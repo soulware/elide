@@ -56,9 +56,10 @@ enum Command {
         #[arg(long, default_value = ".")]
         out_dir: String,
     },
-    /// Find similar (non-identical) chunks within a single image using MinHash/LSH
+    /// Find similar (non-identical) chunks within one or two images using MinHash/LSH
     Similar {
-        image: String,
+        image1: String,
+        image2: Option<String>,
         #[arg(long, default_value_t = DEFAULT_CHUNK_KB)]
         chunk_kb: usize,
     },
@@ -275,8 +276,8 @@ fn main() {
             nbd::run(&image, port, chunk_kb * 1024).expect("NBD server error");
         }
 
-        Command::Similar { image, chunk_kb } => {
-            similar::run(Path::new(&image), chunk_kb * 1024).expect("similar failed");
+        Command::Similar { image1, image2, chunk_kb } => {
+            similar::run(Path::new(&image1), image2.as_deref().map(Path::new), chunk_kb * 1024).expect("similar failed");
         }
 
         Command::Delta { image1, image2, chunk_kb, level } => {
