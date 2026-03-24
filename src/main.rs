@@ -12,6 +12,7 @@ mod delta;
 mod manifest;
 mod nbd;
 mod similar;
+mod snapshot;
 
 const DEFAULT_CHUNK_KB: usize = 32;
 const DEFAULT_ENTROPY_THRESHOLD: f64 = 7.0;
@@ -56,6 +57,25 @@ enum Command {
         image: String,
         #[arg(long, default_value = ".")]
         out_dir: String,
+    },
+    /// Generate a binary snapshot from an ext4 image
+    Snapshot {
+        image: String,
+        #[arg(long, default_value_t = DEFAULT_CHUNK_KB)]
+        chunk_kb: usize,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long, default_value = "snapshots")]
+        out_dir: String,
+    },
+    /// Print metadata from a binary snapshot file
+    SnapshotInfo {
+        snapshot: String,
+    },
+    /// Diff two binary snapshots
+    SnapshotDiff {
+        snapshot1: String,
+        snapshot2: String,
     },
     /// Generate a chunk manifest from an ext4 image
     Manifest {
@@ -290,6 +310,23 @@ fn main() {
 
         Command::Serve { image, port, chunk_kb } => {
             nbd::run(&image, port, chunk_kb * 1024).expect("NBD server error");
+        }
+
+        Command::Snapshot { image, chunk_kb, parent, out_dir } => {
+            snapshot::generate(
+                Path::new(&image),
+                chunk_kb,
+                parent.as_deref().map(Path::new),
+                Path::new(&out_dir),
+            ).expect("snapshot failed");
+        }
+
+        Command::SnapshotInfo { snapshot } => {
+            snapshot::info(Path::new(&snapshot));
+        }
+
+        Command::SnapshotDiff { snapshot1, snapshot2 } => {
+            snapshot::diff(Path::new(&snapshot1), Path::new(&snapshot2));
         }
 
         Command::Manifest { image, chunk_kb, out } => {
