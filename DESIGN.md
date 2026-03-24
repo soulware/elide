@@ -17,71 +17,69 @@ The combination is particularly effective for the VM-at-scale use case because: 
 
 **Block** — the fundamental unit of a block device, 4KB. This is what the VM sees.
 
-**Chunk** — a fixed-size group of consecutive blocks, the unit of dedup and storage. At 32KB, a chunk covers 8 blocks. All chunks within the system are the same size (stored in the manifest header). Chunks are identified by their BLAKE3 hash.
+**Extent** — a contiguous run of blocks written in a single operation, and the fundamental unit of dedup and storage. Extents are variable-size and identified by the BLAKE3 hash of their content. On a live write path, extent boundaries are naturally observable as discontinuities in the LBA sequence between writes. For static images, ext4 inode extent trees provide the boundaries directly. The approximation "one extent ≈ one file" holds well for ext4 images — 84% of extents match exactly between Ubuntu point releases.
 
-**Extent** — a variable-size application write. Extents are split into fixed-size chunks on the write path.
+**Manifest** — a sorted list of `(start_LBA, length, extent_hash)` triples describing the complete state of a volume at a point in time. Held in memory on the host for running volumes. **The manifest is always derivable from the segments** — each segment carries the LBA metadata for the extents it contains, so the manifest can be reconstructed by scanning segments on startup. S3 persistence of the manifest is an optimisation (to avoid expensive segment scans at startup), not a correctness requirement.
 
-**Manifest** — a sorted list of `(LBA, chunk_hash)` pairs describing the complete state of a volume at a point in time. The manifest is the volume's index: given an LBA, it returns the hash of the chunk that should be there. Manifests are small (a few MB for a typical image volume) and held in memory on the host for running volumes.
+**Snapshot** — a frozen, immutable manifest. Snapshots and images are the same thing — there is no separate image concept. A snapshot is taken by freezing the current in-memory manifest. Since extents are immutable and content-addressed, no data is copied. Snapshot identity is `blake3(all extent hashes in LBA order)` — derived from the manifest, not stored separately.
 
-**Snapshot** — a frozen, immutable manifest. Snapshots and images are the same thing — there is no separate image concept. A snapshot is taken by freezing the current manifest; since chunks are immutable and content-addressed, no data is copied. Snapshots are identified by `blake3(manifest_bytes)`.
+**Segment** — a packed collection of extents, typically ~32MB, stored as a single S3 object. Each segment carries the LBA metadata for its extents, making the manifest reconstructible from segments alone. Segments are the unit of S3 I/O.
 
-**Segment** — a packed collection of chunks, typically ~32MB, stored as a single S3 object. Segments are the unit of S3 I/O.
+**Write log** — the local durability boundary. Writes land here first (fsync = durable). Extents are promoted to segments in the background.
 
-**Write log** — the local durability boundary. Writes land here first (fsync = durable). Chunks are promoted to segments in the background.
-
-**Chunk index** — maps `chunk_hash → S3 location`. Tells the read path where in S3 a given chunk lives. Maintained by the global service, updated by GC when chunks are repacked.
+**Extent index** — maps `extent_hash → S3 location`. Tells the read path where in S3 a given extent lives. Maintained by the global service, updated by GC when extents are repacked.
 
 ## Architecture
 
 Two components run on each host:
 
-**Per-volume process** — one per running VM. Owns the ublk/NBD frontend, the live manifest (in memory), the write log (local NVMe), and the per-volume extent index. Classifies chunks by entropy, routes low-entropy chunks to the global service for dedup, stores high-entropy chunks directly in per-volume segments.
+**Per-volume process** — one per running VM. Owns the ublk/NBD frontend, the live manifest (in memory), the write log (local NVMe), and the per-volume extent cache. Classifies extents by entropy, routes low-entropy extents to the global service for dedup, stores high-entropy extents directly in per-volume segments.
 
-**Global service** — one per host. Owns the chunk index (on-disk), the in-memory filter (xor/ribbon), and the host-level read cache. Handles dedup lookups, segment packing, S3 upload/download, and GC.
+**Global service** — one per host. Owns the extent index (on-disk), the in-memory filter (xor/ribbon), and the host-level read cache. Handles dedup lookups, segment packing, S3 upload/download, and GC.
 
-S3 is shared across all hosts. Segments from any volume on any host land in a single shared namespace. The manifest and chunk index together replace the per-volume segment list of the reference LSVD implementation.
+S3 is shared across all hosts. Segments from any volume on any host land in a single shared namespace. The in-memory manifest (reconstructible from segments) and extent index together replace the per-volume segment list of the reference LSVD implementation.
 
 ```
 VM
  │  block I/O (ublk / NBD)
  ▼
 Per-volume process
- │  write path: split → entropy check → chunk → hash
+ │  write path: buffer → extent boundary → hash → dedup check
  │  read path:  LBA → manifest → hash → local cache → S3
  │
  ├─ Write log (local NVMe, durability boundary)
- ├─ Live manifest (in memory, LBA → hash)
+ ├─ Live manifest (in memory, LBA → hash, reconstructible from segments)
  └─ Global service client
       │
       ▼
 Global service (per host)
- ├─ Chunk index (on-disk, hash → S3 location)
+ ├─ Extent index (on-disk, hash → S3 location)
  ├─ Xor/ribbon filter (in memory, ~100MB)
  ├─ Read cache (small, absorbs S3 fetch bursts)
  └─ S3 (shared, all hosts)
-      ├─ segments/<id>       — packed chunks
-      ├─ snapshots/<id>.snap — frozen manifests
-      └─ index/chunk-index   — global chunk hash → location
+      ├─ segments/<id>  — packed extents (carry LBA metadata)
+      └─ index/extent-index  — global extent hash → location
 ```
 
 ## Write Path
 
 ```
 1. VM issues write for LBA range
-2. Split into fixed-size chunks
-3. For each chunk:
+2. Buffer contiguous writes; each non-contiguous LBA gap finalises an extent
+3. For each extent:
    a. Entropy check
       - High entropy → local tier (per-volume segment, no dedup)
       - Low entropy  → continue
-   b. Check per-volume extent index (in memory)
-      - Hit  → point LBA at existing chunk, done
+   b. Hash extent content → extent_hash
+   c. Check per-volume extent cache (in memory)
+      - Hit  → point LBA range at existing extent, done
       - Miss → continue
-   c. Check xor/ribbon filter (in memory)
-      - Miss → new chunk, store it
-      - Hit  → check chunk index on disk to confirm
-   d. If new: write to write log (fsync = durable), promote to segment in background
-   e. If duplicate: reference existing chunk, no write
-4. Update live manifest with new LBA → hash mappings
+   d. Check xor/ribbon filter (in memory)
+      - Miss → new extent, store it
+      - Hit  → check extent index on disk to confirm
+   e. If new: write to write log (fsync = durable), promote to segment in background
+   f. If duplicate: reference existing extent, no write
+4. Update live manifest with new (start_LBA, length, extent_hash) entries
 ```
 
 Durability is at the write log. S3 upload is asynchronous and not on the critical path.
@@ -102,56 +100,63 @@ The kernel page cache sits above the block device and handles most hot reads —
 
 ## Manifest Format
 
-Binary flat file. Content-addressed: `snapshot_id = blake3(file_bytes)`, used as the filename (`<snapshot_id>.snap`).
+The manifest is primarily an **in-memory data structure** — a sorted list of `(start_LBA, length, extent_hash)` triples. It is always reconstructible by scanning segment metadata, so S3 persistence is an optimisation rather than a requirement.
 
-**Header (88 bytes):**
+When persisted (at snapshot time, or as a startup cache), the format is a binary flat file:
+
+**Header (84 bytes):**
 
 | Offset | Size | Field        | Description                          |
 |--------|------|--------------|--------------------------------------|
-| 0      | 8    | magic        | `PLMPST\x00\x01`                     |
-| 8      | 32   | volume_id    | blake3 of all chunk hashes (content-derived) |
+| 0      | 8    | magic        | `PLMPST\x00\x02`                     |
+| 8      | 32   | volume_id    | blake3 of all extent hashes in LBA order |
 | 40     | 32   | parent_id    | snapshot_id of parent; zeros = root  |
-| 72     | 4    | chunk_size   | chunk size in bytes (u32 le)         |
-| 76     | 4    | entry_count  | number of entries (u32 le)           |
-| 80     | 8    | timestamp    | unix seconds (u64 le)                |
+| 72     | 4    | entry_count  | number of entries (u32 le)           |
+| 76     | 8    | timestamp    | unix seconds (u64 le)                |
 
-**Entries (40 bytes each, sorted by LBA):**
+**Entries (44 bytes each, sorted by start_LBA):**
 
-| Offset | Size | Field | Description              |
-|--------|------|-------|--------------------------|
-| 0      | 8    | lba   | logical block address (u64 le) |
-| 8      | 32   | hash  | BLAKE3 chunk hash        |
+| Offset | Size | Field      | Description                          |
+|--------|------|------------|--------------------------------------|
+| 0      | 8    | start_lba  | first logical block address (u64 le) |
+| 4      | 4    | length     | extent length in 4KB blocks (u32 le) |
+| 12     | 32   | hash       | BLAKE3 extent hash                   |
 
-One entry per chunk. The LBA is chunk-aligned (multiple of `chunk_size / 4096`). Unwritten LBAs have no entry (implicitly zero). At 32KB chunks and a 2GB volume, a fully-written manifest is ~2.5MB.
+One entry per extent. Unwritten LBA ranges have no entry (implicitly zero).
 
-**Snapshot identity:** `snapshot_id = blake3(entire file)`. Not stored in the file — derived on load. The snapshot filename is its own ID.
+**Snapshot identity:** `snapshot_id = blake3(all extent hashes in LBA order)` — derived from the in-memory manifest, not from the file bytes. Identical volume state always produces the same snapshot_id regardless of when or where the manifest was serialised.
 
-**Volume identity:** `volume_id = blake3(all chunk hashes in LBA order)`. Deterministic from content. Two independently-generated snapshots of the same image produce the same `volume_id`. Two snapshots of the same running volume have the same `volume_id`, enabling LBA-level diffing to show what changed.
+**Volume identity:** `volume_id = blake3(all extent hashes in LBA order)` — same derivation. Two independently-generated snapshots of the same image produce the same `volume_id`.
 
-**Parent chain:** `parent_id` references the `snapshot_id` of the previous snapshot. This enables chain traversal without loading both manifests. A snapshot with `parent_id = [0; 32]` is a root snapshot with no history.
+**Parent chain:** `parent_id` references the `snapshot_id` of the previous snapshot, enabling chain traversal.
 
-## Chunk Index
+**Reconstruction:** on startup, if no cached manifest is available (or the cache is stale), the manifest is rebuilt by scanning all segment metadata headers. Each segment records the `(start_LBA, length, extent_hash)` of every extent it contains.
 
-Maps `chunk_hash → S3 location`. Separate from the manifest — the manifest is purely logical (what data is at each LBA), the chunk index is physical (where that data lives in S3).
+## Extent Index
 
-This separation means GC can repack chunks (changing their S3 location) by updating only the chunk index. Manifests are never rewritten after being frozen.
+Maps `extent_hash → S3 location`. Separate from the manifest — the manifest is purely logical (what data is at each LBA range), the extent index is physical (where that data lives in S3).
 
-The chunk index also stores delta compression metadata: if chunk B is stored as a delta against chunk A, the index records `hash_B → {segment, offset, delta_source: hash_A}`. The manifest is unaware of this — it just records `lba → hash_B`. The read path fetches the delta and the source chunk, reconstructs B, and caches the full chunk locally.
+This separation means GC can repack extents (changing their S3 location) by updating only the extent index. Manifests are never rewritten after being frozen.
 
-**In-memory filter:** an xor or ribbon filter (~100MB for 80M entries) guards the on-disk index. Chunks not in the filter are definitively new — no disk lookup needed. False positives fall through to disk. Filter is rebuilt periodically during GC sweep.
+The extent index also stores delta compression metadata: if extent B is stored as a delta against extent A, the index records `hash_B → {segment, offset, delta_source: hash_A}`. The manifest is unaware of this — it just records `(start_lba, length, hash_B)`. The read path fetches the delta and the source extent, reconstructs B, and caches the full extent locally.
+
+**In-memory filter:** an xor or ribbon filter (~100MB for 80M entries) guards the on-disk index. Extents not in the filter are definitively new — no disk lookup needed. False positives fall through to disk. Filter is rebuilt periodically during GC sweep.
 
 ## Dedup
 
-**Exact dedup:** two chunks with the same BLAKE3 hash are identical. The second write costs nothing — the manifest is updated to point the new LBA at the existing chunk. No data stored, no S3 upload.
+**Exact dedup:** two extents with the same BLAKE3 hash are identical. The second write costs nothing — the manifest is updated to point the new LBA range at the existing extent. No data stored, no S3 upload.
 
-**Delta compression:** chunks that are similar but not identical (e.g. a file updated by a security patch) can be stored as a delta against a known chunk. Applied at S3 upload time — the local cache always holds full reconstructed chunks. The benefit is reduced S3 fetch size, not storage cost. The primary value is latency: fetching a 2KB delta instead of a 32KB chunk from S3 is ~16× faster on the network path.
+**Delta compression:** extents that are similar but not identical (e.g. a file updated by a security patch) can be stored as a delta against a known extent. Applied at S3 upload time — the local cache always holds full reconstructed extents. The benefit is reduced S3 fetch size, not storage cost. The primary value is latency: fetching a small delta instead of a full extent from S3 is dramatically faster on the cold-read path.
+
+**Delta source selection** is trivial at the extent level: the natural reference for a changed file is the same-path file in the previous snapshot. No similarity search required — the manifest parent chain gives direct access to the prior version of each extent.
 
 Delta compression is compelling for point-release image updates; not worth the complexity for cross-version (major version) updates where content is genuinely different throughout.
 
 **Empirically measured (Ubuntu 22.04 point releases, 14 months apart):**
-- 70% of chunks are exact matches (zero marginal cost)
-- Of the remaining 30%, delta compression achieves ~90% size reduction on similar chunks
-- Overall marginal S3 fetch to advance from one point release to the next: ~456MB vs ~700MB for a full fetch (~35% of full image, ~94% saving vs fetching fresh)
+- 84% of file extents are exact matches by count (zero marginal cost)
+- 35% of bytes are covered by exact-match extents; the remaining 65% are in files touched by security patches
+- The 65% in changed extents is the delta compression target: whole-file deltas against the previous snapshot's copy, which are typically tiny (a patch changes a small region of a large binary)
+- Overall marginal S3 fetch to advance from one point release to the next: ~94% saving vs fetching fresh
 
 ## Volume Types and Namespace Scoping
 
@@ -164,7 +169,7 @@ Volumes have a type that determines which chunk namespace they participate in.
 Snapshot manifests are uniform across volume types — snapshot management is identical regardless of type. Only the chunk storage routing differs.
 
 **Routing at write time:**
-- `volume.type == Image && entropy(chunk) < threshold` → global service (dedup check)
+- `volume.type == Image && entropy(extent) < threshold` → global service (dedup check)
 - Everything else → per-volume segments (no dedup)
 
 **Open question:** binary global/non-global routing may not be granular enough. Hierarchical namespaces (global → org → image-family → volume) are a plausible future requirement. The design should treat namespace as an attribute of the volume, not a boolean flag.
@@ -183,15 +188,15 @@ A snapshot is a frozen manifest. Taking a snapshot is cheap: copy the current in
 
 ## GC and Repacking
 
-**Standard GC:** walk all manifests, build the set of live chunk hashes, delete unreferenced chunks from S3 after a grace period. No per-write refcounting — the manifest scan is the reference count.
+**Standard GC:** walk all manifests, build the set of live extent hashes, delete unreferenced extents from S3 after a grace period. No per-write refcounting — the manifest scan is the reference count.
 
-**Delta dependency handling:** when a source chunk is about to be deleted and a live delta depends on it, materialize the delta first (fetch source + delta → full chunk, write full chunk to S3, update chunk index). Then delete the source. The dependency map is derived fresh each GC sweep from the chunk index — no persistent reverse index needed.
+**Delta dependency handling:** when a source extent is about to be deleted and a live delta depends on it, materialise the delta first (fetch source + delta → full extent, write full extent to S3, update extent index). Then delete the source. The dependency map is derived fresh each GC sweep from the extent index — no persistent reverse index needed.
 
-**Access-pattern-driven repacking:** GC extends beyond space reclamation to also improve data locality. Boot-path chunks — identified from observed access patterns during VM startup — are co-located in dedicated segments. A cold VM boot then fetches one or two S3 segments to get everything needed for boot, rather than many scattered segments.
+**Access-pattern-driven repacking:** GC extends beyond space reclamation to also improve data locality. Boot-path extents — identified from observed access patterns during VM startup — are co-located in dedicated segments. A cold VM boot then fetches one or two S3 segments to get everything needed for boot, rather than many scattered segments.
 
-**Boot hint accumulation:** every VM boot records which chunks were accessed during the boot phase (identified by time window after volume attach, or explicit VM lifecycle signals from the hypervisor). These observations accumulate per snapshot. After sufficient boots (converges quickly at scale — 500 VMs/day = 500 observations/day), the hint set is stable enough to guide repacking decisions.
+**Boot hint accumulation:** every VM boot records which extents were accessed during the boot phase (identified by time window after volume attach, or explicit VM lifecycle signals from the hypervisor). These observations accumulate per snapshot. After sufficient boots (converges quickly at scale — 500 VMs/day = 500 observations/day), the hint set is stable enough to guide repacking decisions.
 
-**Continuous improvement:** first boot is cold; boot access patterns are recorded; next GC repack co-locates those chunks; subsequent boots are faster. The feedback loop strengthens with scale. This is novel in production block storage — most S3-backed systems are write-once and never reorganise for locality.
+**Continuous improvement:** first boot is cold; boot access patterns are recorded; next GC repack co-locates those extents; subsequent boots are faster. The feedback loop strengthens with scale. This is novel in production block storage — most S3-backed systems are write-once and never reorganise for locality.
 
 ## Empirical Findings
 
@@ -210,17 +215,24 @@ Ubuntu 22.04 minimal cloud image (2.1GB root partition, 68,512 × 32KB chunks):
 
 **93.9% of the image is never read during a full boot.** Even exhaustive use of the system touches only ~16% of the raw image (including unallocated space; ~35% of actual filesystem data).
 
-### Dedup: chunk overlap between image versions
+### Dedup: extent overlap between image versions
 
-File-content-aware chunking (32KB chunks, per-file boundaries):
+Extent-level dedup using inode-based physical extent boundaries:
 
-| Comparison | Exact chunk overlap |
+| Comparison | Exact extent overlap (count) | Exact extent overlap (bytes) |
+|---|---|---|
+| 22.04 point releases (14 months apart) | 84% | 35% |
+
+The count/bytes divergence reveals the size distribution: the 84% of extents that match are predominantly small files (configs, scripts, locale data). The 16% that don't match are the large files (libraries, executables) touched by security patches — these account for 65% of bytes. That 65% is the delta compression target.
+
+For comparison, earlier analysis using fixed-size file-content-aware chunking:
+
+| Approach | Exact overlap |
 |---|---|
-| 22.04 point releases (14 months apart) | 70% |
-| 22.04 vs 24.04 | 6–12% |
-| Raw block-level (any comparison) | ~1% |
+| 32KB chunks, file-aligned | ~70% of chunks |
+| Raw block-level (fixed offsets) | ~1% of chunks |
 
-File-content-aware chunking is essential. Raw block-level dedup across image versions is nearly useless because file content does not align to fixed block offsets consistently.
+The chunk-level 70% includes partial credit — a library with a 200-byte patch still contributes 31/32 unchanged chunks. Extent-level loses that partial credit but recovers it via delta compression at a coarser, more natural granularity (whole-file deltas with trivial source selection).
 
 ### Delta compression: marginal S3 cost
 
@@ -235,17 +247,16 @@ In production, the relevant comparison is always point-release: continuous deplo
 
 ### Manifest size
 
-Ubuntu 22.04 (~700MB of file data, 32KB chunks): 51,247 entries, ~5MB TSV / ~2MB binary. Well within "a few MB" as expected.
+Ubuntu 22.04 (~762MB of file data): ~33,700 extents. At 44 bytes per entry, the binary manifest is ~1.5MB. Well within "a few MB" as expected.
 
 ## Open Questions
 
-- **Chunk size:** 32KB proposed but tunable. Smaller = better dedup granularity, larger index. Larger = better compression, coarser dedup.
 - **Entropy threshold:** 7.0 bits used in experiments. Optimal value depends on workload mix.
 - **Write log format:** not yet designed. Affects recovery, promotion to segments, snapshot consistency.
-- **Chunk index implementation:** sled, rocksdb, or custom. Needs random reads and range scans.
-- **Shared chunk index:** per-host or shared service? DynamoDB, S3-backed, or dedicated process?
-- **Write log → hash transition point:** hash on write (lowest dedup latency), hash on promotion to segment (preferred), or hash at S3 upload (simplest).
-- **Delta source selection:** how to find a good reference chunk at upload time efficiently. TLSH or MinHash over a per-image-family index.
+- **Extent index implementation:** sled, rocksdb, or custom. Needs random reads and range scans.
+- **Shared extent index:** per-host or shared service? DynamoDB, S3-backed, or dedicated process?
+- **Extent boundary detection on the live write path:** buffering contiguous writes into extents is straightforward; the open question is the coalescing window — how long to wait for a burst to complete before finalising an extent. Too short fragments large files; too long adds write latency.
+- **Manifest cache invalidation:** the reference implementation (lab47/lsvd) validates the cached manifest against a hash of current segment IDs. Same approach applies here.
 - **Namespace granularity:** binary global/non-global may not be sufficient for multi-tenancy.
 - **Boot hint persistence:** where are hint sets stored, how are they distributed across hosts?
 - **Empirical validation of repacking benefit:** measure segment fetch count before and after access-pattern-driven repacking.
