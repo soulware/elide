@@ -81,7 +81,7 @@ Global service (per host)
  ├─ Xor/ribbon filter (in memory, ~100MB)
  ├─ Read cache (small, absorbs S3 fetch bursts)
  └─ S3 (shared, all hosts)
-      ├─ segments/<id>  — packed extents (carry LBA metadata)
+      ├─ segments/<ULID>  — packed extents (carry LBA metadata)
       └─ index/extent-index  — global extent hash → location
 ```
 
@@ -124,11 +124,30 @@ Live write dedup is **opportunistic** — extents are fsync-bounded and contiguo
 
 The kernel page cache sits above the block device and handles most hot reads — the system never sees page cache hits. The local chunk cache is a small S3 fetch buffer, not a general-purpose cache.
 
-## Manifest Format
+## LBA Map
 
-The manifest is primarily an **in-memory data structure** — a sorted list of `(start_LBA, length, extent_hash)` triples. It is always reconstructible by scanning segment metadata, so S3 persistence is an optimisation rather than a requirement.
+The **LBA map** is the live in-memory data structure mapping logical block addresses to content. It is a sorted structure (B-tree or equivalent) keyed by `start_LBA`, where each entry holds `(start_lba, lba_length, extent_hash)`. It is updated on every write (new entries added, existing entries trimmed or replaced for overwrites) and is the authoritative source for read path lookups.
 
-When persisted (at snapshot time, or as a startup cache), the format is a binary flat file:
+**Contrast with lab47/lsvd:** the reference implementation calls this `lba2pba` and maps `LBA → segment+offset` (physical location). GC repacking must update it for every moved extent. Palimpsest maps `LBA → hash` — the logical layer. Physical location (`hash → segment+offset`) is a separate extent index. This two-level indirection means GC repacking updates only the extent index; the LBA map is never rewritten for GC. Manifests and snapshots become immutable once written.
+
+### LBA map persistence
+
+The LBA map is persisted to a local `lba.map` file on clean shutdown and used as a fast-start cache on restart — analogous to the reference implementation's `head.map`.
+
+**Freshness guard:** the file includes a BLAKE3 hash of the sorted list of all current local segment IDs. On startup, if the guard matches the current segment list, the cached LBA map is loaded directly without scanning `.idx` files. If the guard doesn't match (new segments were written or old ones removed since last checkpoint), the LBA map is rebuilt from scratch.
+
+**Rebuild procedure:**
+1. Scan all local segment `.idx` files (fast — `.idx` files are small, ~60KB each)
+2. For each `.idx` entry, apply to the LBA map (later segments take precedence for any overlapping LBA range)
+3. Replay any WAL file(s) on top (WAL entries are the most recent writes)
+
+Since `.idx` files are the ground truth for segment contents, rebuilding the LBA map requires only `.idx` files and the WAL — never the segment data bodies. A full startup rebuild for a volume with 100 segments is a scan of ~6MB of `.idx` data, not 3GB of segment bodies.
+
+### Manifest format
+
+"Manifest" refers specifically to the **serialised form** written at snapshot time (or as a startup cache). The live LBA map is the source; the manifest is a point-in-time freeze of it.
+
+When persisted, the format is a binary flat file:
 
 **Header (84 bytes):**
 
@@ -150,13 +169,11 @@ When persisted (at snapshot time, or as a startup cache), the format is a binary
 
 One entry per extent. Unwritten LBA ranges have no entry (implicitly zero).
 
-**Snapshot identity:** `snapshot_id = blake3(all extent hashes in LBA order)` — derived from the in-memory manifest, not from the file bytes. Identical volume state always produces the same snapshot_id regardless of when or where the manifest was serialised.
+**Snapshot identity:** `snapshot_id = blake3(all extent hashes in LBA order)` — derived from the live LBA map, not from the file bytes. Identical volume state always produces the same snapshot_id regardless of when or where the manifest was serialised.
 
 **Volume identity:** `volume_id = blake3(all extent hashes in LBA order)` — same derivation. Two independently-generated snapshots of the same image produce the same `volume_id`.
 
 **Parent chain:** `parent_id` references the `snapshot_id` of the previous snapshot, enabling chain traversal.
-
-**Reconstruction:** on startup, if no cached manifest is available (or the cache is stale), the manifest is rebuilt by scanning all segment metadata headers. Each segment records the `(start_LBA, length, extent_hash)` of every extent it contains.
 
 ## Extent Index
 
@@ -248,8 +265,8 @@ The snapshot index covers no more and no less than what is needed to read that s
 Segments are the unit of S3 storage. Each segment is a packed collection of extents (~32MB). Alongside each segment, a small companion index file is written:
 
 ```
-s3://bucket/segments/<id>       — packed extents (~32MB), raw bytes
-s3://bucket/segments/<id>.idx   — per-extent metadata (LBA, hash, body location)
+s3://bucket/segments/<ULID>       — packed extents (~32MB), raw bytes
+s3://bucket/segments/<ULID>.idx   — per-extent metadata (LBA, hash, body location)
 ```
 
 The segment body is raw bytes — concatenated extent data with no per-extent framing. All structure lives in the `.idx` file. The `.idx` is always fetched before the segment body: it tells the read path whether a segment fetch is needed at all, and if so which byte ranges to request.
@@ -382,54 +399,12 @@ One simplifying factor across all levels: ext4's default journaling mode is `dat
 
 ## Empirical Findings
 
-Measured using `palimpsest` — a Rust tool purpose-built to explore these concepts against real Ubuntu images.
+See [FINDINGS.md](FINDINGS.md) for full measurements. Key results:
 
-### Demand-fetch: how much of an image is actually read?
-
-Ubuntu 22.04 minimal cloud image (2.1GB root partition, 68,512 × 32KB chunks):
-
-| Stage | Chunks read | Data | % of image |
-|---|---|---|---|
-| Full systemd boot to login prompt | 4,159 | 130 MB | 6.1% |
-| + all shared libraries | 923 | 29 MB | 7.6% cumulative |
-| + all of /usr/share | 4,244 | 133 MB | 13.8% cumulative |
-| + all executables | 1,289 | 40 MB | 15.7% cumulative |
-
-**93.9% of the image is never read during a full boot.** Even exhaustive use of the system touches only ~16% of the raw image (including unallocated space; ~35% of actual filesystem data).
-
-### Dedup: extent overlap between image versions
-
-Extent-level dedup using inode-based physical extent boundaries:
-
-| Comparison | Exact extent overlap (count) | Exact extent overlap (bytes) |
-|---|---|---|
-| 22.04 point releases (14 months apart) | 84% | 35% |
-
-The count/bytes divergence reveals the size distribution: the 84% of extents that match are predominantly small files (configs, scripts, locale data). The 16% that don't match are the large files (libraries, executables) touched by security patches — these account for 65% of bytes. That 65% is the delta compression target.
-
-For comparison, earlier analysis using fixed-size file-content-aware chunking:
-
-| Approach | Exact overlap |
-|---|---|
-| 32KB chunks, file-aligned | ~70% of chunks |
-| Raw block-level (fixed offsets) | ~1% of chunks |
-
-The chunk-level 70% includes partial credit — a library with a 200-byte patch still contributes 31/32 unchanged chunks. Extent-level loses that partial credit but recovers it via delta compression at a coarser, more natural granularity (whole-file deltas with trivial source selection).
-
-### Delta compression: marginal S3 cost
-
-| Scenario | Exact dedup | Delta benefit | Marginal fetch |
-|---|---|---|---|
-| 22.04 point release | 67% exact | 56% of remainder | ~43MB of ~700MB (~94% saving) |
-| 22.04 vs 24.04 | 19% exact | 13% of remainder | ~95MB of ~700MB (~86% saving) |
-
-The 22.04 vs 24.04 saving (86%) is almost entirely from compression — delta contributes little. For point releases, delta compression does the heavy lifting.
-
-In production, the relevant comparison is always point-release: continuous deployment means each update is a small delta from the previous. The system always operates in the point-release regime, never the major-version regime.
-
-### Manifest size
-
-Ubuntu 22.04 (~762MB of file data): ~33,700 extents. At 44 bytes per entry, the binary manifest is ~1.5MB. Well within "a few MB" as expected.
+- **93.9% of a 2.1GB Ubuntu image is never read during a full boot** — validates the demand-fetch model
+- **84% of extents match exactly between 22.04 point releases** (by count); 35% by bytes — the large changed files are the delta compression target
+- **~94% marginal S3 fetch saving** for a point-release update (exact dedup + delta compression combined)
+- **~1.5MB manifest** for a 762MB filesystem (~33,700 extents at 44 bytes each)
 
 ## Write Log
 
@@ -437,7 +412,7 @@ The write log is the local durability boundary. Writes land here on fsync; the l
 
 ### File format
 
-A single append-only file per in-progress segment: `writelog.<id>`. This is the same shape as the lsvd reference implementation — one file, records appended sequentially, no separate index. On promotion the file is consumed to produce the local segment file and `.idx`, then deleted.
+A single append-only file per in-progress segment: `writelog.<ULID>`. This is the same shape as the lsvd reference implementation — one file, records appended sequentially, no separate index. On promotion the file is consumed to produce the local segment file and `.idx`, then deleted.
 
 **Magic header:** `PLMPWL\x00\x01` (8 bytes)
 
@@ -497,16 +472,81 @@ After a guest fsync returns, all prior writes are durable in the write log on lo
 
 ### Crash recovery
 
-On startup, if a write log file exists, `scan()` reads it sequentially. If a partial record is found at the tail (power loss mid-write), the file is truncated to the last complete record. All complete records are replayed to reconstruct the in-memory manifest. The write log is then reopened for continued appending.
+On startup, if a write log file exists, `scan()` reads it sequentially. If a partial record is found at the tail (power loss mid-write), the file is truncated to the last complete record. All complete records are replayed to reconstruct the in-memory LBA map. The write log is then reopened for continued appending.
+
+**Failure scenarios:**
+
+| Scenario | State on restart | Recovery |
+|---|---|---|
+| Crash mid-write (before fsync) | WAL tail partial | Truncate WAL to last complete record; replay |
+| Crash after fsync, before promotion starts | `wal/<ULID>` intact; nothing in `pending/` | Replay WAL; promote normally |
+| Crash during `.idx` write (steps 1–3) | `.idx.tmp` may exist in `pending/`; WAL intact in `wal/` | Delete `.idx.tmp`; replay WAL |
+| Crash between `.idx` rename and body rename (steps 3–4) | `pending/<ULID>.idx` exists; WAL intact in `wal/` | `.idx` exists but no body — WAL intact, complete the rename to finish promotion |
+| Crash after body rename, before LBA map update (step 4+) | Both `pending/<ULID>` and `.idx` exist | Rebuild LBA map from `pending/` `.idx` files; queue S3 upload |
+| Crash mid-upload or after upload before rename (steps 6–7) | Body and `.idx` still in `pending/`; may be in S3 already | Retry upload (idempotent); complete rename on success |
+| Crash between body rename and `.idx` rename (steps 7–8) | Body in `segments/`; `.idx` still in `pending/` | Move `pending/<ULID>.idx` → `segments/<ULID>.idx` |
+| Total local disk loss | All local state gone | Data loss bounded to writes not yet in S3 — same guarantee as a local SSD |
+
+The commit point (step 4, body rename into `pending/`) requires no fsync of a list file. The WAL is available as fallback for any crash before that rename. After it, the segment is committed and the WAL is gone — recovery reads `.idx` files directly from the filesystem.
+
+The final row is an intentional design choice: local NVMe is the durability boundary, matching the stated goal of "durability semantics similar to a local SSD". S3 is async offload, not the primary durability mechanism.
 
 ### Promotion to segment
 
-When the write log reaches the 32MB threshold (or on an explicit flush), a background task reads it sequentially and produces:
+When the write log reaches the 32MB threshold (or on an explicit flush), the background promotion task converts the WAL into a committed local segment. The WAL is assigned a ULID at creation time; that same ULID becomes the segment ID, tying the two together throughout the promotion.
 
-1. `segments/<id>` — segment body: raw extent data concatenated (DATA records only)
-2. `segments/<id>.idx` — per-extent metadata in the `.idx` format
+**Zero-copy promotion:** the WAL file is renamed directly to `pending/<ULID>` — no data is copied. WAL records are `[header | data]`, so the segment body contains embedded WAL headers as inert padding between the extent data regions. The `.idx` `body_offset` for each extent points past the WAL header to the start of that extent's data bytes. Reads use `.idx` byte-range offsets and never parse the embedded headers. GC repacking rewrites segments into clean bodies (no embedded headers) as a side effect of extent coalescing.
 
-The body bytes stream directly from the write log into the local segment file (one sequential read, one sequential write). The `.idx` entries (~60 bytes each, ~60KB total for a 32MB segment) are accumulated in memory during the scan and written once. After successful local write and S3 upload, the write log is deleted.
+The `body_offset` for each extent is recorded at write time: `append_data` returns the byte offset of the data bytes within the WAL file (captured from `self.size` after writing the header, before writing the data). This is what goes into the `.idx` as `body_offset` — correct because the WAL file becomes the segment body unchanged.
+
+**Directory layout:**
+
+```
+wal/<ULID>              — WAL file (active or awaiting promotion)
+pending/<ULID>          — promoted segment, not yet uploaded to S3
+pending/<ULID>.idx      — .idx for a pending segment
+segments/<ULID>         — segment confirmed uploaded to S3
+segments/<ULID>.idx     — .idx for an uploaded segment
+```
+
+Each directory corresponds to one stage in the lifecycle, and each transition is an atomic rename:
+
+```
+wal/<ULID>  →  pending/<ULID>  →  segments/<ULID>
+```
+
+`wal/` normally contains one entry — the active WAL — but can contain two during the brief promotion window: the old WAL being promoted by the background task and the new WAL already receiving writes. Since promotion is fast (write ~60KB `.idx`, two renames), this is transient. On crash recovery all files in `wal/` are treated identically: scan, truncate partial tail, promote. The active/inactive distinction does not matter for recovery.
+
+`pending/` segments are the only local copy of their data; they must not be evicted. `segments/` are S3-backed caches; freely evictable under space pressure. No list files are needed — the filesystem is the index.
+
+**Commit ordering:**
+
+```
+1. Build .idx in memory from the session's extent list (body_offsets from append_data)
+2. Write pending/<ULID>.idx.tmp
+3. Rename pending/<ULID>.idx.tmp → pending/<ULID>.idx
+4. Rename wal/<ULID> → pending/<ULID>            ← COMMIT POINT
+5. Update LBA map in memory
+```
+
+Step 4 is the commit point — the presence of the body file in `pending/` signals that promotion is complete. No fsync of a list file is needed; the rename is atomic. The `.idx` must exist before the body appears (step 3 before step 4) because LBA map rebuild reads `.idx` for every segment found on startup.
+
+**S3 upload completion:**
+
+```
+6. Upload pending/<ULID> and pending/<ULID>.idx to S3
+7. Rename pending/<ULID> → segments/<ULID>
+8. Rename pending/<ULID>.idx → segments/<ULID>.idx
+```
+
+Steps 7 and 8 are two renames, not one atomic operation. If we crash between them, the body is in `segments/` but `.idx` is still in `pending/`. Recovery: if a body exists in `segments/` without a `.idx` alongside it, look for the `.idx` in `pending/` and move it. If an upload succeeds but we crash before the rename, the upload is retried on restart — idempotent for content-addressed data.
+
+**On startup:** scan all three directories. Each maps to one recovery action:
+- `wal/` — replay (truncate partial tail if needed) and promote
+- `pending/` — load `.idx` for LBA map rebuild; queue S3 upload
+- `segments/` — load `.idx` for LBA map rebuild
+
+The read path checks `pending/` before `segments/` (or maintains an in-memory set of pending IDs populated at startup to avoid redundant stat calls).
 
 ---
 
@@ -514,21 +554,68 @@ The body bytes stream directly from the write log into the local segment file (o
 
 The [lab47/lsvd](https://github.com/lab47/lsvd) Go implementation is the primary reference. Key design decisions we studied and how they influenced palimpsest:
 
-**Segment format:** A single file per segment: `[SegmentHeader (8 bytes)][ExtentHeaders (varint-encoded)][body data]`. No companion `.idx` file — all metadata is embedded. Palimpsest diverges here: body and `.idx` are separate files, enabling the extent index to be built from `.idx` alone without reading body data, and allowing the in-memory filter to be rebuilt cheaply.
+### lsvd local directory layout
 
-**Write log format:** Single append-only file, one record per finalised extent, each record is `[header][data]` appended sequentially. No coalescing in the log. Palimpsest's write log follows this shape exactly, adding the BLAKE3 hash and a `FLAG_DEDUP_REF` record type (absent in lsvd which is LBA-addressed, not content-addressed).
+```
+<volume-dir>/
+├── head.map                          — persisted LBA→PBA map (CBOR-encoded,
+│                                       SHA-256 of segment list as freshness guard)
+├── writecache.<ULID>                 — active WAL (receiving writes)
+├── writecache.<ULID>                 — old WAL(s) queued for promotion (up to 20)
+├── segments/
+│   ├── segment.<ULID>               — single-file segment:
+│   │                                   [SegmentHeader 8B][varint index][data body]
+│   └── segment.<ULID>.complete      — transient during Flush(); renamed to final
+└── volumes/
+    └── <volName>/
+        └── segments                 — binary: appended 16-byte ULIDs, one per segment
+```
+
+WAL files live at the root alongside `head.map`. There is no upload-state distinction in the directory layout because S3 upload is synchronous within the background promotion goroutine — by the time a WAL is deleted, its segment is already in S3 and `volumes/<vol>/segments` has been updated. Everything in `segments/` is guaranteed to be in S3.
+
+### Palimpsest local directory layout (comparison)
+
+```
+<volume-dir>/
+├── lba.map                          — persisted LBA map (rebuilt from .idx if stale)
+├── wal/
+│   └── <ULID>                      — WAL file(s): active or awaiting promotion
+├── pending/
+│   ├── <ULID>                      — segment body committed locally, S3 upload pending
+│   └── <ULID>.idx                  — segment index
+└── segments/
+    ├── <ULID>                      — segment body confirmed uploaded to S3 (evictable)
+    └── <ULID>.idx                  — segment index
+```
+
+The `pending/` directory exists because palimpsest decouples local promotion from S3 upload. lsvd has no equivalent — it never has locally-committed segments that aren't yet in S3. The three-directory structure makes the full lifecycle visible via `ls`: `wal/` = in flight, `pending/` = local only, `segments/` = safely in S3.
+
+| | lsvd | Palimpsest |
+|---|---|---|
+| WAL location | Root-level `writecache.<ULID>` | `wal/` subdir |
+| Segment format | Single file (index embedded) | Separate body + `.idx` |
+| Upload tracking | Not needed (S3 sync in promotion) | `pending/` vs `segments/` dirs |
+| Temp files | `segment.<ULID>.complete` | `pending/<ULID>.idx.tmp` |
+| LBA map | `head.map` (CBOR, SHA-256 guard) | `lba.map` (rebuilt from `.idx` files) |
+| Eviction policy | Not applicable | `segments/` evictable; `pending/` never |
+
+**Segment format:** A single file per segment: `[SegmentHeader (8 bytes)][ExtentHeaders (varint-encoded)][body data]`. No companion `.idx` file — all metadata is embedded in the body. Palimpsest uses separate body and `.idx` files for three reasons: (1) the `.idx` can be fetched alone to decide whether a segment fetch is needed at all and which byte ranges to request, avoiding transferring data that isn't needed; (2) the extent index and in-memory filter can be rebuilt from `.idx` files without reading segment bodies; (3) inline small extents and delta metadata are stored in `.idx` without inflating the body. The cost is that `.idx` loss without a corresponding S3 copy would leave a segment's LBA mappings unrecoverable — mitigated by uploading `.idx` to S3 alongside the body.
+
+**Write log format:** Single append-only file, one record per finalised extent, each record is `[header][data]` appended sequentially. No coalescing in the log. Palimpsest's write log follows this shape exactly, adding the BLAKE3 hash and a `FLAG_DEDUP_REF` record type (absent in lsvd which is LBA-addressed, not content-addressed). Additionally, `append_data` records each extent's `body_offset` (byte position of data within the WAL file) so the WAL can be renamed directly to the segment body on promotion — zero copy.
 
 **Pre-log coalescing:** lsvd's `nbdWrapper` buffers up to 20 contiguous blocks in a `pendingWrite` buffer before calling `WriteExtent()`. This is where adjacent LBA writes are merged. The log sees finalised extents, not raw 4KB writes. Palimpsest follows the same pattern; the count limit (lsvd: 20 blocks) is a tuning parameter.
 
 **Fsync handling:** `writeLog()` calls `bufio.Flush()` after each extent (OS buffer, not disk). The actual `fsync` happens only in `SegmentBuilder.Sync()`, called when the guest issues a flush. Reply is sent after `logF.Sync()` completes. Palimpsest's `WriteLog::fsync()` follows this exactly.
 
-**Async S3 upload:** `closeSegmentAsync()` sends a `CloseSegment` event to a background controller goroutine and returns immediately. The controller calls `Flush()`, writes the local segment file, uploads to S3, and updates the LBA→PBA map. The write path is never blocked on S3. Palimpsest will follow the same async promotion model.
+**Async promotion — important distinction:** lsvd's `closeSegmentAsync()` sends a `CloseSegment` event to a background goroutine and the write path returns immediately. However, within that goroutine, `Flush()` calls `UploadSegment()` synchronously — the LBA map is not updated until after the S3 upload completes. If S3 is slow or unavailable, the background queue backs up and old WAL files accumulate on local NVMe (up to 20 queued, one per channel slot). Palimpsest decouples local promotion from S3 upload entirely: the WAL is committed as a local segment (segments.list fsync + WAL rename) and the LBA map is updated without waiting for S3. S3 upload is a separate background step tracked via `uploaded.list`.
+
+**Durability equivalence:** both lsvd and palimpsest have the same fundamental durability guarantee — local NVMe is the boundary, not S3. At any moment lsvd has: one active WAL + up to 20 queued old WALs not yet in S3. Palimpsest has: one active WAL + some number of promoted-but-not-yet-uploaded local segments. In both cases, total local disk failure loses data that the guest's fsync acknowledged. Neither design guarantees S3 durability for in-flight writes. The difference is only naming: lsvd calls staged data "old WAL files"; palimpsest calls them "local segments".
 
 **Local segment cache:** Segment files are kept in `segments/` on local disk indefinitely after upload. Reads check in-memory write cache → previous segment cache → local disk → S3 (via HTTP range requests). Palimpsest retains the same local cache tier.
 
 **Post-hoc extent merging:** lsvd does not merge adjacent extents at write time. Adjacent-extent merging happens in `pack.go` during GC, where runs of adjacent extents are coalesced into larger records (up to 100 blocks). Palimpsest's repacking / GC pass will do the same.
 
-**LBA→PBA vs content-addressed:** lsvd's extent map is `LBA → segment+offset` (physical location). GC repacking must update this map for every moved extent. Palimpsest splits this into a logical manifest (`LBA → hash`) and a physical extent index (`hash → segment+offset`). The manifest is immutable once frozen; only the extent index is updated during GC. This is the primary structural divergence from lsvd.
+**LBA map vs content-addressed:** lsvd calls its in-memory working structure `lba2pba` (`LBA → segment+offset`, physical location). GC repacking must update it for every moved extent. Palimpsest's equivalent is the **LBA map** (`LBA → hash`, logical). Physical location (`hash → segment+offset`) is tracked separately in the extent index. GC repacking updates only the extent index; the LBA map is unaffected. Frozen manifests (snapshots) are therefore immutable. This is the primary structural divergence from lsvd. The persistence and recovery story is otherwise analogous: lsvd persists `head.map` with a segment-list hash guard; palimpsest persists `lba.map` with the same guard, rebuilding from `.idx` files if stale.
 
 **Compression:** lsvd uses LZ4 with an entropy threshold of 7.0 bits/byte and a minimum compression ratio of 1.5×. Palimpsest uses zstd (already a dependency) with the same 7.0-bit entropy threshold as a starting point.
 
@@ -536,6 +623,7 @@ The [lab47/lsvd](https://github.com/lab47/lsvd) Go implementation is the primary
 
 ## Open Questions
 
+- **Hash output size:** BLAKE3 at full 256-bit is the current choice — collision probability is negligible (~2^-128 birthday bound) at any realistic extent count, and speed is equivalent to non-cryptographic hashes on AVX2/NEON hardware. A truncated 128-bit output would halve the per-entry cost in the extent index (~1.6GB saved at 80M entries) while keeping collision probability effectively zero at practical scales (birthday bound ~2^64). Worth revisiting once the index size and memory pressure are measured empirically.
 - **Inline extent threshold:** extents below this size are stored inline in `.idx` files rather than referenced by segment offset. Needs empirical validation against the actual extent size distribution in target images.
 - **Entropy threshold:** 7.0 bits used in experiments, taken from the lab47/lsvd reference implementation. Optimal value depends on workload mix.
 - **Segment size:** ~32MB soft threshold, taken from the lab47/lsvd reference implementation (`FlushThreshHold = 32MB`). Not a hard maximum — a segment closes when it exceeds the threshold. Optimal value depends on S3 request cost vs read amplification tradeoff.

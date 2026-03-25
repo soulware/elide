@@ -81,6 +81,10 @@ impl WriteLog {
 
     /// Append a new data extent. `data` must already be compressed if FLAG_COMPRESSED is set.
     /// FLAG_DEDUP_REF must not be set in flags.
+    ///
+    /// Returns the byte offset of the data payload within the WAL file. Because the WAL is
+    /// renamed directly to the segment body on promotion (zero copy), this offset is also the
+    /// `body_offset` recorded in the segment `.idx` for this extent.
     pub fn append_data(
         &mut self,
         start_lba: u64,
@@ -88,7 +92,7 @@ impl WriteLog {
         hash: &blake3::Hash,
         flags: u8,
         data: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
         debug_assert!(flags & FLAG_DEDUP_REF == 0, "use append_ref for dedup references");
 
         let mut header = Vec::with_capacity(32 + 10 + 5 + 1 + 5);
@@ -99,7 +103,9 @@ impl WriteLog {
         push_varint32(&mut header, data.len() as u32);
 
         self.write_all_bytes(&header)?;
-        self.write_all_bytes(data)
+        let body_offset = self.size;
+        self.write_all_bytes(data)?;
+        Ok(body_offset)
     }
 
     /// Append a dedup reference. No data payload is written.
