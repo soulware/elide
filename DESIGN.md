@@ -412,7 +412,7 @@ The write log is the local durability boundary. Writes land here on fsync; the l
 
 ### File format
 
-A single append-only file per in-progress segment: `writelog.<ULID>`. This is the same shape as the lsvd reference implementation — one file, records appended sequentially, no separate index. On promotion the file is consumed to produce the local segment file and `.idx`, then deleted.
+A single append-only file per in-progress segment, living at `wal/<ULID>`. This is the same shape as the lsvd reference implementation — one file, records appended sequentially, no separate index. On promotion the file is renamed to `pending/<ULID>` (zero copy); no data is written.
 
 **Magic header:** `PLMPWL\x00\x01` (8 bytes)
 

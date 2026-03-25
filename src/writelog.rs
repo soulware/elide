@@ -1,10 +1,11 @@
-// Write log: the in-progress segment before it is flushed to S3.
+// Write log: the in-progress segment before it is promoted to a local segment.
 //
 // Each record is either:
 //   DATA — a new extent with its (optionally compressed) payload
 //   REF  — a dedup reference: an LBA mapping to an already-stored extent
 //
-// The log is an append-only file. On promotion to S3 it is deleted.
+// The log is an append-only file living in wal/<ULID>. On promotion it is
+// renamed to pending/<ULID> (zero-copy); the same ULID becomes the segment ID.
 // On crash recovery, scan() reads the file and truncates any partial tail record.
 //
 // Record layout (DATA):
@@ -45,6 +46,10 @@ pub enum LogRecord {
         start_lba: u64,
         lba_length: u32,
         flags: u8,
+        /// Byte offset of the payload within the WAL file. Because the WAL is
+        /// renamed directly to the segment body on promotion, this is also the
+        /// `body_offset` to record in the segment `.idx` for this extent.
+        body_offset: u64,
         /// Raw payload bytes (compressed if flags & FLAG_COMPRESSED).
         data: Vec<u8>,
     },
@@ -183,9 +188,10 @@ fn parse_record(data: &[u8], pos: &mut usize) -> io::Result<LogRecord> {
     }
 
     let data_len = read_varint32(data, pos)? as usize;
+    let body_offset = *pos as u64;
     let payload = read_bytes(data, pos, data_len)?.to_vec();
 
-    Ok(LogRecord::Data { hash, start_lba, lba_length, flags, data: payload })
+    Ok(LogRecord::Data { hash, start_lba, lba_length, flags, body_offset, data: payload })
 }
 
 // --- slice-based read helpers ---
@@ -285,12 +291,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
         let (records, size) = scan(&path).unwrap();
         assert_eq!(records.len(), 1);
         match &records[0] {
-            LogRecord::Data { hash: h, start_lba, lba_length, flags, data } => {
+            LogRecord::Data { hash: h, start_lba, lba_length, flags, body_offset, data } => {
                 assert_eq!(h, &hash);
                 assert_eq!(*start_lba, 42);
                 assert_eq!(*lba_length, 4);
                 assert_eq!(*flags, 0);
                 assert_eq!(data, payload);
+                // body_offset points past the record header to the data bytes
+                assert_eq!(*body_offset, size - payload.len() as u64);
             }
             _ => panic!("expected Data record"),
         }
