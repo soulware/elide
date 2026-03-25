@@ -10,8 +10,9 @@
 //   2. When the WAL reaches FLUSH_THRESHOLD, it is promoted to pending/
 //
 // Read path:
-//   Not yet implemented: returns zeros. The extent index (hash → segment body
-//   location) must be built before reads can serve real data.
+//   1. lbamap.lookup(lba) → (hash, block_offset)
+//   2. extent_index.lookup(hash) → ExtentLocation (segment_id, body_offset, body_length)
+//   3. find_segment_file (wal/ → pending/ → segments/) → open file, seek, read
 //
 // Recovery:
 //   Volume::open() calls lbamap::rebuild_segments() (segments only), then
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use ulid::Ulid;
 
-use crate::{lbamap, segment, writelog};
+use crate::{extentindex, lbamap, segment, writelog};
 
 /// WAL size (bytes) at which the log is promoted to a pending segment.
 /// This is a soft cap: a single write larger than this threshold will still
@@ -43,6 +44,7 @@ const MAX_WRITE_SIZE: usize = (u32::MAX as usize / 4096) * 4096;
 pub struct Volume {
     base_dir: PathBuf,
     lbamap: lbamap::LbaMap,
+    extent_index: extentindex::ExtentIndex,
     wal: writelog::WriteLog,
     wal_ulid: String,
     wal_path: PathBuf,
@@ -66,8 +68,9 @@ impl Volume {
         fs::create_dir_all(&pending_dir)?;
         fs::create_dir_all(&segments_dir)?;
 
-        // Rebuild the LBA map from all committed segments (pending/ + segments/).
+        // Rebuild the LBA map and extent index from all committed segments.
         let mut lbamap = lbamap::rebuild_segments(base_dir)?;
+        let mut extent_index = extentindex::rebuild(base_dir)?;
 
         // Find the in-progress WAL file (there should be at most one).
         let mut wal_files: Vec<PathBuf> = Vec::new();
@@ -83,7 +86,7 @@ impl Volume {
         // replays records into the LBA map, and rebuilds pending_entries.
         let (wal, wal_ulid, wal_path, pending_entries) =
             if let Some(path) = wal_files.into_iter().last() {
-                recover_wal(path, &mut lbamap)?
+                recover_wal(path, &mut lbamap, &mut extent_index)?
             } else {
                 create_fresh_wal(&wal_dir)?
             };
@@ -91,6 +94,7 @@ impl Volume {
         Ok(Self {
             base_dir: base_dir.to_owned(),
             lbamap,
+            extent_index,
             wal,
             wal_ulid,
             wal_path,
@@ -125,6 +129,14 @@ impl Volume {
 
         let body_offset = self.wal.append_data(lba, lba_length, &hash, 0, data)?;
         self.lbamap.insert(lba, lba_length, hash);
+        self.extent_index.insert(
+            hash,
+            extentindex::ExtentLocation {
+                segment_id: self.wal_ulid.clone(),
+                body_offset,
+                body_length: data.len() as u32,
+            },
+        );
         self.pending_entries.push(segment::IdxEntry {
             hash,
             start_lba: lba,
@@ -144,11 +156,29 @@ impl Volume {
 
     /// Read `lba_count` blocks (4096 bytes each) starting at `lba`.
     ///
-    /// Not yet implemented: always returns zeros. The extent index
-    /// (hash → segment body location) must be built before reads serve data.
+    /// Blocks that have never been written are returned as zeros (the
+    /// block-device convention for unwritten regions). Each written block
+    /// is fetched from the segment file identified by the extent index.
     pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
-        let _ = lba;
-        Ok(vec![0u8; lba_count as usize * 4096])
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut out = vec![0u8; lba_count as usize * 4096];
+        for i in 0..lba_count as u64 {
+            let cur_lba = lba + i;
+            let Some((hash, block_offset)) = self.lbamap.lookup(cur_lba) else {
+                continue; // unwritten region — block stays zero
+            };
+            let Some(loc) = self.extent_index.lookup(&hash) else {
+                continue; // hash not indexed — treat as unwritten
+            };
+            let path = find_segment_file(&self.base_dir, &loc.segment_id)?;
+            let mut f = fs::File::open(path)?;
+            let byte_offset = loc.body_offset + block_offset as u64 * 4096;
+            f.seek(SeekFrom::Start(byte_offset))?;
+            let out_slice = &mut out[i as usize * 4096..(i as usize + 1) * 4096];
+            f.read_exact(out_slice)?;
+        }
+        Ok(out)
     }
 
     /// Flush buffered WAL writes and fsync to disk.
@@ -188,6 +218,23 @@ impl Volume {
     }
 }
 
+// --- helpers ---
+
+/// Locate the segment body file for `segment_id` by checking each storage
+/// directory in order: wal/ (in-progress), pending/ (promoted), segments/.
+///
+/// Returns the first path that exists. WAL files are found here before
+/// promotion; after promotion the same ULID lives in pending/.
+fn find_segment_file(base_dir: &Path, segment_id: &str) -> io::Result<PathBuf> {
+    for subdir in ["wal", "pending", "segments"] {
+        let path = base_dir.join(subdir).join(segment_id);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(io::Error::other(format!("segment not found: {segment_id}")))
+}
+
 // --- WAL helpers ---
 
 /// Scan an existing WAL, replay its records into `lbamap`, rebuild
@@ -201,6 +248,7 @@ impl Volume {
 fn recover_wal(
     path: PathBuf,
     lbamap: &mut lbamap::LbaMap,
+    extent_index: &mut extentindex::ExtentIndex,
 ) -> io::Result<(writelog::WriteLog, String, PathBuf, Vec<segment::IdxEntry>)> {
     let ulid_str = path
         .file_name()
@@ -224,6 +272,14 @@ fn recover_wal(
                 data,
             } => {
                 lbamap.insert(start_lba, lba_length, hash);
+                extent_index.insert(
+                    hash,
+                    extentindex::ExtentLocation {
+                        segment_id: ulid.clone(),
+                        body_offset,
+                        body_length: data.len() as u32,
+                    },
+                );
                 pending_entries.push(segment::IdxEntry {
                     hash,
                     start_lba,
@@ -390,12 +446,88 @@ mod tests {
     }
 
     #[test]
-    fn read_returns_zeros() {
+    fn read_unwritten_returns_zeros() {
         let base = temp_dir();
         let vol = Volume::open(&base).unwrap();
         let data = vol.read(0, 4).unwrap();
         assert_eq!(data.len(), 4 * 4096);
         assert!(data.iter().all(|&b| b == 0));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn read_written_data_same_session() {
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        let payload = vec![0x42u8; 4096];
+        vol.write(5, &payload).unwrap();
+
+        // Written block reads back correctly.
+        let result = vol.read(5, 1).unwrap();
+        assert_eq!(result, payload);
+
+        // Adjacent unwritten blocks are zero.
+        let before = vol.read(4, 1).unwrap();
+        assert!(before.iter().all(|&b| b == 0));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn read_multi_block_extent() {
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        // Write 4 blocks with distinct fill bytes so we can verify each block.
+        let mut payload = Vec::with_capacity(4 * 4096);
+        for fill in [0xAAu8, 0xBB, 0xCC, 0xDD] {
+            payload.extend_from_slice(&[fill; 4096]);
+        }
+        vol.write(10, &payload).unwrap();
+
+        let result = vol.read(10, 4).unwrap();
+        assert_eq!(result, payload);
+
+        // Reading a sub-range within the extent.
+        let mid = vol.read(11, 2).unwrap();
+        assert_eq!(mid, payload[4096..3 * 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn read_after_promote() {
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        let payload = vec![0x55u8; 4096];
+        vol.write(0, &payload).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // After promotion, data lives in pending/<ulid>; reads must still work.
+        let result = vol.read(0, 1).unwrap();
+        assert_eq!(result, payload);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn read_after_reopen() {
+        let base = temp_dir();
+
+        let payload = vec![0x77u8; 4096];
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(3, &payload).unwrap();
+            vol.fsync().unwrap();
+        }
+
+        // Reopen: WAL recovery must restore both the LBA map and extent index.
+        let vol = Volume::open(&base).unwrap();
+        let result = vol.read(3, 1).unwrap();
+        assert_eq!(result, payload);
+
         fs::remove_dir_all(base).unwrap();
     }
 

@@ -23,7 +23,7 @@
 //   flags       (u8)          FLAG_DEDUP_REF set; no further fields
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 
 // --- flag bits ---
@@ -63,13 +63,13 @@ pub enum LogRecord {
 
 /// An open write log, ready for appending.
 pub struct WriteLog {
-    writer: BufWriter<File>,
+    writer: File,
     /// Current byte size of the log, for flush-threshold checks.
     size: u64,
 }
 
 impl WriteLog {
-    /// Current byte size of the log file, including buffered writes.
+    /// Current byte size of the log file.
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -80,7 +80,7 @@ impl WriteLog {
     pub fn create(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut wl = Self {
-            writer: BufWriter::new(file),
+            writer: file,
             size: 0,
         };
         wl.write_all_bytes(MAGIC)?;
@@ -92,10 +92,7 @@ impl WriteLog {
     pub fn reopen(path: &Path, size: u64) -> io::Result<Self> {
         let mut file = OpenOptions::new().write(true).open(path)?;
         file.seek(SeekFrom::End(0))?;
-        Ok(Self {
-            writer: BufWriter::new(file),
-            size,
-        })
+        Ok(Self { writer: file, size })
     }
 
     /// Append a new data extent. `data` must already be compressed if FLAG_COMPRESSED is set.
@@ -146,11 +143,10 @@ impl WriteLog {
         self.write_all_bytes(&rec)
     }
 
-    /// Flush buffered writes and fsync the log to disk.
+    /// Fsync the log to disk.
     /// Call this when the guest issues an fsync — everything before this point is durable.
     pub fn fsync(&mut self) -> io::Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()
+        self.writer.sync_data()
     }
 
     fn write_all_bytes(&mut self, data: &[u8]) -> io::Result<()> {
