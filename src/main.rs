@@ -7,6 +7,8 @@ mod extents;
 mod nbd;
 // Infrastructure modules under active development; not yet wired to main.
 #[allow(dead_code)]
+mod lbamap;
+#[allow(dead_code)]
 mod segment;
 #[allow(dead_code)]
 mod writelog;
