@@ -431,15 +431,117 @@ In production, the relevant comparison is always point-release: continuous deplo
 
 Ubuntu 22.04 (~762MB of file data): ~33,700 extents. At 44 bytes per entry, the binary manifest is ~1.5MB. Well within "a few MB" as expected.
 
+## Write Log
+
+The write log is the local durability boundary. Writes land here on fsync; the log is promoted to a segment and uploaded to S3 in the background.
+
+### File format
+
+A single append-only file per in-progress segment: `writelog.<id>`. This is the same shape as the lsvd reference implementation — one file, records appended sequentially, no separate index. On promotion the file is consumed to produce the local segment file and `.idx`, then deleted.
+
+**Magic header:** `PLMPWL\x00\x01` (8 bytes)
+
+**Record types:**
+
+*DATA record* — a new extent with its payload:
+```
+hash        (32 bytes)    BLAKE3 extent hash
+start_lba   (u64 varint)  first logical block address
+lba_length  (u32 varint)  extent length in 4KB blocks
+flags       (u8)          see flag bits below
+data_length (u32 varint)  byte length of payload (compressed size if FLAG_COMPRESSED)
+data        (data_length bytes)
+```
+
+*REF record* — a dedup reference; no data payload, maps an LBA range to an existing extent:
+```
+hash        (32 bytes)    BLAKE3 hash of the existing extent
+start_lba   (u64 varint)
+lba_length  (u32 varint)
+flags       (u8)          FLAG_DEDUP_REF set; no further fields
+```
+
+**Flag bits:**
+- `0x01` `FLAG_COMPRESSED` — payload is zstd-compressed; `data_length` is compressed size
+- `0x02` `FLAG_DEDUP_REF` — REF record; no data payload
+- `0x04` `FLAG_HIGH_ENTROPY` — bypass global dedup service; store in per-volume segment only
+
+The hash is computed before the dedup check and stored in the log record. Recovery can reconstruct the manifest without re-reading or re-hashing the data.
+
+### Pre-log coalescing
+
+Contiguous LBA writes are merged in memory before they reach the write log — in the NBD/ublk handler, not in the log itself. This mirrors lsvd's `pendingWrite` buffer. The coalescing window is bounded by both a block count limit (to prevent unbounded memory accumulation between fsyncs) and the fsync boundary (a guest fsync flushes any pending buffer). The write log only ever sees finalised, already-coalesced extents.
+
+### Durability model
+
+```
+write arrives → in-memory coalescing buffer
+                        │
+               count limit or fsync
+                        │
+                        ▼
+               hash → dedup check → append_data / append_ref → bufio (OS buffer)
+                        │
+                    guest fsync
+                        │
+                        ▼
+               logF.sync_data() ← write log durable on local disk; reply sent to guest
+                        │
+                [background, async]
+                        │
+                        ▼
+               segment close → local segment file + .idx written → S3 upload
+```
+
+After a guest fsync returns, all prior writes are durable in the write log on local NVMe. S3 upload is asynchronous and not on the fsync critical path. This matches lsvd's two-tier durability model exactly.
+
+### Crash recovery
+
+On startup, if a write log file exists, `scan()` reads it sequentially. If a partial record is found at the tail (power loss mid-write), the file is truncated to the last complete record. All complete records are replayed to reconstruct the in-memory manifest. The write log is then reopened for continued appending.
+
+### Promotion to segment
+
+When the write log reaches the 32MB threshold (or on an explicit flush), a background task reads it sequentially and produces:
+
+1. `segments/<id>` — segment body: raw extent data concatenated (DATA records only)
+2. `segments/<id>.idx` — per-extent metadata in the `.idx` format
+
+The body bytes stream directly from the write log into the local segment file (one sequential read, one sequential write). The `.idx` entries (~60 bytes each, ~60KB total for a 32MB segment) are accumulated in memory during the scan and written once. After successful local write and S3 upload, the write log is deleted.
+
+---
+
+## lsvd Reference Implementation Notes
+
+The [lab47/lsvd](https://github.com/lab47/lsvd) Go implementation is the primary reference. Key design decisions we studied and how they influenced palimpsest:
+
+**Segment format:** A single file per segment: `[SegmentHeader (8 bytes)][ExtentHeaders (varint-encoded)][body data]`. No companion `.idx` file — all metadata is embedded. Palimpsest diverges here: body and `.idx` are separate files, enabling the extent index to be built from `.idx` alone without reading body data, and allowing the in-memory filter to be rebuilt cheaply.
+
+**Write log format:** Single append-only file, one record per finalised extent, each record is `[header][data]` appended sequentially. No coalescing in the log. Palimpsest's write log follows this shape exactly, adding the BLAKE3 hash and a `FLAG_DEDUP_REF` record type (absent in lsvd which is LBA-addressed, not content-addressed).
+
+**Pre-log coalescing:** lsvd's `nbdWrapper` buffers up to 20 contiguous blocks in a `pendingWrite` buffer before calling `WriteExtent()`. This is where adjacent LBA writes are merged. The log sees finalised extents, not raw 4KB writes. Palimpsest follows the same pattern; the count limit (lsvd: 20 blocks) is a tuning parameter.
+
+**Fsync handling:** `writeLog()` calls `bufio.Flush()` after each extent (OS buffer, not disk). The actual `fsync` happens only in `SegmentBuilder.Sync()`, called when the guest issues a flush. Reply is sent after `logF.Sync()` completes. Palimpsest's `WriteLog::fsync()` follows this exactly.
+
+**Async S3 upload:** `closeSegmentAsync()` sends a `CloseSegment` event to a background controller goroutine and returns immediately. The controller calls `Flush()`, writes the local segment file, uploads to S3, and updates the LBA→PBA map. The write path is never blocked on S3. Palimpsest will follow the same async promotion model.
+
+**Local segment cache:** Segment files are kept in `segments/` on local disk indefinitely after upload. Reads check in-memory write cache → previous segment cache → local disk → S3 (via HTTP range requests). Palimpsest retains the same local cache tier.
+
+**Post-hoc extent merging:** lsvd does not merge adjacent extents at write time. Adjacent-extent merging happens in `pack.go` during GC, where runs of adjacent extents are coalesced into larger records (up to 100 blocks). Palimpsest's repacking / GC pass will do the same.
+
+**LBA→PBA vs content-addressed:** lsvd's extent map is `LBA → segment+offset` (physical location). GC repacking must update this map for every moved extent. Palimpsest splits this into a logical manifest (`LBA → hash`) and a physical extent index (`hash → segment+offset`). The manifest is immutable once frozen; only the extent index is updated during GC. This is the primary structural divergence from lsvd.
+
+**Compression:** lsvd uses LZ4 with an entropy threshold of 7.0 bits/byte and a minimum compression ratio of 1.5×. Palimpsest uses zstd (already a dependency) with the same 7.0-bit entropy threshold as a starting point.
+
+---
+
 ## Open Questions
 
 - **Inline extent threshold:** extents below this size are stored inline in `.idx` files rather than referenced by segment offset. Needs empirical validation against the actual extent size distribution in target images.
 - **Entropy threshold:** 7.0 bits used in experiments, taken from the lab47/lsvd reference implementation. Optimal value depends on workload mix.
 - **Segment size:** ~32MB soft threshold, taken from the lab47/lsvd reference implementation (`FlushThreshHold = 32MB`). Not a hard maximum — a segment closes when it exceeds the threshold. Optimal value depends on S3 request cost vs read amplification tradeoff.
-- **Write log format:** not yet designed. Affects recovery, promotion to segments, snapshot consistency.
 - **Extent index implementation:** sled, rocksdb, or custom. Needs random reads and range scans.
 - **Shared extent index:** per-host or shared service? DynamoDB, S3-backed, or dedicated process?
-- **Extent boundary detection on the live write path:** buffering contiguous writes into extents is straightforward; the open question is the coalescing window — how long to wait for a burst to complete before finalising an extent. Too short fragments large files; too long adds write latency.
+- **Pre-log coalescing block limit:** lsvd uses 20 blocks. The right value for palimpsest depends on typical write burst sizes and acceptable memory footprint between fsyncs.
 - **Manifest cache invalidation:** the reference implementation (lab47/lsvd) validates the cached manifest against a hash of current segment IDs. Same approach applies here.
 - **Namespace granularity:** binary global/non-global may not be sufficient for multi-tenancy.
 - **Boot hint persistence:** where are hint sets stored, how are they distributed across hosts?

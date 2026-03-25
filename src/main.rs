@@ -5,6 +5,7 @@ use ext4_view::{Ext4, Ext4Error, PathBuf as Ext4PathBuf};
 
 mod extents;
 mod nbd;
+mod writelog;
 
 /// Analyse ext4 disk images for dedup and delta compression potential.
 #[derive(Parser)]
