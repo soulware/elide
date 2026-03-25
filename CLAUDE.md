@@ -26,6 +26,15 @@ These rules apply to all Rust code in this project. Follow them without needing 
 - Prefer `div_ceil()` over manual ceiling-division idioms.
 - Use const-generic `read_fixed::<N>` helpers rather than `.try_into().expect(...)` for fixed-size slice conversions.
 
+**Prefer crates over hand-rolled implementations.**
+- Before implementing a non-trivial algorithm or format (e.g. ULID, UUID, base64, checksums), check whether a well-known crate exists and discuss with the user before deciding to roll it by hand.
+- Hand-rolling is sometimes the right call (zero-dep binary, custom constraints), but the choice should be explicit, not a default.
+
+**Parse, don't validate: use typed parsers when reading string representations.**
+- When reading a string from an external source (filename, file content, CLI arg) that represents a typed value, always parse it through the type's own parser rather than using the raw string directly.
+- This validates the value at the boundary and produces a canonical string if re-serialised (e.g. `Ulid::from_string(s)?.to_string()`, not `s.to_owned()`).
+- The same applies to any structured string: paths, hashes, addresses, IDs.
+
 ## References
 
 - [Beating the I/O Bottleneck: A Case for Log-Structured Virtual Disks](https://dl.acm.org/doi/pdf/10.1145/3492321.3524271) — the original LSVD paper

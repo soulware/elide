@@ -11,6 +11,8 @@ mod lbamap;
 #[allow(dead_code)]
 mod segment;
 #[allow(dead_code)]
+mod volume;
+#[allow(dead_code)]
 mod writelog;
 
 /// Analyse ext4 disk images for dedup and delta compression potential.

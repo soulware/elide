@@ -65,7 +65,14 @@ pub enum LogRecord {
 pub struct WriteLog {
     writer: BufWriter<File>,
     /// Current byte size of the log, for flush-threshold checks.
-    pub size: u64,
+    size: u64,
+}
+
+impl WriteLog {
+    /// Current byte size of the log file, including buffered writes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 impl WriteLog {
@@ -406,7 +413,7 @@ mod tests {
         let mut wl = WriteLog::create(&path).unwrap();
         wl.append_data(0, 1, &hash, 0, payload).unwrap();
         wl.fsync().unwrap();
-        let good_size = wl.size;
+        let good_size = wl.size();
         drop(wl);
 
         // Append garbage to simulate a partial write.
@@ -436,7 +443,7 @@ mod tests {
         let mut wl = WriteLog::create(&path).unwrap();
         wl.append_data(0, 2, &h1, 0, b"extent one").unwrap();
         wl.fsync().unwrap();
-        let size_after_first = wl.size;
+        let size_after_first = wl.size();
         drop(wl);
 
         // Simulate crash-recovery then reopen.

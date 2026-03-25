@@ -8,7 +8,8 @@
 //   1. Scan pending/*.idx and segments/*.idx in ULID order (oldest first).
 //      Applying oldest-to-newest means each insert naturally overwrites
 //      earlier entries for the same LBA range — no special ordering logic needed.
-//   2. Replay wal/* on top: WAL files are always the most recent writes.
+//   2. Volume::open() replays the in-progress WAL on top in a single pass
+//      that also rebuilds pending_entries (see src/volume.rs).
 //
 // Contrast with lab47/lsvd: the reference uses a red-black tree (TreeMap) with
 // a `compactPE` value encoding both logical and physical location. Palimpsest's
@@ -22,7 +23,6 @@ use std::io;
 use std::path::Path;
 
 use crate::segment;
-use crate::writelog;
 
 /// Value stored per LBA map entry.
 #[derive(Clone, Copy)]
@@ -166,12 +166,14 @@ impl Default for LbaMap {
 
 // --- rebuild from disk ---
 
-/// Rebuild the LBA map from all committed segments and in-progress WAL files.
+/// Rebuild the LBA map from all committed segments.
 ///
 /// Scans `<base>/pending/*.idx` and `<base>/segments/*.idx` in ULID order
-/// (oldest first), then replays `<base>/wal/*` on top. Directories that do not
-/// exist are silently skipped — a fresh volume has none of these yet.
-pub fn rebuild(base_dir: &Path) -> io::Result<LbaMap> {
+/// (oldest first). Directories that do not exist are silently skipped.
+///
+/// The caller (`Volume::open`) is responsible for replaying the in-progress
+/// WAL on top of the result — doing so in one pass also builds `pending_entries`.
+pub fn rebuild_segments(base_dir: &Path) -> io::Result<LbaMap> {
     let mut map = LbaMap::new();
 
     // Committed segments: pending/ (local, not yet uploaded) and segments/ (S3-backed).
@@ -183,29 +185,6 @@ pub fn rebuild(base_dir: &Path) -> io::Result<LbaMap> {
     for path in &idx_paths {
         for entry in segment::read_idx(path)? {
             map.insert(entry.start_lba, entry.lba_length, entry.hash);
-        }
-    }
-
-    // WAL files are always more recent than any segment; replay them last.
-    let mut wal_paths = collect_dir_files(&base_dir.join("wal"))?;
-    wal_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
-
-    for path in &wal_paths {
-        let (records, _) = writelog::scan(path)?;
-        for record in records {
-            match record {
-                writelog::LogRecord::Data {
-                    hash,
-                    start_lba,
-                    lba_length,
-                    ..
-                } => map.insert(start_lba, lba_length, hash),
-                writelog::LogRecord::Ref {
-                    hash,
-                    start_lba,
-                    lba_length,
-                } => map.insert(start_lba, lba_length, hash),
-            }
         }
     }
 
@@ -225,26 +204,6 @@ fn collect_idx_files(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
                 let path = entry?.path();
                 if path.extension().is_some_and(|e| e == "idx") {
                     paths.push(path);
-                }
-            }
-            Ok(paths)
-        }
-    }
-}
-
-/// Return all regular files in `dir`. Returns an empty Vec if the directory
-/// does not exist. Uses `DirEntry::file_type()` to avoid an extra stat per
-/// entry on Linux (the file type is returned by `getdents64`).
-fn collect_dir_files(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
-    match fs::read_dir(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e),
-        Ok(entries) => {
-            let mut paths = Vec::new();
-            for entry in entries {
-                let entry = entry?;
-                if entry.file_type()?.is_file() {
-                    paths.push(entry.path());
                 }
             }
             Ok(paths)
@@ -411,7 +370,7 @@ mod tests {
             write_idx(&pending.join("01BBBBBBBBBBBBBBBBBBBBBBBBB.idx"), &entries).unwrap();
         }
 
-        let map = rebuild(&base).unwrap();
+        let map = rebuild_segments(&base).unwrap();
 
         // [0, 5) should be from segment 1.
         assert_eq!(map.lookup(0), Some((h(1), 0)));
@@ -428,7 +387,7 @@ mod tests {
         let base = temp_dir();
         // No subdirs at all — fresh volume.
         std::fs::create_dir_all(&base).unwrap();
-        let map = rebuild(&base).unwrap();
+        let map = rebuild_segments(&base).unwrap();
         assert!(map.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
