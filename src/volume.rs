@@ -27,7 +27,15 @@ use ulid::Ulid;
 use crate::{lbamap, segment, writelog};
 
 /// WAL size (bytes) at which the log is promoted to a pending segment.
+/// This is a soft cap: a single write larger than this threshold will still
+/// succeed, producing a segment larger than intended. The block layer
+/// (NBD/ublk) enforces its own per-request maximum before reaching here.
 const FLUSH_THRESHOLD: u64 = 32 * 1024 * 1024;
+
+/// Maximum byte length of a single write. The `.idx` format stores
+/// `body_length` as a `u32`, so payloads must fit in 4 GiB. We cap at
+/// `u32::MAX` rounded down to a 4 KiB boundary.
+const MAX_WRITE_SIZE: usize = (u32::MAX as usize / 4096) * 4096;
 
 /// A writable block-device volume backed by a content-addressable store.
 ///
@@ -92,14 +100,24 @@ impl Volume {
 
     /// Write `data` starting at logical block address `lba`.
     ///
-    /// `data.len()` must be a non-zero multiple of 4096. The data is appended
-    /// to the WAL and the LBA map is updated in memory. If the WAL reaches
-    /// `FLUSH_THRESHOLD` after this write, it is automatically promoted to a
-    /// pending segment.
+    /// `data.len()` must be a non-zero multiple of 4096 and must not exceed
+    /// `MAX_WRITE_SIZE` (4 GiB − 4 KiB). The `.idx` format stores `body_length`
+    /// as a `u32` byte count, so larger payloads cannot be represented.
+    ///
+    /// The data is appended to the WAL and the LBA map is updated in memory.
+    /// Promotion to a pending segment is triggered after the write if the WAL
+    /// reaches `FLUSH_THRESHOLD` (32 MiB). Because the check is post-write, a
+    /// single large write may produce a segment larger than the threshold; the
+    /// block layer (NBD/ublk) is expected to enforce its own per-request cap.
     pub fn write(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
         if data.is_empty() || !data.len().is_multiple_of(4096) {
             return Err(io::Error::other(
                 "data length must be a non-zero multiple of 4096",
+            ));
+        }
+        if data.len() > MAX_WRITE_SIZE {
+            return Err(io::Error::other(
+                "data length exceeds maximum write size (4 GiB − 4 KiB)",
             ));
         }
         let lba_length = (data.len() / 4096) as u32;
