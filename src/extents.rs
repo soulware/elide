@@ -746,6 +746,105 @@ fn scan_inode(path: &Path) -> io::Result<(Vec<ExtentEntry>, u64)> {
     Ok((entries, block_size))
 }
 
+// --- rename analysis ---
+
+pub fn run_rename_analysis(image1: &Path, image2: &Path) -> io::Result<()> {
+    println!("Scanning image1 ...");
+    let hashes1 = enumerate_file_hashes(image1)?;
+    println!("Scanning image2 ...");
+    let hashes2 = enumerate_file_hashes(image2)?;
+
+    // Invert image1: hash → path (for exact-rename detection)
+    let mut hash_to_path1: HashMap<blake3::Hash, String> = HashMap::new();
+    for (path, (hash, _)) in &hashes1 {
+        hash_to_path1.entry(*hash).or_insert_with(|| path.clone());
+    }
+
+    // Invert image1: size → paths (for size-matched candidates)
+    let mut size_to_paths1: HashMap<u64, Vec<String>> = HashMap::new();
+    for (path, (_, size)) in &hashes1 {
+        size_to_paths1.entry(*size).or_default().push(path.clone());
+    }
+
+    let mut exact_renames: Vec<(String, String, u64)> = Vec::new(); // (old, new, bytes)
+    let mut size_candidates: Vec<(String, u64)> = Vec::new();       // (new_path, size)
+    let mut genuinely_new: Vec<(String, u64)> = Vec::new();
+
+    for (path2, (hash2, size2)) in &hashes2 {
+        if hashes1.contains_key(path2) {
+            // Path exists in both — not a rename
+            continue;
+        }
+        // Path is new in image2. Check for exact rename.
+        if let Some(old_path) = hash_to_path1.get(hash2) {
+            exact_renames.push((old_path.clone(), path2.clone(), *size2));
+            continue;
+        }
+        // Check for size match — rename + modification candidate
+        if let Some(candidates) = size_to_paths1.get(size2) {
+            if !candidates.is_empty() && *size2 > 0 {
+                size_candidates.push((path2.clone(), *size2));
+                continue;
+            }
+        }
+        genuinely_new.push((path2.clone(), *size2));
+    }
+
+    // Files removed in image2 (present in image1 but not image2, not accounted for as rename source)
+    let renamed_away: std::collections::HashSet<String> = exact_renames.iter()
+        .map(|(old, _, _)| old.clone())
+        .collect();
+    let removed: Vec<(&String, u64)> = hashes1.iter()
+        .filter(|(path, _)| !hashes2.contains_key(*path) && !renamed_away.contains(*path))
+        .map(|(path, (_, size))| (path, *size))
+        .collect();
+
+    let exact_bytes: u64 = exact_renames.iter().map(|(_, _, b)| b).sum();
+    let candidate_bytes: u64 = size_candidates.iter().map(|(_, b)| b).sum();
+    let new_bytes: u64 = genuinely_new.iter().map(|(_, b)| b).sum();
+
+    println!("\n=== Rename Analysis ===");
+    println!("  image1: {}", image1.display());
+    println!("  image2: {}", image2.display());
+    println!();
+    println!("  New paths in image2 (not present in image1 by path):");
+    println!("    Exact renames (same content, different path): {:>5} files  {:>7.1} MB",
+        exact_renames.len(), exact_bytes as f64 / MB);
+    println!("    Size-matched (rename+modify candidates):      {:>5} files  {:>7.1} MB",
+        size_candidates.len(), candidate_bytes as f64 / MB);
+    println!("    Genuinely new (no size match in image1):      {:>5} files  {:>7.1} MB",
+        genuinely_new.len(), new_bytes as f64 / MB);
+    println!();
+    println!("  Removed paths in image2 (not accounted for as rename source): {:>5} files",
+        removed.len());
+
+    if !exact_renames.is_empty() {
+        println!("\n  Exact renames:");
+        let mut sorted = exact_renames.clone();
+        sorted.sort_by(|a, b| b.2.cmp(&a.2));
+        for (old, new, bytes) in sorted.iter().take(20) {
+            println!("    {:>7.1} KB  {} → {}", *bytes as f64 / 1024.0, old, new);
+        }
+        if sorted.len() > 20 {
+            println!("    ... and {} more", sorted.len() - 20);
+        }
+    }
+
+    if !size_candidates.is_empty() {
+        println!("\n  Size-matched candidates (rename+modify — need similarity check to confirm):");
+        let mut sorted = size_candidates.clone();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        for (path, bytes) in sorted.iter().take(20) {
+            println!("    {:>7.1} KB  {}", *bytes as f64 / 1024.0, path);
+        }
+        if sorted.len() > 20 {
+            println!("    ... and {} more", sorted.len() - 20);
+        }
+    }
+
+    Ok(())
+}
+
 // --- cold boot analysis ---
 
 pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32) -> io::Result<()> {
@@ -779,9 +878,11 @@ pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32
     let mut exact_bytes = 0u64;
     let mut delta_count = 0usize;
     let mut delta_raw_bytes = 0u64;
+    let mut delta_standalone_bytes = 0u64;
     let mut delta_compressed_bytes = 0u64;
     let mut new_count = 0usize;
     let mut new_bytes = 0u64;
+    let mut new_compressed_bytes = 0u64;
     let mut unmapped = 0usize;
     let mut total_boot_bytes = 0u64;
 
@@ -803,8 +904,13 @@ pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32
 
                 if path.is_empty() {
                     // extent belongs to a file we couldn't map to a path
+                    let mut buf = vec![0u8; entry.byte_count as usize];
+                    image2_raw.seek(SeekFrom::Start(entry.start_byte))?;
+                    image2_raw.read_exact(&mut buf)?;
+                    let compressed = zstd::bulk::compress(&buf, level).unwrap_or_default();
                     new_count += 1;
                     new_bytes += entry.byte_count;
+                    new_compressed_bytes += compressed.len().min(buf.len()) as u64;
                     continue;
                 }
 
@@ -823,21 +929,29 @@ pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32
 
                         delta_count += 1;
                         delta_raw_bytes += entry.byte_count;
+                        delta_standalone_bytes += standalone.len() as u64;
                         // Take whichever is smaller — dict can sometimes be worse for tiny extents
                         delta_compressed_bytes += dict_compressed.len().min(standalone.len()) as u64;
                     }
                     Err(_) => {
                         // File is genuinely new in image2
+                        let mut buf = vec![0u8; entry.byte_count as usize];
+                        image2_raw.seek(SeekFrom::Start(entry.start_byte))?;
+                        image2_raw.read_exact(&mut buf)?;
+                        let compressed = zstd::bulk::compress(&buf, level).unwrap_or_default();
                         new_count += 1;
                         new_bytes += entry.byte_count;
+                        new_compressed_bytes += compressed.len().min(buf.len()) as u64;
                     }
                 }
             }
         }
     }
 
-    let warm_host_fetch = delta_compressed_bytes + new_bytes;
-    let cold_host_fetch = exact_bytes + delta_compressed_bytes + new_bytes;
+    let warm_host_fetch = delta_compressed_bytes + new_compressed_bytes;
+    let warm_host_fetch_zstd_only = delta_standalone_bytes + new_compressed_bytes;
+    let cold_host_fetch = exact_bytes + delta_compressed_bytes + new_compressed_bytes;
+    let cold_host_fetch_zstd_only = exact_bytes + delta_standalone_bytes + new_compressed_bytes;
 
     println!("\n=== Cold Boot Analysis ===");
     println!("  image1: {}", image1.display());
@@ -863,31 +977,34 @@ pub fn run_cold_boot(image1: &Path, image2: &Path, trace_path: &Path, level: i32
         100.0 * exact_bytes as f64 / total_boot_bytes.max(1) as f64,
     );
     if delta_count > 0 {
+        let delta_extra_pct = 100.0 * (1.0 - delta_compressed_bytes as f64 / delta_standalone_bytes.max(1) as f64);
         println!(
-            "  Delta-compressible:  {:>5} extents   {:>7.1} MB raw  →  {:.1} MB delta  ({:.1}% smaller)",
-            delta_count, delta_raw_bytes as f64 / MB, delta_compressed_bytes as f64 / MB,
-            100.0 * (1.0 - delta_compressed_bytes as f64 / delta_raw_bytes.max(1) as f64),
+            "  Delta-compressible:  {:>5} extents   {:>7.1} MB raw  →  {:.1} MB zstd  →  {:.1} MB delta  ({:.1}% beyond zstd)",
+            delta_count, delta_raw_bytes as f64 / MB,
+            delta_standalone_bytes as f64 / MB,
+            delta_compressed_bytes as f64 / MB,
+            delta_extra_pct,
         );
     }
     println!(
-        "  New (no prior):      {:>5} extents   {:>7.1} MB",
-        new_count, new_bytes as f64 / MB,
+        "  New (no prior):      {:>5} extents   {:>7.1} MB raw  →  {:.1} MB zstd",
+        new_count, new_bytes as f64 / MB, new_compressed_bytes as f64 / MB,
     );
 
     println!();
     println!("  Fetch cost — warm host (deduped extents already in local SSD cache):");
     println!(
-        "    {:.1} MB  vs  {:.1} MB boot footprint  ({:.1}% reduction from dedup + delta)",
+        "    {:.1} MB zstd-only  →  {:.1} MB with delta  ({:.1}% delta benefit beyond zstd)",
+        warm_host_fetch_zstd_only as f64 / MB,
         warm_host_fetch as f64 / MB,
-        total_boot_bytes as f64 / MB,
-        100.0 * (1.0 - warm_host_fetch as f64 / total_boot_bytes.max(1) as f64),
+        100.0 * (1.0 - warm_host_fetch as f64 / warm_host_fetch_zstd_only.max(1) as f64),
     );
     println!("  Fetch cost — cold host (no local cache, fetch all from S3):");
     println!(
-        "    {:.1} MB  vs  {:.1} MB boot footprint  ({:.1}% reduction from delta only)",
+        "    {:.1} MB zstd-only  →  {:.1} MB with delta  ({:.1}% delta benefit beyond zstd)",
+        cold_host_fetch_zstd_only as f64 / MB,
         cold_host_fetch as f64 / MB,
-        total_boot_bytes as f64 / MB,
-        100.0 * (1.0 - cold_host_fetch as f64 / total_boot_bytes.max(1) as f64),
+        100.0 * (1.0 - cold_host_fetch as f64 / cold_host_fetch_zstd_only.max(1) as f64),
     );
 
     println!();

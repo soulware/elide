@@ -40,6 +40,11 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         level: i32,
     },
+    /// Measure file renames between two images (exact renames and size-matched rename+modify candidates)
+    RenameAnalysis {
+        image1: String,
+        image2: String,
+    },
     /// Extract kernel and initrd from an ext4 image's /boot directory
     ExtractBoot {
         image: String,
@@ -68,6 +73,11 @@ fn main() {
                 Path::new(&trace),
                 level,
             ).expect("cold-boot analysis failed");
+        }
+
+        Command::RenameAnalysis { image1, image2 } => {
+            extents::run_rename_analysis(Path::new(&image1), Path::new(&image2))
+                .expect("rename-analysis failed");
         }
 
         Command::ExtractBoot { image, out_dir } => {
