@@ -40,6 +40,7 @@ const MAGIC: &[u8; 8] = b"PLMPWL\x00\x01";
 // ---
 
 /// A recovered record from the write log.
+#[derive(Debug)]
 pub enum LogRecord {
     Data {
         hash: blake3::Hash,
@@ -176,14 +177,15 @@ pub fn scan(path: &Path) -> io::Result<(Vec<LogRecord>, u64)> {
                 records.push(record);
                 last_good = pos;
             }
-            Err(_) => {
-                // Partial write at tail — truncate the file and stop.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // Partial write at tail (power loss mid-record) — truncate and stop.
                 OpenOptions::new()
                     .write(true)
                     .open(path)?
                     .set_len(last_good as u64)?;
                 break;
             }
+            Err(e) => return Err(e), // InvalidData (corruption) — don't silently truncate
         }
     }
 
@@ -209,6 +211,13 @@ fn parse_record(data: &[u8], pos: &mut usize) -> io::Result<LogRecord> {
     let data_len = read_varint32(data, pos)? as usize;
     let body_offset = *pos as u64;
     let payload = read_bytes(data, pos, data_len)?.to_vec();
+
+    if blake3::hash(&payload) != hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "extent hash mismatch",
+        ));
+    }
 
     Ok(LogRecord::Data {
         hash,
@@ -438,6 +447,67 @@ mod tests {
 
         let (records, _) = scan(&path).unwrap();
         assert_eq!(records.len(), 2);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn corrupted_payload_returns_error() {
+        // Corruption mid-file should propagate as InvalidData, not silently truncate.
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+
+        let payload = b"uncorrupted extent data";
+        let hash = blake3::hash(payload);
+
+        let mut wl = WriteLog::create(&path).unwrap();
+        let body_offset = wl.append_data(0, 1, &hash, 0, payload).unwrap();
+        wl.fsync().unwrap();
+        drop(wl);
+
+        // Flip a byte in the payload.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(body_offset)).unwrap();
+            f.write_all(&[0xffu8]).unwrap();
+        }
+
+        let err = scan(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("hash mismatch"));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn mid_file_corruption_does_not_truncate_good_records() {
+        // Two records: first corrupted, second valid. scan() should error,
+        // not truncate to before the first record and return empty.
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+
+        let p1 = b"first extent";
+        let p2 = b"second extent";
+        let h1 = blake3::hash(p1);
+        let h2 = blake3::hash(p2);
+
+        let mut wl = WriteLog::create(&path).unwrap();
+        let body1 = wl.append_data(0, 1, &h1, 0, p1).unwrap();
+        wl.append_data(8, 1, &h2, 0, p2).unwrap();
+        wl.fsync().unwrap();
+        drop(wl);
+
+        // Corrupt the first record's payload.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(body1)).unwrap();
+            f.write_all(&[0xffu8]).unwrap();
+        }
+
+        let err = scan(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         std::fs::remove_file(&path).unwrap();
     }
