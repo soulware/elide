@@ -163,6 +163,11 @@ impl Volume {
     pub fn lbamap_len(&self) -> usize {
         self.lbamap.len()
     }
+
+    #[cfg(test)]
+    pub fn promote_for_test(&mut self) -> io::Result<()> {
+        self.promote()
+    }
 }
 
 // --- WAL helpers ---
@@ -384,5 +389,63 @@ mod tests {
         assert_ne!(u1, u2);
         // ULIDs generated in sequence should sort correctly (same millisecond
         // is not guaranteed, but two different values prove uniqueness).
+    }
+
+    #[test]
+    fn recovery_after_promotion() {
+        // Write enough to trigger a promotion, drop, reopen — the LBA map must
+        // be rebuilt from both pending/*.idx and the remaining WAL.
+        let base = temp_dir();
+
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            let block = vec![0u8; 1024 * 1024]; // 1 MiB = 256 LBAs
+            for i in 0u64..33 {
+                vol.write(i * 256, &block).unwrap();
+            }
+            vol.fsync().unwrap();
+        }
+
+        // All 33 extents should survive across the promotion boundary.
+        let vol = Volume::open(&base).unwrap();
+        assert_eq!(vol.lbamap_len(), 33);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn promotion_after_wal_recovery() {
+        // Write to the WAL, drop (simulating a crash), reopen (WAL recovery),
+        // promote, then reopen again — verifies that pending_entries is correctly
+        // rebuilt from the recovered WAL so the .idx contains the pre-crash writes.
+        let base = temp_dir();
+
+        // Phase 1: write two blocks, fsync, drop.
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &vec![1u8; 4096]).unwrap();
+            vol.write(1, &vec![2u8; 4096]).unwrap();
+            vol.fsync().unwrap();
+        }
+
+        // Phase 2: recover and immediately promote.
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            assert_eq!(vol.lbamap_len(), 2); // confirm recovery
+            vol.promote_for_test().unwrap();
+        }
+
+        // Phase 3: reopen — both blocks must now come from pending/*.idx.
+        let vol = Volume::open(&base).unwrap();
+        assert_eq!(vol.lbamap_len(), 2);
+
+        // Confirm the promoted segment landed correctly: body + .idx in pending/.
+        let pending_count = fs::read_dir(base.join("pending"))
+            .unwrap()
+            .filter(|e| e.is_ok())
+            .count();
+        assert_eq!(pending_count, 2, "expected segment body + .idx in pending/");
+
+        fs::remove_dir_all(base).unwrap();
     }
 }
