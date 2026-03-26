@@ -31,7 +31,7 @@ Note: "extent" is also an ext4 term — an ext4 extent is a mapping from a range
 
 **Write log** — the local durability boundary. Writes land here first (fsync = durable). Extents are promoted to segments in the background.
 
-**Extent index** — maps `extent_hash → location` (segment file + offset). Tells the read path where a given extent lives. Per-volume, rebuilt at startup by scanning the volume tree's `.idx` files, and updated by GC when extents are repacked.
+**Extent index** — maps `extent_hash → (segment_ULID, body_offset)`. Tells the read path where a given extent lives. The ULID is globally unique; its path on disk is derived at runtime by scanning the common root. Built at startup by scanning the volume's own tree plus, opportunistically, all other volumes' segments under the common root — enabling best-effort cross-volume dedup with no coordinator involvement.
 
 ## Operation Modes
 
@@ -223,13 +223,15 @@ Maps `extent_hash → local location` (segment file + offset). Separate from the
 
 **Contrast with lab47/lsvd:** the reference implementation uses a single `lba2pba` map — a direct `LBA → segment+offset` (physical location) index. GC repacking requires updating this map for every moved extent. The LBA map + extent index split means GC can repack extents (changing their location) by updating only the extent index. The LBA map is never rewritten for GC.
 
-The extent index covers the live node's own segments plus all ancestor segments — rebuilt at startup by scanning `.idx` files up the directory tree.
+The extent index covers the live node's own segments, all ancestor segments, and — on a best-effort basis — segments from other volumes stored under the same common root. At startup, the volume process scans the full common root directory tree, reading the index section of each segment file it finds. Ongoing updates use inotify (or periodic re-scan) to pick up new segments from other volumes as they are promoted. Because segment ULIDs are globally unique, `hash → ULID + body_offset` is sufficient to locate any extent; the on-disk path is derived at runtime from the ULID by searching the common root.
+
+This is **purely local and coordinator-free**: the shared filesystem layout is the coordination mechanism. Cross-volume dedup is best-effort — a segment promoted by another volume after the last scan is a missed opportunity, not an error. Such duplicates are harmless and can be coalesced by GC.
 
 ## Dedup
 
 **Exact dedup:** two extents with the same BLAKE3 hash are identical. Dedup is detected and applied **opportunistically on the write path**: before writing a DATA record to the WAL, the extent hash is checked against the local extent index (covering own + all ancestor segments). If a match is found, a REF record is written instead — no data payload, just a reference to the existing extent. This keeps the data volume in the WAL and segment files minimal without requiring any coordination or remote lookup.
 
-Dedup scope is **local to the volume tree**. No cross-tree or cross-host dedup check is performed. Dedup quality is therefore highest for snapshot-derived volumes (where the ancestor segments contain most of the data) and lower for freshly provisioned volumes with no ancestry.
+Dedup scope is **all volumes on the local host**. The extent index covers the current volume's own tree (own + ancestor segments) plus, on a best-effort basis, all other volumes stored under the same common root. No remote or cross-host dedup check is performed. Dedup quality is highest for snapshot-derived volumes (ancestor segments already contain most of the data) and lower for freshly provisioned volumes; cross-volume dedup raises quality for volumes that share a common base image even without a snapshot relationship.
 
 **Delta compression** is a separate concern from dedup and is **S3-only**. Local segment bodies never contain delta records — an entry in a local segment is either a full extent (DATA record, data present in body) or a reference (REF record, no data in this segment's body, data lives in an ancestor segment). At S3 upload time, extents that differ only slightly from extents in ancestor segments are stored as deltas in a separate delta segment file (see S3 Layout). The benefit is reduced S3 fetch size, not local storage cost. The primary value is latency: fetching a small delta instead of a full extent from S3 is dramatically faster on the cold-read path. On fetch, the delta is applied and the full extent is materialised locally before being cached and served.
 
@@ -681,7 +683,7 @@ The `pending/` directory exists because palimpsest decouples local promotion fro
 | LBA map | `head.map` (CBOR, SHA-256 guard) | `lba.map` (optional; rebuilt from segment index sections) |
 | Eviction policy | Not applicable | `segments/` evictable; `pending/` never |
 | Snapshot model | `lowers` array (read-only lower disks) | Directory tree (ancestors are frozen nodes) |
-| Dedup | Not implemented | Opportunistic on write path, local tree only |
+| Dedup | Not implemented | Opportunistic on write path; local tree + best-effort cross-volume via shared root |
 
 **Segment format:** lsvd uses a single file per segment: `[SegmentHeader (8 bytes)][ExtentHeaders (varint-encoded)][body data]` — all metadata embedded in the body. Palimpsest also uses a single file, but with a four-section layout (header + index + inline + body + delta) that allows the index section to be fetched independently via byte-range GET, avoiding retrieval of body data that isn't needed. The local file and S3 object use the same format; the S3 object may additionally carry a delta body computed at upload time.
 
