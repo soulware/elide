@@ -128,7 +128,6 @@ impl WriteLog {
     }
 
     /// Append a dedup reference. No data payload is written.
-    #[allow(dead_code)] // used when dedup is wired up
     pub fn append_ref(
         &mut self,
         start_lba: u64,

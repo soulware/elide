@@ -223,6 +223,21 @@ impl Volume {
         let lba_length = (data.len() / 4096) as u32;
         let hash = blake3::hash(data);
 
+        // Write-path dedup: if this extent already exists in this volume's
+        // segment tree (own segments + ancestors), write a REF record instead
+        // of a DATA record. Scope is limited to within-volume so that every
+        // REF resolves within the same S3 volume tree (self-contained uploads).
+        if self.extent_index.lookup(&hash).is_some() {
+            self.wal.append_ref(lba, lba_length, &hash)?;
+            self.lbamap.insert(lba, lba_length, hash);
+            self.pending_entries
+                .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
+            if self.wal.size() >= FLUSH_THRESHOLD {
+                self.promote()?;
+            }
+            return Ok(());
+        }
+
         let compressed_data = maybe_compress(data);
         let write_data: &[u8] = compressed_data.as_deref().unwrap_or(data);
         let compressed = compressed_data.is_some();
@@ -1143,6 +1158,90 @@ mod tests {
 
         assert_eq!(vol.read(0, 1).unwrap(), compressible);
         assert_eq!(vol.read(1, 1).unwrap(), incompressible);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- write-path dedup tests ---
+
+    #[test]
+    fn dedup_write_same_data_same_lba() {
+        // Writing identical data to the same LBA twice: second write is a dedup hit.
+        // The LBA map must have exactly one entry, reads must return the correct data.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        let data = vec![0x42u8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.write(0, &data).unwrap();
+
+        assert_eq!(vol.lbamap_len(), 1);
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn dedup_write_same_data_different_lba() {
+        // Identical data written to two different LBAs: second write is a dedup hit.
+        // Both LBA entries exist in the map; reads return the correct data from both.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        let data = vec![0x77u8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.write(5, &data).unwrap();
+
+        assert_eq!(vol.lbamap_len(), 2);
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+        assert_eq!(vol.read(5, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn dedup_ref_survives_promote_and_reopen() {
+        // Write data, promote so it lands in pending/, then write the same data
+        // to a new LBA (dedup REF in WAL). Reopen and verify both LBAs read back.
+        let base = temp_dir();
+
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            let data = vec![0xABu8; 4096];
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+            // Second write: same data, different LBA → dedup hit, REF record in WAL.
+            vol.write(1, &data).unwrap();
+            vol.fsync().unwrap();
+        }
+
+        let vol = Volume::open(&base).unwrap();
+        let data = vec![0xABu8; 4096];
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+        assert_eq!(vol.read(1, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn dedup_ref_in_segment_survives_reopen() {
+        // Write data, promote, write same data (REF in WAL), promote again so
+        // the REF lands in a segment. Reopen and verify reads still work.
+        let base = temp_dir();
+
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            let data = vec![0xCDu8; 4096];
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+            vol.write(1, &data).unwrap(); // REF
+            vol.promote_for_test().unwrap(); // REF lands in segment
+        }
+
+        let vol = Volume::open(&base).unwrap();
+        let data = vec![0xCDu8; 4096];
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+        assert_eq!(vol.read(1, 1).unwrap(), data);
 
         fs::remove_dir_all(base).unwrap();
     }
