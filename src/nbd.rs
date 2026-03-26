@@ -477,24 +477,27 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
     serve_volume_listener(dir, size_bytes, listener)
 }
 
-/// Serve one NBD connection on an already-bound listener.
+/// Serve NBD connections on an already-bound listener, looping until the
+/// listener is closed. The volume is opened once and reused across connections
+/// so the in-memory LBA map is preserved between reconnects.
 /// Separated from `run_volume` so tests can bind port 0 and learn the port.
 fn serve_volume_listener(dir: &Path, size_bytes: u64, listener: TcpListener) -> io::Result<()> {
     install_sigusr1_handler();
 
     let mut volume = Volume::open(dir)?;
 
-    if let Some(stream) = listener.incoming().next() {
+    for stream in listener.incoming() {
         let stream = stream?;
         println!("[connected: {}]", stream.peer_addr()?);
 
         let result = handle_volume_connection(stream, &mut volume, size_bytes);
 
-        if let Err(e) = result {
-            eprintln!("[connection error: {}]", e);
-        } else {
-            println!("[disconnected]");
+        match result {
+            Ok(()) => println!("[disconnected]"),
+            Err(e) => eprintln!("[connection error: {}]", e),
         }
+
+        println!("Waiting for connection...\n");
     }
 
     Ok(())
