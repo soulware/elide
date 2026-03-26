@@ -107,12 +107,19 @@ Durability is at the write log. S3 upload is asynchronous and not on the critica
 2. Look up LBA in live LBA map → extent_hash H
 3. Check local segments (own pending/ + segments/, then ancestor segments/) for H
    - Hit  → return data
-   - Miss → look up H in extent index → S3 location
-4. Fetch extent from S3 (using segment index section to select full or delta retrieval strategy)
-5. Materialise full extent locally; return data to VM
+   - Miss → look up H in extent index → (segment_id, body_offset, body_length)
+4. Issue a byte-range GET to S3 covering a chunk of the segment body
+   - The fetch unit is a contiguous byte range (e.g. 1MB-aligned chunk) that
+     includes the needed extent(s) plus neighbours for spatial locality
+   - The segment index section encodes body_offset + body_length per extent,
+     so the chunk boundaries can be derived precisely
+   - If a delta body is available and smaller, fetch from the delta instead
+5. Cache the fetched chunk; decompress and return the needed extent(s) to VM
 ```
 
 The kernel page cache sits above the block device and handles most hot reads. The local segment cache handles warm reads. S3 is the cold path.
+
+**Demand-fetch is at extent granularity, not segment granularity.** A segment file on S3 may contain hundreds of extents. Only the specific extent needed for a given read is fetched — the rest of the segment is never downloaded unless separately requested. This is the same design as the lab47/lsvd reference implementation, which issues byte-range `GetObject` requests for chunk-sized slices of segment bodies (1MB chunks, LRU-cached locally) and never downloads entire segment files. In practice, 93.9% of a 2.1GB Ubuntu cloud image is never read during a typical systemd boot — meaning 93.9% of S3 segment data is never fetched.
 
 ## LBA Map
 
