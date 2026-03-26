@@ -5,7 +5,9 @@ use ext4_view::{Ext4, Ext4Error, PathBuf as Ext4PathBuf};
 
 mod extentindex;
 mod extents;
+mod inspect;
 mod lbamap;
+mod ls;
 mod nbd;
 mod segment;
 mod volume;
@@ -67,6 +69,19 @@ enum Command {
         #[arg(long, default_value = ".")]
         out_dir: String,
     },
+    /// Inspect a palimpsest volume directory and print a human-readable summary
+    InspectVolume {
+        /// Path to the volume root directory
+        dir: String,
+    },
+    /// List ext4 filesystem contents of a volume directory (read-only)
+    LsVolume {
+        /// Path to the volume root directory
+        dir: String,
+        /// Path within the ext4 filesystem to list (default: /)
+        #[arg(default_value = "/")]
+        path: String,
+    },
 }
 
 fn main() {
@@ -124,6 +139,14 @@ fn main() {
 
         Command::ExtractBoot { image, out_dir } => {
             extract_boot(Path::new(&image), Path::new(&out_dir)).expect("extract-boot failed");
+        }
+
+        Command::InspectVolume { dir } => {
+            inspect::run(Path::new(&dir)).expect("inspect-volume failed");
+        }
+
+        Command::LsVolume { dir, path } => {
+            ls::run(Path::new(&dir), &path).expect("ls-volume failed");
         }
     }
 }

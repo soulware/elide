@@ -157,6 +157,37 @@ impl WriteLog {
     }
 }
 
+/// Scan an existing write log without modifying it.
+///
+/// Returns `(records, has_partial_tail)`. A partial tail (e.g. from power loss
+/// mid-write or an active WAL being written to) is noted but not truncated.
+/// Use `scan` instead when truncation is desired (e.g. crash recovery).
+pub fn scan_readonly(path: &Path) -> io::Result<(Vec<LogRecord>, bool)> {
+    let data = std::fs::read(path)?;
+
+    if data.len() < MAGIC.len() || &data[..MAGIC.len()] != MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad write log magic",
+        ));
+    }
+
+    let mut pos = MAGIC.len();
+    let mut records = Vec::new();
+
+    while pos < data.len() {
+        match parse_record(&data, &mut pos) {
+            Ok(record) => records.push(record),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok((records, true));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok((records, false))
+}
+
 /// Scan an existing write log. Returns all complete records and the valid byte count.
 ///
 /// If a partial record is found at the tail (e.g. due to power loss mid-write),
