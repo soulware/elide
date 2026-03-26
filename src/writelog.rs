@@ -247,7 +247,15 @@ fn parse_record(data: &[u8], pos: &mut usize) -> io::Result<LogRecord> {
     let body_offset = *pos as u64;
     let payload = read_bytes(data, pos, data_len)?.to_vec();
 
-    if blake3::hash(&payload) != hash {
+    // When compressed, verify against the content hash (hash of uncompressed data).
+    // When uncompressed, verify directly.
+    let verify_against = if flags & FLAG_COMPRESSED != 0 {
+        zstd::decode_all(payload.as_slice())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decompression failed"))?
+    } else {
+        payload.clone()
+    };
+    if blake3::hash(&verify_against) != hash {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "extent hash mismatch",
@@ -555,19 +563,25 @@ mod tests {
         let path = temp_path();
         let _ = std::fs::remove_file(&path);
 
-        let payload = b"compressed payload bytes";
-        let hash = blake3::hash(payload);
+        let original = b"compressed payload bytes - original uncompressed content";
+        let compressed = zstd::bulk::compress(original, 1).unwrap();
+        // Hash is always of the uncompressed content.
+        let hash = blake3::hash(original);
 
         let mut wl = WriteLog::create(&path).unwrap();
-        wl.append_data(512, 6, &hash, FLAG_COMPRESSED, payload)
+        wl.append_data(512, 6, &hash, FLAG_COMPRESSED, &compressed)
             .unwrap();
         wl.fsync().unwrap();
         drop(wl);
 
         let (records, _) = scan(&path).unwrap();
         match &records[0] {
-            LogRecord::Data { flags: f, .. } => {
+            LogRecord::Data {
+                flags: f, data: d, ..
+            } => {
                 assert_eq!(*f, FLAG_COMPRESSED);
+                // The stored bytes are the compressed form.
+                assert_eq!(d.as_slice(), compressed.as_slice());
             }
             _ => panic!("expected Data record"),
         }

@@ -32,9 +32,10 @@ pub struct ExtentLocation {
     pub segment_id: String,
     /// Absolute byte offset of the start of the payload in the file.
     pub body_offset: u64,
-    /// Byte length of the payload (compressed size if the entry is compressed).
-    #[allow(dead_code)] // used for bounds checking / compressed reads
+    /// Byte length of the stored payload (compressed size if `compressed`).
     pub body_length: u32,
+    /// True if the payload is zstd-compressed.
+    pub compressed: bool,
 }
 
 /// In-memory index mapping content hash to segment location.
@@ -120,6 +121,7 @@ pub fn rebuild(base_dir: &Path) -> io::Result<ExtentIndex> {
                     segment_id: segment_id.clone(),
                     body_offset: body_section_start + entry.stored_offset,
                     body_length: entry.stored_length,
+                    compressed: entry.compressed,
                 },
             );
         }
@@ -169,12 +171,14 @@ mod tests {
                 segment_id: "01JQEXAMPLEULID0000000000A".to_string(),
                 body_offset: 1024,
                 body_length: 4096,
+                compressed: false,
             },
         );
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.segment_id, "01JQEXAMPLEULID0000000000A");
         assert_eq!(loc.body_offset, 1024);
         assert_eq!(loc.body_length, 4096);
+        assert!(!loc.compressed);
     }
 
     #[test]

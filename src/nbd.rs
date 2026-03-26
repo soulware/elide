@@ -1001,4 +1001,26 @@ mod tests {
         c.disconnect().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn write_incompressible_data_roundtrip() {
+        // All existing NBD tests use repetitive (compressible) data.
+        // This test exercises the uncompressed path through the full NBD stack.
+        let dir = temp_dir();
+        let port = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+
+        // Build a high-entropy block: LCG with coprime multiplier gives all 256
+        // values exactly 16 times in 4096 bytes (entropy = 8 bits/byte).
+        let data: Vec<u8> = (0..4096u16)
+            .map(|i| (i as u8).wrapping_mul(0x6D).wrapping_add(0xA7))
+            .collect();
+
+        c.write(1, 0, &data).unwrap();
+        let back = c.read(1, 0, 4096).unwrap();
+        assert_eq!(back, data);
+
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

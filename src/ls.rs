@@ -131,9 +131,9 @@ impl VolumeReader {
                         hash,
                         start_lba,
                         lba_length,
+                        flags,
                         body_offset,
                         data,
-                        ..
                     } => {
                         lbamap.insert(start_lba, lba_length, hash);
                         extent_index.insert(
@@ -142,6 +142,7 @@ impl VolumeReader {
                                 segment_id: ulid.clone(),
                                 body_offset,
                                 body_length: data.len() as u32,
+                                compressed: flags & writelog::FLAG_COMPRESSED != 0,
                             },
                         );
                     }

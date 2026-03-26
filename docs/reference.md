@@ -75,6 +75,8 @@ The `pending/` directory exists because palimpsest decouples local promotion fro
 
 **Compression:** lsvd uses LZ4 with an entropy threshold of 7.0 bits/byte and a minimum compression ratio of 1.5×. Palimpsest uses zstd (already a dependency) with the same 7.0-bit entropy threshold as a starting point.
 
+**Compression and read amplification:** extents are compressed as a unit. A read of a single block from a multi-block compressed extent requires decompressing the entire extent — the stored bytes cannot be seeked into at block granularity. This means the maximum extent size directly bounds worst-case read amplification: a 20-block cap means at most 80KB decompressed to serve a 4KB read (20×). The pre-log coalescing block limit therefore doubles as a read amplification cap and must be chosen with both concerns in mind.
+
 ---
 
 ## Implementation Notes
@@ -100,7 +102,7 @@ Constraints to keep in mind so S3 integration stays straightforward:
 - **Entropy threshold:** 7.0 bits used in experiments, taken from the lab47/lsvd reference implementation. Optimal value depends on workload mix.
 - **Segment size:** ~32MB soft threshold, taken from the lab47/lsvd reference implementation (`FlushThreshHold = 32MB`). Not a hard maximum — a segment closes when it exceeds the threshold. Optimal value depends on S3 request cost vs read amplification tradeoff.
 - **Extent index implementation:** sled, rocksdb, or custom. Needs random reads and range scans.
-- **Pre-log coalescing block limit:** lsvd uses 20 blocks. The right value for palimpsest depends on typical write burst sizes and acceptable memory footprint between fsyncs.
+- **Pre-log coalescing block limit:** lsvd uses 20 blocks. The right value for palimpsest depends on typical write burst sizes, acceptable memory footprint between fsyncs, and worst-case read amplification when compression is enabled (see above). The limit must be enforced at the write path even when the NBD layer delivers larger contiguous writes — splitting oversized writes into capped extents is preferable to unbounded amplification.
 - **LBA map cache invalidation:** validate the cached `lba.map` against a hash of the current segment IDs across the full ancestor tree, not just the live node.
 - **Delta segment threshold:** not every segment needs a delta body — only useful when changed extents have known prior versions in the ancestor tree. Criteria for when to compute and upload a delta body need empirical validation.
 - **Boot hint persistence:** where are hint sets stored, how are they distributed across hosts?

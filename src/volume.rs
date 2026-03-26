@@ -30,6 +30,55 @@ use ulid::Ulid;
 
 use crate::{extentindex, lbamap, segment, writelog};
 
+/// Compute the Shannon entropy of `data` in bits per byte.
+///
+/// Used to gate compression: data with entropy above 7.0 bits/byte is
+/// already close to random and unlikely to compress meaningfully.
+fn shannon_entropy(data: &[u8]) -> f64 {
+    let mut counts = [0u32; 256];
+    for &b in data {
+        counts[b as usize] += 1;
+    }
+    let len = data.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// Entropy threshold above which compression is skipped (bits/byte).
+///
+/// Taken from the lab47/lsvd reference implementation. Data at or above this
+/// level is already near-random and compression would at best be a no-op.
+const ENTROPY_THRESHOLD: f64 = 7.0;
+
+/// Minimum compression ratio required to store compressed data (1.5×).
+///
+/// If the compressed payload is not at least 1/3 smaller than the original,
+/// the compression overhead is not worth it and the raw data is stored instead.
+const MIN_COMPRESSION_RATIO_NUM: usize = 3;
+const MIN_COMPRESSION_RATIO_DEN: usize = 2;
+
+/// Attempt zstd compression on `data`.
+///
+/// Returns `Some(compressed_bytes)` if the entropy is low enough and the
+/// compression ratio meets the minimum threshold; `None` to store raw.
+fn maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
+    if shannon_entropy(data) > ENTROPY_THRESHOLD {
+        return None;
+    }
+    let compressed = zstd::bulk::compress(data, 1).ok()?;
+    // Only keep if we achieve at least MIN_COMPRESSION_RATIO (1.5×).
+    if compressed.len() * MIN_COMPRESSION_RATIO_NUM / MIN_COMPRESSION_RATIO_DEN >= data.len() {
+        return None;
+    }
+    Some(compressed)
+}
+
 /// WAL size (bytes) at which the log is promoted to a pending segment.
 /// This is a soft cap: a single write larger than this threshold will still
 /// succeed, producing a segment larger than intended. The block layer
@@ -154,7 +203,23 @@ impl Volume {
         let lba_length = (data.len() / 4096) as u32;
         let hash = blake3::hash(data);
 
-        let body_offset = self.wal.append_data(lba, lba_length, &hash, 0, data)?;
+        let compressed_data = maybe_compress(data);
+        let write_data: &[u8] = compressed_data.as_deref().unwrap_or(data);
+        let compressed = compressed_data.is_some();
+        let wal_flags = if compressed {
+            writelog::FLAG_COMPRESSED
+        } else {
+            0
+        };
+        let seg_flags = if compressed {
+            segment::FLAG_COMPRESSED
+        } else {
+            0
+        };
+
+        let body_offset = self
+            .wal
+            .append_data(lba, lba_length, &hash, wal_flags, write_data)?;
         self.lbamap.insert(lba, lba_length, hash);
         // Temporary extent index entry: points into the WAL at the raw payload offset.
         // Updated to segment file offsets after promotion.
@@ -163,15 +228,16 @@ impl Volume {
             extentindex::ExtentLocation {
                 segment_id: self.wal_ulid.clone(),
                 body_offset,
-                body_length: data.len() as u32,
+                body_length: write_data.len() as u32,
+                compressed,
             },
         );
         self.pending_entries.push(segment::SegmentEntry::new_data(
             hash,
             lba,
             lba_length,
-            0,
-            data.to_vec(),
+            seg_flags,
+            write_data.to_vec(),
         ));
 
         if self.wal.size() >= FLUSH_THRESHOLD {
@@ -200,10 +266,21 @@ impl Volume {
             };
             let path = find_segment_file(&self.base_dir, &loc.segment_id)?;
             let mut f = fs::File::open(path)?;
-            let byte_offset = loc.body_offset + block_offset as u64 * 4096;
-            f.seek(SeekFrom::Start(byte_offset))?;
             let out_slice = &mut out[i as usize * 4096..(i as usize + 1) * 4096];
-            f.read_exact(out_slice)?;
+            if loc.compressed {
+                f.seek(SeekFrom::Start(loc.body_offset))?;
+                let mut compressed_buf = vec![0u8; loc.body_length as usize];
+                f.read_exact(&mut compressed_buf)?;
+                let decompressed =
+                    zstd::decode_all(compressed_buf.as_slice()).map_err(io::Error::other)?;
+                let start = block_offset as usize * 4096;
+                out_slice.copy_from_slice(&decompressed[start..start + 4096]);
+            } else {
+                f.seek(SeekFrom::Start(
+                    loc.body_offset + block_offset as u64 * 4096,
+                ))?;
+                f.read_exact(out_slice)?;
+            }
         }
         Ok(out)
     }
@@ -234,6 +311,7 @@ impl Volume {
                     segment_id: self.wal_ulid.clone(),
                     body_offset: body_section_start + entry.stored_offset,
                     body_length: entry.stored_length,
+                    compressed: entry.compressed,
                 },
             );
         }
@@ -318,6 +396,7 @@ fn recover_wal(
                 data,
             } => {
                 let body_length = data.len() as u32;
+                let compressed = flags & writelog::FLAG_COMPRESSED != 0;
                 lbamap.insert(start_lba, lba_length, hash);
                 // Temporary WAL offset — updated to segment offset on promotion.
                 extent_index.insert(
@@ -326,6 +405,7 @@ fn recover_wal(
                         segment_id: ulid.clone(),
                         body_offset,
                         body_length,
+                        compressed,
                     },
                 );
                 pending_entries.push(segment::SegmentEntry::new_data(
@@ -449,9 +529,15 @@ mod tests {
         let base = temp_dir();
         let mut vol = Volume::open(&base).unwrap();
 
-        // Write 33 × 1 MiB to exceed FLUSH_THRESHOLD (32 MiB).
-        let block = vec![0u8; 1024 * 1024];
+        // Write 33 × 1 MiB of incompressible data to exceed FLUSH_THRESHOLD (32 MiB).
+        // Each block uses a unique byte value so entropy is high and compression is skipped.
+        let mut block = vec![0u8; 1024 * 1024];
         for i in 0u64..33 {
+            // Fill with a pattern that defeats compression: vary every byte.
+            let fill = (i & 0xFF) as u8;
+            for (j, b) in block.iter_mut().enumerate() {
+                *b = fill ^ (j as u8).wrapping_mul(0x6D).wrapping_add(0x4F);
+            }
             vol.write(i * 256, &block).unwrap();
         }
 
@@ -698,6 +784,86 @@ mod tests {
             !base.join("wal").join(&ulid).exists(),
             "stale WAL was not removed"
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- compression helper unit tests ---
+
+    /// Build a 4096-byte block where every byte is distinct (entropy = 8 bits/byte).
+    /// The LCG multiplier 109 (0x6D) is odd so it is coprime to 256, giving a
+    /// bijection on [0, 255] — each value appears exactly 16 times in 4096 bytes.
+    fn high_entropy_block(seed: u8) -> Vec<u8> {
+        (0..4096u16)
+            .map(|i| (i as u8).wrapping_mul(0x6D).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn shannon_entropy_all_same_byte() {
+        assert_eq!(shannon_entropy(&vec![0x42u8; 4096]), 0.0);
+    }
+
+    #[test]
+    fn shannon_entropy_uniform_is_8_bits() {
+        // 256 distinct values each appearing 16 times → exactly 8 bits/byte.
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let e = shannon_entropy(&data);
+        assert!((e - 8.0).abs() < 0.01, "expected ~8.0, got {e}");
+    }
+
+    #[test]
+    fn maybe_compress_compresses_low_entropy() {
+        // All-zeros: entropy = 0, compresses to almost nothing.
+        let data = vec![0u8; 4096];
+        let compressed = maybe_compress(&data).expect("expected compression to succeed");
+        // Must achieve at least 1.5× ratio.
+        assert!(
+            compressed.len() * MIN_COMPRESSION_RATIO_NUM / MIN_COMPRESSION_RATIO_DEN < data.len()
+        );
+    }
+
+    #[test]
+    fn maybe_compress_skips_high_entropy() {
+        let data = high_entropy_block(0);
+        assert!(shannon_entropy(&data) > ENTROPY_THRESHOLD);
+        assert!(maybe_compress(&data).is_none());
+    }
+
+    // --- volume read/write tests for compressed and uncompressed paths ---
+
+    #[test]
+    fn read_incompressible_data() {
+        // High-entropy data must not be compressed, and must read back correctly.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        let payload = high_entropy_block(0x5A);
+        assert!(
+            shannon_entropy(&payload) > ENTROPY_THRESHOLD,
+            "test data must be incompressible"
+        );
+
+        vol.write(0, &payload).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), payload);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compressed_and_uncompressed_extents_coexist() {
+        // Write one compressible and one incompressible extent; both must read back correctly.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        let compressible = vec![0xCCu8; 4096];
+        let incompressible = high_entropy_block(0xA3);
+
+        vol.write(0, &compressible).unwrap();
+        vol.write(1, &incompressible).unwrap();
+
+        assert_eq!(vol.read(0, 1).unwrap(), compressible);
+        assert_eq!(vol.read(1, 1).unwrap(), incompressible);
 
         fs::remove_dir_all(base).unwrap();
     }
