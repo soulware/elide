@@ -543,10 +543,11 @@ fn handle_volume_connection(
                 info.extend_from_slice(&tx_flags.to_be_bytes());
                 opt_reply(&mut s, option, NBD_REP_INFO, &info)?;
 
-                // Block size: minimum=4096, preferred=4096, maximum=4MB
+                // Block size: minimum=512, preferred=4096, maximum=4MB.
+                // We handle sub-4096 writes internally via read-modify-write.
                 let mut bsz = Vec::new();
                 bsz.extend_from_slice(&NBD_INFO_BLOCK_SIZE.to_be_bytes());
-                bsz.extend_from_slice(&4096u32.to_be_bytes());
+                bsz.extend_from_slice(&512u32.to_be_bytes());
                 bsz.extend_from_slice(&4096u32.to_be_bytes());
                 bsz.extend_from_slice(&(4u32 * 1024 * 1024).to_be_bytes());
                 opt_reply(&mut s, option, NBD_REP_INFO, &bsz)?;
@@ -602,19 +603,17 @@ fn handle_volume_connection(
         match cmd {
             NBD_CMD_READ => {
                 reads += 1;
-                if !offset.is_multiple_of(4096) || !length.is_multiple_of(4096) {
-                    tx_reply(&mut s, 22, handle)?; // EINVAL
-                    continue;
-                }
-                let lba = offset / 4096;
-                let lba_count = (length / 4096) as u32;
-                match volume.read(lba, lba_count) {
-                    Ok(buf) => {
+                let start_lba = offset / 4096;
+                let end_lba = (offset + length as u64).div_ceil(4096);
+                let lba_count = (end_lba - start_lba) as u32;
+                match volume.read(start_lba, lba_count) {
+                    Ok(blocks) => {
+                        let skip = (offset % 4096) as usize;
                         tx_reply(&mut s, 0, handle)?;
-                        s.write_all(&buf)?;
+                        s.write_all(&blocks[skip..skip + length])?;
                     }
                     Err(e) => {
-                        eprintln!("[read error lba={} count={}: {}]", lba, lba_count, e);
+                        eprintln!("[read error offset={} len={}: {}]", offset, length, e);
                         tx_reply(&mut s, 5, handle)?; // EIO — no data follows on error
                     }
                 }
@@ -624,15 +623,24 @@ fn handle_volume_connection(
                 writes += 1;
                 let mut buf = vec![0u8; length];
                 s.read_exact(&mut buf)?;
-                if !offset.is_multiple_of(4096) || !length.is_multiple_of(4096) {
-                    tx_reply(&mut s, 22, handle)?; // EINVAL
-                    continue;
-                }
-                let lba = offset / 4096;
-                match volume.write(lba, &buf) {
+                let start_lba = offset / 4096;
+                let end_lba = (offset + length as u64).div_ceil(4096);
+                let lba_count = (end_lba - start_lba) as u32;
+                let skip = (offset % 4096) as usize;
+                let result = if skip == 0 && length.is_multiple_of(4096) {
+                    // Already block-aligned — write directly.
+                    volume.write(start_lba, &buf)
+                } else {
+                    // Sub-block write: read covering blocks, patch, write back.
+                    volume.read(start_lba, lba_count).and_then(|mut blocks| {
+                        blocks[skip..skip + length].copy_from_slice(&buf);
+                        volume.write(start_lba, &blocks)
+                    })
+                };
+                match result {
                     Ok(()) => tx_reply(&mut s, 0, handle)?,
                     Err(e) => {
-                        eprintln!("[write error lba={} len={}: {}]", lba, length, e);
+                        eprintln!("[write error offset={} len={}: {}]", offset, length, e);
                         tx_reply(&mut s, 5, handle)?; // EIO
                     }
                 }
@@ -939,6 +947,56 @@ mod tests {
         c.write(2, 0, &second).unwrap();
         let back = c.read(3, 0, 4096).unwrap();
         assert_eq!(back, second);
+
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sub_block_write_read_roundtrip() {
+        // Simulate the kernel using 512-byte sectors: write 1024 bytes at
+        // offset 1024 (the ext4 superblock location), then read it back.
+        let dir = temp_dir();
+        let port = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+
+        // Write 1024 bytes at byte offset 1024 (not 4096-aligned).
+        let payload: Vec<u8> = (0..1024u16).map(|i| (i & 0xff) as u8).collect();
+        c.write(1, 1024, &payload).unwrap();
+
+        // Read back the same 1024 bytes.
+        let back = c.read(2, 1024, 1024).unwrap();
+        assert_eq!(back, payload);
+
+        // Bytes before and after should be zero (unwritten).
+        let before = c.read(3, 0, 1024).unwrap();
+        assert!(before.iter().all(|&b| b == 0));
+        let after = c.read(4, 2048, 2048).unwrap();
+        assert!(after.iter().all(|&b| b == 0));
+
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sub_block_write_preserves_neighbours() {
+        // Write a full block, then overwrite part of it with a sub-block write.
+        // The untouched bytes in the block should be preserved.
+        let dir = temp_dir();
+        let port = start_server(&dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+
+        // Fill block 0 with 0xaa.
+        c.write(1, 0, &vec![0xaau8; 4096]).unwrap();
+
+        // Overwrite bytes 512..1024 with 0xbb.
+        c.write(2, 512, &vec![0xbbu8; 512]).unwrap();
+
+        // Read the whole block back.
+        let back = c.read(3, 0, 4096).unwrap();
+        assert!(back[..512].iter().all(|&b| b == 0xaa));
+        assert!(back[512..1024].iter().all(|&b| b == 0xbb));
+        assert!(back[1024..].iter().all(|&b| b == 0xaa));
 
         c.disconnect().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
