@@ -81,6 +81,8 @@ The `pending/` directory exists because palimpsest decouples local promotion fro
 
 ## Implementation Notes
 
+**The NBD server is a development and testing tool.** The production block device frontend will be ublk (Linux, io_uring-based). NBD is kept for development convenience and macOS compatibility during local testing. This is architecturally identical to the lab47/lsvd reference implementation, which also exposes an NBD device. Palimpsest's NBD server listens on TCP rather than a Unix socket purely for convenience during dev/test (e.g. connecting a VM running under Multipass or QEMU without configuring shared sockets). No design decisions should be made to optimise the NBD path at the expense of the ublk path.
+
 **S3 is intentionally deferred.** The system can be developed and validated end-to-end using local storage only — `pending/` and `segments/` act as local-only segment stores without any upload step. This covers the full write path, promotion pipeline, LBA map, crash recovery, and read path. S3 hookup comes later.
 
 A clean progression for introducing S3:
@@ -107,4 +109,4 @@ Constraints to keep in mind so S3 integration stays straightforward:
 - **Delta segment threshold:** not every segment needs a delta body — only useful when changed extents have known prior versions in the ancestor tree. Criteria for when to compute and upload a delta body need empirical validation.
 - **Boot hint persistence:** where are hint sets stored, how are they distributed across hosts?
 - **Empirical validation of repacking benefit:** measure segment fetch count before and after access-pattern-driven repacking.
-- **ublk integration:** Linux-only, io_uring-based. NBD kept for development and macOS.
+- **ublk integration:** Linux-only, io_uring-based. NBD is the dev/test frontend; ublk is the production target.
