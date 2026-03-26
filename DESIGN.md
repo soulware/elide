@@ -8,10 +8,10 @@ The goal is a block storage system that minimises storage cost, minimises cold-s
 
 - **Log-structured virtual disk (LSVD)** — write ordering and local durability, with S3 as the large capacity tier
 - **Demand-fetch** — only retrieve data from S3 when it is actually needed; data never accessed is never transferred
-- **Content-addressed dedup** — identical chunks are stored once regardless of how many volumes reference them
-- **Delta compression** — near-identical chunks (e.g. a file updated by a security patch) are stored as small deltas against their predecessors, reducing S3 fetch size for updated images
+- **Content-addressed dedup** — identical chunks written to the same volume tree are stored once; dedup is local and opportunistic
+- **Delta compression** — near-identical chunks (e.g. a file updated by a security patch) are stored as small deltas in S3, reducing fetch size for updated images
 
-The combination is particularly effective for the VM-at-scale use case because: base images are highly repetitive across VMs (dedup captures shared content), images evolve incrementally (delta compression captures changed content), most of each image is never read at runtime (demand-fetch avoids fetching unused data), and the same image is booted many times (locality optimisation pays back repeatedly).
+The combination is particularly effective for the VM-at-scale use case because: base images are highly repetitive across snapshots of the same volume (dedup captures shared content), images evolve incrementally (delta compression captures changed content), most of each image is never read at runtime (demand-fetch avoids fetching unused data), and the same image is booted many times (locality optimisation pays back repeatedly).
 
 ## Key Concepts
 
@@ -23,15 +23,15 @@ Note: "extent" is also an ext4 term — an ext4 extent is a mapping from a range
 
 **Live write extents** are bounded by fsync and contiguous LBA writes. A write to LBA 100–115 and an adjacent write to LBA 116–131 arriving before the next fsync are coalesced into one extent covering LBA 100–131. Writes to non-contiguous LBAs stay as separate extents regardless of fsync timing — coalescing only applies to adjacent LBA ranges. Live write extents are **opportunistic dedup candidates**: full-file writes (e.g. `apt install`) may happen to align with file boundaries and dedup well; partial file edits will not.
 
-**Manifest** — a sorted list of `(start_LBA, length, extent_hash)` triples describing the complete state of a volume at a point in time. Held in memory on the host for running volumes. **The manifest is always derivable from the segments** — each segment carries the LBA metadata for the extents it contains, so the manifest can be reconstructed by scanning segments on startup. S3 persistence of the manifest is an optimisation (to avoid expensive segment scans at startup), not a correctness requirement.
+**Manifest** — a serialised point-in-time freeze of the LBA map. The live LBA map is the authoritative source; the manifest is an optional cache of it, useful for fast startup. **The manifest is always derivable from the segments** — each segment's `.idx` file carries the LBA metadata for its extents, so the LBA map can be reconstructed by scanning the volume tree's `.idx` files. S3 persistence of the manifest is an optimisation (to avoid expensive segment scans at startup), not a correctness requirement.
 
-**Snapshot** — a frozen, immutable manifest. Snapshots and images are the same thing — there is no separate image concept. A snapshot is taken by freezing the current in-memory manifest. Since extents are immutable and content-addressed, no data is copied. Snapshot identity is `blake3(all extent hashes in LBA order)` — derived from the manifest, not stored separately.
+**Snapshot** — a frozen volume node. Taking a snapshot creates a new live child node under the current node; the current node becomes frozen (read-only). Snapshots form a tree: the directory structure is the source of truth for the parent chain. No separate manifest is required to traverse the tree. A snapshot can be used as a rollback point or as the base for multiple independent forks.
 
-**Segment** — a packed collection of extents, typically ~32MB, stored as a single S3 object. The 32MB size is a soft flush threshold inherited from the lab47/lsvd reference implementation. Each segment carries the LBA metadata for its extents, making the manifest reconstructible from segments alone. Segments are the unit of S3 I/O.
+**Segment** — a packed collection of extents, typically ~32MB, stored as three S3 objects: a full body, a delta body, and a companion `.idx` file. The 32MB size is a soft flush threshold. Each segment's `.idx` carries the LBA metadata for its extents, making the LBA map reconstructible from `.idx` files alone. Segments are the unit of S3 I/O.
 
 **Write log** — the local durability boundary. Writes land here first (fsync = durable). Extents are promoted to segments in the background.
 
-**Extent index** — maps `extent_hash → S3 location`. Tells the read path where in S3 a given extent lives. Maintained by the global service, updated by GC when extents are repacked.
+**Extent index** — maps `extent_hash → location` (segment file + offset). Tells the read path where a given extent lives. Per-volume, rebuilt at startup by scanning the volume tree's `.idx` files, and updated by GC when extents are repacked.
 
 ## Operation Modes
 
@@ -55,35 +55,84 @@ Other filesystem parsers (XFS, btrfs) could bring additional filesystems into th
 
 ## Architecture
 
-Two components run on each host:
+### Design principle: the volume is the primitive
 
-**Per-volume process** — one per running VM. Owns the ublk/NBD frontend, the live manifest (in memory), the write log (local NVMe), and the per-volume extent cache. Classifies extents by entropy, routes low-entropy extents to the global service for dedup, stores high-entropy extents directly in per-volume segments.
+A volume process is **always self-contained and fully functional on its own**. It requires no coordinator, no S3, no other volumes. Local storage (WAL + segments on NVMe) is a complete and correct deployment — not a degraded or temporary state. This must remain true as the system grows: nothing added to the coordinator should become a correctness dependency for the volume.
 
-**Global service** — one per host. Owns the extent index (on-disk), the in-memory filter (xor/ribbon), and the host-level read cache. Handles dedup lookups, segment packing, S3 upload/download, and GC.
+The coordinator and S3 are **strictly additive**:
+- Without coordinator: volumes run indefinitely on local storage; `pending/` accumulates but I/O is always correct
+- With coordinator: GC reclaims space, S3 provides durability and capacity beyond local NVMe
+- With coordinator + S3: full production deployment
 
-S3 is shared across all hosts. Segments from any volume on any host land in a single shared namespace. The in-memory manifest (reconstructible from segments) and extent index together replace the per-volume segment list of the reference LSVD implementation.
+This layering also means a single volume process can be started standalone for development, testing, or debugging with no service scaffolding required.
+
+### Components
+
+A single **palimpsest coordinator** runs on each host and manages all volumes. It forks one child process per volume — the process boundary is deliberate: a fault in one volume's I/O path cannot corrupt another, and the boundary forces the inter-component interface to be explicit and real (filesystem layout, IPC protocol, GC ownership) rather than loose in-process coupling.
+
+**Coordinator (main process)** — spawns and supervises volume processes; owns GC (runs as a coordinator-level task with access to all volumes' on-disk state); handles S3 upload/download.
+
+**Volume process** (one per volume) — owns the ublk/NBD frontend for one volume; owns the WAL and pending promotion for that volume; holds the live LBA map in memory. Does not communicate with other volume processes directly. Communicates with the coordinator via a defined IPC boundary (TBD — Unix socket or similar). Never requires the coordinator for correct I/O.
+
+### Directory layout
+
+All volume state lives under a shared root directory on a dedicated local NVMe mount. **The directory tree is the snapshot tree**: each node is a volume state at a point in time. A node containing `wal/` is a live (writable) leaf. A node without `wal/` is frozen (read-only). The parent chain is the directory ancestry — no manifest is needed to traverse it.
+
+```
+/var/lib/palimpsest/
+  volumes/
+    <volume-id>/                  — root node of a volume tree
+      segments/                   — frozen after first snapshot
+      <snap-ulid>/                — child node (snapshot or fork)
+        segments/                 — frozen after next snapshot
+        <snap-ulid>/              — grandchild node
+          segments/
+          wal/                    — live leaf: this is the current write target
+          pending/
+        <fork-ulid>/              — another live fork from the same parent
+          segments/
+          wal/
+          pending/
+  service.sock                    — Unix socket at a stable, known path
+```
+
+**Invariants:**
+- `wal/` present → live leaf; the volume process writes here
+- `wal/` absent → frozen; contents are immutable
+- `pending/` always accompanies `wal/`
+- All ancestor nodes of a live leaf are frozen and shared across all sibling forks; GC must not modify them
+
+**Finding live volumes:** scan for directories containing `wal/`. Each such directory is an independently running volume process.
+
+**Finding a volume's ancestry:** walk up the directory tree from the live leaf to the root. Each parent directory is a frozen snapshot layer; its `segments/` contribute to the LBA map via layer merging (ancestors first, descendants shadow).
 
 ```
 VM
  │  block I/O (ublk / NBD)
  ▼
-Per-volume process
- │  write path: buffer → extent boundary → hash → dedup check
- │  read path:  LBA → manifest → hash → local cache → S3
+Volume process  (one per volume)
+ │  write path: buffer → extent boundary → hash → local dedup check → WAL append
+ │  read path:  LBA → LBA map → extent index → segment file (local or S3)
  │
- ├─ Write log (local NVMe, durability boundary)
- ├─ Live manifest (in memory, LBA → hash, reconstructible from segments)
- └─ Global service client
+ ├─ WAL  (wal/<ULID>)
+ ├─ Pending segments  (pending/<ULID>{,.idx})
+ ├─ Live LBA map  (in memory, LBA → hash; merged from own + ancestor layers)
+ └─ IPC  (service.sock — optional for I/O, used for coordination)
       │
       ▼
-Global service (per host)
- ├─ Extent index (on-disk, hash → S3 location)
- ├─ Xor/ribbon filter (in memory, ~100MB)
- ├─ Read cache (small, absorbs S3 fetch bursts)
- └─ S3 (shared, all hosts)
-      ├─ segments/<ULID>  — packed extents (carry LBA metadata)
-      └─ index/extent-index  — global extent hash → location
+Coordinator (main process)
+ ├─ Volume supervisor  (spawn/re-adopt volume processes)
+ ├─ GC / segment packer  (compacts live leaf segments; never touches frozen ancestors)
+ └─ S3 uploader  (async, not on write critical path)
 ```
+
+### Coordinator restartability
+
+Volume processes are **detached** from the coordinator at spawn time (`setsid` / new session) so they are not in the coordinator's process group and are not signalled when it exits. The coordinator can be stopped, upgraded, or restarted without interrupting running volumes.
+
+**Re-adoption on coordinator start:** when the coordinator starts, it scans for `wal/` directories and checks whether each has a running process (via a `volume.pid` file alongside `wal/`). Volumes with a live process are re-adopted. Volumes with no running process are started fresh and recover from their WAL as normal.
+
+**IPC is reconnectable:** volume processes handle `service.sock` disappearing and attempt reconnection when it reappears. The IPC channel carries coordination traffic only (GC notifications, S3 upload confirmations) — loss of the channel degrades background efficiency but never affects correctness or I/O availability.
 
 ## Write Path
 
@@ -91,61 +140,58 @@ Global service (per host)
 1. VM issues write for LBA range
 2. Buffer contiguous writes; each non-contiguous LBA gap finalises an extent
 3. For each extent:
-   a. Entropy check
-      - High entropy → local tier (per-volume segment, no dedup)
-      - Low entropy  → continue
-   b. Hash extent content → extent_hash
-   c. Check per-volume extent cache (in memory)
-      - Hit  → point LBA range at existing extent, done
-      - Miss → continue
-   d. Check xor/ribbon filter (in memory)
-      - Miss → new extent, store it
-      - Hit  → check extent index on disk to confirm
-   e. If new: write to write log (fsync = durable), promote to segment in background
-   f. If duplicate: reference existing extent, no write
-4. Update live manifest with new (start_LBA, length, extent_hash) entries
+   a. Hash extent content → extent_hash
+   b. Check local extent index (own segments + all ancestor segments) for extent_hash
+      - Found  → write REF record to WAL (no data payload)
+      - Not found → write DATA record to WAL (fsync = durable)
+4. Update live LBA map with new (start_LBA, length, extent_hash) entries
 ```
 
 Durability is at the write log. S3 upload is asynchronous and not on the critical path.
 
-Live write dedup is **opportunistic** — extents are fsync-bounded and contiguous-LBA-bounded, not file-aligned. Full file writes (e.g. `apt install`, library replacement) may happen to align with file boundaries and dedup well; partial file edits will not. Reliable file-aligned dedup happens at snapshot time via ext4 re-alignment.
+**Dedup is local and opportunistic.** The write path checks the local extent index (covering the current volume's segments and all ancestor segments in the tree) before writing data. If the extent already exists anywhere in the local tree, a REF record is written instead — no data is stored again. Dedup is bounded to the local volume tree; no cross-tree or cross-host dedup check is performed. The quality of dedup depends on write alignment: fsync-bounded writes to the same files as prior snapshots dedup well; partial overwrites do not.
+
+**No delta compression locally.** Delta compression is computed at S3 upload time and exists in S3 only. Local segment bodies contain either the full extent data (DATA records) or nothing (REF records, where the data already lives in an ancestor segment and is not duplicated). On S3 fetch, deltas are applied and the full extent is materialised locally before being cached and served to the VM.
 
 ## Read Path
 
 ```
 1. VM reads LBA range
-2. Look up LBA in live manifest → chunk hash H
-3. Check local cache for H
+2. Look up LBA in live LBA map → extent_hash H
+3. Check local segments (own pending/ + segments/, then ancestor segments/) for H
    - Hit  → return data
-   - Miss → look up H in chunk index → S3 location
-4. Fetch chunk from S3, populate local cache
-5. Return data to VM
+   - Miss → look up H in extent index → S3 location
+4. Fetch extent from S3 (using .idx to select full or delta retrieval strategy)
+5. Materialise full extent locally; return data to VM
 ```
 
-The kernel page cache sits above the block device and handles most hot reads — the system never sees page cache hits. The local chunk cache is a small S3 fetch buffer, not a general-purpose cache.
+The kernel page cache sits above the block device and handles most hot reads. The local segment cache handles warm reads. S3 is the cold path.
 
 ## LBA Map
 
 The **LBA map** is the live in-memory data structure mapping logical block addresses to content. It is a sorted structure (B-tree or equivalent) keyed by `start_LBA`, where each entry holds `(start_lba, lba_length, extent_hash)`. It is updated on every write (new entries added, existing entries trimmed or replaced for overwrites) and is the authoritative source for read path lookups.
 
-**Contrast with lab47/lsvd:** the reference implementation calls this `lba2pba` and maps `LBA → segment+offset` (physical location). GC repacking must update it for every moved extent. Palimpsest maps `LBA → hash` — the logical layer. Physical location (`hash → segment+offset`) is a separate extent index. This two-level indirection means GC repacking updates only the extent index; the LBA map is never rewritten for GC. Manifests and snapshots become immutable once written.
+**Contrast with lab47/lsvd:** the reference implementation calls this `lba2pba` and maps `LBA → segment+offset` (physical location). GC repacking must update it for every moved extent. Palimpsest maps `LBA → hash` — the logical layer. Physical location (`hash → segment+offset`) is a separate extent index. This two-level indirection means GC repacking updates only the extent index; the LBA map is never rewritten for GC.
+
+**Layer merging:** a live volume's LBA map is the union of its own data and all ancestor layers. At startup, layers are merged oldest-first (root ancestor first, live node last), so later writes shadow earlier ones. This is the same model as the lsvd `lowers` array, encoded in the directory tree.
 
 ### LBA map persistence
 
-The LBA map is persisted to a local `lba.map` file on clean shutdown and used as a fast-start cache on restart — analogous to the reference implementation's `head.map`.
+The LBA map is optionally persisted to a local `lba.map` file on clean shutdown and used as a fast-start cache on restart.
 
-**Freshness guard:** the file includes a BLAKE3 hash of the sorted list of all current local segment IDs. On startup, if the guard matches the current segment list, the cached LBA map is loaded directly without scanning `.idx` files. If the guard doesn't match (new segments were written or old ones removed since last checkpoint), the LBA map is rebuilt from scratch.
+**Freshness guard:** the file includes a BLAKE3 hash of the sorted list of all current local segment IDs (own + ancestors). On startup, if the guard matches the current segment list, the cached LBA map is loaded directly without scanning `.idx` files. If the guard doesn't match (new segments were written, or ancestry changed), the LBA map is rebuilt from scratch.
 
 **Rebuild procedure:**
-1. Scan all local segment `.idx` files (fast — `.idx` files are small, ~60KB each)
-2. For each `.idx` entry, apply to the LBA map (later segments take precedence for any overlapping LBA range)
-3. Replay any WAL file(s) on top (WAL entries are the most recent writes)
+1. Walk the directory tree from the root ancestor to the live node
+2. For each node, scan its `segments/` and `pending/` `.idx` files
+3. Apply each `.idx` entry to the LBA map (later layers take precedence for any overlapping LBA range)
+4. Replay the current WAL on top (WAL entries are the most recent writes)
 
-Since `.idx` files are the ground truth for segment contents, rebuilding the LBA map requires only `.idx` files and the WAL — never the segment data bodies. A full startup rebuild for a volume with 100 segments is a scan of ~6MB of `.idx` data, not 3GB of segment bodies.
+Since `.idx` files are the ground truth for segment contents, rebuilding the LBA map requires only `.idx` files and the WAL — never the segment data bodies. A full startup rebuild for a volume with 100 segments across its ancestry is a scan of ~6MB of `.idx` data, not 3GB of segment bodies.
 
 ### Manifest format
 
-"Manifest" refers specifically to the **serialised form** written at snapshot time (or as a startup cache). The live LBA map is the source; the manifest is a point-in-time freeze of it.
+"Manifest" refers specifically to the **serialised form** of the LBA map, written optionally at snapshot time or as a startup cache. It is a correctness-optional optimisation — the LBA map is always reconstructible from `.idx` files. When a manifest exists and its freshness guard is valid, it allows startup without scanning any `.idx` files.
 
 When persisted, the format is a binary flat file:
 
@@ -154,7 +200,7 @@ When persisted, the format is a binary flat file:
 | Offset | Size | Field        | Description                          |
 |--------|------|--------------|--------------------------------------|
 | 0      | 8    | magic        | `PLMPST\x00\x02`                     |
-| 8      | 32   | volume_id    | blake3 of all extent hashes in LBA order |
+| 8      | 32   | snapshot_id  | blake3 of all extent hashes in LBA order |
 | 40     | 32   | parent_id    | snapshot_id of parent; zeros = root  |
 | 72     | 4    | entry_count  | number of entries (u32 le)           |
 | 76     | 8    | timestamp    | unix seconds (u64 le)                |
@@ -169,31 +215,25 @@ When persisted, the format is a binary flat file:
 
 One entry per extent. Unwritten LBA ranges have no entry (implicitly zero).
 
-**Snapshot identity:** `snapshot_id = blake3(all extent hashes in LBA order)` — derived from the live LBA map, not from the file bytes. Identical volume state always produces the same snapshot_id regardless of when or where the manifest was serialised.
-
-**Volume identity:** `volume_id = blake3(all extent hashes in LBA order)` — same derivation. Two independently-generated snapshots of the same image produce the same `volume_id`.
-
-**Parent chain:** `parent_id` references the `snapshot_id` of the previous snapshot, enabling chain traversal.
+**Snapshot identity:** `snapshot_id = blake3(all extent hashes in LBA order)` — derived from the live LBA map, not from the file bytes. Identical volume state always produces the same snapshot_id regardless of when or where the manifest was serialised. The directory ancestry is the authoritative parent chain; `parent_id` in the manifest is a convenience field for S3 contexts where directory structure is not available.
 
 ## Extent Index
 
-Maps `extent_hash → S3 location`. Separate from the manifest — the manifest is purely logical (what data is at each LBA range), the extent index is physical (where that data lives in S3).
+Maps `extent_hash → local location` (segment file + offset). Separate from the LBA map — the LBA map is purely logical (what data is at each LBA range), the extent index is physical (where that data lives on disk).
 
-**Contrast with lab47/lsvd:** the reference implementation uses a single `lba2pba` map — a direct `LBA → segment+offset` (physical location) index. GC repacking requires updating this map for every moved extent. The manifest + extent index split replaces that single map with two levels of indirection: the manifest is purely logical (`LBA → hash`) and never changes after a snapshot is frozen; only the extent index (`hash → physical location`) is updated during GC. Manifests and snapshots are therefore immutable once written.
+**Contrast with lab47/lsvd:** the reference implementation uses a single `lba2pba` map — a direct `LBA → segment+offset` (physical location) index. GC repacking requires updating this map for every moved extent. The LBA map + extent index split means GC can repack extents (changing their location) by updating only the extent index. The LBA map is never rewritten for GC.
 
-This separation means GC can repack extents (changing their S3 location) by updating only the extent index. Manifests are never rewritten after being frozen.
-
-The extent index also stores delta compression metadata: if extent B is stored as a delta against extent A, the index records `hash_B → {segment, offset, delta_source: hash_A}`. The manifest is unaware of this — it just records `(start_lba, length, hash_B)`. The read path fetches the delta and the source extent, reconstructs B, and caches the full extent locally.
-
-**In-memory filter:** an xor or ribbon filter (~100MB for 80M entries) guards the on-disk index. Extents not in the filter are definitively new — no disk lookup needed. False positives fall through to disk. Filter is rebuilt periodically during GC sweep.
+The extent index covers the live node's own segments plus all ancestor segments — rebuilt at startup by scanning `.idx` files up the directory tree.
 
 ## Dedup
 
-**Exact dedup:** two extents with the same BLAKE3 hash are identical. The second write costs nothing — the manifest is updated to point the new LBA range at the existing extent. No data stored, no S3 upload.
+**Exact dedup:** two extents with the same BLAKE3 hash are identical. Dedup is detected and applied **opportunistically on the write path**: before writing a DATA record to the WAL, the extent hash is checked against the local extent index (covering own + all ancestor segments). If a match is found, a REF record is written instead — no data payload, just a reference to the existing extent. This keeps the data volume in the WAL and segment files minimal without requiring any coordination or remote lookup.
 
-**Delta compression:** extents that are similar but not identical (e.g. a file updated by a security patch) can be stored as a delta against a known extent. Applied at S3 upload time — the local cache always holds full reconstructed extents. The benefit is reduced S3 fetch size, not storage cost. The primary value is latency: fetching a small delta instead of a full extent from S3 is dramatically faster on the cold-read path.
+Dedup scope is **local to the volume tree**. No cross-tree or cross-host dedup check is performed. Dedup quality is therefore highest for snapshot-derived volumes (where the ancestor segments contain most of the data) and lower for freshly provisioned volumes with no ancestry.
 
-**Delta source selection** is trivial at the extent level: the natural reference for a changed file is the same-path file in the previous snapshot. No similarity search required — the manifest parent chain gives direct access to the prior version of each extent.
+**Delta compression** is a separate concern from dedup and is **S3-only**. Local segment bodies never contain delta records — an entry in a local segment is either a full extent (DATA record, data present in body) or a reference (REF record, no data in this segment's body, data lives in an ancestor segment). At S3 upload time, extents that differ only slightly from extents in ancestor segments are stored as deltas in a separate delta segment file (see S3 Layout). The benefit is reduced S3 fetch size, not local storage cost. The primary value is latency: fetching a small delta instead of a full extent from S3 is dramatically faster on the cold-read path. On fetch, the delta is applied and the full extent is materialised locally before being cached and served.
+
+**Delta source selection** is trivial at the extent level: the natural reference for a changed file is the same-path file in the parent snapshot. The snapshot parent chain gives direct access to the prior version of each extent.
 
 Delta compression is compelling for point-release image updates; not worth the complexity for cross-version (major version) updates where content is genuinely different throughout.
 
@@ -203,182 +243,228 @@ Delta compression is compelling for point-release image updates; not worth the c
 - The 65% in changed extents is the delta compression target: whole-file deltas against the previous snapshot's copy, which are typically tiny (a patch changes a small region of a large binary)
 - Overall marginal S3 fetch to advance from one point release to the next: ~94% saving vs fetching fresh
 
-## Volume Types and Namespace Scoping
-
-Volumes have a type that determines which chunk namespace they participate in.
-
-**Image volumes** (rootfs, shared base images) — opt into the global dedup namespace. Low-entropy chunks are routed to the global service for dedup check and shared index storage. Boot hint sets are accumulated and repacking for locality applies.
-
-**Data volumes** (databases, application data) — never touch the global chunk namespace. Chunks go directly to per-volume S3 segments with no dedup check. Still benefit from the local NVMe cache tier, free snapshots, and cheap migration. Kept out of the global namespace to avoid index pollution with high-churn, low-hit-rate entries.
-
-Snapshot manifests are uniform across volume types — snapshot management is identical regardless of type. Only the chunk storage routing differs.
-
-**Routing at write time:**
-- `volume.type == Image && entropy(extent) < threshold` → global service (dedup check)
-- Everything else → per-volume segments (no dedup)
-
-**Open question:** binary global/non-global routing may not be granular enough. Hierarchical namespaces (global → org → image-family → volume) are a plausible future requirement. The design should treat namespace as an attribute of the volume, not a boolean flag.
-
 ## Snapshots
 
-A snapshot is a frozen manifest. Taking a snapshot is cheap: copy the current in-memory manifest, assign a snapshot_id, write to S3. Cost is proportional to manifest size, not volume size.
-
-**Snapshots are images.** There is no separate image concept. Deploying a new image version means taking a snapshot on a configured VM and distributing the manifest. The storage layer handles dedup, delta compression, and locality transparently — the snapshot mechanism is unaware of them.
+A snapshot freezes the current live node and starts a new live child. Snapshots serve two purposes: **checkpointing** (a rollback point for the same ongoing volume) and **forking** (launching a new independent volume from a known state). Both use the same mechanism.
 
 **Taking a snapshot:**
 
 ```
-1. Pause writes briefly (or use a copy-on-write fence)
-2. Freeze the current in-memory manifest → snapshot manifest
-3. [Enhanced mode only] Parse ext4 extent tree from the frozen filesystem state
-   Re-align extents to file boundaries: re-slice data at ext4 boundaries, re-hash
-   - Coalesced extents spanning multiple files → split into per-file extents
-   - Multiple extents covering one file → merged into one extent
-4. Write snapshot manifest to S3
-5. Write consolidated extent index to S3 (see below)
-6. Resume writes
+1. Create <snap-ulid>/ as a child of the current live node
+2. Create <snap-ulid>/wal/, <snap-ulid>/pending/, <snap-ulid>/segments/
+3. Redirect new writes to the child immediately (live volume continues uninterrupted)
+4. Background: flush any remaining WAL data to segments/ in the current (now-freezing) node
+5. Background: remove wal/ and pending/ from the current node when flush completes
+   → node is now frozen; directory contains only segments/
 ```
 
-In enhanced mode, the ext4 re-alignment is what makes snapshot extents reliable dedup candidates. The ext4 metadata is the ground truth; the current manifest's extent boundaries are discarded and replaced with file-aligned ones. In basic mode, the manifest is frozen as-is — dedup quality is lower but correctness is unaffected.
+Steps 1–3 are the only blocking part and are instantaneous. Steps 4–5 are background and do not block I/O.
 
-**A snapshot is self-contained.** At snapshot time, all referenced extents are guaranteed to be in S3. This is the natural moment to write a consolidated extent index covering exactly those extents:
+**Forking** (two VMs from the same snapshot point): once a node is frozen, create multiple children. Each child is an independent live volume that inherits the parent's data via the directory ancestry.
 
 ```
-s3://bucket/snapshots/<id>/manifest   — LBA → extent hash
-s3://bucket/snapshots/<id>/index      — extent hash → segment+offset
+volumes/<base-id>/
+  segments/                 ← frozen, shared by both forks
+  <fork-a-ulid>/            ← VM A
+    wal/
+    pending/
+    segments/
+  <fork-b-ulid>/            ← VM B
+    wal/
+    pending/
+    segments/
 ```
 
-The snapshot index covers no more and no less than what is needed to read that snapshot. Serving a specific image on a new host requires only these two files — no global index scan, no segment enumeration.
+**Rollback:** delete the live leaf (and any of its descendants if needed), then re-create `wal/` and `pending/` in the target ancestor. The ancestor's segments are untouched.
 
-**Cross-image dedup on a new host** is bootstrapped by unioning the snapshot indexes for the images being served. Only the relevant snapshots need to be loaded, not a global index of everything that ever existed.
+**Checkpoint semantics (linear history):**
 
-**The gap between snapshots** — extents written since the last snapshot — is covered by per-segment `.idx` files (see S3 Layout). Recovery is therefore: latest snapshot index + `.idx` files for segments written since.
+```
+Before snapshot:          After snapshot:
+volumes/<base>/           volumes/<base>/
+  segments/                 segments/         ← frozen
+  wal/               →      <snap-1>/
+  pending/                    wal/            ← live continues here
+                              pending/
+                              segments/
+```
 
-**GC interaction:** the GC sweep walks all manifests, including frozen snapshots. Extents referenced by any snapshot are kept alive. Deleting a snapshot releases its extent references; the next GC sweep reclaims extents no longer referenced by any remaining manifest.
+**The directory tree is the source of truth.** No manifest file is required to understand the snapshot relationships or to reconstruct the LBA map. A manifest may be written as an optional startup optimisation, but its absence never affects correctness.
 
-**Rollback:** replace the live manifest with a snapshot manifest and discard the write log since the snapshot point. Instant at the block device level.
+**GC interaction:** GC operates only on live leaf nodes (those with `wal/`). Frozen ancestor nodes are structurally immutable and shared across all descendants — a segment in a frozen ancestor cannot be deleted or repacked while any live descendant exists. This is the same constraint as the lsvd reference implementation's `removeSegmentIfPossible()` check: a segment is only reclaimable when no volume's read path can reach it. In the directory model, this is enforced structurally: a frozen node has no `wal/`, so GC never selects it.
 
 **Migration and disaster recovery** share the snapshot code path: start a volume from a snapshot manifest on a new host. One operation, multiple use cases.
 
 ## S3 Layout and Index
 
-Segments are the unit of S3 storage. Each segment is a packed collection of extents (~32MB). Alongside each segment, a small companion index file is written:
+Each segment is a **single S3 object** at `s3://bucket/segments/<ULID>`. The segment file contains four sections laid out sequentially. All section lengths are recorded in the header, so any byte range within the file is computable after reading the first 32 bytes.
+
+### Segment file format
 
 ```
-s3://bucket/segments/<ULID>       — packed extents (~32MB), raw bytes
-s3://bucket/segments/<ULID>.idx   — per-extent metadata (LBA, hash, body location)
+[Header: 32 bytes]
+  magic          (8 bytes)  — "PLMPSEG\x01"
+  entry_count    (4 bytes)  — number of index entries (u32 le)
+  index_length   (4 bytes)  — byte length of index section (u32 le)
+  inline_length  (4 bytes)  — byte length of inline section (u32 le); 0 if none
+  body_length    (8 bytes)  — byte length of full extent body (u64 le)
+  delta_length   (4 bytes)  — byte length of delta body (u32 le); 0 if no deltas
+
+[Index section]             — starts at byte 32; length = index_length
+[Inline section]            — starts at byte 32 + index_length; length = inline_length
+[Full body]                 — starts at byte 32 + index_length + inline_length; length = body_length
+[Delta body]                — starts at byte 32 + index_length + inline_length + body_length; length = delta_length
 ```
 
-The segment body is raw bytes — concatenated extent data with no per-extent framing. All structure lives in the `.idx` file. The `.idx` is always fetched before the segment body: it tells the read path whether a segment fetch is needed at all, and if so which byte ranges to request.
-
-The `.idx` file is small: ~60 bytes per extent × ~1000 extents per 32MB segment ≈ ~60KB, roughly 1/500th the size of the segment. It is written atomically with the segment upload.
-
-**`.idx` entry format:**
-
+Derived section offsets (computable from the header alone):
 ```
-For each entry:
-  hash        (32 bytes) — BLAKE3 extent hash
-  start_lba   (8 bytes)  — first logical block address (u64 le)
-  lba_length  (4 bytes)  — extent length in 4KB blocks (u32 le); uncompressed size = lba_length × 4096
-  flags       (1 byte)   — bits: 0=inline, 1=delta, 2=compressed
-
-  if delta:
-    source_hash  (32 bytes) — BLAKE3 hash of the source extent to apply delta against
-
-  if !inline (reference):
-    body_offset  (8 bytes) — byte offset within segment body (u64 le)
-    body_length  (4 bytes) — byte length in segment body (u32 le); equals lba_length×4096 if not compressed
-
-  if inline:
-    body_length  (4 bytes) — byte length of inline data (u32 le)
-    data bytes   (body_length bytes) — extent or delta bytes, compressed if flag set
+index_offset  = 32
+inline_offset = 32 + index_length
+body_offset   = 32 + index_length + inline_length
+delta_offset  = 32 + index_length + inline_length + body_length
 ```
 
-`inline` and `delta` are orthogonal bits: a delta can be inlined (delta bytes stored directly in `.idx`) or referenced (delta bytes in segment body). Inlined deltas are common — delta bytes for a patched file are often small, and storing them in `.idx` eliminates a byte-range GET against the segment body. The source extent is always fetched separately via its own hash lookup regardless.
+**The full body** is raw concatenated extent data — DATA-record extents only, clean bytes, no framing. REF-record extents contribute nothing to the body. All navigation is via the index section.
 
-The `.idx` entry serves two purposes with a single scan: manifest reconstruction (`start_lba + lba_length + hash`) and extent index population (`hash → segment_id + body_offset + body_length`). No separate pass needed. These could be split into separate files (the global service only needs the hash→location part; the per-volume process only needs the LBA part), but the hash would then be stored twice and two S3 fetches would be required. Since `.idx` files are small and manifest reconstruction is a rare cold-start path, a single combined file is the better tradeoff.
+**The delta body** is raw concatenated delta blobs, referenced by byte offset from the index section. It is absent on locally-stored segments (delta computation happens at S3 upload time) and present on the S3 object when the coordinator has computed deltas against ancestor segments.
 
-**Compression:** low-entropy extents (those routed through the global service) are compressed with zstd before being written to the segment body. The `compressed` flag is set in `.idx`; `body_length` records the compressed size, which is what determines byte-range GET size. `lba_length × 4096` always gives the uncompressed size — no second size field needed. High-entropy extents (routed to per-volume segments) are stored uncompressed; the entropy check already tells us compression will not help.
+**The inline section** holds raw bytes for inlined extents and inlined delta blobs. It is placed before the full body so a single `GET [0, body_offset)` retrieves the header, index, and all inline data together — sufficient for a warm-start client to serve all small extents without fetching the body at all.
 
-**Inline extents:** small extents are stored directly in the `.idx` file rather than referenced by offset into the segment. A byte-range GET has fixed overhead (latency + S3 request cost) that dominates for tiny extents — inlining eliminates that round-trip entirely.
+### Index section entry format
 
-This is particularly effective for the boot path: small config files, scripts, and locale data appear frequently during boot and are naturally small. Inlining them means loading the snapshot index delivers those extents with zero additional S3 requests. The empirical finding that 84% of extents by count are small files (representing only 35% of bytes) means inlining captures the majority of extents with modest `.idx` size growth.
+**Flag bits** (1 byte per entry):
+- `0x01` `FLAG_INLINE` — extent data is in the inline section; no body fetch needed
+- `0x02` `FLAG_HAS_DELTAS` — one or more delta options follow
+- `0x04` `FLAG_COMPRESSED` — stored data is zstd-compressed; lengths are compressed sizes
+- `0x08` `FLAG_DEDUP_REF` — extent data lives in an ancestor segment; no body in this segment
 
-The inline threshold is an open question — too low misses most small extents, too high bloats `.idx` files and makes index reconstruction expensive. A threshold in the range of a few KB seems reasonable; the actual extent size distribution from image analysis should drive the final value.
+```
+For each extent:
+  hash          (32 bytes)  — BLAKE3 extent hash
+  start_lba     (8 bytes)   — first logical block address (u64 le)
+  lba_length    (4 bytes)   — extent length in 4KB blocks (u32 le)
+  flags         (1 byte)    — flag bits above
 
-**The extent index on the global service** (on-disk, hash → S3 location) is built from these `.idx` files. It is a cache — always reconstructible from S3 without reading segment data. On a cold start or after index loss, reconstruction is: download all `.idx` files (fast, small) rather than scanning all segment data (slow, large).
+  if FLAG_DEDUP_REF:
+    (no body fields — data located via extent index lookup on hash)
 
-**Snapshot indexes** are consolidated views written at snapshot time. They cover all extents reachable from that snapshot and remain immutable. A snapshot index is smaller than the full global index — it contains only live extents at that point in time, not historical or GC'd ones.
+  if !FLAG_DEDUP_REF and !FLAG_INLINE:
+    body_offset (8 bytes)   — byte offset within full body section (u64 le)
+    body_length (4 bytes)   — byte length (compressed size if FLAG_COMPRESSED)
+
+  if FLAG_INLINE:
+    inline_offset (8 bytes) — byte offset within inline section (u64 le)
+    inline_length (4 bytes) — byte length of inline data
+
+  if FLAG_HAS_DELTAS:
+    delta_count  (1 byte)   — number of delta options (≥1)
+    per delta option:
+      source_hash        (32 bytes) — BLAKE3 hash of the source extent
+      option_flags       (1 byte)   — bit 0: FLAG_DELTA_INLINE
+      if !FLAG_DELTA_INLINE:
+        delta_offset     (8 bytes)  — byte offset within delta body section (u64 le)
+        delta_length     (4 bytes)  — byte length in delta body (u32 le)
+      if FLAG_DELTA_INLINE:
+        delta_inline_offset (8 bytes) — byte offset within inline section (u64 le)
+        delta_inline_length (4 bytes) — byte length of inline delta
+```
+
+`lba_length × 4096` always gives the uncompressed extent size. `body_length` / `inline_length` gives the stored (possibly compressed) size.
+
+**FLAG_DEDUP_REF entries** carry only the LBA mapping, sufficient for LBA map reconstruction at startup. The extent data is located via the extent index (`hash → segment + body_offset`), populated from ancestor segment files at startup.
+
+**FLAG_INLINE extents** store their full data in the inline section. This is particularly effective for the boot path: small config files, scripts, and locale data appear frequently during boot and are naturally small. A warm-start client that fetches `[0, body_offset)` gets all inline extents with no further requests.
+
+**Multiple delta options** allow an extent to have deltas against several source extents (e.g. against the immediately prior snapshot and an earlier one). The client picks the first option whose `source_hash` is in its local extent index. If no source is available, the full extent is fetched from the body instead. This provides graceful degradation across skipped releases.
+
+**FLAG_DELTA_INLINE** applies the same logic to delta blobs: a small delta is stored in the inline section, avoiding a separate byte-range fetch into the delta body.
+
+**Index entries serve two purposes with a single scan:** LBA map reconstruction (`start_lba + lba_length + hash`) and extent index population (`hash → segment_id + body_offset + body_length`). No separate pass needed.
+
+### Typical segment file sizes (~1000 extents, ~32MB body)
+
+| Configuration | Index section | Notes |
+|---|---|---|
+| No deltas | ~57KB | Base case |
+| 3 delta options, 16% of extents | ~70KB | Realistic point-release update |
+| 3 delta options, all extents | ~193KB | Worst case |
+
+Inline section size depends on the inline threshold and extent size distribution — typically small if the threshold is kept tight (e.g. ≤ a few KB per extent).
+
+### Retrieval strategies
+
+The header is 32 bytes; all section offsets are computable from it. This drives three distinct retrieval patterns:
+
+**Cold start** (no local data — cannot use deltas):
+```
+Single GET of the entire file.
+Delta body is at the end; the extra bytes are the cost of one request instead of two.
+Parse index section → materialise all extents from body.
+```
+
+**Warm start** (some local data):
+```
+1. GET [0, body_offset)         — header + index + inline; make all fetch decisions
+2. GET byte-ranges within body  — full extents needed (ranges coalesced)
+3. GET byte-ranges within delta — delta blobs where source is available locally (ranges coalesced)
+```
+
+Steps 2 and 3 are independent and can be issued in parallel. Byte ranges within each section are sorted and nearby ranges merged into single GETs before issuing.
+
+**Index-only** (startup LBA map and extent index rebuild):
+```
+GET [0, inline_offset)          — header + index section only; skip inline, body, delta
+```
+
+**Adaptive full-body fetch:** when the ratio of needed body bytes to `body_length` exceeds a threshold, a single GET of the body section is cheaper than many byte-range GETs. Threshold is byte-ratio based (not count-based) since extents are variable size.
+
+**Segment files are the ground truth.** All derived structures (in-memory extent index, optional manifest) are caches reconstructible from segment files. On cold start or after index loss, reconstruction is: download index sections of all segment files (fast, small) rather than full segment bodies.
+
+**Snapshot indexes** are consolidated index-section views written at snapshot time, covering all extents reachable from that snapshot. They are smaller than the full set of per-segment index sections and remain immutable. A snapshot index enables fast cold startup on a new host: download the snapshot index, then download index sections for segments written since the snapshot, union to get the full extent index.
 
 **Index recovery flow:**
-
 ```
-1. Download latest snapshot index for each relevant image
-2. Download .idx files for segments written since that snapshot
-3. Union → full extent index for the extents you care about
-4. Rebuild xor/ribbon filter from index
+1. GET snapshot index for the relevant snapshot (if available)
+2. GET [0, inline_offset) for each segment written since that snapshot
+3. Union → full extent index
 ```
-
-**Adaptive segment fetch:** when extents are needed from a segment, the `.idx` file is consulted first to subtract any already cached locally. The fetch strategy for the remainder is then chosen based on how much of the segment is needed:
-
-```
-missing = extents needed from segment not in local cache
-if missing.bytes / segment.total_bytes > threshold:
-    fetch full segment → populate cache with all extents
-else:
-    byte-range GET per missing extent individually
-```
-
-A full segment fetch amortises the S3 request overhead across all extents; individual byte-range GETs avoid transferring data that won't be used. The threshold is byte-ratio based rather than count-based, since extents are variable size. Boot-hint repacking makes this decision easy in the common case — boot extents are co-located in boot segments, so the ratio is high and a full segment fetch triggers naturally.
-
-**Range coalescing** (fetching one range covering multiple nearby extents, accepting some wasted bytes for gaps) is a possible intermediate strategy but probably not worth the added complexity. The two-choice strategy covers the common cases well, repacking eliminates most of the messy intermediate cases, and gap tolerance would introduce another tunable parameter. Worth revisiting if profiling shows the intermediate case is significant in practice.
-
-**Segment indexes are the ground truth.** The global service's on-disk extent index, the in-memory filter, and the snapshot indexes are all derived from segment `.idx` files. Segments (data + `.idx`) are the canonical record — everything else is a cache.
 
 ## GC and Repacking
 
-**Standard GC:** walk all manifests, build the set of live extent hashes, delete unreferenced extents from S3 after a grace period. No per-write refcounting — the manifest scan is the reference count.
+**GC scope:** GC operates only on live leaf nodes — those containing `wal/`. Frozen ancestor nodes are structurally immutable and shared by all their descendants; their segments cannot be touched while any live descendant exists. This matches the lsvd reference implementation's approach: `removeSegmentIfPossible()` refuses to delete a segment referenced by any volume. In the directory model this is structural: absence of `wal/` means no GC.
 
-**Delta dependency handling:** when a source extent is about to be deleted and a live delta depends on it, materialise the delta first (fetch source + delta → full extent, write full extent to S3, update extent index). Then delete the source. The dependency map is derived fresh each GC sweep from the extent index — no persistent reverse index needed.
+To reclaim space from a frozen ancestor, all its live descendants must first be deleted or re-based. This constraint is intentional: it makes the invariant ("ancestor segments are immutable") enforceable without any reference counting.
+
+**Standard GC within a live node:** walk the live node's LBA map, identify extents no longer referenced by any LBA range (overwritten or deleted), remove them from local segments after a grace period. Compact sparse segments by merging live extents into fresh, denser segments and updating the extent index.
+
+**Delta dependency handling:** when a source extent is about to be removed and a live delta in S3 depends on it, materialise the delta first (fetch source + delta → full extent, write full extent to S3, update extent index). Then remove the source. The dependency map is derived fresh each GC sweep from the extent index — no persistent reverse index needed.
 
 **Access-pattern-driven repacking:** GC extends beyond space reclamation to also improve data locality. Boot-path extents — identified from observed access patterns during VM startup — are co-located in dedicated segments. A cold VM boot then fetches one or two S3 segments to get everything needed for boot, rather than many scattered segments.
 
 **Boot hint accumulation:** every VM boot records which extents were accessed during the boot phase (identified by time window after volume attach, or explicit VM lifecycle signals from the hypervisor). These observations accumulate per snapshot. After sufficient boots (converges quickly at scale — 500 VMs/day = 500 observations/day), the hint set is stable enough to guide repacking decisions.
 
-**Continuous improvement:** first boot is cold; boot access patterns are recorded; next GC repack co-locates those extents; subsequent boots are faster. The feedback loop strengthens with scale. This is novel in production block storage — most S3-backed systems are write-once and never reorganise for locality.
+**Continuous improvement:** first boot is cold; boot access patterns are recorded; next GC repack co-locates those extents; subsequent boots are faster. The feedback loop strengthens with scale.
 
-**Snapshot-aligned repacking:** GC can reorganise segments around snapshot boundaries, converging toward a two-tier layout:
+**Snapshot-aligned repacking:** GC can reorganise S3 segments around snapshot boundaries, converging toward a two-tier layout:
 
 ```
 s3://bucket/segments/base-<hash>     — extents shared across many snapshots
 s3://bucket/segments/snap-<id>-N     — extents unique to a specific snapshot
 ```
 
-Shared extents (e.g. the ~84% identical between Ubuntu 22.04 point releases) are consolidated into base segments. A new host serving any image from the same family fetches these once — they are amortised across all versions. Snapshot-specific segments contain only the extents that changed, stored as deltas against their counterparts in the base segments.
+Shared extents (e.g. the ~84% identical between Ubuntu 22.04 point releases) are consolidated into base segments. A new host serving any snapshot from the same family fetches these once. Snapshot-specific segments contain only the changed extents, stored as deltas against their counterparts in the base segments.
 
-The result is that bringing up a new host to serve a specific snapshot requires fetching only:
-1. **Base segments** — large but shared; already cached if any image from the same family has been served on this host
-2. **Snapshot-specific segments** — small; contain only the changed extents as deltas
+**Ext4 re-alignment during GC:** GC is a natural point to perform or improve extent re-alignment, not just snapshot time.
 
-This unifies the repacking objectives: boot hint ordering applies *within* segments (extents ordered by boot access sequence), while snapshot alignment determines *which* extents go into which segment. The snapshot index records exactly which base segments and snapshot-specific segments are needed, making new host setup fully declarative.
-
-GC repacking loop: observe which extents are referenced across multiple snapshots → consolidate into base segments → write per-snapshot remainder into small delta segments → update snapshot indexes. Layout converges toward optimal with each GC cycle.
-
-**Ext4 re-alignment during GC:** GC is a natural point to perform or improve extent re-alignment, not just snapshot time. The scope differs by what is being processed:
-
-- **Snapshot manifests:** safe and clean — a snapshot is frozen, the filesystem state is fixed. GC can parse ext4 metadata from the snapshot and re-align any snapshot that was not aligned at creation time (e.g. created in basic mode). This retroactively upgrades basic-mode snapshots to enhanced dedup quality.
-
-- **Live volumes:** the filesystem is in flux; parsing ext4 directly risks inconsistency. GC instead uses the most recent snapshot's ext4 metadata as a proxy for the current filesystem layout. Re-alignment is approximate (files created or moved since the snapshot won't be captured) but safe — dedup quality improves progressively without risk of data corruption.
-
-The effect is that volumes gain better extent alignment over successive GC cycles regardless of whether explicit enhanced-mode snapshots were taken. Dedup quality converges upward automatically.
+- **Snapshot nodes:** safe and clean — a snapshot is frozen, the filesystem state is fixed. GC can parse ext4 metadata and re-align any snapshot that was not aligned at creation time.
+- **Live nodes:** the filesystem is in flux. GC uses the most recent frozen ancestor's ext4 metadata as a proxy. Re-alignment is approximate but safe — dedup quality improves progressively without risk of data corruption.
 
 ## Filesystem Metadata Awareness
 
 Since the system controls the underlying block device, it sees every write — including writes to ext4 metadata structures (superblock, group descriptors, inode tables, extent trees, journal). This visibility is an opportunity to handle metadata blocks smarter than opaque data blocks.
 
-**Metadata extent tagging:** once metadata LBAs are identified from the superblock (all at well-defined offsets), those extents can be tagged in the manifest. Tagged metadata extents receive special treatment:
-- Skip dedup — inode tables and group descriptors are volume-specific (unique inode numbers, volume-specific block addresses) and will never match across volumes
-- Stay local-tier — no point routing through the global dedup service
+**Metadata extent tagging:** once metadata LBAs are identified from the superblock (all at well-defined offsets), those extents can be tagged in the LBA map. Tagged metadata extents receive special treatment:
+- Skip dedup — inode tables and group descriptors are volume-specific (unique inode numbers, volume-specific block addresses) and will never match across snapshots
 - Cache aggressively — metadata blocks are hot; every filesystem operation reads them
 
 **Incremental shadow filesystem view:** because every write to a known metadata LBA is visible, the system could maintain a continuously-updated internal view of the filesystem layout — which LBA ranges belong to which files, as files are created, deleted, and modified. At snapshot time, the shadow view is already current: no parse-from-scratch, re-alignment is essentially free.
@@ -408,11 +494,11 @@ See [FINDINGS.md](FINDINGS.md) for full measurements. Key results:
 
 ## Write Log
 
-The write log is the local durability boundary. Writes land here on fsync; the log is promoted to a segment and uploaded to S3 in the background.
+The write log is the local durability boundary. Writes land here on fsync; the log is promoted to a segment in the background.
 
 ### File format
 
-A single append-only file per in-progress segment, living at `wal/<ULID>`. This is the same shape as the lsvd reference implementation — one file, records appended sequentially, no separate index. On promotion the file is renamed to `pending/<ULID>` (zero copy); no data is written.
+A single append-only file per in-progress segment, living at `wal/<ULID>`. One file, records appended sequentially, no separate index.
 
 **Magic header:** `PLMPWL\x00\x01` (8 bytes)
 
@@ -439,9 +525,8 @@ flags       (u8)          FLAG_DEDUP_REF set; no further fields
 **Flag bits:**
 - `0x01` `FLAG_COMPRESSED` — payload is zstd-compressed; `data_length` is compressed size
 - `0x02` `FLAG_DEDUP_REF` — REF record; no data payload
-- `0x04` `FLAG_HIGH_ENTROPY` — bypass global dedup service; store in per-volume segment only
 
-The hash is computed before the dedup check and stored in the log record. Recovery can reconstruct the manifest without re-reading or re-hashing the data.
+The hash is computed before the dedup check and stored in the log record. Recovery can reconstruct the LBA map without re-reading or re-hashing the data.
 
 ### Pre-log coalescing
 
@@ -455,7 +540,7 @@ write arrives → in-memory coalescing buffer
                count limit or fsync
                         │
                         ▼
-               hash → dedup check → append_data / append_ref → bufio (OS buffer)
+               hash → local dedup check → append_data / append_ref → bufio (OS buffer)
                         │
                     guest fsync
                         │
@@ -465,10 +550,10 @@ write arrives → in-memory coalescing buffer
                 [background, async]
                         │
                         ▼
-               segment close → local segment file + .idx written → S3 upload
+               segment close → clean body written + .idx written → S3 upload
 ```
 
-After a guest fsync returns, all prior writes are durable in the write log on local NVMe. S3 upload is asynchronous and not on the fsync critical path. This matches lsvd's two-tier durability model exactly.
+After a guest fsync returns, all prior writes are durable in the write log on local NVMe. S3 upload is asynchronous and not on the fsync critical path.
 
 ### Crash recovery
 
@@ -480,73 +565,68 @@ On startup, if a write log file exists, `scan()` reads it sequentially. If a par
 |---|---|---|
 | Crash mid-write (before fsync) | WAL tail partial | Truncate WAL to last complete record; replay |
 | Crash after fsync, before promotion starts | `wal/<ULID>` intact; nothing in `pending/` | Replay WAL; promote normally |
-| Crash during `.idx` write (steps 1–3) | `.idx.tmp` may exist in `pending/`; WAL intact in `wal/` | Delete `.idx.tmp`; replay WAL |
-| Crash between `.idx` rename and body rename (steps 3–4) | `pending/<ULID>.idx` exists; WAL intact in `wal/` | `.idx` exists but no body — WAL intact, complete the rename to finish promotion |
-| Crash after body rename, before LBA map update (step 4+) | Both `pending/<ULID>` and `.idx` exist | Rebuild LBA map from `pending/` `.idx` files; queue S3 upload |
-| Crash mid-upload or after upload before rename (steps 6–7) | Body and `.idx` still in `pending/`; may be in S3 already | Retry upload (idempotent); complete rename on success |
-| Crash between body rename and `.idx` rename (steps 7–8) | Body in `segments/`; `.idx` still in `pending/` | Move `pending/<ULID>.idx` → `segments/<ULID>.idx` |
+| Crash during segment file write (steps 1–2) | `pending/<ULID>.tmp` may exist; WAL intact | Delete `.tmp`; replay WAL |
+| Crash after rename, before WAL delete (steps 3–4) | Both `pending/<ULID>` and `wal/<ULID>` exist | Delete WAL; use pending segment |
+| Crash after WAL delete, before LBA map update (steps 4–5) | `pending/<ULID>` present; no WAL | Rebuild LBA map from pending segment header + index |
+| Crash mid-upload or after upload before rename (steps 6–8) | Segment still in `pending/`; may be in S3 already | Retry upload (idempotent); rename on success |
 | Total local disk loss | All local state gone | Data loss bounded to writes not yet in S3 — same guarantee as a local SSD |
-
-The commit point (step 4, body rename into `pending/`) requires no fsync of a list file. The WAL is available as fallback for any crash before that rename. After it, the segment is committed and the WAL is gone — recovery reads `.idx` files directly from the filesystem.
 
 The final row is an intentional design choice: local NVMe is the durability boundary, matching the stated goal of "durability semantics similar to a local SSD". S3 is async offload, not the primary durability mechanism.
 
 ### Promotion to segment
 
-When the write log reaches the 32MB threshold (or on an explicit flush), the background promotion task converts the WAL into a committed local segment. The WAL is assigned a ULID at creation time; that same ULID becomes the segment ID, tying the two together throughout the promotion.
+When the write log reaches the 32MB threshold (or on an explicit flush), the background promotion task converts the WAL into a committed local segment. The WAL is assigned a ULID at creation time; that same ULID becomes the segment ID.
 
-**Zero-copy promotion:** the WAL file is renamed directly to `pending/<ULID>` — no data is copied. WAL records are `[header | data]`, so the segment body contains embedded WAL headers as inert padding between the extent data regions. The `.idx` `body_offset` for each extent points past the WAL header to the start of that extent's data bytes. Reads use `.idx` byte-range offsets and never parse the embedded headers. GC repacking rewrites segments into clean bodies (no embedded headers) as a side effect of extent coalescing.
+**Promotion writes a clean segment body.** The WAL format includes per-record headers that are useful for recovery but should not be part of the permanent segment format. Promotion reads the WAL sequentially and writes only the raw extent data bytes (no headers) to a clean body file. REF records contribute no bytes to the body — their `.idx` entries carry only the LBA mapping and `FLAG_DEDUP_REF`. The `.idx` records exact byte offsets into the clean body for DATA records. All segments — freshly promoted or GC-repacked — have the same uniform format: raw concatenated DATA extent bytes, navigated entirely via `.idx`.
 
-The `body_offset` for each extent is recorded at write time: `append_data` returns the byte offset of the data bytes within the WAL file (captured from `self.size` after writing the header, before writing the data). This is what goes into the `.idx` as `body_offset` — correct because the WAL file becomes the segment body unchanged.
-
-**Directory layout:**
+**Directory layout within a live node:**
 
 ```
-wal/<ULID>              — WAL file (active or awaiting promotion)
-pending/<ULID>          — promoted segment, not yet uploaded to S3
-pending/<ULID>.idx      — .idx for a pending segment
-segments/<ULID>         — segment confirmed uploaded to S3
-segments/<ULID>.idx     — .idx for an uploaded segment
+wal/<ULID>          — WAL file (active or awaiting promotion)
+pending/<ULID>      — segment file committed locally, S3 upload pending
+segments/<ULID>     — segment file confirmed uploaded to S3 (evictable)
 ```
 
-Each directory corresponds to one stage in the lifecycle, and each transition is an atomic rename:
+Each directory corresponds to one stage in the lifecycle:
 
 ```
 wal/<ULID>  →  pending/<ULID>  →  segments/<ULID>
 ```
 
-`wal/` normally contains one entry — the active WAL — but can contain two during the brief promotion window: the old WAL being promoted by the background task and the new WAL already receiving writes. Since promotion is fast (write ~60KB `.idx`, two renames), this is transient. On crash recovery all files in `wal/` are treated identically: scan, truncate partial tail, promote. The active/inactive distinction does not matter for recovery.
+Both `pending/` and `segments/` hold segment files in the same format (header + index + inline + body). The distinction is upload state, not file format. Locally-stored segment files have `delta_length = 0` in the header; the coordinator appends the delta body when computing deltas at S3 upload time, producing the final S3 object.
+
+`wal/` normally contains one entry — the active WAL — but can contain two during the brief promotion window. On crash recovery all files in `wal/` are treated identically: scan, truncate partial tail, promote.
 
 `pending/` segments are the only local copy of their data; they must not be evicted. `segments/` are S3-backed caches; freely evictable under space pressure. No list files are needed — the filesystem is the index.
 
 **Commit ordering:**
 
 ```
-1. Build .idx in memory from the session's extent list (body_offsets from append_data)
-2. Write pending/<ULID>.idx.tmp
-3. Rename pending/<ULID>.idx.tmp → pending/<ULID>.idx
-4. Rename wal/<ULID> → pending/<ULID>            ← COMMIT POINT
+1. Build index section in memory from WAL extent list
+2. Write pending/<ULID>.tmp: header + index + inline + body (DATA extents only, no headers)
+3. Rename pending/<ULID>.tmp → pending/<ULID>            ← COMMIT POINT
+4. Delete wal/<ULID>
 5. Update LBA map in memory
 ```
 
-Step 4 is the commit point — the presence of the body file in `pending/` signals that promotion is complete. No fsync of a list file is needed; the rename is atomic. The `.idx` must exist before the body appears (step 3 before step 4) because LBA map rebuild reads `.idx` for every segment found on startup.
+Step 3 is the commit point — a complete segment file at `pending/<ULID>` means promotion is done. The entire file is written atomically via rename; there is no window where a partial file is visible as the committed name.
 
 **S3 upload completion:**
 
 ```
-6. Upload pending/<ULID> and pending/<ULID>.idx to S3
-7. Rename pending/<ULID> → segments/<ULID>
-8. Rename pending/<ULID>.idx → segments/<ULID>.idx
+6. Read pending/<ULID>; compute delta body against ancestor segments (if applicable)
+7. Upload to S3: stream header + index (updated with delta offsets) + inline + body + delta body
+8. Rename pending/<ULID> → segments/<ULID>
 ```
 
-Steps 7 and 8 are two renames, not one atomic operation. If we crash between them, the body is in `segments/` but `.idx` is still in `pending/`. Recovery: if a body exists in `segments/` without a `.idx` alongside it, look for the `.idx` in `pending/` and move it. If an upload succeeds but we crash before the rename, the upload is retried on restart — idempotent for content-addressed data.
+The S3 object may differ from the local file in that it carries a delta body (and correspondingly updated header and index section). The body section is identical and can be streamed directly from the local file. Step 8 is a single rename.
 
-**On startup:** scan all three directories. Each maps to one recovery action:
+**On startup:** scan all three directories within the live node. Each maps to one recovery action:
 - `wal/` — replay (truncate partial tail if needed) and promote
-- `pending/` — load `.idx` for LBA map rebuild; queue S3 upload
-- `segments/` — load `.idx` for LBA map rebuild
+- `pending/` — read header + index section for LBA map rebuild; queue S3 upload
+- `segments/` — read header + index section for LBA map rebuild
 
-The read path checks `pending/` before `segments/` (or maintains an in-memory set of pending IDs populated at startup to avoid redundant stat calls).
+Then scan ancestor nodes' `segments/` directories (no `wal/` or `pending/` — they are frozen), oldest ancestor first, to build the full merged LBA map.
 
 ---
 
@@ -576,16 +656,18 @@ WAL files live at the root alongside `head.map`. There is no upload-state distin
 ### Palimpsest local directory layout (comparison)
 
 ```
-<volume-dir>/
-├── lba.map                          — persisted LBA map (rebuilt from .idx if stale)
+<live-node-dir>/
+├── lba.map                          — optional persisted LBA map (rebuilt from segment headers if stale)
 ├── wal/
 │   └── <ULID>                      — WAL file(s): active or awaiting promotion
 ├── pending/
-│   ├── <ULID>                      — segment body committed locally, S3 upload pending
-│   └── <ULID>.idx                  — segment index
+│   └── <ULID>                      — segment file committed locally, S3 upload pending
 └── segments/
-    ├── <ULID>                      — segment body confirmed uploaded to S3 (evictable)
-    └── <ULID>.idx                  — segment index
+    └── <ULID>                      — segment file confirmed uploaded to S3 (evictable)
+
+<parent-node-dir>/                   — frozen; no wal/ or pending/
+└── segments/
+    └── <ULID>                      — segment file (read-only)
 ```
 
 The `pending/` directory exists because palimpsest decouples local promotion from S3 upload. lsvd has no equivalent — it never has locally-committed segments that aren't yet in S3. The three-directory structure makes the full lifecycle visible via `ls`: `wal/` = in flight, `pending/` = local only, `segments/` = safely in S3.
@@ -593,29 +675,31 @@ The `pending/` directory exists because palimpsest decouples local promotion fro
 | | lsvd | Palimpsest |
 |---|---|---|
 | WAL location | Root-level `writecache.<ULID>` | `wal/` subdir |
-| Segment format | Single file (index embedded) | Separate body + `.idx` |
+| Segment format | Single file (index embedded in body) | Single file (header + index + inline + body + delta) |
 | Upload tracking | Not needed (S3 sync in promotion) | `pending/` vs `segments/` dirs |
-| Temp files | `segment.<ULID>.complete` | `pending/<ULID>.idx.tmp` |
-| LBA map | `head.map` (CBOR, SHA-256 guard) | `lba.map` (rebuilt from `.idx` files) |
+| Temp files | `segment.<ULID>.complete` | `pending/<ULID>.tmp` |
+| LBA map | `head.map` (CBOR, SHA-256 guard) | `lba.map` (optional; rebuilt from segment index sections) |
 | Eviction policy | Not applicable | `segments/` evictable; `pending/` never |
+| Snapshot model | `lowers` array (read-only lower disks) | Directory tree (ancestors are frozen nodes) |
+| Dedup | Not implemented | Opportunistic on write path, local tree only |
 
-**Segment format:** A single file per segment: `[SegmentHeader (8 bytes)][ExtentHeaders (varint-encoded)][body data]`. No companion `.idx` file — all metadata is embedded in the body. Palimpsest uses separate body and `.idx` files for three reasons: (1) the `.idx` can be fetched alone to decide whether a segment fetch is needed at all and which byte ranges to request, avoiding transferring data that isn't needed; (2) the extent index and in-memory filter can be rebuilt from `.idx` files without reading segment bodies; (3) inline small extents and delta metadata are stored in `.idx` without inflating the body. The cost is that `.idx` loss without a corresponding S3 copy would leave a segment's LBA mappings unrecoverable — mitigated by uploading `.idx` to S3 alongside the body.
+**Segment format:** lsvd uses a single file per segment: `[SegmentHeader (8 bytes)][ExtentHeaders (varint-encoded)][body data]` — all metadata embedded in the body. Palimpsest also uses a single file, but with a four-section layout (header + index + inline + body + delta) that allows the index section to be fetched independently via byte-range GET, avoiding retrieval of body data that isn't needed. The local file and S3 object use the same format; the S3 object may additionally carry a delta body computed at upload time.
 
-**Write log format:** Single append-only file, one record per finalised extent, each record is `[header][data]` appended sequentially. No coalescing in the log. Palimpsest's write log follows this shape exactly, adding the BLAKE3 hash and a `FLAG_DEDUP_REF` record type (absent in lsvd which is LBA-addressed, not content-addressed). Additionally, `append_data` records each extent's `body_offset` (byte position of data within the WAL file) so the WAL can be renamed directly to the segment body on promotion — zero copy.
+**Snapshot / lower-disk model:** lsvd implements layering via a `lowers` parameter — an array of read-only disk handles that the read path falls through. Palimpsest encodes the same relationship in the directory tree: ancestor directories are the "lower disks", their absence of `wal/` enforces read-only semantics, and the ancestry is directly inspectable via `ls`.
 
-**Pre-log coalescing:** lsvd's `nbdWrapper` buffers up to 20 contiguous blocks in a `pendingWrite` buffer before calling `WriteExtent()`. This is where adjacent LBA writes are merged. The log sees finalised extents, not raw 4KB writes. Palimpsest follows the same pattern; the count limit (lsvd: 20 blocks) is a tuning parameter.
+**GC asymmetry:** in lsvd, `removeSegmentIfPossible()` prevents deleting a segment referenced by any volume, making lower-disk segments effectively immutable while any volume uses them. Palimpsest enforces this structurally: GC only targets nodes containing `wal/`; frozen nodes are never selected.
 
-**Fsync handling:** `writeLog()` calls `bufio.Flush()` after each extent (OS buffer, not disk). The actual `fsync` happens only in `SegmentBuilder.Sync()`, called when the guest issues a flush. Reply is sent after `logF.Sync()` completes. Palimpsest's `WriteLog::fsync()` follows this exactly.
+**Write log format:** single append-only file, one record per finalised extent. Palimpsest's write log follows this shape, adding the BLAKE3 hash and a `FLAG_DEDUP_REF` record type (absent in lsvd which is LBA-addressed, not content-addressed). Unlike lsvd, palimpsest writes a **clean segment body** at promotion time rather than renaming the WAL directly — the WAL format includes recovery headers that are not part of the segment format.
 
-**Async promotion — important distinction:** lsvd's `closeSegmentAsync()` sends a `CloseSegment` event to a background goroutine and the write path returns immediately. However, within that goroutine, `Flush()` calls `UploadSegment()` synchronously — the LBA map is not updated until after the S3 upload completes. If S3 is slow or unavailable, the background queue backs up and old WAL files accumulate on local NVMe (up to 20 queued, one per channel slot). Palimpsest decouples local promotion from S3 upload entirely: the WAL is committed as a local segment (segments.list fsync + WAL rename) and the LBA map is updated without waiting for S3. S3 upload is a separate background step tracked via `uploaded.list`.
+**Async promotion:** lsvd's `closeSegmentAsync()` sends to a background goroutine, but within that goroutine `Flush()` calls `UploadSegment()` synchronously — the LBA map is not updated until after S3 upload. Palimpsest decouples local promotion from S3 upload entirely: the WAL is committed as a local segment and the LBA map is updated without waiting for S3.
 
-**Durability equivalence:** both lsvd and palimpsest have the same fundamental durability guarantee — local NVMe is the boundary, not S3. At any moment lsvd has: one active WAL + up to 20 queued old WALs not yet in S3. Palimpsest has: one active WAL + some number of promoted-but-not-yet-uploaded local segments. In both cases, total local disk failure loses data that the guest's fsync acknowledged. Neither design guarantees S3 durability for in-flight writes. The difference is only naming: lsvd calls staged data "old WAL files"; palimpsest calls them "local segments".
+**Durability equivalence:** both have the same fundamental durability guarantee — local NVMe is the boundary, not S3. At any moment lsvd has one active WAL + up to 20 queued old WALs not yet in S3. Palimpsest has one active WAL + some number of promoted-but-not-yet-uploaded local segments. In both cases, total local disk failure loses data that the guest's fsync acknowledged.
 
-**Local segment cache:** Segment files are kept in `segments/` on local disk indefinitely after upload. Reads check in-memory write cache → previous segment cache → local disk → S3 (via HTTP range requests). Palimpsest retains the same local cache tier.
+**LBA map vs content-addressed:** lsvd's `lba2pba` maps `LBA → segment+offset` (physical). GC repacking must update it for every moved extent. Palimpsest's LBA map is `LBA → hash` (logical); physical location is tracked separately in the extent index. GC repacking updates only the extent index; the LBA map is unaffected.
 
-**Post-hoc extent merging:** lsvd does not merge adjacent extents at write time. Adjacent-extent merging happens in `pack.go` during GC, where runs of adjacent extents are coalesced into larger records (up to 100 blocks). Palimpsest's repacking / GC pass will do the same.
+**Pre-log coalescing:** lsvd's `nbdWrapper` buffers up to 20 contiguous blocks in a `pendingWrite` buffer. Palimpsest follows the same pattern; the count limit is a tuning parameter.
 
-**LBA map vs content-addressed:** lsvd calls its in-memory working structure `lba2pba` (`LBA → segment+offset`, physical location). GC repacking must update it for every moved extent. Palimpsest's equivalent is the **LBA map** (`LBA → hash`, logical). Physical location (`hash → segment+offset`) is tracked separately in the extent index. GC repacking updates only the extent index; the LBA map is unaffected. Frozen manifests (snapshots) are therefore immutable. This is the primary structural divergence from lsvd. The persistence and recovery story is otherwise analogous: lsvd persists `head.map` with a segment-list hash guard; palimpsest persists `lba.map` with the same guard, rebuilding from `.idx` files if stale.
+**Fsync handling:** `writeLog()` calls `bufio.Flush()` after each extent (OS buffer, not disk). The actual fsync happens only when the guest issues a flush. Palimpsest's `WriteLog::fsync()` follows this exactly.
 
 **Compression:** lsvd uses LZ4 with an entropy threshold of 7.0 bits/byte and a minimum compression ratio of 1.5×. Palimpsest uses zstd (already a dependency) with the same 7.0-bit entropy threshold as a starting point.
 
@@ -633,22 +717,20 @@ A clean progression for introducing S3:
 Constraints to keep in mind so S3 integration stays straightforward:
 - Segment IDs (ULIDs) are already globally unique and suitable as S3 object keys
 - The `pending/` → `segments/` transition maps cleanly to "upload to S3, then rename locally"
-- The `.idx` format is already valid as a standalone S3 object
-- Persistent structures (manifests, `.idx` files) reference segment IDs only — local paths are derived at runtime, never stored
+- Persistent structures (manifests, segment files) reference segment IDs only — local paths are derived at runtime, never stored
 
 ---
 
 ## Open Questions
 
-- **Hash output size:** BLAKE3 at full 256-bit is the current choice — collision probability is negligible (~2^-128 birthday bound) at any realistic extent count, and speed is equivalent to non-cryptographic hashes on AVX2/NEON hardware. A truncated 128-bit output would halve the per-entry cost in the extent index (~1.6GB saved at 80M entries) while keeping collision probability effectively zero at practical scales (birthday bound ~2^64). Worth revisiting once the index size and memory pressure are measured empirically.
+- **Hash output size:** BLAKE3 at full 256-bit is the current choice — collision probability is negligible (~2^-128 birthday bound) at any realistic extent count, and speed is equivalent to non-cryptographic hashes on AVX2/NEON hardware. A truncated 128-bit output would halve the per-entry cost in the extent index while keeping collision probability effectively zero at practical scales. Worth revisiting once the index size and memory pressure are measured empirically.
 - **Inline extent threshold:** extents below this size are stored inline in `.idx` files rather than referenced by segment offset. Needs empirical validation against the actual extent size distribution in target images.
 - **Entropy threshold:** 7.0 bits used in experiments, taken from the lab47/lsvd reference implementation. Optimal value depends on workload mix.
 - **Segment size:** ~32MB soft threshold, taken from the lab47/lsvd reference implementation (`FlushThreshHold = 32MB`). Not a hard maximum — a segment closes when it exceeds the threshold. Optimal value depends on S3 request cost vs read amplification tradeoff.
 - **Extent index implementation:** sled, rocksdb, or custom. Needs random reads and range scans.
-- **Shared extent index:** per-host or shared service? DynamoDB, S3-backed, or dedicated process?
 - **Pre-log coalescing block limit:** lsvd uses 20 blocks. The right value for palimpsest depends on typical write burst sizes and acceptable memory footprint between fsyncs.
-- **Manifest cache invalidation:** the reference implementation (lab47/lsvd) validates the cached manifest against a hash of current segment IDs. Same approach applies here.
-- **Namespace granularity:** binary global/non-global may not be sufficient for multi-tenancy.
+- **LBA map cache invalidation:** validate the cached `lba.map` against a hash of the current segment IDs across the full ancestor tree, not just the live node.
+- **Delta segment threshold:** not every segment needs a delta companion — only useful when changed extents have known prior versions in the ancestor tree. Criteria for when to compute and upload a delta segment need empirical validation.
 - **Boot hint persistence:** where are hint sets stored, how are they distributed across hosts?
 - **Empirical validation of repacking benefit:** measure segment fetch count before and after access-pattern-driven repacking.
 - **ublk integration:** Linux-only, io_uring-based. NBD kept for development and macOS.
