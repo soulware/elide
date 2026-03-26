@@ -4,8 +4,9 @@
 //   DATA — a new extent with its (optionally compressed) payload
 //   REF  — a dedup reference: an LBA mapping to an already-stored extent
 //
-// The log is an append-only file living in wal/<ULID>. On promotion it is
-// renamed to pending/<ULID> (zero-copy); the same ULID becomes the segment ID.
+// The log is an append-only file living in wal/<ULID>. On promotion, the
+// promotion step reads the WAL and writes a clean segment file at
+// pending/<ULID>, then deletes the WAL. The same ULID becomes the segment ID.
 // On crash recovery, scan() reads the file and truncates any partial tail record.
 //
 // Record layout (DATA):
@@ -32,8 +33,6 @@ use std::path::Path;
 pub const FLAG_COMPRESSED: u8 = 0x01;
 /// No data payload; this LBA range maps to an existing extent identified by hash.
 pub const FLAG_DEDUP_REF: u8 = 0x02;
-/// High-entropy extent: bypass global dedup service, store in per-volume segment.
-pub const FLAG_HIGH_ENTROPY: u8 = 0x04;
 
 const MAGIC: &[u8; 8] = b"PLMPWL\x00\x01";
 
@@ -47,9 +46,10 @@ pub enum LogRecord {
         start_lba: u64,
         lba_length: u32,
         flags: u8,
-        /// Byte offset of the payload within the WAL file. Because the WAL is
-        /// renamed directly to the segment body on promotion, this is also the
-        /// `body_offset` to record in the segment `.idx` for this extent.
+        /// Byte offset of the data payload within the WAL file. Used as a
+        /// temporary extent index location to enable reads before promotion.
+        /// The promotion step writes a clean segment file; this offset is
+        /// internal to the WAL and is not reused in the segment.
         body_offset: u64,
         /// Raw payload bytes (compressed if flags & FLAG_COMPRESSED).
         data: Vec<u8>,
@@ -98,9 +98,8 @@ impl WriteLog {
     /// Append a new data extent. `data` must already be compressed if FLAG_COMPRESSED is set.
     /// FLAG_DEDUP_REF must not be set in flags.
     ///
-    /// Returns the byte offset of the data payload within the WAL file. Because the WAL is
-    /// renamed directly to the segment body on promotion (zero copy), this offset is also the
-    /// `body_offset` recorded in the segment `.idx` for this extent.
+    /// Returns the byte offset of the data payload within the WAL file, for use
+    /// as the temporary extent index location to enable reads before promotion.
     pub fn append_data(
         &mut self,
         start_lba: u64,
@@ -519,23 +518,23 @@ mod tests {
     }
 
     #[test]
-    fn flags_compressed_and_high_entropy() {
+    fn flag_compressed_roundtrips() {
         let path = temp_path();
         let _ = std::fs::remove_file(&path);
 
         let payload = b"compressed payload bytes";
         let hash = blake3::hash(payload);
-        let flags = FLAG_COMPRESSED | FLAG_HIGH_ENTROPY;
 
         let mut wl = WriteLog::create(&path).unwrap();
-        wl.append_data(512, 6, &hash, flags, payload).unwrap();
+        wl.append_data(512, 6, &hash, FLAG_COMPRESSED, payload)
+            .unwrap();
         wl.fsync().unwrap();
         drop(wl);
 
         let (records, _) = scan(&path).unwrap();
         match &records[0] {
             LogRecord::Data { flags: f, .. } => {
-                assert_eq!(*f, FLAG_COMPRESSED | FLAG_HIGH_ENTROPY);
+                assert_eq!(*f, FLAG_COMPRESSED);
             }
             _ => panic!("expected Data record"),
         }

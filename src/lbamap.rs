@@ -5,9 +5,9 @@
 // lookups and is updated after every promoted write.
 //
 // Rebuild on startup:
-//   1. Scan pending/*.idx and segments/*.idx in ULID order (oldest first).
-//      Applying oldest-to-newest means each insert naturally overwrites
-//      earlier entries for the same LBA range — no special ordering logic needed.
+//   1. Scan pending/ and segments/ for committed segment files in ULID order
+//      (oldest first). Applying oldest-to-newest means each insert naturally
+//      overwrites earlier entries for the same LBA range.
 //   2. Volume::open() replays the in-progress WAL on top in a single pass
 //      that also rebuilds pending_entries (see src/volume.rs).
 //
@@ -18,7 +18,6 @@
 // LBA map.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -168,47 +167,27 @@ impl Default for LbaMap {
 
 /// Rebuild the LBA map from all committed segments.
 ///
-/// Scans `<base>/pending/*.idx` and `<base>/segments/*.idx` in ULID order
-/// (oldest first). Directories that do not exist are silently skipped.
+/// Scans `<base>/pending/` and `<base>/segments/` in ULID order (oldest
+/// first). Reads the index section of each segment file. Directories that do
+/// not exist are silently skipped.
 ///
 /// The caller (`Volume::open`) is responsible for replaying the in-progress
 /// WAL on top of the result — doing so in one pass also builds `pending_entries`.
 pub fn rebuild_segments(base_dir: &Path) -> io::Result<LbaMap> {
     let mut map = LbaMap::new();
 
-    // Committed segments: pending/ (local, not yet uploaded) and segments/ (S3-backed).
-    let mut idx_paths = collect_idx_files(&base_dir.join("pending"))?;
-    idx_paths.extend(collect_idx_files(&base_dir.join("segments"))?);
-    // Sort by filename so inserts go in ULID (chronological) order.
-    idx_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+    let mut paths = segment::collect_segment_files(&base_dir.join("pending"))?;
+    paths.extend(segment::collect_segment_files(&base_dir.join("segments"))?);
+    paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-    for path in &idx_paths {
-        for entry in segment::read_idx(path)? {
+    for path in &paths {
+        let (_body_section_start, entries) = segment::read_segment_index(path)?;
+        for entry in entries {
             map.insert(entry.start_lba, entry.lba_length, entry.hash);
         }
     }
 
     Ok(map)
-}
-
-/// Return all `.idx` files in `dir`. `.idx.tmp` files are excluded because
-/// `Path::extension()` returns `"tmp"` for them, not `"idx"`.
-/// Returns an empty Vec if the directory does not exist.
-fn collect_idx_files(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
-    match fs::read_dir(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e),
-        Ok(entries) => {
-            let mut paths = Vec::new();
-            for entry in entries {
-                let path = entry?.path();
-                if path.extension().is_some_and(|e| e == "idx") {
-                    paths.push(path);
-                }
-            }
-            Ok(paths)
-        }
-    }
 }
 
 // --- tests ---
@@ -352,22 +331,24 @@ mod tests {
 
     #[test]
     fn rebuild_from_segments_in_order() {
+        use crate::segment::SegmentEntry;
+
         let base = temp_dir();
         let pending = base.join("pending");
         std::fs::create_dir_all(&pending).unwrap();
 
         // Segment 1 (ULID "01A..."): covers [0, 10) → hash_1.
         {
-            use crate::segment::{IdxEntry, write_idx};
-            let entries = vec![IdxEntry::from_wal_data(h(1), 0, 10, 0, 0, vec![0u8; 40960])];
-            write_idx(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAAA.idx"), &entries).unwrap();
+            let mut entries = vec![SegmentEntry::new_data(h(1), 0, 10, 0, vec![0u8; 40960])];
+            segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries)
+                .unwrap();
         }
 
         // Segment 2 (ULID "01B..."): overwrites [5, 10) → hash_2.
         {
-            use crate::segment::{IdxEntry, write_idx};
-            let entries = vec![IdxEntry::from_wal_data(h(2), 5, 5, 0, 0, vec![0u8; 20480])];
-            write_idx(&pending.join("01BBBBBBBBBBBBBBBBBBBBBBBBB.idx"), &entries).unwrap();
+            let mut entries = vec![SegmentEntry::new_data(h(2), 5, 5, 0, vec![0u8; 20480])];
+            segment::write_segment(&pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"), &mut entries)
+                .unwrap();
         }
 
         let map = rebuild_segments(&base).unwrap();

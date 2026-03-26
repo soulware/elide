@@ -2,12 +2,14 @@
 //
 // Directory layout:
 //   <base>/wal/       — active write-ahead log (at most one file at a time)
-//   <base>/pending/   — promoted segments awaiting GC or upload
-//   <base>/segments/  — GC'd or downloaded segments (S3-backed in future)
+//   <base>/pending/   — promoted segments awaiting S3 upload
+//   <base>/segments/  — segments confirmed uploaded to S3 (evictable)
 //
 // Write path:
 //   1. Volume::write(lba, data) — hashes data, appends to WAL, updates LBA map
-//   2. When the WAL reaches FLUSH_THRESHOLD, it is promoted to pending/
+//      and extent index (WAL offset as temporary location)
+//   2. When the WAL reaches FLUSH_THRESHOLD, it is promoted to a clean segment
+//      in pending/ and the extent index is updated to segment offsets
 //
 // Read path:
 //   1. lbamap.lookup(lba) → (hash, block_offset)
@@ -17,7 +19,8 @@
 // Recovery:
 //   Volume::open() calls lbamap::rebuild_segments() (segments only), then
 //   scans the WAL once: that single pass truncates any partial-tail record,
-//   replays entries into the LBA map, and rebuilds pending_entries.
+//   replays entries into the LBA map, extent index, and pending_entries.
+//   Any .tmp files in pending/ are removed (incomplete promotions).
 
 use std::fs;
 use std::io;
@@ -33,7 +36,7 @@ use crate::{extentindex, lbamap, segment, writelog};
 /// (NBD/ublk) enforces its own per-request maximum before reaching here.
 const FLUSH_THRESHOLD: u64 = 32 * 1024 * 1024;
 
-/// Maximum byte length of a single write. The `.idx` format stores
+/// Maximum byte length of a single write. The segment format stores
 /// `body_length` as a `u32`, so payloads must fit in 4 GiB. We cap at
 /// `u32::MAX` rounded down to a 4 KiB boundary.
 const MAX_WRITE_SIZE: usize = (u32::MAX as usize / 4096) * 4096;
@@ -48,9 +51,9 @@ pub struct Volume {
     wal: writelog::WriteLog,
     wal_ulid: String,
     wal_path: PathBuf,
-    /// DATA extents written since the last promotion; used to build the .idx
-    /// on the next promote().
-    pending_entries: Vec<segment::IdxEntry>,
+    /// DATA and REF extents written since the last promotion; used to write
+    /// the clean segment file on the next promote().
+    pending_entries: Vec<segment::SegmentEntry>,
 }
 
 impl Volume {
@@ -67,6 +70,15 @@ impl Volume {
         fs::create_dir_all(&wal_dir)?;
         fs::create_dir_all(&pending_dir)?;
         fs::create_dir_all(&segments_dir)?;
+
+        // Remove any .tmp files in pending/ — these are incomplete promotions
+        // left behind by a crash between write and rename.
+        for entry in fs::read_dir(&pending_dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "tmp") {
+                fs::remove_file(&path)?;
+            }
+        }
 
         // Rebuild the LBA map and extent index from all committed segments.
         let mut lbamap = lbamap::rebuild_segments(base_dir)?;
@@ -105,7 +117,7 @@ impl Volume {
     /// Write `data` starting at logical block address `lba`.
     ///
     /// `data.len()` must be a non-zero multiple of 4096 and must not exceed
-    /// `MAX_WRITE_SIZE` (4 GiB − 4 KiB). The `.idx` format stores `body_length`
+    /// `MAX_WRITE_SIZE` (4 GiB − 4 KiB). The segment format stores `body_length`
     /// as a `u32` byte count, so larger payloads cannot be represented.
     ///
     /// The data is appended to the WAL and the LBA map is updated in memory.
@@ -129,6 +141,8 @@ impl Volume {
 
         let body_offset = self.wal.append_data(lba, lba_length, &hash, 0, data)?;
         self.lbamap.insert(lba, lba_length, hash);
+        // Temporary extent index entry: points into the WAL at the raw payload offset.
+        // Updated to segment file offsets after promotion.
         self.extent_index.insert(
             hash,
             extentindex::ExtentLocation {
@@ -137,15 +151,13 @@ impl Volume {
                 body_length: data.len() as u32,
             },
         );
-        self.pending_entries.push(segment::IdxEntry {
+        self.pending_entries.push(segment::SegmentEntry::new_data(
             hash,
-            start_lba: lba,
+            lba,
             lba_length,
-            compressed: false,
-            body_offset,
-            body_length: data.len() as u32,
-            inline_data: Vec::new(),
-        });
+            0,
+            data.to_vec(),
+        ));
 
         if self.wal.size() >= FLUSH_THRESHOLD {
             self.promote()?;
@@ -189,15 +201,29 @@ impl Volume {
     /// Promote the current WAL to a pending segment, then open a fresh WAL.
     fn promote(&mut self) -> io::Result<()> {
         self.wal.fsync()?;
-        segment::promote(
+        let body_section_start = segment::promote(
             &self.wal_path,
             &self.wal_ulid,
             &self.base_dir.join("pending"),
-            &self.pending_entries,
+            &mut self.pending_entries,
         )?;
-        // Create the fresh WAL before clearing state. If this fails after the
-        // rename above, the volume is unrecoverable until reopened; the segment
-        // is safe in pending/ and will be found by the next lbamap rebuild.
+        // Update the extent index: replace temporary WAL offsets with absolute
+        // offsets into the committed segment file.
+        for entry in &self.pending_entries {
+            if entry.is_dedup_ref {
+                continue; // data lives in an ancestor segment; index already correct
+            }
+            self.extent_index.insert(
+                entry.hash,
+                extentindex::ExtentLocation {
+                    segment_id: self.wal_ulid.clone(),
+                    body_offset: body_section_start + entry.stored_offset,
+                    body_length: entry.stored_length,
+                },
+            );
+        }
+        // Create the fresh WAL. If this fails the segment is safe in pending/
+        // and will be found on the next startup rebuild.
         let (wal, wal_ulid, wal_path, _) = create_fresh_wal(&self.base_dir.join("wal"))?;
         self.wal = wal;
         self.wal_ulid = wal_ulid;
@@ -249,7 +275,12 @@ fn recover_wal(
     path: PathBuf,
     lbamap: &mut lbamap::LbaMap,
     extent_index: &mut extentindex::ExtentIndex,
-) -> io::Result<(writelog::WriteLog, String, PathBuf, Vec<segment::IdxEntry>)> {
+) -> io::Result<(
+    writelog::WriteLog,
+    String,
+    PathBuf,
+    Vec<segment::SegmentEntry>,
+)> {
     let ulid_str = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -271,24 +302,20 @@ fn recover_wal(
                 body_offset,
                 data,
             } => {
+                let body_length = data.len() as u32;
                 lbamap.insert(start_lba, lba_length, hash);
+                // Temporary WAL offset — updated to segment offset on promotion.
                 extent_index.insert(
                     hash,
                     extentindex::ExtentLocation {
                         segment_id: ulid.clone(),
                         body_offset,
-                        body_length: data.len() as u32,
+                        body_length,
                     },
                 );
-                pending_entries.push(segment::IdxEntry {
-                    hash,
-                    start_lba,
-                    lba_length,
-                    compressed: flags & writelog::FLAG_COMPRESSED != 0,
-                    body_offset,
-                    body_length: data.len() as u32,
-                    inline_data: Vec::new(),
-                });
+                pending_entries.push(segment::SegmentEntry::new_data(
+                    hash, start_lba, lba_length, flags, data,
+                ));
             }
             writelog::LogRecord::Ref {
                 hash,
@@ -296,8 +323,12 @@ fn recover_wal(
                 lba_length,
             } => {
                 lbamap.insert(start_lba, lba_length, hash);
-                // TODO: dedup — Ref records will need an .idx entry type
-                // before Volume::write can generate them.
+                // Data lives in an ancestor segment; extent index already has it
+                // from rebuild_segments(). Just add to pending_entries so the
+                // dedup-ref is preserved in the next promoted segment.
+                pending_entries.push(segment::SegmentEntry::new_dedup_ref(
+                    hash, start_lba, lba_length,
+                ));
             }
         }
     }
@@ -309,7 +340,12 @@ fn recover_wal(
 /// Create a new WAL file with a fresh ULID.
 fn create_fresh_wal(
     wal_dir: &Path,
-) -> io::Result<(writelog::WriteLog, String, PathBuf, Vec<segment::IdxEntry>)> {
+) -> io::Result<(
+    writelog::WriteLog,
+    String,
+    PathBuf,
+    Vec<segment::SegmentEntry>,
+)> {
     let ulid = Ulid::new().to_string();
     let path = wal_dir.join(&ulid);
     let wal = writelog::WriteLog::create(&path)?;
@@ -544,7 +580,7 @@ mod tests {
     #[test]
     fn recovery_after_promotion() {
         // Write enough to trigger a promotion, drop, reopen — the LBA map must
-        // be rebuilt from both pending/*.idx and the remaining WAL.
+        // be rebuilt from both pending/ segments and the remaining WAL.
         let base = temp_dir();
 
         {
@@ -567,7 +603,7 @@ mod tests {
     fn promotion_after_wal_recovery() {
         // Write to the WAL, drop (simulating a crash), reopen (WAL recovery),
         // promote, then reopen again — verifies that pending_entries is correctly
-        // rebuilt from the recovered WAL so the .idx contains the pre-crash writes.
+        // rebuilt from the recovered WAL so the segment contains the pre-crash writes.
         let base = temp_dir();
 
         // Phase 1: write two blocks, fsync, drop.
@@ -585,16 +621,16 @@ mod tests {
             vol.promote_for_test().unwrap();
         }
 
-        // Phase 3: reopen — both blocks must now come from pending/*.idx.
+        // Phase 3: reopen — both blocks must now come from the pending/ segment.
         let vol = Volume::open(&base).unwrap();
         assert_eq!(vol.lbamap_len(), 2);
 
-        // Confirm the promoted segment landed correctly: body + .idx in pending/.
+        // Confirm the promoted segment landed correctly: one file in pending/.
         let pending_count = fs::read_dir(base.join("pending"))
             .unwrap()
             .filter(|e| e.is_ok())
             .count();
-        assert_eq!(pending_count, 2, "expected segment body + .idx in pending/");
+        assert_eq!(pending_count, 1, "expected one segment file in pending/");
 
         fs::remove_dir_all(base).unwrap();
     }

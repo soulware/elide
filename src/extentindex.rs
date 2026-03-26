@@ -4,19 +4,22 @@
 //   lba → hash      (LBA map, src/lbamap.rs)
 //   hash → location (this module)
 //
-// A location names the segment that contains the payload and the byte range
-// within it. The segment_id is the ULID shared by the WAL file and its
-// promoted counterpart in pending/ or segments/. At read time the file is
-// located by checking each directory in order (wal/ → pending/ → segments/),
-// so no update is needed when a WAL is promoted.
+// A location names the segment file and the absolute byte offset within it
+// where the payload starts. At read time the file is located by checking each
+// storage directory in order (wal/ → pending/ → segments/).
+//
+// Body offsets are always absolute file offsets:
+//   - For in-progress entries (WAL not yet promoted): the absolute offset of
+//     the data payload within the WAL file, as returned by WriteLog::append_data.
+//   - For promoted entries (pending/ or segments/): body_section_start +
+//     entry.stored_offset, where body_section_start comes from the segment header.
 //
 // Rebuild on startup:
-//   extentindex::rebuild(base_dir) scans pending/*.idx and segments/*.idx.
-//   Volume::open() then inserts WAL Data records via recover_wal(), which
-//   calls extent_index.insert() for each record.
+//   extentindex::rebuild(base_dir) scans pending/ and segments/ for committed
+//   segment files and reads their index sections. Volume::open() then inserts
+//   WAL Data records on top via recover_wal().
 
 use std::collections::HashMap;
-use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -27,9 +30,9 @@ use crate::segment;
 pub struct ExtentLocation {
     /// ULID of the segment (filename in wal/, pending/, or segments/).
     pub segment_id: String,
-    /// Byte offset of the start of the payload within the segment body.
+    /// Absolute byte offset of the start of the payload in the file.
     pub body_offset: u64,
-    /// Byte length of the payload.
+    /// Byte length of the payload (compressed size if the entry is compressed).
     pub body_length: u32,
 }
 
@@ -75,46 +78,45 @@ impl Default for ExtentIndex {
 
 /// Rebuild the extent index from all committed segments.
 ///
-/// Scans `<base>/pending/*.idx` and `<base>/segments/*.idx` in ULID order
-/// (oldest first). The ULID is derived from each `.idx` filename and
-/// validated via `ulid::Ulid::from_string`.
+/// Scans `<base>/pending/` and `<base>/segments/` in ULID order (oldest
+/// first). Reads the index section of each segment file; body_offset is
+/// stored as an absolute file offset (`body_section_start + stored_offset`).
 ///
-/// Inline entries (payload lives in the `.idx` rather than the segment body)
-/// are skipped — inline reads are not yet implemented.
+/// Inline entries and dedup-ref entries are skipped:
+/// - Inline entries: read path not yet implemented (INLINE_THRESHOLD = 0).
+/// - Dedup-ref entries: no body in this segment; the hash is already indexed
+///   from the ancestor segment that holds the actual data.
 ///
-/// The caller (`Volume::open`) is responsible for inserting the in-progress
-/// WAL entries on top via `recover_wal`.
+/// The caller (Volume::open) inserts in-progress WAL entries on top.
 pub fn rebuild(base_dir: &Path) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 
-    let mut idx_paths = collect_idx_files(&base_dir.join("pending"))?;
-    idx_paths.extend(collect_idx_files(&base_dir.join("segments"))?);
-    // Chronological order: newer entries overwrite older ones for the same hash.
-    idx_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+    let mut paths = segment::collect_segment_files(&base_dir.join("pending"))?;
+    paths.extend(segment::collect_segment_files(&base_dir.join("segments"))?);
+    paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-    for path in &idx_paths {
-        let stem = path
-            .file_stem()
+    for path in &paths {
+        let segment_id = path
+            .file_name()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| io::Error::other("bad .idx filename"))?;
-        let segment_id = ulid::Ulid::from_string(stem)
+            .ok_or_else(|| io::Error::other("bad segment filename"))?;
+        // Validate as ULID and canonicalize.
+        let segment_id = ulid::Ulid::from_string(segment_id)
             .map_err(|e| io::Error::other(e.to_string()))?
             .to_string();
 
-        for entry in segment::read_idx(path)? {
-            if !entry.inline_data.is_empty() {
-                // TODO: inline entries store their payload in the .idx itself
-                // rather than the segment body, so they need a different read
-                // path. INLINE_THRESHOLD is 0 today, so no inline entries are
-                // generated yet.
+        let (body_section_start, entries) = segment::read_segment_index(path)?;
+
+        for entry in entries {
+            if entry.is_dedup_ref || entry.is_inline {
                 continue;
             }
             index.insert(
                 entry.hash,
                 ExtentLocation {
                     segment_id: segment_id.clone(),
-                    body_offset: entry.body_offset,
-                    body_length: entry.body_length,
+                    body_offset: body_section_start + entry.stored_offset,
+                    body_length: entry.stored_length,
                 },
             );
         }
@@ -123,29 +125,12 @@ pub fn rebuild(base_dir: &Path) -> io::Result<ExtentIndex> {
     Ok(index)
 }
 
-fn collect_idx_files(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
-    match fs::read_dir(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e),
-        Ok(entries) => {
-            let mut paths = Vec::new();
-            for entry in entries {
-                let path = entry?.path();
-                if path.extension().is_some_and(|e| e == "idx") {
-                    paths.push(path);
-                }
-            }
-            Ok(paths)
-        }
-    }
-}
-
 // --- tests ---
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::{IdxEntry, write_idx};
+    use crate::segment::SegmentEntry;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -197,14 +182,45 @@ mod tests {
 
         let data = vec![0xabu8; 4096];
         let hash = blake3::hash(&data);
-        let entries = vec![IdxEntry::from_wal_data(hash, 0, 1, 0, 512, data)];
-        write_idx(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA.idx"), &entries).unwrap();
+        let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
+        let bss = segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries)
+            .unwrap();
 
         let index = rebuild(&base).unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
-        assert_eq!(loc.body_offset, 512);
+        // body_offset should be absolute (body_section_start + 0).
+        assert_eq!(loc.body_offset, bss + entries[0].stored_offset);
         assert_eq!(loc.body_length, 4096);
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn rebuild_skips_dedup_ref() {
+        let base = temp_dir();
+        let pending = base.join("pending");
+        std::fs::create_dir_all(&pending).unwrap();
+
+        let ref_hash = h(0xAA);
+        let data_hash = blake3::hash(b"real data");
+        let mut entries = vec![
+            SegmentEntry::new_dedup_ref(ref_hash, 0, 1),
+            SegmentEntry::new_data(
+                data_hash,
+                1,
+                1,
+                0,
+                b"real data".repeat(512)[..4096].to_vec(),
+            ),
+        ];
+        segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries).unwrap();
+
+        let index = rebuild(&base).unwrap();
+        // Only the DATA entry should be indexed; the dedup-ref is skipped.
+        assert_eq!(index.len(), 1);
+        assert!(index.lookup(&ref_hash).is_none());
+        assert!(index.lookup(&data_hash).is_some());
 
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -218,21 +234,32 @@ mod tests {
         let data = vec![0u8; 4096];
         let hash = blake3::hash(&data);
 
-        // Older segment: hash at body_offset 0.
+        // Older segment.
         {
-            let entries = vec![IdxEntry::from_wal_data(hash, 0, 1, 0, 0, data.clone())];
-            write_idx(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA.idx"), &entries).unwrap();
+            let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data.clone())];
+            segment::write_segment(&pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"), &mut entries)
+                .unwrap();
         }
-        // Newer segment: same hash at body_offset 4096.
+        // Newer segment: same hash, different position.
+        let bss2;
+        let stored_offset2;
         {
-            let entries = vec![IdxEntry::from_wal_data(hash, 0, 1, 0, 4096, data)];
-            write_idx(&pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB.idx"), &entries).unwrap();
+            let data2 = vec![0u8; 8192]; // put something before it
+            let hash2 = blake3::hash(&data2);
+            let mut entries = vec![
+                SegmentEntry::new_data(hash2, 10, 2, 0, data2),
+                SegmentEntry::new_data(hash, 0, 1, 0, data),
+            ];
+            bss2 =
+                segment::write_segment(&pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"), &mut entries)
+                    .unwrap();
+            stored_offset2 = entries[1].stored_offset;
         }
 
         let index = rebuild(&base).unwrap();
-        assert_eq!(index.len(), 1);
-        // Newer segment wins.
-        assert_eq!(index.lookup(&hash).unwrap().body_offset, 4096);
+        // Newer segment's offset wins.
+        let loc = index.lookup(&hash).unwrap();
+        assert_eq!(loc.body_offset, bss2 + stored_offset2);
 
         std::fs::remove_dir_all(base).unwrap();
     }
