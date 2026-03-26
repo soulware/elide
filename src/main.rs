@@ -82,6 +82,14 @@ enum Command {
         #[arg(default_value = "/")]
         path: String,
     },
+    /// Compact sparse segments in a volume, reclaiming space from overwritten extents
+    CompactVolume {
+        /// Path to the volume root directory
+        dir: String,
+        /// Compact segments where fewer than this fraction of stored bytes are live (default: 0.7)
+        #[arg(long, default_value_t = 0.7)]
+        min_live_ratio: f64,
+    },
 }
 
 fn main() {
@@ -147,6 +155,18 @@ fn main() {
 
         Command::LsVolume { dir, path } => {
             ls::run(Path::new(&dir), &path).expect("ls-volume failed");
+        }
+
+        Command::CompactVolume {
+            dir,
+            min_live_ratio,
+        } => {
+            let mut vol = volume::Volume::open(Path::new(&dir)).expect("failed to open volume");
+            let stats = vol.compact(min_live_ratio).expect("compaction failed");
+            println!(
+                "segments compacted: {}  bytes freed: {}  extents removed: {}",
+                stats.segments_compacted, stats.bytes_freed, stats.extents_removed,
+            );
         }
     }
 }

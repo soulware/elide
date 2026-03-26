@@ -91,6 +91,17 @@ const FLUSH_THRESHOLD: u64 = 32 * 1024 * 1024;
 /// `u32::MAX` rounded down to a 4 KiB boundary.
 const MAX_WRITE_SIZE: usize = (u32::MAX as usize / 4096) * 4096;
 
+/// Results from a single compaction run.
+#[derive(Debug, Default)]
+pub struct CompactionStats {
+    /// Number of segments rewritten (old segment deleted, new denser segment written).
+    pub segments_compacted: usize,
+    /// Stored bytes reclaimed from deleted segment bodies.
+    pub bytes_freed: u64,
+    /// Number of dead extent entries removed from the extent index.
+    pub extents_removed: usize,
+}
+
 /// A writable block-device volume backed by a content-addressable store.
 ///
 /// Owns the in-memory LBA map, the active WAL, and the directory layout.
@@ -315,6 +326,122 @@ impl Volume {
     /// Flush buffered WAL writes and fsync to disk.
     pub fn fsync(&mut self) -> io::Result<()> {
         self.wal.fsync()
+    }
+
+    /// Compact sparse segments in `pending/` and `segments/`.
+    ///
+    /// For each segment where the ratio of live stored bytes to total stored
+    /// bytes is below `min_live_ratio`, the live extents are copied into a new
+    /// denser segment in `pending/` and the old segment is deleted. Segments
+    /// where all extents are dead are deleted directly without writing a new one.
+    ///
+    /// The WAL is not touched. The extent index is updated in place.
+    ///
+    /// `min_live_ratio` is in [0.0, 1.0]: 0.7 compacts any segment where more
+    /// than 30% of stored bytes are dead.
+    pub fn compact(&mut self, min_live_ratio: f64) -> io::Result<CompactionStats> {
+        use std::collections::HashSet;
+
+        let live: HashSet<blake3::Hash> = self.lbamap.live_hashes();
+        let mut stats = CompactionStats::default();
+
+        let mut all_segs = segment::collect_segment_files(&self.base_dir.join("pending"))?;
+        all_segs.extend(segment::collect_segment_files(
+            &self.base_dir.join("segments"),
+        )?);
+
+        for seg_path in all_segs {
+            let seg_id = seg_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| io::Error::other("bad segment filename"))?;
+            let seg_id = Ulid::from_string(seg_id)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .to_string();
+
+            let (body_section_start, mut entries) = segment::read_segment_index(&seg_path)?;
+
+            // Dedup-refs have no body bytes; only count DATA entries.
+            let total_bytes: u64 = entries
+                .iter()
+                .filter(|e| !e.is_dedup_ref)
+                .map(|e| e.stored_length as u64)
+                .sum();
+
+            if total_bytes == 0 {
+                continue;
+            }
+
+            let live_bytes: u64 = entries
+                .iter()
+                .filter(|e| !e.is_dedup_ref && live.contains(&e.hash))
+                .map(|e| e.stored_length as u64)
+                .sum();
+
+            if live_bytes as f64 / total_bytes as f64 >= min_live_ratio {
+                continue;
+            }
+
+            let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
+                entries.drain(..).partition(|e| live.contains(&e.hash));
+
+            // Remove dead entries from the extent index (only those pointing at
+            // this segment — entries pointing elsewhere belong to another copy).
+            let mut removed = 0usize;
+            for entry in &dead_entries {
+                if self
+                    .extent_index
+                    .lookup(&entry.hash)
+                    .map(|loc| loc.segment_id == seg_id)
+                    .unwrap_or(false)
+                {
+                    self.extent_index.remove(&entry.hash);
+                    removed += 1;
+                }
+            }
+
+            if !live_entries.is_empty() {
+                // Read body bytes for live entries, then write a new denser segment.
+                segment::read_extent_bodies(&seg_path, body_section_start, &mut live_entries)?;
+
+                let new_ulid = Ulid::new().to_string();
+                let pending_dir = self.base_dir.join("pending");
+                let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
+                let final_path = pending_dir.join(&new_ulid);
+                // write_segment reassigns stored_offset in live_entries to new positions.
+                let new_bss = segment::write_segment(&tmp_path, &mut live_entries)?;
+                fs::rename(&tmp_path, &final_path)?;
+
+                for entry in &live_entries {
+                    if !entry.is_dedup_ref {
+                        self.extent_index.insert(
+                            entry.hash,
+                            extentindex::ExtentLocation {
+                                segment_id: new_ulid.clone(),
+                                body_offset: new_bss + entry.stored_offset,
+                                body_length: entry.stored_length,
+                                compressed: entry.compressed,
+                            },
+                        );
+                    }
+                }
+            }
+
+            // Evict the old segment from the file handle cache before deleting it.
+            let mut cache = self.file_cache.borrow_mut();
+            if cache.as_ref().map(|(id, _)| id.as_str()) == Some(seg_id.as_str()) {
+                *cache = None;
+            }
+            drop(cache);
+
+            fs::remove_file(&seg_path)?;
+
+            stats.segments_compacted += 1;
+            stats.bytes_freed += total_bytes - live_bytes;
+            stats.extents_removed += removed;
+        }
+
+        Ok(stats)
     }
 
     /// Promote the current WAL to a pending segment, then open a fresh WAL.
@@ -811,6 +938,131 @@ mod tests {
             !base.join("wal").join(&ulid).exists(),
             "stale WAL was not removed"
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- compaction tests ---
+
+    #[test]
+    fn compact_noop_when_all_live() {
+        // Write two blocks, promote, compact — nothing should be compacted
+        // since all data is still referenced.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.write(1, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.compact(0.7).unwrap();
+        assert_eq!(stats.segments_compacted, 0);
+        assert_eq!(stats.bytes_freed, 0);
+        assert_eq!(stats.extents_removed, 0);
+
+        // Data still readable.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x11u8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compact_reclaims_overwritten_extent() {
+        // Write block A, promote, overwrite block A with B, promote.
+        // First segment now has a dead extent; compaction should reclaim it.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        let original = vec![0x11u8; 4096];
+        let replacement = vec![0x22u8; 4096];
+
+        vol.write(0, &original).unwrap();
+        vol.promote_for_test().unwrap();
+
+        vol.write(0, &replacement).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Two segments: first is 100% dead, second is live.
+        let stats = vol.compact(0.7).unwrap();
+        assert_eq!(
+            stats.segments_compacted, 1,
+            "first segment should be compacted"
+        );
+        assert!(stats.bytes_freed > 0);
+        assert_eq!(stats.extents_removed, 1);
+
+        // Data still reads back correctly after compaction.
+        assert_eq!(vol.read(0, 1).unwrap(), replacement);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compact_reads_back_correctly_after_reopen() {
+        // Verify that the compacted segment is a valid segment that survives
+        // a volume reopen (LBA map rebuild + extent index rebuild).
+        let base = temp_dir();
+
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &vec![0xAAu8; 4096]).unwrap();
+            vol.promote_for_test().unwrap();
+            vol.write(0, &vec![0xBBu8; 4096]).unwrap(); // overwrite
+            vol.promote_for_test().unwrap();
+            vol.compact(0.7).unwrap();
+        }
+
+        let vol = Volume::open(&base).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0xBBu8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compact_partial_segment() {
+        // Segment has two extents; one is overwritten (dead), one is live.
+        // Compaction should rewrite the segment keeping only the live extent.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap(); // will be overwritten
+        vol.write(1, &vec![0x22u8; 4096]).unwrap(); // stays live
+        vol.promote_for_test().unwrap();
+
+        vol.write(0, &vec![0x33u8; 4096]).unwrap(); // overwrites LBA 0
+        vol.promote_for_test().unwrap();
+
+        // First segment is 50% dead — above default threshold of 30% dead (0.7 live).
+        let stats = vol.compact(0.7).unwrap();
+        assert_eq!(stats.segments_compacted, 1);
+        assert!(stats.bytes_freed > 0);
+
+        // Both LBAs read back correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x33u8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compact_respects_min_live_ratio() {
+        // With a strict ratio (1.0), any dead byte triggers compaction.
+        // With a lenient ratio (0.0), nothing is ever compacted.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap(); // LBA 0 now dead in seg 1
+        vol.promote_for_test().unwrap();
+
+        // Lenient threshold: first segment is 100% dead but ratio=0.0 → nothing compacted.
+        let stats = vol.compact(0.0).unwrap();
+        assert_eq!(stats.segments_compacted, 0);
+
+        // Strict threshold: compact anything with any dead bytes.
+        let stats = vol.compact(1.0).unwrap();
+        assert_eq!(stats.segments_compacted, 1);
 
         fs::remove_dir_all(base).unwrap();
     }

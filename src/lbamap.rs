@@ -17,7 +17,7 @@
 // lives in the separate extent index. This means GC repacking never touches the
 // LBA map.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::Path;
 
@@ -214,6 +214,13 @@ impl LbaMap {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Return the set of all content hashes currently referenced by any LBA range.
+    ///
+    /// Used by GC to identify which extents in segment files are still live.
+    pub fn live_hashes(&self) -> HashSet<blake3::Hash> {
+        self.inner.values().map(|e| e.hash).collect()
     }
 }
 

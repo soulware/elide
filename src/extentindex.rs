@@ -60,6 +60,11 @@ impl ExtentIndex {
         self.inner.get(hash)
     }
 
+    /// Remove the entry for `hash`, if present.
+    pub fn remove(&mut self, hash: &blake3::Hash) {
+        self.inner.remove(hash);
+    }
+
     /// Number of entries in the index.
     #[allow(dead_code)] // used in tests; available for diagnostics
     pub fn len(&self) -> usize {

@@ -338,6 +338,33 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
     Ok(entries)
 }
 
+/// Populate `entry.data` for all body entries by reading from the segment file.
+///
+/// `body_section_start` is the absolute file offset of the body section, as
+/// returned by `read_segment_index`. Dedup-ref and inline entries are skipped.
+/// After this call, each body entry's `data` holds exactly `stored_length` bytes
+/// read from `body_section_start + stored_offset` in the file.
+///
+/// Used by the compaction path to materialise live extent bytes before writing
+/// a new, denser segment.
+pub fn read_extent_bodies(
+    path: &Path,
+    body_section_start: u64,
+    entries: &mut [SegmentEntry],
+) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path)?;
+    for entry in entries.iter_mut() {
+        if entry.is_dedup_ref || entry.is_inline {
+            continue;
+        }
+        f.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
+        entry.data = vec![0u8; entry.stored_length as usize];
+        f.read_exact(&mut entry.data)?;
+    }
+    Ok(())
+}
+
 // --- promotion ---
 
 /// Promote a WAL to a committed local segment.
