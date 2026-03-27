@@ -1,6 +1,6 @@
 // Inspect a volume directory and print a human-readable summary.
 //
-// Walks the volume node tree (root + any ULID-named snapshot/fork children),
+// Walks the volume node tree (root + frozen/live children under children/<ulid>/),
 // reads WAL and segment index sections, and prints a tree view with counts
 // and sizes. Does not modify any files.
 
@@ -97,9 +97,10 @@ fn collect_node(dir: &Path, is_root: bool) -> io::Result<NodeInfo> {
     let pending = collect_seg_dir(&dir.join("pending"))?;
     let segments = collect_seg_dir(&dir.join("segments"))?;
 
-    // Children: ULID-named subdirectories, sorted chronologically.
+    // Children live under <node>/children/<ulid>/. Sorted chronologically by ULID.
     let mut children = Vec::new();
-    match fs::read_dir(dir) {
+    let children_dir = dir.join("children");
+    match fs::read_dir(&children_dir) {
         Ok(entries) => {
             let mut child_dirs: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok())
@@ -117,8 +118,9 @@ fn collect_node(dir: &Path, is_root: bool) -> io::Result<NodeInfo> {
                 children.push(collect_node(&child_dir, false)?);
             }
         }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => {
-            eprintln!("warning: cannot read {}: {e}", dir.display());
+            eprintln!("warning: cannot read {}: {e}", children_dir.display());
         }
     }
 
@@ -403,4 +405,122 @@ fn fmt_commas(n: u64) -> String {
         result.push(c);
     }
     result.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::volume::Volume;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!("elide-inspect-test-{}-{}", std::process::id(), n));
+        p
+    }
+
+    #[test]
+    fn fresh_live_volume() {
+        let base = temp_dir();
+        let _vol = Volume::open(&base).unwrap();
+
+        let node = collect_node(&base, true).unwrap();
+        assert!(node.is_live);
+        assert!(node.is_root);
+        assert!(node.children.is_empty());
+        // Volume::open creates a fresh (empty) WAL file.
+        assert_eq!(node.wal_files.len(), 1);
+        assert_eq!(node.wal_files[0].record_count, 0);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn after_snapshot_shows_frozen_root_and_live_child() {
+        let base = temp_dir();
+
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &vec![0xAAu8; 4096]).unwrap();
+            vol.snapshot().unwrap();
+            // vol now lives in the child; drop releases child lock
+        }
+
+        let node = collect_node(&base, true).unwrap();
+
+        // Root is frozen (snapshot() removed wal/).
+        assert!(!node.is_live);
+        assert!(node.is_root);
+
+        // One child was created by snapshot().
+        assert_eq!(node.children.len(), 1);
+        let child = &node.children[0];
+        assert!(child.is_live);
+        assert!(!child.is_root);
+        assert!(child.children.is_empty());
+
+        // Root pending/ has the segment flushed from the WAL before freezing.
+        assert_eq!(node.pending.len(), 1);
+        assert_eq!(node.pending[0].entry_count, 1);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sibling_children_from_frozen_root() {
+        let base = temp_dir();
+
+        // snapshot() freezes root, continues in child_1.
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.snapshot().unwrap();
+        }
+
+        // Two independent opens of the frozen root each create a new sibling.
+        let _vol_a = Volume::open(&base).unwrap();
+        let _vol_b = Volume::open(&base).unwrap();
+
+        let node = collect_node(&base, true).unwrap();
+        assert!(!node.is_live);
+        // 3 children: 1 from snapshot() + 2 from open() on frozen root.
+        assert_eq!(node.children.len(), 3);
+        assert!(node.children.iter().all(|c| c.is_live));
+
+        drop(_vol_a);
+        drop(_vol_b);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn two_sequential_snapshots_produce_linear_chain() {
+        let base = temp_dir();
+
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.snapshot().unwrap(); // root frozen → child
+            vol.snapshot().unwrap(); // child frozen → grandchild
+            // vol dropped: grandchild lock released
+        }
+
+        let root = collect_node(&base, true).unwrap();
+
+        // Root is frozen with exactly one child.
+        assert!(!root.is_live);
+        assert_eq!(root.children.len(), 1);
+
+        // Child is also frozen with exactly one grandchild.
+        let child = &root.children[0];
+        assert!(!child.is_live);
+        assert_eq!(child.children.len(), 1);
+
+        // Grandchild is the live leaf.
+        let grandchild = &child.children[0];
+        assert!(grandchild.is_live);
+        assert!(grandchild.children.is_empty());
+
+        fs::remove_dir_all(base).unwrap();
+    }
 }

@@ -619,6 +619,11 @@ impl Volume {
     }
 
     #[cfg(test)]
+    pub fn ancestor_dirs(&self) -> &[PathBuf] {
+        &self.ancestor_dirs
+    }
+
+    #[cfg(test)]
     pub fn lbamap_len(&self) -> usize {
         self.lbamap.len()
     }
@@ -1611,6 +1616,37 @@ mod tests {
         // Parent pending/ should be empty (no segment written for empty WAL).
         let pending: Vec<_> = fs::read_dir(base.join("pending")).unwrap().collect();
         assert!(pending.is_empty());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn two_sequential_snapshots_data_visible_at_grandchild() {
+        let base = temp_dir();
+        let data_a = vec![0xAAu8; 4096];
+        let data_b = vec![0xBBu8; 4096];
+        let data_c = vec![0xCCu8; 4096];
+
+        // Write at root, snapshot → child, write, snapshot → grandchild, write.
+        let grandchild_path = {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &data_a).unwrap(); // root
+            vol.snapshot().unwrap(); // root frozen → child
+            vol.write(1, &data_b).unwrap(); // child
+            vol.snapshot().unwrap(); // child frozen → grandchild
+            vol.write(2, &data_c).unwrap(); // grandchild
+            vol.promote_for_test().unwrap();
+            vol.base_dir().to_owned()
+        };
+
+        // Grandchild sees all three layers.
+        let vol = Volume::open(&grandchild_path).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), data_a);
+        assert_eq!(vol.read(1, 1).unwrap(), data_b);
+        assert_eq!(vol.read(2, 1).unwrap(), data_c);
+
+        // Ancestry chain is root → child → grandchild (two levels deep).
+        assert_eq!(vol.ancestor_dirs().len(), 2);
 
         fs::remove_dir_all(base).unwrap();
     }
