@@ -149,7 +149,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "palimpsest-extentindex-test-{}-{}",
+            "elide-extentindex-test-{}-{}",
             std::process::id(),
             n
         ));

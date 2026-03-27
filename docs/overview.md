@@ -49,7 +49,7 @@ The system operates in two tiers depending on whether the volume's filesystem is
 - Everything above, plus snapshot-time ext4 re-alignment of extents to file boundaries
 - Reliable file-aligned extents → ~84% exact match between Ubuntu point releases
 - Delta compression maximally effective because extents correspond to files
-- The approximation "one extent ≈ one file" holds well — the palimpsest `extents` subcommand, which parses ext4 inode extent trees directly, is the prototype for this
+- The approximation "one extent ≈ one file" holds well — the Elide `extents` subcommand, which parses ext4 inode extent trees directly, is the prototype for this
 
 The block device itself is filesystem-agnostic in both modes. ext4 awareness is an optional layer that sits alongside the snapshot process — it re-slices and re-hashes extents at file boundaries using the ext4 extent tree as ground truth. A coalesced extent spanning multiple files is split; multiple extents covering one file are merged. The live write path is unaffected in either mode.
 

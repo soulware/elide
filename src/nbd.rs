@@ -69,7 +69,7 @@ fn install_sigusr1_handler() {
 }
 
 fn report_path() -> String {
-    format!("/tmp/palimpsest-{}.report", std::process::id())
+    format!("/tmp/elide-{}.report", std::process::id())
 }
 
 // --- extent index ---
@@ -719,7 +719,7 @@ mod tests {
     fn temp_dir() -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("palimpsest-nbd-test-{}-{}", std::process::id(), n));
+        p.push(format!("elide-nbd-test-{}-{}", std::process::id(), n));
         p
     }
 

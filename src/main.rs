@@ -49,7 +49,7 @@ enum Command {
     },
     /// Measure file renames between two images (exact renames and size-matched rename+modify candidates)
     RenameAnalysis { image1: String, image2: String },
-    /// Serve a palimpsest volume directory over NBD
+    /// Serve an elide volume directory over NBD
     ServeVolume {
         /// Path to the volume directory (created if it doesn't exist)
         dir: String,
@@ -69,7 +69,7 @@ enum Command {
         #[arg(long, default_value = ".")]
         out_dir: String,
     },
-    /// Inspect a palimpsest volume directory and print a human-readable summary
+    /// Inspect an elide volume directory and print a human-readable summary
     InspectVolume {
         /// Path to the volume root directory
         dir: String,

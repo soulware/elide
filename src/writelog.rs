@@ -360,11 +360,7 @@ mod tests {
     fn temp_path() -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "palimpsest-writelog-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        p.push(format!("elide-writelog-test-{}-{}", std::process::id(), n));
         p
     }
 

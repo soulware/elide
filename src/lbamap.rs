@@ -269,11 +269,7 @@ mod tests {
     fn temp_dir() -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "palimpsest-lbamap-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        p.push(format!("elide-lbamap-test-{}-{}", std::process::id(), n));
         p
     }
 

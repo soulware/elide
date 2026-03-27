@@ -323,7 +323,7 @@ pub struct TraceEntry {
 }
 
 pub fn save_trace(path: &Path, entries: &[TraceEntry]) -> io::Result<()> {
-    let mut out = String::from("# palimpsest-boot-trace v1\n");
+    let mut out = String::from("# elide-boot-trace v1\n");
     for e in entries {
         out.push_str(&format!(
             "{} {} {}\n",

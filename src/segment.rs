@@ -468,7 +468,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "palimpsest-segment-test-{}-{}{}",
+            "elide-segment-test-{}-{}{}",
             std::process::id(),
             n,
             suffix
@@ -480,7 +480,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "palimpsest-segment-test-dir-{}-{}",
+            "elide-segment-test-dir-{}-{}",
             std::process::id(),
             n
         ));

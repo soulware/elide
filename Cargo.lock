@@ -185,6 +185,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
+name = "elide"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "clap",
+ "ext4-view",
+ "libc",
+ "ulid",
+ "zstd",
+]
+
+[[package]]
 name = "ext4-view"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -261,18 +273,6 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
-
-[[package]]
-name = "palimpsest"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "clap",
- "ext4-view",
- "libc",
- "ulid",
- "zstd",
-]
 
 [[package]]
 name = "pkg-config"

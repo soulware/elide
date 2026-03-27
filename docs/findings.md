@@ -1,6 +1,6 @@
 # Empirical Findings
 
-Measured using `palimpsest` — a Rust tool purpose-built to explore these concepts against real Ubuntu images.
+Measured using `elide` — a Rust tool purpose-built to explore these concepts against real Ubuntu images.
 
 ## Demand-fetch: how much of an image is actually read?
 

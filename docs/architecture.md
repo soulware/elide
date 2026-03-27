@@ -15,7 +15,7 @@ This layering also means a single volume process can be started standalone for d
 
 ## Components
 
-A single **palimpsest coordinator** runs on each host and manages all volumes. It forks one child process per volume — the process boundary is deliberate: a fault in one volume's I/O path cannot corrupt another, and the boundary forces the inter-component interface to be explicit and real (filesystem layout, IPC protocol, GC ownership) rather than loose in-process coupling.
+A single **Elide coordinator** runs on each host and manages all volumes. It forks one child process per volume — the process boundary is deliberate: a fault in one volume's I/O path cannot corrupt another, and the boundary forces the inter-component interface to be explicit and real (filesystem layout, IPC protocol, GC ownership) rather than loose in-process coupling.
 
 **Coordinator (main process)** — spawns and supervises volume processes; owns GC (runs as a coordinator-level task with access to all volumes' on-disk state); handles S3 upload/download.
 
@@ -26,7 +26,7 @@ A single **palimpsest coordinator** runs on each host and manages all volumes. I
 All volume state lives under a shared root directory on a dedicated local NVMe mount. **The directory tree is the snapshot tree**: each node is a volume state at a point in time. A node containing `wal/` is a live (writable) leaf. A node without `wal/` is frozen (read-only). The parent chain is the directory ancestry — no manifest is needed to traverse it.
 
 ```
-/var/lib/palimpsest/
+/var/lib/elide/
   volumes/
     <volume-id>/                  — root node of a volume tree
       segments/                   — frozen after first snapshot
@@ -216,23 +216,23 @@ Dedup scope is **all volumes on the local host**. The extent index covers the cu
 
 Delta compression is compelling for point-release image updates; not worth the complexity for cross-version (major version) updates where content is genuinely different throughout.
 
-**Elision** is an alternative S3-only reduction technique that operates at block (4KB) granularity rather than byte granularity, and requires no diff library. At S3 upload time, a newly-promoted extent is compared block-by-block against the ancestor's blocks for the same LBA range. Unchanged blocks are not uploaded — they already exist in the ancestor S3 segment and are inherited implicitly via the layer merge. Only changed blocks are uploaded, as one or more small extents in the live leaf's S3 segment.
+**Sparse** is an alternative S3-only reduction technique that operates at block (4KB) granularity rather than byte granularity, and requires no diff library. At S3 upload time, a newly-promoted extent is compared block-by-block against the ancestor's blocks for the same LBA range. Unchanged blocks are not uploaded — they already exist in the ancestor S3 segment and are inherited implicitly via the layer merge. Only changed blocks are uploaded, as one or more small extents in the live leaf's S3 segment.
 
-No explicit descriptor for the elision is needed. The LBA map encodes it naturally: the live leaf's S3 manifest contains entries only for changed block LBA ranges; any LBA range absent from the live leaf falls through to the ancestor during layer merge. The ancestor blocks are already there.
+No explicit descriptor for this is needed. The LBA map encodes it naturally: the live leaf's S3 manifest contains entries only for changed block LBA ranges; any LBA range absent from the live leaf falls through to the ancestor during layer merge. The ancestor blocks are already there.
 
-**Local/S3 divergence under elision:** the local `pending/<ULID>` segment still holds the full extent (e.g. H_new covering all 256 blocks). The S3 object for the same segment contains only the changed block extents. Local reads are served directly from the full local copy; S3 reads reconstruct via layer merge. The local LBA map and the S3 manifest therefore differ — the local LBA map has one entry covering the full LBA range, the S3 manifest has one small entry per changed block. This divergence is correct by design: the local segment is a complete, self-contained store; the S3 object is an optimised, elided representation of the same data.
+**Local/S3 divergence under sparse:** the local `pending/<ULID>` segment still holds the full extent (e.g. H_new covering all 256 blocks). The S3 object for the same segment contains only the changed block extents. Local reads are served directly from the full local copy; S3 reads reconstruct via layer merge. The local LBA map and the S3 manifest therefore differ — the local LBA map has one entry covering the full LBA range, the S3 manifest has one small entry per changed block. This divergence is correct by design: the local segment is a complete, self-contained store; the S3 object is a sparse representation of the same data.
 
-Because the S3 object under elision is substantially different from the local file (not merely the local file with a delta body appended), the coordinator must build the S3 object fresh rather than streaming the local file with additions. See [formats.md](formats.md) for the upload path.
+Because the S3 object under sparse is substantially different from the local file (not merely the local file with a delta body appended), the coordinator must build the S3 object fresh rather than streaming the local file with additions. See [formats.md](formats.md) for the upload path.
 
-**GC under elision** is simpler than under delta compression. There are no delta dependency chains: each changed block is an independent extent. GC of the live leaf removes only the live leaf's own extents; the ancestor blocks are in frozen ancestor segments, which are structurally immutable while any live descendant exists. No "materialise before removing source" logic is needed.
+**GC under sparse** is simpler than under delta compression. There are no delta dependency chains: each changed block is an independent extent. GC of the live leaf removes only the live leaf's own extents; the ancestor blocks are in frozen ancestor segments, which are structurally immutable while any live descendant exists. No "materialise before removing source" logic is needed.
 
 **Cross-host dedup caveat:** H_new (the full extent hash) is never registered in the S3 extent index, because H_new is never uploaded. If another host holds H_new locally and attempts a cross-host dedup lookup in S3, it will not find it and will re-upload. This is a missed dedup opportunity, not a correctness failure.
 
-### Delta compression vs elision
+### Delta compression vs sparse
 
 Both techniques are S3-only and both require a snapshot ancestor to be present (source blocks must be in a frozen segment to be safe from GC). The key trade-offs:
 
-| | Delta compression | Elision |
+| | Delta compression | Sparse |
 |---|---|---|
 | Minimum stored size per change | bytes actually different | 4KB per changed block |
 | Sub-block changes (e.g. 1 byte in 4KB) | efficient — stores ~tens of bytes | wastes up to 4KB |
@@ -240,20 +240,20 @@ Both techniques are S3-only and both require a snapshot ancestor to be present (
 | S3 read path | apply diff to source; one source extent | layer merge; multi-source but no CPU diff |
 | GC | dependency chain tracking; materialise if source removed | none — no chains |
 | S3 object construction | local file + appended delta body | fresh build; diverges from local file |
-| Local/S3 divergence | header/index only (delta body appended) | index differs (elided sub-extents) |
+| Local/S3 divergence | header/index only (delta body appended) | index differs (changed-block extents only) |
 
-Elision is simpler to implement and has cleaner GC semantics; delta compression is more storage-efficient for sub-block changes. For the common VM image workload — file-level overwrites where changed 4KB blocks are genuinely different — the 4KB floor is not a meaningful constraint and elision may be the right default. For database-style workloads with byte-level random updates, delta compression captures savings that elision cannot.
+Sparse is simpler to implement and has cleaner GC semantics; delta compression is more storage-efficient for sub-block changes. For the common VM image workload — file-level overwrites where changed 4KB blocks are genuinely different — the 4KB floor is not a meaningful constraint and sparse may be the right default. For database-style workloads with byte-level random updates, delta compression captures savings that sparse cannot.
 
-The two are not mutually exclusive: elision could be applied first (skip unchanged blocks entirely), and delta compression applied to the remaining changed blocks. Whether the added complexity is worth it depends on the change distribution of the target workload.
+The two are not mutually exclusive: sparse could be applied first (skip unchanged blocks entirely), and delta compression applied to the remaining changed blocks. Whether the added complexity is worth it depends on the change distribution of the target workload.
 
-**Elision gives the client fetch-strategy flexibility.** Because elided data is raw bytes at known offsets in S3 objects, a client has a choice of how to reconstruct an extent:
+**Sparse gives the client fetch-strategy flexibility.** Because sparse data is raw bytes at known offsets in S3 objects, a client has a choice of how to reconstruct an extent:
 
-- *Simple*: fetch the full ancestor extent and overlay the live leaf's changed blocks on top. Two byte-range GETs, no algorithm. A client that doesn't understand elision at all can do this correctly just by following the layer merge.
+- *Simple*: fetch the full ancestor extent and overlay the live leaf's changed blocks on top. Two byte-range GETs, no algorithm. A client unaware of the sparse strategy can do this correctly just by following the layer merge.
 - *Precise*: compute exactly which LBA sub-ranges come from the ancestor vs the live leaf; issue byte-range GETs only for those ranges. Avoids fetching ancestor bytes that will be overwritten by the live leaf.
 
 The client picks based on economics — bandwidth, request latency, cache state — and neither strategy requires anything beyond "read bytes at offset X, length Y."
 
-Delta compression collapses this flexibility: reconstruction always requires fetching both source and delta, then applying a CPU transform. The data is not directly addressable. Elision also composes cleanly with the boot-hint repacking optimisation: repacked segments co-locate extents contiguously for efficient byte-range fetches, and elision preserves that property since all data remains raw bytes at fixed offsets. Delta compression complicates repacking because moving a source extent can invalidate dependent deltas.
+Delta compression collapses this flexibility: reconstruction always requires fetching both source and delta, then applying a CPU transform. The data is not directly addressable. Sparse also composes cleanly with the boot-hint repacking optimisation: repacked segments co-locate extents contiguously for efficient byte-range fetches, and sparse preserves that property since all data remains raw bytes at fixed offsets. Delta compression complicates repacking because moving a source extent can invalidate dependent deltas.
 
 ## Snapshots
 

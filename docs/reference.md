@@ -4,7 +4,7 @@ Background reading, lsvd comparison, implementation notes, and open questions.
 
 ## lsvd Reference Implementation Notes
 
-The [lab47/lsvd](https://github.com/lab47/lsvd) Go implementation is the primary reference. Key design decisions we studied and how they influenced palimpsest:
+The [lab47/lsvd](https://github.com/lab47/lsvd) Go implementation is the primary reference. Key design decisions we studied and how they influenced Elide:
 
 ### lsvd local directory layout
 
@@ -46,7 +46,7 @@ WAL files live at the root alongside `head.map`. There is no upload-state distin
     └── <ULID>/                      — child node directory
 ```
 
-The `pending/` directory exists because palimpsest decouples local promotion from S3 upload. lsvd has no equivalent — it never has locally-committed segments that aren't yet in S3. The three-directory structure makes the full lifecycle visible via `ls`: `wal/` = in flight, `pending/` = local only, `segments/` = safely in S3.
+The `pending/` directory exists because Elide decouples local promotion from S3 upload. lsvd has no equivalent — it never has locally-committed segments that aren't yet in S3. The three-directory structure makes the full lifecycle visible via `ls`: `wal/` = in flight, `pending/` = local only, `segments/` = safely in S3.
 
 | | lsvd | Palimpsest |
 |---|---|---|
@@ -65,7 +65,7 @@ The `pending/` directory exists because palimpsest decouples local promotion fro
 
 **GC asymmetry:** in lsvd, `removeSegmentIfPossible()` prevents deleting a segment referenced by any volume, making lower-disk segments effectively immutable while any volume uses them. Palimpsest enforces this structurally: GC only targets nodes containing `wal/`; frozen nodes are never selected.
 
-**Write log format:** single append-only file, one record per finalised extent. Palimpsest's write log follows this shape, adding the BLAKE3 hash and a `FLAG_DEDUP_REF` record type (absent in lsvd which is LBA-addressed, not content-addressed). Unlike lsvd, palimpsest writes a **clean segment body** at promotion time rather than renaming the WAL directly — the WAL format includes recovery headers that are not part of the segment format.
+**Write log format:** single append-only file, one record per finalised extent. Palimpsest's write log follows this shape, adding the BLAKE3 hash and a `FLAG_DEDUP_REF` record type (absent in lsvd which is LBA-addressed, not content-addressed). Unlike lsvd, Elide writes a **clean segment body** at promotion time rather than renaming the WAL directly — the WAL format includes recovery headers that are not part of the segment format.
 
 **Async promotion:** lsvd's `closeSegmentAsync()` sends to a background goroutine, but within that goroutine `Flush()` calls `UploadSegment()` synchronously — the LBA map is not updated until after S3 upload. Palimpsest decouples local promotion from S3 upload entirely: the WAL is committed as a local segment and the LBA map is updated without waiting for S3.
 
@@ -79,7 +79,7 @@ The `pending/` directory exists because palimpsest decouples local promotion fro
 
 **Compression:** lsvd uses LZ4 with an entropy threshold of 7.0 bits/byte and a minimum compression ratio of 1.5×. Palimpsest uses zstd (already a dependency) with the same 7.0-bit entropy threshold as a starting point.
 
-**S3 read path — chunk-range reads, not full segment downloads:** lsvd never downloads entire segment files from S3. Instead it issues byte-range `GetObject` requests for chunk-sized slices of segment bodies — the chunk covering the needed extent(s) plus spatial neighbours. A two-level cache sits in front of S3: a 1GB mmap'd disk cache (1MB chunks, LRU eviction) that stores recently-fetched chunks so nearby extents avoid a second round-trip, and a 256-entry LRU of open `SegmentReader` handles (either local file handles or live S3 object reader connections) to avoid re-establishing connections. For palimpsest, the single-entry file handle cache we maintain today maps to lsvd's `LocalFile` reader. When S3 is added, the equivalent of lsvd's 1MB chunk disk cache is the right model for the cold-fetch path — not downloading whole segments.
+**S3 read path — chunk-range reads, not full segment downloads:** lsvd never downloads entire segment files from S3. Instead it issues byte-range `GetObject` requests for chunk-sized slices of segment bodies — the chunk covering the needed extent(s) plus spatial neighbours. A two-level cache sits in front of S3: a 1GB mmap'd disk cache (1MB chunks, LRU eviction) that stores recently-fetched chunks so nearby extents avoid a second round-trip, and a 256-entry LRU of open `SegmentReader` handles (either local file handles or live S3 object reader connections) to avoid re-establishing connections. For Elide, the single-entry file handle cache we maintain today maps to lsvd's `LocalFile` reader. When S3 is added, the equivalent of lsvd's 1MB chunk disk cache is the right model for the cold-fetch path — not downloading whole segments.
 
 **Compression and read amplification:** extents are compressed as a unit. A read of a single block from a multi-block compressed extent requires decompressing the entire extent — the stored bytes cannot be seeked into at block granularity. This means the maximum extent size directly bounds worst-case read amplification: a 20-block cap means at most 80KB decompressed to serve a 4KB read (20×). The pre-log coalescing block limit therefore doubles as a read amplification cap and must be chosen with both concerns in mind.
 
@@ -110,7 +110,7 @@ Constraints to keep in mind so S3 integration stays straightforward:
 - **Entropy threshold:** 7.0 bits used in experiments, taken from the lab47/lsvd reference implementation. Optimal value depends on workload mix.
 - **Segment size:** ~32MB soft threshold, taken from the lab47/lsvd reference implementation (`FlushThreshHold = 32MB`). Not a hard maximum — a segment closes when it exceeds the threshold. Optimal value depends on S3 request cost vs read amplification tradeoff.
 - **Extent index implementation:** sled, rocksdb, or custom. Needs random reads and range scans.
-- **Pre-log coalescing block limit:** lsvd uses 20 blocks. The right value for palimpsest depends on typical write burst sizes, acceptable memory footprint between fsyncs, and worst-case read amplification when compression is enabled (see above). The limit must be enforced at the write path even when the NBD layer delivers larger contiguous writes — splitting oversized writes into capped extents is preferable to unbounded amplification.
+- **Pre-log coalescing block limit:** lsvd uses 20 blocks. The right value for Elide depends on typical write burst sizes, acceptable memory footprint between fsyncs, and worst-case read amplification when compression is enabled (see above). The limit must be enforced at the write path even when the NBD layer delivers larger contiguous writes — splitting oversized writes into capped extents is preferable to unbounded amplification.
 - **LBA map cache invalidation:** validate the cached `lba.map` against a hash of the current segment IDs across the full ancestor tree, not just the live node.
 - **Delta segment threshold:** not every segment needs a delta body — only useful when changed extents have known prior versions in the ancestor tree. Criteria for when to compute and upload a delta body need empirical validation.
 - **Boot hint persistence:** where are hint sets stored, how are they distributed across hosts?
