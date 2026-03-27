@@ -156,7 +156,7 @@ When persisted, the format is a binary flat file:
 
 | Offset | Size | Field        | Description                          |
 |--------|------|--------------|--------------------------------------|
-| 0      | 8    | magic        | `PLMPST\x00\x02`                     |
+| 0      | 8    | magic        | `ELIDMAP\x01`                        |
 | 8      | 32   | snapshot_id  | blake3 of all extent hashes in LBA order |
 | 40     | 32   | parent_id    | snapshot_id of parent; zeros = root  |
 | 72     | 4    | entry_count  | number of entries (u32 le)           |
