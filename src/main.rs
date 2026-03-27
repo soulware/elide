@@ -38,7 +38,7 @@ enum Command {
         #[arg(long)]
         save_trace: Option<String>,
     },
-    /// Combine a boot trace with cross-image dedup + delta to estimate cold-boot fetch cost
+    /// Combine a boot trace with cross-image analysis to estimate cold-boot fetch cost (4 strategies: zstd-only, zstd+sparse, zstd+delta, zstd+delta+sparse)
     ColdBoot {
         image1: String,
         image2: String,
@@ -49,6 +49,8 @@ enum Command {
     },
     /// Measure file renames between two images (exact renames and size-matched rename+modify candidates)
     RenameAnalysis { image1: String, image2: String },
+    /// Measure sparse-strategy savings: within changed files, how many 4KB blocks actually differ?
+    SparseAnalysis { image1: String, image2: String },
     /// Serve an elide volume directory over NBD
     ServeVolume {
         /// Path to the volume directory (created if it doesn't exist)
@@ -131,6 +133,11 @@ fn main() {
         Command::RenameAnalysis { image1, image2 } => {
             extents::run_rename_analysis(Path::new(&image1), Path::new(&image2))
                 .expect("rename-analysis failed");
+        }
+
+        Command::SparseAnalysis { image1, image2 } => {
+            extents::run_sparse_analysis(Path::new(&image1), Path::new(&image2))
+                .expect("sparse-analysis failed");
         }
 
         Command::ServeVolume {

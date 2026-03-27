@@ -208,7 +208,8 @@ fn collect_extents_with_logical(
 // per-extent disk locations and hashes.
 struct InodeExtents {
     full_hash: blake3::Hash,
-    extents: Vec<(u64, u64, blake3::Hash)>, // (start_byte, byte_count, extent_hash)
+    // (disk_start_byte, file_logical_offset, byte_count, extent_hash)
+    extents: Vec<(u64, u64, u64, blake3::Hash)>,
 }
 
 // Scan all regular-file inodes, grouping extents by inode and computing both
@@ -260,21 +261,31 @@ fn scan_file_extents_with_full_hash(
             let mut extent_entries = Vec::new();
             let mut bytes_remaining = i_size;
 
-            for (_, phys_block, num_blocks) in raw {
+            for (logical, phys_block, num_blocks) in raw {
                 if bytes_remaining == 0 {
                     break;
+                }
+                let file_logical_offset = logical as u64 * sb.block_size;
+                if file_logical_offset >= i_size {
+                    // Preallocated extent beyond i_size — not real file data, skip.
+                    continue;
                 }
                 let allocated = num_blocks as u64 * sb.block_size;
                 let byte_count = allocated.min(bytes_remaining);
                 bytes_remaining = bytes_remaining.saturating_sub(byte_count);
 
-                let start_byte = phys_block * sb.block_size;
+                let disk_start_byte = phys_block * sb.block_size;
                 let mut buf = vec![0u8; byte_count as usize];
-                f.seek(SeekFrom::Start(start_byte))?;
+                f.seek(SeekFrom::Start(disk_start_byte))?;
                 f.read_exact(&mut buf)?;
 
                 full_hasher.update(&buf);
-                extent_entries.push((start_byte, byte_count, blake3::hash(&buf)));
+                extent_entries.push((
+                    disk_start_byte,
+                    file_logical_offset,
+                    byte_count,
+                    blake3::hash(&buf),
+                ));
             }
 
             results.push(InodeExtents {
@@ -287,10 +298,9 @@ fn scan_file_extents_with_full_hash(
     Ok(results)
 }
 
-// Build a map from extent_hash → (file_path, start_byte, byte_count) for the given image.
-// The join key is the full-file hash: raw scan computes it in logical block order;
-// enumerate_file_hashes computes it via ext4_view (same bytes, same hash for unfragmented files).
-fn build_extent_path_map(image: &Path) -> io::Result<HashMap<blake3::Hash, (String, u64, u64)>> {
+// Build a map from extent_hash → (file_path, file_logical_offset, byte_count) for the given image.
+// Uses the file-logical byte offset (not disk offset) to locate the extent within ext4_view-read data.
+fn build_extent_logical_map(image: &Path) -> io::Result<HashMap<blake3::Hash, (String, u64, u64)>> {
     let mut f = File::open(image)?;
     let sb = Superblock::read(&mut f)?;
     let inode_data = scan_file_extents_with_full_hash(&mut f, &sb)?;
@@ -307,8 +317,8 @@ fn build_extent_path_map(image: &Path) -> io::Result<HashMap<blake3::Hash, (Stri
             .get(&inode.full_hash)
             .cloned()
             .unwrap_or_default();
-        for (start_byte, byte_count, ext_hash) in inode.extents {
-            map.insert(ext_hash, (path.clone(), start_byte, byte_count));
+        for (_disk_start_byte, file_logical_offset, byte_count, ext_hash) in inode.extents {
+            map.insert(ext_hash, (path.clone(), file_logical_offset, byte_count));
         }
     }
     Ok(map)
@@ -545,6 +555,7 @@ fn print_overlap(stats1: &ExtentStats, stats2: &ExtentStats) {
 // --- delta analysis (path-based) ---
 
 const MB: f64 = 1024.0 * 1024.0;
+const BLOCK_BYTES: usize = 4096;
 
 /// Walk an ext4 image and return a map of path → (blake3 hash of full file, byte count).
 fn enumerate_file_hashes(image: &Path) -> io::Result<HashMap<String, (blake3::Hash, u64)>> {
@@ -937,8 +948,205 @@ pub fn run_rename_analysis(image1: &Path, image2: &Path) -> io::Result<()> {
     Ok(())
 }
 
-// --- cold boot analysis ---
+// --- sparse analysis ---
 
+/// Compare two images at 4KB block granularity to measure sparse-strategy savings.
+///
+/// For each file that changed between image1 and image2, count how many 4KB blocks
+/// actually differ. This shows how effective the sparse fetch strategy would be
+/// compared to re-uploading entire changed extents.
+pub fn run_sparse_analysis(image1: &Path, image2: &Path) -> io::Result<()> {
+    let hashes1 = enumerate_file_hashes(image1)?;
+    let hashes2 = enumerate_file_hashes(image2)?;
+
+    let total_bytes2: u64 = hashes2.values().map(|&(_, b)| b).sum();
+
+    let fs1 = Ext4::load_from_path(image1).map_err(|e| io::Error::other(e.to_string()))?;
+    let fs2 = Ext4::load_from_path(image2).map_err(|e| io::Error::other(e.to_string()))?;
+
+    let mut exact_count = 0usize;
+    let mut exact_bytes = 0u64;
+    let mut changed_count = 0usize;
+    let mut changed_raw_bytes = 0u64;
+    let mut total_blocks = 0u64;
+    let mut changed_blocks_total = 0u64;
+    let mut new_count = 0usize;
+    let mut new_bytes = 0u64;
+    // 5 buckets: 0–20%, 20–40%, 40–60%, 60–80%, 80–100% blocks changed
+    let mut buckets = [0usize; 5];
+
+    for (path, &(h2, b2)) in &hashes2 {
+        match hashes1.get(path) {
+            Some(&(h1, _)) if h1 == h2 => {
+                exact_count += 1;
+                exact_bytes += b2;
+            }
+            Some(_) => {
+                let ext4_path = Ext4PathBuf::new(path);
+                let data2 = match fs2.read(&ext4_path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let data1 = match fs1.read(&ext4_path) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        // File present in both by path but unreadable from image1 — treat as new.
+                        new_count += 1;
+                        new_bytes += b2;
+                        continue;
+                    }
+                };
+
+                let file_blocks = b2.div_ceil(BLOCK_BYTES as u64) as usize;
+                let mut file_changed = 0usize;
+
+                for i in 0..file_blocks {
+                    let start = i * BLOCK_BYTES;
+                    let end2 = (start + BLOCK_BYTES).min(data2.len());
+                    let block2 = &data2[start..end2];
+
+                    // A block is unchanged only if the same byte range in image1 is identical.
+                    // Blocks past the end of data1 (file grew) are always changed.
+                    let identical = if start < data1.len() {
+                        let end1 = (start + BLOCK_BYTES).min(data1.len());
+                        data1[start..end1] == *block2
+                    } else {
+                        false
+                    };
+
+                    if !identical {
+                        file_changed += 1;
+                    }
+                }
+
+                total_blocks += file_blocks as u64;
+                changed_blocks_total += file_changed as u64;
+
+                let frac = file_changed as f64 / file_blocks.max(1) as f64;
+                buckets[((frac * 5.0) as usize).min(4)] += 1;
+
+                changed_count += 1;
+                changed_raw_bytes += b2;
+            }
+            None => {
+                new_count += 1;
+                new_bytes += b2;
+            }
+        }
+    }
+
+    let mut removed_count = 0usize;
+    let mut removed_bytes = 0u64;
+    for (path, &(_, b)) in &hashes1 {
+        if !hashes2.contains_key(path) {
+            removed_count += 1;
+            removed_bytes += b;
+        }
+    }
+
+    let unchanged_blocks = total_blocks - changed_blocks_total;
+    // Each changed block is at most BLOCK_BYTES; cap at actual raw changed file bytes
+    // to avoid overcounting the last partial block per file.
+    let changed_block_bytes = (changed_blocks_total * BLOCK_BYTES as u64).min(changed_raw_bytes);
+    let marginal_sparse = changed_block_bytes + new_bytes;
+    let marginal_full = changed_raw_bytes + new_bytes;
+
+    println!("=== Sparse Analysis ===");
+    println!("  image1: {}", image1.display());
+    println!("  image2: {}", image2.display());
+    println!();
+    println!(
+        "  Total image2 file data: {:.1} MB",
+        total_bytes2 as f64 / MB
+    );
+    println!();
+    println!(
+        "  Exact match (zero cost):   {:>6} files  {:>7.1} MB  ({:.1}%)",
+        exact_count,
+        exact_bytes as f64 / MB,
+        100.0 * exact_bytes as f64 / total_bytes2.max(1) as f64,
+    );
+    println!(
+        "  Changed (sparse applies):  {:>6} files  {:>7.1} MB raw  ({:.1}%)",
+        changed_count,
+        changed_raw_bytes as f64 / MB,
+        100.0 * changed_raw_bytes as f64 / total_bytes2.max(1) as f64,
+    );
+    println!(
+        "  New (image2 only):         {:>6} files  {:>7.1} MB  (full upload)",
+        new_count,
+        new_bytes as f64 / MB,
+    );
+    println!(
+        "  Removed (image1 only):     {:>6} files  {:>7.1} MB",
+        removed_count,
+        removed_bytes as f64 / MB,
+    );
+
+    if changed_count > 0 {
+        println!();
+        println!("  Block-level breakdown within changed files:");
+        println!(
+            "    Total 4KB blocks: {:>8}  ({:.1} MB)",
+            total_blocks,
+            total_blocks as f64 * BLOCK_BYTES as f64 / MB,
+        );
+        println!(
+            "    Unchanged (skip): {:>8}  ({:.1} MB,  {:.1}%)",
+            unchanged_blocks,
+            unchanged_blocks as f64 * BLOCK_BYTES as f64 / MB,
+            100.0 * unchanged_blocks as f64 / total_blocks.max(1) as f64,
+        );
+        println!(
+            "    Changed (upload): {:>8}  ({:.1} MB,  {:.1}%)",
+            changed_blocks_total,
+            changed_block_bytes as f64 / MB,
+            100.0 * changed_blocks_total as f64 / total_blocks.max(1) as f64,
+        );
+        println!(
+            "    Sparse saving vs full re-upload of changed files: {:.1}%",
+            100.0 * (1.0 - changed_block_bytes as f64 / changed_raw_bytes.max(1) as f64),
+        );
+
+        println!();
+        println!("  Change concentration (fraction of 4KB blocks changed per file):");
+        let labels = [
+            "0–20%   (highly sparse)",
+            "20–40%                ",
+            "40–60%                ",
+            "60–80%                ",
+            "80–100% (mostly changed)",
+        ];
+        let n = changed_count as f64;
+        for (i, &count) in buckets.iter().enumerate() {
+            let pct = 100.0 * count as f64 / n;
+            let bar: String = "#".repeat((pct / 2.0) as usize);
+            println!("    {}:  {:>6} ({:>5.1}%)  {}", labels[i], count, pct, bar);
+        }
+    }
+
+    println!();
+    println!("  Marginal S3 upload cost (new files + sparse changed blocks):");
+    println!(
+        "    Sparse:            {:.1} MB  ({:.1}% saving vs naive full image fetch)",
+        marginal_sparse as f64 / MB,
+        100.0 * (1.0 - marginal_sparse as f64 / total_bytes2.max(1) as f64),
+    );
+    println!(
+        "    Full (no sparse):  {:.1} MB  ({:.1}% saving vs naive full image fetch)",
+        marginal_full as f64 / MB,
+        100.0 * (1.0 - marginal_full as f64 / total_bytes2.max(1) as f64),
+    );
+
+    Ok(())
+}
+
+// --- sparse cold-boot analysis ---
+
+/// Per-boot-extent analysis: for each extent read during boot that changed between
+/// image1 and image2, measure fetch cost under four strategies:
+/// zstd-only, zstd+sparse (skip unchanged 4KB blocks), zstd+delta (image1 file as dict),
+/// and zstd+delta+sparse (changed blocks only, image1 file as dict).
 pub fn run_cold_boot(
     image1: &Path,
     image2: &Path,
@@ -949,10 +1157,10 @@ pub fn run_cold_boot(
     let trace = load_trace(trace_path)?;
     println!("  {} extents in trace", trace.len());
 
-    println!("Building image2 extent → path map ...");
-    let extent_to_file = build_extent_path_map(image2)?;
+    println!("Building image2 extent → (path, file-logical offset) map ...");
+    let extent_to_file2 = build_extent_logical_map(image2)?;
 
-    println!("Scanning image2 total size ...");
+    println!("Scanning image2 total file size ...");
     let total_image2_bytes: u64 = {
         let mut f = File::open(image2)?;
         let sb = Superblock::read(&mut f)?;
@@ -972,21 +1180,28 @@ pub fn run_cold_boot(
             .collect()
     };
 
-    println!("Loading image1 filesystem ...");
+    println!("Loading image1 and image2 filesystems ...");
     let fs1 = Ext4::load_from_path(image1).map_err(|e| io::Error::other(e.to_string()))?;
+    let fs2 = Ext4::load_from_path(image2).map_err(|e| io::Error::other(e.to_string()))?;
+    // Raw image2 file for reading new/unmapped extents by disk offset.
     let mut image2_raw = File::open(image2)?;
 
     let mut exact_count = 0usize;
     let mut exact_bytes = 0u64;
-    let mut delta_count = 0usize;
-    let mut delta_raw_bytes = 0u64;
-    let mut delta_standalone_bytes = 0u64;
-    let mut delta_compressed_bytes = 0u64;
+    let mut changed_count = 0usize;
+    let mut changed_raw_bytes = 0u64;
+    let mut changed_block_bytes = 0u64; // raw bytes in changed 4KB blocks
+    let mut changed_standalone_bytes = 0u64; // full extent, standalone zstd
+    let mut changed_zstd_bytes = 0u64; // changed blocks only, standalone zstd
+    let mut changed_delta_bytes = 0u64; // full extent, image1 file as dict
+    let mut changed_delta_sparse_bytes = 0u64; // changed blocks only, image1 file as dict
     let mut new_count = 0usize;
     let mut new_bytes = 0u64;
-    let mut new_compressed_bytes = 0u64;
+    let mut new_zstd_bytes = 0u64;
     let mut unmapped = 0usize;
     let mut total_boot_bytes = 0u64;
+    // 5 buckets: 0–20%, 20–40%, 40–60%, 60–80%, 80–100% blocks changed within extent
+    let mut buckets = [0usize; 5];
 
     println!("Classifying {} boot extents ...", trace.len());
     for entry in &trace {
@@ -997,73 +1212,154 @@ pub fn run_cold_boot(
             continue;
         }
 
-        match extent_to_file.get(&entry.hash) {
-            None => {
-                unmapped += 1;
+        let Some((path, file_logical_offset, byte_count)) = extent_to_file2.get(&entry.hash) else {
+            unmapped += 1;
+            continue;
+        };
+
+        total_boot_bytes += entry.byte_count;
+
+        // New extents: read raw bytes from disk, compress for the zstd baseline.
+        let compress_new = |raw: &mut File, start: u64, len: u64| -> u64 {
+            let mut buf = vec![0u8; len as usize];
+            if raw.seek(SeekFrom::Start(start)).is_err() {
+                return len;
             }
-            Some((path, _start, _len)) => {
-                total_boot_bytes += entry.byte_count;
+            if raw.read_exact(&mut buf).is_err() {
+                return len;
+            }
+            let compressed = zstd::bulk::compress(&buf, level).unwrap_or_default();
+            compressed.len().min(buf.len()) as u64
+        };
 
-                if path.is_empty() {
-                    // extent belongs to a file we couldn't map to a path
-                    let mut buf = vec![0u8; entry.byte_count as usize];
-                    image2_raw.seek(SeekFrom::Start(entry.start_byte))?;
-                    image2_raw.read_exact(&mut buf)?;
-                    let compressed = zstd::bulk::compress(&buf, level).unwrap_or_default();
-                    new_count += 1;
-                    new_bytes += entry.byte_count;
-                    new_compressed_bytes += compressed.len().min(buf.len()) as u64;
-                    continue;
-                }
+        if path.is_empty() {
+            new_count += 1;
+            new_bytes += byte_count;
+            new_zstd_bytes += compress_new(&mut image2_raw, entry.start_byte, *byte_count);
+            continue;
+        }
 
-                let ext4_path = Ext4PathBuf::new(path);
-                match fs1.read(&ext4_path) {
-                    Ok(data1) => {
-                        let mut buf = vec![0u8; entry.byte_count as usize];
-                        image2_raw.seek(SeekFrom::Start(entry.start_byte))?;
-                        image2_raw.read_exact(&mut buf)?;
+        let ext4_path = Ext4PathBuf::new(path);
+        let data2 = match fs2.read(&ext4_path) {
+            Ok(d) => d,
+            Err(_) => {
+                new_count += 1;
+                new_bytes += byte_count;
+                new_zstd_bytes += compress_new(&mut image2_raw, entry.start_byte, *byte_count);
+                continue;
+            }
+        };
+        let data1 = match fs1.read(&ext4_path) {
+            Ok(d) => d,
+            Err(_) => {
+                // Genuinely new file in image2.
+                new_count += 1;
+                new_bytes += byte_count;
+                new_zstd_bytes += compress_new(&mut image2_raw, entry.start_byte, *byte_count);
+                continue;
+            }
+        };
 
-                        let standalone = zstd::bulk::compress(&buf, level).unwrap_or_default();
-                        let dict_compressed =
-                            zstd::bulk::Compressor::with_dictionary(level, &data1)
-                                .ok()
-                                .and_then(|mut c| c.compress(&buf).ok())
-                                .unwrap_or_else(|| standalone.clone());
+        // Slice out the specific extent range within the file.
+        let fstart = *file_logical_offset as usize;
+        if fstart >= data2.len() {
+            // Preallocated extent past i_size that slipped through — treat as new.
+            new_count += 1;
+            new_bytes += byte_count;
+            new_zstd_bytes += compress_new(&mut image2_raw, entry.start_byte, *byte_count);
+            continue;
+        }
+        let fend2 = (fstart + *byte_count as usize).min(data2.len());
+        let slice2 = &data2[fstart..fend2];
+        let slice1 = if fstart < data1.len() {
+            let fend1 = (fstart + *byte_count as usize).min(data1.len());
+            &data1[fstart..fend1]
+        } else {
+            &[][..]
+        };
 
-                        delta_count += 1;
-                        delta_raw_bytes += entry.byte_count;
-                        delta_standalone_bytes += standalone.len() as u64;
-                        // Take whichever is smaller — dict can sometimes be worse for tiny extents
-                        delta_compressed_bytes +=
-                            dict_compressed.len().min(standalone.len()) as u64;
-                    }
-                    Err(_) => {
-                        // File is genuinely new in image2
-                        let mut buf = vec![0u8; entry.byte_count as usize];
-                        image2_raw.seek(SeekFrom::Start(entry.start_byte))?;
-                        image2_raw.read_exact(&mut buf)?;
-                        let compressed = zstd::bulk::compress(&buf, level).unwrap_or_default();
-                        new_count += 1;
-                        new_bytes += entry.byte_count;
-                        new_compressed_bytes += compressed.len().min(buf.len()) as u64;
-                    }
-                }
+        let num_blocks = slice2.len().div_ceil(BLOCK_BYTES);
+        let mut file_changed = 0usize;
+        // Collect changed block bytes to compress together (best case for zstd+sparse).
+        let mut changed_block_data: Vec<u8> = Vec::new();
+
+        for i in 0..num_blocks {
+            let bs = i * BLOCK_BYTES;
+            let be2 = (bs + BLOCK_BYTES).min(slice2.len());
+            let block2 = &slice2[bs..be2];
+            // image1 may be shorter (file grew); blocks past the old EOF are always changed.
+            let block1 = if bs < slice1.len() {
+                let be1 = (bs + BLOCK_BYTES).min(slice1.len());
+                &slice1[bs..be1]
+            } else {
+                &[][..]
+            };
+            if block1 != block2 {
+                file_changed += 1;
+                changed_block_data.extend_from_slice(block2);
             }
         }
+
+        let this_block_bytes = (file_changed as u64 * BLOCK_BYTES as u64).min(*byte_count);
+
+        // Helper: try dict compression, fall back to standalone if it fails or is larger.
+        let dict_compress = |data: &[u8]| -> u64 {
+            let c = zstd::bulk::Compressor::with_dictionary(level, &data1)
+                .ok()
+                .and_then(|mut c| c.compress(data).ok())
+                .unwrap_or_else(|| zstd::bulk::compress(data, level).unwrap_or_default());
+            c.len().min(data.len()) as u64
+        };
+
+        // (1) zstd-only: full extent, standalone.
+        let standalone_full = zstd::bulk::compress(slice2, level).unwrap_or_default();
+        let this_standalone = standalone_full.len().min(slice2.len()) as u64;
+
+        // (2) zstd+sparse: changed blocks only, standalone.
+        let this_sparse_zstd = if changed_block_data.is_empty() {
+            0
+        } else {
+            let c = zstd::bulk::compress(&changed_block_data, level).unwrap_or_default();
+            c.len().min(changed_block_data.len()) as u64
+        };
+
+        // (3) zstd+delta: full extent with image1 file as dict.
+        let this_delta = dict_compress(slice2);
+
+        // (4) zstd+delta+sparse: changed blocks with image1 file as dict.
+        let this_delta_sparse = if changed_block_data.is_empty() {
+            0
+        } else {
+            dict_compress(&changed_block_data)
+        };
+
+        let frac = file_changed as f64 / num_blocks.max(1) as f64;
+        buckets[((frac * 5.0) as usize).min(4)] += 1;
+
+        changed_count += 1;
+        changed_raw_bytes += byte_count;
+        changed_block_bytes += this_block_bytes;
+        changed_standalone_bytes += this_standalone;
+        changed_zstd_bytes += this_sparse_zstd;
+        changed_delta_bytes += this_delta;
+        changed_delta_sparse_bytes += this_delta_sparse;
     }
 
-    let warm_host_fetch = delta_compressed_bytes + new_compressed_bytes;
-    let warm_host_fetch_zstd_only = delta_standalone_bytes + new_compressed_bytes;
-    let cold_host_fetch = exact_bytes + delta_compressed_bytes + new_compressed_bytes;
-    let cold_host_fetch_zstd_only = exact_bytes + delta_standalone_bytes + new_compressed_bytes;
+    let warm_zstd_only = changed_standalone_bytes + new_zstd_bytes;
+    let warm_zstd_sparse = changed_zstd_bytes + new_zstd_bytes;
+    let warm_zstd_delta = changed_delta_bytes + new_zstd_bytes;
+    let warm_zstd_delta_sparse = changed_delta_sparse_bytes + new_zstd_bytes;
+    let cold_zstd_only = exact_bytes + changed_standalone_bytes + new_zstd_bytes;
+    let cold_zstd_sparse = exact_bytes + changed_zstd_bytes + new_zstd_bytes;
+    let cold_zstd_delta = exact_bytes + changed_delta_bytes + new_zstd_bytes;
+    let cold_zstd_delta_sparse = exact_bytes + changed_delta_sparse_bytes + new_zstd_bytes;
+    let boot_extents = trace.len() - unmapped;
 
-    println!("\n=== Cold Boot Analysis ===");
+    println!("\n=== Sparse Cold Boot Analysis ===");
     println!("  image1: {}", image1.display());
     println!("  image2: {}", image2.display());
     println!("  trace:  {}", trace_path.display());
     println!();
-
-    let boot_extents = trace.len() - unmapped;
     println!(
         "  Boot footprint:      {:>5} extents   {:>7.1} MB  ({:.1}% of {:.1} MB total image)",
         boot_extents,
@@ -1074,7 +1370,7 @@ pub fn run_cold_boot(
     if unmapped > 0 {
         println!(
             "  Unmapped reads:      {:>5} extents             (metadata/journal — excluded)",
-            unmapped
+            unmapped,
         );
     }
     println!();
@@ -1084,55 +1380,83 @@ pub fn run_cold_boot(
         exact_bytes as f64 / MB,
         100.0 * exact_bytes as f64 / total_boot_bytes.max(1) as f64,
     );
-    if delta_count > 0 {
-        let delta_extra_pct =
-            100.0 * (1.0 - delta_compressed_bytes as f64 / delta_standalone_bytes.max(1) as f64);
+    if changed_count > 0 {
+        let unchanged_block_bytes = changed_raw_bytes.saturating_sub(changed_block_bytes);
         println!(
-            "  Delta-compressible:  {:>5} extents   {:>7.1} MB raw  →  {:.1} MB zstd  →  {:.1} MB delta  ({:.1}% beyond zstd)",
-            delta_count,
-            delta_raw_bytes as f64 / MB,
-            delta_standalone_bytes as f64 / MB,
-            delta_compressed_bytes as f64 / MB,
-            delta_extra_pct,
+            "  Changed extents:     {:>5} extents   {:>7.1} MB raw  ({:.1}% of blocks unchanged)",
+            changed_count,
+            changed_raw_bytes as f64 / MB,
+            100.0 * unchanged_block_bytes as f64 / changed_raw_bytes.max(1) as f64,
         );
+
+        println!();
+        println!("  Change concentration (fraction of 4KB blocks changed per boot extent):");
+        let labels = [
+            "0–20%   (highly sparse)",
+            "20–40%                ",
+            "40–60%                ",
+            "60–80%                ",
+            "80–100% (mostly changed)",
+        ];
+        let n = changed_count as f64;
+        for (i, &count) in buckets.iter().enumerate() {
+            let pct = 100.0 * count as f64 / n;
+            let bar: String = "#".repeat((pct / 2.0) as usize);
+            println!("    {}:  {:>5} ({:>5.1}%)  {}", labels[i], count, pct, bar);
+        }
     }
     println!(
         "  New (no prior):      {:>5} extents   {:>7.1} MB raw  →  {:.1} MB zstd",
         new_count,
         new_bytes as f64 / MB,
-        new_compressed_bytes as f64 / MB,
+        new_zstd_bytes as f64 / MB,
     );
 
     println!();
     println!("  Fetch cost — warm host (deduped extents already in local SSD cache):");
+    println!("    Strategy            MB      vs boot fetch");
     println!(
-        "    {:.1} MB zstd-only  →  {:.1} MB with delta  ({:.1}% delta benefit beyond zstd)",
-        warm_host_fetch_zstd_only as f64 / MB,
-        warm_host_fetch as f64 / MB,
-        100.0 * (1.0 - warm_host_fetch as f64 / warm_host_fetch_zstd_only.max(1) as f64),
+        "    zstd-only         {:>6.1}    ({:.1}% reduction)",
+        warm_zstd_only as f64 / MB,
+        100.0 * (1.0 - warm_zstd_only as f64 / total_boot_bytes.max(1) as f64),
     );
-    println!("  Fetch cost — cold host (no local cache, fetch all from S3):");
     println!(
-        "    {:.1} MB zstd-only  →  {:.1} MB with delta  ({:.1}% delta benefit beyond zstd)",
-        cold_host_fetch_zstd_only as f64 / MB,
-        cold_host_fetch as f64 / MB,
-        100.0 * (1.0 - cold_host_fetch as f64 / cold_host_fetch_zstd_only.max(1) as f64),
+        "    zstd+sparse       {:>6.1}    ({:.1}% reduction)",
+        warm_zstd_sparse as f64 / MB,
+        100.0 * (1.0 - warm_zstd_sparse as f64 / total_boot_bytes.max(1) as f64),
     );
-
+    println!(
+        "    zstd+delta        {:>6.1}    ({:.1}% reduction)",
+        warm_zstd_delta as f64 / MB,
+        100.0 * (1.0 - warm_zstd_delta as f64 / total_boot_bytes.max(1) as f64),
+    );
+    println!(
+        "    zstd+delta+sparse {:>6.1}    ({:.1}% reduction)",
+        warm_zstd_delta_sparse as f64 / MB,
+        100.0 * (1.0 - warm_zstd_delta_sparse as f64 / total_boot_bytes.max(1) as f64),
+    );
     println!();
+    println!("  Fetch cost — cold host (no local cache, fetch all from S3):");
+    println!("    Strategy            MB      vs naive full image");
     println!(
-        "  Combined saving vs naive full-image download ({:.1} MB):",
-        total_image2_bytes as f64 / MB
+        "    zstd-only         {:>6.1}    ({:.1}% reduction)",
+        cold_zstd_only as f64 / MB,
+        100.0 * (1.0 - cold_zstd_only as f64 / total_image2_bytes.max(1) as f64),
     );
     println!(
-        "    Warm host:  {:.1} MB  ({:.1}% reduction)  [demand-fetch × dedup × delta]",
-        warm_host_fetch as f64 / MB,
-        100.0 * (1.0 - warm_host_fetch as f64 / total_image2_bytes.max(1) as f64),
+        "    zstd+sparse       {:>6.1}    ({:.1}% reduction)",
+        cold_zstd_sparse as f64 / MB,
+        100.0 * (1.0 - cold_zstd_sparse as f64 / total_image2_bytes.max(1) as f64),
     );
     println!(
-        "    Cold host:  {:.1} MB  ({:.1}% reduction)  [demand-fetch × delta]",
-        cold_host_fetch as f64 / MB,
-        100.0 * (1.0 - cold_host_fetch as f64 / total_image2_bytes.max(1) as f64),
+        "    zstd+delta        {:>6.1}    ({:.1}% reduction)",
+        cold_zstd_delta as f64 / MB,
+        100.0 * (1.0 - cold_zstd_delta as f64 / total_image2_bytes.max(1) as f64),
+    );
+    println!(
+        "    zstd+delta+sparse {:>6.1}    ({:.1}% reduction)",
+        cold_zstd_delta_sparse as f64 / MB,
+        100.0 * (1.0 - cold_zstd_delta_sparse as f64 / total_image2_bytes.max(1) as f64),
     );
 
     Ok(())
