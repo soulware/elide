@@ -124,12 +124,21 @@ Step 3 is the commit point — a complete segment file at `pending/<ULID>` means
 **S3 upload completion:**
 
 ```
-6. Read pending/<ULID>; compute delta body against ancestor segments (if applicable)
-7. Upload to S3: stream header + index (updated with delta offsets) + inline + body + delta body
+6. Read pending/<ULID>; choose S3 reduction strategy (if applicable):
+   a. Delta compression: compute delta body against ancestor segments;
+      S3 object = local file + appended delta body (header and index updated with delta offsets)
+   b. Elision: compare extents block-by-block against ancestor; build a fresh S3 object
+      containing only changed-block extents; S3 manifest reflects the elided LBA map
+   c. Neither: upload local file as-is
+7. Upload S3 object
 8. Rename pending/<ULID> → segments/<ULID>
 ```
 
-The S3 object may differ from the local file in that it carries a delta body (and correspondingly updated header and index section). The body section is identical and can be streamed directly from the local file. Step 8 is a single rename.
+Under **delta compression** the S3 object is derived from the local file (body section identical, delta body appended, header/index updated). The local file can be streamed directly.
+
+Under **elision** the S3 object diverges structurally from the local file: its index section contains sub-extent entries for changed blocks only, not the original full-extent entries. The coordinator builds the S3 object fresh. H_new (the full extent hash) is not registered in the S3 extent index — only the changed block hashes are. The local segment retains H_new as a full DATA record; local reads are unaffected.
+
+The two strategies are not mutually exclusive: elision can be applied first (skip unchanged blocks), and delta compression applied to the changed blocks that remain. See [architecture.md](architecture.md) for the trade-off comparison.
 
 **On startup:** scan all three directories within the live node. Each maps to one recovery action:
 - `wal/` — replay (truncate partial tail if needed) and promote

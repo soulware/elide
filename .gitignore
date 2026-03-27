@@ -16,3 +16,6 @@
 
 # Rust build output
 /target/
+
+# Local reference copies (lsvd impl + paper)
+/refs/

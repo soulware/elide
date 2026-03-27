@@ -57,7 +57,7 @@ Other filesystem parsers (XFS, btrfs) could bring additional filesystems into th
 
 ## Empirical Findings
 
-See [FINDINGS.md](../FINDINGS.md) for full measurements. Key results:
+See [findings.md](findings.md) for full measurements. Key results:
 
 - **93.9% of a 2.1GB Ubuntu image is never read during a full boot** — validates the demand-fetch model
 - **84% of extents match exactly between 22.04 point releases** (by count); 35% by bytes — the large changed files are the delta compression target

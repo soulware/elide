@@ -7,6 +7,7 @@ Palimpsest is a log-structured block storage system combining demand-fetch, cont
 | Document | Contents |
 |---|---|
 | [docs/overview.md](docs/overview.md) | Problem statement, key concepts, operation modes, empirical findings |
+| [docs/findings.md](docs/findings.md) | Empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification |
 | [docs/architecture.md](docs/architecture.md) | System architecture, directory layout, write/read paths, LBA map, extent index, dedup, snapshots |
 | [docs/formats.md](docs/formats.md) | WAL format, segment file format (header + index + inline + body + delta), S3 retrieval strategies |
 | [docs/operations.md](docs/operations.md) | GC, repacking, boot hints, filesystem metadata awareness |

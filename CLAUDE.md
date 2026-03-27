@@ -40,6 +40,7 @@ These rules apply to all Rust code in this project. Follow them without needing 
 Design documentation is indexed in `DESIGN.md` and lives in `docs/`.
 
 - `docs/overview.md` — problem statement, key concepts, operation modes, empirical findings
+- `docs/findings.md` — empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification
 - `docs/architecture.md` — system architecture, directory layout, write/read paths, LBA map, extent index, dedup, snapshots
 - `docs/formats.md` — WAL format, segment file format, S3 retrieval strategies
 - `docs/operations.md` — GC, repacking, boot hints, filesystem metadata awareness
@@ -47,6 +48,6 @@ Design documentation is indexed in `DESIGN.md` and lives in `docs/`.
 
 ## References
 
-- [Beating the I/O Bottleneck: A Case for Log-Structured Virtual Disks](https://dl.acm.org/doi/pdf/10.1145/3492321.3524271) — the original LSVD paper
-- [lab47/lsvd](https://github.com/lab47/lsvd) — Evan Phoenix's Go reference implementation
+- `refs/lsvd-paper.pdf` — local copy of "Beating the I/O Bottleneck: A Case for Log-Structured Virtual Disks" (EuroSys 2022)
+- `refs/lsvd/` — local clone of lab47/lsvd, Evan Phoenix's Go reference implementation
 - [composefs/composefs-rs](https://github.com/composefs/composefs-rs) — Rust composefs implementation
