@@ -246,6 +246,15 @@ Elision is simpler to implement and has cleaner GC semantics; delta compression 
 
 The two are not mutually exclusive: elision could be applied first (skip unchanged blocks entirely), and delta compression applied to the remaining changed blocks. Whether the added complexity is worth it depends on the change distribution of the target workload.
 
+**Elision gives the client fetch-strategy flexibility.** Because elided data is raw bytes at known offsets in S3 objects, a client has a choice of how to reconstruct an extent:
+
+- *Simple*: fetch the full ancestor extent and overlay the live leaf's changed blocks on top. Two byte-range GETs, no algorithm. A client that doesn't understand elision at all can do this correctly just by following the layer merge.
+- *Precise*: compute exactly which LBA sub-ranges come from the ancestor vs the live leaf; issue byte-range GETs only for those ranges. Avoids fetching ancestor bytes that will be overwritten by the live leaf.
+
+The client picks based on economics — bandwidth, request latency, cache state — and neither strategy requires anything beyond "read bytes at offset X, length Y."
+
+Delta compression collapses this flexibility: reconstruction always requires fetching both source and delta, then applying a CPU transform. The data is not directly addressable. Elision also composes cleanly with the boot-hint repacking optimisation: repacked segments co-locate extents contiguously for efficient byte-range fetches, and elision preserves that property since all data remains raw bytes at fixed offsets. Delta compression complicates repacking because moving a source extent can invalidate dependent deltas.
+
 ## Snapshots
 
 A snapshot freezes the current live node and starts a new live child. Snapshots serve two purposes: **checkpointing** (a rollback point for the same ongoing volume) and **forking** (launching a new independent volume from a known state). Both use the same mechanism.
