@@ -748,10 +748,24 @@ pub fn walk_ancestors(fork_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
         .map_err(|e| io::Error::other(format!("bad branch ULID in origin: {e}")))?
         .to_string();
 
-    let volume_dir = fork_dir
+    // A fork in forks/ has the structure vol/forks/<name>; its parent is
+    // vol/forks/ and its grandparent is the volume root. The base fork
+    // (default/) lives directly under the volume root, not under forks/.
+    let parent = fork_dir
         .parent()
         .ok_or_else(|| io::Error::other("fork directory has no parent"))?;
-    let parent_fork_dir = volume_dir.join(parent_fork_name);
+    let volume_dir = if parent.file_name().and_then(|n| n.to_str()) == Some("forks") {
+        parent
+            .parent()
+            .ok_or_else(|| io::Error::other("forks directory has no parent"))?
+    } else {
+        parent
+    };
+    let parent_fork_dir = if parent_fork_name == "default" {
+        volume_dir.join("default")
+    } else {
+        volume_dir.join("forks").join(parent_fork_name)
+    };
 
     // Recurse into the parent's ancestry first (builds oldest-first order).
     let mut ancestors = walk_ancestors(&parent_fork_dir)?;
@@ -798,23 +812,28 @@ pub fn fork_volume(
     new_fork_name: &str,
     source_fork_name: &str,
 ) -> io::Result<PathBuf> {
-    // Reject reserved names that would conflict with volume-level files.
-    for reserved in ["readonly", "size"] {
-        if new_fork_name == reserved {
-            return Err(io::Error::other(format!(
-                "fork name '{new_fork_name}' is reserved"
-            )));
-        }
+    // "default" is reserved: the base fork lives at vol/default/ (not in forks/)
+    // and a fork named "default" in forks/ would be confusing.
+    if new_fork_name == "default" {
+        return Err(io::Error::other(
+            "fork name 'default' is reserved for the base import fork",
+        ));
     }
 
-    let new_fork_dir = volume_dir.join(new_fork_name);
+    let forks_dir = volume_dir.join("forks");
+    let new_fork_dir = forks_dir.join(new_fork_name);
     if new_fork_dir.exists() {
         return Err(io::Error::other(format!(
             "fork '{new_fork_name}' already exists"
         )));
     }
 
-    let source_fork_dir = volume_dir.join(source_fork_name);
+    // Source fork: "default" lives at vol/default/; others live in forks/.
+    let source_fork_dir = if source_fork_name == "default" {
+        volume_dir.join("default")
+    } else {
+        forks_dir.join(source_fork_name)
+    };
     let branch_ulid = latest_snapshot(&source_fork_dir)?.ok_or_else(|| {
         io::Error::other(format!(
             "source fork '{source_fork_name}' has no snapshots; run snapshot-volume first"
@@ -1565,7 +1584,7 @@ mod tests {
     fn walk_ancestors_one_level() {
         let vol_dir = temp_dir();
         let default_dir = vol_dir.join("default");
-        let dev_dir = vol_dir.join("dev");
+        let dev_dir = vol_dir.join("forks").join("dev");
 
         // dev's origin points to default at a fixed branch ULID.
         fs::create_dir_all(&dev_dir).unwrap();
@@ -1584,8 +1603,8 @@ mod tests {
     fn walk_ancestors_two_levels() {
         let vol_dir = temp_dir();
         let default_dir = vol_dir.join("default");
-        let mid_dir = vol_dir.join("mid");
-        let leaf_dir = vol_dir.join("leaf");
+        let mid_dir = vol_dir.join("forks").join("mid");
+        let leaf_dir = vol_dir.join("forks").join("leaf");
 
         fs::create_dir_all(&mid_dir).unwrap();
         fs::write(mid_dir.join("origin"), "default/01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
@@ -1777,7 +1796,7 @@ mod tests {
     #[test]
     fn fork_volume_errors_on_reserved_name() {
         let vol_dir = temp_dir();
-        let err = fork_volume(&vol_dir, "readonly", "default").unwrap_err();
+        let err = fork_volume(&vol_dir, "default", "default").unwrap_err();
         assert!(err.to_string().contains("reserved"), "{err}");
     }
 

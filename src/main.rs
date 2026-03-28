@@ -50,7 +50,7 @@ enum Command {
     SparseAnalysis { image1: String, image2: String },
     /// Serve an elide fork directory over NBD
     ServeVolume {
-        /// Path to the fork directory (e.g. volumes/myvm/default)
+        /// Path to the fork directory (e.g. volumes/myvm/default) or volume root (uses default fork)
         dir: String,
         /// Volume size (e.g. "4G", "512M", "1073741824"). Required on first use;
         /// ignored on subsequent opens (size is stored in <vol-dir>/size).
@@ -73,12 +73,12 @@ enum Command {
     },
     /// Inspect an elide volume directory and print a human-readable summary
     InspectVolume {
-        /// Path to the volume root directory
+        /// Path to the volume root directory, or a fork directory (resolves to its parent)
         dir: String,
     },
     /// List ext4 filesystem contents of a volume directory (read-only)
     LsVolume {
-        /// Path to the volume root directory
+        /// Path to the fork directory (e.g. volumes/myvm/default) or volume root (uses default fork)
         dir: String,
         /// Path within the ext4 filesystem to list (default: /)
         #[arg(default_value = "/")]
@@ -86,7 +86,7 @@ enum Command {
     },
     /// Compact sparse segments in a volume, reclaiming space from overwritten extents
     CompactVolume {
-        /// Path to the volume root directory
+        /// Path to the fork directory (e.g. volumes/myvm/default) or volume root (uses default fork)
         dir: String,
         /// Compact segments where fewer than this fraction of stored bytes are live (default: 0.7)
         #[arg(long, default_value_t = 0.7)]
@@ -94,7 +94,7 @@ enum Command {
     },
     /// Checkpoint a fork by writing a snapshot marker; the fork stays live
     SnapshotVolume {
-        /// Path to the fork directory (e.g. volumes/myvm/default)
+        /// Path to the fork directory (e.g. volumes/myvm/default) or volume root (uses default fork)
         dir: String,
     },
     /// Create a new named fork branched from the latest snapshot of the source fork
@@ -174,17 +174,17 @@ fn main() {
             port,
             readonly,
         } => {
-            let fork_dir = Path::new(&dir);
-            // The size file lives at the volume root (parent of the fork dir), falling
-            // back to the fork dir itself for single-fork layouts during development.
-            let size_dir = fork_dir.parent().unwrap_or(fork_dir);
-            let size_bytes = resolve_volume_size(size_dir, size.as_deref())
+            let fork_dir =
+                resolve_fork_dir(Path::new(&dir)).expect("failed to resolve fork directory");
+            // The size file lives at the volume root.
+            let size_dir = resolve_vol_dir(&fork_dir).to_owned();
+            let size_bytes = resolve_volume_size(&size_dir, size.as_deref())
                 .expect("failed to determine volume size");
             if readonly {
-                nbd::run_volume_readonly(fork_dir, size_bytes, &bind, port)
+                nbd::run_volume_readonly(&fork_dir, size_bytes, &bind, port)
                     .expect("readonly NBD server error");
             } else {
-                nbd::run_volume(fork_dir, size_bytes, &bind, port)
+                nbd::run_volume(&fork_dir, size_bytes, &bind, port)
                     .expect("volume NBD server error");
             }
         }
@@ -194,18 +194,22 @@ fn main() {
         }
 
         Command::InspectVolume { dir } => {
-            inspect::run(Path::new(&dir)).expect("inspect-volume failed");
+            inspect::run(resolve_vol_dir(Path::new(&dir))).expect("inspect-volume failed");
         }
 
         Command::LsVolume { dir, path } => {
-            ls::run(Path::new(&dir), &path).expect("ls-volume failed");
+            let fork_dir =
+                resolve_fork_dir(Path::new(&dir)).expect("failed to resolve fork directory");
+            ls::run(&fork_dir, &path).expect("ls-volume failed");
         }
 
         Command::CompactVolume {
             dir,
             min_live_ratio,
         } => {
-            let mut vol = volume::Volume::open(Path::new(&dir)).expect("failed to open volume");
+            let fork_dir =
+                resolve_fork_dir(Path::new(&dir)).expect("failed to resolve fork directory");
+            let mut vol = volume::Volume::open(&fork_dir).expect("failed to open volume");
             let stats = vol.compact(min_live_ratio).expect("compaction failed");
             println!(
                 "segments compacted: {}  bytes freed: {}  extents removed: {}",
@@ -214,7 +218,9 @@ fn main() {
         }
 
         Command::SnapshotVolume { dir } => {
-            let mut vol = volume::Volume::open(Path::new(&dir)).expect("failed to open volume");
+            let fork_dir =
+                resolve_fork_dir(Path::new(&dir)).expect("failed to resolve fork directory");
+            let mut vol = volume::Volume::open(&fork_dir).expect("failed to open volume");
             let snap_ulid = vol.snapshot().expect("snapshot failed");
             println!("{snap_ulid}");
         }
@@ -224,13 +230,14 @@ fn main() {
             fork_name,
             from,
         } => {
-            let fork_dir = volume::fork_volume(Path::new(&vol_dir), &fork_name, &from)
-                .expect("fork-volume failed");
+            let fork_dir =
+                volume::fork_volume(resolve_vol_dir(Path::new(&vol_dir)), &fork_name, &from)
+                    .expect("fork-volume failed");
             println!("{}", fork_dir.display());
         }
 
         Command::ListForks { vol_dir } => {
-            list_forks(Path::new(&vol_dir)).expect("list-forks failed");
+            list_forks(resolve_vol_dir(Path::new(&vol_dir))).expect("list-forks failed");
         }
 
         Command::ImportVolume { image, vol_dir } => {
@@ -263,38 +270,88 @@ fn main() {
     }
 }
 
+/// Returns true if `path` looks like a fork directory (has `wal/` or `pending/`).
+fn is_fork_dir(path: &Path) -> bool {
+    path.join("wal").is_dir() || path.join("pending").is_dir()
+}
+
+/// Resolve a user-supplied path to a volume root.
+///
+/// Accepts a volume root, a fork path under `forks/`, or the frozen `default/`
+/// base fork at the volume root. Returns the volume root in all cases.
+fn resolve_vol_dir(path: &Path) -> &Path {
+    if is_fork_dir(path) {
+        let parent = path.parent().unwrap_or(path);
+        // If parent is "forks/", the volume root is one level above that.
+        if parent.file_name().and_then(|n| n.to_str()) == Some("forks") {
+            parent.parent().unwrap_or(parent)
+        } else {
+            parent
+        }
+    } else {
+        path
+    }
+}
+
+/// Resolve a user-supplied path to a fork directory.
+///
+/// Accepts a fork path directly, or a volume root (resolves to `forks/default`).
+fn resolve_fork_dir(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    if is_fork_dir(path) {
+        return Ok(path.to_path_buf());
+    }
+    // Try vol_root/forks/default.
+    let via_forks = path.join("forks").join("default");
+    if via_forks.is_dir() && is_fork_dir(&via_forks) {
+        return Ok(via_forks);
+    }
+    Err(std::io::Error::other(format!(
+        "{}: not a fork directory and has no 'forks/default' fork; pass the fork path directly (e.g. {}/forks/my-fork)",
+        path.display(),
+        path.display()
+    )))
+}
+
 fn list_forks(vol_dir: &Path) -> std::io::Result<()> {
     use std::fs;
 
     let is_readonly = vol_dir.join("readonly").exists();
 
+    if is_readonly {
+        println!("readonly volume (template)");
+    }
+
+    let forks_dir = vol_dir.join("forks");
     let mut forks: Vec<(String, bool)> = Vec::new(); // (name, is_live)
-    for entry in fs::read_dir(vol_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
+    match fs::read_dir(&forks_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_owned(),
+                    None => continue,
+                };
+                let is_live = path.join("wal").is_dir();
+                forks.push((name, is_live));
+            }
         }
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_owned(),
-            None => continue,
-        };
-        // Skip reserved names that aren't forks.
-        if matches!(name.as_str(), "readonly" | "size") {
-            continue;
-        }
-        let is_live = path.join("wal").is_dir();
-        forks.push((name, is_live));
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     forks.sort_by(|a, b| a.0.cmp(&b.0));
 
-    if is_readonly {
-        println!("readonly volume");
-    }
-    for (name, is_live) in &forks {
-        let state = if *is_live { "live" } else { "base" };
-        let snap_count = count_snapshots(&vol_dir.join(name));
-        println!("  {name}  [{state}]  {snap_count} snapshot(s)");
+    if forks.is_empty() {
+        println!("  (no forks yet — use fork-volume to create one)");
+    } else {
+        for (name, is_live) in &forks {
+            let state = if *is_live { "live" } else { "base" };
+            let snap_count = count_snapshots(&forks_dir.join(name));
+            println!("  {name}  [{state}]  {snap_count} snapshot(s)");
+        }
     }
     Ok(())
 }

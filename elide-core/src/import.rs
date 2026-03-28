@@ -80,7 +80,7 @@ fn flush_segment(segments_dir: &Path, entries: &mut Vec<SegmentEntry>) -> io::Re
 
 /// Import an ext4 disk image into a new readonly Elide volume at `vol_dir`.
 ///
-/// Creates `<vol_dir>/default/{segments,pending,snapshots}/`, reads
+/// Creates `<vol_dir>/default/{segments,snapshots}/`, reads
 /// `image_path` in 4 KiB blocks, and writes segment files. After all data is
 /// written, writes a snapshot marker (branch point for future forks) and the
 /// `readonly` and `size` markers at the volume root.
@@ -107,7 +107,6 @@ pub fn import_image(
     let segments_dir = fork_dir.join("segments");
     let snapshots_dir = fork_dir.join("snapshots");
     fs::create_dir_all(&segments_dir)?;
-    fs::create_dir_all(fork_dir.join("pending"))?;
     fs::create_dir_all(&snapshots_dir)?;
 
     let mut image = fs::File::open(image_path)?;
@@ -182,7 +181,7 @@ mod tests {
             (LBA_SIZE * 3).to_string()
         );
         assert!(vol_dir.join("default").join("segments").exists());
-        assert!(vol_dir.join("default").join("pending").exists());
+        assert!(!vol_dir.join("default").join("pending").exists()); // frozen base: no pending/
 
         // Exactly one snapshot marker.
         let snaps: Vec<_> = fs::read_dir(vol_dir.join("default").join("snapshots"))

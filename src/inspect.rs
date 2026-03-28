@@ -41,18 +41,17 @@ pub fn run(dir: &Path) -> io::Result<()> {
     }
     println!();
 
-    // Collect all forks (subdirectories that look like fork directories).
-    let mut fork_dirs: Vec<PathBuf> = fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| !matches!(n, "readonly" | "size"))
-                    .unwrap_or(false)
-        })
-        .collect();
+    // Collect all forks from the forks/ subdirectory.
+    let forks_dir = dir.join("forks");
+    let mut fork_dirs: Vec<PathBuf> = match fs::read_dir(&forks_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
     fork_dirs.sort();
 
     if fork_dirs.is_empty() {
