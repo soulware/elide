@@ -390,6 +390,7 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
 
 #[derive(Serialize)]
 struct VolumeMeta<'a> {
+    readonly: bool,
     source: &'a str,
     digest: &'a str,
     arch: &'a str,
@@ -398,6 +399,7 @@ struct VolumeMeta<'a> {
 /// Write `meta.toml` to the volume root with OCI image provenance information.
 fn write_meta(vol_dir: &Path, source: &str, digest: &str, arch: &str) -> anyhow::Result<()> {
     let meta = VolumeMeta {
+        readonly: true,
         source,
         digest,
         arch,

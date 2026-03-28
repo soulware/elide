@@ -82,21 +82,20 @@ All volume state lives under a shared root directory on a dedicated local NVMe m
     readonly                     — plain file: marks volume as readonly template
     size
     meta.toml                    — source image metadata (OCI digest, arch, etc.)
-    default/                     — frozen base populated by import (no wal/)
+    base/                        — frozen base populated by import (no wal/)
       segments/
-      pending/
       snapshots/
         <import-ulid>
     forks/                       — absent on fresh import; created on first fork
-      server-1/                  — named fork branched from default (live)
+      server-1/                  — named fork branched from base (live)
         wal/
         pending/
         segments/
-        origin                   — "default/<import-ulid>"
+        origin                   — "base/<import-ulid>"
         snapshots/
 ```
 
-The readonly volume's `default/` fork is a special case: it lives directly under the volume root (not under `forks/`) and is the frozen base populated by the import. It is not writable and is not listed as a user fork. All user-created forks live under `forks/`. `forks/` is absent on a freshly-imported readonly volume and is created automatically when the first fork is taken.
+The readonly volume's `base/` directory lives directly under the volume root (not under `forks/`) and holds the frozen segments and snapshot markers from the import. It is not a user fork and is not writable. All user-created forks live under `forks/`. `forks/` is absent on a freshly-imported readonly volume and is created automatically when the first fork is taken.
 
 **Invariants:**
 - `wal/` present → fork is live; exactly one process writes here (enforced by `volume.lock`)
@@ -104,14 +103,15 @@ The readonly volume's `default/` fork is a special case: it lives directly under
 - `origin` is present only on forks branched from the base; its value is `<fork-name>/<ulid>` recording the branch point
 - `snapshots/<ulid>` is a plain marker file; the ULID sorts after all segments present at snapshot time, giving a stable branch point
 - `readonly` at the volume root marks the volume as a template; it cannot be served writably and requires an explicit fork before use
-- `forks/` is the exclusive home for named user forks; no fork directories appear directly in the volume root
+- `base/` at the volume root is the frozen import data; it is not a user fork and never has a `wal/`
+- `forks/` is the exclusive home for named user forks; no fork directories appear directly in the volume root except `base/`
 - `children/` is not used; forks are named siblings, not anonymous `children/<ulid>/` descendants
 
 **Finding live forks:** scan `forks/` for subdirectories containing `wal/`.
 
 **Exclusive access:** a live fork holds an exclusive `flock` on `<fork-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked fork fails immediately.
 
-**Fork ancestry:** a fork's `origin` file names its parent fork and the branch-point snapshot ULID. For forks in `forks/`, `walk_ancestors` follows this chain to the root (`default/`), building an oldest-first list of ancestor layers. Segments in each ancestor fork are included only up to the branch-point ULID — post-branch writes to an ancestor fork are not visible in derived forks.
+**Fork ancestry:** a fork's `origin` file names its parent fork and the branch-point snapshot ULID. For forks in `forks/`, `walk_ancestors` follows this chain to the root (`base/`), building an oldest-first list of ancestor layers. Segments in each ancestor fork are included only up to the branch-point ULID — post-branch writes to an ancestor fork are not visible in derived forks.
 
 ```
 VM
@@ -321,7 +321,7 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 | **Volume** | A named collection of forks stored under a common base directory. Identified by name (e.g. `myvm`). |
 | **Fork** | A named, independently live line of work within a volume. A fork has its own WAL, pending segments, and checkpoint history. Names are unique within a volume. User forks live under `forks/`. |
 | **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a fork's committed segment sequence. The ULID gives the position: all segments in `segments/` with ULID ≤ the snapshot ULID are part of that snapshot. The file content is empty or an optional human-readable name. |
-| **Readonly volume** | A volume flagged with a `readonly` marker at the root. It is a template: its `default/` fork is the frozen base populated by import (no `wal/`). It cannot be served directly. Named forks are created under `forks/` and are fully writable. `forks/` is absent until the first fork is taken. |
+| **Readonly volume** | A volume flagged with a `readonly` marker at the root. It is a template: its `base/` directory holds the frozen data populated by import (no `wal/`). It cannot be served directly. Named forks are created under `forks/` and are fully writable. `forks/` is absent until the first fork is taken. |
 | **Export** | A squash-and-detach operation that produces a new self-contained volume from a fork, with no ancestry dependencies. |
 
 ### Ancestry walk
@@ -365,7 +365,7 @@ elide export-volume <vol-dir> <fork-name> <new-vol-dir>
 
 **Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The fork remains live; no directory structure changes.
 
-**Import procedure for readonly volumes:** the import path writes data directly into `default/segments/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `default/snapshots/<import-ulid>` is written. This ULID is used as the branch point by all forks created from this volume. The `readonly` and `size` markers at the volume root are written at the end of import. No `forks/` directory is created — it is created automatically when the first fork is taken via `fork-volume`.
+**Import procedure for readonly volumes:** the import path writes data directly into `base/segments/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `base/snapshots/<import-ulid>` is written. This ULID is used as the branch point by all forks created from this volume. The `readonly` and `size` markers at the volume root are written at the end of import. No `forks/` directory is created — it is created automatically when the first fork is taken via `fork-volume`.
 
 **S3 upload for snapshots:** snapshot marker files and `origin` files must also be uploaded to S3 so the fork tree structure is visible to other hosts. These are small and should be uploaded eagerly.
 

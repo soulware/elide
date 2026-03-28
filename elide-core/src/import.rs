@@ -3,12 +3,12 @@
 // Reads the image in 4 KiB LBA-aligned blocks. Zero blocks are skipped — the
 // volume read path returns zeros for unwritten LBAs, so they need no storage.
 // Non-zero blocks are hashed, optionally compressed, and batched into large
-// segment files written directly to `<vol_dir>/default/segments/` via the
+// segment files written directly to `<vol_dir>/base/segments/` via the
 // standard tmp-rename commit pattern (no WAL involved — all data is known
 // upfront so crash recovery reduces to "retry the import").
 //
 // After all segments are written a snapshot marker is created in
-// `<vol_dir>/default/snapshots/`. This ULID is the branch point for writable
+// `<vol_dir>/base/snapshots/`. This ULID is the branch point for writable
 // forks created with `fork-volume`. The volume root then gets `readonly` and
 // `size` marker files, matching the layout described in docs/architecture.md.
 
@@ -80,7 +80,7 @@ fn flush_segment(segments_dir: &Path, entries: &mut Vec<SegmentEntry>) -> io::Re
 
 /// Import an ext4 disk image into a new readonly Elide volume at `vol_dir`.
 ///
-/// Creates `<vol_dir>/default/{segments,snapshots}/`, reads
+/// Creates `<vol_dir>/base/{segments,snapshots}/`, reads
 /// `image_path` in 4 KiB blocks, and writes segment files. After all data is
 /// written, writes a snapshot marker (branch point for future forks) and the
 /// `readonly` and `size` markers at the volume root.
@@ -97,13 +97,20 @@ pub fn import_image(
     vol_dir: &Path,
     mut progress: impl FnMut(u64, u64),
 ) -> io::Result<()> {
+    if vol_dir.exists() {
+        return Err(io::Error::other(format!(
+            "volume directory already exists: {}",
+            vol_dir.display()
+        )));
+    }
+
     let image_size = fs::metadata(image_path)?.len();
     if image_size % LBA_SIZE as u64 != 0 {
         return Err(io::Error::other("image size is not a multiple of 4096"));
     }
     let total_blocks = image_size / LBA_SIZE as u64;
 
-    let fork_dir = vol_dir.join("default");
+    let fork_dir = vol_dir.join("base");
     let segments_dir = fork_dir.join("segments");
     let snapshots_dir = fork_dir.join("snapshots");
     fs::create_dir_all(&segments_dir)?;
@@ -142,8 +149,7 @@ pub fn import_image(
     let snap_ulid = Ulid::new().to_string();
     fs::write(snapshots_dir.join(&snap_ulid), "")?;
 
-    // Volume-root markers.
-    fs::write(vol_dir.join("readonly"), "")?;
+    // Volume-root size marker (readonly is written by the caller in meta.toml).
     fs::write(vol_dir.join("size"), image_size.to_string())?;
 
     Ok(())
@@ -175,16 +181,17 @@ mod tests {
         let vol_dir = vol_tmp.path().join("testimport");
         import_image(&image_path, &vol_dir, |_, _| {}).unwrap();
 
-        assert!(vol_dir.join("readonly").exists());
+        // readonly is now in meta.toml (written by caller, not import_image)
+        assert!(!vol_dir.join("readonly").exists());
         assert_eq!(
             fs::read_to_string(vol_dir.join("size")).unwrap(),
             (LBA_SIZE * 3).to_string()
         );
-        assert!(vol_dir.join("default").join("segments").exists());
-        assert!(!vol_dir.join("default").join("pending").exists()); // frozen base: no pending/
+        assert!(vol_dir.join("base").join("segments").exists());
+        assert!(!vol_dir.join("base").join("pending").exists()); // frozen base: no pending/
 
         // Exactly one snapshot marker.
-        let snaps: Vec<_> = fs::read_dir(vol_dir.join("default").join("snapshots"))
+        let snaps: Vec<_> = fs::read_dir(vol_dir.join("base").join("snapshots"))
             .unwrap()
             .collect();
         assert_eq!(snaps.len(), 1);
@@ -201,7 +208,7 @@ mod tests {
         import_image(&image_path, &vol_dir, |_, _| {}).unwrap();
 
         // All-zero image: no segment files should be written.
-        let segs: Vec<_> = fs::read_dir(vol_dir.join("default").join("segments"))
+        let segs: Vec<_> = fs::read_dir(vol_dir.join("base").join("segments"))
             .unwrap()
             .collect();
         assert_eq!(segs.len(), 0);
@@ -233,7 +240,7 @@ mod tests {
         import_image(&image_path, &vol_dir, |_, _| {}).unwrap();
 
         // Re-open with ReadonlyVolume and verify the blocks.
-        let rv = crate::volume::ReadonlyVolume::open(&vol_dir.join("default")).unwrap();
+        let rv = crate::volume::ReadonlyVolume::open(&vol_dir.join("base")).unwrap();
         let got0 = rv.read(0, 1).unwrap();
         assert_eq!(got0, b0);
         let got1 = rv.read(1, 1).unwrap();

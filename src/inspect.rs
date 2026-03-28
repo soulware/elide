@@ -22,7 +22,8 @@ pub fn run(dir: &Path) -> io::Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("<unknown>");
     let size_bytes = read_size(dir)?;
-    let is_readonly = dir.join("readonly").exists();
+    let meta = read_meta(dir);
+    let is_readonly = meta.as_ref().is_some_and(|m| m.readonly);
 
     println!("Volume: {vol_name}");
     match size_bytes {
@@ -32,12 +33,15 @@ pub fn run(dir: &Path) -> io::Result<()> {
     if is_readonly {
         println!("Type:   readonly");
     }
-    if let Some(meta) = read_meta(dir) {
-        let short_digest = meta.digest.get(7..19).unwrap_or(&meta.digest);
-        println!(
-            "Source: {}  (sha256:{})  {}",
-            meta.source, short_digest, meta.arch
-        );
+    if let Some(VolumeMeta {
+        source: Some(source),
+        digest: Some(digest),
+        arch: Some(arch),
+        ..
+    }) = &meta
+    {
+        let short_digest = digest.get(7..19).unwrap_or(digest);
+        println!("Source: {}  (sha256:{})  {}", source, short_digest, arch);
     }
     println!();
 
@@ -476,9 +480,11 @@ fn print_fs_summary(fork_name: &str, summary: &ls::FsSummary) {
 
 #[derive(Deserialize)]
 struct VolumeMeta {
-    source: String,
-    digest: String,
-    arch: String,
+    #[serde(default)]
+    readonly: bool,
+    source: Option<String>,
+    digest: Option<String>,
+    arch: Option<String>,
 }
 
 fn read_meta(dir: &Path) -> Option<VolumeMeta> {

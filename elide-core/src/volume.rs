@@ -135,6 +135,11 @@ pub struct Volume {
     /// DATA and REF extents written since the last promotion; used to write
     /// the clean segment file on the next promote().
     pending_entries: Vec<segment::SegmentEntry>,
+    /// True if at least one segment has been committed since the last snapshot
+    /// (or since open, if no snapshot has been taken this session). Used by
+    /// `snapshot()` to decide whether a new marker is needed or the latest
+    /// existing snapshot can be reused.
+    has_new_segments: bool,
     /// Single-entry file handle cache for the read path.
     ///
     /// Retains the last opened segment file across `read` calls so that
@@ -218,6 +223,30 @@ impl Volume {
                 create_fresh_wal(&wal_dir)?
             };
 
+        // Determine whether there is uncommitted (un-snapshotted) data from a
+        // previous session. WAL records already recovered into pending_entries
+        // count; so do any segment files in pending/ or segments/ that postdate
+        // the latest snapshot. Cross-session ULID comparison is reliable because
+        // those files were written in earlier runs at distinct timestamps.
+        let has_new_segments = !pending_entries.is_empty() || {
+            match latest_snapshot(base_dir)? {
+                None => false,
+                Some(ref snap) => {
+                    ["pending", "segments"]
+                        .iter()
+                        .try_fold(false, |acc, subdir| {
+                            let files = segment::collect_segment_files(&base_dir.join(subdir))?;
+                            let newer = files.iter().any(|p| {
+                                p.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .is_some_and(|n| n > snap.as_str())
+                            });
+                            io::Result::Ok(acc || newer)
+                        })?
+                }
+            }
+        };
+
         Ok(Self {
             base_dir: base_dir.to_owned(),
             ancestor_layers,
@@ -228,6 +257,7 @@ impl Volume {
             wal_ulid,
             wal_path,
             pending_entries,
+            has_new_segments,
             file_cache: RefCell::new(None),
         })
     }
@@ -463,6 +493,7 @@ impl Volume {
             fs::remove_file(&self.wal_path)?;
             return Ok(());
         }
+        self.has_new_segments = true;
         let body_section_start = segment::promote(
             &self.wal_path,
             &self.wal_ulid,
@@ -507,20 +538,35 @@ impl Volume {
     /// `snapshots/<ulid>` marker file. The fork stays live and continues
     /// writing in the same directory — no directory structure changes occur.
     ///
-    /// The snapshot ULID is guaranteed to sort after all segments present in
-    /// `pending/` and `segments/` at the time of the snapshot, making it a
-    /// stable branch point for `fork-volume`.
+    /// If no new data has been committed since the latest existing snapshot
+    /// (nothing in `pending/` or `segments/` sorts after it), the existing
+    /// snapshot ULID is returned without writing a new marker.
     ///
     /// Returns the snapshot ULID.
     pub fn snapshot(&mut self) -> io::Result<Ulid> {
         // Flush WAL to pending/ first so the snapshot marker sorts after it.
         self.flush_wal_to_pending()?;
 
-        // Write the snapshot marker.
+        // If no new segments have been committed since the last snapshot, reuse
+        // the existing snapshot ULID rather than writing a new marker.
+        if !self.has_new_segments
+            && let Some(latest_str) = latest_snapshot(&self.base_dir)?
+        {
+            let (wal, wal_ulid, wal_path, pending_entries) =
+                create_fresh_wal(&self.base_dir.join("wal"))?;
+            self.wal = wal;
+            self.wal_ulid = wal_ulid;
+            self.wal_path = wal_path;
+            self.pending_entries = pending_entries;
+            return Ulid::from_string(&latest_str).map_err(|e| io::Error::other(e.to_string()));
+        }
+
+        // Write a new snapshot marker.
         let snap_ulid = Ulid::new();
         let snapshots_dir = self.base_dir.join("snapshots");
         fs::create_dir_all(&snapshots_dir)?;
         fs::write(snapshots_dir.join(snap_ulid.to_string()), "")?;
+        self.has_new_segments = false;
 
         // Open a fresh WAL to continue writing.
         let (wal, wal_ulid, wal_path, pending_entries) =
@@ -761,8 +807,8 @@ pub fn walk_ancestors(fork_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
     } else {
         parent
     };
-    let parent_fork_dir = if parent_fork_name == "default" {
-        volume_dir.join("default")
+    let parent_fork_dir = if parent_fork_name == "base" {
+        volume_dir.join("base")
     } else {
         volume_dir.join("forks").join(parent_fork_name)
     };
@@ -812,14 +858,6 @@ pub fn fork_volume(
     new_fork_name: &str,
     source_fork_name: &str,
 ) -> io::Result<PathBuf> {
-    // "default" is reserved: the base fork lives at vol/default/ (not in forks/)
-    // and a fork named "default" in forks/ would be confusing.
-    if new_fork_name == "default" {
-        return Err(io::Error::other(
-            "fork name 'default' is reserved for the base import fork",
-        ));
-    }
-
     let forks_dir = volume_dir.join("forks");
     let new_fork_dir = forks_dir.join(new_fork_name);
     if new_fork_dir.exists() {
@@ -828,9 +866,9 @@ pub fn fork_volume(
         )));
     }
 
-    // Source fork: "default" lives at vol/default/; others live in forks/.
-    let source_fork_dir = if source_fork_name == "default" {
-        volume_dir.join("default")
+    // Source fork: "base" lives at vol/base/; others live in forks/.
+    let source_fork_dir = if source_fork_name == "base" {
+        volume_dir.join("base")
     } else {
         forks_dir.join(source_fork_name)
     };
@@ -1575,7 +1613,7 @@ mod tests {
     #[test]
     fn walk_ancestors_root_returns_empty() {
         let vol_dir = temp_dir();
-        let fork_dir = vol_dir.join("default");
+        let fork_dir = vol_dir.join("base");
         // No origin file → root fork; ancestors are empty.
         assert!(walk_ancestors(&fork_dir).unwrap().is_empty());
     }
@@ -1583,12 +1621,12 @@ mod tests {
     #[test]
     fn walk_ancestors_one_level() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
         let dev_dir = vol_dir.join("forks").join("dev");
 
         // dev's origin points to default at a fixed branch ULID.
         fs::create_dir_all(&dev_dir).unwrap();
-        fs::write(dev_dir.join("origin"), "default/01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        fs::write(dev_dir.join("origin"), "base/01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
 
         let ancestors = walk_ancestors(&dev_dir).unwrap();
         assert_eq!(ancestors.len(), 1);
@@ -1602,12 +1640,12 @@ mod tests {
     #[test]
     fn walk_ancestors_two_levels() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
         let mid_dir = vol_dir.join("forks").join("mid");
         let leaf_dir = vol_dir.join("forks").join("leaf");
 
         fs::create_dir_all(&mid_dir).unwrap();
-        fs::write(mid_dir.join("origin"), "default/01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        fs::write(mid_dir.join("origin"), "base/01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
 
         fs::create_dir_all(&leaf_dir).unwrap();
         fs::write(leaf_dir.join("origin"), "mid/01BX5ZZKJKTSV4RRFFQ69G5FAV").unwrap();
@@ -1633,7 +1671,7 @@ mod tests {
     #[test]
     fn open_reads_ancestor_segments() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
 
         // Write data into the default fork and promote to a segment.
         let data = vec![0xABu8; 4096];
@@ -1645,7 +1683,7 @@ mod tests {
         }
 
         // Create a child fork branched from default.
-        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
+        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
 
         // Child should see the ancestor's data through layer merge.
         let vol = Volume::open(&child_dir).unwrap();
@@ -1658,7 +1696,7 @@ mod tests {
     #[test]
     fn child_write_shadows_ancestor() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
         let ancestor_data = vec![0xAAu8; 4096];
         let child_data = vec![0xBBu8; 4096];
 
@@ -1671,7 +1709,7 @@ mod tests {
         }
 
         // Create child fork, write different data at the same LBA, promote.
-        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
+        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
         {
             let mut vol = Volume::open(&child_dir).unwrap();
             vol.write(0, &child_data).unwrap();
@@ -1690,7 +1728,7 @@ mod tests {
     #[test]
     fn double_open_same_fork_fails() {
         let base = temp_dir();
-        let fork_dir = base.join("default");
+        let fork_dir = base.join("base");
         let _vol = Volume::open(&fork_dir).unwrap();
         // Second open on the same live fork must fail (lock already held).
         assert!(Volume::open(&fork_dir).is_err());
@@ -1702,7 +1740,7 @@ mod tests {
     #[test]
     fn snapshot_writes_marker_and_stays_live() {
         let base = temp_dir();
-        let fork_dir = base.join("default");
+        let fork_dir = base.join("base");
         let data = vec![0xAAu8; 4096];
 
         let mut vol = Volume::open(&fork_dir).unwrap();
@@ -1731,7 +1769,7 @@ mod tests {
     #[test]
     fn snapshot_empty_wal_no_segment_written() {
         let base = temp_dir();
-        let fork_dir = base.join("default");
+        let fork_dir = base.join("base");
         let mut vol = Volume::open(&fork_dir).unwrap();
         // No writes — WAL is empty.
         vol.snapshot().unwrap();
@@ -1744,9 +1782,65 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_idempotent_when_no_new_data() {
+        let base = temp_dir();
+        let fork_dir = base.join("base");
+        let mut vol = Volume::open(&fork_dir).unwrap();
+        vol.write(0, &vec![0xAAu8; 4096]).unwrap();
+
+        let ulid1 = vol.snapshot().unwrap();
+        // No new writes — second snapshot must return the same ULID.
+        let ulid2 = vol.snapshot().unwrap();
+        assert_eq!(ulid1, ulid2);
+
+        // Still only one snapshot marker on disk.
+        let snaps: Vec<_> = fs::read_dir(fork_dir.join("snapshots")).unwrap().collect();
+        assert_eq!(snaps.len(), 1);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn snapshot_not_idempotent_after_new_write() {
+        let base = temp_dir();
+        let fork_dir = base.join("base");
+        let mut vol = Volume::open(&fork_dir).unwrap();
+        vol.write(0, &vec![0xAAu8; 4096]).unwrap();
+
+        let ulid1 = vol.snapshot().unwrap();
+        vol.write(1, &vec![0xBBu8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let ulid2 = vol.snapshot().unwrap();
+        assert_ne!(ulid1, ulid2);
+
+        let snaps: Vec<_> = fs::read_dir(fork_dir.join("snapshots")).unwrap().collect();
+        assert_eq!(snaps.len(), 2);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn snapshot_idempotent_after_auto_promoted_data_already_snapshotted() {
+        // Data promoted via FLUSH_THRESHOLD (pending_entries empty at snapshot
+        // time) but that segment was already covered by a prior snapshot.
+        let base = temp_dir();
+        let fork_dir = base.join("base");
+        let mut vol = Volume::open(&fork_dir).unwrap();
+        vol.write(0, &vec![0xAAu8; 4096]).unwrap();
+        vol.promote_for_test().unwrap(); // lands in pending/ with wal_ulid_1
+        let ulid1 = vol.snapshot().unwrap(); // snapshot covers pending/wal_ulid_1
+        // pending_entries is now empty; pending/ has one file but it's <= ulid1.
+        let ulid2 = vol.snapshot().unwrap();
+        assert_eq!(ulid1, ulid2);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn snapshot_lock_held_after_snapshot() {
         let base = temp_dir();
-        let fork_dir = base.join("default");
+        let fork_dir = base.join("base");
         let mut vol = Volume::open(&fork_dir).unwrap();
         vol.snapshot().unwrap();
 
@@ -1765,7 +1859,7 @@ mod tests {
     #[test]
     fn fork_volume_creates_fork_with_origin() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
 
         // snapshot default to give it a branch point.
         let mut vol = Volume::open(&default_dir).unwrap();
@@ -1774,13 +1868,13 @@ mod tests {
         drop(vol);
 
         // Create the fork.
-        let fork_dir = fork_volume(&vol_dir, "dev", "default").unwrap();
+        let fork_dir = fork_volume(&vol_dir, "dev", "base").unwrap();
         assert!(fork_dir.join("wal").is_dir());
         assert!(fork_dir.join("pending").is_dir());
         assert!(fork_dir.join("segments").is_dir());
 
         let origin = fs::read_to_string(fork_dir.join("origin")).unwrap();
-        assert_eq!(origin.trim(), format!("default/{snap_ulid}"));
+        assert_eq!(origin.trim(), format!("base/{snap_ulid}"));
 
         fs::remove_dir_all(vol_dir).unwrap();
     }
@@ -1789,21 +1883,14 @@ mod tests {
     fn fork_volume_errors_if_source_has_no_snapshots() {
         let vol_dir = temp_dir();
         // default has no snapshot yet.
-        let err = fork_volume(&vol_dir, "dev", "default").unwrap_err();
+        let err = fork_volume(&vol_dir, "dev", "base").unwrap_err();
         assert!(err.to_string().contains("no snapshots"), "{err}");
-    }
-
-    #[test]
-    fn fork_volume_errors_on_reserved_name() {
-        let vol_dir = temp_dir();
-        let err = fork_volume(&vol_dir, "default", "default").unwrap_err();
-        assert!(err.to_string().contains("reserved"), "{err}");
     }
 
     #[test]
     fn fork_volume_uses_latest_snapshot_when_multiple_exist() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
 
         let data_snap1 = vec![0x11u8; 4096];
         let data_snap2 = vec![0x22u8; 4096];
@@ -1820,11 +1907,11 @@ mod tests {
         // snap2 must sort after snap1 (ULIDs are monotonically increasing).
         assert!(snap2 > snap1);
 
-        let fork_dir = fork_volume(&vol_dir, "dev", "default").unwrap();
+        let fork_dir = fork_volume(&vol_dir, "dev", "base").unwrap();
         let origin = fs::read_to_string(fork_dir.join("origin")).unwrap();
         assert_eq!(
             origin.trim(),
-            format!("default/{snap2}"),
+            format!("base/{snap2}"),
             "origin should point to the latest snapshot"
         );
 
@@ -1839,7 +1926,7 @@ mod tests {
     #[test]
     fn fork_volume_from_child_fork_creates_three_level_chain() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
 
         let data_root = vec![0xAAu8; 4096];
         let data_mid = vec![0xBBu8; 4096];
@@ -1853,7 +1940,7 @@ mod tests {
         }
 
         // Mid fork: branch from default, write + snapshot.
-        let mid_dir = fork_volume(&vol_dir, "mid", "default").unwrap();
+        let mid_dir = fork_volume(&vol_dir, "mid", "base").unwrap();
         {
             let mut vol = Volume::open(&mid_dir).unwrap();
             vol.write(1, &data_mid).unwrap();
@@ -1870,10 +1957,7 @@ mod tests {
             "leaf origin: {leaf_origin}"
         );
         let mid_origin = fs::read_to_string(mid_dir.join("origin")).unwrap();
-        assert!(
-            mid_origin.starts_with("default/"),
-            "mid origin: {mid_origin}"
-        );
+        assert!(mid_origin.starts_with("base/"), "mid origin: {mid_origin}");
 
         // Leaf sees data from all three levels.
         let vol = Volume::open(&leaf_dir).unwrap();
@@ -1897,13 +1981,13 @@ mod tests {
     #[test]
     fn fork_volume_errors_if_fork_exists() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
         let mut vol = Volume::open(&default_dir).unwrap();
         vol.snapshot().unwrap();
         drop(vol);
 
-        fork_volume(&vol_dir, "dev", "default").unwrap();
-        let err = fork_volume(&vol_dir, "dev", "default").unwrap_err();
+        fork_volume(&vol_dir, "dev", "base").unwrap();
+        let err = fork_volume(&vol_dir, "dev", "base").unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
 
         fs::remove_dir_all(vol_dir).unwrap();
@@ -1914,7 +1998,7 @@ mod tests {
     #[test]
     fn two_snapshots_data_readable_after_reopen() {
         let base = temp_dir();
-        let fork_dir = base.join("default");
+        let fork_dir = base.join("base");
         let data_a = vec![0xAAu8; 4096];
         let data_b = vec![0xBBu8; 4096];
 
@@ -1937,7 +2021,7 @@ mod tests {
     #[test]
     fn fork_data_visible_across_ancestry() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
         let data_a = vec![0xAAu8; 4096];
         let data_b = vec![0xBBu8; 4096];
 
@@ -1949,7 +2033,7 @@ mod tests {
             vol.snapshot().unwrap();
         }
 
-        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
+        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
         {
             let mut vol = Volume::open(&child_dir).unwrap();
             vol.write(1, &data_b).unwrap();
@@ -1973,7 +2057,7 @@ mod tests {
     #[test]
     fn ulid_cutoff_hides_post_branch_ancestor_writes() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
 
         let pre_branch = vec![0xAAu8; 4096];
         let post_branch = vec![0xBBu8; 4096];
@@ -1984,7 +2068,7 @@ mod tests {
             vol.write(0, &pre_branch).unwrap();
             vol.snapshot().unwrap();
         }
-        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
+        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
 
         // Write post-branch data to the ancestor fork at LBA 1 (a new LBA).
         {
@@ -2014,7 +2098,7 @@ mod tests {
     #[test]
     fn ulid_cutoff_overwrite_stays_invisible() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
 
         let original = vec![0xAAu8; 4096];
         let overwrite = vec![0xBBu8; 4096];
@@ -2024,7 +2108,7 @@ mod tests {
             vol.write(0, &original).unwrap();
             vol.snapshot().unwrap();
         }
-        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
+        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
 
         // Ancestor overwrites LBA 0 after the branch.
         {
@@ -2045,7 +2129,7 @@ mod tests {
     #[test]
     fn readonly_volume_unwritten_returns_zeros() {
         let vol_dir = temp_dir();
-        let fork_dir = vol_dir.join("default");
+        let fork_dir = vol_dir.join("base");
         // Create the directory structure without a WAL (simulating a readonly base).
         fs::create_dir_all(fork_dir.join("segments")).unwrap();
         fs::create_dir_all(fork_dir.join("pending")).unwrap();
@@ -2059,7 +2143,7 @@ mod tests {
     #[test]
     fn readonly_volume_reads_committed_segment() {
         let vol_dir = temp_dir();
-        let fork_dir = vol_dir.join("default");
+        let fork_dir = vol_dir.join("base");
 
         let data = vec![0xCCu8; 4096];
 
@@ -2083,7 +2167,7 @@ mod tests {
     #[test]
     fn readonly_volume_reads_ancestor_data() {
         let vol_dir = temp_dir();
-        let default_dir = vol_dir.join("default");
+        let default_dir = vol_dir.join("base");
 
         let ancestor_data = vec![0xDDu8; 4096];
 
@@ -2093,7 +2177,7 @@ mod tests {
             vol.write(0, &ancestor_data).unwrap();
             vol.snapshot().unwrap();
         }
-        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
+        let child_dir = fork_volume(&vol_dir, "child", "base").unwrap();
         // Drop child lock so ReadonlyVolume can open it without conflict.
         // (ReadonlyVolume doesn't take a write lock, so this always works.)
 
@@ -2106,7 +2190,7 @@ mod tests {
     #[test]
     fn readonly_volume_does_not_see_wal_records() {
         let vol_dir = temp_dir();
-        let fork_dir = vol_dir.join("default");
+        let fork_dir = vol_dir.join("base");
 
         let committed = vec![0xEEu8; 4096];
         let in_wal = vec![0xFFu8; 4096];
