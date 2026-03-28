@@ -1,0 +1,9 @@
+[package]
+name = "elide-import"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clap       = { version = "4", features = ["derive"] }
+elide-core = { path = "../elide-core" }

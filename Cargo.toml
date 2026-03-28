@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "elide-core", "elide-import"]
+resolver = "2"
+
 [package]
 name = "elide"
 version = "0.1.0"
@@ -5,9 +9,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-blake3 = "1"
-clap = { version = "4", features = ["derive"] }
-ext4-view = { version = "0.9", features = ["std"] }
-libc = "0.2"
-ulid = "1"
-zstd = "0.13"
+blake3     = "1"
+clap       = { version = "4", features = ["derive"] }
+elide-core = { path = "elide-core" }
+ext4-view  = { version = "0.9", features = ["std"] }
+libc       = "0.2"
+ulid       = "1"
+zstd       = "0.13"

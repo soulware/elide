@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{segment, writelog};
+use elide_core::{segment, writelog};
 
 pub fn run(dir: &Path) -> io::Result<()> {
     let vol_name = dir

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use ext4_view::{Ext4, Ext4Read, FileType, PathBuf as Ext4PathBuf};
 
-use crate::{extentindex, lbamap, segment, volume, writelog};
+use elide_core::{extentindex, lbamap, segment, volume, writelog};
 
 pub fn run(dir: &Path, fs_path: &str) -> io::Result<()> {
     let reader = VolumeReader::open(dir)?;

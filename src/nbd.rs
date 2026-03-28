@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::volume::{ReadonlyVolume, Volume};
+use elide_core::volume::{ReadonlyVolume, Volume};
 
 use crate::extents::{LocatedExtent, locate_extents};
 

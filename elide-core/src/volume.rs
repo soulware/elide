@@ -554,22 +554,18 @@ impl Volume {
         Err(io::Error::other(format!("segment not found: {segment_id}")))
     }
 
-    #[cfg(test)]
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
 
-    #[cfg(test)]
     pub fn ancestor_count(&self) -> usize {
         self.ancestor_layers.len()
     }
 
-    #[cfg(test)]
     pub fn lbamap_len(&self) -> usize {
         self.lbamap.len()
     }
 
-    #[cfg(test)]
     pub fn promote_for_test(&mut self) -> io::Result<()> {
         self.promote()
     }

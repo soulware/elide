@@ -31,7 +31,7 @@ use std::path::Path;
 
 /// Payload is zstd-compressed; data_length is the compressed size.
 #[allow(dead_code)] // used when compression is wired up
-pub(crate) const FLAG_COMPRESSED: u8 = 0x01;
+pub const FLAG_COMPRESSED: u8 = 0x01;
 /// No data payload; this LBA range maps to an existing extent identified by hash.
 pub const FLAG_DEDUP_REF: u8 = 0x02;
 

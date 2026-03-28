@@ -21,6 +21,32 @@ A single **Elide coordinator** runs on each host and manages all volumes. It for
 
 **Volume process** (one per volume) — owns the ublk/NBD frontend for one volume; owns the WAL and pending promotion for that volume; holds the live LBA map in memory. Does not communicate with other volume processes directly. Communicates with the coordinator via a defined IPC boundary (TBD — Unix socket or similar). Never requires the coordinator for correct I/O.
 
+## Crate structure
+
+The repository is a Cargo workspace with three crates:
+
+```
+elide-core/   — shared library: segment format, WAL, LBA map, extent index,
+                volume read/write, and import_image(). Deps: blake3, zstd, ulid, libc.
+                No async, no network. Usable standalone.
+
+elide/        — volume process binary: NBD server, analysis tools (extents, inspect,
+                ls), and the import-volume CLI subcommand. Adds: clap, ext4-view.
+                Stays small and synchronous — no HTTP client, no async runtime.
+
+elide-import/ — OCI import binary: pulls public OCI images from a container
+                registry, extracts a rootfs, converts to ext4, and calls
+                elide_core::import::import_image to ingest. Adds: tokio,
+                oci-client, ocirender. Heavy async deps are isolated here and
+                never pulled into the volume process.
+```
+
+The split keeps the volume process binary lean and focused. The async HTTP stack
+needed for OCI registry pulls belongs in tooling (`elide-import`), not in the
+process that serves block I/O. As the coordinator is built out, OCI import
+functionality will likely migrate there, with `elide-import` becoming a thin CLI
+wrapper around coordinator APIs.
+
 ## Directory layout
 
 All volume state lives under a shared root directory on a dedicated local NVMe mount. A **volume** is a named directory containing one or more **forks**. Each fork is a named subdirectory that maintains its own WAL, segments, and snapshot history. A fork with `wal/` present is live (writable); a fork without `wal/` is frozen or not yet started.
