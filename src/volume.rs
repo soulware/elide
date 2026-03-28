@@ -1786,6 +1786,100 @@ mod tests {
     }
 
     #[test]
+    fn fork_volume_uses_latest_snapshot_when_multiple_exist() {
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
+
+        let data_snap1 = vec![0x11u8; 4096];
+        let data_snap2 = vec![0x22u8; 4096];
+
+        let mut vol = Volume::open(&default_dir).unwrap();
+        // First snapshot — should NOT be the branch point.
+        vol.write(0, &data_snap1).unwrap();
+        let snap1 = vol.snapshot().unwrap().to_string();
+        // Second snapshot — should be the branch point.
+        vol.write(1, &data_snap2).unwrap();
+        let snap2 = vol.snapshot().unwrap().to_string();
+        drop(vol);
+
+        // snap2 must sort after snap1 (ULIDs are monotonically increasing).
+        assert!(snap2 > snap1);
+
+        let fork_dir = fork_volume(&vol_dir, "dev", "default").unwrap();
+        let origin = fs::read_to_string(fork_dir.join("origin")).unwrap();
+        assert_eq!(
+            origin.trim(),
+            format!("default/{snap2}"),
+            "origin should point to the latest snapshot"
+        );
+
+        // Fork branched from snap2 sees both pre-snap1 and pre-snap2 writes.
+        let vol = Volume::open(&fork_dir).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), data_snap1);
+        assert_eq!(vol.read(1, 1).unwrap(), data_snap2);
+
+        fs::remove_dir_all(vol_dir).unwrap();
+    }
+
+    #[test]
+    fn fork_volume_from_child_fork_creates_three_level_chain() {
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
+
+        let data_root = vec![0xAAu8; 4096];
+        let data_mid = vec![0xBBu8; 4096];
+        let data_leaf = vec![0xCCu8; 4096];
+
+        // Root fork: write + snapshot.
+        {
+            let mut vol = Volume::open(&default_dir).unwrap();
+            vol.write(0, &data_root).unwrap();
+            vol.snapshot().unwrap();
+        }
+
+        // Mid fork: branch from default, write + snapshot.
+        let mid_dir = fork_volume(&vol_dir, "mid", "default").unwrap();
+        {
+            let mut vol = Volume::open(&mid_dir).unwrap();
+            vol.write(1, &data_mid).unwrap();
+            vol.snapshot().unwrap();
+        }
+
+        // Leaf fork: branch from mid.
+        let leaf_dir = fork_volume(&vol_dir, "leaf", "mid").unwrap();
+
+        // origin chain: leaf → mid → default.
+        let leaf_origin = fs::read_to_string(leaf_dir.join("origin")).unwrap();
+        assert!(
+            leaf_origin.starts_with("mid/"),
+            "leaf origin: {leaf_origin}"
+        );
+        let mid_origin = fs::read_to_string(mid_dir.join("origin")).unwrap();
+        assert!(
+            mid_origin.starts_with("default/"),
+            "mid origin: {mid_origin}"
+        );
+
+        // Leaf sees data from all three levels.
+        let vol = Volume::open(&leaf_dir).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), data_root);
+        assert_eq!(vol.read(1, 1).unwrap(), data_mid);
+        assert_eq!(vol.read(2, 1).unwrap(), vec![0u8; 4096]); // unwritten
+
+        // Write to leaf does not affect mid or default.
+        drop(vol);
+        {
+            let mut vol = Volume::open(&leaf_dir).unwrap();
+            vol.write(2, &data_leaf).unwrap();
+        }
+        let vol = Volume::open(&leaf_dir).unwrap();
+        assert_eq!(vol.read(2, 1).unwrap(), data_leaf);
+        assert_eq!(vol.ancestor_count(), 2);
+
+        fs::remove_dir_all(vol_dir).unwrap();
+    }
+
+    #[test]
     fn fork_volume_errors_if_fork_exists() {
         let vol_dir = temp_dir();
         let default_dir = vol_dir.join("default");
