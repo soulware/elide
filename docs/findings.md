@@ -120,20 +120,33 @@ what is present gets touched at boot, but the raw footprint includes a large amo
 zero-padded ext4 blocks. The effective content — what must actually be transferred — is ~1.7 MB
 after compression.
 
-### Demand-fetch cost vs a full OCI pull
+### Cold-start cost vs a full OCI pull
 
-Ubuntu 24.04 OCI is a single layer of 27 MB compressed.
+Ubuntu 24.04 OCI is a single layer of 27 MB compressed. A `docker pull` downloads the full
+layer before the container can start. Elide fetches only the blocks read during boot; the
+rest of the image arrives lazily on demand as the workload touches it.
 
-| Scenario | Fetch cost |
+These are therefore measuring different things:
+
+- **OCI pull (27 MB):** full image on disk before start
+- **Elide fetch (1.7 MB cold / 0.3 MB warm):** blocks needed to reach a running shell; total
+  lifetime fetch will be higher as the workload accesses more of the image
+
+The relevant metric is **time-to-running-VM** — how much must be transferred before the
+instance is usable:
+
+| Scenario | Cold-start fetch |
 |---|---|
-| Full OCI pull (`docker pull`) | 27 MB |
-| Elide cold fetch (no cache) | 1.7 MB |
-| Elide warm fetch — jammy point release cached | 0.3 MB |
-| Elide warm fetch — jammy (cross-major) cached | 1.7 MB |
+| Full OCI pull (`docker pull`) | 27 MB (full layer, then start) |
+| Elide cold fetch (no prior cache) | 1.7 MB |
+| Elide warm fetch — point release cached | 0.3 MB |
+| Elide warm fetch — cross-major cached | 1.7 MB |
 
-Even from cold and with no prior version cached, Elide fetches **16× less** than a full image
-pull, because only the blocks read at boot are retrieved. The rest of the image is fetched
-lazily on demand.
+Even from cold, Elide reaches a running VM having fetched **16× less** than a full pull.
+The warm point-release case (**90× less**) is where the block-level cache compounds the
+demand-fetch savings. OCI layer caching (containerd/docker) does not help here — layers are
+whole-blob content-addressed, so a point-release update re-downloads the entire ~27 MB layer
+even if only a handful of packages changed.
 
 ### Point-release vs cross-major for OCI
 
