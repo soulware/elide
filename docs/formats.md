@@ -342,6 +342,8 @@ The first 32 bytes of the header (all fields except the 64-byte signature field)
 
 Signing at promotion rather than upload means every copy of the segment (`pending/`, `segments/`, S3) carries the same signature. The coordinator uploads the file unchanged; no re-signing step.
 
+Because the private key never leaves the host, **all segment writes for a fork — including GC-compacted and S3-repacked segments — happen on the fork's host**. GC always produces new segments (new ULIDs) rather than modifying existing ones; signed segments are read-only once written. Repacking is therefore a local operation: the coordinator may orchestrate what to repack, but the actual segment creation and signing runs on the host that owns the fork.
+
 **Segments written before key generation** (e.g. by `elide-import`) have an all-zero signature field. These are accepted locally but will be rejected on demand-fetch by a strict verifier. This is expected: imported base segments predate the fork keypair and are not covered by the single-writer guarantee.
 
 ### Verification
