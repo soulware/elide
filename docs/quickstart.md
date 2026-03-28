@@ -18,7 +18,7 @@ Binaries land in `target/debug/`.
 ## Import an OCI image
 
 ```sh
-./target/debug/elide-import ubuntu:22.04 /tmp/elide-test/ubuntu-22.04
+./target/debug/elide-import --image ubuntu:22.04 /tmp/elide-test/ubuntu-22.04
 ```
 
 This pulls the image, builds an ext4 rootfs, and writes a readonly base volume. On Apple Silicon it auto-selects `arm64`; use `--arch amd64` to override.
@@ -71,6 +71,8 @@ If you already have an ext4 image (e.g. extracted from a cloud image), use `--fr
 ```sh
 ./target/debug/elide-import --from-file ubuntu-22.04.ext4 /tmp/elide-test/ubuntu-22.04
 ```
+
+Note: `--image` and `--from-file` are mutually exclusive; `<vol_dir>` is always the positional argument.
 
 ## Other useful commands
 

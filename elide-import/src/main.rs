@@ -28,16 +28,17 @@ use tempfile::TempDir;
 #[derive(Parser)]
 #[command(about = "Import a readonly Elide volume from an OCI image or a raw ext4 file")]
 struct Args {
-    /// OCI image reference (e.g. ubuntu:22.04, ghcr.io/org/image:tag).
-    /// Mutually exclusive with --from-file.
-    image: Option<String>,
-
     /// Path to the volume directory to create (e.g. volumes/ubuntu-22.04)
     vol_dir: String,
 
+    /// OCI image reference (e.g. ubuntu:22.04, ghcr.io/org/image:tag).
+    /// Mutually exclusive with --from-file.
+    #[arg(long, conflicts_with = "from_file")]
+    image: Option<String>,
+
     /// Import a raw ext4 image directly, skipping OCI pull.
-    /// Mutually exclusive with the image positional argument.
-    #[arg(long, value_name = "PATH")]
+    /// Mutually exclusive with --image.
+    #[arg(long, value_name = "PATH", conflicts_with = "image")]
     from_file: Option<PathBuf>,
 
     /// Disk image size (e.g. 4G, 2048M). Auto-sized from unpacked rootfs if omitted.
@@ -61,22 +62,17 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     let vol_dir = Path::new(&args.vol_dir);
-
-    match (&args.image, &args.from_file) {
-        (Some(_), Some(_)) => {
-            bail!("--from-file and an image reference are mutually exclusive");
-        }
-        (None, None) => {
-            bail!("provide an OCI image reference or --from-file <path>");
+    match (args.image, args.from_file) {
+        (Some(image), None) => {
+            run_oci(&image, vol_dir, args.size.as_deref(), args.arch.as_deref()).await?;
         }
         (None, Some(ext4_path)) => {
-            run_from_file(ext4_path, vol_dir)?;
+            run_from_file(&ext4_path, vol_dir)?;
         }
-        (Some(image), None) => {
-            run_oci(image, vol_dir, args.size.as_deref(), args.arch.as_deref()).await?;
+        _ => {
+            bail!("provide --image <ref> or --from-file <path>");
         }
     }
-
     Ok(())
 }
 
