@@ -81,6 +81,11 @@ pub fn segment_key(volume_id: &str, fork_name: &str, ulid_str: &str) -> Result<S
 /// each successfully uploaded segment to `segments/`. Also uploads the fork's
 /// public key to `<volume_id>/<fork_name>/fork.pub` so that new hosts can
 /// verify fetched segments (trust-on-first-use).
+///
+/// `drain_pending` is a one-shot batch command. The key is re-uploaded on every
+/// invocation (idempotent, 32 bytes). A future persistent watcher will replace
+/// this: it uploads the key once at startup and then streams segments as they
+/// appear in `pending/`, making the per-invocation key upload unnecessary.
 pub async fn drain_pending(
     fork_dir: &Path,
     volume_id: &str,
