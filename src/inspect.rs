@@ -10,6 +10,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 use elide_core::{segment, writelog};
 
 use crate::ls;
@@ -29,6 +31,13 @@ pub fn run(dir: &Path) -> io::Result<()> {
     }
     if is_readonly {
         println!("Type:   readonly");
+    }
+    if let Some(meta) = read_meta(dir) {
+        let short_digest = meta.digest.get(7..19).unwrap_or(&meta.digest);
+        println!(
+            "Source: {}  (sha256:{})  {}",
+            meta.source, short_digest, meta.arch
+        );
     }
     println!();
 
@@ -465,6 +474,18 @@ fn print_fs_summary(fork_name: &str, summary: &ls::FsSummary) {
 }
 
 // --- helpers ---
+
+#[derive(Deserialize)]
+struct VolumeMeta {
+    source: String,
+    digest: String,
+    arch: String,
+}
+
+fn read_meta(dir: &Path) -> Option<VolumeMeta> {
+    let content = fs::read_to_string(dir.join("meta.toml")).ok()?;
+    toml::from_str(&content).ok()
+}
 
 fn read_size(dir: &Path) -> io::Result<Option<u64>> {
     match fs::read_to_string(dir.join("size")) {

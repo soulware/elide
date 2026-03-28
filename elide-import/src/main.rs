@@ -17,6 +17,7 @@ use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use oci_spec::image::{Arch, Os};
 use ocirender::{ImageSpec, LayerMeta, StreamingPacker};
+use serde::Serialize;
 use tempfile::TempDir;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -61,14 +62,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .parse()
         .with_context(|| format!("invalid image reference: {}", args.image))?;
     let client = Arc::new(Client::new(Default::default()));
-    let (manifest, _digest) = client
+    let (manifest, initial_digest) = client
         .pull_manifest(&reference, &RegistryAuth::Anonymous)
         .await
         .context("failed to pull manifest")?;
 
     // 2. Resolve to a single-platform image manifest
-    let image_manifest =
-        resolve_image_manifest(&client, &reference, manifest, &target_arch).await?;
+    let (image_manifest, digest) =
+        resolve_image_manifest(&client, &reference, manifest, initial_digest, &target_arch).await?;
     let n_layers = image_manifest.layers.len();
     eprintln!(
         "Image has {n_layers} layer(s), total compressed ~{} MiB",
@@ -126,6 +127,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }
     })?;
 
+    // 8. Write volume metadata
+    write_meta(vol_dir, &args.image, &digest, &target_arch.to_string())?;
+
     eprintln!("Done. Volume ready at {}", args.vol_dir);
     Ok(())
 }
@@ -137,14 +141,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
 /// If the manifest is already a single-image manifest, it is returned as-is.
 /// If it is an image index, the entry matching `linux/<target_arch>` is
 /// selected and its manifest is pulled by digest.
+/// Returns `(manifest, digest)` where `digest` is the sha256 digest of the
+/// resolved platform manifest — the canonical identifier for this specific image.
 async fn resolve_image_manifest(
     client: &Client,
     reference: &Reference,
     manifest: OciManifest,
+    digest: String,
     target_arch: &Arch,
-) -> anyhow::Result<OciImageManifest> {
+) -> anyhow::Result<(OciImageManifest, String)> {
     match manifest {
-        OciManifest::Image(m) => Ok(m),
+        OciManifest::Image(m) => Ok((m, digest)),
         OciManifest::ImageIndex(index) => {
             let entry = index
                 .manifests
@@ -161,11 +168,14 @@ async fn resolve_image_manifest(
                     )
                 })?;
 
+            // The entry digest is the digest of the platform-specific manifest.
+            let platform_digest = entry.digest.clone();
+
             let digest_ref_str = format!(
                 "{}/{}@{}",
                 reference.registry(),
                 reference.repository(),
-                entry.digest
+                platform_digest
             );
             let digest_ref: Reference = digest_ref_str.parse().with_context(|| {
                 format!("failed to construct digest reference: {digest_ref_str}")
@@ -177,7 +187,7 @@ async fn resolve_image_manifest(
                 .context("failed to pull platform manifest")?;
 
             match platform_manifest {
-                OciManifest::Image(m) => Ok(m),
+                OciManifest::Image(m) => Ok((m, platform_digest)),
                 OciManifest::ImageIndex(_) => bail!("nested image index is not supported"),
             }
         }
@@ -374,6 +384,26 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
         .parse()
         .with_context(|| format!("invalid size value: {num}"))?;
     Ok(n << shift)
+}
+
+// ── Volume metadata ───────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct VolumeMeta<'a> {
+    source: &'a str,
+    digest: &'a str,
+    arch: &'a str,
+}
+
+/// Write `meta.toml` to the volume root with OCI image provenance information.
+fn write_meta(vol_dir: &Path, source: &str, digest: &str, arch: &str) -> anyhow::Result<()> {
+    let meta = VolumeMeta {
+        source,
+        digest,
+        arch,
+    };
+    let content = toml::to_string(&meta).context("serialize meta.toml")?;
+    std::fs::write(vol_dir.join("meta.toml"), content).context("write meta.toml")
 }
 
 // ── Architecture helpers ──────────────────────────────────────────────────────
