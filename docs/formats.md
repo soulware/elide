@@ -248,10 +248,20 @@ Inline section size depends on the inline threshold and extent size distribution
 ### S3 object key
 
 ```
-s3://bucket/segments/<ULID>
+<volume_id>/<fork_name>/YYYYMMDD/<ulid>
 ```
 
-Segment ULIDs are globally unique and serve directly as S3 object keys. No path hierarchy needed — ULIDs are time-ordered so lexicographic sort gives chronological order.
+Keys are namespaced by volume and fork, with a date prefix derived from the ULID's embedded millisecond timestamp. The date is decoded and formatted as `YYYYMMDD` rather than taken from the ULID character prefix directly — the character prefix gives either ~3-day or ~2-hour buckets depending on how many characters are used, neither of which aligns with a calendar day. The date reflects segment creation time, not upload time, so keys are stable regardless of when `drain-pending` runs.
+
+Example key for a segment promoted in the `vm1` fork of volume `ubuntu-22.04`:
+```
+ubuntu-22.04/vm1/20260328/01KMTENX98EN5A20523Y2JC8N5
+```
+
+Benefits of this scheme:
+- `list <volume_id>/<fork_name>/` returns all segments for a fork regardless of age
+- `list <volume_id>/<fork_name>/YYYYMMDD/` returns all segments written on a given day — useful for GC audit and time-bounded operations
+- Volume and fork are visible directly in the key — no manifest lookup needed to identify ownership
 
 ### Retrieval strategies
 

@@ -23,22 +23,27 @@ A single **Elide coordinator** runs on each host and manages all volumes. It for
 
 ## Crate structure
 
-The repository is a Cargo workspace with three crates:
+The repository is a Cargo workspace with four crates:
 
 ```
-elide-core/   — shared library: segment format, WAL, LBA map, extent index,
-                volume read/write, and import_image(). Deps: blake3, zstd, ulid, libc.
-                No async, no network. Usable standalone.
+elide-core/        — shared library: segment format, WAL, LBA map, extent index,
+                     volume read/write, and import_image(). Deps: blake3, zstd,
+                     ulid, libc. No async, no network. Usable standalone.
 
-elide/        — volume process binary: NBD server, analysis tools (extents, inspect,
-                ls), and the import-volume CLI subcommand. Adds: clap, ext4-view.
-                Stays small and synchronous — no HTTP client, no async runtime.
+elide/             — volume process binary: NBD server, analysis tools (extents,
+                     inspect, ls), and the import-volume CLI subcommand. Adds:
+                     clap, ext4-view. Stays small and synchronous — no HTTP
+                     client, no async runtime.
 
-elide-import/ — OCI import binary: pulls public OCI images from a container
-                registry, extracts a rootfs, converts to ext4, and calls
-                elide_core::import::import_image to ingest. Adds: tokio,
-                oci-client, ocirender. Heavy async deps are isolated here and
-                never pulled into the volume process.
+elide-import/      — OCI import binary: pulls public OCI images from a container
+                     registry, extracts a rootfs, converts to ext4, and calls
+                     elide_core::import::import_image to ingest. Adds: tokio,
+                     oci-client, ocirender. Heavy async deps isolated here.
+
+elide-coordinator/ — coordinator binary: segment upload and object store
+                     lifecycle. Adds: tokio, object_store (S3 and local
+                     filesystem backends). Currently implements drain-pending;
+                     will grow to own GC scheduling and volume supervision.
 ```
 
 The split keeps the volume process binary lean and focused. The async HTTP stack

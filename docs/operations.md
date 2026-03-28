@@ -1,6 +1,34 @@
 # Operations
 
-Ongoing system behaviour: garbage collection, repacking, and filesystem metadata awareness.
+Ongoing system behaviour: S3 upload, garbage collection, repacking, and filesystem metadata awareness.
+
+## S3 Upload
+
+Segments accumulate in `pending/` after WAL promotion (see [formats.md](formats.md) for the promotion commit sequence). The coordinator is responsible for uploading them to the object store and moving them to `segments/` on success. Each segment is handled independently — a failure on one does not block the others.
+
+**`drain-pending`** is the current upload mechanism. It is a one-shot command that scans `pending/`, uploads each segment, and exits. It is invoked explicitly rather than running as a daemon, which gives direct control over when uploads occur during testing and development:
+
+```
+elide-coordinator drain-pending <fork-dir>
+```
+
+Store selection:
+- `--local <path>` — use a local directory as the object store (no server needed; useful for testing)
+- default — use S3 via environment variables: `ELIDE_S3_BUCKET`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+
+The `object_store` crate is used for all store access, which provides a uniform interface across local filesystem, S3, GCS, and Azure backends. Switching from a local store to S3 or Tigris is a configuration change, not a code change.
+
+**Upload commit sequence per segment:**
+1. Read `pending/<ulid>` into memory
+2. PUT to object store at key `<volume_id>/<fork_name>/YYYYMMDD/<ulid>`
+3. On success: rename `pending/<ulid>` → `segments/<ulid>` (atomic commit)
+4. On failure: leave in `pending/`, record error, continue with remaining segments
+
+The rename in step 3 is the local commit point. If the coordinator crashes between steps 2 and 3, the object is in S3 but the segment is still in `pending/` — a retry will re-PUT (idempotent) and then rename. No ledger file is needed.
+
+**Exit code:** non-zero if any segment failed to upload. Segments that succeeded are committed regardless — the exit code signals that a re-run is needed for the remainder.
+
+**GC and upload ordering:** see the GC section below for the required sequencing between GC and upload when both operate on `pending/` segments.
 
 ## GC and Repacking
 
