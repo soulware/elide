@@ -50,6 +50,11 @@ struct Args {
     /// Ignored when using --from-file.
     #[arg(long)]
     arch: Option<String>,
+
+    /// Save the intermediate flat ext4 image to this path (for boot-trace analysis).
+    /// Only valid with --image; ignored with --from-file (the file is already flat).
+    #[arg(long, value_name = "PATH")]
+    save_flat: Option<PathBuf>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -64,7 +69,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let vol_dir = Path::new(&args.vol_dir);
     match (args.image, args.from_file) {
         (Some(image), None) => {
-            run_oci(&image, vol_dir, args.size.as_deref(), args.arch.as_deref()).await?;
+            run_oci(
+                &image,
+                vol_dir,
+                args.size.as_deref(),
+                args.arch.as_deref(),
+                args.save_flat.as_deref(),
+            )
+            .await?;
         }
         (None, Some(ext4_path)) => {
             run_from_file(&ext4_path, vol_dir)?;
@@ -103,6 +115,7 @@ async fn run_oci(
     vol_dir: &Path,
     size: Option<&str>,
     arch: Option<&str>,
+    save_flat: Option<&Path>,
 ) -> anyhow::Result<()> {
     let target_arch = arch.map(parse_arch).unwrap_or_else(host_arch);
 
@@ -176,7 +189,17 @@ async fn run_oci(
         }
     })?;
 
-    // 8. Write volume metadata
+    // 8. Optionally save flat ext4 for boot-trace analysis
+    if let Some(dst) = save_flat {
+        save_flat_image(&ext4_path, dst)?;
+        eprintln!(
+            "Flat ext4 saved to {} ({:.1} GiB)",
+            dst.display(),
+            std::fs::metadata(dst)?.len() as f64 / (1 << 30) as f64
+        );
+    }
+
+    // 9. Write volume metadata
     write_meta(vol_dir, image, &digest, &target_arch.to_string())?;
 
     eprintln!("Done. Volume ready at {}", vol_dir.display());
@@ -379,6 +402,22 @@ fn try_genext2fs(rootfs: &str, output: &str, size_bytes: u64) -> anyhow::Result<
         .context("run genext2fs")?;
     if !status.success() {
         bail!("genext2fs exited with {status}");
+    }
+    Ok(())
+}
+
+// ── Flat image export ─────────────────────────────────────────────────────────
+
+/// Move or copy the flat ext4 image to `dst`.
+///
+/// Tries a rename first (free if on the same filesystem); falls back to a full
+/// copy if the source and destination are on different filesystems.
+fn save_flat_image(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).context("create output directory")?;
+    }
+    if std::fs::rename(src, dst).is_err() {
+        std::fs::copy(src, dst).with_context(|| format!("copy flat ext4 to {}", dst.display()))?;
     }
     Ok(())
 }

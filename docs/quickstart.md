@@ -74,6 +74,36 @@ If you already have an ext4 image (e.g. extracted from a cloud image), use `--fr
 
 Note: `--image` and `--from-file` are mutually exclusive; `<vol_dir>` is always the positional argument.
 
+## Boot-trace analysis on an OCI-derived volume
+
+To measure what fraction of an OCI image is actually read during a VM boot, retain the intermediate flat ext4 at import time:
+
+```sh
+./target/debug/elide-import --image ubuntu:22.04 /tmp/elide-test/ubuntu-22.04 \
+    --save-flat /tmp/ubuntu-22.04.ext4
+```
+
+Then serve it under the tracing NBD server and boot a VM:
+
+```sh
+./target/debug/elide serve /tmp/ubuntu-22.04.ext4 --save-trace /tmp/ubuntu-22.04.trace
+```
+
+(Boot the VM with `--drive file=nbd://127.0.0.1:10809,format=raw,if=virtio` or use `nbd-client` + QEMU direct kernel boot — see [vm-boot.md](vm-boot.md).)
+
+Disconnect the VM and the trace is written. To compare two OCI versions (e.g. estimate delta-fetch cost when upgrading):
+
+```sh
+# Import the newer version
+./target/debug/elide-import --image ubuntu:24.04 /tmp/elide-test/ubuntu-24.04 \
+    --save-flat /tmp/ubuntu-24.04.ext4
+
+# Cross-image cold-boot analysis: how much data must be fetched if you already
+# have ubuntu:22.04 blocks cached?
+./target/debug/elide cold-boot /tmp/ubuntu-22.04.ext4 /tmp/ubuntu-24.04.ext4 \
+    --trace /tmp/ubuntu-22.04.trace
+```
+
 ## Other useful commands
 
 ```sh
