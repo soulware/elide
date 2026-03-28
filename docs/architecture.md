@@ -128,7 +128,7 @@ Volume process  (one per volume)
       ▼
 Coordinator (main process)
  ├─ Volume supervisor  (spawn/re-adopt volume processes)
- ├─ GC / segment packer  (compacts live leaf segments; never touches frozen ancestors)
+ ├─ GC / segment packer  (compacts post-snapshot segments only; floor = latest snapshot ULID)
  └─ S3 uploader  (async, not on write critical path)
 ```
 
@@ -319,7 +319,7 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 |------|------------|
 | **Volume** | A named collection of forks stored under a common base directory. Identified by name (e.g. `myvm`). |
 | **Fork** | A named, independently live line of work within a volume. A fork has its own WAL, pending segments, and checkpoint history. Names are unique within a volume. User forks live under `forks/`. |
-| **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a fork's committed segment sequence. The ULID gives the position: all segments in `segments/` with ULID ≤ the snapshot ULID are part of that snapshot. The file content is empty or an optional human-readable name. |
+| **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a fork's committed segment sequence. The ULID gives the position: all segments with ULID ≤ the snapshot ULID are part of that snapshot. The latest snapshot ULID also serves as the **compaction floor** — segments at or below it are frozen and will never be compacted. The file content is empty or an optional human-readable name. |
 | **Readonly volume** | A volume with `readonly = true` in its `meta.toml`. It is a template: its `base/` directory holds the frozen data populated by import (no `wal/`). It cannot be served directly. Named forks are created under `forks/` and are fully writable. `forks/` is absent until the first fork is taken. |
 | **Export** | A squash-and-detach operation that produces a new self-contained volume from a fork, with no ancestry dependencies. |
 
@@ -375,8 +375,24 @@ Import is handled by the separate `elide-import` binary (OCI pull → ext4 → v
 
 `<base>` defaults to `ELIDE_VOLUMES_DIR` if set, otherwise `~/.local/share/elide/volumes`. Commands that accept `<vol-dir>` use this default unless an explicit path is given.
 
+### Compaction
+
+Compaction reclaims space in a fork by rewriting segments that contain a high proportion of overwritten (dead) data. The compaction algorithm:
+
+1. Compute the live hash set from the fork's current LBA map.
+2. Determine the **compaction floor** = max ULID across all files in `snapshots/` (none if no snapshots exist).
+3. For each segment in `pending/` and `segments/` with ULID **> floor**:
+   - Count total and live bytes (DATA entries only; DEDUP_REF entries have no body bytes).
+   - If `live_bytes / total_bytes ≥ min_live_ratio`, skip.
+   - Otherwise: read live entries' bodies, write a new denser segment to `pending/<new-ulid>`, update the extent index, delete the old segment.
+4. Segments with ULID **≤ floor** are never touched — they are frozen by the latest snapshot.
+
+The floor ensures segments readable by child forks are never modified or deleted. Any fork that branched from this fork at snapshot ULID S uses ancestor segments with ULID ≤ S ≤ floor. Repacked segments always receive new (higher) ULIDs, landing above the floor — no existing child fork's ancestry walk will include them.
+
+`pending/` and `segments/` encode S3 upload status, not GC eligibility. The compaction floor applies to both.
+
+The `compact-volume` CLI command triggers compaction with a configurable `--min-live-ratio` threshold (default 0.7).
+
 ### Open questions
 
-1. **GC across forks.** Segments in an ancestor fork's `segments/` may be referenced by any fork that branched from a snapshot within that ancestor. GC must not remove a segment if any living fork's `origin` chain passes through it. The exact GC protocol for multi-fork volumes is not yet designed.
-
-2. **Rollback within a fork.** Not yet designed. Two candidate approaches: (a) discard segments and WAL above target snapshot ULID in-place; (b) fork from the target snapshot and rename.
+1. **Rollback within a fork.** Not yet designed. Two candidate approaches: (a) discard segments and WAL above target snapshot ULID in-place; (b) fork from the target snapshot and rename.

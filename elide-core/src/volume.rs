@@ -384,6 +384,13 @@ impl Volume {
         let live: HashSet<blake3::Hash> = self.lbamap.live_hashes();
         let mut stats = CompactionStats::default();
 
+        // Segments at or below the latest snapshot ULID are frozen: they may be
+        // referenced by child forks that branched from a snapshot in this fork.
+        // Only post-snapshot segments are eligible for compaction.
+        let floor: Option<Ulid> = latest_snapshot(&self.base_dir)?
+            .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
+            .transpose()?;
+
         let mut all_segs = segment::collect_segment_files(&self.base_dir.join("pending"))?;
         all_segs.extend(segment::collect_segment_files(
             &self.base_dir.join("segments"),
@@ -394,9 +401,14 @@ impl Volume {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| io::Error::other("bad segment filename"))?;
-            let seg_id = Ulid::from_string(seg_id)
-                .map_err(|e| io::Error::other(e.to_string()))?
-                .to_string();
+            let seg_id = Ulid::from_string(seg_id).map_err(|e| io::Error::other(e.to_string()))?;
+
+            // Skip segments frozen by the latest snapshot.
+            if floor.is_some_and(|f| seg_id <= f) {
+                continue;
+            }
+
+            let seg_id = seg_id.to_string();
 
             let (body_section_start, mut entries) = segment::read_segment_index(&seg_path)?;
 
@@ -1470,6 +1482,68 @@ mod tests {
         // Strict threshold: compact anything with any dead bytes.
         let stats = vol.compact(1.0).unwrap();
         assert_eq!(stats.segments_compacted, 1);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compact_does_not_touch_pre_snapshot_segments() {
+        // Write and overwrite a block, then snapshot. The dead segment is
+        // pre-snapshot and must not be compacted — it is frozen by the floor.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Snapshot freezes both segments (floor = latest segment ULID).
+        vol.snapshot().unwrap();
+
+        // Even with a strict threshold the pre-snapshot segments must be skipped.
+        let stats = vol.compact(1.0).unwrap();
+        assert_eq!(
+            stats.segments_compacted, 0,
+            "pre-snapshot segments must not be compacted"
+        );
+
+        // Data still readable.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compact_only_touches_post_snapshot_segments() {
+        // Pre-snapshot dead segment: frozen. Post-snapshot dead segment: compactable.
+        let base = temp_dir();
+        let mut vol = Volume::open(&base).unwrap();
+
+        // Pre-snapshot: write and overwrite LBA 0.
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        vol.snapshot().unwrap();
+
+        // Post-snapshot: write and overwrite LBA 1.
+        vol.write(1, &vec![0x33u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(1, &vec![0x44u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // One pre-snapshot dead segment (frozen) + one post-snapshot dead segment (eligible).
+        let stats = vol.compact(1.0).unwrap();
+        assert_eq!(
+            stats.segments_compacted, 1,
+            "exactly the post-snapshot dead segment should be compacted"
+        );
+
+        // Both LBAs read back correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0x44u8; 4096]);
 
         fs::remove_dir_all(base).unwrap();
     }
