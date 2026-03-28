@@ -30,6 +30,8 @@ Key design decisions:
 
 **Next: segment eviction.** `segments/` is now a cache tier but has no size cap. A simple policy: scan `segments/` by `mtime` (touched on fetch), evict oldest when total size exceeds a configured cap. Only `segments/` files are evictable — `pending/` files must never be removed (they are not yet in S3).
 
+**Phase-1 simplification: whole-segment fetching.** The current `ObjectStoreFetcher` downloads an entire segment file on cache miss. The documented design intent (`architecture.md` §Read Path) is chunk-granular fetching: 1MB-aligned byte-range GETs covering only the needed extents, with spatial neighbours included for locality. The phase-1 whole-segment fetch is correct and safe but wastes bandwidth when only a few extents within a large segment are needed. The extent-granular path requires a chunk cache with its own format — see Open Questions below.
+
 ---
 
 ## Open Questions
@@ -46,3 +48,4 @@ Key design decisions:
 - **Boot hint ordering:** record LBA access sequence with timestamps (not just a set) to enable priority-ordered prefetch — see nydus NRI optimizer elapsed-time approach.
 - **Empirical validation of repacking benefit:** measure segment fetch count before and after access-pattern-driven repacking.
 - **ublk integration:** Linux-only, io_uring-based. NBD is the dev/test frontend; ublk is the production target.
+- **Local chunk cache format for extent-granular fetching:** the documented read path fetches 1MB-aligned chunks via byte-range GET (matching the lsvd reference implementation), but a local format for storing partially-fetched segments does not yet exist. Three options: (1) **lsvd approach** — a single mmap'd flat file keyed by `(segment_id, chunk_number)` with an in-memory LRU; simple, no partial-presence tracking, but session-scoped (lost on restart); (2) **sidecar presence bitmap** — keep whole-segment files in `segments/`, add a `<ulid>.chunks` sidecar bitset marking which 1MB chunks are locally present; persistent, two files per partial segment; (3) **chunk directory** — `chunks/<segment_id>/<chunk_number>` files; persistent, many small files. The lsvd RangeCache (option 1) is the reference point: it avoids per-file overhead, uses mmap for zero-copy reads on cache hit, and evicts by overwriting the oldest chunk's slot in the flat file. The session-scoped nature is a tradeoff: no persistence overhead, but a restart requires re-fetching all chunks. Evaluate after eviction is working and cache hit rates are measurable.
