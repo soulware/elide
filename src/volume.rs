@@ -1855,4 +1855,167 @@ mod tests {
 
         fs::remove_dir_all(vol_dir).unwrap();
     }
+
+    // --- ULID cutoff tests ---
+
+    /// Segments written to an ancestor fork *after* the branch point must not
+    /// be visible to a child fork.  This is the core correctness property of
+    /// the per-ancestor ULID cutoff stored in `origin`.
+    #[test]
+    fn ulid_cutoff_hides_post_branch_ancestor_writes() {
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
+
+        let pre_branch = vec![0xAAu8; 4096];
+        let post_branch = vec![0xBBu8; 4096];
+
+        // Write pre-branch data to ancestor, snapshot, then branch.
+        {
+            let mut vol = Volume::open(&default_dir).unwrap();
+            vol.write(0, &pre_branch).unwrap();
+            vol.snapshot().unwrap();
+        }
+        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
+
+        // Write post-branch data to the ancestor fork at LBA 1 (a new LBA).
+        {
+            let mut vol = Volume::open(&default_dir).unwrap();
+            vol.write(1, &post_branch).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+
+        // Child must see pre-branch data at LBA 0 and zeros at LBA 1.
+        let vol = Volume::open(&child_dir).unwrap();
+        assert_eq!(
+            vol.read(0, 1).unwrap(),
+            pre_branch,
+            "pre-branch data must be visible"
+        );
+        assert_eq!(
+            vol.read(1, 1).unwrap(),
+            vec![0u8; 4096],
+            "post-branch ancestor write must be invisible"
+        );
+
+        fs::remove_dir_all(vol_dir).unwrap();
+    }
+
+    /// A post-branch write to an ancestor that *overwrites* a pre-branch LBA
+    /// must also be invisible — the child must still see the original value.
+    #[test]
+    fn ulid_cutoff_overwrite_stays_invisible() {
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
+
+        let original = vec![0xAAu8; 4096];
+        let overwrite = vec![0xBBu8; 4096];
+
+        {
+            let mut vol = Volume::open(&default_dir).unwrap();
+            vol.write(0, &original).unwrap();
+            vol.snapshot().unwrap();
+        }
+        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
+
+        // Ancestor overwrites LBA 0 after the branch.
+        {
+            let mut vol = Volume::open(&default_dir).unwrap();
+            vol.write(0, &overwrite).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+
+        // Child must still see the original pre-branch value.
+        let vol = Volume::open(&child_dir).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), original);
+
+        fs::remove_dir_all(vol_dir).unwrap();
+    }
+
+    // --- ReadonlyVolume tests ---
+
+    #[test]
+    fn readonly_volume_unwritten_returns_zeros() {
+        let vol_dir = temp_dir();
+        let fork_dir = vol_dir.join("default");
+        // Create the directory structure without a WAL (simulating a readonly base).
+        fs::create_dir_all(fork_dir.join("segments")).unwrap();
+        fs::create_dir_all(fork_dir.join("pending")).unwrap();
+
+        let rv = ReadonlyVolume::open(&fork_dir).unwrap();
+        assert_eq!(rv.read(0, 1).unwrap(), vec![0u8; 4096]);
+
+        fs::remove_dir_all(vol_dir).unwrap();
+    }
+
+    #[test]
+    fn readonly_volume_reads_committed_segment() {
+        let vol_dir = temp_dir();
+        let fork_dir = vol_dir.join("default");
+
+        let data = vec![0xCCu8; 4096];
+
+        // Write data into the fork via Volume, then drop the lock.
+        {
+            let mut vol = Volume::open(&fork_dir).unwrap();
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+        // Remove wal/ so ReadonlyVolume::open doesn't see a live WAL.
+        // (ReadonlyVolume intentionally skips WAL replay; this also tests the
+        //  no-WAL path.)
+        fs::remove_dir_all(fork_dir.join("wal")).unwrap();
+
+        let rv = ReadonlyVolume::open(&fork_dir).unwrap();
+        assert_eq!(rv.read(0, 1).unwrap(), data);
+
+        fs::remove_dir_all(vol_dir).unwrap();
+    }
+
+    #[test]
+    fn readonly_volume_reads_ancestor_data() {
+        let vol_dir = temp_dir();
+        let default_dir = vol_dir.join("default");
+
+        let ancestor_data = vec![0xDDu8; 4096];
+
+        // Write data into default, snapshot, fork.
+        {
+            let mut vol = Volume::open(&default_dir).unwrap();
+            vol.write(0, &ancestor_data).unwrap();
+            vol.snapshot().unwrap();
+        }
+        let child_dir = fork_volume(&vol_dir, "child", "default").unwrap();
+        // Drop child lock so ReadonlyVolume can open it without conflict.
+        // (ReadonlyVolume doesn't take a write lock, so this always works.)
+
+        let rv = ReadonlyVolume::open(&child_dir).unwrap();
+        assert_eq!(rv.read(0, 1).unwrap(), ancestor_data);
+
+        fs::remove_dir_all(vol_dir).unwrap();
+    }
+
+    #[test]
+    fn readonly_volume_does_not_see_wal_records() {
+        let vol_dir = temp_dir();
+        let fork_dir = vol_dir.join("default");
+
+        let committed = vec![0xEEu8; 4096];
+        let in_wal = vec![0xFFu8; 4096];
+
+        // Write and promote LBA 0, then write LBA 1 to the WAL only.
+        let mut vol = Volume::open(&fork_dir).unwrap();
+        vol.write(0, &committed).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(1, &in_wal).unwrap();
+        // Do NOT promote — LBA 1 is only in the WAL.
+        // Drop the writable volume so the lock is released.
+        drop(vol);
+
+        // ReadonlyVolume skips WAL replay: LBA 1 must appear as zeros.
+        let rv = ReadonlyVolume::open(&fork_dir).unwrap();
+        assert_eq!(rv.read(0, 1).unwrap(), committed);
+        assert_eq!(rv.read(1, 1).unwrap(), vec![0u8; 4096]);
+
+        fs::remove_dir_all(vol_dir).unwrap();
+    }
 }

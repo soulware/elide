@@ -23,57 +23,64 @@ A single **Elide coordinator** runs on each host and manages all volumes. It for
 
 ## Directory layout
 
-All volume state lives under a shared root directory on a dedicated local NVMe mount. **The directory tree is the snapshot tree**: each node is a volume state at a point in time. A node containing `wal/` is a live (writable) leaf. A node without `wal/` is frozen (read-only). The parent chain is the directory ancestry — no manifest is needed to traverse it.
+All volume state lives under a shared root directory on a dedicated local NVMe mount. A **volume** is a named directory containing one or more **forks**. Each fork is a named subdirectory that maintains its own WAL, segments, and snapshot history. A fork with `wal/` present is live (writable); a fork without `wal/` is frozen or not yet started.
 
-**Before any snapshot is taken**, the root node is the live leaf:
+**Writable volume:**
 
 ```
-/var/lib/elide/
-  volumes/
-    <volume-id>/                  — root node; also the live leaf initially
-      wal/                        — live: write target
+/var/lib/elide/volumes/
+  myvm/                          — volume "myvm"
+    size                         — volume size in bytes (plain text)
+    default/                     — default fork (live)
+      wal/                       — present = live; write target
+      pending/                   — segments awaiting promotion
+      segments/                  — committed segment files
+      snapshots/
+        <ulid-1>                 — marker file (empty, or optional name)
+        <ulid-2>
+    dev/                         — named fork branched from default
+      wal/
       pending/
       segments/
-  service.sock
+      origin                     — text: "<fork-name>/<ulid>" (branch point)
+      snapshots/
+        <ulid-3>
+  service.sock                   — Unix socket at a stable, known path
 ```
 
-**After snapshots have been taken**, the root becomes a frozen ancestor and live work continues in descendant nodes:
+**Readonly volume** (e.g. a shared base image):
 
 ```
-/var/lib/elide/
-  volumes/
-    <volume-id>/                  — root node; frozen after first snapshot()
+  ubuntu-22.04/
+    readonly                     — plain file: marks volume as readonly
+    size
+    default/                     — frozen base populated by import (no wal/)
       segments/
-      children/                   — created when snapshot() is first called
-        <snap-ulid>/              — child node; frozen after next snapshot()
-          segments/
-          pending/                — may be present: segments awaiting S3 upload
-          children/
-            <snap-ulid>/          — grandchild node; live leaf
-              segments/
-              wal/                — live: current write target
-              pending/
-            <fork-ulid>/          — another live fork from the same parent
-              segments/
-              wal/
-              pending/
-  service.sock                    — Unix socket at a stable, known path
+      pending/
+      snapshots/
+        <import-ulid>
+    server-1/                    — named fork branched from default (live)
+      wal/
+      pending/
+      segments/
+      origin                     — "default/<import-ulid>"
+      snapshots/
 ```
 
 **Invariants:**
-- `wal/` present → live leaf; exactly one process writes here (enforced by `volume.lock`)
-- `wal/` absent → frozen; contents are immutable
-- `pending/` is always present in a live node; frozen nodes may also retain `pending/` while segments await S3 upload
-- `children/` is created lazily by the first `snapshot()` call; absent on nodes that have never been snapshotted
-- All ancestor nodes of a live leaf are frozen and shared across all sibling forks; GC must not modify them
+- `wal/` present → fork is live; exactly one process writes here (enforced by `volume.lock`)
+- `wal/` absent → fork is frozen or not yet started; cannot be served writably
+- `origin` is present only on non-default forks; its value is `<fork-name>/<ulid>` recording the branch point
+- `snapshots/<ulid>` is a plain marker file; the ULID sorts after all segments present at snapshot time, giving a stable branch point
+- `readonly` at the volume root blocks direct serving of `default/` and prevents it from acquiring a WAL
+- Fork names `default`, `readonly`, and `size` are reserved; other names are user-chosen
+- `children/` is not used; forks are named siblings, not anonymous `children/<ulid>/` descendants
 
-**Finding live volumes:** scan for directories containing `wal/`. Each such directory is an independently running volume process.
+**Finding live forks:** scan for fork directories containing `wal/`.
 
-**Exclusive access:** each live node holds an exclusive `flock` on `<node>/volume.lock` for the lifetime of the volume process. Attempting to open a node whose lock is already held fails immediately — no two processes can write to the same node. The lock is released when the process exits or calls `snapshot()` (which transfers the lock to the child atomically: the child lock is acquired before the old one is released).
+**Exclusive access:** a live fork holds an exclusive `flock` on `<fork-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked fork fails immediately.
 
-**Opening a frozen node:** `Volume::open` on a frozen node (one where `children/` already exists) automatically creates a new child node and opens that instead. The caller always gets a live, writable node; the actual path may differ from the one passed in. This is the correct behaviour for forks: the frozen node is the shared base, and each caller gets an independent live descendant.
-
-**Finding a volume's ancestry:** walk up from the live leaf, stepping up two directory levels at each hop (the node directory, then `children/`). Each ancestor node is a frozen snapshot layer; its `segments/` and `pending/` contribute to the LBA map via layer merging (ancestors first, descendants shadow).
+**Fork ancestry:** a non-default fork's `origin` file names its parent fork and the branch-point snapshot ULID. `walk_ancestors` follows this chain to the root, building an oldest-first list of ancestor layers. Segments in each ancestor fork are included only up to the branch-point ULID — post-branch writes to an ancestor fork are not visible in derived forks.
 
 ```
 VM
@@ -158,9 +165,9 @@ The LBA map is optionally persisted to a local `lba.map` file on clean shutdown 
 **Freshness guard:** the file includes a BLAKE3 hash of the sorted list of all current local segment IDs (own + ancestors). On startup, if the guard matches the current segment list, the cached LBA map is loaded directly without scanning segment index sections. If the guard doesn't match (new segments were written, or ancestry changed), the LBA map is rebuilt from scratch.
 
 **Rebuild procedure:**
-1. Walk the directory tree from the root ancestor to the live node
-2. For each node, scan its `segments/` and `pending/` segment files
-3. Read each segment's index section; apply LBA entries to the map (later layers take precedence for any overlapping LBA range)
+1. Follow the `origin` chain from the fork to the root, collecting ancestor layers (oldest first)
+2. For each ancestor fork: scan `segments/` and `pending/` in ULID order, stopping at the branch-point ULID stored in the child's `origin`
+3. For the current fork: scan all of `segments/` and `pending/`
 4. Replay the current WAL on top (WAL entries are the most recent writes)
 
 Since segment index sections are the ground truth for segment contents, rebuilding the LBA map requires only index sections and the WAL — never the segment data bodies. A full startup rebuild for a volume with 100 segments across its ancestry is a scan of ~6–200KB per segment index section, not 3GB of segment bodies.
@@ -274,16 +281,7 @@ The client picks based on economics — bandwidth, request latency, cache state 
 
 Delta compression collapses this flexibility: reconstruction always requires fetching both source and delta, then applying a CPU transform. The data is not directly addressable. Sparse also composes cleanly with the boot-hint repacking optimisation: repacked segments co-locate extents contiguously for efficient byte-range fetches, and sparse preserves that property since all data remains raw bytes at fixed offsets. Delta compression complicates repacking because moving a source extent can invalidate dependent deltas.
 
-## Proposed: Named Forks and Volume Addressing
-
-> **Status: design proposal — not yet implemented.** The current implementation uses the `children/<ulid>/` nesting model described in the Snapshots section below. This section describes the intended replacement — including readonly volumes, which are only defined for the Named Forks model.
->
-> **Changes from current implementation:**
-> - `children/<ulid>/` nesting is removed; forks are named sibling directories within the volume
-> - `snapshot()` no longer freezes the current node and moves to a child; it writes a marker file and the fork stays live in place
-> - `walk_ancestors` reads `origin` files instead of detecting the `children/` directory pattern
-> - `rebuild_segments` / `rebuild` (extent index) gain a per-ancestor ULID cutoff so that only segments up to the branch point are included from each ancestor fork
-> - The `readonly` marker and the import path are new; no equivalent exists in the current implementation
+## Named Forks and Volume Addressing
 
 ### Concepts
 
@@ -294,61 +292,6 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 | **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a fork's committed segment sequence. The ULID gives the position: all segments in `segments/` with ULID ≤ the snapshot ULID are part of that snapshot. The file content is empty or an optional human-readable name. |
 | **Readonly volume** | A volume flagged with a `readonly` marker at creation time. Its `default` fork is populated by an import (no `wal/`) and cannot be served directly. Named forks branch from it and are fully writable. |
 | **Export** | A squash-and-detach operation that produces a new self-contained volume from a fork, with no ancestry dependencies. |
-
-### Directory layout
-
-**Writable volume:**
-
-```
-<base>/                          ← shared volumes root (e.g. /var/lib/elide/volumes or ~/.local/share/elide/volumes)
-  myvm/                          ← volume "myvm"
-    default/                     ← default fork (live)
-      wal/                       ← present = live
-      pending/                   ← segments awaiting promotion to segments/
-      segments/                  ← committed segment files, ordered by ULID
-      snapshots/
-        <ulid-1>                 ← marker file: empty, or contains optional human-readable name
-        <ulid-2>
-    dev/                         ← named fork (live), branched from default
-      wal/
-      pending/
-      segments/
-      origin                     ← text file: "<fork-name>/<ulid>" (branch point)
-      snapshots/
-        <ulid-3>
-```
-
-**Readonly volume:**
-
-```
-  ubuntu-22.04/                  ← readonly volume
-    readonly                     ← plain file: explicit readonly flag; no direct serving allowed
-    default/                     ← frozen base populated by import (no wal/)
-      segments/
-      pending/
-      snapshots/
-        <import-ulid>            ← single marker written at end of import
-    server-1/                    ← named fork branched from default (live)
-      wal/
-      pending/
-      segments/
-      origin                     ← "default/<import-ulid>"
-      snapshots/
-    dev-test/                    ← another named fork (live)
-      wal/
-      pending/
-      segments/
-      origin                     ← "default/<import-ulid>"
-```
-
-**Invariants:**
-- A live fork has `wal/` present. The default fork of a readonly volume has no `wal/` — it is populated by an import and never written to directly.
-- A snapshot marker `snapshots/<ulid>` is a plain file whose name is a ULID. The ULID is generated after the WAL flush, so it sorts after all segments present at snapshot time. Content is empty or a single line with an optional human-readable name.
-- Taking a snapshot requires only that the WAL be flushed (producing a segment in `pending/`). S3 upload is not required — that is an async durability concern.
-- `origin` is present only on non-default forks. Its value is `<fork-name>/<ulid>` identifying the snapshot within the parent fork where this fork branched.
-- `readonly` at the volume root is a plain file (content ignored). It blocks `serve-volume` on `default` and prevents any direct write to `default`. Named forks of a readonly volume are fully writable.
-- Fork names are unique within a volume. Volume names are unique within a base directory.
-- `children/` is not present in this layout. It belongs to the old implementation model.
 
 ### Ancestry walk
 
@@ -362,28 +305,30 @@ The per-ancestor ULID cutoff is what prevents a concurrently-written ancestor fo
 
 ### Operations
 
-```
-elide serve-volume <vol-dir> [--fork <name>]   # serve a fork (default: "default")
-                                                # errors if volume is readonly and fork is "default"
+Implemented:
 
-elide snapshot-volume <vol-dir> [--fork <name>]  # checkpoint a fork; fork stays live
+```
+elide serve-volume <fork-dir> [--readonly]     # serve a fork over NBD; --readonly required
+                                                # for forks without a live WAL
+
+elide snapshot-volume <fork-dir>               # checkpoint a fork; fork stays live
 
 elide fork-volume <vol-dir> <fork-name> [--from <source-fork>]
-                                                # implicitly snapshot source fork (default: "default"),
-                                                # then create <fork-name> branched from it
+                                                # create <fork-name> branched from the latest
+                                                # snapshot of source fork (default: "default")
 
+elide list-forks <vol-dir>                     # list all named forks in a volume
+
+elide inspect-volume <dir>                     # human-readable summary of a fork or volume
+```
+
+Not yet implemented:
+
+```
 elide create-readonly-volume <vol-dir> --size <size>
-                                                # create a readonly volume; populate default/ via import
-
-elide import-volume <vol-dir> <image-path>      # write image data into a readonly volume's default fork,
-                                                # then write the import snapshot marker
-
-elide list-forks <vol-dir>                      # all named forks in a volume
-elide list-snapshots <vol-dir> [--fork <name>]  # snapshot history for a fork
-
+elide import-volume <vol-dir> <image-path>
+elide list-snapshots <vol-dir> [--fork <name>]
 elide export-volume <vol-dir> <fork-name> <new-vol-dir>
-                                                # implicitly snapshot fork, squash full ancestry
-                                                # into new self-contained volume
 ```
 
 **Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The fork remains live; no directory structure changes.
@@ -400,73 +345,6 @@ elide export-volume <vol-dir> <fork-name> <new-vol-dir>
 
 ### Open questions
 
-1. **`serve-volume` with no ULID.** Opening a fork always opens the live state (tip of `wal/`). No ULID selection needed for `serve-volume`. Resolved.
+1. **GC across forks.** Segments in an ancestor fork's `segments/` may be referenced by any fork that branched from a snapshot within that ancestor. GC must not remove a segment if any living fork's `origin` chain passes through it. The exact GC protocol for multi-fork volumes is not yet designed.
 
-2. **`export` output fork name.** The exported fork is placed at `<new-vol>/default/`. Always `default`. Resolved.
-
-3. **GC across forks.** Segments in an ancestor fork's `segments/` may be referenced by any fork that branched from a snapshot within that ancestor. GC must not remove a segment if any living fork's `origin` chain passes through it. The exact GC protocol for multi-fork volumes is not yet designed.
-
-4. **`origin` chain depth.** Arbitrary depth is fine; the walk is cheap.
-
-5. **Rollback within a fork.** Not yet designed. Two candidate approaches: (a) discard segments and WAL above target snapshot ULID in-place; (b) fork from the target snapshot and rename.
-
-6. **Migration from the `children/` model.** The current implementation uses `children/<ulid>/` nesting. A migration path or compatibility shim may be needed for existing volumes.
-
-7. **Readonly fork naming.** For readonly volumes, `fork-volume` creates forks in the volume directory alongside `default/`. Should there be a naming convention or reserved prefix to distinguish these from the base `default/` (e.g., rejecting a fork named `default`)? Resolved: fork names that conflict with reserved names (`default`, `readonly`, `size`) are rejected.
-
----
-
-## Snapshots (current implementation)
-
-A snapshot freezes the current live node and starts a new live child. Snapshots serve two purposes: **checkpointing** (a rollback point for the same ongoing volume) and **forking** (launching a new independent volume from a known state). Both use the same mechanism.
-
-**Taking a snapshot** (`Volume::snapshot()`):
-
-```
-1. Create children/<snap-ulid>/  with wal/, pending/, segments/ subdirs
-2. Acquire exclusive lock on the child node
-3. Flush current WAL to a segment in this node's pending/  (synchronous; bounded by WAL size ≤ 32 MB)
-4. Remove wal/  from this node  → node is now frozen
-5. Open fresh WAL in the child node
-6. Volume process transitions to the child: all subsequent writes go there
-```
-
-The operation is synchronous. Steps 3–4 involve at most one WAL flush (≤ 32 MB), which completes in milliseconds on local NVMe. The old node's `pending/` segments are retained — they are part of the frozen node's data and remain until S3 upload completes. `wal/` (the directory) is removed as the freeze marker.
-
-**Forking** (two VMs from the same snapshot point): once a node is frozen, create multiple children. Each child is an independent live volume that inherits the parent's data via the directory ancestry.
-
-```
-volumes/<base-id>/
-  segments/                 ← frozen, shared by both forks
-  children/
-    <fork-a-ulid>/          ← VM A
-      wal/
-      pending/
-      segments/
-    <fork-b-ulid>/          ← VM B
-      wal/
-      pending/
-      segments/
-```
-
-**Rollback:** delete the live leaf (and any of its descendants if needed). The target ancestor is a frozen node; call `Volume::open` on it to start a new live child from that point. The ancestor's segments are untouched.
-
-**Checkpoint semantics (linear history):**
-
-```
-Before snapshot():        After snapshot():
-volumes/<base>/           volumes/<base>/
-  wal/                      pending/          ← WAL flushed here; frozen
-  pending/           →      segments/
-  segments/                 children/
-                              <snap-1>/
-                                wal/          ← live continues here
-                                pending/
-                                segments/
-```
-
-**The directory tree is the source of truth.** No manifest file is required to understand the snapshot relationships or to reconstruct the LBA map. A manifest may be written as an optional startup optimisation, but its absence never affects correctness.
-
-**GC interaction:** see [operations.md](operations.md). GC operates only on live leaf nodes; frozen ancestors are structurally immutable.
-
-**Migration and disaster recovery** share the snapshot code path: start a volume from a snapshot manifest on a new host. One operation, multiple use cases.
+2. **Rollback within a fork.** Not yet designed. Two candidate approaches: (a) discard segments and WAL above target snapshot ULID in-place; (b) fork from the target snapshot and rename.

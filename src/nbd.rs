@@ -648,6 +648,26 @@ fn handle_readonly_connection(
     Ok(())
 }
 
+/// Readonly variant of `serve_volume_listener`. Opens the fork with
+/// `ReadonlyVolume` (no WAL, no lock) and serves it read-only.
+/// Separated from `run_volume_readonly` so tests can bind port 0.
+#[cfg(test)]
+fn serve_readonly_volume_listener(
+    dir: &Path,
+    size_bytes: u64,
+    listener: TcpListener,
+) -> io::Result<()> {
+    let volume = ReadonlyVolume::open(dir)?;
+    for stream in listener.incoming() {
+        let stream = stream?;
+        let result = handle_readonly_connection(stream, &volume, size_bytes);
+        if let Err(e) = result {
+            eprintln!("[readonly connection error: {}]", e);
+        }
+    }
+    Ok(())
+}
+
 /// Serve NBD connections on an already-bound listener, looping until the
 /// listener is closed. The volume is opened once and reused across connections
 /// so the in-memory LBA map is preserved between reconnects.
@@ -1049,6 +1069,16 @@ mod tests {
         }
     }
 
+    fn start_readonly_server(dir: &std::path::Path, size_bytes: u64) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            serve_readonly_volume_listener(&dir, size_bytes, listener).ok();
+        });
+        port
+    }
+
     // --- Tests ---
 
     #[test]
@@ -1193,6 +1223,69 @@ mod tests {
         c.write(1, 0, &data).unwrap();
         let back = c.read(1, 0, 4096).unwrap();
         assert_eq!(back, data);
+
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // --- Readonly NBD tests ---
+
+    #[test]
+    fn readonly_nbd_read_returns_data() {
+        let dir = temp_dir();
+        let fork_dir = dir.join("default");
+
+        let data: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
+
+        // Populate the fork via a writable Volume, promote to segment, then drop.
+        {
+            let mut vol = crate::volume::Volume::open(&fork_dir).unwrap();
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+
+        let port = start_readonly_server(&fork_dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+        let back = c.read(1, 0, 4096).unwrap();
+        assert_eq!(back, data);
+
+        c.disconnect().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn readonly_nbd_write_returns_eperm() {
+        let dir = temp_dir();
+        let fork_dir = dir.join("default");
+
+        // Create an empty fork with no WAL so ReadonlyVolume::open works.
+        std::fs::create_dir_all(fork_dir.join("segments")).unwrap();
+        std::fs::create_dir_all(fork_dir.join("pending")).unwrap();
+
+        let port = start_readonly_server(&fork_dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+
+        let result = c.write(1, 0, &vec![0xABu8; 4096]);
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("NBD write error 1"),
+            "expected EPERM (error 1), got: {err_msg}"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn readonly_nbd_unwritten_blocks_read_as_zeros() {
+        let dir = temp_dir();
+        let fork_dir = dir.join("default");
+        std::fs::create_dir_all(fork_dir.join("segments")).unwrap();
+        std::fs::create_dir_all(fork_dir.join("pending")).unwrap();
+
+        let port = start_readonly_server(&fork_dir, 4 * 1024 * 1024);
+        let mut c = NbdClient::connect(port).unwrap();
+        let buf = c.read(1, 0, 4096).unwrap();
+        assert_eq!(buf, vec![0u8; 4096]);
 
         c.disconnect().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
