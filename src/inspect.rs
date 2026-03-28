@@ -54,6 +54,7 @@ pub fn run(dir: &Path) -> io::Result<()> {
         print_totals(&t);
     } else {
         let mut grand_total = Totals::default();
+        let mut fs_summaries: Vec<(String, ls::FsSummary)> = Vec::new();
         let n = fork_dirs.len();
         for (i, fork_dir) in fork_dirs.iter().enumerate() {
             let fork_name = fork_dir.file_name().and_then(|s| s.to_str()).unwrap_or("?");
@@ -79,12 +80,16 @@ pub fn run(dir: &Path) -> io::Result<()> {
             print_seg_section("pending", &node.pending, child_prefix, node.is_live);
             print_seg_section("segments", &node.segments, child_prefix, true);
             if let Some(summary) = ls::try_fs_summary(fork_dir) {
-                print_fs_summary(&summary, child_prefix);
+                fs_summaries.push((fork_name.to_owned(), summary));
             }
             accumulate(&node, &mut grand_total);
         }
         println!();
         print_totals(&grand_total);
+        for (fork_name, summary) in &fs_summaries {
+            println!();
+            print_fs_summary(fork_name, summary);
+        }
     }
 
     Ok(())
@@ -448,14 +453,14 @@ fn print_seg_section(label: &str, segs: &[SegInfo], prefix: &str, always_show: b
     }
 }
 
-fn print_fs_summary(summary: &ls::FsSummary, prefix: &str) {
-    println!("{prefix}filesystem (ext4):");
+fn print_fs_summary(fork_name: &str, summary: &ls::FsSummary) {
+    println!("Filesystem ({fork_name}):");
     if let Some(ref name) = summary.os_name {
-        println!("{prefix}  os: {name}");
+        println!("  OS: {name}");
     }
     if !summary.root_entries.is_empty() {
         let listing = summary.root_entries.join("  ");
-        println!("{prefix}  /:  {listing}");
+        println!("  /  {listing}");
     }
 }
 
