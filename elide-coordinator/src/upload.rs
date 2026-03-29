@@ -15,7 +15,9 @@
 //   4. On failure: leave in pending/, record error, continue
 
 use std::path::Path;
+
 use std::sync::Arc;
+use tracing::warn;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -103,7 +105,7 @@ pub async fn drain_pending(
     if pub_key_path.exists()
         && let Err(e) = upload_pub_key(&pub_key_path, volume_id, fork_name, store).await
     {
-        eprintln!("pub key upload failed: {e:#}");
+        warn!("pub key upload failed: {e:#}");
     }
 
     let mut entries = tokio::fs::read_dir(&pending_dir)
@@ -136,7 +138,7 @@ pub async fn drain_pending(
         {
             Ok(()) => uploaded += 1,
             Err(e) => {
-                eprintln!("upload failed for segment {name}: {e:#}");
+                warn!("upload failed for segment {name}: {e:#}");
                 failed += 1;
             }
         }

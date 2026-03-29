@@ -82,8 +82,16 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    tracing_log::LogTracer::init().ok();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     if let Err(e) = run().await {
-        eprintln!("error: {e:#}");
+        tracing::error!("{e:#}");
         process::exit(1);
     }
 }

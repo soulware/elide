@@ -17,6 +17,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tracing::{error, info, warn};
+
 use tokio::process::Command;
 
 use crate::serve_config::ServeConfig;
@@ -34,31 +36,31 @@ pub async fn supervise(fork_dir: PathBuf, serve_config: ServeConfig, elide_bin: 
         // Check for a running process left by a previous coordinator session.
         if let Some(pid) = read_pid(&fork_dir) {
             if is_alive(pid) {
-                eprintln!("[supervisor {label}] re-adopted running process {pid}");
+                info!("[supervisor {label}] re-adopted running process {pid}");
                 poll_until_dead(pid).await;
-                eprintln!("[supervisor {label}] process {pid} exited");
+                info!("[supervisor {label}] process {pid} exited");
                 remove_pid(&fork_dir);
                 tokio::time::sleep(RESTART_DELAY).await;
                 continue;
             }
             // Stale pid file.
-            eprintln!("[supervisor {label}] removing stale pid file (pid {pid} not running)");
+            warn!("[supervisor {label}] removing stale pid file (pid {pid} not running)");
             remove_pid(&fork_dir);
         }
 
         match spawn_volume(&fork_dir, &serve_config, &elide_bin) {
             Ok(mut child) => {
                 let pid = child.id().unwrap_or(0);
-                eprintln!("[supervisor {label}] started pid {pid}");
+                info!("[supervisor {label}] started pid {pid}");
                 write_pid(&fork_dir, pid);
                 match child.wait().await {
-                    Ok(status) => eprintln!("[supervisor {label}] pid {pid} exited: {status}"),
-                    Err(e) => eprintln!("[supervisor {label}] wait error: {e}"),
+                    Ok(status) => info!("[supervisor {label}] pid {pid} exited: {status}"),
+                    Err(e) => warn!("[supervisor {label}] wait error: {e}"),
                 }
                 remove_pid(&fork_dir);
             }
             Err(e) => {
-                eprintln!("[supervisor {label}] failed to spawn: {e:#}");
+                error!("[supervisor {label}] failed to spawn: {e:#}");
             }
         }
 
@@ -125,7 +127,7 @@ fn read_pid(fork_dir: &Path) -> Option<u32> {
 
 fn write_pid(fork_dir: &Path, pid: u32) {
     if let Err(e) = std::fs::write(fork_dir.join(PID_FILE), pid.to_string()) {
-        eprintln!("[supervisor] failed to write pid file: {e}");
+        warn!("[supervisor] failed to write pid file: {e}");
     }
 }
 

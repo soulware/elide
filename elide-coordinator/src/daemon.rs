@@ -25,6 +25,7 @@ use anyhow::Result;
 use object_store::ObjectStore;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
+use tracing::{info, warn};
 
 use crate::config::CoordinatorConfig;
 use crate::gc;
@@ -38,7 +39,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     let elide_bin = config.elide_bin.clone();
     let gc_config = config.gc.clone();
 
-    eprintln!(
+    info!(
         "[coordinator] watching {} root(s); drain every {}s, scan every {}s; elide bin: {}",
         config.roots.len(),
         config.drain.interval_secs,
@@ -46,7 +47,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         elide_bin.display(),
     );
     for root in &config.roots {
-        eprintln!("[coordinator] root: {}", root.display());
+        info!("[coordinator] root: {}", root.display());
     }
 
     let mut known: HashSet<PathBuf> = HashSet::new();
@@ -61,7 +62,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         let forks = discover_forks(&config.roots);
         for fork_dir in forks {
             if known.insert(fork_dir.clone()) {
-                eprintln!("[coordinator] discovered fork: {}", fork_dir.display());
+                info!("[coordinator] discovered fork: {}", fork_dir.display());
 
                 // Always drain pending segments.
                 tasks.spawn(drain_loop(fork_dir.clone(), store.clone(), drain_interval));
@@ -70,7 +71,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 let (vol_id, frk_name) = match upload::derive_names(&fork_dir) {
                     Ok(names) => names,
                     Err(e) => {
-                        eprintln!(
+                        warn!(
                             "[coordinator] cannot derive names for gc {}: {e}",
                             fork_dir.display()
                         );
@@ -88,7 +89,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 // Supervise if serve.toml is present.
                 match serve_config::load(&fork_dir) {
                     Ok(Some(sc)) => {
-                        eprintln!(
+                        info!(
                             "[coordinator] supervising fork: {} (bind {})",
                             fork_dir.display(),
                             sc.bind,
@@ -96,7 +97,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                         tasks.spawn(supervisor::supervise(fork_dir, sc, elide_bin.clone()));
                     }
                     Ok(None) => {}
-                    Err(e) => eprintln!(
+                    Err(e) => warn!(
                         "[coordinator] failed to read serve.toml for {}: {e}",
                         fork_dir.display()
                     ),
@@ -110,7 +111,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         tokio::select! {
             _ = scan_tick.tick() => {}
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("[coordinator] shutting down");
+                info!("[coordinator] shutting down");
                 tasks.abort_all();
                 break;
             }
@@ -126,7 +127,7 @@ async fn drain_loop(fork_dir: PathBuf, store: Arc<dyn ObjectStore>, interval: Du
     let (volume_id, fork_name) = match upload::derive_names(&fork_dir) {
         Ok(names) => names,
         Err(e) => {
-            eprintln!(
+            warn!(
                 "[coordinator] cannot derive names for {}: {e}",
                 fork_dir.display()
             );
@@ -141,7 +142,7 @@ async fn drain_loop(fork_dir: PathBuf, store: Arc<dyn ObjectStore>, interval: Du
         tick.tick().await;
 
         if !fork_dir.exists() {
-            eprintln!(
+            info!(
                 "[coordinator] fork removed, stopping drain: {}",
                 fork_dir.display()
             );
@@ -155,14 +156,14 @@ async fn drain_loop(fork_dir: PathBuf, store: Arc<dyn ObjectStore>, interval: Du
 
         match upload::drain_pending(&fork_dir, &volume_id, &fork_name, &store).await {
             Ok(r) if r.uploaded > 0 || r.failed > 0 => {
-                eprintln!(
+                info!(
                     "[drain {}/{}] {} uploaded, {} failed",
                     volume_id, fork_name, r.uploaded, r.failed
                 );
             }
             Ok(_) => {}
             Err(e) => {
-                eprintln!("[drain {}/{}] error: {e:#}", volume_id, fork_name);
+                warn!("[drain {}/{}] error: {e:#}", volume_id, fork_name);
             }
         }
     }
@@ -180,7 +181,7 @@ fn discover_forks(roots: &[PathBuf]) -> Vec<PathBuf> {
         let entries = match std::fs::read_dir(root) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[coordinator] cannot read root {}: {e}", root.display());
+                warn!("[coordinator] cannot read root {}: {e}", root.display());
                 continue;
             }
         };

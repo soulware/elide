@@ -33,10 +33,12 @@
 // if GC passes become long enough to stall other coordinator tasks.
 
 use std::fs;
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{error, info};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -107,7 +109,7 @@ pub async fn gc_loop(
         tick.tick().await;
 
         if !fork_dir.exists() {
-            eprintln!(
+            info!(
                 "[coordinator] fork removed, stopping gc: {}",
                 fork_dir.display()
             );
@@ -120,7 +122,7 @@ pub async fn gc_loop(
                 bytes_freed,
                 ..
             }) => {
-                eprintln!(
+                info!(
                     "[gc {volume_id}/{fork_name}] density: compacted 1 segment, ~{bytes_freed} bytes freed"
                 );
             }
@@ -129,12 +131,12 @@ pub async fn gc_loop(
                 candidates,
                 bytes_freed,
             }) => {
-                eprintln!(
+                info!(
                     "[gc {volume_id}/{fork_name}] sweep: packed {candidates} small segment(s), ~{bytes_freed} bytes freed"
                 );
             }
             Ok(_) => {}
-            Err(e) => eprintln!("[gc {volume_id}/{fork_name}] error: {e:#}"),
+            Err(e) => error!("[gc {volume_id}/{fork_name}] error: {e:#}"),
         }
     }
 }

@@ -6,6 +6,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tracing::{error, info, warn};
+
 use elide_core::volume::{ReadonlyVolume, Volume};
 
 use crate::extents::{LocatedExtent, locate_extents};
@@ -222,12 +224,12 @@ pub fn run(image_path: &str, port: u16, save_trace: Option<&str>) -> io::Result<
                     trace_path,
                     entries.len()
                 ),
-                Err(e) => eprintln!("  Boot trace error:  {}", e),
+                Err(e) => error!("  Boot trace error:  {}", e),
             }
         }
 
         if let Err(e) = result {
-            eprintln!("[connection error: {}]", e);
+            warn!("[connection error: {}]", e);
         } else {
             println!("[disconnected]");
         }
@@ -560,7 +562,7 @@ pub fn run_volume_readonly(
         let result = handle_readonly_connection(stream, &volume, size_bytes);
         match result {
             Ok(()) => println!("[disconnected]"),
-            Err(e) => eprintln!("[connection error: {}]", e),
+            Err(e) => warn!("[connection error: {}]", e),
         }
         println!("Waiting for connection...\n");
     }
@@ -674,7 +676,7 @@ fn handle_readonly_connection(
                         s.write_all(&blocks[skip..skip + length])?;
                     }
                     Err(e) => {
-                        eprintln!("[read error offset={} len={}: {}]", offset, length, e);
+                        error!("[read error offset={} len={}: {}]", offset, length, e);
                         tx_reply(&mut s, 5, handle)?; // EIO
                     }
                 }
@@ -714,7 +716,7 @@ fn serve_readonly_volume_listener(
         let stream = stream?;
         let result = handle_readonly_connection(stream, &volume, size_bytes);
         if let Err(e) = result {
-            eprintln!("[readonly connection error: {}]", e);
+            warn!("[readonly connection error: {}]", e);
         }
     }
     Ok(())
@@ -758,7 +760,7 @@ fn serve_volume_listener(
 
         match result {
             Ok(()) => println!("[disconnected]"),
-            Err(e) => eprintln!("[connection error: {}]", e),
+            Err(e) => warn!("[connection error: {}]", e),
         }
 
         println!("Waiting for connection...\n");
@@ -857,12 +859,12 @@ fn handle_volume_connection(
                     && t.elapsed() >= threshold
                 {
                     match volume.flush_wal() {
-                        Err(e) => eprintln!("[auto-flush error: {}]", e),
+                        Err(e) => warn!("[auto-flush error: {}]", e),
                         Ok(()) => {
                             last_write = None;
                             match volume.compact_pending() {
-                                Err(e) => eprintln!("[compact-pending error: {}]", e),
-                                Ok(s) if s.segments_compacted > 0 => eprintln!(
+                                Err(e) => warn!("[compact-pending error: {}]", e),
+                                Ok(s) if s.segments_compacted > 0 => info!(
                                     "[compact-pending: {} → {} segments, {:.1} MB reclaimed]",
                                     s.segments_compacted,
                                     s.new_segments,
@@ -902,7 +904,7 @@ fn handle_volume_connection(
                         s.write_all(&blocks[skip..skip + length])?;
                     }
                     Err(e) => {
-                        eprintln!("[read error offset={} len={}: {}]", offset, length, e);
+                        error!("[read error offset={} len={}: {}]", offset, length, e);
                         tx_reply(&mut s, 5, handle)?; // EIO — no data follows on error
                     }
                 }
@@ -934,7 +936,7 @@ fn handle_volume_connection(
                         tx_reply(&mut s, 0, handle)?;
                     }
                     Err(e) => {
-                        eprintln!("[write error offset={} len={}: {}]", offset, length, e);
+                        error!("[write error offset={} len={}: {}]", offset, length, e);
                         tx_reply(&mut s, 5, handle)?; // EIO
                     }
                 }
@@ -948,7 +950,7 @@ fn handle_volume_connection(
             NBD_CMD_FLUSH => match volume.fsync() {
                 Ok(()) => tx_reply(&mut s, 0, handle)?,
                 Err(e) => {
-                    eprintln!("[fsync error: {}]", e);
+                    error!("[fsync error: {}]", e);
                     tx_reply(&mut s, 5, handle)?; // EIO
                 }
             },
