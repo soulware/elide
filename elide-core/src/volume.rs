@@ -563,6 +563,7 @@ impl Volume {
 
         let mut candidate_paths: Vec<std::path::PathBuf> = Vec::new();
         let mut merged_live: Vec<segment::SegmentEntry> = Vec::new();
+        let mut any_dead = false;
 
         for seg_path in &seg_paths {
             let seg_filename = seg_path
@@ -587,6 +588,10 @@ impl Volume {
 
             if !has_dead && !is_small {
                 continue;
+            }
+
+            if has_dead {
+                any_dead = true;
             }
 
             let (live_entries, dead_entries): (Vec<_>, Vec<_>) = entries
@@ -623,6 +628,14 @@ impl Volume {
 
         if candidate_paths.is_empty() {
             return Ok(stats);
+        }
+
+        // A single small segment with no dead extents gains nothing from
+        // rewriting: the output would be the same size and content. Only
+        // merge when dead space is reclaimed or two or more small segments
+        // can be combined into one.
+        if candidate_paths.len() == 1 && !any_dead {
+            return Ok(CompactionStats::default());
         }
 
         // Write merged output segments, splitting at FLUSH_THRESHOLD.
@@ -1874,19 +1887,19 @@ mod tests {
 
     #[test]
     fn compact_pending_noop_when_all_live() {
-        // Two live extents in pending — no dead extents, and (in tests) small
-        // segments will qualify by size. Verify data survives intact.
+        // Single pending segment with no dead extents: compact_pending must not
+        // rewrite it. Rewriting a single all-live small segment is a no-op that
+        // only wastes IO — merging only makes sense when >=2 segments combine or
+        // dead space is reclaimed.
         let base = temp_dir();
         let mut vol = Volume::open(&base).unwrap();
         vol.write(0, &vec![0x11u8; 4096]).unwrap();
         vol.write(1, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        // No dead extents; segment is small so it will be a size-candidate and
-        // merge into a single equivalent segment. Data must still read back.
         let stats = vol.compact_pending().unwrap();
-        // Small segment qualifies as a candidate and is rewritten.
-        assert_eq!(stats.new_segments, 1);
+        assert_eq!(stats.segments_compacted, 0);
+        assert_eq!(stats.new_segments, 0);
         assert_eq!(vol.read(0, 1).unwrap(), vec![0x11u8; 4096]);
         assert_eq!(vol.read(1, 1).unwrap(), vec![0x22u8; 4096]);
 
@@ -1946,8 +1959,9 @@ mod tests {
         let stats = vol.compact_pending().unwrap();
         // The old dead extent is in segments/ — compact_pending doesn't touch it.
         assert_eq!(stats.extents_removed, 0);
-        // The new pending segment (all live, small) is still a size-candidate.
-        assert_eq!(stats.segments_compacted, 1);
+        // The new pending segment is small and all-live: single segment, no
+        // dead extents, so compact_pending correctly leaves it alone.
+        assert_eq!(stats.segments_compacted, 0);
 
         // Data still reads correctly.
         assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);

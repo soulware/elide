@@ -21,6 +21,7 @@
 
 mod config;
 mod daemon;
+mod gc;
 mod prefetch;
 mod serve_config;
 mod store;

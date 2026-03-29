@@ -27,6 +27,7 @@ use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::CoordinatorConfig;
+use crate::gc;
 use crate::serve_config;
 use crate::supervisor;
 use crate::upload;
@@ -35,6 +36,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     let drain_interval = Duration::from_secs(config.drain.interval_secs);
     let scan_interval = Duration::from_secs(config.drain.scan_interval_secs);
     let elide_bin = config.elide_bin.clone();
+    let gc_config = config.gc.clone();
 
     eprintln!(
         "[coordinator] watching {} root(s); drain every {}s, scan every {}s; elide bin: {}",
@@ -63,6 +65,25 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
                 // Always drain pending segments.
                 tasks.spawn(drain_loop(fork_dir.clone(), store.clone(), drain_interval));
+
+                // Always run GC on uploaded segments.
+                let (vol_id, frk_name) = match upload::derive_names(&fork_dir) {
+                    Ok(names) => names,
+                    Err(e) => {
+                        eprintln!(
+                            "[coordinator] cannot derive names for gc {}: {e}",
+                            fork_dir.display()
+                        );
+                        continue;
+                    }
+                };
+                tasks.spawn(gc::gc_loop(
+                    fork_dir.clone(),
+                    vol_id,
+                    frk_name,
+                    store.clone(),
+                    gc_config.clone(),
+                ));
 
                 // Supervise if serve.toml is present.
                 match serve_config::load(&fork_dir) {

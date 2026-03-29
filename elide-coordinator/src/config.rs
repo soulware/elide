@@ -15,6 +15,11 @@
 //   [drain]
 //   interval_secs      = 5    # how often each fork is checked for pending segments
 //   scan_interval_secs = 30   # how often root directories are re-scanned for new forks
+//
+//   [gc]
+//   density_threshold  = 0.70          # compact when live_bytes/file_bytes < threshold
+//   small_segment_bytes = 8388608      # also compact segments smaller than this
+//   interval_secs      = 300           # how often GC runs per fork (seconds)
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,6 +48,10 @@ pub struct CoordinatorConfig {
     /// Defaults to `"elide"` (resolved via PATH).
     #[serde(default = "default_elide_bin")]
     pub elide_bin: PathBuf,
+
+    /// GC configuration.
+    #[serde(default)]
+    pub gc: GcConfig,
 }
 
 fn default_elide_bin() -> PathBuf {
@@ -114,6 +123,44 @@ impl Default for DrainConfig {
         Self {
             interval_secs: default_interval(),
             scan_interval_secs: default_scan_interval(),
+        }
+    }
+}
+
+/// Configuration for coordinator-driven segment GC.
+#[derive(Deserialize, Clone)]
+pub struct GcConfig {
+    /// Compact a segment when live_bytes / file_bytes falls below this ratio.
+    /// Default: 0.70.
+    #[serde(default = "default_gc_density")]
+    pub density_threshold: f64,
+
+    /// Also compact segments whose file size is below this threshold (bytes).
+    /// Default: 8 MiB.
+    #[serde(default = "default_gc_small_segment")]
+    pub small_segment_bytes: u64,
+
+    /// How often (seconds) to run a GC pass per fork. Default: 300.
+    #[serde(default = "default_gc_interval")]
+    pub interval_secs: u64,
+}
+
+fn default_gc_density() -> f64 {
+    0.70
+}
+fn default_gc_small_segment() -> u64 {
+    8 * 1024 * 1024
+}
+fn default_gc_interval() -> u64 {
+    300
+}
+
+impl Default for GcConfig {
+    fn default() -> Self {
+        Self {
+            density_threshold: default_gc_density(),
+            small_segment_bytes: default_gc_small_segment(),
+            interval_secs: default_gc_interval(),
         }
     }
 }
