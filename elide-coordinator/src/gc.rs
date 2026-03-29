@@ -372,7 +372,13 @@ async fn compact_segments(
 
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
     let segments_dir = fork_dir.join("segments");
-    let new_ulid = Ulid::new();
+
+    let max_input_ulid = candidates
+        .iter()
+        .filter_map(|s| Ulid::from_string(&s.ulid_str).ok())
+        .max()
+        .expect("non-empty candidates");
+    let new_ulid = compaction_ulid(max_input_ulid);
     let new_ulid_str = new_ulid.to_string();
     // Write to a temp file first; rename into segments/ only after S3 upload
     // succeeds, so the invariant "segments/ ↔ in S3" is never violated.
@@ -432,6 +438,36 @@ async fn compact_segments(
     Ok(())
 }
 
+/// Compute the ULID for a compacted output segment.
+///
+/// The output is `max(inputs).increment()` — one step ahead of the newest
+/// input in the total ULID order. This gives the compacted segment a ULID
+/// that is:
+///
+/// - strictly greater than all input segments, so it supersedes them in
+///   ULID-ordered rebuild processing;
+/// - strictly less than any concurrent write that occurs during compaction,
+///   because input segments have already passed through the drain/upload
+///   pipeline and their timestamps are seconds to minutes in the past.
+///   Any write happening *now* gets a ULID from the current wall clock,
+///   which is far ahead of `max(inputs)`.
+///
+/// This eliminates the race between compaction and concurrent writes without
+/// requiring any locking: concurrent writes always win in rebuild by
+/// timestamp alone. The worst case when the liveness check misses a
+/// concurrent write is a small space leak (the compacted output carries an
+/// extent that no LBA references), not data corruption or a stale read.
+///
+/// The `increment()` overflow case (all 80 random bits set) is effectively
+/// unreachable; the fallback advances to the next millisecond with random=0,
+/// which preserves the same ordering guarantee.
+fn compaction_ulid(max_input: Ulid) -> Ulid {
+    match max_input.increment() {
+        Some(u) => u,
+        None => Ulid::from_parts(max_input.timestamp_ms() + 1, 0),
+    }
+}
+
 /// Returns true if any `.pending` GC result files exist in `gc_dir`.
 fn has_pending_results(gc_dir: &Path) -> Result<bool> {
     if !gc_dir.exists() {
@@ -486,6 +522,63 @@ mod tests {
         fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.applied"), "").unwrap();
         fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done"), "").unwrap();
         assert!(!has_pending_results(&gc_dir).unwrap());
+    }
+
+    #[test]
+    fn compaction_ulid_exceeds_single_input() {
+        let input = Ulid::new();
+        let output = compaction_ulid(input);
+        assert!(output > input);
+    }
+
+    #[test]
+    fn compaction_ulid_exceeds_all_inputs() {
+        // Simulate picking max from a set of candidates.
+        let a = Ulid::new();
+        let b = a.increment().unwrap();
+        let c = b.increment().unwrap();
+        let max = [a, b, c].into_iter().max().unwrap();
+        let output = compaction_ulid(max);
+        assert!(output > a);
+        assert!(output > b);
+        assert!(output > c);
+    }
+
+    #[test]
+    fn compaction_ulid_preserves_timestamp_when_no_overflow() {
+        let input = Ulid::new();
+        let output = compaction_ulid(input);
+        // Same millisecond — only the random portion was incremented.
+        assert_eq!(output.timestamp_ms(), input.timestamp_ms());
+    }
+
+    #[test]
+    fn compaction_ulid_overflow_advances_timestamp() {
+        // Construct a ULID with all 80 random bits set (the overflow case).
+        let max_random = (1u128 << 80) - 1;
+        let ts = 12345u64;
+        let input = Ulid::from_parts(ts, max_random);
+        assert!(input.increment().is_none(), "sanity: should overflow");
+
+        let output = compaction_ulid(input);
+        assert_eq!(output.timestamp_ms(), ts + 1);
+        assert!(output > input);
+    }
+
+    #[test]
+    fn compaction_ulid_less_than_current_time() {
+        // A ULID generated right now — simulating a concurrent write —
+        // should be greater than the compacted output. This reflects the
+        // core guarantee: input segments are old (drain pipeline), so
+        // max(inputs) << current time.
+        let old_ts = 1_000u64; // 1 second after epoch
+        let input = Ulid::from_parts(old_ts, 0);
+        let output = compaction_ulid(input);
+        let concurrent_write = Ulid::new();
+        assert!(
+            concurrent_write > output,
+            "concurrent write ({concurrent_write}) should beat compaction output ({output})"
+        );
     }
 
     #[test]

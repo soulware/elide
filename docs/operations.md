@@ -246,7 +246,7 @@ Segment GC — reclaiming space from already-uploaded `segments/` files — is a
 
 The two strategies are mutually exclusive within a tick: if Strategy 1 fires, Strategy 2 is not evaluated. This bounds per-tick work: Strategy 1 processes one segment; Strategy 2 is capped at 32 MiB of live data.
 
-**Liveness:** an extent entry in segment X is live if the reconstructed extent index still points to segment X for that hash. Entries overwritten by a newer segment in the same fork are dead and excluded from the compacted output. The coordinator rebuilds from on-disk files only — in-memory WAL entries are not visible. This means a WAL entry that has not yet been flushed to `pending/` may cause the coordinator to treat a soon-to-be-dead extent as live and include it in the compacted output. This is benign: the entry becomes dead on the next WAL flush, and will be reclaimed by the next GC pass.
+**Liveness:** an extent entry in segment X is live if the reconstructed extent index still points to segment X for that hash. Entries overwritten by a newer segment in the same fork are dead and excluded from the compacted output. The coordinator rebuilds from on-disk files only — in-memory WAL entries are not visible. This means a WAL entry that has not yet been flushed to `pending/` may cause the coordinator to treat a soon-to-be-dead extent as live and include it in the compacted output. The worst case is a small space leak: the compacted output carries an extent that no LBA references, which the hash-based liveness check cannot detect. It does not cause data corruption or stale reads — see *Output ULID assignment* below.
 
 **Snapshot floor:** segments at or below the latest snapshot ULID are frozen and skipped. They may be referenced by child forks.
 
@@ -264,7 +264,15 @@ Writing to `segments/` (not `pending/`) is correct for two reasons:
 - `pending/` signals "not yet in S3; please upload" — the opposite of what is true here
 - `segments/` files are in the evictable cache tier; since the segment is confirmed in S3, it belongs there
 
-**Restart safety:** because the compacted segment is in `segments/<new-ulid>`, `extentindex::rebuild` picks it up on any restart. The new ULID is larger than all its source segments, so it wins in ULID-ordered rebuild processing. The volume's on-disk state is self-consistent without reprocessing any `gc/` files.
+**Output ULID assignment:** the compacted segment is assigned `max(input ULIDs).increment()` — one step ahead of the newest input in the total ULID order. This gives three properties:
+
+1. **Supersedes inputs in rebuild.** The output ULID is strictly greater than all inputs, so `extentindex::rebuild` uses the compacted segment in preference to the originals during the transition period (before the `.applied` handoff redirects the extent index).
+
+2. **Concurrent writes always win.** Input segments have already passed through the drain/upload pipeline, so their timestamps are seconds to minutes behind the current wall clock. Any write that occurs during compaction gets a ULID from the current time, which is far ahead of `max(inputs)`. Concurrent writes therefore always produce higher ULIDs than the compacted output and win in ULID-ordered rebuild — no locking required.
+
+3. **Worst case is a bounded space leak, not data corruption.** If the liveness check misses a concurrent write (WAL not yet flushed), the compacted output carries that extent unnecessarily. The concurrent write's ULID is higher, so it wins for the LBA in rebuild; the orphaned extent in the compacted output is never read. The hash-based liveness check does not detect LBA-orphaned extents, so the data persists across GC passes. This is a known limitation.
+
+The `increment()` overflow case (all 80 random bits set) is effectively unreachable; the fallback is `Ulid::from_parts(max_timestamp + 1ms, 0)`, which preserves the same ordering guarantee.
 
 **At most one outstanding GC pass per fork:** the coordinator defers a new pass if any `gc/*.pending` files exist. This prevents accumulating multiple overlapping handoffs before the volume has applied the first.
 
