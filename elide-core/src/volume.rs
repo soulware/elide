@@ -721,6 +721,15 @@ impl Volume {
             .collect()
     }
 
+    /// Flush the current WAL to a pending segment if it contains any entries.
+    /// No-op if the WAL is empty. Called by the idle-flush path in the NBD server.
+    pub fn flush_wal(&mut self) -> io::Result<()> {
+        if self.pending_entries.is_empty() {
+            return Ok(());
+        }
+        self.promote()
+    }
+
     pub fn promote_for_test(&mut self) -> io::Result<()> {
         self.promote()
     }

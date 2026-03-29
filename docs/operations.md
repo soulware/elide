@@ -2,6 +2,22 @@
 
 Ongoing system behaviour: S3 upload, garbage collection, repacking, and filesystem metadata awareness.
 
+## WAL Promotion
+
+The WAL is promoted to a `pending/` segment in two ways:
+
+**Size threshold (32 MB):** every write checks whether the WAL has crossed 32 MB. If so, `promote()` is called immediately before the write returns. This is a soft cap — a single write larger than 32 MB will still succeed, producing an oversized segment.
+
+**Idle flush:** `serve-volume` watches for write inactivity and promotes the WAL automatically after the configured idle period. This ensures that a short burst of writes — e.g. writing a few files from a VM — lands in `pending/` without requiring an explicit `snapshot-volume` call.
+
+```
+elide serve-volume <vol-dir> <fork> --auto-flush <SECS>
+```
+
+`--auto-flush` defaults to **10 seconds**. Pass `0` to disable. The server prints `[auto-flush: Xs idle]` at startup to confirm the setting. During an idle window, the 200 ms read-timeout loop checks whether `last_write.elapsed() >= threshold`; if so, `flush_wal()` is called and `last_write` is cleared. A subsequent write resets the timer.
+
+Both triggers call the same `promote()` path, producing an identical segment format. Neither is on the fsync critical path — a guest `fsync` returns as soon as the WAL record is durable; promotion happens inline on the next write (size trigger) or on the idle timer.
+
 ## S3 Upload
 
 Segments accumulate in `pending/` after WAL promotion (see [formats.md](formats.md) for the promotion commit sequence). The coordinator is responsible for uploading them to the object store and moving them to `segments/` on success. Each segment is handled independently — a failure on one does not block the others.

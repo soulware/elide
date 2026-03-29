@@ -475,7 +475,7 @@ pub fn run_volume(dir: &Path, size_bytes: u64, bind: &str, port: u16) -> io::Res
         addr.port()
     );
     println!("Waiting for connection...\n");
-    serve_volume_listener(dir, size_bytes, listener, None, None)
+    serve_volume_listener(dir, size_bytes, listener, None, None, None)
 }
 
 /// Serve a fork over NBD with a signing key attached.
@@ -490,6 +490,7 @@ pub fn run_volume_signed(
     port: u16,
     signer: std::sync::Arc<dyn elide_core::segment::SegmentSigner>,
     fetch_config: Option<crate::fetcher::FetchConfig>,
+    auto_flush: Option<std::time::Duration>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
     let addr = listener.local_addr()?;
@@ -505,7 +506,14 @@ pub fn run_volume_signed(
         addr.port()
     );
     println!("Waiting for connection...\n");
-    serve_volume_listener(dir, size_bytes, listener, Some(signer), fetch_config)
+    serve_volume_listener(
+        dir,
+        size_bytes,
+        listener,
+        Some(signer),
+        fetch_config,
+        auto_flush,
+    )
 }
 
 /// Serve a fork as a read-only NBD device.
@@ -722,6 +730,7 @@ fn serve_volume_listener(
     listener: TcpListener,
     signer: Option<std::sync::Arc<dyn elide_core::segment::SegmentSigner>>,
     fetch_config: Option<crate::fetcher::FetchConfig>,
+    auto_flush: Option<std::time::Duration>,
 ) -> io::Result<()> {
     install_sigusr1_handler();
 
@@ -737,11 +746,15 @@ fn serve_volume_listener(
         println!("[demand-fetch enabled]");
     }
 
+    if let Some(d) = auto_flush {
+        println!("[auto-flush: {}s idle]", d.as_secs());
+    }
+
     for stream in listener.incoming() {
         let stream = stream?;
         println!("[connected: {}]", stream.peer_addr()?);
 
-        let result = handle_volume_connection(stream, &mut volume, size_bytes);
+        let result = handle_volume_connection(stream, &mut volume, size_bytes, auto_flush);
 
         match result {
             Ok(()) => println!("[disconnected]"),
@@ -758,6 +771,7 @@ fn handle_volume_connection(
     mut s: TcpStream,
     volume: &mut Volume,
     volume_size: u64,
+    auto_flush: Option<std::time::Duration>,
 ) -> io::Result<()> {
     // Newstyle handshake
     s.write_all(&NBD_MAGIC.to_be_bytes())?;
@@ -830,6 +844,7 @@ fn handle_volume_connection(
     // Transmission loop
     let mut reads: u64 = 0;
     let mut writes: u64 = 0;
+    let mut last_write: Option<std::time::Instant> = None;
     s.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
 
     loop {
@@ -838,6 +853,15 @@ fn handle_volume_connection(
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
+                if let (Some(threshold), Some(t)) = (auto_flush, last_write)
+                    && t.elapsed() >= threshold
+                {
+                    if let Err(e) = volume.flush_wal() {
+                        eprintln!("[auto-flush error: {}]", e);
+                    } else {
+                        last_write = None;
+                    }
+                }
                 continue;
             }
             Err(e) => return Err(e),
@@ -892,7 +916,12 @@ fn handle_volume_connection(
                     })
                 };
                 match result {
-                    Ok(()) => tx_reply(&mut s, 0, handle)?,
+                    Ok(()) => {
+                        if auto_flush.is_some() {
+                            last_write = Some(std::time::Instant::now());
+                        }
+                        tx_reply(&mut s, 0, handle)?;
+                    }
                     Err(e) => {
                         eprintln!("[write error offset={} len={}: {}]", offset, length, e);
                         tx_reply(&mut s, 5, handle)?; // EIO
@@ -982,7 +1011,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
-            serve_volume_listener(&dir, size_bytes, listener, None, None).ok();
+            serve_volume_listener(&dir, size_bytes, listener, None, None, None).ok();
         });
         port
     }

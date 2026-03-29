@@ -36,6 +36,15 @@ flags       (u8)          FLAG_DEDUP_REF set; no further fields
 - `0x01` `FLAG_COMPRESSED` — payload is zstd-compressed; `data_length` is compressed size
 - `0x02` `FLAG_DEDUP_REF` — REF record; no data payload
 
+**Flag namespace note:** WAL flag bits and segment index flag bits are **distinct namespaces with different values**. When promoting WAL records to segment entries, `recover_wal` must translate between them:
+
+| Meaning | WAL bit | Segment bit |
+|---|---|---|
+| `FLAG_COMPRESSED` | `0x01` | `0x04` |
+| `FLAG_DEDUP_REF` | `0x02` | `0x08` |
+
+The segment format also has `FLAG_INLINE` (`0x01`) and `FLAG_HAS_DELTAS` (`0x02`), which have no WAL equivalents. Never copy a WAL `flags` byte directly into a segment index entry.
+
 The hash is computed before the dedup check and stored in the log record. Recovery can reconstruct the LBA map without re-reading or re-hashing the data.
 
 ### Pre-log coalescing
@@ -88,6 +97,8 @@ The final row is an intentional design choice: local NVMe is the durability boun
 When the write log reaches the 32MB threshold (or on an explicit flush), the background promotion task converts the WAL into a committed local segment. The WAL is assigned a ULID at creation time; that same ULID becomes the segment ID.
 
 **Promotion writes a clean segment file.** The WAL format includes per-record headers that are useful for recovery but should not be part of the permanent segment format. Promotion reads the WAL sequentially and writes only the raw extent data bytes (no headers) to a clean body section. REF records contribute no bytes to the body — their index entries carry only the LBA mapping and `FLAG_DEDUP_REF`. All segments — freshly promoted or GC-repacked — have the same uniform format.
+
+**WAL-to-segment flag translation:** WAL and segment index use different bit values for `FLAG_COMPRESSED` and `FLAG_DEDUP_REF` (see the WAL flag namespace note above). `recover_wal` translates WAL flags to segment flags before constructing `SegmentEntry` values — never copy a WAL `flags` byte directly into a segment index entry.
 
 **Directory layout within a live node:**
 

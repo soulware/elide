@@ -125,7 +125,7 @@ VM
  ▼
 Volume process  (one per volume)
  │  write path: buffer → extent boundary → hash → local dedup check → WAL append
- │  read path:  LBA → LBA map → extent index → segment file (local or S3)
+ │  read path:  LBA → LBA map → extent index → segment file (pending/ · segments/ · fetched/ · S3)
  │
  ├─ WAL  (wal/<ULID>)
  ├─ Pending segments  (pending/<ULID>)
@@ -172,15 +172,17 @@ Durability is at the write log. S3 upload is asynchronous and not on the critica
 1. VM reads LBA range
 2. Look up LBA in live LBA map → extent_hash H
 3. Check local segments (own pending/ + segments/, then ancestor segments/) for H
-   - Hit  → return data
-   - Miss → look up H in extent index → (segment_id, body_offset, body_length)
+   - Hit  → return data (decompress if FLAG_COMPRESSED)
+   - Miss → check fetched/<ulid>.body (body-relative offsets; .present bitset guards each extent)
+     - Hit  → read from body file; decompress if needed
+     - Miss → look up H in extent index → (segment_id, body_offset, body_length)
 4. Issue a byte-range GET to S3 covering a chunk of the segment body
    - The fetch unit is a contiguous byte range (e.g. 1MB-aligned chunk) that
      includes the needed extent(s) plus neighbours for spatial locality
    - The segment index section encodes body_offset + body_length per extent,
      so the chunk boundaries can be derived precisely
    - If a delta body is available and smaller, fetch from the delta instead
-5. Cache the fetched chunk; decompress and return the needed extent(s) to VM
+5. Write fetched bytes to fetched/<ulid>.body; set bit in .present; decompress and return to VM
 ```
 
 The kernel page cache sits above the block device and handles most hot reads. The local segment cache handles warm reads. S3 is the cold path.
