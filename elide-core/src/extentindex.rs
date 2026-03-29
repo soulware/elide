@@ -116,6 +116,47 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
     let mut index = ExtentIndex::new();
 
     for (fork_dir, branch_ulid) in layers {
+        // Process fetched/*.idx first (body-relative offsets). pending/ and
+        // segments/ are processed after, so their absolute-offset entries win
+        // when the same segment is present in both places.
+        let mut fetched_paths = segment::collect_fetched_idx_files(&fork_dir.join("fetched"))?;
+        fetched_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
+        if let Some(cutoff) = branch_ulid {
+            fetched_paths.retain(|p| {
+                p.file_stem()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n <= cutoff.as_str())
+                    .unwrap_or(false)
+            });
+        }
+        for path in &fetched_paths {
+            let segment_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| io::Error::other("bad fetched idx filename"))?;
+            let segment_id = ulid::Ulid::from_string(segment_id)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .to_string();
+            let (_body_section_start, entries) = segment::read_segment_index(path)?;
+            for entry in entries {
+                if entry.is_dedup_ref || entry.is_inline {
+                    continue;
+                }
+                // Body-relative offset: the .body file starts at byte 0 of the body section.
+                index.insert(
+                    entry.hash,
+                    ExtentLocation {
+                        segment_id: segment_id.clone(),
+                        body_offset: entry.stored_offset,
+                        body_length: entry.stored_length,
+                        compressed: entry.compressed,
+                    },
+                );
+            }
+        }
+
+        // Process pending/ and segments/ (absolute offsets). These overwrite
+        // any fetched/ entries for the same hashes.
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
         paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));

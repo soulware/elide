@@ -117,9 +117,13 @@ impl ObjectStoreFetcher {
 }
 
 impl SegmentFetcher for ObjectStoreFetcher {
-    fn fetch(&self, segment_id: &str, dest: &Path) -> io::Result<()> {
-        self.rt
-            .block_on(fetch_segment(&self.store, &self.forks, segment_id, dest))
+    fn fetch(&self, segment_id: &str, fetched_dir: &Path) -> io::Result<()> {
+        self.rt.block_on(fetch_segment(
+            &self.store,
+            &self.forks,
+            segment_id,
+            fetched_dir,
+        ))
     }
 }
 
@@ -127,7 +131,7 @@ async fn fetch_segment(
     store: &Arc<dyn ObjectStore>,
     forks: &[(String, String)],
     segment_id: &str,
-    dest: &Path,
+    fetched_dir: &Path,
 ) -> io::Result<()> {
     // Try forks newest-first (reverse of oldest-first slice).
     for (volume_id, fork_name) in forks.iter().rev() {
@@ -138,7 +142,7 @@ async fn fetch_segment(
                     .bytes()
                     .await
                     .map_err(|e| io::Error::other(format!("reading {segment_id}: {e}")))?;
-                write_atomic(dest, &bytes)?;
+                write_fetched(fetched_dir, segment_id, &bytes)?;
                 return Ok(());
             }
             Err(object_store::Error::NotFound { .. }) => continue,
@@ -154,6 +158,78 @@ async fn fetch_segment(
     )))
 }
 
+/// Segment header layout (first 96 bytes):
+///   0..8   magic         "ELIDSEG\x02"
+///   8..12  entry_count   u32 le
+///   12..16 index_length  u32 le
+///   16..20 inline_length u32 le
+///   20..28 body_length   u64 le
+///   28..32 delta_length  u32 le
+///   32..96 signature     Ed25519 (64 bytes)
+const SEGMENT_HEADER_LEN: usize = 96;
+const SEGMENT_MAGIC: &[u8; 8] = b"ELIDSEG\x02";
+
+/// Write the three-file fetched format into `fetched_dir`:
+///   `<segment_id>.idx`     — header + index + inline bytes `[0, body_section_start)`
+///   `<segment_id>.body`    — body bytes (body-relative; byte 0 = first body byte)
+///   `<segment_id>.present` — packed bitset, one bit per index entry; all bits set
+///
+/// All three files are written via tmp + rename. Commit order: `.idx` first
+/// (enables rebuild on the next restart), then `.body` (enables reads), then
+/// `.present`. A crash after `.idx` but before `.body` leaves an orphan `.idx`
+/// which is harmless — it will be re-fetched on the next access.
+fn write_fetched(fetched_dir: &Path, segment_id: &str, bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() < SEGMENT_HEADER_LEN {
+        return Err(io::Error::other(format!(
+            "segment {segment_id}: too short to parse header ({} bytes)",
+            bytes.len()
+        )));
+    }
+    if &bytes[0..8] != SEGMENT_MAGIC {
+        return Err(io::Error::other(format!("segment {segment_id}: bad magic")));
+    }
+
+    // Parse header fields (all within the first 96 bytes, already bounds-checked).
+    let entry_count = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let index_length = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let inline_length = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let body_section_start = SEGMENT_HEADER_LEN + index_length as usize + inline_length as usize;
+
+    if bytes.len() < body_section_start {
+        return Err(io::Error::other(format!(
+            "segment {segment_id}: truncated before body section (need {body_section_start}, got {})",
+            bytes.len()
+        )));
+    }
+
+    let idx_bytes = &bytes[..body_section_start];
+    let body_bytes = &bytes[body_section_start..];
+
+    // Presence bitset: all bits set (full body fetched in this initial implementation).
+    let bitset_len = (entry_count as usize).div_ceil(8);
+    let present_bytes = vec![0xFFu8; bitset_len];
+
+    std::fs::create_dir_all(fetched_dir)?;
+
+    let idx_tmp = fetched_dir.join(format!("{segment_id}.idx.tmp"));
+    let body_tmp = fetched_dir.join(format!("{segment_id}.body.tmp"));
+    let present_tmp = fetched_dir.join(format!("{segment_id}.present.tmp"));
+
+    std::fs::write(&idx_tmp, idx_bytes)?;
+    std::fs::write(&body_tmp, body_bytes)?;
+    std::fs::write(&present_tmp, &present_bytes)?;
+
+    // Commit: idx first (enables index rebuild), then body (enables reads), then present.
+    std::fs::rename(&idx_tmp, fetched_dir.join(format!("{segment_id}.idx")))?;
+    std::fs::rename(&body_tmp, fetched_dir.join(format!("{segment_id}.body")))?;
+    std::fs::rename(
+        &present_tmp,
+        fetched_dir.join(format!("{segment_id}.present")),
+    )?;
+
+    Ok(())
+}
+
 /// Build the S3 object key for a segment.
 /// Format: `<volume_id>/<fork_name>/YYYYMMDD/<ulid>`
 fn segment_key(volume_id: &str, fork_name: &str, ulid_str: &str) -> io::Result<StorePath> {
@@ -165,17 +241,6 @@ fn segment_key(volume_id: &str, fork_name: &str, ulid_str: &str) -> io::Result<S
     Ok(StorePath::from(format!(
         "{volume_id}/{fork_name}/{date}/{ulid_str}"
     )))
-}
-
-/// Write `data` to `dest` atomically using a `.tmp` sibling + rename.
-/// Creates parent directories if they do not exist.
-fn write_atomic(dest: &Path, data: &[u8]) -> io::Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = dest.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, dest)
 }
 
 /// Derive `(volume_id, fork_name)` from a fork directory path.
@@ -216,6 +281,78 @@ pub fn ancestry_chain(fork_dirs: &[PathBuf]) -> io::Result<Vec<(String, String)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal segment file in memory and verify that `write_fetched`
+    /// produces well-formed `.idx`, `.body`, and `.present` files.
+    #[test]
+    fn write_fetched_splits_correctly() {
+        use elide_core::segment::{
+            SegmentEntry, collect_fetched_idx_files, read_segment_index, write_segment,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("elide-fetcher-test-{}-{}", std::process::id(), n));
+        let seg_path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA.full");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a real segment with two data entries.
+        let data1 = vec![0x11u8; 4096];
+        let data2 = vec![0x22u8; 8192];
+        let h1 = blake3::hash(&data1);
+        let h2 = blake3::hash(&data2);
+        let mut entries = vec![
+            SegmentEntry::new_data(h1, 0, 1, 0, data1.clone()),
+            SegmentEntry::new_data(h2, 1, 2, 0, data2.clone()),
+        ];
+        let bss = write_segment(&seg_path, &mut entries, None).unwrap();
+
+        // Read the full segment bytes and split them via write_fetched.
+        let full_bytes = std::fs::read(&seg_path).unwrap();
+        let fetched_dir = dir.join("fetched");
+        let segment_id = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        write_fetched(&fetched_dir, segment_id, &full_bytes).unwrap();
+
+        // Check .idx file: should be parseable and match the original index.
+        let idx_path = fetched_dir.join(format!("{segment_id}.idx"));
+        let (bss2, idx_entries) = read_segment_index(&idx_path).unwrap();
+        assert_eq!(bss, bss2, "body_section_start must match");
+        assert_eq!(idx_entries.len(), 2);
+        assert_eq!(idx_entries[0].hash, h1);
+        assert_eq!(idx_entries[1].hash, h2);
+        assert_eq!(idx_entries[0].stored_offset, 0);
+        assert_eq!(idx_entries[0].stored_length, 4096);
+        assert_eq!(idx_entries[1].stored_offset, 4096);
+        assert_eq!(idx_entries[1].stored_length, 8192);
+
+        // Check .body file: should contain the body bytes (body-relative).
+        let body_path = fetched_dir.join(format!("{segment_id}.body"));
+        let body_bytes = std::fs::read(&body_path).unwrap();
+        assert_eq!(
+            body_bytes.len(),
+            4096 + 8192,
+            "body must contain both extents"
+        );
+        // First extent at body-relative offset 0.
+        assert_eq!(&body_bytes[0..4096], data1.as_slice());
+        // Second extent at body-relative offset 4096.
+        assert_eq!(&body_bytes[4096..], data2.as_slice());
+
+        // Check .present file: 2 entries → ceil(2/8) = 1 byte, all bits set.
+        let present_path = fetched_dir.join(format!("{segment_id}.present"));
+        let present_bytes = std::fs::read(&present_path).unwrap();
+        assert_eq!(present_bytes.len(), 1);
+        assert_eq!(present_bytes[0], 0xFF);
+
+        // Check that collect_fetched_idx_files finds the .idx file.
+        let found = collect_fetched_idx_files(&fetched_dir).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file_stem().unwrap(), segment_id);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn derive_fork_name_base_fork() {

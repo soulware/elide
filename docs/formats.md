@@ -198,8 +198,17 @@ delta_offset  = 96 + index_length + inline_length + body_length
 **Flag bits** (1 byte per entry):
 - `0x01` `FLAG_INLINE` — extent data is in the inline section; no body fetch needed
 - `0x02` `FLAG_HAS_DELTAS` — one or more delta options follow
-- `0x04` `FLAG_COMPRESSED` — stored data is zstd-compressed; lengths are compressed sizes
+- `0x04` `FLAG_COMPRESSED` — stored data is compressed; lengths are compressed sizes
 - `0x08` `FLAG_DEDUP_REF` — extent data lives in an ancestor segment; no body in this segment
+
+**Compression algorithm — Proposed:** two algorithms serve two distinct purposes:
+
+- **LZ4** — body extents written locally (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
+- **zstd** — delta bodies in S3 (`FLAG_HAS_DELTAS` option entries). Delta blobs are small and fetched infrequently (demand-fetch only). zstd achieves substantially better ratio at the cost of slower decompression; the tradeoff favours ratio here since delta data is bandwidth-constrained at both upload and download time.
+
+`FLAG_COMPRESSED` applies uniformly; the algorithm is implied by context (full-body entry vs. delta option entry). Both algorithms apply the same entropy gate (≥ 7.0 bits/byte skips compression) and minimum ratio threshold (< 1.5× skips storage).
+
+**Compression granularity:** `FLAG_COMPRESSED` applies to the full stored payload of an entry — the entire extent is compressed as a unit. There is no sub-extent compression granularity. A read of any portion of a compressed extent must decompress the full payload. This matches lsvd. The practical impact is bounded by the pre-log coalescing block limit, which caps maximum extent size at write time.
 
 ```
 For each extent:

@@ -639,15 +639,31 @@ impl Volume {
     }
 
     /// Locate the segment body file for `segment_id` within this fork's
-    /// ancestry chain. Checks the current fork's `wal/`, `pending/`, `segments/`
-    /// first, then searches ancestor forks' `pending/` and `segments/`. On a
-    /// miss with a fetcher attached, fetches from remote storage into `segments/`.
+    /// ancestry chain.
+    ///
+    /// Search order:
+    ///   1. Current fork: `wal/`, `pending/`, `segments/`, `fetched/<id>.body`
+    ///   2. Ancestor forks (newest first): `pending/`, `segments/`, `fetched/<id>.body`
+    ///   3. Demand-fetch via fetcher (writes three-file format to `fetched/`)
+    ///
+    /// For full segment files (`wal/`, `pending/`, `segments/`), body reads use
+    /// absolute file offsets (`ExtentLocation.body_offset`). For fetched body
+    /// files (`fetched/<id>.body`), the file IS the body section, so reads use
+    /// body-relative offsets — consistent with how `extentindex::rebuild` stores
+    /// offsets for fetched entries.
     fn find_segment_file(&self, segment_id: &str) -> io::Result<PathBuf> {
         for subdir in ["wal", "pending", "segments"] {
             let path = self.base_dir.join(subdir).join(segment_id);
             if path.exists() {
                 return Ok(path);
             }
+        }
+        let fetched_body = self
+            .base_dir
+            .join("fetched")
+            .join(format!("{segment_id}.body"));
+        if fetched_body.exists() {
+            return Ok(fetched_body);
         }
         for layer in self.ancestor_layers.iter().rev() {
             for subdir in ["pending", "segments"] {
@@ -656,11 +672,18 @@ impl Volume {
                     return Ok(path);
                 }
             }
+            let fetched_body = layer.dir.join("fetched").join(format!("{segment_id}.body"));
+            if fetched_body.exists() {
+                return Ok(fetched_body);
+            }
         }
         if let Some(fetcher) = &self.fetcher {
-            let dest = self.base_dir.join("segments").join(segment_id);
-            fetcher.fetch(segment_id, &dest)?;
-            return Ok(dest);
+            let fetched_dir = self.base_dir.join("fetched");
+            fetcher.fetch(segment_id, &fetched_dir)?;
+            return Ok(self
+                .base_dir
+                .join("fetched")
+                .join(format!("{segment_id}.body")));
         }
         Err(io::Error::other(format!("segment not found: {segment_id}")))
     }
@@ -843,6 +866,13 @@ impl ReadonlyVolume {
                 return Ok(path);
             }
         }
+        let fetched_body = self
+            .base_dir
+            .join("fetched")
+            .join(format!("{segment_id}.body"));
+        if fetched_body.exists() {
+            return Ok(fetched_body);
+        }
         for dir in self.ancestor_dirs.iter().rev() {
             for subdir in ["pending", "segments"] {
                 let path = dir.join(subdir).join(segment_id);
@@ -850,11 +880,18 @@ impl ReadonlyVolume {
                     return Ok(path);
                 }
             }
+            let fetched_body = dir.join("fetched").join(format!("{segment_id}.body"));
+            if fetched_body.exists() {
+                return Ok(fetched_body);
+            }
         }
         if let Some(fetcher) = &self.fetcher {
-            let dest = self.base_dir.join("segments").join(segment_id);
-            fetcher.fetch(segment_id, &dest)?;
-            return Ok(dest);
+            let fetched_dir = self.base_dir.join("fetched");
+            fetcher.fetch(segment_id, &fetched_dir)?;
+            return Ok(self
+                .base_dir
+                .join("fetched")
+                .join(format!("{segment_id}.body")));
         }
         Err(io::Error::other(format!("segment not found: {segment_id}")))
     }

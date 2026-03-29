@@ -61,17 +61,21 @@ pub trait SegmentSigner: Send + Sync {
 
 /// Trait for fetching segments from remote storage on a local cache miss.
 ///
-/// Implementations download the segment and write it atomically to `dest`
-/// (write to a `.tmp` file, then rename). `elide-core` is synchronous; async
-/// fetchers must wrap their runtime (e.g. `Runtime::block_on`) inside this
-/// interface.
+/// Implementations write the three-file fetched format to `fetched_dir`:
+///   `<segment_id>.idx`     — header + index section (bytes `[0, body_section_start)`)
+///   `<segment_id>.body`    — body bytes (body-relative offsets, byte 0 = first body byte)
+///   `<segment_id>.present` — packed bitset, one bit per index entry; set = body bytes present
+///
+/// All three files are written atomically (tmp + rename). On success,
+/// `<fetched_dir>/<segment_id>.body` is readable for extent data.
+///
+/// `elide-core` is synchronous; async fetchers must wrap their runtime (e.g.
+/// `Runtime::block_on`) inside this interface.
 pub trait SegmentFetcher: Send + Sync {
-    /// Fetch `segment_id` from remote storage and write it atomically to `dest`.
-    ///
-    /// `dest` is the target path inside `segments/`. The implementation is
-    /// responsible for the atomic write (tmp + rename). Returns `Ok(())` on
-    /// success or an error if the segment cannot be fetched.
-    fn fetch(&self, segment_id: &str, dest: &Path) -> io::Result<()>;
+    /// Fetch `segment_id` from remote storage and write the three-file fetched
+    /// format into `fetched_dir`. Returns `Ok(())` on success or an error if
+    /// the segment cannot be fetched.
+    fn fetch(&self, segment_id: &str, fetched_dir: &Path) -> io::Result<()>;
 }
 
 /// Convenience alias for an optional heap-allocated `SegmentFetcher`.
@@ -481,6 +485,33 @@ pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
                 }
                 if let Some(name) = path.file_name().and_then(|s| s.to_str())
                     && ulid::Ulid::from_string(name).is_ok()
+                {
+                    paths.push(path);
+                }
+            }
+            Ok(paths)
+        }
+    }
+}
+
+/// Collect all `.idx` files in `fetched_dir` whose stem is a valid ULID.
+///
+/// Used by `lbamap` and `extentindex` during startup rebuild to include
+/// segments that were demand-fetched in a previous session. `.idx` files are
+/// the persistent header+index portion of the fetched three-file format.
+pub fn collect_fetched_idx_files(fetched_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    match fs::read_dir(fetched_dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+        Ok(entries) => {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("idx") {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && ulid::Ulid::from_string(stem).is_ok()
                 {
                     paths.push(path);
                 }

@@ -254,6 +254,24 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
     let mut map = LbaMap::new();
 
     for (fork_dir, branch_ulid) in layers {
+        // Include fetched/*.idx so evicted segments are still visible in the map.
+        let mut fetched_paths = segment::collect_fetched_idx_files(&fork_dir.join("fetched"))?;
+        fetched_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
+        if let Some(cutoff) = branch_ulid {
+            fetched_paths.retain(|p| {
+                p.file_stem()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n <= cutoff.as_str())
+                    .unwrap_or(false)
+            });
+        }
+        for path in &fetched_paths {
+            let (_bss, entries) = segment::read_segment_index(path)?;
+            for entry in entries {
+                map.insert(entry.start_lba, entry.lba_length, entry.hash);
+            }
+        }
+
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
         paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
