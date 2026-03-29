@@ -577,9 +577,12 @@ name = "elide-coordinator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "bytes",
  "chrono",
  "clap",
+ "elide-core",
+ "futures",
  "object_store",
  "tempfile",
  "tokio",

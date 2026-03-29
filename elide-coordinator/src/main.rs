@@ -11,6 +11,7 @@
 //   (default)               Use S3 via env vars: ELIDE_S3_BUCKET, AWS_ENDPOINT_URL,
 //                           AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
 
+mod prefetch;
 mod store;
 mod upload;
 
@@ -39,6 +40,16 @@ enum Command {
     /// Upload all pending segments for a fork to the object store, then exit.
     DrainPending {
         /// Path to the fork directory (e.g. volumes/myvm/base or volumes/myvm/forks/vm1)
+        fork_dir: PathBuf,
+    },
+    /// Download index sections (.idx) for all ancestor segments not present locally.
+    ///
+    /// Run this before serving a forked volume on a host that has no local copies
+    /// of its ancestor segments. Populates fetched/<ulid>.idx for each ancestor
+    /// segment so Volume::open can rebuild the LBA map without the full segment
+    /// bodies. Individual reads then demand-fetch body bytes on first access.
+    PrefetchIndexes {
+        /// Path to the fork directory to warm up (e.g. volumes/myvm/forks/vm2)
         fork_dir: PathBuf,
     },
 }
@@ -76,6 +87,21 @@ async fn run() -> Result<()> {
             let result = upload::drain_pending(&fork_dir, &volume_id, &fork_name, &store).await?;
 
             println!("{} uploaded, {} failed", result.uploaded, result.failed);
+
+            if result.failed > 0 {
+                process::exit(1);
+            }
+
+            Ok(())
+        }
+
+        Command::PrefetchIndexes { fork_dir } => {
+            let result = prefetch::prefetch_indexes(&fork_dir, &store).await?;
+
+            println!(
+                "{} fetched, {} already present, {} failed",
+                result.fetched, result.skipped, result.failed
+            );
 
             if result.failed > 0 {
                 process::exit(1);

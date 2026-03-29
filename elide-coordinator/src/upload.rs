@@ -100,10 +100,10 @@ pub async fn drain_pending(
     // For the base fork the key lives at <vol_root>/base.pub; for named forks
     // it is fork.pub inside the fork directory.
     let pub_key_path = pub_key_path(fork_dir, fork_name);
-    if pub_key_path.exists() {
-        if let Err(e) = upload_pub_key(&pub_key_path, volume_id, fork_name, store).await {
-            eprintln!("pub key upload failed: {e:#}");
-        }
+    if pub_key_path.exists()
+        && let Err(e) = upload_pub_key(&pub_key_path, volume_id, fork_name, store).await
+    {
+        eprintln!("pub key upload failed: {e:#}");
     }
 
     let mut entries = tokio::fs::read_dir(&pending_dir)

@@ -9,9 +9,12 @@ anyhow       = "1"
 bytes        = "1"
 chrono       = { version = "0.4", default-features = false, features = ["clock"] }
 clap         = { version = "4", features = ["derive"] }
+elide-core   = { path = "../elide-core" }
+futures      = "0.3"
 object_store = { version = "0.11", features = ["aws"] }
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 ulid         = "1"
 
 [dev-dependencies]
+blake3   = "1"
 tempfile = "3"
