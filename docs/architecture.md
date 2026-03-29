@@ -31,8 +31,9 @@ The repository is a Cargo workspace with four crates:
 
 ```
 elide-core/        — shared library: segment format, WAL, LBA map, extent index,
-                     volume read/write, and import_image(). Deps: blake3, zstd,
-                     ulid, libc. No async, no network. Usable standalone.
+                     volume read/write, import_image(), and Ed25519 signing.
+                     Deps: blake3, zstd, ulid, nix, ed25519-dalek, rand_core.
+                     No async, no network. Usable standalone.
 
 elide/             — volume process binary: NBD server, analysis tools (extents,
                      inspect, ls), and the import-volume CLI subcommand. Adds:
@@ -50,7 +51,7 @@ elide-coordinator/ — coordinator daemon: watches configured volume root
                      directories; discovers forks; drains pending/ to S3;
                      runs segment GC; prefetches indexes for cold forks.
                      Adds: tokio, object_store (S3 and local filesystem
-                     backends), notify (filesystem watching). Holds read-write
+                     backends), nix (process supervision). Holds read-write
                      S3 credentials; volume holds read-only credentials only.
 ```
 
