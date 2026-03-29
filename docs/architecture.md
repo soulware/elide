@@ -353,6 +353,18 @@ To rebuild the LBA map for a fork:
 
 The per-ancestor ULID cutoff is what prevents a concurrently-written ancestor fork from leaking newer data into the derived fork's view.
 
+### Single-writer invariant
+
+**Each fork directory has exactly one process that writes new segments into it.** The volume process that holds `fork.key` is the sole writer of `pending/` and `segments/` for that fork. The coordinator writes only to `gc/` and promotes results into `segments/` after S3 confirmation, using ULIDs derived from the existing write history rather than the current clock.
+
+This invariant is what makes ULID total-order sufficient for all correctness guarantees in rebuild, GC, and ancestor cutoff:
+
+- **Rebuild:** processing segments in ULID order is unambiguous — there is no external writer that could inject a segment with an arbitrary timestamp into the middle of the sequence.
+- **GC ULID assignment:** `max(inputs).increment()` is safe because any write that occurs *during* compaction comes from the one writer, gets a timestamp from the current wall clock, and is therefore far ahead of the old `max(inputs)` timestamp (which has already passed through the drain pipeline). No locking is required.
+- **Ancestor cutoff:** the branch-point ULID is a stable boundary because the ancestor's writer cannot insert segments retroactively below it.
+
+The single-writer property is enforced by the signing key: only the host holding `fork.key` can produce valid segment signatures. An attempt to inject a segment from another host is detected at demand-fetch verification time. See [formats.md](formats.md) — *Fork ownership and signing*.
+
 ### Operations
 
 Implemented:

@@ -413,6 +413,8 @@ Promotion reconstructs the complete file by concatenating: `.idx` bytes + body b
 
 Each fork has exactly one owner: the host that holds its private key. This is a convention enforced at consumption time — signing does not prevent an unauthorised client from uploading bytes to S3 (that is an access-control concern handled at the object-store level), but it does mean any such upload will be **detected and rejected** when a demand-fetch client verifies the segment.
 
+The single-owner property is also a correctness invariant for ULID-ordered rebuild and GC: because only one process writes new segments into a fork directory, ULID timestamps form an unambiguous total order over the write history with no risk of a second writer injecting segments at an arbitrary position in the sequence. See [architecture.md](architecture.md) — *Single-writer invariant*.
+
 **This is not a key management system.** Elide generates an Ed25519 keypair when a fork is created and stores both files in the fork directory. There is no key escrow, rotation, revocation, or HSM integration. The guarantee is simple: a client without the private key cannot produce a valid segment signature for that fork. If `fork.key` is copied to another host, that host becomes an equally valid signer — the single-owner property then depends entirely on the operator keeping the key on one machine.
 
 The practical value is narrow but real: it catches the common misconfiguration case where a coordinator is pointed at the wrong fork, and it provides per-segment integrity at demand-fetch time. It does not replace proper access control on the S3 bucket.
