@@ -175,9 +175,16 @@ pub async fn gc_fork(
     if let Some(pos) = find_least_dense(&all_stats, config.density_threshold) {
         let candidate = all_stats.into_iter().nth(pos).expect("index in bounds");
         let bytes_freed = candidate.dead_bytes();
-        compact_segments(vec![candidate], &gc_dir, volume_id, fork_name, store)
-            .await
-            .context("density compaction")?;
+        compact_segments(
+            vec![candidate],
+            &gc_dir,
+            fork_dir,
+            volume_id,
+            fork_name,
+            store,
+        )
+        .await
+        .context("density compaction")?;
         return Ok(GcStats {
             strategy: GcStrategy::Density,
             candidates: 1,
@@ -215,7 +222,7 @@ pub async fn gc_fork(
 
     let candidates = small.len();
     let bytes_freed: u64 = small.iter().map(|s| s.dead_bytes()).sum();
-    compact_segments(small, &gc_dir, volume_id, fork_name, store)
+    compact_segments(small, &gc_dir, fork_dir, volume_id, fork_name, store)
         .await
         .context("small-segment sweep")?;
 
@@ -337,6 +344,7 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
 async fn compact_segments(
     mut candidates: Vec<SegmentStats>,
     gc_dir: &Path,
+    fork_dir: &Path,
     volume_id: &str,
     fork_name: &str,
     store: &Arc<dyn ObjectStore>,
@@ -363,8 +371,11 @@ async fn compact_segments(
     }
 
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
+    let segments_dir = fork_dir.join("segments");
     let new_ulid = Ulid::new();
     let new_ulid_str = new_ulid.to_string();
+    // Write to a temp file first; rename into segments/ only after S3 upload
+    // succeeds, so the invariant "segments/ ↔ in S3" is never violated.
     let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
 
     let mut new_entries: Vec<SegmentEntry> = all_live
@@ -396,9 +407,13 @@ async fn compact_segments(
         .put(&key, Bytes::from(data).into())
         .await
         .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
-    tokio::fs::remove_file(&tmp_path)
+
+    // Upload confirmed: move into segments/ so the volume can read it locally
+    // without a demand-fetch, and so extentindex::rebuild picks it up on restart.
+    let final_path = segments_dir.join(&new_ulid_str);
+    tokio::fs::rename(&tmp_path, &final_path)
         .await
-        .context("removing temp segment")?;
+        .context("moving compacted segment into segments/")?;
 
     // Write the handoff file: one line per moved extent.
     // Format: <hash_hex> <old_ulid> <new_ulid> <new_absolute_offset>

@@ -197,10 +197,10 @@ Both commands are useful when debugging read failures: `inspect-segment` surface
 1. Scan all segments in `pending/`
 2. Cross-reference against the live LBA map to identify dead extents (LBAs since overwritten)
 3. Identify candidates: any segment with at least one dead extent, or any segment below 8 MB
-4. If no candidates: return (no-op — all pending segments are fully live and dense)
+4. Skip if the only candidate is a single small segment with no dead extents — rewriting it produces an identical output (see below)
 5. Collect all live extents from every candidate segment
-6. Write one new `pending/<ulid>` containing the merged live extents (split at 32 MB if the merged output would exceed the WAL promotion threshold)
-7. Update the in-memory LBA map and extent index to point to the new segment
+6. Write one or more new `pending/<ulid>` segments containing the merged live extents, split at 32 MB
+7. Update the in-memory extent index to point to the new segments
 8. Delete the original candidate segments
 9. Log: `[compact-pending: N → M segments, X MB reclaimed]`
 
@@ -208,7 +208,9 @@ Both commands are useful when debugging read failures: `inspect-segment` surface
 
 **Snapshot floor:** segments at or below the latest snapshot ULID are frozen and are never touched, even if they are in `pending/`.
 
-**Key property:** data written then deleted before `drain-pending` runs is never uploaded to S3. The compaction pass removes it from `pending/` entirely.
+**Single-candidate guard:** a single small segment with no dead extents is not a candidate. Rewriting it would produce an output with identical content — a pointless write amplification. The pass only proceeds for a single segment when it has dead extents to reclaim. When two or more small segments are candidates, they are always merged (reducing segment count from N to 1 is worthwhile even if all extents are live).
+
+**Key property:** data written then deleted before `drain-pending` runs is never uploaded to S3. The compaction pass removes it from `pending/` entirely. This is the primary economic argument for compacting before upload — the local I/O cost of compaction is much cheaper than uploading dead bytes to S3 and paying for coordinator GC later.
 
 ---
 
@@ -228,42 +230,66 @@ Segment GC — reclaiming space from already-uploaded `segments/` files — is a
 
 **Why the coordinator, not the volume:** segment GC requires S3 mutations (uploading replacement segments, deleting old ones). The volume holds read-only S3 credentials; all S3 writes go through the coordinator.
 
-**LBA map reconstruction:** the coordinator does not have access to the volume's in-memory LBA map. Instead, it reconstructs a read-only snapshot of the extent map by scanning all `segments/*.idx` and `fetched/*.idx` files — the same procedure as `Volume::open`. This is sufficient to identify which extents in each segment are live. The manifest (when implemented) will allow this reconstruction to be skipped in favour of a single file read.
+**Two strategies, run per fork on a configurable interval (default: every 5 minutes):**
 
-**Algorithm:**
+*Strategy 1 — Density pass* (mirrors lsvd `StartGC` and volume `compact()`):
+- Reconstruct the extent index from this fork's `segments/` and `pending/` index files
+- Find the single least-dense segment: lowest `live_bytes / file_bytes` ratio
+- If its density is below `density_threshold` (default: 0.70), compact it → one output segment
+- Return immediately after one segment; next tick handles the next candidate
 
-1. Reconstruct the extent map from `segments/*.idx` (and `fetched/*.idx`)
-2. Identify candidate segments: `live_bytes / total_bytes < density_threshold` OR file size < `small_segment_bytes`
-3. Respect the snapshot floor: segments with ULID ≤ latest snapshot ULID are frozen; skip them
-4. For each candidate: read live extents (byte-range GETs from S3 or local file), copy only live sub-ranges (not full physical extents — same logic as LSVD's `ProcessFromExtents`)
-5. Write one new compacted segment locally; upload to S3
-6. Write a GC result file: `gc/<result-ulid>.pending` — see format below
-7. Volume applies the result in its idle arm (see handoff protocol below)
-8. After volume confirms, coordinator deletes old S3 objects and renames result file to `gc/<result-ulid>.done`
+*Strategy 2 — Small-segment sweep* (mirrors lsvd `SweepSmallSegments` and volume `compact_pending()`):
+- Only runs if Strategy 1 finds no candidate (every segment has density ≥ threshold)
+- Collect all segments below `small_segment_bytes` (default: 8 MiB), oldest-first, up to 32 MiB total live bytes
+- Skip if fewer than 2 candidates — a single small segment with density ≥ threshold has no meaningful dead space; Strategy 1 would have caught it if density were below threshold
+- Merge all candidates → one output segment
+
+The two strategies are mutually exclusive within a tick: if Strategy 1 fires, Strategy 2 is not evaluated. This bounds per-tick work: Strategy 1 processes one segment; Strategy 2 is capped at 32 MiB of live data.
+
+**Liveness:** an extent entry in segment X is live if the reconstructed extent index still points to segment X for that hash. Entries overwritten by a newer segment in the same fork are dead and excluded from the compacted output. The coordinator rebuilds from on-disk files only — in-memory WAL entries are not visible. This means a WAL entry that has not yet been flushed to `pending/` may cause the coordinator to treat a soon-to-be-dead extent as live and include it in the compacted output. This is benign: the entry becomes dead on the next WAL flush, and will be reclaimed by the next GC pass.
+
+**Snapshot floor:** segments at or below the latest snapshot ULID are frozen and skipped. They may be referenced by child forks.
+
+**Output placement and the `segments/` invariant:**
+
+`segments/` files are trusted to be in S3. The coordinator maintains this invariant by writing the compacted segment atomically:
+
+1. Write to `gc/<new-ulid>.tmp`
+2. Upload to S3 — confirm success
+3. Rename `gc/<new-ulid>.tmp` → `segments/<new-ulid>`
+
+Only after step 3 is the file visible in `segments/`. A crash between steps 1 and 3 leaves an orphaned `.tmp` file in `gc/`; the file never appears in `segments/` and the invariant is never violated.
+
+Writing to `segments/` (not `pending/`) is correct for two reasons:
+- `pending/` signals "not yet in S3; please upload" — the opposite of what is true here
+- `segments/` files are in the evictable cache tier; since the segment is confirmed in S3, it belongs there
+
+**Restart safety:** because the compacted segment is in `segments/<new-ulid>`, `extentindex::rebuild` picks it up on any restart. The new ULID is larger than all its source segments, so it wins in ULID-ordered rebuild processing. The volume's on-disk state is self-consistent without reprocessing any `gc/` files.
+
+**At most one outstanding GC pass per fork:** the coordinator defers a new pass if any `gc/*.pending` files exist. This prevents accumulating multiple overlapping handoffs before the volume has applied the first.
 
 **GC result file format (`gc/<result-ulid>.pending`):**
 
-The result file describes a set of extent index updates: for each extent hash moved, the new segment ULID and body offset. Because the LBA map maps `LBA → hash` (not `LBA → segment+offset`), only the extent index needs to be patched — the LBA map is unchanged.
+The result file describes extent index patches: for each moved extent, the new segment ULID and absolute body offset. The LBA map does not need patching — it maps `LBA → hash`, and hashes do not change when data is moved.
 
 ```
 # plain text, one entry per line
-<extent_hash_hex> <old_segment_ulid> <new_segment_ulid> <new_body_offset>
+<hash_hex> <old_segment_ulid> <new_segment_ulid> <new_absolute_body_offset>
 ```
-
-The `old_segment_ulid` is included so the volume can verify that its extent index still points there before patching. If the volume has already moved an extent (e.g. it was rewritten by a new write), the patch for that entry is skipped — same safety check as LSVD's concurrent-write detection.
 
 **GC handoff protocol:**
 
-1. Coordinator writes `gc/<result-ulid>.pending`
+1. Coordinator writes `gc/<result-ulid>.pending` and moves compacted segment to `segments/<new-ulid>`
 2. Volume applies in idle arm:
-   - For each entry: if extent index points to `old_segment_ulid` for this hash, update to `new_segment_ulid + new_body_offset`; otherwise skip
-   - Delete old local `segments/<old-ulid>` file (after extent index is updated)
+   - For each entry: if extent index still points to `old_segment_ulid` for this hash, update to `new_segment_ulid + new_body_offset`; otherwise skip (hash was rewritten by a newer WAL entry — stale coordinator snapshot)
    - Rename `gc/<result-ulid>.pending` → `gc/<result-ulid>.applied`
 3. Coordinator (on next poll): sees `.applied`, deletes old S3 objects, renames to `gc/<result-ulid>.done`
 
-This protocol is crash-safe: if either process restarts mid-handoff, the `.pending`/`.applied` state is re-read and the appropriate step retried. No data is lost.
+Old local `segments/<old-ulid>` files are left in place until the volume's eviction pass removes them. They remain readable by the volume until evicted; after eviction they can be re-fetched from S3 if needed (the old S3 objects are not deleted until step 3, after which reads route to the new segment via the patched extent index).
 
-Proposed: the `gc/` result directory protocol is not yet implemented. It will be added as part of the coordinator daemon build-out.
+This protocol is crash-safe: if either process restarts mid-handoff, the `.pending`/`.applied` state is re-read on next tick and the appropriate step retried. No data is lost.
+
+*Volume idle arm for gc/*.pending is not yet implemented.* The coordinator writes `gc/*.pending` files; they accumulate until the volume side is wired up. Old S3 objects are not deleted until `.applied` is seen, so no data is at risk.
 
 *S3 repacking* (locality optimisation in object storage) is a coordinator-level operation and is **not subject to the leaf-only constraint**. The coordinator can read extents from any node's local segments or from S3, create new S3 objects with better layout, and update the extent index to point to them. Local files are caches — the coordinator does not modify them to repack at the S3 level.
 
