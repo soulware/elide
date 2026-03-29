@@ -118,6 +118,29 @@ rm volumes/data-vol/forks/default/segments/$SEGMENT
 
 **Next step: eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used segments from `segments/` and `fetched/` (never from `pending/`). Eviction + demand-fetch together make `segments/` a transparent cache tier.
 
+## Diagnostic tools
+
+Two commands inspect the raw binary file formats written by `elide`. Both are read-only.
+
+**`inspect-segment <path>`** — prints the header and index entries of a segment file or a fetched `.idx` file:
+
+```
+elide inspect-segment volumes/myvm/forks/default/pending/01JQEXAMPLE...
+elide inspect-segment volumes/myvm/forks/vm2/fetched/01JQEXAMPLE....idx
+```
+
+Output includes: file kind (full segment vs index-only), entry counts (data / dedup_ref), a table of data entries sorted by body offset (LBA range, body offset, stored length, compression flag), and total body utilisation. Entries that would read past the end of the body file are flagged `OVERFLOW` — this indicates a segment corruption or a flag-translation bug.
+
+**`inspect-wal <path>`** — prints every record in a WAL file:
+
+```
+elide inspect-wal volumes/myvm/forks/default/wal/01JQEXAMPLE...
+```
+
+Output includes: record counts (data / dedup_ref), a table of records (type, LBA range, body offset within the WAL file, payload size, compression flag). Truncated tail records (from a crash mid-write) are reported but not an error — `Volume::open` handles them during recovery.
+
+Both commands are useful when debugging read failures: `inspect-segment` surfaces the compressed/uncompressed flag and stored lengths that the read path relies on; `inspect-wal` shows what a WAL contains before it is promoted.
+
 ## GC and Repacking
 
 **GC has two distinct scopes with different constraints:**

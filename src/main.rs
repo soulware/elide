@@ -9,6 +9,7 @@ use elide_signing::{FORK_KEY_FILE, FORK_ORIGIN_FILE, FORK_PUB_FILE};
 mod extents;
 mod fetcher;
 mod inspect;
+mod inspect_files;
 mod ls;
 mod nbd;
 
@@ -124,6 +125,26 @@ enum Command {
     ListForks {
         /// Path to the volume directory
         vol_dir: String,
+    },
+    /// Print header and index entries of a segment file or fetched .idx file
+    ///
+    /// Works on full segments (pending/, segments/) and index-only files
+    /// (fetched/*.idx). Shows entry type, LBA range, body offset, stored
+    /// length, and compression flag. Flags any entries that would overflow
+    /// the body file (indicates a flag translation bug or corrupt file).
+    InspectSegment {
+        /// Path to the segment or .idx file
+        path: String,
+    },
+    /// Print all records in a WAL file (wal/<ulid>)
+    ///
+    /// Uses read-only scanning — never modifies the file. Shows record type,
+    /// LBA range, body offset, payload size, and compression flag. Reports
+    /// truncated tail records (indicating a crash before the record was
+    /// fully written).
+    InspectWal {
+        /// Path to the WAL file
+        path: String,
     },
 }
 
@@ -275,6 +296,14 @@ fn main() {
 
         Command::ListForks { vol_dir } => {
             list_forks(Path::new(&vol_dir)).expect("list-forks failed");
+        }
+
+        Command::InspectSegment { path } => {
+            inspect_files::inspect_segment(Path::new(&path)).expect("inspect-segment failed");
+        }
+
+        Command::InspectWal { path } => {
+            inspect_files::inspect_wal(Path::new(&path)).expect("inspect-wal failed");
         }
     }
 }
