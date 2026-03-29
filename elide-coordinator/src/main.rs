@@ -1,16 +1,26 @@
 // elide-coordinator: manages segment upload and object store lifecycle.
 //
 // Subcommands:
+//   run [--config <path>]
+//     Start the coordinator daemon. Watches configured volume roots, discovers
+//     forks, and continuously drains pending segments to S3. Store and timing
+//     configuration comes from the config file (default: coordinator.toml).
+//
 //   drain-pending <fork-dir>
 //     Upload all committed segments from pending/ to the object store, then exit.
 //     Each segment is handled independently; partial success is possible.
 //     Exits non-zero if any segment failed to upload.
 //
-// Store selection (mutually exclusive):
+//   prefetch-indexes <fork-dir>
+//     Download index sections (.idx) for all ancestor segments not present locally.
+//
+// Store selection for one-shot commands (mutually exclusive):
 //   --local <path>          Use a local directory as the object store (no server needed).
 //   (default)               Use S3 via env vars: ELIDE_S3_BUCKET, AWS_ENDPOINT_URL,
 //                           AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
 
+mod config;
+mod daemon;
 mod prefetch;
 mod store;
 mod upload;
@@ -27,7 +37,8 @@ use object_store::ObjectStore;
 #[command(about = "Elide coordinator: manages segment upload and object store lifecycle")]
 struct Args {
     /// Use a local directory as the object store instead of S3.
-    /// Useful for testing without a running object store server.
+    /// Applies to one-shot commands (drain-pending, prefetch-indexes).
+    /// The `run` command reads its store config from coordinator.toml.
     #[arg(long, global = true, value_name = "PATH")]
     local: Option<PathBuf>,
 
@@ -37,11 +48,23 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Start the coordinator daemon.
+    ///
+    /// Watches configured volume root directories, discovers forks automatically,
+    /// and continuously drains pending segments to the object store. Store and
+    /// timing configuration are read from the config file.
+    Run {
+        /// Path to the coordinator configuration file.
+        #[arg(long, default_value = "coordinator.toml")]
+        config: PathBuf,
+    },
+
     /// Upload all pending segments for a fork to the object store, then exit.
     DrainPending {
         /// Path to the fork directory (e.g. volumes/myvm/base or volumes/myvm/forks/vm1)
         fork_dir: PathBuf,
     },
+
     /// Download index sections (.idx) for all ancestor segments not present locally.
     ///
     /// Run this before serving a forked volume on a host that has no local copies
@@ -77,10 +100,16 @@ fn build_store(local: Option<PathBuf>) -> Result<Arc<dyn ObjectStore>> {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
-    let store = build_store(args.local)?;
 
     match args.command {
+        Command::Run { config } => {
+            let config = config::load(&config)?;
+            let store = config.store.build()?;
+            daemon::run(config, store).await
+        }
+
         Command::DrainPending { fork_dir } => {
+            let store = build_store(args.local)?;
             let (volume_id, fork_name) = upload::derive_names(&fork_dir)
                 .context("resolving volume and fork names from fork dir")?;
 
@@ -96,6 +125,7 @@ async fn run() -> Result<()> {
         }
 
         Command::PrefetchIndexes { fork_dir } => {
+            let store = build_store(args.local)?;
             let result = prefetch::prefetch_indexes(&fork_dir, &store).await?;
 
             println!(

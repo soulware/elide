@@ -18,11 +18,42 @@ elide serve-volume <vol-dir> <fork> --auto-flush <SECS>
 
 Both triggers call the same `promote()` path, producing an identical segment format. Neither is on the fsync critical path — a guest `fsync` returns as soon as the WAL record is durable; promotion happens inline on the next write (size trigger) or on the idle timer.
 
-## S3 Upload
+## Coordinator Daemon
 
-Segments accumulate in `pending/` after WAL promotion (see [formats.md](formats.md) for the promotion commit sequence). The coordinator is responsible for uploading them to the object store and moving them to `segments/` on success. Each segment is handled independently — a failure on one does not block the others.
+The coordinator is a long-running daemon that runs on each host and manages all volumes on that host. It is the exclusive owner of all S3 mutations — upload, delete, and GC rewrites. The volume process holds read-only S3 credentials (for demand-fetch only); it never writes to or deletes from S3.
 
-**`drain-pending`** is the current upload mechanism. It is a one-shot command that scans `pending/`, uploads each segment, and exits. It is invoked explicitly rather than running as a daemon, which gives direct control over when uploads occur during testing and development:
+**Proposed: coordinator daemon configuration (`coordinator.toml`):**
+
+```toml
+roots = ["/var/lib/elide/volumes"]   # directories to watch for volumes and forks
+
+[s3]
+bucket   = "my-elide-bucket"
+endpoint = "https://s3.amazonaws.com"
+region   = "us-east-1"
+
+[gc]
+density_threshold  = 0.70            # compact segments when live_bytes/total_bytes < threshold
+small_segment_bytes = 8_388_608      # also compact segments smaller than this
+```
+
+**Fork discovery:** the coordinator watches each configured root directory (using filesystem notifications) and discovers forks by scanning for `forks/<name>/pending/` or `forks/<name>/segments/` directories. Each discovered fork gets its own per-fork state machine.
+
+**Per-fork responsibilities:**
+
+| Trigger | Action |
+|---|---|
+| New files appear in `pending/` | Upload to S3; rename to `segments/` on success |
+| Segment density drops below threshold | Segment GC: rewrite sparse segments; upload replacements; delete old S3 objects |
+| New fork opened (cold-start) | `prefetch-indexes`: download `.idx` files for ancestor segments |
+
+**`fetched/` is the volume's concern, not the coordinator's.** The volume creates and manages the `fetched/` cache directory — writing triplets on demand-fetch, promoting fully-populated triplets to `segments/`, and evicting LRU entries when the cache exceeds capacity. The coordinator does not read or write `fetched/`.
+
+### S3 Upload
+
+Segments accumulate in `pending/` after WAL promotion (see [formats.md](formats.md) for the promotion commit sequence). The coordinator uploads them to S3 and moves them to `segments/` on success. Each segment is handled independently — a failure on one does not block the others.
+
+**`drain-pending`** is the current one-shot upload command, used during development and testing:
 
 ```
 elide-coordinator drain-pending <fork-dir>
@@ -32,7 +63,7 @@ Store selection:
 - `--local <path>` — use a local directory as the object store (no server needed; useful for testing)
 - default — use S3 via environment variables: `ELIDE_S3_BUCKET`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 
-The `object_store` crate is used for all store access, which provides a uniform interface across local filesystem, S3, GCS, and Azure backends. Switching from a local store to S3 or Tigris is a configuration change, not a code change.
+The `object_store` crate is used for all store access, providing a uniform interface across local filesystem, S3, GCS, and Azure backends.
 
 **Upload commit sequence per segment:**
 1. Read `pending/<ulid>` into memory
@@ -41,8 +72,6 @@ The `object_store` crate is used for all store access, which provides a uniform 
 4. On failure: leave in `pending/`, record error, continue with remaining segments
 
 The rename in step 3 is the local commit point. If the coordinator crashes between steps 2 and 3, the object is in S3 but the segment is still in `pending/` — a retry will re-PUT (idempotent) and then rename. No ledger file is needed.
-
-**Exit code:** non-zero if any segment failed to upload. Segments that succeeded are committed regardless — the exit code signals that a re-run is needed for the remainder.
 
 **GC and upload ordering:** see the GC section below for the required sequencing between GC and upload when both operate on `pending/` segments.
 
@@ -192,6 +221,49 @@ To reclaim local space from a frozen ancestor, all its live descendants must fir
 Within a live leaf node, **all** of its own segments are GC-eligible — there is no distinction between segments promoted in the current session and those promoted in earlier sessions. GC operates on `pending/` and `segments/` within the live node's directory only; ancestor directories are never scanned or modified.
 
 **GC and S3 upload ordering:** GC intentionally covers `pending/` segments (not yet uploaded) as well as `segments/` (already uploaded). Compacting a `pending/` segment before it is uploaded avoids sending sparse data to S3 — only the denser replacement is uploaded. This requires that GC and the S3 uploader are serialised by the coordinator and never run concurrently on the same `pending/` segment. The coordinator-level ownership of both tasks makes this natural: the intended sequencing is promote → GC → upload.
+
+### Coordinator-driven segment GC
+
+Segment GC — reclaiming space from already-uploaded `segments/` files — is a coordinator operation. The volume process is not taken offline; it remains available for reads and writes throughout.
+
+**Why the coordinator, not the volume:** segment GC requires S3 mutations (uploading replacement segments, deleting old ones). The volume holds read-only S3 credentials; all S3 writes go through the coordinator.
+
+**LBA map reconstruction:** the coordinator does not have access to the volume's in-memory LBA map. Instead, it reconstructs a read-only snapshot of the extent map by scanning all `segments/*.idx` and `fetched/*.idx` files — the same procedure as `Volume::open`. This is sufficient to identify which extents in each segment are live. The manifest (when implemented) will allow this reconstruction to be skipped in favour of a single file read.
+
+**Algorithm:**
+
+1. Reconstruct the extent map from `segments/*.idx` (and `fetched/*.idx`)
+2. Identify candidate segments: `live_bytes / total_bytes < density_threshold` OR file size < `small_segment_bytes`
+3. Respect the snapshot floor: segments with ULID ≤ latest snapshot ULID are frozen; skip them
+4. For each candidate: read live extents (byte-range GETs from S3 or local file), copy only live sub-ranges (not full physical extents — same logic as LSVD's `ProcessFromExtents`)
+5. Write one new compacted segment locally; upload to S3
+6. Write a GC result file: `gc/<result-ulid>.pending` — see format below
+7. Volume applies the result in its idle arm (see handoff protocol below)
+8. After volume confirms, coordinator deletes old S3 objects and renames result file to `gc/<result-ulid>.done`
+
+**GC result file format (`gc/<result-ulid>.pending`):**
+
+The result file describes a set of extent index updates: for each extent hash moved, the new segment ULID and body offset. Because the LBA map maps `LBA → hash` (not `LBA → segment+offset`), only the extent index needs to be patched — the LBA map is unchanged.
+
+```
+# plain text, one entry per line
+<extent_hash_hex> <old_segment_ulid> <new_segment_ulid> <new_body_offset>
+```
+
+The `old_segment_ulid` is included so the volume can verify that its extent index still points there before patching. If the volume has already moved an extent (e.g. it was rewritten by a new write), the patch for that entry is skipped — same safety check as LSVD's concurrent-write detection.
+
+**GC handoff protocol:**
+
+1. Coordinator writes `gc/<result-ulid>.pending`
+2. Volume applies in idle arm:
+   - For each entry: if extent index points to `old_segment_ulid` for this hash, update to `new_segment_ulid + new_body_offset`; otherwise skip
+   - Delete old local `segments/<old-ulid>` file (after extent index is updated)
+   - Rename `gc/<result-ulid>.pending` → `gc/<result-ulid>.applied`
+3. Coordinator (on next poll): sees `.applied`, deletes old S3 objects, renames to `gc/<result-ulid>.done`
+
+This protocol is crash-safe: if either process restarts mid-handoff, the `.pending`/`.applied` state is re-read and the appropriate step retried. No data is lost.
+
+Proposed: the `gc/` result directory protocol is not yet implemented. It will be added as part of the coordinator daemon build-out.
 
 *S3 repacking* (locality optimisation in object storage) is a coordinator-level operation and is **not subject to the leaf-only constraint**. The coordinator can read extents from any node's local segments or from S3, create new S3 objects with better layout, and update the extent index to point to them. Local files are caches — the coordinator does not modify them to repack at the S3 level.
 

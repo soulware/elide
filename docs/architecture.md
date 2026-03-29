@@ -17,9 +17,13 @@ This layering also means a single volume process can be started standalone for d
 
 A single **Elide coordinator** runs on each host and manages all volumes. It forks one child process per volume — the process boundary is deliberate: a fault in one volume's I/O path cannot corrupt another, and the boundary forces the inter-component interface to be explicit and real (filesystem layout, IPC protocol, GC ownership) rather than loose in-process coupling.
 
-**Coordinator (main process)** — spawns and supervises volume processes; owns GC (runs as a coordinator-level task with access to all volumes' on-disk state); handles S3 upload/download.
+**Coordinator (main process)** — spawns and supervises volume processes; owns all S3 mutations (upload, delete, segment GC rewrites); watches one or more configured volume root directories and discovers forks automatically; handles `prefetch-indexes` for forks cold-starting from S3.
 
-**Volume process** (one per volume) — owns the ublk/NBD frontend for one volume; owns the WAL and pending promotion for that volume; holds the live LBA map in memory. Does not communicate with other volume processes directly. Communicates with the coordinator via a defined IPC boundary (TBD — Unix socket or similar). Never requires the coordinator for correct I/O.
+**Volume process** (one per volume) — owns the ublk/NBD frontend for one volume; owns the WAL and pending promotion for that volume; holds the live LBA map in memory; runs background `pending/` compaction and `fetched/` promotion in the idle arm. Does not communicate with other volume processes directly. Communicates with the coordinator via a defined IPC boundary (TBD — Unix socket or similar). Never requires the coordinator for correct I/O.
+
+**S3 credential split:** the volume process requires only **read-only** S3 credentials (for demand-fetch). All S3 mutations — segment upload, segment delete, GC rewrites — are performed exclusively by the coordinator, which holds read-write credentials. This limits the blast radius if a volume host is compromised.
+
+Proposed: this split is the design target. Currently the volume holds full S3 credentials for demand-fetch (via `object_store` in `elide/src/fetcher.rs`). Read-only credential enforcement is deferred until the coordinator daemon is built out.
 
 ## Crate structure
 
@@ -42,10 +46,12 @@ elide-import/      — OCI import binary: pulls public OCI images from a contain
                      elide_core::import::import_image to ingest. Adds: tokio,
                      oci-client, ocirender. Heavy async deps isolated here.
 
-elide-coordinator/ — coordinator binary: segment upload and object store
-                     lifecycle. Adds: tokio, object_store (S3 and local
-                     filesystem backends). Currently implements drain-pending;
-                     will grow to own GC scheduling and volume supervision.
+elide-coordinator/ — coordinator daemon: watches configured volume root
+                     directories; discovers forks; drains pending/ to S3;
+                     runs segment GC; prefetches indexes for cold forks.
+                     Adds: tokio, object_store (S3 and local filesystem
+                     backends), notify (filesystem watching). Holds read-write
+                     S3 credentials; volume holds read-only credentials only.
 ```
 
 The split keeps the volume process binary lean and focused. The async HTTP stack
@@ -134,9 +140,11 @@ Volume process  (one per volume)
       │
       ▼
 Coordinator (main process)
- ├─ Volume supervisor  (spawn/re-adopt volume processes)
- ├─ GC / segment packer  (compacts post-snapshot segments only; floor = latest snapshot ULID)
- └─ S3 uploader  (async, not on write critical path)
+ ├─ Volume supervisor    (spawn/re-adopt volume processes)
+ ├─ Fork watcher         (inotify on configured root dirs; discovers new forks/volumes)
+ ├─ S3 uploader          (drains pending/ → S3; async, not on write critical path)
+ ├─ Segment GC           (coordinator-driven; reads LBA map from indexes; writes gc/ result files)
+ └─ prefetch-indexes     (downloads .idx files for cold-start forks)
 ```
 
 ## Coordinator restartability
