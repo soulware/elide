@@ -92,15 +92,22 @@ When the write log reaches the 32MB threshold (or on an explicit flush), the bac
 **Directory layout within a live node:**
 
 ```
-wal/<ULID>          — WAL file (active or awaiting promotion)
-pending/<ULID>      — segment file committed locally, S3 upload pending
-segments/<ULID>     — segment file confirmed uploaded to S3 (evictable)
+wal/<ULID>              — WAL file (active or awaiting promotion)
+pending/<ULID>          — segment file committed locally, S3 upload pending
+segments/<ULID>         — segment file confirmed uploaded to S3 (evictable)
+fetched/<ULID>.idx      — header + index + inline fetched from S3 (always present first)
+fetched/<ULID>.body     — sparse body file; body-relative byte offsets
+fetched/<ULID>.present  — presence bitset; one bit per index entry
 ```
 
-Each directory corresponds to one stage in the lifecycle:
+The first three directories correspond to the write-path lifecycle; `fetched/` is the fetch-path cache:
 
 ```
-wal/<ULID>  →  pending/<ULID>  →  segments/<ULID>
+wal/<ULID>  →  pending/<ULID>  →  segments/<ULID>   (write path)
+
+                     S3
+                      ↓
+               fetched/<ULID>.*  →  segments/<ULID>   (fetch path, when fully populated)
 ```
 
 Both `pending/` and `segments/` hold segment files in the same format (header + index + inline + body). The distinction is upload state, not file format. Locally-stored segment files have `delta_length = 0` in the header; the coordinator appends the delta body when computing deltas at S3 upload time, producing the final S3 object.
@@ -140,12 +147,13 @@ Under the **sparse** strategy the S3 object diverges structurally from the local
 
 The two strategies are not mutually exclusive: sparse can be applied first (skip unchanged blocks), and delta compression applied to the changed blocks that remain. See [architecture.md](architecture.md) for the trade-off comparison.
 
-**On startup:** scan all three directories within the live node. Each maps to one recovery action:
+**On startup:** scan all four directories within the live node. Each maps to one recovery action:
 - `wal/` — replay (truncate partial tail if needed) and promote
 - `pending/` — read header + index section for LBA map rebuild; queue S3 upload
 - `segments/` — read header + index section for LBA map rebuild
+- `fetched/*.idx` — read header + index section for LBA map rebuild (same as `segments/`, just a different path to the same data)
 
-Then scan ancestor nodes' `segments/` directories (no `wal/` or `pending/` — they are frozen), oldest ancestor first, to build the full merged LBA map.
+Then scan ancestor nodes' `segments/` and `fetched/` directories (no `wal/` or `pending/` — they are frozen), oldest ancestor first, to build the full merged LBA map.
 
 ---
 
@@ -303,6 +311,81 @@ Snapshot indexes are consolidated index-section views written at snapshot time, 
 ```
 
 **Segment files are the ground truth.** All derived structures (in-memory extent index, optional manifest) are caches reconstructible from segment files. On cold start or after index loss, reconstruction is: download index sections of all segment files (fast, small) rather than full segment bodies.
+
+---
+
+## Fetched Segment Format
+
+Segments fetched from S3 are **inherently partial**: a newly-arrived segment has its header and index available immediately, but body bytes arrive on demand as specific extents are read. The locally-written format cannot represent this state — a file in `pending/` or `segments/` is always complete by construction (written atomically via tmp→rename). Fetched segments live in a separate `fetched/` directory and use a three-file representation.
+
+### Format comparison
+
+| Property | Locally-written (`pending/` · `segments/`) | Fetched (`fetched/`) |
+|---|---|---|
+| File count | 1 per segment | 3 per segment (`.idx`, `.body`, `.present`) |
+| Completeness | Always complete (atomic tmp→rename) | Partial; body populated incrementally |
+| Format | Header + index + inline + body (+ delta on S3) | `.idx`: header + index + inline; `.body`: sparse body bytes |
+| Delta section | `delta_length = 0` locally; appended by coordinator at upload | Never stored; materialised into `.body` if a delta path is taken |
+| `body_offset` reference point | File-relative (as written) | Body-relative (0 = first byte of body section) — matches `entry.body_offset` directly |
+| Presence tracking | N/A — always 100% present | `.present` bitset; one bit per index entry |
+| Signature location | `header[32..96]` in the single file | `header[32..96]` in `.idx`; verified before any body fetch |
+| Eviction unit | Full file | Full triplet (`.idx` + `.body` + `.present`) |
+| Promotion | `pending/` → `segments/` (after upload) | `fetched/` → `segments/` (when `.present` is fully set) |
+
+### File details
+
+**`<ulid>.idx` — header + index + inline**
+
+Exactly the bytes `[0, body_section_start)` of the S3 object, where `body_section_start = 96 + index_length + inline_length`. This is the same slice retrieved by an index-only GET (`GET [0, inline_offset)` from the retrieval strategies section, extended to include the inline section). The existing segment reader parses this unchanged — header fields and index entries are at their normal byte offsets. The `body_length` and `delta_length` fields in the header reflect the full S3 object; they are valid metadata even though the body is not stored in this file.
+
+`.idx` is always fetched first, before any body bytes. It contains everything needed for LBA map and extent index rebuild at `Volume::open`, so a host can open a volume with partial body coverage as long as all `.idx` files are present.
+
+**`<ulid>.body` — sparse body file**
+
+An OS sparse file of `body_length` bytes. Byte offsets within the file are **body-relative**: offset 0 corresponds to the first byte of the body section of the S3 object. This matches `entry.body_offset` directly — no arithmetic is needed to locate an extent in the body file.
+
+Each fetched extent is written at its exact `body_offset` within this file. OS holes represent unfetched ranges. The `.present` bitset is the authoritative record of what is present; OS zeros in a hole are not distinguishable from legitimate zero-filled extent data without it.
+
+Extents materialised from a delta (delta bytes fetched, applied against a local source extent, result written) are stored at the same `body_offset` as the full-body version. From the read path's perspective, materialised delta output is identical to a directly-fetched body extent.
+
+**`<ulid>.present` — presence bitset**
+
+A packed bitset with one bit per index entry (entry N → bit N). Size: `ceil(entry_count / 8)` bytes. A set bit means the bytes `[body_offset, body_offset + body_length)` for that entry are present in `.body` and ready to serve.
+
+Entries that have no body bytes never need fetching and can be treated as implicitly present:
+- `FLAG_DEDUP_REF` — data lives in an ancestor segment; no bytes in this segment's body
+- `FLAG_INLINE` — data is in the inline section of `.idx`; no body fetch needed
+
+All other entries (standard DATA entries with body bytes) start with their bit unset and are set when the extent is fetched and written to `.body`.
+
+The bitset is written atomically per extent: write the bytes to `.body`, fsync (or at minimum ensure the write is visible), then set the bit. This ordering ensures a set bit is never visible before the corresponding body bytes.
+
+### Fetch sequence
+
+For a read that hits a missing body extent:
+
+```
+1. Check segments/<ulid>          — complete file; serve directly if present
+2. Check fetched/<ulid>.present   — check bit N for this extent
+   - Set → read from fetched/<ulid>.body at entry.body_offset
+   - Unset → proceed to step 3
+3. Verify signature in fetched/<ulid>.idx (if not already verified this session)
+4. Issue byte-range GET to S3: [body_section_start + entry.body_offset,
+                                body_section_start + entry.body_offset + entry.body_length)
+   - If a delta option is available and its source_hash is in the local extent index:
+     fetch delta bytes instead; apply against local source; write materialised result
+5. Write bytes to fetched/<ulid>.body at entry.body_offset
+6. Set bit N in fetched/<ulid>.present
+7. Serve from fetched/<ulid>.body
+```
+
+Coalescing: before issuing GETs, collect all absent extents required for the current read and merge adjacent or nearby `(body_offset, body_length)` ranges into a minimal set of byte-range requests. This is the same coalescing described in the warm-start retrieval strategy.
+
+### Promotion to `segments/`
+
+When all bits in `.present` are set (accounting for implicitly-present REF and INLINE entries), the three fetched files can be collapsed into a single complete segment file and moved to `segments/`. This is a background operation — identical in character to GC — and does not need to block reads. The read path checks `segments/<ulid>` before `fetched/<ulid>.*`, so once promotion completes all subsequent reads use the simpler path.
+
+Promotion reconstructs the complete file by concatenating: `.idx` bytes + body bytes read sequentially from `.body`. The resulting file is identical in format to a locally-written segment (body-relative offsets in the index match file-relative offsets once the header and index sections are prepended). After the rename to `segments/<ulid>` succeeds, the three fetched files are deleted.
 
 ---
 
