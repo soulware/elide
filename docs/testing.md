@@ -162,15 +162,22 @@ exactly the state the handoff protocol is designed to make safe.  Fixed by
 collecting and deleting the consumed paths after `apply_gc_handoffs`, matching
 the real coordinator protocol.
 
-**`CompactVolume` SimOp is entirely absent.**  `vol.compact(min_live_ratio)`
-is the volume-level density pass.  It iterates both `pending/` and `segments/`,
-rewrites sparse segments, and deletes the originals.  It is subject to the
-snapshot-floor invariant and produces new segment ULIDs — both correctness
-properties that proptest verifies for other ops.  There is no `CompactVolume`
-variant in `SimOp`, no weight in `arb_sim_op`, and no handling in either
-property block.  Adding it follows the standard pattern: capture `ulids_before`,
-call `vol.compact(0.9)` (high threshold to ensure there are always candidates),
-assert new ULIDs in `ulid_monotonicity`.
+**`CompactVolume` SimOp is entirely absent.**  *(Fixed, two bugs found.)*
+`vol.compact(min_live_ratio)` is the volume-level density pass.  It iterates
+both `pending/` and `segments/`, rewrites sparse segments, and deletes the
+originals.  Adding `CompactVolume` to the simulation immediately found two bugs:
+
+1. `compact()` used `mint.next()` for output ULIDs, producing values above the
+   current WAL ULID.  On rebuild the compact output sorted after the WAL flush
+   segment and overwrote newer data with stale compacted data.  Fixed by reusing
+   the source segment's own ULID as the output ULID — the same approach as
+   `compact_pending`.
+
+2. When the source segment is in `pending/`, the output path equals the source
+   path.  The `rename(.tmp → pending/<ulid>)` atomically replaced the source,
+   but the subsequent `remove_file(seg_path)` deleted the newly-written compact
+   output.  Fixed by skipping the delete when the source is in `pending/` (the
+   rename already replaced it in-place).
 
 **Coordinator multi-segment sweep not modelled.**  `CoordGcLocal` always picks
 exactly two segments.  The real coordinator Strategy 2 can consume three or

@@ -53,6 +53,10 @@ enum SimOp {
     },
     Flush,
     CompactPending,
+    /// Volume-level density pass: rewrites sparse segments from both pending/
+    /// and segments/. Analogous to the coordinator's Strategy 1 but runs
+    /// in-process on the volume.
+    CompactVolume,
     /// Move all committed pending/ segments to segments/, simulating
     /// drain-pending without S3 upload. Required before CoordGcLocal has
     /// material to work with.
@@ -66,6 +70,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::Write { lba, seed }),
         Just(SimOp::Flush),
         Just(SimOp::CompactPending),
+        Just(SimOp::CompactVolume),
         Just(SimOp::DrainLocal),
         Just(SimOp::CoordGcLocal),
         Just(SimOp::Crash),
@@ -115,6 +120,18 @@ proptest! {
                         prop_assert!(
                             *u > max_before,
                             "compact_pending produced ULID {u} ≤ existing max {max_before}"
+                        );
+                    }
+                }
+                SimOp::CompactVolume => {
+                    // Use a high threshold so any segment with dead bytes is a
+                    // candidate, maximising the chance of actually compacting.
+                    let _ = vol.compact(0.9);
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            *u > max_before,
+                            "compact produced ULID {u} ≤ existing max {max_before}"
                         );
                     }
                 }
@@ -180,6 +197,9 @@ proptest! {
                 }
                 SimOp::CompactPending => {
                     let _ = vol.compact_pending();
+                }
+                SimOp::CompactVolume => {
+                    let _ = vol.compact(0.9);
                 }
                 SimOp::DrainLocal => {
                     common::drain_local(fork_dir);

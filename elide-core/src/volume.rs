@@ -517,7 +517,13 @@ impl Volume {
                 // Read body bytes for live entries, then write a new denser segment.
                 segment::read_extent_bodies(&seg_path, body_section_start, &mut live_entries)?;
 
-                let new_ulid = self.mint.next().to_string();
+                // Reuse the source segment's own ULID for the output.  This
+                // guarantees the output ULID < the current WAL ULID (all segments
+                // predate the current WAL), so a subsequent WAL flush always
+                // produces a higher ULID and wins on rebuild.  Using mint.next()
+                // here would generate a ULID past the WAL ULID and break that
+                // ordering — the same bug fixed in compact_pending.
+                let new_ulid = seg_id.clone();
                 let pending_dir = self.base_dir.join("pending");
                 let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
                 let final_path = pending_dir.join(&new_ulid);
@@ -549,7 +555,17 @@ impl Volume {
             }
             drop(cache);
 
-            fs::remove_file(&seg_path)?;
+            // When the source is in pending/ the rename above already replaced
+            // it atomically (final_path == seg_path), so there is nothing left
+            // to delete.  When the source is in segments/ the output went to
+            // pending/ (different path) and we remove the original to complete
+            // the replacement.
+            let source_in_pending = seg_path
+                .parent()
+                .is_some_and(|p| p == self.base_dir.join("pending"));
+            if !source_in_pending {
+                fs::remove_file(&seg_path)?;
+            }
 
             stats.segments_compacted += 1;
             stats.bytes_freed += total_bytes - live_bytes;
