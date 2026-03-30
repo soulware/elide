@@ -1,7 +1,8 @@
 # Design: GC ULID ordering and the single-mint invariant
 
-Status: **partially resolved** (extent index guard + per-entry tracking committed;
-single-mint attempted and reverted; rebuild-time ordering still open)
+Status: **resolved** (extent index guard + per-entry tracking committed;
+gc_checkpoint closes rebuild-time ordering gap; removal-only handoffs handle
+LBA-dead extent cleanup)
 
 Date: 2026-03-30
 
@@ -83,34 +84,19 @@ produces a ULID from the old inputs' timestamp, which is far below any
 concurrent WAL ULID.  The GC output sorts before the WAL segment, so the WAL's
 entries win on rebuild.
 
-**Current state:** `compaction_ulid(max_input)` remains.  The same-millisecond
-collision is theoretically possible but astronomically unlikely in production
-(GC inputs are seconds to minutes old).  The extent index guard (bug 1)
-protects the live apply_gc_handoffs path.  The rebuild path relies on timestamp
-separation between old GC inputs and current writes.
+**Fix: `gc_checkpoint` (option A — WAL flush before mint).**  Before running a
+GC pass the coordinator calls `gc_checkpoint` on the volume via the actor
+channel.  The handler flushes the in-flight WAL to `pending/` and then mints
+a fresh ULID from the volume's own generator.  The coordinator uses this ULID
+as the output segment name.
 
-**Open question:** how to close the rebuild-time ordering gap.  Options:
+Because the WAL is flushed *before* minting, no in-flight WAL segment can have
+a ULID below the returned value — the volume's mint advances past the minted
+ULID, so all subsequent WAL segments sort above the GC output.  The GC output
+therefore always sorts below any concurrent or future write, and the WAL's
+entries win on rebuild.  The two-source ordering race is closed.
 
-  A. **WAL flush before mint:** `MintUlid` handler flushes the in-flight WAL
-     before minting, so no WAL segment can have a ULID below the minted one.
-     Adds latency to the GC path and couples volume I/O to coordinator timing.
-
-  B. **GC-aware rebuild:** tag GC output segments (e.g. a header flag or a
-     sidecar file) so rebuild knows to apply them at the position of their
-     *input* segments, not their output ULID.  Adds complexity to the segment
-     format and rebuild logic.
-
-  C. **Rebuild from handoff files:** instead of pure ULID-ordered rebuild, use
-     `.pending`/`.applied`/`.done` files to understand GC relationships.
-     Rebuild applies the GC output's entries only where the extent index still
-     points at the consumed input — the same guard used at runtime.  This
-     requires the handoff files to survive across restarts (they already do).
-
-  D. **Accept the gap:** document that the same-millisecond collision requires
-     both (a) GC inputs from the current millisecond and (b) random bits that
-     happen to sort the wrong way.  In production this requires drain + GC to
-     complete within 1ms, which is physically implausible with S3 upload in
-     the path.  The proptest exercises it because it collapses time.
+**Status:** committed (b3f9244 + 23fd569).
 
 ### 3. `.pending` file per-entry old_ulid (test helper bug)
 
@@ -150,13 +136,22 @@ a segment file).  Should skip with a warning — the new compacted segment
 
 ### All-dead segment case
 
-When all extents in GC candidates are dead, no handoff is needed (no extent
-index entries reference the segments).  The coordinator should delete S3
-objects and local files directly, skipping the handoff protocol.
+When all extents in GC candidates are truly extent-dead (no extent index entry
+references them), the coordinator deletes S3 objects and local files directly —
+no handoff is needed.
 
-**Fix:** direct delete in the all-dead branch of `compact_segments`.
+However, extents that are *extent-live but LBA-dead* (the extent index still
+references them, but the LBA has since been overwritten with different data)
+require a removal-only handoff: a `.pending` file containing only 2-field lines
+(`<hash> <old_ulid>`).  Without this, deleting the source segments leaves
+dangling extent index references that cause "segment not found" errors on reads
+(particularly via dedup-ref entries that resolve through the stale entry).
 
-**Status:** committed (7e8eeec).
+**Fix:** direct delete in the truly-all-dead branch; removal-only handoff when
+extent-live/LBA-dead entries exist.
+
+**Status:** initial direct-delete committed (7e8eeec); removal-only handoff
+committed (2d0a6ce).
 
 ### `.applied` -> `.done` cleanup
 
@@ -178,5 +173,7 @@ S3 404 on delete is treated as success (idempotent across coordinator crashes).
 | Atomic `.pending` write | Done | 7e8eeec |
 | All-dead direct cleanup | Done | 7e8eeec |
 | `.applied` -> `.done` | Done | 7e8eeec |
-| Single-mint (bug 2) | Attempted, reverted | -- |
-| Rebuild-time ordering | Open | -- |
+| gc_checkpoint / rebuild-time ordering (bug 2) | Done | b3f9244 + 23fd569 |
+| LBA-level liveness filtering | Done | b3f9244 + 23fd569 |
+| Removal-only handoffs (LBA-dead cleanup) | Done | 2d0a6ce |
+| Dedup-ref liveness in all compaction paths | Done | d71b084 |

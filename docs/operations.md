@@ -240,7 +240,14 @@ Segment GC — reclaiming space from already-uploaded `segments/` files — is a
 
 The two strategies are mutually exclusive within a tick: if Strategy 1 fires, Strategy 2 is not evaluated. This bounds per-tick work: Strategy 1 processes one segment; Strategy 2 is capped at 32 MiB of live data.
 
-**Liveness:** an extent entry in segment X is live if the reconstructed extent index still points to segment X for that hash. Entries overwritten by a newer segment in the same fork are dead and excluded from the compacted output. The coordinator rebuilds from on-disk files only — in-memory WAL entries are not visible. This means a WAL entry that has not yet been flushed to `pending/` may cause the coordinator to treat a soon-to-be-dead extent as live and include it in the compacted output. The worst case is a small space leak: the compacted output carries an extent that no LBA references, which the hash-based liveness check cannot detect. It does not cause data corruption or stale reads — see *Output ULID assignment* below.
+**Liveness:** an extent entry is live only if it passes two checks:
+
+1. **Extent-live:** the reconstructed extent index still points to the input segment for that hash. Entries overwritten by a newer segment in the same fork are extent-dead and excluded.
+2. **LBA-live:** the LBA map still maps the original LBA to that hash (`lbamap.hash_at(lba) == Some(hash)`). If the LBA has since been overwritten with different data, the entry is LBA-dead even though the extent index still references it. LBA-dead entries are recorded as *removed entries* in the handoff file so the volume can clean the stale extent index reference when it applies the handoff.
+
+The coordinator rebuilds from on-disk files only — in-memory WAL entries are not visible. This means a WAL entry not yet flushed to `pending/` may cause the coordinator to treat a soon-to-be-dead extent as live. The worst case is a small space leak (the compacted output carries an extent whose LBA will be dead after the WAL flushes). This does not cause data corruption or stale reads — see *Output ULID assignment* below.
+
+**Dedup-ref entries during compaction:** dedup-ref segment entries carry an LBA mapping but no body data. All three compaction paths (volume `compact`, `compact_pending`, and coordinator GC) carry a dedup-ref entry only if `lbamap.hash_at(start_lba) == Some(hash)`. Unconditionally carrying a dedup-ref is wrong because a stale ref (LBA since overwritten with different data) reintroduces the old LBA mapping into the output segment, corrupting reads after a crash+rebuild. Unconditionally dropping is also wrong because a live ref (LBA still maps to that hash) loses its mapping, causing "segment not found" errors after the input segment is deleted.
 
 **Snapshot floor:** segments at or below the latest snapshot ULID are frozen and skipped. They may be referenced by child forks.
 
@@ -264,34 +271,44 @@ Writing to `segments/` (not `pending/`) is correct for two reasons:
 
 2. **Concurrent writes always win.** Input segments have already passed through the drain/upload pipeline, so their timestamps are seconds to minutes behind the current wall clock. Any write that occurs during compaction gets a ULID from the current time, which is far ahead of `max(inputs)`. Concurrent writes therefore always produce higher ULIDs than the compacted output and win in ULID-ordered rebuild — no locking required.
 
-3. **Worst case is a bounded space leak, not data corruption.** If the liveness check misses a concurrent write (WAL not yet flushed), the compacted output carries that extent unnecessarily. The concurrent write's ULID is higher, so it wins for the LBA in rebuild; the orphaned extent in the compacted output is never read. The hash-based liveness check does not detect LBA-orphaned extents, so the data persists across GC passes. This is a known limitation.
+3. **Worst case is a bounded space leak, not data corruption.** If the liveness check misses a concurrent write (WAL not yet flushed), the compacted output carries that extent unnecessarily. The concurrent write's ULID is higher, so it wins for the LBA in rebuild; the orphaned extent in the compacted output is never read. LBA-dead extents are caught by the LBA-level liveness check (see above) when their source LBA has already been flushed; the remaining gap is only extents whose overwriting write is still in the WAL at the moment the coordinator runs.
 
 The `increment()` overflow case (all 80 random bits set) is effectively unreachable; the fallback is `Ulid::from_parts(max_timestamp + 1ms, 0)`, which preserves the same ordering guarantee.
 
 **At most one outstanding GC pass per fork:** the coordinator defers a new pass if any `gc/*.pending` files exist. This prevents accumulating multiple overlapping handoffs before the volume has applied the first.
 
+**`gc_checkpoint`:** before running a GC pass, the coordinator calls `gc_checkpoint` on the volume via the actor channel. This flushes the volume's WAL (ensuring all in-flight writes are in `pending/` where the coordinator can see them) and returns a fresh ULID minted by the volume's own generator. The coordinator uses this ULID as the output segment ULID. Because the WAL was flushed before minting, no in-flight WAL segment can have a ULID below the returned value — the GC output is guaranteed to sort before any subsequent write. This closes the rebuild-time ordering race described in the design notes.
+
 **GC result file format (`gc/<result-ulid>.pending`):**
 
-The result file describes extent index patches: for each moved extent, the new segment ULID and absolute body offset. The LBA map does not need patching — it maps `LBA → hash`, and hashes do not change when data is moved.
+The result file describes extent index patches. The LBA map does not need patching — it maps `LBA → hash`, and hashes do not change when data is moved.
 
 ```
 # plain text, one entry per line
+
+# 4-field: carried entry — extent moved to new segment
 <hash_hex> <old_segment_ulid> <new_segment_ulid> <new_absolute_body_offset>
+
+# 2-field: removed entry — extent-live but LBA-dead; remove from extent index
+<hash_hex> <old_segment_ulid>
 ```
+
+A handoff file containing only 2-field lines is a *removal-only handoff*. It has no associated output segment (nothing was carried). A handoff file may also have a mix of both line types.
 
 **GC handoff protocol:**
 
-1. Coordinator writes `gc/<result-ulid>.pending` and moves compacted segment to `segments/<new-ulid>`
-2. Volume applies in idle arm:
-   - For each entry: if extent index still points to `old_segment_ulid` for this hash, update to `new_segment_ulid + new_body_offset`; otherwise skip (hash was rewritten by a newer WAL entry — stale coordinator snapshot)
+1. Coordinator calls `gc_checkpoint` → flushes WAL, receives output ULID
+2. Coordinator compacts input segments, writes `gc/<result-ulid>.pending`, moves compacted segment (if any) to `segments/<new-ulid>`
+3. Volume applies in idle arm:
+   - For each 4-field entry: if extent index still points to `old_segment_ulid` for this hash, update to `new_segment_ulid + new_body_offset`; otherwise skip (hash was rewritten by a newer write — stale coordinator snapshot)
+   - For each 2-field entry: if extent index still points to `old_segment_ulid` for this hash, remove the entry (LBA has been overwritten; the reference is dangling)
+   - Removal-only handoffs (all 2-field lines) are applied immediately — no output segment is needed. Handoffs with 4-field entries wait until `segments/<new-ulid>` is present locally (may require a demand-fetch)
    - Rename `gc/<result-ulid>.pending` → `gc/<result-ulid>.applied`
-3. Coordinator (on next poll): sees `.applied`, deletes old S3 objects, renames to `gc/<result-ulid>.done`
+4. Coordinator (on next poll): sees `.applied`, deletes old S3 objects, renames to `gc/<result-ulid>.done`
 
-Old local `segments/<old-ulid>` files are left in place until the volume's eviction pass removes them. They remain readable by the volume until evicted; after eviction they can be re-fetched from S3 if needed (the old S3 objects are not deleted until step 3, after which reads route to the new segment via the patched extent index).
+Old local `segments/<old-ulid>` files are left in place until the coordinator removes them in step 4. They remain readable by the volume until then; after deletion reads route to the new segment via the patched extent index (for carried entries) or fail-fast on dangling references that have been cleaned (for removed entries).
 
 This protocol is crash-safe: if either process restarts mid-handoff, the `.pending`/`.applied` state is re-read on next tick and the appropriate step retried. No data is lost.
-
-*Volume idle arm for gc/*.pending is not yet implemented.* The coordinator writes `gc/*.pending` files; they accumulate until the volume side is wired up. Old S3 objects are not deleted until `.applied` is seen, so no data is at risk.
 
 *S3 repacking* (locality optimisation in object storage) is a coordinator-level operation and is **not subject to the leaf-only constraint**. The coordinator can read extents from any node's local segments or from S3, create new S3 objects with better layout, and update the extent index to point to them. Local files are caches — the coordinator does not modify them to repack at the S3 level.
 
