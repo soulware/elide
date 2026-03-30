@@ -46,8 +46,14 @@ fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
 ///
 /// Picks the two lowest-ULID segments as candidates, compacts their entries
 /// (including REF entries so the oracle test can still resolve dedup hashes),
-/// writes a new segment with ULID = `max(inputs).increment()`, and deletes
-/// the inputs.
+/// writes a new segment with ULID = `max(inputs).increment()`, writes
+/// `gc/<new_ulid>.pending` (the handoff file the coordinator produces), and
+/// deletes the inputs.
+///
+/// The handoff file is written before the inputs are deleted, matching the
+/// real coordinator's ordering.  Callers are expected to call
+/// `vol.apply_gc_handoffs()` after this function to exercise the full
+/// handoff protocol through the volume.
 ///
 /// Returns `Some((consumed_ulids, produced_ulid))` when candidates were found,
 /// `None` when fewer than two segments exist.
@@ -95,10 +101,29 @@ fn simulate_coord_gc_local(fork_dir: &Path) -> Option<(Vec<Ulid>, Ulid)> {
 
     let tmp_path = segments_dir.join(format!("{new_ulid}.tmp"));
     let final_path = segments_dir.join(new_ulid.to_string());
-    if segment::write_segment(&tmp_path, &mut all_entries, None).is_err() {
-        return None;
-    }
+    let new_bss = match segment::write_segment(&tmp_path, &mut all_entries, None) {
+        Ok(bss) => bss,
+        Err(_) => return None,
+    };
     fs::rename(&tmp_path, &final_path).ok()?;
+
+    // Write the handoff file before deleting the inputs, matching the real
+    // coordinator's ordering.  apply_gc_handoffs reads the new segment's index
+    // directly, so the file content is informational; we write the correct
+    // format with max_input as the representative old_ulid.
+    let gc_dir = fork_dir.join("gc");
+    let _ = fs::create_dir_all(&gc_dir);
+    let mut lines = String::new();
+    for e in &all_entries {
+        if !e.is_dedup_ref {
+            let abs_offset = new_bss + e.stored_offset;
+            lines.push_str(&format!(
+                "{} {} {} {}\n",
+                e.hash, max_input, new_ulid, abs_offset
+            ));
+        }
+    }
+    let _ = fs::write(gc_dir.join(format!("{new_ulid}.pending")), lines);
 
     for (_, path) in &candidates {
         let _ = fs::remove_file(path);
@@ -211,6 +236,9 @@ proptest! {
                             "coord_gc produced ULID {produced} ≤ consumed max {max_consumed}"
                         );
                     }
+                    // Apply any pending gc handoffs (from this pass or a
+                    // pre-crash pass) through the volume's handoff path.
+                    let _ = vol.apply_gc_handoffs();
                 }
                 SimOp::Crash => {
                     drop(vol);
@@ -254,6 +282,9 @@ proptest! {
                 }
                 SimOp::CoordGcLocal => {
                     let _ = simulate_coord_gc_local(fork_dir);
+                    // Apply any pending gc handoffs through the volume's
+                    // handoff path, including handoffs from pre-crash passes.
+                    let _ = vol.apply_gc_handoffs();
                 }
                 SimOp::Crash => {
                     drop(vol);

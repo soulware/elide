@@ -180,6 +180,13 @@ segments span both `pending/` and `segments/`, stressing the boundary that the
 `max(inputs).increment() < new volume ULIDs` ordering invariant is designed to
 protect.
 
+**GC handoff coverage** (now implemented): `CoordGcLocal` now goes through the
+full handoff protocol — it writes `gc/<new_ulid>.pending` before deleting the
+old input segments, then calls `vol.apply_gc_handoffs()` to exercise the volume's
+handoff path.  A `Crash` after the deletion but before `apply_gc_handoffs` is
+automatically covered: the rebuilt volume reads from the new segment (which
+survived), and the pending handoff is applied on the next `CoordGcLocal`.
+
 ---
 
 ## Actor-layer property tests
