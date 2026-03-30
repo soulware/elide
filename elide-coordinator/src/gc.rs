@@ -169,6 +169,7 @@ pub async fn gc_loop(
 /// Tries Strategy 1 (density) first. If no segment is sparse enough, tries
 /// Strategy 2 (small-segment sweep). Returns `GcStrategy::None` if neither
 /// finds candidates.
+///
 pub async fn gc_fork(
     fork_dir: &Path,
     volume_id: &str,
@@ -656,16 +657,6 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_pending_files_in_gc_dir() {
-        let tmp = TempDir::new().unwrap();
-        let gc_dir = tmp.path().join("gc");
-        fs::create_dir_all(&gc_dir).unwrap();
-        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.applied"), "").unwrap();
-        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done"), "").unwrap();
-        assert!(!has_pending_results(&gc_dir).unwrap());
-    }
-
-    #[test]
     fn compaction_ulid_exceeds_single_input() {
         let input = Ulid::new();
         let output = compaction_ulid(input);
@@ -674,7 +665,6 @@ mod tests {
 
     #[test]
     fn compaction_ulid_exceeds_all_inputs() {
-        // Simulate picking max from a set of candidates.
         let a = Ulid::new();
         let b = a.increment().unwrap();
         let c = b.increment().unwrap();
@@ -689,18 +679,15 @@ mod tests {
     fn compaction_ulid_preserves_timestamp_when_no_overflow() {
         let input = Ulid::new();
         let output = compaction_ulid(input);
-        // Same millisecond — only the random portion was incremented.
         assert_eq!(output.timestamp_ms(), input.timestamp_ms());
     }
 
     #[test]
     fn compaction_ulid_overflow_advances_timestamp() {
-        // Construct a ULID with all 80 random bits set (the overflow case).
         let max_random = (1u128 << 80) - 1;
         let ts = 12345u64;
         let input = Ulid::from_parts(ts, max_random);
         assert!(input.increment().is_none(), "sanity: should overflow");
-
         let output = compaction_ulid(input);
         assert_eq!(output.timestamp_ms(), ts + 1);
         assert!(output > input);
@@ -708,11 +695,7 @@ mod tests {
 
     #[test]
     fn compaction_ulid_less_than_current_time() {
-        // A ULID generated right now — simulating a concurrent write —
-        // should be greater than the compacted output. This reflects the
-        // core guarantee: input segments are old (drain pipeline), so
-        // max(inputs) << current time.
-        let old_ts = 1_000u64; // 1 second after epoch
+        let old_ts = 1_000u64;
         let input = Ulid::from_parts(old_ts, 0);
         let output = compaction_ulid(input);
         let concurrent_write = Ulid::new();
@@ -720,6 +703,16 @@ mod tests {
             concurrent_write > output,
             "concurrent write ({concurrent_write}) should beat compaction output ({output})"
         );
+    }
+
+    #[test]
+    fn ignores_non_pending_files_in_gc_dir() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.applied"), "").unwrap();
+        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done"), "").unwrap();
+        assert!(!has_pending_results(&gc_dir).unwrap());
     }
 
     #[test]

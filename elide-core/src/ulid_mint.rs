@@ -22,8 +22,7 @@
 /// `Ulid::increment()` returns `None` when all 80 random bits are set.
 /// This is physically impossible to reach in practice (2^80 calls within the
 /// same millisecond), but the fallback advances the timestamp by 1 ms and
-/// resets the random portion to zero. This is the same approach used by the
-/// coordinator GC (`compaction_ulid`).
+/// resets the random portion to zero.
 pub struct UlidMint {
     last: ulid::Ulid,
     /// True while the system clock is behind `last`. Used to gate the warn-once

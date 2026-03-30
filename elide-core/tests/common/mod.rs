@@ -62,21 +62,28 @@ pub fn simulate_coord_gc_local(fork_dir: &Path) -> Option<(Vec<Ulid>, Ulid, Vec<
     candidates.sort_by_key(|(u, _)| *u);
     let candidates = candidates[..2].to_vec();
 
+    let max_input = candidates.iter().map(|(u, _)| *u).max()?;
+    let new_ulid = max_input
+        .increment()
+        .unwrap_or_else(|| Ulid::from_parts(max_input.timestamp_ms() + 1, 0));
+
+    // Track per-entry source ULIDs separately since SegmentEntry doesn't
+    // derive Clone.  source_ulids[i] is the segment ULID that entry i came
+    // from — needed for the .pending file format.
     let mut all_entries: Vec<segment::SegmentEntry> = Vec::new();
-    for (_, path) in &candidates {
+    let mut source_ulids: Vec<Ulid> = Vec::new();
+    for (ulid, path) in &candidates {
         let Ok((bss, mut entries)) = segment::read_segment_index(path) else {
             continue;
         };
         if segment::read_extent_bodies(path, bss, &mut entries).is_err() {
             continue;
         }
-        all_entries.extend(entries);
+        for entry in entries.drain(..) {
+            source_ulids.push(*ulid);
+            all_entries.push(entry);
+        }
     }
-
-    let max_input = candidates.iter().map(|(u, _)| *u).max()?;
-    let new_ulid = max_input
-        .increment()
-        .unwrap_or_else(|| Ulid::from_parts(max_input.timestamp_ms() + 1, 0));
 
     if all_entries.is_empty() {
         let consumed = candidates.iter().map(|(u, _)| *u).collect();
@@ -92,19 +99,17 @@ pub fn simulate_coord_gc_local(fork_dir: &Path) -> Option<(Vec<Ulid>, Ulid, Vec<
     };
     fs::rename(&tmp_path, &final_path).ok()?;
 
-    // Write the handoff file before deleting the inputs, matching the real
-    // coordinator's ordering.  apply_gc_handoffs reads the new segment's index
-    // directly, so the file content is informational; we write the correct
-    // format with max_input as the representative old_ulid.
+    // Write the handoff file with per-entry source segment ULIDs, matching
+    // the real coordinator's format.
     let gc_dir = fork_dir.join("gc");
     let _ = fs::create_dir_all(&gc_dir);
     let mut lines = String::new();
-    for e in &all_entries {
+    for (e, src_ulid) in all_entries.iter().zip(source_ulids.iter()) {
         if !e.is_dedup_ref {
             let abs_offset = new_bss + e.stored_offset;
             lines.push_str(&format!(
                 "{} {} {} {}\n",
-                e.hash, max_input, new_ulid, abs_offset
+                e.hash, src_ulid, new_ulid, abs_offset
             ));
         }
     }

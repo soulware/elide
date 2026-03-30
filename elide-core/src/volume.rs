@@ -24,6 +24,7 @@
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -788,13 +789,42 @@ impl Volume {
                 continue;
             }
 
-            // Read the compacted segment's index.  `read_segment_index` gives us
-            // body_section_start so we can compute absolute body offsets, plus
-            // body_length and compressed — fields the .pending file does not carry.
+            // Parse the .pending file to learn which old segment each extent
+            // came from.  We only update the extent index if it still points
+            // at the old segment — if a newer write has landed since GC ran,
+            // the current entry is more recent and must not be overwritten.
+            let pending_content = fs::read_to_string(entry.path())?;
+            let mut old_ulid_by_hash: HashMap<blake3::Hash, String> = HashMap::new();
+            for line in pending_content.lines() {
+                let mut parts = line.split_whitespace();
+                if let (Some(hash_hex), Some(old_ulid)) = (parts.next(), parts.next())
+                    && let Ok(hash) = blake3::Hash::from_hex(hash_hex)
+                {
+                    old_ulid_by_hash.insert(hash, old_ulid.to_owned());
+                }
+            }
+
+            // Read the compacted segment's index for authoritative body_offset,
+            // body_length, and compressed values.
             let (body_section_start, entries) = segment::read_segment_index(&segment_path)?;
 
             for e in &entries {
                 if e.is_dedup_ref {
+                    continue;
+                }
+                // Only update if the extent index still points at the old
+                // segment that GC consumed.  If a newer write has superseded
+                // it, the current entry is more recent and must not be
+                // overwritten.
+                let still_at_old = match (
+                    self.extent_index.lookup(&e.hash),
+                    old_ulid_by_hash.get(&e.hash),
+                ) {
+                    (Some(loc), Some(old_ulid)) => loc.segment_id == *old_ulid,
+                    _ => false,
+                };
+                if !still_at_old {
+                    // Superseded by a newer write — skip.
                     continue;
                 }
                 Arc::make_mut(&mut self.extent_index).insert(
