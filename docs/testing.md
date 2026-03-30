@@ -151,12 +151,6 @@ that the proptest also passes.
 The current tests focus on crash-recovery correctness for a single fork.
 Other dimensions worth adding:
 
-**Live read-your-writes oracle.** The crash-recovery oracle only asserts after
-`Crash`.  Asserting `vol.read(lba) == last_write` after every `Write` would
-catch in-memory state bugs (lbamap / extent_index corruption, wrong WAL offset
-tracking).  The marginal value over the existing unit tests is lower here, but
-it would close the gap for unusual sequences that unit tests don't cover.
-
 **Fork ancestry isolation oracle.** The most compelling gap.  The layered read
 path with ULID cutoffs is the most complex logic in the volume and is not
 exercised by the current proptest at all.  A fork oracle would run sequences
@@ -185,3 +179,74 @@ realistic simulation would interleave GC with live `Flush` operations while
 segments span both `pending/` and `segments/`, stressing the boundary that the
 `max(inputs).increment() < new volume ULIDs` ordering invariant is designed to
 protect.
+
+---
+
+## Actor-layer property tests
+
+`elide-core/tests/actor_proptest.rs` tests the concurrency layer — `VolumeActor`,
+`VolumeHandle`, and `ReadSnapshot` — rather than `Volume` directly.  This matters
+because the actor introduces objects that `Volume` doesn't know about: a per-handle
+file-handle cache and an `ArcSwap`-published snapshot.  Bugs in the interaction
+between these objects and the Volume's internal state are invisible to the
+volume-level proptest.
+
+### What is different at this layer
+
+The volume-level proptest calls `Volume` methods directly in a single thread.
+The actor-layer proptest:
+
+- Spawns a real `VolumeActor` thread and communicates through the channel
+- Uses `VolumeHandle` for all reads and writes (the production code path)
+- Asserts **read-your-writes** after every write — not just after crash
+
+The read-your-writes assertion is the key addition: after `handle.write()` returns
+`Ok`, `handle.read()` of the same LBA must immediately return the written data,
+without any flush.  This exercises the `ArcSwap` snapshot publication path.
+
+### The simulation model
+
+| Op | Action | Assertion |
+|----|--------|-----------|
+| `Write { lba, seed }` | `handle.write(lba, [seed; 4096])` | immediately read back same LBA — must match |
+| `Flush` | `handle.flush()` — promotes WAL to `pending/` | none |
+| `Crash` | shutdown actor + join thread + reopen Volume + new actor | assert full oracle on reopen |
+
+`Crash` is a clean shutdown (`Shutdown` message + thread join) followed by
+`Volume::open()`, which triggers WAL recovery.  The oracle covers all writes —
+including those never explicitly flushed — because WAL recovery makes them
+readable.
+
+### Bug found immediately on first run
+
+The proptest found a stale file-handle cache bug on its first run.  Proptest
+automatically shrunk the failure to three operations:
+
+```
+Write { lba: 0, seed: 50 }
+Flush
+Write { lba: 0, seed: 50 }   ← same data as first write
+```
+
+**What happened:**
+
+1. First `Write`: data written to WAL.  Extent index: `hash → {wal/W1, WAL_OFFSET}`.  Handle file cache populated with an open fd to `wal/W1`.
+2. `Flush`: WAL promoted to `pending/W1`.  Extent index updated: `hash → {W1, SEGMENT_OFFSET}` (segment-format absolute offset, a different number).  WAL file deleted — but the open fd in the handle's cache remains valid (Unix keeps the inode alive).
+3. Second `Write` (same data): dedup path — the hash is already in the extent index, so a REF record is written.  Extent index unchanged (still `SEGMENT_OFFSET`).  Snapshot published with `SEGMENT_OFFSET`.
+4. Read-your-writes check: handle loads snapshot (`SEGMENT_OFFSET`), hits the cached fd (still pointing at the deleted WAL inode), seeks to `SEGMENT_OFFSET` in the WAL file — past the end of the file — and gets `UnexpectedEof`.
+
+**Why it was invisible before:**
+
+The `Volume`-level proptest never exercises this because `Volume` serialises its
+own mutations and file cache.  Only the actor/handle split — where the snapshot
+and file cache live in a separate object from `Volume` — creates the exposure.
+In production this would have triggered on any VM workload that writes a block,
+issues a sync, and writes the same block again (a normal pattern for many
+filesystems and databases).
+
+**Fix:** a `flush_gen: Arc<AtomicU64>` is shared between the actor and all
+handles.  The actor increments it after every WAL promotion and republishes the
+snapshot with post-promote offsets.  `VolumeHandle::read()` compares its cached
+generation against the current value; if they differ it evicts the file cache
+before loading the snapshot.  `flush_wal_to_pending` also evicts `Volume`'s own
+file cache for the promoted WAL ULID.
