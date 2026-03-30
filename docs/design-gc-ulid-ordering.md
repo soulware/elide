@@ -1,6 +1,7 @@
 # Design: GC ULID ordering and the single-mint invariant
 
-Status: **open** (stashed WIP in git stash, needs design before implementation)
+Status: **partially resolved** (extent index guard + per-entry tracking committed;
+single-mint attempted and reverted; rebuild-time ordering still open)
 
 Date: 2026-03-30
 
@@ -55,7 +56,7 @@ output's stale entry overwrites the correct one.
 extent index if `extent_index[hash].segment_id == old_ulid`.  Uses
 `blake3::Hash::from_hex()` (available in the `blake3` crate, no new deps).
 
-**Status:** implemented in stash, tested, correct.
+**Status:** committed (07828b2).
 
 ### 2. ULID source unification (two-source ordering race)
 
@@ -65,19 +66,51 @@ order is determined by random bits — a coin flip.  After a crash, the LBA map
 is rebuilt from segment files in ULID order.  If the GC output sorts after a
 newer segment, its stale LBA entries shadow the correct ones.
 
-**Fix:** the coordinator must request GC output ULIDs from the volume's mint
-via `VolumeRequest::MintUlid`.  This ensures all ULIDs in a fork come from a
-single monotonic source.  `compaction_ulid()` is removed.
+**Attempted fix: single-mint.**  The coordinator requests GC output ULIDs from
+the volume's mint via `VolumeRequest::MintUlid`.  This ensures all ULIDs in a
+fork come from a single monotonic source.  `compaction_ulid()` is removed.
 
-**Status:** partially implemented in stash.  Design issues remain:
-- `mint_ulid()` must not be called speculatively — only after confirming GC
-  will proceed (candidates exist).  Otherwise wasted ULIDs advance the mint
-  unnecessarily.
-- The coordinator needs a `mint_ulid` callback plumbed through `gc_fork` and
-  `compact_segments`.  For production, this will eventually be an IPC call to
-  the volume process.  For now, the daemon can use `Ulid::new()` as a
-  placeholder (safe in production where GC inputs are old).
-- The test helper `simulate_coord_gc_local` needs the same parameter.
+**Why it was reverted:** the single-mint approach fundamentally breaks rebuild
+ordering.  The volume's mint tracks the highest ULID issued.  When a WAL
+segment is opened (step N), it gets ULID W from the mint.  When the coordinator
+later calls `mint_ulid()` (step N+K), it gets ULID M > W.  The GC output is
+named M.  If the WAL is flushed to pending/ and then a crash occurs, rebuild
+processes segments in ULID order: W first, then M.  M's stale entries overwrite
+W's correct entries — the exact bug we're trying to fix.
+
+The `increment()` approach avoids this because `max(old inputs).increment()`
+produces a ULID from the old inputs' timestamp, which is far below any
+concurrent WAL ULID.  The GC output sorts before the WAL segment, so the WAL's
+entries win on rebuild.
+
+**Current state:** `compaction_ulid(max_input)` remains.  The same-millisecond
+collision is theoretically possible but astronomically unlikely in production
+(GC inputs are seconds to minutes old).  The extent index guard (bug 1)
+protects the live apply_gc_handoffs path.  The rebuild path relies on timestamp
+separation between old GC inputs and current writes.
+
+**Open question:** how to close the rebuild-time ordering gap.  Options:
+
+  A. **WAL flush before mint:** `MintUlid` handler flushes the in-flight WAL
+     before minting, so no WAL segment can have a ULID below the minted one.
+     Adds latency to the GC path and couples volume I/O to coordinator timing.
+
+  B. **GC-aware rebuild:** tag GC output segments (e.g. a header flag or a
+     sidecar file) so rebuild knows to apply them at the position of their
+     *input* segments, not their output ULID.  Adds complexity to the segment
+     format and rebuild logic.
+
+  C. **Rebuild from handoff files:** instead of pure ULID-ordered rebuild, use
+     `.pending`/`.applied`/`.done` files to understand GC relationships.
+     Rebuild applies the GC output's entries only where the extent index still
+     points at the consumed input — the same guard used at runtime.  This
+     requires the handoff files to survive across restarts (they already do).
+
+  D. **Accept the gap:** document that the same-millisecond collision requires
+     both (a) GC inputs from the current millisecond and (b) random bits that
+     happen to sort the wrong way.  In production this requires drain + GC to
+     complete within 1ms, which is physically implausible with S3 upload in
+     the path.  The proptest exercises it because it collapses time.
 
 ### 3. `.pending` file per-entry old_ulid (test helper bug)
 
@@ -88,7 +121,7 @@ entry came from — required for the extent index guard (bug 1) to work.
 
 **Fix:** track per-entry source segment ULID in the test helper.
 
-**Status:** implemented in stash.
+**Status:** committed (07828b2).
 
 ## Additional findings
 
@@ -101,7 +134,7 @@ S3 objects.
 
 **Fix:** write via tmp + rename.
 
-**Status:** implemented in stash.
+**Status:** committed (7e8eeec).
 
 ### NotFound tolerance in rebuild
 
@@ -113,7 +146,7 @@ a segment file).  Should skip with a warning — the new compacted segment
 
 **Fix:** match on `ErrorKind::NotFound` and continue with a `warn!()`.
 
-**Status:** implemented in stash.
+**Status:** committed (7e8eeec).
 
 ### All-dead segment case
 
@@ -123,7 +156,7 @@ objects and local files directly, skipping the handoff protocol.
 
 **Fix:** direct delete in the all-dead branch of `compact_segments`.
 
-**Status:** implemented in stash.
+**Status:** committed (7e8eeec).
 
 ### `.applied` -> `.done` cleanup
 
@@ -133,33 +166,17 @@ S3 404 on delete is treated as success (idempotent across coordinator crashes).
 
 **Fix:** `apply_done_handoffs()` in coordinator `gc.rs`.
 
-**Status:** implemented in stash with unit tests.
+**Status:** committed (7e8eeec) with 8 unit tests.
 
-## Proposed implementation plan
+## Implementation status
 
-1. Extract the non-controversial fixes from the stash:
-   - NotFound tolerance in rebuild (lbamap, extentindex, volume::compact)
-   - Atomic `.pending` write
-   - All-dead segment direct cleanup
-   - `.applied` -> `.done` cleanup with unit tests
-
-2. Design and implement the single-mint fix:
-   - Add `Volume::mint_ulid()` and `VolumeRequest::MintUlid`
-   - Add `mint_ulid` callback to coordinator's `gc_fork` / `compact_segments`
-   - Call `mint_ulid` only after confirming candidates exist (not speculatively)
-   - Remove `compaction_ulid()`
-   - Update test helpers
-
-3. Add the extent index guard:
-   - Parse `.pending` for per-entry `old_ulid`
-   - Guard on `extent_index[hash].segment_id == old_ulid`
-   - Fix test helper to write per-entry source segment ULIDs
-
-4. Update docs and tests
-
-## Stash reference
-
-```
-git stash list   # find "WIP: apply_done_handoffs + ULID ordering fixes"
-git stash show   # see the diff
-```
+| Fix | Status | Commit |
+|-----|--------|--------|
+| Extent index guard (bug 1) | Done | 07828b2 |
+| Per-entry old_ulid (bug 3) | Done | 07828b2 |
+| NotFound tolerance | Done | 7e8eeec |
+| Atomic `.pending` write | Done | 7e8eeec |
+| All-dead direct cleanup | Done | 7e8eeec |
+| `.applied` -> `.done` | Done | 7e8eeec |
+| Single-mint (bug 2) | Attempted, reverted | -- |
+| Rebuild-time ordering | Open | -- |
