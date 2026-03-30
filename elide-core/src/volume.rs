@@ -462,7 +462,11 @@ impl Volume {
 
             let seg_id = seg_id.to_string();
 
-            let (body_section_start, mut entries) = segment::read_segment_index(&seg_path)?;
+            let (body_section_start, mut entries) = match segment::read_segment_index(&seg_path) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
 
             // Dedup-refs have no body bytes; only count DATA entries.
             let total_bytes: u64 = entries

@@ -21,6 +21,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
+use log::warn;
+
 use crate::segment;
 
 /// A portion of a stored extent that overlaps a read request.
@@ -267,7 +269,17 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
             });
         }
         for path in &fetched_paths {
-            let (_bss, entries) = segment::read_segment_index(path)?;
+            let (_bss, entries) = match segment::read_segment_index(path) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    warn!(
+                        "segment vanished during rebuild (GC race): {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for entry in entries {
                 map.insert(entry.start_lba, entry.lba_length, entry.hash);
             }
@@ -287,7 +299,17 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
         }
 
         for path in &paths {
-            let (_body_section_start, entries) = segment::read_segment_index(path)?;
+            let (_body_section_start, entries) = match segment::read_segment_index(path) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    warn!(
+                        "segment vanished during rebuild (GC race): {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for entry in entries {
                 map.insert(entry.start_lba, entry.lba_length, entry.hash);
             }

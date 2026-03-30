@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
+use log::warn;
+
 use crate::segment;
 
 /// Physical location of an extent within a segment file.
@@ -138,7 +140,17 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
             let segment_id = ulid::Ulid::from_string(segment_id)
                 .map_err(|e| io::Error::other(e.to_string()))?
                 .to_string();
-            let (_body_section_start, entries) = segment::read_segment_index(path)?;
+            let (_body_section_start, entries) = match segment::read_segment_index(path) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    warn!(
+                        "segment vanished during rebuild (GC race): {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for entry in entries {
                 if entry.is_dedup_ref || entry.is_inline {
                     continue;
@@ -181,7 +193,17 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 .map_err(|e| io::Error::other(e.to_string()))?
                 .to_string();
 
-            let (body_section_start, entries) = segment::read_segment_index(path)?;
+            let (body_section_start, entries) = match segment::read_segment_index(path) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    warn!(
+                        "segment vanished during rebuild (GC race): {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             for entry in entries {
                 if entry.is_dedup_ref || entry.is_inline {

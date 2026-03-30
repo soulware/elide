@@ -18,12 +18,25 @@
 // Per-tick work is bounded in both cases: Strategy 1 processes one segment;
 // Strategy 2 is capped at 32 MiB of live data.
 //
-// Handoff protocol:
-//   Coordinator writes gc/<new-ulid>.pending — one line per moved extent:
-//     <hash_hex> <old_segment_ulid> <new_segment_ulid> <new_absolute_offset>
-//   Volume reads the new segment's index, applies the patches to its in-memory
-//   extent index on the next idle tick, then renames the file to gc/<new-ulid>.applied.
-//   Coordinator deletes old S3 objects and renames to gc/<new-ulid>.done.
+// Handoff protocol (crash-safe, filesystem-only coordination):
+//
+//   1. Coordinator writes gc/<new-ulid>.pending (via tmp + rename for atomicity)
+//      — one line per moved extent:
+//        <hash_hex> <old_segment_ulid> <new_segment_ulid> <new_absolute_offset>
+//
+//   2. Volume reads the new segment's index, applies extent index patches on
+//      its idle tick, renames gc/<new-ulid>.pending → gc/<new-ulid>.applied.
+//
+//   3. Coordinator (next GC tick) sees .applied, deletes old S3 objects and
+//      old local segment files from segments/, renames → gc/<new-ulid>.done.
+//
+//   Crash at any step:
+//   - Before step 1 completes: no .pending file; coordinator retries next tick.
+//   - After step 1, before step 2: volume re-applies on next idle tick (idempotent).
+//   - After step 2, before step 3: coordinator re-runs cleanup (S3 404 = success).
+//
+//   All-dead segments bypass the protocol entirely: no extent index entries
+//   reference them, so the coordinator deletes S3 + local files directly.
 //
 // A pass is deferred if any .pending files already exist (at most one
 // outstanding GC result per fork at a time).
@@ -114,6 +127,16 @@ pub async fn gc_loop(
                 fork_dir.display()
             );
             break;
+        }
+
+        // Process any handoffs the volume has already acknowledged (.applied).
+        // This deletes old S3 objects and local segment files before running a
+        // new GC pass, preventing the old files from being included in the next
+        // extent index rebuild.
+        match apply_done_handoffs(&fork_dir, &volume_id, &fork_name, &store).await {
+            Ok(0) => {}
+            Ok(n) => info!("[gc {volume_id}/{fork_name}] completed {n} GC handoff(s)"),
+            Err(e) => error!("[gc {volume_id}/{fork_name}] handoff cleanup error: {e:#}"),
         }
 
         match gc_fork(&fork_dir, &volume_id, &fork_name, &store, &config).await {
@@ -233,6 +256,107 @@ pub async fn gc_fork(
         candidates,
         bytes_freed,
     })
+}
+
+/// Process `.applied` GC handoff files: delete old S3 objects and local
+/// segment files, then rename each `.applied` file to `.done`.
+///
+/// Called at the start of every `gc_loop` tick so that old S3 objects are
+/// cleaned up promptly after the volume acknowledges each handoff.  Any
+/// `.applied` files that survive a coordinator crash are processed on the
+/// next startup tick — the rename-to-`.done` is idempotent with respect to
+/// S3 (a 404 on delete is treated as success) and safe to retry.
+///
+/// Returns the number of handoffs completed.
+pub async fn apply_done_handoffs(
+    fork_dir: &Path,
+    volume_id: &str,
+    fork_name: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<usize> {
+    let gc_dir = fork_dir.join("gc");
+    if !gc_dir.try_exists().context("checking gc dir")? {
+        return Ok(0);
+    }
+
+    let mut applied: Vec<fs::DirEntry> = fs::read_dir(&gc_dir)
+        .context("reading gc dir")?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".applied"))
+        })
+        .collect();
+
+    if applied.is_empty() {
+        return Ok(0);
+    }
+
+    applied.sort_by_key(|e| e.file_name());
+    let segments_dir = fork_dir.join("segments");
+    let mut count = 0;
+
+    for entry in &applied {
+        let filename = entry.file_name();
+        let name = filename
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("gc filename is not valid UTF-8"))?;
+        let new_ulid_str = name
+            .strip_suffix(".applied")
+            .ok_or_else(|| anyhow::anyhow!("expected .applied suffix"))?;
+
+        // Validate the ULID.
+        Ulid::from_string(new_ulid_str)
+            .map_err(|e| anyhow::anyhow!("invalid ULID in gc filename '{name}': {e}"))?;
+
+        // Collect the unique old segment ULIDs referenced in the handoff file.
+        // Format: <hash_hex> <old_ulid> <new_ulid> <new_absolute_offset>
+        let content =
+            fs::read_to_string(entry.path()).with_context(|| format!("reading {name}"))?;
+
+        let mut old_ulids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for line in content.lines() {
+            let mut parts = line.split_whitespace();
+            parts.next(); // hash
+            if let Some(old_ulid) = parts.next() {
+                old_ulids.insert(old_ulid.to_owned());
+            }
+        }
+
+        // Delete old S3 objects.  A 404 means the object is already gone
+        // (e.g. coordinator crashed after delete but before rename); treat as
+        // success so the cleanup is idempotent.
+        for old_ulid_str in &old_ulids {
+            let key = segment_key(volume_id, fork_name, old_ulid_str)
+                .with_context(|| format!("building key for {old_ulid_str}"))?;
+            match store.delete(&key).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => {
+                    return Err(
+                        anyhow::anyhow!(e).context(format!("deleting S3 object {old_ulid_str}"))
+                    );
+                }
+            }
+        }
+
+        // Delete old local segment files from segments/ (best-effort: the
+        // files may already be evicted or absent if the volume has not cached
+        // them locally).
+        for old_ulid_str in &old_ulids {
+            let _ = fs::remove_file(segments_dir.join(old_ulid_str));
+        }
+
+        // Rename .applied → .done.
+        let done_path = gc_dir.join(format!("{new_ulid_str}.done"));
+        fs::rename(entry.path(), &done_path)
+            .with_context(|| format!("renaming {name} to .done"))?;
+
+        count += 1;
+    }
+
+    Ok(count)
 }
 
 // --- internals ---
@@ -366,9 +490,21 @@ async fn compact_segments(
     }
 
     if all_live.is_empty() {
-        // All candidates are fully dead — no DATA entries to carry forward.
-        // TODO: write a gc/*.pending that tells the volume to drop these segment
-        // ULIDs from its extent index so the old S3 objects can be deleted.
+        // All candidates are fully dead — no extent index entries reference
+        // these segments, so no volume handoff is needed.  Delete old S3
+        // objects and local files directly.
+        for candidate in &candidates {
+            let key = segment_key(volume_id, fork_name, &candidate.ulid_str)?;
+            match store.delete(&key).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => {
+                    return Err(anyhow::anyhow!(e)
+                        .context(format!("deleting dead S3 object {}", candidate.ulid_str)));
+                }
+            }
+            let _ = fs::remove_file(&candidate.path);
+        }
         return Ok(());
     }
 
@@ -434,8 +570,10 @@ async fn compact_segments(
         ));
     }
     let pending_path = gc_dir.join(format!("{new_ulid_str}.pending"));
-    fs::write(&pending_path, &lines)
-        .with_context(|| format!("writing gc result {new_ulid_str}"))?;
+    let pending_tmp = gc_dir.join(format!("{new_ulid_str}.pending.tmp"));
+    fs::write(&pending_tmp, &lines).with_context(|| format!("writing gc result {new_ulid_str}"))?;
+    fs::rename(&pending_tmp, &pending_path)
+        .with_context(|| format!("committing gc result {new_ulid_str}"))?;
 
     Ok(())
 }
@@ -491,6 +629,7 @@ fn has_pending_results(gc_dir: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::memory::InMemory;
     use tempfile::TempDir;
 
     #[test]
@@ -637,5 +776,232 @@ mod tests {
         }
         let stats = vec![make(80), make(90), make(100)];
         assert_eq!(find_least_dense(&stats, 0.7), None);
+    }
+
+    // --- apply_done_handoffs tests ---
+
+    fn make_store() -> Arc<dyn ObjectStore> {
+        Arc::new(InMemory::new())
+    }
+
+    #[tokio::test]
+    async fn done_no_gc_dir() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store();
+        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn done_empty_gc_dir() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("gc")).unwrap();
+        let store = make_store();
+        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn done_ignores_non_applied_files() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+        // .pending and .done files should be ignored.
+        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.pending"), "").unwrap();
+        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done"), "").unwrap();
+        let store = make_store();
+        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        // Files should be untouched.
+        assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.pending").exists());
+        assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done").exists());
+    }
+
+    #[tokio::test]
+    async fn done_renames_applied_to_done() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(tmp.path().join("segments")).unwrap();
+
+        let new_ulid = Ulid::from_parts(1000, 1).to_string();
+        let old_ulid = Ulid::from_parts(999, 0).to_string();
+
+        let hash_hex = "a".repeat(64);
+        let content = format!("{hash_hex} {old_ulid} {new_ulid} 1234\n");
+        let applied_path = gc_dir.join(format!("{new_ulid}.applied"));
+        fs::write(&applied_path, &content).unwrap();
+
+        let store = make_store();
+        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(!applied_path.exists(), ".applied should be gone");
+        assert!(
+            gc_dir.join(format!("{new_ulid}.done")).exists(),
+            ".done should exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_deletes_s3_object() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(tmp.path().join("segments")).unwrap();
+
+        let new_ulid = Ulid::from_parts(1000, 1).to_string();
+        let old_ulid = Ulid::from_parts(999, 0).to_string();
+
+        let store = make_store();
+        let key = segment_key("vol", "fork", &old_ulid).unwrap();
+        store
+            .put(&key, bytes::Bytes::from("old segment data").into())
+            .await
+            .unwrap();
+        assert!(store.get(&key).await.is_ok());
+
+        let hash_hex = "b".repeat(64);
+        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
+
+        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            store.get(&key).await.is_err(),
+            "old S3 object should be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_s3_notfound_is_not_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(tmp.path().join("segments")).unwrap();
+
+        let new_ulid = Ulid::from_parts(1000, 2).to_string();
+        let old_ulid = Ulid::from_parts(999, 1).to_string();
+
+        let store = make_store();
+        let hash_hex = "c".repeat(64);
+        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
+
+        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(gc_dir.join(format!("{new_ulid}.done")).exists());
+    }
+
+    #[tokio::test]
+    async fn done_deletes_local_segment_file() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        let segments_dir = tmp.path().join("segments");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(&segments_dir).unwrap();
+
+        let new_ulid = Ulid::from_parts(1000, 3).to_string();
+        let old_ulid = Ulid::from_parts(999, 2).to_string();
+
+        let old_local = segments_dir.join(&old_ulid);
+        fs::write(&old_local, "old local segment").unwrap();
+        assert!(old_local.exists());
+
+        let store = make_store();
+        let hash_hex = "d".repeat(64);
+        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
+
+        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            !old_local.exists(),
+            "old local segment file should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_multiple_old_ulids_in_one_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        let segments_dir = tmp.path().join("segments");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(&segments_dir).unwrap();
+
+        let new_ulid = Ulid::from_parts(1000, 4).to_string();
+        let old_a = Ulid::from_parts(998, 0).to_string();
+        let old_b = Ulid::from_parts(999, 0).to_string();
+
+        let store = make_store();
+        for ulid_str in [&old_a, &old_b] {
+            let key = segment_key("vol", "fork", ulid_str).unwrap();
+            store
+                .put(&key, bytes::Bytes::from("data").into())
+                .await
+                .unwrap();
+            fs::write(segments_dir.join(ulid_str), "data").unwrap();
+        }
+
+        let h1 = "e".repeat(64);
+        let h2 = "f".repeat(64);
+        let content = format!("{h1} {old_a} {new_ulid} 0\n{h2} {old_b} {new_ulid} 4096\n");
+        fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
+
+        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        for ulid_str in [&old_a, &old_b] {
+            let key = segment_key("vol", "fork", ulid_str).unwrap();
+            assert!(
+                store.get(&key).await.is_err(),
+                "{ulid_str} S3 object should be deleted"
+            );
+            assert!(
+                !segments_dir.join(ulid_str).exists(),
+                "{ulid_str} local file should be removed"
+            );
+        }
+        assert!(gc_dir.join(format!("{new_ulid}.done")).exists());
+    }
+
+    #[tokio::test]
+    async fn done_processes_multiple_applied_files() {
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(tmp.path().join("segments")).unwrap();
+
+        let store = make_store();
+        for i in 1u64..=3 {
+            let new_ulid = Ulid::from_parts(1000 + i, 0).to_string();
+            let old_ulid = Ulid::from_parts(999 + i, 0).to_string();
+            let content = format!("{} {old_ulid} {new_ulid} 0\n", "a".repeat(64));
+            fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
+        }
+
+        let n = apply_done_handoffs(tmp.path(), "vol", "fork", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+        for entry in fs::read_dir(&gc_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name = name.to_str().unwrap();
+            assert!(name.ends_with(".done"), "expected .done, got {name}");
+        }
     }
 }
