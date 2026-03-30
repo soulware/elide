@@ -146,6 +146,38 @@ To increase confidence after a bug fix, add the minimal failing sequence as a
 deterministic regression test in `elide-core/src/volume.rs` before verifying
 that the proptest also passes.
 
+### Known gaps
+
+These are gaps in the current simulation model that could allow bugs to go
+undetected.  They are documented here so they are not forgotten.
+
+**`crash_recovery_oracle` does not delete consumed GC segments.**  After
+`CoordGcLocal`, the helper returns the paths of old input segments to be
+deleted.  `ulid_monotonicity` collects and removes them correctly.
+`crash_recovery_oracle` discards the returned paths (`let _ = ...`), so
+consumed segment files accumulate indefinitely and are never removed.  This
+means the oracle never runs in the post-GC steady state — where the old
+segments are gone and reads must go entirely through the new compacted
+output — which is exactly the state the handoff protocol is designed to
+make safe.  This is a false-negative risk: a bug that corrupts reads after
+old segments are deleted would not be caught.
+
+**`CompactVolume` SimOp is entirely absent.**  `vol.compact(min_live_ratio)`
+is the volume-level density pass.  It iterates both `pending/` and `segments/`,
+rewrites sparse segments, and deletes the originals.  It is subject to the
+snapshot-floor invariant and produces new segment ULIDs — both correctness
+properties that proptest verifies for other ops.  There is no `CompactVolume`
+variant in `SimOp`, no weight in `arb_sim_op`, and no handling in either
+property block.  Adding it follows the standard pattern: capture `ulids_before`,
+call `vol.compact(0.9)` (high threshold to ensure there are always candidates),
+assert new ULIDs in `ulid_monotonicity`.
+
+**Coordinator multi-segment sweep not modelled.**  `CoordGcLocal` always picks
+exactly two segments.  The real coordinator Strategy 2 can consume three or
+more segments in a single pass.  A three-segment merge that produces one output
+exercises different liveness and ULID ordering combinations that the two-segment
+model cannot reach.
+
 ### Future dimensions
 
 The current tests focus on crash-recovery correctness for a single fork.
