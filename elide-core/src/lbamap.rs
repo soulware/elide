@@ -225,6 +225,20 @@ impl LbaMap {
     pub fn live_hashes(&self) -> HashSet<blake3::Hash> {
         self.inner.values().map(|e| e.hash).collect()
     }
+
+    /// Return the content hash mapped to `lba`, if any entry covers it.
+    ///
+    /// Used by GC to check whether a dedup-ref entry is still live: the ref
+    /// should only be carried into the GC output if the LBA still maps to
+    /// the ref's hash.
+    pub fn hash_at(&self, lba: u64) -> Option<blake3::Hash> {
+        if let Some((&start, entry)) = self.inner.range(..=lba).next_back()
+            && lba < start + entry.lba_length as u64
+        {
+            return Some(entry.hash);
+        }
+        None
+    }
 }
 
 impl Default for LbaMap {
@@ -287,7 +301,7 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
 
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
-        paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+        segment::sort_for_rebuild(fork_dir, &mut paths);
 
         if let Some(cutoff) = branch_ulid {
             paths.retain(|p| {

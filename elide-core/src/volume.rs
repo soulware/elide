@@ -24,7 +24,7 @@
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -491,7 +491,12 @@ impl Volume {
             }
 
             let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
-                entries.drain(..).partition(|e| live.contains(&e.hash));
+                entries.drain(..).partition(|e| {
+                    if e.is_dedup_ref {
+                        return self.lbamap.hash_at(e.start_lba) == Some(e.hash);
+                    }
+                    live.contains(&e.hash)
+                });
 
             // Remove dead entries from the extent index (only those pointing at
             // this segment — entries pointing elsewhere belong to another copy).
@@ -616,9 +621,16 @@ impl Volume {
                 any_dead = true;
             }
 
-            let (live_entries, dead_entries): (Vec<_>, Vec<_>) = entries
-                .drain(..)
-                .partition(|e| e.is_dedup_ref || live.contains(&e.hash));
+            let (live_entries, dead_entries): (Vec<_>, Vec<_>) = entries.drain(..).partition(|e| {
+                if e.is_dedup_ref {
+                    // A dedup ref is only live if the LBA still maps to
+                    // this hash. If the LBA was overwritten with different
+                    // data, carrying the stale ref would reintroduce the
+                    // old mapping after crash + rebuild.
+                    return self.lbamap.hash_at(e.start_lba) == Some(e.hash);
+                }
+                live.contains(&e.hash)
+            });
 
             let dead_bytes: u64 = dead_entries
                 .iter()
@@ -725,6 +737,21 @@ impl Volume {
         Ok(stats)
     }
 
+    /// Establish a consistent checkpoint for coordinator GC.
+    ///
+    /// Flushes any in-flight WAL data to `pending/` so that the coordinator's
+    /// extent index rebuild sees all committed writes, then mints and returns
+    /// a fresh ULID for the GC output segment.  Because the flush happens
+    /// before the mint, the returned ULID is guaranteed to sort after every
+    /// segment that existed at checkpoint time, and any write that arrives
+    /// after this call gets a WAL ULID strictly greater than the returned
+    /// value.  This establishes a clean ordering boundary: GC output (named
+    /// with this ULID) sorts before all future writes on rebuild.
+    pub fn gc_checkpoint(&mut self) -> io::Result<String> {
+        self.flush_wal()?;
+        Ok(self.mint.next().to_string())
+    }
+
     /// Apply any pending GC handoff files written by the coordinator.
     ///
     /// The coordinator writes `gc/<new-ulid>.pending` after compacting segments
@@ -781,14 +808,6 @@ impl Volume {
             // Validate the ULID so we never act on a malformed filename.
             Ulid::from_string(new_ulid).map_err(|e| io::Error::other(e.to_string()))?;
 
-            let segment_path = segments_dir.join(new_ulid);
-
-            // The segment may not be present locally yet (e.g. only in S3 and
-            // not yet fetched).  Skip and retry on the next idle tick.
-            if !segment_path.try_exists()? {
-                continue;
-            }
-
             // Parse the .pending file to learn which old segment each extent
             // came from.  We only update the extent index if it still points
             // at the old segment — if a newer write has landed since GC ran,
@@ -804,38 +823,80 @@ impl Volume {
                 }
             }
 
-            // Read the compacted segment's index for authoritative body_offset,
-            // body_length, and compressed values.
-            let (body_section_start, entries) = segment::read_segment_index(&segment_path)?;
+            let segment_path = segments_dir.join(new_ulid);
+            let segment_exists = segment_path.try_exists()?;
 
-            for e in &entries {
-                if e.is_dedup_ref {
+            // If the segment doesn't exist, we can only process removal-only
+            // handoffs (all 2-field lines).  Handoffs with carried entries
+            // (4-field lines) need the segment for extent index updates —
+            // defer until it's available locally (e.g. fetched from S3).
+            // Empty handoffs (nothing to do) are also deferred.
+            if !segment_exists {
+                let has_removals = !old_ulid_by_hash.is_empty();
+                let has_carried = pending_content
+                    .lines()
+                    .any(|l| l.split_whitespace().count() >= 4);
+                if has_carried || !has_removals {
                     continue;
                 }
-                // Only update if the extent index still points at the old
-                // segment that GC consumed.  If a newer write has superseded
-                // it, the current entry is more recent and must not be
-                // overwritten.
-                let still_at_old = match (
-                    self.extent_index.lookup(&e.hash),
-                    old_ulid_by_hash.get(&e.hash),
-                ) {
-                    (Some(loc), Some(old_ulid)) => loc.segment_id == *old_ulid,
-                    _ => false,
-                };
-                if !still_at_old {
-                    // Superseded by a newer write — skip.
+            }
+
+            // Track which hashes are in the GC output so we can identify
+            // removed entries below.
+            let mut carried_hashes: HashSet<blake3::Hash> = HashSet::new();
+
+            if segment_exists {
+                // Read the compacted segment's index for authoritative
+                // body_offset, body_length, and compressed values.
+                let (body_section_start, entries) = segment::read_segment_index(&segment_path)?;
+
+                for e in &entries {
+                    if e.is_dedup_ref {
+                        continue;
+                    }
+                    carried_hashes.insert(e.hash);
+                    // Only update if the extent index still points at the old
+                    // segment that GC consumed.  If a newer write has
+                    // superseded it, the current entry is more recent and must
+                    // not be overwritten.
+                    let still_at_old = match (
+                        self.extent_index.lookup(&e.hash),
+                        old_ulid_by_hash.get(&e.hash),
+                    ) {
+                        (Some(loc), Some(old_ulid)) => loc.segment_id == *old_ulid,
+                        _ => false,
+                    };
+                    if !still_at_old {
+                        continue;
+                    }
+                    Arc::make_mut(&mut self.extent_index).insert(
+                        e.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: new_ulid.to_owned(),
+                            body_offset: body_section_start + e.stored_offset,
+                            body_length: e.stored_length,
+                            compressed: e.compressed,
+                        },
+                    );
+                }
+            }
+
+            // Remove extent index entries for hashes that were in the
+            // consumed segments but filtered out of the GC output (LBA-dead
+            // extents).  Without this, the extent index would retain a
+            // dangling reference to the old segment file which is about to
+            // be deleted.
+            for (hash, old_ulid) in &old_ulid_by_hash {
+                if carried_hashes.contains(hash) {
                     continue;
                 }
-                Arc::make_mut(&mut self.extent_index).insert(
-                    e.hash,
-                    extentindex::ExtentLocation {
-                        segment_id: new_ulid.to_owned(),
-                        body_offset: body_section_start + e.stored_offset,
-                        body_length: e.stored_length,
-                        compressed: e.compressed,
-                    },
-                );
+                if self
+                    .extent_index
+                    .lookup(hash)
+                    .is_some_and(|loc| loc.segment_id == *old_ulid)
+                {
+                    Arc::make_mut(&mut self.extent_index).remove(hash);
+                }
             }
 
             // Rename to .applied — signals the coordinator it is safe to delete
@@ -3075,10 +3136,10 @@ mod tests {
     //   new segment + writes gc/*.pending → volume applies handoff.
 
     /// Simulate one coordinator GC pass: read the given segment, write a
-    /// compacted copy with a new ULID into segments/, and write gc/<new>.pending.
-    /// Returns the new ULID string.  Does NOT delete the old segment — tests
+    /// compacted copy with the given ULID (from gc_checkpoint) into segments/,
+    /// and write gc/<new>.pending.  Does NOT delete the old segment — tests
     /// that need to verify post-cleanup reads do so explicitly.
-    fn simulate_coord_gc(fork_dir: &Path, old_ulid: &str) -> String {
+    fn simulate_coord_gc(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -> String {
         use crate::segment;
 
         let segments_dir = fork_dir.join("segments");
@@ -3086,11 +3147,7 @@ mod tests {
         let (old_bss, mut entries) = segment::read_segment_index(&old_path).unwrap();
         segment::read_extent_bodies(&old_path, old_bss, &mut entries).unwrap();
 
-        let old = Ulid::from_string(old_ulid).unwrap();
-        let new_ulid = old
-            .increment()
-            .unwrap_or_else(|| Ulid::from_parts(old.timestamp_ms() + 1, 0))
-            .to_string();
+        let new_ulid = vol.gc_checkpoint().unwrap();
 
         let tmp_path = segments_dir.join(format!("{new_ulid}.tmp"));
         let new_bss = segment::write_segment(&tmp_path, &mut entries, None).unwrap();
@@ -3138,7 +3195,7 @@ mod tests {
         fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
 
         // Coordinator GC: compact into new segment, write .pending.
-        let new_ulid = simulate_coord_gc(&base, &old_ulid);
+        let new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
 
         // Apply the handoff.
         let count = vol.apply_gc_handoffs().unwrap();
@@ -3213,7 +3270,7 @@ mod tests {
             fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
 
             // Coordinator GC: new segment + .pending written.
-            new_ulid = simulate_coord_gc(&base, &old_ulid);
+            new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
 
             // Coordinator deletes old local segment (data is in new segment +
             // S3; volume hasn't processed the handoff yet).
