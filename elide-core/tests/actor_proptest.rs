@@ -1,6 +1,6 @@
 // Property-based tests for the actor + snapshot layer.
 //
-// Tests two invariants:
+// Tests three invariants:
 //
 // 1. Read-your-writes: after handle.write() returns Ok, handle.read() of the
 //    same LBA immediately returns the written data. This exercises the ArcSwap
@@ -12,23 +12,43 @@
 //    recover_wal(), so writes that were never flushed to a pending segment are
 //    still recoverable from the WAL.
 //
-// Together these verify that the actor correctly publishes snapshots and that
-// no combination of writes, flushes, and crashes loses data visible through
-// the handle.
+// 3. GC handoff correctness: after DrainLocal + CoordGcLocal + ApplyGcHandoffs,
+//    every oracle LBA is still readable via the handle with correct data.  This
+//    exercises the ApplyGcHandoffs message path through the actor channel and
+//    verifies that the snapshot is republished so reads reflect the updated
+//    extent index immediately.
+//
+// Together these verify that the actor correctly publishes snapshots, that no
+// combination of writes, flushes, and crashes loses data visible through the
+// handle, and that coordinator GC handoffs propagate correctly through the
+// actor/snapshot layer.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::thread;
 
 use elide_core::actor::spawn;
 use elide_core::volume::Volume;
 use proptest::prelude::*;
 
+mod common;
+
 // --- strategy ---
 
 #[derive(Debug, Clone)]
 enum ActorOp {
-    Write { lba: u8, seed: u8 },
+    Write {
+        lba: u8,
+        seed: u8,
+    },
     Flush,
+    /// Move all committed pending/ segments to segments/, simulating
+    /// drain-pending. Required before CoordGcLocal has material to work with.
+    DrainLocal,
+    /// Simulate one coordinator GC pass and apply the resulting handoff
+    /// through the actor channel.  Verifies that the snapshot is republished
+    /// and all oracle LBAs remain readable via the handle.
+    CoordGcLocal,
     Crash,
 }
 
@@ -36,21 +56,27 @@ fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
     prop_oneof![
         4 => (0u8..8, any::<u8>()).prop_map(|(lba, seed)| ActorOp::Write { lba, seed }),
         2 => Just(ActorOp::Flush),
+        2 => Just(ActorOp::DrainLocal),
+        1 => Just(ActorOp::CoordGcLocal),
         1 => Just(ActorOp::Crash),
     ]
 }
 
 fn arb_actor_ops() -> impl Strategy<Value = Vec<ActorOp>> {
-    prop::collection::vec(arb_actor_op(), 1..30)
+    prop::collection::vec(arb_actor_op(), 1..40)
 }
 
 // --- property ---
 
 proptest! {
-    /// Actor correctness: read-your-writes and crash recovery.
+    /// Actor correctness: read-your-writes, crash recovery, and GC handoff.
     ///
     /// After every Write: immediately read the same LBA and assert the data
     /// matches (read-your-writes via ArcSwap snapshot, no flush needed).
+    ///
+    /// After every CoordGcLocal: simulate a coordinator GC pass, apply the
+    /// handoff through the actor channel, then assert every oracle LBA is
+    /// still readable with correct data.
     ///
     /// After every Crash: shut down the actor, reopen the Volume (triggering
     /// WAL recovery), spawn a new actor, then assert that every oracle entry
@@ -91,6 +117,28 @@ proptest! {
                 }
                 ActorOp::Flush => {
                     let _ = handle.flush();
+                }
+                ActorOp::DrainLocal => {
+                    common::drain_local(fork_dir);
+                }
+                ActorOp::CoordGcLocal => {
+                    // Simulate one coordinator GC pass (writes gc/*.pending,
+                    // deletes old input segments).
+                    let _ = common::simulate_coord_gc_local(fork_dir);
+                    // Apply the handoff through the actor channel.  This
+                    // exercises the ApplyGcHandoffs message path and verifies
+                    // the snapshot is republished with the updated extent index.
+                    let _ = handle.apply_gc_handoffs();
+                    // All oracle LBAs must still be readable with correct data.
+                    for (&lba, expected) in &oracle {
+                        let actual = handle.read(lba, 1).unwrap();
+                        prop_assert_eq!(
+                            actual.as_slice(),
+                            expected.as_slice(),
+                            "lba {} wrong after gc handoff",
+                            lba
+                        );
+                    }
                 }
                 ActorOp::Crash => {
                     // Shut down the actor and wait for it to exit before

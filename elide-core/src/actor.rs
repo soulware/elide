@@ -91,6 +91,9 @@ pub(crate) enum VolumeRequest {
     Compact {
         reply: Sender<io::Result<CompactionStats>>,
     },
+    ApplyGcHandoffs {
+        reply: Sender<io::Result<usize>>,
+    },
     Shutdown,
 }
 
@@ -176,6 +179,18 @@ impl VolumeActor {
                         }
                         VolumeRequest::Compact { reply } => {
                             let _ = reply.send(self.volume.compact_pending());
+                        }
+                        VolumeRequest::ApplyGcHandoffs { reply } => {
+                            let result = self.volume.apply_gc_handoffs();
+                            if matches!(&result, Ok(n) if *n > 0) {
+                                let (lbamap, extent_index) = self.volume.snapshot_maps();
+                                self.snapshot.store(Arc::new(ReadSnapshot {
+                                    lbamap,
+                                    extent_index,
+                                    flush_gen: self.flush_gen,
+                                }));
+                            }
+                            let _ = reply.send(result);
                         }
                         VolumeRequest::Shutdown => return,
                     }
@@ -323,6 +338,19 @@ impl VolumeHandle {
                 )
             },
         )
+    }
+
+    /// Apply any pending GC handoff files via the actor.  Blocks until the
+    /// actor replies.  The actor republishes the snapshot if any handoffs were
+    /// applied so that reads immediately reflect the updated extent index.
+    pub fn apply_gc_handoffs(&self) -> io::Result<usize> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::ApplyGcHandoffs { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
     /// Signal the actor to shut down and drain remaining requests.
