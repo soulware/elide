@@ -758,6 +758,13 @@ impl Volume {
             );
         }
         self.pending_entries.clear();
+        // Evict the promoted WAL from the file handle cache.  After promotion
+        // the body offsets in the extent index point into the new segment file;
+        // any cached fd for this ULID would use the old WAL byte layout.
+        let mut cache = self.file_cache.borrow_mut();
+        if cache.as_ref().map(|(id, _)| id.as_str()) == Some(self.wal_ulid.as_str()) {
+            *cache = None;
+        }
         Ok(())
     }
 

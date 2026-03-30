@@ -15,11 +15,12 @@
 //
 // See docs/architecture.md — "Concurrency model" for rationale and design.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -97,6 +98,10 @@ pub struct VolumeActor {
     volume: Volume,
     snapshot: Arc<ArcSwap<ReadSnapshot>>,
     rx: Receiver<VolumeRequest>,
+    /// Incremented after every WAL promotion (explicit flush or threshold-triggered).
+    /// Handles compare their cached value against this to detect when their
+    /// file handle cache may be stale.
+    flush_gen: Arc<AtomicU64>,
 }
 
 /// Idle period after which the actor promotes a non-empty WAL to a pending
@@ -106,6 +111,19 @@ pub struct VolumeActor {
 const IDLE_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 
 impl VolumeActor {
+    /// Called after every successful WAL promotion (explicit flush, threshold,
+    /// or idle tick).  Republishes the snapshot with post-promote extent_index
+    /// offsets and increments `flush_gen` so that handles know to evict their
+    /// file handle caches before the next read.
+    fn after_promote(&mut self) {
+        let (lbamap, extent_index) = self.volume.snapshot_maps();
+        self.snapshot.store(Arc::new(ReadSnapshot {
+            lbamap,
+            extent_index,
+        }));
+        self.flush_gen.fetch_add(1, Ordering::Release);
+    }
+
     pub fn run(mut self) {
         let idle_tick = tick(IDLE_FLUSH_INTERVAL);
         loop {
@@ -130,14 +148,20 @@ impl VolumeActor {
                             // (fsync + segment write) is paid before the next
                             // queued message is processed, not by this caller.
                             let _ = reply.send(result);
-                            if self.volume.needs_promote()
-                                && let Err(e) = self.volume.flush_wal()
-                            {
-                                warn!("threshold-triggered promote failed: {e}");
+                            if self.volume.needs_promote() {
+                                if let Err(e) = self.volume.flush_wal() {
+                                    warn!("threshold-triggered promote failed: {e}");
+                                } else {
+                                    self.after_promote();
+                                }
                             }
                         }
                         VolumeRequest::Flush { reply } => {
-                            let _ = reply.send(self.volume.flush_wal());
+                            let result = self.volume.flush_wal();
+                            if result.is_ok() {
+                                self.after_promote();
+                            }
+                            let _ = reply.send(result);
                         }
                         VolumeRequest::Compact { reply } => {
                             let _ = reply.send(self.volume.compact_pending());
@@ -152,6 +176,8 @@ impl VolumeActor {
                     // flush will retry.
                     if let Err(e) = self.volume.flush_wal() {
                         warn!("idle flush failed: {e}");
+                    } else {
+                        self.after_promote();
                     }
                 }
             }
@@ -176,6 +202,11 @@ pub struct VolumeHandle {
     /// Per-handle file-handle cache.  Never contended: each ublk queue thread
     /// holds its own clone.  `RefCell` is sufficient; `Mutex` is not needed.
     file_cache: RefCell<Option<(String, fs::File)>>,
+    /// Shared promotion counter.  The actor increments this after every WAL
+    /// promotion.  The handle compares its `last_flush_gen` against it before
+    /// each read; if they differ the file cache is stale and must be cleared.
+    flush_gen: Arc<AtomicU64>,
+    last_flush_gen: Cell<u64>,
 }
 
 // VolumeHandle is Send: all fields are Send and file_cache is only accessed
@@ -186,11 +217,15 @@ unsafe impl Send for VolumeHandle {}
 
 impl Clone for VolumeHandle {
     fn clone(&self) -> Self {
+        let flush_gen = Arc::clone(&self.flush_gen);
+        let current_gen = flush_gen.load(Ordering::Acquire);
         Self {
             tx: self.tx.clone(),
             snapshot: Arc::clone(&self.snapshot),
             config: Arc::clone(&self.config),
             file_cache: RefCell::new(None), // fresh cache per clone/thread
+            flush_gen,
+            last_flush_gen: Cell::new(current_gen),
         }
     }
 }
@@ -239,6 +274,15 @@ impl VolumeHandle {
     /// — no channel round-trip.  Reflects all writes that have returned `Ok`,
     /// including those not yet flushed to disk (read-your-writes guarantee).
     pub fn read(&self, lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+        // Evict the file cache if a WAL promotion has occurred since the last
+        // read.  After promotion the body offsets in the extent index change
+        // from WAL-format to segment-format; a cached WAL fd would cause
+        // reads to seek to the wrong position.
+        let current_gen = self.flush_gen.load(Ordering::Acquire);
+        if current_gen != self.last_flush_gen.get() {
+            *self.file_cache.borrow_mut() = None;
+            self.last_flush_gen.set(current_gen);
+        }
         let snap = self.snapshot.load();
         read_extents(
             lba,
@@ -291,11 +335,13 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
     // Channel depth of 64: enough to absorb bursts without blocking callers
     // while still providing backpressure if the actor falls behind.
     let (tx, rx) = bounded(64);
+    let flush_gen = Arc::new(AtomicU64::new(0));
 
     let actor = VolumeActor {
         volume,
         snapshot: Arc::clone(&snapshot),
         rx,
+        flush_gen: Arc::clone(&flush_gen),
     };
 
     let handle = VolumeHandle {
@@ -303,6 +349,8 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         snapshot,
         config,
         file_cache: RefCell::new(None),
+        last_flush_gen: Cell::new(0),
+        flush_gen,
     };
 
     (actor, handle)
