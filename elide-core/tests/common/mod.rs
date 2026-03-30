@@ -32,18 +32,19 @@ pub fn drain_local(fork_dir: &Path) {
 ///
 /// Picks the two lowest-ULID segments as candidates, compacts their entries
 /// (including REF entries so the oracle test can still resolve dedup hashes),
-/// writes a new segment with ULID = `max(inputs).increment()`, writes
-/// `gc/<new_ulid>.pending` (the handoff file the coordinator produces), and
-/// deletes the inputs.
+/// writes a new segment with ULID = `max(inputs).increment()`, and writes
+/// `gc/<new_ulid>.pending` (the handoff file the coordinator produces).
 ///
-/// The handoff file is written before the inputs are deleted, matching the
-/// real coordinator's ordering.  Callers are expected to call
-/// `vol.apply_gc_handoffs()` (or `handle.apply_gc_handoffs()`) after this
-/// function to exercise the full handoff protocol through the volume.
+/// The input segment files are **not** deleted inline.  The caller receives
+/// the consumed paths and is responsible for deleting them — after calling
+/// `vol.apply_gc_handoffs()` (or `handle.apply_gc_handoffs()`).  This models
+/// the real coordinator's ordering constraint: local segment files must not
+/// disappear until the volume has acknowledged the handoff by renaming
+/// `.pending` → `.applied`.
 ///
-/// Returns `Some((consumed_ulids, produced_ulid))` when candidates were found,
-/// `None` when fewer than two segments exist.
-pub fn simulate_coord_gc_local(fork_dir: &Path) -> Option<(Vec<Ulid>, Ulid)> {
+/// Returns `Some((consumed_ulids, produced_ulid, paths_to_delete))` when
+/// candidates were found, `None` when fewer than two segments exist.
+pub fn simulate_coord_gc_local(fork_dir: &Path) -> Option<(Vec<Ulid>, Ulid, Vec<PathBuf>)> {
     let segments_dir = fork_dir.join("segments");
 
     let seg_files = segment::collect_segment_files(&segments_dir).ok()?;
@@ -78,11 +79,9 @@ pub fn simulate_coord_gc_local(fork_dir: &Path) -> Option<(Vec<Ulid>, Ulid)> {
         .unwrap_or_else(|| Ulid::from_parts(max_input.timestamp_ms() + 1, 0));
 
     if all_entries.is_empty() {
-        for (_, path) in &candidates {
-            let _ = fs::remove_file(path);
-        }
         let consumed = candidates.iter().map(|(u, _)| *u).collect();
-        return Some((consumed, new_ulid));
+        let to_delete = candidates.into_iter().map(|(_, p)| p).collect();
+        return Some((consumed, new_ulid, to_delete));
     }
 
     let tmp_path = segments_dir.join(format!("{new_ulid}.tmp"));
@@ -111,10 +110,7 @@ pub fn simulate_coord_gc_local(fork_dir: &Path) -> Option<(Vec<Ulid>, Ulid)> {
     }
     let _ = fs::write(gc_dir.join(format!("{new_ulid}.pending")), lines);
 
-    for (_, path) in &candidates {
-        let _ = fs::remove_file(path);
-    }
-
     let consumed = candidates.iter().map(|(u, _)| *u).collect();
-    Some((consumed, new_ulid))
+    let to_delete = candidates.into_iter().map(|(_, p)| p).collect();
+    Some((consumed, new_ulid, to_delete))
 }

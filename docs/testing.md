@@ -257,3 +257,65 @@ snapshot with post-promote offsets.  `VolumeHandle::read()` compares its cached
 generation against the current value; if they differ it evicts the file cache
 before loading the snapshot.  `flush_wal_to_pending` also evicts `Volume`'s own
 file cache for the promoted WAL ULID.
+
+---
+
+## Concurrent integration test
+
+`elide-core/tests/concurrent_test.rs` tests the ordering invariant between
+the coordinator and the volume that neither proptest can cover: a live reader
+must never observe a `segment not found` error during a concurrent GC pass.
+
+The proptest suites are single-threaded by design — they call
+`simulate_coord_gc_local` and `apply_gc_handoffs` sequentially on the test
+thread, so the window between file deletion and extent-index update never opens.
+A dedicated concurrent test is required.
+
+**The invariant:** the coordinator must not delete old local segment files until
+after the volume has acknowledged the GC handoff (renamed `gc/<ulid>.pending`
+to `gc/<ulid>.applied`).  That rename is the volume's signal that its extent
+index now points at the new compacted segment and the old files are safe to
+delete.  Violating the ordering — deleting before `apply_gc_handoffs` — leaves
+a window where reads of cold LBAs fail with `segment not found`.
+
+**Test structure:** seeds two segments of data (LBAs 0–7), then runs a reader
+thread (500 iterations of reading all LBAs) concurrently with a coordinator
+thread (one GC pass).  The coordinator applies the handoff first, then deletes
+the old segment files.  The reader records any error; the test asserts the error
+list is empty.
+
+**How the failure mode was confirmed:** the test was run with
+`simulate_coord_gc_local` deleting files inline (before returning), reproducing
+the original bug.  The test failed immediately with `segment not found` errors
+for LBAs 0–3.  The fix — returning paths to the caller for deferred deletion —
+made the test pass.
+
+---
+
+## Future: deeper concurrency verification
+
+The concurrent integration test validates the ordering invariant under a fixed
+workload and real OS thread scheduling.  Two approaches would give stronger
+guarantees:
+
+**`loom`** ([tokio-rs/loom](https://github.com/tokio-rs/loom)) is a
+deterministic concurrency testing library for Rust.  It replaces the standard
+library's atomics, mutexes, and thread APIs with instrumented versions and
+exhaustively explores all possible thread interleavings of a test scenario.
+Applied here, it could prove that no scheduling of the coordinator and reader
+threads produces a `segment not found` error — not just that it didn't happen in
+practice during test runs.  The cost is rewriting the concurrent paths to use
+`loom`-aware primitives within the test, which requires some test-specific
+abstraction.
+
+**TLA+** is a formal specification language for concurrent and distributed
+systems.  The GC handoff protocol — coordinator writes `.pending`, volume reads
+new segment index, volume renames to `.applied`, coordinator deletes old files —
+is exactly the kind of multi-step protocol TLA+ excels at specifying.  A TLA+
+model would express the protocol as a state machine, define the safety property
+(`read_returns_valid_data` for all reachable states), and use the TLC model
+checker to verify it exhaustively over all interleavings and crash points.  TLA+
+catches classes of bugs that are difficult to exercise in code tests: e.g.
+partial handoff application after a crash mid-rename, or coordinator/volume
+forks seeing different filesystem states.  The model lives outside the codebase
+and does not require changes to the implementation.

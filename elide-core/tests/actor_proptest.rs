@@ -24,7 +24,6 @@
 // actor/snapshot layer.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::thread;
 
 use elide_core::actor::spawn;
@@ -122,13 +121,21 @@ proptest! {
                     common::drain_local(fork_dir);
                 }
                 ActorOp::CoordGcLocal => {
-                    // Simulate one coordinator GC pass (writes gc/*.pending,
-                    // deletes old input segments).
-                    let _ = common::simulate_coord_gc_local(fork_dir);
+                    // Simulate one coordinator GC pass (writes gc/*.pending).
+                    // Returns paths to delete — we hold them until after the
+                    // handoff is applied, matching the real coordinator's ordering.
+                    let to_delete = common::simulate_coord_gc_local(fork_dir)
+                        .map(|(_, _, paths)| paths)
+                        .unwrap_or_default();
                     // Apply the handoff through the actor channel.  This
                     // exercises the ApplyGcHandoffs message path and verifies
                     // the snapshot is republished with the updated extent index.
                     let _ = handle.apply_gc_handoffs();
+                    // Old segment files are safe to delete only after the
+                    // handoff is applied.
+                    for path in &to_delete {
+                        let _ = std::fs::remove_file(path);
+                    }
                     // All oracle LBAs must still be readable with correct data.
                     for (&lba, expected) in &oracle {
                         let actual = handle.read(lba, 1).unwrap();

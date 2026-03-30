@@ -123,16 +123,25 @@ proptest! {
                     // DrainLocal only renames files; no new ULIDs are created.
                 }
                 SimOp::CoordGcLocal => {
-                    if let Some((consumed, produced)) = common::simulate_coord_gc_local(fork_dir) {
+                    let to_delete = if let Some((consumed, produced, paths)) =
+                        common::simulate_coord_gc_local(fork_dir)
+                    {
                         let max_consumed = consumed.iter().copied().max().unwrap();
                         prop_assert!(
                             produced > max_consumed,
                             "coord_gc produced ULID {produced} ≤ consumed max {max_consumed}"
                         );
-                    }
+                        paths
+                    } else {
+                        vec![]
+                    };
                     // Apply any pending gc handoffs (from this pass or a
                     // pre-crash pass) through the volume's handoff path.
                     let _ = vol.apply_gc_handoffs();
+                    // Delete old segment files only after the handoff is applied.
+                    for path in &to_delete {
+                        let _ = std::fs::remove_file(path);
+                    }
                 }
                 SimOp::Crash => {
                     drop(vol);
