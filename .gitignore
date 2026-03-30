@@ -1,5 +1,6 @@
-# Claude Code local settings
+# Claude Code local settings (but agents are project-level, so track them)
 .claude/
+!.claude/agents/
 
 # Disk images
 *.img
