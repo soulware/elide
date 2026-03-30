@@ -186,10 +186,20 @@ proptest! {
                 }
                 SimOp::CoordGcLocal => {
                     let gc_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
-                    let _ = common::simulate_coord_gc_local(fork_dir, gc_ulid);
-                    // Apply any pending gc handoffs through the volume's
-                    // handoff path, including handoffs from pre-crash passes.
+                    let to_delete = if let Some((_, _, paths)) =
+                        common::simulate_coord_gc_local(fork_dir, gc_ulid)
+                    {
+                        paths
+                    } else {
+                        vec![]
+                    };
+                    // Apply handoffs before deleting consumed segments — mirrors
+                    // the real coordinator protocol (volume acknowledges first,
+                    // then coordinator deletes).
                     let _ = vol.apply_gc_handoffs();
+                    for path in &to_delete {
+                        let _ = std::fs::remove_file(path);
+                    }
                 }
                 SimOp::Crash => {
                     drop(vol);

@@ -151,16 +151,16 @@ that the proptest also passes.
 These are gaps in the current simulation model that could allow bugs to go
 undetected.  They are documented here so they are not forgotten.
 
-**`crash_recovery_oracle` does not delete consumed GC segments.**  After
-`CoordGcLocal`, the helper returns the paths of old input segments to be
+**`crash_recovery_oracle` does not delete consumed GC segments.**  *(Fixed.)*
+After `CoordGcLocal`, the helper returns the paths of old input segments to be
 deleted.  `ulid_monotonicity` collects and removes them correctly.
-`crash_recovery_oracle` discards the returned paths (`let _ = ...`), so
-consumed segment files accumulate indefinitely and are never removed.  This
-means the oracle never runs in the post-GC steady state — where the old
-segments are gone and reads must go entirely through the new compacted
-output — which is exactly the state the handoff protocol is designed to
-make safe.  This is a false-negative risk: a bug that corrupts reads after
-old segments are deleted would not be caught.
+`crash_recovery_oracle` was discarding the returned paths (`let _ = ...`), so
+consumed segment files accumulated indefinitely and were never removed.  This
+meant the oracle never ran in the post-GC steady state — where the old segments
+are gone and reads must go entirely through the new compacted output — which is
+exactly the state the handoff protocol is designed to make safe.  Fixed by
+collecting and deleting the consumed paths after `apply_gc_handoffs`, matching
+the real coordinator protocol.
 
 **`CompactVolume` SimOp is entirely absent.**  `vol.compact(min_live_ratio)`
 is the volume-level density pass.  It iterates both `pending/` and `segments/`,
