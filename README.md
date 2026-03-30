@@ -18,5 +18,6 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/reference-lsvd.md](docs/reference-lsvd.md) | lab47/lsvd design decisions and comparison to Elide |
 | [docs/reference-nydus.md](docs/reference-nydus.md) | nydus-snapshotter: lazy loading, RAFS format, NRI optimizer, boot hints |
 | [docs/vm-boot.md](docs/vm-boot.md) | Booting a VM from an Elide volume with QEMU direct kernel boot |
+| [docs/status-2026-03-30.md](docs/status-2026-03-30.md) | Implementation status snapshot: what's built, remaining work, lsvd deviations (2026-03-30) |
 
 Start with [docs/overview.md](docs/overview.md).
