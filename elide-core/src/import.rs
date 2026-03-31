@@ -47,7 +47,7 @@ fn shannon_entropy(data: &[u8]) -> f64 {
         .sum()
 }
 
-/// Attempt zstd level-1 compression on a single block.
+/// Attempt lz4 compression on a single block.
 ///
 /// Returns `Some(compressed)` only if entropy is below 7.0 bits/byte and the
 /// result achieves at least a 1.5× ratio; otherwise returns `None` (store raw).
@@ -55,7 +55,7 @@ fn maybe_compress(block: &[u8]) -> Option<Vec<u8>> {
     if shannon_entropy(block) > 7.0 {
         return None;
     }
-    let compressed = zstd::bulk::compress(block, 1).ok()?;
+    let compressed = lz4_flex::compress_prepend_size(block);
     // Require at least 1.5× ratio (compressed × 3/2 < raw).
     if compressed.len() * 3 / 2 >= block.len() {
         return None;

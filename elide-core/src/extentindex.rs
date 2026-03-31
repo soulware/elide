@@ -36,7 +36,7 @@ pub struct ExtentLocation {
     pub body_offset: u64,
     /// Byte length of the stored payload (compressed size if `compressed`).
     pub body_length: u32,
-    /// True if the payload is zstd-compressed.
+    /// True if the payload is lz4-compressed.
     pub compressed: bool,
 }
 

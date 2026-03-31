@@ -97,7 +97,7 @@ pub const FLAG_INLINE: u8 = 0x01;
 /// One or more delta options follow this entry (S3 only; not used locally).
 #[allow(dead_code)]
 pub const FLAG_HAS_DELTAS: u8 = 0x02;
-/// Stored data is zstd-compressed; stored_length is the compressed size.
+/// Stored data is lz4-compressed; stored_length is the compressed size.
 pub const FLAG_COMPRESSED: u8 = 0x04;
 /// Extent data lives in an ancestor segment; no bytes in this segment's body.
 pub const FLAG_DEDUP_REF: u8 = 0x08;

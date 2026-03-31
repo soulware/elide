@@ -10,11 +10,17 @@ blake3         = "1"
 crossbeam-channel = "0.5"
 log            = "0.4"
 ed25519-dalek  = { version = "2", features = ["rand_core"] }
+lz4_flex       = "0.11"
 nix            = { version = "0.29", features = ["fs", "hostname", "process", "signal"] }
 rand_core      = { version = "0.6", features = ["getrandom"] }
 ulid           = "1"
-zstd           = "0.13"
 
 [dev-dependencies]
-proptest = "1"
-tempfile = "3"
+criterion  = { version = "0.5", features = ["html_reports"] }
+proptest   = "1"
+tempfile   = "3"
+zstd       = "0.13"
+
+[[bench]]
+name = "compression"
+harness = false

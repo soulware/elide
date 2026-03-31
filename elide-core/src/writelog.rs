@@ -29,7 +29,7 @@ use std::path::Path;
 
 // --- flag bits ---
 
-/// Payload is zstd-compressed; data_length is the compressed size.
+/// Payload is lz4-compressed; data_length is the compressed size.
 #[allow(dead_code)] // used when compression is wired up
 pub const FLAG_COMPRESSED: u8 = 0x01;
 /// No data payload; this LBA range maps to an existing extent identified by hash.
@@ -249,7 +249,7 @@ fn parse_record(data: &[u8], pos: &mut usize) -> io::Result<LogRecord> {
     // When compressed, verify against the content hash (hash of uncompressed data).
     // When uncompressed, verify directly.
     let verify_against = if flags & FLAG_COMPRESSED != 0 {
-        zstd::decode_all(payload.as_slice())
+        lz4_flex::decompress_size_prepended(payload.as_slice())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decompression failed"))?
     } else {
         payload.clone()
@@ -559,7 +559,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let original = b"compressed payload bytes - original uncompressed content";
-        let compressed = zstd::bulk::compress(original, 1).unwrap();
+        let compressed = lz4_flex::compress_prepend_size(original);
         // Hash is always of the uncompressed content.
         let hash = blake3::hash(original);
 

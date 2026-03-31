@@ -239,7 +239,8 @@ impl VolumeReader {
             f.seek(SeekFrom::Start(loc.body_offset))?;
             let mut buf = vec![0u8; loc.body_length as usize];
             f.read_exact(&mut buf)?;
-            let decompressed = zstd::decode_all(buf.as_slice()).map_err(io::Error::other)?;
+            let decompressed =
+                lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?;
             let src = block_offset as usize * 4096;
             block.copy_from_slice(&decompressed[src..src + 4096]);
         } else {

@@ -69,7 +69,7 @@ const ENTROPY_THRESHOLD: f64 = 7.0;
 const MIN_COMPRESSION_RATIO_NUM: usize = 3;
 const MIN_COMPRESSION_RATIO_DEN: usize = 2;
 
-/// Attempt zstd compression on `data`.
+/// Attempt lz4 compression on `data`.
 ///
 /// Returns `Some(compressed_bytes)` if the entropy is low enough and the
 /// compression ratio meets the minimum threshold; `None` to store raw.
@@ -77,7 +77,7 @@ fn maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
     if shannon_entropy(data) > ENTROPY_THRESHOLD {
         return None;
     }
-    let compressed = zstd::bulk::compress(data, 1).ok()?;
+    let compressed = lz4_flex::compress_prepend_size(data);
     // Only keep if we achieve at least MIN_COMPRESSION_RATIO (1.5×).
     if compressed.len() * MIN_COMPRESSION_RATIO_NUM / MIN_COMPRESSION_RATIO_DEN >= data.len() {
         return None;
@@ -1185,7 +1185,7 @@ pub(crate) fn read_extents(
             let mut compressed_buf = vec![0u8; body_length as usize];
             f.read_exact(&mut compressed_buf)?;
             let decompressed =
-                zstd::decode_all(compressed_buf.as_slice()).map_err(io::Error::other)?;
+                lz4_flex::decompress_size_prepended(&compressed_buf).map_err(io::Error::other)?;
             let src_start = er.payload_block_offset as usize * 4096;
             let src_end = src_start + block_count * 4096;
             let src_slice = decompressed.get(src_start..src_end).ok_or_else(|| {
