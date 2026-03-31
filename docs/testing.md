@@ -74,7 +74,7 @@ directory:
 | `Flush` | `vol.flush_wal()` — promotes WAL to `pending/` | none (write already recorded) |
 | `SweepPending` | `vol.sweep_pending()` — merges/deduplicates `pending/` segments | none (no data change) |
 | `DrainLocal` | Moves all `pending/` files to `segments/` (simulates coordinator upload) | none |
-| `CoordGcLocal` | Runs a coordinator-style GC pass on `segments/` in-process | none (no data change) |
+| `CoordGcLocal { n }` | Runs a coordinator-style GC pass on `segments/` in-process, merging `n` segments (2–5) | none (no data change) |
 | `Crash` | Drops the `Volume` and reopens it (full rebuild from disk) | assert all oracle LBAs match |
 
 `DrainLocal` is needed before `CoordGcLocal` has material to work with, just
@@ -82,10 +82,10 @@ as in production the coordinator only compacts segments that have been
 uploaded.  The proptest engine discovers on its own which interleavings are
 interesting.
 
-`CoordGcLocal` picks the two oldest segments in `segments/`, merges their
-entries, writes an output with `ULID = max(inputs).increment()`, and deletes
-the inputs — the same algorithm as the real coordinator GC in
-`elide-coordinator/src/gc.rs`.
+`CoordGcLocal { n }` picks the `n` oldest segments in `segments/` (proptest
+generates `n` in the range 2–5), merges their entries, writes an output with
+`ULID = max(inputs).increment()`, and deletes the inputs — the same algorithm
+as the real coordinator GC in `elide-coordinator/src/gc.rs`.
 
 ### Bug found by these tests
 
@@ -179,11 +179,12 @@ originals.  Adding `Repack` to the simulation immediately found two bugs:
    output.  Fixed by skipping the delete when the source is in `pending/` (the
    rename already replaced it in-place).
 
-**Coordinator multi-segment sweep not modelled.**  `CoordGcLocal` always picks
-exactly two segments.  The real coordinator sweep can consume three or
-more segments in a single pass.  A three-segment merge that produces one output
-exercises different liveness and ULID ordering combinations that the two-segment
-model cannot reach.
+**Coordinator multi-segment sweep not modelled.**  *(Fixed.)*  `CoordGcLocal`
+now takes an `n: usize` parameter; the proptest generates `n` in the range 2–5.
+A GC merge ordering bug was found and fixed during the implementation: without
+sorting GC-output segments before regular segments, a higher-ULID GC output
+containing older writes could shadow newer data from a lower-ULID regular
+segment during rebuild.
 
 ### Future dimensions
 
