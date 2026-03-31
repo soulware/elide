@@ -64,6 +64,9 @@ enum SimOp {
     CoordGcLocal {
         n: usize,
     },
+    /// Simulate coordinator GC running both repack and sweep in the same tick.
+    /// Requires ≥ 3 segments in segments/; no-ops otherwise.
+    CoordGcLocalBoth,
     Crash,
     /// Read an LBA that has never been written; must return all-zero bytes.
     ReadUnwritten,
@@ -79,6 +82,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::Repack),
         Just(SimOp::DrainLocal),
         (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
+        Just(SimOp::CoordGcLocalBoth),
         Just(SimOp::Crash),
         Just(SimOp::ReadUnwritten),
         Just(SimOp::Snapshot),
@@ -143,6 +147,29 @@ fn multi_segment_prefix() -> Vec<SimOp> {
     ]
 }
 
+/// One low-density segment + two small high-density segments — sets up state
+/// where both repack and sweep have candidates simultaneously.
+///
+/// S1 (LBA 0 = 0xAA) is overwritten by S2 (LBA 0 = 0xBB), making S1
+/// low-density.  S3 (LBA 1) and S4 (LBA 2) are small and fully live.
+/// CoordGcLocalBoth can fire: S1 → repack, S2+S3+S4 → sweep.
+fn repack_and_sweep_prefix() -> Vec<SimOp> {
+    vec![
+        SimOp::Write { lba: 0, seed: 0xAA },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+        SimOp::Write { lba: 0, seed: 0xBB }, // overwrites LBA 0 — S1 becomes stale
+        SimOp::Flush,
+        SimOp::DrainLocal,
+        SimOp::Write { lba: 1, seed: 0xCC },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+        SimOp::Write { lba: 2, seed: 0xDD },
+        SimOp::Flush,
+        SimOp::DrainLocal,
+    ]
+}
+
 /// One full GC pass already applied — tests the "second round of GC" path and
 /// rebuild from a volume that already has GC history.
 fn post_gc_prefix() -> Vec<SimOp> {
@@ -177,6 +204,8 @@ fn arb_gc_interleaved_ops() -> impl Strategy<Value = Vec<SimOp>> {
         arb_sim_ops().prop_map(|ops| with_prefix(multi_segment_prefix(), ops)),
         // Post-GC: one GC pass already applied, tests second-round GC path.
         arb_sim_ops().prop_map(|ops| with_prefix(post_gc_prefix(), ops)),
+        // One low-density + two small dense segments: CoordGcLocalBoth can fire.
+        arb_sim_ops().prop_map(|ops| with_prefix(repack_and_sweep_prefix(), ops)),
     ]
 }
 
@@ -288,6 +317,31 @@ proptest! {
                         let _ = std::fs::remove_file(path);
                     }
                 }
+                SimOp::CoordGcLocalBoth => {
+                    let repack_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let sweep_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let mut to_delete: Vec<std::path::PathBuf> = vec![];
+                    if let Some(((r_consumed, r_produced, r_paths), (s_consumed, s_produced, s_paths))) =
+                        common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid)
+                    {
+                        let r_max = r_consumed.iter().copied().max().unwrap();
+                        prop_assert!(
+                            r_produced > r_max,
+                            "coord_gc_both repack produced {r_produced} ≤ consumed max {r_max}"
+                        );
+                        let s_max = s_consumed.iter().copied().max().unwrap();
+                        prop_assert!(
+                            s_produced > s_max,
+                            "coord_gc_both sweep produced {s_produced} ≤ consumed max {s_max}"
+                        );
+                        to_delete.extend(r_paths);
+                        to_delete.extend(s_paths);
+                    }
+                    let _ = vol.apply_gc_handoffs();
+                    for path in &to_delete {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
                 SimOp::Crash => {
                     drop(vol);
                     vol = Volume::open(fork_dir).unwrap();
@@ -358,6 +412,21 @@ proptest! {
                     // Apply handoffs before deleting consumed segments — mirrors
                     // the real coordinator protocol (volume acknowledges first,
                     // then coordinator deletes).
+                    let _ = vol.apply_gc_handoffs();
+                    for path in &to_delete {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+                SimOp::CoordGcLocalBoth => {
+                    let repack_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let sweep_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let mut to_delete: Vec<std::path::PathBuf> = vec![];
+                    if let Some(((_, _, r_paths), (_, _, s_paths))) =
+                        common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid)
+                    {
+                        to_delete.extend(r_paths);
+                        to_delete.extend(s_paths);
+                    }
                     let _ = vol.apply_gc_handoffs();
                     for path in &to_delete {
                         let _ = std::fs::remove_file(path);
@@ -435,6 +504,21 @@ proptest! {
                     } else {
                         vec![]
                     };
+                    let _ = vol.apply_gc_handoffs();
+                    for path in &to_delete {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+                SimOp::CoordGcLocalBoth => {
+                    let repack_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let sweep_ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    let mut to_delete: Vec<std::path::PathBuf> = vec![];
+                    if let Some(((_, _, r_paths), (_, _, s_paths))) =
+                        common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid)
+                    {
+                        to_delete.extend(r_paths);
+                        to_delete.extend(s_paths);
+                    }
                     let _ = vol.apply_gc_handoffs();
                     for path in &to_delete {
                         let _ = std::fs::remove_file(path);

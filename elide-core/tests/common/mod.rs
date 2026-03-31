@@ -6,10 +6,11 @@
 // coordinator-side simulation.
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use elide_core::{lbamap, segment};
+use elide_core::{extentindex, lbamap, segment};
 use ulid::Ulid;
 
 /// Move all committed segments from pending/ to segments/.
@@ -27,53 +28,10 @@ pub fn drain_local(fork_dir: &Path) {
     }
 }
 
-/// Simulate one coordinator GC pass on `segments/` without an object store.
-///
-/// Picks the two lowest-ULID segments as candidates, compacts their entries
-/// (including REF entries so the oracle test can still resolve dedup hashes),
-/// writes a new segment with the given `new_ulid` (obtained from
-/// `gc_checkpoint` which flushes the volume's WAL first), and writes
-/// `gc/<new_ulid>.pending` (the handoff file the coordinator produces).
-///
-/// The input segment files are **not** deleted inline.  The caller receives
-/// the consumed paths and is responsible for deleting them — after calling
-/// `vol.apply_gc_handoffs()` (or `handle.apply_gc_handoffs()`).  This models
-/// the real coordinator's ordering constraint: local segment files must not
-/// disappear until the volume has acknowledged the handoff by renaming
-/// `.pending` → `.applied`.
-///
-/// Returns `Some((consumed_ulids, produced_ulid, paths_to_delete))` when
-/// candidates were found, `None` when fewer than two segments exist.
-pub fn simulate_coord_gc_local(
-    fork_dir: &Path,
-    new_ulid: Ulid,
-    n_candidates: usize,
-) -> Option<(Vec<Ulid>, Ulid, Vec<PathBuf>)> {
-    let segments_dir = fork_dir.join("segments");
-
-    let seg_files = segment::collect_segment_files(&segments_dir).ok()?;
-    let mut candidates: Vec<(Ulid, PathBuf)> = seg_files
-        .iter()
-        .filter_map(|p| {
-            let name = p.file_name()?.to_str()?;
-            let ulid = Ulid::from_string(name).ok()?;
-            Some((ulid, p.clone()))
-        })
-        .collect();
-    if candidates.len() < 2 {
-        return None;
-    }
-    // Sort using sort_for_rebuild semantics: GC outputs (segments that have a
-    // .pending or .applied handoff file) come first (lower priority); regular
-    // segments come last (higher priority, win on conflict).  This matches how
-    // Volume::open() applies segments during rebuild, so the GC output never
-    // contains conflicting entries for the same LBA where the stale value wins.
-    //
-    // Without this, a GC output G1 (higher ULID, but containing older writes)
-    // merged with a regular segment S3 (lower ULID, newer writes) would produce
-    // entries in the wrong order: G1's DATA for lba=X would sort last (by ULID)
-    // and override S3's REF for the same lba=X during rebuild.
-    let gc_dir = fork_dir.join("gc");
+/// Sort-for-rebuild ordering: GC outputs (.pending/.applied handoff present)
+/// come first (lower priority); regular segments come last (higher priority).
+/// Within each group, sort by ULID ascending.
+fn sort_candidates(candidates: &mut Vec<(Ulid, PathBuf)>, gc_dir: &Path) {
     let is_gc = |u: &Ulid| {
         let name = u.to_string();
         gc_dir.join(format!("{name}.pending")).exists()
@@ -84,26 +42,36 @@ pub fn simulate_coord_gc_local(
         (false, true) => std::cmp::Ordering::Greater,
         _ => ua.cmp(ub),
     });
-    let n = n_candidates.min(candidates.len());
-    let candidates = candidates[..n].to_vec();
+}
 
-    // Rebuild the LBA map to determine which hashes are still reachable.
-    // gc_checkpoint flushed the WAL, so the rebuild sees all committed writes.
-    // An entry is only carried into the GC output if its hash is both
-    // extent-index-live and LBA-map-live, preventing stale LBA entries from
-    // being compacted into the output.  Dedup-ref entries are also checked:
-    // a ref is only carried if the LBA still maps to the ref's hash.
-    let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
-    let lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
-    let live_hashes = lba_map.live_hashes();
-    let extent_index = elide_core::extentindex::rebuild(&rebuild_chain).ok()?;
+/// Compact a pre-selected set of candidates using a pre-built liveness snapshot.
+///
+/// Reads live entries from each candidate, filters them against the shared
+/// lba_map + extent_index snapshot, writes a merged output segment with
+/// `new_ulid`, and writes a `gc/<new_ulid>.pending` handoff file.
+///
+/// Returns `(consumed_ulids, new_ulid, paths_to_delete)` if the pass
+/// produced output, or if there were extent-index entries to remove.
+/// Returns `None` only if the candidates list is empty.
+fn compact_candidates_inner(
+    fork_dir: &Path,
+    candidates: Vec<(Ulid, PathBuf)>,
+    lba_map: &lbamap::LbaMap,
+    live_hashes: &HashSet<blake3::Hash>,
+    extent_index: &extentindex::ExtentIndex,
+    new_ulid: Ulid,
+) -> Option<(Vec<Ulid>, Ulid, Vec<PathBuf>)> {
+    if candidates.is_empty() {
+        return None;
+    }
 
-    // Track per-entry source ULIDs separately since SegmentEntry doesn't
-    // derive Clone.  source_ulids[i] is the segment ULID that entry i came
-    // from — needed for the .pending file format.
+    let segments_dir = fork_dir.join("segments");
+    let gc_dir = fork_dir.join("gc");
+
     let mut all_entries: Vec<segment::SegmentEntry> = Vec::new();
     let mut source_ulids: Vec<Ulid> = Vec::new();
     let mut removed: Vec<(blake3::Hash, Ulid)> = Vec::new();
+
     for (ulid, path) in &candidates {
         let seg_id = ulid.to_string();
         let Ok((bss, mut entries)) = segment::read_segment_index(path) else {
@@ -115,9 +83,6 @@ pub fn simulate_coord_gc_local(
         for entry in entries.drain(..) {
             if entry.is_dedup_ref {
                 // Carry a dedup ref only if the LBA still maps to this hash.
-                // A stale ref (LBA was overwritten with different data) must
-                // be dropped — otherwise it reintroduces the old LBA mapping
-                // into the GC output and corrupts reads after rebuild.
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
                 if lba_live {
                     source_ulids.push(*ulid);
@@ -125,7 +90,6 @@ pub fn simulate_coord_gc_local(
                 }
                 continue;
             }
-            // Check extent-level liveness: extent index points at this segment.
             let extent_live = extent_index
                 .lookup(&entry.hash)
                 .is_some_and(|loc| loc.segment_id == seg_id);
@@ -133,10 +97,8 @@ pub fn simulate_coord_gc_local(
                 source_ulids.push(*ulid);
                 all_entries.push(entry);
             } else if extent_live {
-                // Extent-live but LBA-dead: record for removal.
                 removed.push((entry.hash, *ulid));
             }
-            // If not extent-live, another segment owns this hash — skip.
         }
     }
 
@@ -146,13 +108,10 @@ pub fn simulate_coord_gc_local(
         return Some((consumed, new_ulid, to_delete));
     }
 
+    let _ = fs::create_dir_all(&gc_dir);
+
     if all_entries.is_empty() {
-        // No live entries to compact, but there are extent-index entries that
-        // must be removed before the old segment files are deleted (otherwise
-        // the extent index points at deleted files → "segment not found").
-        // Write a handoff file with only removed entries.
-        let gc_dir = fork_dir.join("gc");
-        let _ = fs::create_dir_all(&gc_dir);
+        // Only extent-index removals — no output segment needed.
         let mut lines = String::new();
         for (hash, old_ulid) in &removed {
             lines.push_str(&format!("{} {}\n", hash, old_ulid));
@@ -171,12 +130,6 @@ pub fn simulate_coord_gc_local(
     };
     fs::rename(&tmp_path, &final_path).ok()?;
 
-    // Write the handoff file with per-entry source segment ULIDs, matching
-    // the real coordinator's format.
-    // Carried entries (4 fields): <hash> <old_ulid> <new_ulid> <offset>
-    // Removed entries (2 fields): <hash> <old_ulid>
-    let gc_dir = fork_dir.join("gc");
-    let _ = fs::create_dir_all(&gc_dir);
     let mut lines = String::new();
     for (e, src_ulid) in all_entries.iter().zip(source_ulids.iter()) {
         if !e.is_dedup_ref {
@@ -195,4 +148,137 @@ pub fn simulate_coord_gc_local(
     let consumed = candidates.iter().map(|(u, _)| *u).collect();
     let to_delete = candidates.into_iter().map(|(_, p)| p).collect();
     Some((consumed, new_ulid, to_delete))
+}
+
+/// Simulate one coordinator GC pass on `segments/` without an object store.
+///
+/// Picks the `n_candidates` lowest-priority segments (sort_for_rebuild order),
+/// compacts their entries, writes a new segment with the given `new_ulid`
+/// (obtained from `gc_checkpoint` which flushes the volume's WAL first), and
+/// writes `gc/<new_ulid>.pending`.
+///
+/// The input segment files are **not** deleted inline.  The caller receives
+/// the consumed paths and is responsible for deleting them — after calling
+/// `vol.apply_gc_handoffs()`.  This models the real coordinator's ordering
+/// constraint: local segment files must not disappear until the volume has
+/// acknowledged the handoff.
+///
+/// Returns `Some((consumed_ulids, produced_ulid, paths_to_delete))` when
+/// candidates were found, `None` when fewer than two segments exist.
+pub fn simulate_coord_gc_local(
+    fork_dir: &Path,
+    new_ulid: Ulid,
+    n_candidates: usize,
+) -> Option<(Vec<Ulid>, Ulid, Vec<PathBuf>)> {
+    let segments_dir = fork_dir.join("segments");
+    let gc_dir = fork_dir.join("gc");
+
+    let seg_files = segment::collect_segment_files(&segments_dir).ok()?;
+    let mut candidates: Vec<(Ulid, PathBuf)> = seg_files
+        .iter()
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?;
+            let ulid = Ulid::from_string(name).ok()?;
+            Some((ulid, p.clone()))
+        })
+        .collect();
+    if candidates.len() < 2 {
+        return None;
+    }
+
+    sort_candidates(&mut candidates, &gc_dir);
+    let n = n_candidates.min(candidates.len());
+    let candidates = candidates[..n].to_vec();
+
+    let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+    let lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
+    let live_hashes = lba_map.live_hashes();
+    let extent_index = extentindex::rebuild(&rebuild_chain).ok()?;
+
+    compact_candidates_inner(
+        fork_dir,
+        candidates,
+        &lba_map,
+        &live_hashes,
+        &extent_index,
+        new_ulid,
+    )
+}
+
+/// Simulate coordinator GC running both repack and sweep in one tick.
+///
+/// Requires ≥ 3 segments in `segments/`: the first (lowest-priority) segment
+/// is the repack candidate; the remaining segments are the sweep candidates.
+/// Both passes share a single liveness snapshot (lba_map + extent_index
+/// rebuilt once before either pass runs), which matches the real coordinator's
+/// behaviour: `gc_fork` calls `collect_stats` once, removes the repack
+/// candidate with `all_stats.remove(pos)`, and sweeps the remainder — neither
+/// pass rebuilds liveness data mid-tick.
+///
+/// Note: the real coordinator splits candidates by density threshold; this
+/// simulation splits by position (first → repack, rest → sweep).  That
+/// difference does not affect oracle correctness — the test only verifies that
+/// two independent compactions from disjoint input sets preserve all data.
+///
+/// Returns `Some((repack_result, sweep_result))` when both strategies found
+/// candidates, where each result is `(consumed_ulids, produced_ulid,
+/// paths_to_delete)`.  Returns `None` when fewer than 3 segments exist.
+pub fn simulate_coord_gc_both_local(
+    fork_dir: &Path,
+    repack_ulid: Ulid,
+    sweep_ulid: Ulid,
+) -> Option<(
+    (Vec<Ulid>, Ulid, Vec<PathBuf>),
+    (Vec<Ulid>, Ulid, Vec<PathBuf>),
+)> {
+    let segments_dir = fork_dir.join("segments");
+    let gc_dir = fork_dir.join("gc");
+
+    let seg_files = segment::collect_segment_files(&segments_dir).ok()?;
+    let mut all_candidates: Vec<(Ulid, PathBuf)> = seg_files
+        .iter()
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?;
+            let ulid = Ulid::from_string(name).ok()?;
+            Some((ulid, p.clone()))
+        })
+        .collect();
+
+    // Need at least 1 for repack + 2 for sweep.
+    if all_candidates.len() < 3 {
+        return None;
+    }
+
+    sort_candidates(&mut all_candidates, &gc_dir);
+
+    // Rebuild liveness snapshot once — shared by both passes.
+    let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+    let lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
+    let live_hashes = lba_map.live_hashes();
+    let extent_index = extentindex::rebuild(&rebuild_chain).ok()?;
+
+    // Repack: first candidate (lowest priority / most likely stale).
+    let mut iter = all_candidates.into_iter();
+    let repack_candidate = vec![iter.next().unwrap()];
+    // Sweep: all remaining candidates.
+    let sweep_candidates: Vec<(Ulid, PathBuf)> = iter.collect();
+
+    let repack = compact_candidates_inner(
+        fork_dir,
+        repack_candidate,
+        &lba_map,
+        &live_hashes,
+        &extent_index,
+        repack_ulid,
+    )?;
+    let sweep = compact_candidates_inner(
+        fork_dir,
+        sweep_candidates,
+        &lba_map,
+        &live_hashes,
+        &extent_index,
+        sweep_ulid,
+    )?;
+
+    Some((repack, sweep))
 }
