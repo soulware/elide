@@ -1,4 +1,5 @@
-# Claude Code local settings (but agents are project-level, so track them)
+# Editor local settings
+.vscode/
 .claude/
 !.claude/agents/
 
