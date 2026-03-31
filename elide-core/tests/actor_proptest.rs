@@ -42,10 +42,10 @@ mod common;
 
 #[derive(Debug, Clone)]
 enum ActorOp {
-    Write {
-        lba: u8,
-        seed: u8,
-    },
+    /// Write data to an LBA through the actor channel; immediately assert
+    /// read-your-writes before any flush.
+    Write { lba: u8, seed: u8 },
+    /// Flush the WAL to a pending/ segment through the actor channel.
     Flush,
     /// Move all committed pending/ segments to segments/, simulating
     /// drain-pending. Required before CoordGcLocal has material to work with.
@@ -53,9 +53,7 @@ enum ActorOp {
     /// Simulate one coordinator GC pass and apply the resulting handoff
     /// through the actor channel.  Verifies that the snapshot is republished
     /// and all oracle LBAs remain readable via the handle.
-    CoordGcLocal {
-        n: usize,
-    },
+    CoordGcLocal { n: usize },
     /// Sweep small pending segments via the actor channel.  After the call,
     /// old pending/ files are deleted; publish_snapshot() must have bumped
     /// flush_gen so handles evict stale cached fds before the next read.
@@ -63,6 +61,8 @@ enum ActorOp {
     /// Repack sparse pending segments via the actor channel.  Same invariant
     /// as SweepPending: old files deleted, snapshot must be republished.
     Repack,
+    /// Simulate a crash: shut down the actor, reopen the Volume (triggering
+    /// WAL recovery), and assert all oracle LBAs are still readable.
     Crash,
 }
 

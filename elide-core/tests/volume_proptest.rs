@@ -47,26 +47,31 @@ fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
 
 #[derive(Debug, Clone)]
 enum SimOp {
-    Write {
-        lba: u8,
-        seed: u8,
-    },
+    /// Write data to an LBA directly on the volume (no actor channel).
+    Write { lba: u8, seed: u8 },
+    /// Flush the WAL to a pending/ segment, directly on the volume.
     Flush,
+    /// Volume-level sweep: packs small segments from pending/ into a single
+    /// new segment. Calls vol.sweep_pending() directly, bypassing the actor
+    /// channel. Exercises ULID monotonicity and crash-recovery invariants.
     SweepPending,
     /// Volume-level density pass: rewrites sparse segments from both pending/
     /// and segments/. Analogous to the coordinator's repack pass but runs
-    /// in-process on the volume.
+    /// in-process on the volume, bypassing the actor channel.
     Repack,
     /// Move all committed pending/ segments to segments/, simulating
     /// drain-pending without S3 upload. Required before CoordGcLocal has
     /// material to work with.
     DrainLocal,
-    CoordGcLocal {
-        n: usize,
-    },
+    /// Simulate one coordinator GC sweep pass directly on the filesystem,
+    /// using `n` segments as input. Exercises ULID monotonicity and
+    /// crash-recovery invariants for the coordinator GC path.
+    CoordGcLocal { n: usize },
     /// Simulate coordinator GC running both repack and sweep in the same tick.
     /// Requires ≥ 3 segments in segments/; no-ops otherwise.
     CoordGcLocalBoth,
+    /// Simulate a crash: drop the Volume, reopen it (triggering WAL recovery),
+    /// and assert all oracle LBAs read back their last-written values.
     Crash,
     /// Read an LBA that has never been written; must return all-zero bytes.
     ReadUnwritten,
