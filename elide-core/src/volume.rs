@@ -249,7 +249,9 @@ impl Volume {
         // the promotion completed (rename succeeded) but the WAL delete was
         // interrupted. The segment is authoritative — delete the stale WAL file.
         wal_files.retain(|path| {
-            let ulid = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let Some(ulid) = path.file_name().and_then(|s| s.to_str()) else {
+                return true; // non-UTF-8 name: leave it alone
+            };
             if pending_dir.join(ulid).exists() {
                 let _ = fs::remove_file(path);
                 false
@@ -1196,7 +1198,11 @@ pub(crate) fn read_extents(
             let decompressed =
                 zstd::decode_all(compressed_buf.as_slice()).map_err(io::Error::other)?;
             let src_start = er.payload_block_offset as usize * 4096;
-            out_slice.copy_from_slice(&decompressed[src_start..src_start + block_count * 4096]);
+            let src_end = src_start + block_count * 4096;
+            let src_slice = decompressed.get(src_start..src_end).ok_or_else(|| {
+                io::Error::other("corrupt segment: decompressed payload too short")
+            })?;
+            out_slice.copy_from_slice(src_slice);
         } else {
             f.seek(SeekFrom::Start(
                 body_offset + er.payload_block_offset as u64 * 4096,

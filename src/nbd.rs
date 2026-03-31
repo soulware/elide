@@ -664,6 +664,8 @@ fn handle_readonly_connection(
                 match volume.read(start_lba, lba_count) {
                     Ok(blocks) => {
                         let skip = (offset % 4096) as usize;
+                        // skip + length <= lba_count * 4096 = blocks.len() by construction.
+                        debug_assert!(skip + length <= blocks.len());
                         tx_reply(&mut s, 0, handle)?;
                         s.write_all(&blocks[skip..skip + length])?;
                     }
@@ -862,6 +864,8 @@ fn handle_volume_connection(
                 match volume.read(start_lba, lba_count) {
                     Ok(blocks) => {
                         let skip = (offset % 4096) as usize;
+                        // skip + length <= lba_count * 4096 = blocks.len() by construction.
+                        debug_assert!(skip + length <= blocks.len());
                         tx_reply(&mut s, 0, handle)?;
                         s.write_all(&blocks[skip..skip + length])?;
                     }
@@ -886,6 +890,8 @@ fn handle_volume_connection(
                 } else {
                     // Sub-block write: read covering blocks, patch, write back.
                     volume.read(start_lba, lba_count).and_then(|mut blocks| {
+                        // skip + length <= lba_count * 4096 = blocks.len() by construction.
+                        debug_assert!(skip + length <= blocks.len());
                         blocks[skip..skip + length].copy_from_slice(&buf);
                         volume.write(start_lba, blocks)
                     })
