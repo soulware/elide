@@ -268,8 +268,8 @@ impl Volume {
         let mut all_segment_ulids: Vec<String> = Vec::new();
         for subdir in ["pending", "segments"] {
             for p in segment::collect_segment_files(&base_dir.join(subdir))? {
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                    all_segment_ulids.push(name.to_owned());
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()).map(str::to_owned) {
+                    all_segment_ulids.push(name);
                 }
             }
         }
@@ -1180,7 +1180,10 @@ pub(crate) fn read_extents(
             let path = find_segment(&segment_id)?;
             *cache = Some((segment_id, fs::File::open(path)?));
         }
-        let f = &mut cache.as_mut().unwrap().1;
+        let f = &mut cache
+            .as_mut()
+            .expect("cache was just assigned Some above")
+            .1;
 
         let block_count = (er.range_end - er.range_start) as usize;
         let out_start = (er.range_start - lba) as usize * 4096;
