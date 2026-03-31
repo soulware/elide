@@ -59,12 +59,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::error;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use object_store::ObjectStore;
-use tokio::time::MissedTickBehavior;
 use ulid::Ulid;
 
 use elide_core::extentindex::{self, ExtentIndex};
@@ -79,7 +78,7 @@ use crate::upload::segment_key;
 ///
 /// `.done` files are kept for this duration after completion for post-mortem
 /// debugging, then removed by `cleanup_done_handoffs`.
-const DONE_FILE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const DONE_FILE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Maximum total live bytes included in one small-segment sweep pass.
 /// Matches the volume's FLUSH_THRESHOLD to keep output segment size bounded.
@@ -119,88 +118,6 @@ impl GcStats {
             strategy: GcStrategy::None,
             candidates: 0,
             bytes_freed: 0,
-        }
-    }
-}
-
-/// Long-running GC loop for a single fork.
-pub async fn gc_loop(
-    fork_dir: PathBuf,
-    volume_id: String,
-    fork_name: String,
-    store: Arc<dyn ObjectStore>,
-    config: GcConfig,
-    gc_checkpoint: Arc<dyn Fn() -> String + Send + Sync>,
-) {
-    let interval = Duration::from_secs(config.interval_secs);
-    let mut tick = tokio::time::interval(interval);
-    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    loop {
-        tick.tick().await;
-
-        if !fork_dir.exists() {
-            info!(
-                "[coordinator] fork removed, stopping gc: {}",
-                fork_dir.display()
-            );
-            break;
-        }
-
-        // Process any handoffs the volume has already acknowledged (.applied).
-        // This deletes old S3 objects and local segment files before running a
-        // new GC pass, preventing the old files from being included in the next
-        // extent index rebuild.
-        match apply_done_handoffs(&fork_dir, &volume_id, &fork_name, &store).await {
-            Ok(0) => {}
-            Ok(n) => info!("[gc {volume_id}/{fork_name}] completed {n} GC handoff(s)"),
-            Err(e) => error!("[gc {volume_id}/{fork_name}] handoff cleanup error: {e:#}"),
-        }
-
-        let pruned = cleanup_done_handoffs(&fork_dir, DONE_FILE_TTL);
-        if pruned > 0 {
-            info!("[gc {volume_id}/{fork_name}] pruned {pruned} expired .done file(s)");
-        }
-
-        match gc_fork(
-            &fork_dir,
-            &volume_id,
-            &fork_name,
-            &store,
-            &config,
-            &*gc_checkpoint,
-        )
-        .await
-        {
-            Ok(GcStats {
-                strategy: GcStrategy::Repack,
-                bytes_freed,
-                ..
-            }) => {
-                info!(
-                    "[gc {volume_id}/{fork_name}] density: compacted 1 segment, ~{bytes_freed} bytes freed"
-                );
-            }
-            Ok(GcStats {
-                strategy: GcStrategy::Sweep,
-                candidates,
-                bytes_freed,
-            }) => {
-                info!(
-                    "[gc {volume_id}/{fork_name}] sweep: packed {candidates} small segment(s), ~{bytes_freed} bytes freed"
-                );
-            }
-            Ok(GcStats {
-                strategy: GcStrategy::Both,
-                candidates,
-                bytes_freed,
-            }) => {
-                info!(
-                    "[gc {volume_id}/{fork_name}] repack+sweep: {candidates} segment(s) compacted, ~{bytes_freed} bytes freed"
-                );
-            }
-            Ok(_) => {}
-            Err(e) => error!("[gc {volume_id}/{fork_name}] error: {e:#}"),
         }
     }
 }

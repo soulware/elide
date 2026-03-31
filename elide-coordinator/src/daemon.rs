@@ -1,16 +1,23 @@
 // Coordinator daemon: watches configured volume roots, discovers forks,
-// drains pending segments to S3, and supervises volume processes.
+// drains pending segments to S3, runs GC, and supervises volume processes.
 //
 // Architecture:
 //   - A root scanner runs every `scan_interval_secs`, walking configured root
 //     directories to find fork directories. Each newly-discovered fork gets:
-//       - a drain task: polls `pending/` every `interval_secs` and uploads
+//       - a fork_loop task: drain + GC, sequential within each tick
 //       - a supervisor task (if `serve.toml` exists): spawns and restarts
 //         `elide serve-volume`
 //   - The first scan fires immediately at startup to clear any backlog and
 //     adopt any volume processes already running.
 //   - Shutdown on Ctrl+C: all tasks are aborted. Volume processes are detached
 //     (setsid) and continue running after the coordinator exits.
+//
+// Per-tick sequencing (fork_loop):
+//   1. Upload pending/ segments to S3 (drain_pending)
+//   2. If gc_interval has elapsed: apply done handoffs, run GC pass (gc_fork)
+//
+// Drain and GC are sequential within each tick so that GC sees all segments
+// uploaded this tick, and concurrent GC rewrites can never race an upload.
 //
 // Fork directory layout expected:
 //   <root>/<volume>/base/            — base fork
@@ -19,13 +26,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use object_store::ObjectStore;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::CoordinatorConfig;
 use crate::gc;
@@ -64,35 +71,11 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
             if known.insert(fork_dir.clone()) {
                 info!("[coordinator] discovered fork: {}", fork_dir.display());
 
-                // Always drain pending segments.
-                tasks.spawn(drain_loop(fork_dir.clone(), store.clone(), drain_interval));
-
-                // Always run GC on uploaded segments.
-                let (vol_id, frk_name) = match upload::derive_names(&fork_dir) {
-                    Ok(names) => names,
-                    Err(e) => {
-                        warn!(
-                            "[coordinator] cannot derive names for gc {}: {e}",
-                            fork_dir.display()
-                        );
-                        continue;
-                    }
-                };
-                // In production the coordinator will call gc_checkpoint on
-                // the volume process via IPC.  For now, Ulid::new() is a
-                // safe placeholder: GC inputs are always old segments whose
-                // timestamps are seconds to minutes behind the current clock,
-                // so a fresh ULID is guaranteed to sort between them and any
-                // concurrent write.
-                let checkpoint: Arc<dyn Fn() -> String + Send + Sync> =
-                    Arc::new(|| ulid::Ulid::new().to_string());
-                tasks.spawn(gc::gc_loop(
+                tasks.spawn(fork_loop(
                     fork_dir.clone(),
-                    vol_id,
-                    frk_name,
                     store.clone(),
+                    drain_interval,
                     gc_config.clone(),
-                    checkpoint,
                 ));
 
                 // Supervise if serve.toml is present.
@@ -130,9 +113,23 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     Ok(())
 }
 
-/// Drain pending segments for a single fork, polling every `interval`.
+/// Sequential drain + GC loop for a single fork.
+///
+/// Each tick:
+///   1. Upload any pending segments to the object store.
+///   2. If the GC interval has elapsed, run a GC pass on uploaded segments.
+///
+/// Drain and GC are sequential within each tick so that GC sees a stable
+/// `segments/` directory that already contains all segments uploaded this
+/// tick, and uploads are never racing with a concurrent GC rewrite.
+///
 /// Exits if the fork directory is removed.
-async fn drain_loop(fork_dir: PathBuf, store: Arc<dyn ObjectStore>, interval: Duration) {
+async fn fork_loop(
+    fork_dir: PathBuf,
+    store: Arc<dyn ObjectStore>,
+    drain_interval: Duration,
+    gc_config: crate::config::GcConfig,
+) {
     let (volume_id, fork_name) = match upload::derive_names(&fork_dir) {
         Ok(names) => names,
         Err(e) => {
@@ -144,7 +141,21 @@ async fn drain_loop(fork_dir: PathBuf, store: Arc<dyn ObjectStore>, interval: Du
         }
     };
 
-    let mut tick = tokio::time::interval(interval);
+    let gc_interval = Duration::from_secs(gc_config.interval_secs);
+    // In production the coordinator will call gc_checkpoint on the volume
+    // process via IPC.  For now, Ulid::new() is a safe placeholder: GC
+    // inputs are always old segments whose timestamps are seconds to minutes
+    // behind the current clock, so a fresh ULID is guaranteed to sort between
+    // them and any concurrent write.
+    let gc_checkpoint: Arc<dyn Fn() -> String + Send + Sync> =
+        Arc::new(|| ulid::Ulid::new().to_string());
+
+    // Run GC on the first tick to clear any backlog from a previous run.
+    let mut last_gc = Instant::now()
+        .checked_sub(gc_interval)
+        .unwrap_or_else(Instant::now);
+
+    let mut tick = tokio::time::interval(drain_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
@@ -152,28 +163,83 @@ async fn drain_loop(fork_dir: PathBuf, store: Arc<dyn ObjectStore>, interval: Du
 
         if !fork_dir.exists() {
             info!(
-                "[coordinator] fork removed, stopping drain: {}",
+                "[coordinator] fork removed, stopping: {}",
                 fork_dir.display()
             );
             break;
         }
 
-        let pending = fork_dir.join("pending");
-        if !pending.exists() {
-            continue;
+        // Step 1: drain pending segments to S3.
+        if fork_dir.join("pending").exists() {
+            match upload::drain_pending(&fork_dir, &volume_id, &fork_name, &store).await {
+                Ok(r) if r.uploaded > 0 || r.failed > 0 => {
+                    info!(
+                        "[drain {}/{}] {} uploaded, {} failed",
+                        volume_id, fork_name, r.uploaded, r.failed
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!("[drain {}/{}] error: {e:#}", volume_id, fork_name),
+            }
         }
 
-        match upload::drain_pending(&fork_dir, &volume_id, &fork_name, &store).await {
-            Ok(r) if r.uploaded > 0 || r.failed > 0 => {
-                info!(
-                    "[drain {}/{}] {} uploaded, {} failed",
-                    volume_id, fork_name, r.uploaded, r.failed
-                );
+        // Step 2: GC pass (rate-limited to gc_interval).
+        if last_gc.elapsed() >= gc_interval {
+            // Process any handoffs the volume has acknowledged (.applied) before
+            // running a new pass, so old segments are removed from the index first.
+            match gc::apply_done_handoffs(&fork_dir, &volume_id, &fork_name, &store).await {
+                Ok(0) => {}
+                Ok(n) => info!("[gc {volume_id}/{fork_name}] completed {n} GC handoff(s)"),
+                Err(e) => error!("[gc {volume_id}/{fork_name}] handoff cleanup error: {e:#}"),
             }
-            Ok(_) => {}
-            Err(e) => {
-                warn!("[drain {}/{}] error: {e:#}", volume_id, fork_name);
+
+            let pruned = gc::cleanup_done_handoffs(&fork_dir, gc::DONE_FILE_TTL);
+            if pruned > 0 {
+                info!("[gc {volume_id}/{fork_name}] pruned {pruned} expired .done file(s)");
             }
+
+            match gc::gc_fork(
+                &fork_dir,
+                &volume_id,
+                &fork_name,
+                &store,
+                &gc_config,
+                &*gc_checkpoint,
+            )
+            .await
+            {
+                Ok(gc::GcStats {
+                    strategy: gc::GcStrategy::Repack,
+                    bytes_freed,
+                    ..
+                }) => {
+                    info!(
+                        "[gc {volume_id}/{fork_name}] density: compacted 1 segment, ~{bytes_freed} bytes freed"
+                    );
+                }
+                Ok(gc::GcStats {
+                    strategy: gc::GcStrategy::Sweep,
+                    candidates,
+                    bytes_freed,
+                }) => {
+                    info!(
+                        "[gc {volume_id}/{fork_name}] sweep: packed {candidates} small segment(s), ~{bytes_freed} bytes freed"
+                    );
+                }
+                Ok(gc::GcStats {
+                    strategy: gc::GcStrategy::Both,
+                    candidates,
+                    bytes_freed,
+                }) => {
+                    info!(
+                        "[gc {volume_id}/{fork_name}] repack+sweep: {candidates} segment(s) compacted, ~{bytes_freed} bytes freed"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => error!("[gc {volume_id}/{fork_name}] error: {e:#}"),
+            }
+
+            last_gc = Instant::now();
         }
     }
 }
