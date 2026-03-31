@@ -4,7 +4,10 @@
 
 The correctness of the volume's crash-recovery model is verified with
 property-based tests using [proptest](https://proptest-rs.github.io/proptest/).
-These live in `elide-core/tests/volume_proptest.rs`.
+The main suite lives in `elide-core/tests/volume_proptest.rs`; fork ancestry
+isolation is in `elide-core/tests/fork_proptest.rs`; deterministic integration
+tests for GC ordering and `ReadonlyVolume` live in `gc_ordering_test.rs` and
+`readonly_volume_test.rs` respectively.
 
 Proptest generates random sequences of operations, runs them against the real
 volume implementation, and checks invariants after each relevant step.  When a
@@ -75,9 +78,12 @@ directory:
 | `Write { lba, seed }` | `vol.write(lba, [seed; 4096])` | `oracle.insert(lba, [seed; 4096])` |
 | `Flush` | `vol.flush_wal()` — promotes WAL to `pending/` | none (write already recorded) |
 | `SweepPending` | `vol.sweep_pending()` — merges/deduplicates `pending/` segments | none (no data change) |
+| `Repack` | `vol.repack(0.9)` — density pass on `pending/` + `segments/` | none (no data change) |
 | `DrainLocal` | Moves all `pending/` files to `segments/` (simulates coordinator upload) | none |
 | `CoordGcLocal { n }` | Runs a coordinator-style GC pass on `segments/` in-process, merging `n` segments (2–5) | none (no data change) |
 | `Crash` | Drops the `Volume` and reopens it (full rebuild from disk) | assert all oracle LBAs match |
+| `Snapshot` | `vol.snapshot()` — records branch point; sets snapshot floor for sweep/repack assertions | tracks floor ULID |
+| `ReadUnwritten` | Reads LBA 64 (always outside write range) | assert all-zero bytes |
 
 `DrainLocal` is needed before `CoordGcLocal` has material to work with, just
 as in production the coordinator only compacts segments that have been
@@ -193,22 +199,17 @@ segment during rebuild.
 The current tests focus on crash-recovery correctness for a single fork.
 Other dimensions worth adding:
 
-**Fork ancestry isolation oracle.** The most compelling gap.  The layered read
-path with ULID cutoffs is the most complex logic in the volume and is not
-exercised by the current proptest at all.  A fork oracle would run sequences
-like:
+**Fork ancestry isolation oracle** (now implemented).
+`elide-core/tests/fork_proptest.rs` covers the layered read path with ULID
+cutoffs.  The test runs two phases: random pre-fork base ops (Write/Flush/Drain)
+followed by random post-fork mixed ops (BaseWrite/BaseFlush/BaseDrain/
+ChildWrite/ChildFlush/ChildDrain/ChildCrash/BaseCrash).  Two oracles are
+maintained — `base_oracle` and `child_oracle` (snapshot of base at fork time,
+updated only by child writes).  After every `ChildCrash`:
 
-```
-BaseWrite, BaseWrite, Snapshot, ForkFromBase,
-ChildWrite, ChildWrite, Crash(child), ...
-```
-
-...and maintain two independent `HashMap<lba, data>` views — the base's state
-at snapshot time and the child's own writes on top — asserting after every
-`Crash` that:
 - ancestral LBAs not overwritten by the child read back base data
 - child writes shadow base data at the same LBA
-- post-branch base writes are invisible to the child
+- post-branch base writes to new LBAs are invisible to the child (read zero)
 
 **Snapshot floor invariant** (now implemented).  The `Snapshot` SimOp in
 `ulid_monotonicity` tracks the floor ULID and asserts after every
