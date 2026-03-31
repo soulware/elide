@@ -105,7 +105,7 @@ fn coordinator_gc_does_not_create_read_failures() {
         thread::sleep(Duration::from_millis(5));
 
         let gc_ulid = ulid::Ulid::from_string(&gc_handle.gc_checkpoint().unwrap()).unwrap();
-        if let Some((_, _, to_delete)) = common::simulate_coord_gc_local(&fork_dir_gc, gc_ulid) {
+        if let Some((_, _, to_delete)) = common::simulate_coord_gc_local(&fork_dir_gc, gc_ulid, 2) {
             // Apply the handoff before deleting old files.  This updates the
             // volume's extent index to point at the new compacted segment,
             // ensuring reads find valid data before the old files disappear.
