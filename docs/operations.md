@@ -232,12 +232,11 @@ Segment GC — reclaiming space from already-uploaded `segments/` files — is a
 - Return immediately after one segment; next tick handles the next candidate
 
 *Sweep* (mirrors lsvd `SweepSmallSegments` and volume `sweep_pending()`):
-- Only runs if repack finds no candidate (every segment has density ≥ threshold)
-- Collect all segments below `small_segment_bytes` (default: 8 MiB), oldest-first, up to 32 MiB total live bytes
-- Skip if fewer than 2 candidates — a single small segment with density ≥ threshold has no meaningful dead space; repack would have caught it if density were below threshold
+- Collect segments below `small_segment_bytes` (default: 8 MiB) that have density ≥ `density_threshold` (lower-density small segments are owned by repack), oldest-first, up to 32 MiB total live bytes
+- Skip if fewer than 2 candidates — a single small segment with density ≥ threshold has no meaningful dead space
 - Merge all candidates → one output segment
 
-The two passes are mutually exclusive within a tick: if repack fires, sweep is not evaluated. This bounds per-tick work: repack processes one segment; sweep is capped at 32 MiB of live data.
+Both passes run in the same tick if both find candidates; they operate on disjoint input sets (repack removes its candidate from the stats before sweep selects). Each produces an independent output segment with its own ULID, obtained via a separate `gc_checkpoint` call (the second WAL flush is a no-op). Per-tick work remains bounded: repack processes one segment; sweep is capped at 32 MiB of live data.
 
 **Liveness:** an extent entry is live only if it passes two checks:
 
