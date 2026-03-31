@@ -133,13 +133,20 @@ Both `pending/` and `segments/` hold segment files in the same format (header + 
 
 ```
 1. Build index section in memory from WAL extent list
-2. Write pending/<ULID>.tmp: header + index + inline + body (DATA extents only, no headers)
-3. Rename pending/<ULID>.tmp → pending/<ULID>            ← COMMIT POINT
-4. Delete wal/<ULID>
-5. Update LBA map in memory
+2. sync_data() on WAL file
+3. Write pending/<ULID>.tmp: header + index + inline + body (DATA extents only, no headers)
+4. sync_data() on pending/<ULID>.tmp
+5. Rename pending/<ULID>.tmp → pending/<ULID>            ← COMMIT POINT
+6. fsync() on pending/ directory                         ← makes rename durable
+7. Delete wal/<ULID>
+8. Update LBA map in memory
 ```
 
-Step 3 is the commit point — a complete segment file at `pending/<ULID>` means promotion is done. The entire file is written atomically via rename; there is no window where a partial file is visible as the committed name.
+Step 5 is the commit point — a complete segment file at `pending/<ULID>` means promotion is done. The file is written atomically via rename; there is no window where a partial file is visible as the committed name.
+
+Step 6 — the directory fsync — is required because `rename()` updates the directory entry atomically in the VFS but the entry is only written to disk when the parent directory is fsynced. Without step 6, a machine crash immediately after step 5 could leave the rename uncommitted in the journal; on recovery the `.tmp` file would be the visible state and `pending/<ULID>` would not exist. Step 2 ensures the WAL is intact as a fallback in this case (recovery would replay from the WAL), but the directory fsync closes the gap and ensures the segment is the recovery path rather than the WAL.
+
+The same `rename + fsync_dir` pattern applies to all segment-creating renames: WAL promotion, repack, sweep, and import.
 
 **S3 upload completion:**
 

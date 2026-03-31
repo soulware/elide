@@ -79,6 +79,7 @@ fn flush_segment(
     let final_path = segments_dir.join(&ulid);
     segment::write_segment(&tmp, entries, signer)?;
     fs::rename(&tmp, &final_path)?;
+    segment::fsync_dir(&final_path)?;
     entries.clear();
     Ok(Some(ulid))
 }
@@ -165,7 +166,7 @@ pub fn import_image(
     fs::write(snapshots_dir.join(&snap_ulid), "")?;
 
     // Volume-root size marker (readonly is written by the caller in meta.toml).
-    fs::write(vol_dir.join("size"), image_size.to_string())?;
+    segment::write_file_atomic(&vol_dir.join("size"), image_size.to_string().as_bytes())?;
 
     Ok(())
 }

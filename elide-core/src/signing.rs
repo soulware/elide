@@ -59,8 +59,8 @@ impl SegmentSigner for Ed25519Signer {
 /// without re-reading from disk.
 pub fn generate_keypair(dir: &Path, key_file: &str, pub_file: &str) -> io::Result<SigningKey> {
     let key = SigningKey::generate(&mut OsRng);
-    std::fs::write(dir.join(key_file), key.to_bytes())?;
-    std::fs::write(dir.join(pub_file), key.verifying_key().to_bytes())?;
+    crate::segment::write_file_atomic(&dir.join(key_file), &key.to_bytes())?;
+    crate::segment::write_file_atomic(&dir.join(pub_file), &key.verifying_key().to_bytes())?;
     Ok(key)
 }
 
@@ -95,7 +95,7 @@ pub fn write_origin(dir: &Path, key: &SigningKey, origin_file: &str) -> io::Resu
         "hostname: {hostname}\npath: {path_str}\nsig: {}\n",
         encode_hex(&sig)
     );
-    std::fs::write(dir.join(origin_file), content)
+    crate::segment::write_file_atomic(&dir.join(origin_file), content.as_bytes())
 }
 
 /// Verify an origin file against the current hostname and canonical path.

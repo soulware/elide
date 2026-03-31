@@ -530,6 +530,7 @@ impl Volume {
                 let new_bss =
                     segment::write_segment(&tmp_path, &mut live_entries, self.signer.as_deref())?;
                 fs::rename(&tmp_path, &final_path)?;
+                segment::fsync_dir(&final_path)?;
                 stats.new_segments += 1;
 
                 for entry in &live_entries {
@@ -707,6 +708,7 @@ impl Volume {
             let new_bss =
                 segment::write_segment(&tmp_path, &mut merged_live, self.signer.as_deref())?;
             fs::rename(&tmp_path, &final_path)?;
+            segment::fsync_dir(&final_path)?;
             stats.new_segments += 1;
 
             for entry in &merged_live {
@@ -1499,7 +1501,7 @@ pub fn fork_volume(
     } else {
         format!("forks/{source_fork_name}/snapshots/{branch_ulid}")
     };
-    fs::write(new_fork_dir.join("origin"), origin_rel)?;
+    segment::write_file_atomic(&new_fork_dir.join("origin"), origin_rel.as_bytes())?;
 
     Ok(new_fork_dir)
 }
@@ -1982,6 +1984,75 @@ mod tests {
             !base.join("wal").join(&ulid).exists(),
             "stale WAL was not removed"
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- durability guarantee tests ---
+    //
+    // These tests make the crash-recovery guarantees from docs/formats.md explicit
+    // and executable. They simulate the intermediate filesystem states that can
+    // arise from a machine crash at each step of the promotion commit sequence,
+    // and verify that Volume::open() recovers correctly in each case.
+    //
+    // What these tests cannot cover: whether sync_data() / fsync_dir() actually
+    // flush to physical media. That requires hardware fault injection (dm-flakey,
+    // CrashMonkey, etc.) and is out of scope for a unit test suite.
+
+    #[test]
+    fn recovery_reads_data_after_promotion_and_reopen() {
+        // Guarantee: after flush_wal() completes (WAL promoted to pending/),
+        // a subsequent Volume::open() reads the correct data from the segment.
+        // This covers the common path: crash after a guest fsync, before the
+        // coordinator uploads the segment to S3.
+        let base = temp_dir();
+
+        let payload_a = vec![0xAAu8; 4096];
+        let payload_b = vec![0xBBu8; 4096];
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &payload_a).unwrap();
+            vol.write(1, &payload_b).unwrap();
+            // promote_for_test flushes the WAL to pending/ and opens a fresh WAL.
+            vol.promote_for_test().unwrap();
+            // Drop without explicit shutdown — simulates a process crash after promotion.
+        }
+
+        // On reopen, data must come from the pending/ segment.
+        // The fresh empty WAL (opened after promotion) contributes nothing.
+        let vol = Volume::open(&base).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), payload_a);
+        assert_eq!(vol.read(1, 1).unwrap(), payload_b);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn recovery_removes_tmp_orphans() {
+        // Guarantee: a .tmp file left in pending/ by a crashed segment write
+        // (crash between write_segment and rename — the rename never committed)
+        // is removed by Volume::open() and does not affect recovery.
+        // The WAL is intact as a fallback and is replayed normally.
+        let base = temp_dir();
+
+        let payload = vec![0xCCu8; 4096];
+        {
+            let mut vol = Volume::open(&base).unwrap();
+            vol.write(0, &payload).unwrap();
+            vol.fsync().unwrap();
+            // Drop with WAL intact — simulates crash before/during promotion.
+        }
+
+        // Simulate a crash mid-promotion: a .tmp file exists in pending/ but
+        // no completed segment (the rename never happened).
+        let orphan = base.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAAA.tmp");
+        fs::write(&orphan, b"incomplete segment bytes").unwrap();
+
+        // Recovery must succeed, data must be correct, and the orphan removed.
+        let vol = Volume::open(&base).unwrap();
+        assert_eq!(vol.lbamap_len(), 1);
+        assert_eq!(vol.read(0, 1).unwrap(), payload);
+        assert!(!orphan.exists(), ".tmp orphan should be cleaned up on open");
 
         fs::remove_dir_all(base).unwrap();
     }

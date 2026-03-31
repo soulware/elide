@@ -459,6 +459,8 @@ pub fn promote(
 
     // Atomic rename — COMMIT POINT.
     fs::rename(&tmp_path, &final_path)?;
+    // Fsync the directory so the rename is durable before we delete the WAL.
+    fsync_dir(&final_path)?;
 
     // WAL is now redundant; segment is the sole copy.
     fs::remove_file(wal_path)?;
@@ -467,6 +469,50 @@ pub fn promote(
 }
 
 // --- filesystem helpers ---
+
+/// Fsync the directory containing `path`, making any preceding rename durable.
+///
+/// A `rename()` atomically updates the directory entry but does not guarantee
+/// the entry is flushed to disk until the parent directory is fsynced.  Call
+/// this immediately after every `.tmp` → final rename to close that gap.
+pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("path has no parent directory"))?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Write `content` to `path` atomically via a `.tmp` sibling file.
+///
+/// Sequence: write to `<path>.tmp` → `sync_data()` → rename to `path` →
+/// `fsync` parent directory.  This ensures that either the complete file is
+/// visible after a crash or no file is visible — never a partial write.
+/// Used for small metadata files (`origin`, `size`, key material) that are
+/// not large enough to warrant the full segment write path but still need
+/// atomic, durable creation.
+pub(crate) fn write_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
+    let tmp = {
+        let mut name = path
+            .file_name()
+            .ok_or_else(|| io::Error::other("path has no filename"))?
+            .to_owned();
+        name.push(".tmp");
+        path.with_file_name(name)
+    };
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(content)?;
+        f.sync_data()?;
+    }
+    fs::rename(&tmp, path)?;
+    fsync_dir(path)?;
+    Ok(())
+}
 
 /// Collect all committed segment files in `dir` (files with valid ULID names,
 /// no extension). Excludes `.tmp` files (incomplete promotions).
