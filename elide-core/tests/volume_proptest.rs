@@ -65,6 +65,8 @@ enum SimOp {
         n: usize,
     },
     Crash,
+    /// Read an LBA that has never been written; must return all-zero bytes.
+    ReadUnwritten,
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -76,6 +78,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::DrainLocal),
         (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
         Just(SimOp::Crash),
+        Just(SimOp::ReadUnwritten),
     ]
 }
 
@@ -169,6 +172,16 @@ proptest! {
                     // No assertion here: the next Flush or SweepPending
                     // will verify that the mint was correctly reseeded.
                 }
+                SimOp::ReadUnwritten => {
+                    // LBA 64 is outside the Write range (0..8) so it is
+                    // always unwritten; the volume must return all zeros.
+                    let actual = vol.read(64, 1).unwrap();
+                    prop_assert_eq!(
+                        actual.as_slice(),
+                        [0u8; 4096].as_slice(),
+                        "unwritten lba 64 returned non-zero data"
+                    );
+                }
             }
         }
     }
@@ -235,6 +248,16 @@ proptest! {
                             lba
                         );
                     }
+                }
+                SimOp::ReadUnwritten => {
+                    // LBA 64 is outside the Write range (0..8) so it is
+                    // always unwritten; the volume must return all zeros.
+                    let actual = vol.read(64, 1).unwrap();
+                    prop_assert_eq!(
+                        actual.as_slice(),
+                        [0u8; 4096].as_slice(),
+                        "unwritten lba 64 returned non-zero data"
+                    );
                 }
             }
         }
