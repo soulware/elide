@@ -1,6 +1,6 @@
 // Property-based tests for fork ancestry isolation.
 //
-// Two properties are checked:
+// For deterministic fork integration tests (three-level chain) see fork_test.rs.
 //
 // `fork_ancestry_oracle`
 //   Runs a sequence of pre-fork base ops (Write/Flush/Drain), takes a
