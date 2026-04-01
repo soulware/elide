@@ -23,8 +23,6 @@ A single **Elide coordinator** runs on each host and manages all volumes. It for
 
 **S3 credential split:** the volume process requires only **read-only** S3 credentials (for demand-fetch). All S3 mutations — segment upload, segment delete, GC rewrites — are performed exclusively by the coordinator, which holds read-write credentials. This limits the blast radius if a volume host is compromised.
 
-Proposed: this split is the design target. Currently the volume holds full S3 credentials for demand-fetch (via `object_store` in `elide/src/fetcher.rs`). Read-only credential enforcement is deferred until the coordinator daemon is built out.
-
 ## Crate structure
 
 The repository is a Cargo workspace with four crates:
@@ -78,36 +76,36 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
     01JQAAAAAAA/                      — imported base (ULID = stable S3 prefix)
       volume.name                     — "ubuntu-22.04"
       volume.readonly                 — present = permanently readonly (imported/frozen)
-      size                            — volume size in bytes (plain text)
-      segments/
-        01JQXXXXX.seg
+      volume.size                     — volume size in bytes (plain text)
+      volume.pub                      — Ed25519 public key (uploaded to S3)
+      volume.key                      — Ed25519 signing key (never uploaded)
+      manifest.toml                   — name, size, OCI source metadata
+      pending/                        — segments awaiting S3 upload (populated by import)
+      segments/                       — segments confirmed in S3 (empty until drain completes)
+      fetched/                        — demand-fetched index files (01JQXXXXX.idx, .body, .present)
       snapshots/
         01JQXXXXX                     — branch point marker for derived volumes
-      meta.toml                       — OCI source metadata (digest, arch)
-      volume.key                      — Ed25519 signing key (never uploaded)
-      volume.pub                      — Ed25519 public key (uploaded to S3)
-      volume.origin                   — hostname + path + signature (tamper detection)
       import.lock                     — present while import is running or interrupted
     01JQBBBBBBB/                      — writable volume forked from ubuntu-22.04
       volume.name                     — "server-1"
-      size
+      volume.size
+      volume.parent                   — "01JQAAAAAAA/snapshots/01JQXXXXX"
+      volume.key
+      volume.pub
+      volume.pid                      — PID of running volume process
       wal/                            — present = live; write target
       pending/
       segments/
+      fetched/
       snapshots/
-      origin                          — "01JQAAAAAAA/snapshots/01JQXXXXX"
-      volume.key
-      volume.pub
-      volume.origin
-      volume.pid                      — PID of running volume process
       control.sock                    — volume process IPC socket
     01JQCCCCCCC/
       volume.name                     — "server-2"
-      origin                          — "01JQAAAAAAA/snapshots/01JQXXXXX"
+      volume.parent                   — "01JQAAAAAAA/snapshots/01JQXXXXX"
       ...
     01JQDDDDDDD/
       volume.name                     — "server-2-experiment"
-      origin                          — "01JQCCCCCCC/snapshots/<ulid>"
+      volume.parent                   — "01JQCCCCCCC/snapshots/<ulid>"
       ...
   by_name/
     ubuntu-22.04  ->  ../by_id/01JQAAAAAAA
@@ -116,9 +114,9 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
     server-2-experiment  ->  ../by_id/01JQDDDDDDD
 ```
 
-The `origin` file contains a single line: `<parent-ulid>/snapshots/<snapshot-ulid>`, where `<parent-ulid>` is the sibling directory name within `by_id/`. Using ULIDs in `origin` means ancestry links survive renames and host moves. `walk_ancestors(vol_dir, by_id_dir)` resolves `by_id_dir/<parent-ulid>` and follows the chain to the root.
+The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snapshot-ulid>`, where `<parent-ulid>` is the sibling directory name within `by_id/`. Using ULIDs in `volume.parent` means ancestry links survive renames and host moves. `walk_ancestors(vol_dir, by_id_dir)` resolves `by_id_dir/<parent-ulid>` and follows the chain to the root.
 
-**S3 path:** `<bucket>/<volume-ulid>/segments/<segment-ulid>.seg` — the volume ULID is both the `by_id/` directory name and the S3 prefix. A volume moved to another host or renamed locally keeps the same S3 path.
+**S3 path:** `by_id/<volume-ulid>/YYYYMMDD/<segment-ulid>` — the volume ULID is both the `by_id/` directory name and the S3 prefix. A volume moved to another host or renamed locally keeps the same S3 path. Additional per-volume S3 objects: `by_id/<volume-ulid>/manifest.toml` and `by_id/<volume-ulid>/volume.pub`. Volume names are indexed at `names/<name>` (plain text ULID), enabling O(1) lookup and a single `LIST names/` to enumerate all named volumes.
 
 **Name resolution:** the CLI accepts human-readable names in all commands. `by_name/<name>` is a symlink → O(1) resolution via `readlink`. Names must be unique within a `data_dir` — the CLI refuses to create a volume whose name would duplicate an existing `by_name/` entry. The uniqueness constraint is local only; different hosts sharing the same S3 bucket may assign different names to the same ULID.
 
@@ -130,12 +128,12 @@ The `origin` file contains a single line: `<parent-ulid>/snapshots/<snapshot-uli
 - `volume.name` is present in every volume; single non-empty line
 - `volume.readonly` present → volume is permanently readonly; coordinator skips supervision; volume process refuses writable open
 - `wal/` present → volume is live (writable); exactly one process writes here (enforced by `volume.lock`)
-- `origin` present → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`
+- `volume.parent` present → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
-- `meta.toml` present only on OCI-imported volumes
+- `manifest.toml` present on OCI-imported volumes and on volumes reconstructed via `remote pull`
 - `import.lock` present only while an import is running or interrupted
 
-**Finding live volumes:** scan `by_id/` for subdirectories; skip those with `volume.readonly`.
+**Finding live volumes:** the coordinator scans `by_id/` for ULID-named subdirectories that have either a `pending/` or `segments/` subdirectory. Readonly volumes (with `volume.readonly`) are included for drain if they have pending segments (import just completed), and for prefetch if `segments/` is empty and `fetched/` is absent or empty (just pulled from the store). Readonly volumes with non-empty `segments/` or `fetched/` are already indexed and are skipped.
 
 **Exclusive access:** a live volume holds an exclusive `flock` on `<vol-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked volume fails immediately.
 
@@ -153,7 +151,7 @@ The `origin` file contains a single line: `<parent-ulid>/snapshots/<snapshot-uli
 | `volume.readonly` | readonly — coordinator never supervises |
 | none of the above | idle — coordinator will start the volume process |
 
-**Volume ancestry:** a volume's `origin` file names its parent ULID and the branch-point snapshot ULID. `walk_ancestors(vol_dir, by_id_dir)` follows this chain to the root (a volume with no `origin` file), building an oldest-first list of ancestor layers. Segments in each ancestor are included only up to the branch-point ULID — post-branch writes to an ancestor are not visible in derived volumes.
+**Volume ancestry:** a volume's `volume.parent` file names its parent ULID and the branch-point snapshot ULID. `walk_ancestors(vol_dir, by_id_dir)` follows this chain to the root (a volume with no `volume.parent` file), building an oldest-first list of ancestor layers. Segments in each ancestor are included only up to the branch-point ULID — post-branch writes to an ancestor are not visible in derived volumes.
 
 ```
 VM
@@ -266,7 +264,7 @@ The volume process listens on `<vol-dir>/control.sock`. The coordinator connects
 
 The socket is absent when the volume is not running. All coordinator IPC calls treat a missing socket as a silent no-op and proceed with the remaining drain/GC steps that do not require volume cooperation.
 
-## Proposed: User-facing CLI surface
+## User-facing CLI surface
 
 The `elide` binary serves a dual role: it is both the **user-facing CLI** and the **volume process binary** that the coordinator spawns. The `elide-coordinator` binary is the coordinator daemon only — it has no user-facing subcommands.
 

@@ -16,22 +16,28 @@ Both triggers call the same `flush_wal()` → `promote()` path, producing an ide
 
 The coordinator is a long-running daemon that runs on each host and manages all volumes on that host. It is the exclusive owner of all S3 mutations — upload, delete, and GC rewrites. The volume process holds read-only S3 credentials (for demand-fetch only); it never writes to or deletes from S3.
 
-**Proposed: coordinator daemon configuration (`coordinator.toml`):**
+**Coordinator configuration (`coordinator.toml`):** loaded from the current directory by default; location overridable with `--config`. All fields optional — defaults work for local development with `./elide_data` and `./elide_store`.
 
 ```toml
-roots = ["/var/lib/elide/volumes"]   # directories to watch for volumes and forks
+data_dir = "elide_data"              # directory containing by_id/ and by_name/; default: ./elide_data
 
-[s3]
-bucket   = "my-elide-bucket"
-endpoint = "https://s3.amazonaws.com"
-region   = "us-east-1"
+[store]
+# local_path = "elide_store"        # local filesystem store (default if no bucket set)
+# bucket = "my-elide-bucket"        # S3 bucket
+# endpoint = "https://..."          # S3 endpoint override (MinIO, Tigris, etc.)
+# region = "us-east-1"              # AWS region (falls back to AWS_DEFAULT_REGION)
+
+[drain]
+interval_secs      = 5              # drain pending/ every N seconds
+scan_interval_secs = 30             # rescan by_id/ for new volumes every N seconds
 
 [gc]
-density_threshold  = 0.70            # compact segments when live_bytes/total_bytes < threshold
-small_segment_bytes = 8_388_608      # also compact segments smaller than this
+density_threshold   = 0.70          # compact segments when live_bytes/total_bytes < threshold
+small_segment_bytes = 8_388_608     # also compact segments smaller than this (8 MiB)
+interval_secs       = 300           # run GC pass every N seconds (5 minutes)
 ```
 
-**Fork discovery:** the coordinator watches each configured root directory (using filesystem notifications) and discovers forks by scanning for `forks/<name>/pending/` or `forks/<name>/segments/` directories. Each discovered fork gets its own per-fork state machine.
+**Volume discovery:** the coordinator scans `<data_dir>/by_id/` for ULID-named subdirectories. Each discovered fork gets its own `fork_loop` task. The coordinator only starts supervision (spawning a volume process) for writable volumes — readonly volumes (imported bases, pulled snapshots) are discovered for drain and prefetch only.
 
 **Per-fork responsibilities:**
 
@@ -53,9 +59,10 @@ The `object_store` crate is used for all store access, providing a uniform inter
 
 **Upload commit sequence per segment:**
 1. Read `pending/<ulid>` into memory
-2. PUT to object store at key `<volume_id>/<fork_name>/YYYYMMDD/<ulid>`
-3. On success: rename `pending/<ulid>` → `segments/<ulid>` (atomic commit)
-4. On failure: leave in `pending/`, record error, continue with remaining segments
+2. PUT to object store at key `by_id/<volume_ulid>/YYYYMMDD/<segment_ulid>`
+3. On first drain: also PUT `by_id/<volume_ulid>/manifest.toml`, `by_id/<volume_ulid>/volume.pub`, and `names/<volume_name>` (idempotent; same content on every retry)
+4. On success: rename `pending/<ulid>` → `segments/<ulid>` (atomic commit)
+5. On failure: leave in `pending/`, record error, continue with remaining segments
 
 The rename in step 3 is the local commit point. If the coordinator crashes between steps 2 and 3, the object is in S3 but the segment is still in `pending/` — a retry will re-PUT (idempotent) and then rename. No ledger file is needed.
 
@@ -93,10 +100,64 @@ region   = "us-east-1"                  # optional; falls back to AWS_DEFAULT_RE
 # local_path = "/tmp/elide-store"
 ```
 
-If `fetch.toml` is absent, the following env vars are tried: `ELIDE_S3_BUCKET` (required), `AWS_ENDPOINT_URL`, `AWS_DEFAULT_REGION`. If neither is present, demand-fetch is disabled and `serve-volume` runs normally.
+If `fetch.toml` is absent, the following sources are tried in order:
+1. Env vars: `ELIDE_S3_BUCKET` (required), `AWS_ENDPOINT_URL`, `AWS_DEFAULT_REGION`
+2. `./elide_store` — the coordinator's default local store location (auto-detected if it exists)
+
+If none of these are present, demand-fetch is disabled and reads of missing segment bodies fail with "segment not found".
+
+**Current implementation note:** demand-fetch currently downloads the entire segment body in one GET. The `.present` bitset is written with all bits set (full body present). Partial fetching (range-GETs for individual extents) is a future optimisation.
 
 
 **Next step: eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used segments from `segments/` and `fetched/` (never from `pending/`). Eviction + demand-fetch together make `segments/` a transparent cache tier.
+
+## Bootstrap from the Store
+
+A volume can be reconstructed on any host that has access to the object store, without copying local data.
+
+### `volume remote list`
+
+```
+elide volume remote list
+```
+
+Issues a `LIST names/` against the store and prints all named volumes:
+
+```
+ubuntu-22.04    01JQAAAAAAAAAAAAAAAAAAAAAA
+server-base     01JQBBBBBBBBBBBBBBBBBBBBBB
+```
+
+Uses the same store configuration as demand-fetch (`fetch.toml`, env vars, or `./elide_store` fallback).
+
+### `volume remote pull <name>`
+
+```
+elide volume remote pull ubuntu-22.04
+```
+
+Reconstructs a local volume skeleton from the store:
+
+1. Resolve `names/<name>` → volume ULID
+2. Download `by_id/<ulid>/manifest.toml` (size, readonly flag, OCI source)
+3. Download `by_id/<ulid>/volume.pub` (Ed25519 public key)
+4. Create `<data_dir>/by_id/<ulid>/` with `volume.name`, `volume.size`, `volume.readonly`, `volume.pub`, `manifest.toml`, and an empty `segments/`
+5. Create `by_name/<name>` symlink
+6. Send a rescan request to the coordinator
+
+**After the pull:** the coordinator discovers the new volume on the next scan (the empty `segments/` triggers prefetch). It downloads the index section (`.idx`) of every segment from the store into `fetched/`, then `Volume::open` rebuilds the full LBA map. Subsequent reads demand-fetch body bytes on first access.
+
+The volume is readable (via `volume ls`, `volume serve --readonly`) as soon as the coordinator's prefetch pass completes. No full body download is required upfront.
+
+### Full bootstrap sequence
+
+```
+# On a fresh host with access to the same store:
+elide volume remote list                    # discover available volumes
+elide volume remote pull ubuntu-22.04       # reconstruct skeleton + trigger prefetch
+# coordinator prefetches .idx files automatically
+elide volume ls ubuntu-22.04                # readable; first access demand-fetches bodies
+```
 
 ## Diagnostic tools
 
