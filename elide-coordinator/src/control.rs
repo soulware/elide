@@ -131,7 +131,16 @@ async fn call(fork_dir: &Path, op: &str) -> Option<String> {
     match result {
         Ok(line) => Some(line),
         Err(e) => {
-            warn!("[control] {op} for {} failed: {e}", fork_dir.display());
+            // ECONNREFUSED / ENOENT are expected while the volume process is
+            // starting up or has not yet been spawned; log at debug only.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) {
+                tracing::debug!("[control] {op} for {} not ready: {e}", fork_dir.display());
+            } else {
+                warn!("[control] {op} for {} failed: {e}", fork_dir.display());
+            }
             None
         }
     }

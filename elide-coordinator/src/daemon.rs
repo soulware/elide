@@ -152,6 +152,13 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     info!("[coordinator] done");
                 }
 
+                // Clean up pid files now that processes have exited. The
+                // supervisor tasks were aborted above and cannot do this
+                // themselves.
+                for vol_dir in &known {
+                    let _ = std::fs::remove_file(vol_dir.join("volume.pid"));
+                }
+
                 break;
             }
         }
