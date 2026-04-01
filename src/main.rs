@@ -230,17 +230,26 @@ fn main() {
     match args.command {
         Command::Volume { command } => match command {
             VolumeCommand::List => {
-                list_volumes(&args.data_dir).expect("volume list failed");
+                if let Err(e) = list_volumes(&args.data_dir) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
 
             VolumeCommand::Info { name } => {
                 let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                inspect::run(&vol_dir).expect("volume info failed");
+                if let Err(e) = inspect::run(&vol_dir) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
 
             VolumeCommand::Ls { name, path } => {
                 let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                ls::run(&vol_dir, &path).expect("volume ls failed");
+                if let Err(e) = ls::run(&vol_dir, &path) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
 
             VolumeCommand::Snapshot { name } => {
@@ -251,11 +260,18 @@ fn main() {
                     match UnixStream::connect(fork_dir.join("control.sock")) {
                         Ok(mut stream) => {
                             // Volume is live — snapshot via the control socket.
-                            writeln!(stream, "snapshot").expect("write failed");
-                            stream.flush().expect("flush failed");
+                            if let Err(e) =
+                                writeln!(stream, "snapshot").and_then(|_| stream.flush())
+                            {
+                                eprintln!("error: snapshot request failed: {e}");
+                                std::process::exit(1);
+                            }
                             let mut reader = io::BufReader::new(stream);
                             let mut line = String::new();
-                            reader.read_line(&mut line).expect("read failed");
+                            if let Err(e) = reader.read_line(&mut line) {
+                                eprintln!("error: snapshot response failed: {e}");
+                                std::process::exit(1);
+                            }
                             let line = line.trim();
                             match line.strip_prefix("ok ") {
                                 Some(ulid) => ulid.trim().to_owned(),
@@ -273,9 +289,15 @@ fn main() {
                         {
                             // Volume is not running — open directly.
                             let by_id_dir = args.data_dir.join("by_id");
-                            let mut vol = volume::Volume::open(&fork_dir, &by_id_dir)
-                                .expect("failed to open volume");
-                            vol.snapshot().expect("snapshot failed").to_string()
+                            match volume::Volume::open(&fork_dir, &by_id_dir)
+                                .and_then(|mut v| v.snapshot().map(|u| u.to_string()))
+                            {
+                                Ok(ulid) => ulid,
+                                Err(e) => {
+                                    eprintln!("error: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
                         }
                         Err(e) => {
                             eprintln!("failed to connect to control socket: {e}");
@@ -296,15 +318,28 @@ fn main() {
                 let source_fork_dir = resolve_volume_dir(&args.data_dir, &from);
                 let new_vol_ulid = ulid::Ulid::new().to_string();
                 let new_fork_dir = args.data_dir.join("by_id").join(&new_vol_ulid);
-                volume::fork_volume(&new_fork_dir, &source_fork_dir).expect("volume fork failed");
-                // Copy volume.size from source so the coordinator can serve the fork.
-                if let Ok(size) = std::fs::read(source_fork_dir.join("volume.size")) {
-                    std::fs::write(new_fork_dir.join("volume.size"), size)
-                        .expect("failed to copy volume.size");
+                if let Err(e) = volume::fork_volume(&new_fork_dir, &source_fork_dir) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
                 }
-                std::fs::write(new_fork_dir.join("volume.name"), &fork_name)
-                    .expect("failed to write volume.name");
-                std::fs::create_dir_all(&by_name_dir).expect("failed to create by_name dir");
+                // Copy volume.size from source so the coordinator can serve the fork.
+                if let Ok(size) = std::fs::read(source_fork_dir.join("volume.size"))
+                    && let Err(e) = std::fs::write(new_fork_dir.join("volume.size"), size)
+                {
+                    let _ = std::fs::remove_dir_all(&new_fork_dir);
+                    eprintln!("error: failed to copy volume.size: {e}");
+                    std::process::exit(1);
+                }
+                if let Err(e) = std::fs::write(new_fork_dir.join("volume.name"), &fork_name) {
+                    let _ = std::fs::remove_dir_all(&new_fork_dir);
+                    eprintln!("error: failed to write volume.name: {e}");
+                    std::process::exit(1);
+                }
+                if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
+                    let _ = std::fs::remove_dir_all(&new_fork_dir);
+                    eprintln!("error: failed to create by_name dir: {e}");
+                    std::process::exit(1);
+                }
                 if let Err(e) =
                     std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path)
                 {
@@ -312,20 +347,35 @@ fn main() {
                     eprintln!("error: failed to create by_name symlink: {e}");
                     std::process::exit(1);
                 }
-                let key = elide_core::signing::generate_keypair(
+                let key = match elide_core::signing::generate_keypair(
                     &new_fork_dir,
                     VOLUME_KEY_FILE,
                     VOLUME_PUB_FILE,
-                )
-                .expect("failed to generate fork keypair");
-                elide_core::signing::write_origin(&new_fork_dir, &key, VOLUME_ORIGIN_FILE)
-                    .expect("failed to write volume.origin");
+                ) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&symlink_path);
+                        let _ = std::fs::remove_dir_all(&new_fork_dir);
+                        eprintln!("error: failed to generate fork keypair: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(e) =
+                    elide_core::signing::write_origin(&new_fork_dir, &key, VOLUME_ORIGIN_FILE)
+                {
+                    let _ = std::fs::remove_file(&symlink_path);
+                    let _ = std::fs::remove_dir_all(&new_fork_dir);
+                    eprintln!("error: failed to write volume.origin: {e}");
+                    std::process::exit(1);
+                }
                 println!("{}", new_fork_dir.display());
             }
 
             VolumeCommand::Create { name, size } => {
-                create_volume(&args.data_dir, &name, size.as_deref())
-                    .expect("volume create failed");
+                if let Err(e) = create_volume(&args.data_dir, &name, size.as_deref()) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
                 if coordinator_client::rescan(&socket_path).is_err() {
                     eprintln!(
                         "warning: coordinator not running; volume will be picked up on next scan"
@@ -348,9 +398,13 @@ fn main() {
 
             VolumeCommand::Import { command } => match command {
                 ImportCommand::Start { name, oci_ref } => {
-                    let ulid = coordinator_client::import_start(&socket_path, &name, &oci_ref)
-                        .expect("import start failed");
-                    println!("{ulid}");
+                    match coordinator_client::import_start(&socket_path, &name, &oci_ref) {
+                        Ok(ulid) => println!("{ulid}"),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
                 }
                 ImportCommand::Status { ulid } => {
                     let resp = coordinator_client::import_status(&socket_path, &ulid)
@@ -376,8 +430,10 @@ fn main() {
             },
 
             VolumeCommand::Delete { name } => {
-                coordinator_client::delete_volume(&socket_path, &name)
-                    .expect("volume delete failed");
+                if let Err(e) = coordinator_client::delete_volume(&socket_path, &name) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         },
 
