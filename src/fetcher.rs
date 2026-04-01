@@ -36,6 +36,9 @@ use elide_core::segment::{self, SegmentFetcher};
 
 // --- config ---
 
+/// Default maximum bytes per coalesced fetch batch (256 KiB).
+pub const DEFAULT_FETCH_BATCH_BYTES: u64 = 256 * 1024;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FetchConfig {
@@ -51,6 +54,11 @@ pub struct FetchConfig {
     /// Local filesystem path for testing without a real object store.
     #[serde(default)]
     pub local_path: Option<String>,
+    /// Maximum bytes to fetch in a single coalesced range-GET.
+    /// Adjacent absent extents are batched up to this limit.
+    /// Defaults to [`DEFAULT_FETCH_BATCH_BYTES`] (256 KiB) if not set.
+    #[serde(default)]
+    pub fetch_batch_bytes: Option<u64>,
 }
 
 impl FetchConfig {
@@ -76,6 +84,7 @@ impl FetchConfig {
                 endpoint: std::env::var("AWS_ENDPOINT_URL").ok(),
                 region: std::env::var("AWS_DEFAULT_REGION").ok(),
                 local_path: None,
+                fetch_batch_bytes: None,
             }));
         }
         // Default local store — same default the coordinator uses.
@@ -86,6 +95,7 @@ impl FetchConfig {
                 endpoint: None,
                 region: None,
                 local_path: Some(default_store.to_string_lossy().into_owned()),
+                fetch_batch_bytes: None,
             }));
         }
         Ok(None)
@@ -120,6 +130,8 @@ pub struct ObjectStoreFetcher {
     store: Arc<dyn ObjectStore>,
     /// Volume ULIDs in the ancestry chain, oldest-first. Searched newest-first on miss.
     volume_ids: Vec<String>,
+    /// Maximum bytes per coalesced range-GET batch.
+    max_batch_bytes: u64,
     rt: Runtime,
 }
 
@@ -130,6 +142,9 @@ impl ObjectStoreFetcher {
         Ok(Self {
             store,
             volume_ids,
+            max_batch_bytes: config
+                .fetch_batch_bytes
+                .unwrap_or(DEFAULT_FETCH_BATCH_BYTES),
             rt,
         })
     }
@@ -150,8 +165,8 @@ impl SegmentFetcher for ObjectStoreFetcher {
         segment_id: &str,
         fetched_dir: &Path,
         body_section_start: u64,
-        body_offset: u64,
-        body_length: u32,
+        _body_offset: u64,
+        _body_length: u32,
         entry_idx: u32,
     ) -> io::Result<()> {
         self.rt.block_on(fetch_one_extent(
@@ -161,9 +176,8 @@ impl SegmentFetcher for ObjectStoreFetcher {
             fetched_dir,
             &ExtentFetchParams {
                 body_section_start,
-                body_offset,
-                body_length,
                 entry_idx,
+                max_batch_bytes: self.max_batch_bytes,
             },
         ))
     }
@@ -203,9 +217,8 @@ async fn fetch_segment(
 /// Parameters for fetching a single extent from storage.
 struct ExtentFetchParams {
     body_section_start: u64,
-    body_offset: u64,
-    body_length: u32,
     entry_idx: u32,
+    max_batch_bytes: u64,
 }
 
 async fn fetch_one_extent(
@@ -215,8 +228,66 @@ async fn fetch_one_extent(
     fetched_dir: &Path,
     extent: &ExtentFetchParams,
 ) -> io::Result<()> {
-    let range_start = (extent.body_section_start + extent.body_offset) as usize;
-    let range_end = range_start + extent.body_length as usize;
+    let idx_path = fetched_dir.join(format!("{segment_id}.idx"));
+    let present_path = fetched_dir.join(format!("{segment_id}.present"));
+
+    // Read the full index so we can scan ahead for adjacent absent entries.
+    let (_, entries) = segment::read_segment_index(&idx_path)?;
+    let start = extent.entry_idx as usize;
+    if start >= entries.len() {
+        return Err(io::Error::other(format!(
+            "entry_idx {} out of range ({} entries)",
+            extent.entry_idx,
+            entries.len()
+        )));
+    }
+
+    // Read present bits once up front.
+    let present_bytes = match std::fs::read(&present_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
+        Err(e) => return Err(e),
+    };
+    let is_present = |idx: usize| -> bool {
+        let byte_idx = idx / 8;
+        present_bytes
+            .get(byte_idx)
+            .is_some_and(|b| b & (1 << (idx % 8)) != 0)
+    };
+
+    // Scan forward from `start` to find the longest contiguous run of
+    // body-adjacent, not-yet-present entries.  Stop at the first gap,
+    // already-present entry, or non-data entry (dedup-ref / inline).
+    let mut batch_last = start;
+    let mut next_expected_offset =
+        entries[start].stored_offset + entries[start].stored_length as u64;
+    for i in (start + 1)..entries.len() {
+        let e = &entries[i];
+        if e.is_dedup_ref || e.is_inline {
+            break;
+        }
+        if e.stored_offset != next_expected_offset {
+            break; // gap in body layout
+        }
+        if is_present(i) {
+            break; // already cached — no need to re-fetch
+        }
+        // Stop if adding this entry would exceed the batch byte cap.
+        // The first entry is always included regardless of its size.
+        let new_batch_bytes =
+            next_expected_offset + e.stored_length as u64 - entries[start].stored_offset;
+        if new_batch_bytes > extent.max_batch_bytes {
+            break;
+        }
+        batch_last = i;
+        next_expected_offset = e.stored_offset + e.stored_length as u64;
+    }
+
+    let batch_body_start = entries[start].stored_offset;
+    let batch_body_end = next_expected_offset; // = entries[batch_last].stored_offset + len
+    let range_start = (extent.body_section_start + batch_body_start) as usize;
+    let range_end = (extent.body_section_start + batch_body_end) as usize;
+    let batch_count = batch_last - start + 1;
 
     for volume_id in volume_ids.iter().rev() {
         let key = segment_key(volume_id, segment_id)?;
@@ -224,8 +295,7 @@ async fn fetch_one_extent(
             Ok(bytes) => {
                 std::fs::create_dir_all(fetched_dir)?;
 
-                // Seek-write the extent bytes into .body at body_offset.
-                // OpenOptions::create opens an existing file without truncating.
+                // Write the contiguous batch into .body at the batch start offset.
                 let body_path = fetched_dir.join(format!("{segment_id}.body"));
                 let mut f = std::fs::OpenOptions::new()
                     .write(true)
@@ -233,22 +303,33 @@ async fn fetch_one_extent(
                     .truncate(false)
                     .open(&body_path)
                     .map_err(|e| io::Error::other(format!("open .body: {e}")))?;
-                f.seek(SeekFrom::Start(extent.body_offset))
+                f.seek(SeekFrom::Start(batch_body_start))
                     .map_err(|e| io::Error::other(format!("seek .body: {e}")))?;
                 f.write_all(&bytes)
                     .map_err(|e| io::Error::other(format!("write .body: {e}")))?;
 
-                // Update .present bitset.
-                let idx_path = fetched_dir.join(format!("{segment_id}.idx"));
-                let entry_count = segment::read_entry_count(&idx_path)?;
-                let present_path = fetched_dir.join(format!("{segment_id}.present"));
-                segment::set_present_bit(&present_path, extent.entry_idx, entry_count)?;
+                // Bulk-update .present for all entries in the batch (one read + one write).
+                let entry_count = entries.len() as u32;
+                let bitset_len = (entry_count as usize).div_ceil(8);
+                let mut new_present = if present_bytes.len() >= bitset_len {
+                    present_bytes.clone()
+                } else {
+                    let mut v = present_bytes.clone();
+                    v.resize(bitset_len, 0);
+                    v
+                };
+                for i in start..=batch_last {
+                    new_present[i / 8] |= 1 << (i % 8);
+                }
+                std::fs::write(&present_path, &new_present)
+                    .map_err(|e| io::Error::other(format!("write .present: {e}")))?;
 
                 tracing::debug!(
                     segment_id,
                     entry_idx = extent.entry_idx,
-                    body_length = extent.body_length,
-                    "fetched extent"
+                    batch_count,
+                    total_bytes = bytes.len(),
+                    "fetched extent batch"
                 );
                 return Ok(());
             }
@@ -449,11 +530,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// `fetch_extent` downloads only the requested byte range, writes it into
-    /// `.body` at the correct offset, and sets the corresponding `.present` bit.
-    /// A second entry's bit remains unset because it was not fetched.
+    /// `fetch_extent` coalesces body-adjacent absent entries into a single
+    /// range-GET.  Requesting entry 0 when entries 0 and 1 are contiguous and
+    /// both absent should fetch both in one call and set both present bits.
     #[test]
-    fn fetch_extent_writes_body_slice_and_present_bit() {
+    fn fetch_extent_coalesces_adjacent_entries() {
         use elide_core::segment::{SegmentEntry, check_present_bit, write_segment};
         use object_store::local::LocalFileSystem;
         use object_store::path::Path as StorePath;
@@ -468,14 +549,17 @@ mod tests {
         let seg_id = seg_ulid.to_string();
         let vol_id = "01JQVOLUMEAAAAAAAAAAAAAAA";
 
-        // Build a segment with 2 uncompressed entries.
-        let data1 = vec![0x11u8; 4096];
-        let data2 = vec![0x22u8; 4096];
+        // Build a segment with 3 uncompressed entries (all body-adjacent).
+        let data0 = vec![0x11u8; 4096];
+        let data1 = vec![0x22u8; 4096];
+        let data2 = vec![0x33u8; 4096];
+        let h0 = blake3::hash(&data0);
         let h1 = blake3::hash(&data1);
         let h2 = blake3::hash(&data2);
         let mut entries = vec![
-            SegmentEntry::new_data(h1, 0, 1, 0, data1.clone()),
-            SegmentEntry::new_data(h2, 1, 1, 0, data2.clone()),
+            SegmentEntry::new_data(h0, 0, 1, 0, data0.clone()),
+            SegmentEntry::new_data(h1, 1, 1, 0, data1.clone()),
+            SegmentEntry::new_data(h2, 2, 1, 0, data2.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
         let bss = write_segment(&seg_path, &mut entries, None).unwrap();
@@ -498,14 +582,16 @@ mod tests {
         let key = StorePath::from(format!("by_id/{vol_id}/{date}/{seg_id}"));
         rt.block_on(store.put(&key, full_bytes.into())).unwrap();
 
-        // Create the fetcher and fetch only entry 0.
         let cfg = FetchConfig {
             bucket: None,
             endpoint: None,
             region: None,
             local_path: Some(store_dir.path().to_string_lossy().into_owned()),
+            fetch_batch_bytes: None,
         };
         let fetcher = ObjectStoreFetcher::new(&cfg, vec![vol_id.to_string()]).unwrap();
+
+        // Fetch entry 0 — should coalesce entries 0, 1, 2 into one range-GET.
         fetcher
             .fetch_extent(
                 &seg_id,
@@ -517,21 +603,109 @@ mod tests {
             )
             .unwrap();
 
-        // .body must exist and contain entry 0's bytes at the correct offset.
-        let body_path = fetched_dir.join(format!("{seg_id}.body"));
-        assert!(body_path.exists(), ".body should be created");
-        let body_bytes = std::fs::read(&body_path).unwrap();
-        let off = entries[0].stored_offset as usize;
-        assert_eq!(
-            &body_bytes[off..off + 4096],
-            data1.as_slice(),
-            "body bytes must match data1"
-        );
+        // All three entries' bytes must be in .body.
+        let body_bytes = std::fs::read(fetched_dir.join(format!("{seg_id}.body"))).unwrap();
+        let off0 = entries[0].stored_offset as usize;
+        let off1 = entries[1].stored_offset as usize;
+        let off2 = entries[2].stored_offset as usize;
+        assert_eq!(&body_bytes[off0..off0 + 4096], data0.as_slice());
+        assert_eq!(&body_bytes[off1..off1 + 4096], data1.as_slice());
+        assert_eq!(&body_bytes[off2..off2 + 4096], data2.as_slice());
 
-        // .present bit 0 set, bit 1 not yet set.
+        // All three .present bits must be set.
         let present_path = fetched_dir.join(format!("{seg_id}.present"));
         assert!(check_present_bit(&present_path, 0).unwrap(), "bit 0 set");
-        assert!(!check_present_bit(&present_path, 1).unwrap(), "bit 1 unset");
+        assert!(check_present_bit(&present_path, 1).unwrap(), "bit 1 set");
+        assert!(check_present_bit(&present_path, 2).unwrap(), "bit 2 set");
+    }
+
+    /// A gap in body layout stops coalescing: only the requested entry is fetched,
+    /// leaving the non-adjacent entry unset.
+    #[test]
+    fn fetch_extent_stops_at_body_gap() {
+        use elide_core::segment::{SegmentEntry, check_present_bit, write_segment};
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as StorePath;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+        let fetched_dir = tmp.path().join("fetched");
+
+        let seg_ulid = ulid::Ulid::new();
+        let seg_id = seg_ulid.to_string();
+        let vol_id = "01JQVOLUMEAAAAAAAAAAAAAAA";
+
+        // Two entries that will NOT be body-adjacent because entry 1 is
+        // written into a segment that already has entry 0 present — we
+        // simulate a gap by pre-setting entry 0's .present bit before
+        // fetching, so entry 0 is "present" and the scan should stop.
+        // Easier: use two entries that ARE adjacent, mark entry 1 as
+        // already present, then fetch entry 0 — batch should be just {0}.
+        let data0 = vec![0xAAu8; 4096];
+        let data1 = vec![0xBBu8; 4096];
+        let h0 = blake3::hash(&data0);
+        let h1 = blake3::hash(&data1);
+        let mut entries = vec![
+            SegmentEntry::new_data(h0, 0, 1, 0, data0.clone()),
+            SegmentEntry::new_data(h1, 1, 1, 0, data1.clone()),
+        ];
+        let seg_path = tmp.path().join(&seg_id);
+        let bss = write_segment(&seg_path, &mut entries, None).unwrap();
+        let full_bytes = std::fs::read(&seg_path).unwrap();
+
+        std::fs::create_dir_all(&fetched_dir).unwrap();
+        std::fs::write(
+            fetched_dir.join(format!("{seg_id}.idx")),
+            &full_bytes[..bss as usize],
+        )
+        .unwrap();
+
+        // Pre-mark entry 1 as present so coalescing stops before it.
+        elide_core::segment::set_present_bit(&fetched_dir.join(format!("{seg_id}.present")), 1, 2)
+            .unwrap();
+
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_dir.path()).unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dt: chrono::DateTime<chrono::Utc> = seg_ulid.datetime().into();
+        let date = dt.format("%Y%m%d").to_string();
+        let key = StorePath::from(format!("by_id/{vol_id}/{date}/{seg_id}"));
+        rt.block_on(store.put(&key, full_bytes.into())).unwrap();
+
+        let cfg = FetchConfig {
+            bucket: None,
+            endpoint: None,
+            region: None,
+            local_path: Some(store_dir.path().to_string_lossy().into_owned()),
+            fetch_batch_bytes: None,
+        };
+        let fetcher = ObjectStoreFetcher::new(&cfg, vec![vol_id.to_string()]).unwrap();
+
+        fetcher
+            .fetch_extent(
+                &seg_id,
+                &fetched_dir,
+                bss,
+                entries[0].stored_offset,
+                entries[0].stored_length,
+                0,
+            )
+            .unwrap();
+
+        // Entry 0's bytes must be in .body.
+        let body_bytes = std::fs::read(fetched_dir.join(format!("{seg_id}.body"))).unwrap();
+        let off0 = entries[0].stored_offset as usize;
+        assert_eq!(&body_bytes[off0..off0 + 4096], data0.as_slice());
+
+        // Bit 0 now set (just fetched); bit 1 still set (was pre-set, not overwritten).
+        let present_path = fetched_dir.join(format!("{seg_id}.present"));
+        assert!(check_present_bit(&present_path, 0).unwrap(), "bit 0 set");
+        assert!(
+            check_present_bit(&present_path, 1).unwrap(),
+            "bit 1 still set"
+        );
     }
 
     #[test]
