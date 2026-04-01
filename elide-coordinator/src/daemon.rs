@@ -144,25 +144,20 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 tasks.abort_all();
 
                 // SIGTERM every volume and import process across all known forks.
-                let mut all_pids: Vec<u32> = Vec::new();
-                for fork_dir in &known {
-                    let pids = import::terminate_fork_processes(fork_dir);
-                    if !pids.is_empty() {
-                        info!(
-                            "[coordinator] sent SIGTERM to {} process(es) in {}",
-                            pids.len(),
-                            fork_dir.display()
-                        );
-                    }
-                    all_pids.extend(pids);
-                }
+                let all_pids: Vec<u32> = known
+                    .iter()
+                    .flat_map(|fork_dir| import::terminate_fork_processes(fork_dir))
+                    .collect();
 
-                if !all_pids.is_empty() {
+                if all_pids.is_empty() {
+                    info!("[coordinator] no processes to stop");
+                } else {
                     info!(
                         "[coordinator] waiting for {} process(es) to exit...",
                         all_pids.len()
                     );
                     wait_for_pids(&all_pids, Duration::from_secs(10)).await;
+                    info!("[coordinator] done");
                 }
 
                 break;
