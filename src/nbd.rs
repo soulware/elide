@@ -1355,7 +1355,7 @@ mod tests {
 
         // Populate the fork via a writable Volume, promote to segment, then drop.
         {
-            let mut vol = crate::volume::Volume::open(&fork_dir, &fork_dir).unwrap();
+            let mut vol = elide_core::volume::Volume::open(&fork_dir, &fork_dir).unwrap();
             vol.write(0, &data).unwrap();
             vol.promote_for_test().unwrap();
         }
