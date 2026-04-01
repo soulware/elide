@@ -1,19 +1,19 @@
-// Ed25519 keypair management and origin sanity checks.
+// Ed25519 keypair management and provenance sanity checks.
 //
 // Key file naming convention (all volumes, flat layout):
-//   volume.key / volume.pub / volume.origin  (under <by_id>/<ulid>/)
+//   volume.key / volume.pub / volume.provenance  (under <by_id>/<ulid>/)
 //
 // File contents:
-//   *.key    — Ed25519 private key (32 bytes, never uploaded)
-//   *.pub    — Ed25519 public key (32 bytes, uploaded to S3)
-//   *.origin — plaintext hostname + canonical path + signature (local only)
+//   *.key         — Ed25519 private key (32 bytes, never uploaded)
+//   *.pub         — Ed25519 public key (32 bytes, uploaded to S3)
+//   *.provenance  — plaintext hostname + canonical path + signature (local only)
 //
-// origin file format:
+// provenance file format:
 //   hostname: <value>
 //   path: <canonical absolute path>
 //   sig: <hex-encoded 64-byte Ed25519 signature>
 //
-// Signing input for origin:  hostname_bytes || b"\0" || path_bytes
+// Signing input for provenance:  hostname_bytes || b"\0" || path_bytes
 // Signing input for segments: passed in from segment::SegmentSigner::sign(); the caller
 //   (segment.rs) pre-hashes with BLAKE3 before calling sign(), so the key signs
 //   the 32-byte hash.
@@ -30,15 +30,7 @@ use crate::segment::SegmentSigner;
 // File name constants.
 pub const VOLUME_KEY_FILE: &str = "volume.key";
 pub const VOLUME_PUB_FILE: &str = "volume.pub";
-pub const VOLUME_ORIGIN_FILE: &str = "volume.origin";
-
-// Deprecated: use VOLUME_* constants instead.
-pub const FORK_KEY_FILE: &str = "fork.key";
-pub const FORK_PUB_FILE: &str = "fork.pub";
-pub const FORK_ORIGIN_FILE: &str = "fork.origin";
-pub const BASE_KEY_FILE: &str = "base.key";
-pub const BASE_PUB_FILE: &str = "base.pub";
-pub const BASE_ORIGIN_FILE: &str = "base.origin";
+pub const VOLUME_PROVENANCE_FILE: &str = "volume.provenance";
 
 // --- Ed25519Signer ---
 

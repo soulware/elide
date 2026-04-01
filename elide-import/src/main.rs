@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::Parser;
-use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_ORIGIN_FILE, VOLUME_PUB_FILE};
+use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE};
 use oci_client::manifest::{OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
@@ -107,8 +107,8 @@ fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
     std::fs::write(vol_dir.join("volume.readonly"), "").context("write volume.readonly")?;
     let key = elide_core::signing::generate_keypair(vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
         .context("generate volume keypair")?;
-    elide_core::signing::write_origin(vol_dir, &key, VOLUME_ORIGIN_FILE)
-        .context("write volume.origin")?;
+    elide_core::signing::write_origin(vol_dir, &key, VOLUME_PROVENANCE_FILE)
+        .context("write volume.provenance")?;
     let signer = elide_core::signing::load_signer(vol_dir, VOLUME_KEY_FILE)
         .context("load volume signing key")?;
     let mut last_pct = u64::MAX;
@@ -198,8 +198,8 @@ async fn run_oci(
     std::fs::write(vol_dir.join("volume.readonly"), "").context("write volume.readonly")?;
     let key = elide_core::signing::generate_keypair(vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
         .context("generate volume keypair")?;
-    elide_core::signing::write_origin(vol_dir, &key, VOLUME_ORIGIN_FILE)
-        .context("write volume.origin")?;
+    elide_core::signing::write_origin(vol_dir, &key, VOLUME_PROVENANCE_FILE)
+        .context("write volume.provenance")?;
     let signer = elide_core::signing::load_signer(vol_dir, VOLUME_KEY_FILE)
         .context("load volume signing key")?;
     let mut last_pct = u64::MAX;

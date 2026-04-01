@@ -42,7 +42,7 @@ fn fork_via_symlink_writes_ulid_in_origin() {
     fork_volume(&fork_dir, &symlink).unwrap();
 
     // The origin file must contain the real ULID, not the symlink name.
-    let origin = std::fs::read_to_string(fork_dir.join("origin")).unwrap();
+    let origin = std::fs::read_to_string(fork_dir.join("volume.parent")).unwrap();
     assert!(
         origin.starts_with(source_ulid),
         "origin should start with the source ULID, got: {origin:?}"

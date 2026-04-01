@@ -178,7 +178,7 @@ fn count_snapshots(fork_dir: &Path) -> usize {
 }
 
 fn read_origin(fork_dir: &Path) -> Option<String> {
-    fs::read_to_string(fork_dir.join("origin"))
+    fs::read_to_string(fork_dir.join("volume.parent"))
         .ok()
         .map(|s| s.trim().to_owned())
 }

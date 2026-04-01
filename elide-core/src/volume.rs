@@ -178,7 +178,7 @@ impl Volume {
     /// `base_dir` must be the fork directory (e.g. `volumes/myvm/default/`), not the
     /// volume root. Creates `wal/`, `pending/`, and `segments/` if they do not exist.
     /// Rebuilds the LBA map from all committed segments across the ancestry chain
-    /// (following `origin` files), then recovers or creates the WAL.
+    /// (following `volume.parent` files), then recovers or creates the WAL.
     ///
     /// Segments written by this volume will be unsigned. Use `open_with_signer`
     /// when the volume's private key is available.
@@ -1374,12 +1374,12 @@ impl ReadonlyVolume {
 /// Segments with ULID > `branch_ulid` in that ancestor fork were written after
 /// the branch and are excluded when rebuilding the LBA map.
 ///
-/// A fork with no `origin` file is the root fork; returns an empty vec.
-/// The `origin` file format is `<parent-ulid>/snapshots/<branch-ulid>`, where
+/// A fork with no `volume.parent` file is the root fork; returns an empty vec.
+/// The `volume.parent` file format is `<parent-ulid>/snapshots/<branch-ulid>`, where
 /// `parent-ulid` is the ULID-named directory under `by_id_dir`. Both components
 /// are validated as ULIDs to prevent path traversal.
 pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
-    let origin_path = fork_dir.join("origin");
+    let origin_path = fork_dir.join("volume.parent");
     let content = match fs::read_to_string(&origin_path) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1389,7 +1389,7 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
     let (parent_ulid_str, branch_ulid_str) =
         origin.rsplit_once("/snapshots/").ok_or_else(|| {
             io::Error::other(format!(
-                "malformed origin file in {}: {origin}",
+                "malformed volume.parent in {}: {origin}",
                 fork_dir.display()
             ))
         })?;
@@ -1400,7 +1400,7 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
     // Validate parent component: must be a valid ULID (no path traversal).
     Ulid::from_string(parent_ulid_str).map_err(|_| {
         io::Error::other(format!(
-            "malformed origin file in {}: parent '{}' is not a valid ULID",
+            "malformed volume.parent in {}: parent '{}' is not a valid ULID",
             fork_dir.display(),
             parent_ulid_str
         ))
@@ -1443,7 +1443,7 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<String>> {
 /// Create a new volume directory, branched from the latest snapshot of the source volume.
 ///
 /// The source volume must have at least one snapshot (written by `snapshot()`).
-/// `new_fork_dir` is created with `wal/`, `pending/`, `segments/`, and an `origin`
+/// `new_fork_dir` is created with `wal/`, `pending/`, `segments/`, and a `volume.parent`
 /// file using the flat format: `<source-ulid>/snapshots/<branch-ulid>`.
 /// The source ULID is derived from `source_fork_dir`'s directory name.
 ///
@@ -1474,9 +1474,9 @@ pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()
     fs::create_dir_all(new_fork_dir.join("wal"))?;
     fs::create_dir_all(new_fork_dir.join("pending"))?;
     fs::create_dir_all(new_fork_dir.join("segments"))?;
-    // origin format: "<source-ulid>/snapshots/<branch-ulid>"
+    // volume.parent format: "<source-ulid>/snapshots/<branch-ulid>"
     let origin = format!("{source_ulid}/snapshots/{branch_ulid}");
-    segment::write_file_atomic(&new_fork_dir.join("origin"), origin.as_bytes())?;
+    segment::write_file_atomic(&new_fork_dir.join("volume.parent"), origin.as_bytes())?;
 
     Ok(())
 }
@@ -2586,7 +2586,7 @@ mod tests {
             "01AAAAAAAAAAAAAAAAAAAAAAAA/snapshots/",
         ];
         for bad in bad_origins {
-            fs::write(fork_dir.join("origin"), bad).unwrap();
+            fs::write(fork_dir.join("volume.parent"), bad).unwrap();
             assert!(
                 walk_ancestors(&fork_dir, &by_id).is_err(),
                 "expected error for origin: {bad}"
@@ -2605,7 +2605,7 @@ mod tests {
         // dev's origin points to default at a fixed branch ULID.
         fs::create_dir_all(&dev_dir).unwrap();
         fs::write(
-            dev_dir.join("origin"),
+            dev_dir.join("volume.parent"),
             format!("{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
         )
         .unwrap();
@@ -2631,14 +2631,14 @@ mod tests {
 
         fs::create_dir_all(&mid_dir).unwrap();
         fs::write(
-            mid_dir.join("origin"),
+            mid_dir.join("volume.parent"),
             format!("{root_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
         )
         .unwrap();
 
         fs::create_dir_all(&leaf_dir).unwrap();
         fs::write(
-            leaf_dir.join("origin"),
+            leaf_dir.join("volume.parent"),
             format!("{mid_ulid}/snapshots/01BX5ZZKJKTSV4RRFFQ69G5FAV"),
         )
         .unwrap();
@@ -2891,7 +2891,7 @@ mod tests {
         assert!(fork_dir.join("pending").is_dir());
         assert!(fork_dir.join("segments").is_dir());
 
-        let origin = fs::read_to_string(fork_dir.join("origin")).unwrap();
+        let origin = fs::read_to_string(fork_dir.join("volume.parent")).unwrap();
         assert_eq!(origin.trim(), format!("{root_ulid}/snapshots/{snap_ulid}"));
 
         fs::remove_dir_all(by_id).unwrap();
@@ -2931,7 +2931,7 @@ mod tests {
         assert!(snap2 > snap1);
 
         fork_volume(&fork_dir, &default_dir).unwrap();
-        let origin = fs::read_to_string(fork_dir.join("origin")).unwrap();
+        let origin = fs::read_to_string(fork_dir.join("volume.parent")).unwrap();
         assert_eq!(
             origin.trim(),
             format!("{root_ulid}/snapshots/{snap2}"),
@@ -2979,12 +2979,12 @@ mod tests {
         fork_volume(&leaf_dir, &mid_dir).unwrap();
 
         // origin chain: leaf → mid → default (ULID-based flat layout).
-        let leaf_origin = fs::read_to_string(leaf_dir.join("origin")).unwrap();
+        let leaf_origin = fs::read_to_string(leaf_dir.join("volume.parent")).unwrap();
         assert!(
             leaf_origin.starts_with(&format!("{mid_ulid}/snapshots/")),
             "leaf origin: {leaf_origin}"
         );
-        let mid_origin = fs::read_to_string(mid_dir.join("origin")).unwrap();
+        let mid_origin = fs::read_to_string(mid_dir.join("volume.parent")).unwrap();
         assert!(
             mid_origin.starts_with(&format!("{root_ulid}/snapshots/")),
             "mid origin: {mid_origin}"

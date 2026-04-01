@@ -214,9 +214,9 @@ mod tests {
         let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
         std::fs::write(parent_dir.join("snapshots").join(snap_ulid), "").unwrap();
 
-        // child's origin: forks/parent/snapshots/<snap_ulid>
+        // child's volume.parent: forks/parent/snapshots/<snap_ulid>
         std::fs::write(
-            child_dir.join("origin"),
+            child_dir.join("volume.parent"),
             format!("forks/parent/snapshots/{snap_ulid}"),
         )
         .unwrap();

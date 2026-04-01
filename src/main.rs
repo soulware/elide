@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use ext4_view::{Ext4, Ext4Error, PathBuf as Ext4PathBuf};
 
-use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_ORIGIN_FILE, VOLUME_PUB_FILE};
+use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE};
 use elide_core::volume;
 
 mod control;
@@ -226,6 +226,7 @@ fn main() {
     let args = Args::parse();
 
     let socket_path = args.data_dir.join("control.sock");
+    let by_id_dir = args.data_dir.join("by_id");
 
     match args.command {
         Command::Volume { command } => match command {
@@ -253,59 +254,14 @@ fn main() {
             }
 
             VolumeCommand::Snapshot { name } => {
-                let fork_dir = resolve_volume_dir(&args.data_dir, &name);
-                let snap_ulid = {
-                    use std::io::{self, BufRead, Write};
-                    use std::os::unix::net::UnixStream;
-                    match UnixStream::connect(fork_dir.join("control.sock")) {
-                        Ok(mut stream) => {
-                            // Volume is live — snapshot via the control socket.
-                            if let Err(e) =
-                                writeln!(stream, "snapshot").and_then(|_| stream.flush())
-                            {
-                                eprintln!("error: snapshot request failed: {e}");
-                                std::process::exit(1);
-                            }
-                            let mut reader = io::BufReader::new(stream);
-                            let mut line = String::new();
-                            if let Err(e) = reader.read_line(&mut line) {
-                                eprintln!("error: snapshot response failed: {e}");
-                                std::process::exit(1);
-                            }
-                            let line = line.trim();
-                            match line.strip_prefix("ok ") {
-                                Some(ulid) => ulid.trim().to_owned(),
-                                None => {
-                                    eprintln!("snapshot failed: {line}");
-                                    std::process::exit(1);
-                                }
-                            }
-                        }
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-                            ) =>
-                        {
-                            // Volume is not running — open directly.
-                            let by_id_dir = args.data_dir.join("by_id");
-                            match volume::Volume::open(&fork_dir, &by_id_dir)
-                                .and_then(|mut v| v.snapshot().map(|u| u.to_string()))
-                            {
-                                Ok(ulid) => ulid,
-                                Err(e) => {
-                                    eprintln!("error: {e}");
-                                    std::process::exit(1);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("failed to connect to control socket: {e}");
-                            std::process::exit(1);
-                        }
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                match snapshot_volume(&vol_dir, &by_id_dir) {
+                    Ok(ulid) => println!("{ulid}"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
                     }
-                };
-                println!("{snap_ulid}");
+                }
             }
 
             VolumeCommand::Fork { fork_name, from } => {
@@ -316,6 +272,12 @@ fn main() {
                     std::process::exit(1);
                 }
                 let source_fork_dir = resolve_volume_dir(&args.data_dir, &from);
+                // Take an implicit snapshot of the source so fork branches from "now".
+                // Idempotent if the tip is already snapshotted.
+                if let Err(e) = snapshot_volume(&source_fork_dir, &by_id_dir) {
+                    eprintln!("error: failed to snapshot source volume: {e}");
+                    std::process::exit(1);
+                }
                 let new_vol_ulid = ulid::Ulid::new().to_string();
                 let new_fork_dir = args.data_dir.join("by_id").join(&new_vol_ulid);
                 if let Err(e) = volume::fork_volume(&new_fork_dir, &source_fork_dir) {
@@ -361,11 +323,11 @@ fn main() {
                     }
                 };
                 if let Err(e) =
-                    elide_core::signing::write_origin(&new_fork_dir, &key, VOLUME_ORIGIN_FILE)
+                    elide_core::signing::write_origin(&new_fork_dir, &key, VOLUME_PROVENANCE_FILE)
                 {
                     let _ = std::fs::remove_file(&symlink_path);
                     let _ = std::fs::remove_dir_all(&new_fork_dir);
-                    eprintln!("error: failed to write volume.origin: {e}");
+                    eprintln!("error: failed to write volume.provenance: {e}");
                     std::process::exit(1);
                 }
                 println!("{}", new_fork_dir.display());
@@ -460,14 +422,14 @@ fn main() {
                         elide_core::signing::verify_origin(
                             &fork_dir,
                             VOLUME_PUB_FILE,
-                            VOLUME_ORIGIN_FILE,
+                            VOLUME_PROVENANCE_FILE,
                         )
                         .map_err(|e| {
                             std::io::Error::other(format!(
                                 "{e} — use --force-origin if this fork has been intentionally moved"
                             ))
                         })
-                        .expect("volume.origin check failed");
+                        .expect("volume.provenance check failed");
                     }
                     elide_core::signing::load_signer(&fork_dir, VOLUME_KEY_FILE)
                         .expect("failed to load volume signing key")
@@ -478,8 +440,8 @@ fn main() {
                         VOLUME_PUB_FILE,
                     )
                     .expect("failed to generate volume keypair");
-                    elide_core::signing::write_origin(&fork_dir, &key, VOLUME_ORIGIN_FILE)
-                        .expect("failed to write volume.origin");
+                    elide_core::signing::write_origin(&fork_dir, &key, VOLUME_PROVENANCE_FILE)
+                        .expect("failed to write volume.provenance");
                     elide_core::signing::load_signer(&fork_dir, VOLUME_KEY_FILE)
                         .expect("failed to load volume signing key")
                 };
@@ -565,6 +527,36 @@ fn resolve_volume_dir(data_dir: &Path, name: &str) -> PathBuf {
     data_dir.join("by_name").join(name)
 }
 
+/// Snapshot a volume: uses the control socket if the volume is live,
+/// falls back to direct open if not running.  Returns the snapshot ULID.
+fn snapshot_volume(vol_dir: &Path, by_id_dir: &Path) -> std::io::Result<String> {
+    use std::io::{self, BufRead, Write};
+    use std::os::unix::net::UnixStream;
+    match UnixStream::connect(vol_dir.join("control.sock")) {
+        Ok(mut stream) => {
+            writeln!(stream, "snapshot")?;
+            stream.flush()?;
+            let mut reader = io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            let line = line.trim();
+            line.strip_prefix("ok ")
+                .map(|u| u.trim().to_owned())
+                .ok_or_else(|| io::Error::other(format!("snapshot failed: {line}")))
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            let mut vol = volume::Volume::open(vol_dir, by_id_dir)?;
+            vol.snapshot().map(|u| u.to_string())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn list_volumes(data_dir: &Path) -> std::io::Result<()> {
     let by_name_dir = data_dir.join("by_name");
     let mut names: Vec<String> = Vec::new();
@@ -616,6 +608,9 @@ fn create_volume(data_dir: &Path, name: &str, size: Option<&str>) -> std::io::Re
     std::fs::create_dir_all(vol_dir.join("pending"))?;
     std::fs::create_dir_all(vol_dir.join("segments"))?;
     std::fs::write(vol_dir.join("volume.size"), bytes.to_string())?;
+
+    let key = elide_core::signing::generate_keypair(&vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)?;
+    elide_core::signing::write_origin(&vol_dir, &key, VOLUME_PROVENANCE_FILE)?;
 
     std::fs::create_dir_all(&by_name_dir)?;
     std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
