@@ -400,10 +400,15 @@ fn collect_fetched_file(
         .map(|e| e.stored_length as u64)
         .sum();
 
-    // Count set bits in .present — each bit corresponds to one fetchable entry.
+    // Count set bits in .present, capped at fetchable_count to ignore padding
+    // bits in the last byte (write_fetched sets all bits in the final byte).
     let present_path = fetched_dir.join(format!("{ulid}.present"));
     let present_bytes = fs::read(&present_path).unwrap_or_default();
-    let present_count: usize = present_bytes.iter().map(|b| b.count_ones() as usize).sum();
+    let present_count: usize = present_bytes
+        .iter()
+        .map(|b| b.count_ones() as usize)
+        .sum::<usize>()
+        .min(fetchable_count);
 
     // Actual disk blocks used by the sparse .body file.
     let body_path = fetched_dir.join(format!("{ulid}.body"));

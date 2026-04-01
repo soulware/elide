@@ -389,7 +389,7 @@ impl VolumeHandle {
             &snap.lbamap,
             &snap.extent_index,
             &self.file_cache,
-            |id| {
+            |id, _, _| {
                 find_segment_in_dirs(
                     id,
                     &self.config.base_dir,

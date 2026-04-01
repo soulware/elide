@@ -417,7 +417,7 @@ impl Volume {
             &self.lbamap,
             &self.extent_index,
             &self.file_cache,
-            |id| self.find_segment_file(id),
+            |id, _, _| self.find_segment_file(id),
         )
     }
 
@@ -1156,7 +1156,7 @@ pub(crate) fn read_extents(
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<Option<(String, fs::File)>>,
-    find_segment: impl Fn(&str) -> io::Result<PathBuf>,
+    find_segment: impl Fn(&str, Option<u64>, Option<u32>) -> io::Result<PathBuf>,
 ) -> io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -1164,7 +1164,7 @@ pub(crate) fn read_extents(
     for er in lbamap.extents_in_range(lba, lba + lba_count as u64) {
         // Extract owned copies so the borrow of extent_index ends before
         // we mutate file_cache.
-        let (segment_id, body_offset, body_length, compressed) = {
+        let (segment_id, body_offset, body_length, compressed, body_section_start, entry_idx) = {
             let Some(loc) = extent_index.lookup(&er.hash) else {
                 continue; // hash not indexed — treat as unwritten
             };
@@ -1173,6 +1173,8 @@ pub(crate) fn read_extents(
                 loc.body_offset,
                 loc.body_length,
                 loc.compressed,
+                loc.body_section_start,
+                loc.entry_idx,
             )
         };
 
@@ -1180,7 +1182,7 @@ pub(crate) fn read_extents(
         // otherwise open the new segment and replace the cache entry.
         let mut cache = file_cache.borrow_mut();
         if cache.as_ref().map(|(id, _)| id.as_str()) != Some(segment_id.as_str()) {
-            let path = find_segment(&segment_id)?;
+            let path = find_segment(&segment_id, body_section_start, entry_idx)?;
             *cache = Some((segment_id, fs::File::open(path)?));
         }
         let f = &mut cache
@@ -1320,11 +1322,16 @@ impl ReadonlyVolume {
             &self.lbamap,
             &self.extent_index,
             &self.file_cache,
-            |id| self.find_segment_file(id),
+            |id, bss, idx| self.find_segment_file(id, bss, idx),
         )
     }
 
-    fn find_segment_file(&self, segment_id: &str) -> io::Result<PathBuf> {
+    fn find_segment_file(
+        &self,
+        segment_id: &str,
+        body_section_start: Option<u64>,
+        entry_idx: Option<u32>,
+    ) -> io::Result<PathBuf> {
         for subdir in ["pending", "segments"] {
             let path = self.base_dir.join(subdir).join(segment_id);
             if path.exists() {
@@ -1352,7 +1359,14 @@ impl ReadonlyVolume {
         }
         if let Some(fetcher) = &self.fetcher {
             let fetched_dir = self.base_dir.join("fetched");
-            fetcher.fetch(segment_id, &fetched_dir)?;
+            match (body_section_start, entry_idx) {
+                (Some(bss), Some(idx)) => {
+                    fetcher.fetch_extent(segment_id, &fetched_dir, bss, 0, 0, idx)?;
+                }
+                _ => {
+                    fetcher.fetch(segment_id, &fetched_dir)?;
+                }
+            }
             return Ok(self
                 .base_dir
                 .join("fetched")
