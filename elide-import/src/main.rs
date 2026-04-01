@@ -546,3 +546,94 @@ fn parse_arch(s: &str) -> Arch {
         other => Arch::Other(other.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_size ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_size_bare_bytes() {
+        assert_eq!(parse_size("1073741824").unwrap(), 1 << 30);
+    }
+
+    #[test]
+    fn parse_size_suffix_k() {
+        assert_eq!(parse_size("4K").unwrap(), 4 * 1024);
+        assert_eq!(parse_size("4KB").unwrap(), 4 * 1024);
+    }
+
+    #[test]
+    fn parse_size_suffix_m() {
+        assert_eq!(parse_size("512M").unwrap(), 512 << 20);
+        assert_eq!(parse_size("512MB").unwrap(), 512 << 20);
+    }
+
+    #[test]
+    fn parse_size_suffix_g() {
+        assert_eq!(parse_size("4G").unwrap(), 4u64 << 30);
+        assert_eq!(parse_size("4GB").unwrap(), 4u64 << 30);
+    }
+
+    #[test]
+    fn parse_size_suffix_t() {
+        assert_eq!(parse_size("2T").unwrap(), 2u64 << 40);
+        assert_eq!(parse_size("2TB").unwrap(), 2u64 << 40);
+    }
+
+    #[test]
+    fn parse_size_trims_whitespace() {
+        assert_eq!(parse_size("  8G  ").unwrap(), 8u64 << 30);
+    }
+
+    #[test]
+    fn parse_size_rejects_invalid() {
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("").is_err());
+        assert!(parse_size("4X").is_err());
+    }
+
+    // ── auto_size ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn auto_size_floor_for_tiny_input() {
+        // Tiny rootfs → floor of 1 GiB, rounded up to 1 GiB.
+        assert_eq!(auto_size(0), 1u64 << 30);
+        assert_eq!(auto_size(1024), 1u64 << 30);
+    }
+
+    #[test]
+    fn auto_size_2x_overhead_rounds_up() {
+        // 600 MiB unpacked → 1200 MiB with overhead → rounds up to 1536 MiB (3 × 512 MiB).
+        let unpacked = 600u64 << 20;
+        let result = auto_size(unpacked);
+        assert_eq!(result, 3 * (512u64 << 20));
+    }
+
+    #[test]
+    fn auto_size_already_aligned() {
+        // 1 GiB unpacked → 2 GiB with overhead → exactly 4 × 512 MiB, no rounding needed.
+        let unpacked = 1u64 << 30;
+        assert_eq!(auto_size(unpacked), 4 * (512u64 << 20));
+    }
+
+    // ── parse_arch ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_arch_oci_names() {
+        assert_eq!(parse_arch("amd64"), Arch::Amd64);
+        assert_eq!(parse_arch("arm64"), Arch::ARM64);
+    }
+
+    #[test]
+    fn parse_arch_rust_aliases() {
+        assert_eq!(parse_arch("x86_64"), Arch::Amd64);
+        assert_eq!(parse_arch("aarch64"), Arch::ARM64);
+    }
+
+    #[test]
+    fn parse_arch_unknown_passthrough() {
+        assert_eq!(parse_arch("mips64"), Arch::Other("mips64".to_string()));
+    }
+}
