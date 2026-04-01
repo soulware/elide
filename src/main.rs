@@ -131,15 +131,15 @@ enum VolumeCommand {
 
     /// Show a human-readable summary of a volume
     Info {
-        /// Path to the volume root directory
-        vol_dir: PathBuf,
+        /// Volume name
+        name: String,
     },
 
     /// Browse ext4 filesystem contents of a fork
     Ls {
-        /// Path to the volume directory
-        vol_dir: PathBuf,
-        /// Name of the fork to inspect
+        /// Volume name
+        name: String,
+        /// Name of the fork to inspect (use "base" for the import base)
         fork: String,
         /// Path within the ext4 filesystem (default: /)
         #[arg(default_value = "/")]
@@ -148,16 +148,16 @@ enum VolumeCommand {
 
     /// Write a snapshot marker; the fork stays live
     Snapshot {
-        /// Path to the volume directory
-        vol_dir: PathBuf,
+        /// Volume name
+        name: String,
         /// Name of the fork to snapshot
         fork: String,
     },
 
     /// Create a new named fork branched from the latest snapshot of the source fork
     Fork {
-        /// Path to the volume directory
-        vol_dir: PathBuf,
+        /// Volume name
+        name: String,
         /// Name for the new fork
         fork_name: String,
         /// Source fork to branch from
@@ -236,39 +236,42 @@ fn main() {
                 list_volumes(&args.data_dir).expect("volume list failed");
             }
 
-            VolumeCommand::Info { vol_dir } => {
+            VolumeCommand::Info { name } => {
+                let vol_dir = args.data_dir.join(&name);
                 inspect::run(&vol_dir).expect("volume info failed");
             }
 
-            VolumeCommand::Ls {
-                vol_dir,
-                fork,
-                path,
-            } => {
-                let fork_dir = vol_dir.join("forks").join(&fork);
+            VolumeCommand::Ls { name, fork, path } => {
+                let vol_dir = args.data_dir.join(&name);
+                let fork_dir = fork_dir(&vol_dir, &fork);
                 ls::run(&fork_dir, &path).expect("volume ls failed");
             }
 
-            VolumeCommand::Snapshot { vol_dir, fork } => {
-                let fork_dir = vol_dir.join("forks").join(&fork);
+            VolumeCommand::Snapshot { name, fork } => {
+                let vol_dir = args.data_dir.join(&name);
+                let fork_dir = fork_dir(&vol_dir, &fork);
                 let mut vol = volume::Volume::open(&fork_dir).expect("failed to open volume");
                 let snap_ulid = vol.snapshot().expect("snapshot failed");
                 println!("{snap_ulid}");
             }
 
             VolumeCommand::Fork {
-                vol_dir,
+                name,
                 fork_name,
                 from,
             } => {
-                let fork_dir =
+                let vol_dir = args.data_dir.join(&name);
+                let new_fork_dir =
                     volume::fork_volume(&vol_dir, &fork_name, &from).expect("volume fork failed");
-                let key =
-                    elide_core::signing::generate_keypair(&fork_dir, FORK_KEY_FILE, FORK_PUB_FILE)
-                        .expect("failed to generate fork keypair");
-                elide_core::signing::write_origin(&fork_dir, &key, FORK_ORIGIN_FILE)
+                let key = elide_core::signing::generate_keypair(
+                    &new_fork_dir,
+                    FORK_KEY_FILE,
+                    FORK_PUB_FILE,
+                )
+                .expect("failed to generate fork keypair");
+                elide_core::signing::write_origin(&new_fork_dir, &key, FORK_ORIGIN_FILE)
                     .expect("failed to write fork.origin");
-                println!("{}", fork_dir.display());
+                println!("{}", new_fork_dir.display());
             }
 
             VolumeCommand::Create { name, size } => {
@@ -448,6 +451,18 @@ fn main() {
         Command::InspectWal { path } => {
             inspect_files::inspect_wal(&path).expect("inspect-wal failed");
         }
+    }
+}
+
+/// Resolve a fork name to its directory under a volume root.
+///
+/// The `base` fork lives directly at `<vol_dir>/base`; all other forks live
+/// under `<vol_dir>/forks/<name>`.
+fn fork_dir(vol_dir: &Path, fork: &str) -> PathBuf {
+    if fork == "base" {
+        vol_dir.join("base")
+    } else {
+        vol_dir.join("forks").join(fork)
     }
 }
 
