@@ -80,11 +80,21 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn default_elide_bin() -> PathBuf {
-    PathBuf::from("elide")
+    sibling_bin("elide")
 }
 
 fn default_elide_import_bin() -> PathBuf {
-    PathBuf::from("elide-import")
+    sibling_bin("elide-import")
+}
+
+/// Return a path to `name` in the same directory as the running coordinator
+/// binary. Falls back to just `name` (PATH lookup) if the current exe path
+/// cannot be determined.
+fn sibling_bin(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 #[derive(Deserialize)]
