@@ -366,7 +366,7 @@ fn main() {
                 println!("{}", new_fork_dir.display());
                 if coordinator_client::rescan(&socket_path).is_err() {
                     eprintln!(
-                        "warning: coordinator not running; volume will be picked up on next scan"
+                        "warning: coordinator unreachable; volume will be picked up on next scan"
                     );
                 }
             }
@@ -378,7 +378,7 @@ fn main() {
                 }
                 if coordinator_client::rescan(&socket_path).is_err() {
                     eprintln!(
-                        "warning: coordinator not running; volume will be picked up on next scan"
+                        "warning: coordinator unreachable; volume will be picked up on next scan"
                     );
                 }
             }
@@ -841,6 +841,10 @@ fn remote_pull(
 
     std::fs::write(vol_dir.join("volume.pub"), &pub_key_bytes)?;
 
+    // Create segments/ so discover_volumes picks up the volume and the
+    // coordinator runs prefetch_indexes to download the .idx files.
+    std::fs::create_dir_all(vol_dir.join("segments"))?;
+
     // Step 4: create by_name symlink.
     let by_name_dir = data_dir.join("by_name");
     std::fs::create_dir_all(&by_name_dir)?;
@@ -858,7 +862,7 @@ fn remote_pull(
 
     // Step 5: signal coordinator to rescan (best-effort).
     if coordinator_client::rescan(socket_path).is_err() {
-        eprintln!("warning: coordinator not running; volume will be picked up on next scan");
+        eprintln!("warning: coordinator unreachable; volume will be picked up on next scan");
     }
 
     Ok(())

@@ -40,6 +40,7 @@ use crate::control;
 use crate::gc;
 use crate::import;
 use crate::inbound;
+use crate::prefetch;
 use crate::supervisor;
 use crate::upload;
 
@@ -100,6 +101,11 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     scan_tick.tick().await;
 
     loop {
+        // Prune volumes that have been deleted since we last saw them so that
+        // if the same ULID directory is recreated (e.g. by `volume remote pull`
+        // after a `volume delete`), it will be discovered and processed again.
+        known.retain(|p| p.exists());
+
         let volumes = discover_volumes(&data_dir);
         for vol_dir in volumes {
             // Skip volumes that are being actively imported — they will be picked
@@ -239,6 +245,29 @@ async fn fork_loop(
         .checked_sub(gc_interval)
         .unwrap_or_else(Instant::now);
 
+    // Prefetch segment indexes on startup if the fork has no local segments.
+    // This covers the common case of a volume pulled from the store with only
+    // the directory skeleton — without .idx files Volume::open cannot rebuild
+    // the LBA map and the volume is unreadable.
+    let has_local_segments = fork_dir.join("segments").exists()
+        && fork_dir
+            .join("segments")
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+    if !has_local_segments {
+        match prefetch::prefetch_indexes(&fork_dir, &store).await {
+            Ok(r) if r.fetched > 0 => {
+                info!(
+                    "[prefetch {volume_id}] fetched {} index section(s)",
+                    r.fetched
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!("[prefetch {volume_id}] error: {e:#}"),
+        }
+    }
+
     let mut tick = tokio::time::interval(drain_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -366,16 +395,17 @@ async fn fork_loop(
 }
 
 /// Scan `<data_dir>/by_id/` and return volume directories that need coordinator
-/// attention (drain, GC, or supervision).
+/// attention (drain, GC, supervision, or prefetch).
 ///
 /// Skips:
 ///   - entries whose name is not a valid ULID
 ///   - volumes with no `pending/` or `segments/` subdirectory (not yet initialised)
-///   - readonly volumes that have no `pending/` — they are fully drained and need
-///     no further coordinator work (GC is not run on readonly volumes)
+///   - readonly volumes that are fully indexed: either `segments/` is non-empty
+///     (drain completed) or `fetched/` is non-empty (prefetch completed)
 ///
-/// Readonly volumes with a `pending/` directory ARE included so that imported
-/// segments are drained to the store even though the volume accepts no new writes.
+/// Readonly volumes with `pending/` are included for drain. Readonly volumes
+/// with empty `segments/` and no `fetched/` are included for prefetch (pulled
+/// from the store but not yet indexed locally).
 fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
     let by_id_dir = data_dir.join("by_id");
     let mut volumes = Vec::new();
@@ -406,10 +436,20 @@ fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
         if !has_pending && !has_segments {
             continue;
         }
-        // Skip readonly volumes that are already fully drained (no pending/).
-        // Readonly volumes with pending/ still need their import segments drained.
+        // Skip readonly volumes that are already fully indexed locally —
+        // either segments/ is non-empty (drain completed) or fetched/ is
+        // non-empty (prefetch completed). Include volumes with pending/ (need
+        // drain) or with both empty (pulled but not yet prefetched).
         if path.join("volume.readonly").exists() && !has_pending {
-            continue;
+            let dir_non_empty = |sub: &str| {
+                path.join(sub)
+                    .read_dir()
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(false)
+            };
+            if dir_non_empty("segments") || dir_non_empty("fetched") {
+                continue;
+            }
         }
         volumes.push(path);
     }
@@ -505,15 +545,38 @@ mod tests {
         mk(root, &format!("by_id/{ulid1}/segments"));
         mk(root, &format!("by_id/{ulid2}/pending"));
 
-        // Readonly volume with only segments/ — fully drained, must be skipped.
+        // Readonly volume with non-empty segments/ — fully drained, must be skipped.
         let ulid3 = "01JQCCCCCCCCCCCCCCCCCCCCCC";
         mk(root, &format!("by_id/{ulid3}/segments"));
+        std::fs::write(
+            root.join(format!("by_id/{ulid3}/segments/01JQAAAAAAAAAAAAAAAAAAAAA1")),
+            "",
+        )
+        .unwrap();
         std::fs::write(root.join(format!("by_id/{ulid3}/volume.readonly")), "").unwrap();
 
-        // Readonly volume with pending/ — newly imported, must be included for drain.
+        // Readonly volume with non-empty fetched/ — prefetch done, must be skipped.
+        let ulid6 = "01JQFFFFFFFFFFFFFFFFFFFFFF";
+        mk(root, &format!("by_id/{ulid6}/segments"));
+        mk(root, &format!("by_id/{ulid6}/fetched"));
+        std::fs::write(
+            root.join(format!(
+                "by_id/{ulid6}/fetched/01JQAAAAAAAAAAAAAAAAAAAAA1.idx"
+            )),
+            "",
+        )
+        .unwrap();
+        std::fs::write(root.join(format!("by_id/{ulid6}/volume.readonly")), "").unwrap();
+
+        // Readonly volume with empty segments/ and no fetched/ — pulled, needs prefetch.
         let ulid5 = "01JQEEEEEEEEEEEEEEEEEEEEEE";
-        mk(root, &format!("by_id/{ulid5}/pending"));
+        mk(root, &format!("by_id/{ulid5}/segments"));
         std::fs::write(root.join(format!("by_id/{ulid5}/volume.readonly")), "").unwrap();
+
+        // Readonly volume with pending/ — newly imported, must be included for drain.
+        let ulid7 = "01JQGGGGGGGGGGGGGGGGGGGGGG";
+        mk(root, &format!("by_id/{ulid7}/pending"));
+        std::fs::write(root.join(format!("by_id/{ulid7}/volume.readonly")), "").unwrap();
 
         // Non-ULID entry — must be skipped.
         mk(root, "by_id/not-a-ulid/segments");
@@ -535,6 +598,7 @@ mod tests {
                 format!("by_id/{ulid1}"),
                 format!("by_id/{ulid2}"),
                 format!("by_id/{ulid5}"),
+                format!("by_id/{ulid7}"),
             ]
         );
     }

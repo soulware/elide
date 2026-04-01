@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 
 use ext4_view::{Ext4, Ext4Read, FileType, PathBuf as Ext4PathBuf};
 
+use elide_core::segment::SegmentFetcher;
 use elide_core::{extentindex, lbamap, segment, volume, writelog};
+
+use crate::fetcher::{FetchConfig, ObjectStoreFetcher, ancestry_chain};
 
 /// Brief summary of a fork's ext4 filesystem, for use in inspect output.
 pub struct FsSummary {
@@ -161,6 +164,11 @@ struct VolumeReader {
     search_dirs: Vec<PathBuf>,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
+    /// Demand-fetcher: downloads a segment body from the object store on a miss.
+    /// `None` if no store is configured (local-only volumes always have their bodies).
+    fetcher: Option<Box<dyn SegmentFetcher>>,
+    /// Directory where demand-fetched `.body` files are written (`<fork>/fetched/`).
+    primary_fetched_dir: PathBuf,
 }
 
 impl VolumeReader {
@@ -226,10 +234,25 @@ impl VolumeReader {
             }
         }
 
+        // Try to configure demand-fetch from the object store.
+        // search_dirs is newest-first; ancestry_chain expects oldest-first.
+        let primary_fetched_dir = dir.join("fetched");
+        let data_dir = by_id_dir.parent().unwrap_or(by_id_dir);
+        let fetcher: Option<Box<dyn SegmentFetcher>> =
+            FetchConfig::load(data_dir).ok().flatten().and_then(|cfg| {
+                let fork_dirs: Vec<PathBuf> = search_dirs.iter().rev().cloned().collect();
+                let volume_ids = ancestry_chain(&fork_dirs).ok()?;
+                ObjectStoreFetcher::new(&cfg, volume_ids)
+                    .ok()
+                    .map(|f| Box::new(f) as Box<dyn SegmentFetcher>)
+            });
+
         Ok(Self {
             search_dirs,
             lbamap,
             extent_index,
+            fetcher,
+            primary_fetched_dir,
         })
     }
 
@@ -241,7 +264,21 @@ impl VolumeReader {
             return Ok([0u8; 4096]); // hash not indexed — treat as unwritten
         };
         let loc = loc.clone();
-        let path = find_segment_file(&self.search_dirs, &loc.segment_id)?;
+        let path = match find_segment_file(&self.search_dirs, &loc.segment_id) {
+            Ok(p) => p,
+            Err(_) => match &self.fetcher {
+                Some(fetcher) => {
+                    fetcher.fetch(&loc.segment_id, &self.primary_fetched_dir)?;
+                    find_segment_file(&self.search_dirs, &loc.segment_id)?
+                }
+                None => {
+                    return Err(io::Error::other(format!(
+                        "segment not found: {}",
+                        loc.segment_id
+                    )));
+                }
+            },
+        };
         let mut f = fs::File::open(path)?;
         let mut block = [0u8; 4096];
         if loc.compressed {
@@ -416,6 +453,13 @@ fn find_segment_file(search_dirs: &[PathBuf], segment_id: &str) -> io::Result<Pa
             if path.exists() {
                 return Ok(path);
             }
+        }
+        // Check for a demand-fetched body file. The `.body` file contains only
+        // the body section, and ExtentLocation.body_offset is body-relative for
+        // fetched entries, so seeking to body_offset in this file is correct.
+        let body = dir.join("fetched").join(format!("{segment_id}.body"));
+        if body.exists() {
+            return Ok(body);
         }
     }
     Err(io::Error::other(format!("segment not found: {segment_id}")))
