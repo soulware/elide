@@ -280,9 +280,9 @@ fn main() {
             VolumeCommand::Create { name, size } => {
                 let vol_dir = args.data_dir.join(&name);
                 create_volume(&vol_dir, size.as_deref()).expect("volume create failed");
-                if let Err(e) = coordinator_client::rescan(&socket_path) {
+                if coordinator_client::rescan(&socket_path).is_err() {
                     eprintln!(
-                        "warning: coordinator not running, volume will be picked up on next scan ({e})"
+                        "warning: coordinator not running; volume will be picked up on next scan"
                     );
                 }
             }
