@@ -211,8 +211,28 @@ impl Default for GcConfig {
 }
 
 /// Load and parse a `coordinator.toml` file.
+///
+/// If the file does not exist, returns a default config (all fields use their
+/// defaults: `data_dir = ./elide_data`, `store = ./elide_store`, etc.).
 pub fn load(path: &Path) -> Result<CoordinatorConfig> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config file: {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("parsing config file: {}", path.display()))
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text)
+            .with_context(|| format!("parsing config file: {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CoordinatorConfig::default()),
+        Err(e) => Err(e).with_context(|| format!("reading config file: {}", path.display())),
+    }
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: default_data_dir(),
+            socket_path: None,
+            store: StoreSection::default(),
+            drain: DrainConfig::default(),
+            elide_bin: default_elide_bin(),
+            elide_import_bin: default_elide_import_bin(),
+            gc: GcConfig::default(),
+        }
+    }
 }
