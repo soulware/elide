@@ -291,7 +291,7 @@ async fn fork_loop(
             let prewarm_store = store.clone();
             let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_owned();
             match tokio::task::spawn_blocking(move || {
-                elide_fetch::prewarm_ext4_metadata(
+                elide_fetch::prewarm_volume_start(
                     &prewarm_dir,
                     &by_id_dir,
                     prewarm_store,
@@ -300,7 +300,7 @@ async fn fork_loop(
             })
             .await
             {
-                Ok(Ok(())) => info!("[prewarm {volume_id}{volume_name}] ext4 metadata pre-warmed"),
+                Ok(Ok(())) => info!("[prewarm {volume_id}{volume_name}] volume start pre-warmed"),
                 Ok(Err(e)) => warn!("[prewarm {volume_id}{volume_name}] {e}"),
                 Err(e) => warn!("[prewarm {volume_id}{volume_name}] task error: {e}"),
             }

@@ -470,26 +470,17 @@ pub fn ancestry_chain(fork_dirs: &[PathBuf]) -> io::Result<Vec<String>> {
     fork_dirs.iter().map(|d| derive_volume_id(d)).collect()
 }
 
-// --- ext4 pre-warm ---
+// --- volume pre-warm ---
 
-/// ext4 superblock magic (little-endian `0xEF53` at byte offset 1080 from disk start).
-const EXT4_MAGIC: u16 = 0xEF53;
-/// Byte offset of the ext4 magic within the first 4 KiB LBA block.
-/// Superblock starts at disk byte 1024; magic field is at superblock offset +56.
-const EXT4_MAGIC_OFFSET: usize = 1080;
-
-/// Pre-warm ext4 structural metadata for a readonly (fetched) volume.
+/// Pre-warm the start of a readonly (fetched) volume.
 ///
-/// Demand-fetches LBAs 0 and 1 (the first 8 KiB of the disk), which contain:
-///   - The ext4 superblock (at byte offset 1024)
-///   - The block group descriptor table (at block 1 for 4 KiB block ext4)
+/// Demand-fetches LBAs 0 and 1 (the first 8 KiB of the disk) into the local
+/// fetched cache. These blocks are almost universally accessed on first use
+/// regardless of filesystem type, so pre-fetching them on pull avoids cold
+/// round-trips.
 ///
-/// These are unconditionally required for any ext4 operation. Pre-fetching
-/// them on pull avoids a cold round-trip on first use.
-///
-/// If the volume is not ext4 (magic mismatch), returns `Ok(())` silently.
-/// If the volume is not yet indexed (no `.idx` files), returns `Ok(())` silently.
-pub fn prewarm_ext4_metadata(
+/// Returns `Ok(())` silently if the volume is not yet indexed.
+pub fn prewarm_volume_start(
     fork_dir: &Path,
     by_id_dir: &Path,
     store: Arc<dyn ObjectStore>,
@@ -514,21 +505,9 @@ pub fn prewarm_ext4_metadata(
     let mut vol = ReadonlyVolume::open(fork_dir, by_id_dir)?;
     vol.set_fetcher(fetcher);
 
-    // LBA 0: 4 KiB block containing the ext4 superblock at byte offset 1024.
-    let block0 = vol.read(0, 1)?;
+    vol.read(0, 2)?;
 
-    if block0.len() < EXT4_MAGIC_OFFSET + 2 {
-        return Ok(()); // volume too small to be ext4
-    }
-    let magic = u16::from_le_bytes([block0[EXT4_MAGIC_OFFSET], block0[EXT4_MAGIC_OFFSET + 1]]);
-    if magic != EXT4_MAGIC {
-        return Ok(()); // not ext4
-    }
-
-    // LBA 1: block group descriptor table (for 4 KiB block ext4).
-    vol.read(1, 1)?;
-
-    tracing::info!("[prewarm] ext4 metadata pre-warmed: {}", fork_dir.display());
+    tracing::info!("[prewarm] volume start pre-warmed: {}", fork_dir.display());
     Ok(())
 }
 

@@ -389,12 +389,14 @@ impl VolumeHandle {
             &snap.lbamap,
             &snap.extent_index,
             &self.file_cache,
-            |id, _, _| {
+            |id, bss, idx| {
                 find_segment_in_dirs(
                     id,
                     &self.config.base_dir,
                     &self.config.ancestor_layers,
                     self.config.fetcher.as_ref(),
+                    bss,
+                    idx,
                 )
             },
         )

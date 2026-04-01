@@ -417,7 +417,7 @@ impl Volume {
             &self.lbamap,
             &self.extent_index,
             &self.file_cache,
-            |id, _, _| self.find_segment_file(id),
+            |id, bss, idx| self.find_segment_file(id, bss, idx),
         )
     }
 
@@ -1058,12 +1058,19 @@ impl Volume {
     /// files (`fetched/<id>.body`), the file IS the body section, so reads use
     /// body-relative offsets — consistent with how `extentindex::rebuild` stores
     /// offsets for fetched entries.
-    fn find_segment_file(&self, segment_id: &str) -> io::Result<PathBuf> {
+    fn find_segment_file(
+        &self,
+        segment_id: &str,
+        body_section_start: Option<u64>,
+        entry_idx: Option<u32>,
+    ) -> io::Result<PathBuf> {
         find_segment_in_dirs(
             segment_id,
             &self.base_dir,
             &self.ancestor_layers,
             self.fetcher.as_ref(),
+            body_section_start,
+            entry_idx,
         )
     }
 
@@ -1178,10 +1185,14 @@ pub(crate) fn read_extents(
             )
         };
 
-        // Reuse the cached file handle if it is for the same segment;
-        // otherwise open the new segment and replace the cache entry.
+        // Reuse the cached file handle if it is for the same segment.
+        // For fetched entries (entry_idx.is_some()), always call find_segment to
+        // check the .present bitset — the .body file may exist but the specific
+        // entry may not yet be fetched.
         let mut cache = file_cache.borrow_mut();
-        if cache.as_ref().map(|(id, _)| id.as_str()) != Some(segment_id.as_str()) {
+        let need_find = cache.as_ref().map(|(id, _)| id.as_str()) != Some(segment_id.as_str())
+            || entry_idx.is_some();
+        if need_find {
             let path = find_segment(&segment_id, body_section_start, entry_idx)?;
             *cache = Some((segment_id, fs::File::open(path)?));
         }
@@ -1223,6 +1234,10 @@ pub(crate) fn read_extents(
 ///   2. Ancestor forks (newest-first): `pending/`, `segments/`, `fetched/<id>.body`
 ///   3. Demand-fetch via fetcher (writes three-file format to `fetched/`)
 ///
+/// When `entry_idx` is `Some`, a `fetched/<id>.body` hit is only accepted if
+/// the corresponding bit in `fetched/<id>.present` is set — otherwise the entry
+/// is not yet locally available and we fall through to the fetcher.
+///
 /// Extracted from `Volume::find_segment_file` so that `VolumeHandle` can serve
 /// reads directly from a `ReadSnapshot` without going through the actor channel.
 pub(crate) fn find_segment_in_dirs(
@@ -1230,6 +1245,8 @@ pub(crate) fn find_segment_in_dirs(
     base_dir: &Path,
     ancestor_layers: &[AncestorLayer],
     fetcher: Option<&BoxFetcher>,
+    body_section_start: Option<u64>,
+    entry_idx: Option<u32>,
 ) -> io::Result<PathBuf> {
     for subdir in ["wal", "pending", "segments"] {
         let path = base_dir.join(subdir).join(segment_id);
@@ -1239,7 +1256,16 @@ pub(crate) fn find_segment_in_dirs(
     }
     let fetched_body = base_dir.join("fetched").join(format!("{segment_id}.body"));
     if fetched_body.exists() {
-        return Ok(fetched_body);
+        let entry_present = entry_idx.is_none_or(|idx| {
+            let present_path = base_dir
+                .join("fetched")
+                .join(format!("{segment_id}.present"));
+            segment::check_present_bit(&present_path, idx).unwrap_or(false)
+        });
+        if entry_present {
+            return Ok(fetched_body);
+        }
+        // Entry not yet fetched — fall through to fetcher below.
     }
     for layer in ancestor_layers.iter().rev() {
         for subdir in ["pending", "segments"] {
@@ -1250,12 +1276,28 @@ pub(crate) fn find_segment_in_dirs(
         }
         let fetched_body = layer.dir.join("fetched").join(format!("{segment_id}.body"));
         if fetched_body.exists() {
-            return Ok(fetched_body);
+            let entry_present = entry_idx.is_none_or(|idx| {
+                let present_path = layer
+                    .dir
+                    .join("fetched")
+                    .join(format!("{segment_id}.present"));
+                segment::check_present_bit(&present_path, idx).unwrap_or(false)
+            });
+            if entry_present {
+                return Ok(fetched_body);
+            }
         }
     }
     if let Some(fetcher) = fetcher {
         let fetched_dir = base_dir.join("fetched");
-        fetcher.fetch(segment_id, &fetched_dir)?;
+        match (body_section_start, entry_idx) {
+            (Some(bss), Some(idx)) => {
+                fetcher.fetch_extent(segment_id, &fetched_dir, bss, 0, 0, idx)?;
+            }
+            _ => {
+                fetcher.fetch(segment_id, &fetched_dir)?;
+            }
+        }
         return Ok(base_dir.join("fetched").join(format!("{segment_id}.body")));
     }
     Err(io::Error::other(format!("segment not found: {segment_id}")))
@@ -1280,7 +1322,7 @@ fn acquire_lock(dir: &Path) -> io::Result<nix::fcntl::Flock<fs::File>> {
 /// Reads work identically to `Volume`; writes and fsyncs are not supported.
 pub struct ReadonlyVolume {
     base_dir: PathBuf,
-    ancestor_dirs: Vec<PathBuf>,
+    ancestor_layers: Vec<AncestorLayer>,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
     file_cache: RefCell<Option<(String, fs::File)>>,
@@ -1302,10 +1344,9 @@ impl ReadonlyVolume {
             .collect();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
         let extent_index = extentindex::rebuild(&rebuild_chain)?;
-        let ancestor_dirs = ancestor_layers.into_iter().map(|l| l.dir).collect();
         Ok(Self {
             base_dir: fork_dir.to_owned(),
-            ancestor_dirs,
+            ancestor_layers,
             lbamap,
             extent_index,
             file_cache: RefCell::new(None),
@@ -1332,47 +1373,14 @@ impl ReadonlyVolume {
         body_section_start: Option<u64>,
         entry_idx: Option<u32>,
     ) -> io::Result<PathBuf> {
-        for subdir in ["pending", "segments"] {
-            let path = self.base_dir.join(subdir).join(segment_id);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-        let fetched_body = self
-            .base_dir
-            .join("fetched")
-            .join(format!("{segment_id}.body"));
-        if fetched_body.exists() {
-            return Ok(fetched_body);
-        }
-        for dir in self.ancestor_dirs.iter().rev() {
-            for subdir in ["pending", "segments"] {
-                let path = dir.join(subdir).join(segment_id);
-                if path.exists() {
-                    return Ok(path);
-                }
-            }
-            let fetched_body = dir.join("fetched").join(format!("{segment_id}.body"));
-            if fetched_body.exists() {
-                return Ok(fetched_body);
-            }
-        }
-        if let Some(fetcher) = &self.fetcher {
-            let fetched_dir = self.base_dir.join("fetched");
-            match (body_section_start, entry_idx) {
-                (Some(bss), Some(idx)) => {
-                    fetcher.fetch_extent(segment_id, &fetched_dir, bss, 0, 0, idx)?;
-                }
-                _ => {
-                    fetcher.fetch(segment_id, &fetched_dir)?;
-                }
-            }
-            return Ok(self
-                .base_dir
-                .join("fetched")
-                .join(format!("{segment_id}.body")));
-        }
-        Err(io::Error::other(format!("segment not found: {segment_id}")))
+        find_segment_in_dirs(
+            segment_id,
+            &self.base_dir,
+            &self.ancestor_layers,
+            self.fetcher.as_ref(),
+            body_section_start,
+            entry_idx,
+        )
     }
 
     /// Attach a `SegmentFetcher` for demand-fetch on segment cache miss.
@@ -1383,9 +1391,9 @@ impl ReadonlyVolume {
     /// Return all fork directories in the ancestry chain, oldest-first,
     /// with the current fork last.
     pub fn fork_dirs(&self) -> Vec<PathBuf> {
-        self.ancestor_dirs
+        self.ancestor_layers
             .iter()
-            .cloned()
+            .map(|l| l.dir.clone())
             .chain(std::iter::once(self.base_dir.clone()))
             .collect()
     }
