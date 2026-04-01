@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use object_store::ObjectStore;
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
@@ -37,6 +38,7 @@ use tracing::{error, info, warn};
 use crate::config::CoordinatorConfig;
 use crate::control;
 use crate::gc;
+use crate::inbound;
 use crate::serve_config;
 use crate::supervisor;
 use crate::upload;
@@ -46,16 +48,30 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     let scan_interval = Duration::from_secs(config.drain.scan_interval_secs);
     let elide_bin = config.elide_bin.clone();
     let gc_config = config.gc.clone();
+    let socket_path = config.resolved_socket_path();
+    let roots = Arc::new(config.roots.clone());
 
     info!(
         "[coordinator] watching {} root(s); drain every {}s, scan every {}s; elide bin: {}",
-        config.roots.len(),
+        roots.len(),
         config.drain.interval_secs,
         config.drain.scan_interval_secs,
         elide_bin.display(),
     );
-    for root in &config.roots {
+    for root in roots.iter() {
         info!("[coordinator] root: {}", root.display());
+    }
+
+    // Shared notify: inbound socket triggers this to request an immediate rescan.
+    let rescan_notify = Arc::new(Notify::new());
+
+    // Spawn the inbound socket server.
+    {
+        let roots = roots.clone();
+        let notify = rescan_notify.clone();
+        tokio::spawn(async move {
+            inbound::serve(&socket_path, roots, notify).await;
+        });
     }
 
     let mut known: HashSet<PathBuf> = HashSet::new();
@@ -67,7 +83,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     scan_tick.tick().await;
 
     loop {
-        let forks = discover_forks(&config.roots);
+        let forks = discover_forks(&roots);
         for fork_dir in forks {
             if known.insert(fork_dir.clone()) {
                 info!("[coordinator] discovered fork: {}", fork_dir.display());
@@ -103,6 +119,9 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
         tokio::select! {
             _ = scan_tick.tick() => {}
+            _ = rescan_notify.notified() => {
+                info!("[coordinator] rescan triggered via socket");
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("[coordinator] shutting down");
                 tasks.abort_all();

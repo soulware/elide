@@ -10,6 +10,7 @@ mod config;
 mod control;
 mod daemon;
 mod gc;
+mod inbound;
 mod prefetch;
 mod serve_config;
 mod store;

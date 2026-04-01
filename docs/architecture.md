@@ -227,17 +227,24 @@ elide-coordinator serve --daemon                       # detach and run in backg
 
 ### Finding the coordinator socket
 
-The `elide` CLI locates the coordinator inbound socket in this order:
+Every managed process has a `control.sock` in its own directory. The directory structure is the namespace:
 
-1. `--coordinator <path>` flag
-2. `ELIDE_COORDINATOR_SOCK` environment variable
-3. Same directory as `coordinator.toml` (if `--config` is given)
-4. `~/.elide/coordinator.sock` (user default)
-5. `/run/elide/coordinator.sock` (system default)
+```
+<data-dir>/
+  control.sock                      ← coordinator inbound (CLI talks here)
+  <volume>/forks/<fork>/
+    control.sock                    ← volume process control (coordinator talks here)
+```
+
+The `elide` CLI derives the coordinator socket path from `--data-dir`:
+
+1. `--data-dir <path>` flag → `<path>/control.sock`
+2. `ELIDE_DATA_DIR` environment variable → `<value>/control.sock`
+3. `./elide_data/control.sock` (default)
 
 ## Proposed: Coordinator inbound socket
 
-The coordinator listens on an inbound socket (`coordinator.sock`, alongside `coordinator.toml`) for commands from the `elide` CLI. This is distinct from the per-fork `control.sock` that the coordinator uses to talk to volume processes.
+The coordinator listens on `<data-dir>/control.sock` for commands from the `elide` CLI. Volume processes each listen on `<fork-dir>/control.sock` for commands from the coordinator. Same socket name, different directory level — the path encodes what you're talking to.
 
 Same text line protocol as the volume control socket: `<op> [args...]\n` → `ok [values...]\n` / `err <message>\n`.
 
@@ -342,7 +349,7 @@ The coordinator holds a **root key** (random bytes, generated at first start, st
 The PID is only known after the volume process is spawned, so the macaroon cannot be minted before spawn. Instead, the volume registers with the coordinator on startup:
 
 1. Coordinator spawns volume process, records PID in `volume.pid`
-2. Volume connects to `coordinator.sock` and sends `register <volume> <fork>`
+2. Volume connects to `control.sock` and sends `register <volume> <fork>`
 3. Coordinator reads `SO_PEERCRED` from the Unix socket connection → obtains peer PID
 4. Coordinator cross-checks: is this PID the one recorded in `volume.pid` for `<volume>/<fork>`? If not, reject
 5. Coordinator mints a macaroon with the caveats above (including `pid = <peer-pid>`) and responds with it
@@ -352,7 +359,7 @@ The PID is only known after the volume process is spawned, so the macaroon canno
 
 When the volume needs S3 credentials (at startup or before expiry):
 
-1. Volume sends `credentials <macaroon>` to `coordinator.sock`
+1. Volume sends `credentials <macaroon>` to `control.sock`
 2. Coordinator verifies the HMAC chain (proves it minted this token)
 3. Coordinator checks all caveats: volume/fork match, scope is `credentials`, `pid` matches `SO_PEERCRED` of the current connection
 4. Coordinator issues short-lived read-only STS credentials (or equivalent) scoped to the volume's S3 prefix

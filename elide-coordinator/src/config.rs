@@ -37,6 +37,10 @@ pub struct CoordinatorConfig {
     /// Root directories to watch for volumes and forks.
     pub roots: Vec<PathBuf>,
 
+    /// Path to the coordinator inbound socket.
+    /// Defaults to `<roots[0]>/coordinator.sock`.
+    pub socket_path: Option<PathBuf>,
+
     /// Object store configuration.
     pub store: StoreSection,
 
@@ -52,6 +56,18 @@ pub struct CoordinatorConfig {
     /// GC configuration.
     #[serde(default)]
     pub gc: GcConfig,
+}
+
+impl CoordinatorConfig {
+    /// Resolve the socket path: explicit config value, or `<roots[0]>/coordinator.sock`.
+    pub fn resolved_socket_path(&self) -> PathBuf {
+        self.socket_path.clone().unwrap_or_else(|| {
+            self.roots
+                .first()
+                .map(|r| r.join("control.sock"))
+                .unwrap_or_else(|| PathBuf::from("coordinator.sock"))
+        })
+    }
 }
 
 fn default_elide_bin() -> PathBuf {

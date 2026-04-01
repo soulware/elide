@@ -7,6 +7,7 @@ use elide_core::signing::{FORK_KEY_FILE, FORK_ORIGIN_FILE, FORK_PUB_FILE};
 use elide_core::volume;
 
 mod control;
+mod coordinator_client;
 mod extents;
 mod fetcher;
 mod inspect;
@@ -17,6 +18,15 @@ mod nbd;
 /// Elide volume management and analysis tools.
 #[derive(Parser)]
 struct Args {
+    /// Directory containing volumes and the coordinator socket.
+    #[arg(
+        long,
+        env = "ELIDE_DATA_DIR",
+        default_value = "elide_data",
+        global = true
+    )]
+    data_dir: PathBuf,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -116,11 +126,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum VolumeCommand {
-    /// List all volumes in a directory
-    List {
-        /// Directory containing volumes
-        data_dir: PathBuf,
-    },
+    /// List all volumes in the data directory
+    List,
 
     /// Show a human-readable summary of a volume
     Info {
@@ -158,13 +165,19 @@ enum VolumeCommand {
         from: String,
     },
 
-    /// Create a new volume directory structure
+    /// Create a new volume
     Create {
-        /// Path for the new volume
-        vol_dir: PathBuf,
+        /// Volume name
+        name: String,
         /// Volume size (e.g. "4G", "512M")
         #[arg(long)]
         size: Option<String>,
+    },
+
+    /// Show the running status of a volume
+    Status {
+        /// Volume name
+        name: String,
     },
 }
 
@@ -180,10 +193,12 @@ fn main() {
 
     let args = Args::parse();
 
+    let socket_path = args.data_dir.join("control.sock");
+
     match args.command {
         Command::Volume { command } => match command {
-            VolumeCommand::List { data_dir } => {
-                list_volumes(&data_dir).expect("volume list failed");
+            VolumeCommand::List => {
+                list_volumes(&args.data_dir).expect("volume list failed");
             }
 
             VolumeCommand::Info { vol_dir } => {
@@ -221,8 +236,27 @@ fn main() {
                 println!("{}", fork_dir.display());
             }
 
-            VolumeCommand::Create { vol_dir, size } => {
+            VolumeCommand::Create { name, size } => {
+                let vol_dir = args.data_dir.join(&name);
                 create_volume(&vol_dir, size.as_deref()).expect("volume create failed");
+                if let Err(e) = coordinator_client::rescan(&socket_path) {
+                    eprintln!(
+                        "warning: coordinator not running, volume will be picked up on next scan ({e})"
+                    );
+                }
+            }
+
+            VolumeCommand::Status { name } => {
+                let resp = coordinator_client::status(&socket_path, &name)
+                    .unwrap_or_else(|e| format!("err {e}"));
+                match resp.split_once(' ') {
+                    Some(("ok", rest)) => println!("{name}: {rest}"),
+                    Some(("err", msg)) => {
+                        eprintln!("{name}: {msg}");
+                        std::process::exit(1);
+                    }
+                    _ => println!("{name}: {resp}"),
+                }
             }
         },
 

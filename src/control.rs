@@ -67,9 +67,14 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, handle: &VolumeHand
     let mut writer = &stream;
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
+        // Caller disconnected before sending a request — not an error.
         return;
     }
     let line = line.trim();
+    if line.is_empty() {
+        let _ = writeln!(writer, "err empty request");
+        return;
+    }
     if line == "flush" {
         match handle.flush() {
             Ok(()) => {
