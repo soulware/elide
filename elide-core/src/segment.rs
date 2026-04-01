@@ -72,10 +72,30 @@ pub trait SegmentSigner: Send + Sync {
 /// `elide-core` is synchronous; async fetchers must wrap their runtime (e.g.
 /// `Runtime::block_on`) inside this interface.
 pub trait SegmentFetcher: Send + Sync {
-    /// Fetch `segment_id` from remote storage and write the three-file fetched
-    /// format into `fetched_dir`. Returns `Ok(())` on success or an error if
-    /// the segment cannot be fetched.
+    /// Fetch the full segment body and write the three-file fetched format
+    /// (`.idx`, `.body`, `.present`) into `fetched_dir`.
     fn fetch(&self, segment_id: &str, fetched_dir: &Path) -> io::Result<()>;
+
+    /// Fetch a single extent and write it into `fetched_dir/<segment_id>.body`
+    /// at `body_offset`, then set bit `entry_idx` in `.present`.
+    ///
+    /// `body_section_start` is the absolute offset of the body section within
+    /// the segment file in the store (from the `.idx` header). The range-GET
+    /// covers `[body_section_start + body_offset, … + body_length)`.
+    ///
+    /// The default implementation fetches the entire segment body; override
+    /// for efficient per-extent range-GETs.
+    fn fetch_extent(
+        &self,
+        segment_id: &str,
+        fetched_dir: &Path,
+        _body_section_start: u64,
+        _body_offset: u64,
+        _body_length: u32,
+        _entry_idx: u32,
+    ) -> io::Result<()> {
+        self.fetch(segment_id, fetched_dir)
+    }
 }
 
 /// Convenience alias for an optional heap-allocated `SegmentFetcher`.
@@ -567,6 +587,57 @@ pub fn collect_fetched_idx_files(fetched_dir: &Path) -> io::Result<Vec<PathBuf>>
     }
 }
 
+// --- .present bitset helpers ---
+
+/// Read `entry_count` from the 96-byte header of a segment or `.idx` file.
+///
+/// `entry_count` is stored at bytes 8–12 (little-endian u32). Used when
+/// creating or resizing the `.present` bitset for per-extent fetching.
+pub fn read_entry_count(path: &Path) -> io::Result<u32> {
+    let mut f = fs::File::open(path)?;
+    let mut h = [0u8; 12];
+    f.read_exact(&mut h)?;
+    if &h[0..8] != MAGIC {
+        return Err(io::Error::other("bad segment magic"));
+    }
+    Ok(u32::from_le_bytes([h[8], h[9], h[10], h[11]]))
+}
+
+/// Return `true` if bit `entry_idx` is set in the `.present` file at `path`.
+///
+/// Returns `false` if the file does not exist or is too short (treat as not
+/// present so the caller demand-fetches the extent).
+pub fn check_present_bit(path: &Path, entry_idx: u32) -> io::Result<bool> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let byte_idx = (entry_idx / 8) as usize;
+            let bit = entry_idx % 8;
+            Ok(bytes.get(byte_idx).is_some_and(|b| b & (1 << bit) != 0))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Set bit `entry_idx` in the `.present` file at `path`.
+///
+/// Creates the file (all-zero, sized for `entry_count` entries) if absent.
+/// The file is written in place — no tmp+rename — since the `.present` file
+/// is a cache: losing a bit on crash just causes a re-fetch on next access.
+pub fn set_present_bit(path: &Path, entry_idx: u32, entry_count: u32) -> io::Result<()> {
+    let bitset_len = (entry_count as usize).div_ceil(8);
+    let mut bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => vec![0u8; bitset_len],
+        Err(e) => return Err(e),
+    };
+    if bytes.len() < bitset_len {
+        bytes.resize(bitset_len, 0);
+    }
+    bytes[entry_idx as usize / 8] |= 1 << (entry_idx % 8);
+    fs::write(path, &bytes)
+}
+
 /// Sort segment paths for rebuild, with GC output segments first.
 ///
 /// GC output segments — identified by a corresponding
@@ -995,5 +1066,94 @@ mod tests {
         // GC output comes first regardless of ULID order so the regular
         // segment (higher priority) is processed last and wins on rebuild.
         assert_eq!(paths, vec![gc_path, reg_path]);
+    }
+
+    // --- .present bitset helpers ---
+
+    #[test]
+    fn present_bit_missing_file_returns_false() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.present");
+        assert!(!check_present_bit(&path, 0).unwrap());
+        assert!(!check_present_bit(&path, 7).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn present_bit_set_and_query() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.present");
+
+        set_present_bit(&path, 0, 8).unwrap();
+        assert!(check_present_bit(&path, 0).unwrap());
+        assert!(!check_present_bit(&path, 1).unwrap());
+        assert!(!check_present_bit(&path, 7).unwrap());
+
+        set_present_bit(&path, 7, 8).unwrap();
+        assert!(check_present_bit(&path, 0).unwrap());
+        assert!(check_present_bit(&path, 7).unwrap());
+        assert!(!check_present_bit(&path, 1).unwrap());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn present_bit_crosses_byte_boundary() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.present");
+
+        // 16 entries → 2 bytes. Set bit 8 (first bit of second byte).
+        set_present_bit(&path, 8, 16).unwrap();
+        assert!(!check_present_bit(&path, 7).unwrap());
+        assert!(check_present_bit(&path, 8).unwrap());
+        assert!(!check_present_bit(&path, 9).unwrap());
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 0x01);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn set_present_bit_resizes_short_file() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.present");
+
+        // Write a 1-byte file, then set a bit in the (non-existent) second byte.
+        fs::write(&path, &[0u8]).unwrap();
+        set_present_bit(&path, 8, 16).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(bytes[1] & 0x01, 0x01);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_entry_count_from_segment_file() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let data = vec![0xAAu8; 4096];
+        let hash = blake3::hash(&data);
+        let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
+        let path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        write_segment(&path, &mut entries, None).unwrap();
+
+        assert_eq!(read_entry_count(&path).unwrap(), 1);
+
+        // Also works on a .idx file (same header format).
+        let full_bytes = fs::read(&path).unwrap();
+        let (bss, _) = read_segment_index(&path).unwrap();
+        let idx_path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA.idx");
+        fs::write(&idx_path, &full_bytes[..bss as usize]).unwrap();
+        assert_eq!(read_entry_count(&idx_path).unwrap(), 1);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }

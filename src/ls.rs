@@ -219,6 +219,8 @@ impl VolumeReader {
                                 body_offset,
                                 body_length: data.len() as u32,
                                 compressed: flags & writelog::FLAG_COMPRESSED != 0,
+                                entry_idx: None,
+                                body_section_start: None,
                             },
                         );
                     }
@@ -256,6 +258,18 @@ impl VolumeReader {
         })
     }
 
+    /// Find the `fetched/` directory that holds the `.idx` file for `segment_id`.
+    /// Returns `None` if not found in any search dir (fall back to primary).
+    fn find_fetched_dir(&self, segment_id: &str) -> Option<PathBuf> {
+        for dir in &self.search_dirs {
+            let idx = dir.join("fetched").join(format!("{segment_id}.idx"));
+            if idx.exists() {
+                return Some(dir.join("fetched"));
+            }
+        }
+        None
+    }
+
     fn read_block(&self, lba: u64) -> io::Result<[u8; 4096]> {
         let Some((hash, block_offset)) = self.lbamap.lookup(lba) else {
             return Ok([0u8; 4096]); // unwritten block — return zeros
@@ -264,20 +278,52 @@ impl VolumeReader {
             return Ok([0u8; 4096]); // hash not indexed — treat as unwritten
         };
         let loc = loc.clone();
+
+        // Per-extent demand-fetch for fetched entries (have entry_idx and body_section_start).
+        if let (Some(entry_idx), Some(bss)) = (loc.entry_idx, loc.body_section_start) {
+            let fetched_dir = self
+                .find_fetched_dir(&loc.segment_id)
+                .unwrap_or_else(|| self.primary_fetched_dir.clone());
+            let present_path = fetched_dir.join(format!("{}.present", loc.segment_id));
+            if !segment::check_present_bit(&present_path, entry_idx)? {
+                match &self.fetcher {
+                    Some(fetcher) => fetcher.fetch_extent(
+                        &loc.segment_id,
+                        &fetched_dir,
+                        bss,
+                        loc.body_offset,
+                        loc.body_length,
+                        entry_idx,
+                    )?,
+                    None => {
+                        return Err(io::Error::other(format!(
+                            "extent {}[{}] not cached and no fetcher configured",
+                            loc.segment_id, entry_idx
+                        )));
+                    }
+                }
+            }
+        }
+
         let path = match find_segment_file(&self.search_dirs, &loc.segment_id) {
             Ok(p) => p,
-            Err(_) => match &self.fetcher {
-                Some(fetcher) => {
-                    fetcher.fetch(&loc.segment_id, &self.primary_fetched_dir)?;
-                    find_segment_file(&self.search_dirs, &loc.segment_id)?
+            Err(_) if loc.entry_idx.is_none() => {
+                // Full-segment fallback: entry has no entry_idx (local segment
+                // that was evicted). Download the whole body.
+                match &self.fetcher {
+                    Some(fetcher) => {
+                        fetcher.fetch(&loc.segment_id, &self.primary_fetched_dir)?;
+                        find_segment_file(&self.search_dirs, &loc.segment_id)?
+                    }
+                    None => {
+                        return Err(io::Error::other(format!(
+                            "segment not found: {}",
+                            loc.segment_id
+                        )));
+                    }
                 }
-                None => {
-                    return Err(io::Error::other(format!(
-                        "segment not found: {}",
-                        loc.segment_id
-                    )));
-                }
-            },
+            }
+            Err(e) => return Err(e),
         };
         let mut f = fs::File::open(path)?;
         let mut block = [0u8; 4096];
@@ -402,6 +448,90 @@ mod tests {
             "ancestor block must be visible through symlink path"
         );
         assert_eq!(reader.read_block(1).unwrap(), [0u8; 4096]);
+    }
+
+    /// VolumeReader triggers per-extent demand-fetch when the `.present` bit is
+    /// unset: the `.body` file is written, the bit is set, and the block reads back
+    /// correctly.
+    #[test]
+    fn volume_reader_per_extent_demand_fetch() {
+        use object_store::ObjectStore;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as StorePath;
+        use std::sync::Arc;
+
+        let data_dir = TempDir::new().unwrap();
+        let by_id = data_dir.path().join("by_id");
+        let store_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(&by_id).unwrap();
+
+        // Write fetch.toml in data_dir pointing to the local store.
+        std::fs::write(
+            data_dir.path().join("fetch.toml"),
+            format!(
+                "local_path = {:?}\n",
+                store_dir.path().to_string_lossy().as_ref()
+            ),
+        )
+        .unwrap();
+
+        let vol_dir = new_vol_dir(&by_id);
+        let vol_id = vol_dir.file_name().unwrap().to_str().unwrap().to_owned();
+
+        // Write LBA 0 and snapshot so the data lands in pending/.
+        write_and_snapshot(&vol_dir, &by_id, 0, 0xAB);
+
+        // Find the segment in pending/.
+        let pending_dir = vol_dir.join("pending");
+        let seg_entry = std::fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap();
+        let seg_path = seg_entry.path();
+        let seg_id = seg_path.file_name().unwrap().to_str().unwrap().to_owned();
+
+        // Read the segment bytes and compute bss before removing the local copy.
+        let seg_bytes = std::fs::read(&seg_path).unwrap();
+        let (bss, _) = elide_core::segment::read_segment_index(&seg_path).unwrap();
+
+        // Upload the full segment to the local store, then remove the pending copy.
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_dir.path()).unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let seg_ulid: ulid::Ulid = seg_id.parse().unwrap();
+        let dt: chrono::DateTime<chrono::Utc> = seg_ulid.datetime().into();
+        let date = dt.format("%Y%m%d").to_string();
+        let key = StorePath::from(format!("by_id/{vol_id}/{date}/{seg_id}"));
+        rt.block_on(store.put(&key, seg_bytes.clone().into()))
+            .unwrap();
+        std::fs::remove_file(&seg_path).unwrap();
+        let fetched_dir = vol_dir.join("fetched");
+        std::fs::create_dir_all(&fetched_dir).unwrap();
+        std::fs::write(
+            fetched_dir.join(format!("{seg_id}.idx")),
+            &seg_bytes[..bss as usize],
+        )
+        .unwrap();
+
+        // VolumeReader should configure a fetcher from fetch.toml and trigger
+        // per-extent fetch on the first read_block(0).
+        let reader = VolumeReader::open(&vol_dir).unwrap();
+        let block = reader.read_block(0).unwrap();
+        assert_eq!(
+            block, [0xABu8; 4096],
+            "fetched block must match written data"
+        );
+
+        // .body and .present must have been created by the demand-fetch.
+        assert!(
+            fetched_dir.join(format!("{seg_id}.body")).exists(),
+            ".body should be created"
+        );
+        assert!(
+            fetched_dir.join(format!("{seg_id}.present")).exists(),
+            ".present should be created"
+        );
     }
 
     /// A fork's own writes shadow the ancestor's data for the same LBA.

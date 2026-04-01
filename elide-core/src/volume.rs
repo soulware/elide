@@ -393,6 +393,8 @@ impl Volume {
                 body_offset,
                 body_length: owned_data.len() as u32,
                 compressed,
+                entry_idx: None,
+                body_section_start: None,
             },
         );
         self.pending_entries.push(segment::SegmentEntry::new_data(
@@ -544,6 +546,8 @@ impl Volume {
                                 body_offset: new_bss + entry.stored_offset,
                                 body_length: entry.stored_length,
                                 compressed: entry.compressed,
+                                entry_idx: None,
+                                body_section_start: None,
                             },
                         );
                     }
@@ -722,6 +726,8 @@ impl Volume {
                             body_offset: new_bss + entry.stored_offset,
                             body_length: entry.stored_length,
                             compressed: entry.compressed,
+                            entry_idx: None,
+                            body_section_start: None,
                         },
                     );
                 }
@@ -885,6 +891,8 @@ impl Volume {
                             body_offset: body_section_start + e.stored_offset,
                             body_length: e.stored_length,
                             compressed: e.compressed,
+                            entry_idx: None,
+                            body_section_start: None,
                         },
                     );
                 }
@@ -954,6 +962,8 @@ impl Volume {
                     body_offset: body_section_start + entry.stored_offset,
                     body_length: entry.stored_length,
                     compressed: entry.compressed,
+                    entry_idx: None,
+                    body_section_start: None,
                 },
             );
         }
@@ -1541,6 +1551,8 @@ fn recover_wal(
                         body_offset,
                         body_length,
                         compressed,
+                        entry_idx: None,
+                        body_section_start: None,
                     },
                 );
                 pending_entries.push(segment::SegmentEntry::new_data(

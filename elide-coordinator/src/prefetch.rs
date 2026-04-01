@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
+use tracing::{info, warn};
 use ulid::Ulid;
 
 use elide_core::volume::walk_ancestors;
@@ -128,10 +129,11 @@ async fn prefetch_layer(
 
         match fetch_idx(store, key, layer_dir, ulid_str).await {
             Ok(()) => {
+                info!("[prefetch] fetched index: {ulid_str}");
                 result.fetched += 1;
             }
             Err(e) => {
-                eprintln!("  {ulid_str}: {e:#}");
+                warn!("[prefetch] failed to fetch index {ulid_str}: {e:#}");
                 result.failed += 1;
             }
         }

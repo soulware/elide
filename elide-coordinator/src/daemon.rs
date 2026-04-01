@@ -114,7 +114,8 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 continue;
             }
             if known.insert(vol_dir.clone()) {
-                info!("[coordinator] discovered volume: {}", vol_dir.display());
+                let label = volume_label(&vol_dir);
+                info!("[coordinator] discovered volume: {label}");
 
                 tasks.spawn(fork_loop(
                     vol_dir.clone(),
@@ -237,6 +238,9 @@ async fn fork_loop(
             return;
         }
     };
+    let volume_name = read_volume_name(&fork_dir)
+        .map(|n| format!(" ({n})"))
+        .unwrap_or_default();
 
     let gc_interval = Duration::from_secs(gc_config.interval_secs);
 
@@ -259,12 +263,12 @@ async fn fork_loop(
         match prefetch::prefetch_indexes(&fork_dir, &store).await {
             Ok(r) if r.fetched > 0 => {
                 info!(
-                    "[prefetch {volume_id}] fetched {} index section(s)",
+                    "[prefetch {volume_id}{volume_name}] fetched {} index section(s)",
                     r.fetched
                 );
             }
             Ok(_) => {}
-            Err(e) => warn!("[prefetch {volume_id}] error: {e:#}"),
+            Err(e) => warn!("[prefetch {volume_id}{volume_name}] error: {e:#}"),
         }
     }
 
@@ -522,6 +526,33 @@ fn reconcile_by_name(data_dir: &Path) {
         } else {
             info!("[coordinator] created by_name/{name} -> {target}");
         }
+    }
+}
+
+/// Read the volume name from `<fork_dir>/volume.name`, if present and non-empty.
+fn read_volume_name(fork_dir: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(fork_dir.join("volume.name")).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+/// Human-readable label for log messages: "name (ulid)" if the volume has a
+/// name, otherwise just the path.
+fn volume_label(fork_dir: &Path) -> String {
+    let path_str = fork_dir.display().to_string();
+    match read_volume_name(fork_dir) {
+        Some(name) => {
+            if let Some(ulid) = fork_dir.file_name().and_then(|n| n.to_str()) {
+                format!("{name} ({ulid})")
+            } else {
+                format!("{name} ({path_str})")
+            }
+        }
+        None => path_str,
     }
 }
 

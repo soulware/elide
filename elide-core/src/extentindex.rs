@@ -32,12 +32,27 @@ use crate::segment;
 pub struct ExtentLocation {
     /// ULID of the segment (filename in wal/, pending/, or segments/).
     pub segment_id: String,
-    /// Absolute byte offset of the start of the payload in the file.
+    /// Byte offset of the start of the payload.
+    ///
+    /// For full segments (`pending/`, `segments/`, `wal/`): absolute file offset
+    /// (`body_section_start + stored_offset`).
+    /// For fetched entries (from `fetched/*.idx`): body-relative offset
+    /// (`stored_offset`), matching byte 0 of the `.body` file.
     pub body_offset: u64,
     /// Byte length of the stored payload (compressed size if `compressed`).
     pub body_length: u32,
     /// True if the payload is lz4-compressed.
     pub compressed: bool,
+    /// Position of this entry in the segment's raw index (0-based).
+    /// `Some` for entries rebuilt from `fetched/*.idx`; `None` for full segments.
+    /// Used to check and update the `.present` bitset for per-extent fetching.
+    pub entry_idx: Option<u32>,
+    /// Absolute offset of the body section within the segment file in the store.
+    /// Equals `HEADER_LEN + index_length + inline_length` for this segment.
+    /// `Some` for entries rebuilt from `fetched/*.idx`; `None` for full segments.
+    /// Combined with `body_offset` to compute the store range-GET start:
+    /// `body_section_start + body_offset`.
+    pub body_section_start: Option<u64>,
 }
 
 /// In-memory index mapping content hash to segment location.
@@ -140,7 +155,7 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
             let segment_id = ulid::Ulid::from_string(segment_id)
                 .map_err(|e| io::Error::other(e.to_string()))?
                 .to_string();
-            let (_body_section_start, entries) = match segment::read_segment_index(path) {
+            let (body_section_start, entries) = match segment::read_segment_index(path) {
                 Ok(v) => v,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     warn!(
@@ -151,11 +166,13 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 }
                 Err(e) => return Err(e),
             };
-            for entry in entries {
+            for (raw_idx, entry) in entries.iter().enumerate() {
                 if entry.is_dedup_ref || entry.is_inline {
                     continue;
                 }
-                // Body-relative offset: the .body file starts at byte 0 of the body section.
+                // body_offset is body-relative: the .body file starts at byte 0
+                // of the body section, so no adjustment needed.
+                // entry_idx and body_section_start enable per-extent range-GETs.
                 index.insert(
                     entry.hash,
                     ExtentLocation {
@@ -163,6 +180,8 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                         body_offset: entry.stored_offset,
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
+                        entry_idx: Some(raw_idx as u32),
+                        body_section_start: Some(body_section_start),
                     },
                 );
             }
@@ -216,6 +235,8 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                         body_offset: body_section_start + entry.stored_offset,
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
+                        entry_idx: None,
+                        body_section_start: None,
                     },
                 );
             }
@@ -267,6 +288,8 @@ mod tests {
                 body_offset: 1024,
                 body_length: 4096,
                 compressed: false,
+                entry_idx: None,
+                body_section_start: None,
             },
         );
         let loc = index.lookup(&hash).unwrap();

@@ -21,7 +21,7 @@
 //   2. On first hit: write to <segments_dir>/<ulid>.tmp, then rename
 //   3. On all-miss: return a NotFound error
 
-use std::io;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,7 +32,7 @@ use serde::Deserialize;
 use tokio::runtime::Runtime;
 use ulid::Ulid;
 
-use elide_core::segment::SegmentFetcher;
+use elide_core::segment::{self, SegmentFetcher};
 
 // --- config ---
 
@@ -144,6 +144,29 @@ impl SegmentFetcher for ObjectStoreFetcher {
             fetched_dir,
         ))
     }
+
+    fn fetch_extent(
+        &self,
+        segment_id: &str,
+        fetched_dir: &Path,
+        body_section_start: u64,
+        body_offset: u64,
+        body_length: u32,
+        entry_idx: u32,
+    ) -> io::Result<()> {
+        self.rt.block_on(fetch_one_extent(
+            &self.store,
+            &self.volume_ids,
+            segment_id,
+            fetched_dir,
+            &ExtentFetchParams {
+                body_section_start,
+                body_offset,
+                body_length,
+                entry_idx,
+            },
+        ))
+    }
 }
 
 async fn fetch_segment(
@@ -174,6 +197,73 @@ async fn fetch_segment(
     }
     Err(io::Error::other(format!(
         "segment {segment_id} not found in any ancestor"
+    )))
+}
+
+/// Parameters for fetching a single extent from storage.
+struct ExtentFetchParams {
+    body_section_start: u64,
+    body_offset: u64,
+    body_length: u32,
+    entry_idx: u32,
+}
+
+async fn fetch_one_extent(
+    store: &Arc<dyn ObjectStore>,
+    volume_ids: &[String],
+    segment_id: &str,
+    fetched_dir: &Path,
+    extent: &ExtentFetchParams,
+) -> io::Result<()> {
+    let range_start = (extent.body_section_start + extent.body_offset) as usize;
+    let range_end = range_start + extent.body_length as usize;
+
+    for volume_id in volume_ids.iter().rev() {
+        let key = segment_key(volume_id, segment_id)?;
+        match store.get_range(&key, range_start..range_end).await {
+            Ok(bytes) => {
+                std::fs::create_dir_all(fetched_dir)?;
+
+                // Seek-write the extent bytes into .body at body_offset.
+                // OpenOptions::create opens an existing file without truncating.
+                let body_path = fetched_dir.join(format!("{segment_id}.body"));
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&body_path)
+                    .map_err(|e| io::Error::other(format!("open .body: {e}")))?;
+                f.seek(SeekFrom::Start(extent.body_offset))
+                    .map_err(|e| io::Error::other(format!("seek .body: {e}")))?;
+                f.write_all(&bytes)
+                    .map_err(|e| io::Error::other(format!("write .body: {e}")))?;
+
+                // Update .present bitset.
+                let idx_path = fetched_dir.join(format!("{segment_id}.idx"));
+                let entry_count = segment::read_entry_count(&idx_path)?;
+                let present_path = fetched_dir.join(format!("{segment_id}.present"));
+                segment::set_present_bit(&present_path, extent.entry_idx, entry_count)?;
+
+                tracing::debug!(
+                    segment_id,
+                    entry_idx = extent.entry_idx,
+                    body_length = extent.body_length,
+                    "fetched extent"
+                );
+                return Ok(());
+            }
+            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "fetching extent {segment_id}[{}] from {volume_id}: {e}",
+                    extent.entry_idx
+                )));
+            }
+        }
+    }
+    Err(io::Error::other(format!(
+        "extent {segment_id}[{}] not found in any ancestor",
+        extent.entry_idx
     )))
 }
 
@@ -357,6 +447,91 @@ mod tests {
         assert_eq!(found[0].file_stem().unwrap(), segment_id);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `fetch_extent` downloads only the requested byte range, writes it into
+    /// `.body` at the correct offset, and sets the corresponding `.present` bit.
+    /// A second entry's bit remains unset because it was not fetched.
+    #[test]
+    fn fetch_extent_writes_body_slice_and_present_bit() {
+        use elide_core::segment::{SegmentEntry, check_present_bit, write_segment};
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as StorePath;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+        let fetched_dir = tmp.path().join("fetched");
+
+        let seg_ulid = ulid::Ulid::new();
+        let seg_id = seg_ulid.to_string();
+        let vol_id = "01JQVOLUMEAAAAAAAAAAAAAAA";
+
+        // Build a segment with 2 uncompressed entries.
+        let data1 = vec![0x11u8; 4096];
+        let data2 = vec![0x22u8; 4096];
+        let h1 = blake3::hash(&data1);
+        let h2 = blake3::hash(&data2);
+        let mut entries = vec![
+            SegmentEntry::new_data(h1, 0, 1, 0, data1.clone()),
+            SegmentEntry::new_data(h2, 1, 1, 0, data2.clone()),
+        ];
+        let seg_path = tmp.path().join(&seg_id);
+        let bss = write_segment(&seg_path, &mut entries, None).unwrap();
+        let full_bytes = std::fs::read(&seg_path).unwrap();
+
+        // Write only the .idx portion — no .body, no .present yet.
+        std::fs::create_dir_all(&fetched_dir).unwrap();
+        std::fs::write(
+            fetched_dir.join(format!("{seg_id}.idx")),
+            &full_bytes[..bss as usize],
+        )
+        .unwrap();
+
+        // Upload the full segment to a local object store.
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_dir.path()).unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dt: chrono::DateTime<chrono::Utc> = seg_ulid.datetime().into();
+        let date = dt.format("%Y%m%d").to_string();
+        let key = StorePath::from(format!("by_id/{vol_id}/{date}/{seg_id}"));
+        rt.block_on(store.put(&key, full_bytes.into())).unwrap();
+
+        // Create the fetcher and fetch only entry 0.
+        let cfg = FetchConfig {
+            bucket: None,
+            endpoint: None,
+            region: None,
+            local_path: Some(store_dir.path().to_string_lossy().into_owned()),
+        };
+        let fetcher = ObjectStoreFetcher::new(&cfg, vec![vol_id.to_string()]).unwrap();
+        fetcher
+            .fetch_extent(
+                &seg_id,
+                &fetched_dir,
+                bss,
+                entries[0].stored_offset,
+                entries[0].stored_length,
+                0,
+            )
+            .unwrap();
+
+        // .body must exist and contain entry 0's bytes at the correct offset.
+        let body_path = fetched_dir.join(format!("{seg_id}.body"));
+        assert!(body_path.exists(), ".body should be created");
+        let body_bytes = std::fs::read(&body_path).unwrap();
+        let off = entries[0].stored_offset as usize;
+        assert_eq!(
+            &body_bytes[off..off + 4096],
+            data1.as_slice(),
+            "body bytes must match data1"
+        );
+
+        // .present bit 0 set, bit 1 not yet set.
+        let present_path = fetched_dir.join(format!("{seg_id}.present"));
+        assert!(check_present_bit(&present_path, 0).unwrap(), "bit 0 set");
+        assert!(!check_present_bit(&present_path, 1).unwrap(), "bit 1 unset");
     }
 
     #[test]
