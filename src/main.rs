@@ -350,6 +350,11 @@ fn main() {
                     std::process::exit(1);
                 }
                 println!("{}", new_fork_dir.display());
+                if coordinator_client::rescan(&socket_path).is_err() {
+                    eprintln!(
+                        "warning: coordinator not running; volume will be picked up on next scan"
+                    );
+                }
             }
 
             VolumeCommand::Create { name, size } => {

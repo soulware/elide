@@ -157,21 +157,29 @@ fn entry_suffix(ft: FileType) -> &'static str {
 // --- VolumeReader ---
 
 struct VolumeReader {
-    base_dir: PathBuf,
+    /// Search path for segment files: fork dir first, then ancestors (oldest last).
+    search_dirs: Vec<PathBuf>,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
 }
 
 impl VolumeReader {
     fn open(dir: &Path) -> io::Result<Self> {
-        // Rebuild LBA map and extent index from all committed segments (including ancestors).
-        let by_id_dir = dir.parent().unwrap_or(dir);
-        let ancestor_layers = volume::walk_ancestors(dir, by_id_dir)?;
+        // Canonicalize so that by_name/<name> symlinks resolve to by_id/<ulid>,
+        // making dir.parent() the correct by_id/ directory for ancestor lookup.
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
+        let by_id_dir = dir.parent().unwrap_or(&dir);
+        let ancestor_layers = volume::walk_ancestors(&dir, by_id_dir)?;
         let rebuild_chain: Vec<(std::path::PathBuf, Option<String>)> = ancestor_layers
-            .into_iter()
-            .map(|l| (l.dir, l.branch_ulid))
+            .iter()
+            .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
             .chain(std::iter::once((dir.to_owned(), None)))
             .collect();
+        // Collect all directories to search for segment files (fork first, then ancestors).
+        let mut search_dirs: Vec<PathBuf> = std::iter::once(dir.to_owned())
+            .chain(ancestor_layers.into_iter().map(|l| l.dir))
+            .collect();
+        search_dirs.dedup();
         let mut lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
         let mut extent_index = extentindex::rebuild(&rebuild_chain)?;
 
@@ -219,7 +227,7 @@ impl VolumeReader {
         }
 
         Ok(Self {
-            base_dir: dir.to_owned(),
+            search_dirs,
             lbamap,
             extent_index,
         })
@@ -233,7 +241,7 @@ impl VolumeReader {
             return Ok([0u8; 4096]); // hash not indexed — treat as unwritten
         };
         let loc = loc.clone();
-        let path = find_segment_file(&self.base_dir, &loc.segment_id)?;
+        let path = find_segment_file(&self.search_dirs, &loc.segment_id)?;
         let mut f = fs::File::open(path)?;
         let mut block = [0u8; 4096];
         if loc.compressed {
@@ -275,11 +283,13 @@ impl Ext4Read for VolumeReader {
     }
 }
 
-fn find_segment_file(base_dir: &Path, segment_id: &str) -> io::Result<PathBuf> {
-    for subdir in ["wal", "pending", "segments"] {
-        let path = base_dir.join(subdir).join(segment_id);
-        if path.exists() {
-            return Ok(path);
+fn find_segment_file(search_dirs: &[PathBuf], segment_id: &str) -> io::Result<PathBuf> {
+    for dir in search_dirs {
+        for subdir in ["wal", "pending", "segments"] {
+            let path = dir.join(subdir).join(segment_id);
+            if path.exists() {
+                return Ok(path);
+            }
         }
     }
     Err(io::Error::other(format!("segment not found: {segment_id}")))
