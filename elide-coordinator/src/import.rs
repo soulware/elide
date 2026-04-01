@@ -269,6 +269,32 @@ pub fn kill_import(fork_dir: &Path) -> bool {
     true
 }
 
+/// Send SIGTERM to the volume and import processes in `fork_dir`.
+///
+/// Returns the PIDs that were signalled so the caller can wait for them
+/// to exit. Used for clean coordinator shutdown in foreground mode.
+pub fn terminate_fork_processes(fork_dir: &Path) -> Vec<u32> {
+    let mut pids = Vec::new();
+
+    if let Ok(text) = std::fs::read_to_string(fork_dir.join("volume.pid"))
+        && let Ok(pid) = text.trim().parse::<u32>()
+        && is_alive(pid)
+    {
+        sigterm(pid);
+        pids.push(pid);
+    }
+
+    if let Ok(text) = std::fs::read_to_string(fork_dir.join(PID_FILE))
+        && let Ok(pid) = text.trim().parse::<u32>()
+        && is_alive(pid)
+    {
+        sigterm(pid);
+        pids.push(pid);
+    }
+
+    pids
+}
+
 /// Send SIGTERM to all volume and import processes under `vol_dir`, then wait
 /// briefly for them to exit. Used by the `delete` operation.
 pub fn kill_all_for_volume(vol_dir: &Path) {

@@ -138,14 +138,72 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 info!("[coordinator] rescan triggered via socket");
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("[coordinator] shutting down");
+                info!("[coordinator] shutting down (foreground mode)");
+                // Abort supervisor and drain tasks first so they cannot
+                // interfere with or restart processes we are about to stop.
                 tasks.abort_all();
+
+                // SIGTERM every volume and import process across all known forks.
+                let mut all_pids: Vec<u32> = Vec::new();
+                for fork_dir in &known {
+                    let pids = import::terminate_fork_processes(fork_dir);
+                    if !pids.is_empty() {
+                        info!(
+                            "[coordinator] sent SIGTERM to {} process(es) in {}",
+                            pids.len(),
+                            fork_dir.display()
+                        );
+                    }
+                    all_pids.extend(pids);
+                }
+
+                if !all_pids.is_empty() {
+                    info!(
+                        "[coordinator] waiting for {} process(es) to exit...",
+                        all_pids.len()
+                    );
+                    wait_for_pids(&all_pids, Duration::from_secs(10)).await;
+                }
+
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+/// Poll until all pids have exited or the timeout elapses.
+///
+/// Logs a warning if any processes are still alive after the timeout.
+async fn wait_for_pids(pids: &[u32], timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let still_alive: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|&pid| {
+                if let Ok(raw) = i32::try_from(pid) {
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None).is_ok()
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        if still_alive.is_empty() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                "[coordinator] shutdown timed out; {} process(es) still running: {:?}",
+                still_alive.len(),
+                still_alive
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Sequential drain + GC loop for a single fork.
