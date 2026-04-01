@@ -92,35 +92,42 @@ All volume state lives under a shared root directory on a dedicated local NVMe m
   control.sock                   — Unix domain socket; coordinator-to-volume IPC
 ```
 
-**Readonly volume** (a template; no forks until explicitly forked):
+**Imported volume** (OCI image imported via `volume import`):
 
 ```
   ubuntu-22.04/
-    meta.toml                    — source metadata (OCI digest, arch, readonly = true)
+    meta.toml                    — source metadata (OCI digest, arch)
     size
-    base/                        — frozen base populated by import (no wal/)
-      segments/
-      snapshots/
-        <import-ulid>
-    forks/                       — absent on fresh import; created on first fork
-      server-1/                  — named fork branched from base (live)
+    forks/
+      base/                      — frozen import fork (readonly, no wal/)
+        segments/
+        snapshots/
+          <import-ulid>
+      default/                   — writable CoW fork, branched from base at import time
         wal/
         pending/
         segments/
-        origin                   — "base/snapshots/<import-ulid>"
+        origin                   — "forks/base/snapshots/<import-ulid>"
+        snapshots/
+      server-1/                  — additional named fork branched from base
+        wal/
+        pending/
+        segments/
+        origin                   — "forks/base/snapshots/<import-ulid>"
         snapshots/
 ```
 
-The readonly volume's `base/` directory lives directly under the volume root (not under `forks/`) and holds the frozen segments and snapshot markers from the import. It is not a user fork and is not writable. All user-created forks live under `forks/`. `forks/` is absent on a freshly-imported readonly volume and is created automatically when the first fork is taken.
+`forks/base/` is created by `volume import` and holds the frozen, readonly import data. It is never written to after import completes — no `wal/`, no `pending/`. `volume import` also creates `forks/default/` as a writable CoW fork branched from `base`, so the volume is immediately usable without a separate `volume fork` step. Additional named forks can be branched from `base` at any time.
 
 **Invariants:**
 - `wal/` present → fork is live; exactly one process writes here (enforced by `volume.lock`)
 - `wal/` absent → fork is frozen or not yet started; cannot be served writably
-- `origin` is present only on forks branched from another fork; its value is a path relative to the volume root: `base/snapshots/<ulid>` for forks from the import base, or `forks/<name>/snapshots/<ulid>` for forks from a user fork
+- `origin` is present only on forks branched from another fork; its value is a path relative to the volume root: `forks/base/snapshots/<ulid>` for forks from the import base, or `forks/<name>/snapshots/<ulid>` for forks from a user fork
 - `snapshots/<ulid>` is a plain marker file; the ULID sorts after all segments present at snapshot time, giving a stable branch point
-- `meta.toml` at the volume root records source metadata; `readonly = true` in this file marks the volume as a template — it cannot be served writably and requires an explicit fork before use
-- `base/` at the volume root is the frozen import data; it is not a user fork and never has a `wal/`
-- `forks/` is the exclusive home for named user forks; no fork directories appear directly in the volume root except `base/`
+- `meta.toml` at the volume root records source metadata
+- `forks/` is the exclusive home for all forks; no fork directories appear directly in the volume root
+- `forks/base/` is reserved for the import fork and is always readonly (no `wal/`)
+- `forks/default/` is the initial writable fork, created by both `volume create` and `volume import`
 - `children/` is not used; forks are named siblings, not anonymous `children/<ulid>/` descendants
 
 **Finding live forks:** scan `forks/` for subdirectories containing `wal/`.
@@ -138,9 +145,9 @@ The readonly volume's `base/` directory lives directly under the volume root (no
 | `volume.pid` alive | running — volume process is serving I/O |
 | `volume.stopped` | explicitly stopped — coordinator will not restart |
 | `import.lock` | import in progress or interrupted |
-| none of the above | idle — coordinator will start if `serve.toml` present |
+| none of the above | idle — coordinator will start the volume process |
 
-**Fork ancestry:** a fork's `origin` file names its parent fork and the branch-point snapshot ULID. For forks in `forks/`, `walk_ancestors` follows this chain to the root (`base/`), building an oldest-first list of ancestor layers. Segments in each ancestor fork are included only up to the branch-point ULID — post-branch writes to an ancestor fork are not visible in derived forks.
+**Fork ancestry:** a fork's `origin` file names its parent fork and the branch-point snapshot ULID. `walk_ancestors` follows this chain to the root (`forks/base/` for imported volumes, or `forks/default/` for blank volumes), building an oldest-first list of ancestor layers. Segments in each ancestor fork are included only up to the branch-point ULID — post-branch writes to an ancestor fork are not visible in derived forks.
 
 ```
 VM
@@ -324,7 +331,7 @@ The `elide` CLI derives the coordinator socket path from `--data-dir`:
 
 The current CLI exposes both the **volume** (directory containing base + forks) and the **fork** (the writable branch) as separate concepts. Most commands take both a volume name and a fork name. This is accurate to the internal layout but unnecessarily exposes implementation detail.
 
-**Target model:** a user-facing *volume* maps directly to a single fork internally. The `base/` import data is an invisible ancestor layer — users never address it. The fork concept disappears from the user-facing vocabulary; what users think of as "volumes" are forks under the hood.
+**Target model:** a user-facing *volume* maps directly to a single fork internally. The `forks/base/` import data is an invisible ancestor layer — users never address it directly. The fork concept disappears from the user-facing vocabulary; what users think of as "volumes" are forks under the hood.
 
 **Multi-VM use case:** today you might create one volume (`ubuntu-22.04`) with multiple named forks (`server-1`, `server-2`). In the target model, `server-1` and `server-2` are themselves named volumes that were cloned from `ubuntu-22.04`. The shared base data is still shared on disk; it's just not visible as a separate addressable object.
 
@@ -344,7 +351,7 @@ elide volume delete <name>              stop process and remove volume
 
 `volume clone` replaces `volume fork`. The `fork` argument disappears from all commands — there is at most one active fork per user-visible volume name.
 
-**What changes internally:** the coordinator discovers and supervises forks as it does today. The mapping from user-visible volume name to fork directory is one-to-one: each user volume corresponds to a fork under some parent volume's `forks/` directory (or to a standalone volume's default fork). The `base/` directory of an imported volume would become an internal detail not exposed as a user-addressable volume.
+**What changes internally:** the coordinator discovers and supervises forks as it does today. The mapping from user-visible volume name to fork directory is one-to-one: each user volume corresponds to a fork under some parent volume's `forks/` directory (or to a standalone volume's `forks/default/` fork). The `forks/base/` fork of an imported volume is an internal ancestor layer not exposed as a user-addressable volume.
 
 **Migration path:** the current `volume fork` → `volume clone` rename is straightforward. The harder part is deciding what `elide volume list` shows — it should show user volumes (forks), not the internal volume root directories. This requires either a naming convention (`forks/` entries are the user objects) or a marker file. This design work is deferred.
 
@@ -523,9 +530,18 @@ The caveat set is small and typed (`volume`, `fork`, `scope`, `pid`, optionally 
 
 OCI import is a potentially long-running operation. The coordinator supervises it as a short-lived child process, analogous to a volume process, with an explicit lifecycle marker on disk.
 
+### Fork layout after import
+
+`volume import start <name> <oci-ref>` creates two forks:
+
+1. `forks/base/` — the frozen, readonly import data. Populated by `elide-import`. Never written to after import completes: no `wal/`, no `pending/`. Serves as the base layer for all derived forks.
+2. `forks/default/` — a writable CoW fork branched from `base` at the import snapshot. Created automatically so the volume is immediately usable without a separate `volume fork` step.
+
+The `import.lock` is written to `forks/base/` for the duration of the import. The `default` fork is created only after `base` is fully written and the import process exits successfully.
+
 ### `import.lock`
 
-When the coordinator begins an import it writes `<fork-dir>/import.lock` containing a single line: the import ULID. This file is the source of truth for "an import is in progress or was interrupted here". The coordinator removes the file when the import process exits (whether success or failure).
+When the coordinator begins an import it writes `forks/base/import.lock` containing a single line: the import ULID. This file is the source of truth for "an import is in progress or was interrupted here". The coordinator removes the file when the import process exits (whether success or failure).
 
 The ULID in `import.lock` matches the ULID returned to the caller by `import <name> <oci-ref>`. This lets an operator correlate a lock file with coordinator logs or `import status` output.
 
@@ -751,7 +767,7 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 | **Volume** | A named collection of forks stored under a common base directory. Identified by name (e.g. `myvm`). |
 | **Fork** | A named, independently live line of work within a volume. A fork has its own WAL, pending segments, and checkpoint history. Names are unique within a volume. User forks live under `forks/`. |
 | **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a fork's committed segment sequence. The ULID gives the position: all segments with ULID ≤ the snapshot ULID are part of that snapshot. The latest snapshot ULID also serves as the **compaction floor** — segments at or below it are frozen and will never be compacted. The file content is empty or an optional human-readable name. |
-| **Readonly volume** | A volume with `readonly = true` in its `meta.toml`. It is a template: its `base/` directory holds the frozen data populated by import (no `wal/`). It cannot be served directly. Named forks are created under `forks/` and are fully writable. `forks/` is absent until the first fork is taken. |
+| **Imported volume** | A volume populated by `volume import`. Its `forks/base/` fork holds the frozen import data (readonly, no `wal/`). `forks/default/` is created automatically as a writable CoW fork ready to use. Additional forks can be branched from `base` at any time. |
 | **Export** | A squash-and-detach operation that produces a new self-contained volume from a fork, with no ancestry dependencies. |
 
 ### Ancestry walk
@@ -843,7 +859,7 @@ elide snapshot-volume <vol-dir|fork-dir>       # checkpoint a fork; fork stays l
 
 elide fork-volume <vol-dir> <fork-name> [--from <source-fork>]
                                                 # create forks/<fork-name> branched from the
-                                                # latest snapshot of source fork (default: "base")
+                                                # latest snapshot of source fork (default: "default")
 
 elide list-forks <vol-dir|fork-dir>            # list all named forks under forks/
 
@@ -862,11 +878,11 @@ Import is handled by `elide volume import <name> <oci-ref>`, which asks the coor
 
 **Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The snapshot ULID matches the ULID of the last committed segment, making the branch point self-describing. If no new segments have been committed since the latest existing snapshot, the operation is idempotent — it returns the existing snapshot ULID without writing a new marker. The fork remains live; no directory structure changes.
 
-**Import procedure for readonly volumes:** the import path writes data directly into `base/segments/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `base/snapshots/<import-ulid>` is written; this ULID matches the last segment written. It is used as the branch point by all forks created from this volume. The `size` marker and `meta.toml` (containing `readonly = true` plus OCI source metadata) are written at the volume root. No `forks/` directory is created — it is created automatically when the first fork is taken via `fork-volume`.
+**Import procedure:** the import path writes data directly into `forks/base/segments/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `forks/base/snapshots/<import-ulid>` is written; this ULID matches the last segment written. It is used as the branch point for `forks/default/` and any other forks created from this volume. The `size` marker and `meta.toml` (OCI source metadata) are written at the volume root. `forks/default/` is created automatically after `forks/base/` is complete.
 
 **S3 upload for snapshots:** snapshot marker files and `origin` files must also be uploaded to S3 so the fork tree structure is visible to other hosts. These are small and should be uploaded eagerly.
 
-**Implicit snapshot rule:** `fork-volume` and `export-volume` always take an implicit snapshot of the source fork. For a readonly volume's `base/` directory (which already has a snapshot from import), a new snapshot is not needed — `fork-volume` uses the latest existing snapshot marker from `base/snapshots/`.
+**Implicit snapshot rule:** `fork-volume` and `export-volume` always take an implicit snapshot of the source fork. For `forks/base/` (which already has a snapshot from import), a new snapshot is not needed — `fork-volume` uses the latest existing snapshot marker from `forks/base/snapshots/`.
 
 ### Base directory defaulting
 
