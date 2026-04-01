@@ -1456,7 +1456,10 @@ pub fn fork_volume(new_fork_dir: &Path, source_fork_dir: &Path) -> io::Result<()
         )));
     }
 
-    let source_ulid = source_fork_dir
+    // Canonicalize so that symlink paths (e.g. by_name/<name>) resolve to
+    // their real by_id/<ulid> directory before we extract the ULID component.
+    let source_real = fs::canonicalize(source_fork_dir)?;
+    let source_ulid = source_real
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| io::Error::other("source fork dir has no name"))?;

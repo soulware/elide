@@ -456,7 +456,7 @@ fn read_meta(dir: &Path) -> Option<VolumeMeta> {
 }
 
 fn read_size(dir: &Path) -> io::Result<Option<u64>> {
-    match fs::read_to_string(dir.join("size")) {
+    match fs::read_to_string(dir.join("volume.size")) {
         Ok(s) => {
             let b = s
                 .trim()

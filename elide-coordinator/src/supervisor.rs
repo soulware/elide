@@ -30,11 +30,16 @@ const PID_FILE: &str = "volume.pid";
 const NBD_PORT_FILE: &str = "nbd.port";
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// A process that exits within this many seconds is considered a fast failure.
+const FAST_EXIT_THRESHOLD_SECS: u64 = 5;
+/// Maximum backoff delay after repeated fast failures.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Supervise a single fork: spawn `elide serve-volume`, restart on exit.
 /// Runs indefinitely; cancel the task to stop supervision.
 pub async fn supervise(fork_dir: PathBuf, elide_bin: PathBuf) {
     let label = fork_dir.display().to_string();
+    let mut fast_failures: u32 = 0;
 
     loop {
         // Exit if the fork directory has been removed (e.g. by `volume delete`).
@@ -63,18 +68,27 @@ pub async fn supervise(fork_dir: PathBuf, elide_bin: PathBuf) {
                 let pid = child.id().unwrap_or(0);
                 info!("[supervisor {label}] started pid {pid}");
                 write_pid(&fork_dir, pid);
+                let started = std::time::Instant::now();
                 match child.wait().await {
                     Ok(status) => info!("[supervisor {label}] pid {pid} exited: {status}"),
                     Err(e) => warn!("[supervisor {label}] wait error: {e}"),
                 }
                 remove_pid(&fork_dir);
+                if started.elapsed().as_secs() < FAST_EXIT_THRESHOLD_SECS {
+                    fast_failures = fast_failures.saturating_add(1);
+                    let delay = MAX_BACKOFF.min(Duration::from_secs(1u64 << fast_failures.min(6)));
+                    warn!("[supervisor {label}] fast exit #{fast_failures}, backing off {delay:?}");
+                    tokio::time::sleep(delay).await;
+                } else {
+                    fast_failures = 0;
+                    tokio::time::sleep(RESTART_DELAY).await;
+                }
             }
             Err(e) => {
                 error!("[supervisor {label}] failed to spawn: {e:#}");
+                tokio::time::sleep(RESTART_DELAY).await;
             }
         }
-
-        tokio::time::sleep(RESTART_DELAY).await;
     }
 }
 

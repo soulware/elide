@@ -245,27 +245,73 @@ fn main() {
 
             VolumeCommand::Snapshot { name } => {
                 let fork_dir = resolve_volume_dir(&args.data_dir, &name);
-                let by_id_dir = args.data_dir.join("by_id");
-                let mut vol =
-                    volume::Volume::open(&fork_dir, &by_id_dir).expect("failed to open volume");
-                let snap_ulid = vol.snapshot().expect("snapshot failed");
+                let snap_ulid = {
+                    use std::io::{self, BufRead, Write};
+                    use std::os::unix::net::UnixStream;
+                    match UnixStream::connect(fork_dir.join("control.sock")) {
+                        Ok(mut stream) => {
+                            // Volume is live — snapshot via the control socket.
+                            writeln!(stream, "snapshot").expect("write failed");
+                            stream.flush().expect("flush failed");
+                            let mut reader = io::BufReader::new(stream);
+                            let mut line = String::new();
+                            reader.read_line(&mut line).expect("read failed");
+                            let line = line.trim();
+                            match line.strip_prefix("ok ") {
+                                Some(ulid) => ulid.trim().to_owned(),
+                                None => {
+                                    eprintln!("snapshot failed: {line}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                            ) =>
+                        {
+                            // Volume is not running — open directly.
+                            let by_id_dir = args.data_dir.join("by_id");
+                            let mut vol = volume::Volume::open(&fork_dir, &by_id_dir)
+                                .expect("failed to open volume");
+                            vol.snapshot().expect("snapshot failed").to_string()
+                        }
+                        Err(e) => {
+                            eprintln!("failed to connect to control socket: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                };
                 println!("{snap_ulid}");
             }
 
             VolumeCommand::Fork { fork_name, from } => {
+                let by_name_dir = args.data_dir.join("by_name");
+                let symlink_path = by_name_dir.join(&fork_name);
+                if symlink_path.exists() {
+                    eprintln!("error: volume already exists: {fork_name}");
+                    std::process::exit(1);
+                }
                 let source_fork_dir = resolve_volume_dir(&args.data_dir, &from);
                 let new_vol_ulid = ulid::Ulid::new().to_string();
                 let new_fork_dir = args.data_dir.join("by_id").join(&new_vol_ulid);
                 volume::fork_volume(&new_fork_dir, &source_fork_dir).expect("volume fork failed");
+                // Copy volume.size from source so the coordinator can serve the fork.
+                if let Ok(size) = std::fs::read(source_fork_dir.join("volume.size")) {
+                    std::fs::write(new_fork_dir.join("volume.size"), size)
+                        .expect("failed to copy volume.size");
+                }
                 std::fs::write(new_fork_dir.join("volume.name"), &fork_name)
                     .expect("failed to write volume.name");
-                let by_name_dir = args.data_dir.join("by_name");
                 std::fs::create_dir_all(&by_name_dir).expect("failed to create by_name dir");
-                std::os::unix::fs::symlink(
-                    format!("../by_id/{new_vol_ulid}"),
-                    by_name_dir.join(&fork_name),
-                )
-                .expect("failed to create by_name symlink");
+                if let Err(e) =
+                    std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path)
+                {
+                    let _ = std::fs::remove_dir_all(&new_fork_dir);
+                    eprintln!("error: failed to create by_name symlink: {e}");
+                    std::process::exit(1);
+                }
                 let key = elide_core::signing::generate_keypair(
                     &new_fork_dir,
                     VOLUME_KEY_FILE,
@@ -513,7 +559,7 @@ fn create_volume(data_dir: &Path, name: &str, size: Option<&str>) -> std::io::Re
     std::fs::write(vol_dir.join("volume.name"), name)?;
     std::fs::create_dir_all(vol_dir.join("pending"))?;
     std::fs::create_dir_all(vol_dir.join("segments"))?;
-    std::fs::write(vol_dir.join("size"), bytes.to_string())?;
+    std::fs::write(vol_dir.join("volume.size"), bytes.to_string())?;
 
     std::fs::create_dir_all(&by_name_dir)?;
     std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), by_name_dir.join(name))?;
@@ -543,9 +589,9 @@ fn parse_size(s: &str) -> Result<u64, String> {
     Ok(n << shift)
 }
 
-/// Read the volume size from `<dir>/size`, or create it from `--size` if not present.
+/// Read the volume size from `<dir>/volume.size`, or create it from `--size` if not present.
 fn resolve_volume_size(dir: &Path, size_arg: Option<&str>) -> std::io::Result<u64> {
-    let size_file = dir.join("size");
+    let size_file = dir.join("volume.size");
     if size_file.exists() {
         let s = std::fs::read_to_string(&size_file)?;
         s.trim()

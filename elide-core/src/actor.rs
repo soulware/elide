@@ -101,6 +101,9 @@ pub(crate) enum VolumeRequest {
     GcCheckpoint {
         reply: Sender<io::Result<(String, String)>>,
     },
+    Snapshot {
+        reply: Sender<io::Result<String>>,
+    },
     Shutdown,
 }
 
@@ -226,6 +229,13 @@ impl VolumeActor {
                                 (u1, u2)
                             });
                             let _ = reply.send(pair);
+                        }
+                        VolumeRequest::Snapshot { reply } => {
+                            let result = self.volume.snapshot().map(|u| u.to_string());
+                            if result.is_ok() {
+                                self.publish_snapshot();
+                            }
+                            let _ = reply.send(result);
                         }
                         VolumeRequest::Shutdown => return,
                     }
@@ -411,6 +421,18 @@ impl VolumeHandle {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::GcCheckpoint { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Write a snapshot marker for the current volume state.
+    /// Flushes the WAL first.  Returns the snapshot ULID string.
+    pub fn snapshot(&self) -> io::Result<String> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::Snapshot { reply: reply_tx })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()

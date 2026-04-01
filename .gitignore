@@ -21,3 +21,7 @@
 
 # Local reference copies (lsvd impl + paper)
 /refs/
+
+# Local data and object store directories (default dev paths)
+/elide_data/
+/elide_store/

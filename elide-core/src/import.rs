@@ -166,7 +166,10 @@ pub fn import_image(
     fs::write(snapshots_dir.join(&snap_ulid), "")?;
 
     // Volume-root size marker (readonly is written by the caller in meta.toml).
-    segment::write_file_atomic(&vol_dir.join("size"), image_size.to_string().as_bytes())?;
+    segment::write_file_atomic(
+        &vol_dir.join("volume.size"),
+        image_size.to_string().as_bytes(),
+    )?;
 
     Ok(())
 }
@@ -200,7 +203,7 @@ mod tests {
         // readonly is now in meta.toml (written by caller, not import_image)
         assert!(!vol_dir.join("readonly").exists());
         assert_eq!(
-            fs::read_to_string(vol_dir.join("size")).unwrap(),
+            fs::read_to_string(vol_dir.join("volume.size")).unwrap(),
             (LBA_SIZE * 3).to_string()
         );
         assert!(vol_dir.join("base").join("segments").exists());
