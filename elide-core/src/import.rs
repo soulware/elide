@@ -105,11 +105,11 @@ pub fn import_image(
     mut progress: impl FnMut(u64, u64),
 ) -> io::Result<()> {
     // `vol_dir` may already exist (caller may have created it to write key files
-    // before calling import). Fail only if segments/ already exists, which means
+    // before calling import). Fail only if pending/ already exists, which means
     // a previous import completed or is in progress.
-    if vol_dir.join("segments").exists() {
+    if vol_dir.join("pending").exists() {
         return Err(io::Error::other(format!(
-            "volume already has segments: {}",
+            "volume already has pending segments: {}",
             vol_dir.display()
         )));
     }
@@ -120,7 +120,9 @@ pub fn import_image(
     }
     let total_blocks = image_size / LBA_SIZE as u64;
 
-    let segments_dir = vol_dir.join("segments");
+    // Write to pending/ so the coordinator's normal drain loop picks them up,
+    // uploads to the store, and moves them to segments/ — same path as WAL flushes.
+    let segments_dir = vol_dir.join("pending");
     let snapshots_dir = vol_dir.join("snapshots");
     fs::create_dir_all(&segments_dir)?;
     fs::create_dir_all(&snapshots_dir)?;
@@ -205,11 +207,11 @@ mod tests {
             fs::read_to_string(vol_dir.join("volume.size")).unwrap(),
             (LBA_SIZE * 3).to_string()
         );
-        assert!(vol_dir.join("segments").exists());
-        assert!(!vol_dir.join("pending").exists()); // flat layout: no pending/ on import
+        assert!(vol_dir.join("pending").exists());
+        assert!(!vol_dir.join("segments").exists()); // coordinator drains pending/ → segments/
 
         // Exactly one snapshot marker, and its ULID matches the segment ULID.
-        let segs: Vec<_> = fs::read_dir(vol_dir.join("segments"))
+        let segs: Vec<_> = fs::read_dir(vol_dir.join("pending"))
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
@@ -240,7 +242,7 @@ mod tests {
         import_image(&image_path, &vol_dir, None, |_, _| {}).unwrap();
 
         // All-zero image: no segment files should be written.
-        let segs: Vec<_> = fs::read_dir(vol_dir.join("segments")).unwrap().collect();
+        let segs: Vec<_> = fs::read_dir(vol_dir.join("pending")).unwrap().collect();
         assert_eq!(segs.len(), 0);
     }
 
