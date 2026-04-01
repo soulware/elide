@@ -20,8 +20,7 @@
 // uploaded this tick, and concurrent GC rewrites can never race an upload.
 //
 // Fork directory layout expected:
-//   <root>/<volume>/base/            — base fork
-//   <root>/<volume>/forks/<name>/    — named fork
+//   <root>/<volume>/forks/<name>/    — all forks (base, default, and named)
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -350,8 +349,7 @@ async fn fork_loop(
 /// Scan the data directory and return all fork directories found.
 ///
 /// A fork directory is any directory that contains a `pending/` or `segments/`
-/// subdirectory. Forks live at:
-///   `<data_dir>/<volume>/base/`
+/// subdirectory. All forks live at:
 ///   `<data_dir>/<volume>/forks/<name>/`
 fn discover_forks(data_dir: &Path) -> Vec<PathBuf> {
     let mut forks = Vec::new();
@@ -371,13 +369,7 @@ fn discover_forks(data_dir: &Path) -> Vec<PathBuf> {
             continue;
         }
 
-        // base/ fork lives directly under the volume root.
-        let base = vol_path.join("base");
-        if is_fork_dir(&base) {
-            forks.push(base);
-        }
-
-        // Named forks live under forks/<name>/.
+        // All forks live under forks/<name>/.
         let forks_dir = vol_path.join("forks");
         if let Ok(fork_entries) = std::fs::read_dir(&forks_dir) {
             for fork_entry in fork_entries.flatten() {
@@ -406,17 +398,17 @@ mod tests {
     }
 
     #[test]
-    fn discover_base_and_named_forks() {
+    fn discover_forks_under_forks_dir() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
-        // Volume "myvol" with base/ and two named forks.
-        mk(root, "myvol/base/pending");
+        // Volume "myvol" with base, default, and a named fork — all under forks/.
+        mk(root, "myvol/forks/base/segments");
+        mk(root, "myvol/forks/default/pending");
         mk(root, "myvol/forks/vm1/segments");
-        mk(root, "myvol/forks/vm2/pending");
 
-        // Volume "other" with only a bare base/ dir (no pending or segments — not a fork).
-        mk(root, "other/base");
+        // Volume "other" with only a bare forks/ dir (no fork subdirs with pending/segments).
+        mk(root, "other/forks");
 
         // Volume "empty" — just a volume root, no forks.
         mk(root, "empty");
@@ -430,7 +422,7 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["myvol/base", "myvol/forks/vm1", "myvol/forks/vm2"]
+            vec!["myvol/forks/base", "myvol/forks/default", "myvol/forks/vm1"]
         );
     }
 

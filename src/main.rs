@@ -142,7 +142,7 @@ enum VolumeCommand {
     Ls {
         /// Volume name
         name: String,
-        /// Name of the fork to inspect (use "base" for the import base)
+        /// Name of the fork to inspect (e.g. "default", "base")
         fork: String,
         /// Path within the ext4 filesystem (default: /)
         #[arg(default_value = "/")]
@@ -164,7 +164,7 @@ enum VolumeCommand {
         /// Name for the new fork
         fork_name: String,
         /// Source fork to branch from
-        #[arg(long, default_value = "base")]
+        #[arg(long, default_value = "default")]
         from: String,
     },
 
@@ -457,14 +457,9 @@ fn main() {
 
 /// Resolve a fork name to its directory under a volume root.
 ///
-/// The `base` fork lives directly at `<vol_dir>/base`; all other forks live
-/// under `<vol_dir>/forks/<name>`.
+/// All forks live under `<vol_dir>/forks/<name>`.
 fn fork_dir(vol_dir: &Path, fork: &str) -> PathBuf {
-    if fork == "base" {
-        vol_dir.join("base")
-    } else {
-        vol_dir.join("forks").join(fork)
-    }
+    vol_dir.join("forks").join(fork)
 }
 
 fn list_volumes(data_dir: &Path) -> std::io::Result<()> {
@@ -518,8 +513,8 @@ fn create_volume(vol_dir: &Path, size: Option<&str>) -> std::io::Result<()> {
         return Err(std::io::Error::other("volume size must be non-zero"));
     }
     std::fs::create_dir_all(vol_dir.join("forks"))?;
-    std::fs::create_dir_all(vol_dir.join("base").join("pending"))?;
-    std::fs::create_dir_all(vol_dir.join("base").join("segments"))?;
+    std::fs::create_dir_all(vol_dir.join("forks").join("default").join("pending"))?;
+    std::fs::create_dir_all(vol_dir.join("forks").join("default").join("segments"))?;
     std::fs::write(vol_dir.join("size"), bytes.to_string())?;
     println!("{}", vol_dir.display());
     Ok(())
@@ -527,14 +522,9 @@ fn create_volume(vol_dir: &Path, size: Option<&str>) -> std::io::Result<()> {
 
 /// Resolve the volume directory from a fork directory.
 ///
-/// `base` forks live at `<vol>/base` — one level up.
-/// Named forks live at `<vol>/forks/<name>` — two levels up (skipping `forks/`).
+/// All forks live at `<vol>/forks/<name>` — two levels up.
 fn fork_vol_dir(fork_dir: &Path) -> Option<&Path> {
-    if fork_dir.file_name()? == "base" {
-        fork_dir.parent()
-    } else {
-        fork_dir.parent()?.parent()
-    }
+    fork_dir.parent()?.parent()
 }
 
 /// Parse a human-readable size string: plain bytes, or with suffix K/M/G/T (base-2).

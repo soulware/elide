@@ -90,7 +90,7 @@ pub async fn spawn_import(
     registry: &ImportRegistry,
 ) -> std::io::Result<String> {
     let vol_dir = data_dir.join(vol_name);
-    let fork_dir = vol_dir.join("base");
+    let fork_dir = vol_dir.join("forks").join("base");
 
     // Reject if a volume process is already running in this fork.
     if let Ok(text) = std::fs::read_to_string(fork_dir.join("volume.pid"))
@@ -205,7 +205,6 @@ pub fn cleanup_stale_locks(data_dir: &Path) {
         if !vol_path.is_dir() {
             continue;
         }
-        cleanup_stale_lock_in(&vol_path.join("base"));
         if let Ok(fork_entries) = std::fs::read_dir(vol_path.join("forks")) {
             for fork_entry in fork_entries.flatten() {
                 cleanup_stale_lock_in(&fork_entry.path());
@@ -297,13 +296,9 @@ pub fn terminate_fork_processes(fork_dir: &Path) -> Vec<u32> {
 /// briefly for them to exit. Used by the `delete` operation.
 pub fn kill_all_for_volume(vol_dir: &Path) {
     // Kill volume processes under forks/ and base/.
-    let fork_dirs: Vec<PathBuf> = {
-        let mut dirs = vec![vol_dir.join("base")];
-        if let Ok(entries) = std::fs::read_dir(vol_dir.join("forks")) {
-            dirs.extend(entries.flatten().map(|e| e.path()));
-        }
-        dirs
-    };
+    let fork_dirs: Vec<PathBuf> = std::fs::read_dir(vol_dir.join("forks"))
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
 
     for fork_dir in &fork_dirs {
         // Kill volume process.

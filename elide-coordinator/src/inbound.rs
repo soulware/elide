@@ -235,10 +235,10 @@ fn volume_status(volume_name: &str, data_dir: &Path) -> String {
         return format!("err volume not found: {volume_name}");
     }
 
-    // Check for an active import in the base fork.
-    let base_dir = vol_dir.join("base");
-    if base_dir.join(import::LOCK_FILE).exists() {
-        let ulid = std::fs::read_to_string(base_dir.join(import::LOCK_FILE))
+    // Check for an active import in forks/base/.
+    let base_fork_dir = vol_dir.join("forks").join("base");
+    if base_fork_dir.join(import::LOCK_FILE).exists() {
+        let ulid = std::fs::read_to_string(base_fork_dir.join(import::LOCK_FILE))
             .unwrap_or_default()
             .trim()
             .to_owned();
