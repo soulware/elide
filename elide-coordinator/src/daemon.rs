@@ -117,7 +117,11 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     gc_config.clone(),
                 ));
 
-                tasks.spawn(supervisor::supervise(vol_dir, elide_bin.clone()));
+                // Readonly volumes (imported bases) have no live process —
+                // skip supervision so we don't crash-loop on serve-volume.
+                if !vol_dir.join("volume.readonly").exists() {
+                    tasks.spawn(supervisor::supervise(vol_dir, elide_bin.clone()));
+                }
             }
         }
 
@@ -361,12 +365,17 @@ async fn fork_loop(
     }
 }
 
-/// Scan `<data_dir>/by_id/` and return all writable volume directories.
+/// Scan `<data_dir>/by_id/` and return volume directories that need coordinator
+/// attention (drain, GC, or supervision).
 ///
 /// Skips:
 ///   - entries whose name is not a valid ULID
-///   - volumes with a `volume.readonly` marker
 ///   - volumes with no `pending/` or `segments/` subdirectory (not yet initialised)
+///   - readonly volumes that have no `pending/` — they are fully drained and need
+///     no further coordinator work (GC is not run on readonly volumes)
+///
+/// Readonly volumes with a `pending/` directory ARE included so that imported
+/// segments are drained to the store even though the volume accepts no new writes.
 fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
     let by_id_dir = data_dir.join("by_id");
     let mut volumes = Vec::new();
@@ -392,10 +401,14 @@ fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
         if ulid::Ulid::from_string(name).is_err() {
             continue;
         }
-        if path.join("volume.readonly").exists() {
+        let has_pending = path.join("pending").exists();
+        let has_segments = path.join("segments").exists();
+        if !has_pending && !has_segments {
             continue;
         }
-        if !path.join("pending").exists() && !path.join("segments").exists() {
+        // Skip readonly volumes that are already fully drained (no pending/).
+        // Readonly volumes with pending/ still need their import segments drained.
+        if path.join("volume.readonly").exists() && !has_pending {
             continue;
         }
         volumes.push(path);
@@ -489,13 +502,18 @@ mod tests {
         // Valid writable volumes in by_id/.
         let ulid1 = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let ulid2 = "01JQBBBBBBBBBBBBBBBBBBBBBB";
-        let ulid3 = "01JQCCCCCCCCCCCCCCCCCCCCCC";
         mk(root, &format!("by_id/{ulid1}/segments"));
         mk(root, &format!("by_id/{ulid2}/pending"));
 
-        // Readonly volume — must be skipped.
+        // Readonly volume with only segments/ — fully drained, must be skipped.
+        let ulid3 = "01JQCCCCCCCCCCCCCCCCCCCCCC";
         mk(root, &format!("by_id/{ulid3}/segments"));
         std::fs::write(root.join(format!("by_id/{ulid3}/volume.readonly")), "").unwrap();
+
+        // Readonly volume with pending/ — newly imported, must be included for drain.
+        let ulid5 = "01JQEEEEEEEEEEEEEEEEEEEEEE";
+        mk(root, &format!("by_id/{ulid5}/pending"));
+        std::fs::write(root.join(format!("by_id/{ulid5}/volume.readonly")), "").unwrap();
 
         // Non-ULID entry — must be skipped.
         mk(root, "by_id/not-a-ulid/segments");
@@ -513,7 +531,11 @@ mod tests {
 
         assert_eq!(
             names,
-            vec![format!("by_id/{ulid1}"), format!("by_id/{ulid2}"),]
+            vec![
+                format!("by_id/{ulid1}"),
+                format!("by_id/{ulid2}"),
+                format!("by_id/{ulid5}"),
+            ]
         );
     }
 }
