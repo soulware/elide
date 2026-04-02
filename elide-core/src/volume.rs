@@ -385,13 +385,37 @@ impl Volume {
                 body_length: owned_data.len() as u32,
                 compressed,
                 entry_idx: None,
-                body_section_start: None,
+                body_section_start: 0,
             },
         );
         self.pending_entries.push(segment::SegmentEntry::new_data(
             hash, lba, lba_length, seg_flags, owned_data,
         ));
 
+        Ok(())
+    }
+
+    /// Trim (discard) `lba_count` blocks starting at `lba`.
+    ///
+    /// Writes zeros to the given range using the normal write path so the
+    /// operation is crash-safe and benefits from dedup (all-zero extents share
+    /// the same hash).  This mirrors the lsvd reference implementation's
+    /// `ZeroBlocks` approach: TRIM is modelled as write-zeros, not as a map
+    /// deletion.
+    ///
+    /// Large ranges are chunked at `TRIM_CHUNK_LBAS` to stay within the segment
+    /// body-length limit.
+    pub fn trim(&mut self, start_lba: u64, lba_count: u32) -> io::Result<()> {
+        const TRIM_CHUNK_LBAS: u32 = 1024; // 4 MB per chunk
+        let zeros = vec![0u8; TRIM_CHUNK_LBAS as usize * 4096];
+        let mut remaining = lba_count;
+        let mut lba = start_lba;
+        while remaining > 0 {
+            let chunk = remaining.min(TRIM_CHUNK_LBAS);
+            self.write(lba, &zeros[..chunk as usize * 4096])?;
+            lba += chunk as u64;
+            remaining -= chunk;
+        }
         Ok(())
     }
 
@@ -539,7 +563,7 @@ impl Volume {
                                 body_length: entry.stored_length,
                                 compressed: entry.compressed,
                                 entry_idx: None,
-                                body_section_start: Some(new_bss),
+                                body_section_start: new_bss,
                             },
                         );
                     }
@@ -727,7 +751,7 @@ impl Volume {
                             body_length: entry.stored_length,
                             compressed: entry.compressed,
                             entry_idx: None,
-                            body_section_start: Some(new_bss),
+                            body_section_start: new_bss,
                         },
                     );
                 }
@@ -914,7 +938,7 @@ impl Volume {
                             body_length: e.stored_length,
                             compressed: e.compressed,
                             entry_idx: None,
-                            body_section_start: Some(body_section_start),
+                            body_section_start,
                         },
                     );
                 }
@@ -985,7 +1009,7 @@ impl Volume {
                     body_length: entry.stored_length,
                     compressed: entry.compressed,
                     entry_idx: None,
-                    body_section_start: Some(body_section_start),
+                    body_section_start,
                 },
             );
         }
@@ -1083,7 +1107,7 @@ impl Volume {
     fn find_segment_file(
         &self,
         segment_id: &str,
-        body_section_start: Option<u64>,
+        body_section_start: u64,
         entry_idx: Option<u32>,
     ) -> io::Result<PathBuf> {
         find_segment_in_dirs(
@@ -1185,7 +1209,7 @@ pub(crate) fn read_extents(
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<Option<(String, bool, fs::File)>>,
-    find_segment: impl Fn(&str, Option<u64>, Option<u32>) -> io::Result<PathBuf>,
+    find_segment: impl Fn(&str, u64, Option<u32>) -> io::Result<PathBuf>,
 ) -> io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -1228,7 +1252,7 @@ pub(crate) fn read_extents(
         let file_body_offset = if *is_body {
             body_offset
         } else {
-            body_section_start.unwrap_or(0) + body_offset
+            body_section_start + body_offset
         };
 
         let block_count = (er.range_end - er.range_start) as usize;
@@ -1275,7 +1299,7 @@ pub(crate) fn find_segment_in_dirs(
     base_dir: &Path,
     ancestor_layers: &[AncestorLayer],
     fetcher: Option<&BoxFetcher>,
-    body_section_start: Option<u64>,
+    body_section_start: u64,
     entry_idx: Option<u32>,
 ) -> io::Result<PathBuf> {
     for subdir in ["wal", "pending", "segments"] {
@@ -1320,13 +1344,10 @@ pub(crate) fn find_segment_in_dirs(
     }
     if let Some(fetcher) = fetcher {
         let fetched_dir = base_dir.join("fetched");
-        match (body_section_start, entry_idx) {
-            (Some(bss), Some(idx)) => {
-                fetcher.fetch_extent(segment_id, &fetched_dir, bss, 0, 0, idx)?;
-            }
-            _ => {
-                fetcher.fetch(segment_id, &fetched_dir)?;
-            }
+        if let Some(idx) = entry_idx {
+            fetcher.fetch_extent(segment_id, &fetched_dir, body_section_start, 0, 0, idx)?;
+        } else {
+            fetcher.fetch(segment_id, &fetched_dir)?;
         }
         return Ok(base_dir.join("fetched").join(format!("{segment_id}.body")));
     }
@@ -1393,7 +1414,7 @@ impl ReadonlyVolume {
     fn find_segment_file(
         &self,
         segment_id: &str,
-        body_section_start: Option<u64>,
+        body_section_start: u64,
         entry_idx: Option<u32>,
     ) -> io::Result<PathBuf> {
         find_segment_in_dirs(
@@ -1621,7 +1642,7 @@ fn recover_wal(
                         body_length,
                         compressed,
                         entry_idx: None,
-                        body_section_start: None,
+                        body_section_start: 0,
                     },
                 );
                 pending_entries.push(segment::SegmentEntry::new_data(

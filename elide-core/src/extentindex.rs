@@ -4,15 +4,18 @@
 //   lba → hash      (LBA map, src/lbamap.rs)
 //   hash → location (this module)
 //
-// A location names the segment file and the absolute byte offset within it
-// where the payload starts. At read time the file is located by checking each
+// A location names the segment file and the body-relative byte offset where
+// the payload starts. At read time the file is located by checking each
 // storage directory in order (wal/ → pending/ → segments/).
 //
-// Body offsets are always absolute file offsets:
-//   - For in-progress entries (WAL not yet promoted): the absolute offset of
-//     the data payload within the WAL file, as returned by WriteLog::append_data.
-//   - For promoted entries (pending/ or segments/): body_section_start +
-//     entry.stored_offset, where body_section_start comes from the segment header.
+// Body offsets are always body-relative (= stored_offset from the segment index):
+//   - For WAL entries (not yet promoted): body_section_start == 0 and
+//     body_offset is the absolute WAL file offset (WAL has no header prefix).
+//   - For promoted entries (pending/ or segments/): body_offset == stored_offset;
+//     body_section_start is the absolute file offset of the body section.
+//     The actual file seek position is body_section_start + body_offset.
+//   - For fetched entries (.body files): body_section_start == 0 and
+//     body_offset is the body-relative offset (file starts at body section byte 0).
 //
 // Rebuild on startup:
 //   extentindex::rebuild(base_dir) scans pending/ and segments/ for committed
@@ -33,12 +36,9 @@ use crate::signing;
 pub struct ExtentLocation {
     /// ULID of the segment (filename in wal/, pending/, or segments/).
     pub segment_id: String,
-    /// Byte offset of the start of the payload.
-    ///
-    /// For full segments (`pending/`, `segments/`, `wal/`): absolute file offset
-    /// (`body_section_start + stored_offset`).
-    /// For fetched entries (from `fetched/*.idx`): body-relative offset
-    /// (`stored_offset`), matching byte 0 of the `.body` file.
+    /// Body-relative byte offset of the start of the payload (= `stored_offset`
+    /// from the segment index). For WAL entries, equals the absolute WAL file
+    /// offset (WAL has no header, so body_section_start == 0 and the two coincide).
     pub body_offset: u64,
     /// Byte length of the stored payload (compressed size if `compressed`).
     pub body_length: u32,
@@ -48,12 +48,12 @@ pub struct ExtentLocation {
     /// `Some` for entries rebuilt from `fetched/*.idx`; `None` for full segments.
     /// Used to check and update the `.present` bitset for per-extent fetching.
     pub entry_idx: Option<u32>,
-    /// Absolute offset of the body section within the segment file in the store.
-    /// Equals `HEADER_LEN + index_length + inline_length` for this segment.
-    /// `Some` for entries rebuilt from `fetched/*.idx`; `None` for full segments.
-    /// Combined with `body_offset` to compute the store range-GET start:
-    /// `body_section_start + body_offset`.
-    pub body_section_start: Option<u64>,
+    /// Absolute offset of the body section within the full segment file.
+    /// 0 for WAL entries and `.body` fetched files (both start at byte 0 of
+    /// the body data). Non-zero for entries in `pending/` or `segments/` files.
+    /// The actual seek position for a read is `body_section_start + body_offset`.
+    /// Also used to compute the store range-GET start for per-extent fetching.
+    pub body_section_start: u64,
 }
 
 /// In-memory index mapping content hash to segment location.
@@ -205,7 +205,7 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
                         entry_idx: Some(raw_idx as u32),
-                        body_section_start: Some(body_section_start),
+                        body_section_start,
                     },
                 );
             }
@@ -246,7 +246,7 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
                         entry_idx: None,
-                        body_section_start: Some(body_section_start),
+                        body_section_start,
                     },
                 );
             }
@@ -310,7 +310,7 @@ mod tests {
                 body_length: 4096,
                 compressed: false,
                 entry_idx: None,
-                body_section_start: None,
+                body_section_start: 0,
             },
         );
         let loc = index.lookup(&hash).unwrap();
@@ -348,7 +348,7 @@ mod tests {
         let loc = index.lookup(&hash).unwrap();
         // body_offset is body-relative (= stored_offset); body_section_start carries bss.
         assert_eq!(loc.body_offset, entries[0].stored_offset);
-        assert_eq!(loc.body_section_start, Some(bss));
+        assert_eq!(loc.body_section_start, bss);
         assert_eq!(loc.body_length, 4096);
 
         std::fs::remove_dir_all(base).unwrap();
@@ -438,7 +438,7 @@ mod tests {
         // Newer segment's offset wins; body_offset is body-relative.
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.body_offset, stored_offset2);
-        assert_eq!(loc.body_section_start, Some(bss2));
+        assert_eq!(loc.body_section_start, bss2);
 
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.body_offset, stored_offset);
-        assert_eq!(loc.body_section_start, Some(bss));
+        assert_eq!(loc.body_section_start, bss);
 
         std::fs::remove_dir_all(ancestor).unwrap();
         std::fs::remove_dir_all(live).unwrap();

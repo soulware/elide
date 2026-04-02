@@ -302,15 +302,32 @@ pub async fn apply_done_handoffs(
             }
         }
 
+        // Determine whether this is a repack handoff (has 4-field carried lines)
+        // or a removal-only handoff (all 2-field lines, no output segment).
+        // A removal-only handoff has no new segment file; a repack handoff must.
+        let is_repack = content.lines().any(|l| l.split_whitespace().count() >= 4);
+
         // Upload the volume-signed compacted segment to S3.  This happens here
         // rather than in the compact pass so that S3 always receives the version
         // that the volume has re-signed with its own key.  The put is idempotent:
         // if the coordinator crashes and retries, the same bytes are written again.
         let new_seg_path = segments_dir.join(new_ulid_str);
-        if new_seg_path
+        let seg_exists = new_seg_path
             .try_exists()
-            .context("checking new segment path")?
-        {
+            .context("checking new segment path")?;
+
+        if is_repack && !seg_exists {
+            // The volume creates segments/<new-ulid> before renaming the handoff
+            // to .applied, so a missing segment here is always a bug.  Abort
+            // rather than silently deleting the old segments without uploading
+            // the replacement — that would cause permanent data loss.
+            return Err(anyhow::anyhow!(
+                "compacted segment {new_ulid_str} missing from segments/ for repack handoff \
+                 — refusing to delete old segments before upload"
+            ));
+        }
+
+        if seg_exists {
             // Verify the volume's signature before uploading.  This catches any
             // case where the volume failed to sign correctly — we refuse to
             // propagate a bad segment to S3.  Load volume.pub here rather than
@@ -552,7 +569,13 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
     stats
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.density() < threshold)
+        .filter(|(_, s)| {
+            // Exclude segments with no dead body bytes: repacking them produces
+            // an identically-sized output (the header/index overhead is always
+            // present and cannot be reclaimed), so density never improves and
+            // the segment would be selected again every tick indefinitely.
+            s.density() < threshold && s.dead_bytes() > 0
+        })
         .min_by(|(_, a), (_, b)| {
             a.density()
                 .partial_cmp(&b.density())

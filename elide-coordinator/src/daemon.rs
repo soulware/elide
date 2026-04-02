@@ -123,7 +123,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
             let vol_ino = vol_dir.metadata().map(|m| m.ino()).unwrap_or(0);
             if known
                 .insert(vol_dir.clone(), vol_ino)
-                .map_or(true, |old| old != vol_ino)
+                .is_none_or(|old| old != vol_ino)
             {
                 let label = volume_label(&vol_dir);
                 info!("[coordinator] discovered volume: {label}");

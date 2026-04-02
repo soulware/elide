@@ -63,6 +63,7 @@ pub fn segment_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
 /// Build the object store key for a snapshot marker.
 ///
 /// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>`
+#[allow(dead_code)] // used when S3 snapshot upload is wired up
 pub fn snapshot_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
     let ulid: Ulid = ulid_str
         .parse()
@@ -157,10 +158,10 @@ pub async fn drain_pending(
 /// All uploads are best-effort — failures are logged but do not abort drain.
 async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
     let pub_key_path = vol_dir.join("volume.pub");
-    if pub_key_path.exists() {
-        if let Err(e) = upload_pub_key(&pub_key_path, volume_id, store).await {
-            warn!("pub key upload failed: {e:#}");
-        }
+    if pub_key_path.exists()
+        && let Err(e) = upload_pub_key(&pub_key_path, volume_id, store).await
+    {
+        warn!("pub key upload failed: {e:#}");
     }
 
     if let Err(e) = upload_manifest(vol_dir, volume_id, store).await {
@@ -253,6 +254,7 @@ async fn upload_manifest(
 
 /// Upload a snapshot marker as an empty object at
 /// `by_id/<volume_id>/snapshots/YYYYMMDD/<snapshot_ulid>`.
+#[allow(dead_code)] // used when S3 snapshot upload is wired up
 pub async fn upload_snapshot(
     volume_id: &str,
     snapshot_ulid: &str,

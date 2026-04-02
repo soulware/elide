@@ -46,11 +46,13 @@ const NBD_CMD_READ: u16 = 0;
 const NBD_CMD_WRITE: u16 = 1;
 const NBD_CMD_DISC: u16 = 2;
 const NBD_CMD_FLUSH: u16 = 3;
+const NBD_CMD_TRIM: u16 = 4;
 
 // Transmission flags
 const NBD_FLAG_HAS_FLAGS: u16 = 1;
 const NBD_FLAG_READ_ONLY: u16 = 2;
 const NBD_FLAG_SEND_FLUSH: u16 = 4;
+const NBD_FLAG_SEND_TRIM: u16 = 32;
 
 // COW granularity — 4KB blocks
 const COW_BLOCK: u64 = 4096;
@@ -697,6 +699,9 @@ fn handle_readonly_connection(
             NBD_CMD_FLUSH => {
                 tx_reply(&mut s, 0, handle)?; // flush is a no-op on readonly
             }
+            NBD_CMD_TRIM => {
+                tx_reply(&mut s, 1, handle)?; // EPERM — device is read-only; no data to drain
+            }
             _ => {
                 tx_reply(&mut s, 22, handle)?; // EINVAL
             }
@@ -820,7 +825,7 @@ fn handle_volume_connection(
 
     let _client_flags = read_u32(&mut s)?;
 
-    let tx_flags: u16 = NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH;
+    let tx_flags: u16 = NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM;
 
     // Options loop
     loop {
@@ -963,6 +968,26 @@ fn handle_volume_connection(
                     tx_reply(&mut s, 5, handle)?; // EIO
                 }
             },
+
+            NBD_CMD_TRIM => {
+                // Round inward to fully-covered 4096-byte blocks.
+                // Sub-block-aligned TRIM ranges are no-ops (the filesystem
+                // will rewrite those LBAs before reading them anyway).
+                let start_lba = offset.div_ceil(4096);
+                let end_lba = (offset + length as u64) / 4096;
+                if end_lba > start_lba {
+                    let lba_count = (end_lba - start_lba) as u32;
+                    match volume.trim(start_lba, lba_count) {
+                        Ok(()) => tx_reply(&mut s, 0, handle)?,
+                        Err(e) => {
+                            error!("[trim error offset={} len={}: {}]", offset, length, e);
+                            tx_reply(&mut s, 5, handle)?; // EIO
+                        }
+                    }
+                } else {
+                    tx_reply(&mut s, 0, handle)?;
+                }
+            }
 
             _ => {
                 tx_reply(&mut s, 22, handle)?; // EINVAL

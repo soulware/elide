@@ -22,7 +22,7 @@
 //   [gc]
 //   density_threshold  = 0.70          # compact when live_bytes/file_bytes < threshold
 //   small_segment_bytes = 8388608      # also compact segments smaller than this
-//   interval_secs      = 300           # how often GC runs per fork (seconds)
+//   interval_secs      = 30            # how often GC runs per fork (seconds)
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -97,7 +97,7 @@ fn sibling_bin(name: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct StoreSection {
     /// Use a local directory as the object store (for testing).
     /// Mutually exclusive with `bucket`.
@@ -111,17 +111,6 @@ pub struct StoreSection {
 
     /// AWS region (optional; falls back to AWS_DEFAULT_REGION env var).
     pub region: Option<String>,
-}
-
-impl Default for StoreSection {
-    fn default() -> Self {
-        Self {
-            local_path: None,
-            bucket: None,
-            endpoint: None,
-            region: None,
-        }
-    }
 }
 
 impl StoreSection {
@@ -207,7 +196,7 @@ fn default_gc_small_segment() -> u64 {
     8 * 1024 * 1024
 }
 fn default_gc_interval() -> u64 {
-    300
+    30
 }
 
 impl Default for GcConfig {

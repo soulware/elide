@@ -88,6 +88,11 @@ pub(crate) enum VolumeRequest {
     Flush {
         reply: Sender<io::Result<()>>,
     },
+    Trim {
+        start_lba: u64,
+        lba_count: u32,
+        reply: Sender<io::Result<()>>,
+    },
     SweepPending {
         reply: Sender<io::Result<CompactionStats>>,
     },
@@ -190,6 +195,29 @@ impl VolumeActor {
                                 self.publish_snapshot();
                             }
                             let _ = reply.send(result);
+                        }
+                        VolumeRequest::Trim {
+                            start_lba,
+                            lba_count,
+                            reply,
+                        } => {
+                            let result = self.volume.trim(start_lba, lba_count);
+                            if result.is_ok() {
+                                let (lbamap, extent_index) = self.volume.snapshot_maps();
+                                self.snapshot.store(Arc::new(ReadSnapshot {
+                                    lbamap,
+                                    extent_index,
+                                    flush_gen: self.flush_gen,
+                                }));
+                            }
+                            let _ = reply.send(result);
+                            if self.volume.needs_promote() {
+                                if let Err(e) = self.volume.flush_wal() {
+                                    warn!("threshold-triggered promote after trim failed: {e}");
+                                } else {
+                                    self.publish_snapshot();
+                                }
+                            }
                         }
                         VolumeRequest::SweepPending { reply } => {
                             let result = self.volume.sweep_pending();
@@ -324,6 +352,24 @@ impl VolumeHandle {
             .send(VolumeRequest::Write {
                 lba,
                 data,
+                reply: reply_tx,
+            })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Trim (discard) `lba_count` blocks starting at `lba`.  Blocks until the actor replies.
+    ///
+    /// Internally writes zeros to the given range so the operation is crash-safe
+    /// and appears in the segment history.  See [`Volume::trim`] for details.
+    pub fn trim(&self, start_lba: u64, lba_count: u32) -> io::Result<()> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::Trim {
+                start_lba,
+                lba_count,
                 reply: reply_tx,
             })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
