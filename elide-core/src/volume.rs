@@ -259,16 +259,16 @@ impl Volume {
         //
         // Done before WAL recovery so we can compute the mint floor below.
         let latest_snap = latest_snapshot(base_dir)?;
-        let mut all_segment_ulids: Vec<String> = Vec::new();
+        let mut last_segment_ulid: Option<String> = None;
         for subdir in ["pending", "segments"] {
             for p in segment::collect_segment_files(&base_dir.join(subdir))? {
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()).map(str::to_owned) {
-                    all_segment_ulids.push(name);
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()).map(str::to_owned)
+                    && last_segment_ulid.as_deref() < Some(name.as_str())
+                {
+                    last_segment_ulid = Some(name);
                 }
             }
         }
-        all_segment_ulids.sort_unstable();
-        let last_segment_ulid = all_segment_ulids.last().cloned();
 
         // Compute the mint floor: max of the highest segment ULID and the
         // WAL filename ULID (if one exists). This guarantees the first fresh
@@ -1488,23 +1488,20 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
 /// snapshots exist. Snapshots live as plain files under `fork_dir/snapshots/`.
 pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<String>> {
     let snapshots_dir = fork_dir.join("snapshots");
-    let mut ulids: Vec<String> = match fs::read_dir(&snapshots_dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                Ulid::from_string(&name).ok()?;
-                Some(name)
-            })
-            .collect(),
+    let iter = match fs::read_dir(&snapshots_dir) {
+        Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    if ulids.is_empty() {
-        return Ok(None);
-    }
-    ulids.sort();
-    Ok(ulids.into_iter().last())
+    let latest = iter
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            Ulid::from_string(&name).ok()?;
+            Some(name)
+        })
+        .max();
+    Ok(latest)
 }
 
 /// Create a new volume directory, branched from the latest snapshot of the source volume.
