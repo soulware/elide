@@ -205,7 +205,7 @@ Both commands are useful when debugging read failures: `inspect-segment` surface
 
 **Single-candidate guard:** a single small segment with no dead extents is not a candidate. Rewriting it would produce an output with identical content — a pointless write amplification. The pass only proceeds for a single segment when it has dead extents to reclaim. When two or more small segments are candidates, they are always merged (reducing segment count from N to 1 is worthwhile even if all extents are live).
 
-**Key property:** data written then deleted before `drain-pending` runs is never uploaded to S3. The compaction pass removes it from `pending/` entirely. This is the primary economic argument for compacting before upload — the local I/O cost of compaction is much cheaper than uploading dead bytes to S3 and paying for coordinator GC later.
+**Key property:** data written then deleted before the drain loop runs is never uploaded to S3. The compaction pass removes it from `pending/` entirely. This is the primary economic argument for compacting before upload — the local I/O cost of compaction is much cheaper than uploading dead bytes to S3 and paying for coordinator GC later.
 
 ---
 
