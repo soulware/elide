@@ -221,12 +221,11 @@ delta_offset  = 96 + index_length + inline_length + body_length
 - `0x04` `FLAG_COMPRESSED` — stored data is compressed; lengths are compressed sizes
 - `0x08` `FLAG_DEDUP_REF` — extent data lives in an ancestor segment; no body in this segment
 
-**Compression algorithm — Proposed:** two algorithms serve two distinct purposes:
+**Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
 
-- **LZ4** — body extents written locally (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
-- **zstd** — delta bodies in S3 (`FLAG_HAS_DELTAS` option entries). Delta blobs are small and fetched infrequently (demand-fetch only). zstd achieves substantially better ratio at the cost of slower decompression; the tradeoff favours ratio here since delta data is bandwidth-constrained at both upload and download time.
+**Planned:** zstd for delta bodies in S3 (`FLAG_HAS_DELTAS` option entries). Delta blobs are small and fetched infrequently; zstd achieves substantially better ratio at the cost of slower decompression — the tradeoff favours ratio for bandwidth-constrained S3 data. Delta compression is not yet implemented; when it is, `FLAG_COMPRESSED` will continue to apply uniformly and the algorithm will be implied by context (full-body entry vs. delta option entry).
 
-`FLAG_COMPRESSED` applies uniformly; the algorithm is implied by context (full-body entry vs. delta option entry). Both algorithms apply the same entropy gate (≥ 7.0 bits/byte skips compression) and minimum ratio threshold (< 1.5× skips storage).
+Both algorithms apply the same entropy gate (≥ 7.0 bits/byte skips compression) and minimum ratio threshold (< 1.5× skips storage).
 
 **Compression granularity:** `FLAG_COMPRESSED` applies to the full stored payload of an entry — the entire extent is compressed as a unit. There is no sub-extent compression granularity. A read of any portion of a compressed extent must decompress the full payload. This matches lsvd. The practical impact is bounded by the pre-log coalescing block limit, which caps maximum extent size at write time.
 
@@ -297,7 +296,7 @@ names/    — one tiny file per named volume; the name→ULID index
 by_id/<volume-ulid>/YYYYMMDD/<segment-ulid>
 ```
 
-The date is extracted from the segment ULID's embedded millisecond timestamp and formatted as `YYYYMMDD`. Using the ULID timestamp (creation time) rather than upload time makes keys stable and deterministic regardless of when `drain-pending` runs.
+The date is extracted from the segment ULID's embedded millisecond timestamp and formatted as `YYYYMMDD`. Using the ULID timestamp (creation time) rather than upload time makes keys stable and deterministic regardless of when the coordinator drain loop runs.
 
 Example segment key:
 ```

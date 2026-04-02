@@ -339,22 +339,28 @@ The `elide` CLI derives the coordinator socket path from `--data-dir`:
 2. `ELIDE_DATA_DIR` environment variable → `<value>/control.sock`
 3. `./elide_data/control.sock` (default)
 
-## Proposed: Coordinator inbound socket
+## Coordinator inbound socket
 
 The coordinator listens on `<data-dir>/control.sock` for commands from the `elide` CLI. Volume processes each listen on `<vol-dir>/control.sock` for commands from the coordinator. Same socket name, different directory level — the path encodes what you're talking to.
 
 Same text line protocol as the volume control socket: `<op> [args...]\n` → `ok [values...]\n` / `err <message>\n`.
 
-Three auth tiers apply to this socket:
-
-**Unauthenticated** (read-only, no volume targeting; any connected process):
+**Implemented operations:**
 
 | Operation | Request | Response |
 |---|---|---|
 | Trigger immediate fork discovery | `rescan` | `ok` |
-| Query volume process state | `status <volume>` | `ok running <device-or-address>` or `ok stopped` |
+| Query volume process state | `status <volume>` | `ok running` / `ok stopped` / `ok importing <ulid>` |
+| Start OCI import | `import <name> <oci-ref>` | `ok <ulid>` |
+| Poll import state | `import status <ulid>` | `ok running` / `ok done` / `err failed: <msg>` |
+| Stream import output | `import attach <ulid>` | lines… then `ok done` or `err failed: <msg>` |
+| Stop processes and remove volume | `delete <volume>` | `ok` |
 
-**Unauthenticated — volume stop/start and quiesce:**
+`import` and `import status` follow the standard one-request / one-response model. `import attach` is the exception: the coordinator streams buffered and live output lines until the import completes, then sends a terminal `ok done\n` or `err failed: <message>\n` and closes the connection. If the import has already finished, the stored output is replayed immediately followed by the terminal line.
+
+`rescan` is the lightweight hook used by `create` and `fork`. The coordinator runs a discovery pass immediately and starts supervising any new volumes found.
+
+**Planned — volume stop/start and quiesce** (see *Volume stop/start and coordinator quiesce* above):
 
 | Operation | Request | Response |
 |---|---|---|
@@ -363,25 +369,7 @@ Three auth tiers apply to this socket:
 | Stop all volumes | `quiesce` | `ok` |
 | Start all stopped volumes | `resume` | `ok` |
 
-`stop` sends SIGTERM to the volume process and writes `volume.stopped`. `start` removes the marker; the supervisor picks the volume up on the next scan. `quiesce` and `resume` apply the same operations to all supervised forks.
-
-**Unauthenticated — import management:**
-
-| Operation | Request | Response |
-|---|---|---|
-| Start OCI import | `import <name> <oci-ref>` | `ok <ulid>` |
-| Poll import state | `import status <ulid>` | `ok running` / `ok done` / `err failed: <msg>` |
-| Stream import output | `import attach <ulid>` | lines… then `ok done` or `err failed: <msg>` |
-
-`import` and `import status` follow the standard one-request / one-response model. `import attach` is the exception: the coordinator streams buffered and live output lines until the import completes, then sends a terminal `ok done\n` or `err failed: <message>\n` and closes the connection. If the import has already finished, the stored output is replayed immediately followed by the terminal line.
-
-**Operator macaroon** (CLI-originated mutations; see *Operator tokens* below):
-
-| Operation | Request | Response |
-|---|---|---|
-| Stop volume and delete directory | `delete <volume> <macaroon>` | `ok` |
-
-**Volume macaroon** (volume process identity; PID-bound; see *S3 credential distribution via macaroons* below):
+**Planned — S3 credential distribution** (see *S3 credential distribution via macaroons* below):
 
 | Operation | Request | Response |
 |---|---|---|
@@ -389,10 +377,6 @@ Three auth tiers apply to this socket:
 | Exchange macaroon for S3 credentials | `credentials <macaroon>` | `ok <key> <secret> <session-token> <expiry-unix>` |
 
 The core isolation goal: **a compromised volume process must not be able to affect another volume's S3 data**. See *Isolation model* below for what this does and does not enforce.
-
-`rescan` is the lightweight hook used by `create` and `import`. The coordinator runs a discovery pass immediately and starts supervising any new forks found.
-
-`register` is called by the volume process on startup; the coordinator verifies the caller's PID via `SO_PEERCRED` before minting and returning a macaroon. `credentials` is called by the volume whenever its S3 credentials are about to expire; the macaroon is verified (HMAC + caveats + PID check) before new credentials are issued.
 
 ## Proposed: Operator tokens
 
@@ -509,7 +493,7 @@ The attenuated token is derived by the volume in-process — no coordinator roun
 
 The caveat set is small and typed (`volume`, `fork`, `scope`, `pid`, optionally `not-after`). This is implementable in ~150–200 lines of HMAC-SHA256 chain code. Existing `macaroon` crates on crates.io should be evaluated before hand-rolling; if they use untyped opaque blobs (as noted in the fly.io design), a thin typed wrapper or a minimal hand-rolled implementation may be preferable for clarity.
 
-## Proposed: Import process lifecycle
+## Import process lifecycle
 
 OCI import is a potentially long-running operation. The coordinator supervises it as a short-lived child process, analogous to a volume process, with an explicit lifecycle marker on disk.
 
@@ -520,7 +504,7 @@ OCI import is a potentially long-running operation. The coordinator supervises i
 - No `wal/` or `pending/` — the volume is frozen after import completes
 - `segments/` holds the imported data
 - `snapshots/<import-ulid>` marks the branch point for derived volumes
-- `meta.toml` records source metadata (OCI digest, arch)
+- `manifest.toml` records source metadata (OCI digest, arch)
 
 To get a writable copy, the user runs `elide volume fork <name> <new-name>` after import completes. This is an explicit step, not automatic.
 
@@ -867,7 +851,7 @@ Import is handled by `elide volume import <name> <oci-ref>`, which asks the coor
 
 **Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The snapshot ULID matches the ULID of the last committed segment, making the branch point self-describing. If no new segments have been committed since the latest existing snapshot, the operation is idempotent — it returns the existing snapshot ULID without writing a new marker. The volume remains live; no directory structure changes.
 
-**Import procedure:** the import path writes data directly into `<vol-dir>/segments/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. The `size` marker and `meta.toml` (OCI source metadata) are written into the volume directory.
+**Import procedure:** the import path writes data directly into `<vol-dir>/segments/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. The `volume.size` marker and `manifest.toml` (OCI source metadata) are written into the volume directory.
 
 **S3 upload for volume metadata:** at import, fork, and create time, two objects are written to the store eagerly: `names/<name>` (contains the ULID, plain text) and `by_id/<ulid>/manifest.toml` (name, size, origin, source metadata). Snapshot markers are uploaded as empty objects at `by_id/<ulid>/snapshots/YYYYMMDD/<snapshot-ulid>` after each `volume snapshot` and at the end of import. Together these allow any host to reconstruct the full volume ancestry skeleton with O(depth) GETs before segment index prefetch begins. See *S3 object layout* in `docs/formats.md` for the full key structure.
 

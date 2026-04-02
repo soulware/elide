@@ -6,54 +6,87 @@ Import an OCI image, fork it, and serve it over NBD.
 
 - Rust toolchain (`cargo`)
 - `mke2fs` from e2fsprogs (macOS: `brew install e2fsprogs`)
+- `nbd-client` for connecting a block device (Linux only; on macOS use QEMU direct kernel boot — see [vm-boot.md](vm-boot.md))
 
 ## Build
 
 ```sh
-cargo build -p elide -p elide-import
+cargo build -p elide -p elide-import -p elide-coordinator
 ```
 
 Binaries land in `target/debug/`.
 
+## Start the coordinator
+
+The coordinator supervises volume processes, drains segments to the store, and handles imports. Run it in a dedicated terminal from the project root:
+
+```sh
+./target/debug/elide-coordinator serve
+```
+
+With no config file it defaults to `elide_data/` for volume state and `elide_store/` for local object storage — no setup needed for local development.
+
 ## Import an OCI image
 
 ```sh
-./target/debug/elide-import --image ubuntu:22.04 /tmp/elide-test/ubuntu-22.04
+./target/debug/elide volume import start ubuntu-22.04 ubuntu:22.04
+# prints an import job ULID, e.g.: 01JQA3NDEKTSV4RRFFQ69G5FAV
 ```
 
-This pulls the image, builds an ext4 rootfs, and writes a readonly base volume. On Apple Silicon it auto-selects `arm64`; use `--arch amd64` to override.
-
-The result:
-
-```
-/tmp/elide-test/ubuntu-22.04/
-  meta.toml          — OCI source, digest, arch; readonly = true
-  size               — volume size in bytes
-  base/
-    segments/        — imported data
-    snapshots/
-      <ulid>         — branch point for forks
-```
-
-## Fork
-
-Create a writable fork from the base:
+Stream the import log until completion:
 
 ```sh
-./target/debug/elide fork-volume /tmp/elide-test/ubuntu-22.04 vm1
+./target/debug/elide volume import attach 01JQA3NDEKTSV4RRFFQ69G5FAV
 ```
 
-The fork lands at `forks/vm1/` and its `origin` file points to `base/snapshots/<ulid>`.
+Or poll the state:
+
+```sh
+./target/debug/elide volume import status 01JQA3NDEKTSV4RRFFQ69G5FAV
+# ubuntu-22.04: done
+```
+
+On Apple Silicon, `elide-import` auto-selects `arm64`.
+
+## Check volumes
+
+```sh
+./target/debug/elide volume list
+# ubuntu-22.04  01JQA3...  readonly
+```
+
+```sh
+./target/debug/elide volume info ubuntu-22.04
+```
+
+## Browse the filesystem (without mounting)
+
+```sh
+./target/debug/elide volume ls ubuntu-22.04 /etc
+```
+
+## Fork for a VM
+
+Create a writable fork branched from the imported base:
+
+```sh
+./target/debug/elide volume fork vm1 --from ubuntu-22.04
+```
 
 ## Serve over NBD
 
+By default the coordinator runs volumes in IPC-only mode (no NBD listener). To expose a volume over NBD, write the desired port to `nbd.port` in the volume directory. The supervisor reads this file at spawn time:
+
 ```sh
-./target/debug/elide serve-volume /tmp/elide-test/ubuntu-22.04 vm1
+echo 10809 > elide_data/by_name/vm1/nbd.port
 ```
 
-Binds to `127.0.0.1:10809`. Leave it running in a separate terminal.
+Since `vm1` was just created, the coordinator will start it fresh on the next scan and pick up the port. Check status:
 
-To bind on all interfaces (for VM access): `--bind 0.0.0.0`
+```sh
+./target/debug/elide volume status vm1
+# vm1: running
+```
 
 ## Connect with nbd-client
 
@@ -64,62 +97,18 @@ sudo mount /dev/nbd0 /mnt
 
 Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).
 
-## Import a raw ext4 image directly
-
-If you already have an ext4 image (e.g. extracted from a cloud image), use `--from-file` to skip the OCI pull:
+## Take a snapshot
 
 ```sh
-./target/debug/elide-import --from-file ubuntu-22.04.ext4 /tmp/elide-test/ubuntu-22.04
+./target/debug/elide volume snapshot vm1
+# prints the snapshot ULID
 ```
 
-Note: `--image` and `--from-file` are mutually exclusive; `<vol_dir>` is always the positional argument.
+`vm1/snapshots/<ulid>` is now a branch point for further forks — `elide volume fork vm2 --from vm1` will branch from here.
 
-## Boot-trace analysis on an OCI-derived volume
-
-To measure what fraction of an OCI image is actually read during a VM boot, retain the intermediate flat ext4 at import time:
+## Clean up
 
 ```sh
-./target/debug/elide-import --image ubuntu:22.04 /tmp/elide-test/ubuntu-22.04 \
-    --save-flat /tmp/ubuntu-22.04.ext4
+./target/debug/elide volume delete vm1
+./target/debug/elide volume delete ubuntu-22.04
 ```
-
-Then serve it under the tracing NBD server and boot a VM:
-
-```sh
-./target/debug/elide serve /tmp/ubuntu-22.04.ext4 --save-trace /tmp/ubuntu-22.04.trace
-```
-
-(Boot the VM with `--drive file=nbd://127.0.0.1:10809,format=raw,if=virtio` or use `nbd-client` + QEMU direct kernel boot — see [vm-boot.md](vm-boot.md).)
-
-Disconnect the VM and the trace is written. To compare two OCI versions (e.g. estimate delta-fetch cost when upgrading):
-
-```sh
-# Import the newer version
-./target/debug/elide-import --image ubuntu:24.04 /tmp/elide-test/ubuntu-24.04 \
-    --save-flat /tmp/ubuntu-24.04.ext4
-
-# Cross-image cold-boot analysis: how much data must be fetched if you already
-# have ubuntu:22.04 blocks cached?
-./target/debug/elide cold-boot /tmp/ubuntu-22.04.ext4 /tmp/ubuntu-24.04.ext4 \
-    --trace /tmp/ubuntu-22.04.trace
-```
-
-## Other useful commands
-
-```sh
-# Human-readable summary of the volume layout
-./target/debug/elide inspect-volume /tmp/elide-test/ubuntu-22.04
-
-# List forks
-./target/debug/elide list-forks /tmp/elide-test/ubuntu-22.04
-
-# Browse the ext4 filesystem without mounting
-./target/debug/elide ls-volume /tmp/elide-test/ubuntu-22.04 vm1 /etc
-
-# Snapshot a live fork (idempotent if no new writes)
-./target/debug/elide snapshot-volume /tmp/elide-test/ubuntu-22.04 vm1
-
-# Fork from a user fork instead of base
-./target/debug/elide fork-volume /tmp/elide-test/ubuntu-22.04 vm2 --from vm1
-```
-
