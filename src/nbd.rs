@@ -714,7 +714,8 @@ fn serve_readonly_volume_listener(
     size_bytes: u64,
     listener: TcpListener,
 ) -> io::Result<()> {
-    let volume = ReadonlyVolume::open(dir, dir)?;
+    let by_id_dir = dir.parent().unwrap_or(dir);
+    let volume = ReadonlyVolume::open(dir, by_id_dir)?;
     for stream in listener.incoming() {
         let stream = stream?;
         let result = handle_readonly_connection(stream, &volume, size_bytes);
@@ -1362,8 +1363,9 @@ mod tests {
         let data: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
 
         // Populate the fork via a writable Volume, promote to segment, then drop.
+        // `dir` is the by_id equivalent; `fork_dir` is one volume under it.
         {
-            let mut vol = elide_core::volume::Volume::open(&fork_dir, &fork_dir).unwrap();
+            let mut vol = elide_core::volume::Volume::open(&fork_dir, &dir).unwrap();
             vol.write(0, &data).unwrap();
             vol.promote_for_test().unwrap();
         }
