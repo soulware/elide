@@ -1021,6 +1021,13 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
         p.push(format!("elide-nbd-test-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&p).unwrap();
+        elide_core::signing::generate_keypair(
+            &p,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
         p
     }
 
@@ -1344,6 +1351,13 @@ mod tests {
     fn readonly_nbd_read_returns_data() {
         let dir = temp_dir();
         let fork_dir = dir.join("default");
+        std::fs::create_dir_all(&fork_dir).unwrap();
+        elide_core::signing::generate_keypair(
+            &fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
 
         let data: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
 

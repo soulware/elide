@@ -311,6 +311,20 @@ pub async fn apply_done_handoffs(
             .try_exists()
             .context("checking new segment path")?
         {
+            // Verify the volume's signature before uploading.  This catches any
+            // case where the volume failed to sign correctly — we refuse to
+            // propagate a bad segment to S3.  Load volume.pub here rather than
+            // at the top of the function so that removal-only handoffs (where
+            // no segment file is written) do not require volume.pub to exist.
+            let vk = elide_core::signing::load_verifying_key(
+                fork_dir,
+                elide_core::signing::VOLUME_PUB_FILE,
+            )
+            .context("loading volume verifying key")?;
+            segment::read_and_verify_segment_index(&new_seg_path, &vk).with_context(|| {
+                format!("signature verification failed for compacted segment {new_ulid_str}")
+            })?;
+
             let key = segment_key(volume_id, new_ulid_str)
                 .with_context(|| format!("building key for {new_ulid_str}"))?;
             let data = tokio::fs::read(&new_seg_path)
@@ -1015,6 +1029,115 @@ mod tests {
             let name = name.to_str().unwrap();
             assert!(name.ends_with(".done"), "expected .done, got {name}");
         }
+    }
+
+    /// Write `volume.pub` into `dir` using an ephemeral keypair.
+    /// Returns the signer so the caller can sign segments with it.
+    fn setup_vol_pub(dir: &Path) -> Arc<dyn elide_core::segment::SegmentSigner> {
+        fs::create_dir_all(dir).unwrap();
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        fs::write(
+            dir.join(elide_core::signing::VOLUME_PUB_FILE),
+            vk.to_bytes(),
+        )
+        .unwrap();
+        signer
+    }
+
+    #[tokio::test]
+    async fn done_verifies_signature_before_upload() {
+        // A correctly-signed segment must be uploaded to S3 successfully.
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        let segments_dir = tmp.path().join("segments");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(&segments_dir).unwrap();
+
+        let signer = setup_vol_pub(tmp.path());
+
+        let new_ulid = Ulid::from_parts(1000, 10).to_string();
+        let old_ulid = Ulid::from_parts(999, 9).to_string();
+
+        // Write a properly volume-signed segment to segments/<new_ulid>.
+        let entry = elide_core::segment::SegmentEntry::new_data(
+            blake3::hash(b"payload"),
+            0,
+            1,
+            0,
+            b"payload".to_vec(),
+        );
+        elide_core::segment::write_segment(
+            &segments_dir.join(&new_ulid),
+            &mut vec![entry],
+            signer.as_ref(),
+        )
+        .unwrap();
+
+        let hash_hex = "a".repeat(64);
+        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
+
+        let store = make_store();
+        let n = apply_done_handoffs(tmp.path(), "vol", &store)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // Segment should be in S3.
+        let key = segment_key("vol", &new_ulid).unwrap();
+        assert!(store.get(&key).await.is_ok(), "segment should be in S3");
+        assert!(gc_dir.join(format!("{new_ulid}.done")).exists());
+    }
+
+    #[tokio::test]
+    async fn done_rejects_wrong_key_segment() {
+        // A segment signed with the wrong key must not be uploaded.
+        let tmp = TempDir::new().unwrap();
+        let gc_dir = tmp.path().join("gc");
+        let segments_dir = tmp.path().join("segments");
+        fs::create_dir_all(&gc_dir).unwrap();
+        fs::create_dir_all(&segments_dir).unwrap();
+
+        // Set up volume.pub with one keypair…
+        setup_vol_pub(tmp.path());
+
+        // …but sign the segment with a different (ephemeral) keypair.
+        let (wrong_signer, _) = elide_core::signing::generate_ephemeral_signer();
+        let new_ulid = Ulid::from_parts(1000, 11).to_string();
+        let old_ulid = Ulid::from_parts(999, 10).to_string();
+
+        elide_core::segment::write_segment(
+            &segments_dir.join(&new_ulid),
+            &mut vec![elide_core::segment::SegmentEntry::new_data(
+                blake3::hash(b"payload"),
+                0,
+                1,
+                0,
+                b"payload".to_vec(),
+            )],
+            wrong_signer.as_ref(),
+        )
+        .unwrap();
+
+        let hash_hex = "b".repeat(64);
+        let content = format!("{hash_hex} {old_ulid} {new_ulid} 0\n");
+        fs::write(gc_dir.join(format!("{new_ulid}.applied")), &content).unwrap();
+
+        let store = make_store();
+        let err = apply_done_handoffs(tmp.path(), "vol", &store)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("signature verification failed"),
+            "expected signature error, got: {err}"
+        );
+
+        // Segment must NOT be in S3.
+        let key = segment_key("vol", &new_ulid).unwrap();
+        assert!(
+            store.get(&key).await.is_err(),
+            "bad segment must not be uploaded"
+        );
     }
 
     // --- cleanup_done_handoffs tests ---
