@@ -157,7 +157,7 @@ pub struct Volume {
     /// sequential reads hitting the same segment avoid repeated `open` syscalls.
     /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
     /// the cache to be updated internally.
-    file_cache: RefCell<Option<(String, fs::File)>>,
+    file_cache: RefCell<Option<(String, bool, fs::File)>>,
     /// Signer for segment promotion. Every segment written by this volume
     /// (at WAL promotion and compaction) is signed with the fork's private key.
     /// See `segment::SegmentSigner`.
@@ -385,13 +385,37 @@ impl Volume {
                 body_length: owned_data.len() as u32,
                 compressed,
                 entry_idx: None,
-                body_section_start: None,
+                body_section_start: 0,
             },
         );
         self.pending_entries.push(segment::SegmentEntry::new_data(
             hash, lba, lba_length, seg_flags, owned_data,
         ));
 
+        Ok(())
+    }
+
+    /// Trim (discard) `lba_count` blocks starting at `lba`.
+    ///
+    /// Writes zeros to the given range using the normal write path so the
+    /// operation is crash-safe and benefits from dedup (all-zero extents share
+    /// the same hash).  This mirrors the lsvd reference implementation's
+    /// `ZeroBlocks` approach: TRIM is modelled as write-zeros, not as a map
+    /// deletion.
+    ///
+    /// Large ranges are chunked at `TRIM_CHUNK_LBAS` to stay within the segment
+    /// body-length limit.
+    pub fn trim(&mut self, start_lba: u64, lba_count: u32) -> io::Result<()> {
+        const TRIM_CHUNK_LBAS: u32 = 1024; // 4 MB per chunk
+        let zeros = vec![0u8; TRIM_CHUNK_LBAS as usize * 4096];
+        let mut remaining = lba_count;
+        let mut lba = start_lba;
+        while remaining > 0 {
+            let chunk = remaining.min(TRIM_CHUNK_LBAS);
+            self.write(lba, &zeros[..chunk as usize * 4096])?;
+            lba += chunk as u64;
+            remaining -= chunk;
+        }
         Ok(())
     }
 
@@ -535,11 +559,11 @@ impl Volume {
                             entry.hash,
                             extentindex::ExtentLocation {
                                 segment_id: new_ulid.clone(),
-                                body_offset: new_bss + entry.stored_offset,
+                                body_offset: entry.stored_offset,
                                 body_length: entry.stored_length,
                                 compressed: entry.compressed,
                                 entry_idx: None,
-                                body_section_start: None,
+                                body_section_start: new_bss,
                             },
                         );
                     }
@@ -548,7 +572,7 @@ impl Volume {
 
             // Evict the old segment from the file handle cache before deleting it.
             let mut cache = self.file_cache.borrow_mut();
-            if cache.as_ref().map(|(id, _)| id.as_str()) == Some(seg_id.as_str()) {
+            if cache.as_ref().map(|(id, _, _)| id.as_str()) == Some(seg_id.as_str()) {
                 *cache = None;
             }
             drop(cache);
@@ -723,11 +747,11 @@ impl Volume {
                         entry.hash,
                         extentindex::ExtentLocation {
                             segment_id: new_ulid.clone(),
-                            body_offset: new_bss + entry.stored_offset,
+                            body_offset: entry.stored_offset,
                             body_length: entry.stored_length,
                             compressed: entry.compressed,
                             entry_idx: None,
-                            body_section_start: None,
+                            body_section_start: new_bss,
                         },
                     );
                 }
@@ -742,7 +766,7 @@ impl Volume {
                 continue; // already replaced atomically above
             }
             let mut cache = self.file_cache.borrow_mut();
-            if cache.as_ref().map(|(id, _)| id.as_str()) == Some(seg_id) {
+            if cache.as_ref().map(|(id, _, _)| id.as_str()) == Some(seg_id) {
                 *cache = None;
             }
             drop(cache);
@@ -825,18 +849,25 @@ impl Volume {
             // Validate the ULID so we never act on a malformed filename.
             Ulid::from_string(new_ulid).map_err(|e| io::Error::other(e.to_string()))?;
 
-            // Parse the .pending file to learn which old segment each extent
-            // came from.  We only update the extent index if it still points
-            // at the old segment — if a newer write has landed since GC ran,
-            // the current entry is more recent and must not be overwritten.
+            // Parse the .pending file into typed HandoffLines.
+            //
+            // old_ulid_by_hash maps each hash to the old segment it came from
+            // so the extent index can be updated only when it still points at
+            // the old segment.  Dead lines carry no hash — they are a no-op
+            // from the volume's perspective (just an acknowledgment).
             let pending_content = fs::read_to_string(entry.path())?;
             let mut old_ulid_by_hash: HashMap<blake3::Hash, String> = HashMap::new();
+            let mut is_tombstone = false;
             for line in pending_content.lines() {
-                let mut parts = line.split_whitespace();
-                if let (Some(hash_hex), Some(old_ulid)) = (parts.next(), parts.next())
-                    && let Ok(hash) = blake3::Hash::from_hex(hash_hex)
-                {
-                    old_ulid_by_hash.insert(hash, old_ulid.to_owned());
+                match crate::gc::HandoffLine::parse(line) {
+                    Some(crate::gc::HandoffLine::Repack { hash, old_ulid, .. })
+                    | Some(crate::gc::HandoffLine::Remove { hash, old_ulid }) => {
+                        old_ulid_by_hash.insert(hash, old_ulid.to_string());
+                    }
+                    Some(crate::gc::HandoffLine::Dead { .. }) => {
+                        is_tombstone = true;
+                    }
+                    None => {}
                 }
             }
 
@@ -862,17 +893,20 @@ impl Volume {
 
             let segment_exists = segment_path.try_exists()?;
 
-            // If the segment still doesn't exist, we can only process removal-only
-            // handoffs (all 2-field lines).  Handoffs with carried entries
-            // (4-field lines) need the segment for extent index updates —
-            // defer until it's available locally (e.g. fetched from S3).
-            // Empty handoffs (nothing to do) are also deferred.
+            // If the new segment doesn't exist locally, only some handoff
+            // types can proceed without it:
+            //   tombstone — no segment ever exists; just acknowledge.
+            //   removal-only — no segment needed; just clean extent index.
+            //   repack — needs the segment for extent index updates;
+            //            defer until available (e.g. fetched from S3).
             if !segment_exists {
-                let has_removals = !old_ulid_by_hash.is_empty();
-                let has_carried = pending_content
-                    .lines()
-                    .any(|l| l.split_whitespace().count() >= 4);
-                if has_carried || !has_removals {
+                let has_carried = pending_content.lines().any(|l| {
+                    matches!(
+                        crate::gc::HandoffLine::parse(l),
+                        Some(crate::gc::HandoffLine::Repack { .. })
+                    )
+                });
+                if !is_tombstone && (has_carried || old_ulid_by_hash.is_empty()) {
                     continue;
                 }
             }
@@ -910,11 +944,11 @@ impl Volume {
                         e.hash,
                         extentindex::ExtentLocation {
                             segment_id: new_ulid.to_owned(),
-                            body_offset: body_section_start + e.stored_offset,
+                            body_offset: e.stored_offset,
                             body_length: e.stored_length,
                             compressed: e.compressed,
                             entry_idx: None,
-                            body_section_start: None,
+                            body_section_start,
                         },
                     );
                 }
@@ -971,8 +1005,8 @@ impl Volume {
             &mut self.pending_entries,
             self.signer.as_ref(),
         )?;
-        // Update the extent index: replace temporary WAL offsets with absolute
-        // offsets into the committed segment file.
+        // Update the extent index: replace temporary WAL offsets with
+        // body-relative offsets into the committed segment file.
         for entry in &self.pending_entries {
             if entry.is_dedup_ref {
                 continue; // data lives in an ancestor segment; index already correct
@@ -981,11 +1015,11 @@ impl Volume {
                 entry.hash,
                 extentindex::ExtentLocation {
                     segment_id: self.wal_ulid.clone(),
-                    body_offset: body_section_start + entry.stored_offset,
+                    body_offset: entry.stored_offset,
                     body_length: entry.stored_length,
                     compressed: entry.compressed,
                     entry_idx: None,
-                    body_section_start: None,
+                    body_section_start,
                 },
             );
         }
@@ -994,7 +1028,7 @@ impl Volume {
         // the body offsets in the extent index point into the new segment file;
         // any cached fd for this ULID would use the old WAL byte layout.
         let mut cache = self.file_cache.borrow_mut();
-        if cache.as_ref().map(|(id, _)| id.as_str()) == Some(self.wal_ulid.as_str()) {
+        if cache.as_ref().map(|(id, _, _)| id.as_str()) == Some(self.wal_ulid.as_str()) {
             *cache = None;
         }
         Ok(())
@@ -1083,7 +1117,7 @@ impl Volume {
     fn find_segment_file(
         &self,
         segment_id: &str,
-        body_section_start: Option<u64>,
+        body_section_start: u64,
         entry_idx: Option<u32>,
     ) -> io::Result<PathBuf> {
         find_segment_in_dirs(
@@ -1184,8 +1218,8 @@ pub(crate) fn read_extents(
     lba_count: u32,
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
-    file_cache: &RefCell<Option<(String, fs::File)>>,
-    find_segment: impl Fn(&str, Option<u64>, Option<u32>) -> io::Result<PathBuf>,
+    file_cache: &RefCell<Option<(String, bool, fs::File)>>,
+    find_segment: impl Fn(&str, u64, Option<u32>) -> io::Result<PathBuf>,
 ) -> io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -1212,23 +1246,31 @@ pub(crate) fn read_extents(
         // check the .present bitset — the .body file may exist but the specific
         // entry may not yet be fetched.
         let mut cache = file_cache.borrow_mut();
-        let need_find = cache.as_ref().map(|(id, _)| id.as_str()) != Some(segment_id.as_str())
+        let need_find = cache.as_ref().map(|(id, _, _)| id.as_str()) != Some(segment_id.as_str())
             || entry_idx.is_some();
         if need_find {
             let path = find_segment(&segment_id, body_section_start, entry_idx)?;
-            *cache = Some((segment_id, fs::File::open(path)?));
+            // .body files store body bytes starting at offset 0 (body-relative);
+            // full segment files store them starting at body_section_start.
+            let is_body = path.extension().is_some_and(|e| e == "body");
+            *cache = Some((segment_id, is_body, fs::File::open(path)?));
         }
-        let f = &mut cache
-            .as_mut()
-            .expect("cache was just assigned Some above")
-            .1;
+        let (_, is_body, f) = cache.as_mut().expect("cache was just assigned Some above");
+
+        // body_offset is always body-relative (= stored_offset from the segment index).
+        // For full segment files we must add body_section_start to get the file offset.
+        let file_body_offset = if *is_body {
+            body_offset
+        } else {
+            body_section_start + body_offset
+        };
 
         let block_count = (er.range_end - er.range_start) as usize;
         let out_start = (er.range_start - lba) as usize * 4096;
         let out_slice = &mut out[out_start..out_start + block_count * 4096];
 
         if compressed {
-            f.seek(SeekFrom::Start(body_offset))?;
+            f.seek(SeekFrom::Start(file_body_offset))?;
             let mut compressed_buf = vec![0u8; body_length as usize];
             f.read_exact(&mut compressed_buf)?;
             let decompressed =
@@ -1241,7 +1283,7 @@ pub(crate) fn read_extents(
             out_slice.copy_from_slice(src_slice);
         } else {
             f.seek(SeekFrom::Start(
-                body_offset + er.payload_block_offset as u64 * 4096,
+                file_body_offset + er.payload_block_offset as u64 * 4096,
             ))?;
             f.read_exact(out_slice)?;
         }
@@ -1267,7 +1309,7 @@ pub(crate) fn find_segment_in_dirs(
     base_dir: &Path,
     ancestor_layers: &[AncestorLayer],
     fetcher: Option<&BoxFetcher>,
-    body_section_start: Option<u64>,
+    body_section_start: u64,
     entry_idx: Option<u32>,
 ) -> io::Result<PathBuf> {
     for subdir in ["wal", "pending", "segments"] {
@@ -1312,13 +1354,10 @@ pub(crate) fn find_segment_in_dirs(
     }
     if let Some(fetcher) = fetcher {
         let fetched_dir = base_dir.join("fetched");
-        match (body_section_start, entry_idx) {
-            (Some(bss), Some(idx)) => {
-                fetcher.fetch_extent(segment_id, &fetched_dir, bss, 0, 0, idx)?;
-            }
-            _ => {
-                fetcher.fetch(segment_id, &fetched_dir)?;
-            }
+        if let Some(idx) = entry_idx {
+            fetcher.fetch_extent(segment_id, &fetched_dir, body_section_start, 0, 0, idx)?;
+        } else {
+            fetcher.fetch(segment_id, &fetched_dir)?;
         }
         return Ok(base_dir.join("fetched").join(format!("{segment_id}.body")));
     }
@@ -1347,7 +1386,7 @@ pub struct ReadonlyVolume {
     ancestor_layers: Vec<AncestorLayer>,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
-    file_cache: RefCell<Option<(String, fs::File)>>,
+    file_cache: RefCell<Option<(String, bool, fs::File)>>,
     fetcher: Option<BoxFetcher>,
 }
 
@@ -1385,7 +1424,7 @@ impl ReadonlyVolume {
     fn find_segment_file(
         &self,
         segment_id: &str,
-        body_section_start: Option<u64>,
+        body_section_start: u64,
         entry_idx: Option<u32>,
     ) -> io::Result<PathBuf> {
         find_segment_in_dirs(
@@ -1613,7 +1652,7 @@ fn recover_wal(
                         body_length,
                         compressed,
                         entry_idx: None,
-                        body_section_start: None,
+                        body_section_start: 0,
                     },
                 );
                 pending_entries.push(segment::SegmentEntry::new_data(
@@ -3381,17 +3420,23 @@ mod tests {
             segment::write_segment(&tmp_path, &mut entries, ephemeral_signer.as_ref()).unwrap();
         fs::rename(&tmp_path, gc_dir.join(&new_ulid)).unwrap();
 
-        let mut lines = String::new();
-        for e in &entries {
-            if !e.is_dedup_ref {
-                let abs_offset = new_bss + e.stored_offset;
-                lines.push_str(&format!(
-                    "{} {} {} {}\n",
-                    e.hash, old_ulid, new_ulid, abs_offset
-                ));
-            }
-        }
-        fs::write(gc_dir.join(format!("{new_ulid}.pending")), lines).unwrap();
+        let old_ulid_parsed = Ulid::from_string(old_ulid).unwrap();
+        let new_ulid_parsed = Ulid::from_string(&new_ulid).unwrap();
+        let handoff_lines: Vec<crate::gc::HandoffLine> = entries
+            .iter()
+            .filter(|e| !e.is_dedup_ref)
+            .map(|e| crate::gc::HandoffLine::Repack {
+                hash: e.hash,
+                old_ulid: old_ulid_parsed,
+                new_ulid: new_ulid_parsed,
+                new_offset: new_bss + e.stored_offset,
+            })
+            .collect();
+        fs::write(
+            gc_dir.join(format!("{new_ulid}.pending")),
+            crate::gc::format_handoff_file(handoff_lines),
+        )
+        .unwrap();
 
         new_ulid
     }

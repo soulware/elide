@@ -811,6 +811,37 @@ Background promotes that fail (I/O error, disk full) are logged and do not crash
 
 **Current state (NBD):** the NBD server is single-threaded (one TCP connection). It uses a `VolumeHandle` through a single thread — the concurrency benefit is not yet exercised, but the structure is correct for ublk when that integration is added.
 
+**NBD protocol coverage:** the server implements the fixed newstyle handshake and the following transmission-phase commands:
+
+| Command | Code | Status | Notes |
+|---------|------|--------|-------|
+| `NBD_CMD_READ` | 0 | Implemented | demand-fetches extents on miss |
+| `NBD_CMD_WRITE` | 1 | Implemented | writes to WAL via actor |
+| `NBD_CMD_DISC` | 2 | Implemented | clean shutdown |
+| `NBD_CMD_FLUSH` | 3 | Implemented | promotes WAL to pending segment |
+| `NBD_CMD_TRIM` | 4 | Implemented | write-zeros path; see note below |
+| `NBD_CMD_WRITE_ZEROES` | 6 | Not implemented | see note below |
+| `NBD_CMD_BLOCK_STATUS` | 7 | Not implemented | allows clients to query allocated vs sparse regions |
+| `NBD_CMD_RESIZE` | 8 | Not implemented | live resize; not needed without dynamic sizing |
+
+Transmission flags advertised in the server's handshake:
+
+| Flag | Status | Notes |
+|------|--------|-------|
+| `NBD_FLAG_HAS_FLAGS` | Advertised | always set per spec |
+| `NBD_FLAG_SEND_FLUSH` | Advertised | client may send `NBD_CMD_FLUSH` |
+| `NBD_FLAG_READ_ONLY` | Advertised (conditional) | set when `--readonly` is passed |
+| `NBD_FLAG_SEND_TRIM` | Advertised | client may send `NBD_CMD_TRIM` |
+| `NBD_FLAG_SEND_WRITE_ZEROES` | Not advertised | `NBD_CMD_WRITE_ZEROES` not implemented |
+| `NBD_FLAG_SEND_FUA` | Not advertised | force-unit-access per write not implemented |
+| `NBD_FLAG_CAN_MULTI_CONN` | Not advertised | single connection only |
+
+Protocol options not negotiated during the option haggling phase: `NBD_OPT_STRUCTURED_REPLY`, `NBD_OPT_STARTTLS`.
+
+**TRIM and space reclamation:** `NBD_CMD_TRIM` is implemented as a write-zeros operation, mirroring the lsvd reference implementation's `ZeroBlocks` approach. When a filesystem (e.g. ext4) frees blocks, it issues TRIM for those LBAs; the volume writes zero-filled extents for the freed range via the normal write path. This is crash-safe, benefits from dedup (all-zero blocks share one hash), and makes those LBAs GC-eligible as soon as the zeros displace the old live data in the LBA map. Sub-block-aligned TRIM ranges are rounded inward to fully-covered 4096-byte blocks (ext4 only TRIMs on block boundaries in practice, so this edge case is theoretical).
+
+**`NBD_CMD_WRITE_ZEROES` (not yet implemented):** this command has the same effect as TRIM — zero a range — but it is a write command, not a discard command: the filesystem explicitly wants the range to read back as zeros after the operation. The correct implementation is the same write-zeros path already used for TRIM. The difference from TRIM is that `WRITE_ZEROES` requires the zeros to be durable; our write-zeros approach already satisfies this since it goes through the normal WAL path. Adding `WRITE_ZEROES` is a small extension: handle the command code (6), advertise `NBD_FLAG_SEND_WRITE_ZEROES`, and route to the same zero-fill logic. The `NO_HOLE` flag in `WRITE_ZEROES` requests (which asks the server not to punch a hole but to store actual zeros) is automatically satisfied by our write-zeros approach.
+
 **Share-nothing coordination:** the coordinator and volume share a filesystem layout and a ULID total order, but nothing else — no shared memory, no locks, no clock synchronisation, no protocol negotiation for normal operation. The coordinator reads the fork's on-disk state, extends its timeline by one step, and the volume applies or ignores the result at its own pace. The only real coordination is the `.pending` → `.applied` handoff, and even that is asynchronous and crash-safe: if the volume never processes it, the worst case is a space leak, not inconsistency. The filesystem directory structure is the entire coordination mechanism — inspectable with standard tools, recoverable without special tooling, and correct by construction from ULID ordering alone.
 
 The volume actor processes `gc/*.pending` files on its idle tick. For each file it first re-signs the staged segment: reads `gc/<ulid>` (ephemeral-signed by the coordinator), writes a volume-signed copy to `segments/<ulid>`, then deletes `gc/<ulid>`. Only after re-signing does it read the compacted segment's index to get authoritative `body_offset`, `body_length`, and `compressed` values (the handoff file records the new absolute offset but omits length and compression flag), update the in-memory extent index (updating carried entries, removing LBA-dead entries), and rename the file to `.applied`. Removal-only handoffs (all 2-field lines, no output segment) skip the re-sign step and are applied immediately. The re-sign step is idempotent: if the process is killed after writing `segments/<ulid>` but before deleting `gc/<ulid>`, both files are present on restart and the volume re-signs (overwriting `segments/<ulid>` with identical content) before proceeding. If the process is killed before the final rename, the handoff is re-applied on the next idle tick with identical results. No `flush_gen` bump is needed — GC moves data between segment files only, so body offsets remain absolute and the fd cache's existing segment-id mismatch detection handles eviction naturally when reads switch from the old segment to the new one.

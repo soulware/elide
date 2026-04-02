@@ -220,7 +220,7 @@ impl VolumeReader {
                                 body_length: data.len() as u32,
                                 compressed: flags.contains(writelog::WalFlags::COMPRESSED),
                                 entry_idx: None,
-                                body_section_start: None,
+                                body_section_start: 0,
                             },
                         );
                     }
@@ -280,7 +280,7 @@ impl VolumeReader {
         let loc = loc.clone();
 
         // Per-extent demand-fetch for fetched entries (have entry_idx and body_section_start).
-        if let (Some(entry_idx), Some(bss)) = (loc.entry_idx, loc.body_section_start) {
+        if let Some(entry_idx) = loc.entry_idx {
             let fetched_dir = self
                 .find_fetched_dir(&loc.segment_id)
                 .unwrap_or_else(|| self.primary_fetched_dir.clone());
@@ -290,7 +290,7 @@ impl VolumeReader {
                     Some(fetcher) => fetcher.fetch_extent(
                         &loc.segment_id,
                         &fetched_dir,
-                        bss,
+                        loc.body_section_start,
                         loc.body_offset,
                         loc.body_length,
                         entry_idx,
@@ -325,10 +325,12 @@ impl VolumeReader {
             }
             Err(e) => return Err(e),
         };
+        let is_body = path.extension().is_some_and(|e| e == "body");
+        let file_base = if is_body { 0 } else { loc.body_section_start };
         let mut f = fs::File::open(path)?;
         let mut block = [0u8; 4096];
         if loc.compressed {
-            f.seek(SeekFrom::Start(loc.body_offset))?;
+            f.seek(SeekFrom::Start(file_base + loc.body_offset))?;
             let mut buf = vec![0u8; loc.body_length as usize];
             f.read_exact(&mut buf)?;
             let decompressed =
@@ -337,7 +339,7 @@ impl VolumeReader {
             block.copy_from_slice(&decompressed[src..src + 4096]);
         } else {
             f.seek(SeekFrom::Start(
-                loc.body_offset + block_offset as u64 * 4096,
+                file_base + loc.body_offset + block_offset as u64 * 4096,
             ))?;
             f.read_exact(&mut block)?;
         }

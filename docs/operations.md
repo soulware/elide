@@ -34,7 +34,7 @@ scan_interval_secs = 30             # rescan by_id/ for new volumes every N seco
 [gc]
 density_threshold   = 0.70          # compact segments when live_bytes/total_bytes < threshold
 small_segment_bytes = 8_388_608     # also compact segments smaller than this (8 MiB)
-interval_secs       = 300           # run GC pass every N seconds (5 minutes)
+interval_secs       = 30            # run GC pass every N seconds
 ```
 
 **Volume discovery:** the coordinator scans `<data_dir>/by_id/` for ULID-named subdirectories. Each discovered fork gets its own `fork_loop` task. The coordinator only starts supervision (spawning a volume process) for writable volumes — readonly volumes (imported bases, pulled snapshots) are discovered for drain and prefetch only.
@@ -228,7 +228,7 @@ Segment GC — reclaiming space from already-uploaded `segments/` files — is a
 
 **Why the coordinator, not the volume:** segment GC requires S3 mutations (uploading replacement segments, deleting old ones). The volume holds read-only S3 credentials; all S3 writes go through the coordinator.
 
-**Two strategies, run per fork on a configurable interval (default: every 5 minutes):**
+**Two strategies, run per fork on a configurable interval (default: every 30 seconds):**
 
 *Repack pass* (mirrors lsvd `StartGC` and volume `repack()`):
 - Reconstruct the extent index from this fork's `segments/` and `pending/` index files
@@ -289,16 +289,21 @@ ULIDs are always minted by the volume process, never by the coordinator. This is
 The result file describes extent index patches. The LBA map does not need patching — it maps `LBA → hash`, and hashes do not change when data is moved.
 
 ```
-# plain text, one entry per line
+# plain text, one entry per line; first token is the line type
 
-# 4-field: carried entry — extent moved to new segment
-<hash_hex> <old_segment_ulid> <new_segment_ulid> <new_absolute_body_offset>
+# repack — extent moved to new segment (formerly "4-field")
+repack <hash_hex> <old_segment_ulid> <new_segment_ulid> <new_absolute_body_offset>
 
-# 2-field: removed entry — extent-live but LBA-dead; remove from extent index
-<hash_hex> <old_segment_ulid>
+# remove — extent-live but LBA-dead; remove from extent index (formerly "2-field")
+remove <hash_hex> <old_segment_ulid>
+
+# dead — entire segment is all-dead; no output segment produced
+dead <old_segment_ulid>
 ```
 
-A handoff file containing only 2-field lines is a *removal-only handoff*. It has no associated output segment (nothing was carried). A handoff file may also have a mix of both line types.
+Explicit type prefixes replace the previous implicit word-count format (4-field / 2-field). This makes the format self-documenting, unambiguous to parse, and extensible.
+
+A handoff file may mix `repack` and `remove` lines freely. A file containing only `remove` lines is a *removal-only handoff* — no output segment is produced and no re-signing step is needed. A file containing only `dead` lines is a *tombstone handoff* — see the *Coordinator deletion invariant* section below.
 
 **GC handoff protocol:**
 
@@ -306,9 +311,10 @@ A handoff file containing only 2-field lines is a *removal-only handoff*. It has
 2. Coordinator compacts input segments using the appropriate ULID (`repack_ulid` for density repack, `sweep_ulid` for sweep), stages the compacted segment (if any) in `gc/<result-ulid>` (signed with an ephemeral key), then writes `gc/<result-ulid>.pending` (handoff entries)
 3. Volume applies in idle arm:
    - Re-signs `gc/<result-ulid>` with `volume.key`, writes `segments/<result-ulid>`, deletes `gc/<result-ulid>`
-   - For each 4-field entry: if extent index still points to `old_segment_ulid` for this hash, update to `new_segment_ulid + new_body_offset`; otherwise skip (hash was rewritten by a newer write — stale coordinator snapshot)
-   - For each 2-field entry: if extent index still points to `old_segment_ulid` for this hash, remove the entry (LBA has been overwritten; the reference is dangling)
-   - Removal-only handoffs (all 2-field lines) are applied immediately — no output segment or re-signing needed. Handoffs with 4-field entries complete the re-sign step before applying carried entries
+   - For each `repack` entry: if extent index still points to `old_segment_ulid` for this hash, update to `new_segment_ulid + new_body_offset`; otherwise skip (hash was rewritten by a newer write — stale coordinator snapshot)
+   - For each `remove` entry: if extent index still points to `old_segment_ulid` for this hash, remove the entry (LBA has been overwritten; the reference is dangling)
+   - For each `dead` entry: verify no LBA map or extent index entry references `old_segment_ulid`; this is expected and is a no-op from the volume's perspective — its purpose is to obtain the volume's acknowledgment before deletion
+   - Removal-only handoffs (only `remove` lines) are applied immediately — no output segment or re-signing needed. Handoffs with `repack` entries complete the re-sign step before applying carried entries. Tombstone handoffs (only `dead` lines) are also applied without a re-sign step
    - Rename `gc/<result-ulid>.pending` → `gc/<result-ulid>.applied`
 4. Coordinator (on next poll): sees `.applied`, uploads `segments/<result-ulid>` (volume-signed) to S3, deletes old S3 objects, removes old local `segments/<old-ulid>` files, renames to `gc/<result-ulid>.done`
 5. Coordinator (periodic cleanup): deletes `gc/*.done` files older than 7 days
@@ -316,6 +322,16 @@ A handoff file containing only 2-field lines is a *removal-only handoff*. It has
 Old local `segments/<old-ulid>` files are left in place until step 4. They remain readable by the volume until then; after deletion reads route to the new segment via the patched extent index (for carried entries) or fail-fast on dangling references that have been cleaned (for removed entries).
 
 This protocol is crash-safe: if either process restarts mid-handoff, the `.pending`/`.applied` state is re-read on next tick and the appropriate step retried. No data is lost.
+
+**Coordinator deletion invariant — no segment is ever deleted without the volume's acknowledgment:**
+
+The coordinator must never directly delete a `segments/` file or its S3 counterpart. All deletions, including segments the coordinator believes to be entirely unreferenced, must go through the handoff protocol (`.pending` → `.applied` → coordinator deletes). This invariant holds even when both `repack` and `remove` sets are empty — i.e. when the coordinator's liveness analysis says a segment has no live extents and no extent index entries at all.
+
+**Why direct deletion is unsafe.** The coordinator rebuilds liveness from on-disk index files. The volume's in-memory LBA map may be ahead of those files: writes that arrived between the last `gc_checkpoint` WAL flush and the end of the GC pass are not yet visible to the coordinator. If the coordinator deletes a segment based on a stale liveness view, the volume may still hold a live reference to it, producing a "segment not found" error on the next read.
+
+**The tombstone handoff.** For segments the coordinator determines to be all-dead (no extent index or LBA map entries visible in on-disk state), a *tombstone handoff* is written: a `.pending` file containing only `dead <old_segment_ulid>` lines, with no associated output segment file. The volume applies the tombstone (verifying from its own perspective that no references exist — a no-op in the normal case), writes `.applied`, and the coordinator proceeds with deletion as in step 4 above.
+
+This design was validated in the TLA+ model (`specs/HandoffProtocol.tla`): `CoordApplyDone` (the only deletion action) requires `handoff = "applied"`, and the `NoSegmentNotFound` and `NoLostData` invariants are checked exhaustively across all crash and concurrent-write interleavings. The all-dead direct deletion path that previously existed in the coordinator was not modelled in the spec — an inconsistency that reflected a real safety violation in the code.
 
 **`.done` file accumulation:** at the default 5-minute GC interval, a fork accumulates ~288 `.done` files per day. Each file is small (one line per moved or removed extent, ~100–130 bytes each), but directory inode count grows unboundedly without cleanup. The coordinator runs a TTL cleanup pass each tick, deleting `.done` files whose mtime is older than 7 days. This retains a recent window useful for post-mortem debugging (which segments were compacted, when) without unbounded growth. Deletion is safe because by the time a handoff reaches `.done` the old input segments are already removed; `sort_for_rebuild` only classifies `.pending` and `.applied` sidecars as in-flight GC outputs.
 
