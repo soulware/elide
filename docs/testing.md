@@ -194,6 +194,43 @@ sorting GC-output segments before regular segments, a higher-ULID GC output
 containing older writes could shadow newer data from a lower-ULID regular
 segment during rebuild.
 
+**Multi-LBA writes and reads never issued.**  Every `Write` SimOp writes exactly
+4096 bytes (one LBA) and every `ReadUnwritten` reads one LBA.  `vol.write()` and
+`vol.read()` accept any non-zero multiple of 4096, and the `read_extents` path
+has distinct logic for multi-LBA extents: it iterates `lbamap.extents_in_range()`
+and computes `payload_block_offset` to seek into a compressed or uncompressed
+body.  That arithmetic and the partial-range read path are never exercised.  A
+`WriteMulti { lba, count, seed }` SimOp would cover it and would also surface any
+mixed live/dead partial-extent accounting errors in `sweep_pending` and `repack`.
+
+**Dedup path not reliably triggered.**  The DEDUP_REF write path fires only when
+two LBAs hold identical data.  With the current `lba: 0..8, seed: any::<u8>()`
+strategy the dedup path may or may not be reached on any given run.  The
+corruption bug fixed in `sweep_pending` (dead DEDUP_REF incorrectly evicting a
+live DATA extent) was found by chance rather than by design.  A `DedupWrite`
+SimOp that explicitly writes the same seed to two different LBAs would guarantee
+the dedup and dead-REF paths are exercised on every run.
+
+**Actor `Snapshot` op absent.**  `VolumeHandle::snapshot()` sends a
+`VolumeRequest::Snapshot` through the actor channel, which flushes the WAL,
+opens a new one, and republishes the snapshot.  The actor proptest has no
+`ActorOp::Snapshot` variant, so the read-your-writes guarantee after a snapshot
+— and the interaction between snapshot, handle file-descriptor cache eviction,
+and subsequent writes — is never tested through the actor layer.
+
+**`ReadonlyVolume` has no property-based test.**  The five scenarios in
+`readonly_volume_test.rs` are fixed sequences.  A proptest that opens a
+`ReadonlyVolume` after an arbitrary sequence of writes, flushes, drains, and GC
+passes would explore cases the fixed tests cannot, particularly: GC running after
+the `ReadonlyVolume` was opened (the `ReadonlyVolume` has no `apply_gc_handoffs`
+path, so its extent index may reference a deleted segment on the next read).
+
+**WAL truncated-tail recovery not triggered by proptest.**  `recover_wal()`
+truncates any partial tail record and replays the rest.  The `Crash` SimOp always
+drops a clean `Volume` (full records only), so the truncation branch is never
+exercised at this level.  It is covered by WAL unit tests in `writelog.rs` but
+not by any cross-layer proptest sequence.
+
 ### Future dimensions
 
 The current tests focus on crash-recovery correctness for a single fork.
