@@ -109,7 +109,31 @@ If none of these are present, demand-fetch is disabled and reads of missing segm
 **Current implementation note:** demand-fetch currently downloads the entire segment body in one GET. The `.present` bitset is written with all bits set (full body present). Partial fetching (range-GETs for individual extents) is a future optimisation.
 
 
-**Next step: eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used segments from `segments/` and `fetched/` (never from `pending/`). Eviction + demand-fetch together make `segments/` a transparent cache tier.
+**Next step: automatic eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used segments from `segments/` and `fetched/` (never from `pending/`). Eviction + demand-fetch together make `segments/` a transparent cache tier.
+
+## Manual Eviction
+
+```
+elide volume evict <vol>
+```
+
+Deletes all evictable segment files from `segments/` to reclaim local disk space. Safe to run on any volume that has S3 backing — evicted segments are demand-fetched on next access.
+
+**Preconditions checked before eviction:**
+
+- `pending/` must be empty (coordinator must have drained all pending segments to S3 first)
+- No `gc/*.pending` handoff may be in flight
+
+If either precondition fails, `evict` returns an error and makes no changes.
+
+**In-flight GC handoff protection:**
+
+Evict does not block on `gc/*.applied` or `gc/*.done` files — those states indicate the handoff is complete from the volume's perspective. However, it protects specific segments that are still needed:
+
+- For each `gc/<ulid>.pending`: the handoff file is parsed and every `old_ulid` referenced in it is added to a protected set. These are the input segments that the volume still needs for reads until the handoff is applied.
+- For each `gc/<ulid>.applied`: the segment named `<ulid>` is protected from eviction. This is the compacted output segment that the coordinator has not yet uploaded to S3 — evicting it would make those LBAs unreadable until the upload completes.
+
+All other files in `segments/` are deleted. The protected segments are skipped silently and remain on disk.
 
 ## Bootstrap from the Store
 
@@ -304,6 +328,18 @@ dead <old_segment_ulid>
 Explicit type prefixes replace the previous implicit word-count format (4-field / 2-field). This makes the format self-documenting, unambiguous to parse, and extensible.
 
 A handoff file may mix `repack` and `remove` lines freely. A file containing only `remove` lines is a *removal-only handoff* — no output segment is produced and no re-signing step is needed. A file containing only `dead` lines is a *tombstone handoff* — see the *Coordinator deletion invariant* section below.
+
+**GC handoff file lifecycle:**
+
+Each handoff file in `gc/` progresses through three states, represented by the typed `GcHandoffState` enum in `elide-core/src/gc.rs`:
+
+| File | State | Meaning |
+|------|-------|---------|
+| `gc/<ulid>.pending` | `Pending` | Coordinator staged the handoff; volume has not yet applied it |
+| `gc/<ulid>.applied` | `Applied` | Volume applied the handoff; coordinator has not yet uploaded or cleaned up |
+| `gc/<ulid>.done` | `Done` | Coordinator completed upload and cleanup; retained for 7 days, then pruned |
+
+`GcHandoff::from_filename` parses any `gc/` directory entry into a `(ulid, state)` pair. All code that inspects handoff file state goes through this parser rather than matching raw filename suffixes.
 
 **GC handoff protocol:**
 
