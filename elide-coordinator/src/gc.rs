@@ -590,9 +590,7 @@ async fn compact_segments(
     }
 
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
-    let segments_dir = fork_dir.join("segments");
-    // Write to a temp file first; rename into segments/ only after S3 upload
-    // succeeds, so the invariant "segments/ ↔ in S3" is never violated.
+    // Write to a tmp file first; rename into gc/ only after S3 upload succeeds.
     let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
 
     let mut new_entries: Vec<SegmentEntry> = all_live
@@ -612,9 +610,16 @@ async fn compact_segments(
         })
         .collect();
 
-    // TODO: sign compacted segment with the fork's key.
-    let new_body_section_start = segment::write_segment(&tmp_path, &mut new_entries, None)
-        .context("writing compacted segment")?;
+    // The coordinator does not hold the volume's private key, so it signs the
+    // compacted segment with an ephemeral key.  The volume re-signs it with its
+    // own key inside apply_gc_handoffs, at which point the file moves from gc/
+    // into segments/.  This ensures segments/ always contains only volume-signed
+    // files and extentindex::rebuild never needs to skip verification for
+    // in-transit coordinator output.
+    let (ephemeral_signer, _) = elide_core::signing::generate_ephemeral_signer();
+    let new_body_section_start =
+        segment::write_segment(&tmp_path, &mut new_entries, ephemeral_signer.as_ref())
+            .context("writing compacted segment")?;
 
     let key = segment_key(volume_id, new_ulid_str)?;
     let data = tokio::fs::read(&tmp_path)
@@ -625,12 +630,13 @@ async fn compact_segments(
         .await
         .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
 
-    // Upload confirmed: move into segments/ so the volume can read it locally
-    // without a demand-fetch, and so extentindex::rebuild picks it up on restart.
-    let final_path = segments_dir.join(new_ulid_str);
+    // Upload confirmed: stage in gc/<ulid> so apply_gc_handoffs can re-sign and
+    // move it into segments/.  Keeping it in gc/ until the volume re-signs means
+    // segments/ always contains only volume-signed files.
+    let final_path = gc_dir.join(new_ulid_str);
     tokio::fs::rename(&tmp_path, &final_path)
         .await
-        .context("moving compacted segment into segments/")?;
+        .context("staging compacted segment in gc/")?;
 
     // Write the handoff file.
     // Carried entries (4 fields): <hash> <old_ulid> <new_ulid> <offset>

@@ -74,7 +74,6 @@ fn compact_candidates_inner(
     live_hashes: &HashSet<blake3::Hash>,
     extent_index: &extentindex::ExtentIndex,
     new_ulid: Ulid,
-    signer: &dyn segment::SegmentSigner,
 ) -> Option<(Vec<Ulid>, Ulid, Vec<PathBuf>)> {
     if candidates.is_empty() {
         return None;
@@ -82,7 +81,11 @@ fn compact_candidates_inner(
 
     let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE).ok()?;
 
-    let segments_dir = fork_dir.join("segments");
+    // The coordinator uses an ephemeral signer — it doesn't have the volume's
+    // private key.  The volume re-signs the output segment with its own key
+    // inside apply_gc_handoffs, so the signature here is discarded.
+    let (ephemeral_signer, _) = signing::generate_ephemeral_signer();
+
     let gc_dir = fork_dir.join("gc");
 
     let mut all_entries: Vec<segment::SegmentEntry> = Vec::new();
@@ -139,12 +142,15 @@ fn compact_candidates_inner(
         return Some((consumed, new_ulid, to_delete));
     }
 
-    let tmp_path = segments_dir.join(format!("{new_ulid}.tmp"));
-    let final_path = segments_dir.join(new_ulid.to_string());
-    let new_bss = match segment::write_segment(&tmp_path, &mut all_entries, signer) {
-        Ok(bss) => bss,
-        Err(_) => return None,
-    };
+    // Write the compacted segment to gc/<ulid> — the volume re-signs it when
+    // applying the handoff, at which point it moves to segments/<ulid>.
+    let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
+    let final_path = gc_dir.join(new_ulid.to_string());
+    let new_bss =
+        match segment::write_segment(&tmp_path, &mut all_entries, ephemeral_signer.as_ref()) {
+            Ok(bss) => bss,
+            Err(_) => return None,
+        };
     fs::rename(&tmp_path, &final_path).ok()?;
 
     let mut lines = String::new();
@@ -207,8 +213,6 @@ pub fn simulate_coord_gc_local(
     let n = n_candidates.min(candidates.len());
     let candidates = candidates[..n].to_vec();
 
-    let (signer, _) = signing::load_keypair(fork_dir, signing::VOLUME_KEY_FILE).ok()?;
-
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
     let lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
     let live_hashes = lba_map.live_hashes();
@@ -221,7 +225,6 @@ pub fn simulate_coord_gc_local(
         &live_hashes,
         &extent_index,
         new_ulid,
-        signer.as_ref(),
     )
 }
 
@@ -271,8 +274,6 @@ pub fn simulate_coord_gc_both_local(
 
     sort_candidates(&mut all_candidates, &gc_dir);
 
-    let (signer, _) = signing::load_keypair(fork_dir, signing::VOLUME_KEY_FILE).ok()?;
-
     // Rebuild liveness snapshot once — shared by both passes.
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
     let lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
@@ -292,7 +293,6 @@ pub fn simulate_coord_gc_both_local(
         &live_hashes,
         &extent_index,
         repack_ulid,
-        signer.as_ref(),
     )?;
     let sweep = compact_candidates_inner(
         fork_dir,
@@ -301,7 +301,6 @@ pub fn simulate_coord_gc_both_local(
         &live_hashes,
         &extent_index,
         sweep_ulid,
-        signer.as_ref(),
     )?;
 
     Some((repack, sweep))
