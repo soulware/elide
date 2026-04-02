@@ -652,6 +652,13 @@ impl Volume {
 
             let seg_id_str = seg_ulid.to_string();
             for entry in &dead_entries {
+                if entry.is_dedup_ref {
+                    // Dedup refs have no body; the extent_index tracks DATA body
+                    // locations only.  Removing the hash here would evict the DATA
+                    // entry for whichever other LBA shares this hash, corrupting reads
+                    // of that LBA.
+                    continue;
+                }
                 if self
                     .extent_index
                     .lookup(&entry.hash)

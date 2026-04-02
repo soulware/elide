@@ -320,6 +320,47 @@ generation against the current value; if they differ it evicts the file cache
 before loading the snapshot.  `flush_wal_to_pending` also evicts `Volume`'s own
 file cache for the promoted WAL ULID.
 
+### Second bug found: dead DEDUP_REF removes live DATA extent
+
+`actor_correctness` found a data-corruption bug in `sweep_pending`.  Proptest
+shrunk the failure to six operations:
+
+```
+Write { lba: 0, seed: 1 }   -- content H1
+Write { lba: 3, seed: 1 }   -- same content H1 → DEDUP_REF in WAL
+Flush                        -- S1: DATA(lba=0, H1), DEDUP_REF(lba=3, H1)
+Write { lba: 3, seed: 2 }   -- lba 3 overwritten in WAL (seed 2 ≠ seed 1)
+SweepPending
+CoordGcLocal { n: 2 }
+```
+
+After the GC handoff, `handle.read(0, 1)` returned all zeros instead of `[1; 4096]`.
+
+**What happened:**
+
+1. `S1` contains `DATA(lba=0, H1)` and `DEDUP_REF(lba=3, H1)`.
+2. After `Write(lba=3, seed=2)`, lba 3 is live with hash H2.  The DEDUP_REF for
+   lba=3 in S1 is therefore dead.
+3. `sweep_pending` classifies `DEDUP_REF(lba=3, H1)` as a dead entry.
+4. The dead-entry loop then called `extent_index.remove(H1)` — evicting the
+   DATA body location for lba=0, which legitimately has hash H1.
+5. Because the dead entry was a DEDUP_REF (no body bytes), `any_dead` was not
+   set.  The `candidate_paths.len() == 1 && !any_dead` early-return path fired,
+   exiting without rewriting S1 and without re-inserting H1.
+6. Subsequent reads of lba=0 found no extent_index entry for H1 and returned zeros.
+
+**Why `any_dead` doesn't cover DEDUP_REFs:**  `any_dead` is only set by dead
+non-dedup-ref entries (those with actual body bytes worth reclaiming).  A dead
+dedup ref carries no bytes, so it does not contribute to `dead_bytes` and was
+never intended to trigger a rewrite — but the removal loop iterated over all
+dead entries regardless.
+
+**Fix:** skip DEDUP_REF entries at the top of the dead-entry extent_index
+removal loop.  Dedup refs have no body; the extent_index tracks DATA body
+locations only.  A dead dedup ref means the LBA has been overwritten, but the
+DATA body for the shared hash is still live (referenced by whichever LBA owns
+the DATA entry).
+
 ---
 
 ## Concurrent integration test
