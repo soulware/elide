@@ -4,8 +4,8 @@
 //   volume.key / volume.pub / volume.provenance  (under <by_id>/<ulid>/)
 //
 // File contents:
-//   *.key         — Ed25519 private key (32 bytes, never uploaded)
-//   *.pub         — Ed25519 public key (32 bytes, uploaded to S3)
+//   *.key         — Ed25519 private key (32 raw bytes, never uploaded)
+//   *.pub         — Ed25519 public key (64 lowercase hex chars + newline, uploaded to S3)
 //   *.provenance  — plaintext hostname + canonical path + signature (local only)
 //
 // provenance file format:
@@ -57,7 +57,8 @@ impl SegmentSigner for Ed25519Signer {
 pub fn generate_keypair(dir: &Path, key_file: &str, pub_file: &str) -> io::Result<SigningKey> {
     let key = SigningKey::generate(&mut OsRng);
     crate::segment::write_file_atomic(&dir.join(key_file), &key.to_bytes())?;
-    crate::segment::write_file_atomic(&dir.join(pub_file), &key.verifying_key().to_bytes())?;
+    let pub_hex = encode_hex(&key.verifying_key().to_bytes()) + "\n";
+    crate::segment::write_file_atomic(&dir.join(pub_file), pub_hex.as_bytes())?;
     Ok(key)
 }
 
@@ -86,12 +87,16 @@ pub fn load_keypair(
 }
 
 /// Load an Ed25519 verifying key from `dir/<pub_file>`.
+///
+/// The file must contain exactly 64 lowercase hex chars followed by a newline.
 pub fn load_verifying_key(dir: &Path, pub_file: &str) -> io::Result<VerifyingKey> {
-    let bytes = std::fs::read(dir.join(pub_file))
+    let hex = std::fs::read_to_string(dir.join(pub_file))
         .map_err(|e| io::Error::other(format!("{pub_file} not readable: {e}")))?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| io::Error::other(format!("{pub_file} wrong length (expected 32 bytes)")))?;
+    let bytes = decode_hex(hex.trim())
+        .map_err(|_| io::Error::other(format!("{pub_file} is not valid hex")))?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+        io::Error::other(format!("{pub_file} wrong length (expected 64 hex chars)"))
+    })?;
     VerifyingKey::from_bytes(&arr).map_err(|e| io::Error::other(format!("{pub_file} invalid: {e}")))
 }
 
@@ -117,7 +122,8 @@ pub fn setup_readonly_identity(
     provenance_file: &str,
 ) -> io::Result<Arc<dyn SegmentSigner>> {
     let key = SigningKey::generate(&mut OsRng);
-    crate::segment::write_file_atomic(&dir.join(pub_file), &key.verifying_key().to_bytes())?;
+    let pub_hex = encode_hex(&key.verifying_key().to_bytes()) + "\n";
+    crate::segment::write_file_atomic(&dir.join(pub_file), pub_hex.as_bytes())?;
     write_origin(dir, &key, provenance_file)?;
     Ok(Arc::new(Ed25519Signer { key }))
 }
@@ -178,13 +184,7 @@ pub fn verify_origin(dir: &Path, pub_file: &str, origin_file: &str) -> io::Resul
         )));
     }
 
-    let pub_bytes = std::fs::read(dir.join(pub_file))
-        .map_err(|e| io::Error::other(format!("{pub_file} not readable: {e}")))?;
-    let pub_arr: [u8; 32] = pub_bytes
-        .try_into()
-        .map_err(|_| io::Error::other(format!("{pub_file} wrong length (expected 32 bytes)")))?;
-    let verifying_key = VerifyingKey::from_bytes(&pub_arr)
-        .map_err(|e| io::Error::other(format!("{pub_file} invalid: {e}")))?;
+    let verifying_key = load_verifying_key(dir, pub_file)?;
 
     let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| {
         io::Error::other(format!(
@@ -245,7 +245,7 @@ fn get_hostname() -> io::Result<String> {
         .map_err(|_| io::Error::other("hostname is not valid UTF-8"))
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

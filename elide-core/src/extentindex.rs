@@ -282,7 +282,8 @@ mod tests {
     /// Returns the signer so the caller can sign segments with it.
     fn write_test_pub(dir: &std::path::Path) -> std::sync::Arc<dyn crate::segment::SegmentSigner> {
         let (signer, vk) = signing::generate_ephemeral_signer();
-        crate::segment::write_file_atomic(&dir.join(signing::VOLUME_PUB_FILE), &vk.to_bytes())
+        let pub_hex = signing::encode_hex(&vk.to_bytes()) + "\n";
+        crate::segment::write_file_atomic(&dir.join(signing::VOLUME_PUB_FILE), pub_hex.as_bytes())
             .unwrap();
         signer
     }

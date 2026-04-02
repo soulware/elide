@@ -1036,9 +1036,10 @@ mod tests {
     fn setup_vol_pub(dir: &Path) -> Arc<dyn elide_core::segment::SegmentSigner> {
         fs::create_dir_all(dir).unwrap();
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let pub_hex: String = vk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
         fs::write(
             dir.join(elide_core::signing::VOLUME_PUB_FILE),
-            vk.to_bytes(),
+            format!("{pub_hex}\n"),
         )
         .unwrap();
         signer

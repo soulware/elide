@@ -367,7 +367,9 @@ mod tests {
     /// Write `volume.pub` into `dir` and return the signer.
     fn write_test_pub(dir: &std::path::Path) -> std::sync::Arc<dyn segment::SegmentSigner> {
         let (signer, vk) = signing::generate_ephemeral_signer();
-        segment::write_file_atomic(&dir.join(signing::VOLUME_PUB_FILE), &vk.to_bytes()).unwrap();
+        let pub_hex = signing::encode_hex(&vk.to_bytes()) + "\n";
+        segment::write_file_atomic(&dir.join(signing::VOLUME_PUB_FILE), pub_hex.as_bytes())
+            .unwrap();
         signer
     }
 
