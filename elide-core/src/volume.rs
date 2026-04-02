@@ -3527,4 +3527,81 @@ mod tests {
 
         fs::remove_dir_all(base).unwrap();
     }
+
+    #[test]
+    fn gc_handoff_idempotent_after_partial_resign() {
+        // Simulate a crash between the re-sign write and the gc/<ulid> deletion:
+        // both gc/<new_ulid> (staged) and segments/<new_ulid> (re-signed) are
+        // present when apply_gc_handoffs is called a second time.
+        //
+        // The re-sign step must be idempotent: it overwrites segments/<new_ulid>
+        // with identical content, then deletes gc/<new_ulid>, and the handoff
+        // completes normally.
+        let base = keyed_temp_dir();
+
+        let old_ulid;
+        let new_ulid;
+        let data = vec![0xCDu8; 4096];
+
+        {
+            let mut vol = Volume::open(&base, &base).unwrap();
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+
+            let pending_dir = base.join("pending");
+            let segments_dir = base.join("segments");
+            let entry = fs::read_dir(&pending_dir)
+                .unwrap()
+                .flatten()
+                .next()
+                .unwrap();
+            let filename = entry.file_name();
+            old_ulid = filename.to_str().unwrap().to_owned();
+            fs::rename(pending_dir.join(&old_ulid), segments_dir.join(&old_ulid)).unwrap();
+
+            new_ulid = simulate_coord_gc(&mut vol, &base, &old_ulid);
+        }
+
+        // Simulate a partial apply_gc_handoffs: re-sign gc/<new_ulid> into
+        // segments/<new_ulid> but leave gc/<new_ulid> in place (as if the
+        // process crashed before remove_file completed).
+        {
+            let mut vol = Volume::open(&base, &base).unwrap();
+            vol.apply_gc_handoffs().unwrap();
+            // .applied now exists — handoff fully applied.
+        }
+
+        // Restore the crash state: rename .applied back to .pending and
+        // recreate gc/<new_ulid> from segments/<new_ulid> to simulate the
+        // partial-apply crash window.
+        let gc_dir = base.join("gc");
+        let segments_dir = base.join("segments");
+        fs::rename(
+            gc_dir.join(format!("{new_ulid}.applied")),
+            gc_dir.join(format!("{new_ulid}.pending")),
+        )
+        .unwrap();
+        // Re-create gc/<new_ulid> as a copy of the re-signed segment, mimicking
+        // the state after write but before delete.
+        fs::copy(segments_dir.join(&new_ulid), gc_dir.join(&new_ulid)).unwrap();
+
+        // Now apply_gc_handoffs must succeed: it detects gc/<new_ulid>, re-signs
+        // (idempotently overwrites segments/<new_ulid>), deletes gc/<new_ulid>,
+        // and renames .pending → .applied.
+        let mut vol = Volume::open(&base, &base).unwrap();
+        let count = vol.apply_gc_handoffs().unwrap();
+        assert_eq!(count, 1);
+
+        assert!(!gc_dir.join(format!("{new_ulid}.pending")).exists());
+        assert!(gc_dir.join(format!("{new_ulid}.applied")).exists());
+        assert!(
+            !gc_dir.join(&new_ulid).exists(),
+            "gc/<ulid> must be deleted after re-sign"
+        );
+
+        // Data still correct.
+        assert_eq!(vol.read(0, 1).unwrap(), data);
+
+        fs::remove_dir_all(base).unwrap();
+    }
 }

@@ -220,6 +220,16 @@ mod tests {
         );
         assert!(vol_dir.join("pending").exists());
         assert!(!vol_dir.join("segments").exists()); // coordinator drains pending/ → segments/
+        // Readonly volumes must have volume.pub (for segment verification) but
+        // must NOT have volume.key (private key must never be written to disk).
+        assert!(
+            vol_dir.join(signing::VOLUME_PUB_FILE).exists(),
+            "volume.pub must exist"
+        );
+        assert!(
+            !vol_dir.join(signing::VOLUME_KEY_FILE).exists(),
+            "volume.key must not exist on readonly volume"
+        );
 
         // Exactly one snapshot marker, and its ULID matches the segment ULID.
         let segs: Vec<_> = fs::read_dir(vol_dir.join("pending"))
@@ -285,6 +295,15 @@ mod tests {
         let signer = setup_vol_pub(&vol_dir);
         import_image(&image_path, &vol_dir, signer.as_ref(), |_, _| {}).unwrap();
 
+        // Readonly volumes must have volume.pub but not volume.key.
+        assert!(
+            vol_dir.join(signing::VOLUME_PUB_FILE).exists(),
+            "volume.pub must exist"
+        );
+        assert!(
+            !vol_dir.join(signing::VOLUME_KEY_FILE).exists(),
+            "volume.key must not exist on readonly volume"
+        );
         // Re-open with ReadonlyVolume (imported volumes have no volume.key).
         // No ancestors in this test; by_id_dir is unused.
         let by_id = vol_dir.parent().unwrap();
