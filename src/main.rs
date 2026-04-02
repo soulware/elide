@@ -1001,20 +1001,10 @@ fn remote_pull(
 
 /// Evict locally cached segment bodies from `segments/`.
 ///
-/// Refuses if `pending/` is non-empty (segments not yet uploaded) or if any
-/// `gc/*.pending` files exist (a GC handoff is in flight and the replacement
-/// segment may not yet be in the store).
+/// Always succeeds: segments that cannot safely be evicted are skipped and
+/// the count of actually-deleted files is returned.  `pending/` files are
+/// never touched (they have not yet been uploaded to S3).
 fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
-    // Check pending/ is empty.
-    let pending_dir = vol_dir.join("pending");
-    if let Ok(mut entries) = std::fs::read_dir(&pending_dir)
-        && entries.next().is_some()
-    {
-        return Err(std::io::Error::other(
-            "pending/ is non-empty — wait for the coordinator to drain it before evicting",
-        ));
-    }
-
     // Collect segments that must be kept despite eviction:
     //
     //   .pending — handoff in flight; old input segments are still needed for
@@ -1109,16 +1099,33 @@ mod tests {
     }
 
     #[test]
-    fn evict_blocked_by_pending_dir_nonempty() {
+    fn evict_proceeds_with_pending_dir_nonempty() {
         let tmp = TempDir::new().unwrap();
         let vol = setup_vol(&tmp);
+        // pending/ has an unuploaded segment — evict should still proceed on
+        // segments/ (those are S3-confirmed) and leave pending/ untouched.
         fs::write(
             vol.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAA1"),
             b"wal",
         )
         .unwrap();
-        let err = evict_segments(&vol).unwrap_err();
-        assert!(err.to_string().contains("pending/"), "{err}");
+        fs::write(
+            vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA2"),
+            b"seg",
+        )
+        .unwrap();
+        let n = evict_segments(&vol).unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            vol.join("pending")
+                .join("01AAAAAAAAAAAAAAAAAAAAAAA1")
+                .exists()
+        );
+        assert!(
+            !vol.join("segments")
+                .join("01AAAAAAAAAAAAAAAAAAAAAAA2")
+                .exists()
+        );
     }
 
     #[test]
