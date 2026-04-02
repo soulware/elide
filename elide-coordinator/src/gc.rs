@@ -153,6 +153,10 @@ pub async fn gc_fork(
         return Ok(GcStats::none());
     }
 
+    let vk =
+        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+            .context("loading volume verifying key")?;
+
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
     let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
     let lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
@@ -162,7 +166,7 @@ pub async fn gc_fork(
         .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
         .transpose()?;
 
-    let mut all_stats = collect_stats(fork_dir, &index, &live_hashes, &lbamap, floor)
+    let mut all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
         .context("collecting segment stats")?;
 
     // Repack: density pass — extract the single least-dense segment.
@@ -452,6 +456,7 @@ impl SegmentStats {
 /// lower ULID than an older GC output) override stale GC-output entries.
 fn collect_stats(
     fork_dir: &Path,
+    vk: &elide_core::signing::VerifyingKey,
     index: &ExtentIndex,
     live_hashes: &HashSet<blake3::Hash>,
     lba_map: &LbaMap,
@@ -476,7 +481,7 @@ fn collect_stats(
         }
 
         let file_size = fs::metadata(&path)?.len();
-        let (body_section_start, entries) = segment::read_segment_index(&path)?;
+        let (body_section_start, entries) = segment::read_and_verify_segment_index(&path, vk)?;
 
         let mut live_bytes: u64 = 0;
         let mut total_body_bytes: u64 = 0;

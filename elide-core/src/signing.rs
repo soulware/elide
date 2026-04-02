@@ -22,7 +22,8 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+pub use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use rand_core::OsRng;
 
 use crate::segment::SegmentSigner;
