@@ -200,6 +200,16 @@ enum VolumeCommand {
         command: ImportCommand,
     },
 
+    /// Evict locally cached segment bodies so they are demand-fetched on next read
+    ///
+    /// Deletes files from segments/ (the local segment cache). On the next read
+    /// the volume will fetch them back from the object store. Refused if pending/
+    /// is non-empty (data not yet uploaded) or if a GC handoff is in flight.
+    Evict {
+        /// Volume name
+        name: String,
+    },
+
     /// Stop all processes for a volume and remove its directory
     Delete {
         /// Volume name
@@ -469,6 +479,17 @@ fn main() {
                     }
                 }
             },
+
+            VolumeCommand::Evict { name } => {
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                match evict_segments(&vol_dir) {
+                    Ok(n) => println!("evicted {n} segment(s)"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
 
             VolumeCommand::Delete { name } => {
                 if let Err(e) = coordinator_client::delete_volume(&socket_path, &name) {
@@ -976,6 +997,48 @@ fn remote_pull(
     }
 
     Ok(())
+}
+
+/// Evict locally cached segment bodies from `segments/`.
+///
+/// Refuses if `pending/` is non-empty (segments not yet uploaded) or if any
+/// `gc/*.pending` files exist (a GC handoff is in flight and the replacement
+/// segment may not yet be in the store).
+fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
+    // Check pending/ is empty.
+    let pending_dir = vol_dir.join("pending");
+    if let Ok(mut entries) = std::fs::read_dir(&pending_dir)
+        && entries.next().is_some()
+    {
+        return Err(std::io::Error::other(
+            "pending/ is non-empty — wait for the coordinator to drain it before evicting",
+        ));
+    }
+
+    // Check no GC handoff is in flight.
+    let gc_dir = vol_dir.join("gc");
+    if gc_dir.exists() {
+        for entry in std::fs::read_dir(&gc_dir)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().ends_with(".pending") {
+                return Err(std::io::Error::other(
+                    "GC handoff in flight (gc/*.pending exists) — wait for it to complete before evicting",
+                ));
+            }
+        }
+    }
+
+    // Delete segment files.
+    let segments_dir = vol_dir.join("segments");
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir(&segments_dir) {
+        for entry in entries {
+            let entry = entry?;
+            std::fs::remove_file(entry.path())?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
