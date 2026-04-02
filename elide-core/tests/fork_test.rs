@@ -28,13 +28,7 @@ fn fork_via_symlink_writes_ulid_in_origin() {
     let fork_dir = by_id.join(fork_ulid);
 
     // Create source volume with a snapshot.
-    std::fs::create_dir_all(&source_dir).unwrap();
-    elide_core::signing::generate_keypair(
-        &source_dir,
-        elide_core::signing::VOLUME_KEY_FILE,
-        elide_core::signing::VOLUME_PUB_FILE,
-    )
-    .unwrap();
+    common::write_test_keypair(&source_dir);
     let mut vol = Volume::open(&source_dir, &by_id).unwrap();
     vol.write(0, &[0xABu8; 4096]).unwrap();
     vol.flush_wal().unwrap();
@@ -83,13 +77,7 @@ fn three_level_fork_isolation() {
     let grandchild_dir: PathBuf = by_id.join(grandchild_ulid);
 
     // --- root level ---
-    std::fs::create_dir_all(&root_dir).unwrap();
-    elide_core::signing::generate_keypair(
-        &root_dir,
-        elide_core::signing::VOLUME_KEY_FILE,
-        elide_core::signing::VOLUME_PUB_FILE,
-    )
-    .unwrap();
+    common::write_test_keypair(&root_dir);
     let mut base = Volume::open(&root_dir, &by_id).unwrap();
     base.write(0, &[0xAA; 4096]).unwrap();
     base.write(1, &[0xBB; 4096]).unwrap();

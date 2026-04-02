@@ -33,12 +33,7 @@ mod common;
 fn coordinator_gc_does_not_create_read_failures() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
-    elide_core::signing::generate_keypair(
-        &fork_dir,
-        elide_core::signing::VOLUME_KEY_FILE,
-        elide_core::signing::VOLUME_PUB_FILE,
-    )
-    .unwrap();
+    common::write_test_keypair(&fork_dir);
 
     let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
     let (actor, handle) = spawn(vol);

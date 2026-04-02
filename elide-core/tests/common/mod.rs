@@ -13,6 +13,20 @@ use std::path::{Path, PathBuf};
 use elide_core::{extentindex, lbamap, segment, signing};
 use ulid::Ulid;
 
+/// Create `dir` and write a fresh Ed25519 keypair into it.
+///
+/// Required before `Volume::open` in tests that construct their own directories
+/// (rather than using a `tempfile::TempDir` that already has keys).
+pub fn write_test_keypair(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    elide_core::signing::generate_keypair(
+        dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+}
+
 /// Move all committed segments from pending/ to segments/.
 /// Simulates `drain-pending` (upload + rename) without touching an object store.
 pub fn drain_local(fork_dir: &Path) {

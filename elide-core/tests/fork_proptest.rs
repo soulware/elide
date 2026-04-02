@@ -90,13 +90,7 @@ proptest! {
         let child_dir: PathBuf = by_id.join(child_ulid);
 
         // Write keypair into base_dir so Volume::open can load volume.key.
-        std::fs::create_dir_all(&base_dir).unwrap();
-        elide_core::signing::generate_keypair(
-            &base_dir,
-            elide_core::signing::VOLUME_KEY_FILE,
-            elide_core::signing::VOLUME_PUB_FILE,
-        )
-        .unwrap();
+        common::write_test_keypair(&base_dir);
 
         let mut base = Volume::open(&base_dir, &by_id).unwrap();
         let mut base_oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
