@@ -200,7 +200,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use elide_core::segment::{SegmentEntry, write_segment};
+    use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
     use elide_core::signing::generate_ephemeral_signer;
 
     /// Build a parent+child fork pair using the flat by_id/<ulid> layout.
@@ -226,7 +226,13 @@ mod tests {
         let data = vec![0xABu8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
         let (signer, _) = generate_ephemeral_signer();
         write_segment(
             &parent_dir.join("segments").join(seg_ulid),
@@ -292,7 +298,13 @@ mod tests {
         let data = vec![0xCDu8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
         let (signer, _) = generate_ephemeral_signer();
         write_segment(
             &root_dir.join("segments").join(seg_ulid),

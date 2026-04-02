@@ -18,7 +18,7 @@ use std::path::Path;
 
 use ulid::Ulid;
 
-use crate::segment::{self, FLAG_COMPRESSED, SegmentEntry, SegmentSigner};
+use crate::segment::{self, SegmentEntry, SegmentFlags, SegmentSigner};
 
 const LBA_SIZE: usize = 4096;
 const ZERO_BLOCK: [u8; LBA_SIZE] = [0u8; LBA_SIZE];
@@ -143,8 +143,8 @@ pub fn import_image(
 
         let hash = blake3::hash(&block);
         let (flags, data) = match maybe_compress(&block) {
-            Some(compressed) => (FLAG_COMPRESSED, compressed),
-            None => (0u8, block.to_vec()),
+            Some(compressed) => (SegmentFlags::COMPRESSED, compressed),
+            None => (SegmentFlags::empty(), block.to_vec()),
         };
         entries.push(SegmentEntry::new_data(hash, lba, 1, flags, data));
         batch_raw_bytes += LBA_SIZE;

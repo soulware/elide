@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9df318fcf1288aefc7ea037db94176227c7185cf3ebd12367dc5d179d5dc2b84 # shrinks to ops = [Write { lba: 0, seed: 0 }]
+cc f3912ef937748d31bdedd5275688f65c5a8c9054705e6293b3c1d3ce1867414f # shrinks to ops = [Write { lba: 0, seed: 1 }, Write { lba: 3, seed: 1 }, Flush, Write { lba: 3, seed: 2 }, SweepPending, CoordGcLocal { n: 2 }]

@@ -636,9 +636,9 @@ async fn compact_segments(
                 e.start_lba,
                 e.lba_length,
                 if e.compressed {
-                    segment::FLAG_COMPRESSED
+                    segment::SegmentFlags::COMPRESSED
                 } else {
-                    0
+                    segment::SegmentFlags::empty()
                 },
                 std::mem::take(&mut e.data),
             )
@@ -1063,7 +1063,7 @@ mod tests {
             blake3::hash(b"payload"),
             0,
             1,
-            0,
+            elide_core::segment::SegmentFlags::empty(),
             b"payload".to_vec(),
         );
         elide_core::segment::write_segment(
@@ -1112,7 +1112,7 @@ mod tests {
                 blake3::hash(b"payload"),
                 0,
                 1,
-                0,
+                elide_core::segment::SegmentFlags::empty(),
                 b"payload".to_vec(),
             )],
             wrong_signer.as_ref(),

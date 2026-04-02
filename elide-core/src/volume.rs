@@ -361,14 +361,14 @@ impl Volume {
         let compressed = compressed_data.is_some();
         let owned_data: Vec<u8> = compressed_data.unwrap_or_else(|| data.to_vec());
         let wal_flags = if compressed {
-            writelog::FLAG_COMPRESSED
+            writelog::WalFlags::COMPRESSED
         } else {
-            0
+            writelog::WalFlags::empty()
         };
         let seg_flags = if compressed {
-            segment::FLAG_COMPRESSED
+            segment::SegmentFlags::COMPRESSED
         } else {
-            0
+            segment::SegmentFlags::empty()
         };
 
         let body_offset = self
@@ -1598,14 +1598,13 @@ fn recover_wal(
                 data,
             } => {
                 let body_length = data.len() as u32;
-                let compressed = flags & writelog::FLAG_COMPRESSED != 0;
-                // Translate WAL flags to segment flags: the two flag sets use
-                // different bit values (writelog::FLAG_COMPRESSED = 0x01,
-                // segment::FLAG_COMPRESSED = 0x04).
+                let compressed = flags.contains(writelog::WalFlags::COMPRESSED);
+                // Translate WalFlags → SegmentFlags: the two namespaces use different
+                // bit values (WalFlags::COMPRESSED = 0x01, SegmentFlags::COMPRESSED = 0x04).
                 let seg_flags = if compressed {
-                    segment::FLAG_COMPRESSED
+                    segment::SegmentFlags::COMPRESSED
                 } else {
-                    0
+                    segment::SegmentFlags::empty()
                 };
                 lbamap.insert(start_lba, lba_length, hash);
                 // Temporary WAL offset — updated to segment offset on promotion.
@@ -1913,9 +1912,9 @@ mod tests {
     }
 
     /// Regression: compressed WAL entries must be promoted with the correct
-    /// segment FLAG_COMPRESSED so reads after recovery+promote work.
+    /// SegmentFlags::COMPRESSED so reads after recovery+promote work.
     ///
-    /// WAL uses FLAG_COMPRESSED=0x01; segment uses FLAG_COMPRESSED=0x04.
+    /// WalFlags::COMPRESSED=0x01; SegmentFlags::COMPRESSED=0x04.
     /// recover_wal must translate between them before calling new_data().
     #[test]
     fn compressed_entry_survives_recover_and_promote() {

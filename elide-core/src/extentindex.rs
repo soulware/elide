@@ -328,7 +328,13 @@ mod tests {
 
         let data = vec![0xabu8; 4096];
         let hash = blake3::hash(&data);
-        let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            segment::SegmentFlags::empty(),
+            data,
+        )];
         let bss = segment::write_segment(
             &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
             &mut entries,
@@ -361,7 +367,7 @@ mod tests {
                 data_hash,
                 1,
                 1,
-                0,
+                segment::SegmentFlags::empty(),
                 b"real data".repeat(512)[..4096].to_vec(),
             ),
         ];
@@ -393,7 +399,13 @@ mod tests {
 
         // Older segment.
         {
-            let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data.clone())];
+            let mut entries = vec![SegmentEntry::new_data(
+                hash,
+                0,
+                1,
+                segment::SegmentFlags::empty(),
+                data.clone(),
+            )];
             segment::write_segment(
                 &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 &mut entries,
@@ -408,8 +420,8 @@ mod tests {
             let data2 = vec![0u8; 8192]; // put something before it
             let hash2 = blake3::hash(&data2);
             let mut entries = vec![
-                SegmentEntry::new_data(hash2, 10, 2, 0, data2),
-                SegmentEntry::new_data(hash, 0, 1, 0, data),
+                SegmentEntry::new_data(hash2, 10, 2, segment::SegmentFlags::empty(), data2),
+                SegmentEntry::new_data(hash, 0, 1, segment::SegmentFlags::empty(), data),
             ];
             bss2 = segment::write_segment(
                 &pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
@@ -452,7 +464,13 @@ mod tests {
         let bss;
         let stored_offset;
         {
-            let mut entries = vec![SegmentEntry::new_data(hash, 0, 1, 0, data)];
+            let mut entries = vec![SegmentEntry::new_data(
+                hash,
+                0,
+                1,
+                segment::SegmentFlags::empty(),
+                data,
+            )];
             bss = segment::write_segment(
                 &ancestor.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 &mut entries,

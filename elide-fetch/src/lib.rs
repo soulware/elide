@@ -520,7 +520,8 @@ mod tests {
     #[test]
     fn write_fetched_splits_correctly() {
         use elide_core::segment::{
-            SegmentEntry, collect_fetched_idx_files, read_segment_index, write_segment,
+            SegmentEntry, SegmentFlags, collect_fetched_idx_files, read_segment_index,
+            write_segment,
         };
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -537,8 +538,8 @@ mod tests {
         let h1 = blake3::hash(&data1);
         let h2 = blake3::hash(&data2);
         let mut entries = vec![
-            SegmentEntry::new_data(h1, 0, 1, 0, data1.clone()),
-            SegmentEntry::new_data(h2, 1, 2, 0, data2.clone()),
+            SegmentEntry::new_data(h1, 0, 1, SegmentFlags::empty(), data1.clone()),
+            SegmentEntry::new_data(h2, 1, 2, SegmentFlags::empty(), data2.clone()),
         ];
         let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
         let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
@@ -593,7 +594,7 @@ mod tests {
     /// both absent should fetch both in one call and set both present bits.
     #[test]
     fn fetch_extent_coalesces_adjacent_entries() {
-        use elide_core::segment::{SegmentEntry, check_present_bit, write_segment};
+        use elide_core::segment::{SegmentEntry, SegmentFlags, check_present_bit, write_segment};
         use object_store::local::LocalFileSystem;
         use object_store::path::Path as StorePath;
         use std::sync::Arc;
@@ -615,9 +616,9 @@ mod tests {
         let h1 = blake3::hash(&data1);
         let h2 = blake3::hash(&data2);
         let mut entries = vec![
-            SegmentEntry::new_data(h0, 0, 1, 0, data0.clone()),
-            SegmentEntry::new_data(h1, 1, 1, 0, data1.clone()),
-            SegmentEntry::new_data(h2, 2, 1, 0, data2.clone()),
+            SegmentEntry::new_data(h0, 0, 1, SegmentFlags::empty(), data0.clone()),
+            SegmentEntry::new_data(h1, 1, 1, SegmentFlags::empty(), data1.clone()),
+            SegmentEntry::new_data(h2, 2, 1, SegmentFlags::empty(), data2.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
@@ -682,7 +683,7 @@ mod tests {
     /// leaving the non-adjacent entry unset.
     #[test]
     fn fetch_extent_stops_at_body_gap() {
-        use elide_core::segment::{SegmentEntry, check_present_bit, write_segment};
+        use elide_core::segment::{SegmentEntry, SegmentFlags, check_present_bit, write_segment};
         use object_store::local::LocalFileSystem;
         use object_store::path::Path as StorePath;
         use std::sync::Arc;
@@ -707,8 +708,8 @@ mod tests {
         let h0 = blake3::hash(&data0);
         let h1 = blake3::hash(&data1);
         let mut entries = vec![
-            SegmentEntry::new_data(h0, 0, 1, 0, data0.clone()),
-            SegmentEntry::new_data(h1, 1, 1, 0, data1.clone()),
+            SegmentEntry::new_data(h0, 0, 1, SegmentFlags::empty(), data0.clone()),
+            SegmentEntry::new_data(h1, 1, 1, SegmentFlags::empty(), data1.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();

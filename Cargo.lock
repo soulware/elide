@@ -746,6 +746,7 @@ name = "elide-core"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "bitflags",
  "blake3",
  "criterion",
  "crossbeam-channel",
@@ -757,6 +758,7 @@ dependencies = [
  "rand_core 0.6.4",
  "tempfile",
  "ulid",
+ "zerocopy",
  "zstd",
 ]
 

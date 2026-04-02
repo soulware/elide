@@ -27,13 +27,24 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use bitflags::bitflags;
+
 // --- flag bits ---
 
-/// Payload is lz4-compressed; data_length is the compressed size.
-#[allow(dead_code)] // used when compression is wired up
-pub const FLAG_COMPRESSED: u8 = 0x01;
-/// No data payload; this LBA range maps to an existing extent identified by hash.
-pub const FLAG_DEDUP_REF: u8 = 0x02;
+bitflags! {
+    /// Flag byte in a WAL record.
+    ///
+    /// **These bit values differ from `segment::SegmentFlags`.**  Any code that
+    /// translates WAL records into segment entries must explicitly convert between
+    /// the two namespaces (see `volume::recover_wal`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct WalFlags: u8 {
+        /// Payload is lz4-compressed; data_length is the compressed size.
+        const COMPRESSED = 0x01;
+        /// No data payload; this LBA range maps to an existing extent identified by hash.
+        const DEDUP_REF  = 0x02;
+    }
+}
 
 const MAGIC: &[u8; 8] = b"ELIDWAL\x01";
 
@@ -46,13 +57,13 @@ pub enum LogRecord {
         hash: blake3::Hash,
         start_lba: u64,
         lba_length: u32,
-        flags: u8,
+        flags: WalFlags,
         /// Byte offset of the data payload within the WAL file. Used as a
         /// temporary extent index location to enable reads before promotion.
         /// The promotion step writes a clean segment file; this offset is
         /// internal to the WAL and is not reused in the segment.
         body_offset: u64,
-        /// Raw payload bytes (compressed if flags & FLAG_COMPRESSED).
+        /// Raw payload bytes (compressed if flags contains WalFlags::COMPRESSED).
         data: Vec<u8>,
     },
     Ref {
@@ -96,8 +107,8 @@ impl WriteLog {
         Ok(Self { writer: file, size })
     }
 
-    /// Append a new data extent. `data` must already be compressed if FLAG_COMPRESSED is set.
-    /// FLAG_DEDUP_REF must not be set in flags.
+    /// Append a new data extent. `data` must already be compressed if `WalFlags::COMPRESSED` is set.
+    /// `WalFlags::DEDUP_REF` must not be set in flags.
     ///
     /// Returns the byte offset of the data payload within the WAL file, for use
     /// as the temporary extent index location to enable reads before promotion.
@@ -106,11 +117,11 @@ impl WriteLog {
         start_lba: u64,
         lba_length: u32,
         hash: &blake3::Hash,
-        flags: u8,
+        flags: WalFlags,
         data: &[u8],
     ) -> io::Result<u64> {
         debug_assert!(
-            flags & FLAG_DEDUP_REF == 0,
+            !flags.contains(WalFlags::DEDUP_REF),
             "use append_ref for dedup references"
         );
 
@@ -118,7 +129,7 @@ impl WriteLog {
         header.extend_from_slice(hash.as_bytes());
         push_varint(&mut header, start_lba);
         push_varint32(&mut header, lba_length);
-        header.push(flags);
+        header.push(flags.bits());
         push_varint32(&mut header, data.len() as u32);
 
         self.write_all_bytes(&header)?;
@@ -138,7 +149,7 @@ impl WriteLog {
         rec.extend_from_slice(hash.as_bytes());
         push_varint(&mut rec, start_lba);
         push_varint32(&mut rec, lba_length);
-        rec.push(FLAG_DEDUP_REF);
+        rec.push(WalFlags::DEDUP_REF.bits());
 
         self.write_all_bytes(&rec)
     }
@@ -232,9 +243,9 @@ fn parse_record(data: &[u8], pos: &mut usize) -> io::Result<LogRecord> {
     let hash = read_hash(data, pos)?;
     let start_lba = read_varint(data, pos)?;
     let lba_length = read_varint32(data, pos)?;
-    let flags = read_u8(data, pos)?;
+    let flags = WalFlags::from_bits_retain(read_u8(data, pos)?);
 
-    if flags & FLAG_DEDUP_REF != 0 {
+    if flags.contains(WalFlags::DEDUP_REF) {
         return Ok(LogRecord::Ref {
             hash,
             start_lba,
@@ -248,7 +259,7 @@ fn parse_record(data: &[u8], pos: &mut usize) -> io::Result<LogRecord> {
 
     // When compressed, verify against the content hash (hash of uncompressed data).
     // When uncompressed, verify directly.
-    let verify_against = if flags & FLAG_COMPRESSED != 0 {
+    let verify_against = if flags.contains(WalFlags::COMPRESSED) {
         lz4_flex::decompress_size_prepended(payload.as_slice())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decompression failed"))?
     } else {
@@ -373,7 +384,8 @@ mod tests {
         let hash = blake3::hash(payload);
 
         let mut wl = WriteLog::create(&path).unwrap();
-        wl.append_data(42, 4, &hash, 0, payload).unwrap();
+        wl.append_data(42, 4, &hash, WalFlags::empty(), payload)
+            .unwrap();
         wl.fsync().unwrap();
         drop(wl);
 
@@ -391,7 +403,7 @@ mod tests {
                 assert_eq!(h, &hash);
                 assert_eq!(*start_lba, 42);
                 assert_eq!(*lba_length, 4);
-                assert_eq!(*flags, 0);
+                assert_eq!(*flags, WalFlags::empty());
                 assert_eq!(data, payload);
                 // body_offset points past the record header to the data bytes
                 assert_eq!(*body_offset, size - payload.len() as u64);
@@ -442,7 +454,8 @@ mod tests {
         let hash = blake3::hash(payload);
 
         let mut wl = WriteLog::create(&path).unwrap();
-        wl.append_data(0, 1, &hash, 0, payload).unwrap();
+        wl.append_data(0, 1, &hash, WalFlags::empty(), payload)
+            .unwrap();
         wl.fsync().unwrap();
         let good_size = wl.size();
         drop(wl);
@@ -472,7 +485,8 @@ mod tests {
         let h2 = blake3::hash(b"extent two");
 
         let mut wl = WriteLog::create(&path).unwrap();
-        wl.append_data(0, 2, &h1, 0, b"extent one").unwrap();
+        wl.append_data(0, 2, &h1, WalFlags::empty(), b"extent one")
+            .unwrap();
         wl.fsync().unwrap();
         let size_after_first = wl.size();
         drop(wl);
@@ -502,7 +516,9 @@ mod tests {
         let hash = blake3::hash(payload);
 
         let mut wl = WriteLog::create(&path).unwrap();
-        let body_offset = wl.append_data(0, 1, &hash, 0, payload).unwrap();
+        let body_offset = wl
+            .append_data(0, 1, &hash, WalFlags::empty(), payload)
+            .unwrap();
         wl.fsync().unwrap();
         drop(wl);
 
@@ -534,8 +550,8 @@ mod tests {
         let h2 = blake3::hash(p2);
 
         let mut wl = WriteLog::create(&path).unwrap();
-        let body1 = wl.append_data(0, 1, &h1, 0, p1).unwrap();
-        wl.append_data(8, 1, &h2, 0, p2).unwrap();
+        let body1 = wl.append_data(0, 1, &h1, WalFlags::empty(), p1).unwrap();
+        wl.append_data(8, 1, &h2, WalFlags::empty(), p2).unwrap();
         wl.fsync().unwrap();
         drop(wl);
 
@@ -564,7 +580,7 @@ mod tests {
         let hash = blake3::hash(original);
 
         let mut wl = WriteLog::create(&path).unwrap();
-        wl.append_data(512, 6, &hash, FLAG_COMPRESSED, &compressed)
+        wl.append_data(512, 6, &hash, WalFlags::COMPRESSED, &compressed)
             .unwrap();
         wl.fsync().unwrap();
         drop(wl);
@@ -574,7 +590,7 @@ mod tests {
             LogRecord::Data {
                 flags: f, data: d, ..
             } => {
-                assert_eq!(*f, FLAG_COMPRESSED);
+                assert_eq!(*f, WalFlags::COMPRESSED);
                 // The stored bytes are the compressed form.
                 assert_eq!(d.as_slice(), compressed.as_slice());
             }

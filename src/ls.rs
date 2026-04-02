@@ -218,7 +218,7 @@ impl VolumeReader {
                                 segment_id: ulid.clone(),
                                 body_offset,
                                 body_length: data.len() as u32,
-                                compressed: flags & writelog::FLAG_COMPRESSED != 0,
+                                compressed: flags.contains(writelog::WalFlags::COMPRESSED),
                                 entry_idx: None,
                                 body_section_start: None,
                             },

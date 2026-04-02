@@ -175,7 +175,7 @@ pub fn inspect_wal(path: &Path) -> std::io::Result<()> {
                 data,
                 ..
             } => {
-                let compressed = flags & writelog::FLAG_COMPRESSED != 0;
+                let compressed = flags.contains(writelog::WalFlags::COMPRESSED);
                 println!(
                     "{:<6}  {:<14}  {:>10}  {:>8}  {}",
                     "data",

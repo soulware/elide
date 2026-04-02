@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 arc-swap       = "1"
+bitflags       = "2"
 blake3         = "1"
 crossbeam-channel = "0.5"
 log            = "0.4"
@@ -14,6 +15,7 @@ lz4_flex       = "0.11"
 nix            = { version = "0.29", features = ["fs", "hostname", "process", "signal"] }
 rand_core      = { version = "0.6", features = ["getrandom"] }
 ulid           = "1"
+zerocopy       = { version = "0.8", features = ["derive"] }
 
 [dev-dependencies]
 criterion  = { version = "0.5", features = ["html_reports"] }
