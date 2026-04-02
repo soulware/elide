@@ -98,12 +98,28 @@ pub fn load_verifying_key(dir: &Path, pub_file: &str) -> io::Result<VerifyingKey
 /// Generate an ephemeral Ed25519 keypair in memory.
 ///
 /// Returns `(signer, verifying_key)`. Nothing is written to disk.
-/// Used by `elide-import` to sign all segments during import without persisting
-/// a private key — readonly volumes have no use for the private key after import.
 pub fn generate_ephemeral_signer() -> (Arc<dyn SegmentSigner>, VerifyingKey) {
     let key = SigningKey::generate(&mut OsRng);
     let verifying_key = key.verifying_key();
     (Arc::new(Ed25519Signer { key }), verifying_key)
+}
+
+/// Set up a readonly volume's identity and return a signer for segment writing.
+///
+/// Generates an ephemeral Ed25519 keypair, writes `volume.pub` and
+/// `volume.provenance`, and returns the signer.  The private key is never
+/// written to disk — readonly volumes (e.g. OCI imports) have no use for
+/// it after the one-time write.  `extentindex::rebuild` verifies segments
+/// using the persisted `volume.pub`.
+pub fn setup_readonly_identity(
+    dir: &Path,
+    pub_file: &str,
+    provenance_file: &str,
+) -> io::Result<Arc<dyn SegmentSigner>> {
+    let key = SigningKey::generate(&mut OsRng);
+    crate::segment::write_file_atomic(&dir.join(pub_file), &key.verifying_key().to_bytes())?;
+    write_origin(dir, &key, provenance_file)?;
+    Ok(Arc::new(Ed25519Signer { key }))
 }
 
 // --- origin files ---
