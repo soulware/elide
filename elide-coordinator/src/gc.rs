@@ -28,20 +28,24 @@
 //
 // Handoff protocol (crash-safe, filesystem-only coordination):
 //
-//   1. Coordinator writes gc/<new-ulid>.pending (via tmp + rename for atomicity)
-//      — one line per moved extent:
+//   1. Coordinator writes the compacted segment to gc/<new-ulid> (signed with
+//      an ephemeral key — coordinator does not hold the volume's private key),
+//      then writes gc/<new-ulid>.pending (via tmp + rename for atomicity):
 //        <hash_hex> <old_segment_ulid> <new_segment_ulid> <new_absolute_offset>
 //
-//   2. Volume reads the new segment's index, applies extent index patches on
-//      its idle tick, renames gc/<new-ulid>.pending → gc/<new-ulid>.applied.
+//   2. Volume re-signs gc/<new-ulid> with its own key, moves it to
+//      segments/<new-ulid>, applies extent index patches, renames
+//      gc/<new-ulid>.pending → gc/<new-ulid>.applied.
 //
-//   3. Coordinator (next GC tick) sees .applied, deletes old S3 objects and
-//      old local segment files from segments/, renames → gc/<new-ulid>.done.
+//   3. Coordinator (next GC tick) sees .applied: uploads segments/<new-ulid>
+//      (the volume-signed version) to S3, deletes old S3 objects and old local
+//      segment files, renames → gc/<new-ulid>.done.
 //
 //   Crash at any step:
 //   - Before step 1 completes: no .pending file; coordinator retries next tick.
 //   - After step 1, before step 2: volume re-applies on next idle tick (idempotent).
-//   - After step 2, before step 3: coordinator re-runs cleanup (S3 404 = success).
+//   - After step 2, before step 3: coordinator re-runs upload + cleanup
+//     (S3 put and 404-on-delete are both idempotent).
 //
 //   All-dead segments bypass the protocol entirely: no extent index entries
 //   reference them, so the coordinator deletes S3 + local files directly.
@@ -167,16 +171,9 @@ pub async fn gc_fork(
     let ran_repack = if let Some(pos) = find_least_dense(&all_stats, config.density_threshold) {
         let candidate = all_stats.remove(pos);
         repack_bytes = candidate.dead_bytes();
-        compact_segments(
-            vec![candidate],
-            &gc_dir,
-            fork_dir,
-            volume_id,
-            store,
-            repack_ulid,
-        )
-        .await
-        .context("density compaction")?;
+        compact_segments(vec![candidate], &gc_dir, volume_id, store, repack_ulid)
+            .await
+            .context("density compaction")?;
         true
     } else {
         false
@@ -208,7 +205,7 @@ pub async fn gc_fork(
     let ran_sweep = if small.len() >= 2 {
         let sweep_candidates = small.len();
         let sweep_bytes: u64 = small.iter().map(|s| s.dead_bytes()).sum();
-        compact_segments(small, &gc_dir, fork_dir, volume_id, store, sweep_ulid)
+        compact_segments(small, &gc_dir, volume_id, store, sweep_ulid)
             .await
             .context("small-segment sweep")?;
         Some((sweep_candidates, sweep_bytes))
@@ -299,6 +296,26 @@ pub async fn apply_done_handoffs(
             if let Some(old_ulid) = parts.next() {
                 old_ulids.insert(old_ulid.to_owned());
             }
+        }
+
+        // Upload the volume-signed compacted segment to S3.  This happens here
+        // rather than in the compact pass so that S3 always receives the version
+        // that the volume has re-signed with its own key.  The put is idempotent:
+        // if the coordinator crashes and retries, the same bytes are written again.
+        let new_seg_path = segments_dir.join(new_ulid_str);
+        if new_seg_path
+            .try_exists()
+            .context("checking new segment path")?
+        {
+            let key = segment_key(volume_id, new_ulid_str)
+                .with_context(|| format!("building key for {new_ulid_str}"))?;
+            let data = tokio::fs::read(&new_seg_path)
+                .await
+                .with_context(|| format!("reading compacted segment {new_ulid_str}"))?;
+            store
+                .put(&key, Bytes::from(data).into())
+                .await
+                .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
         }
 
         // Delete old S3 objects.  A 404 means the object is already gone
@@ -526,11 +543,10 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
 }
 
 /// Read live extent bodies from each candidate, write a compacted segment,
-/// upload it to S3, and write the gc/*.pending handoff file.
+/// stage it in gc/, and write the gc/*.pending handoff file.
 async fn compact_segments(
     mut candidates: Vec<SegmentStats>,
     gc_dir: &Path,
-    fork_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
     new_ulid_str: &str,
@@ -590,7 +606,7 @@ async fn compact_segments(
     }
 
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
-    // Write to a tmp file first; rename into gc/ only after S3 upload succeeds.
+    // Write to a tmp file first; rename into gc/ for staging.
     let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
 
     let mut new_entries: Vec<SegmentEntry> = all_live
@@ -621,18 +637,10 @@ async fn compact_segments(
         segment::write_segment(&tmp_path, &mut new_entries, ephemeral_signer.as_ref())
             .context("writing compacted segment")?;
 
-    let key = segment_key(volume_id, new_ulid_str)?;
-    let data = tokio::fs::read(&tmp_path)
-        .await
-        .context("reading compacted segment for upload")?;
-    store
-        .put(&key, Bytes::from(data).into())
-        .await
-        .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
-
-    // Upload confirmed: stage in gc/<ulid> so apply_gc_handoffs can re-sign and
-    // move it into segments/.  Keeping it in gc/ until the volume re-signs means
-    // segments/ always contains only volume-signed files.
+    // Stage in gc/<ulid> so apply_gc_handoffs can re-sign it and move it into
+    // segments/.  S3 upload happens in apply_done_handoffs, after the volume
+    // has re-signed the segment, so that S3 always receives the volume-signed
+    // version rather than the ephemeral-signed coordinator output.
     let final_path = gc_dir.join(new_ulid_str);
     tokio::fs::rename(&tmp_path, &final_path)
         .await
