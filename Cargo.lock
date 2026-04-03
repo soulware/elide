@@ -731,6 +731,7 @@ dependencies = [
  "futures",
  "nix",
  "object_store",
+ "proptest",
  "serde",
  "tempfile",
  "tokio",
