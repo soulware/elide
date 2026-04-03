@@ -224,9 +224,13 @@ mixed live/dead partial-extent accounting errors in `sweep_pending` and `repack`
 two LBAs hold identical data.  With the current `lba: 0..8, seed: any::<u8>()`
 strategy the dedup path may or may not be reached on any given run.  The
 corruption bug fixed in `sweep_pending` (dead DEDUP_REF incorrectly evicting a
-live DATA extent) was found by chance rather than by design.  A `DedupWrite`
-SimOp that explicitly writes the same seed to two different LBAs would guarantee
-the dedup and dead-REF paths are exercised on every run.
+live DATA extent) was found by chance rather than by design.  A second bug —
+the coordinator GC compactor converting live DEDUP_REF entries into DATA entries
+with `stored_length=0`, corrupting the extent index on rebuild — was missed
+entirely by proptest for the same reason and was only found in production (see
+"Fourth bug found" below).  A `DedupWrite` SimOp that explicitly writes the same
+seed to two different LBAs would guarantee the dedup and dead-REF paths are
+exercised on every run.
 
 **Actor `Snapshot` op absent.**  `VolumeHandle::snapshot()` sends a
 `VolumeRequest::Snapshot` through the actor channel, which flushes the WAL,
@@ -485,6 +489,74 @@ the merge loop.  Since ULIDs encode write order, this guarantees oldest entries
 appear first in `merged_live` and therefore first in the output segment.
 `rebuild_segments` then always applies the most-recent write last — the correct
 last-write-wins result — regardless of how the OS orders `read_dir` results.
+
+### Fourth bug found: GC compactor converts DEDUP_REF entries to DATA with stored_length=0
+
+Observed as a reproducible EIO ("failed to fill whole buffer") on the first NBD
+read after coordinator stop/restart, at a fixed byte offset (1 MB = LBA 256).
+The diagnostic log added to `read_extents` identified the failure:
+
+```
+read_extents failed: lba=256 segment=01KNANEFZZ8D3BTJFJXJ5EQ3D7 is_body=false
+  bss=15486 body_offset=801 body_length=0 payload_block_offset=14
+  file_body_offset=16287 read_len=4096 file_size=23803
+```
+
+`body_length=0` in the extent index for a non-DEDUP_REF entry is the invariant
+violation.  The seek target was `16287 + 14 × 4096 = 73631`, far past
+`file_size=23803`.
+
+**What happened:**
+
+1. A segment S1 contains `DATA(lba=242, H, lba_length=14)` and, from a
+   deduplicated write, `DEDUP_REF(lba=0, H, lba_length=...)` (same hash, no body
+   bytes in S1 for the REF).
+2. GC selects S1 as a compaction candidate.  In `compact_candidates_inner`, each
+   entry is tested for LBA-liveness: the DEDUP_REF is LBA-live, so it is pushed
+   into `live_entries`.
+3. `read_extent_bodies` skips DEDUP_REF entries (they have no body); their `data`
+   field stays as `Vec::new()`.
+4. The map over `live_entries` calls `SegmentEntry::new_data(...,
+   std::mem::take(&mut e.data))` for every entry, including the DEDUP_REF.
+   `new_data` sets `stored_length = data.len() = 0`.
+5. The GC output segment is written with a DATA entry at `stored_offset=801,
+   stored_length=0` for hash H — a zero-length body record that looks valid to
+   the parser.
+6. On restart, `extentindex::rebuild` sees this entry as a non-DEDUP_REF DATA
+   entry (it is flagged as DATA in the output segment) and inserts it into the
+   extent index with `body_length=0`.
+7. A read of LBA 256 (14 blocks into the extent starting at LBA 242) seeks to
+   `bss + 801 + 14 × 4096 = 73631` — past EOF → EIO.
+
+**Fix** (`elide-coordinator/src/gc.rs`): in the `new_entries` map, check
+`e.is_dedup_ref` and emit `SegmentEntry::new_dedup_ref` instead of `new_data`.
+This preserves the LBA→hash mapping in the output segment without fabricating a
+zero-length body.  DEDUP_REF entries are also skipped when building the handoff
+file — no `Repack` line is needed because the extent index still correctly points
+at the ancestor segment that holds the actual body bytes.
+
+**Why proptest missed it:**  two independent gaps.
+
+First, the documented "Dedup path not reliably triggered" gap: DEDUP_REF entries
+are only written when two LBAs contain identical data, which the current strategy
+only reaches by chance.
+
+Second, and more fundamentally: the proptest's `simulate_coord_gc_local` in
+`elide-core/tests/common/mod.rs` is a **separate reimplementation** of GC
+compaction that already handled DEDUP_REF entries correctly — it was never
+broken.  Even if dedup writes had fired reliably on every run, the proptest
+oracle would always have passed, because the oracle runs the test helper, not the
+real coordinator code in `elide-coordinator/src/gc.rs`.  Bugs in the real
+coordinator are invisible to the current proptest design.
+
+**What would close both gaps:**
+
+- A `DedupWrite` SimOp (writing the same seed to two different LBAs) to
+  guarantee DEDUP_REF entries appear in segments on every run.
+- A deterministic regression test in `elide-coordinator` that calls the real
+  `compact_candidates_inner` with DEDUP_REF inputs, drops and reopens the
+  volume, and asserts correct reads.  This is the only path that exercises the
+  code that was actually broken.
 
 ---
 

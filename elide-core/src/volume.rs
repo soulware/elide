@@ -1305,7 +1305,27 @@ pub(crate) fn read_extents(
             f.seek(SeekFrom::Start(
                 file_body_offset + er.payload_block_offset as u64 * 4096,
             ))?;
-            f.read_exact(out_slice)?;
+            if let Err(e) = f.read_exact(out_slice) {
+                let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                let (seg_id, is_body_ref, _) = cache.as_ref().expect("cache assigned above");
+                log::error!(
+                    "read_extents failed: lba={} segment={} is_body={} \
+                     bss={} body_offset={} body_length={} payload_block_offset={} \
+                     file_body_offset={} read_len={} file_size={} err={}",
+                    lba,
+                    seg_id,
+                    is_body_ref,
+                    body_section_start,
+                    body_offset,
+                    body_length,
+                    er.payload_block_offset,
+                    file_body_offset,
+                    out_slice.len(),
+                    file_size,
+                    e,
+                );
+                return Err(e);
+            }
         }
     }
     Ok(out)
