@@ -200,12 +200,26 @@ enum VolumeCommand {
         command: ImportCommand,
     },
 
-    /// Evict locally cached segment bodies so they are demand-fetched on next read
+    /// Evict locally cached data so it is demand-fetched on next read
     ///
-    /// Deletes files from segments/ (the local segment cache). On the next read
-    /// the volume will fetch them back from the object store. Refused if pending/
-    /// is non-empty (data not yet uploaded) or if a GC handoff is in flight.
+    /// Default: deletes all evictable bodies from segments/ (S3-confirmed,
+    /// no active GC handoff). The coordinator writes index/<ulid>.idx before
+    /// eviction is safe, so the LBA map survives.
+    ///
+    /// --cache: deletes .body and .present files from cache/ instead.
+    /// Safe at any time — index/ entries and the LBA map are untouched.
+    ///
+    /// --segment <ulid>: evicts one specific segment from segments/.
+    /// Refused if the ULID is GC-protected or if index/<ulid>.idx is absent.
     Evict {
+        /// Evict demand-fetch body cache (cache/) instead of segments/
+        #[arg(long, conflicts_with = "segment")]
+        cache: bool,
+
+        /// Evict a single segment by ULID
+        #[arg(long, conflicts_with = "cache")]
+        segment: Option<String>,
+
         /// Volume name
         name: String,
     },
@@ -480,10 +494,24 @@ fn main() {
                 }
             },
 
-            VolumeCommand::Evict { name } => {
+            VolumeCommand::Evict {
+                cache,
+                segment,
+                name,
+            } => {
                 let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                match evict_segments(&vol_dir) {
-                    Ok(n) => println!("evicted {n} segment(s)"),
+                let result = if cache {
+                    evict_cache(&vol_dir).map(|n| (n, "cache entry", "cache entries"))
+                } else if let Some(ulid_str) = segment {
+                    evict_one_segment(&vol_dir, &ulid_str).map(|n| (n, "segment", "segments"))
+                } else {
+                    evict_segments(&vol_dir).map(|n| (n, "segment", "segments"))
+                };
+                match result {
+                    Ok((n, singular, plural)) => {
+                        let label = if n == 1 { singular } else { plural };
+                        println!("evicted {n} {label}");
+                    }
                     Err(e) => {
                         eprintln!("error: {e}");
                         std::process::exit(1);
@@ -1067,6 +1095,108 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
     Ok(count)
 }
 
+/// Evict demand-fetch body cache entries from `cache/`.
+///
+/// Deletes `.body` and `.present` files for every cached segment.  The
+/// corresponding `index/<ulid>.idx` entries are left intact — the LBA map
+/// is unaffected.  On the next read, body bytes are re-fetched from S3.
+///
+/// Always safe: cache entries are ephemeral by design.
+fn evict_cache(vol_dir: &Path) -> std::io::Result<usize> {
+    let cache_dir = vol_dir.join("cache");
+    let mut count = 0;
+    let entries = match std::fs::read_dir(&cache_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Only delete .body and .present; leave any other files alone.
+        if name_str.ends_with(".body") || name_str.ends_with(".present") {
+            std::fs::remove_file(entry.path())?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Evict a single segment body from `segments/` by ULID.
+///
+/// Refuses if:
+///   - the segment is GC-protected (`.pending` or `.applied` handoff in flight)
+///   - `index/<ulid>.idx` is absent (segment not yet S3-confirmed; evicting
+///     would lose its LBA map entries)
+///   - the segment does not exist in `segments/`
+///
+/// On success, returns 1.
+fn evict_one_segment(vol_dir: &Path, ulid_str: &str) -> std::io::Result<usize> {
+    // Validate the ULID.
+    ulid::Ulid::from_string(ulid_str)
+        .map_err(|e| std::io::Error::other(format!("invalid ULID '{ulid_str}': {e}")))?;
+
+    let seg_path = vol_dir.join("segments").join(ulid_str);
+    if !seg_path.try_exists()? {
+        return Err(std::io::Error::other(format!(
+            "segment {ulid_str} not found in segments/"
+        )));
+    }
+
+    // Refuse if no index entry — segment is not S3-confirmed.
+    let idx_path = vol_dir.join("index").join(format!("{ulid_str}.idx"));
+    if !idx_path.try_exists()? {
+        return Err(std::io::Error::other(format!(
+            "segment {ulid_str} has no index/{ulid_str}.idx — not S3-confirmed; \
+             run coordinator drain first"
+        )));
+    }
+
+    // Refuse if GC-protected.
+    let gc_dir = vol_dir.join("gc");
+    if gc_dir.exists() {
+        for entry in std::fs::read_dir(&gc_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let Some(handoff) = elide_core::gc::GcHandoff::from_filename(&name_str) else {
+                continue;
+            };
+            match handoff.state {
+                elide_core::gc::GcHandoffState::Pending => {
+                    let content = std::fs::read_to_string(entry.path())?;
+                    for line in content.lines() {
+                        if let Some(hl) = elide_core::gc::HandoffLine::parse(line) {
+                            let old_ulid = match hl {
+                                elide_core::gc::HandoffLine::Repack { old_ulid, .. } => old_ulid,
+                                elide_core::gc::HandoffLine::Remove { old_ulid, .. } => old_ulid,
+                                elide_core::gc::HandoffLine::Dead { old_ulid } => old_ulid,
+                            };
+                            if old_ulid.to_string() == ulid_str {
+                                return Err(std::io::Error::other(format!(
+                                    "segment {ulid_str} is referenced by a pending GC handoff"
+                                )));
+                            }
+                        }
+                    }
+                }
+                elide_core::gc::GcHandoffState::Applied => {
+                    if handoff.ulid.to_string() == ulid_str {
+                        return Err(std::io::Error::other(format!(
+                            "segment {ulid_str} has a pending upload (gc/{ulid_str}.applied)"
+                        )));
+                    }
+                }
+                elide_core::gc::GcHandoffState::Done => {}
+            }
+        }
+    }
+
+    std::fs::remove_file(&seg_path)?;
+    Ok(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,6 +1360,107 @@ mod tests {
                 .exists(),
             "other segment must be evicted"
         );
+    }
+
+    #[test]
+    fn evict_cache_removes_body_and_present_leaves_idx() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let cache_dir = vol.join("cache");
+        let index_dir = vol.join("index");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&index_dir).unwrap();
+
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+        fs::write(cache_dir.join(format!("{ulid}.body")), b"body").unwrap();
+        fs::write(cache_dir.join(format!("{ulid}.present")), b"\xff").unwrap();
+        fs::write(index_dir.join(format!("{ulid}.idx")), b"idx").unwrap();
+
+        let n = evict_cache(&vol).unwrap();
+
+        assert_eq!(n, 2, "body + present = 2 files removed");
+        assert!(!cache_dir.join(format!("{ulid}.body")).exists());
+        assert!(!cache_dir.join(format!("{ulid}.present")).exists());
+        // index/ entry must survive
+        assert!(index_dir.join(format!("{ulid}.idx")).exists());
+    }
+
+    #[test]
+    fn evict_cache_missing_dir_returns_zero() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        // cache/ does not exist
+        let n = evict_cache(&vol).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn evict_one_segment_succeeds_with_idx() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let index_dir = vol.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
+
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+        write_seg(&vol, "segments", ulid);
+        // Simulate coordinator-written index entry.
+        fs::write(index_dir.join(format!("{ulid}.idx")), b"idx").unwrap();
+
+        let n = evict_one_segment(&vol, ulid).unwrap();
+
+        assert_eq!(n, 1);
+        assert!(!vol.join("segments").join(ulid).exists());
+        // index/ entry survives
+        assert!(index_dir.join(format!("{ulid}.idx")).exists());
+    }
+
+    #[test]
+    fn evict_one_segment_refuses_without_idx() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+        write_seg(&vol, "segments", ulid);
+        // No index/ entry — not S3-confirmed.
+
+        let err = evict_one_segment(&vol, ulid).unwrap_err();
+        assert!(err.to_string().contains("not S3-confirmed"));
+        // Segment must still exist.
+        assert!(vol.join("segments").join(ulid).exists());
+    }
+
+    #[test]
+    fn evict_one_segment_refuses_if_gc_protected() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let index_dir = vol.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
+
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+        let new_ulid = ulid::Ulid::from_parts(2, 1);
+        write_seg(&vol, "segments", ulid);
+        fs::write(index_dir.join(format!("{ulid}.idx")), b"idx").unwrap();
+
+        // .pending handoff references our ulid as an old segment.
+        use elide_core::gc::{HandoffLine, format_handoff_file};
+        let old = ulid::Ulid::from_string(ulid).unwrap();
+        let handoff = format_handoff_file([HandoffLine::Dead { old_ulid: old }]);
+        fs::write(
+            vol.join("gc").join(format!("{new_ulid}.pending")),
+            handoff.as_bytes(),
+        )
+        .unwrap();
+
+        let err = evict_one_segment(&vol, ulid).unwrap_err();
+        assert!(err.to_string().contains("pending GC handoff"));
+        assert!(vol.join("segments").join(ulid).exists());
+    }
+
+    #[test]
+    fn evict_one_segment_refuses_missing_segment() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let err = evict_one_segment(&vol, "01AAAAAAAAAAAAAAAAAAAAAAA1").unwrap_err();
+        assert!(err.to_string().contains("not found in segments/"));
     }
 }
 
