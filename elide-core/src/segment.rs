@@ -662,6 +662,47 @@ pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
 }
 
+/// Collect volume-signed GC output bodies from `gc/` that are in `.applied`
+/// state (awaiting coordinator upload to S3).
+///
+/// These are segments that the volume has re-signed in-place within `gc/` and
+/// acknowledged (`.applied` marker written), but that the coordinator has not
+/// yet uploaded and moved to `segments/`.  They must be included in LBA map
+/// and extent index rebuild at lower priority than `segments/` entries so the
+/// original input segments (still in `segments/`) win for any LBA they cover.
+///
+/// Bodies with `.pending` markers (coordinator-signed, not yet volume-applied)
+/// are excluded — the old input segments in `segments/` are still authoritative.
+pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let gc_dir = fork_dir.join("gc");
+    match fs::read_dir(&gc_dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+        Ok(entries) => {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let path = entry?.path();
+                // Skip sidecar files (.pending, .applied, .done, .tmp).
+                if path.extension().is_some() {
+                    continue;
+                }
+                let name = match path.file_name().and_then(|s| s.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if ulid::Ulid::from_string(name).is_err() {
+                    continue;
+                }
+                // Only include bodies that the volume has re-signed (.applied present).
+                if gc_dir.join(format!("{name}.applied")).exists() {
+                    paths.push(path);
+                }
+            }
+            Ok(paths)
+        }
+    }
+}
+
 /// Collect all `.idx` files in `index_dir` whose stem is a valid ULID.
 ///
 /// Used by `lbamap` and `extentindex` during startup rebuild. The `index/`
@@ -755,12 +796,17 @@ pub fn set_present_bit(path: &Path, entry_idx: u32, entry_count: u32) -> io::Res
 /// entries would shadow the concurrent write's correct entries.
 pub fn sort_for_rebuild(fork_dir: &Path, paths: &mut Vec<PathBuf>) {
     let gc_dir = fork_dir.join("gc");
-    // Partition into GC outputs and non-GC segments.
+    // Partition by source directory: paths from gc/ are in-flight GC outputs
+    // (lower priority); paths from pending/ or segments/ are regular (higher
+    // priority).
+    //
+    // Because segments/ now only contains S3-confirmed bodies, there is no
+    // need to cross-reference sidecar files in gc/ to identify GC outputs —
+    // the source directory is the authoritative signal.
     let mut gc_paths: Vec<PathBuf> = Vec::new();
     let mut non_gc_paths: Vec<PathBuf> = Vec::new();
     for p in paths.drain(..) {
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if is_gc_output(&gc_dir, name) {
+        if p.parent() == Some(gc_dir.as_path()) {
             gc_paths.push(p);
         } else {
             non_gc_paths.push(p);
@@ -771,29 +817,6 @@ pub fn sort_for_rebuild(fork_dir: &Path, paths: &mut Vec<PathBuf>) {
     // GC outputs first (lower priority), then non-GC segments (higher priority).
     paths.extend(gc_paths);
     paths.extend(non_gc_paths);
-}
-
-/// Returns true if `segment_name` is an in-flight GC output.
-///
-/// A segment is a GC output while its handoff file is in `.pending` or
-/// `.applied` state — i.e. while the old input segments may still exist
-/// in `segments/`. During this window `sort_for_rebuild` places these
-/// segments first (lower priority) so the originals win on rebuild.
-///
-/// `.done` is intentionally excluded: by the time a handoff reaches
-/// `.done` the coordinator has already deleted the old input segments,
-/// so there is nothing to conflict with. ULID ordering (guaranteed by
-/// `gc_checkpoint`) ensures the GC output sorts before any subsequent
-/// write without needing special classification.
-fn is_gc_output(gc_dir: &Path, segment_name: &str) -> bool {
-    use crate::gc::GcHandoffState;
-    [GcHandoffState::Pending, GcHandoffState::Applied]
-        .iter()
-        .any(|state| {
-            gc_dir
-                .join(format!("{segment_name}.{}", state.suffix()))
-                .exists()
-        })
 }
 
 // --- slice read helpers ---
@@ -1152,53 +1175,41 @@ mod tests {
         fork_dir.join("segments").join(ulid)
     }
 
-    #[test]
-    fn sort_for_rebuild_pending_is_gc_output() {
-        let (_tmp, fork_dir) = make_fork_dir();
-        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
-        let path = seg_path(&fork_dir, ulid);
-        fs::write(&path, b"").unwrap();
-        fs::write(fork_dir.join("gc").join(format!("{ulid}.pending")), b"").unwrap();
-
-        let mut paths = vec![path.clone()];
-        sort_for_rebuild(&fork_dir, &mut paths);
-
-        // A .pending sidecar marks the segment as a GC output (first / lower priority).
-        assert_eq!(paths, vec![path]);
+    fn gc_path(fork_dir: &Path, ulid: &str) -> PathBuf {
+        fork_dir.join("gc").join(ulid)
     }
 
     #[test]
-    fn sort_for_rebuild_applied_is_gc_output() {
+    fn sort_for_rebuild_gc_dir_path_is_gc_output() {
+        // A path in gc/ is treated as a GC output (lower priority) regardless
+        // of which sidecar files exist.  The source directory is the signal.
         let (_tmp, fork_dir) = make_fork_dir();
         let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
-        let path = seg_path(&fork_dir, ulid);
+        let path = gc_path(&fork_dir, ulid);
         fs::write(&path, b"").unwrap();
         fs::write(fork_dir.join("gc").join(format!("{ulid}.applied")), b"").unwrap();
 
         let mut paths = vec![path.clone()];
         sort_for_rebuild(&fork_dir, &mut paths);
 
-        // A .applied sidecar marks the segment as a GC output (first / lower priority).
         assert_eq!(paths, vec![path]);
     }
 
     #[test]
-    fn sort_for_rebuild_done_is_not_gc_output() {
+    fn sort_for_rebuild_segments_dir_path_is_not_gc_output() {
+        // A path in segments/ is always regular (higher priority), even if a
+        // .done sidecar exists in gc/ — .done means the handoff is complete and
+        // the old inputs are already gone; the body in segments/ is S3-confirmed.
         let (_tmp, fork_dir) = make_fork_dir();
-        let gc_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
-        let reg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAC0";
-        let gc_path = seg_path(&fork_dir, gc_ulid);
-        let reg_path = seg_path(&fork_dir, reg_ulid);
-        fs::write(&gc_path, b"").unwrap();
-        fs::write(&reg_path, b"").unwrap();
-        // Only a .done sidecar — handoff is complete, old inputs already deleted.
-        fs::write(fork_dir.join("gc").join(format!("{gc_ulid}.done")), b"").unwrap();
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
+        let path = seg_path(&fork_dir, ulid);
+        fs::write(&path, b"").unwrap();
+        fs::write(fork_dir.join("gc").join(format!("{ulid}.done")), b"").unwrap();
 
-        let mut paths = vec![gc_path.clone(), reg_path.clone()];
+        let mut paths = vec![path.clone()];
         sort_for_rebuild(&fork_dir, &mut paths);
 
-        // Both segments treated as regular; sorted by ULID (gc_ulid < reg_ulid).
-        assert_eq!(paths, vec![gc_path, reg_path]);
+        assert_eq!(paths, vec![path]);
     }
 
     #[test]
@@ -1206,18 +1217,18 @@ mod tests {
         let (_tmp, fork_dir) = make_fork_dir();
         let gc_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
         let reg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAA9"; // lower ULID than gc_ulid
-        let gc_path = seg_path(&fork_dir, gc_ulid);
-        let reg_path = seg_path(&fork_dir, reg_ulid);
-        fs::write(&gc_path, b"").unwrap();
-        fs::write(&reg_path, b"").unwrap();
-        fs::write(fork_dir.join("gc").join(format!("{gc_ulid}.pending")), b"").unwrap();
+        let path_gc = gc_path(&fork_dir, gc_ulid);
+        let path_reg = seg_path(&fork_dir, reg_ulid);
+        fs::write(&path_gc, b"").unwrap();
+        fs::write(&path_reg, b"").unwrap();
+        fs::write(fork_dir.join("gc").join(format!("{gc_ulid}.applied")), b"").unwrap();
 
-        let mut paths = vec![gc_path.clone(), reg_path.clone()];
+        let mut paths = vec![path_gc.clone(), path_reg.clone()];
         sort_for_rebuild(&fork_dir, &mut paths);
 
-        // GC output comes first regardless of ULID order so the regular
-        // segment (higher priority) is processed last and wins on rebuild.
-        assert_eq!(paths, vec![gc_path, reg_path]);
+        // GC output (from gc/) comes first regardless of ULID order so the
+        // regular segment (higher priority) is processed last and wins on rebuild.
+        assert_eq!(paths, vec![path_gc, path_reg]);
     }
 
     // --- .present bitset helpers ---

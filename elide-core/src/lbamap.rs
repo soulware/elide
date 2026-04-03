@@ -286,6 +286,10 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
 
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
+        // Include GC handoff bodies in .applied state (volume-signed, in gc/
+        // awaiting coordinator upload to S3).  These are treated as lower-priority
+        // GC outputs by sort_for_rebuild; the old input segments in segments/ win.
+        paths.extend(segment::collect_gc_applied_segment_files(fork_dir)?);
         segment::sort_for_rebuild(fork_dir, &mut paths);
 
         if let Some(cutoff) = branch_ulid {

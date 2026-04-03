@@ -152,6 +152,9 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
         // any cache/ entries for the same hashes.
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         paths.extend(segment::collect_segment_files(&fork_dir.join("segments"))?);
+        // Include GC handoff bodies in .applied state (volume-signed, in gc/
+        // awaiting coordinator upload to S3).  Lower priority than segments/.
+        paths.extend(segment::collect_gc_applied_segment_files(fork_dir)?);
         segment::sort_for_rebuild(fork_dir, &mut paths);
 
         if let Some(cutoff) = branch_ulid {
