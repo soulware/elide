@@ -125,23 +125,11 @@ Deletes all evictable segment files from `segments/` to reclaim local disk space
 
 **Eviction always succeeds.** Segments that cannot safely be evicted are skipped silently; the command reports only the count of files actually deleted. `pending/` files are never touched — they have not yet been uploaded to S3 and are not part of `segments/`.
 
-**In-flight GC handoff protection:**
+**No GC protection logic needed.**
 
-Evict does not block on `gc/*.applied` or `gc/*.done` files — those states indicate the handoff is complete from the volume's perspective. However, it protects specific segments that are still needed:
+Because `segments/<ulid>` is present only after confirmed S3 upload, every file in `segments/` is safe to evict (subject to the `index/<ulid>.idx` check below). In-progress GC handoffs keep their new output body in `gc/` until the coordinator completes the upload and moves it to `segments/` — evict never touches `gc/`.
 
-- For each `gc/<ulid>.pending`: the handoff file is parsed and every `old_ulid` referenced in it is added to a protected set. These are the input segments that the volume still needs for reads until the handoff is applied.
-- For each `gc/<ulid>.applied`: the segment named `<ulid>` is protected from eviction. This is the compacted output segment that the coordinator has not yet uploaded to S3 — evicting it would make those LBAs unreadable until the upload completes.
-
-All other files in `segments/` are deleted. The protected segments are skipped silently and remain on disk.
-
-**Crash safety — the coordinator writes `index/*.idx`, not evict.**  The
-coordinator writes `index/<ulid>.idx` as part of the upload commit sequence —
-after confirmed S3 upload and before (or coincident with) the
-`pending/` → `segments/` rename.  By the time `evict` runs, every file in
-`segments/` already has a corresponding `index/<ulid>.idx`.  Evict therefore
-has nothing special to do: it simply deletes the body file.  After a
-crash+reopen, `Volume::open` rebuilds the LBA map from `index/*.idx`, and
-subsequent reads fall through to the `SegmentFetcher` for body bytes.
+**Crash safety.**  Every file in `segments/` is structurally guaranteed to be S3-confirmed — the coordinator is the only process that moves bodies there, and does so only after upload and `index/` write.  Evict therefore has nothing special to do: it simply deletes the body file and the LBA map remains intact via `index/<ulid>.idx`.  After a crash+reopen, `Volume::open` rebuilds the LBA map from `index/*.idx`, and subsequent reads fall through to the `SegmentFetcher` for body bytes.
 
 **S3 dependency after eviction.**  Before eviction, `segments/<ulid>` is
 redundant with S3 — that is why it is safe to delete.  After eviction,
@@ -298,9 +286,9 @@ To reclaim local space from a frozen ancestor, all its live descendants must fir
 Within a live leaf node there is a clean ownership split by directory: `pending/` belongs to the volume; `segments/` belongs to the coordinator.
 
 - Volume GC (`repack`, `sweep_pending`) operates on `pending/` only. Ancestor directories are never scanned or modified.
-- Coordinator GC operates on `segments/` — it reads segment index files from both `pending/` and `segments/` to determine liveness, but only writes and deletes within `segments/` (via the handoff protocol).
+- Coordinator GC operates on `segments/` — it reads segment index files from both `pending/` and `segments/` to determine liveness; writes and deletes within `segments/` via the handoff protocol (the coordinator is the only process that moves bodies into `segments/`).
 
-This split ensures the `segments/` invariant ("file present ↔ confirmed in S3") is never violated by the volume, and eliminates ULID-reuse races between local compaction and S3 upload. See *Open questions* below for details.
+This split structurally enforces the `segments/` invariant ("file present ↔ confirmed in S3"): neither the volume nor evict ever write to `segments/`. The coordinator performs the `pending/` → `segments/` rename after upload on the drain path, and the `gc/` → `segments/` move after upload on the GC handoff path. This eliminates any need for eviction to inspect in-flight GC state and eliminates ULID-reuse races between local compaction and S3 upload. See *Open questions* below for details.
 
 ### Coordinator-driven segment GC
 
@@ -336,17 +324,19 @@ The coordinator rebuilds from on-disk files only — in-memory WAL entries are n
 
 **Output placement and the `segments/` invariant:**
 
-`segments/` files are always signed with `volume.key`. The coordinator does not hold the volume's private key, so it cannot write directly to `segments/`. Instead it stages the compacted segment in `gc/` using an ephemeral key, and the volume re-signs it before moving it into `segments/`:
+`segments/<ulid>` present ↔ confirmed in S3. The coordinator is the sole process that moves bodies into `segments/`, and does so only after confirmed S3 upload. For GC handoffs this means the coordinator stages the compacted segment in `gc/`, the volume re-signs it in-place within `gc/`, the coordinator uploads it and writes `index/<new-ulid>.idx`, then moves it to `segments/`. The `segments/` move is the final step — it is the S3-confirmation marker for the body itself. Eviction therefore requires no GC protection checks: every file already in `segments/` is redundant with S3.
 
 1. Coordinator writes `gc/<new-ulid>` (ephemeral-signed segment, via tmp-rename) — only for Repack handoffs; Dead/Remove handoffs skip this step (no new body)
 2. Coordinator writes `gc/<new-ulid>.pending` (handoff entries, via tmp-rename); both files (if applicable) are now visible
-3. Volume re-signs `gc/<new-ulid>` with `volume.key`, writes `segments/<new-ulid>`, deletes `gc/<new-ulid>`
+3. Volume re-signs `gc/<new-ulid>` in-place with `volume.key` (writes to `gc/<new-ulid>.tmp`, then renames over `gc/<new-ulid>`). The body remains in `gc/` — it is not yet moved to `segments/`.
 4. Volume applies extent index patches and renames `gc/<new-ulid>.pending` → `gc/<new-ulid>.applied`
-5. Coordinator uploads `segments/<new-ulid>` (volume-signed) to S3, deletes old S3 objects and local `segments/<old-ulid>` files
-6. Coordinator writes `index/<new-ulid>.idx` — only when a new segment was produced (step 1 ran); marks the output as S3-confirmed so evict can safely remove the body
-7. Coordinator renames `gc/<new-ulid>.applied` → `gc/<new-ulid>.done`
+5. Coordinator uploads `gc/<new-ulid>` (now volume-signed) to S3
+6. Coordinator writes `index/<new-ulid>.idx` — only when a new segment was produced (step 1 ran); this is the S3-confirmation marker
+7. Coordinator moves `gc/<new-ulid>` → `segments/<new-ulid>` — the final confirmation step; `segments/` now reflects that the segment is S3-backed
+8. Coordinator deletes old S3 objects and local `segments/<old-ulid>` files
+9. Coordinator renames `gc/<new-ulid>.applied` → `gc/<new-ulid>.done`
 
-Only after step 3 is the file visible in `segments/`, and it is always volume-signed. The `index/` write at step 6 is the S3-confirmation marker for the compacted output; it is omitted for Dead/Remove handoffs because there is no new segment body. A crash at any step leaves recoverable file state: `gc/<new-ulid>` and/or `.pending`/`.applied` remain present and are re-processed on the next tick.
+The `segments/<ulid>` invariant — "present ↔ confirmed in S3" — is maintained because the coordinator (not the volume) performs the move into `segments/` only after upload and `index/` write. During the `.applied` window (steps 5–7), the volume-signed body lives in `gc/<new-ulid>`; reads for LBAs covered by this segment fall back to `gc/<new-ulid>` when `segments/<new-ulid>` is absent. The `index/` write at step 6 is omitted for Dead/Remove handoffs (no new segment body). A crash at any step leaves recoverable file state: `gc/<new-ulid>` and/or `.pending`/`.applied` remain present and are re-processed on the next tick.
 
 **Output ULID assignment:** the compacted segment is assigned `max(input ULIDs).increment()` — one step ahead of the newest input in the total ULID order. This gives three properties:
 
