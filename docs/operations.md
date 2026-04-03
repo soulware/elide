@@ -130,6 +130,26 @@ Evict does not block on `gc/*.applied` or `gc/*.done` files — those states ind
 
 All other files in `segments/` are deleted. The protected segments are skipped silently and remain on disk.
 
+**Known bug — evict does not write `.idx` before deleting.**  `Volume::open`
+rebuilds the LBA map from `pending/`, `segments/`, and `fetched/*.idx`.  If
+evict deletes a segment without first writing its header+index section to
+`fetched/<ulid>.idx`, that segment's LBAs are absent from the rebuilt map after
+a crash.  Reads for those LBAs return zeros rather than triggering a
+demand-fetch.
+
+The fix is for `evict` to atomically write `fetched/<ulid>.idx` (header+index
+bytes `[0, body_section_start)`) and an all-zero `fetched/<ulid>.present`
+bitset before deleting `segments/<ulid>`.  With those files in place, the LBA
+map survives a restart and missing body bytes fall through to the
+`SegmentFetcher` as intended.
+
+**Open question — evicting `fetched/` body data.**  Once the `.idx` bug is
+fixed, `evict` could also reclaim space used by previously demand-fetched body
+bytes: delete `fetched/<ulid>.body` and remove (or zero) `fetched/<ulid>.present`
+while preserving the `.idx`.  The LBA map still survives; subsequent reads
+re-fetch body bytes from S3.  This needs separate design and test work before
+implementation.
+
 ## Bootstrap from the Store
 
 A volume can be reconstructed on any host that has access to the object store, without copying local data.
