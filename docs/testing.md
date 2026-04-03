@@ -154,6 +154,23 @@ To increase confidence after a bug fix, add the minimal failing sequence as a
 deterministic regression test in `elide-core/src/volume.rs` before verifying
 that the proptest also passes.
 
+### Proptest regression files
+
+Each proptest suite has a companion `*.proptest-regressions` file (e.g.
+`elide-core/tests/volume_proptest.proptest-regressions`).  When proptest finds
+a failure it appends the seed for the minimal failing input to that file.  On
+subsequent runs, those seeds are replayed before any novel cases are generated,
+providing free regression coverage for every previously-found bug.
+
+**Keep these files committed.**  They are the test suite's memory.  Without
+them, proptest would have to rediscover the same inputs by chance.
+
+**Deduplicate periodically.**  Proptest appends a new seed each time a failure
+is found, even if it shrinks to the same minimal sequence as an existing entry.
+Multiple seeds with identical comments are redundant — keep one.  Check the
+comments (the `# shrinks to ...` suffix) and delete duplicates before
+committing.
+
 ### Known gaps
 
 These are gaps in the current simulation model that could allow bugs to go
