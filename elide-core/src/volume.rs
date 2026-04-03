@@ -937,7 +937,7 @@ impl Volume {
                 let (body_section_start, entries) =
                     segment::read_and_verify_segment_index(&gc_seg_path, &self.verifying_key)?;
 
-                for e in &entries {
+                for (i, e) in entries.iter().enumerate() {
                     if e.is_dedup_ref {
                         continue;
                     }
@@ -963,7 +963,7 @@ impl Volume {
                             body_offset: e.stored_offset,
                             body_length: e.stored_length,
                             compressed: e.compressed,
-                            entry_idx: None,
+                            entry_idx: Some(i as u32),
                             body_section_start,
                         },
                     );
