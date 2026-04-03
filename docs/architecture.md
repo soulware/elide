@@ -82,7 +82,8 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
       manifest.toml                   — name, size, OCI source metadata
       pending/                        — segments awaiting S3 upload (populated by import)
       segments/                       — segments confirmed in S3 (empty until drain completes)
-      fetched/                        — demand-fetched index files (01JQXXXXX.idx, .body, .present)
+      index/                          — coordinator-written LBA index files (01JQXXXXX.idx)
+      fetched/                        — volume-managed demand-fetch body cache (.body, .present)
       snapshots/
         01JQXXXXX                     — branch point marker for derived volumes
       import.lock                     — present while import is running or interrupted
@@ -97,6 +98,7 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
       wal/                            — present = live; write target
       pending/
       segments/
+      index/
       fetched/
       snapshots/
       control.sock                    — volume process IPC socket
@@ -136,6 +138,7 @@ The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snaps
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
 - `manifest.toml` present on OCI-imported volumes and on volumes reconstructed via `remote pull`
 - `import.lock` present only while an import is running or interrupted
+- **`index/<ulid>.idx` present ↔ segment `<ulid>` is confirmed in S3.** The coordinator writes these files at the two S3-confirmation points: (1) after `pending/<ulid>` → `segments/<ulid>` rename in the upload drain; (2) after a GC handoff output segment is uploaded, before renaming `.applied` → `.done`. These are the only two write paths. The volume and evict never write to `index/`. `fetched/` body files (`.body`, `.present`) may or may not exist for a given `.idx` entry — their absence means body bytes have not been demand-fetched yet.
 
 **Finding live volumes:** the coordinator scans `by_id/` for ULID-named subdirectories that have either a `pending/` or `segments/` subdirectory. Readonly volumes (with `volume.readonly`) are included for drain if they have pending segments (import just completed), and for prefetch if `segments/` is empty and `fetched/` is absent or empty (just pulled from the store). Readonly volumes with non-empty `segments/` or `fetched/` are already indexed and are skipped.
 

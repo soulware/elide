@@ -49,7 +49,10 @@ interval_secs       = 30            # run GC pass every N seconds
 
 The volume process is a pure data servant: it accepts NBD reads and writes, flushes the WAL to `pending/` on a size threshold or idle tick, applies GC handoffs from the coordinator, and demand-fetches segments from S3 on cache miss. It does not initiate compaction or upload — those are exclusively coordinator responsibilities.
 
-**`fetched/` is the volume's concern, not the coordinator's.** The volume creates and manages the `fetched/` cache directory — writing triplets on demand-fetch, promoting fully-populated triplets to `segments/`, and evicting LRU entries when the cache exceeds capacity. The coordinator does not read or write `fetched/`.
+**Directory ownership split.** Two directories under each fork have distinct ownership:
+
+- **`index/`** (coordinator-written): the coordinator writes `index/<ulid>.idx` after confirmed S3 upload, and never reads it back. These files are the permanent LBA index — they survive eviction and allow `Volume::open` to rebuild the full LBA map even when segment bodies are absent locally. The volume and evict never write to `index/`.
+- **`fetched/`** (volume-managed): the volume writes `.body` and `.present` files here on demand-fetch. The coordinator does not read or write `fetched/`.
 
 ### S3 Upload
 
@@ -62,9 +65,10 @@ The `object_store` crate is used for all store access, providing a uniform inter
 2. PUT to object store at key `by_id/<volume_ulid>/YYYYMMDD/<segment_ulid>`
 3. On first drain: also PUT `by_id/<volume_ulid>/manifest.toml`, `by_id/<volume_ulid>/volume.pub`, and `names/<volume_name>` (idempotent; same content on every retry)
 4. On success: rename `pending/<ulid>` → `segments/<ulid>` (atomic commit)
-5. On failure: leave in `pending/`, record error, continue with remaining segments
+5. Write `index/<ulid>.idx` — header+index section of the just-renamed segment (S3-confirmation marker)
+6. On failure at any step: leave in `pending/`, record error, continue with remaining segments
 
-The rename in step 3 is the local commit point. If the coordinator crashes between steps 2 and 3, the object is in S3 but the segment is still in `pending/` — a retry will re-PUT (idempotent) and then rename. No ledger file is needed.
+The rename in step 4 is the local commit point. Step 5 writes the `index/` entry that marks this segment as S3-confirmed and allows safe eviction of the body. If the coordinator crashes between steps 4 and 5, `segments/<ulid>` exists but `index/<ulid>.idx` does not — the next drain tick retries (PUT is idempotent, rename is a no-op on an existing file, and `extract_idx` is re-run). No explicit ledger is needed.
 
 **Drain loop sequencing:** the coordinator's per-fork drain loop (`fork_loop`) runs the following steps sequentially on each tick:
 
@@ -84,9 +88,9 @@ Segments that are dense at upload time will not need coordinator GC later — th
 
 Segments in `segments/` are S3-backed and evictable. When `find_segment_file` is called during a read and the segment file is absent locally, the volume delegates to an optional `SegmentFetcher`. If a fetcher is configured, it downloads the segment from the object store, writes the three-file fetched format to `fetched/`, and the read proceeds normally. If no fetcher is configured, the read fails with "segment not found".
 
-**Rebuild vs. runtime:** demand-fetch operates at read time, after the volume is open. The LBA map and extent index are rebuilt at `Volume::open` by scanning `pending/`, `segments/`, and `fetched/*.idx` on local disk. If none of these are present for an ancestor segment, that data will appear as zeros at open time rather than triggering a fetch. This is the **cold-start problem**.
+**Rebuild vs. runtime:** demand-fetch operates at read time, after the volume is open. The LBA map and extent index are rebuilt at `Volume::open` by scanning `pending/`, `segments/`, and `index/*.idx` on local disk. If none of these are present for an ancestor segment, that data will appear as zeros at open time rather than triggering a fetch. This is the **cold-start problem**.
 
-**Cold-start prefetch solves the cold-start problem.** When the coordinator discovers a new fork on a host with no local ancestor segments, it automatically walks the fork's ancestry chain, lists S3 objects for each ancestor fork, and downloads the header+index portion (`[0, body_section_start)`) of each segment not already present locally, writing it as `fetched/<ulid>.idx` in the ancestor's fork directory. Body bytes are not downloaded. After this, `Volume::open` rebuilds the full LBA map from `fetched/*.idx`, and individual reads demand-fetch body bytes on first access. This happens automatically as part of fork discovery — no manual invocation required.
+**Cold-start prefetch solves the cold-start problem.** When the coordinator discovers a new fork on a host with no local ancestor segments, it automatically walks the fork's ancestry chain, lists S3 objects for each ancestor fork, and downloads the header+index portion (`[0, body_section_start)`) of each segment not already present locally, writing it as `index/<ulid>.idx` in the ancestor's fork directory. Body bytes are not downloaded. After this, `Volume::open` rebuilds the full LBA map from `index/*.idx`, and individual reads demand-fetch body bytes on first access. This happens automatically as part of fork discovery — no manual invocation required.
 
 **Configuration — `fetch.toml`** in the volume root directory:
 
@@ -130,20 +134,29 @@ Evict does not block on `gc/*.applied` or `gc/*.done` files — those states ind
 
 All other files in `segments/` are deleted. The protected segments are skipped silently and remain on disk.
 
-**Crash safety — evict writes `.idx` before deleting.**  Before removing
-`segments/<ulid>`, evict copies the header+index section (bytes
-`[0, body_section_start)`) to `fetched/<ulid>.idx`.  This preserves the LBA
-map entry across a crash+reopen: `Volume::open` rebuilds the map from
-`fetched/*.idx`, and subsequent reads for the evicted body fall through to the
-`SegmentFetcher` as intended.  The write is idempotent — if `.idx` already
-exists (e.g. from a previous partial evict run), it is left unchanged.
+**Crash safety — the coordinator writes `index/*.idx`, not evict.**  The
+coordinator writes `index/<ulid>.idx` as part of the upload commit sequence —
+after confirmed S3 upload and before (or coincident with) the
+`pending/` → `segments/` rename.  By the time `evict` runs, every file in
+`segments/` already has a corresponding `index/<ulid>.idx`.  Evict therefore
+has nothing special to do: it simply deletes the body file.  After a
+crash+reopen, `Volume::open` rebuilds the LBA map from `index/*.idx`, and
+subsequent reads fall through to the `SegmentFetcher` for body bytes.
 
-**Open question — evicting `fetched/` body data.**  Once the `.idx` bug is
-fixed, `evict` could also reclaim space used by previously demand-fetched body
-bytes: delete `fetched/<ulid>.body` and remove (or zero) `fetched/<ulid>.present`
-while preserving the `.idx`.  The LBA map still survives; subsequent reads
-re-fetch body bytes from S3.  This needs separate design and test work before
-implementation.
+**S3 dependency after eviction.**  Before eviction, `segments/<ulid>` is
+redundant with S3 — that is why it is safe to delete.  After eviction,
+`index/<ulid>.idx` is the sole local record that those LBAs exist.  If an
+`index/` entry is deleted or corrupted, the coordinator will regenerate it
+automatically on startup by running prefetch against S3 (triggered whenever
+`segments/` is empty and `index/` is empty).  Eviction is therefore only safe
+on volumes with S3 backing; running it on a volume without a reachable store
+risks permanent LBA map loss.
+
+**Evicting demand-fetched body data.**  `evict` also reclaims space used by
+previously demand-fetched body bytes: it deletes `fetched/<ulid>.body` and
+`fetched/<ulid>.present` for any segment whose body is locally cached.  The
+`index/<ulid>.idx` entry is preserved, so the LBA map survives; subsequent
+reads re-fetch body bytes from S3 on demand.
 
 ## Bootstrap from the Store
 
@@ -179,7 +192,7 @@ Reconstructs a local volume skeleton from the store:
 5. Create `by_name/<name>` symlink
 6. Send a rescan request to the coordinator
 
-**After the pull:** the coordinator discovers the new volume on the next scan (the empty `segments/` triggers prefetch). It downloads the index section (`.idx`) of every segment from the store into `fetched/`, then `Volume::open` rebuilds the full LBA map. Subsequent reads demand-fetch body bytes on first access.
+**After the pull:** the coordinator discovers the new volume on the next scan (the empty `segments/` triggers prefetch). It downloads the index section (`.idx`) of every segment from the store into `index/`, then `Volume::open` rebuilds the full LBA map. Subsequent reads demand-fetch body bytes on first access.
 
 The volume is readable (via `volume ls`, `volume serve --readonly`) as soon as the coordinator's prefetch pass completes. No full body download is required upfront.
 
@@ -192,6 +205,39 @@ elide volume remote pull ubuntu-22.04       # reconstruct skeleton + trigger pre
 # coordinator prefetches .idx files automatically
 elide volume ls ubuntu-22.04                # readable; first access demand-fetches bodies
 ```
+
+## Disaster recovery
+
+### Disk loss on a live volume
+
+**What is recoverable:** all data that was in segments fully uploaded to S3.
+
+**What is lost:** the contents of `pending/` (WAL segments not yet uploaded) and any writes buffered in the current in-memory WAL.  The recovery point is the last segment the coordinator successfully uploaded.
+
+**Recovery:** `volume remote pull <name>` reconstructs the directory skeleton from S3 — `manifest.toml`, `volume.pub`, an empty `segments/`.  The coordinator then runs prefetch automatically (empty `segments/` and empty `index/` is the trigger) and downloads `.idx` files for every uploaded segment into `index/`.  The volume is readable once prefetch completes.
+
+The recovered volume is permanently readonly: `volume.key` was never uploaded to S3 and cannot be reconstructed.  To continue writing, fork from a snapshot (see below).
+
+### Lost private key
+
+All data in S3 remains readable — signature verification uses `volume.pub`, which is stored in S3.  However, new writes are impossible without `volume.key`.
+
+**If snapshots exist in S3:** fork from the latest snapshot.  The fork creates a new volume with a new key pair; the parent's segments are read through the parent's `volume.pub`.
+
+**If no snapshots exist:** snapshot markers are intentionally unsigned empty files.  Any party with write access to the bucket can create one — this is by design: a volume originally created on one host should be snapshotable and forkable from a different host using a different keypair.  Segment content integrity is enforced by the segment signatures regardless.  To create an emergency branch point: upload an empty file to `by_id/<volume_ulid>/snapshots/<ulid>` using any S3 client, with a ULID equal to the last existing segment ULID (so the branch point covers all uploaded data).  Once the snapshot is visible in S3, `volume fork` can branch from it.  There is no `elide` command for this today — it requires direct S3 manipulation.
+
+### Accidental local deletion with the private key intact
+
+If `segments/`, `index/`, and `fetched/` are deleted locally but `volume.key` remains, recovery is fully automatic.  On startup, the coordinator's `fork_loop` detects that `segments/` and `index/` are both empty and runs prefetch against S3, downloading `.idx` files for every uploaded segment into `index/`.  The volume reopens with a complete LBA map and is immediately writable.
+
+**Partially deleting `segments/` is not the same as emptying it.**  The prefetch trigger fires when `segments/` is completely empty *and* `index/` is completely empty.  If some segment files are deleted by hand and others remain (or if `index/*.idx` files still exist), the coordinator sees locally present data and does not run prefetch.  The deleted segments' LBAs are absent from the rebuilt LBA map unless `index/<ulid>.idx` files exist for them.  Reads to those LBAs return zeros with no error — silent data loss.  The only safe ways to remove individual segment bodies are `elide volume evict` (which relies on coordinator-written `index/*.idx`) or ensuring the deleted segment's LBAs are fully covered by newer entries in `pending/` (i.e. they have all been overwritten).
+
+`discover_volumes` skips ULID directories that have neither a `segments/` nor a `pending/` subdirectory — this guards against partially-created volume shells during `volume fork`.  The check is on directory *existence*, not contents, so:
+
+- Delete `segments/` contents only → still discovered (`segments/` dir exists); prefetch triggers (empty dir + empty `index/`).
+- Delete `segments/` directory entirely → still discovered via `pending/`; prefetch triggers.
+- Delete `pending/` directory entirely → still discovered via `segments/`; prefetch triggers if `segments/` and `index/` are both empty.
+- Delete both directories entirely → **not discovered**.  Fix: `mkdir <vol_dir>/segments`.
 
 ## Diagnostic tools
 
@@ -292,13 +338,15 @@ The coordinator rebuilds from on-disk files only — in-memory WAL entries are n
 
 `segments/` files are always signed with `volume.key`. The coordinator does not hold the volume's private key, so it cannot write directly to `segments/`. Instead it stages the compacted segment in `gc/` using an ephemeral key, and the volume re-signs it before moving it into `segments/`:
 
-1. Coordinator writes `gc/<new-ulid>` (ephemeral-signed segment, via tmp-rename)
-2. Coordinator writes `gc/<new-ulid>.pending` (handoff entries, via tmp-rename); both files are now visible
+1. Coordinator writes `gc/<new-ulid>` (ephemeral-signed segment, via tmp-rename) — only for Repack handoffs; Dead/Remove handoffs skip this step (no new body)
+2. Coordinator writes `gc/<new-ulid>.pending` (handoff entries, via tmp-rename); both files (if applicable) are now visible
 3. Volume re-signs `gc/<new-ulid>` with `volume.key`, writes `segments/<new-ulid>`, deletes `gc/<new-ulid>`
 4. Volume applies extent index patches and renames `gc/<new-ulid>.pending` → `gc/<new-ulid>.applied`
-5. Coordinator uploads `segments/<new-ulid>` (volume-signed) to S3, deletes old files, renames to `.done`
+5. Coordinator uploads `segments/<new-ulid>` (volume-signed) to S3, deletes old S3 objects and local `segments/<old-ulid>` files
+6. Coordinator writes `index/<new-ulid>.idx` — only when a new segment was produced (step 1 ran); marks the output as S3-confirmed so evict can safely remove the body
+7. Coordinator renames `gc/<new-ulid>.applied` → `gc/<new-ulid>.done`
 
-Only after step 3 is the file visible in `segments/`, and it is always volume-signed. A crash at any step leaves recoverable file state: `gc/<new-ulid>` and/or `.pending` remain present and are re-processed on the next tick.
+Only after step 3 is the file visible in `segments/`, and it is always volume-signed. The `index/` write at step 6 is the S3-confirmation marker for the compacted output; it is omitted for Dead/Remove handoffs because there is no new segment body. A crash at any step leaves recoverable file state: `gc/<new-ulid>` and/or `.pending`/`.applied` remain present and are re-processed on the next tick.
 
 **Output ULID assignment:** the compacted segment is assigned `max(input ULIDs).increment()` — one step ahead of the newest input in the total ULID order. This gives three properties:
 

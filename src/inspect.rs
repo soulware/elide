@@ -340,8 +340,10 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
 }
 
 fn collect_fetched_dir(dir: &Path) -> io::Result<Vec<FetchedInfo>> {
+    // .idx files live in index/ (coordinator-written); .body/.present in fetched/ (volume cache).
+    let index_dir = dir.join("index");
     let fetched_dir = dir.join("fetched");
-    let rd = match fs::read_dir(&fetched_dir) {
+    let rd = match fs::read_dir(&index_dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -580,7 +582,7 @@ fn print_fetched_section(fetched: &[FetchedInfo], prefix: &str) {
         return;
     }
     let plural = if fetched.len() == 1 { "file" } else { "files" };
-    println!("{prefix}fetched/ ({} {plural}):", fetched.len());
+    println!("{prefix}index/ ({} {plural}):", fetched.len());
     for f in fetched {
         let p = format!("{prefix}  ");
         if let Some(ref e) = f.error {

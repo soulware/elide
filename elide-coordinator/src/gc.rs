@@ -382,6 +382,19 @@ pub async fn apply_done_handoffs(
             let _ = fs::remove_file(segments_dir.join(old_ulid_str));
         }
 
+        // Write index/<new_ulid>.idx before renaming to .done.  Only needed
+        // when a compacted segment was produced; removal-only and tombstone
+        // handoffs have no body to index.  This is the S3-confirmation marker:
+        // evict can now safely remove the local body without losing LBA entries.
+        if seg_exists {
+            let index_dir = fork_dir.join("index");
+            fs::create_dir_all(&index_dir)
+                .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
+            let idx_path = index_dir.join(format!("{new_ulid_str}.idx"));
+            elide_core::segment::extract_idx(&new_seg_path, &idx_path)
+                .with_context(|| format!("writing index/{new_ulid_str}.idx"))?;
+        }
+
         // Rename .applied → .done.
         let done_path = gc_dir.join(
             handoff

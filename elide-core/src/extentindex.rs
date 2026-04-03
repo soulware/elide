@@ -135,10 +135,10 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
     let mut index = ExtentIndex::new();
 
     for (fork_dir, branch_ulid) in layers {
-        // Process fetched/*.idx first (body-relative offsets). pending/ and
+        // Process index/*.idx first (body-relative offsets). pending/ and
         // segments/ are processed after, so their absolute-offset entries win
         // when the same segment is present in both places.
-        let mut fetched_paths = segment::collect_fetched_idx_files(&fork_dir.join("fetched"))?;
+        let mut fetched_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
         fetched_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
         if let Some(cutoff) = branch_ulid {
             fetched_paths.retain(|p| {

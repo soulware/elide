@@ -90,41 +90,52 @@ pub trait SegmentSigner: Send + Sync {
 
 /// Trait for fetching segments from remote storage on a local cache miss.
 ///
-/// Implementations write the three-file fetched format to `fetched_dir`:
-///   `<segment_id>.idx`     — header + index section (bytes `[0, body_section_start)`)
-///   `<segment_id>.body`    — body bytes (body-relative offsets, byte 0 = first body byte)
-///   `<segment_id>.present` — packed bitset, one bit per index entry; set = body bytes present
+/// On success, files are written into two separate directories:
+///   `<index_dir>/<segment_id>.idx`     — header + index section (bytes `[0, body_section_start)`)
+///   `<body_dir>/<segment_id>.body`     — body bytes (body-relative offsets)
+///   `<body_dir>/<segment_id>.present`  — packed bitset, one bit per index entry
 ///
-/// All three files are written atomically (tmp + rename). On success,
-/// `<fetched_dir>/<segment_id>.body` is readable for extent data.
+/// `index_dir` is the volume's `index/` directory (coordinator-maintained, permanent).
+/// `body_dir` is the volume's `fetched/` directory (volume-managed read cache).
 ///
 /// `elide-core` is synchronous; async fetchers must wrap their runtime (e.g.
 /// `Runtime::block_on`) inside this interface.
 pub trait SegmentFetcher: Send + Sync {
-    /// Fetch the full segment body and write the three-file fetched format
-    /// (`.idx`, `.body`, `.present`) into `fetched_dir`.
-    fn fetch(&self, segment_id: &str, fetched_dir: &Path) -> io::Result<()>;
+    /// Fetch the full segment body and write `.idx` to `index_dir` and
+    /// `.body`/`.present` to `body_dir`.
+    fn fetch(&self, segment_id: &str, index_dir: &Path, body_dir: &Path) -> io::Result<()>;
 
-    /// Fetch a single extent and write it into `fetched_dir/<segment_id>.body`
-    /// at `body_offset`, then set bit `entry_idx` in `.present`.
-    ///
-    /// `body_section_start` is the absolute offset of the body section within
-    /// the segment file in the store (from the `.idx` header). The range-GET
-    /// covers `[body_section_start + body_offset, … + body_length)`.
+    /// Fetch a single extent and write body bytes into `body_dir/<segment_id>.body`
+    /// at `extent.body_offset`, then set bit `extent.entry_idx` in `.present`.
     ///
     /// The default implementation fetches the entire segment body; override
     /// for efficient per-extent range-GETs.
     fn fetch_extent(
         &self,
         segment_id: &str,
-        fetched_dir: &Path,
-        _body_section_start: u64,
-        _body_offset: u64,
-        _body_length: u32,
-        _entry_idx: u32,
+        index_dir: &Path,
+        body_dir: &Path,
+        _extent: &ExtentFetch,
     ) -> io::Result<()> {
-        self.fetch(segment_id, fetched_dir)
+        self.fetch(segment_id, index_dir, body_dir)
     }
+}
+
+/// Parameters for fetching a single extent from an object store.
+///
+/// Passed to [`SegmentFetcher::fetch_extent`] to describe which extent to
+/// fetch and where to write the result.
+pub struct ExtentFetch {
+    /// Absolute offset in the object where the body section starts
+    /// (parsed from the `.idx` header; `body_section_start` in the segment format).
+    pub body_section_start: u64,
+    /// Body-relative offset of this extent's compressed bytes.
+    pub body_offset: u64,
+    /// Compressed (stored) length of this extent in bytes.
+    pub body_length: u32,
+    /// Index of this entry within the segment's index section.
+    /// Used to address the corresponding `.present` bit.
+    pub entry_idx: u32,
 }
 
 /// Convenience alias for an optional heap-allocated `SegmentFetcher`.
@@ -651,13 +662,13 @@ pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
 }
 
-/// Collect all `.idx` files in `fetched_dir` whose stem is a valid ULID.
+/// Collect all `.idx` files in `index_dir` whose stem is a valid ULID.
 ///
-/// Used by `lbamap` and `extentindex` during startup rebuild to include
-/// segments that were demand-fetched in a previous session. `.idx` files are
-/// the persistent header+index portion of the fetched three-file format.
-pub fn collect_fetched_idx_files(fetched_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    match fs::read_dir(fetched_dir) {
+/// Used by `lbamap` and `extentindex` during startup rebuild. The `index/`
+/// directory holds the coordinator-written header+index portion for all
+/// segments confirmed to be in S3.
+pub fn collect_idx_files(index_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    match fs::read_dir(index_dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e),
         Ok(entries) => {

@@ -1,12 +1,10 @@
 // Regression tests for eviction correctness.
 //
 // `evict` (the `elide volume evict` command) deletes segment files from
-// `segments/` to reclaim local disk space.  For a volume that has S3 backing,
-// evicted segments must still be accessible after a crash+reopen: the LBA map
-// is rebuilt at `Volume::open` from `pending/`, `segments/`, and
-// `fetched/*.idx`.  If `evict` does not write `fetched/<ulid>.idx` before
-// deleting `segments/<ulid>`, those LBAs are absent from the rebuilt map and
-// reads silently return zeros.
+// `segments/` to reclaim local disk space.  The coordinator writes
+// `index/<ulid>.idx` after confirmed S3 upload, so evict can safely delete the
+// body without any additional work.  After a crash+reopen, `Volume::open`
+// rebuilds the LBA map from `pending/`, `segments/`, and `index/*.idx`.
 
 use std::fs;
 use std::path::PathBuf;
@@ -16,13 +14,13 @@ use elide_core::volume::Volume;
 
 mod common;
 
-/// After correctly evicting local segment bodies, data must still be
-/// recoverable after a crash+reopen via the `.idx` files written to `fetched/`.
+/// After correctly evicting local segment bodies (with coordinator-written
+/// `index/*.idx` already present), the LBA map survives a crash+reopen.
 ///
-/// The correct evict sequence is: for each segment, write `fetched/<id>.idx`
-/// (header+index bytes) first, then delete `segments/<id>`.  After a restart,
-/// `Volume::open` rebuilds the LBA map from `fetched/*.idx` and subsequent
-/// reads fall through to the `SegmentFetcher` for body bytes.
+/// The coordinator writes `index/<ulid>.idx` after S3 upload.  Evict then
+/// simply deletes `segments/<ulid>`.  After a restart, `Volume::open` rebuilds
+/// the LBA map from `index/*.idx` and subsequent reads fall through to the
+/// `SegmentFetcher` for body bytes.
 #[test]
 fn evict_then_crash_data_survives() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -35,14 +33,16 @@ fn evict_then_crash_data_survives() {
     vol.flush_wal().unwrap();
     common::drain_local(&fork_dir); // pending/ → segments/
 
-    // Correct evict: write .idx to fetched/ before deleting the segment body.
+    // Simulate coordinator: write index/<ulid>.idx for each segment, then
+    // evict deletes the body.  In production the coordinator does step 1;
+    // evict does step 2.
     let segments_dir = fork_dir.join("segments");
-    let fetched_dir = fork_dir.join("fetched");
-    fs::create_dir_all(&fetched_dir).unwrap();
+    let index_dir = fork_dir.join("index");
+    fs::create_dir_all(&index_dir).unwrap();
     for entry in fs::read_dir(&segments_dir).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name();
-        let idx_path = fetched_dir.join(format!("{}.idx", name.to_string_lossy()));
+        let idx_path = index_dir.join(format!("{}.idx", name.to_string_lossy()));
         extract_idx(&entry.path(), &idx_path).unwrap();
         fs::remove_file(entry.path()).unwrap();
     }
@@ -51,13 +51,10 @@ fn evict_then_crash_data_survives() {
     drop(vol);
     let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
-    // LBA map is rebuilt from fetched/*.idx; the data is known to exist but
+    // LBA map is rebuilt from index/*.idx; the data is known to exist but
     // the body is not locally present.  Without a SegmentFetcher configured,
     // the read fails with "segment not found" rather than returning zeros —
     // which is the correct behaviour (fail loudly vs silently corrupt).
-    //
-    // For LBA map survival we check: the volume knows these LBAs exist (the
-    // lbamap has entries for them).  The body-fetch path is tested separately.
     assert_eq!(
         vol.lbamap_len(),
         2,
@@ -65,9 +62,8 @@ fn evict_then_crash_data_survives() {
     );
 }
 
-/// Without `.idx` files, evicting segment bodies causes silent data loss after
-/// a crash: the LBA map has no entries and reads return zeros instead of
-/// failing with a meaningful error.  This is the behaviour the fix eliminates.
+/// Without `index/*.idx` files, evicting segment bodies causes silent data
+/// loss after a crash: the LBA map has no entries and reads return zeros.
 #[test]
 fn evict_without_idx_loses_lba_map() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -79,7 +75,7 @@ fn evict_without_idx_loses_lba_map() {
     vol.flush_wal().unwrap();
     common::drain_local(&fork_dir);
 
-    // Broken evict: delete without writing .idx.
+    // Broken evict: delete without index/*.idx (coordinator never ran).
     let segments_dir = fork_dir.join("segments");
     for entry in fs::read_dir(&segments_dir).unwrap() {
         fs::remove_file(entry.unwrap().path()).unwrap();
@@ -92,6 +88,6 @@ fn evict_without_idx_loses_lba_map() {
     assert_eq!(
         vol.lbamap_len(),
         0,
-        "broken evict must produce empty lba map"
+        "evict without index/*.idx must produce empty lba map"
     );
 }

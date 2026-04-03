@@ -121,7 +121,7 @@ async fn prefetch_layer(
 
         // Skip if already available locally (full segment or index).
         let local_seg = layer_dir.join("segments").join(ulid_str);
-        let local_idx = layer_dir.join("fetched").join(format!("{ulid_str}.idx"));
+        let local_idx = layer_dir.join("index").join(format!("{ulid_str}.idx"));
         if local_seg.exists() || local_idx.exists() {
             result.skipped += 1;
             continue;
@@ -174,13 +174,13 @@ async fn fetch_idx(
         .with_context(|| format!("fetching index section for {ulid_str}"))?;
 
     // Write atomically: tmp → rename.
-    let fetched_dir = fork_dir.join("fetched");
-    tokio::fs::create_dir_all(&fetched_dir)
+    let index_dir = fork_dir.join("index");
+    tokio::fs::create_dir_all(&index_dir)
         .await
-        .context("creating fetched dir")?;
+        .context("creating index dir")?;
 
-    let tmp_path = fetched_dir.join(format!("{ulid_str}.idx.tmp"));
-    let final_path = fetched_dir.join(format!("{ulid_str}.idx"));
+    let tmp_path = index_dir.join(format!("{ulid_str}.idx.tmp"));
+    let final_path = index_dir.join(format!("{ulid_str}.idx"));
 
     tokio::fs::write(&tmp_path, &idx_bytes)
         .await
@@ -269,8 +269,8 @@ mod tests {
         assert_eq!(result.fetched, 1, "should fetch one .idx");
         assert_eq!(result.failed, 0);
 
-        // Verify the .idx file was written into parent's fetched/ dir.
-        let idx_path = parent_dir.join("fetched").join(format!("{seg_ulid}.idx"));
+        // Verify the .idx file was written into parent's index/ dir.
+        let idx_path = parent_dir.join("index").join(format!("{seg_ulid}.idx"));
         assert!(idx_path.exists(), ".idx file should exist");
 
         // Verify it is parseable as a segment index.
@@ -329,11 +329,8 @@ mod tests {
         assert_eq!(result.fetched, 1, "should fetch own .idx");
         assert_eq!(result.failed, 0);
 
-        let idx_path = root_dir.join("fetched").join(format!("{seg_ulid}.idx"));
-        assert!(
-            idx_path.exists(),
-            ".idx file should exist in root's fetched/"
-        );
+        let idx_path = root_dir.join("index").join(format!("{seg_ulid}.idx"));
+        assert!(idx_path.exists(), ".idx file should exist in root's index/");
 
         let (_, entries) = elide_core::segment::read_segment_index(&idx_path).unwrap();
         assert_eq!(entries.len(), 1);

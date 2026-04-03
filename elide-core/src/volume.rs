@@ -1310,6 +1310,9 @@ pub(crate) fn read_extents(
 /// the corresponding bit in `fetched/<id>.present` is set — otherwise the entry
 /// is not yet locally available and we fall through to the fetcher.
 ///
+/// `.idx` files live in `index/` (coordinator-written, permanent).
+/// `.body` and `.present` files live in `fetched/` (volume-managed read cache).
+///
 /// Extracted from `Volume::find_segment_file` so that `VolumeHandle` can serve
 /// reads directly from a `ReadSnapshot` without going through the actor channel.
 pub(crate) fn find_segment_in_dirs(
@@ -1361,11 +1364,22 @@ pub(crate) fn find_segment_in_dirs(
         }
     }
     if let Some(fetcher) = fetcher {
-        let fetched_dir = base_dir.join("fetched");
+        let index_dir = base_dir.join("index");
+        let body_dir = base_dir.join("fetched");
         if let Some(idx) = entry_idx {
-            fetcher.fetch_extent(segment_id, &fetched_dir, body_section_start, 0, 0, idx)?;
+            fetcher.fetch_extent(
+                segment_id,
+                &index_dir,
+                &body_dir,
+                &segment::ExtentFetch {
+                    body_section_start,
+                    body_offset: 0,
+                    body_length: 0,
+                    entry_idx: idx,
+                },
+            )?;
         } else {
-            fetcher.fetch(segment_id, &fetched_dir)?;
+            fetcher.fetch(segment_id, &index_dir, &body_dir)?;
         }
         return Ok(base_dir.join("fetched").join(format!("{segment_id}.body")));
     }

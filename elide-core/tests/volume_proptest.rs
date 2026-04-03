@@ -25,7 +25,7 @@ mod common;
 
 // --- simulation helpers ---
 
-/// Collect every ULID-named file across wal/, pending/, segments/, and fetched/*.idx.
+/// Collect every ULID-named file across wal/, pending/, segments/, and index/*.idx.
 fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
     let mut result = std::collections::BTreeSet::new();
     for subdir in ["wal", "pending", "segments"] {
@@ -40,8 +40,8 @@ fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
             }
         }
     }
-    // Include fetched/*.idx stems so ULID monotonicity assertions cover demand-fetched segments.
-    if let Ok(entries) = fs::read_dir(fork_dir.join("fetched")) {
+    // Include index/*.idx stems so ULID monotonicity assertions cover demand-fetched segments.
+    if let Ok(entries) = fs::read_dir(fork_dir.join("index")) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
                 if let Some(stem) = name.strip_suffix(".idx") {

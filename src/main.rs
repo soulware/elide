@@ -1049,12 +1049,10 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
         }
     }
 
-    // For each evictable segment: write fetched/<ulid>.idx (header+index bytes)
-    // before deleting the body, so the LBA map survives a crash+reopen.
-    // Skips the .idx write if it already exists (idempotent — safe to re-run).
+    // Delete each evictable segment body.  The coordinator writes
+    // index/<ulid>.idx after confirmed S3 upload, so the LBA map entry is
+    // already preserved before evict runs.  No .idx extraction needed here.
     let segments_dir = vol_dir.join("segments");
-    let fetched_dir = vol_dir.join("fetched");
-    std::fs::create_dir_all(&fetched_dir)?;
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(&segments_dir) {
         for entry in entries {
@@ -1062,9 +1060,6 @@ fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
             if protected.contains(&entry.file_name()) {
                 continue;
             }
-            let seg_name = entry.file_name();
-            let idx_path = fetched_dir.join(format!("{}.idx", seg_name.to_string_lossy()));
-            elide_core::segment::extract_idx(&entry.path(), &idx_path)?;
             std::fs::remove_file(entry.path())?;
             count += 1;
         }
@@ -1117,17 +1112,7 @@ mod tests {
 
         assert_eq!(n, 2);
         assert_eq!(fs::read_dir(vol.join("segments")).unwrap().count(), 0);
-        // .idx files must be written to fetched/ so the LBA map survives a crash.
-        assert!(
-            vol.join("fetched")
-                .join("01AAAAAAAAAAAAAAAAAAAAAAA1.idx")
-                .exists()
-        );
-        assert!(
-            vol.join("fetched")
-                .join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx")
-                .exists()
-        );
+        // index/*.idx is written by the coordinator after S3 upload, not by evict.
     }
 
     #[test]
@@ -1154,11 +1139,6 @@ mod tests {
         assert!(
             !vol.join("segments")
                 .join("01AAAAAAAAAAAAAAAAAAAAAAA2")
-                .exists()
-        );
-        assert!(
-            vol.join("fetched")
-                .join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx")
                 .exists()
         );
     }
@@ -1192,12 +1172,11 @@ mod tests {
         )
         .unwrap();
 
-        // old1 and old2 are protected — fake content is fine (extract_idx is
-        // never called for protected segments).
-        // other is unrelated and must be evicted — needs a valid segment header.
+        // old1 and old2 are protected — fake content is fine (evict just deletes,
+        // no extract_idx needed).  other is unrelated and must be evicted.
         fs::write(vol.join("segments").join(old1.to_string()), b"old1").unwrap();
         fs::write(vol.join("segments").join(old2.to_string()), b"old2").unwrap();
-        write_seg(&vol, "segments", &other.to_string());
+        fs::write(vol.join("segments").join(other.to_string()), b"other").unwrap();
 
         let n = evict_segments(&vol).unwrap();
 
@@ -1214,10 +1193,6 @@ mod tests {
             !vol.join("segments").join(other.to_string()).exists(),
             "other must be evicted"
         );
-        assert!(
-            vol.join("fetched").join(format!("{other}.idx")).exists(),
-            "other .idx must exist"
-        );
     }
 
     #[test]
@@ -1232,7 +1207,7 @@ mod tests {
             b"",
         )
         .unwrap();
-        // protected segment — fake content OK (extract_idx skipped for it)
+        // protected segment — fake content OK (evict just skips it, no parsing)
         fs::write(
             vol.join("segments").join("01AAAAAAAAAAAAAAAAAAAAAAA1"),
             b"protected",
@@ -1254,12 +1229,6 @@ mod tests {
                 .join("01AAAAAAAAAAAAAAAAAAAAAAA2")
                 .exists(),
             "other segment must be evicted"
-        );
-        assert!(
-            vol.join("fetched")
-                .join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx")
-                .exists(),
-            ".idx must be written for evicted segment"
         );
     }
 }
