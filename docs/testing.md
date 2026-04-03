@@ -225,25 +225,26 @@ passes would explore cases the fixed tests cannot, particularly: GC running afte
 the `ReadonlyVolume` was opened (the `ReadonlyVolume` has no `apply_gc_handoffs`
 path, so its extent index may reference a deleted segment on the next read).
 
-**`fetched/` presence-bit gate not covered by any test.**  *(Gaps 1 and 2
+**`cache/` presence-bit gate not covered by any test.**  *(Gaps 1 and 2
 below are now closed; gap 3 remains.)*
 
 `SimOp::PopulateFetched { lba, seed }` (added in `volume_proptest.rs`) writes
-the three-file fetched format (`.idx`, `.body`, `.present`) directly to
-`fetched/` and exercises the `fetched/` branch of `find_segment_in_dirs` after
-a `Crash` + reopen (gap 1).  `all_segment_ulids` now scans `fetched/*.idx` so
-ULID monotonicity assertions include demand-fetched segments.
+the three-file cache format (`.idx`, `.body`, `.present`) — `.idx` to `index/`,
+`.body` and `.present` to `cache/` — and exercises the `cache/` branch of
+`find_segment_in_dirs` after a `Crash` + reopen (gap 1).  `all_segment_ulids`
+now scans `index/*.idx` so ULID monotonicity assertions include demand-fetched
+segments.
 
-*Gap 2 — `pending/` shadowing `fetched/`* is covered by the proptest via the
+*Gap 2 — `pending/` shadowing `cache/`* is covered by the proptest via the
 disjoint-LBA design: a `PopulateFetched` followed by any `Write` to LBAs 0–7
 exercises a rebuild where pending data must win.  A targeted deterministic test
-for the same-LBA case (fetched then overwrite, then crash) would add clarity
+for the same-LBA case (cached then overwrite, then crash) would add clarity
 but is not the only coverage.
 
 *Gap 3 — partial-fetch presence-bit gate.*  An entry whose `.present` bit is
 clear must fall through to the `SegmentFetcher`; an entry whose bit is set must
 be served from the body file.  Neither path is triggered by the proptest because
-`populate_fetched` always sets all present bits.  Closing this gap requires a
+`populate_cache` always sets all present bits.  Closing this gap requires a
 `NoopFetcher` / `FileFetcher` test implementation of `SegmentFetcher` and a
 separate deterministic test that manually clears bits in a `.present` file.
 

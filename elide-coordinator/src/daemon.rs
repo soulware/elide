@@ -634,7 +634,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join(format!("by_id/{ulid6}/volume.readonly")), "").unwrap();
 
-        // Readonly volume with empty segments/ and no fetched/ — pulled, needs prefetch.
+        // Readonly volume with empty segments/ and no cache/ — pulled, needs prefetch.
         let ulid5 = "01JQEEEEEEEEEEEEEEEEEEEEEE";
         mk(root, &format!("by_id/{ulid5}/segments"));
         std::fs::write(root.join(format!("by_id/{ulid5}/volume.readonly")), "").unwrap();

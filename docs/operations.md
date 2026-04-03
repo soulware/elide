@@ -52,7 +52,7 @@ The volume process is a pure data servant: it accepts NBD reads and writes, flus
 **Directory ownership split.** Two directories under each fork have distinct ownership:
 
 - **`index/`** (coordinator-written): the coordinator writes `index/<ulid>.idx` after confirmed S3 upload, and never reads it back. These files are the permanent LBA index — they survive eviction and allow `Volume::open` to rebuild the full LBA map even when segment bodies are absent locally. The volume and evict never write to `index/`.
-- **`fetched/`** (volume-managed): the volume writes `.body` and `.present` files here on demand-fetch. The coordinator does not read or write `fetched/`.
+- **`cache/`** (volume-managed): the volume writes `.body` and `.present` files here on demand-fetch. The coordinator does not read or write `cache/`.
 
 ### S3 Upload
 
@@ -86,7 +86,7 @@ Segments that are dense at upload time will not need coordinator GC later — th
 
 ## Demand-fetch
 
-Segments in `segments/` are S3-backed and evictable. When `find_segment_file` is called during a read and the segment file is absent locally, the volume delegates to an optional `SegmentFetcher`. If a fetcher is configured, it downloads the segment from the object store, writes the three-file fetched format to `fetched/`, and the read proceeds normally. If no fetcher is configured, the read fails with "segment not found".
+Segments in `segments/` are S3-backed and evictable. When `find_segment_file` is called during a read and the segment file is absent locally, the volume delegates to an optional `SegmentFetcher`. If a fetcher is configured, it downloads the segment from the object store, writes the three-file cache format to `cache/`, and the read proceeds normally. If no fetcher is configured, the read fails with "segment not found".
 
 **Rebuild vs. runtime:** demand-fetch operates at read time, after the volume is open. The LBA map and extent index are rebuilt at `Volume::open` by scanning `pending/`, `segments/`, and `index/*.idx` on local disk. If none of these are present for an ancestor segment, that data will appear as zeros at open time rather than triggering a fetch. This is the **cold-start problem**.
 
@@ -113,7 +113,7 @@ If none of these are present, demand-fetch is disabled and reads of missing segm
 **Fetch granularity:** demand-fetch issues a range-GET for only the extents needed, not the full segment body. When a specific extent is required, the fetcher scans forward from that entry collecting contiguous, not-yet-present adjacent entries into a batch (up to 256 KiB by default, configurable via `fetch_batch_bytes` in `fetch.toml`). A single range-GET covers the batch; bytes are written into `.body` at the correct offset and the `.present` bitset is updated for all fetched entries. The `.body` file may appear as large as the full segment because it is written as a sparse file at the extent's body offset — only the fetched regions contain actual data.
 
 
-**Next step: automatic eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used segments from `segments/` and `fetched/` (never from `pending/`). Eviction + demand-fetch together make `segments/` a transparent cache tier.
+**Next step: automatic eviction.** Track segment access time (mtime touch on fetch or read), enforce a configurable `max_cache_bytes` in `fetch.toml`, and evict least-recently-used segments from `segments/` and `cache/` (never from `pending/`). Eviction + demand-fetch together make `segments/` a transparent cache tier.
 
 ## Manual Eviction
 
@@ -153,8 +153,8 @@ on volumes with S3 backing; running it on a volume without a reachable store
 risks permanent LBA map loss.
 
 **Evicting demand-fetched body data.**  `evict` also reclaims space used by
-previously demand-fetched body bytes: it deletes `fetched/<ulid>.body` and
-`fetched/<ulid>.present` for any segment whose body is locally cached.  The
+previously demand-fetched body bytes: it deletes `cache/<ulid>.body` and
+`cache/<ulid>.present` for any segment whose body is locally cached.  The
 `index/<ulid>.idx` entry is preserved, so the LBA map survives; subsequent
 reads re-fetch body bytes from S3 on demand.
 
@@ -228,7 +228,7 @@ All data in S3 remains readable — signature verification uses `volume.pub`, wh
 
 ### Accidental local deletion with the private key intact
 
-If `segments/`, `index/`, and `fetched/` are deleted locally but `volume.key` remains, recovery is fully automatic.  On startup, the coordinator's `fork_loop` detects that `segments/` and `index/` are both empty and runs prefetch against S3, downloading `.idx` files for every uploaded segment into `index/`.  The volume reopens with a complete LBA map and is immediately writable.
+If `segments/`, `index/`, and `cache/` are deleted locally but `volume.key` remains, recovery is fully automatic.  On startup, the coordinator's `fork_loop` detects that `segments/` and `index/` are both empty and runs prefetch against S3, downloading `.idx` files for every uploaded segment into `index/`.  The volume reopens with a complete LBA map and is immediately writable.
 
 **Partially deleting `segments/` is not the same as emptying it.**  The prefetch trigger fires when `segments/` is completely empty *and* `index/` is completely empty.  If some segment files are deleted by hand and others remain (or if `index/*.idx` files still exist), the coordinator sees locally present data and does not run prefetch.  The deleted segments' LBAs are absent from the rebuilt LBA map unless `index/<ulid>.idx` files exist for them.  Reads to those LBAs return zeros with no error — silent data loss.  The only safe ways to remove individual segment bodies are `elide volume evict` (which relies on coordinator-written `index/*.idx`) or ensuring the deleted segment's LBAs are fully covered by newer entries in `pending/` (i.e. they have all been overwritten).
 
@@ -243,11 +243,11 @@ If `segments/`, `index/`, and `fetched/` are deleted locally but `volume.key` re
 
 Two commands inspect the raw binary file formats written by `elide`. Both are read-only.
 
-**`inspect-segment <path>`** — prints the header and index entries of a segment file or a fetched `.idx` file:
+**`inspect-segment <path>`** — prints the header and index entries of a segment file or a cached `.idx` file:
 
 ```
 elide inspect-segment volumes/myvm/forks/default/pending/01JQEXAMPLE...
-elide inspect-segment volumes/myvm/forks/vm2/fetched/01JQEXAMPLE....idx
+elide inspect-segment volumes/myvm/forks/vm2/index/01JQEXAMPLE....idx
 ```
 
 Output includes: file kind (full segment vs index-only), entry counts (data / dedup_ref), a table of data entries sorted by body offset (LBA range, body offset, stored length, compression flag), and total body utilisation. Entries that would read past the end of the body file are flagged `OVERFLOW` — this indicates a segment corruption or a flag-translation bug.

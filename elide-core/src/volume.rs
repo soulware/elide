@@ -1113,15 +1113,15 @@ impl Volume {
     /// ancestry chain.
     ///
     /// Search order:
-    ///   1. Current fork: `wal/`, `pending/`, `segments/`, `fetched/<id>.body`
-    ///   2. Ancestor forks (newest first): `pending/`, `segments/`, `fetched/<id>.body`
-    ///   3. Demand-fetch via fetcher (writes three-file format to `fetched/`)
+    ///   1. Current fork: `wal/`, `pending/`, `segments/`, `cache/<id>.body`
+    ///   2. Ancestor forks (newest first): `pending/`, `segments/`, `cache/<id>.body`
+    ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
     ///
     /// For full segment files (`wal/`, `pending/`, `segments/`), body reads use
-    /// absolute file offsets (`ExtentLocation.body_offset`). For fetched body
-    /// files (`fetched/<id>.body`), the file IS the body section, so reads use
+    /// absolute file offsets (`ExtentLocation.body_offset`). For cached body
+    /// files (`cache/<id>.body`), the file IS the body section, so reads use
     /// body-relative offsets — consistent with how `extentindex::rebuild` stores
-    /// offsets for fetched entries.
+    /// offsets for cached entries.
     fn find_segment_file(
         &self,
         segment_id: &str,
@@ -1250,7 +1250,7 @@ pub(crate) fn read_extents(
         };
 
         // Reuse the cached file handle if it is for the same segment.
-        // For fetched entries (entry_idx.is_some()), always call find_segment to
+        // For cached entries (entry_idx.is_some()), always call find_segment to
         // check the .present bitset — the .body file may exist but the specific
         // entry may not yet be fetched.
         let mut cache = file_cache.borrow_mut();
@@ -1302,16 +1302,16 @@ pub(crate) fn read_extents(
 /// Search for a segment file across the fork directory tree.
 ///
 /// Search order:
-///   1. Current fork: `wal/`, `pending/`, `segments/`, `fetched/<id>.body`
-///   2. Ancestor forks (newest-first): `pending/`, `segments/`, `fetched/<id>.body`
-///   3. Demand-fetch via fetcher (writes three-file format to `fetched/`)
+///   1. Current fork: `wal/`, `pending/`, `segments/`, `cache/<id>.body`
+///   2. Ancestor forks (newest-first): `pending/`, `segments/`, `cache/<id>.body`
+///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
 ///
-/// When `entry_idx` is `Some`, a `fetched/<id>.body` hit is only accepted if
-/// the corresponding bit in `fetched/<id>.present` is set — otherwise the entry
+/// When `entry_idx` is `Some`, a `cache/<id>.body` hit is only accepted if
+/// the corresponding bit in `cache/<id>.present` is set — otherwise the entry
 /// is not yet locally available and we fall through to the fetcher.
 ///
 /// `.idx` files live in `index/` (coordinator-written, permanent).
-/// `.body` and `.present` files live in `fetched/` (volume-managed read cache).
+/// `.body` and `.present` files live in `cache/` (volume-managed read cache).
 ///
 /// Extracted from `Volume::find_segment_file` so that `VolumeHandle` can serve
 /// reads directly from a `ReadSnapshot` without going through the actor channel.
@@ -1329,16 +1329,14 @@ pub(crate) fn find_segment_in_dirs(
             return Ok(path);
         }
     }
-    let fetched_body = base_dir.join("fetched").join(format!("{segment_id}.body"));
-    if fetched_body.exists() {
+    let cache_body = base_dir.join("cache").join(format!("{segment_id}.body"));
+    if cache_body.exists() {
         let entry_present = entry_idx.is_none_or(|idx| {
-            let present_path = base_dir
-                .join("fetched")
-                .join(format!("{segment_id}.present"));
+            let present_path = base_dir.join("cache").join(format!("{segment_id}.present"));
             segment::check_present_bit(&present_path, idx).unwrap_or(false)
         });
         if entry_present {
-            return Ok(fetched_body);
+            return Ok(cache_body);
         }
         // Entry not yet fetched — fall through to fetcher below.
     }
@@ -1349,23 +1347,23 @@ pub(crate) fn find_segment_in_dirs(
                 return Ok(path);
             }
         }
-        let fetched_body = layer.dir.join("fetched").join(format!("{segment_id}.body"));
-        if fetched_body.exists() {
+        let cache_body = layer.dir.join("cache").join(format!("{segment_id}.body"));
+        if cache_body.exists() {
             let entry_present = entry_idx.is_none_or(|idx| {
                 let present_path = layer
                     .dir
-                    .join("fetched")
+                    .join("cache")
                     .join(format!("{segment_id}.present"));
                 segment::check_present_bit(&present_path, idx).unwrap_or(false)
             });
             if entry_present {
-                return Ok(fetched_body);
+                return Ok(cache_body);
             }
         }
     }
     if let Some(fetcher) = fetcher {
         let index_dir = base_dir.join("index");
-        let body_dir = base_dir.join("fetched");
+        let body_dir = base_dir.join("cache");
         if let Some(idx) = entry_idx {
             fetcher.fetch_extent(
                 segment_id,
@@ -1381,7 +1379,7 @@ pub(crate) fn find_segment_in_dirs(
         } else {
             fetcher.fetch(segment_id, &index_dir, &body_dir)?;
         }
-        return Ok(base_dir.join("fetched").join(format!("{segment_id}.body")));
+        return Ok(base_dir.join("cache").join(format!("{segment_id}.body")));
     }
     Err(io::Error::other(format!("segment not found: {segment_id}")))
 }

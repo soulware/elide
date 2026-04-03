@@ -19,7 +19,7 @@ A single **Elide coordinator** runs on each host and manages all volumes. It for
 
 **Coordinator (main process)** — spawns and supervises volume processes; owns all S3 mutations (upload, delete, segment GC rewrites); watches one or more configured volume root directories and discovers forks automatically; handles `prefetch-indexes` for forks cold-starting from S3.
 
-**Volume process** (one per volume) — owns the ublk/NBD frontend for one volume; owns the WAL and pending promotion for that volume; holds the live LBA map in memory; runs background `pending/` compaction and `fetched/` promotion in the idle arm. Does not communicate with other volume processes directly. Communicates with the coordinator via `control.sock` (Unix domain socket; see Control Socket Protocol below). Never requires the coordinator for correct I/O.
+**Volume process** (one per volume) — owns the ublk/NBD frontend for one volume; owns the WAL and pending promotion for that volume; holds the live LBA map in memory; runs background `pending/` compaction and `cache/` promotion in the idle arm. Does not communicate with other volume processes directly. Communicates with the coordinator via `control.sock` (Unix domain socket; see Control Socket Protocol below). Never requires the coordinator for correct I/O.
 
 **S3 credential split:** the volume process requires only **read-only** S3 credentials (for demand-fetch). All S3 mutations — segment upload, segment delete, GC rewrites — are performed exclusively by the coordinator, which holds read-write credentials. This limits the blast radius if a volume host is compromised.
 
@@ -83,7 +83,7 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
       pending/                        — segments awaiting S3 upload (populated by import)
       segments/                       — segments confirmed in S3 (empty until drain completes)
       index/                          — coordinator-written LBA index files (01JQXXXXX.idx)
-      fetched/                        — volume-managed demand-fetch body cache (.body, .present)
+      cache/                          — volume-managed demand-fetch body cache (.body, .present)
       snapshots/
         01JQXXXXX                     — branch point marker for derived volumes
       import.lock                     — present while import is running or interrupted
@@ -99,7 +99,7 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
       pending/
       segments/
       index/
-      fetched/
+      cache/
       snapshots/
       control.sock                    — volume process IPC socket
     01JQCCCCCCC/
@@ -138,9 +138,9 @@ The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snaps
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
 - `manifest.toml` present on OCI-imported volumes and on volumes reconstructed via `remote pull`
 - `import.lock` present only while an import is running or interrupted
-- **`index/<ulid>.idx` present ↔ segment `<ulid>` is confirmed in S3.** The coordinator writes these files at the two S3-confirmation points: (1) after `pending/<ulid>` → `segments/<ulid>` rename in the upload drain; (2) after a GC handoff output segment is uploaded, before renaming `.applied` → `.done`. These are the only two write paths. The volume and evict never write to `index/`. `fetched/` body files (`.body`, `.present`) may or may not exist for a given `.idx` entry — their absence means body bytes have not been demand-fetched yet.
+- **`index/<ulid>.idx` present ↔ segment `<ulid>` is confirmed in S3.** The coordinator writes these files at the two S3-confirmation points: (1) after `pending/<ulid>` → `segments/<ulid>` rename in the upload drain; (2) after a GC handoff output segment is uploaded, before renaming `.applied` → `.done`. These are the only two write paths. The volume and evict never write to `index/`. `cache/` body files (`.body`, `.present`) may or may not exist for a given `.idx` entry — their absence means body bytes have not been demand-fetched yet.
 
-**Finding live volumes:** the coordinator scans `by_id/` for ULID-named subdirectories that have either a `pending/` or `segments/` subdirectory. Readonly volumes (with `volume.readonly`) are included for drain if they have pending segments (import just completed), and for prefetch if `segments/` is empty and `fetched/` is absent or empty (just pulled from the store). Readonly volumes with non-empty `segments/` or `fetched/` are already indexed and are skipped.
+**Finding live volumes:** the coordinator scans `by_id/` for ULID-named subdirectories that have either a `pending/` or `segments/` subdirectory. Readonly volumes (with `volume.readonly`) are included for drain if they have pending segments (import just completed), and for prefetch if `segments/` is empty and `index/` is absent or empty (just pulled from the store). Readonly volumes with non-empty `segments/` or `index/` are already indexed and are skipped.
 
 **Exclusive access:** a live volume holds an exclusive `flock` on `<vol-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked volume fails immediately.
 
@@ -166,7 +166,7 @@ VM
  ▼
 Volume process  (one per volume)
  │  write path: buffer → extent boundary → hash → local dedup check → WAL append
- │  read path:  LBA → LBA map → extent index → segment file (pending/ · segments/ · fetched/ · S3)
+ │  read path:  LBA → LBA map → extent index → segment file (pending/ · segments/ · cache/ · S3)
  │
  ├─ WAL  (wal/<ULID>)
  ├─ Pending segments  (pending/<ULID>)
@@ -581,7 +581,7 @@ The consequence of pre-assignment is that `sweep_pending` — which may run whil
 2. Look up LBA in live LBA map → extent_hash H
 3. Check local segments (own pending/ + segments/, then ancestor segments/) for H
    - Hit  → return data (decompress if FLAG_COMPRESSED)
-   - Miss → check fetched/<ulid>.body (body-relative offsets; .present bitset guards each extent)
+   - Miss → check cache/<ulid>.body (body-relative offsets; .present bitset guards each extent)
      - Hit  → read from body file; decompress if needed
      - Miss → look up H in extent index → (segment_id, body_offset, body_length)
 4. Issue a byte-range GET to S3 covering a chunk of the segment body
@@ -590,7 +590,7 @@ The consequence of pre-assignment is that `sweep_pending` — which may run whil
    - The segment index section encodes body_offset + body_length per extent,
      so the chunk boundaries can be derived precisely
    - If a delta body is available and smaller, fetch from the delta instead
-5. Write fetched bytes to fetched/<ulid>.body; set bit in .present; decompress and return to VM
+5. Write fetched bytes to cache/<ulid>.body; set bit in .present; decompress and return to VM
 ```
 
 The kernel page cache sits above the block device and handles most hot reads. The local segment cache handles warm reads. S3 is the cold path.
@@ -770,7 +770,7 @@ The single-writer property and crash safety are enforced through ULID ordering a
 
 This protocol keeps the private key (`volume.key`) on the volume host and prevents the coordinator from forging new data.
 
-**Known gap — demand-fetched segments:** segments in `fetched/` (pulled from S3 on demand) are not currently verified against `volume.pub`. The fetch path uses `read_segment_index` (unverified) rather than `read_and_verify_segment_index`. As a result, a tampered S3 object would not be detected when it enters the local read path. This gap pre-dates the mandatory-signing work; extending verification to the fetch path is deferred and tracked as a known gap. The intended fix is to verify content integrity (hash checks) and re-sign with `volume.key` when a fetched segment is promoted into the local cache.
+**Known gap — demand-fetched segments:** segments in `cache/` (pulled from S3 on demand) are not currently verified against `volume.pub`. The fetch path uses `read_segment_index` (unverified) rather than `read_and_verify_segment_index`. As a result, a tampered S3 object would not be detected when it enters the local read path. This gap pre-dates the mandatory-signing work; extending verification to the fetch path is deferred and tracked as a known gap. The intended fix is to verify content integrity (hash checks) and re-sign with `volume.key` when a fetched segment is promoted into the local cache.
 
 See [formats.md](formats.md) — *Fork ownership and signing*.
 

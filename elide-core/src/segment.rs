@@ -96,7 +96,7 @@ pub trait SegmentSigner: Send + Sync {
 ///   `<body_dir>/<segment_id>.present`  — packed bitset, one bit per index entry
 ///
 /// `index_dir` is the volume's `index/` directory (coordinator-maintained, permanent).
-/// `body_dir` is the volume's `fetched/` directory (volume-managed read cache).
+/// `body_dir` is the volume's `cache/` directory (volume-managed read cache).
 ///
 /// `elide-core` is synchronous; async fetchers must wrap their runtime (e.g.
 /// `Runtime::block_on`) inside this interface.
@@ -615,14 +615,14 @@ pub(crate) fn write_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
 ///
 /// Used by `lbamap` and `extentindex` during startup rebuild.
 /// Copy the header+index section (bytes `[0, body_section_start)`) from a full
-/// segment file into an `.idx` file in the fetched three-file format.
+/// segment file into an `.idx` file in the cache three-file format.
 ///
 /// Does nothing if `idx_path` already exists — the operation is idempotent and
 /// safe to call on a segment that was previously evicted or partially processed.
 ///
 /// Written atomically via `.tmp` + rename.  The resulting `.idx` is identical
 /// to what a `SegmentFetcher` would write, so `rebuild_segments` and
-/// `extentindex::rebuild` treat it exactly like a demand-fetched index.
+/// `extentindex::rebuild` treat it exactly like a demand-cached index.
 pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
     if idx_path.exists() {
         return Ok(());

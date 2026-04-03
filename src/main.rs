@@ -1084,7 +1084,7 @@ mod tests {
     /// Write a minimal valid segment to `<vol>/<subdir>/<name>`.
     ///
     /// Evictable segments must have parseable headers so `extract_idx` can
-    /// copy the header+index section to `fetched/` before deletion.
+    /// copy the header+index section to `cache/` before deletion.
     fn write_seg(vol: &std::path::Path, subdir: &str, name: &str) {
         use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
         use elide_core::signing::generate_ephemeral_signer;

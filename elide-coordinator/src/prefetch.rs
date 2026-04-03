@@ -11,13 +11,13 @@
 // For each ancestor fork in the rebuild chain:
 //   1. List S3 objects under by_id/<volume_id>/
 //   2. For each ULID that passes the branch-point cutoff and is not already
-//      present in segments/ or fetched/:
+//      present in segments/ or cache/:
 //        a. Range-GET [0..96] to parse the header (determines body_section_start)
 //        b. Range-GET [0..body_section_start] — header + index + inline
-//        c. Write atomically to <ancestor_fork_dir>/fetched/<ulid>.idx
+//        c. Write atomically to <ancestor_fork_dir>/index/<ulid>.idx
 //
 // After this runs, Volume::open will find the .idx files, rebuild_segments and
-// extentindex::rebuild will both scan fetched/*.idx, and the volume opens
+// extentindex::rebuild will both scan index/*.idx, and the volume opens
 // correctly. Individual reads then demand-fetch the body bytes on first access.
 
 use std::path::Path;
@@ -50,7 +50,7 @@ const SEGMENT_MAGIC: &[u8; 8] = b"ELIDSEG\x02";
 /// Processes the current fork first (no branch cutoff), then each ancestor layer
 /// in order (with their respective branch-point cutoffs). For each layer, lists
 /// S3 objects under `by_id/<volume_id>/` and downloads the header+index portion
-/// of any segment not already in `segments/` or `fetched/`.
+/// of any segment not already in `segments/` or `cache/`.
 pub async fn prefetch_indexes(
     fork_dir: &Path,
     store: &Arc<dyn ObjectStore>,
@@ -143,7 +143,7 @@ async fn prefetch_layer(
 }
 
 /// Download the index portion of one segment and write it as
-/// `<fork_dir>/fetched/<ulid>.idx`.
+/// `<fork_dir>/index/<ulid>.idx`.
 async fn fetch_idx(
     store: &Arc<dyn ObjectStore>,
     key: &StorePath,
