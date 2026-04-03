@@ -279,6 +279,7 @@ pub async fn apply_done_handoffs(
 
     applied.sort_by_key(|e| e.file_name());
     let segments_dir = fork_dir.join("segments");
+    let index_dir = fork_dir.join("index");
     let mut count = 0;
 
     for entry in &applied {
@@ -372,8 +373,7 @@ pub async fn apply_done_handoffs(
 
             // Write index/<new_ulid>.idx — the S3-confirmation marker.  Must
             // happen before the gc/ → segments/ move so that the invariant
-            // "index present ↔ segments present ↔ S3-confirmed" holds.
-            let index_dir = fork_dir.join("index");
+            // "index/<ulid>.idx present ↔ segment in S3" holds.
             fs::create_dir_all(&index_dir)
                 .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
             let idx_path = index_dir.join(format!("{new_ulid_str}.idx"));
@@ -387,6 +387,30 @@ pub async fn apply_done_handoffs(
                 fs::rename(&gc_body, &seg_body)
                     .with_context(|| format!("moving gc/{new_ulid_str} to segments/"))?;
             }
+        }
+
+        // Delete index/<old>.idx for each old input segment before deleting the
+        // S3 objects.  Ordering is critical: the invariant
+        //   index/<ulid>.idx present  ↔  segment guaranteed to be in S3
+        // means the .idx must be removed first.  If the coordinator crashes
+        // between here and the S3 deletes below, the .idx is gone but the S3
+        // object remains — a transient space overhead, not corruption.  On
+        // restart the coordinator retries from .applied; the .idx deletes are
+        // idempotent (already-absent files are silently skipped).
+        //
+        // Without this step, evicting segments/ and restarting leaves dangling
+        // .idx files that rebuild_segments includes in the extent index, mapping
+        // hashes to segments absent from both disk and S3 — causing "not found
+        // in any ancestor" read errors on every access to those LBAs.
+        for old_ulid_str in &old_ulids {
+            let _ = fs::remove_file(index_dir.join(format!("{old_ulid_str}.idx")));
+        }
+
+        // Delete old local segment bodies from segments/ before deleting from
+        // S3, preserving the invariant: local body present ↔ S3 present.
+        // Best-effort: files may already be evicted or absent.
+        for old_ulid_str in &old_ulids {
+            let _ = fs::remove_file(segments_dir.join(old_ulid_str));
         }
 
         // Delete old S3 objects.  A 404 means the object is already gone
@@ -404,13 +428,6 @@ pub async fn apply_done_handoffs(
                     );
                 }
             }
-        }
-
-        // Delete old local segment files from segments/ (best-effort: the
-        // files may already be evicted or absent if the volume has not cached
-        // them locally).
-        for old_ulid_str in &old_ulids {
-            let _ = fs::remove_file(segments_dir.join(old_ulid_str));
         }
 
         // Rename .applied → .done.
