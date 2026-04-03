@@ -393,8 +393,10 @@ proptest! {
                 }
                 SimOp::PopulateFetched { lba, seed } => {
                     // gc_checkpoint flushes the WAL (may create a pending segment) then
-                    // mints a fresh ULID for the cache file.  Both must be > max_before.
-                    let ulid = Ulid::from_string(&vol.gc_checkpoint().unwrap()).unwrap();
+                    // mints two fresh ULIDs; we use the first for the cache file.  All
+                    // new ULIDs must be > max_before.
+                    let (ulid_str, _) = vol.gc_checkpoint().unwrap();
+                    let ulid = Ulid::from_string(&ulid_str).unwrap();
                     common::populate_cache(fork_dir, ulid, 16 + *lba as u64, *seed);
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
