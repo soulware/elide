@@ -105,6 +105,8 @@ proptest! {
         };
 
         let segments_dir = fork_dir.join("segments");
+        let index_dir = fork_dir.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
 
         for op in &ops {
             match op {
@@ -121,14 +123,18 @@ proptest! {
                 }
                 SimOp::GcSweep => {
                     // Drain pending/ → segments/ before gc_checkpoint, mirroring
-                    // the coordinator tick (Upload before GC).
+                    // the coordinator upload tick. Write .idx before rename to
+                    // keep the simulation faithful to the production invariant:
+                    // segments/<ulid> exists → index/<ulid>.idx exists.
                     let pending_dir = fork_dir.join("pending");
                     if let Ok(entries) = fs::read_dir(&pending_dir) {
                         for entry in entries.flatten() {
-                            let _ = fs::rename(
-                                entry.path(),
-                                segments_dir.join(entry.file_name()),
-                            );
+                            let name = entry.file_name();
+                            let src = entry.path();
+                            let idx_path =
+                                index_dir.join(format!("{}.idx", name.to_string_lossy()));
+                            let _ = elide_core::segment::extract_idx(&src, &idx_path);
+                            let _ = fs::rename(src, segments_dir.join(name));
                         }
                     }
 
@@ -187,6 +193,8 @@ proptest! {
 
         // segments/ must exist before gc_fork tries to read it.
         fs::create_dir_all(fork_dir.join("segments")).unwrap();
+        let index_dir = fork_dir.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
 
         // Single runtime reused across all GcSweep ops in this sequence.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -219,15 +227,19 @@ proptest! {
                 }
                 SimOp::GcSweep => {
                     // Drain pending/ → segments/ before gc_checkpoint, mirroring
-                    // the coordinator tick (Upload before GC).
+                    // the coordinator upload tick. Write .idx before rename to
+                    // keep the simulation faithful to the production invariant:
+                    // segments/<ulid> exists → index/<ulid>.idx exists.
                     let pending_dir = fork_dir.join("pending");
                     let segments_dir = fork_dir.join("segments");
                     if let Ok(entries) = fs::read_dir(&pending_dir) {
                         for entry in entries.flatten() {
-                            let _ = fs::rename(
-                                entry.path(),
-                                segments_dir.join(entry.file_name()),
-                            );
+                            let name = entry.file_name();
+                            let src = entry.path();
+                            let idx_path =
+                                index_dir.join(format!("{}.idx", name.to_string_lossy()));
+                            let _ = elide_core::segment::extract_idx(&src, &idx_path);
+                            let _ = fs::rename(src, segments_dir.join(name));
                         }
                     }
 
