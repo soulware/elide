@@ -191,9 +191,7 @@ pub async fn gc_fork(
     let lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
     let live_hashes = lbamap.live_hashes();
 
-    let floor: Option<Ulid> = latest_snapshot(fork_dir)?
-        .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
-        .transpose()?;
+    let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
 
     let mut all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
         .context("collecting segment stats")?;
@@ -585,13 +583,12 @@ fn collect_stats(
         let Some(ulid_str) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
             continue;
         };
+        let seg_ulid = Ulid::from_string(&ulid_str).map_err(|e| io::Error::other(e.to_string()))?;
 
-        if let Some(f) = floor {
-            match Ulid::from_string(&ulid_str) {
-                Ok(u) if u <= f => continue,
-                Err(e) => return Err(io::Error::other(e.to_string())),
-                Ok(_) => {}
-            }
+        if let Some(f) = floor
+            && seg_ulid <= f
+        {
+            continue;
         }
 
         let file_size = fs::metadata(&path)?.len();
@@ -620,7 +617,7 @@ fn collect_stats(
             total_body_bytes += entry.stored_length as u64;
             let extent_live = index
                 .lookup(&entry.hash)
-                .is_some_and(|loc| loc.segment_id == ulid_str);
+                .is_some_and(|loc| loc.segment_id == seg_ulid);
             if extent_live && live_hashes.contains(&entry.hash) {
                 live_bytes += entry.stored_length as u64;
                 live_entries.push(entry);

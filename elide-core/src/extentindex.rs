@@ -27,6 +27,7 @@ use std::io;
 use std::path::PathBuf;
 
 use log::warn;
+use ulid::Ulid;
 
 use crate::segment;
 use crate::signing;
@@ -35,7 +36,7 @@ use crate::signing;
 #[derive(Clone)]
 pub struct ExtentLocation {
     /// ULID of the segment (filename in wal/, pending/, or segments/).
-    pub segment_id: String,
+    pub segment_id: Ulid,
     /// Body-relative byte offset of the start of the payload (= `stored_offset`
     /// from the segment index). For WAL entries, equals the absolute WAL file
     /// offset (WAL has no header, so body_section_start == 0 and the two coincide).
@@ -178,9 +179,8 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| io::Error::other("bad cache idx filename"))?;
-            let segment_id = ulid::Ulid::from_string(segment_id)
-                .map_err(|e| io::Error::other(e.to_string()))?
-                .to_string();
+            let segment_id =
+                Ulid::from_string(segment_id).map_err(|e| io::Error::other(e.to_string()))?;
             let (body_section_start, entries) =
                 match segment::read_and_verify_segment_index(path, &vk) {
                     Ok(v) => v,
@@ -203,7 +203,7 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 index.insert(
                     entry.hash,
                     ExtentLocation {
-                        segment_id: segment_id.clone(),
+                        segment_id,
                         body_offset: entry.stored_offset,
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
@@ -219,10 +219,9 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 .file_name()
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| io::Error::other("bad segment filename"))?;
-            // Validate as ULID and canonicalize.
-            let segment_id = ulid::Ulid::from_string(segment_id)
-                .map_err(|e| io::Error::other(e.to_string()))?
-                .to_string();
+            // Validate as ULID.
+            let segment_id =
+                Ulid::from_string(segment_id).map_err(|e| io::Error::other(e.to_string()))?;
 
             let (body_section_start, entries) =
                 match segment::read_and_verify_segment_index(path, &vk) {
@@ -244,7 +243,7 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 index.insert(
                     entry.hash,
                     ExtentLocation {
-                        segment_id: segment_id.clone(),
+                        segment_id,
                         body_offset: entry.stored_offset,
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
@@ -308,7 +307,7 @@ mod tests {
         index.insert(
             hash,
             ExtentLocation {
-                segment_id: "01JQEXAMPLEULID0000000000A".to_string(),
+                segment_id: Ulid::from_string("01JQTEST000000000000000001").unwrap(),
                 body_offset: 1024,
                 body_length: 4096,
                 compressed: false,
@@ -317,7 +316,10 @@ mod tests {
             },
         );
         let loc = index.lookup(&hash).unwrap();
-        assert_eq!(loc.segment_id, "01JQEXAMPLEULID0000000000A");
+        assert_eq!(
+            loc.segment_id,
+            Ulid::from_string("01JQTEST000000000000000001").unwrap()
+        );
         assert_eq!(loc.body_offset, 1024);
         assert_eq!(loc.body_length, 4096);
         assert!(!loc.compressed);

@@ -138,7 +138,6 @@ fn compact_candidates_inner(
     let mut removed: Vec<(blake3::Hash, Ulid)> = Vec::new();
 
     for (ulid, path) in &candidates {
-        let seg_id = ulid.to_string();
         let Ok((bss, mut entries)) = segment::read_and_verify_segment_index(path, &vk) else {
             continue;
         };
@@ -157,7 +156,7 @@ fn compact_candidates_inner(
             }
             let extent_live = extent_index
                 .lookup(&entry.hash)
-                .is_some_and(|loc| loc.segment_id == seg_id);
+                .is_some_and(|loc| loc.segment_id == *ulid);
             if extent_live && live_hashes.contains(&entry.hash) {
                 source_ulids.push(*ulid);
                 all_entries.push(entry);

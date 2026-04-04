@@ -167,11 +167,11 @@ impl ObjectStoreFetcher {
 }
 
 impl SegmentFetcher for ObjectStoreFetcher {
-    fn fetch(&self, segment_id: &str, index_dir: &Path, body_dir: &Path) -> io::Result<()> {
+    fn fetch(&self, segment_id: ulid::Ulid, index_dir: &Path, body_dir: &Path) -> io::Result<()> {
         self.rt.block_on(fetch_segment(
             &self.store,
             &self.volume_ids,
-            segment_id,
+            &segment_id.to_string(),
             index_dir,
             body_dir,
         ))
@@ -179,7 +179,7 @@ impl SegmentFetcher for ObjectStoreFetcher {
 
     fn fetch_extent(
         &self,
-        segment_id: &str,
+        segment_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
         extent: &segment::ExtentFetch,
@@ -187,7 +187,7 @@ impl SegmentFetcher for ObjectStoreFetcher {
         self.rt.block_on(fetch_one_extent(
             &self.store,
             &self.volume_ids,
-            segment_id,
+            &segment_id.to_string(),
             index_dir,
             body_dir,
             &ExtentFetchParams {
@@ -660,7 +660,7 @@ mod tests {
         // Fetch entry 0 — should coalesce entries 0, 1, 2 into one range-GET.
         fetcher
             .fetch_extent(
-                &seg_id,
+                seg_ulid,
                 &index_dir,
                 &cache_dir,
                 &segment::ExtentFetch {
@@ -757,7 +757,7 @@ mod tests {
 
         fetcher
             .fetch_extent(
-                &seg_id,
+                seg_ulid,
                 &index_dir,
                 &cache_dir,
                 &segment::ExtentFetch {
