@@ -34,7 +34,13 @@ pub use segment::BoxFetcher;
 
 use ulid::Ulid;
 
-use crate::{extentindex, lbamap, segment, ulid_mint::UlidMint, writelog};
+use crate::{
+    extentindex,
+    gc::{GcHandoff, GcHandoffState, HandoffLine},
+    lbamap, segment,
+    ulid_mint::UlidMint,
+    writelog,
+};
 
 /// Compute the Shannon entropy of `data` in bits per byte.
 ///
@@ -137,7 +143,7 @@ pub struct Volume {
     lbamap: Arc<lbamap::LbaMap>,
     extent_index: Arc<extentindex::ExtentIndex>,
     wal: writelog::WriteLog,
-    wal_ulid: String,
+    wal_ulid: Ulid,
     wal_path: PathBuf,
     /// DATA and REF extents written since the last promotion; used to write
     /// the clean segment file on the next promote().
@@ -150,14 +156,14 @@ pub struct Volume {
     /// ULID of the most recently committed segment across pending/ and segments/,
     /// or `None` if no segments exist. Used by `snapshot()` to name the snapshot
     /// marker with the same ULID as the segment it covers.
-    last_segment_ulid: Option<String>,
+    last_segment_ulid: Option<Ulid>,
     /// Single-entry file handle cache for the read path.
     ///
     /// Retains the last opened segment file across `read` calls so that
     /// sequential reads hitting the same segment avoid repeated `open` syscalls.
     /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
     /// the cache to be updated internally.
-    file_cache: RefCell<Option<(String, bool, fs::File)>>,
+    file_cache: RefCell<Option<(Ulid, bool, fs::File)>>,
     /// Signer for segment promotion. Every segment written by this volume
     /// (at WAL promotion and compaction) is signed with the fork's private key.
     /// See `segment::SegmentSigner`.
@@ -259,7 +265,7 @@ impl Volume {
         //
         // Done before WAL recovery so we can compute the mint floor below.
         let latest_snap = latest_snapshot(base_dir)?;
-        let mut last_segment_ulid: Option<String> = None;
+        let mut last_segment_ulid: Option<Ulid> = None;
         let mut all_seg_paths = Vec::new();
         for subdir in ["pending", "segments"] {
             all_seg_paths.extend(segment::collect_segment_files(&base_dir.join(subdir))?);
@@ -268,10 +274,13 @@ impl Volume {
         // which may be the highest known ULID — include it so the mint floor is correct.
         all_seg_paths.extend(segment::collect_gc_applied_segment_files(base_dir)?);
         for p in all_seg_paths {
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()).map(str::to_owned)
-                && last_segment_ulid.as_deref() < Some(name.as_str())
+            if let Some(ulid) = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| Ulid::from_string(s).ok())
+                && last_segment_ulid < Some(ulid)
             {
-                last_segment_ulid = Some(name);
+                last_segment_ulid = Some(ulid);
             }
         }
 
@@ -279,10 +288,7 @@ impl Volume {
         // WAL filename ULID (if one exists). This guarantees the first fresh
         // WAL ULID is above all existing local data even when the system clock
         // has drifted backwards.
-        let segment_floor = last_segment_ulid
-            .as_deref()
-            .and_then(|s| Ulid::from_string(s).ok())
-            .unwrap_or(Ulid::from_parts(0, 0));
+        let segment_floor = last_segment_ulid.unwrap_or(Ulid::from_parts(0, 0));
         let wal_floor = wal_files
             .last()
             .and_then(|p| p.file_name().and_then(|n| n.to_str()))
@@ -300,10 +306,7 @@ impl Volume {
             };
 
         let has_new_segments = !pending_entries.is_empty()
-            || match (&latest_snap, &last_segment_ulid) {
-                (Some(snap), Some(last)) => last.as_str() > snap.as_str(),
-                _ => false,
-            };
+            || matches!((&latest_snap, &last_segment_ulid), (Some(snap), Some(last)) if last > snap);
 
         Ok(Self {
             base_dir: base_dir.to_owned(),
@@ -385,7 +388,7 @@ impl Volume {
         Arc::make_mut(&mut self.extent_index).insert(
             hash,
             extentindex::ExtentLocation {
-                segment_id: self.wal_ulid.clone(),
+                segment_id: self.wal_ulid,
                 body_offset,
                 body_length: owned_data.len() as u32,
                 compressed,
@@ -466,9 +469,7 @@ impl Volume {
         // Segments at or below the latest snapshot ULID are frozen: they may be
         // referenced by child forks that branched from a snapshot in this fork.
         // Only post-snapshot segments are eligible for compaction.
-        let floor: Option<Ulid> = latest_snapshot(&self.base_dir)?
-            .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
-            .transpose()?;
+        let floor: Option<Ulid> = latest_snapshot(&self.base_dir)?;
 
         let all_segs = segment::collect_segment_files(&self.base_dir.join("pending"))?;
 
@@ -483,8 +484,6 @@ impl Volume {
             if floor.is_some_and(|f| seg_id <= f) {
                 continue;
             }
-
-            let seg_id = seg_id.to_string();
 
             let (body_section_start, mut entries) =
                 match segment::read_and_verify_segment_index(&seg_path, &self.verifying_key) {
@@ -547,10 +546,11 @@ impl Volume {
                 // produces a higher ULID and wins on rebuild.  Using mint.next()
                 // here would generate a ULID past the WAL ULID and break that
                 // ordering — the same bug fixed in sweep_pending.
-                let new_ulid = seg_id.clone();
+                let new_ulid = seg_id;
+                let new_ulid_str = new_ulid.to_string();
                 let pending_dir = self.base_dir.join("pending");
-                let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
-                let final_path = pending_dir.join(&new_ulid);
+                let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
+                let final_path = pending_dir.join(&new_ulid_str);
                 // write_segment reassigns stored_offset in live_entries to new positions.
                 let new_bss =
                     segment::write_segment(&tmp_path, &mut live_entries, self.signer.as_ref())?;
@@ -563,7 +563,7 @@ impl Volume {
                         Arc::make_mut(&mut self.extent_index).insert(
                             entry.hash,
                             extentindex::ExtentLocation {
-                                segment_id: new_ulid.clone(),
+                                segment_id: new_ulid,
                                 body_offset: entry.stored_offset,
                                 body_length: entry.stored_length,
                                 compressed: entry.compressed,
@@ -577,7 +577,7 @@ impl Volume {
 
             // Evict the old segment from the file handle cache before deleting it.
             let mut cache = self.file_cache.borrow_mut();
-            if cache.as_ref().map(|(id, _, _)| id.as_str()) == Some(seg_id.as_str()) {
+            if cache.as_ref().map(|(id, _, _)| *id) == Some(seg_id) {
                 *cache = None;
             }
             drop(cache);
@@ -614,9 +614,7 @@ impl Volume {
         let live: HashSet<blake3::Hash> = self.lbamap.live_hashes();
         let mut stats = CompactionStats::default();
 
-        let floor: Option<Ulid> = latest_snapshot(&self.base_dir)?
-            .map(|s| Ulid::from_string(&s).map_err(|e| io::Error::other(e.to_string())))
-            .transpose()?;
+        let floor: Option<Ulid> = latest_snapshot(&self.base_dir)?;
 
         let pending_dir = self.base_dir.join("pending");
         let mut seg_paths = segment::collect_segment_files(&pending_dir)?;
@@ -679,7 +677,6 @@ impl Volume {
                 .map(|e| e.stored_length as u64)
                 .sum();
 
-            let seg_id_str = seg_ulid.to_string();
             for entry in &dead_entries {
                 if entry.is_dedup_ref {
                     // Dedup refs have no body; the extent_index tracks DATA body
@@ -691,7 +688,7 @@ impl Volume {
                 if self
                     .extent_index
                     .lookup(&entry.hash)
-                    .map(|loc| loc.segment_id == seg_id_str)
+                    .map(|loc| loc.segment_id == seg_ulid)
                     .unwrap_or(false)
                 {
                     Arc::make_mut(&mut self.extent_index).remove(&entry.hash);
@@ -740,13 +737,13 @@ impl Volume {
                     .and_then(|s| Ulid::from_string(s).ok())
             })
             .max()
-            .ok_or_else(|| io::Error::other("sweep_pending: no valid candidate ULIDs"))?
-            .to_string();
+            .ok_or_else(|| io::Error::other("sweep_pending: no valid candidate ULIDs"))?;
+        let new_ulid_str = new_ulid.to_string();
 
         // Write the merged output, atomically replacing the max-ULID candidate.
         if !merged_live.is_empty() {
-            let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
-            let final_path = pending_dir.join(&new_ulid);
+            let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
+            let final_path = pending_dir.join(&new_ulid_str);
             let new_bss =
                 segment::write_segment(&tmp_path, &mut merged_live, self.signer.as_ref())?;
             fs::rename(&tmp_path, &final_path)?;
@@ -758,7 +755,7 @@ impl Volume {
                     Arc::make_mut(&mut self.extent_index).insert(
                         entry.hash,
                         extentindex::ExtentLocation {
-                            segment_id: new_ulid.clone(),
+                            segment_id: new_ulid,
                             body_offset: entry.stored_offset,
                             body_length: entry.stored_length,
                             compressed: entry.compressed,
@@ -773,12 +770,15 @@ impl Volume {
         // Evict and delete input candidates. The max-ULID candidate was already
         // replaced atomically by the output rename above; skip re-deleting it.
         for seg_path in &candidate_paths {
-            let seg_id = seg_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if seg_id == new_ulid && !merged_live.is_empty() {
+            let seg_ulid_opt = seg_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|s| Ulid::from_string(s).ok());
+            if seg_ulid_opt == Some(new_ulid) && !merged_live.is_empty() {
                 continue; // already replaced atomically above
             }
             let mut cache = self.file_cache.borrow_mut();
-            if cache.as_ref().map(|(id, _, _)| id.as_str()) == Some(seg_id) {
+            if seg_ulid_opt.is_some() && cache.as_ref().map(|(id, _, _)| *id) == seg_ulid_opt {
                 *cache = None;
             }
             drop(cache);
@@ -823,12 +823,12 @@ impl Volume {
         // Mint all three ULIDs in sequence.  UlidMint guarantees strict
         // monotonicity even within the same millisecond (increments random bits),
         // so no sleep is needed — u_repack < u_sweep < u_wal is always satisfied.
-        let u_repack = self.mint.next().to_string();
-        let u_sweep = self.mint.next().to_string();
-        let u_wal = self.mint.next().to_string();
+        let u_repack = self.mint.next();
+        let u_sweep = self.mint.next();
+        let u_wal = self.mint.next();
         // Flush the current WAL to pending/ under u_wal.  If the WAL is empty,
         // the file is deleted and u_wal is unused (no segment produced).
-        self.flush_wal_to_pending_as(&u_wal)?;
+        self.flush_wal_to_pending_as(u_wal)?;
         // Open a new WAL with ULID > u_wal.
         let (wal, wal_ulid, wal_path, pending_entries) =
             create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
@@ -836,7 +836,7 @@ impl Volume {
         self.wal_ulid = wal_ulid;
         self.wal_path = wal_path;
         self.pending_entries = pending_entries;
-        Ok((u_repack, u_sweep))
+        Ok((u_repack.to_string(), u_sweep.to_string()))
     }
 
     /// Apply any pending GC handoff files written by the coordinator.
@@ -877,18 +877,12 @@ impl Volume {
             return Ok(0);
         }
 
-        let mut pending: Vec<fs::DirEntry> = fs::read_dir(&gc_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .and_then(crate::gc::GcHandoff::from_filename)
-                    .is_some_and(|h| {
-                        matches!(
-                            h.state,
-                            crate::gc::GcHandoffState::Pending | crate::gc::GcHandoffState::Applied
-                        )
-                    })
+        let mut pending: Vec<(String, GcHandoff)> = fs::read_dir(&gc_dir)?
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().into_string().ok()?;
+                let handoff = GcHandoff::from_filename(&name)?;
+                handoff.state.needs_apply().then_some((name, handoff))
             })
             .collect();
 
@@ -897,19 +891,14 @@ impl Volume {
         }
 
         // Process oldest-first so the extent index is correct after a partial run.
-        pending.sort_by_key(|e| e.file_name());
+        pending.sort_by(|(a, _), (b, _)| a.cmp(b));
 
         let mut count = 0;
 
-        for entry in &pending {
-            let filename = entry.file_name();
-            let name = filename
-                .to_str()
-                .ok_or_else(|| io::Error::other("gc filename is not valid UTF-8"))?;
-            let handoff = crate::gc::GcHandoff::from_filename(name)
-                .ok_or_else(|| io::Error::other(format!("invalid gc filename: {name}")))?;
-            let new_ulid = handoff.ulid.to_string();
-            let is_already_applied = matches!(handoff.state, crate::gc::GcHandoffState::Applied);
+        for (name, handoff) in &pending {
+            let new_ulid = handoff.ulid;
+            let new_ulid_str = new_ulid.to_string();
+            let is_already_applied = handoff.state == GcHandoffState::Applied;
 
             // Parse the .pending / .applied file into typed HandoffLines.
             //
@@ -917,16 +906,16 @@ impl Volume {
             // so the extent index can be updated only when it still points at
             // the old segment.  Dead lines carry no hash — they are a no-op
             // from the volume's perspective (just an acknowledgment).
-            let pending_content = fs::read_to_string(entry.path())?;
-            let mut old_ulid_by_hash: HashMap<blake3::Hash, String> = HashMap::new();
+            let pending_content = fs::read_to_string(gc_dir.join(name))?;
+            let mut old_ulid_by_hash: HashMap<blake3::Hash, Ulid> = HashMap::new();
             let mut is_tombstone = false;
             for line in pending_content.lines() {
-                match crate::gc::HandoffLine::parse(line) {
-                    Some(crate::gc::HandoffLine::Repack { hash, old_ulid, .. })
-                    | Some(crate::gc::HandoffLine::Remove { hash, old_ulid }) => {
-                        old_ulid_by_hash.insert(hash, old_ulid.to_string());
+                match HandoffLine::parse(line) {
+                    Some(HandoffLine::Repack { hash, old_ulid, .. })
+                    | Some(HandoffLine::Remove { hash, old_ulid }) => {
+                        old_ulid_by_hash.insert(hash, old_ulid);
                     }
-                    Some(crate::gc::HandoffLine::Dead { .. }) => {
+                    Some(HandoffLine::Dead { .. }) => {
                         is_tombstone = true;
                     }
                     None => {}
@@ -942,28 +931,24 @@ impl Volume {
             //
             // Idempotency: re-signing is a pure function of the segment content;
             // if we crash mid-rename and retry, the output is identical.
-            let gc_seg_path = gc_dir.join(&new_ulid);
+            let gc_seg_path = gc_dir.join(&new_ulid_str);
             // .pending handoffs: re-sign the coordinator-staged body with the volume key.
             // .applied handoffs: already volume-signed; skip re-signing.
             if !is_already_applied && gc_seg_path.try_exists()? {
                 let (bss, mut entries) = segment::read_segment_index(&gc_seg_path)?;
                 segment::read_extent_bodies(&gc_seg_path, bss, &mut entries)?;
-                let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
+                let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
                 segment::write_segment(&tmp_path, &mut entries, self.signer.as_ref())?;
                 fs::rename(&tmp_path, &gc_seg_path)?;
             }
 
             // Locate the body: normally in gc/; after a restart with a partial
             // apply_done_handoffs run, it may have already been moved to segments/.
-            let body_path: Option<std::path::PathBuf> = if gc_seg_path.try_exists()? {
+            let body_path: Option<PathBuf> = if gc_seg_path.try_exists()? {
                 Some(gc_seg_path.clone())
             } else if is_already_applied {
-                let seg_path = self.base_dir.join("segments").join(&new_ulid);
-                if seg_path.try_exists()? {
-                    Some(seg_path)
-                } else {
-                    None
-                }
+                let seg_path = self.base_dir.join("segments").join(&new_ulid_str);
+                seg_path.try_exists()?.then_some(seg_path)
             } else {
                 None
             };
@@ -976,12 +961,9 @@ impl Volume {
             //   repack — needs the segment for extent index updates;
             //            defer until available (e.g. fetched from S3).
             if !segment_exists {
-                let has_carried = pending_content.lines().any(|l| {
-                    matches!(
-                        crate::gc::HandoffLine::parse(l),
-                        Some(crate::gc::HandoffLine::Repack { .. })
-                    )
-                });
+                let has_carried = pending_content
+                    .lines()
+                    .any(|l| matches!(HandoffLine::parse(l), Some(HandoffLine::Repack { .. })));
                 if !is_tombstone && (has_carried || old_ulid_by_hash.is_empty()) {
                     continue;
                 }
@@ -990,15 +972,10 @@ impl Volume {
             // Read the (now volume-signed) compacted segment's index.  This
             // is done once and reused for both the carried_hashes scan and the
             // extent index update, avoiding a second signature verification.
-            let segment_index: Option<(u64, Vec<segment::SegmentEntry>)> =
-                if let Some(ref bp) = body_path {
-                    Some(segment::read_and_verify_segment_index(
-                        bp,
-                        &self.verifying_key,
-                    )?)
-                } else {
-                    None
-                };
+            let segment_index = body_path
+                .as_ref()
+                .map(|bp| segment::read_and_verify_segment_index(bp, &self.verifying_key))
+                .transpose()?;
 
             // First pass: build carried_hashes WITHOUT touching the extent
             // index.  We must know the full set before the Bug B check below,
@@ -1044,7 +1021,7 @@ impl Volume {
                     .keys()
                     .any(|hash| !carried_hashes.contains(hash) && live.contains(hash));
                 if stale_liveness {
-                    let _ = fs::remove_file(entry.path()); // .pending
+                    let _ = fs::remove_file(gc_dir.join(name)); // .pending
                     if gc_seg_path.try_exists()? {
                         let _ = fs::remove_file(&gc_seg_path); // body
                     }
@@ -1076,7 +1053,7 @@ impl Volume {
                     Arc::make_mut(&mut self.extent_index).insert(
                         e.hash,
                         extentindex::ExtentLocation {
-                            segment_id: new_ulid.to_owned(),
+                            segment_id: new_ulid,
                             body_offset: e.stored_offset,
                             body_length: e.stored_length,
                             compressed: e.compressed,
@@ -1114,12 +1091,9 @@ impl Volume {
             // it is safe to delete superseded S3 objects.
             // For .applied handoffs: already in the correct state; no rename needed.
             if !is_already_applied {
-                let applied_path = gc_dir.join(
-                    handoff
-                        .with_state(crate::gc::GcHandoffState::Applied)
-                        .filename(),
-                );
-                fs::rename(entry.path(), &applied_path)?;
+                let applied_path =
+                    gc_dir.join(handoff.with_state(GcHandoffState::Applied).filename());
+                fs::rename(gc_dir.join(name), &applied_path)?;
             }
 
             count += 1;
@@ -1136,8 +1110,7 @@ impl Volume {
     ///
     /// Does NOT open a new WAL — the caller is responsible for that.
     fn flush_wal_to_pending(&mut self) -> io::Result<()> {
-        let ulid = self.wal_ulid.clone();
-        self.flush_wal_to_pending_as(&ulid)
+        self.flush_wal_to_pending_as(self.wal_ulid)
     }
 
     /// Like `flush_wal_to_pending`, but names the output segment `segment_ulid`
@@ -1149,14 +1122,14 @@ impl Volume {
     ///
     /// The WAL file itself retains its original name (the WAL ULID) — only the
     /// output segment in `pending/` receives `segment_ulid`.
-    fn flush_wal_to_pending_as(&mut self, segment_ulid: &str) -> io::Result<()> {
+    fn flush_wal_to_pending_as(&mut self, segment_ulid: Ulid) -> io::Result<()> {
         self.wal.fsync()?;
         if self.pending_entries.is_empty() {
             fs::remove_file(&self.wal_path)?;
             return Ok(());
         }
         self.has_new_segments = true;
-        self.last_segment_ulid = Some(segment_ulid.to_owned());
+        self.last_segment_ulid = Some(segment_ulid);
         let body_section_start = segment::promote(
             &self.wal_path,
             segment_ulid,
@@ -1173,7 +1146,7 @@ impl Volume {
             Arc::make_mut(&mut self.extent_index).insert(
                 entry.hash,
                 extentindex::ExtentLocation {
-                    segment_id: segment_ulid.to_owned(),
+                    segment_id: segment_ulid,
                     body_offset: entry.stored_offset,
                     body_length: entry.stored_length,
                     compressed: entry.compressed,
@@ -1189,7 +1162,7 @@ impl Volume {
         // The cache key is the WAL's original ULID (the file that was deleted),
         // not segment_ulid — the cache is keyed by the path that was open.
         let mut cache = self.file_cache.borrow_mut();
-        if cache.as_ref().map(|(id, _, _)| id.as_str()) == Some(self.wal_ulid.as_str()) {
+        if cache.as_ref().map(|(id, _, _)| *id) == Some(self.wal_ulid) {
             *cache = None;
         }
         Ok(())
@@ -1234,18 +1207,14 @@ impl Volume {
             self.wal_ulid = wal_ulid;
             self.wal_path = wal_path;
             self.pending_entries = pending_entries;
-            return Ulid::from_string(&latest_str).map_err(|e| io::Error::other(e.to_string()));
+            return Ok(latest_str);
         }
 
         // Write a new snapshot marker, reusing the last segment's ULID so the
         // branch point is self-describing. Falls back to a fresh ULID only when
         // no segments exist (e.g. first snapshot on an empty fork).
-        let snap_ulid_str = match &self.last_segment_ulid {
-            Some(ulid) => ulid.clone(),
-            None => self.mint.next().to_string(),
-        };
-        let snap_ulid =
-            Ulid::from_string(&snap_ulid_str).map_err(|e| io::Error::other(e.to_string()))?;
+        let snap_ulid = self.last_segment_ulid.unwrap_or_else(|| self.mint.next());
+        let snap_ulid_str = snap_ulid.to_string();
         let snapshots_dir = self.base_dir.join("snapshots");
         fs::create_dir_all(&snapshots_dir)?;
         fs::write(snapshots_dir.join(&snap_ulid_str), "")?;
@@ -1277,7 +1246,7 @@ impl Volume {
     /// offsets for cached entries.
     fn find_segment_file(
         &self,
-        segment_id: &str,
+        segment_id: Ulid,
         body_section_start: u64,
         entry_idx: Option<u32>,
     ) -> io::Result<PathBuf> {
@@ -1379,8 +1348,8 @@ pub(crate) fn read_extents(
     lba_count: u32,
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
-    file_cache: &RefCell<Option<(String, bool, fs::File)>>,
-    find_segment: impl Fn(&str, u64, Option<u32>) -> io::Result<PathBuf>,
+    file_cache: &RefCell<Option<(Ulid, bool, fs::File)>>,
+    find_segment: impl Fn(Ulid, u64, Option<u32>) -> io::Result<PathBuf>,
 ) -> io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -1393,7 +1362,7 @@ pub(crate) fn read_extents(
                 continue; // hash not indexed — treat as unwritten
             };
             (
-                loc.segment_id.clone(),
+                loc.segment_id,
                 loc.body_offset,
                 loc.body_length,
                 loc.compressed,
@@ -1407,10 +1376,10 @@ pub(crate) fn read_extents(
         // check the .present bitset — the .body file may exist but the specific
         // entry may not yet be fetched.
         let mut cache = file_cache.borrow_mut();
-        let need_find = cache.as_ref().map(|(id, _, _)| id.as_str()) != Some(segment_id.as_str())
-            || entry_idx.is_some();
+        let need_find =
+            cache.as_ref().map(|(id, _, _)| *id) != Some(segment_id) || entry_idx.is_some();
         if need_find {
-            let path = find_segment(&segment_id, body_section_start, entry_idx)?;
+            let path = find_segment(segment_id, body_section_start, entry_idx)?;
             // .body files store body bytes starting at offset 0 (body-relative);
             // full segment files store them starting at body_section_start.
             let is_body = path.extension().is_some_and(|e| e == "body");
@@ -1489,15 +1458,16 @@ pub(crate) fn read_extents(
 /// Extracted from `Volume::find_segment_file` so that `VolumeHandle` can serve
 /// reads directly from a `ReadSnapshot` without going through the actor channel.
 pub(crate) fn find_segment_in_dirs(
-    segment_id: &str,
+    segment_id: Ulid,
     base_dir: &Path,
     ancestor_layers: &[AncestorLayer],
     fetcher: Option<&BoxFetcher>,
     body_section_start: u64,
     entry_idx: Option<u32>,
 ) -> io::Result<PathBuf> {
+    let sid = segment_id.to_string();
     for subdir in ["wal", "pending", "segments"] {
-        let path = base_dir.join(subdir).join(segment_id);
+        let path = base_dir.join(subdir).join(&sid);
         if path.exists() {
             return Ok(path);
         }
@@ -1507,19 +1477,14 @@ pub(crate) fn find_segment_in_dirs(
     // already points at this segment_id, so reads must be able to find it here.
     // The .applied marker distinguishes a volume-signed body from a coordinator-
     // staged body (.pending) which is not yet safe to read.
-    let gc_body = base_dir.join("gc").join(segment_id);
-    if gc_body.exists()
-        && base_dir
-            .join("gc")
-            .join(format!("{segment_id}.applied"))
-            .exists()
-    {
+    let gc_body = base_dir.join("gc").join(&sid);
+    if gc_body.exists() && base_dir.join("gc").join(format!("{sid}.applied")).exists() {
         return Ok(gc_body);
     }
-    let cache_body = base_dir.join("cache").join(format!("{segment_id}.body"));
+    let cache_body = base_dir.join("cache").join(format!("{sid}.body"));
     if cache_body.exists() {
         let entry_present = entry_idx.is_none_or(|idx| {
-            let present_path = base_dir.join("cache").join(format!("{segment_id}.present"));
+            let present_path = base_dir.join("cache").join(format!("{sid}.present"));
             segment::check_present_bit(&present_path, idx).unwrap_or(false)
         });
         if entry_present {
@@ -1529,18 +1494,15 @@ pub(crate) fn find_segment_in_dirs(
     }
     for layer in ancestor_layers.iter().rev() {
         for subdir in ["pending", "segments"] {
-            let path = layer.dir.join(subdir).join(segment_id);
+            let path = layer.dir.join(subdir).join(&sid);
             if path.exists() {
                 return Ok(path);
             }
         }
-        let cache_body = layer.dir.join("cache").join(format!("{segment_id}.body"));
+        let cache_body = layer.dir.join("cache").join(format!("{sid}.body"));
         if cache_body.exists() {
             let entry_present = entry_idx.is_none_or(|idx| {
-                let present_path = layer
-                    .dir
-                    .join("cache")
-                    .join(format!("{segment_id}.present"));
+                let present_path = layer.dir.join("cache").join(format!("{sid}.present"));
                 segment::check_present_bit(&present_path, idx).unwrap_or(false)
             });
             if entry_present {
@@ -1566,9 +1528,9 @@ pub(crate) fn find_segment_in_dirs(
         } else {
             fetcher.fetch(segment_id, &index_dir, &body_dir)?;
         }
-        return Ok(base_dir.join("cache").join(format!("{segment_id}.body")));
+        return Ok(base_dir.join("cache").join(format!("{sid}.body")));
     }
-    Err(io::Error::other(format!("segment not found: {segment_id}")))
+    Err(io::Error::other(format!("segment not found: {sid}")))
 }
 
 /// Acquire an exclusive non-blocking flock on `<dir>/volume.lock`.
@@ -1593,7 +1555,7 @@ pub struct ReadonlyVolume {
     ancestor_layers: Vec<AncestorLayer>,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
-    file_cache: RefCell<Option<(String, bool, fs::File)>>,
+    file_cache: RefCell<Option<(Ulid, bool, fs::File)>>,
     fetcher: Option<BoxFetcher>,
 }
 
@@ -1630,7 +1592,7 @@ impl ReadonlyVolume {
 
     fn find_segment_file(
         &self,
-        segment_id: &str,
+        segment_id: Ulid,
         body_section_start: u64,
         entry_idx: Option<u32>,
     ) -> io::Result<PathBuf> {
@@ -1732,7 +1694,7 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
 
 /// Return the latest snapshot ULID string for a fork, or `None` if no
 /// snapshots exist. Snapshots live as plain files under `fork_dir/snapshots/`.
-pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<String>> {
+pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<Ulid>> {
     let snapshots_dir = fork_dir.join("snapshots");
     let iter = match fs::read_dir(&snapshots_dir) {
         Ok(entries) => entries,
@@ -1741,11 +1703,7 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<String>> {
     };
     let latest = iter
         .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            Ulid::from_string(&name).ok()?;
-            Some(name)
-        })
+        .filter_map(|e| Ulid::from_string(e.file_name().to_str()?).ok())
         .max();
     Ok(latest)
 }
@@ -1815,7 +1773,7 @@ fn recover_wal(
     extent_index: &mut extentindex::ExtentIndex,
 ) -> io::Result<(
     writelog::WriteLog,
-    String,
+    Ulid,
     PathBuf,
     Vec<segment::SegmentEntry>,
 )> {
@@ -1823,9 +1781,7 @@ fn recover_wal(
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| io::Error::other("bad WAL filename"))?;
-    let ulid = Ulid::from_string(ulid_str)
-        .map_err(|e| io::Error::other(e.to_string()))?
-        .to_string();
+    let ulid = Ulid::from_string(ulid_str).map_err(|e| io::Error::other(e.to_string()))?;
 
     let (records, valid_size) = writelog::scan(&path)?;
 
@@ -1854,7 +1810,7 @@ fn recover_wal(
                 extent_index.insert(
                     hash,
                     extentindex::ExtentLocation {
-                        segment_id: ulid.clone(),
+                        segment_id: ulid,
                         body_offset,
                         body_length,
                         compressed,
@@ -1895,14 +1851,13 @@ fn create_fresh_wal(
     ulid: Ulid,
 ) -> io::Result<(
     writelog::WriteLog,
-    String,
+    Ulid,
     PathBuf,
     Vec<segment::SegmentEntry>,
 )> {
-    let ulid_str = ulid.to_string();
-    let path = wal_dir.join(&ulid_str);
+    let path = wal_dir.join(ulid.to_string());
     let wal = writelog::WriteLog::create(&path)?;
-    Ok((wal, ulid_str, path, Vec::new()))
+    Ok((wal, ulid, path, Vec::new()))
 }
 
 // --- tests ---
@@ -3629,10 +3584,10 @@ mod tests {
 
         let old_ulid_parsed = Ulid::from_string(old_ulid).unwrap();
         let new_ulid_parsed = Ulid::from_string(&new_ulid).unwrap();
-        let handoff_lines: Vec<crate::gc::HandoffLine> = entries
+        let handoff_lines: Vec<HandoffLine> = entries
             .iter()
             .filter(|e| !e.is_dedup_ref)
-            .map(|e| crate::gc::HandoffLine::Repack {
+            .map(|e| HandoffLine::Repack {
                 hash: e.hash,
                 old_ulid: old_ulid_parsed,
                 new_ulid: new_ulid_parsed,

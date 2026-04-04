@@ -103,7 +103,7 @@ pub trait SegmentSigner: Send + Sync {
 pub trait SegmentFetcher: Send + Sync {
     /// Fetch the full segment body and write `.idx` to `index_dir` and
     /// `.body`/`.present` to `body_dir`.
-    fn fetch(&self, segment_id: &str, index_dir: &Path, body_dir: &Path) -> io::Result<()>;
+    fn fetch(&self, segment_id: ulid::Ulid, index_dir: &Path, body_dir: &Path) -> io::Result<()>;
 
     /// Fetch a single extent and write body bytes into `body_dir/<segment_id>.body`
     /// at `extent.body_offset`, then set bit `extent.entry_idx` in `.present`.
@@ -112,7 +112,7 @@ pub trait SegmentFetcher: Send + Sync {
     /// for efficient per-extent range-GETs.
     fn fetch_extent(
         &self,
-        segment_id: &str,
+        segment_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
         _extent: &ExtentFetch,
@@ -543,13 +543,14 @@ pub fn read_extent_bodies(
 /// Returns `body_section_start` so the caller can compute absolute offsets.
 pub fn promote(
     wal_path: &Path,
-    ulid: &str,
+    ulid: ulid::Ulid,
     pending_dir: &Path,
     entries: &mut [SegmentEntry],
     signer: &dyn SegmentSigner,
 ) -> io::Result<u64> {
-    let tmp_path = pending_dir.join(format!("{ulid}.tmp"));
-    let final_path = pending_dir.join(ulid);
+    let ulid_str = ulid.to_string();
+    let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
+    let final_path = pending_dir.join(&ulid_str);
 
     let body_section_start = write_segment(&tmp_path, entries, signer)?;
 
@@ -1090,8 +1091,8 @@ mod tests {
         fs::create_dir_all(base.join("wal")).unwrap();
         fs::create_dir_all(base.join("pending")).unwrap();
 
-        let ulid = "01JQEXAMPLEULID0000000000A";
-        let wal_path = base.join("wal").join(ulid);
+        let ulid = ulid::Ulid::from_string("01JQTEST000000000000000001").unwrap();
+        let wal_path = base.join("wal").join(ulid.to_string());
 
         // Write a minimal WAL.
         let payload = b"segment extent payload";
@@ -1124,10 +1125,14 @@ mod tests {
         assert!(!wal_path.exists(), "WAL should be deleted after promotion");
 
         // Segment must exist (no .tmp).
-        let seg_path = base.join("pending").join(ulid);
+        let ulid_str = ulid.to_string();
+        let seg_path = base.join("pending").join(&ulid_str);
         assert!(seg_path.exists(), "segment missing from pending/");
         assert!(
-            !base.join("pending").join(format!("{ulid}.tmp")).exists(),
+            !base
+                .join("pending")
+                .join(format!("{ulid_str}.tmp"))
+                .exists(),
             ".tmp must be gone"
         );
 

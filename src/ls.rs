@@ -199,8 +199,8 @@ impl VolumeReader {
             let ulid = path
                 .file_name()
                 .and_then(|s| s.to_str())
-                .ok_or_else(|| io::Error::other("bad WAL filename"))?
-                .to_owned();
+                .and_then(|s| ulid::Ulid::from_string(s).ok())
+                .ok_or_else(|| io::Error::other("bad WAL filename"))?;
 
             let (records, _partial_tail) = writelog::scan_readonly(&path)?;
             for record in records {
@@ -217,7 +217,7 @@ impl VolumeReader {
                         extent_index.insert(
                             hash,
                             extentindex::ExtentLocation {
-                                segment_id: ulid.clone(),
+                                segment_id: ulid,
                                 body_offset,
                                 body_length: data.len() as u32,
                                 compressed: flags.contains(writelog::WalFlags::COMPRESSED),
@@ -265,9 +265,10 @@ impl VolumeReader {
     /// Find the `(index_dir, body_dir)` pair for `segment_id` by locating its
     /// `.idx` file in one of the search dirs' `index/` subdirectories.
     /// Returns `None` if not found in any search dir (fall back to primary dirs).
-    fn find_dirs_for_segment(&self, segment_id: &str) -> Option<(PathBuf, PathBuf)> {
+    fn find_dirs_for_segment(&self, segment_id: ulid::Ulid) -> Option<(PathBuf, PathBuf)> {
+        let sid = segment_id.to_string();
         for dir in &self.search_dirs {
-            let idx = dir.join("index").join(format!("{segment_id}.idx"));
+            let idx = dir.join("index").join(format!("{sid}.idx"));
             if idx.exists() {
                 return Some((dir.join("index"), dir.join("cache")));
             }
@@ -287,7 +288,7 @@ impl VolumeReader {
         // Per-extent demand-fetch for cached entries (have entry_idx and body_section_start).
         if let Some(entry_idx) = loc.entry_idx {
             let (index_dir, body_dir) =
-                self.find_dirs_for_segment(&loc.segment_id)
+                self.find_dirs_for_segment(loc.segment_id)
                     .unwrap_or_else(|| {
                         (
                             self.primary_index_dir.clone(),
@@ -298,7 +299,7 @@ impl VolumeReader {
             if !segment::check_present_bit(&present_path, entry_idx)? {
                 match &self.fetcher {
                     Some(fetcher) => fetcher.fetch_extent(
-                        &loc.segment_id,
+                        loc.segment_id,
                         &index_dir,
                         &body_dir,
                         &segment::ExtentFetch {
@@ -318,7 +319,7 @@ impl VolumeReader {
             }
         }
 
-        let path = match find_segment_file(&self.search_dirs, &loc.segment_id) {
+        let path = match find_segment_file(&self.search_dirs, loc.segment_id) {
             Ok(p) => p,
             Err(_) if loc.entry_idx.is_none() => {
                 // Full-segment fallback: entry has no entry_idx (local segment
@@ -326,11 +327,11 @@ impl VolumeReader {
                 match &self.fetcher {
                     Some(fetcher) => {
                         fetcher.fetch(
-                            &loc.segment_id,
+                            loc.segment_id,
                             &self.primary_index_dir,
                             &self.primary_cache_dir,
                         )?;
-                        find_segment_file(&self.search_dirs, &loc.segment_id)?
+                        find_segment_file(&self.search_dirs, loc.segment_id)?
                     }
                     None => {
                         return Err(io::Error::other(format!(
@@ -612,10 +613,11 @@ mod tests {
     }
 }
 
-fn find_segment_file(search_dirs: &[PathBuf], segment_id: &str) -> io::Result<PathBuf> {
+fn find_segment_file(search_dirs: &[PathBuf], segment_id: ulid::Ulid) -> io::Result<PathBuf> {
+    let sid = segment_id.to_string();
     for dir in search_dirs {
         for subdir in ["wal", "pending", "segments"] {
-            let path = dir.join(subdir).join(segment_id);
+            let path = dir.join(subdir).join(&sid);
             if path.exists() {
                 return Ok(path);
             }
@@ -623,10 +625,10 @@ fn find_segment_file(search_dirs: &[PathBuf], segment_id: &str) -> io::Result<Pa
         // Check for a demand-fetched body file. The `.body` file contains only
         // the body section, and ExtentLocation.body_offset is body-relative for
         // cached entries, so seeking to body_offset in this file is correct.
-        let body = dir.join("cache").join(format!("{segment_id}.body"));
+        let body = dir.join("cache").join(format!("{sid}.body"));
         if body.exists() {
             return Ok(body);
         }
     }
-    Err(io::Error::other(format!("segment not found: {segment_id}")))
+    Err(io::Error::other(format!("segment not found: {sid}")))
 }

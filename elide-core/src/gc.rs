@@ -60,6 +60,15 @@ impl GcHandoffState {
             _ => None,
         }
     }
+
+    /// Returns `true` for states that `apply_gc_handoffs` must act on.
+    ///
+    /// Both `Pending` (normal path) and `Applied` (restart-safety re-apply)
+    /// require the volume to update its extent index.  `Done` is terminal and
+    /// requires no action from the volume.
+    pub fn needs_apply(&self) -> bool {
+        matches!(self, Self::Pending | Self::Applied)
+    }
 }
 
 /// A parsed GC handoff filename: a ULID plus its current lifecycle state.
@@ -87,7 +96,7 @@ impl GcHandoff {
     }
 
     /// Return a new `GcHandoff` with the same ULID in `state`.
-    pub fn with_state(self, state: GcHandoffState) -> Self {
+    pub fn with_state(&self, state: GcHandoffState) -> Self {
         Self {
             ulid: self.ulid,
             state,
