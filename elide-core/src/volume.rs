@@ -1017,10 +1017,19 @@ impl Volume {
             // already acknowledged that deleting the old segment is safe.
             let live = self.lbamap.live_hashes();
             if !is_already_applied {
-                let stale_liveness = old_ulid_by_hash
+                let stale: Vec<blake3::Hash> = old_ulid_by_hash
                     .keys()
-                    .any(|hash| !carried_hashes.contains(hash) && live.contains(hash));
-                if stale_liveness {
+                    .filter(|h| !carried_hashes.contains(h) && live.contains(h))
+                    .copied()
+                    .collect();
+                if !stale.is_empty() {
+                    let hex: Vec<String> = stale.iter().map(|h| h.to_hex().to_string()).collect();
+                    log::warn!(
+                        "GC handoff {name}: stale-liveness cancellation — {} hash(es) live \
+                         in volume but absent from coordinator output; re-running next tick. \
+                         hashes: {hex:?}",
+                        stale.len()
+                    );
                     let _ = fs::remove_file(gc_dir.join(name)); // .pending
                     if gc_seg_path.try_exists()? {
                         let _ = fs::remove_file(&gc_seg_path); // body
@@ -1031,6 +1040,15 @@ impl Volume {
 
             // Second pass: apply extent index updates for carried hashes.
             // Safe to mutate the index now — stale_liveness was clear above.
+            //
+            // `index_mutated` tracks whether this pass actually changed the
+            // extent index.  For `.applied` handoffs (restart-recovery path)
+            // the idle tick has usually already applied the same mutations, so
+            // `still_at_old` will be false for every entry and nothing changes.
+            // We only count an `.applied` handoff toward the return value when
+            // mutations did happen, so the coordinator can distinguish genuine
+            // restart recovery from a redundant steady-state re-check.
+            let mut index_mutated = false;
             if let Some((body_section_start, ref entries)) = segment_index {
                 for (i, e) in entries.iter().enumerate() {
                     if e.is_dedup_ref {
@@ -1061,6 +1079,7 @@ impl Volume {
                             body_section_start,
                         },
                     );
+                    index_mutated = true;
                 }
             }
 
@@ -1084,6 +1103,7 @@ impl Volume {
                     .is_some_and(|loc| loc.segment_id == *old_ulid)
                 {
                     Arc::make_mut(&mut self.extent_index).remove(hash);
+                    index_mutated = true;
                 }
             }
 
@@ -1096,7 +1116,14 @@ impl Volume {
                 fs::rename(gc_dir.join(name), &applied_path)?;
             }
 
-            count += 1;
+            // Count this handoff if it was a normal .pending application, or
+            // if it was an .applied re-application that actually mutated the
+            // extent index (genuine restart recovery).  A redundant re-check
+            // of an already-applied .applied handoff returns 0 so the
+            // coordinator's "re-applied after restart" log stays silent.
+            if !is_already_applied || index_mutated {
+                count += 1;
+            }
         }
 
         Ok(count)
