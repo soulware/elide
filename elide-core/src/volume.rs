@@ -34,7 +34,13 @@ pub use segment::BoxFetcher;
 
 use ulid::Ulid;
 
-use crate::{extentindex, lbamap, segment, ulid_mint::UlidMint, writelog};
+use crate::{
+    extentindex,
+    gc::{GcHandoff, GcHandoffState, HandoffLine},
+    lbamap, segment,
+    ulid_mint::UlidMint,
+    writelog,
+};
 
 /// Compute the Shannon entropy of `data` in bits per byte.
 ///
@@ -877,11 +883,11 @@ impl Volume {
             return Ok(0);
         }
 
-        let mut pending: Vec<(String, crate::gc::GcHandoff)> = fs::read_dir(&gc_dir)?
+        let mut pending: Vec<(String, GcHandoff)> = fs::read_dir(&gc_dir)?
             .filter_map(|e| {
                 let e = e.ok()?;
                 let name = e.file_name().into_string().ok()?;
-                let handoff = crate::gc::GcHandoff::from_filename(&name)?;
+                let handoff = GcHandoff::from_filename(&name)?;
                 handoff.state.needs_apply().then_some((name, handoff))
             })
             .collect();
@@ -897,7 +903,7 @@ impl Volume {
 
         for (name, handoff) in &pending {
             let new_ulid = handoff.ulid.to_string();
-            let is_already_applied = handoff.state == crate::gc::GcHandoffState::Applied;
+            let is_already_applied = handoff.state == GcHandoffState::Applied;
 
             // Parse the .pending / .applied file into typed HandoffLines.
             //
@@ -909,12 +915,12 @@ impl Volume {
             let mut old_ulid_by_hash: HashMap<blake3::Hash, String> = HashMap::new();
             let mut is_tombstone = false;
             for line in pending_content.lines() {
-                match crate::gc::HandoffLine::parse(line) {
-                    Some(crate::gc::HandoffLine::Repack { hash, old_ulid, .. })
-                    | Some(crate::gc::HandoffLine::Remove { hash, old_ulid }) => {
+                match HandoffLine::parse(line) {
+                    Some(HandoffLine::Repack { hash, old_ulid, .. })
+                    | Some(HandoffLine::Remove { hash, old_ulid }) => {
                         old_ulid_by_hash.insert(hash, old_ulid.to_string());
                     }
-                    Some(crate::gc::HandoffLine::Dead { .. }) => {
+                    Some(HandoffLine::Dead { .. }) => {
                         is_tombstone = true;
                     }
                     None => {}
@@ -943,15 +949,11 @@ impl Volume {
 
             // Locate the body: normally in gc/; after a restart with a partial
             // apply_done_handoffs run, it may have already been moved to segments/.
-            let body_path: Option<std::path::PathBuf> = if gc_seg_path.try_exists()? {
+            let body_path: Option<PathBuf> = if gc_seg_path.try_exists()? {
                 Some(gc_seg_path.clone())
             } else if is_already_applied {
                 let seg_path = self.base_dir.join("segments").join(&new_ulid);
-                if seg_path.try_exists()? {
-                    Some(seg_path)
-                } else {
-                    None
-                }
+                seg_path.try_exists()?.then_some(seg_path)
             } else {
                 None
             };
@@ -964,12 +966,9 @@ impl Volume {
             //   repack — needs the segment for extent index updates;
             //            defer until available (e.g. fetched from S3).
             if !segment_exists {
-                let has_carried = pending_content.lines().any(|l| {
-                    matches!(
-                        crate::gc::HandoffLine::parse(l),
-                        Some(crate::gc::HandoffLine::Repack { .. })
-                    )
-                });
+                let has_carried = pending_content
+                    .lines()
+                    .any(|l| matches!(HandoffLine::parse(l), Some(HandoffLine::Repack { .. })));
                 if !is_tombstone && (has_carried || old_ulid_by_hash.is_empty()) {
                     continue;
                 }
@@ -978,15 +977,10 @@ impl Volume {
             // Read the (now volume-signed) compacted segment's index.  This
             // is done once and reused for both the carried_hashes scan and the
             // extent index update, avoiding a second signature verification.
-            let segment_index: Option<(u64, Vec<segment::SegmentEntry>)> =
-                if let Some(ref bp) = body_path {
-                    Some(segment::read_and_verify_segment_index(
-                        bp,
-                        &self.verifying_key,
-                    )?)
-                } else {
-                    None
-                };
+            let segment_index = body_path
+                .as_ref()
+                .map(|bp| segment::read_and_verify_segment_index(bp, &self.verifying_key))
+                .transpose()?;
 
             // First pass: build carried_hashes WITHOUT touching the extent
             // index.  We must know the full set before the Bug B check below,
@@ -1102,11 +1096,8 @@ impl Volume {
             // it is safe to delete superseded S3 objects.
             // For .applied handoffs: already in the correct state; no rename needed.
             if !is_already_applied {
-                let applied_path = gc_dir.join(
-                    handoff
-                        .with_state(crate::gc::GcHandoffState::Applied)
-                        .filename(),
-                );
+                let applied_path =
+                    gc_dir.join(handoff.with_state(GcHandoffState::Applied).filename());
                 fs::rename(gc_dir.join(name), &applied_path)?;
             }
 
@@ -3617,10 +3608,10 @@ mod tests {
 
         let old_ulid_parsed = Ulid::from_string(old_ulid).unwrap();
         let new_ulid_parsed = Ulid::from_string(&new_ulid).unwrap();
-        let handoff_lines: Vec<crate::gc::HandoffLine> = entries
+        let handoff_lines: Vec<HandoffLine> = entries
             .iter()
             .filter(|e| !e.is_dedup_ref)
-            .map(|e| crate::gc::HandoffLine::Repack {
+            .map(|e| HandoffLine::Repack {
                 hash: e.hash,
                 old_ulid: old_ulid_parsed,
                 new_ulid: new_ulid_parsed,
