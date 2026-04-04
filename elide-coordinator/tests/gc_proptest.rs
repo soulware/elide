@@ -45,18 +45,30 @@ enum SimOp {
     /// the coordinator never produces and masks a structurally distinct bug
     /// (pre-existing pending segments with ULIDs below the GC output ULID).
     GcSweep,
+    /// Simulate a coordinator/volume restart.
+    ///
+    /// Drops the current Volume and reopens it from disk (rebuilding the extent
+    /// index from .idx files).  Mirrors the production invariant: the coordinator
+    /// calls apply_gc_handoffs (IPC) immediately after restart to re-apply any
+    /// .applied handoffs before apply_done_handoffs can delete old segments.
+    ///
+    /// After reopen, asserts that all oracle LBAs are still readable.  This
+    /// catches the Bug E class: extent index rebuilt to stale state, then old
+    /// segment deleted → "segment not found".
+    Restart,
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
     prop_oneof![
-        (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::Write { lba, seed }),
-        (0u8..4, 4u8..8, any::<u8>()).prop_map(|(lba_a, lba_b, seed)| SimOp::DedupWrite {
+        4 => (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::Write { lba, seed }),
+        2 => (0u8..4, 4u8..8, any::<u8>()).prop_map(|(lba_a, lba_b, seed)| SimOp::DedupWrite {
             lba_a,
             lba_b,
             seed
         }),
-        Just(SimOp::Flush),
-        Just(SimOp::GcSweep),
+        2 => Just(SimOp::Flush),
+        1 => Just(SimOp::GcSweep),
+        1 => Just(SimOp::Restart),
     ]
 }
 
@@ -169,6 +181,16 @@ proptest! {
                         }
                     }
                 }
+                SimOp::Restart => {
+                    // Drop and reopen the volume, mirroring a coordinator/volume
+                    // restart.  Volume::open rebuilds the extent index from .idx
+                    // files; apply_gc_handoffs then re-applies any .applied
+                    // handoffs (Bug E fix).  No oracle mutation: restart is
+                    // invisible to the logical data model.
+                    drop(vol);
+                    vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    let _ = vol.apply_gc_handoffs();
+                }
             }
         }
     }
@@ -277,6 +299,38 @@ proptest! {
                             Err(e) => prop_assert!(
                                 false,
                                 "lba {} read failed after GcSweep: {}",
+                                lba,
+                                e
+                            ),
+                        }
+                    }
+                }
+                SimOp::Restart => {
+                    // Drop and reopen the volume, mirroring a coordinator/volume
+                    // restart.  Volume::open rebuilds the extent index from .idx
+                    // files; apply_gc_handoffs then re-applies any .applied
+                    // handoffs (Bug E fix) before any subsequent GcSweep can
+                    // call apply_done_handoffs and delete old segments.
+                    drop(vol);
+                    vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    let _ = vol.apply_gc_handoffs();
+
+                    // Assert: every oracle LBA is still readable after restart.
+                    // The segment bodies have not been deleted yet (no
+                    // apply_done_handoffs since restart), so both old and new
+                    // segments are present — reads must succeed regardless of
+                    // which one the extent index points to.
+                    for (&lba, expected) in &oracle {
+                        match vol.read(lba, 1) {
+                            Ok(data) => prop_assert_eq!(
+                                data.as_slice(),
+                                expected.as_slice(),
+                                "lba {} reads wrong data after Restart",
+                                lba
+                            ),
+                            Err(e) => prop_assert!(
+                                false,
+                                "lba {} read failed after Restart: {}",
                                 lba,
                                 e
                             ),
