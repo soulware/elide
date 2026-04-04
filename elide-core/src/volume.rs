@@ -877,18 +877,12 @@ impl Volume {
             return Ok(0);
         }
 
-        let mut pending: Vec<fs::DirEntry> = fs::read_dir(&gc_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .and_then(crate::gc::GcHandoff::from_filename)
-                    .is_some_and(|h| {
-                        matches!(
-                            h.state,
-                            crate::gc::GcHandoffState::Pending | crate::gc::GcHandoffState::Applied
-                        )
-                    })
+        let mut pending: Vec<(String, crate::gc::GcHandoff)> = fs::read_dir(&gc_dir)?
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().into_string().ok()?;
+                let handoff = crate::gc::GcHandoff::from_filename(&name)?;
+                handoff.state.needs_apply().then_some((name, handoff))
             })
             .collect();
 
@@ -897,19 +891,13 @@ impl Volume {
         }
 
         // Process oldest-first so the extent index is correct after a partial run.
-        pending.sort_by_key(|e| e.file_name());
+        pending.sort_by(|(a, _), (b, _)| a.cmp(b));
 
         let mut count = 0;
 
-        for entry in &pending {
-            let filename = entry.file_name();
-            let name = filename
-                .to_str()
-                .ok_or_else(|| io::Error::other("gc filename is not valid UTF-8"))?;
-            let handoff = crate::gc::GcHandoff::from_filename(name)
-                .ok_or_else(|| io::Error::other(format!("invalid gc filename: {name}")))?;
+        for (name, handoff) in &pending {
             let new_ulid = handoff.ulid.to_string();
-            let is_already_applied = matches!(handoff.state, crate::gc::GcHandoffState::Applied);
+            let is_already_applied = handoff.state == crate::gc::GcHandoffState::Applied;
 
             // Parse the .pending / .applied file into typed HandoffLines.
             //
@@ -917,7 +905,7 @@ impl Volume {
             // so the extent index can be updated only when it still points at
             // the old segment.  Dead lines carry no hash — they are a no-op
             // from the volume's perspective (just an acknowledgment).
-            let pending_content = fs::read_to_string(entry.path())?;
+            let pending_content = fs::read_to_string(gc_dir.join(name))?;
             let mut old_ulid_by_hash: HashMap<blake3::Hash, String> = HashMap::new();
             let mut is_tombstone = false;
             for line in pending_content.lines() {
@@ -1044,7 +1032,7 @@ impl Volume {
                     .keys()
                     .any(|hash| !carried_hashes.contains(hash) && live.contains(hash));
                 if stale_liveness {
-                    let _ = fs::remove_file(entry.path()); // .pending
+                    let _ = fs::remove_file(gc_dir.join(name)); // .pending
                     if gc_seg_path.try_exists()? {
                         let _ = fs::remove_file(&gc_seg_path); // body
                     }
@@ -1119,7 +1107,7 @@ impl Volume {
                         .with_state(crate::gc::GcHandoffState::Applied)
                         .filename(),
                 );
-                fs::rename(entry.path(), &applied_path)?;
+                fs::rename(gc_dir.join(name), &applied_path)?;
             }
 
             count += 1;
