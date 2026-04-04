@@ -6,6 +6,28 @@
 //
 // See docs/testing.md for the convention: proptest suites live in *_proptest.rs;
 // deterministic reproductions live in *_test.rs.
+//
+// Bug inventory:
+//
+//   Bug A — DEDUP_REF-only consumed segments never deleted after GC.
+//            Fixed by emitting a Dead handoff line for every consumed segment
+//            not covered by a Repack or Remove line.
+//            Covered by: gc_proptest::gc_segment_cleanup (proptest)
+//
+//   Bug B — DEDUP_REF written after gc_checkpoint makes a hash live again;
+//            apply_gc_handoffs incorrectly removes it from the extent index
+//            and apply_done_handoffs deletes the segment it lives in.
+//            Fixed by stale-liveness detection before any extent index mutations.
+//            Covered by: gc_handoff_bug_b_dedup_ref_after_checkpoint (below)
+//
+//   Bug C — gc_checkpoint mints GC output ULIDs before opening a new WAL.
+//            When the WAL is empty at checkpoint time flush_wal is a no-op,
+//            so the active WAL ULID stays below the minted GC output ULIDs.
+//            After the GC output lands in segments/, a subsequent WAL flush
+//            creates a segment with a lower ULID; on crash-recovery rebuild
+//            the GC output sorts after and wins, returning stale data.
+//            Fixed by always opening a new WAL after minting in gc_checkpoint.
+//            Covered by: gc_checkpoint_ulid_ordering_crash_recovery (below)
 
 use std::fs;
 use std::sync::Arc;
@@ -163,5 +185,120 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
         got0.as_slice(),
         &d1,
         "lba=0 should return D1 after second sweep"
+    );
+}
+
+/// Regression test for Bug C: gc_checkpoint mints GC output ULIDs before
+/// opening a new WAL, so when the WAL is empty at checkpoint time the active
+/// WAL ULID stays below the minted values.
+///
+/// Sequence that exposes the bug:
+///
+///   1. Write D0 to lba=0, flush → segment W1 in pending/.
+///   2. Overwrite lba=0 with D1, flush → segment W2 in pending/. H0 is now dead.
+///   3. Drain pending/ → segments/.  WAL W3 is empty.
+///   4. GcSweep: gc_checkpoint with empty WAL → flush_wal is a no-op, WAL stays
+///      W3.  Minted ULIDs u_repack, u_sweep are both > W3.  gc_fork compacts W1
+///      and W2 into gc/u_sweep (H1 live, H0 dead).  apply_gc_handoffs updates
+///      extent index; apply_done_handoffs moves gc/u_sweep → segments/u_sweep
+///      and deletes W1, W2.
+///      segments/ = { u_sweep }.  WAL ULID = W3 < u_sweep.  Bug C created.
+///   5. Write D2 to lba=0, flush → segment W3 in pending/.  Drain → segments/.
+///      segments/ = { u_sweep, W3 }.  u_sweep > W3: the GC output sorts AFTER
+///      the segment containing the newer write.
+///   6. Crash (drop Volume, reopen from disk).
+///      Rebuild applies segments in ULID order: W3 first, u_sweep second.
+///      u_sweep wins for lba=0, returning D1 (stale) instead of D2 (correct).
+///
+/// Without the fix, the post-crash read returns D1.
+/// With the fix (gc_checkpoint always opens a new WAL after minting), the new
+/// WAL has ULID > u_sweep, so the W3 segment with D2 always sorts above the GC
+/// output and wins on rebuild.
+///
+/// Note: Bug B's stale-liveness detection does NOT protect against this.
+/// Bug B prevents in-memory corruption; crash recovery bypasses in-memory state
+/// entirely and rebuilds from disk, where the ULID ordering is wrong.
+#[test]
+fn gc_checkpoint_ulid_ordering_crash_recovery() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    fs::create_dir_all(fork_dir.join("segments")).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let gc_config = make_gc_config();
+
+    // Step 1-2: write D0 then D1 to lba=0 so H0 is dead and H1 is live.
+    // Two separate flushes so gc_fork has two distinct input segments to compact.
+    let d0 = [11u8; 4096];
+    let d1 = [22u8; 4096];
+    let d2 = [33u8; 4096];
+
+    vol.write(0, &d0).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(0, &d1).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Step 3: drain pending/ → segments/.  The WAL is now empty.
+    drain_pending(fork_dir);
+
+    // Step 4: GcSweep with an empty WAL.
+    //
+    // BUG C is created here: gc_checkpoint calls flush_wal(), which is a no-op
+    // because pending_entries is empty.  The active WAL ULID is therefore NOT
+    // advanced before minting the GC output ULIDs, so:
+    //   WAL ULID < u_repack < u_sweep
+    // After apply_done_handoffs moves the GC output into segments/, any segment
+    // produced by flushing the current WAL will have a ULID below u_sweep.
+    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
+
+    rt.block_on(gc_fork(
+        fork_dir,
+        "test-vol",
+        &store,
+        &gc_config,
+        &repack_ulid,
+        &sweep_ulid,
+    ))
+    .unwrap();
+    vol.apply_gc_handoffs().unwrap();
+    rt.block_on(apply_done_handoffs(fork_dir, "test-vol", &store))
+        .unwrap();
+
+    // Step 5: write D2 to lba=0 and flush.  This goes to the current WAL whose
+    // ULID is below u_sweep.  After draining, segments/ contains both the GC
+    // output (u_sweep, carrying D1) and the new segment (W3 < u_sweep, carrying D2).
+    vol.write(0, &d2).unwrap();
+    vol.flush_wal().unwrap();
+    drain_pending(fork_dir);
+
+    // Step 6: crash — drop the Volume and reopen from disk.
+    //
+    // This is the critical step.  Rebuild processes segments in ULID order.
+    // With Bug C: GC output u_sweep > W3, so u_sweep is applied last and wins,
+    // returning D1 (stale) for lba=0.
+    // With the fix: the WAL opened after gc_checkpoint has ULID > u_sweep, so
+    // W3 sorts above the GC output and D2 (correct) is returned.
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let got = vol.read(0, 1).expect("read lba=0 after crash");
+    assert_eq!(
+        got.as_slice(),
+        &d2,
+        "lba=0 should return D2 (latest write) after crash, not D1 (stale GC output)"
     );
 }
