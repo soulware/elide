@@ -52,7 +52,8 @@ enum Command {
         /// (volume runs for coordinator IPC only).
         #[arg(long)]
         port: Option<u16>,
-        /// Serve as a read-only block device
+        /// Serve as a read-only block device (auto-detected for imported bases;
+        /// use this flag to explicitly serve a writable volume read-only)
         #[arg(long)]
         readonly: bool,
         /// Skip the fork.origin hostname/path check (use after an intentional move)
@@ -125,8 +126,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum VolumeCommand {
-    /// List all volumes in the data directory
-    List,
+    /// List volumes in the data directory (writable by default)
+    List {
+        /// List only readonly volumes (imported bases)
+        #[arg(long, conflicts_with = "all")]
+        readonly: bool,
+        /// List all volumes (writable and readonly)
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Show a human-readable summary of a volume
     Info {
@@ -289,8 +297,15 @@ fn main() {
 
     match args.command {
         Command::Volume { command } => match command {
-            VolumeCommand::List => {
-                if let Err(e) = list_volumes(&args.data_dir) {
+            VolumeCommand::List { readonly, all } => {
+                let filter = if all {
+                    ListFilter::All
+                } else if readonly {
+                    ListFilter::Readonly
+                } else {
+                    ListFilter::Writable
+                };
+                if let Err(e) = list_volumes(&args.data_dir, filter) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -570,7 +585,9 @@ fn main() {
                 .expect("failed to determine volume size");
             let fetch_config =
                 elide_fetch::FetchConfig::load(&fork_dir).expect("failed to load fetch config");
-            if readonly {
+            // Serve as readonly if explicitly requested or if the volume.readonly
+            // marker is present (imported bases have no private key on disk).
+            if readonly || fork_dir.join("volume.readonly").exists() {
                 nbd::run_volume_readonly(&fork_dir, size_bytes, &bind, port, fetch_config)
                     .expect("readonly NBD server error");
             } else {
@@ -708,7 +725,13 @@ fn snapshot_volume(vol_dir: &Path, by_id_dir: &Path) -> std::io::Result<String> 
     }
 }
 
-fn list_volumes(data_dir: &Path) -> std::io::Result<()> {
+enum ListFilter {
+    Writable,
+    Readonly,
+    All,
+}
+
+fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
     let by_name_dir = data_dir.join("by_name");
     let mut names: Vec<String> = Vec::new();
     match std::fs::read_dir(&by_name_dir) {
@@ -716,7 +739,27 @@ fn list_volumes(data_dir: &Path) -> std::io::Result<()> {
             for entry in entries {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                names.push(name);
+                // Resolve symlink to get the actual volume dir, then check for
+                // volume.readonly marker.
+                let vol_dir = std::fs::read_link(entry.path())
+                    .ok()
+                    .map(|target| {
+                        if target.is_absolute() {
+                            target
+                        } else {
+                            by_name_dir.join(target)
+                        }
+                    })
+                    .unwrap_or_else(|| entry.path());
+                let is_readonly = vol_dir.join("volume.readonly").exists();
+                let include = match filter {
+                    ListFilter::All => true,
+                    ListFilter::Readonly => is_readonly,
+                    ListFilter::Writable => !is_readonly,
+                };
+                if include {
+                    names.push(name);
+                }
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
