@@ -216,8 +216,8 @@ mod tests {
         // readonly is now in meta.toml (written by caller, not import_image)
         assert!(!vol_dir.join("readonly").exists());
         assert_eq!(
-            fs::read_to_string(vol_dir.join("volume.size")).unwrap(),
-            (LBA_SIZE * 3).to_string()
+            crate::config::VolumeConfig::read(&vol_dir).unwrap().size,
+            Some((LBA_SIZE * 3) as u64)
         );
         assert!(vol_dir.join("pending").exists());
         assert!(!vol_dir.join("segments").exists()); // coordinator drains pending/ → segments/
