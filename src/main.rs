@@ -813,10 +813,8 @@ fn create_volume(
     let vol_dir = data_dir.join("by_id").join(&vol_ulid);
 
     std::fs::create_dir_all(&vol_dir)?;
-    std::fs::write(vol_dir.join("volume.name"), name)?;
     std::fs::create_dir_all(vol_dir.join("pending"))?;
     std::fs::create_dir_all(vol_dir.join("segments"))?;
-    std::fs::write(vol_dir.join("volume.size"), bytes.to_string())?;
 
     let key = elide_core::signing::generate_keypair(&vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)?;
     elide_core::signing::write_origin(&vol_dir, &key, VOLUME_PROVENANCE_FILE)?;
