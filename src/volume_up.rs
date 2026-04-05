@@ -117,6 +117,14 @@ pub fn run_volume_daemon(vol_dir: &Path, mountpoint: &Path, format: bool) -> io:
 }
 
 async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Result<()> {
+    // Fail early with a clear message rather than mysterious EACCES errors
+    // deep in the setup sequence (nbd-client, mount, and probe_ext4 all need root).
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(io::Error::other(
+            "must run as root (or with CAP_SYS_ADMIN) to attach block devices",
+        ));
+    }
+
     use elide_core::signing::{
         VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, generate_keypair, load_signer,
         write_origin,
@@ -172,8 +180,9 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
         io::Error::other("no free NBD device found; is the nbd kernel module loaded?")
     })?;
 
+    // Use -u (short form); -unix is not recognised on all Ubuntu nbd-client versions.
     let status = Command::new("nbd-client")
-        .arg("-unix")
+        .arg("-u")
         .arg(&nbd_sock)
         .arg(&nbd_dev)
         .status()?;
@@ -236,7 +245,22 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
     if let Some(task) = drain_task {
         task.abort();
     }
-    let _ = Command::new("umount").arg(mountpoint).status();
+    // Try a clean umount first; fall back to lazy (-l) if the filesystem is
+    // still busy. Disconnecting NBD before the filesystem is fully unmounted
+    // risks data loss, so we always attempt unmount before disconnect.
+    let umount_ok = Command::new("umount")
+        .arg(mountpoint)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !umount_ok {
+        eprintln!("warning: umount failed, retrying with -l (lazy unmount)");
+        Command::new("umount")
+            .arg("-l")
+            .arg(mountpoint)
+            .status()
+            .ok();
+    }
     disconnect_nbd(&nbd_dev);
     let _ = std::fs::remove_file(vol_dir.join("mount.pid"));
 
@@ -291,7 +315,14 @@ fn probe_ext4(device: &Path) -> io::Result<bool> {
 }
 
 fn run_mkfs(device: &Path) -> io::Result<()> {
-    let status = Command::new("mkfs.ext4").arg("-F").arg(device).status()?;
+    // -E nodiscard: skip the discard/TRIM pass that mkfs performs by default.
+    // On NBD devices this can be extremely slow (TRIM is sent as WRITE_ZEROES
+    // which flushes the entire volume). Safe to skip — the volume is either
+    // brand new (all zeros) or we've confirmed it's blank via probe_ext4.
+    let status = Command::new("mkfs.ext4")
+        .args(["-F", "-E", "nodiscard"])
+        .arg(device)
+        .status()?;
     if !status.success() {
         return Err(io::Error::other(format!("mkfs.ext4 failed: {status}")));
     }
