@@ -117,9 +117,14 @@ pub fn run_volume_daemon(vol_dir: &Path, mountpoint: &Path, format: bool) -> io:
 }
 
 async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Result<()> {
-    // 1. Load S3 store config from the volume directory (or environment).
-    //    If no config is found, run without S3 (drain/GC tasks will be no-ops
-    //    until a store is configured, but the volume can still be used locally).
+    use elide_core::signing::{
+        VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, generate_keypair, load_signer,
+        write_origin,
+    };
+
+    // 1. Load S3 store config (two separate loads: one Arc<dyn ObjectStore> for
+    //    coordinator tasks, one FetchConfig for the NBD server's demand-fetch path).
+    //    If no config is found, run without S3.
     let store = match elide_fetch::FetchConfig::load(vol_dir)? {
         Some(cfg) => Some(cfg.build_store()?),
         None => {
@@ -127,35 +132,42 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
             None
         }
     };
+    let nbd_fetch_config = elide_fetch::FetchConfig::load(vol_dir)?;
 
-    // 2. Start the embedded NBD server as a blocking task.
-    //    run_volume_signed is synchronous (blocking actor loop + NBD accept loop);
-    //    spawn_blocking runs it on the dedicated blocking thread pool.
-    let exe = std::env::current_exe()?;
+    // 2. Resolve volume size and signing key (load or generate on first use).
+    //    Origin check is skipped: standalone mode is always single-host.
+    let size_bytes = elide::resolve_volume_size(vol_dir, None)?;
+    let signer = if vol_dir.join(VOLUME_KEY_FILE).exists() {
+        load_signer(vol_dir, VOLUME_KEY_FILE)?
+    } else {
+        let key = generate_keypair(vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)?;
+        write_origin(vol_dir, &key, VOLUME_PROVENANCE_FILE)?;
+        load_signer(vol_dir, VOLUME_KEY_FILE)?
+    };
+
+    // 3. Start the embedded NBD server as a blocking task.
+    //    run_volume_signed owns the VolumeActor thread, control socket thread,
+    //    and NBD accept loop — all synchronous, running inside spawn_blocking.
+    //    It never returns while the volume is up; process::exit(0) on teardown
+    //    is the intended shutdown path for single-volume standalone mode.
     let nbd_sock = vol_dir.join("nbd.sock");
-    let vol_dir_owned = vol_dir.to_owned();
-    let nbd_sock_owned = nbd_sock.clone();
+    let vol_dir_for_nbd = vol_dir.to_owned();
+    let nbd_sock_for_nbd = nbd_sock.clone();
 
-    let _nbd_task = tokio::task::spawn_blocking({
-        let exe = exe.clone();
-        move || {
-            // Re-exec serve-volume in-process: delegate to the existing
-            // run_volume_signed path via a subprocess for now.  Step 4b will
-            // replace this with a direct call once the NBD server exposes a
-            // cancellable async API.
-            std::process::Command::new(&exe)
-                .args(["serve-volume"])
-                .arg(&vol_dir_owned)
-                .arg("--socket")
-                .arg(&nbd_sock_owned)
-                .status()
-        }
+    let _nbd_task = tokio::task::spawn_blocking(move || {
+        elide::nbd::run_volume_signed(
+            &vol_dir_for_nbd,
+            size_bytes,
+            Some(elide::nbd::NbdBind::Unix(nbd_sock_for_nbd)),
+            signer,
+            nbd_fetch_config,
+        )
     });
 
-    // 3. Wait for the NBD socket to appear.
+    // 4. Wait for the NBD socket to appear.
     wait_for_path_async(&nbd_sock, Duration::from_secs(30)).await?;
 
-    // 4. Find a free /dev/nbdN and attach via nbd-client.
+    // 5. Find a free /dev/nbdN and attach via nbd-client.
     let nbd_dev = find_free_nbd().ok_or_else(|| {
         io::Error::other("no free NBD device found; is the nbd kernel module loaded?")
     })?;
@@ -169,7 +181,7 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
         return Err(io::Error::other(format!("nbd-client failed: {status}")));
     }
 
-    // 5. Probe for a filesystem; format if needed.
+    // 6. Probe for a filesystem; format if needed.
     //    --format means "initialise if blank" — safe to pass on every mount.
     let has_fs = probe_ext4(&nbd_dev)?;
     match (has_fs, format) {
@@ -189,7 +201,7 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
         }
     }
 
-    // 6. Mount.
+    // 7. Mount.
     let status = Command::new("mount")
         .arg(&nbd_dev)
         .arg(mountpoint)
@@ -199,7 +211,7 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
         return Err(io::Error::other(format!("mount failed: {status}")));
     }
 
-    // 7. Start coordinator tasks (drain + GC + prefetch) if a store is available.
+    // 8. Start coordinator tasks (drain + GC + prefetch) if a store is available.
     let drain_task = store.map(|s| {
         let drain_interval = Duration::from_secs(5);
         let gc_config = elide_coordinator::config::GcConfig::default();
@@ -211,16 +223,16 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
         ))
     });
 
-    // 8. Signal ready: write PID so `volume up` knows setup succeeded and
+    // 9. Signal ready: write PID so `volume up` knows setup succeeded and
     //    `volume down` knows where to send SIGTERM.
     let pid = unsafe { libc::getpid() };
     std::fs::write(vol_dir.join("mount.pid"), format!("{pid}\n"))?;
 
-    // 9. Wait for SIGTERM.
+    // 10. Wait for SIGTERM.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     sigterm.recv().await;
 
-    // 10. Teardown.
+    // 11. Teardown.
     if let Some(task) = drain_task {
         task.abort();
     }
