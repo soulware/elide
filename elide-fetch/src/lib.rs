@@ -830,6 +830,89 @@ mod tests {
         );
     }
 
+    /// A segment with a flipped body byte fails signature verification.
+    #[test]
+    fn verify_rejects_tampered_bytes() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let seg_path = tmp.path().join("seg");
+        let data = vec![0xABu8; 4096];
+        let mut entries = vec![SegmentEntry::new_data(
+            blake3::hash(&data),
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        let mut bytes = std::fs::read(&seg_path).unwrap();
+        // Flip the first byte of the index section (covered by the signature).
+        // The body is NOT covered by the signature, so tampering there would pass.
+        bytes[96] ^= 0xFF;
+
+        let err = elide_core::segment::verify_segment_bytes(&bytes, "test", &vk).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid signature"));
+    }
+
+    /// A segment signed with key A is rejected when verified with key B.
+    #[test]
+    fn verify_rejects_wrong_key() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let seg_path = tmp.path().join("seg");
+        let data = vec![0xCDu8; 4096];
+        let mut entries = vec![SegmentEntry::new_data(
+            blake3::hash(&data),
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        let (signer_a, _vk_a) = elide_core::signing::generate_ephemeral_signer();
+        let (_signer_b, vk_b) = elide_core::signing::generate_ephemeral_signer();
+        write_segment(&seg_path, &mut entries, signer_a.as_ref()).unwrap();
+
+        let bytes = std::fs::read(&seg_path).unwrap();
+        let err = elide_core::segment::verify_segment_bytes(&bytes, "test", &vk_b).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid signature"));
+    }
+
+    /// A segment with a zeroed signature field is rejected as unsigned.
+    #[test]
+    fn verify_rejects_unsigned_segment() {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let seg_path = tmp.path().join("seg");
+        let data = vec![0xEFu8; 4096];
+        let mut entries = vec![SegmentEntry::new_data(
+            blake3::hash(&data),
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        let mut bytes = std::fs::read(&seg_path).unwrap();
+        // Zero out the signature field at header[32..96].
+        bytes[32..96].fill(0);
+
+        let err = elide_core::segment::verify_segment_bytes(&bytes, "test", &vk).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unsigned"));
+    }
+
     #[test]
     fn derive_volume_id_returns_ulid() {
         let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
