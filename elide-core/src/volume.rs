@@ -809,42 +809,41 @@ impl Volume {
     /// opens a fresh WAL with ULID > `u_wal`.  Returns `(u_repack, u_sweep)` to
     /// the coordinator.
     ///
-    /// **Why three ULIDs, minted first.**
+    /// **Why four ULIDs, minted first.**
     ///
-    /// The monotonic mint is a logical clock.  Pulling all three identifiers
+    /// The monotonic mint is a logical clock.  Pulling all four identifiers
     /// from it *before* any I/O encodes the relative ordering of operations in
-    /// advance: `u_repack < u_sweep < u_wal < new_wal`.  The I/O steps then
+    /// advance: `u_repack < u_sweep < u_flush < u_wal`.  The I/O steps then
     /// execute in the pre-determined logical order without requiring any
     /// coordination after the fact.
     ///
-    /// Without pre-minting `u_wal`, the WAL segment flushed by this call would
+    /// Without pre-minting `u_flush`, the WAL segment flushed by this call would
     /// carry the WAL's *existing* ULID (assigned when the WAL was opened,
     /// before the GC ULIDs were minted).  That ULID is lower than `u_sweep`, so
     /// after the segment is drained to `segments/`, crash-recovery rebuild would
     /// apply the GC output *after* the WAL segment and return stale data.
     ///
-    /// When the WAL is empty, the WAL file is deleted and `u_wal` is not used
+    /// When the WAL is empty, the WAL file is deleted and `u_flush` is not used
     /// (no segment is produced), so the empty-WAL case is also safe: the fresh
     /// WAL opened after minting carries a ULID > `u_sweep`.
     ///
     /// All ULIDs come from the volume's own monotonic mint, never from an
     /// external clock — coordinator clock skew cannot corrupt ULID ordering.
     pub fn gc_checkpoint(&mut self) -> io::Result<(String, String)> {
-        // Mint all three ULIDs before any I/O.  The ordering constraint —
-        // u_repack < u_sweep < u_wal < new_wal — is established here, before
-        // the flush or the new WAL open.
-        // Mint all three ULIDs in sequence.  UlidMint guarantees strict
-        // monotonicity even within the same millisecond (increments random bits),
-        // so no sleep is needed — u_repack < u_sweep < u_wal is always satisfied.
+        // Mint all four ULIDs before any I/O.  The ordering constraint —
+        // u_repack < u_sweep < u_flush < u_wal — is established here, before
+        // any flush or WAL rotation.  UlidMint guarantees strict monotonicity
+        // even within the same millisecond (increments random bits).
         let u_repack = self.mint.next();
         let u_sweep = self.mint.next();
+        let u_flush = self.mint.next();
         let u_wal = self.mint.next();
-        // Flush the current WAL to pending/ under u_wal.  If the WAL is empty,
-        // the file is deleted and u_wal is unused (no segment produced).
-        self.flush_wal_to_pending_as(u_wal)?;
-        // Open a new WAL with ULID > u_wal.
+        // Flush the current WAL to pending/ under u_flush.  If the WAL is
+        // empty, the file is deleted and u_flush is unused (no segment produced).
+        self.flush_wal_to_pending_as(u_flush)?;
+        // Open a new WAL with u_wal > u_flush.
         let (wal, wal_ulid, wal_path, pending_entries) =
-            create_fresh_wal(&self.base_dir.join("wal"), self.mint.next())?;
+            create_fresh_wal(&self.base_dir.join("wal"), u_wal)?;
         self.wal = wal;
         self.wal_ulid = wal_ulid;
         self.wal_path = wal_path;
