@@ -269,10 +269,9 @@ impl VolumeActor {
                     // No-op if the WAL is empty.  Errors are logged and not fatal:
                     // the data is safe in the WAL; the next write or explicit
                     // flush will retry.
-                    if let Err(e) = self.volume.flush_wal() {
-                        warn!("idle flush failed: {e}");
-                    } else {
-                        self.publish_snapshot();
+                    match self.volume.flush_wal() {
+                        Ok(()) => self.publish_snapshot(),
+                        Err(e) => warn!("idle flush failed: {e}"),
                     }
                     // Apply any GC handoff files written by the coordinator.
                     // No flush_gen bump: GC is a segment-to-segment move; body
