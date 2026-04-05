@@ -52,7 +52,8 @@ enum Command {
         /// (volume runs for coordinator IPC only).
         #[arg(long)]
         port: Option<u16>,
-        /// Serve as a read-only block device
+        /// Serve as a read-only block device (auto-detected for imported bases;
+        /// use this flag to explicitly serve a writable volume read-only)
         #[arg(long)]
         readonly: bool,
         /// Skip the fork.origin hostname/path check (use after an intentional move)
@@ -584,7 +585,9 @@ fn main() {
                 .expect("failed to determine volume size");
             let fetch_config =
                 elide_fetch::FetchConfig::load(&fork_dir).expect("failed to load fetch config");
-            if readonly {
+            // Serve as readonly if explicitly requested or if the volume.readonly
+            // marker is present (imported bases have no private key on disk).
+            if readonly || fork_dir.join("volume.readonly").exists() {
                 nbd::run_volume_readonly(&fork_dir, size_bytes, &bind, port, fetch_config)
                     .expect("readonly NBD server error");
             } else {
