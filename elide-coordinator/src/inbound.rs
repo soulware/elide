@@ -5,12 +5,13 @@
 // Exception: `import attach` streams multiple response lines until done.
 //
 // Unauthenticated operations (any caller):
-//   rescan                — trigger an immediate fork discovery pass
-//   status <volume>       — report running state of a named volume
-//   import <name> <ref>   — spawn an OCI import
-//   import status <name>  — poll import state by volume name (running / done / failed)
-//   import attach <name>  — stream import output by volume name until completion
-//   delete <volume>       — stop all processes and remove the volume directory
+//   rescan                    — trigger an immediate fork discovery pass
+//   status <volume>           — report running state of a named volume
+//   import <name> <ref>       — spawn an OCI import
+//   import status <name>      — poll import state by volume name (running / done / failed)
+//   import attach <name>      — stream import output by volume name until completion
+//   delete <volume>           — stop all processes and remove the volume directory
+//   evict <volume> [<ulid>]   — evict all (or one) S3-confirmed segment body from cache/
 //
 // Volume-process operations (macaroon required — not yet implemented):
 //   register <volume> <fork>   — mint a per-fork macaroon (PID-bound)
@@ -27,6 +28,7 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::import::{self, ImportRegistry, ImportState};
+use elide_coordinator::EvictRegistry;
 
 pub async fn serve(
     socket_path: &Path,
@@ -34,6 +36,7 @@ pub async fn serve(
     rescan: Arc<Notify>,
     registry: ImportRegistry,
     elide_import_bin: Arc<PathBuf>,
+    evict_registry: EvictRegistry,
 ) {
     let _ = std::fs::remove_file(socket_path);
 
@@ -54,7 +57,8 @@ pub async fn serve(
                 let rescan = rescan.clone();
                 let registry = registry.clone();
                 let bin = elide_import_bin.clone();
-                tokio::spawn(handle(stream, data_dir, rescan, registry, bin));
+                let evict_reg = evict_registry.clone();
+                tokio::spawn(handle(stream, data_dir, rescan, registry, bin, evict_reg));
             }
             Err(e) => warn!("[inbound] accept error: {e}"),
         }
@@ -67,6 +71,7 @@ async fn handle(
     rescan: Arc<Notify>,
     registry: ImportRegistry,
     elide_import_bin: Arc<PathBuf>,
+    evict_registry: EvictRegistry,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -88,7 +93,15 @@ async fn handle(
         return;
     }
 
-    let response = dispatch(&line, &data_dir, rescan, &registry, &elide_import_bin).await;
+    let response = dispatch(
+        &line,
+        &data_dir,
+        rescan,
+        &registry,
+        &elide_import_bin,
+        &evict_registry,
+    )
+    .await;
     let _ = writer.write_all(format!("{response}\n").as_bytes()).await;
 }
 
@@ -98,6 +111,7 @@ async fn dispatch(
     rescan: Arc<Notify>,
     registry: &ImportRegistry,
     elide_import_bin: &Path,
+    evict_registry: &EvictRegistry,
 ) -> String {
     if line.is_empty() {
         return "err empty request".to_string();
@@ -148,6 +162,17 @@ async fn dispatch(
                 return "err usage: delete <volume>".to_string();
             }
             delete_volume(args, data_dir)
+        }
+
+        "evict" => {
+            if args.is_empty() {
+                return "err usage: evict <volume> [<ulid>]".to_string();
+            }
+            let (vol_name, ulid_str) = match args.split_once(' ') {
+                Some((name, ulid)) => (name, Some(ulid.trim().to_owned())),
+                None => (args, None),
+            };
+            evict_volume(vol_name, ulid_str, data_dir, evict_registry).await
         }
 
         _ => {
@@ -280,6 +305,43 @@ async fn stream_import_by_name(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+    }
+}
+
+// ── Volume evict ─────────────────────────────────────────────────────────────
+
+/// Route an eviction request to the fork's task loop.
+///
+/// The fork task processes the request between drain/GC ticks, ensuring it
+/// never races with the GC pass's collect_stats → compact_segments window.
+async fn evict_volume(
+    vol_name: &str,
+    ulid_str: Option<String>,
+    data_dir: &Path,
+    evict_registry: &EvictRegistry,
+) -> String {
+    // Resolve name → canonical fork directory path.
+    let link = data_dir.join("by_name").join(vol_name);
+    let fork_dir = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(_) => return format!("err volume not found: {vol_name}"),
+    };
+
+    // Look up the fork's evict sender.
+    let sender = evict_registry.lock().await.get(&fork_dir).cloned();
+    let Some(sender) = sender else {
+        return format!("err volume not managed by coordinator: {vol_name}");
+    };
+
+    // Send the request and wait for the result.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if sender.send((ulid_str, reply_tx)).await.is_err() {
+        return "err fork task no longer running".to_string();
+    }
+    match reply_rx.await {
+        Ok(Ok(n)) => format!("ok {n}"),
+        Ok(Err(e)) => format!("err {e}"),
+        Err(_) => "err fork task dropped reply".to_string(),
     }
 }
 

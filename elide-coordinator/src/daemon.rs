@@ -33,6 +33,7 @@ use crate::config::CoordinatorConfig;
 use crate::import;
 use crate::inbound;
 use crate::supervisor;
+use elide_coordinator::EvictRegistry;
 
 pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Result<()> {
     let drain_interval = Duration::from_secs(config.drain.interval_secs);
@@ -71,14 +72,18 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     // Import job registry: tracks running and recently-completed import jobs.
     let import_registry = import::new_registry();
 
+    // Per-fork eviction channel registry.
+    let evict_registry: EvictRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
     // Spawn the inbound socket server.
     {
         let data_dir = data_dir.clone();
         let notify = rescan_notify.clone();
         let registry = import_registry.clone();
         let bin = elide_import_bin.clone();
+        let evict_reg = evict_registry.clone();
         tokio::spawn(async move {
-            inbound::serve(&socket_path, data_dir, notify, registry, bin).await;
+            inbound::serve(&socket_path, data_dir, notify, registry, bin, evict_reg).await;
         });
     }
 
@@ -118,11 +123,17 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 let label = volume_label(&vol_dir);
                 info!("[coordinator] discovered volume: {label}");
 
+                let (evict_tx, evict_rx) = tokio::sync::mpsc::channel(4);
+                evict_registry
+                    .blocking_lock()
+                    .insert(vol_dir.clone(), evict_tx);
+
                 tasks.spawn(elide_coordinator::tasks::run_volume_tasks(
                     vol_dir.clone(),
                     store.clone(),
                     drain_interval,
                     gc_config.clone(),
+                    evict_rx,
                 ));
 
                 // Readonly volumes (imported bases) have no live process —
