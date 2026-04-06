@@ -161,14 +161,12 @@ pub async fn run_volume_tasks(
 
         // Step 4: drain pending segments to S3.
         //
-        // ORDERING INVARIANT: step 4 must fully succeed before step 5 (GC)
-        // runs.  gc_checkpoint mints GC output ULIDs from the volume's
-        // monotonic clock; any segment already in pending/ at that moment has
-        // a ULID below the GC output.  If such a segment is later drained to
-        // segments/, crash-recovery rebuild gives the GC output incorrect
-        // priority for the shared LBAs, returning stale data.  Skipping GC
-        // when drain has failures enforces the invariant and defers the GC
-        // pass to the next tick.
+        // Skip GC this tick if drain had upload or promote failures.  Pending
+        // segments that failed to promote still have no cache/<ulid>.body, so
+        // collect_stats would skip them and GC would not compact them — but
+        // their LBAs would not appear in the GC candidate set either.  Deferring
+        // GC until drain succeeds avoids repeated no-ops and ensures GC always
+        // operates on a fully-promoted, consistent segment set.
         let mut drain_ok = true;
         if fork_dir.join("pending").exists() {
             match upload::drain_pending(&fork_dir, &volume_id, &store).await {
