@@ -60,11 +60,9 @@ The tests are designed to protect these invariants:
    `> wal_ulid`.  The mechanism: `sweep_pending` uses `max(candidate_ULIDs)`
    as output; coordinator GC uses `max(inputs).increment()`.  Both are
    guaranteed to be below the current WAL ULID because all `pending/` and
-   `segments/` files were created before the current WAL was opened.
+   S3-confirmed segments were created before the current WAL was opened.
 
-3. **`segments/` ↔ S3 invariant.** The coordinator only touches `segments/`,
-   never `pending/`.  This boundary is what makes invariant 2 hold: coordinator
-   inputs are always from a prior write epoch.
+3. **`index/` ↔ S3 invariant.** The coordinator reads `index/` to find GC candidates but never writes directly into `cache/`. The volume's promote IPC handler is the sole path that moves bodies into `cache/`, and only after the coordinator confirms S3 upload. This boundary is what makes invariant 2 hold: coordinator inputs are always from a prior write epoch.
 
 4. **Snapshot floor.** Segments at or below the latest snapshot ULID are
    frozen — `sweep_pending` and `repack` must never modify or delete
@@ -109,9 +107,9 @@ directory:
 | `Write { lba, seed }` | `vol.write(lba, [seed; 4096])` | `oracle.insert(lba, [seed; 4096])` |
 | `Flush` | `vol.flush_wal()` — promotes WAL to `pending/` | none (write already recorded) |
 | `SweepPending` | `vol.sweep_pending()` — merges/deduplicates `pending/` segments | none (no data change) |
-| `Repack` | `vol.repack(0.9)` — density pass on `pending/` + `segments/` | none (no data change) |
-| `DrainLocal` | Moves all `pending/` files to `segments/` (simulates coordinator upload) | none |
-| `CoordGcLocal { n }` | Runs a coordinator-style GC pass on `segments/` in-process, merging `n` segments (2–5) | none (no data change) |
+| `Repack` | `vol.repack(0.9)` — density pass on `pending/` + S3-confirmed segments | none (no data change) |
+| `DrainLocal` | Simulates coordinator upload: promotes all `pending/` files to `index/` + `cache/` | none |
+| `CoordGcLocal { n }` | Runs a coordinator-style GC pass on S3-confirmed segments in-process, merging `n` segments (2–5) | none (no data change) |
 | `Crash` | Drops the `Volume` and reopens it (full rebuild from disk) | assert all oracle LBAs match |
 | `Snapshot` | `vol.snapshot()` — records branch point; sets snapshot floor for sweep/repack assertions | tracks floor ULID |
 | `ReadUnwritten` | Reads LBA 64 (always outside write range) | assert all-zero bytes |
@@ -121,7 +119,7 @@ as in production the coordinator only compacts segments that have been
 uploaded.  The proptest engine discovers on its own which interleavings are
 interesting.
 
-`CoordGcLocal { n }` picks the `n` oldest segments in `segments/` (proptest
+`CoordGcLocal { n }` picks the `n` oldest S3-confirmed segments (proptest
 generates `n` in the range 2–5), merges their entries, writes an output with
 `ULID = max(inputs).increment()`, and deletes the inputs — the same algorithm
 as the real coordinator GC in `elide-coordinator/src/gc.rs`.
@@ -282,7 +280,7 @@ the real coordinator protocol.
 
 **`Repack` SimOp is entirely absent.**  *(Fixed, two bugs found.)*
 `vol.repack(min_live_ratio)` is the volume-level density pass.  It iterates
-both `pending/` and `segments/`, rewrites sparse segments, and deletes the
+both `pending/` and S3-confirmed segments, rewrites sparse segments, and deletes the
 originals.  Adding `Repack` to the simulation immediately found two bugs:
 
 1. `repack()` used `mint.next()` for output ULIDs, producing values above the
@@ -409,7 +407,7 @@ survived), and the pending handoff is applied on the next `CoordGcLocal`.
 **`ReadonlyVolume`** (now implemented).
 `elide-core/tests/readonly_volume_test.rs` covers the five key behaviours:
 unwritten LBA returns zeros; flushed `pending/` data is visible; WAL-only
-writes (not yet flushed) are invisible; drained `segments/` data is visible;
+writes (not yet flushed) are invisible; drained (`index/` + `cache/`) data is visible;
 and data remains correct after a coordinator GC pass.
 
 ---
@@ -442,8 +440,8 @@ without any flush.  This exercises the `ArcSwap` snapshot publication path.
 |----|--------|-----------|
 | `Write { lba, seed }` | `handle.write(lba, [seed; 4096])` | immediately read back same LBA — must match |
 | `Flush` | `handle.flush()` — promotes WAL to `pending/` | none |
-| `DrainLocal` | moves all `pending/` to `segments/` (simulates coordinator upload) | none |
-| `CoordGcLocal { n }` | coordinator-style GC on `segments/`, merges `n` segments (2–5), applies handoff | assert full oracle after handoff |
+| `DrainLocal` | promotes all `pending/` to `index/` + `cache/` (simulates coordinator upload) | none |
+| `CoordGcLocal { n }` | coordinator-style GC on S3-confirmed segments, merges `n` (2–5), applies handoff | assert full oracle after handoff |
 | `SweepPending` | `handle.sweep_pending()` via actor channel — merges small `pending/` segments | assert full oracle (old files deleted; `publish_snapshot()` must evict handle fd cache) |
 | `Repack` | `handle.repack(0.5)` via actor channel — density pass on `pending/` | assert full oracle (same stale-fd invariant as `SweepPending`) |
 | `Crash` | shutdown actor + join thread + reopen Volume + new actor | assert full oracle on reopen |

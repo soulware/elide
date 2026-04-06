@@ -61,13 +61,13 @@ pub async fn run_volume_tasks(
         .checked_sub(gc_interval)
         .unwrap_or_else(Instant::now);
 
-    // Prefetch segment indexes on startup if the fork has no local segments.
+    // Prefetch segment indexes on startup if the fork has no local index files.
     // This covers the common case of a volume pulled from the store with only
     // the directory skeleton — without .idx files Volume::open cannot rebuild
     // the LBA map and the volume is unreadable.
-    let has_local_segments = fork_dir.join("segments").exists()
+    let has_local_segments = fork_dir.join("index").exists()
         && fork_dir
-            .join("segments")
+            .join("index")
             .read_dir()
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);

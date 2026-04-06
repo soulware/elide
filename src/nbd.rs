@@ -1463,7 +1463,7 @@ mod tests {
         let fork_dir = dir.join("default");
 
         // Create an empty fork with no WAL so ReadonlyVolume::open works.
-        std::fs::create_dir_all(fork_dir.join("segments")).unwrap();
+        std::fs::create_dir_all(fork_dir.join("index")).unwrap();
         std::fs::create_dir_all(fork_dir.join("pending")).unwrap();
 
         let port = start_readonly_server(&fork_dir, 4 * 1024 * 1024);
@@ -1483,7 +1483,7 @@ mod tests {
     fn readonly_nbd_unwritten_blocks_read_as_zeros() {
         let dir = temp_dir();
         let fork_dir = dir.join("default");
-        std::fs::create_dir_all(fork_dir.join("segments")).unwrap();
+        std::fs::create_dir_all(fork_dir.join("index")).unwrap();
         std::fs::create_dir_all(fork_dir.join("pending")).unwrap();
 
         let port = start_readonly_server(&fork_dir, 4 * 1024 * 1024);

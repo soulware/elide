@@ -30,28 +30,29 @@ WAL files live at the root alongside `head.map`. There is no upload-state distin
 │   └── <ULID>                      — WAL file(s): active or awaiting promotion
 ├── pending/
 │   └── <ULID>                      — segment file committed locally, S3 upload pending
-├── segments/
-│   └── <ULID>                      — segment file confirmed uploaded to S3 (evictable)
-└── children/                        — snapshot and fork children (absent until first snapshot)
-    └── <ULID>/                      — child node directory
+├── index/
+│   └── <ULID>.idx                  — header + index section; written at flush and on confirm; permanent
+└── cache/
+    ├── <ULID>.body                  — segment body bytes; evictable once S3-confirmed (index/ entry present)
+    └── <ULID>.present               — per-entry presence bitset for demand-fetched extents
 
 <parent-node-dir>/                   — frozen; no wal/ or pending/
-├── segments/
-│   └── <ULID>                      — segment file (read-only)
-└── children/
-    └── <ULID>/                      — child node directory
+├── index/
+│   └── <ULID>.idx                  — permanent index (downloaded by prefetch)
+└── cache/
+    └── <ULID>.body                  — evictable body cache
 ```
 
-The `pending/` directory exists because Elide decouples local promotion from S3 upload. lsvd has no equivalent — it never has locally-committed segments that aren't yet in S3. The three-directory structure makes the full lifecycle visible via `ls`: `wal/` = in flight, `pending/` = local only, `segments/` = safely in S3.
+The `pending/` directory exists because Elide decouples local promotion from S3 upload. lsvd has no equivalent — it never has locally-committed segments that aren't yet in S3. The three-directory lifecycle is visible via `ls`: `wal/` = in flight, `pending/` = local only, `index/` + `cache/` = S3-confirmed. Body bytes in `cache/` are evictable; `index/` entries are permanent and are the only prerequisite for LBA-map rebuild and demand-fetch.
 
 | | lsvd | Elide |
 |---|---|---|
 | WAL location | Root-level `writecache.<ULID>` | `wal/` subdir |
 | Segment format | Single file (index embedded in body) | Single file (header + index + inline + body + delta) |
-| Upload tracking | Not needed (S3 sync in promotion) | `pending/` vs `segments/` dirs |
+| Upload tracking | Not needed (S3 sync in promotion) | `pending/` (unconfirmed) vs `index/` (confirmed) |
 | Temp files | `segment.<ULID>.complete` | `pending/<ULID>.tmp` |
-| LBA map | `head.map` (CBOR, SHA-256 guard) | `lba.map` (optional; rebuilt from segment index sections) |
-| Eviction policy | Not applicable | `segments/` evictable; `pending/` never |
+| LBA map | `head.map` (CBOR, SHA-256 guard) | `lba.map` (optional; rebuilt from `index/*.idx`) |
+| Eviction policy | Not applicable | `cache/*.body` evictable; `index/*.idx` permanent; `pending/` never |
 | Snapshot model | `lowers` array (read-only lower disks) | Directory tree (ancestors are frozen nodes) |
 | Dedup | Not implemented | Opportunistic on write path; local tree + best-effort cross-volume via shared root |
 

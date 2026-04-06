@@ -67,7 +67,7 @@ The coordinator uploads `pending/` segments to the store on each drain tick (def
 ./target/debug/elide volume info data-vol
 ```
 
-After drain, segments move from `pending/` to `segments/` locally and are committed to `elide_store/`.
+After drain, segments are uploaded to `elide_store/` and promoted: the volume writes `index/<ulid>.idx` (permanent LBA index) and `cache/<ulid>.body` (evictable body), then removes the `pending/` file.
 
 ## Volume directory layout
 
@@ -76,8 +76,10 @@ elide_data/by_id/<ulid>/
   wal/
     <ulid>          — active WAL (unflushed remainder between drain ticks)
   pending/          — empty between ticks; segments here are uploading
-  segments/
-    <ulid>          — committed to store after drain
+  index/
+    <ulid>.idx      — LBA index section; written at flush; permanent (survives eviction)
+  cache/
+    <ulid>.body     — segment body; evictable once committed to store
   volume.name       — "data-vol"
   volume.size       — "1073741824"
   volume.key        — Ed25519 signing key (never uploaded)

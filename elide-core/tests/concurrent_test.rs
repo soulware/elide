@@ -42,7 +42,7 @@ fn coordinator_gc_does_not_create_read_failures() {
     let mut oracle: HashMap<u64, Vec<u8>> = HashMap::new();
 
     // Seed phase: write two separate batches, flush each to a distinct
-    // segment, then drain both to segments/.  This gives the coordinator
+    // segment, then drain both to index/ + cache/.  This gives the coordinator
     // two candidates to compact.
     for lba in 0u64..4 {
         let data = vec![(lba as u8).wrapping_mul(11); 4096];
@@ -61,7 +61,7 @@ fn coordinator_gc_does_not_create_read_failures() {
     common::drain_local(&fork_dir);
 
     // Reader thread: continuously reads all seeded LBAs.  These are cold —
-    // they are in segments/, not in the WAL.  A read failure here means the
+    // they are in cache/, not in the WAL.  A read failure here means the
     // extent index still points at a file the coordinator has already deleted.
     let read_handle = handle.clone();
     let oracle_snap = oracle.clone();

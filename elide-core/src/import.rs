@@ -220,7 +220,9 @@ mod tests {
             Some((LBA_SIZE * 3) as u64)
         );
         assert!(vol_dir.join("pending").exists());
-        assert!(!vol_dir.join("segments").exists()); // coordinator drains pending/ → index/ + cache/
+        // import_image writes to pending/ only; cache/ is written by the coordinator
+        // after S3 upload (promote IPC). Verify import does not skip that step.
+        assert!(!vol_dir.join("cache").exists());
         // Readonly volumes must have volume.pub (for segment verification) but
         // must NOT have volume.key (private key must never be written to disk).
         assert!(

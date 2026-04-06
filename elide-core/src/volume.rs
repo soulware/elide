@@ -160,7 +160,7 @@ pub struct Volume {
     /// `snapshot()` to decide whether a new marker is needed or the latest
     /// existing snapshot can be reused.
     has_new_segments: bool,
-    /// ULID of the most recently committed segment across pending/ and segments/,
+    /// ULID of the most recently committed segment across pending/ and index/,
     /// or `None` if no segments exist. Used by `snapshot()` to name the snapshot
     /// marker with the same ULID as the segment it covers.
     last_segment_ulid: Option<Ulid>,
@@ -180,7 +180,7 @@ pub struct Volume {
     verifying_key: ed25519_dalek::VerifyingKey,
     /// Optional fetcher for demand-fetch on segment cache miss. When set,
     /// `find_segment_file` fetches missing segments from remote storage and
-    /// caches them in `segments/`. See `segment::SegmentFetcher`.
+    /// caches them in `cache/`. See `segment::SegmentFetcher`.
     fetcher: Option<BoxFetcher>,
     /// Monotonic ULID generator. Seeded from the highest known ULID at open
     /// (WAL filename or max segment). Used for all WAL and compaction outputs
