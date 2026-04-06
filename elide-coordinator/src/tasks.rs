@@ -122,15 +122,22 @@ pub async fn run_volume_tasks(
             break;
         }
 
-        // Skip drain/GC while an import is writing to this fork.
-        if fork_dir.join(IMPORT_LOCK_FILE).exists() {
+        // Skip drain/GC while an import is in its write phase (import.lock
+        // present but no control.sock yet).  When both are present the import
+        // is in its serve phase and is ready to handle promote IPC — fall
+        // through to the normal drain path.
+        if fork_dir.join(IMPORT_LOCK_FILE).exists() && !fork_dir.join("control.sock").exists() {
             continue;
         }
 
         // Steps 1-3: compact pending segments via volume IPC (best-effort;
         // skipped silently if the control socket is absent so that upload
         // still runs for forks without a live volume process).
-        if fork_dir.join("control.sock").exists() {
+        // Skipped for readonly volumes: flush/sweep/repack are WAL and
+        // compaction operations that only make sense for writable volumes.
+        // During an import serve phase, control.sock is bound by the import
+        // process which only handles promote IPC.
+        if fork_dir.join("control.sock").exists() && !fork_dir.join("volume.readonly").exists() {
             control::flush(&fork_dir).await;
 
             if let Some(s) = control::sweep_pending(&fork_dir).await

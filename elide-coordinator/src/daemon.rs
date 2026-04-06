@@ -104,9 +104,10 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
         let volumes = discover_volumes(&data_dir);
         for vol_dir in volumes {
-            // Skip volumes that are being actively imported — they will be picked
-            // up on the next scan pass once the import.lock is removed.
-            if vol_dir.join(import::LOCK_FILE).exists() {
+            // Skip volumes in the write phase of an import (import.lock present,
+            // no control.sock). The serve phase (both present) is handled normally
+            // — run_volume_tasks drains pending/ via promote IPC.
+            if vol_dir.join(import::LOCK_FILE).exists() && !vol_dir.join("control.sock").exists() {
                 continue;
             }
             let vol_ino = vol_dir.metadata().map(|m| m.ino()).unwrap_or(0);

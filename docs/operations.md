@@ -82,12 +82,14 @@ If `.idx` were written **after** the rename (the previous incorrect ordering), a
 1. Flush WAL — call `flush` on the volume via `control.sock` to push any pending WAL data to `pending/`
 2. Sweep — call `sweep_pending` on the volume via `control.sock`, merging small `pending/` segments
 3. Repack — call `repack` on the volume via `control.sock`, compacting sparse `pending/` segments
-4. Upload — read each `pending/` file, PUT to S3, rename to `segments/` on success
+4. Upload — read each `pending/` file, PUT to S3, send `promote <ulid>` IPC on success
 5. GC — if the GC interval has elapsed, call `gc_checkpoint` to get two output ULIDs, run a GC pass on `segments/`, and apply any completed handoffs (see Coordinator-driven segment GC below)
 
 Steps 1–4 run every tick; step 5 is rate-limited to a configurable `gc_interval` (default 5 minutes). All five steps run sequentially within a single task per fork. Because the coordinator is the only caller of sweep and repack, and upload follows immediately in the same task, there is no concurrent access to `pending/` and no race between compaction and upload.
 
 Steps 1–3 require `control.sock` to be present (volume running). If the socket is absent, those steps are skipped silently and the drain proceeds with upload only. Step 5 (GC) also requires the socket; if absent, the GC tick is skipped and retried next interval.
+
+**Import serve phase.** The drain loop skips a fork entirely when `import.lock` is present and `control.sock` is absent — the import process is still writing segments and the directory must not be touched. When both `import.lock` and `control.sock` are present, the import is in its serve phase and the drain loop runs as normal: steps 1–3 send IPC to the import's socket (the import responds `ok` to all; flush/sweep/repack are no-ops), step 4 uploads segments and sends `promote` IPC to the import, which writes `index/` + `cache/` files and removes `pending/<ulid>`. GC (step 5) is naturally skipped because the import process does not return valid ULIDs in response to `gc_checkpoint`. The import exits when `pending/` is empty.
 
 Segments that are dense at upload time will not need coordinator GC later — the S3 round-trip cost is only paid for extents whose LBAs are overwritten *after* upload.
 

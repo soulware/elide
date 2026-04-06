@@ -160,6 +160,62 @@ impl ObjectStore for FailStore {
     }
 }
 
+/// Spawn a mock control socket in `fork_dir` that handles `promote <ulid>` by
+/// writing index/ + cache/ and deleting pending/<ulid>, and responds "ok" to
+/// everything else.  Aborts its task on drop.
+struct MockSocket(tokio::task::JoinHandle<()>);
+impl Drop for MockSocket {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
+    let socket_path = fork_dir.join("control.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let dir = fork_dir.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                let (r, mut w) = stream.into_split();
+                let mut lines = BufReader::new(r).lines();
+                if let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(ulid_str) = line.strip_prefix("promote ") {
+                        let ulid_str = ulid_str.trim().to_owned();
+                        // Check gc/ first (GC handoff path), then pending/ (drain path).
+                        let gc_src = dir.join("gc").join(&ulid_str);
+                        let pending_src = dir.join("pending").join(&ulid_str);
+                        let (src, is_drain) = if gc_src.exists() {
+                            (gc_src, false)
+                        } else {
+                            (pending_src, true)
+                        };
+                        if src.exists() {
+                            let index_dir = dir.join("index");
+                            let cache_dir = dir.join("cache");
+                            std::fs::create_dir_all(&cache_dir).ok();
+                            let idx = index_dir.join(format!("{ulid_str}.idx"));
+                            let body = cache_dir.join(format!("{ulid_str}.body"));
+                            let present = cache_dir.join(format!("{ulid_str}.present"));
+                            elide_core::segment::extract_idx(&src, &idx).ok();
+                            elide_core::segment::promote_to_cache(&src, &body, &present).ok();
+                            if is_drain {
+                                std::fs::remove_file(&src).ok();
+                            }
+                        }
+                    }
+                }
+                w.write_all(b"ok\n").await.ok();
+            });
+        }
+    });
+    MockSocket(handle)
+}
+
 fn make_gc_config() -> GcConfig {
     // density_threshold=0.0 ensures any dead segment is compacted.
     // small_segment_bytes=MAX ensures all segments qualify for sweep.
@@ -653,9 +709,10 @@ fn drain_failure_skips_gc_and_data_survives() {
 
     // --- Tick N+1: drain succeeds, GC runs ---
     //
-    // On the next tick, drain succeeds with a working store.  GC then runs
-    // with pending/ empty and produces correct output.
+    // On the next tick, drain succeeds with a working store.  A mock control
+    // socket handles the promote IPC that drain_pending sends after upload.
     let good_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let _mock = rt.block_on(spawn_mock_socket(fork_dir.to_owned()));
     let drain_result2 = rt
         .block_on(upload::drain_pending(fork_dir, "test-vol", &good_store))
         .expect("drain should succeed with good store");

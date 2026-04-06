@@ -10,6 +10,8 @@
 // Raw ext4 (--from-file):
 //   1. Import the ext4 image directly into an Elide volume via elide_core::import
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -125,6 +127,7 @@ fn run_from_file(ext4_path: &Path, vol_dir: &Path) -> anyhow::Result<()> {
         }
     })?;
     write_meta(vol_dir, &ext4_path.display().to_string(), "", "")?;
+    serve_promote(vol_dir).context("serve promote IPC")?;
     eprintln!("Done. Volume ready at {}", vol_dir.display());
     Ok(())
 }
@@ -231,8 +234,122 @@ async fn run_oci(
     // 9. Write volume metadata
     write_meta(vol_dir, image, &digest, &target_arch.to_string())?;
 
+    // 10. Serve promote IPC until coordinator drains all pending/ segments.
+    serve_promote(vol_dir).context("serve promote IPC")?;
+
     eprintln!("Done. Volume ready at {}", vol_dir.display());
     Ok(())
+}
+
+// ── Promote IPC server ────────────────────────────────────────────────────────
+
+/// Serve the coordinator's `promote <ulid>` IPC until all pending/ segments
+/// have been promoted (pending/ is empty).
+///
+/// After `import_image` writes all segments to `pending/`, this function binds
+/// `control.sock` — signalling to the coordinator that the import is in serve
+/// phase and ready to handle promote requests.  Each promote writes
+/// `index/<ulid>.idx` and `cache/<ulid>.{body,present}` and removes the
+/// `pending/<ulid>` file.  The function returns when `pending/` is empty,
+/// then removes `control.sock`.
+///
+/// The coordinator may also send flush/sweep_pending/repack/gc_checkpoint; all
+/// non-promote commands receive an `ok` no-op response.
+fn serve_promote(vol_dir: &Path) -> anyhow::Result<()> {
+    let pending_dir = vol_dir.join("pending");
+    let index_dir = vol_dir.join("index");
+    let cache_dir = vol_dir.join("cache");
+
+    // Count pending segments (excluding .tmp files).
+    let pending_count = count_pending(&pending_dir);
+    if pending_count == 0 {
+        return Ok(());
+    }
+    eprintln!("Draining {pending_count} segment(s) to object store...");
+
+    std::fs::create_dir_all(&index_dir).context("create index dir")?;
+    std::fs::create_dir_all(&cache_dir).context("create cache dir")?;
+
+    let socket_path = vol_dir.join("control.sock");
+    // Remove any leftover socket from a previous interrupted run.
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).context("bind control.sock")?;
+
+    let result = serve_loop(&listener, &pending_dir, &index_dir, &cache_dir);
+    let _ = std::fs::remove_file(&socket_path);
+    result
+}
+
+fn serve_loop(
+    listener: &UnixListener,
+    pending_dir: &Path,
+    index_dir: &Path,
+    cache_dir: &Path,
+) -> anyhow::Result<()> {
+    loop {
+        if count_pending(pending_dir) == 0 {
+            break;
+        }
+        let (stream, _) = listener.accept().context("accept connection")?;
+        let mut reader = BufReader::new(&stream);
+        let mut writer = &stream;
+
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() {
+            continue;
+        }
+        let cmd = line.trim_end_matches('\n').trim_end_matches('\r');
+
+        if let Some(ulid_str) = cmd.strip_prefix("promote ") {
+            let ulid_str = ulid_str.trim();
+            // Validate ULID before using it as a path component.
+            let Ok(_ulid) = ulid::Ulid::from_string(ulid_str) else {
+                let _ = writer.write_all(b"err invalid ulid\n");
+                continue;
+            };
+            handle_promote(ulid_str, pending_dir, index_dir, cache_dir);
+        }
+        // All commands (including promote) receive "ok\n".
+        // Non-promote commands (flush, sweep_pending, repack, gc_checkpoint)
+        // are no-ops — the coordinator handles their absence gracefully.
+        let _ = writer.write_all(b"ok\n");
+    }
+    Ok(())
+}
+
+fn handle_promote(ulid_str: &str, pending_dir: &Path, index_dir: &Path, cache_dir: &Path) {
+    let segment_path = pending_dir.join(ulid_str);
+    if !segment_path.exists() {
+        return; // already promoted (idempotent)
+    }
+    let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+    let body_path = cache_dir.join(format!("{ulid_str}.body"));
+    let present_path = cache_dir.join(format!("{ulid_str}.present"));
+
+    if let Err(e) = elide_core::segment::extract_idx(&segment_path, &idx_path) {
+        eprintln!("WARN: extract_idx for {ulid_str}: {e}");
+        return;
+    }
+    if let Err(e) = elide_core::segment::promote_to_cache(&segment_path, &body_path, &present_path)
+    {
+        eprintln!("WARN: promote_to_cache for {ulid_str}: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(&segment_path) {
+        eprintln!("WARN: remove pending/{ulid_str}: {e}");
+    }
+}
+
+/// Count non-.tmp files in `pending_dir`.  Returns 0 if the directory is
+/// absent or unreadable.
+fn count_pending(pending_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(pending_dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(|n| !n.ends_with(".tmp")))
+        .count()
 }
 
 // ── Manifest resolution ───────────────────────────────────────────────────────

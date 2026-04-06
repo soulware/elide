@@ -60,13 +60,13 @@ The split keeps the volume process binary lean and focused. The async HTTP stack
 needed for OCI registry pulls belongs in tooling (`elide-import`), not in the
 process that serves block I/O.
 
-**Import model.** `elide volume import <name> <oci-ref>` is a user-facing CLI command that asks the coordinator to spawn `elide-import` as a supervised short-lived process. The coordinator creates the volume directory, writes an `import.lock` marker, spawns `elide-import`, streams its output to any attached clients, and cleans up the lock on exit. The import produces a single readonly volume at `<data-dir>/<name>/` with no `wal/` directory. To get a writable copy, the user runs `elide volume fork <name> <new-name>` after the import completes. The import ULID returned by the coordinator is the handle for status polling and output streaming. `elide-import` remains a separate binary because of its heavy OCI/async dependencies; the `elide` CLI is the user-facing surface.
+**Import model.** `elide volume import <name> <oci-ref>` is a user-facing CLI command that asks the coordinator to spawn `elide-import` as a supervised process. The coordinator creates the volume directory, writes an `import.lock` marker, spawns `elide-import`, and streams its output to attached clients. The import process runs in two phases: a **write phase** (segments written to `pending/`) followed by a **serve phase** (the import binds `control.sock` and handles `promote` IPC from the coordinator until `pending/` is empty). The coordinator removes `import.lock` when the process exits. The import produces a single readonly volume at `<data-dir>/<name>/` with no `wal/` directory. To get a writable copy, the user runs `elide volume fork <name> <new-name>` after the import completes. The import ULID returned by the coordinator is the handle for status polling and output streaming. `elide-import` remains a separate binary because of its heavy OCI/async dependencies; the `elide` CLI is the user-facing surface.
 
 ## Correctness foundations
 
 Four mechanisms compose to guarantee that any read returns correct data, whether the segment body is present locally or must be demand-fetched from S3:
 
-**Directory structure encodes lifecycle state.** `pending/`, `index/`, `cache/`, and `gc/` are not interchangeable storage tiers — they encode what is known about a segment at each point in its life. `pending/` means "written locally, not yet in S3". `index/<ulid>.idx` means "coordinator-confirmed in S3; LBA index permanently available". `cache/<ulid>.body` means "body bytes locally cached; safe to evict — S3 is authoritative". `gc/<ulid>` during an `.applied` handoff means "volume-signed, coordinator uploading". The coordinator is the sole writer of `index/`, and writes `index/<ulid>.idx` only after confirmed S3 upload. `cache/<ulid>.{body,present}` is written alongside `index/<ulid>.idx` and deleted by the coordinator on eviction or GC cleanup. This makes the directory a machine-readable record of durability state, inspectable with standard tools without any binary decoding.
+**Directory structure encodes lifecycle state.** `pending/`, `index/`, `cache/`, and `gc/` are not interchangeable storage tiers — they encode what is known about a segment at each point in its life. `pending/` means "written locally, not yet in S3". `index/<ulid>.idx` means "coordinator-confirmed in S3; LBA index permanently available". `cache/<ulid>.body` means "body bytes locally cached; safe to evict — S3 is authoritative". `gc/<ulid>` during an `.applied` handoff means "volume-signed, coordinator uploading". The process controlling a volume directory is the sole writer of `index/` and `cache/`: the volume process for writable volumes, the import process for readonly volumes during its serve phase. In both cases the write is triggered by the coordinator's `promote <ulid>` IPC after confirmed S3 upload. `cache/<ulid>.{body,present}` is written alongside `index/<ulid>.idx`; the volume may also write `cache/` on demand-fetch. This makes the directory a machine-readable record of durability state, inspectable with standard tools without any binary decoding.
 
 **ULIDs enforce total ordering.** Every segment has a ULID assigned at creation by the volume's own clock. ULIDs give a total order used in three places: (1) LBA map rebuild replays segments oldest-first, so the newest write for any LBA wins unambiguously; (2) fork ancestry walks stop at a ULID cutoff, preventing post-branch ancestor writes from leaking into derived volumes; (3) GC output ULIDs are derived as `max(inputs).increment()`, placing the output strictly after its inputs so concurrent writes always win in rebuild ordering. No external clock synchronisation is required — all ordering decisions are local to the volume's write history.
 
@@ -150,7 +150,7 @@ The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snaps
 - `volume.parent` present → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
 - `manifest.toml` present on OCI-imported volumes and on volumes reconstructed via `remote pull`
-- `import.lock` present only while an import is running or interrupted
+- `import.lock` present while an import is in progress (write phase) or in serve phase (handling promote IPC) or was interrupted
 - **`index/<ulid>.idx` present** means the volume has flushed segment `<ulid>` to `pending/` (or applied a GC handoff producing it). The volume writes `index/<ulid>.idx` at two points: (1) when flushing the WAL to `pending/<ulid>`; (2) when applying a GC handoff — writing `index/<new>.idx` from `gc/<new>` and deleting `index/<old>.idx` for each consumed input. `index/` is never written by the coordinator. `index/<ulid>.idx` files are never evicted — they are the permanent LBA index for all segments the volume has ever created or compacted.
 - **`pending/<ulid>` absent ↔ segment `<ulid>` is confirmed in S3.** The volume deletes `pending/<ulid>` as part of responding to the coordinator's `promote` IPC, which the coordinator issues only after a confirmed S3 upload. If `pending/<ulid>` exists, the segment has not yet been confirmed in S3. `cache/<ulid>.body` and `cache/<ulid>.present` are volume-owned: written by the volume on `promote` response and on demand-fetch; may be evicted by the volume at any time; their absence means body bytes must be fetched from S3.
 
@@ -158,7 +158,7 @@ The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snaps
 
 **Exclusive access:** a live volume holds an exclusive `flock` on `<vol-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked volume fails immediately.
 
-**Import lock:** `<vol-dir>/import.lock` (plain text, one line: the import job ULID) is present while an import process is running or was interrupted. The coordinator removes it on clean import exit. Cleaned up on the next coordinator startup or rescan pass if stale. See *Import process lifecycle* below.
+**Import lock:** `<vol-dir>/import.lock` (plain text, one line: the import job ULID) is present for the full lifetime of the import process: both the write phase (segments being written to `pending/`) and the serve phase (import handling `promote` IPC). The coordinator removes it when the process exits. A `control.sock` alongside `import.lock` signals that the import is in the serve phase and the coordinator may send IPC. Cleaned up on the next coordinator startup if stale. See *Import process lifecycle* below.
 
 **Stopped marker:** `<vol-dir>/volume.stopped` is written by the coordinator when a volume is explicitly stopped via `volume stop` or `coordinator quiesce`. While present, the supervisor will not start or restart the volume process. Removed by `volume start`. Persists across coordinator restarts.
 
@@ -168,7 +168,8 @@ The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snaps
 |---|---|
 | `volume.pid` alive | running — volume process is serving I/O |
 | `volume.stopped` | explicitly stopped — coordinator will not restart |
-| `import.lock` | import in progress or interrupted |
+| `import.lock` (no `control.sock`) | import write phase or interrupted |
+| `import.lock` + `control.sock` | import serve phase — coordinator may send IPC |
 | `volume.readonly` | readonly — coordinator never supervises |
 | none of the above | idle — coordinator will start the volume process |
 
@@ -607,11 +608,19 @@ OCI import is a potentially long-running operation. The coordinator supervises i
 
 To get a writable copy, the user runs `elide volume fork <name> <new-name>` after import completes. This is an explicit step, not automatic.
 
-### `import.lock`
+### `import.lock` and the two-phase lifecycle
 
 When the coordinator begins an import it writes `<data_dir>/<name>/import.lock` containing a single line: the import ULID. This file is the source of truth for "an import is in progress or was interrupted here". The coordinator removes the file when the import process exits (whether success or failure).
 
 The ULID in `import.lock` matches the ULID returned to the caller by `import <name> <oci-ref>`. This lets an operator correlate a lock file with coordinator logs or `import status` output.
+
+The import process runs in two sequential phases:
+
+**Write phase:** `elide-import` writes all segments directly into `pending/`. During this phase only `import.lock` is present (no `control.sock`). The coordinator sees this combination and skips drain entirely — segments are still being written and must not be uploaded mid-stream.
+
+**Serve phase:** once all segments are written, the import process binds `control.sock` and enters a blocking loop that handles `promote <ulid>` IPC from the coordinator. Each promote causes the import to call `extract_idx` + `promote_to_cache` + remove `pending/<ulid>`. The import exits when `pending/` is empty, then removes `control.sock` before exiting.
+
+The transition from write phase to serve phase is atomic from the coordinator's perspective: `control.sock` appears only when the import is fully ready to handle promote requests.
 
 ### Concurrency guard
 
@@ -619,15 +628,17 @@ The coordinator enforces mutual exclusion between volume processes and import pr
 
 - Before spawning an import: check `volume.pid` — if a process is alive, refuse with `err volume already running`
 - Before spawning a volume: check `import.lock` — if present, skip this volume (logged as a warning; no volume is started until the lock is cleared)
-- The drain loop skips any volume directory that has an `import.lock` present
+- The drain loop skips any volume directory that has `import.lock` present **and** no `control.sock` (write phase in progress). When both `import.lock` and `control.sock` are present (serve phase), the drain loop runs as normal — GC is naturally skipped because the import process does not respond to `gc_checkpoint` with valid ULIDs.
 
 ### Stale lock detection and cleanup
 
-A crash (coordinator or import process) can leave `import.lock` behind with no matching live process. On every coordinator startup and rescan pass, the coordinator checks each `import.lock`:
+A crash (coordinator or import process) can leave `import.lock` behind with no matching live process. On every coordinator startup, the coordinator checks each `import.lock`:
 
 1. Read the ULID from the file
 2. If no import job with that ULID is tracked in memory, check whether any process wrote `import.pid` alongside the lock
-3. If no live process is found: remove the lock, log a warning including the ULID and volume path
+3. If a live process is found **and** `control.sock` is present: the import is in serve phase and doing useful work — leave it running. The coordinator will begin draining against it on the next tick.
+4. If a live process is found but no `control.sock`: the import was mid-write when the coordinator restarted — send SIGTERM (write phase must be restarted clean)
+5. If no live process is found: remove the lock, log a warning including the ULID and volume path
 
 The volume directory is left intact — it may contain partial segment data useful for debugging. After the stale lock is removed, the coordinator resumes normal supervision of the volume.
 
@@ -854,7 +865,7 @@ The per-ancestor ULID cutoff is what prevents a concurrently-written ancestor fr
 
 ### Single-writer invariant
 
-**Each volume directory has exactly one process that writes new segments into it.** The volume process that holds `volume.key` is the sole writer of `pending/`. The coordinator is the sole writer of `index/` and `cache/` — it writes `index/<ulid>.idx` and `cache/<ulid>.{body,present}` only after confirmed S3 upload (draining from `pending/` or uploading a GC output from `gc/`). The coordinator writes only to `gc/` as a staging area; the volume re-signs the coordinator's staged output in-place within `gc/`, then the coordinator uploads it to S3 and writes the resulting `index/` and `cache/` files. Crucially, the coordinator derives the output ULID from the volume's existing write history (`max(input ULIDs).increment()`) rather than from its own wall clock. The coordinator does not author an independent position in the volume's timeline — it extends the sequence by one step from where the volume left off.
+**Each volume directory has exactly one process that writes new segments into it.** For writable volumes, the volume process (holding `volume.key`) is the sole writer of `pending/`, `index/`, and `cache/` — `index/<ulid>.idx` and `cache/<ulid>.{body,present}` are written by the volume in response to the coordinator's `promote <ulid>` IPC, which the coordinator sends only after confirmed S3 upload. For readonly/imported volumes, the import process is the sole writer of `pending/` during the write phase and writes `index/` + `cache/` during its serve phase, also in response to `promote` IPC. The coordinator writes only to `gc/` as a staging area; the volume re-signs the coordinator's staged output in-place within `gc/`, then the coordinator uploads it to S3 and triggers `promote` IPC so the volume writes the resulting `index/` and `cache/` files. Crucially, the coordinator derives the output ULID from the volume's existing write history (`max(input ULIDs).increment()`) rather than from its own wall clock. The coordinator does not author an independent position in the volume's timeline — it extends the sequence by one step from where the volume left off.
 
 This invariant is what makes ULID total-order sufficient for all correctness guarantees in rebuild, GC, and ancestor cutoff:
 
@@ -993,7 +1004,9 @@ Import is handled by `elide volume import <name> <oci-ref>`, which asks the coor
 
 **Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The snapshot ULID matches the ULID of the last committed segment, making the branch point self-describing. If no new segments have been committed since the latest existing snapshot, the operation is idempotent — it returns the existing snapshot ULID without writing a new marker. The volume remains live; no directory structure changes.
 
-**Import procedure:** the import path writes data directly into `<vol-dir>/pending/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. The `volume.size` marker and `manifest.toml` (OCI source metadata) are written into the volume directory. The coordinator's normal drain loop then uploads the `pending/` segments to S3 and moves them to `index/` + `cache/`.
+**Import procedure:** the import path writes data directly into `<vol-dir>/pending/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. The `volume.size` marker and `manifest.toml` (OCI source metadata) are written into the volume directory.
+
+The import process then enters its serve phase: it binds `control.sock` and handles `promote <ulid>` IPC from the coordinator. Each promote call causes the import to write `index/<ulid>.idx` and `cache/<ulid>.{body,present}`, then remove `pending/<ulid>`. This keeps the same ownership boundary as writable volumes: the process that controls the directory performs the `pending/ → index/ + cache/` transition in response to coordinator IPC. The import exits when `pending/` is empty.
 
 **S3 upload for volume metadata:** at import, fork, and create time, two objects are written to the store eagerly: `names/<name>` (contains the ULID, plain text) and `by_id/<ulid>/manifest.toml` (name, size, origin, source metadata). Snapshot markers are uploaded as empty objects at `by_id/<ulid>/snapshots/YYYYMMDD/<snapshot-ulid>` after each `volume snapshot` and at the end of import. Together these allow any host to reconstruct the full volume ancestry skeleton with O(depth) GETs before segment index prefetch begins. See *S3 object layout* in `docs/formats.md` for the full key structure.
 

@@ -200,11 +200,23 @@ proptest! {
                     // promote_segment directly on the volume.
                     simulate_upload(&vol, fork_dir);
 
+                    // Count idx files before gc_checkpoint so we can detect
+                    // any new segments it writes (WAL flush).  Those segments
+                    // land in pending/ without a cache body, so collect_stats
+                    // skips them — they will not be compacted this sweep and
+                    // legitimately remain in index/ after GC.
+                    let idx_pre_checkpoint: usize = fs::read_dir(&index_dir)
+                        .map(|d| d.flatten().count())
+                        .unwrap_or(0);
+
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
 
                     let idx_before: usize = fs::read_dir(&index_dir)
                         .map(|d| d.flatten().count())
                         .unwrap_or(0);
+                    // Segments added by gc_checkpoint (WAL flush) are excluded
+                    // from this GC pass and survive into the next tick.
+                    let checkpoint_extra = idx_before.saturating_sub(idx_pre_checkpoint);
 
                     let gc_stats = rt.block_on(gc_fork(
                         fork_dir,
@@ -234,15 +246,23 @@ proptest! {
 
                     if let Ok(stats) = gc_stats {
                         if stats.strategy != GcStrategy::None {
-                            // After GC, index/ should have ≤1 .idx file (old ones deleted).
+                            // After GC, index/ should have ≤1 .idx file from
+                            // the compacted set, plus any segments that
+                            // gc_checkpoint wrote this tick (they were excluded
+                            // from compaction because their cache body is not
+                            // yet present and will be drained next tick).
                             let idx_after: usize = fs::read_dir(&index_dir)
                                 .map(|d| d.flatten().count())
                                 .unwrap_or(0);
+                            let idx_max = 1 + checkpoint_extra;
                             prop_assert!(
-                                idx_after <= 1,
-                                "after GcSweep on {} segments, {} .idx files remain (expected ≤1)",
+                                idx_after <= idx_max,
+                                "after GcSweep on {} segments, {} .idx files remain \
+                                 (expected ≤{}: 1 GC output + {} checkpoint segment(s))",
                                 idx_before,
-                                idx_after
+                                idx_after,
+                                idx_max,
+                                checkpoint_extra
                             );
                             // cache/ .body files: same count as .idx files.
                             let bodies_after: usize = fs::read_dir(&cache_dir)
