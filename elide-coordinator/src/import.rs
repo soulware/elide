@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -105,6 +105,7 @@ pub async fn spawn_import(
     data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
+    rescan_notify: Arc<Notify>,
 ) -> std::io::Result<String> {
     validate_volume_name(vol_name)?;
 
@@ -180,6 +181,26 @@ pub async fn spawn_import(
         .lock()
         .await
         .insert(import_ulid.clone(), job.clone());
+
+    // Watch for the import to enter the serve phase (control.sock appears) and
+    // trigger an immediate rescan so the coordinator starts draining without
+    // waiting up to scan_interval_secs.
+    {
+        let watch_dir = vol_dir.clone();
+        let watch_lock = vol_dir.join(LOCK_FILE);
+        tokio::spawn(async move {
+            loop {
+                if watch_dir.join("control.sock").exists() {
+                    rescan_notify.notify_one();
+                    break;
+                }
+                if !watch_lock.exists() {
+                    break; // import finished or failed before entering serve phase
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
 
     let import_ulid_clone = import_ulid.clone();
     tokio::spawn(async move {

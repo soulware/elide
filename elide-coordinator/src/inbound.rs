@@ -88,14 +88,14 @@ async fn handle(
         return;
     }
 
-    let response = dispatch(&line, &data_dir, &rescan, &registry, &elide_import_bin).await;
+    let response = dispatch(&line, &data_dir, rescan, &registry, &elide_import_bin).await;
     let _ = writer.write_all(format!("{response}\n").as_bytes()).await;
 }
 
 async fn dispatch(
     line: &str,
     data_dir: &Path,
-    rescan: &Notify,
+    rescan: Arc<Notify>,
     registry: &ImportRegistry,
     elide_import_bin: &Path,
 ) -> String {
@@ -138,7 +138,7 @@ async fn dispatch(
                     if sub_args.is_empty() {
                         return "err usage: import <name> <oci-ref>".to_string();
                     }
-                    start_import(sub, sub_args, data_dir, elide_import_bin, registry).await
+                    start_import(sub, sub_args, data_dir, elide_import_bin, registry, &rescan).await
                 }
             }
         }
@@ -165,8 +165,18 @@ async fn start_import(
     data_dir: &Path,
     elide_import_bin: &Path,
     registry: &ImportRegistry,
+    rescan: &Arc<Notify>,
 ) -> String {
-    match import::spawn_import(vol_name, oci_ref, data_dir, elide_import_bin, registry).await {
+    match import::spawn_import(
+        vol_name,
+        oci_ref,
+        data_dir,
+        elide_import_bin,
+        registry,
+        rescan.clone(),
+    )
+    .await
+    {
         Ok(ulid) => format!("ok {ulid}"),
         Err(e) => format!("err {e}"),
     }
