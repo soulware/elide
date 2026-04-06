@@ -562,6 +562,22 @@ fn collect_stats(
         let (_, entries) = segment::read_and_verify_segment_index(&idx_path, vk)?;
         let body_section_start = 0u64;
 
+        // Skip segments with a partial body: demand-fetch populates entries on
+        // demand, so the body file may exist but not all entries are present.
+        // GC's read_extent_bodies reads raw bytes directly — it cannot
+        // demand-fetch missing entries and would fail with UnexpectedEof.
+        let present_path = cache_dir.join(format!("{ulid_str}.present"));
+        let all_present = entries.iter().enumerate().all(|(i, e)| {
+            if e.is_dedup_ref || e.is_inline || e.is_zero_extent {
+                true
+            } else {
+                segment::check_present_bit(&present_path, i as u32).unwrap_or(false)
+            }
+        });
+        if !all_present {
+            continue;
+        }
+
         let mut live_bytes: u64 = 0;
         let mut total_body_bytes: u64 = 0;
         let mut live_entries: Vec<SegmentEntry> = Vec::new();

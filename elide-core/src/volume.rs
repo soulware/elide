@@ -1055,12 +1055,37 @@ impl Volume {
                     .copied()
                     .collect();
                 if !stale.is_empty() {
-                    let hex: Vec<String> = stale.iter().map(|h| h.to_hex().to_string()).collect();
+                    let details: Vec<String> = stale
+                        .iter()
+                        .map(|h| {
+                            let lbas = self.lbamap.lbas_for_hash(h);
+                            let in_pending = self.pending_entries.iter().any(|e| &e.hash == h);
+                            let seg = self
+                                .extent_index
+                                .lookup(h)
+                                .map(|loc| {
+                                    format!("seg={} off={}", loc.segment_id, loc.body_offset)
+                                })
+                                .unwrap_or_else(|| "not-in-extent-index".to_string());
+                            let old_ulid = old_ulid_by_hash
+                                .get(h)
+                                .map(|u| u.to_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            format!(
+                                "{}: lbas={:?} in_pending_entries={} {} old_ulid={}",
+                                &h.to_hex()[..12],
+                                lbas,
+                                in_pending,
+                                seg,
+                                old_ulid,
+                            )
+                        })
+                        .collect();
                     log::warn!(
                         "GC handoff {name}: stale-liveness cancellation — {} hash(es) live \
-                         in volume but absent from coordinator output; re-running next tick. \
-                         hashes: {hex:?}",
-                        stale.len()
+                         in volume but absent from coordinator output; re-running next tick.\n  {}",
+                        stale.len(),
+                        details.join("\n  "),
                     );
                     let _ = fs::remove_file(gc_dir.join(name)); // .pending
                     if gc_seg_path.try_exists()? {
@@ -1640,7 +1665,26 @@ pub(crate) fn read_extents(
             let mut compressed_buf = vec![0u8; body_length as usize];
             f.read_exact(&mut compressed_buf)?;
             let decompressed =
-                lz4_flex::decompress_size_prepended(&compressed_buf).map_err(io::Error::other)?;
+                lz4_flex::decompress_size_prepended(&compressed_buf).map_err(|e| {
+                    let (cached_id, is_body_ref, _) = cache.as_ref().expect("cache assigned above");
+                    log::error!(
+                        "lz4 decompression failed: lba={} segment={} cached_id={} is_body={} \
+                     bss={} body_offset={} body_length={} entry_idx={:?} \
+                     file_body_offset={} first_bytes={:?} err={}",
+                        lba,
+                        segment_id,
+                        cached_id,
+                        is_body_ref,
+                        body_section_start,
+                        body_offset,
+                        body_length,
+                        entry_idx,
+                        file_body_offset,
+                        &compressed_buf[..compressed_buf.len().min(16)],
+                        e,
+                    );
+                    io::Error::other(e)
+                })?;
             let src_start = er.payload_block_offset as usize * 4096;
             let src_end = src_start + block_count * 4096;
             let src_slice = decompressed.get(src_start..src_end).ok_or_else(|| {
