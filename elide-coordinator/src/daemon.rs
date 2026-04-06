@@ -125,7 +125,8 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
                 let (evict_tx, evict_rx) = tokio::sync::mpsc::channel(4);
                 evict_registry
-                    .blocking_lock()
+                    .lock()
+                    .await
                     .insert(vol_dir.clone(), evict_tx);
 
                 tasks.spawn(elide_coordinator::tasks::run_volume_tasks(
