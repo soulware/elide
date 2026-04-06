@@ -755,12 +755,13 @@ pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 ///
 /// These are segments that the volume has re-signed in-place within `gc/` and
 /// acknowledged (`.applied` marker written), but that the coordinator has not
-/// yet uploaded and moved to `segments/`.  They must be included in LBA map
-/// and extent index rebuild at lower priority than `segments/` entries so the
-/// original input segments (still in `segments/`) win for any LBA they cover.
+/// yet uploaded to S3 and written `index/<new>.idx` for.  They must be included
+/// in LBA map and extent index rebuild at lower priority than `index/*.idx`
+/// entries so the original input segments (still in `index/`) win for any LBA
+/// they cover.
 ///
 /// Bodies with `.pending` markers (coordinator-signed, not yet volume-applied)
-/// are excluded — the old input segments in `segments/` are still authoritative.
+/// are excluded — the old input segments referenced by `index/` are still authoritative.
 pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let gc_dir = fork_dir.join("gc");
     match fs::read_dir(&gc_dir) {
@@ -885,12 +886,8 @@ pub fn set_present_bit(path: &Path, entry_idx: u32, entry_count: u32) -> io::Res
 pub fn sort_for_rebuild(fork_dir: &Path, paths: &mut Vec<PathBuf>) {
     let gc_dir = fork_dir.join("gc");
     // Partition by source directory: paths from gc/ are in-flight GC outputs
-    // (lower priority); paths from pending/ or segments/ are regular (higher
-    // priority).
-    //
-    // Because segments/ now only contains S3-confirmed bodies, there is no
-    // need to cross-reference sidecar files in gc/ to identify GC outputs —
-    // the source directory is the authoritative signal.
+    // (lower priority); paths from pending/ are regular (higher priority).
+    // The source directory is the authoritative signal.
     let mut gc_paths: Vec<PathBuf> = Vec::new();
     let mut non_gc_paths: Vec<PathBuf> = Vec::new();
     for p in paths.drain(..) {
@@ -1258,13 +1255,13 @@ mod tests {
     fn make_fork_dir() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
         let fork_dir = tmp.path().to_path_buf();
-        fs::create_dir_all(fork_dir.join("segments")).unwrap();
+        fs::create_dir_all(fork_dir.join("pending")).unwrap();
         fs::create_dir_all(fork_dir.join("gc")).unwrap();
         (tmp, fork_dir)
     }
 
     fn seg_path(fork_dir: &Path, ulid: &str) -> PathBuf {
-        fork_dir.join("segments").join(ulid)
+        fork_dir.join("pending").join(ulid)
     }
 
     fn gc_path(fork_dir: &Path, ulid: &str) -> PathBuf {
@@ -1288,10 +1285,10 @@ mod tests {
     }
 
     #[test]
-    fn sort_for_rebuild_segments_dir_path_is_not_gc_output() {
-        // A path in segments/ is always regular (higher priority), even if a
+    fn sort_for_rebuild_pending_dir_path_is_not_gc_output() {
+        // A path in pending/ is always regular (higher priority), even if a
         // .done sidecar exists in gc/ — .done means the handoff is complete and
-        // the old inputs are already gone; the body in segments/ is S3-confirmed.
+        // the old inputs are already gone.
         let (_tmp, fork_dir) = make_fork_dir();
         let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
         let path = seg_path(&fork_dir, ulid);

@@ -35,7 +35,7 @@ use crate::signing;
 /// Physical location of an extent within a segment file.
 #[derive(Clone)]
 pub struct ExtentLocation {
-    /// ULID of the segment (filename in wal/, pending/, or segments/).
+    /// ULID of the segment (filename in wal/, pending/, gc/, or index/).
     pub segment_id: Ulid,
     /// Body-relative byte offset of the start of the payload (= `stored_offset`
     /// from the segment index). For WAL entries, equals the absolute WAL file
@@ -51,7 +51,7 @@ pub struct ExtentLocation {
     pub entry_idx: Option<u32>,
     /// Absolute offset of the body section within the full segment file.
     /// 0 for WAL entries and `.body` cache files (both start at byte 0 of
-    /// the body data). Non-zero for entries in `pending/` or `segments/` files.
+    /// the body data). Non-zero for entries in `pending/` or `gc/*.applied` files.
     /// The actual seek position for a read is `body_section_start + body_offset`.
     /// Also used to compute the store range-GET start for per-extent fetching.
     pub body_section_start: u64,
@@ -107,22 +107,11 @@ impl Default for ExtentIndex {
 
 /// Rebuild the extent index from all committed segments across an ancestor chain.
 ///
-/// `node_chain` is ordered oldest-first (root ancestor first, live node last).
-/// Each node's `pending/` and `segments/` are scanned in ULID order. Later
-/// entries for the same hash overwrite earlier ones (same segment ULID is
-/// globally unique, so this only matters across layers for moved extents after
-/// GC repacking).
-///
-/// Inline entries and dedup-ref entries are skipped:
-/// - Inline entries: read path not yet implemented (INLINE_THRESHOLD = 0).
-/// - Dedup-ref entries: no body in this segment; the hash is already indexed
-///   from the ancestor segment that holds the actual data.
-///
 /// Rebuild the extent index from all committed segments across a fork ancestry chain.
 ///
 /// `layers` is ordered oldest-first (root ancestor first, live fork last).
 /// Each element is `(fork_dir, branch_ulid)`:
-/// - `fork_dir`: the fork directory containing `pending/` and `segments/`.
+/// - `fork_dir`: the fork directory containing `pending/`, `index/`, and `cache/`.
 /// - `branch_ulid`: if `Some`, only segments whose ULID string is ≤ this value
 ///   are included. `None` means include all segments (used for the live fork).
 ///
@@ -136,9 +125,10 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
     let mut index = ExtentIndex::new();
 
     for (fork_dir, branch_ulid) in layers {
-        // Process index/*.idx first (body-relative offsets). pending/ and
-        // segments/ are processed after, so their absolute-offset entries win
-        // when the same segment is present in both places.
+        // Process index/*.idx first (body-relative offsets). pending/ is
+        // processed after, so its absolute-offset entries win when the same
+        // segment is present in both index/ and pending/ (e.g. coordinator
+        // crash between writing index/ and deleting pending/).
         let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
         cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
         if let Some(cutoff) = branch_ulid {

@@ -250,11 +250,6 @@ impl Default for LbaMap {
 
 // --- rebuild from disk ---
 
-/// Rebuild the LBA map from all committed segments.
-///
-/// Scans `<base>/pending/` and `<base>/segments/` in ULID order (oldest
-/// first). Reads the index section of each segment file. Directories that do
-/// not exist are silently skipped.
 /// Rebuild the LBA map from all committed segments across a fork ancestry chain.
 ///
 /// `layers` is ordered oldest-first (root ancestor first, live fork last).

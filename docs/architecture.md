@@ -66,15 +66,15 @@ process that serves block I/O.
 
 Four mechanisms compose to guarantee that any read returns correct data, whether the segment body is present locally or must be demand-fetched from S3:
 
-**Directory structure encodes lifecycle state.** `pending/`, `segments/`, and `gc/` are not interchangeable cache tiers — they encode what is known about a segment at each point in its life. `pending/` means "written locally, not yet in S3". `segments/` means "confirmed in S3; safe to evict". `gc/<ulid>` during a `.applied` handoff means "volume-signed, coordinator uploading". The coordinator is the sole writer of `segments/`, and writes there only after confirmed S3 upload. This makes the directory a machine-readable record of durability state, inspectable with standard tools without any binary decoding.
+**Directory structure encodes lifecycle state.** `pending/`, `index/`, `cache/`, and `gc/` are not interchangeable storage tiers — they encode what is known about a segment at each point in its life. `pending/` means "written locally, not yet in S3". `index/<ulid>.idx` means "coordinator-confirmed in S3; LBA index permanently available". `cache/<ulid>.body` means "body bytes locally cached; safe to evict — S3 is authoritative". `gc/<ulid>` during an `.applied` handoff means "volume-signed, coordinator uploading". The coordinator is the sole writer of `index/`, and writes `index/<ulid>.idx` only after confirmed S3 upload. `cache/<ulid>.{body,present}` is written alongside `index/<ulid>.idx` and deleted by the coordinator on eviction or GC cleanup. This makes the directory a machine-readable record of durability state, inspectable with standard tools without any binary decoding.
 
 **ULIDs enforce total ordering.** Every segment has a ULID assigned at creation by the volume's own clock. ULIDs give a total order used in three places: (1) LBA map rebuild replays segments oldest-first, so the newest write for any LBA wins unambiguously; (2) fork ancestry walks stop at a ULID cutoff, preventing post-branch ancestor writes from leaking into derived volumes; (3) GC output ULIDs are derived as `max(inputs).increment()`, placing the output strictly after its inputs so concurrent writes always win in rebuild ordering. No external clock synchronisation is required — all ordering decisions are local to the volume's write history.
 
-**Signatures enforce authorship integrity.** Only the process holding `volume.key` can produce valid segment signatures. The coordinator does not hold this key — it stages GC output in `gc/` with an ephemeral key; the volume re-signs before the coordinator uploads. Signature verification is enforced on every segment read from `pending/` and `segments/`. Together with the exclusive `volume.lock` flock, this makes the single-writer property cryptographically verifiable: not only is there at most one writer at a time, but any segment that exists in the directory was authored by that writer.
+**Signatures enforce authorship integrity.** Only the process holding `volume.key` can produce valid segment signatures. The coordinator does not hold this key — it stages GC output in `gc/` with an ephemeral key; the volume re-signs before the coordinator uploads. Signature verification is enforced on every segment read from `pending/` and `gc/*.applied`. Together with the exclusive `volume.lock` flock, this makes the single-writer property cryptographically verifiable: not only is there at most one writer at a time, but any segment that exists in the directory was authored by that writer.
 
-**The handoff protocol enforces GC correctness.** Coordinator GC compacts segments without taking the volume offline. The three-state handoff (`pending` → `applied` → `done`) ensures: no segment is deleted without the volume's explicit acknowledgment; no GC output reaches `segments/` before it is S3-confirmed; and all crash/restart interleavings leave the system in a recoverable state. The safety invariants — no extent references a missing segment, no segment is removed while referenced — are verified across all interleavings by the TLA+ model in `specs/HandoffProtocol.tla`.
+**The handoff protocol enforces GC correctness.** Coordinator GC compacts segments without taking the volume offline. The three-state handoff (`pending` → `applied` → `done`) ensures: no segment is deleted without the volume's explicit acknowledgment; no GC output is uploaded to S3 before the volume has re-signed it; and all crash/restart interleavings leave the system in a recoverable state. The safety invariants — no extent references a missing segment, no segment is removed while referenced — are verified across all interleavings by the TLA+ model in `specs/HandoffProtocol.tla`.
 
-**Together:** the directory structure ensures every file in `segments/` is redundant with S3 (so eviction is always safe), ULIDs ensure the LBA map is always reconstructable from whatever segments are present, signatures ensure that what is reconstructed was written by the authorised writer, and the handoff protocol ensures GC transitions never break the first three properties. The result: any read can be served correctly from local storage, or — when bodies are absent — by demand-fetching from S3 with the guarantee that the index is accurate and the data is authentic.
+**Together:** the directory structure ensures every `cache/` body is redundant with S3 (so eviction is always safe) and every `index/<ulid>.idx` guarantees the segment exists in S3, ULIDs ensure the LBA map is always reconstructable from whatever index and pending files are present, signatures ensure that what is reconstructed was written by the authorised writer, and the handoff protocol ensures GC transitions never break the first three properties. The result: any read can be served correctly from local storage, or — when bodies are absent from `cache/` — by demand-fetching from S3 with the guarantee that the index is accurate and the data is authentic.
 
 ## Directory layout
 
@@ -95,9 +95,8 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
       volume.provenance               — hostname + canonical path + sig (local sanity check; never uploaded)
       manifest.toml                   — name, size, OCI source metadata
       pending/                        — segments awaiting S3 upload (populated by import)
-      segments/                       — segments confirmed in S3 (empty until drain completes)
       index/                          — coordinator-written LBA index files (01JQXXXXX.idx)
-      cache/                          — volume-managed demand-fetch body cache (.body, .present)
+      cache/                          — coordinator-written body cache (.body, .present); evictable
       snapshots/
         01JQXXXXX                     — branch point marker for derived volumes
       import.lock                     — present while import is running or interrupted
@@ -111,7 +110,6 @@ All volume state lives under a shared `data_dir` on a dedicated local NVMe mount
       volume.pid                      — PID of running volume process
       wal/                            — present = live; write target
       pending/
-      segments/
       index/
       cache/
       snapshots/
@@ -152,10 +150,9 @@ The `volume.parent` file contains a single line: `<parent-ulid>/snapshots/<snaps
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
 - `manifest.toml` present on OCI-imported volumes and on volumes reconstructed via `remote pull`
 - `import.lock` present only while an import is running or interrupted
-- **`segments/<ulid>` present ↔ segment `<ulid>` is confirmed in S3.** The coordinator is the only process that moves bodies into `segments/`, at two S3-confirmation points: (1) rename `pending/<ulid>` → `segments/<ulid>` after upload in the drain loop; (2) move `gc/<ulid>` → `segments/<ulid>` after a GC handoff output is uploaded, as the final step before renaming `.applied` → `.done`. The volume never writes to `segments/`. This invariant is what makes eviction safe — every file in `segments/` is redundant with S3.
-- **`index/<ulid>.idx` present ↔ segment `<ulid>` is confirmed in S3.** The coordinator writes these files at the same two S3-confirmation points: (1) after the `pending/` → `segments/` rename in the upload drain; (2) after a GC handoff output is uploaded, before moving `gc/<ulid>` → `segments/<ulid>`. These are the only two write paths. The volume and evict never write to `index/`. `cache/` body files (`.body`, `.present`) may or may not exist for a given `.idx` entry — their absence means body bytes have not been demand-fetched yet.
+- **`index/<ulid>.idx` present ↔ segment `<ulid>` is confirmed in S3.** The coordinator is the sole writer of `index/`. It writes `index/<ulid>.idx` (the segment's header and LBA index section) at two S3-confirmation points: (1) after uploading `pending/<ulid>` to S3 in the drain loop, before deleting `pending/<ulid>`; (2) after uploading a GC handoff output from `gc/<ulid>` to S3, before deleting the old input index entries. The volume never writes to `index/`. `index/<ulid>.idx` files are never evicted — they are the permanent LBA index. `cache/<ulid>.body` (body section) and `cache/<ulid>.present` (bitset of fetched extents) are written alongside `index/<ulid>.idx` and may be evicted at any time — their absence means body bytes must be demand-fetched from S3.
 
-**Finding live volumes:** the coordinator scans `by_id/` for ULID-named subdirectories that have either a `pending/` or `segments/` subdirectory. Readonly volumes (with `volume.readonly`) are included for drain if they have pending segments (import just completed), and for prefetch if `segments/` is empty and `index/` is absent or empty (just pulled from the store). Readonly volumes with non-empty `segments/` or `index/` are already indexed and are skipped.
+**Finding live volumes:** the coordinator scans `by_id/` for ULID-named subdirectories that have a `pending/` subdirectory (segments awaiting upload) or an `index/` subdirectory (already-uploaded segments). Readonly volumes (with `volume.readonly`) are included for drain if they have pending segments (import just completed), and for prefetch if `index/` is absent or empty (just pulled from the store, no segments indexed yet). Readonly volumes with a non-empty `index/` are already indexed and are skipped.
 
 **Exclusive access:** a live volume holds an exclusive `flock` on `<vol-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked volume fails immediately.
 
@@ -181,7 +178,7 @@ VM
  ▼
 Volume process  (one per volume)
  │  write path: buffer → extent boundary → hash → local dedup check → WAL append
- │  read path:  LBA → LBA map → extent index → segment file (pending/ · segments/ · cache/ · S3)
+ │  read path:  LBA → LBA map → extent index → segment body (pending/ · gc/*.applied · cache/ · S3)
  │
  ├─ WAL  (wal/<ULID>)
  ├─ Pending segments  (pending/<ULID>)
@@ -196,6 +193,63 @@ Coordinator (main process)
  ├─ Segment GC           (coordinator-driven; reads LBA map from indexes; writes gc/ result files)
  └─ prefetch-indexes     (downloads .idx files for cold-start forks)
 ```
+
+## Coordinator/volume split: who writes what
+
+The directory structure enforces a clean ownership boundary between the volume process and the coordinator. Every local file has one owner; no file is shared-writable.
+
+### Volume process writes
+- `wal/<ulid>` — active WAL file (WAL append path)
+- `pending/<ulid>` — segment flushed from WAL; awaiting coordinator upload
+- `gc/<ulid>` — coordinator-staged GC output, re-signed in-place by the volume
+
+### Coordinator writes
+- `index/<ulid>.idx` — LBA index (header + index section), written after confirmed S3 upload
+- `cache/<ulid>.body` — segment body cache, written alongside `index/<ulid>.idx`
+- `cache/<ulid>.present` — bitset of locally-present extents, written alongside `.body`
+- `gc/<ulid>.pending` — proposed GC handoff for the volume to review and re-sign
+
+### Coordinator deletes
+- `pending/<ulid>` — deleted after `index/<ulid>.idx` + `cache/<ulid>.*` are written (confirmed)
+- `index/<old>.idx` — deleted before the corresponding S3 object is removed (GC cleanup)
+- `cache/<old>.body` + `cache/<old>.present` — deleted after S3 object is confirmed removed (GC cleanup)
+- `cache/<ulid>.body` — deleted on eviction (body is in S3; `index/<ulid>.idx` and `.present` remain)
+
+The volume never writes to `index/` or `cache/`. The coordinator never writes to `pending/` or `wal/`.
+
+### Drain/upload flow (pending/ → S3 → index/ + cache/)
+
+When the coordinator drains a volume's `pending/` directory to S3:
+
+```
+1. Read pending/<ulid>
+2. Upload to S3
+3. Write index/<ulid>.idx   (header + LBA index section extracted from the segment file)
+4. Write cache/<ulid>.body  (body section — the raw extent bytes)
+5. Write cache/<ulid>.present  (bitset of all extents: all bits set = fully present)
+6. Delete pending/<ulid>
+```
+
+Steps 3–5 are written before step 6 so that a coordinator crash between steps 5 and 6 leaves both the `pending/` file and the `index/` + `cache/` files on disk. On the next drain pass, the coordinator detects that `index/<ulid>.idx` already exists and skips re-upload (idempotent).
+
+The `index/<ulid>.idx` format is a complete segment header plus the index section (LBA → body offset mappings). The body section is stripped out and stored separately as `cache/<ulid>.body`. This split keeps the LBA index small and permanently available for fast startup (no segment body download needed), while the body is independently evictable.
+
+### GC cleanup ordering (index/ deletion before S3 deletion)
+
+After a GC handoff completes and the compacted segment is uploaded to S3:
+
+```
+1. Write index/<new>.idx + cache/<new>.{body,present}   (new compacted segment)
+2. Delete index/<old>.idx for each consumed input       ← BEFORE S3 deletion
+3. Delete cache/<old>.{body,present} for each input
+4. Delete the old S3 objects
+5. Delete gc/<new> (body now in cache)
+6. Rename gc/<new>.applied → gc/<new>.done
+```
+
+The critical ordering is step 2 before step 4. If the coordinator deleted the S3 objects first and then crashed before deleting `index/<old>.idx`, the stale index entries would survive. On next startup, `rebuild_segments` would map LBAs to segments that no longer exist in S3 or locally — making the volume unreadable for those LBAs after eviction.
+
+Deleting `index/<old>.idx` before removing S3 objects ensures the invariant holds across all crash/restart interleavings: `index/<ulid>.idx` present ↔ segment `<ulid>` exists in S3.
 
 ## Coordinator lifecycle and shutdown behaviour
 
@@ -519,8 +573,9 @@ OCI import is a potentially long-running operation. The coordinator supervises i
 
 `volume import <name> <oci-ref>` creates a single readonly volume at `<data_dir>/<name>/`:
 
-- No `wal/` or `pending/` — the volume is frozen after import completes
-- `segments/` holds the imported data
+- `pending/` holds the imported data until the coordinator drains it to S3
+- After the coordinator drains: `index/` + `cache/` hold the segment index and body cache; `pending/` is empty
+- No `wal/` — the volume is frozen after import completes
 - `snapshots/<import-ulid>` marks the branch point for derived volumes
 - `manifest.toml` records source metadata (OCI digest, arch)
 
@@ -594,11 +649,10 @@ The consequence of pre-assignment is that `sweep_pending` — which may run whil
 ```
 1. VM reads LBA range
 2. Look up LBA in live LBA map → extent_hash H
-3. Check local segments (own pending/ + segments/ + gc/<ulid> for any .applied handoff, then ancestor segments/) for H
-   - Hit  → return data (decompress if FLAG_COMPRESSED)
-   - Miss → check cache/<ulid>.body (body-relative offsets; .present bitset guards each extent)
-     - Hit  → read from body file; decompress if needed
-     - Miss → look up H in extent index → (segment_id, body_offset, body_length)
+3. Check local segment bodies for H (own pending/ + gc/*.applied + cache/<ulid>.body, then ancestor layers):
+   - Hit in pending/ or gc/*.applied → read directly from the full segment file; decompress if needed
+   - Hit in cache/<ulid>.body → read from body-relative offset; .present bitset guards each extent; decompress if needed
+   - Miss → look up H in extent index → (segment_id, body_offset, body_length)
 4. Issue a byte-range GET to S3 covering a chunk of the segment body
    - The fetch unit is a contiguous byte range (e.g. 1MB-aligned chunk) that
      includes the needed extent(s) plus neighbours for spatial locality
@@ -610,7 +664,7 @@ The consequence of pre-assignment is that `sweep_pending` — which may run whil
 
 The kernel page cache sits above the block device and handles most hot reads. The local segment cache handles warm reads. S3 is the cold path.
 
-**GC `.applied` window — reading from `gc/`.** During the window between the volume applying a GC handoff (step 4) and the coordinator moving the output to `segments/` (step 7 in the handoff sequence), the new GC output body lives in `gc/<new-ulid>` (volume-signed). The in-memory extent index has already been updated to reference `<new-ulid>`. The volume's read path checks `segments/<ulid>` first; if absent, it falls back to `gc/<ulid>` for any segment that has a corresponding `.applied` marker. Old input segments are still in `segments/` during this window (coordinator deletes them in step 8), so reads for LBAs not yet covered by the GC output also work normally. This fallback is the only place the read path is aware of `gc/`; it disappears once the coordinator completes step 7.
+**GC `.applied` window — reading from `gc/`.** During the window between the volume applying a GC handoff and the coordinator uploading the output to S3 and writing `index/<new>.idx`, the new GC output body lives in `gc/<new-ulid>` (volume-signed). The in-memory extent index has already been updated to reference `<new-ulid>`. The volume's read path checks `gc/<ulid>` for any segment that has a corresponding `.applied` marker. Old input segments are still available via `cache/<old>.body` or `pending/<old>` during this window, so reads for LBAs not yet covered by the GC output also work normally. Once the coordinator writes `index/<new>.idx` + `cache/<new>.body` and deletes `gc/<new>`, the `.applied` fallback is no longer needed.
 
 **Local read path implementation.** The in-process read path resolves each LBA range as follows: LBA map BTreeMap range scan → per-extent HashMap lookup in the extent index → seek + read from the segment file. A single file-handle cache avoids repeated `open` syscalls for sequential extents within the same segment; a cache miss incurs one `open` plus O(ancestor_depth) `stat` calls to locate the segment across the directory tree. Compressed extents are decompressed in full on every read — there is no sub-extent decompression granularity (same model as lsvd). Both overheads are bounded in practice by the segment size limit and the pre-log coalescing block limit.
 
@@ -634,8 +688,8 @@ The LBA map is optionally persisted to a local `lba.map` file on clean shutdown 
 
 **Rebuild procedure:**
 1. Follow the `origin` chain from the fork to the root, collecting ancestor layers (oldest first)
-2. For each ancestor fork: scan `segments/` and `pending/` in ULID order, stopping at the branch-point ULID stored in the child's `origin`
-3. For the current fork: scan all of `segments/` and `pending/`
+2. For each ancestor fork: scan `gc/*.applied` (lowest priority), then `index/*.idx`, then `pending/` in ULID order, stopping at the branch-point ULID stored in the child's `origin`
+3. For the current fork: scan all of `gc/*.applied`, `index/*.idx`, and `pending/` (all of them)
 4. Replay the current WAL on top (WAL entries are the most recent writes)
 
 Since segment index sections are the ground truth for segment contents, rebuilding the LBA map requires only index sections and the WAL — never the segment data bodies. A full startup rebuild for a volume with 100 segments across its ancestry is a scan of ~6–200KB per segment index section, not 3GB of segment bodies.
@@ -765,16 +819,16 @@ Delta compression collapses this flexibility: reconstruction always requires fet
 
 To rebuild the LBA map for a volume:
 1. Follow the `origin` chain to the root volume (no `origin` file). Each `origin` file contains `<parent-ulid>/snapshots/<snapshot-ulid>` — the parent is resolved as `by_id_dir/<parent-ulid>`. Using ULIDs in `origin` means the chain is stable across renames and host moves. `walk_ancestors(vol_dir, by_id_dir)` performs this traversal.
-2. From the root outward, for each ancestor in the chain: scan both `segments/` and `pending/` in ULID order (merged), stopping at (and including) the branch-point ULID recorded in the child's `origin`. Snapshot markers are not scanned during replay.
-3. Apply the current volume's own `segments/` and `pending/` in ULID order (all of them).
-4. **Explicitly handle in-progress GC handoffs from `gc/`:** scan `gc/` for body files whose handoff marker is in `.applied` state — these are volume-signed GC outputs awaiting coordinator upload. Include them at lower priority than `segments/` (the old input segments still present in `segments/` win for any LBA they cover). Bodies with `.pending` markers are coordinator-signed and not yet volume-applied; they are ignored by rebuild (the old segments in `segments/` remain authoritative). Bodies with `.done` markers have already moved to `segments/`; nothing in `gc/` to scan.
+2. From the root outward, for each ancestor in the chain: apply `gc/*.applied` (lowest priority), then `index/*.idx`, then `pending/`, in ULID order within each group, stopping at (and including) the branch-point ULID recorded in the child's `origin`. Snapshot markers are not scanned during replay.
+3. Apply the current volume's own `gc/*.applied`, `index/*.idx`, and `pending/` in ULID order within each group (all of them, no cutoff).
+4. **Priority within each rebuild pass:** `gc/*.applied` are applied first (lowest priority — GC-compacted data, ULID < the WAL flush that followed), then `index/*.idx` (committed segments promoted from pending/), then `pending/` (highest priority — in-flight WAL flushes, always the most recent write for any LBA). Bodies with `.pending` markers are coordinator-staged and not yet volume-re-signed; they are ignored by rebuild. Bodies with `.done` markers have been uploaded and their `index/*.idx` counterparts are already present; nothing in `gc/` to scan for `.done`.
 5. Replay the WAL.
 
 The per-ancestor ULID cutoff is what prevents a concurrently-written ancestor from leaking newer data into the derived volume's view.
 
 ### Single-writer invariant
 
-**Each volume directory has exactly one process that writes new segments into it.** The volume process that holds `volume.key` is the sole writer of `pending/`. The coordinator is the sole writer of `segments/` — it moves bodies there only after confirmed S3 upload (from `pending/` on the drain path, from `gc/` on the GC handoff path). The coordinator writes only to `gc/` as a staging area; the volume re-signs the coordinator's staged output in-place within `gc/`, then the coordinator uploads and moves it to `segments/`. Crucially, the coordinator derives the output ULID from the volume's existing write history (`max(input ULIDs).increment()`) rather than from its own wall clock. The coordinator does not author an independent position in the volume's timeline — it extends the sequence by one step from where the volume left off.
+**Each volume directory has exactly one process that writes new segments into it.** The volume process that holds `volume.key` is the sole writer of `pending/`. The coordinator is the sole writer of `index/` and `cache/` — it writes `index/<ulid>.idx` and `cache/<ulid>.{body,present}` only after confirmed S3 upload (draining from `pending/` or uploading a GC output from `gc/`). The coordinator writes only to `gc/` as a staging area; the volume re-signs the coordinator's staged output in-place within `gc/`, then the coordinator uploads it to S3 and writes the resulting `index/` and `cache/` files. Crucially, the coordinator derives the output ULID from the volume's existing write history (`max(input ULIDs).increment()`) rather than from its own wall clock. The coordinator does not author an independent position in the volume's timeline — it extends the sequence by one step from where the volume left off.
 
 This invariant is what makes ULID total-order sufficient for all correctness guarantees in rebuild, GC, and ancestor cutoff:
 
@@ -784,9 +838,9 @@ This invariant is what makes ULID total-order sufficient for all correctness gua
 
 The single-writer property and crash safety are enforced through ULID ordering and signing verification. Only the volume process holding `volume.key` can produce valid segment signatures; any unsigned or incorrectly-signed segment will be rejected at read time.
 
-**Signing trust boundary:** signature verification is enforced on all segments in `pending/` and `segments/`. Every file in those directories was either:
+**Signing trust boundary:** signature verification is enforced on all segments in `pending/` and `gc/*.applied`. Every such file was either:
 - Written directly by the volume process itself at WAL promotion time (signed with `volume.key`), or
-- Produced by the coordinator's GC handoff protocol: the coordinator creates compacted segments in `gc/<ulid>` (signed with an ephemeral key) and writes a `gc/<ulid>.pending` handoff file. The volume re-signs `gc/<ulid>` with `volume.key` and moves it into `segments/` before applying extent index patches. Only after the volume signals completion (`.applied`) does the coordinator upload the volume-signed segment to S3 and delete old files. This ensures `segments/` is always a fully-trusted zone and S3 always receives the volume-signed version.
+- Produced by the coordinator's GC handoff protocol: the coordinator creates compacted segments in `gc/<ulid>` (signed with an ephemeral key) and writes a `gc/<ulid>.pending` handoff file. The volume re-signs `gc/<ulid>` with `volume.key` in-place before applying extent index patches. Only after the volume signals completion (`.applied`) does the coordinator upload the volume-signed segment to S3 and write the resulting `index/` + `cache/` files. This ensures S3 always receives the volume-signed version. Note that `cache/` body files are coordinator-written (not volume-signed) — see the known gap below.
 
 This protocol keeps the private key (`volume.key`) on the volume host and prevents the coordinator from forging new data.
 
@@ -875,13 +929,13 @@ Sub-block-aligned TRIM and WRITE_ZEROES ranges are rounded inward to fully-cover
 
 **Share-nothing coordination:** the coordinator and volume share a filesystem layout and a ULID total order, but nothing else — no shared memory, no locks, no clock synchronisation, no protocol negotiation for normal operation. The coordinator reads the fork's on-disk state, extends its timeline by one step, and the volume applies or ignores the result at its own pace. The only real coordination is the `.pending` → `.applied` handoff, and even that is asynchronous and crash-safe: if the volume never processes it, the worst case is a space leak, not inconsistency. The filesystem directory structure is the entire coordination mechanism — inspectable with standard tools, recoverable without special tooling, and correct by construction from ULID ordering alone.
 
-The volume actor processes `gc/*.pending` files on its idle tick. For each file it first re-signs the staged segment: reads `gc/<ulid>` (ephemeral-signed by the coordinator), writes a volume-signed copy to `segments/<ulid>`, then deletes `gc/<ulid>`. Only after re-signing does it read the compacted segment's index to get authoritative `body_offset`, `body_length`, and `compressed` values (the handoff file records the new absolute offset but omits length and compression flag), update the in-memory extent index (updating carried entries, removing LBA-dead entries), and rename the file to `.applied`. Removal-only handoffs (all 2-field lines, no output segment) skip the re-sign step and are applied immediately. The re-sign step is idempotent: if the process is killed after writing `segments/<ulid>` but before deleting `gc/<ulid>`, both files are present on restart and the volume re-signs (overwriting `segments/<ulid>` with identical content) before proceeding. If the process is killed before the final rename, the handoff is re-applied on the next idle tick with identical results. No `flush_gen` bump is needed — GC moves data between segment files only, so body offsets remain absolute and the fd cache's existing segment-id mismatch detection handles eviction naturally when reads switch from the old segment to the new one.
+The volume actor processes `gc/*.pending` files on its idle tick. For each file it first re-signs the staged segment in-place: reads `gc/<ulid>` (ephemeral-signed by the coordinator) and overwrites it with a volume-signed copy. Only after re-signing does it read the compacted segment's index to get authoritative `body_offset`, `body_length`, and `compressed` values (the handoff file records the new absolute offset but omits length and compression flag), update the in-memory extent index (updating carried entries, removing LBA-dead entries), and rename the file to `.applied`. Removal-only handoffs (all 2-field lines, no output segment) skip the re-sign step and are applied immediately. The re-sign step is idempotent: if the process is killed after re-signing `gc/<ulid>` but before renaming to `.applied`, the volume re-signs on the next idle tick with identical results. If the process is killed before the final rename, the handoff is re-applied on the next idle tick with identical results. No `flush_gen` bump is needed — GC moves data between segment files only, so body offsets remain absolute and the fd cache's existing segment-id mismatch detection handles eviction naturally when reads switch from the old segment to the new one.
 
-The coordinator processes `gc/*.applied` files at the start of each GC tick. For each `.applied` file it parses the new and old segment ULIDs from the handoff content, uploads `segments/<new-ulid>` (the volume-signed segment) to S3, deletes the corresponding old S3 objects, removes the old local segment files from `segments/`, and renames the file to `.done`. S3 404 on delete is treated as success (idempotent across coordinator crashes). The `.done` files are retained for a 7-day window (useful for post-mortem: which segments were compacted and when) and then deleted by a TTL cleanup pass that runs each tick.
+The coordinator processes `gc/*.applied` files at the start of each GC tick. For each `.applied` file it: uploads `gc/<new-ulid>` (the volume-signed segment) to S3; writes `index/<new-ulid>.idx` + `cache/<new-ulid>.{body,present}`; deletes `index/<old-ulid>.idx` for each consumed input segment (before S3 deletion — see GC cleanup ordering above); deletes the old S3 objects; removes `cache/<old-ulid>.{body,present}`; deletes `gc/<new-ulid>`; renames the file to `.done`. S3 404 on delete is treated as success (idempotent across coordinator crashes). The `.done` files are retained for a 7-day window (useful for post-mortem: which segments were compacted and when) and then deleted by a TTL cleanup pass that runs each tick.
 
-**Ownership of local `segments/` deletion:** the coordinator — not the volume — deletes local segment files from `segments/`. This follows from the credential split: the coordinator owns all S3 mutations, and `segments/` files are local caches of S3 objects the coordinator uploaded. The volume never deletes from `segments/`; if it needs data after the coordinator has removed a local cache file, it demand-fetches from S3.
+**Ownership of `cache/` eviction:** the coordinator — not the volume — deletes files from `cache/`. This follows from the credential split: the coordinator owns all S3 mutations and manages the lifecycle of uploaded segments. The volume never deletes from `cache/`; if it needs body bytes after the coordinator has evicted `cache/<ulid>.body`, it demand-fetches from S3.
 
-**Race tolerance:** LBA map and extent index rebuild (`Volume::open`) collect file paths from `segments/` and then read each one. If the coordinator deletes a segment file between path collection and the read, the rebuild skips the missing file with a warning rather than failing. This is always correct: the new compacted segment (with a higher ULID) is also present in `segments/` and its entries will overwrite whatever the deleted segment would have contributed. The same tolerance is applied in `repack()` when it scans `segments/`.
+**Race tolerance:** LBA map and extent index rebuild (`Volume::open`) collect `index/*.idx` paths and then read each one. If the coordinator deletes an index file during a GC cleanup pass between path collection and the read, the rebuild skips the missing file with a warning rather than failing. This is always correct: the new compacted segment (with a higher ULID) has its own `index/<new>.idx` and its entries will overwrite whatever the deleted file would have contributed. The same tolerance is applied in `repack()` when it scans `index/`.
 
 **The `.pending` file is written atomically** (tmp file + rename) to prevent a coordinator crash from leaving a partial handoff that the volume might misparse or that `apply_done_handoffs` might read with missing old ULIDs.
 
@@ -913,7 +967,7 @@ Import is handled by `elide volume import <name> <oci-ref>`, which asks the coor
 
 **Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The snapshot ULID matches the ULID of the last committed segment, making the branch point self-describing. If no new segments have been committed since the latest existing snapshot, the operation is idempotent — it returns the existing snapshot ULID without writing a new marker. The volume remains live; no directory structure changes.
 
-**Import procedure:** the import path writes data directly into `<vol-dir>/segments/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. The `volume.size` marker and `manifest.toml` (OCI source metadata) are written into the volume directory.
+**Import procedure:** the import path writes data directly into `<vol-dir>/pending/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. The `volume.size` marker and `manifest.toml` (OCI source metadata) are written into the volume directory. The coordinator's normal drain loop then uploads the `pending/` segments to S3 and moves them to `index/` + `cache/`.
 
 **S3 upload for volume metadata:** at import, fork, and create time, two objects are written to the store eagerly: `names/<name>` (contains the ULID, plain text) and `by_id/<ulid>/manifest.toml` (name, size, origin, source metadata). Snapshot markers are uploaded as empty objects at `by_id/<ulid>/snapshots/YYYYMMDD/<snapshot-ulid>` after each `volume snapshot` and at the end of import. Together these allow any host to reconstruct the full volume ancestry skeleton with O(depth) GETs before segment index prefetch begins. See *S3 object layout* in `docs/formats.md` for the full key structure.
 
@@ -929,15 +983,15 @@ Compaction reclaims space in a fork by rewriting segments that contain a high pr
 
 1. Compute the live hash set from the fork's current LBA map.
 2. Determine the **compaction floor** = max ULID across all files in `snapshots/` (none if no snapshots exist).
-3. For each segment in `pending/` and `segments/` with ULID **> floor**:
+3. For each segment in `pending/` and `index/` (via `index/*.idx`) with ULID **> floor**:
    - Count total and live bytes (DATA entries only; DEDUP_REF entries have no body bytes).
    - If `live_bytes / total_bytes ≥ min_live_ratio`, skip.
-   - Otherwise: read live entries' bodies, write a new denser segment to `pending/<new-ulid>`, update the extent index, delete the old segment.
+   - Otherwise: read live entries' bodies (from `pending/<ulid>` or `cache/<ulid>.body`), write a new denser segment to `pending/<new-ulid>`, update the extent index, delete the old segment from `pending/` (or coordinate deletion of the old `index/<ulid>.idx` and `cache/<ulid>.*` via the coordinator).
 4. Segments with ULID **≤ floor** are never touched — they are frozen by the latest snapshot.
 
 The floor ensures segments readable by child forks are never modified or deleted. Any fork that branched from this fork at snapshot ULID S uses ancestor segments with ULID ≤ S ≤ floor. Repacked segments always receive new (higher) ULIDs, landing above the floor — no existing child fork's ancestry walk will include them.
 
-`pending/` and `segments/` encode S3 upload status, not GC eligibility. The compaction floor applies to both. In practice, a snapshot is always taken against a segment that is still in `pending/` (the WAL flush lands there; promotion to `segments/` happens asynchronously at S3 upload). The ULID comparison is directory-agnostic: a frozen segment retains its ULID when promoted, so the floor check remains correct regardless of which directory the segment currently lives in.
+`pending/` and `index/` encode S3 upload status, not GC eligibility. The compaction floor applies to both. In practice, a snapshot is always taken against a segment that is still in `pending/` (the WAL flush lands there; promotion to `index/` + `cache/` happens asynchronously at S3 upload). The ULID comparison is directory-agnostic: a segment's ULID is assigned at creation and remains stable across the `pending/` → `index/` transition, so the floor check remains correct regardless of which directory the segment currently lives in.
 
 The `repack` CLI command triggers repacking with a configurable `--min-live-ratio` threshold (default 0.7).
 

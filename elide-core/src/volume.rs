@@ -3,7 +3,8 @@
 // Directory layout:
 //   <base>/wal/       — active write-ahead log (at most one file at a time)
 //   <base>/pending/   — promoted segments awaiting S3 upload
-//   <base>/segments/  — segments confirmed uploaded to S3 (evictable)
+//   <base>/index/     — coordinator-written LBA index files (*.idx); permanent; never evicted
+//   <base>/cache/     — coordinator-written body cache (*.body, *.present); evictable
 //   <base>/gc/        — coordinator GC handoff files (*.pending → *.applied → *.done)
 //
 // Write path:
@@ -15,7 +16,7 @@
 // Read path:
 //   1. lbamap.lookup(lba) → (hash, block_offset)
 //   2. extent_index.lookup(hash) → ExtentLocation (segment_id, body_offset, body_length)
-//   3. find_segment_file (wal/ → pending/ → segments/) → open file, seek, read
+//   3. find_segment_file (wal/ → pending/ → gc/*.applied → cache/<id>.body) → open file, seek, read
 //
 // Recovery:
 //   Volume::open() calls lbamap::rebuild_segments() (segments only), then
@@ -191,7 +192,7 @@ impl Volume {
     /// Open (or create) a fork at `base_dir`.
     ///
     /// `base_dir` must be the fork directory (e.g. `volumes/myvm/default/`), not the
-    /// volume root. Creates `wal/`, `pending/`, and `segments/` if they do not exist.
+    /// volume root. Creates `wal/` and `pending/` if they do not exist.
     /// Rebuilds the LBA map from all committed segments across the ancestry chain
     /// (following `volume.parent` files), then recovers or creates the WAL.
     ///
@@ -262,7 +263,7 @@ impl Volume {
             }
         });
 
-        // Scan pending/ and segments/ to find the latest committed segment ULID
+        // Scan pending/ and index/ to find the latest committed segment ULID
         // and determine whether any segments postdate the latest snapshot.
         // Cross-session ULID comparison is reliable: those files came from
         // earlier runs at distinct timestamps.
@@ -835,7 +836,7 @@ impl Volume {
     /// Without pre-minting `u_flush`, the WAL segment flushed by this call would
     /// carry the WAL's *existing* ULID (assigned when the WAL was opened,
     /// before the GC ULIDs were minted).  That ULID is lower than `u_sweep`, so
-    /// after the segment is drained to `segments/`, crash-recovery rebuild would
+    /// after the segment is drained to `index/`, crash-recovery rebuild would
     /// apply the GC output *after* the WAL segment and return stale data.
     ///
     /// When the WAL is empty, the WAL file is deleted and `u_flush` is not used
@@ -870,15 +871,15 @@ impl Volume {
     ///
     /// The coordinator writes the compacted segment to `gc/<new-ulid>` (staged,
     /// signed with an ephemeral key) and then writes `gc/<new-ulid>.pending`.
-    /// This method re-signs `gc/<new-ulid>` with the volume's own key, moves it
-    /// into `segments/`, updates the in-memory extent index, and renames the
-    /// handoff file to `gc/<new-ulid>.applied`.  The coordinator monitors
-    /// `.applied` files and uses them as the signal to delete the superseded S3
-    /// objects and old local segment files.
+    /// This method re-signs `gc/<new-ulid>` in-place with the volume's own key,
+    /// updates the in-memory extent index, and renames the handoff file to
+    /// `gc/<new-ulid>.applied`.  The coordinator monitors `.applied` files and
+    /// uses them as the signal to upload the segment to S3, write
+    /// `index/<new-ulid>.idx` + `cache/<new-ulid>.{body,present}`, delete the
+    /// superseded `index/<old>.idx` entries, and clean up old cache files.
     ///
-    /// The re-signing step ensures that `segments/` always contains only
-    /// volume-signed files, so `extentindex::rebuild` never needs to skip
-    /// signature verification for in-transit coordinator output.
+    /// The re-signing step ensures that the coordinator uploads only
+    /// volume-signed segment bodies to S3.
     ///
     /// Apply GC handoff files from `gc/`, covering both `.pending` and `.applied` states.
     ///
@@ -952,9 +953,8 @@ impl Volume {
             // The coordinator stages its output in gc/<ulid> with an ephemeral
             // key.  Re-sign it in-place with the volume's key (write to
             // gc/<ulid>.tmp, rename over gc/<ulid>).  The body stays in gc/
-            // until the coordinator moves it to segments/ after confirmed S3
-            // upload — this preserves the segments/ invariant (present ↔
-            // S3-confirmed).
+            // until the coordinator uploads it to S3 and writes index/<ulid>.idx
+            // + cache/<ulid>.{body,present}, then deletes gc/<ulid>.
             //
             // Idempotency: re-signing is a pure function of the segment content;
             // if we crash mid-rename and retry, the output is identical.
@@ -1247,7 +1247,7 @@ impl Volume {
     /// writing in the same directory — no directory structure changes occur.
     ///
     /// If no new data has been committed since the latest existing snapshot
-    /// (nothing in `pending/` or `segments/` sorts after it), the existing
+    /// (nothing in `pending/` or `index/` sorts after it), the existing
     /// snapshot ULID is returned without writing a new marker.
     ///
     /// Returns the snapshot ULID.
@@ -1294,11 +1294,11 @@ impl Volume {
     /// ancestry chain.
     ///
     /// Search order:
-    ///   1. Current fork: `wal/`, `pending/`, `segments/`, `cache/<id>.body`
-    ///   2. Ancestor forks (newest first): `pending/`, `segments/`, `cache/<id>.body`
+    ///   1. Current fork: `wal/`, `pending/`, `gc/*.applied`, `cache/<id>.body`
+    ///   2. Ancestor forks (newest first): `pending/`, `gc/*.applied`, `cache/<id>.body`
     ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
     ///
-    /// For full segment files (`wal/`, `pending/`, `segments/`), body reads use
+    /// For full segment files (`wal/`, `pending/`, `gc/*.applied`), body reads use
     /// absolute file offsets (`ExtentLocation.body_offset`). For cached body
     /// files (`cache/<id>.body`), the file IS the body section, so reads use
     /// body-relative offsets — consistent with how `extentindex::rebuild` stores
@@ -1334,7 +1334,7 @@ impl Volume {
     /// Attach a `SegmentFetcher` for demand-fetch on segment cache miss.
     ///
     /// Once set, `find_segment_file` will call the fetcher after all local
-    /// directories are checked, caching the result in `segments/`.
+    /// directories are checked, caching the result in `cache/`.
     pub fn set_fetcher(&mut self, fetcher: BoxFetcher) {
         self.fetcher = Some(fetcher);
     }
@@ -1508,8 +1508,8 @@ pub(crate) fn read_extents(
 /// Search for a segment file across the fork directory tree.
 ///
 /// Search order:
-///   1. Current fork: `wal/`, `pending/`, `segments/`, `cache/<id>.body`
-///   2. Ancestor forks (newest-first): `pending/`, `segments/`, `cache/<id>.body`
+///   1. Current fork: `wal/`, `pending/`, `gc/*.applied`, `cache/<id>.body`
+///   2. Ancestor forks (newest-first): `pending/`, `gc/*.applied`, `cache/<id>.body`
 ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
 ///
 /// When `entry_idx` is `Some`, a `cache/<id>.body` hit is only accepted if
@@ -1773,7 +1773,7 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<Ulid>> {
 /// Create a new volume directory, branched from the latest snapshot of the source volume.
 ///
 /// The source volume must have at least one snapshot (written by `snapshot()`).
-/// `new_fork_dir` is created with `wal/`, `pending/`, `segments/`, and a `volume.parent`
+/// `new_fork_dir` is created with `wal/`, `pending/`, and a `volume.parent`
 /// file using the flat format: `<source-ulid>/snapshots/<branch-ulid>`.
 /// The source ULID is derived from `source_fork_dir`'s directory name.
 ///
@@ -3944,8 +3944,8 @@ mod tests {
         //
         // apply_gc_handoffs must succeed on retry: it re-signs gc/<new_ulid>
         // idempotently, updates the extent index, and renames .pending → .applied.
-        // The body stays in gc/ — the coordinator moves it to segments/ after
-        // confirmed S3 upload.
+        // The body stays in gc/ — the coordinator uploads it to S3 and writes
+        // index/<new>.idx + cache/<new>.{body,present} after confirmed upload.
         let base = keyed_temp_dir();
 
         let old_ulid;
