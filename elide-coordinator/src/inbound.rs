@@ -320,12 +320,20 @@ async fn evict_volume(
     data_dir: &Path,
     evict_registry: &EvictRegistry,
 ) -> String {
-    // Resolve name → canonical fork directory path.
+    // Resolve name → fork directory path using the same construction as
+    // daemon.rs (data_dir.join("by_id/<ulid>")), so the key matches the
+    // EvictRegistry entry.  canonicalize() returns an absolute path which
+    // would not match when data_dir is relative.
     let link = data_dir.join("by_name").join(vol_name);
-    let fork_dir = match std::fs::canonicalize(&link) {
-        Ok(p) => p,
+    let target = match std::fs::read_link(&link) {
+        Ok(t) => t,
         Err(_) => return format!("err volume not found: {vol_name}"),
     };
+    // The symlink target is ../by_id/<ulid>; extract just the ULID component.
+    let Some(ulid_component) = target.file_name() else {
+        return format!("err malformed volume symlink: {vol_name}");
+    };
+    let fork_dir = data_dir.join("by_id").join(ulid_component);
 
     // Look up the fork's evict sender.
     let sender = evict_registry.lock().await.get(&fork_dir).cloned();
