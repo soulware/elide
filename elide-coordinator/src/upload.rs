@@ -22,12 +22,10 @@
 //     S3 PUT) and re-sends promote on next tick.
 //   - Crash after step 3: pending/<ulid> is gone (volume deleted it); done.
 //
-// Note: index/<ulid>.idx is written by the volume at WAL flush time (before upload),
-// so it already exists when drain runs. The coordinator never writes index/.
-//
-// Ordering invariant: pending/<ulid> absent ↔ segment confirmed in S3. The volume
-// deletes pending/<ulid> only after receiving the promote IPC, which the coordinator
-// sends only after a confirmed S3 upload.
+// Ordering invariant: index/<ulid>.idx present ↔ segment confirmed in S3.
+// The volume writes index/<ulid>.idx inside the promote_segment IPC handler,
+// which the coordinator calls only after a confirmed S3 PUT. This means every
+// .idx file the coordinator sees is safe to fetch from the object store.
 
 use std::path::Path;
 
