@@ -1190,14 +1190,13 @@ impl Volume {
                 fs::rename(gc_dir.join(name), &applied_path)?;
             }
 
-            // Count this handoff if it was a normal .pending application, or
-            // if it was an .applied re-application that actually mutated the
-            // extent index (genuine restart recovery).  A redundant re-check
-            // of an already-applied .applied handoff returns 0 so the
-            // coordinator's "re-applied after restart" log stays silent.
-            if !is_already_applied || index_mutated {
-                count += 1;
-            }
+            // Count every handoff that was successfully processed: both normal
+            // .pending applications and .applied re-applications on restart.
+            // Volume::open already incorporates gc/*.applied during rebuild so
+            // the extent index is already correct on the restart path — count
+            // the handoff regardless of whether mutations occurred.
+            let _ = index_mutated; // tracked above but no longer drives the count
+            count += 1;
         }
 
         Ok(count)

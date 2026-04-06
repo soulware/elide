@@ -258,6 +258,15 @@ fn cleanup_stale_lock_in(dir: &Path) {
     if let Some(pid) = pid
         && is_alive(pid)
     {
+        // If control.sock is present the import is in its serve phase and is
+        // actively handling promote IPC from the coordinator.  Leave it running
+        // — the coordinator will resume draining against it on the next tick.
+        if dir.join("control.sock").exists() {
+            return;
+        }
+        // Process is alive but no control.sock: still in write phase when the
+        // coordinator restarted.  Send SIGTERM so the volume is in a clean
+        // state for retry.
         sigterm(pid);
         warn!(
             "[import] killed stale import process pid={pid} in {} (ulid={ulid})",

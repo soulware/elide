@@ -122,8 +122,11 @@ pub async fn run_volume_tasks(
             break;
         }
 
-        // Skip drain/GC while an import is writing to this fork.
-        if fork_dir.join(IMPORT_LOCK_FILE).exists() {
+        // Skip drain/GC while an import is in its write phase (import.lock
+        // present but no control.sock yet).  When both are present the import
+        // is in its serve phase and is ready to handle promote IPC — fall
+        // through to the normal drain path.
+        if fork_dir.join(IMPORT_LOCK_FILE).exists() && !fork_dir.join("control.sock").exists() {
             continue;
         }
 

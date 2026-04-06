@@ -116,9 +116,17 @@ struct ManifestSource<'a> {
 }
 
 /// Upload all committed segments from `pending/` to the object store, then
-/// send promote IPC to the volume for each uploaded segment. Also uploads the
-/// volume's public key and manifest so that new hosts can bootstrap the volume.
+/// promote each segment to the local cache.
 ///
+/// For writable volumes the promote is done via IPC to the running volume
+/// process (`promote <ulid>`), which copies the body to `cache/` and deletes
+/// `pending/<ulid>`.  If the volume is not running the segment stays in
+/// `pending/` and the coordinator retries on the next tick.
+///
+/// For readonly volumes no volume process ever runs, so the coordinator
+/// performs the promote directly: it writes `index/<ulid>.idx` and
+/// `cache/<ulid>.{body,present}` then deletes `pending/<ulid>`.  This is safe
+/// because readonly volumes have no concurrent readers or writers — the only
 /// `drain_pending` is a one-shot batch command. Metadata (pub key, manifest,
 /// name entry) is re-uploaded on every invocation — all are idempotent and tiny.
 pub async fn drain_pending(
@@ -155,14 +163,15 @@ pub async fn drain_pending(
 
         match upload_segment(&segment_path, name, volume_id, store).await {
             Ok(()) => {
-                // Segment confirmed in S3; promote IPC tells the volume to cache
-                // the body and delete pending/<ulid>.
+                // Segment confirmed in S3; promote IPC tells the controlling
+                // process (volume or import in serve phase) to write index/ +
+                // cache/ and delete pending/<ulid>.
                 if crate::control::promote_segment(vol_dir, ulid).await {
                     uploaded += 1;
                 } else {
-                    // Volume not running; pending/<ulid> stays in place.
+                    // No process listening; pending/<ulid> stays in place.
                     // The coordinator retries on the next drain tick.
-                    warn!("promote {name}: volume not running; will retry next tick");
+                    warn!("promote {name}: no process listening; will retry next tick");
                     failed += 1;
                 }
             }

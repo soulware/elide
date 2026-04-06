@@ -561,6 +561,13 @@ fn collect_stats(
         // File size is idx + body; used for the small_segment_bytes threshold.
         let idx_size = fs::metadata(&idx_path)?.len();
         let body_path = cache_dir.join(format!("{ulid_str}.body"));
+        // Skip segments whose cache body is absent — they are still in
+        // pending/ (not yet promoted) and must not be GC'd.  This happens
+        // when gc_checkpoint flushes the WAL to pending/ and writes index/,
+        // then gc_fork runs before the coordinator can promote the segment.
+        if !body_path.exists() {
+            continue;
+        }
         let body_size = fs::metadata(&body_path).map(|m| m.len()).unwrap_or(0);
         let file_size = idx_size + body_size;
 
