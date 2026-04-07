@@ -17,7 +17,6 @@
 use std::path::PathBuf;
 
 use elide_core::volume::Volume;
-use ulid::Ulid;
 
 mod common;
 
@@ -35,14 +34,14 @@ fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
         vol.write(lba, &[0xAA; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir);
+    common::drain_with_materialise(&mut vol);
 
     // Seed batch 2 — LBAs 4-7 = 0xBB — drain to index/ + cache/.
     for lba in 4u64..8 {
         vol.write(lba, &[0xBB; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir);
+    common::drain_with_materialise(&mut vol);
 
     // Take GC checkpoint (flushes WAL, advances mint).
     let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
@@ -106,14 +105,14 @@ fn gc_output_loses_to_live_write_applied_after_gc() {
         vol.write(lba, &[0xAA; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir);
+    common::drain_with_materialise(&mut vol);
 
     // Seed batch 2 — LBAs 4-7 = 0xBB.
     for lba in 4u64..8 {
         vol.write(lba, &[0xBB; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_local(&fork_dir);
+    common::drain_with_materialise(&mut vol);
 
     // GC checkpoint then GC pass — no overwrites yet so GC output contains
     // 0xAA for LBAs 0-3 and 0xBB for LBAs 4-7.
