@@ -3685,6 +3685,341 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[test]
+    fn materialise_segment_idempotent() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xAAu8; 4096];
+        // Write data to LBA 0 → DATA entry in segment S1.
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_first = pending_ulids(&base);
+        let s1_ulid = after_first[0];
+
+        // Write same data to LBA 1 → dedup hit → DedupRef in segment S2.
+        vol.write(1, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let after_second = pending_ulids(&base);
+        let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
+
+        // First materialise — creates .materialized.
+        vol.materialise_segment(s2_ulid).unwrap();
+        let mat_path = base
+            .join("pending")
+            .join(format!("{}.materialized", s2_ulid));
+        assert!(
+            mat_path.exists(),
+            ".materialized must exist after first call"
+        );
+
+        // Second materialise — idempotent, should succeed immediately.
+        vol.materialise_segment(s2_ulid).unwrap();
+        assert!(
+            mat_path.exists(),
+            ".materialized must still exist after second call"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn materialise_segment_hardlinks_when_no_thin_refs() {
+        use std::os::unix::fs::MetadataExt;
+
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Write unique data (no dedup possible).
+        let data = vec![0x77u8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let ulids = pending_ulids(&base);
+        assert_eq!(ulids.len(), 1);
+        let ulid = ulids[0];
+
+        vol.materialise_segment(ulid).unwrap();
+
+        let seg_path = base.join("pending").join(ulid.to_string());
+        let mat_path = base.join("pending").join(format!("{}.materialized", ulid));
+        assert!(mat_path.exists(), ".materialized must exist");
+
+        // Hard link: both files share the same inode.
+        let seg_meta = fs::metadata(&seg_path).unwrap();
+        let mat_meta = fs::metadata(&mat_path).unwrap();
+        assert_eq!(
+            seg_meta.ino(),
+            mat_meta.ino(),
+            "no-thin-ref materialise should hard link, not copy"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn wal_recovery_with_thin_ref() {
+        // Write data to LBA 0, promote to pending, then write same data to
+        // LBA 1 (dedup hit → thin ref in WAL). Do NOT flush — leave the thin
+        // ref in the WAL. Drop (crash), reopen, verify both LBAs read back.
+        let base = keyed_temp_dir();
+        let data = vec![0x99u8; 4096];
+
+        {
+            let mut vol = Volume::open(&base, &base).unwrap();
+            vol.write(0, &data).unwrap();
+            vol.promote_for_test().unwrap();
+            // Second write: same data, different LBA → dedup hit → REF in WAL.
+            vol.write(1, &data).unwrap();
+            vol.fsync().unwrap();
+            // Drop without promote — thin ref stays in WAL only.
+        }
+
+        // Reopen triggers WAL recovery.
+        let vol = Volume::open(&base, &base).unwrap();
+        assert_eq!(
+            vol.read(0, 1).unwrap(),
+            data,
+            "LBA 0 must survive crash with thin ref in WAL"
+        );
+        assert_eq!(
+            vol.read(1, 1).unwrap(),
+            data,
+            "LBA 1 (thin ref) must survive crash with thin ref in WAL"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Known failure: proptest minimal reproducer for dedup canonical overwrite
+    /// data loss. When PopulateFetched overwrites the extent index entry for a
+    /// hash that a DedupRef depends on, then DrainLocal removes pending/, then
+    /// GC runs, the thin ref's canonical body is lost. After crash, LBA 4
+    /// reads zeros instead of the expected data.
+    ///
+    /// Un-ignore when the fix lands.
+    #[test]
+    #[ignore]
+    fn proptest_minimal_dedup_overwrite_data_loss() {
+        let base = keyed_temp_dir();
+        let fork_dir = base.clone();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // DedupWrite: write [1u8; 4096] to LBA 0 and LBA 4 (dedup hit on LBA 4).
+        let data = [1u8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.write(4, &data).unwrap();
+
+        // Flush — promotes WAL to pending/.
+        vol.flush_wal().unwrap();
+
+        // PopulateFetched: write different data to cache for LBA 0,
+        // overwriting the extent index entry for the original hash.
+        let (pop_ulid, _) = vol.gc_checkpoint().unwrap();
+        {
+            // Use the common helper pattern from tests/common/mod.rs.
+            let index_dir = fork_dir.join("index");
+            let cache_dir = fork_dir.join("cache");
+            let _ = fs::create_dir_all(&index_dir);
+            let _ = fs::create_dir_all(&cache_dir);
+
+            let seed = 128u8;
+            let pop_data = vec![seed; 4096];
+            let pop_hash = blake3::hash(&pop_data);
+            let mut entries = vec![segment::SegmentEntry::new_data(
+                pop_hash,
+                0,
+                1,
+                segment::SegmentFlags::empty(),
+                pop_data,
+            )];
+
+            let signer =
+                crate::signing::load_signer(&fork_dir, crate::signing::VOLUME_KEY_FILE).unwrap();
+            let tmp = cache_dir.join(format!("{pop_ulid}.tmp"));
+            let bss = segment::write_segment(&tmp, &mut entries, signer.as_ref()).unwrap();
+            let bytes = fs::read(&tmp).unwrap();
+            fs::remove_file(&tmp).unwrap();
+
+            let s = pop_ulid.to_string();
+            fs::write(index_dir.join(format!("{s}.idx")), &bytes[..bss as usize]).unwrap();
+            fs::write(cache_dir.join(format!("{s}.body")), &bytes[bss as usize..]).unwrap();
+            segment::set_present_bit(&cache_dir.join(format!("{s}.present")), 0, 1).unwrap();
+        }
+
+        // DrainLocal: promote all pending segments to index/ + cache/.
+        {
+            let pending = fork_dir.join("pending");
+            let index_dir = fork_dir.join("index");
+            let cache_dir = fork_dir.join("cache");
+            let _ = fs::create_dir_all(&index_dir);
+            let _ = fs::create_dir_all(&cache_dir);
+            if let Ok(entries) = fs::read_dir(&pending) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().into_string().unwrap();
+                    if name.contains('.') {
+                        continue;
+                    }
+                    let file_data = fs::read(entry.path()).unwrap();
+                    if file_data.len() < 96 {
+                        continue;
+                    }
+                    let entry_count = u32::from_le_bytes([
+                        file_data[8],
+                        file_data[9],
+                        file_data[10],
+                        file_data[11],
+                    ]);
+                    let index_length = u32::from_le_bytes([
+                        file_data[12],
+                        file_data[13],
+                        file_data[14],
+                        file_data[15],
+                    ]);
+                    let inline_length = u32::from_le_bytes([
+                        file_data[16],
+                        file_data[17],
+                        file_data[18],
+                        file_data[19],
+                    ]);
+                    let bss = 96 + index_length as usize + inline_length as usize;
+                    if file_data.len() < bss {
+                        continue;
+                    }
+                    let _ = fs::write(index_dir.join(format!("{name}.idx")), &file_data[..bss]);
+                    let _ = fs::write(cache_dir.join(format!("{name}.body")), &file_data[bss..]);
+                    let bitset_len = (entry_count as usize).div_ceil(8);
+                    let _ = fs::write(
+                        cache_dir.join(format!("{name}.present")),
+                        vec![0xFFu8; bitset_len],
+                    );
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        // CoordGcLocal: run GC.
+        {
+            let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
+            vol.flush_wal().unwrap();
+            // Need at least 2 segments for GC; use all available.
+            let idx_files = segment::collect_idx_files(&fork_dir.join("index")).unwrap();
+            if idx_files.len() >= 2 {
+                let to_delete = {
+                    use crate::{extentindex, lbamap};
+                    let rebuild_chain = vec![(fork_dir.clone(), None)];
+                    let lba_map = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+                    let _live_hashes = lba_map.live_hashes();
+                    let extent_index = extentindex::rebuild(&rebuild_chain).unwrap();
+
+                    let vk = crate::signing::load_verifying_key(
+                        &fork_dir,
+                        crate::signing::VOLUME_PUB_FILE,
+                    )
+                    .unwrap();
+                    let (ephemeral_signer, _) = crate::signing::generate_ephemeral_signer();
+
+                    let gc_dir = fork_dir.join("gc");
+                    let _ = fs::create_dir_all(&gc_dir);
+
+                    // Build candidates from all .idx files
+                    let mut candidates: Vec<(Ulid, PathBuf)> = idx_files
+                        .iter()
+                        .filter_map(|p| {
+                            let stem = p.file_stem()?.to_str()?;
+                            let ulid = Ulid::from_string(stem).ok()?;
+                            Some((ulid, p.clone()))
+                        })
+                        .collect();
+                    candidates.sort_by_key(|(u, _)| *u);
+
+                    // Read and compact
+                    let mut all_entries: Vec<segment::SegmentEntry> = Vec::new();
+                    let mut source_ulids: Vec<Ulid> = Vec::new();
+                    for (ulid, path) in &candidates {
+                        let Ok((_bss, mut seg_entries)) =
+                            segment::read_and_verify_segment_index(path, &vk)
+                        else {
+                            continue;
+                        };
+                        let body_path = fork_dir.join("cache").join(format!("{}.body", ulid));
+                        if segment::read_extent_bodies(&body_path, 0, &mut seg_entries).is_err() {
+                            continue;
+                        }
+                        for e in seg_entries {
+                            if e.kind == EntryKind::DedupRef {
+                                continue;
+                            }
+                            let lba_live = lba_map.hash_at(e.start_lba) == Some(e.hash);
+                            let extent_live = extent_index
+                                .lookup(&e.hash)
+                                .is_some_and(|loc| loc.segment_id == *ulid);
+                            if lba_live || extent_live {
+                                source_ulids.push(*ulid);
+                                all_entries.push(e);
+                            }
+                        }
+                    }
+
+                    if !all_entries.is_empty() {
+                        let tmp = gc_dir.join(format!("{gc_ulid}.tmp"));
+                        let final_path = gc_dir.join(gc_ulid.to_string());
+                        let new_bss = segment::write_segment(
+                            &tmp,
+                            &mut all_entries,
+                            ephemeral_signer.as_ref(),
+                        )
+                        .unwrap();
+                        fs::rename(&tmp, &final_path).unwrap();
+
+                        let handoff_lines: Vec<HandoffLine> = all_entries
+                            .iter()
+                            .zip(source_ulids.iter())
+                            .filter(|(e, _)| e.kind != EntryKind::DedupRef)
+                            .map(|(e, src)| HandoffLine::Repack {
+                                hash: e.hash,
+                                old_ulid: *src,
+                                new_ulid: gc_ulid,
+                                new_offset: new_bss + e.stored_offset,
+                            })
+                            .collect();
+                        let _ = fs::write(
+                            gc_dir.join(format!("{gc_ulid}.pending")),
+                            crate::gc::format_handoff_file(handoff_lines),
+                        );
+                    }
+
+                    candidates
+                        .iter()
+                        .map(|(_, p)| p.clone())
+                        .collect::<Vec<_>>()
+                };
+                let applied = vol.apply_gc_handoffs().unwrap_or(0);
+                if applied > 0 {
+                    for path in &to_delete {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+        }
+
+        // Crash: drop and reopen.
+        drop(vol);
+        let vol = Volume::open(&base, &base).unwrap();
+
+        // Assert LBA 4 reads [1u8; 4096] — the dedup ref target.
+        // This is the assertion that currently fails due to the known bug.
+        assert_eq!(
+            vol.read(4, 1).unwrap(),
+            vec![1u8; 4096],
+            "LBA 4 (dedup ref) must read back original data after GC + crash"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     // --- walk_ancestors tests ---
 
     #[test]

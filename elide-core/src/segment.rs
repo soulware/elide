@@ -1510,4 +1510,50 @@ mod tests {
 
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn roundtrip_materialized_ref_entry() {
+        let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+        let data = vec![0xFFu8; 4096];
+        let hash = blake3::hash(&data);
+
+        let mut entries = vec![SegmentEntry::new_materialized_ref(
+            hash,
+            7,
+            2,
+            SegmentFlags::empty(),
+            data,
+        )];
+        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+
+        let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
+        assert_eq!(read_back.len(), 1);
+
+        let e = &read_back[0];
+        assert_eq!(e.kind, EntryKind::MaterializedRef);
+        assert_eq!(e.hash, hash);
+        assert_eq!(e.start_lba, 7);
+        assert_eq!(e.lba_length, 2);
+        assert_eq!(e.stored_offset, 0);
+        assert_eq!(e.stored_length, 4096);
+        assert!(!e.compressed);
+
+        // Verify the flag byte round-trips as DEDUP_REF | MATERIALIZED.
+        // We already confirmed kind == MaterializedRef above, which is only
+        // produced when both flags are present during parsing.
+        // Additionally, read the raw flag byte from the file to be explicit.
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = fs::File::open(&path).unwrap();
+        // The first index entry starts at HEADER_LEN. The flag byte is at
+        // offset: hash(32) + start_lba(8) + lba_length(4) = 44 bytes in.
+        f.seek(SeekFrom::Start(HEADER_LEN as u64 + 44)).unwrap();
+        let mut flag_byte = [0u8; 1];
+        f.read_exact(&mut flag_byte).unwrap();
+        let flags = SegmentFlags::from_bits_truncate(flag_byte[0]);
+        assert!(flags.contains(SegmentFlags::DEDUP_REF));
+        assert!(flags.contains(SegmentFlags::MATERIALIZED));
+
+        fs::remove_file(&path).unwrap();
+    }
 }
