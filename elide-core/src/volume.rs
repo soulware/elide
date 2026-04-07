@@ -1432,6 +1432,23 @@ impl Volume {
         // Read body bytes for existing DATA/MaterializedRef entries.
         segment::read_extent_bodies(&seg_path, body_section_start, &mut new_entries)?;
 
+        {
+            let (mut fat, mut data, mut zero) = (0usize, 0usize, 0usize);
+            for e in &new_entries {
+                match e.kind {
+                    EntryKind::MaterializedRef => fat += 1,
+                    EntryKind::Data => data += 1,
+                    EntryKind::Zero => zero += 1,
+                    EntryKind::DedupRef | EntryKind::Inline => {}
+                }
+            }
+            log::info!(
+                "materialise {ulid_str}: {fat} thin→fat, \
+                 {data} data, {zero} zero ({} entries total)",
+                new_entries.len()
+            );
+        }
+
         // Atomic rewrite.
         let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
         segment::write_segment(&tmp_path, &mut new_entries, self.signer.as_ref())?;
@@ -1495,6 +1512,22 @@ impl Volume {
                     entry_idx: None,
                     body_section_start,
                 },
+            );
+        }
+        {
+            let (mut data, mut refs, mut zero) = (0usize, 0usize, 0usize);
+            for e in &self.pending_entries {
+                match e.kind {
+                    EntryKind::Data => data += 1,
+                    EntryKind::DedupRef => refs += 1,
+                    EntryKind::Zero => zero += 1,
+                    EntryKind::MaterializedRef | EntryKind::Inline => {}
+                }
+            }
+            log::info!(
+                "flush {segment_ulid}: {data} data, {refs} dedup-ref, \
+                 {zero} zero ({} entries total)",
+                self.pending_entries.len()
             );
         }
         self.pending_entries.clear();
