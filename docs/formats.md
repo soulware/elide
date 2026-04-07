@@ -221,7 +221,7 @@ body_offset   = 96 + index_length + inline_length
 delta_offset  = 96 + index_length + inline_length + body_length
 ```
 
-**The full body** is raw concatenated extent data — DATA-record extents only, clean bytes, no framing. REF-record extents contribute nothing to the body. All navigation is via the index section.
+**The full body** is raw concatenated extent data — DATA-record extents only, clean bytes, no framing. REF-record extents currently contribute nothing to the body. **Proposed:** REF records will also materialise their body bytes here; see architecture.md § Dedup. All navigation is via the index section.
 
 **The delta body** is raw concatenated delta blobs, referenced by byte offset from the index section. Absent on locally-stored segment files (`delta_length = 0`); present on S3 objects when the coordinator has computed deltas against ancestor segments.
 
@@ -252,7 +252,10 @@ For each extent:
   flags         (1 byte)    — flag bits above
 
   if FLAG_DEDUP_REF:
-    (no body fields — data located via extent index lookup on hash)
+    body_offset (8 bytes)   — byte offset within full body section (u64 le)
+    body_length (4 bytes)   — byte length (compressed size if FLAG_COMPRESSED)
+    (Proposed: REF entries carry a materialised body — see architecture.md § Dedup.
+     Current implementation: no body fields; data located via extent index lookup.)
 
   if FLAG_ZERO:
     (no body fields — hash is ZERO_HASH; reads return lba_length × 4096 zero bytes)
@@ -280,7 +283,7 @@ For each extent:
 
 `lba_length × 4096` always gives the uncompressed extent size. `body_length` / `inline_length` gives the stored (possibly compressed) size.
 
-**FLAG_DEDUP_REF entries** carry only the LBA mapping, sufficient for LBA map reconstruction at startup. The extent data is located via the extent index (`hash → ULID + body_offset`), populated from ancestor segment files at startup.
+**FLAG_DEDUP_REF entries** carry the LBA mapping and the canonical-segment reference (implicit in the hash, resolved via the extent index), sufficient for LBA map reconstruction at startup. **Proposed:** entries also carry `body_offset + body_length` pointing into this segment's own body section — the full extent is materialised here, making the extent index reference a local-cache optimisation hint rather than a load-bearing pointer. The read path uses the hint only when the canonical segment is already cached; otherwise falls through to the body in this segment. The fetch path always reads from this segment's body, never chasing cross-segment refs.
 
 **FLAG_ZERO entries** carry only the LBA mapping with ZERO_HASH. No extent index lookup is performed for these entries — the read path returns zeros directly. Zero entries must be present in the segment index (and in the serialised manifest) to correctly mask ancestor data; they are never omitted even though they have no body bytes.
 
@@ -452,7 +455,7 @@ Extents materialised from a delta (delta bytes fetched, applied against a local 
 A packed bitset with one bit per index entry (entry N → bit N). Size: `ceil(entry_count / 8)` bytes. A set bit means the bytes `[body_offset, body_offset + body_length)` for that entry are present in `.body` and ready to serve.
 
 Entries that have no body bytes never need fetching and can be treated as implicitly present:
-- `FLAG_DEDUP_REF` — data lives in an ancestor segment; no bytes in this segment's body
+- `FLAG_DEDUP_REF` — **Proposed:** body bytes present in this segment (see architecture.md § Dedup); currently no bytes in this segment's body, data lives in an ancestor segment
 - `FLAG_INLINE` — data is in the inline section of `.idx`; no body fetch needed
 - `FLAG_ZERO` — zero extent; no bytes in this segment's body; reads return zeros directly
 
