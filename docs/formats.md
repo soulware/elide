@@ -59,7 +59,7 @@ Zero extents differ from unwritten regions in one important way: an unwritten LB
 | `FLAG_DEDUP_REF` | `0x02` | `0x08` |
 | `FLAG_ZERO`      | `0x04` | `0x10` |
 
-The segment format also has `FLAG_INLINE` (`0x01`), `FLAG_HAS_DELTAS` (`0x02`), and `FLAG_DEDUP_MATERIALIZED` (`0x20`), which have no WAL equivalents. `FLAG_DEDUP_MATERIALIZED` is set by `materialise_segment` when rewriting a thin REF to a fat REF before S3 upload — it is never written by the volume during normal WAL promotion. Never copy a WAL `flags` byte directly into a segment index entry.
+The segment format also has `FLAG_INLINE` (`0x01`), `FLAG_HAS_DELTAS` (`0x02`), and `FLAG_MATERIALIZED` (`0x20`), which have no WAL equivalents. `FLAG_MATERIALIZED` is set by `materialise_segment` when rewriting a thin REF to a fat REF before S3 upload — it is never written by the volume during normal WAL promotion. Never copy a WAL `flags` byte directly into a segment index entry.
 
 For DATA and REF records, the hash is computed before the dedup check and stored in the log record. Recovery can reconstruct the LBA map without re-reading or re-hashing the data. ZERO records carry ZERO_HASH as a fixed sentinel — no hash computation is performed.
 
@@ -237,9 +237,9 @@ delta_offset  = 96 + index_length + inline_length + body_length
 - `0x01` `FLAG_INLINE` — extent data is in the inline section; no body fetch needed
 - `0x02` `FLAG_HAS_DELTAS` — one or more delta options follow
 - `0x04` `FLAG_COMPRESSED` — stored data is compressed; lengths are compressed sizes
-- `0x08` `FLAG_DEDUP_REF` — dedup reference (thin variant): no body bytes; extent data located via extent index (`hash → canonical ULID + body_offset`). When combined with `FLAG_DEDUP_MATERIALIZED`, body bytes are present — see below.
+- `0x08` `FLAG_DEDUP_REF` — dedup reference (thin variant): no body bytes; extent data located via extent index (`hash → canonical ULID + body_offset`). When combined with `FLAG_MATERIALIZED`, body bytes are present — see below.
 - `0x10` `FLAG_ZERO` — zero extent; hash field is ZERO_HASH; no body in this segment; reads as zeros
-- `0x20` `FLAG_DEDUP_MATERIALIZED` — modifier for `FLAG_DEDUP_REF` (always set together, never alone): body bytes have been materialised into this segment's body section (fat variant); entry layout gains `body_offset + body_length`, identical to a DATA entry. Set only by `materialise_segment` before S3 upload.
+- `0x20` `FLAG_MATERIALIZED` — modifier for `FLAG_DEDUP_REF` (always set together, never alone): body bytes have been materialised into this segment's body section (fat variant); entry layout gains `body_offset + body_length`, identical to a DATA entry. Set only by `materialise_segment` before S3 upload.
 
 **Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
 
@@ -256,10 +256,10 @@ For each extent:
   lba_length    (4 bytes)   — extent length in 4KB blocks (u32 le)
   flags         (1 byte)    — flag bits above
 
-  if FLAG_DEDUP_REF (thin — FLAG_DEDUP_MATERIALIZED not set):
+  if FLAG_DEDUP_REF (thin — FLAG_MATERIALIZED not set):
     (no body fields — body lives in canonical segment; same 45-byte layout as ZERO)
 
-  if FLAG_DEDUP_REF | FLAG_DEDUP_MATERIALIZED (fat — both flags set together):
+  if FLAG_DEDUP_REF | FLAG_MATERIALIZED (fat — both flags set together):
     body_offset (8 bytes)   — byte offset within this segment's full body section (u64 le)
     body_length (4 bytes)   — byte length (compressed size if FLAG_COMPRESSED)
 
@@ -293,7 +293,7 @@ For each extent:
 
 - **Thin REF** (`FLAG_DEDUP_REF` alone): no body bytes in this segment. The hash is a key into the local extent index (`hash → canonical segment ULID + body_offset`), which is used to serve reads from the canonical segment's body. Thin REFs appear in WAL, `pending/`, and locally-cached segments. They are never uploaded to S3 in this form.
 
-- **Fat REF** (`FLAG_DEDUP_REF | FLAG_DEDUP_MATERIALIZED`): body bytes are materialised in this segment's body section; the segment is self-contained. Entry layout is identical to a DATA entry (`body_offset + body_length`). Fat REFs appear exclusively in S3 objects, produced by `materialise_segment` before upload. S3 segments are always self-contained.
+- **Fat REF** (`FLAG_DEDUP_REF | FLAG_MATERIALIZED`): body bytes are materialised in this segment's body section; the segment is self-contained. Entry layout is identical to a DATA entry (`body_offset + body_length`). Fat REFs appear exclusively in S3 objects, produced by `materialise_segment` before upload. S3 segments are always self-contained.
 
 The thin-cache optimisation: when promoting a fat REF from S3 to `cache/`, the volume looks up the extent hash in the local extent index (`hash → canonical ULID`). If the canonical segment is already warm in `cache/`, the volume may skip writing the REF body bytes (`present = 0` for that entry). On a subsequent read miss, the canonical segment is tried first; if it has been evicted, the fat segment itself is re-fetched from S3. See architecture.md § Dedup for the full rationale.
 
