@@ -574,6 +574,14 @@ impl Volume {
                 }
             }
 
+            // Evict the old segment from the file handle cache before
+            // replacing or deleting it.
+            let mut cache = self.file_cache.borrow_mut();
+            if cache.as_ref().map(|(id, _, _)| *id) == Some(seg_id) {
+                *cache = None;
+            }
+            drop(cache);
+
             if !live_entries.is_empty() {
                 // Read body bytes for live entries, then write a new denser segment.
                 segment::read_extent_bodies(&seg_path, body_section_start, &mut live_entries)?;
@@ -592,6 +600,7 @@ impl Volume {
                 // write_segment reassigns stored_offset in live_entries to new positions.
                 let new_bss =
                     segment::write_segment(&tmp_path, &mut live_entries, self.signer.as_ref())?;
+                // Atomically replaces the original segment file.
                 fs::rename(&tmp_path, &final_path)?;
                 segment::fsync_dir(&final_path)?;
                 stats.new_segments += 1;
@@ -614,17 +623,15 @@ impl Volume {
                         EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => {}
                     }
                 }
+            } else {
+                // All entries are dead — delete the segment file.  Without this,
+                // a subsequent materialise_segment would try to resolve thin
+                // DedupRef entries whose canonical hashes we just removed from
+                // the extent index.
+                fs::remove_file(&seg_path)?;
+                segment::fsync_dir(&seg_path)?;
             }
 
-            // Evict the old segment from the file handle cache before deleting it.
-            let mut cache = self.file_cache.borrow_mut();
-            if cache.as_ref().map(|(id, _, _)| *id) == Some(seg_id) {
-                *cache = None;
-            }
-            drop(cache);
-
-            // The rename above replaced the source atomically (final_path == seg_path),
-            // so there is nothing left to delete.
             stats.segments_compacted += 1;
             stats.bytes_freed += total_bytes - live_bytes;
             stats.extents_removed += removed;
@@ -3789,6 +3796,82 @@ mod tests {
             data,
             "LBA 1 (thin ref) must survive crash with thin ref in WAL"
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Proptest regression: DedupWrite → Flush → DedupWrite (overwrite) →
+    /// Repack → DrainWithMaterialise.
+    ///
+    /// Repack finds all entries in the first segment dead (overwritten by the
+    /// second DedupWrite) and removes the hash from the extent index.  Before
+    /// the fix, repack left the segment file behind; DrainWithMaterialise then
+    /// tried to materialise it, hit a DedupRef whose canonical hash was gone,
+    /// and panicked.  The fix: repack deletes the segment file when all
+    /// entries are dead.
+    #[test]
+    fn repack_deletes_fully_dead_segment_before_materialise() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Pre-snapshot segments (frozen by snapshot, skipped by repack).
+        // Write → Flush → DrainWithMaterialise (materialise + promote).
+        let data_a = vec![17u8; 4096];
+        vol.write(2, &data_a).unwrap();
+        vol.flush_wal().unwrap();
+        for ulid in pending_ulids(&base) {
+            vol.materialise_segment(ulid).unwrap();
+            vol.promote_segment(ulid).unwrap();
+        }
+
+        let data_b = vec![34u8; 4096];
+        vol.write(3, &data_b).unwrap();
+        vol.flush_wal().unwrap();
+        for ulid in pending_ulids(&base) {
+            vol.materialise_segment(ulid).unwrap();
+            vol.promote_segment(ulid).unwrap();
+        }
+
+        vol.snapshot().unwrap();
+
+        // DedupWrite seed=0: LBA 0 (Data) + LBA 6 (DedupRef), same hash.
+        let dedup_data_0 = vec![0u8; 4096];
+        vol.write(0, &dedup_data_0).unwrap();
+        vol.write(6, &dedup_data_0).unwrap();
+        vol.flush_wal().unwrap();
+
+        // DedupWrite seed=1: overwrite both LBAs with new data.
+        let dedup_data_1 = vec![1u8; 4096];
+        vol.write(0, &dedup_data_1).unwrap();
+        vol.write(6, &dedup_data_1).unwrap();
+
+        // Repack: the post-snapshot segment (seed=0) is now fully dead.
+        // min_live_ratio=0.01 so the segment (0% live) is eligible.
+        // Before the fix this left the segment file on disk.
+        vol.repack(0.01).unwrap();
+
+        // The fully-dead segment must have been deleted.
+        let ulids = pending_ulids(&base);
+        assert!(
+            ulids.is_empty(),
+            "repack should delete fully-dead segment, but found: {ulids:?}"
+        );
+
+        // DrainWithMaterialise: flush the WAL (seed=1), materialise, promote.
+        // Before the fix, materialise_segment would panic here because the
+        // stale segment still existed and its DedupRef's hash was gone from
+        // the extent index.
+        vol.flush_wal().unwrap();
+        for ulid in pending_ulids(&base) {
+            vol.materialise_segment(ulid).unwrap();
+            vol.promote_segment(ulid).unwrap();
+        }
+
+        // Verify reads.
+        assert_eq!(vol.read(0, 1).unwrap(), dedup_data_1, "LBA 0");
+        assert_eq!(vol.read(6, 1).unwrap(), dedup_data_1, "LBA 6");
+        assert_eq!(vol.read(2, 1).unwrap(), data_a, "LBA 2 (pre-snapshot)");
+        assert_eq!(vol.read(3, 1).unwrap(), data_b, "LBA 3 (pre-snapshot)");
 
         fs::remove_dir_all(base).unwrap();
     }
