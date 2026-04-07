@@ -371,7 +371,7 @@ proptest! {
                     }
                 }
                 SimOp::DrainLocal => {
-                    common::drain_local(fork_dir);
+                    common::drain_with_materialise(&mut vol);
                 }
                 SimOp::DrainWithMaterialise => {
                     common::drain_with_materialise(&mut vol);
@@ -548,7 +548,7 @@ proptest! {
                     let _ = vol.repack(0.9);
                 }
                 SimOp::DrainLocal => {
-                    common::drain_local(fork_dir);
+                    common::drain_with_materialise(&mut vol);
                 }
                 SimOp::DrainWithMaterialise => {
                     common::drain_with_materialise(&mut vol);
@@ -684,7 +684,7 @@ proptest! {
                     let _ = vol.repack(0.9);
                 }
                 SimOp::DrainLocal => {
-                    common::drain_local(fork_dir);
+                    common::drain_with_materialise(&mut vol);
                 }
                 SimOp::DrainWithMaterialise => {
                     common::drain_with_materialise(&mut vol);
