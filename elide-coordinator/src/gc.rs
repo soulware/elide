@@ -64,7 +64,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, warn};
@@ -158,12 +158,17 @@ pub async fn gc_fork(
         return Ok(GcStats::none());
     }
 
+    // Clean up any stale .fetch files left by a coordinator crash mid-compaction.
+    // .fetch files are transient S3 downloads; the source is always in S3, so
+    // deleting them unconditionally is safe.
+    cleanup_fetch_files(&gc_dir);
+
     // Pending segments created by WAL auto-flush during drain are safe to
-    // ignore here: collect_stats (below) skips any index/<ulid>.idx that has
-    // no corresponding cache/<ulid>.body, so un-promoted segments are never
-    // GC candidates.  rebuild_segments includes pending/ with highest priority,
-    // so the LBA map correctly reflects those writes and their LBAs are not
-    // included in older-segment candidates.
+    // ignore here: collect_stats (below) only considers index/<ulid>.idx files,
+    // so un-promoted segments (no .idx yet) are never GC candidates.
+    // rebuild_segments includes pending/ with highest priority, so the LBA map
+    // correctly reflects those writes and their LBAs are not included in
+    // older-segment candidates.
 
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
@@ -184,7 +189,14 @@ pub async fn gc_fork(
     let mut repack_bytes: u64 = 0;
     let ran_repack = if let Some(pos) = find_least_dense(&all_stats, config.density_threshold) {
         let candidate = all_stats.remove(pos);
-        repack_bytes = candidate.dead_bytes();
+        repack_bytes = candidate.dead_lba_bytes();
+        tracing::info!(
+            "[gc] repack candidate: {} density={:.3} live={} dead={}",
+            candidate.ulid_str,
+            candidate.density(),
+            candidate.live_lba_bytes,
+            candidate.dead_lba_bytes(),
+        );
         compact_segments(vec![candidate], &gc_dir, volume_id, store, repack_ulid)
             .await
             .context("density compaction")?;
@@ -207,10 +219,10 @@ pub async fn gc_fork(
             continue;
         }
         // Always include at least one; then enforce the live-bytes cap.
-        if !small.is_empty() && acc_live + s.live_bytes > SWEEP_LIVE_CAP {
+        if !small.is_empty() && acc_live + s.live_lba_bytes > SWEEP_LIVE_CAP {
             break;
         }
-        acc_live += s.live_bytes;
+        acc_live += s.live_lba_bytes;
         small.push(s);
     }
 
@@ -218,7 +230,7 @@ pub async fn gc_fork(
     // A single small segment with no dead space is not worth a standalone pass.
     let ran_sweep = if small.len() >= 2 {
         let sweep_candidates = small.len();
-        let sweep_bytes: u64 = small.iter().map(|s| s.dead_bytes()).sum();
+        let sweep_bytes: u64 = small.iter().map(|s| s.dead_lba_bytes()).sum();
         compact_segments(small, &gc_dir, volume_id, store, sweep_ulid)
             .await
             .context("small-segment sweep")?;
@@ -469,34 +481,61 @@ pub fn cleanup_done_handoffs(fork_dir: &Path, ttl: Duration) -> usize {
     deleted
 }
 
+/// Delete any `gc/<ulid>.fetch` files left by a coordinator crash.
+///
+/// `.fetch` files are transient S3 downloads written by `compact_segments`
+/// and deleted immediately after the body is read.  If the coordinator crashes
+/// between the write and the delete, the file is left behind.  It is always
+/// safe to remove unconditionally — the full segment remains in S3.
+fn cleanup_fetch_files(gc_dir: &Path) {
+    let Ok(entries) = fs::read_dir(gc_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.ends_with(".fetch")
+            && let Err(e) = fs::remove_file(entry.path())
+        {
+            error!("[gc] failed to delete stale fetch file {name_str}: {e}");
+        }
+    }
+}
+
 // --- internals ---
+
+/// Logical block size: all LBA lengths are in units of this many bytes.
+const BLOCK_BYTES: u64 = 4096;
 
 /// Per-segment stats computed during the scan phase.
 struct SegmentStats {
     ulid_str: String,
-    path: PathBuf,
+    /// Physical on-disk size (idx + DATA body bytes); used for small_segment_bytes threshold.
     file_size: u64,
-    /// Sum of stored_length for entries still canonical in the extent index.
-    live_bytes: u64,
-    /// Sum of stored_length for all non-dedup body entries.
-    total_body_bytes: u64,
-    /// Live non-dedup body entries (data field not yet populated).
+    /// Logical live bytes: lba_length * BLOCK_BYTES summed over all live entries
+    /// (DATA, dedup_ref, zero_extent).  Dedup refs and zero extents are included
+    /// so that a segment full of live dedup refs is not treated as density=0.
+    live_lba_bytes: u64,
+    /// Logical total bytes: lba_length * BLOCK_BYTES summed over all entries.
+    total_lba_bytes: u64,
+    /// Live entries (data field not yet populated for DATA entries).
     live_entries: Vec<SegmentEntry>,
     /// Hashes that are in the extent index but not reachable from the LBA map.
     /// The volume must remove these from its extent index when applying the
     /// handoff, since the old segment files will be deleted.
     removed_hashes: Vec<blake3::Hash>,
-    body_section_start: u64,
 }
 
 impl SegmentStats {
-    fn dead_bytes(&self) -> u64 {
-        self.total_body_bytes.saturating_sub(self.live_bytes)
+    fn dead_lba_bytes(&self) -> u64 {
+        self.total_lba_bytes.saturating_sub(self.live_lba_bytes)
     }
 
     fn density(&self) -> f64 {
-        if self.file_size > 0 {
-            self.live_bytes as f64 / self.file_size as f64
+        if self.total_lba_bytes > 0 {
+            self.live_lba_bytes as f64 / self.total_lba_bytes as f64
         } else {
             0.0
         }
@@ -523,7 +562,6 @@ fn collect_stats(
     floor: Option<Ulid>,
 ) -> io::Result<Vec<SegmentStats>> {
     let index_dir = fork_dir.join("index");
-    let cache_dir = fork_dir.join("cache");
     let mut idx_files = segment::collect_idx_files(&index_dir)?;
     segment::sort_for_rebuild(fork_dir, &mut idx_files);
 
@@ -544,42 +582,18 @@ fn collect_stats(
             continue;
         }
 
-        // File size is idx + body; used for the small_segment_bytes threshold.
+        // Read index from .idx — the only local file we need for stats.
+        // Presence of .idx means the segment is confirmed in S3 (invariant:
+        // .idx is written inside promote_segment IPC, after confirmed S3 PUT).
+        // body_section_start for .body files is 0 (body starts at byte 0);
+        // for full segments it is non-zero — compact_segments fetches the full
+        // segment from S3 and calls read_segment_index to get the correct value.
         let idx_size = fs::metadata(&idx_path)?.len();
-        let body_path = cache_dir.join(format!("{ulid_str}.body"));
-        // Skip segments whose cache body is absent — they are still in
-        // pending/ (not yet promoted) and must not be GC'd.  This happens
-        // when gc_checkpoint flushes the WAL to pending/ and writes index/,
-        // then gc_fork runs before the coordinator can promote the segment.
-        if !body_path.exists() {
-            continue;
-        }
-        let body_size = fs::metadata(&body_path).map(|m| m.len()).unwrap_or(0);
-        let file_size = idx_size + body_size;
-
-        // Read index from .idx; body_section_start for the .body file is 0
-        // since cache .body files contain only the body section (byte 0 = first body byte).
         let (_, entries) = segment::read_and_verify_segment_index(&idx_path, vk)?;
-        let body_section_start = 0u64;
 
-        // Skip segments with a partial body: demand-fetch populates entries on
-        // demand, so the body file may exist but not all entries are present.
-        // GC's read_extent_bodies reads raw bytes directly — it cannot
-        // demand-fetch missing entries and would fail with UnexpectedEof.
-        let present_path = cache_dir.join(format!("{ulid_str}.present"));
-        let all_present = entries.iter().enumerate().all(|(i, e)| {
-            if e.is_dedup_ref || e.is_inline || e.is_zero_extent {
-                true
-            } else {
-                segment::check_present_bit(&present_path, i as u32).unwrap_or(false)
-            }
-        });
-        if !all_present {
-            continue;
-        }
-
-        let mut live_bytes: u64 = 0;
-        let mut total_body_bytes: u64 = 0;
+        let mut live_lba_bytes: u64 = 0;
+        let mut total_lba_bytes: u64 = 0;
+        let mut physical_body_bytes: u64 = 0;
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
@@ -587,6 +601,9 @@ fn collect_stats(
             if entry.is_inline {
                 continue;
             }
+            let lba_bytes = entry.lba_length as u64 * BLOCK_BYTES;
+            total_lba_bytes += lba_bytes;
+
             // Zero extents have no body bytes and use ZERO_HASH as a sentinel
             // (never in the extent index). Liveness is determined by LBA-map
             // ownership: the entry is live if the LBA still maps to ZERO_HASH.
@@ -597,6 +614,7 @@ fn collect_stats(
             if entry.is_zero_extent {
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(ZERO_HASH);
                 if lba_live {
+                    live_lba_bytes += lba_bytes;
                     live_entries.push(entry);
                 }
                 continue;
@@ -608,16 +626,17 @@ fn collect_stats(
             if entry.is_dedup_ref {
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
                 if lba_live {
+                    live_lba_bytes += lba_bytes;
                     live_entries.push(entry);
                 }
                 continue;
             }
-            total_body_bytes += entry.stored_length as u64;
+            physical_body_bytes += entry.stored_length as u64;
             let extent_live = index
                 .lookup(&entry.hash)
                 .is_some_and(|loc| loc.segment_id == seg_ulid);
             if extent_live && live_hashes.contains(&entry.hash) {
-                live_bytes += entry.stored_length as u64;
+                live_lba_bytes += lba_bytes;
                 live_entries.push(entry);
             } else if extent_live {
                 // Extent-index-live but not LBA-map-live: the LBA was
@@ -627,15 +646,17 @@ fn collect_stats(
             }
         }
 
+        // file_size: physical on-disk size for small_segment_bytes threshold.
+        // Uses stored (compressed) DATA body bytes + idx overhead — not LBA bytes,
+        // since the threshold is about disk space, not logical coverage.
+        let file_size = idx_size + physical_body_bytes;
         result.push(SegmentStats {
             ulid_str,
-            path: body_path,
             file_size,
-            live_bytes,
-            total_body_bytes,
+            live_lba_bytes,
+            total_lba_bytes,
             live_entries,
             removed_hashes,
-            body_section_start,
         });
     }
     Ok(result)
@@ -652,7 +673,7 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
             // an identically-sized output (the header/index overhead is always
             // present and cannot be reclaimed), so density never improves and
             // the segment would be selected again every tick indefinitely.
-            s.density() < threshold && s.dead_bytes() > 0
+            s.density() < threshold && s.dead_lba_bytes() > 0
         })
         .min_by(|(_, a), (_, b)| {
             a.density()
@@ -664,24 +685,67 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
 
 /// Read live extent bodies from each candidate, write a compacted segment,
 /// stage it in gc/, and write the gc/*.pending handoff file.
+///
+/// For each candidate, the full segment is downloaded from S3 to a temporary
+/// `gc/<ulid>.fetch` file.  This guarantees the body is complete regardless of
+/// demand-fetch state, and keeps the fetch consistent with other full-segment
+/// files in gc/.  The `.fetch` file is deleted after the body is read.
 async fn compact_segments(
     mut candidates: Vec<SegmentStats>,
     gc_dir: &Path,
-    _volume_id: &str,
-    _store: &Arc<dyn ObjectStore>,
+    volume_id: &str,
+    store: &Arc<dyn ObjectStore>,
     new_ulid: Ulid,
 ) -> Result<()> {
     let new_ulid_str = new_ulid.to_string();
-    // Read live extent bodies from local segment files.
+    fs::create_dir_all(gc_dir).context("creating gc dir")?;
+
+    // For each candidate: if it has live DATA entries, download the full segment
+    // from S3 to read the body bytes.  Dedup refs and zero extents carry no body
+    // data, so candidates with only those entry types skip the S3 fetch entirely.
+    // removed_hashes are already fully populated from collect_stats and need no fetch.
     let mut all_live: Vec<(String, SegmentEntry)> = Vec::new();
     let mut all_removed: Vec<(blake3::Hash, String)> = Vec::new();
     for candidate in &mut candidates {
-        segment::read_extent_bodies(
-            &candidate.path,
-            candidate.body_section_start,
-            &mut candidate.live_entries,
-        )
-        .with_context(|| format!("reading bodies from {}", candidate.ulid_str))?;
+        let has_data_entries = candidate
+            .live_entries
+            .iter()
+            .any(|e| !e.is_dedup_ref && !e.is_zero_extent);
+
+        if has_data_entries {
+            let fetch_path = gc_dir.join(format!("{}.fetch", candidate.ulid_str));
+
+            let key = segment_key(volume_id, &candidate.ulid_str)
+                .with_context(|| format!("building S3 key for {}", candidate.ulid_str))?;
+            let data = store
+                .get(&key)
+                .await
+                .with_context(|| format!("fetching segment {} from S3", candidate.ulid_str))?
+                .bytes()
+                .await
+                .with_context(|| format!("reading S3 body for {}", candidate.ulid_str))?;
+            tokio::fs::write(&fetch_path, &data)
+                .await
+                .with_context(|| format!("writing fetch file for {}", candidate.ulid_str))?;
+
+            // Read the full segment header to get body_section_start.
+            let (body_section_start, _) =
+                segment::read_segment_index(&fetch_path).with_context(|| {
+                    format!(
+                        "reading segment index from fetch for {}",
+                        candidate.ulid_str
+                    )
+                })?;
+
+            segment::read_extent_bodies(
+                &fetch_path,
+                body_section_start,
+                &mut candidate.live_entries,
+            )
+            .with_context(|| format!("reading bodies from {}", candidate.ulid_str))?;
+
+            let _ = fs::remove_file(&fetch_path);
+        }
         for entry in candidate.live_entries.drain(..) {
             all_live.push((candidate.ulid_str.clone(), entry));
         }
@@ -713,6 +777,7 @@ async fn compact_segments(
         fs::write(&tmp_path, format_handoff_file(handoff_lines))
             .context("writing tombstone handoff")?;
         fs::rename(&tmp_path, &pending_path).context("committing tombstone handoff")?;
+        tracing::info!("[gc] tombstone handoff → {new_ulid_str} (no live entries)");
         return Ok(());
     }
 
@@ -735,6 +800,10 @@ async fn compact_segments(
         fs::write(&tmp_path, format_handoff_file(handoff_lines))
             .context("writing removal-only handoff")?;
         fs::rename(&tmp_path, &pending_path).context("committing removal-only handoff")?;
+        tracing::info!(
+            "[gc] removal-only handoff → {new_ulid_str} ({} hash(es) removed)",
+            all_removed.len()
+        );
         return Ok(());
     }
 
@@ -791,6 +860,10 @@ async fn compact_segments(
     tokio::fs::rename(&tmp_path, &final_path)
         .await
         .context("staging compacted segment in gc/")?;
+    tracing::info!(
+        "[gc] output segment → {new_ulid_str} ({} live entries)",
+        new_entries.len()
+    );
 
     // Write the handoff file using the typed HandoffLine format.
     let mut handoff_lines: Vec<HandoffLine> = Vec::new();
@@ -961,16 +1034,14 @@ mod tests {
 
     #[test]
     fn find_least_dense_picks_sparsest_below_threshold() {
-        fn make(file_size: u64, live_bytes: u64) -> SegmentStats {
+        fn make(total_lba_bytes: u64, live_lba_bytes: u64) -> SegmentStats {
             SegmentStats {
                 ulid_str: String::new(),
-                path: PathBuf::new(),
-                file_size,
-                live_bytes,
-                total_body_bytes: file_size,
+                file_size: total_lba_bytes, // physical size irrelevant for density
+                live_lba_bytes,
+                total_lba_bytes,
                 live_entries: Vec::new(),
                 removed_hashes: Vec::new(),
-                body_section_start: 0,
             }
         }
 
@@ -984,34 +1055,30 @@ mod tests {
         // Repack owns single-segment compaction (by density). By the time
         // sweep runs, a lone small segment — whether all-live or sparsely
         // live — has density >= threshold and is not worth a standalone GC pass.
-        // Verify dead_bytes() is available for the ≥2 case.
+        // Verify dead_lba_bytes() is available for the ≥2 case.
         let s = SegmentStats {
             ulid_str: String::new(),
-            path: PathBuf::new(),
             file_size: 1024 * 1024,
-            live_bytes: 800 * 1024,
-            total_body_bytes: 1024 * 1024,
+            live_lba_bytes: 800 * 1024,
+            total_lba_bytes: 1024 * 1024,
             live_entries: Vec::new(),
             removed_hashes: Vec::new(),
-            body_section_start: 0,
         };
-        assert_eq!(s.dead_bytes(), 224 * 1024);
+        assert_eq!(s.dead_lba_bytes(), 224 * 1024);
         // density = 0.78 >= 0.70 threshold: repack would have caught it if below.
         assert!(s.density() >= 0.70);
     }
 
     #[test]
     fn find_least_dense_returns_none_when_all_above_threshold() {
-        fn make(live: u64) -> SegmentStats {
+        fn make(live_lba_bytes: u64) -> SegmentStats {
             SegmentStats {
                 ulid_str: String::new(),
-                path: PathBuf::new(),
                 file_size: 100,
-                live_bytes: live,
-                total_body_bytes: 100,
+                live_lba_bytes,
+                total_lba_bytes: 100,
                 live_entries: Vec::new(),
                 removed_hashes: Vec::new(),
-                body_section_start: 0,
             }
         }
         let stats = vec![make(80), make(90), make(100)];
@@ -1063,6 +1130,29 @@ mod tests {
 
             fs::remove_file(&path).unwrap();
         }
+    }
+
+    /// Upload all segments currently in `pending/` to the in-memory store under
+    /// the given volume_id, then run `simulate_upload` to drain them locally.
+    /// Used by tests that exercise the S3-fetch path in `compact_segments`.
+    async fn simulate_upload_with_store(dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
+        let pending_dir = dir.join("pending");
+        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let Some(ulid_str) = name.to_str() else {
+                continue;
+            };
+            if ulid_str.ends_with(".tmp") {
+                continue;
+            }
+            let data = fs::read(entry.path()).unwrap();
+            let key = segment_key(volume_id, ulid_str).unwrap();
+            store
+                .put(&key, bytes::Bytes::from(data).into())
+                .await
+                .unwrap();
+        }
+        simulate_upload(dir);
     }
 
     // --- apply_done_handoffs tests ---
@@ -1510,40 +1600,25 @@ mod tests {
         // the volume to acknowledge before deletion.
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
-        let cache_dir = tmp.path().join("cache");
-        fs::create_dir_all(&cache_dir).unwrap();
 
         let old_ulid = Ulid::from_parts(999, 20).to_string();
         let handoff_ulid = Ulid::from_parts(1000, 20);
 
-        // Create a fake cache body — read_extent_bodies opens the file even
-        // when live_entries is empty, so the path must exist.
-        let old_body_path = cache_dir.join(format!("{old_ulid}.body"));
-        fs::write(&old_body_path, b"fake dead segment").unwrap();
-
+        // The tombstone path has no live entries and no removed hashes, so
+        // compact_segments returns before fetching from S3.  No local files needed.
         let store = make_store();
         let candidate = SegmentStats {
             ulid_str: old_ulid.clone(),
-            path: old_body_path.clone(),
             file_size: 17,
-            live_bytes: 0,
-            total_body_bytes: 17,
+            live_lba_bytes: 0,
+            total_lba_bytes: 17,
             live_entries: Vec::new(),
             removed_hashes: Vec::new(),
-            body_section_start: 0,
         };
 
         compact_segments(vec![candidate], &gc_dir, "vol", &store, handoff_ulid)
             .await
             .unwrap();
-
-        // The cache body must NOT have been deleted directly — the volume has not
-        // acknowledged the handoff yet so it may still be reading from it.
-        assert!(
-            old_body_path.exists(),
-            "all-dead segment must not be deleted directly — tombstone handoff required \
-             (coordinator deletion invariant)"
-        );
 
         // A tombstone .pending file must have been written so the volume can
         // acknowledge before the coordinator deletes.
@@ -1641,6 +1716,8 @@ mod tests {
         )
         .unwrap();
 
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
         let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
 
         let content = [0xAAu8; 4096];
@@ -1649,13 +1726,13 @@ mod tests {
         // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
         vol.write(0, &content).unwrap();
         vol.flush_wal().unwrap();
-        simulate_upload(dir);
+        simulate_upload_with_store(dir, "test-vol", &store).await;
 
         // Step 2: write the same content to lba 1, flush, simulate drain.
         // Same hash H_aa → the write path emits DEDUP_REF(lba=1, H_aa) in S2.
         vol.write(1, &content).unwrap();
         vol.flush_wal().unwrap();
-        simulate_upload(dir);
+        simulate_upload_with_store(dir, "test-vol", &store).await;
 
         drop(vol);
 
@@ -1663,7 +1740,6 @@ mod tests {
         // small_segment_bytes=u64::MAX: all segments qualify as "small" for sweep.
         // density_threshold=0.0: all segments pass the density check.
         // Both S1 and S2 should be swept together (small.len() >= 2).
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
             small_segment_bytes: u64::MAX,

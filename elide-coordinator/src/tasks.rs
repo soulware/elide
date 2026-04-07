@@ -274,10 +274,7 @@ pub async fn run_volume_tasks(
 
             let handoffs_applied = control::apply_gc_handoffs(&fork_dir).await;
             if handoffs_applied > 0 {
-                info!(
-                    "[gc {volume_id}] re-applied {handoffs_applied} GC handoff(s) \
-                     after restart"
-                );
+                info!("[gc {volume_id}] volume applied {handoffs_applied} GC handoff(s)");
             }
 
             match gc::apply_done_handoffs(&fork_dir, &volume_id, &store).await {
