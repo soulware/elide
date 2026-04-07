@@ -141,9 +141,11 @@ pub struct ExtentFetch {
 /// Convenience alias for an optional heap-allocated `SegmentFetcher`.
 pub type BoxFetcher = Arc<dyn SegmentFetcher>;
 
-/// Size of a DEDUP_REF or ZERO index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1).
-const IDX_ENTRY_REF_LEN: u32 = 45;
-/// Size of a DATA index entry: above + stored_offset(8) + stored_length(4).
+/// Size of a ZERO index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1).
+/// ZERO extents have no body bytes and carry no body_offset/body_length fields.
+const IDX_ENTRY_ZERO_LEN: u32 = 45;
+/// Size of a DATA or DEDUP_REF index entry: above + stored_offset(8) + stored_length(4).
+/// DEDUP_REF entries carry materialised body bytes and use the same layout as DATA.
 const IDX_ENTRY_DATA_LEN: u32 = 57;
 
 /// Extents at or below this byte size are stored inline in the inline section.
@@ -326,9 +328,10 @@ pub fn write_segment(
             w.write_all(&entry.data)?;
         }
     }
-    // Body section: DATA extents only, raw bytes, no framing.
+    // Body section: DATA and DEDUP_REF extents, raw bytes, no framing.
+    // ZERO extents contribute no bytes; inline entries are in the inline section.
     for entry in entries.iter() {
-        if !entry.is_dedup_ref && !entry.is_zero_extent && !entry.is_inline {
+        if !entry.is_zero_extent && !entry.is_inline {
             w.write_all(&entry.data)?;
         }
     }
@@ -347,8 +350,8 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
     let mut body_cursor: u64 = 0;
 
     for entry in entries.iter_mut() {
-        index_length += if entry.is_dedup_ref || entry.is_zero_extent {
-            IDX_ENTRY_REF_LEN
+        index_length += if entry.is_zero_extent {
+            IDX_ENTRY_ZERO_LEN
         } else {
             IDX_ENTRY_DATA_LEN
         };
@@ -356,7 +359,8 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
         if entry.is_inline {
             entry.stored_offset = inline_cursor;
             inline_cursor += entry.stored_length as u64;
-        } else if !entry.is_dedup_ref && !entry.is_zero_extent {
+        } else if !entry.is_zero_extent {
+            // Both DATA and DEDUP_REF entries have materialised bodies.
             entry.stored_offset = body_cursor;
             body_cursor += entry.stored_length as u64;
         }
@@ -385,8 +389,9 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     w.write_all(&e.lba_length.to_le_bytes())?;
     w.write_all(&[flags.bits()])?;
 
-    if !e.is_dedup_ref && !e.is_zero_extent {
-        // Both inline and body entries store offset + length (in their respective sections).
+    if !e.is_zero_extent {
+        // DATA, DEDUP_REF, and inline entries all store offset + length.
+        // ZERO entries have no body and carry no offset/length fields.
         w.write_all(&e.stored_offset.to_le_bytes())?;
         w.write_all(&e.stored_length.to_le_bytes())?;
     }
@@ -561,7 +566,9 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
         let is_inline = flags.contains(SegmentFlags::INLINE);
         let compressed = flags.contains(SegmentFlags::COMPRESSED);
 
-        let (stored_offset, stored_length) = if is_dedup_ref || is_zero_extent {
+        // ZERO extents have no body fields; DATA and DEDUP_REF both carry
+        // stored_offset + stored_length pointing into the body section.
+        let (stored_offset, stored_length) = if is_zero_extent {
             (0u64, 0u32)
         } else {
             let off = u64::from_le_bytes(read_fixed(data, &mut pos)?);
@@ -589,9 +596,10 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
 /// Populate `entry.data` for all body entries by reading from the segment file.
 ///
 /// `body_section_start` is the absolute file offset of the body section, as
-/// returned by `read_segment_index`. Dedup-ref and inline entries are skipped.
-/// After this call, each body entry's `data` holds exactly `stored_length` bytes
-/// read from `body_section_start + stored_offset` in the file.
+/// returned by `read_segment_index`. ZERO and inline entries are skipped.
+/// Both DATA and DEDUP_REF entries are read — they both have materialised body
+/// bytes in the body section. After this call, each body entry's `data` holds
+/// exactly `stored_length` bytes read from `body_section_start + stored_offset`.
 ///
 /// Used by the compaction path to materialise live extent bytes before writing
 /// a new, denser segment.
@@ -603,7 +611,7 @@ pub fn read_extent_bodies(
     use std::io::{Read, Seek, SeekFrom};
     let mut f = fs::File::open(path)?;
     for entry in entries.iter_mut() {
-        if entry.is_dedup_ref || entry.is_zero_extent || entry.is_inline {
+        if entry.is_zero_extent || entry.is_inline {
             continue;
         }
         f.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;

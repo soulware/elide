@@ -375,18 +375,6 @@ impl Volume {
         let lba_length = (data.len() / 4096) as u32;
         let hash = blake3::hash(data);
 
-        // Write-path dedup: if this extent already exists in this volume's
-        // segment tree (own segments + ancestors), write a REF record instead
-        // of a DATA record. Scope is limited to within-volume so that every
-        // REF resolves within the same S3 volume tree (self-contained uploads).
-        if self.extent_index.lookup(&hash).is_some() {
-            self.wal.append_ref(lba, lba_length, &hash)?;
-            Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
-            self.pending_entries
-                .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
-            return Ok(());
-        }
-
         let compressed_data = maybe_compress(data);
         let compressed = compressed_data.is_some();
         let owned_data: Vec<u8> = compressed_data.unwrap_or_else(|| data.to_vec());
@@ -395,6 +383,37 @@ impl Volume {
         } else {
             writelog::WalFlags::empty()
         };
+
+        // Write-path dedup: if this extent already exists in this volume's
+        // segment tree (own segments + ancestors), write a REF record instead
+        // of a DATA record. The body bytes are already in hand (from the write
+        // buffer) so no fetching is required — they are written into the WAL
+        // REF record alongside the hash. Scope is limited to within-volume so
+        // that every REF is self-contained within the same S3 volume tree.
+        if self.extent_index.lookup(&hash).is_some() {
+            let body_offset =
+                self.wal
+                    .append_ref(lba, lba_length, &hash, wal_flags, &owned_data)?;
+            Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
+            Arc::make_mut(&mut self.extent_index).insert(
+                hash,
+                extentindex::ExtentLocation {
+                    segment_id: self.wal_ulid,
+                    body_offset,
+                    body_length: owned_data.len() as u32,
+                    compressed,
+                    entry_idx: None,
+                    body_section_start: 0,
+                },
+            );
+            let mut entry = segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length);
+            entry.compressed = compressed;
+            entry.stored_length = owned_data.len() as u32;
+            entry.data = owned_data;
+            self.pending_entries.push(entry);
+            return Ok(());
+        }
+
         let seg_flags = if compressed {
             segment::SegmentFlags::COMPRESSED
         } else {
@@ -517,10 +536,10 @@ impl Volume {
                     Err(e) => return Err(e),
                 };
 
-            // Dedup-refs and zero extents have no body bytes; only count DATA entries.
+            // Zero extents have no body bytes; DATA and REF entries both do.
             let total_bytes: u64 = entries
                 .iter()
-                .filter(|e| !e.is_dedup_ref && !e.is_zero_extent)
+                .filter(|e| !e.is_zero_extent)
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -530,7 +549,7 @@ impl Volume {
 
             let live_bytes: u64 = entries
                 .iter()
-                .filter(|e| !e.is_dedup_ref && !e.is_zero_extent && live.contains(&e.hash))
+                .filter(|e| !e.is_zero_extent && live.contains(&e.hash))
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -552,8 +571,13 @@ impl Volume {
 
             // Remove dead entries from the extent index (only those pointing at
             // this segment — entries pointing elsewhere belong to another copy).
+            // Applies to both DATA and REF entries; zero extents are not in the
+            // extent index.
             let mut removed = 0usize;
             for entry in &dead_entries {
+                if entry.is_zero_extent {
+                    continue;
+                }
                 if self
                     .extent_index
                     .lookup(&entry.hash)
@@ -588,7 +612,7 @@ impl Volume {
                 stats.new_segments += 1;
 
                 for entry in &live_entries {
-                    if !entry.is_dedup_ref && !entry.is_zero_extent {
+                    if !entry.is_zero_extent {
                         Arc::make_mut(&mut self.extent_index).insert(
                             entry.hash,
                             extentindex::ExtentLocation {
@@ -675,10 +699,7 @@ impl Volume {
             let (body_section_start, mut entries) =
                 segment::read_and_verify_segment_index(seg_path, &self.verifying_key)?;
 
-            let has_dead = entries
-                .iter()
-                .filter(|e| !e.is_dedup_ref)
-                .any(|e| !live.contains(&e.hash));
+            let has_dead = entries.iter().any(|e| !live.contains(&e.hash));
             let is_small = file_size < Self::COMPACT_SMALL_THRESHOLD;
 
             if !has_dead && !is_small {
@@ -700,18 +721,10 @@ impl Volume {
                 live.contains(&e.hash)
             });
 
-            let dead_bytes: u64 = dead_entries
-                .iter()
-                .filter(|e| !e.is_dedup_ref)
-                .map(|e| e.stored_length as u64)
-                .sum();
+            let dead_bytes: u64 = dead_entries.iter().map(|e| e.stored_length as u64).sum();
 
             for entry in &dead_entries {
-                if entry.is_dedup_ref {
-                    // Dedup refs have no body; the extent_index tracks DATA body
-                    // locations only.  Removing the hash here would evict the DATA
-                    // entry for whichever other LBA shares this hash, corrupting reads
-                    // of that LBA.
+                if entry.is_zero_extent {
                     continue;
                 }
                 if self
@@ -780,7 +793,7 @@ impl Volume {
             stats.new_segments += 1;
 
             for entry in &merged_live {
-                if !entry.is_dedup_ref {
+                if !entry.is_zero_extent {
                     Arc::make_mut(&mut self.extent_index).insert(
                         entry.hash,
                         extentindex::ExtentLocation {
@@ -1392,9 +1405,11 @@ impl Volume {
         )?;
         // Update the extent index: replace temporary WAL offsets with
         // body-relative offsets into the committed segment file.
+        // REF entries carry materialised body bytes in their own segment —
+        // they must be indexed here, not skipped. Zero extents are not indexed.
         for entry in &self.pending_entries {
-            if entry.is_dedup_ref {
-                continue; // data lives in an ancestor segment; index already correct
+            if entry.is_zero_extent {
+                continue;
             }
             Arc::make_mut(&mut self.extent_index).insert(
                 entry.hash,
@@ -2103,14 +2118,30 @@ fn recover_wal(
                 hash,
                 start_lba,
                 lba_length,
+                flags,
+                body_offset,
+                data,
             } => {
                 lbamap.insert(start_lba, lba_length, hash);
-                // Data lives in an ancestor segment; extent index already has it
-                // from rebuild_segments(). Just add to pending_entries so the
-                // dedup-ref is preserved in the next promoted segment.
-                pending_entries.push(segment::SegmentEntry::new_dedup_ref(
-                    hash, start_lba, lba_length,
-                ));
+                let compressed = flags.contains(writelog::WalFlags::COMPRESSED);
+                extent_index.insert(
+                    hash,
+                    extentindex::ExtentLocation {
+                        segment_id: ulid,
+                        body_offset,
+                        body_length: data.len() as u32,
+                        compressed,
+                        entry_idx: None,
+                        body_section_start: 0,
+                    },
+                );
+                // Store body bytes so promote_segment can write them into the
+                // segment body section alongside DATA entries.
+                let mut entry = segment::SegmentEntry::new_dedup_ref(hash, start_lba, lba_length);
+                entry.compressed = compressed;
+                entry.stored_length = data.len() as u32;
+                entry.data = data;
+                pending_entries.push(entry);
             }
             writelog::LogRecord::Zero {
                 start_lba,
