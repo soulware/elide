@@ -2,7 +2,7 @@
 //
 // `dir` is a single volume directory (by_id/<ulid>/ or a by_name/<name>
 // symlink resolving to one). The volume owns its own wal/, pending/,
-// segments/, and snapshots/ directly — there is no forks/ subdirectory.
+// index/, cache/, and snapshots/ directly — there is no forks/ subdirectory.
 //
 // Does not modify any files.
 
@@ -81,7 +81,6 @@ struct NodeInfo {
     is_live: bool,
     wal_files: Vec<WalInfo>,
     pending: Vec<SegInfo>,
-    segments: Vec<SegInfo>,
     cache: Vec<CacheInfo>,
     children: Vec<NodeInfo>,
 }
@@ -135,7 +134,6 @@ fn collect_node(dir: &Path, is_root: bool, with_children: bool) -> io::Result<No
 
     let wal_files = collect_wal_dir(&dir.join("wal"))?;
     let pending = collect_seg_dir(&dir.join("pending"))?;
-    let segments = collect_seg_dir(&dir.join("segments"))?;
     let cache = collect_cache_dir(dir)?;
 
     // Children only used in legacy single-node mode; Named Forks lists forks separately.
@@ -173,7 +171,6 @@ fn collect_node(dir: &Path, is_root: bool, with_children: bool) -> io::Result<No
         is_live,
         wal_files,
         pending,
-        segments,
         cache,
         children,
     })
@@ -453,7 +450,7 @@ fn accumulate(node: &NodeInfo, t: &mut Totals) {
         t.wal_files += 1;
         t.wal_records += w.record_count;
     }
-    for s in node.pending.iter().chain(node.segments.iter()) {
+    for s in node.pending.iter() {
         t.seg_entries += s.entry_count;
         t.body_bytes += s.body_bytes;
     }
@@ -486,7 +483,6 @@ fn print_node(node: &NodeInfo, line_prefix: &str, child_prefix: &str) {
 
     print_wal_section(&node.wal_files, child_prefix, node.is_live);
     print_seg_section("pending", &node.pending, child_prefix, node.is_live);
-    print_seg_section("segments", &node.segments, child_prefix, true);
     print_cache_section(&node.cache, child_prefix);
 
     let n = node.children.len();
@@ -727,7 +723,7 @@ mod tests {
         let tmp = temp_vol_dir();
         let vol_dir = tmp.join("by_id").join("01JQAAAAAAAAAAAAAAAAAAAAAA");
 
-        fs::create_dir_all(vol_dir.join("segments")).unwrap();
+        fs::create_dir_all(vol_dir.join("index")).unwrap();
         fs::create_dir_all(vol_dir.join("pending")).unwrap();
 
         let node = collect_node(&vol_dir, true, false).unwrap();

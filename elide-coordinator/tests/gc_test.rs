@@ -228,6 +228,35 @@ fn make_gc_config() -> GcConfig {
 
 /// Simulate coordinator drain: promote all files from pending/ to index/ + cache/,
 /// mirroring what upload::drain_pending does in production after a successful S3 upload.
+/// Like `drain_pending` but also uploads each segment to `store` under
+/// `volume_id`, mirroring what the real coordinator drain does.  Required for
+/// tests that call `gc_fork`, which now fetches candidates from S3.
+async fn drain_pending_to_store(
+    fork_dir: &std::path::Path,
+    volume_id: &str,
+    store: &Arc<dyn ObjectStore>,
+) {
+    let pending_dir = fork_dir.join("pending");
+    if let Ok(entries) = fs::read_dir(&pending_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(ulid_str) = name.to_str() else {
+                continue;
+            };
+            if ulid_str.ends_with(".tmp") {
+                continue;
+            }
+            let data = fs::read(entry.path()).unwrap();
+            let key = elide_coordinator::upload::segment_key(volume_id, ulid_str).unwrap();
+            store
+                .put(&key, bytes::Bytes::from(data).into())
+                .await
+                .unwrap();
+        }
+    }
+    drain_pending(fork_dir);
+}
+
 fn drain_pending(fork_dir: &std::path::Path) {
     const HEADER_LEN: usize = 96;
     let pending_dir = fork_dir.join("pending");
@@ -308,8 +337,8 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     vol.write(0, &d1).unwrap();
     vol.flush_wal().unwrap();
 
-    // Promote both pending segments to index/ + cache/ so gc_fork can operate on them.
-    drain_pending(fork_dir);
+    // Promote both pending segments to index/ + cache/ and upload to store.
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
 
     // Step 3: gc_checkpoint — flush WAL, mint GC output ULIDs.
     // H0 is LBA-dead at this point: lba=0 now points to H1.  gc_fork will
@@ -457,8 +486,8 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
     vol.write(0, &d1).unwrap();
     vol.flush_wal().unwrap();
 
-    // Step 3: drain pending/ → segments/.  The WAL is now empty.
-    drain_pending(fork_dir);
+    // Step 3: drain pending/ → segments/ and upload to store.  The WAL is now empty.
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
 
     // Step 4: GcSweep with an empty WAL.
     //
@@ -661,6 +690,9 @@ fn drain_failure_skips_gc_and_data_survives() {
         .unwrap();
 
     let gc_config = make_gc_config();
+    // good_store is declared early so it can receive the first two segments,
+    // which are drained locally (not through upload::drain_pending).
+    let good_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
     let d0 = [11u8; 4096];
     let d1 = [22u8; 4096];
@@ -670,7 +702,7 @@ fn drain_failure_skips_gc_and_data_survives() {
     vol.flush_wal().unwrap();
     vol.write(0, &d1).unwrap();
     vol.flush_wal().unwrap();
-    drain_pending(fork_dir);
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &good_store));
 
     // Write more data — this ends up in pending/ after flushing.
     vol.write(1, &d0).unwrap();
@@ -709,9 +741,8 @@ fn drain_failure_skips_gc_and_data_survives() {
 
     // --- Tick N+1: drain succeeds, GC runs ---
     //
-    // On the next tick, drain succeeds with a working store.  A mock control
+    // On the next tick, drain succeeds with the same good_store.  A mock control
     // socket handles the promote IPC that drain_pending sends after upload.
-    let good_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let _mock = rt.block_on(spawn_mock_socket(fork_dir.to_owned()));
     let drain_result2 = rt
         .block_on(upload::drain_pending(fork_dir, "test-vol", &good_store))
@@ -798,12 +829,12 @@ fn gc_restart_safety_applied_handoff() {
     vol.write(0, &d0).unwrap();
     vol.write(1, &d1).unwrap();
     vol.flush_wal().unwrap();
-    drain_pending(fork_dir);
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
 
     // Step 2: overwrite lba=0 with D2, flush, drain.  D0's hash is now dead.
     vol.write(0, &d2).unwrap();
     vol.flush_wal().unwrap();
-    drain_pending(fork_dir);
+    rt.block_on(drain_pending_to_store(fork_dir, "test-vol", &store));
 
     // Step 3: GC pass — gc_checkpoint mints ULIDs, gc_fork compacts the two
     // input segments into one GC output in gc/<new>.pending.

@@ -99,6 +99,31 @@ pub fn import_attach_by_name(
     Ok(())
 }
 
+/// Evict S3-confirmed segment bodies from a volume's cache/ directory.
+///
+/// Routed through the coordinator so eviction is sequenced between drain/GC
+/// ticks and never races with the GC pass's collect_stats → compact_segments
+/// window.
+///
+/// If `ulid` is `Some`, evicts only that segment. If `None`, evicts all
+/// S3-confirmed bodies.
+///
+/// Returns the number of segments evicted.
+pub fn evict_volume(socket_path: &Path, name: &str, ulid: Option<&str>) -> io::Result<usize> {
+    let cmd = match ulid {
+        Some(u) => format!("evict {name} {u}"),
+        None => format!("evict {name}"),
+    };
+    let resp = call(socket_path, &cmd)?;
+    match resp.split_once(' ') {
+        Some(("ok", n)) => n
+            .parse::<usize>()
+            .map_err(|e| io::Error::other(format!("unexpected response: {resp}: {e}"))),
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
 /// Stop all processes for a volume and remove its directory.
 pub fn delete_volume(socket_path: &Path, name: &str) -> io::Result<()> {
     let resp = call(socket_path, &format!("delete {name}"))?;

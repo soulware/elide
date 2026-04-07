@@ -40,7 +40,7 @@ means the GC inputs have ULIDs from the same millisecond as the current WAL.
 time (depending on random bits).
 
 After multiple GC rounds, the effect accumulates: each GC output goes into
-`segments/`, gets picked up by the next GC, and `increment()` deterministically
+`cache/`, gets picked up by the next GC, and `increment()` deterministically
 marches forward through the ULID space while the volume's mint draws random
 positions.
 

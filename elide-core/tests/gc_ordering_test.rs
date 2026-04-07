@@ -1,7 +1,7 @@
 // Integration tests: GC correctness with interleaved live writes.
 //
 // Two scenarios that the random proptest rarely hits because CoordGcLocal
-// silently no-ops when segments/ is empty:
+// silently no-ops when index/ is empty:
 //
 // 1. Live write overwrites a GC candidate LBA *before* the GC pass runs.
 //    `simulate_coord_gc_local` rebuilds the LBA map from all current segments,
@@ -30,14 +30,14 @@ fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
     common::write_test_keypair(&fork_dir);
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
 
-    // Seed batch 1 — LBAs 0-3 = 0xAA — drain to segments/.
+    // Seed batch 1 — LBAs 0-3 = 0xAA — drain to index/ + cache/.
     for lba in 0u64..4 {
         vol.write(lba, &[0xAA; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
     common::drain_local(&fork_dir);
 
-    // Seed batch 2 — LBAs 4-7 = 0xBB — drain to segments/.
+    // Seed batch 2 — LBAs 4-7 = 0xBB — drain to index/ + cache/.
     for lba in 4u64..8 {
         vol.write(lba, &[0xBB; 4096]).unwrap();
     }

@@ -247,7 +247,7 @@ fn compact_candidates_inner(
     }
 
     // Write the compacted segment to gc/<ulid> — the volume re-signs it when
-    // applying the handoff, at which point it moves to segments/<ulid>.
+    // applying the handoff, at which point it moves to cache/<ulid>.body.
     let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
     let final_path = gc_dir.join(new_ulid.to_string());
     let new_bss =

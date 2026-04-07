@@ -227,6 +227,17 @@ impl LbaMap {
         self.inner.values().map(|e| e.hash).collect()
     }
 
+    /// Return all (start_lba, lba_length) ranges whose hash equals `target`.
+    ///
+    /// Used for diagnostics only (linear scan).
+    pub fn lbas_for_hash(&self, target: &blake3::Hash) -> Vec<(u64, u32)> {
+        self.inner
+            .iter()
+            .filter(|(_, e)| &e.hash == target)
+            .map(|(&lba, e)| (lba, e.lba_length))
+            .collect()
+    }
+
     /// Return the content hash mapped to `lba`, if any entry covers it.
     ///
     /// Used by GC to check whether a dedup-ref entry is still live: the ref

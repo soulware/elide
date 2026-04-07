@@ -25,10 +25,10 @@ mod common;
 
 // --- simulation helpers ---
 
-/// Collect every ULID-named file across wal/, pending/, segments/, and index/*.idx.
+/// Collect every ULID-named file across wal/, pending/, and index/*.idx.
 fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
     let mut result = std::collections::BTreeSet::new();
-    for subdir in ["wal", "pending", "segments"] {
+    for subdir in ["wal", "pending"] {
         let dir = fork_dir.join(subdir);
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -67,11 +67,11 @@ enum SimOp {
     /// new segment. Calls vol.sweep_pending() directly, bypassing the actor
     /// channel. Exercises ULID monotonicity and crash-recovery invariants.
     SweepPending,
-    /// Volume-level density pass: rewrites sparse segments from both pending/
-    /// and segments/. Analogous to the coordinator's repack pass but runs
-    /// in-process on the volume, bypassing the actor channel.
+    /// Volume-level density pass: rewrites sparse segments from pending/.
+    /// Analogous to the coordinator's repack pass but runs in-process on the
+    /// volume, bypassing the actor channel.
     Repack,
-    /// Move all committed pending/ segments to segments/, simulating
+    /// Promote all committed pending/ segments to index/ + cache/, simulating
     /// drain-pending without S3 upload. Required before CoordGcLocal has
     /// material to work with.
     DrainLocal,
@@ -80,7 +80,7 @@ enum SimOp {
     /// crash-recovery invariants for the coordinator GC path.
     CoordGcLocal { n: usize },
     /// Simulate coordinator GC running both repack and sweep in the same tick.
-    /// Requires ≥ 3 segments in segments/; no-ops otherwise.
+    /// Requires ≥ 3 segments in index/; no-ops otherwise.
     CoordGcLocalBoth,
     /// Simulate a crash: drop the Volume, reopen it (triggering WAL recovery),
     /// and assert all oracle LBAs read back their last-written values.
@@ -142,7 +142,7 @@ fn arb_sim_ops() -> impl Strategy<Value = Vec<SimOp>> {
     prop::collection::vec(arb_sim_op(), 1..40)
 }
 
-/// Two segments drained to `segments/` — CoordGcLocal has material to compact.
+/// Two segments drained to `index/` — CoordGcLocal has material to compact.
 fn two_segment_prefix() -> Vec<SimOp> {
     vec![
         SimOp::Write { lba: 0, seed: 0x0A },
@@ -180,7 +180,7 @@ fn pending_prefix() -> Vec<SimOp> {
     ]
 }
 
-/// Three segments drained to `segments/` — allows CoordGcLocal { n: 3 } to
+/// Three segments drained to `index/` — allows CoordGcLocal { n: 3 } to
 /// fire so the n=3..=5 range is exercised rather than always no-opping.
 fn multi_segment_prefix() -> Vec<SimOp> {
     vec![
@@ -247,7 +247,7 @@ fn arb_gc_interleaved_ops() -> impl Strategy<Value = Vec<SimOp>> {
         arb_sim_ops().prop_map(|ops| with_prefix(two_segment_prefix(), ops)),
         // Snapshot in place: floor guard fires from the first SweepPending/Repack.
         arb_sim_ops().prop_map(|ops| with_prefix(snapshot_prefix(), ops)),
-        // Pending-only: data in pending/ not yet drained to segments/.
+        // Pending-only: data in pending/ not yet drained to index/ + cache/.
         arb_sim_ops().prop_map(|ops| with_prefix(pending_prefix(), ops)),
         // Three drained segments: CoordGcLocal { n: 3..=5 } can fire.
         arb_sim_ops().prop_map(|ops| with_prefix(multi_segment_prefix(), ops)),

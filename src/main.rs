@@ -233,22 +233,15 @@ enum VolumeCommand {
 
     /// Evict locally cached data so it is demand-fetched on next read
     ///
-    /// Default: deletes all evictable bodies from segments/ (S3-confirmed,
-    /// no active GC handoff). The coordinator writes index/<ulid>.idx before
-    /// eviction is safe, so the LBA map survives.
+    /// Deletes cache/<ulid>.body and cache/<ulid>.present for segments where
+    /// index/<ulid>.idx confirms S3 upload. The LBA map (index/) is untouched;
+    /// evicted bodies are re-fetched from S3 on next access. Only safe on
+    /// volumes with S3 backing.
     ///
-    /// --cache: deletes .body and .present files from cache/ instead.
-    /// Safe at any time — index/ entries and the LBA map are untouched.
-    ///
-    /// --segment <ulid>: evicts one specific segment from segments/.
-    /// Refused if the ULID is GC-protected or if index/<ulid>.idx is absent.
+    /// --segment <ulid>: evict one specific body by ULID.
     Evict {
-        /// Evict demand-fetch body cache (cache/) instead of segments/
-        #[arg(long, conflicts_with = "segment")]
-        cache: bool,
-
-        /// Evict a single segment by ULID
-        #[arg(long, conflicts_with = "cache")]
+        /// Evict a single segment body by ULID
+        #[arg(long)]
         segment: Option<String>,
 
         /// Volume name
@@ -546,22 +539,10 @@ fn main() {
                 }
             },
 
-            VolumeCommand::Evict {
-                cache,
-                segment,
-                name,
-            } => {
-                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                let result = if cache {
-                    evict_cache(&vol_dir).map(|n| (n, "cache entry", "cache entries"))
-                } else if let Some(ulid_str) = segment {
-                    evict_one_segment(&vol_dir, &ulid_str).map(|n| (n, "segment", "segments"))
-                } else {
-                    evict_segments(&vol_dir).map(|n| (n, "segment", "segments"))
-                };
-                match result {
-                    Ok((n, singular, plural)) => {
-                        let label = if n == 1 { singular } else { plural };
+            VolumeCommand::Evict { segment, name } => {
+                match coordinator_client::evict_volume(&socket_path, &name, segment.as_deref()) {
+                    Ok(n) => {
+                        let label = if n == 1 { "segment" } else { "segments" };
                         println!("evicted {n} {label}");
                     }
                     Err(e) => {
@@ -885,7 +866,8 @@ fn create_volume(
 
     std::fs::create_dir_all(&vol_dir)?;
     std::fs::create_dir_all(vol_dir.join("pending"))?;
-    std::fs::create_dir_all(vol_dir.join("segments"))?;
+    std::fs::create_dir_all(vol_dir.join("index"))?;
+    std::fs::create_dir_all(vol_dir.join("cache"))?;
 
     let key = elide_core::signing::generate_keypair(&vol_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)?;
     elide_core::signing::write_origin(&vol_dir, &key, VOLUME_PROVENANCE_FILE)?;
@@ -1248,9 +1230,9 @@ fn remote_pull(
 
     std::fs::write(vol_dir.join("volume.pub"), &pub_key_bytes)?;
 
-    // Create segments/ so discover_volumes picks up the volume and the
+    // Create index/ so discover_volumes picks up the volume and the
     // coordinator runs prefetch_indexes to download the .idx files.
-    std::fs::create_dir_all(vol_dir.join("segments"))?;
+    std::fs::create_dir_all(vol_dir.join("index"))?;
 
     // Step 4: create by_name symlink.
     let by_name_dir = data_dir.join("by_name");
@@ -1273,330 +1255,6 @@ fn remote_pull(
     }
 
     Ok(())
-}
-
-/// Evict locally cached segment bodies from `segments/`.
-///
-/// Every file in `segments/` is structurally guaranteed to be S3-confirmed —
-/// the coordinator moves bodies there only after upload and `index/` write.
-/// Eviction therefore needs no GC protection logic; all files are safe to delete.
-///
-/// Always succeeds: returns the count of actually-deleted files.  `pending/`
-/// and `gc/` are never touched.
-fn evict_segments(vol_dir: &Path) -> std::io::Result<usize> {
-    let segments_dir = vol_dir.join("segments");
-    let index_dir = vol_dir.join("index");
-    let mut count = 0;
-    if let Ok(entries) = std::fs::read_dir(&segments_dir) {
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(ulid_str) = name.to_str() else {
-                continue;
-            };
-            // Only evict bodies that have a corresponding index entry.
-            // A segment in segments/ without index/<ulid>.idx has not had its
-            // .idx written yet (drain crashed between rename and .idx write under
-            // the old ordering, or the .idx write itself failed). Evicting such
-            // a body would make the segment unreadable with no recovery path.
-            let idx_path = index_dir.join(format!("{ulid_str}.idx"));
-            if !idx_path.try_exists()? {
-                continue;
-            }
-            std::fs::remove_file(entry.path())?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-/// Evict demand-fetch body cache entries from `cache/`.
-///
-/// Deletes `.body` and `.present` files for every cached segment.  The
-/// corresponding `index/<ulid>.idx` entries are left intact — the LBA map
-/// is unaffected.  On the next read, body bytes are re-fetched from S3.
-///
-/// Always safe: cache entries are ephemeral by design.
-fn evict_cache(vol_dir: &Path) -> std::io::Result<usize> {
-    let cache_dir = vol_dir.join("cache");
-    let mut count = 0;
-    let entries = match std::fs::read_dir(&cache_dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        // Only delete .body and .present; leave any other files alone.
-        if name_str.ends_with(".body") || name_str.ends_with(".present") {
-            std::fs::remove_file(entry.path())?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-/// Evict a single segment body from `segments/` by ULID.
-///
-/// Refuses if:
-///   - `index/<ulid>.idx` is absent — segment not yet S3-confirmed (would not
-///     be in `segments/` under the structural invariant, but checked defensively)
-///   - the segment does not exist in `segments/`
-///
-/// No GC protection check is needed: `segments/` only contains S3-confirmed
-/// bodies; in-flight GC outputs live in `gc/` until the coordinator completes
-/// the upload and moves them.
-///
-/// On success, returns 1.
-fn evict_one_segment(vol_dir: &Path, ulid_str: &str) -> std::io::Result<usize> {
-    ulid::Ulid::from_string(ulid_str)
-        .map_err(|e| std::io::Error::other(format!("invalid ULID '{ulid_str}': {e}")))?;
-
-    let seg_path = vol_dir.join("segments").join(ulid_str);
-    if !seg_path.try_exists()? {
-        return Err(std::io::Error::other(format!(
-            "segment {ulid_str} not found in segments/"
-        )));
-    }
-
-    // Defensive check: refuse if no index entry (structurally should not happen,
-    // but guards against manual filesystem manipulation).
-    let idx_path = vol_dir.join("index").join(format!("{ulid_str}.idx"));
-    if !idx_path.try_exists()? {
-        return Err(std::io::Error::other(format!(
-            "segment {ulid_str} has no index/{ulid_str}.idx — not S3-confirmed"
-        )));
-    }
-
-    std::fs::remove_file(&seg_path)?;
-    Ok(1)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    fn setup_vol(tmp: &TempDir) -> std::path::PathBuf {
-        let vol = tmp.path().to_path_buf();
-        fs::create_dir_all(vol.join("pending")).unwrap();
-        fs::create_dir_all(vol.join("segments")).unwrap();
-        fs::create_dir_all(vol.join("gc")).unwrap();
-        vol
-    }
-
-    /// Write a minimal valid segment to `<vol>/<subdir>/<name>`.
-    ///
-    /// Evictable segments must have parseable headers so `extract_idx` can
-    /// copy the header+index section to `cache/` before deletion.
-    fn write_seg(vol: &std::path::Path, subdir: &str, name: &str) {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
-        use elide_core::signing::generate_ephemeral_signer;
-        let path = vol.join(subdir).join(name);
-        let hash = blake3::hash(name.as_bytes());
-        let mut entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            vec![0u8; 4096],
-        )];
-        let (signer, _) = generate_ephemeral_signer();
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
-    }
-
-    #[test]
-    fn evict_clean_state_removes_segments() {
-        let tmp = TempDir::new().unwrap();
-        let vol = setup_vol(&tmp);
-        let index_dir = vol.join("index");
-        fs::create_dir_all(&index_dir).unwrap();
-
-        write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA1");
-        write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA2");
-        fs::write(index_dir.join("01AAAAAAAAAAAAAAAAAAAAAAA1.idx"), b"idx").unwrap();
-        fs::write(index_dir.join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx"), b"idx").unwrap();
-
-        let n = evict_segments(&vol).unwrap();
-
-        assert_eq!(n, 2);
-        assert_eq!(fs::read_dir(vol.join("segments")).unwrap().count(), 0);
-        // index/*.idx entries survive eviction — they are the LBA map source.
-    }
-
-    #[test]
-    fn evict_proceeds_with_pending_dir_nonempty() {
-        let tmp = TempDir::new().unwrap();
-        let vol = setup_vol(&tmp);
-        let index_dir = vol.join("index");
-        fs::create_dir_all(&index_dir).unwrap();
-
-        // pending/ has an unuploaded segment — evict should still proceed on
-        // segments/ (those are S3-confirmed) and leave pending/ untouched.
-        fs::write(
-            vol.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAA1"),
-            b"wal",
-        )
-        .unwrap();
-        write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA2");
-        fs::write(index_dir.join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx"), b"idx").unwrap();
-
-        let n = evict_segments(&vol).unwrap();
-
-        assert_eq!(n, 1);
-        assert!(
-            vol.join("pending")
-                .join("01AAAAAAAAAAAAAAAAAAAAAAA1")
-                .exists()
-        );
-        assert!(
-            !vol.join("segments")
-                .join("01AAAAAAAAAAAAAAAAAAAAAAA2")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn evict_segments_deletes_all_in_segments_dir() {
-        // All S3-confirmed segments (those with index/*.idx) are safe to evict.
-        let tmp = TempDir::new().unwrap();
-        let vol = setup_vol(&tmp);
-        let index_dir = vol.join("index");
-        fs::create_dir_all(&index_dir).unwrap();
-
-        write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA1");
-        write_seg(&vol, "segments", "01AAAAAAAAAAAAAAAAAAAAAAA2");
-        fs::write(index_dir.join("01AAAAAAAAAAAAAAAAAAAAAAA1.idx"), b"idx").unwrap();
-        fs::write(index_dir.join("01AAAAAAAAAAAAAAAAAAAAAAA2.idx"), b"idx").unwrap();
-        // Even if a .pending GC handoff exists, those old inputs are already in
-        // segments/ and are safe to evict — the .applied body is in gc/, not segments/.
-        fs::write(
-            vol.join("gc").join("01AAAAAAAAAAAAAAAAAAAAAAB0.pending"),
-            b"dead 01AAAAAAAAAAAAAAAAAAAAAAA1\n",
-        )
-        .unwrap();
-
-        let n = evict_segments(&vol).unwrap();
-
-        assert_eq!(n, 2);
-        assert!(
-            !vol.join("segments")
-                .join("01AAAAAAAAAAAAAAAAAAAAAAA1")
-                .exists()
-        );
-        assert!(
-            !vol.join("segments")
-                .join("01AAAAAAAAAAAAAAAAAAAAAAA2")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn evict_segments_skips_segment_without_idx() {
-        // A segment in segments/ without a corresponding index/<ulid>.idx has not
-        // been S3-confirmed. Evicting it would make it permanently unreadable.
-        // evict_segments must skip such bodies and only count the confirmed one.
-        let tmp = TempDir::new().unwrap();
-        let vol = setup_vol(&tmp);
-        let index_dir = vol.join("index");
-        fs::create_dir_all(&index_dir).unwrap();
-
-        let confirmed = "01AAAAAAAAAAAAAAAAAAAAAAA1";
-        let unconfirmed = "01AAAAAAAAAAAAAAAAAAAAAAA2";
-        write_seg(&vol, "segments", confirmed);
-        write_seg(&vol, "segments", unconfirmed);
-        // Only confirmed has an .idx entry.
-        fs::write(index_dir.join(format!("{confirmed}.idx")), b"idx").unwrap();
-
-        let n = evict_segments(&vol).unwrap();
-
-        assert_eq!(n, 1, "only the S3-confirmed segment should be evicted");
-        assert!(
-            !vol.join("segments").join(confirmed).exists(),
-            "confirmed segment should be removed"
-        );
-        assert!(
-            vol.join("segments").join(unconfirmed).exists(),
-            "unconfirmed segment must be preserved"
-        );
-    }
-
-    #[test]
-    fn evict_cache_removes_body_and_present_leaves_idx() {
-        let tmp = TempDir::new().unwrap();
-        let vol = setup_vol(&tmp);
-        let cache_dir = vol.join("cache");
-        let index_dir = vol.join("index");
-        fs::create_dir_all(&cache_dir).unwrap();
-        fs::create_dir_all(&index_dir).unwrap();
-
-        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
-        fs::write(cache_dir.join(format!("{ulid}.body")), b"body").unwrap();
-        fs::write(cache_dir.join(format!("{ulid}.present")), b"\xff").unwrap();
-        fs::write(index_dir.join(format!("{ulid}.idx")), b"idx").unwrap();
-
-        let n = evict_cache(&vol).unwrap();
-
-        assert_eq!(n, 2, "body + present = 2 files removed");
-        assert!(!cache_dir.join(format!("{ulid}.body")).exists());
-        assert!(!cache_dir.join(format!("{ulid}.present")).exists());
-        // index/ entry must survive
-        assert!(index_dir.join(format!("{ulid}.idx")).exists());
-    }
-
-    #[test]
-    fn evict_cache_missing_dir_returns_zero() {
-        let tmp = TempDir::new().unwrap();
-        let vol = setup_vol(&tmp);
-        // cache/ does not exist
-        let n = evict_cache(&vol).unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn evict_one_segment_succeeds_with_idx() {
-        let tmp = TempDir::new().unwrap();
-        let vol = setup_vol(&tmp);
-        let index_dir = vol.join("index");
-        fs::create_dir_all(&index_dir).unwrap();
-
-        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
-        write_seg(&vol, "segments", ulid);
-        // Simulate coordinator-written index entry.
-        fs::write(index_dir.join(format!("{ulid}.idx")), b"idx").unwrap();
-
-        let n = evict_one_segment(&vol, ulid).unwrap();
-
-        assert_eq!(n, 1);
-        assert!(!vol.join("segments").join(ulid).exists());
-        // index/ entry survives
-        assert!(index_dir.join(format!("{ulid}.idx")).exists());
-    }
-
-    #[test]
-    fn evict_one_segment_refuses_without_idx() {
-        let tmp = TempDir::new().unwrap();
-        let vol = setup_vol(&tmp);
-        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
-        write_seg(&vol, "segments", ulid);
-        // No index/ entry — not S3-confirmed.
-
-        let err = evict_one_segment(&vol, ulid).unwrap_err();
-        assert!(err.to_string().contains("not S3-confirmed"));
-        // Segment must still exist.
-        assert!(vol.join("segments").join(ulid).exists());
-    }
-
-    #[test]
-    fn evict_one_segment_refuses_missing_segment() {
-        let tmp = TempDir::new().unwrap();
-        let vol = setup_vol(&tmp);
-        let err = evict_one_segment(&vol, "01AAAAAAAAAAAAAAAAAAAAAAA1").unwrap_err();
-        assert!(err.to_string().contains("not found in segments/"));
-    }
 }
 
 fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {

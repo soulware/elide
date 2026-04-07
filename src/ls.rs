@@ -621,7 +621,7 @@ mod tests {
 fn find_segment_file(search_dirs: &[PathBuf], segment_id: ulid::Ulid) -> io::Result<PathBuf> {
     let sid = segment_id.to_string();
     for dir in search_dirs {
-        for subdir in ["wal", "pending", "segments"] {
+        for subdir in ["wal", "pending"] {
             let path = dir.join(subdir).join(&sid);
             if path.exists() {
                 return Ok(path);

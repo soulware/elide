@@ -47,7 +47,7 @@ enum ActorOp {
     Write { lba: u8, seed: u8 },
     /// Flush the WAL to a pending/ segment through the actor channel.
     Flush,
-    /// Move all committed pending/ segments to segments/, simulating
+    /// Promote all committed pending/ segments to index/ + cache/, simulating
     /// drain-pending. Required before CoordGcLocal has material to work with.
     DrainLocal,
     /// Simulate one coordinator GC pass and apply the resulting handoff

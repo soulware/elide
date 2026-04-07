@@ -224,11 +224,15 @@ async fn daemon_main(vol_dir: &Path, mountpoint: &Path, format: bool) -> io::Res
     let drain_task = store.map(|s| {
         let drain_interval = Duration::from_secs(5);
         let gc_config = elide_coordinator::config::GcConfig::default();
+        // Standalone mode has no coordinator inbound handler; evict is not
+        // supported. Pass a receiver that will never be sent to.
+        let (_evict_tx, evict_rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(elide_coordinator::tasks::run_volume_tasks(
             vol_dir.to_owned(),
             s,
             drain_interval,
             gc_config,
+            evict_rx,
         ))
     });
 

@@ -118,10 +118,9 @@ async fn prefetch_layer(
             continue;
         }
 
-        // Skip if already available locally (full segment or index).
-        let local_seg = layer_dir.join("segments").join(ulid_str);
+        // Skip if the index section is already present locally.
         let local_idx = layer_dir.join("index").join(format!("{ulid_str}.idx"));
-        if local_seg.exists() || local_idx.exists() {
+        if local_idx.exists() {
             result.skipped += 1;
             continue;
         }
@@ -216,12 +215,10 @@ mod tests {
         let parent_dir = by_id.join(parent_ulid);
         let child_dir = by_id.join(child_ulid);
 
-        std::fs::create_dir_all(parent_dir.join("segments")).unwrap();
         std::fs::create_dir_all(parent_dir.join("snapshots")).unwrap();
         std::fs::create_dir_all(child_dir.join("pending")).unwrap();
-        std::fs::create_dir_all(child_dir.join("segments")).unwrap();
 
-        // Write one segment into parent's segments/.
+        // Write one segment into a staging file, upload it, then discard locally.
         let data = vec![0xABu8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
@@ -233,12 +230,8 @@ mod tests {
             data,
         )];
         let (signer, _) = generate_ephemeral_signer();
-        write_segment(
-            &parent_dir.join("segments").join(seg_ulid),
-            &mut entries,
-            signer.as_ref(),
-        )
-        .unwrap();
+        let staging = tmp.path().join(seg_ulid);
+        write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
 
         // Create a snapshot marker in parent (branch point for child).
         let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
@@ -256,12 +249,9 @@ mod tests {
         let store_tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
-        let seg_bytes = std::fs::read(parent_dir.join("segments").join(seg_ulid)).unwrap();
+        let seg_bytes = std::fs::read(&staging).unwrap();
         let key = StorePath::from(format!("by_id/{parent_ulid}/19700101/{seg_ulid}"));
         store.put(&key, seg_bytes.into()).await.unwrap();
-
-        // Delete the local segment to simulate eviction.
-        std::fs::remove_file(parent_dir.join("segments").join(seg_ulid)).unwrap();
 
         // Run prefetch_indexes on the child fork.
         let result = prefetch_indexes(&child_dir, &store).await.unwrap();
@@ -291,9 +281,7 @@ mod tests {
         let root_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let root_dir = by_id.join(root_ulid);
 
-        std::fs::create_dir_all(root_dir.join("segments")).unwrap();
-
-        // Write one segment into root's segments/.
+        // Write one segment to a staging file, upload it, then discard locally.
         let data = vec![0xCDu8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
@@ -305,23 +293,16 @@ mod tests {
             data,
         )];
         let (signer, _) = generate_ephemeral_signer();
-        write_segment(
-            &root_dir.join("segments").join(seg_ulid),
-            &mut entries,
-            signer.as_ref(),
-        )
-        .unwrap();
+        let staging = tmp.path().join(seg_ulid);
+        write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
 
         // Upload the segment to the store.
         let store_tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
-        let seg_bytes = std::fs::read(root_dir.join("segments").join(seg_ulid)).unwrap();
+        let seg_bytes = std::fs::read(&staging).unwrap();
         let key = StorePath::from(format!("by_id/{root_ulid}/19700101/{seg_ulid}"));
         store.put(&key, seg_bytes.into()).await.unwrap();
-
-        // Remove the local segment to simulate a freshly-pulled volume.
-        std::fs::remove_file(root_dir.join("segments").join(seg_ulid)).unwrap();
 
         // prefetch_indexes should now fetch the root's own segment.
         let result = prefetch_indexes(&root_dir, &store).await.unwrap();

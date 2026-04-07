@@ -11,11 +11,13 @@
 // Drain and GC are sequential within each tick so that GC sees all segments
 // uploaded this tick, and concurrent GC rewrites can never race an upload.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use object_store::ObjectStore;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
@@ -30,7 +32,62 @@ use crate::upload;
 /// are skipped during this window.
 const IMPORT_LOCK_FILE: &str = "import.lock";
 
+/// Request type for the per-fork evict channel.
+/// The sender receives the eviction result (count of bodies deleted).
+pub type EvictReply = oneshot::Sender<io::Result<usize>>;
+
+/// Evict all S3-confirmed segment bodies from `cache/` for the given fork.
+///
+/// Called from within the fork task (between drain/GC ticks) so it never
+/// races with the GC pass's collect_stats → compact_segments window.
+fn evict_bodies(fork_dir: &Path) -> io::Result<usize> {
+    let cache_dir = fork_dir.join("cache");
+    let index_dir = fork_dir.join("index");
+    let mut count = 0;
+    let entries = match std::fs::read_dir(&cache_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let Some(ulid_str) = name_str.strip_suffix(".body") else {
+            continue;
+        };
+        if !index_dir.join(format!("{ulid_str}.idx")).exists() {
+            continue; // not yet S3-confirmed; skip
+        }
+        let _ = std::fs::remove_file(entry.path());
+        let _ = std::fs::remove_file(cache_dir.join(format!("{ulid_str}.present")));
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Evict a single S3-confirmed segment body from `cache/`.
+fn evict_one_body(fork_dir: &Path, ulid_str: &str) -> io::Result<usize> {
+    let idx_path = fork_dir.join("index").join(format!("{ulid_str}.idx"));
+    if !idx_path.try_exists()? {
+        return Err(io::Error::other(format!(
+            "segment {ulid_str} has no index/{ulid_str}.idx — not S3-confirmed"
+        )));
+    }
+    let body_path = fork_dir.join("cache").join(format!("{ulid_str}.body"));
+    if !body_path.try_exists()? {
+        return Err(io::Error::other(format!(
+            "segment {ulid_str} not found in cache/"
+        )));
+    }
+    std::fs::remove_file(&body_path)?;
+    let _ = std::fs::remove_file(fork_dir.join("cache").join(format!("{ulid_str}.present")));
+    Ok(1)
+}
+
 /// Run the drain + GC loop for a single volume directory.
+///
+/// `evict_rx` receives eviction requests from the coordinator inbound handler.
+/// Evictions are processed between ticks so they never race with the GC pass.
 ///
 /// Exits when the volume directory is removed. Intended to be spawned as a
 /// tokio task.
@@ -39,6 +96,7 @@ pub async fn run_volume_tasks(
     store: Arc<dyn ObjectStore>,
     drain_interval: Duration,
     gc_config: GcConfig,
+    mut evict_rx: mpsc::Receiver<(Option<String>, EvictReply)>,
 ) {
     let volume_id = match upload::derive_names(&fork_dir) {
         Ok(id) => id,
@@ -60,14 +118,17 @@ pub async fn run_volume_tasks(
     let mut last_gc = Instant::now()
         .checked_sub(gc_interval)
         .unwrap_or_else(Instant::now);
+    // Track whether the previous GC tick did any work, so we can log once
+    // when GC transitions from active → idle (converged).
+    let mut gc_was_active = true;
 
-    // Prefetch segment indexes on startup if the fork has no local segments.
+    // Prefetch segment indexes on startup if the fork has no local index files.
     // This covers the common case of a volume pulled from the store with only
     // the directory skeleton — without .idx files Volume::open cannot rebuild
     // the LBA map and the volume is unreadable.
-    let has_local_segments = fork_dir.join("segments").exists()
+    let has_local_segments = fork_dir.join("index").exists()
         && fork_dir
-            .join("segments")
+            .join("index")
             .read_dir()
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);
@@ -112,7 +173,18 @@ pub async fn run_volume_tasks(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        tick.tick().await;
+        tokio::select! {
+            // Eviction requests are processed between ticks — never mid-GC.
+            Some((ulid_str, reply_tx)) = evict_rx.recv() => {
+                let result = match ulid_str {
+                    Some(ref s) => evict_one_body(&fork_dir, s),
+                    None => evict_bodies(&fork_dir),
+                };
+                let _ = reply_tx.send(result);
+                continue;
+            }
+            _ = tick.tick() => {}
+        }
 
         if !fork_dir.exists() {
             info!(
@@ -161,14 +233,12 @@ pub async fn run_volume_tasks(
 
         // Step 4: drain pending segments to S3.
         //
-        // ORDERING INVARIANT: step 4 must fully succeed before step 5 (GC)
-        // runs.  gc_checkpoint mints GC output ULIDs from the volume's
-        // monotonic clock; any segment already in pending/ at that moment has
-        // a ULID below the GC output.  If such a segment is later drained to
-        // segments/, crash-recovery rebuild gives the GC output incorrect
-        // priority for the shared LBAs, returning stale data.  Skipping GC
-        // when drain has failures enforces the invariant and defers the GC
-        // pass to the next tick.
+        // Skip GC this tick if drain had upload or promote failures.  Pending
+        // segments that failed to promote still have no cache/<ulid>.body, so
+        // collect_stats would skip them and GC would not compact them — but
+        // their LBAs would not appear in the GC candidate set either.  Deferring
+        // GC until drain succeeds avoids repeated no-ops and ensures GC always
+        // operates on a fully-promoted, consistent segment set.
         let mut drain_ok = true;
         if fork_dir.join("pending").exists() {
             match upload::drain_pending(&fork_dir, &volume_id, &store).await {
@@ -207,10 +277,7 @@ pub async fn run_volume_tasks(
 
             let handoffs_applied = control::apply_gc_handoffs(&fork_dir).await;
             if handoffs_applied > 0 {
-                info!(
-                    "[gc {volume_id}] re-applied {handoffs_applied} GC handoff(s) \
-                     after restart"
-                );
+                info!("[gc {volume_id}] volume applied {handoffs_applied} GC handoff(s)");
             }
 
             match gc::apply_done_handoffs(&fork_dir, &volume_id, &store).await {
@@ -239,6 +306,7 @@ pub async fn run_volume_tasks(
                     bytes_freed,
                     ..
                 }) => {
+                    gc_was_active = true;
                     info!(
                         "[gc {volume_id}] density: compacted 1 segment, ~{bytes_freed} bytes freed"
                     );
@@ -247,7 +315,9 @@ pub async fn run_volume_tasks(
                     strategy: gc::GcStrategy::Sweep,
                     candidates,
                     bytes_freed,
+                    ..
                 }) => {
+                    gc_was_active = true;
                     info!(
                         "[gc {volume_id}] sweep: packed {candidates} small segment(s), ~{bytes_freed} bytes freed"
                     );
@@ -256,12 +326,27 @@ pub async fn run_volume_tasks(
                     strategy: gc::GcStrategy::Both,
                     candidates,
                     bytes_freed,
+                    ..
                 }) => {
+                    gc_was_active = true;
                     info!(
                         "[gc {volume_id}] repack+sweep: {candidates} segment(s) compacted, ~{bytes_freed} bytes freed"
                     );
                 }
-                Ok(_) => {}
+                Ok(gc::GcStats {
+                    strategy: gc::GcStrategy::None,
+                    total_segments,
+                    ..
+                }) => {
+                    if gc_was_active {
+                        info!(
+                            "[gc {volume_id}] idle — {total_segments} segment(s), \
+                             all at or above density threshold ({:.2})",
+                            gc_config.density_threshold
+                        );
+                        gc_was_active = false;
+                    }
+                }
                 Err(e) => error!("[gc {volume_id}] error: {e:#}"),
             }
 
@@ -278,5 +363,98 @@ pub fn read_volume_name(fork_dir: &Path) -> Option<String> {
         None
     } else {
         Some(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn setup_vol(tmp: &TempDir) -> PathBuf {
+        let vol = tmp.path().to_path_buf();
+        fs::create_dir_all(vol.join("cache")).unwrap();
+        fs::create_dir_all(vol.join("index")).unwrap();
+        vol
+    }
+
+    fn write_stub_body(vol: &Path, ulid: &str) {
+        fs::write(vol.join("cache").join(format!("{ulid}.body")), b"body").unwrap();
+        fs::write(vol.join("cache").join(format!("{ulid}.present")), b"\xff").unwrap();
+    }
+
+    #[test]
+    fn evict_bodies_removes_body_and_present_leaves_idx() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+        write_stub_body(&vol, ulid);
+        fs::write(vol.join("index").join(format!("{ulid}.idx")), b"idx").unwrap();
+
+        assert_eq!(evict_bodies(&vol).unwrap(), 1);
+        assert!(!vol.join("cache").join(format!("{ulid}.body")).exists());
+        assert!(!vol.join("cache").join(format!("{ulid}.present")).exists());
+        assert!(vol.join("index").join(format!("{ulid}.idx")).exists());
+    }
+
+    #[test]
+    fn evict_bodies_skips_body_without_idx() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let confirmed = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+        let unconfirmed = "01AAAAAAAAAAAAAAAAAAAAAAA2";
+        write_stub_body(&vol, confirmed);
+        write_stub_body(&vol, unconfirmed);
+        fs::write(vol.join("index").join(format!("{confirmed}.idx")), b"idx").unwrap();
+
+        assert_eq!(evict_bodies(&vol).unwrap(), 1);
+        assert!(!vol.join("cache").join(format!("{confirmed}.body")).exists());
+        assert!(
+            vol.join("cache")
+                .join(format!("{unconfirmed}.body"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn evict_bodies_missing_cache_dir_returns_zero() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(evict_bodies(tmp.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn evict_one_body_succeeds_with_idx() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+        write_stub_body(&vol, ulid);
+        fs::write(vol.join("index").join(format!("{ulid}.idx")), b"idx").unwrap();
+
+        assert_eq!(evict_one_body(&vol, ulid).unwrap(), 1);
+        assert!(!vol.join("cache").join(format!("{ulid}.body")).exists());
+        assert!(!vol.join("cache").join(format!("{ulid}.present")).exists());
+        assert!(vol.join("index").join(format!("{ulid}.idx")).exists());
+    }
+
+    #[test]
+    fn evict_one_body_refuses_without_idx() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+        write_stub_body(&vol, ulid);
+        let err = evict_one_body(&vol, ulid).unwrap_err();
+        assert!(err.to_string().contains("not S3-confirmed"));
+        assert!(vol.join("cache").join(format!("{ulid}.body")).exists());
+    }
+
+    #[test]
+    fn evict_one_body_refuses_missing_body() {
+        let tmp = TempDir::new().unwrap();
+        let vol = setup_vol(&tmp);
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+        fs::write(vol.join("index").join(format!("{ulid}.idx")), b"idx").unwrap();
+        let err = evict_one_body(&vol, ulid).unwrap_err();
+        assert!(err.to_string().contains("not found in cache/"));
     }
 }

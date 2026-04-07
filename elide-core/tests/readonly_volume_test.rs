@@ -50,7 +50,7 @@ fn readonly_sees_flushed_pending_not_wal() {
     assert_eq!(lba1, vec![0u8; 4096], "WAL-only LBA 1 should be invisible");
 }
 
-/// Data drained to segments/ is visible.
+/// Data drained to index/ + cache/ is visible.
 #[test]
 fn readonly_sees_drained_segments() {
     let dir = tempfile::TempDir::new().unwrap();
