@@ -520,6 +520,10 @@ struct SegmentStats {
     live_lba_bytes: u64,
     /// Logical total bytes: lba_length * BLOCK_BYTES summed over all entries.
     total_lba_bytes: u64,
+    /// True if the segment contains at least one DATA entry (live, stale, or fully dead).
+    /// Used to distinguish ref/zero-only segments (no physical body to reclaim) from
+    /// segments with real data that warrant GC even when all DATA entries are dead.
+    has_data_entries: bool,
     /// Live entries (data field not yet populated for DATA entries).
     live_entries: Vec<SegmentEntry>,
     /// Hashes that are in the extent index but not reachable from the LBA map.
@@ -541,19 +545,13 @@ impl SegmentStats {
         }
     }
 
-    /// True if compacting this segment would produce a meaningful result:
-    /// either a live DATA entry to carry forward (real body bytes in the output)
-    /// or a dead DATA entry in `removed_hashes` (dangling extent index entry to
-    /// clean up).  A segment of only dead/live dedup refs and zero extents has
-    /// no DATA content — compacting it writes an equivalent output segment with
-    /// no physical storage savings and no extent index changes, so it should be
-    /// skipped.
+    /// True if this segment contains at least one DATA entry (regardless of
+    /// liveness state).  Only DATA entries have physical body bytes to reclaim
+    /// from S3.  A segment of only dedup refs / zero extents — whether live or
+    /// dead — has no physical body; compacting it produces no storage savings
+    /// and should be skipped.
     fn has_data_content(&self) -> bool {
-        !self.removed_hashes.is_empty()
-            || self
-                .live_entries
-                .iter()
-                .any(|e| !e.is_dedup_ref && !e.is_zero_extent)
+        self.has_data_entries
     }
 }
 
@@ -667,6 +665,7 @@ fn collect_stats(
         let file_size = idx_size + physical_body_bytes;
         result.push(SegmentStats {
             ulid_str,
+            has_data_entries: physical_body_bytes > 0,
             file_size,
             live_lba_bytes,
             total_lba_bytes,
@@ -1065,6 +1064,7 @@ mod tests {
                 file_size: total_lba_bytes, // physical size irrelevant for density
                 live_lba_bytes,
                 total_lba_bytes,
+                has_data_entries: true,
                 live_entries: vec![data_entry()],
                 removed_hashes: Vec::new(),
             }
@@ -1086,6 +1086,7 @@ mod tests {
             file_size: 1024 * 1024,
             live_lba_bytes: 800 * 1024,
             total_lba_bytes: 1024 * 1024,
+            has_data_entries: true,
             live_entries: Vec::new(),
             removed_hashes: Vec::new(),
         };
@@ -1102,6 +1103,7 @@ mod tests {
                 file_size: 100,
                 live_lba_bytes,
                 total_lba_bytes: 100,
+                has_data_entries: true,
                 live_entries: Vec::new(),
                 removed_hashes: Vec::new(),
             }
@@ -1637,6 +1639,7 @@ mod tests {
             file_size: 17,
             live_lba_bytes: 0,
             total_lba_bytes: 17,
+            has_data_entries: true,
             live_entries: Vec::new(),
             removed_hashes: Vec::new(),
         };
