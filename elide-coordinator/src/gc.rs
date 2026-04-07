@@ -689,10 +689,18 @@ fn collect_stats(
                 }
                 continue;
             }
+            // DATA entries are content-addressed: the extent_index tracks a
+            // single canonical location per hash.  When the same hash appears
+            // in multiple segments (e.g. a regular write and a later
+            // materialised dedup ref), only one segment is "canonical" in the
+            // extent_index — the other looks extent-dead even though its LBA
+            // mapping is still live.  Check lba_live first (same as
+            // MaterializedRef above) so we never drop a live LBA mapping.
+            let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
             let extent_live = index
                 .lookup(&entry.hash)
                 .is_some_and(|loc| loc.segment_id == seg_ulid);
-            if extent_live && live_hashes.contains(&entry.hash) {
+            if lba_live || (extent_live && live_hashes.contains(&entry.hash)) {
                 live_lba_bytes += lba_bytes;
                 live_entries.push(entry);
             } else if extent_live {
@@ -1874,6 +1882,87 @@ mod tests {
             vol.read(1, 1).unwrap().as_slice(),
             &content,
             "lba 1 must read back [0xAA; 4096] after GC + crash + reopen"
+        );
+    }
+
+    /// Bug F: DATA entry at a non-canonical extent location must be kept when
+    /// its LBA mapping is live.
+    ///
+    /// Two segments with the same hash for different LBAs: S1 has DATA(LBA 0→H),
+    /// S2 has MaterializedRef(LBA 1→H).  The extent_index maps H→S2 (S2 processed
+    /// last).  collect_stats for S1 should still keep the DATA entry via lba_live.
+    #[test]
+    fn collect_stats_keeps_data_entry_when_lba_live_but_not_extent_canonical() {
+        let dir = TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let vk =
+            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+
+        let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+
+        // S1: DATA(LBA 0→H101)
+        vol.write(0, &[101u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+
+        // S2: DedupRef(LBA 1→H101) — same hash, write-path dedup
+        vol.write(1, &[101u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+
+        // Drain both: materialise converts S2's DedupRef → MaterializedRef.
+        let pending_dir = fork_dir.join("pending");
+        let mut ulids: Vec<ulid::Ulid> = Vec::new();
+        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap();
+            if name_str.contains('.') {
+                continue;
+            }
+            if let Ok(ulid) = ulid::Ulid::from_string(name_str) {
+                ulids.push(ulid);
+            }
+        }
+        ulids.sort();
+        for ulid in &ulids {
+            vol.materialise_segment(*ulid).unwrap();
+            vol.promote_segment(*ulid).unwrap();
+        }
+
+        // Rebuild from disk — extent_index has H101→S2 (S2 processed last).
+        let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let live_hashes = lbamap.live_hashes();
+
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+
+        // Both segments should have 1 live entry each.
+        // S1: DATA(LBA 0→H101) — not extent-canonical (H101→S2), but lba_live.
+        // S2: MaterializedRef(LBA 1→H101) — lba_live.
+        let total_live: usize = stats.iter().map(|s| s.live_entries.len()).sum();
+        assert_eq!(
+            total_live,
+            2,
+            "both LBA mappings must survive: got {} live entries across {} segments \
+             (segments: {:?})",
+            total_live,
+            stats.len(),
+            stats
+                .iter()
+                .map(|s| format!(
+                    "{}:live={},removed={}",
+                    &s.ulid_str[..8],
+                    s.live_entries.len(),
+                    s.removed_hashes.len()
+                ))
+                .collect::<Vec<_>>()
         );
     }
 }

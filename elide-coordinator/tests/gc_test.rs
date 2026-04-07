@@ -55,6 +55,18 @@
 //                 volume's extent index is consistent before old segments are deleted.
 //            Covered by: gc_restart_safety_applied_handoff (below)
 //
+//   Bug F — Write-path dedup creates two segments with the same hash: one
+//            DATA (original write), one MaterializedRef (materialised dedup
+//            ref).  The extent_index tracks one canonical location per hash;
+//            GC's liveness check for DATA entries used only extent_live, so the
+//            non-canonical DATA entry was classified as dead even though its LBA
+//            mapping was still live.  After the old segment was deleted the
+//            extent_index (or lba_map on crash rebuild) pointed to a missing
+//            segment, causing "segment not found" read errors.
+//            Fixed by adding an lba_live check for DATA entries in the GC
+//            compaction path, matching what MaterializedRef already had.
+//            Covered by: gc::tests::collect_stats_keeps_data_entry_when_lba_live_but_not_extent_canonical (unit test)
+//
 //   Note: a structurally similar scenario exists — segments already in pending/
 //         *before* gc_checkpoint is called also have ULIDs below the GC output
 //         and would cause the same crash-recovery ordering problem if drained
