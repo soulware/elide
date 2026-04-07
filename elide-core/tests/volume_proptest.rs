@@ -126,7 +126,6 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::Flush),
         Just(SimOp::SweepPending),
         Just(SimOp::Repack),
-        Just(SimOp::DrainLocal),
         Just(SimOp::DrainWithMaterialise),
         (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
         Just(SimOp::CoordGcLocalBoth),
@@ -152,10 +151,10 @@ fn two_segment_prefix() -> Vec<SimOp> {
     vec![
         SimOp::Write { lba: 0, seed: 0x0A },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
         SimOp::Write { lba: 1, seed: 0x0B },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
     ]
 }
 
@@ -166,10 +165,10 @@ fn snapshot_prefix() -> Vec<SimOp> {
     vec![
         SimOp::Write { lba: 2, seed: 0x11 },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
         SimOp::Write { lba: 3, seed: 0x22 },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
         SimOp::Snapshot,
     ]
 }
@@ -214,13 +213,13 @@ fn multi_segment_prefix() -> Vec<SimOp> {
     vec![
         SimOp::Write { lba: 0, seed: 0x55 },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
         SimOp::Write { lba: 1, seed: 0x66 },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
         SimOp::Write { lba: 2, seed: 0x77 },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
     ]
 }
 
@@ -234,16 +233,16 @@ fn repack_and_sweep_prefix() -> Vec<SimOp> {
     vec![
         SimOp::Write { lba: 0, seed: 0x14 },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
         SimOp::Write { lba: 0, seed: 0x15 }, // overwrites LBA 0 — S1 becomes stale
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
         SimOp::Write { lba: 1, seed: 0x16 },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
         SimOp::Write { lba: 2, seed: 0x17 },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
     ]
 }
 
@@ -253,10 +252,10 @@ fn post_gc_prefix() -> Vec<SimOp> {
     vec![
         SimOp::Write { lba: 0, seed: 0x28 },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
         SimOp::Write { lba: 1, seed: 0x29 },
         SimOp::Flush,
-        SimOp::DrainLocal,
+        SimOp::DrainWithMaterialise,
         SimOp::CoordGcLocal { n: 2 },
     ]
 }
