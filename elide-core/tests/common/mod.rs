@@ -50,7 +50,7 @@ pub fn drain_local(fork_dir: &Path) {
         let Some(ulid_str) = name.to_str() else {
             continue;
         };
-        if ulid_str.ends_with(".tmp") {
+        if ulid_str.ends_with(".tmp") || ulid_str.contains('.') {
             continue;
         }
         let Ok(data) = fs::read(&path) else {
@@ -74,6 +74,38 @@ pub fn drain_local(fork_dir: &Path) {
             vec![0xFFu8; bitset_len],
         );
         let _ = fs::remove_file(&path);
+    }
+}
+
+/// Drain via the full materialise → promote path, matching the production
+/// coordinator upload protocol.
+///
+/// For each pending segment: calls `vol.materialise_segment(ulid)` to produce
+/// `pending/<ulid>.materialized`, then `vol.promote_segment(ulid)` which
+/// writes `index/<ulid>.idx` + `cache/<ulid>.{body,present}` from the
+/// `.materialized` sidecar and updates the extent index.
+pub fn drain_with_materialise(vol: &mut elide_core::volume::Volume) {
+    let pending_dir = vol.base_dir().join("pending");
+    let Ok(entries) = fs::read_dir(&pending_dir) else {
+        return;
+    };
+    let mut ulids: Vec<Ulid> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.contains('.') {
+            continue;
+        }
+        if let Ok(ulid) = Ulid::from_string(name_str) {
+            ulids.push(ulid);
+        }
+    }
+    ulids.sort();
+    for ulid in ulids {
+        vol.materialise_segment(ulid).unwrap();
+        vol.promote_segment(ulid).unwrap();
     }
 }
 
@@ -193,11 +225,23 @@ fn compact_candidates_inner(
         }
         for entry in entries.drain(..) {
             if entry.kind == EntryKind::DedupRef {
-                // Carry a dedup ref only if the LBA still maps to this hash.
+                // Thin DedupRef has no body bytes — drop from GC output.
+                // The canonical DATA entry (in another segment) carries the
+                // body. Carrying the thin ref would leave a dangling reference
+                // when the old segment is deleted.
+                continue;
+            }
+            if entry.kind == EntryKind::MaterializedRef {
+                // Fat ref — treat like DATA for liveness (LBA-based).
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
+                let extent_live = extent_index
+                    .lookup(&entry.hash)
+                    .is_some_and(|loc| loc.segment_id == *ulid);
                 if lba_live {
                     source_ulids.push(*ulid);
                     all_entries.push(entry);
+                } else if extent_live {
+                    removed.push((entry.hash, *ulid));
                 }
                 continue;
             }

@@ -75,6 +75,10 @@ enum SimOp {
     /// drain-pending without S3 upload. Required before CoordGcLocal has
     /// material to work with.
     DrainLocal,
+    /// Like DrainLocal but exercises the full materialise → promote path:
+    /// materialise_segment (produces .materialized sidecar) then promote_segment
+    /// (reads from .materialized, updates extent index, publishes snapshot).
+    DrainWithMaterialise,
     /// Simulate one coordinator GC sweep pass directly on the filesystem,
     /// using `n` segments as input. Exercises ULID monotonicity and
     /// crash-recovery invariants for the coordinator GC path.
@@ -123,6 +127,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::SweepPending),
         Just(SimOp::Repack),
         Just(SimOp::DrainLocal),
+        Just(SimOp::DrainWithMaterialise),
         (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
         Just(SimOp::CoordGcLocalBoth),
         Just(SimOp::Crash),
@@ -177,6 +182,29 @@ fn pending_prefix() -> Vec<SimOp> {
         SimOp::Flush,
         SimOp::Write { lba: 5, seed: 0x44 },
         SimOp::Flush,
+    ]
+}
+
+/// Dedup write drained via materialise → promote, then overwritten so GC
+/// has dead entries. Exercises the full materialise + GC path with thin refs.
+fn dedup_materialise_gc_prefix() -> Vec<SimOp> {
+    vec![
+        // Write canonical data and flush.
+        SimOp::Write { lba: 0, seed: 0xD0 },
+        SimOp::Flush,
+        SimOp::DrainWithMaterialise,
+        // Write same data to different LBA — creates thin DedupRef.
+        SimOp::DedupWrite {
+            lba_a: 1,
+            lba_b: 2,
+            seed: 0xD0,
+        },
+        SimOp::Flush,
+        SimOp::DrainWithMaterialise,
+        // Overwrite LBA 0 to make the first segment's data dead for GC.
+        SimOp::Write { lba: 0, seed: 0xD1 },
+        SimOp::Flush,
+        SimOp::DrainWithMaterialise,
     ]
 }
 
@@ -255,6 +283,8 @@ fn arb_gc_interleaved_ops() -> impl Strategy<Value = Vec<SimOp>> {
         arb_sim_ops().prop_map(|ops| with_prefix(post_gc_prefix(), ops)),
         // One low-density + two small dense segments: CoordGcLocalBoth can fire.
         arb_sim_ops().prop_map(|ops| with_prefix(repack_and_sweep_prefix(), ops)),
+        // Dedup + materialise + GC: exercises thin→fat materialisation before GC.
+        arb_sim_ops().prop_map(|ops| with_prefix(dedup_materialise_gc_prefix(), ops)),
     ]
 }
 
@@ -343,7 +373,9 @@ proptest! {
                 }
                 SimOp::DrainLocal => {
                     common::drain_local(fork_dir);
-                    // DrainLocal only renames files; no new ULIDs are created.
+                }
+                SimOp::DrainWithMaterialise => {
+                    common::drain_with_materialise(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
                     let (gc_ulid, gc_ulid2) = vol.gc_checkpoint().unwrap();
@@ -519,6 +551,9 @@ proptest! {
                 SimOp::DrainLocal => {
                     common::drain_local(fork_dir);
                 }
+                SimOp::DrainWithMaterialise => {
+                    common::drain_with_materialise(&mut vol);
+                }
                 SimOp::CoordGcLocal { n } => {
                     let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
@@ -651,6 +686,9 @@ proptest! {
                 }
                 SimOp::DrainLocal => {
                     common::drain_local(fork_dir);
+                }
+                SimOp::DrainWithMaterialise => {
+                    common::drain_with_materialise(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
                     let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
