@@ -121,6 +121,19 @@ impl Default for ExtentIndex {
 ///   from the ancestor segment that holds the actual data.
 ///
 /// The caller (Volume::open) inserts in-progress WAL entries on top.
+/// Canonical location semantics: when the same hash appears in multiple
+/// segments (e.g. a DATA entry and a later MaterializedRef from dedup),
+/// the **highest ULID wins** — segments are processed in ascending order
+/// with last-write-wins insert, so the latest segment becomes canonical.
+///
+/// TODO: reverse to lowest-ULID-canonical.  The original DATA entry
+/// always has the lowest ULID; making it canonical is more intuitive
+/// (a DedupRef should point *to* the original, not supersede it).
+/// Requires changing insert to first-write-wins (or processing in
+/// descending order), plus matching changes in `promote_segment`'s
+/// `should_update` check and `compact_candidates_inner`'s Repack
+/// deduplication.  The invariant that all three sites agree on canonical
+/// direction is the critical constraint.
 pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 

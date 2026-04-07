@@ -7,12 +7,11 @@
 
 #![allow(dead_code)]
 
-pub mod actor_drain;
-
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use elide_core::actor::VolumeHandle;
 use elide_core::gc::{HandoffLine, format_handoff_file};
 use elide_core::{
     extentindex, lbamap,
@@ -46,6 +45,18 @@ pub fn drain_with_materialise(vol: &mut elide_core::volume::Volume) {
     for ulid in pending_ulids(vol.base_dir()) {
         vol.materialise_segment(ulid).unwrap();
         vol.promote_segment(ulid).unwrap();
+    }
+}
+
+/// Drain via the actor handle: materialise + promote each pending segment.
+///
+/// Equivalent to `drain_with_materialise` but works when the `Volume` is behind
+/// an actor — sends `MaterialiseSegment` and `Promote` messages through the
+/// handle's channel, so the actor's in-memory snapshot is updated correctly.
+pub fn drain_via_handle(handle: &VolumeHandle, base_dir: &Path) {
+    for ulid in pending_ulids(base_dir) {
+        handle.materialise_segment(ulid).unwrap();
+        handle.promote_segment(ulid).unwrap();
     }
 }
 
@@ -276,17 +287,52 @@ fn compact_candidates_inner(
         };
     fs::rename(&tmp_path, &final_path).ok()?;
 
-    let mut handoff_lines: Vec<HandoffLine> = all_entries
-        .iter()
-        .zip(source_ulids.iter())
-        .filter(|(e, _)| e.kind != EntryKind::DedupRef)
-        .map(|(e, src_ulid)| HandoffLine::Repack {
-            hash: e.hash,
-            old_ulid: *src_ulid,
-            new_ulid,
-            new_offset: new_bss + e.stored_offset,
-        })
-        .collect();
+    // Build Repack lines, deduplicating by hash: emit one Repack per unique
+    // hash, preferring the extent-canonical source segment.  With dedup, the
+    // same hash can appear in multiple input segments (DATA in one,
+    // MaterializedRef in another).  The extent index tracks one canonical
+    // location per hash, and apply_gc_handoffs' still_at_old check compares
+    // against the single old_ulid in the handoff — so we must use the
+    // canonical segment's ULID.  Non-canonical entries are still in the output
+    // segment (preserving their LBA mappings) but don't generate Repack lines.
+    let mut seen_repack_hashes: HashSet<blake3::Hash> = HashSet::new();
+    let mut handoff_lines: Vec<HandoffLine> = Vec::new();
+    // First pass: emit Repacks for extent-canonical entries.
+    for (e, src_ulid) in all_entries.iter().zip(source_ulids.iter()) {
+        if e.kind == EntryKind::DedupRef {
+            continue;
+        }
+        if seen_repack_hashes.contains(&e.hash) {
+            continue;
+        }
+        let is_canonical = extent_index
+            .lookup(&e.hash)
+            .is_some_and(|loc| loc.segment_id == *src_ulid);
+        if is_canonical {
+            seen_repack_hashes.insert(e.hash);
+            handoff_lines.push(HandoffLine::Repack {
+                hash: e.hash,
+                old_ulid: *src_ulid,
+                new_ulid,
+                new_offset: new_bss + e.stored_offset,
+            });
+        }
+    }
+    // Second pass: emit Repacks for any remaining hashes (no canonical entry
+    // was in the candidate set — use whichever source we have).
+    for (e, src_ulid) in all_entries.iter().zip(source_ulids.iter()) {
+        if e.kind == EntryKind::DedupRef {
+            continue;
+        }
+        if seen_repack_hashes.insert(e.hash) {
+            handoff_lines.push(HandoffLine::Repack {
+                hash: e.hash,
+                old_ulid: *src_ulid,
+                new_ulid,
+                new_offset: new_bss + e.stored_offset,
+            });
+        }
+    }
     for (hash, old_ulid) in &removed {
         handoff_lines.push(HandoffLine::Remove {
             hash: *hash,

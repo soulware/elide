@@ -1379,11 +1379,24 @@ impl Volume {
                         continue;
                     }
                 }
-                let points_to_this_segment = self
+                // Update the extent index if:
+                //   (a) it already points to this segment (offset rewrite
+                //       after materialisation changed the index section size), or
+                //   (b) it points to an older segment with the same hash.
+                //       With dedup, multiple segments carry body bytes for
+                //       the same hash.  On-disk rebuild picks the latest ULID
+                //       as canonical; the in-memory index must agree so that
+                //       apply_gc_handoffs' still_at_old check matches the
+                //       coordinator's disk-rebuilt view.
+                //
+                // We do NOT overwrite an entry with a higher ULID — that
+                // would be a genuinely newer write (e.g. WAL entry from a
+                // concurrent write serialised by the actor).
+                let should_update = self
                     .extent_index
                     .lookup(&entry.hash)
-                    .is_some_and(|loc| loc.segment_id == ulid);
-                if points_to_this_segment {
+                    .is_none_or(|loc| loc.segment_id <= ulid);
+                if should_update {
                     Arc::make_mut(&mut self.extent_index).insert(
                         entry.hash,
                         extentindex::ExtentLocation {

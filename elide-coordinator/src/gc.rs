@@ -205,9 +205,16 @@ pub async fn gc_fork(
             candidate.live_entries.len(),
             candidate.removed_hashes.len(),
         );
-        compact_segments(vec![candidate], &gc_dir, volume_id, store, repack_ulid)
-            .await
-            .context("density compaction")?;
+        compact_segments(
+            vec![candidate],
+            &gc_dir,
+            volume_id,
+            store,
+            repack_ulid,
+            &index,
+        )
+        .await
+        .context("density compaction")?;
         true
     } else {
         false
@@ -239,7 +246,7 @@ pub async fn gc_fork(
     let ran_sweep = if small.len() >= 2 {
         let sweep_candidates = small.len();
         let sweep_bytes: u64 = small.iter().map(|s| s.dead_lba_bytes()).sum();
-        compact_segments(small, &gc_dir, volume_id, store, sweep_ulid)
+        compact_segments(small, &gc_dir, volume_id, store, sweep_ulid, &index)
             .await
             .context("small-segment sweep")?;
         Some((sweep_candidates, sweep_bytes))
@@ -762,6 +769,7 @@ async fn compact_segments(
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
     new_ulid: Ulid,
+    extent_index: &ExtentIndex,
 ) -> Result<()> {
     let new_ulid_str = new_ulid.to_string();
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
@@ -947,28 +955,63 @@ async fn compact_segments(
     );
 
     // Write the handoff file using the typed HandoffLine format.
+    //
+    // Deduplicate Repack lines by hash: with dedup, the same hash can appear
+    // in multiple input segments (DATA in one, MaterializedRef in another).
+    // The extent index tracks one canonical location per hash, and
+    // apply_gc_handoffs' still_at_old check compares against the single
+    // old_ulid in the handoff — so we emit one Repack per unique hash,
+    // preferring the entry whose source segment is extent-canonical.
+    // Non-canonical entries are still in the output segment (preserving
+    // their LBA mappings) but don't generate Repack lines.
     let mut handoff_lines: Vec<HandoffLine> = Vec::new();
     // Track which candidate ULIDs get at least one Repack or Remove line.
     // Any candidate not covered had only DEDUP_REF live entries; it needs a
     // Dead line so apply_done_handoffs deletes the old segment file.
     let mut covered_ulids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen_repack_hashes: std::collections::HashSet<blake3::Hash> =
+        std::collections::HashSet::new();
+    // First pass: emit Repacks for extent-canonical entries.
     for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
         if !matches!(new_entry.kind, EntryKind::Data | EntryKind::MaterializedRef) {
-            // Zero extents and thin dedup-ref entries have no body in the new
-            // segment and no extent index entries to update.  No Repack line
-            // is needed — apply_gc_handoffs must not touch the extent index
-            // for these entries.
             continue;
         }
-        covered_ulids.insert(old_ulid_str.as_str());
+        if seen_repack_hashes.contains(&old_entry.hash) {
+            continue;
+        }
         let old_ulid = Ulid::from_string(old_ulid_str).context("parsing old ulid")?;
-        let new_offset = new_body_section_start + new_entry.stored_offset;
-        handoff_lines.push(HandoffLine::Repack {
-            hash: old_entry.hash,
-            old_ulid,
-            new_ulid,
-            new_offset,
-        });
+        let is_canonical = extent_index
+            .lookup(&old_entry.hash)
+            .is_some_and(|loc| loc.segment_id == old_ulid);
+        if is_canonical {
+            seen_repack_hashes.insert(old_entry.hash);
+            covered_ulids.insert(old_ulid_str.as_str());
+            let new_offset = new_body_section_start + new_entry.stored_offset;
+            handoff_lines.push(HandoffLine::Repack {
+                hash: old_entry.hash,
+                old_ulid,
+                new_ulid,
+                new_offset,
+            });
+        }
+    }
+    // Second pass: emit Repacks for any remaining hashes (no canonical entry
+    // was in the candidate set — use whichever source we have).
+    for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
+        if !matches!(new_entry.kind, EntryKind::Data | EntryKind::MaterializedRef) {
+            continue;
+        }
+        if seen_repack_hashes.insert(old_entry.hash) {
+            covered_ulids.insert(old_ulid_str.as_str());
+            let old_ulid = Ulid::from_string(old_ulid_str).context("parsing old ulid")?;
+            let new_offset = new_body_section_start + new_entry.stored_offset;
+            handoff_lines.push(HandoffLine::Repack {
+                hash: old_entry.hash,
+                old_ulid,
+                new_ulid,
+                new_offset,
+            });
+        }
     }
     for (hash, old_ulid_str) in &all_removed {
         covered_ulids.insert(old_ulid_str.as_str());
@@ -1676,9 +1719,17 @@ mod tests {
             removed_hashes: Vec::new(),
         };
 
-        compact_segments(vec![candidate], &gc_dir, "vol", &store, handoff_ulid)
-            .await
-            .unwrap();
+        let empty_index = elide_core::extentindex::ExtentIndex::new();
+        compact_segments(
+            vec![candidate],
+            &gc_dir,
+            "vol",
+            &store,
+            handoff_ulid,
+            &empty_index,
+        )
+        .await
+        .unwrap();
 
         // A tombstone .pending file must have been written so the volume can
         // acknowledge before the coordinator deletes.
