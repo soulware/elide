@@ -191,11 +191,14 @@ pub async fn gc_fork(
         let candidate = all_stats.remove(pos);
         repack_bytes = candidate.dead_lba_bytes();
         tracing::info!(
-            "[gc] repack candidate: {} density={:.3} live={} dead={}",
+            "[gc] repack candidate: {} density={:.3} live_lba={} dead_lba={} \
+             live_entries={} removed_hashes={}",
             candidate.ulid_str,
             candidate.density(),
             candidate.live_lba_bytes,
             candidate.dead_lba_bytes(),
+            candidate.live_entries.len(),
+            candidate.removed_hashes.len(),
         );
         compact_segments(vec![candidate], &gc_dir, volume_id, store, repack_ulid)
             .await
