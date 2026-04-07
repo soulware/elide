@@ -119,14 +119,17 @@ pub struct GcStats {
     pub candidates: usize,
     /// Estimated bytes freed (dead bytes removed from old segments).
     pub bytes_freed: u64,
+    /// Total segments considered during this pass (above the snapshot floor).
+    pub total_segments: usize,
 }
 
 impl GcStats {
-    fn none() -> Self {
+    fn none(total_segments: usize) -> Self {
         Self {
             strategy: GcStrategy::None,
             candidates: 0,
             bytes_freed: 0,
+            total_segments,
         }
     }
 }
@@ -150,12 +153,12 @@ pub async fn gc_fork(
 ) -> Result<GcStats> {
     let index_dir = fork_dir.join("index");
     if !index_dir.exists() {
-        return Ok(GcStats::none());
+        return Ok(GcStats::none(0));
     }
 
     let gc_dir = fork_dir.join("gc");
     if has_pending_results(&gc_dir)? {
-        return Ok(GcStats::none());
+        return Ok(GcStats::none(0));
     }
 
     // Clean up any stale .fetch files left by a coordinator crash mid-compaction.
@@ -183,6 +186,7 @@ pub async fn gc_fork(
 
     let mut all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
         .context("collecting segment stats")?;
+    let total_segments = all_stats.len();
 
     // Repack: density pass — extract the single least-dense segment.
     // Removes it from all_stats so sweep only sees the remainder.
@@ -244,21 +248,24 @@ pub async fn gc_fork(
     };
 
     match (ran_repack, ran_sweep) {
-        (false, None) => Ok(GcStats::none()),
+        (false, None) => Ok(GcStats::none(total_segments)),
         (true, None) => Ok(GcStats {
             strategy: GcStrategy::Repack,
             candidates: 1,
             bytes_freed: repack_bytes,
+            total_segments,
         }),
         (false, Some((n, sweep_bytes))) => Ok(GcStats {
             strategy: GcStrategy::Sweep,
             candidates: n,
             bytes_freed: sweep_bytes,
+            total_segments,
         }),
         (true, Some((n, sweep_bytes))) => Ok(GcStats {
             strategy: GcStrategy::Both,
             candidates: 1 + n,
             bytes_freed: repack_bytes + sweep_bytes,
+            total_segments,
         }),
     }
 }

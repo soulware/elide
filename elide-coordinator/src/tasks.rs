@@ -118,6 +118,9 @@ pub async fn run_volume_tasks(
     let mut last_gc = Instant::now()
         .checked_sub(gc_interval)
         .unwrap_or_else(Instant::now);
+    // Track whether the previous GC tick did any work, so we can log once
+    // when GC transitions from active → idle (converged).
+    let mut gc_was_active = true;
 
     // Prefetch segment indexes on startup if the fork has no local index files.
     // This covers the common case of a volume pulled from the store with only
@@ -303,6 +306,7 @@ pub async fn run_volume_tasks(
                     bytes_freed,
                     ..
                 }) => {
+                    gc_was_active = true;
                     info!(
                         "[gc {volume_id}] density: compacted 1 segment, ~{bytes_freed} bytes freed"
                     );
@@ -311,7 +315,9 @@ pub async fn run_volume_tasks(
                     strategy: gc::GcStrategy::Sweep,
                     candidates,
                     bytes_freed,
+                    ..
                 }) => {
+                    gc_was_active = true;
                     info!(
                         "[gc {volume_id}] sweep: packed {candidates} small segment(s), ~{bytes_freed} bytes freed"
                     );
@@ -320,12 +326,27 @@ pub async fn run_volume_tasks(
                     strategy: gc::GcStrategy::Both,
                     candidates,
                     bytes_freed,
+                    ..
                 }) => {
+                    gc_was_active = true;
                     info!(
                         "[gc {volume_id}] repack+sweep: {candidates} segment(s) compacted, ~{bytes_freed} bytes freed"
                     );
                 }
-                Ok(_) => {}
+                Ok(gc::GcStats {
+                    strategy: gc::GcStrategy::None,
+                    total_segments,
+                    ..
+                }) => {
+                    if gc_was_active {
+                        info!(
+                            "[gc {volume_id}] idle — {total_segments} segment(s), \
+                             all at or above density threshold ({:.2})",
+                            gc_config.density_threshold
+                        );
+                        gc_was_active = false;
+                    }
+                }
                 Err(e) => error!("[gc {volume_id}] error: {e:#}"),
             }
 
