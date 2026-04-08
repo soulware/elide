@@ -203,6 +203,13 @@ pub enum EntryKind {
     Inline,
 }
 
+impl EntryKind {
+    /// Entry kinds with locally-available body bytes (pending/ segments).
+    pub const LOCAL_BODY: [EntryKind; 1] = [EntryKind::Data];
+    /// Entry kinds with body bytes in materialised/S3 segments.
+    pub const ALL_BODY: [EntryKind; 2] = [EntryKind::Data, EntryKind::DedupRef];
+}
+
 /// One entry in the in-memory representation of a segment's index section.
 ///
 /// Used in two contexts:
@@ -633,27 +640,28 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
 /// Populate `entry.data` by reading body bytes from the segment file.
 ///
 /// `body_section_start` is the absolute file offset of the body section, as
-/// returned by `read_segment_index`.  Every entry with `stored_length > 0`
-/// is read.  Entries with no body (Zero, Inline, or any entry where
-/// `stored_length == 0`) are skipped.
+/// returned by `read_segment_index`.  Only entries whose `kind` is in
+/// `kinds` and whose `stored_length > 0` are read.
 ///
-/// When `skip_dedup_ref` is true, DedupRef entries are skipped.  Use this
-/// when reading from local pending/ segments where DedupRef body regions
-/// are sparse holes (not real data).  Pass false when reading from S3 or
-/// materialized segments where all body regions are populated.
+/// Common usage:
+/// - `&[EntryKind::Data]` — local pending/ segments where DedupRef body
+///   regions are sparse holes (not real data).
+/// - `&[EntryKind::Data, EntryKind::DedupRef]` — S3-fetched or materialised
+///   segments where all body regions are populated.
 pub fn read_extent_bodies(
     path: &Path,
     body_section_start: u64,
     entries: &mut [SegmentEntry],
-    skip_dedup_ref: bool,
+    kinds: impl AsRef<[EntryKind]>,
 ) -> io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
+    let kinds = kinds.as_ref();
     let mut f = fs::File::open(path)?;
     for entry in entries.iter_mut() {
         if entry.stored_length == 0 {
             continue;
         }
-        if skip_dedup_ref && entry.kind == EntryKind::DedupRef {
+        if !kinds.contains(&entry.kind) {
             continue;
         }
         f.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;

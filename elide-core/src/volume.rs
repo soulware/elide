@@ -587,7 +587,7 @@ impl Volume {
                     &seg_path,
                     body_section_start,
                     &mut live_entries,
-                    true,
+                    segment::EntryKind::LOCAL_BODY,
                 )?;
 
                 // Reuse the source segment's own ULID for the output.  This
@@ -739,7 +739,12 @@ impl Volume {
             }
 
             let mut live_entries = live_entries;
-            segment::read_extent_bodies(seg_path, body_section_start, &mut live_entries, true)?;
+            segment::read_extent_bodies(
+                seg_path,
+                body_section_start,
+                &mut live_entries,
+                segment::EntryKind::LOCAL_BODY,
+            )?;
             merged_live.extend(live_entries);
 
             candidate_paths.push(seg_path.clone());
@@ -979,7 +984,12 @@ impl Volume {
             // .applied handoffs: already volume-signed; skip re-signing.
             if !is_already_applied && gc_seg_path.try_exists()? {
                 let (bss, mut entries) = segment::read_segment_index(&gc_seg_path)?;
-                segment::read_extent_bodies(&gc_seg_path, bss, &mut entries, false)?;
+                segment::read_extent_bodies(
+                    &gc_seg_path,
+                    bss,
+                    &mut entries,
+                    segment::EntryKind::ALL_BODY,
+                )?;
                 let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
                 segment::write_segment(&tmp_path, &mut entries, self.signer.as_ref())?;
                 fs::rename(&tmp_path, &gc_seg_path)?;
@@ -3991,8 +4001,13 @@ mod tests {
                             continue;
                         };
                         let body_path = fork_dir.join("cache").join(format!("{}.body", ulid));
-                        if segment::read_extent_bodies(&body_path, 0, &mut seg_entries, true)
-                            .is_err()
+                        if segment::read_extent_bodies(
+                            &body_path,
+                            0,
+                            &mut seg_entries,
+                            segment::EntryKind::LOCAL_BODY,
+                        )
+                        .is_err()
                         {
                             continue;
                         }
@@ -4783,7 +4798,8 @@ mod tests {
         let (_old_bss, mut entries) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
         // Cache .body files start at byte 0 of the body section.
-        segment::read_extent_bodies(&body_path, 0, &mut entries, true).unwrap();
+        segment::read_extent_bodies(&body_path, 0, &mut entries, segment::EntryKind::LOCAL_BODY)
+            .unwrap();
 
         let (new_ulid, _) = vol.gc_checkpoint().unwrap();
         let new_ulid_str = new_ulid.to_string();

@@ -194,7 +194,14 @@ fn compact_candidates_inner(
         } else {
             (path.clone(), bss_header)
         };
-        if segment::read_extent_bodies(&body_path, bss, &mut entries, true).is_err() {
+        if segment::read_extent_bodies(
+            &body_path,
+            bss,
+            &mut entries,
+            segment::EntryKind::LOCAL_BODY,
+        )
+        .is_err()
+        {
             continue;
         }
         for entry in entries.drain(..) {

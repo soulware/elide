@@ -802,7 +802,7 @@ async fn compact_segments(
                 &fetch_path,
                 body_section_start,
                 &mut candidate.live_entries,
-                false,
+                segment::EntryKind::ALL_BODY,
             )
             .with_context(|| format!("reading bodies from {}", candidate.ulid_str))?;
 
