@@ -288,13 +288,14 @@ fn compact_candidates_inner(
     fs::rename(&tmp_path, &final_path).ok()?;
 
     // Build Repack lines, deduplicating by hash: emit one Repack per unique
-    // hash, preferring the extent-canonical source segment.  With dedup, the
-    // same hash can appear in multiple input segments (DATA in one,
-    // MaterializedRef in another).  The extent index tracks one canonical
-    // location per hash, and apply_gc_handoffs' still_at_old check compares
-    // against the single old_ulid in the handoff — so we must use the
-    // canonical segment's ULID.  Non-canonical entries are still in the output
-    // segment (preserving their LBA mappings) but don't generate Repack lines.
+    // hash, preferring the extent-canonical source segment (lowest ULID).
+    // With dedup, the same hash can appear in multiple input segments (DATA
+    // in one, MaterializedRef in another).  The extent index tracks one
+    // canonical location per hash (lowest ULID wins), and apply_gc_handoffs'
+    // still_at_old check compares against the single old_ulid in the handoff
+    // — so we must use the canonical segment's ULID.  Non-canonical entries
+    // are still in the output segment (preserving their LBA mappings) but
+    // don't generate Repack lines.
     let mut seen_repack_hashes: HashSet<blake3::Hash> = HashSet::new();
     let mut handoff_lines: Vec<HandoffLine> = Vec::new();
     // First pass: emit Repacks for extent-canonical entries.
