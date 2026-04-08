@@ -75,6 +75,19 @@ impl ExtentIndex {
         self.inner.insert(hash, location);
     }
 
+    /// Insert `location` only if `hash` is not already present.
+    /// Returns `true` if the entry was inserted, `false` if it already existed.
+    pub fn insert_if_absent(&mut self, hash: blake3::Hash, location: ExtentLocation) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.inner.entry(hash) {
+            Entry::Vacant(v) => {
+                v.insert(location);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
     /// Look up the segment location for `hash`.
     pub fn lookup(&self, hash: &blake3::Hash) -> Option<&ExtentLocation> {
         self.inner.get(hash)
@@ -123,17 +136,14 @@ impl Default for ExtentIndex {
 /// The caller (Volume::open) inserts in-progress WAL entries on top.
 /// Canonical location semantics: when the same hash appears in multiple
 /// segments (e.g. a DATA entry and a later MaterializedRef from dedup),
-/// the **highest ULID wins** — segments are processed in ascending order
-/// with last-write-wins insert, so the latest segment becomes canonical.
+/// the **lowest ULID wins** — segments are processed in ascending order
+/// with first-write-wins insert (`insert_if_absent`), so the earliest
+/// segment becomes canonical.  This is correct because a DedupRef always
+/// refers to a segment with a lower ULID than itself, so the original
+/// DATA entry (lowest ULID) is the natural canonical location.
 ///
-/// TODO: reverse to lowest-ULID-canonical.  The original DATA entry
-/// always has the lowest ULID; making it canonical is more intuitive
-/// (a DedupRef should point *to* the original, not supersede it).
-/// Requires changing insert to first-write-wins (or processing in
-/// descending order), plus matching changes in `promote_segment`'s
-/// `should_update` check and `compact_candidates_inner`'s Repack
-/// deduplication.  The invariant that all three sites agree on canonical
-/// direction is the critical constraint.
+/// `promote_segment`'s `should_update` check and `compact_candidates_inner`'s
+/// Repack deduplication both agree on this direction.
 pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 
@@ -152,9 +162,10 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                     .unwrap_or(false)
             });
         }
-        // Process pending/ (absolute offsets). These overwrite any index/ entries
-        // for the same hashes, since pending/ segments are not yet uploaded and
-        // have full local bodies with known body_section_start.
+        // Process pending/ (absolute offsets). These overwrite index/ entries
+        // only when the same segment appears in both (crash recovery: coordinator
+        // wrote index/ but didn't delete pending/). For different segments with
+        // the same hash, first-write-wins preserves lowest-ULID-canonical.
         let mut paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
         // Include GC handoff bodies in .applied state (volume-signed, in gc/
         // awaiting coordinator upload to S3).  Lower priority than pending/.
@@ -206,7 +217,8 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 // body_offset is body-relative: the .body file starts at byte 0
                 // of the body section, so no adjustment needed.
                 // entry_idx and body_section_start enable per-extent range-GETs.
-                index.insert(
+                // First-write-wins: lowest ULID keeps canonical status.
+                index.insert_if_absent(
                     entry.hash,
                     ExtentLocation {
                         segment_id,
@@ -246,6 +258,16 @@ pub fn rebuild(layers: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> 
                 match entry.kind {
                     EntryKind::Data | EntryKind::MaterializedRef => {}
                     EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
+                }
+                // First-write-wins (lowest ULID canonical), but overwrite
+                // if the existing entry is the same segment (crash-recovery
+                // offset correction: index/ had body-relative, pending/ has
+                // absolute offsets for the still-local full segment file).
+                let dominated = index
+                    .lookup(&entry.hash)
+                    .is_some_and(|loc| loc.segment_id != segment_id);
+                if dominated {
+                    continue;
                 }
                 index.insert(
                     entry.hash,
@@ -414,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_segment_overwrites_older_for_same_hash() {
+    fn oldest_segment_wins_for_same_hash() {
         let base = temp_dir();
         let pending = base.join("pending");
         std::fs::create_dir_all(&pending).unwrap();
@@ -424,6 +446,8 @@ mod tests {
         let hash = blake3::hash(&data);
 
         // Older segment.
+        let bss1;
+        let stored_offset1;
         {
             let mut entries = vec![SegmentEntry::new_data(
                 hash,
@@ -432,16 +456,15 @@ mod tests {
                 segment::SegmentFlags::empty(),
                 data.clone(),
             )];
-            segment::write_segment(
+            bss1 = segment::write_segment(
                 &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 &mut entries,
                 signer.as_ref(),
             )
             .unwrap();
+            stored_offset1 = entries[0].stored_offset;
         }
         // Newer segment: same hash, different position.
-        let bss2;
-        let stored_offset2;
         {
             let data2 = vec![0u8; 8192]; // put something before it
             let hash2 = blake3::hash(&data2);
@@ -449,20 +472,19 @@ mod tests {
                 SegmentEntry::new_data(hash2, 10, 2, segment::SegmentFlags::empty(), data2),
                 SegmentEntry::new_data(hash, 0, 1, segment::SegmentFlags::empty(), data),
             ];
-            bss2 = segment::write_segment(
+            segment::write_segment(
                 &pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
                 &mut entries,
                 signer.as_ref(),
             )
             .unwrap();
-            stored_offset2 = entries[1].stored_offset;
         }
 
         let index = rebuild(&[(base.clone(), None)]).unwrap();
-        // Newer segment's offset wins; body_offset is body-relative.
+        // Oldest segment (lowest ULID) wins; body_offset is body-relative.
         let loc = index.lookup(&hash).unwrap();
-        assert_eq!(loc.body_offset, stored_offset2);
-        assert_eq!(loc.body_section_start, bss2);
+        assert_eq!(loc.body_offset, stored_offset1);
+        assert_eq!(loc.body_section_start, bss1);
 
         std::fs::remove_dir_all(base).unwrap();
     }
