@@ -511,6 +511,21 @@ pub fn verify_segment_bytes(
         })
 }
 
+/// Return `body_section_start` for a cached `.idx` file.
+///
+/// A `.idx` file contains exactly `[0, body_section_start)` of the full
+/// segment (header + index section + inline section).  Its file size **is**
+/// `body_section_start` — no header parse required.
+///
+/// This is the authoritative way to obtain `body_section_start` when you
+/// already have (or only need) the `.idx` path.  Callers that also need the
+/// parsed entries should still use [`read_segment_index`] or
+/// [`read_and_verify_segment_index`], which return the same value via the
+/// header.
+pub fn idx_body_section_start(idx_path: &Path) -> io::Result<u64> {
+    Ok(fs::metadata(idx_path)?.len())
+}
+
 /// Parse a segment index without verifying the signature.
 ///
 /// Returns `(body_section_start, entries)`.
