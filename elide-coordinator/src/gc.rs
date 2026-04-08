@@ -388,15 +388,17 @@ pub async fn apply_done_handoffs(
                     format!("signature verification failed for compacted segment {new_ulid_str}")
                 })?;
 
-            // Sanity check: GC output must not contain thin DedupRef.
-            let thin_count = gc_entries
+            // Sanity check: GC output should contain only Data and Zero entries.
+            // DedupRef entries from S3 input are reclassified as Data during
+            // compaction; if any survive, something is wrong.
+            let dedup_count = gc_entries
                 .iter()
                 .filter(|e| e.kind == EntryKind::DedupRef)
                 .count();
-            if thin_count > 0 {
+            if dedup_count > 0 {
                 return Err(anyhow::anyhow!(
-                    "compacted segment {new_ulid_str} has {thin_count} thin DedupRef entries; \
-                     refusing to upload — this would lose body data when old segments are deleted"
+                    "compacted segment {new_ulid_str} has {dedup_count} DedupRef entries; \
+                     refusing to upload — GC output must be self-contained"
                 ));
             }
 
@@ -641,20 +643,6 @@ fn collect_stats(
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
 
-        // Thin DedupRef should never appear in S3 segments (upload sanity
-        // check rejects them). If one slipped through (legacy data or bug),
-        // skip this segment entirely — compacting it would lose body bytes
-        // because the canonical segment referenced by the thin ref may be
-        // deleted by GC cleanup.
-        let has_thin_ref = entries.iter().any(|e| e.kind == EntryKind::DedupRef);
-        if has_thin_ref {
-            warn!(
-                "[gc] skipping {ulid_str}: segment contains thin DedupRef entries \
-                 (should not appear in S3); re-upload with materialise_segment first"
-            );
-            continue;
-        }
-
         for entry in entries {
             if entry.kind == EntryKind::Inline {
                 continue;
@@ -678,12 +666,10 @@ fn collect_stats(
                 continue;
             }
             physical_body_bytes += entry.stored_length as u64;
-            // Materialised refs carry body bytes (same layout as DATA) and an
-            // LBA mapping. Liveness is LBA-based: the entry is live if the LBA
-            // still maps to its hash. Thin DedupRef should not appear in S3
-            // segments (upload sanity check), but is handled identically here
-            // (stored_length = 0, so no body-byte contribution).
-            if entry.kind == EntryKind::DedupRef || entry.kind == EntryKind::MaterializedRef {
+            // DedupRef entries carry body bytes in S3 (filled by materialization)
+            // and an LBA mapping. Liveness is LBA-based: the entry is live if
+            // the LBA still maps to its hash.
+            if entry.kind == EntryKind::DedupRef {
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
                 let extent_live = index
                     .lookup(&entry.hash)
@@ -699,10 +685,10 @@ fn collect_stats(
             // DATA entries are content-addressed: the extent_index tracks a
             // single canonical location per hash.  When the same hash appears
             // in multiple segments (e.g. a regular write and a later
-            // materialised dedup ref), only one segment is "canonical" in the
+            // dedup ref), only one segment is "canonical" in the
             // extent_index — the other looks extent-dead even though its LBA
             // mapping is still live.  Check lba_live first (same as
-            // MaterializedRef above) so we never drop a live LBA mapping.
+            // DedupRef above) so we never drop a live LBA mapping.
             let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
             let extent_live = index
                 .lookup(&entry.hash)
@@ -785,7 +771,7 @@ async fn compact_segments(
         let has_body_entries = candidate
             .live_entries
             .iter()
-            .any(|e| matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef));
+            .any(|e| matches!(e.kind, EntryKind::Data | EntryKind::DedupRef));
 
         if has_body_entries {
             let fetch_path = gc_dir.join(format!("{}.fetch", candidate.ulid_str));
@@ -816,6 +802,7 @@ async fn compact_segments(
                 &fetch_path,
                 body_section_start,
                 &mut candidate.live_entries,
+                false,
             )
             .with_context(|| format!("reading bodies from {}", candidate.ulid_str))?;
 
@@ -892,19 +879,9 @@ async fn compact_segments(
             EntryKind::Zero => {
                 new_entries.push(SegmentEntry::new_zero(e.start_lba, e.lba_length));
             }
-            EntryKind::DedupRef => {
-                // collect_stats skips segments with thin refs, so this
-                // should not happen. Drop the entry rather than emitting
-                // a bodyless ref that would cause data loss on old-segment
-                // deletion. The apply_done_handoffs sanity check catches
-                // this before upload.
-                warn!(
-                    "[gc] dropping thin DedupRef {} from compaction output \
-                     (should have been filtered by collect_stats)",
-                    e.hash.to_hex()
-                );
-            }
-            EntryKind::Data | EntryKind::MaterializedRef => {
+            EntryKind::DedupRef | EntryKind::Data => {
+                // GC input comes from S3 where DedupRef body holes are filled
+                // by materialization.  Convert both to Data in the output.
                 let flags = if e.compressed {
                     segment::SegmentFlags::COMPRESSED
                 } else {
@@ -957,7 +934,7 @@ async fn compact_segments(
     // Write the handoff file using the typed HandoffLine format.
     //
     // Deduplicate Repack lines by hash: with dedup, the same hash can appear
-    // in multiple input segments (DATA in one, MaterializedRef in another).
+    // in multiple input segments (DATA in one, DedupRef in another).
     // The extent index tracks one canonical location per hash, and
     // apply_gc_handoffs' still_at_old check compares against the single
     // old_ulid in the handoff — so we emit one Repack per unique hash,
@@ -973,7 +950,7 @@ async fn compact_segments(
         std::collections::HashSet::new();
     // First pass: emit Repacks for extent-canonical entries.
     for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
-        if !matches!(new_entry.kind, EntryKind::Data | EntryKind::MaterializedRef) {
+        if !matches!(new_entry.kind, EntryKind::Data) {
             continue;
         }
         if seen_repack_hashes.contains(&old_entry.hash) {
@@ -998,7 +975,7 @@ async fn compact_segments(
     // Second pass: emit Repacks for any remaining hashes (no canonical entry
     // was in the candidate set — use whichever source we have).
     for ((old_ulid_str, old_entry), new_entry) in all_live.iter().zip(new_entries.iter()) {
-        if !matches!(new_entry.kind, EntryKind::Data | EntryKind::MaterializedRef) {
+        if !matches!(new_entry.kind, EntryKind::Data) {
             continue;
         }
         if seen_repack_hashes.insert(old_entry.hash) {
@@ -1841,7 +1818,7 @@ mod tests {
 
         // Step 2: write the same content to lba 1, flush, materialise, drain.
         // Same hash H_aa → the write path emits DEDUP_REF(lba=1, H_aa) in S2,
-        // which materialise_segment converts to MaterializedRef before upload.
+        // which materialise_segment converts to DedupRef before upload.
         vol.write(1, &content).unwrap();
         vol.flush_wal().unwrap();
         drain_with_materialise(&mut vol, dir, "test-vol", &store).await;
@@ -1906,7 +1883,7 @@ mod tests {
     /// its LBA mapping is live.
     ///
     /// Two segments with the same hash for different LBAs: S1 has DATA(LBA 0→H),
-    /// S2 has MaterializedRef(LBA 1→H).  The extent_index maps H→S2 (S2 processed
+    /// S2 has DedupRef(LBA 1→H).  The extent_index maps H→S2 (S2 processed
     /// last).  collect_stats for S1 should still keep the DATA entry via lba_live.
     #[test]
     fn collect_stats_keeps_data_entry_when_lba_live_but_not_extent_canonical() {
@@ -1933,7 +1910,7 @@ mod tests {
         vol.write(1, &[101u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
 
-        // Drain both: materialise converts S2's DedupRef → MaterializedRef.
+        // Drain both: materialise converts S2's DedupRef → DedupRef.
         let pending_dir = fork_dir.join("pending");
         let mut ulids: Vec<ulid::Ulid> = Vec::new();
         for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
@@ -1962,7 +1939,7 @@ mod tests {
 
         // Both segments should have 1 live entry each.
         // S1: DATA(LBA 0→H101) — not extent-canonical (H101→S2), but lba_live.
-        // S2: MaterializedRef(LBA 1→H101) — lba_live.
+        // S2: DedupRef(LBA 1→H101) — lba_live.
         let total_live: usize = stats.iter().map(|s| s.live_entries.len()).sum();
         assert_eq!(
             total_live,

@@ -56,7 +56,7 @@
 //            Covered by: gc_restart_safety_applied_handoff (below)
 //
 //   Bug F — Write-path dedup creates two segments with the same hash: one
-//            DATA (original write), one MaterializedRef (materialised dedup
+//            DATA (original write), one DedupRef (materialised dedup
 //            ref).  The extent_index tracks one canonical location per hash;
 //            GC's liveness check for DATA entries used only extent_live, so the
 //            non-canonical DATA entry was classified as dead even though its LBA
@@ -64,7 +64,7 @@
 //            extent_index (or lba_map on crash rebuild) pointed to a missing
 //            segment, causing "segment not found" read errors.
 //            Fixed by adding an lba_live check for DATA entries in the GC
-//            compaction path, matching what MaterializedRef already had.
+//            compaction path, matching what DedupRef already had.
 //            Covered by: gc::tests::collect_stats_keeps_data_entry_when_lba_live_but_not_extent_canonical (unit test)
 //
 //   Note: a structurally similar scenario exists — segments already in pending/
@@ -980,11 +980,11 @@ fn gc_collect_stats_skips_thin_dedup_ref_segment() {
         ))
         .unwrap();
 
-    // S2 (thin DedupRef) must be excluded from total_segments.
-    // Only S1 and S3 should appear: S1 is dead, S3 is live.
+    // All three segments (S1, S2, S3) should be included in stats.
+    // With unified format, DedupRef segments are processed normally.
     assert_eq!(
-        stats.total_segments, 2,
-        "collect_stats should skip thin DedupRef segment (expected 2, got {})",
+        stats.total_segments, 3,
+        "collect_stats should include DedupRef segment (expected 3, got {})",
         stats.total_segments
     );
 
@@ -992,26 +992,6 @@ fn gc_collect_stats_skips_thin_dedup_ref_segment() {
     assert!(
         stats.candidates >= 1,
         "S1 is 100% dead and should be a GC candidate"
-    );
-
-    // S2 must NOT have been compacted (it was skipped).
-    // Verify S2's .idx still exists in index/ — GC did not touch it.
-    let index_dir = fork_dir.join("index");
-    let idx_count = fs::read_dir(&index_dir)
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .ok()
-                .and_then(|e| e.file_name().to_str().map(|s| s.ends_with(".idx")))
-                .unwrap_or(false)
-        })
-        .count();
-    // After GC: S1 consumed (idx deleted by handoff), S2 skipped (idx remains),
-    // S3 live (idx remains), plus new GC output (idx written by handoff).
-    // At minimum S2 and S3 idx files must exist.
-    assert!(
-        idx_count >= 2,
-        "S2 and S3 idx files must survive GC (found {idx_count})"
     );
 }
 
@@ -1378,7 +1358,7 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
     .unwrap();
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

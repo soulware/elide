@@ -51,7 +51,7 @@ fn simulate_upload(vol: &mut Volume, dir: &Path) {
         let Ok(ulid) = ulid::Ulid::from_string(ulid_str) else {
             continue;
         };
-        // Materialise thin DedupRef → MaterializedRef, then promote.
+        // Materialise thin DedupRef → DedupRef (filled), then promote.
         let _ = vol.materialise_segment(ulid);
         let _ = vol.promote_segment(ulid);
     }
@@ -497,7 +497,7 @@ fn gc_oracle_repro_bug_h() {
     vol.write(1, &[195u8; 4096]).unwrap();
 
     // Second GcSweep: simulate_upload materialises S1 (DedupRef → fat
-    // MaterializedRef) and promotes it — pending/S1 is deleted, replaced by
+    // DedupRef (filled)) and promotes it — pending/S1 is deleted, replaced by
     // cache/S1.body.  The extent index is updated with offsets from the
     // .materialized segment.  Without the Bug H fix, the file cache still
     // holds the stale fd to pending/S1.

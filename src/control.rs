@@ -33,8 +33,8 @@
 //     Returns "ok <n>" where n is the number of handoffs processed.
 //
 //   materialise <ulid>
-//     Rewrite pending/<ulid> so thin DedupRef entries become fat MaterializedRef
-//     with body bytes from the canonical segment. Idempotent. Called before S3 upload.
+//     Fill DedupRef body holes in pending/<ulid> with data from the canonical
+//     segment. Idempotent. Called before S3 upload.
 //     Returns "ok".
 //
 //   shutdown

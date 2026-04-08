@@ -101,7 +101,7 @@ pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
     }
 }
 
-/// Materialise a pending segment: rewrite thin DedupRef → fat MaterializedRef
+/// Materialise a pending segment: fill DedupRef body holes with canonical data
 /// before S3 upload. Called before `upload_segment`.
 ///
 /// Returns `true` on success. Returns `false` if the socket is absent or fails.

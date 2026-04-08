@@ -498,11 +498,11 @@ impl VolumeHandle {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Materialise a pending segment: rewrite thin DedupRef entries as fat
-    /// MaterializedRef with body bytes from the canonical segment.
+    /// Materialise a pending segment: fill DedupRef body holes with data
+    /// from the canonical segment.
     ///
     /// Called by the coordinator before reading `pending/<ulid>` for S3 upload.
-    /// Idempotent: if no thin refs exist, no rewrite occurs.
+    /// Idempotent: if no DedupRef entries exist, a hard link is created.
     pub fn materialise_segment(&self, ulid: Ulid) -> io::Result<()> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx

@@ -307,13 +307,11 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                 Ok((_body_start, entries)) => {
                     let dedup_ref_count = entries
                         .iter()
-                        .filter(|e| {
-                            e.kind == EntryKind::DedupRef || e.kind == EntryKind::MaterializedRef
-                        })
+                        .filter(|e| e.kind == EntryKind::DedupRef)
                         .count();
                     let body_bytes: u64 = entries
                         .iter()
-                        .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef))
+                        .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::DedupRef))
                         .map(|e| e.stored_length as u64)
                         .sum();
                     let lba_blocks: u64 = entries.iter().map(|e| e.lba_length as u64).sum();
@@ -394,11 +392,11 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
 
     let fetchable_count = entries
         .iter()
-        .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef))
+        .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::DedupRef))
         .count();
     let body_bytes_total: u64 = entries
         .iter()
-        .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef))
+        .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::DedupRef))
         .map(|e| e.stored_length as u64)
         .sum();
 

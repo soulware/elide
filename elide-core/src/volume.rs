@@ -389,13 +389,19 @@ impl Volume {
         // segment tree (own segments + ancestors), write a thin REF record
         // instead of a DATA record. No body bytes in the WAL — reads resolve
         // through the extent index to the canonical segment's body.
-        if self.extent_index.lookup(&hash).is_some() {
+        if let Some(loc) = self.extent_index.lookup(&hash) {
             self.wal.append_ref(lba, lba_length, &hash)?;
             Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash);
             // Do NOT update extent_index — the canonical entry already points
             // to the segment with the body bytes.
             self.pending_entries
-                .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
+                .push(segment::SegmentEntry::new_dedup_ref(
+                    hash,
+                    lba,
+                    lba_length,
+                    loc.body_length,
+                    loc.compressed,
+                ));
             return Ok(());
         }
 
@@ -521,11 +527,11 @@ impl Volume {
                     Err(e) => return Err(e),
                 };
 
-            // Only DATA and MaterializedRef entries have body bytes.
-            // Thin DedupRef and Zero have stored_length=0.
+            // Only DATA entries have real body bytes.
+            // DedupRef body regions are zero-filled; Zero has stored_length=0.
             let total_bytes: u64 = entries
                 .iter()
-                .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef))
+                .filter(|e| matches!(e.kind, EntryKind::Data))
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -535,10 +541,7 @@ impl Volume {
 
             let live_bytes: u64 = entries
                 .iter()
-                .filter(|e| {
-                    matches!(e.kind, EntryKind::Data | EntryKind::MaterializedRef)
-                        && live.contains(&e.hash)
-                })
+                .filter(|e| matches!(e.kind, EntryKind::Data) && live.contains(&e.hash))
                 .map(|e| e.stored_length as u64)
                 .sum();
 
@@ -549,9 +552,7 @@ impl Volume {
             let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
                 entries.drain(..).partition(|e| match e.kind {
                     EntryKind::Zero => self.lbamap.hash_at(e.start_lba) == Some(ZERO_HASH),
-                    EntryKind::DedupRef | EntryKind::MaterializedRef => {
-                        self.lbamap.hash_at(e.start_lba) == Some(e.hash)
-                    }
+                    EntryKind::DedupRef => self.lbamap.hash_at(e.start_lba) == Some(e.hash),
                     EntryKind::Data | EntryKind::Inline => live.contains(&e.hash),
                 });
 
@@ -579,8 +580,15 @@ impl Volume {
             self.evict_cached_segment(seg_id);
 
             if !live_entries.is_empty() {
-                // Read body bytes for live entries, then write a new denser segment.
-                segment::read_extent_bodies(&seg_path, body_section_start, &mut live_entries)?;
+                // Read body bytes for live entries.  Only Data entries have
+                // real body bytes; DedupRef regions are zero-filled placeholders
+                // in pending/ and are re-emitted as zeros by write_segment.
+                segment::read_extent_bodies(
+                    &seg_path,
+                    body_section_start,
+                    &mut live_entries,
+                    true,
+                )?;
 
                 // Reuse the source segment's own ULID for the output.  This
                 // guarantees the output ULID < the current WAL ULID (all segments
@@ -603,7 +611,7 @@ impl Volume {
 
                 for entry in &live_entries {
                     match entry.kind {
-                        EntryKind::Data | EntryKind::MaterializedRef => {
+                        EntryKind::Data => {
                             Arc::make_mut(&mut self.extent_index).insert(
                                 entry.hash,
                                 extentindex::ExtentLocation {
@@ -731,7 +739,7 @@ impl Volume {
             }
 
             let mut live_entries = live_entries;
-            segment::read_extent_bodies(seg_path, body_section_start, &mut live_entries)?;
+            segment::read_extent_bodies(seg_path, body_section_start, &mut live_entries, true)?;
             merged_live.extend(live_entries);
 
             candidate_paths.push(seg_path.clone());
@@ -786,7 +794,7 @@ impl Volume {
 
             for entry in &merged_live {
                 match entry.kind {
-                    EntryKind::Data | EntryKind::MaterializedRef => {
+                    EntryKind::Data => {
                         Arc::make_mut(&mut self.extent_index).insert(
                             entry.hash,
                             extentindex::ExtentLocation {
@@ -971,7 +979,7 @@ impl Volume {
             // .applied handoffs: already volume-signed; skip re-signing.
             if !is_already_applied && gc_seg_path.try_exists()? {
                 let (bss, mut entries) = segment::read_segment_index(&gc_seg_path)?;
-                segment::read_extent_bodies(&gc_seg_path, bss, &mut entries)?;
+                segment::read_extent_bodies(&gc_seg_path, bss, &mut entries, false)?;
                 let tmp_path = gc_dir.join(format!("{new_ulid_str}.tmp"));
                 segment::write_segment(&tmp_path, &mut entries, self.signer.as_ref())?;
                 fs::rename(&tmp_path, &gc_seg_path)?;
@@ -1324,108 +1332,39 @@ impl Volume {
             )));
         };
 
-        // For drain path: prefer the .materialized sidecar (fat variant) over
-        // the original pending segment. The .materialized file matches what was
-        // uploaded to S3 — its index has MaterializedRef entries (not thin
-        // DedupRef), so the .idx file and cache body are consistent with S3.
-        let mat_path = self
-            .base_dir
-            .join("pending")
-            .join(format!("{ulid_str}.materialized"));
-        let promote_src = if is_drain && mat_path.try_exists()? {
-            &mat_path
-        } else {
-            &src_path
-        };
-
         // Write index/<ulid>.idx now — after confirmed S3 upload — so that
         // idx presence ↔ segment confirmed in S3 (restored invariant).
         // This must happen before deleting old idx files (GC path below) so
         // there is no window where no idx covers the affected LBAs.
+        //
+        // The .idx is extracted from the original segment — the index section
+        // is identical between the original and .materialized (only the body
+        // section differs).
         let index_dir = self.base_dir.join("index");
         fs::create_dir_all(&index_dir)?;
         let idx_path = index_dir.join(format!("{ulid_str}.idx"));
-        segment::extract_idx(promote_src, &idx_path)?;
+        segment::extract_idx(&src_path, &idx_path)?;
 
+        // Promote the original (sparse) body to cache/.  DedupRef body regions
+        // are zero-filled; the .present bitset marks only Data entries as present.
+        // Reads of dedup ref data go through the extent index to the canonical
+        // segment — the zeros are never read.
         fs::create_dir_all(&cache_dir)?;
-        segment::promote_to_cache(promote_src, &body_path, &present_path)?;
+        segment::promote_to_cache(&src_path, &body_path, &present_path)?;
 
-        // When promoting from .materialized, the cache body has different
-        // offsets than the original pending segment (index section grew:
-        // DedupRef 45 bytes → MaterializedRef 57 bytes). Update the extent
-        // index so reads find body bytes at the correct positions. The actor
-        // serializes all requests — no reads can run during this update.
-        //
-        // Future: if we switch to promoting the thin version to cache (for
-        // local storage savings), this update would use the thin .idx offsets
-        // instead — and a separate fat .idx would be written for GC.
-        if is_drain && promote_src == &mat_path {
-            // The pending file is about to be deleted and replaced by a cache
-            // body with different offsets.  Evict any cached fd for this segment
-            // so the next read opens the new cache/<ulid>.body instead of
-            // reusing a stale handle to the deleted pending file.
+        // Evict any cached fd for this segment so the next read opens the new
+        // cache/<ulid>.body instead of reusing a stale handle to the deleted
+        // pending file.
+        if is_drain {
             self.evict_cached_segment(ulid);
-
-            let (new_bss, entries) =
-                segment::read_and_verify_segment_index(promote_src, &self.verifying_key)?;
-            let mut updated = 0usize;
-            let mut skipped_kind = 0usize;
-            let mut skipped_seg = 0usize;
-            for entry in &entries {
-                match entry.kind {
-                    EntryKind::Data | EntryKind::MaterializedRef => {}
-                    _ => {
-                        skipped_kind += 1;
-                        continue;
-                    }
-                }
-                // Update the extent index if:
-                //   (a) it already points to this segment (offset rewrite
-                //       after materialisation changed the index section size), or
-                //   (b) it points to a newer segment with the same hash.
-                //       With dedup, multiple segments carry body bytes for
-                //       the same hash.  On-disk rebuild picks the lowest ULID
-                //       as canonical; the in-memory index must agree so that
-                //       apply_gc_handoffs' still_at_old check matches the
-                //       coordinator's disk-rebuilt view.
-                //
-                // We do NOT overwrite an entry with a lower ULID — that is
-                // the original DATA entry and the natural canonical location.
-                let should_update = self
-                    .extent_index
-                    .lookup(&entry.hash)
-                    .is_none_or(|loc| loc.segment_id >= ulid);
-                if should_update {
-                    Arc::make_mut(&mut self.extent_index).insert(
-                        entry.hash,
-                        extentindex::ExtentLocation {
-                            segment_id: ulid,
-                            body_offset: entry.stored_offset,
-                            body_length: entry.stored_length,
-                            compressed: entry.compressed,
-                            entry_idx: None,
-                            body_section_start: new_bss,
-                        },
-                    );
-                    updated += 1;
-                } else {
-                    skipped_seg += 1;
-                }
-            }
-            log::info!(
-                "promote {ulid_str}: extent index rewritten: \
-                 {updated} updated, {skipped_seg} pointed elsewhere, \
-                 {skipped_kind} non-body, new_bss={new_bss}"
-            );
-        } else if is_drain {
-            log::info!(
-                "promote {ulid_str}: no .materialized sidecar, \
-                 extent index unchanged"
-            );
         }
 
         if is_drain {
             // Clean up .materialized sidecar if materialise_segment produced one.
+            let mat_path = self
+                .base_dir
+                .join("pending")
+                .join(format!("{ulid_str}.materialized"));
             let _ = fs::remove_file(&mat_path);
             fs::remove_file(&pending_path)?;
         } else {
@@ -1453,13 +1392,16 @@ impl Volume {
         Ok(())
     }
 
-    /// Produce `pending/<ulid>.materialized` — a self-contained segment with
-    /// every thin DedupRef replaced by a fat MaterializedRef. Called by the
+    /// Produce `pending/<ulid>.materialized` — a copy of the segment with
+    /// DedupRef body holes filled from canonical segments.  Called by the
     /// coordinator before reading the segment for S3 upload.
     ///
-    /// If the segment already has no thin DedupRef entries, a hard link to
-    /// the original is created (zero-cost copy). Otherwise a new fat segment
-    /// is written alongside the original.
+    /// The index section is identical between the original and materialized
+    /// files — only the body section differs (holes filled with real data).
+    /// The signature covers header + index, so it remains valid.
+    ///
+    /// If the segment has no DedupRef entries, a hard link to the original
+    /// is created (zero-cost copy).
     ///
     /// The original `pending/<ulid>` is never modified — the extent index
     /// stays valid and reads continue to use the original file.
@@ -1467,7 +1409,7 @@ impl Volume {
     /// Idempotent: if `.materialized` already exists, returns Ok immediately.
     /// `promote_segment` cleans up `.materialized` alongside the original.
     pub fn materialise_segment(&self, ulid: Ulid) -> io::Result<()> {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::{Read, Seek, SeekFrom, Write};
 
         let ulid_str = ulid.to_string();
         let pending_dir = self.base_dir.join("pending");
@@ -1481,111 +1423,86 @@ impl Volume {
         let (body_section_start, entries) =
             segment::read_and_verify_segment_index(&seg_path, &self.verifying_key)?;
 
-        // Fast path: no thin refs — hard link the original.
-        let has_thin = entries.iter().any(|e| e.kind == EntryKind::DedupRef);
-        if !has_thin {
+        // Classify each entry as live or dead.  Dead entries must have their
+        // body bytes zeroed before upload to S3 — deleted data must never
+        // leave the local machine.  Live DedupRef entries need their body
+        // holes filled from the canonical segment.
+        let has_dedup_ref = entries
+            .iter()
+            .any(|e| e.kind == EntryKind::DedupRef && e.stored_length > 0);
+        let has_dead = entries
+            .iter()
+            .any(|e| e.stored_length > 0 && self.lbamap.hash_at(e.start_lba) != Some(e.hash));
+
+        // Fast path: no dedup refs and no dead entries — hard link the original.
+        if !has_dedup_ref && !has_dead {
             fs::hard_link(&seg_path, &mat_path)?;
             return Ok(());
         }
 
-        // Build new entries. For each entry:
-        // - DATA: read body bytes from the original segment file
-        // - DedupRef (thin): read body from canonical segment, emit MaterializedRef
-        // - Zero: pass through as-is
-        // All body reads happen here; no separate read_extent_bodies call
-        // (MaterializedRef entries have stored_offset=0 which is invalid for
-        // the original file — they must not be passed to read_extent_bodies).
-        let mut seg_file = fs::File::open(&seg_path)?;
-        let mut new_entries: Vec<segment::SegmentEntry> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            match entry.kind {
-                EntryKind::Data | EntryKind::MaterializedRef => {
-                    // Read body from the original segment file.
-                    let mut body = vec![0u8; entry.stored_length as usize];
-                    seg_file.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
-                    seg_file.read_exact(&mut body)?;
-                    let flags = if entry.compressed {
-                        segment::SegmentFlags::COMPRESSED
-                    } else {
-                        segment::SegmentFlags::empty()
-                    };
-                    new_entries.push(segment::SegmentEntry::new_data(
-                        entry.hash,
-                        entry.start_lba,
-                        entry.lba_length,
-                        flags,
-                        body,
-                    ));
-                }
-                EntryKind::DedupRef => {
-                    // Thin → look up canonical location in extent index.
-                    let loc = self.extent_index.lookup(&entry.hash).ok_or_else(|| {
-                        io::Error::other(format!(
-                            "materialise {ulid_str}: hash {} not in extent index",
-                            entry.hash.to_hex()
-                        ))
-                    })?;
-                    let canonical_path = self.find_segment_file(
-                        loc.segment_id,
-                        loc.body_section_start,
-                        loc.entry_idx,
-                    )?;
-                    let is_body = canonical_path.extension().is_some_and(|e| e == "body");
-                    let file_offset = if is_body {
-                        loc.body_offset
-                    } else {
-                        loc.body_section_start + loc.body_offset
-                    };
-                    let mut f = fs::File::open(&canonical_path)?;
-                    f.seek(SeekFrom::Start(file_offset))?;
-                    let mut data = vec![0u8; loc.body_length as usize];
-                    f.read_exact(&mut data)?;
-
-                    let flags = if loc.compressed {
-                        segment::SegmentFlags::COMPRESSED
-                    } else {
-                        segment::SegmentFlags::empty()
-                    };
-                    new_entries.push(segment::SegmentEntry::new_materialized_ref(
-                        entry.hash,
-                        entry.start_lba,
-                        entry.lba_length,
-                        flags,
-                        data,
-                    ));
-                }
-                EntryKind::Zero => {
-                    new_entries.push(segment::SegmentEntry::new_zero(
-                        entry.start_lba,
-                        entry.lba_length,
-                    ));
-                }
-                EntryKind::Inline => {
-                    new_entries.push(entry);
-                }
-            }
-        }
-
-        {
-            let (mut fat, mut data, mut zero) = (0usize, 0usize, 0usize);
-            for e in &new_entries {
-                match e.kind {
-                    EntryKind::MaterializedRef => fat += 1,
-                    EntryKind::Data => data += 1,
-                    EntryKind::Zero => zero += 1,
-                    EntryKind::DedupRef | EntryKind::Inline => {}
-                }
-            }
-            log::info!(
-                "materialise {ulid_str}: {fat} thin→fat, \
-                 {data} data, {zero} zero ({} entries total)",
-                new_entries.len()
-            );
-        }
-
-        // Write to .tmp then rename to .materialized (atomic).
+        // Copy the original segment, then patch body regions in place.
         let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
-        segment::write_segment(&tmp_path, &mut new_entries, self.signer.as_ref())?;
+        fs::copy(&seg_path, &tmp_path)?;
+        let mut out = fs::OpenOptions::new().write(true).open(&tmp_path)?;
+
+        let mut filled = 0usize;
+        let mut zeroed = 0usize;
+        for entry in &entries {
+            if entry.stored_length == 0 {
+                continue;
+            }
+
+            let is_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
+
+            if !is_live {
+                // Zero-fill the body region so deleted data is not uploaded.
+                let zeros = vec![0u8; entry.stored_length as usize];
+                out.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
+                out.write_all(&zeros)?;
+                zeroed += 1;
+                continue;
+            }
+
+            if entry.kind == EntryKind::DedupRef {
+                // Live DedupRef: fill the body hole from the canonical segment.
+                let Some(loc) = self.extent_index.lookup(&entry.hash) else {
+                    // Should not happen for a live entry, but if the extent
+                    // index is stale, leave the hole zero-filled rather than
+                    // failing the entire materialisation.
+                    zeroed += 1;
+                    let zeros = vec![0u8; entry.stored_length as usize];
+                    out.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
+                    out.write_all(&zeros)?;
+                    continue;
+                };
+                let canonical_path =
+                    self.find_segment_file(loc.segment_id, loc.body_section_start, loc.entry_idx)?;
+                let is_body = canonical_path.extension().is_some_and(|e| e == "body");
+                let file_offset = if is_body {
+                    loc.body_offset
+                } else {
+                    loc.body_section_start + loc.body_offset
+                };
+                let mut f = fs::File::open(&canonical_path)?;
+                f.seek(SeekFrom::Start(file_offset))?;
+                let mut data = vec![0u8; loc.body_length as usize];
+                f.read_exact(&mut data)?;
+
+                out.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
+                out.write_all(&data)?;
+                filled += 1;
+            }
+            // Live Data/Zero/Inline: body bytes are already correct from the copy.
+        }
+        out.sync_data()?;
+        drop(out);
+
+        log::info!(
+            "materialise {ulid_str}: filled {filled} dedup-ref holes, \
+             zeroed {zeroed} dead entries, {} entries total",
+            entries.len()
+        );
+
         fs::rename(&tmp_path, &mat_path)?;
         segment::fsync_dir(&mat_path)?;
         Ok(())
@@ -1662,7 +1579,7 @@ impl Volume {
         // not indexed.
         for entry in &self.pending_entries {
             match entry.kind {
-                EntryKind::Data | EntryKind::MaterializedRef => {}
+                EntryKind::Data => {}
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
             }
             Arc::make_mut(&mut self.extent_index).insert(
@@ -1684,7 +1601,7 @@ impl Volume {
                     EntryKind::Data => data += 1,
                     EntryKind::DedupRef => refs += 1,
                     EntryKind::Zero => zero += 1,
-                    EntryKind::MaterializedRef | EntryKind::Inline => {}
+                    EntryKind::Inline => {}
                 }
             }
             log::info!(
@@ -2387,11 +2304,21 @@ fn recover_wal(
                 lba_length,
             } => {
                 lbamap.insert(start_lba, lba_length, hash);
-                // Thin REF: no body bytes, no extent_index update — the
-                // canonical entry is populated from the segment that holds
-                // the body (rebuilt from pending/ or segments/).
+                // REF: no body bytes, no extent_index update — the canonical
+                // entry is populated from the segment that holds the body
+                // (rebuilt from pending/ or segments/).
+                // Look up the canonical extent to get stored_length/compressed
+                // for the unified index entry format.
+                let (body_length, compressed) = extent_index
+                    .lookup(&hash)
+                    .map(|loc| (loc.body_length, loc.compressed))
+                    .unwrap_or((0, false));
                 pending_entries.push(segment::SegmentEntry::new_dedup_ref(
-                    hash, start_lba, lba_length,
+                    hash,
+                    start_lba,
+                    lba_length,
+                    body_length,
+                    compressed,
                 ));
             }
             writelog::LogRecord::Zero {
@@ -3545,9 +3472,9 @@ mod tests {
     }
 
     #[test]
-    fn materialise_segment_replaces_dedup_ref_with_correct_body() {
-        // Bug 1: materialise_segment must replace thin DedupRef entries with
-        // MaterializedRef entries whose body bytes match the original data.
+    fn materialise_segment_fills_dedup_ref_body_holes() {
+        // materialise_segment must fill DedupRef body holes with the canonical
+        // segment's body bytes, without changing the index section.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -3569,20 +3496,18 @@ mod tests {
         let s2_ulid = *after_second.iter().find(|u| **u != s1_ulid).unwrap();
 
         // Verify S2 has a DedupRef before materialisation.
-        let (_, entries_before) = segment::read_and_verify_segment_index(
-            &base.join("pending").join(s2_ulid.to_string()),
-            &vol.verifying_key,
-        )
-        .unwrap();
+        let s2_path = base.join("pending").join(s2_ulid.to_string());
+        let (_, entries_before) =
+            segment::read_and_verify_segment_index(&s2_path, &vol.verifying_key).unwrap();
         assert!(
             entries_before.iter().any(|e| e.kind == EntryKind::DedupRef),
-            "S2 should contain a thin DedupRef before materialisation"
+            "S2 should contain a DedupRef before materialisation"
         );
 
         // Materialise S2.
         vol.materialise_segment(s2_ulid).unwrap();
 
-        // Read the .materialized file and verify: no DedupRef, all MaterializedRef.
+        // Read the .materialized file — it should have the same index as original.
         let mat_path = base
             .join("pending")
             .join(format!("{}.materialized", s2_ulid));
@@ -3590,30 +3515,22 @@ mod tests {
 
         let (mat_bss, mat_entries) =
             segment::read_and_verify_segment_index(&mat_path, &vol.verifying_key).unwrap();
+        // Index should still contain DedupRef entries (same as original).
         assert!(
-            !mat_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
-            ".materialized must not contain any DedupRef entries"
-        );
-        assert!(
-            mat_entries
-                .iter()
-                .any(|e| e.kind == EntryKind::MaterializedRef),
-            ".materialized should contain MaterializedRef entries"
+            mat_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
+            ".materialized should still contain DedupRef entries (index unchanged)"
         );
 
-        // Verify the body bytes of the MaterializedRef match the original data.
+        // Verify the body bytes of the DedupRef are now filled with real data.
         use std::io::{Read, Seek, SeekFrom};
         let mut mat_file = fs::File::open(&mat_path).unwrap();
         for entry in &mat_entries {
-            if entry.kind == EntryKind::MaterializedRef {
+            if entry.kind == EntryKind::DedupRef {
                 let mut body = vec![0u8; entry.stored_length as usize];
                 mat_file
                     .seek(SeekFrom::Start(mat_bss + entry.stored_offset))
                     .unwrap();
                 mat_file.read_exact(&mut body).unwrap();
-                // Body should be the same as our original data (possibly compressed).
-                // Since the data is small (4096 bytes of a single byte), compression
-                // may or may not be applied. Decompress if compressed.
                 let resolved = if entry.compressed {
                     lz4_flex::decompress_size_prepended(&body).unwrap()
                 } else {
@@ -3621,7 +3538,7 @@ mod tests {
                 };
                 assert_eq!(
                     resolved, data,
-                    "MaterializedRef body must match original data"
+                    "DedupRef body in .materialized must match original data"
                 );
             }
         }
@@ -3630,9 +3547,10 @@ mod tests {
     }
 
     #[test]
-    fn promote_from_materialized_writes_materialized_ref_idx() {
-        // Bug 3: after materialise + promote, index/<ulid>.idx must contain
-        // MaterializedRef entries (not thin DedupRef).
+    fn promote_uses_original_idx_not_materialized() {
+        // After materialise + promote, the .idx is extracted from the original
+        // segment (not .materialized), and contains DedupRef entries.  The index
+        // is identical between original and materialized.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -3653,7 +3571,7 @@ mod tests {
         vol.materialise_segment(s2_ulid).unwrap();
         vol.promote_segment(s2_ulid).unwrap();
 
-        // The .idx should exist in index/ and contain MaterializedRef, not DedupRef.
+        // The .idx should exist and contain DedupRef entries (unified format).
         let idx_path = base.join("index").join(format!("{}.idx", s2_ulid));
         assert!(
             idx_path.exists(),
@@ -3663,24 +3581,29 @@ mod tests {
         let (_, idx_entries) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
         assert!(
-            !idx_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
-            "idx must not contain thin DedupRef after promote from .materialized"
+            idx_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
+            "idx should contain DedupRef entries (unified format)"
         );
-        assert!(
-            idx_entries
-                .iter()
-                .any(|e| e.kind == EntryKind::MaterializedRef),
-            "idx should contain MaterializedRef after promote from .materialized"
-        );
+
+        // The .present bitset should mark DedupRef entries as not-present.
+        let present_path = base.join("cache").join(format!("{}.present", s2_ulid));
+        assert!(present_path.exists(), ".present must exist after promote");
+        for (i, entry) in idx_entries.iter().enumerate() {
+            let present = segment::check_present_bit(&present_path, i as u32).unwrap_or(false);
+            if entry.kind == EntryKind::Data {
+                assert!(present, "Data entry {i} should be marked present");
+            } else if entry.kind == EntryKind::DedupRef {
+                assert!(!present, "DedupRef entry {i} should NOT be marked present");
+            }
+        }
 
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn extent_index_updated_after_promote_from_materialized() {
-        // Bug 4: after materialise + promote, reads must still work correctly
-        // because the extent index is updated to reflect the .materialized body
-        // offsets (which differ from the thin pending segment).
+    fn reads_work_after_materialise_and_promote() {
+        // After materialise + promote, reads must still work correctly.
+        // DedupRef reads go through the extent index to the canonical segment.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -4068,7 +3991,9 @@ mod tests {
                             continue;
                         };
                         let body_path = fork_dir.join("cache").join(format!("{}.body", ulid));
-                        if segment::read_extent_bodies(&body_path, 0, &mut seg_entries).is_err() {
+                        if segment::read_extent_bodies(&body_path, 0, &mut seg_entries, true)
+                            .is_err()
+                        {
                             continue;
                         }
                         for e in seg_entries {
@@ -4858,7 +4783,7 @@ mod tests {
         let (_old_bss, mut entries) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
         // Cache .body files start at byte 0 of the body section.
-        segment::read_extent_bodies(&body_path, 0, &mut entries).unwrap();
+        segment::read_extent_bodies(&body_path, 0, &mut entries, true).unwrap();
 
         let (new_ulid, _) = vol.gc_checkpoint().unwrap();
         let new_ulid_str = new_ulid.to_string();
