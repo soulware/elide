@@ -237,18 +237,22 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                 .ok_or_else(|| io::Error::other("bad cache idx filename"))?;
             let segment_id =
                 Ulid::from_string(segment_id).map_err(|e| io::Error::other(e.to_string()))?;
-            let (body_section_start, entries) =
-                match segment::read_and_verify_segment_index(path, &vk) {
-                    Ok(v) => v,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        warn!(
-                            "segment vanished during rebuild (GC race): {}",
-                            path.display()
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
+
+            // .idx file size == body_section_start (the file is exactly the
+            // [0, body_section_start) prefix of the full segment).
+            let body_section_start = segment::idx_body_section_start(path)?;
+
+            let entries = match segment::read_and_verify_segment_index(path, &vk) {
+                Ok((_, entries)) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    warn!(
+                        "segment vanished during rebuild (GC race): {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for (raw_idx, entry) in entries.iter().enumerate() {
                 // Only index entries with body bytes in this segment.
                 // Thin DedupRef has no body (reads via extent index to canonical).

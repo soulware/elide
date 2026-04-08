@@ -543,6 +543,9 @@ const BLOCK_BYTES: u64 = 4096;
 /// Per-segment stats computed during the scan phase.
 struct SegmentStats {
     ulid_str: String,
+    /// `body_section_start` for this segment's S3 object (== .idx file size).
+    /// Used to compute absolute byte offsets for range-GETs into S3.
+    body_section_start: u64,
     /// Physical on-disk size (idx + DATA body bytes); used for small_segment_bytes threshold.
     file_size: u64,
     /// Logical live bytes: lba_length * BLOCK_BYTES summed over all live entries
@@ -629,10 +632,10 @@ fn collect_stats(
         // Read index from .idx — the only local file we need for stats.
         // Presence of .idx means the segment is confirmed in S3 (invariant:
         // .idx is written inside promote_segment IPC, after confirmed S3 PUT).
-        // body_section_start for .body files is 0 (body starts at byte 0);
-        // for full segments it is non-zero — compact_segments fetches the full
-        // segment from S3 and calls read_segment_index to get the correct value.
-        let idx_size = fs::metadata(&idx_path)?.len();
+        //
+        // idx_size == body_section_start: the .idx file is exactly the
+        // [0, body_section_start) prefix of the full S3 segment.
+        let idx_size = segment::idx_body_section_start(&idx_path)?;
         let (_, entries) = segment::read_and_verify_segment_index(&idx_path, vk)?;
 
         let mut live_lba_bytes: u64 = 0;
@@ -724,6 +727,7 @@ fn collect_stats(
         let file_size = idx_size + physical_body_bytes;
         result.push(SegmentStats {
             ulid_str,
+            body_section_start: idx_size,
             has_body_entries: physical_body_bytes > 0,
             file_size,
             live_lba_bytes,
@@ -803,18 +807,11 @@ async fn compact_segments(
                 .await
                 .with_context(|| format!("writing fetch file for {}", candidate.ulid_str))?;
 
-            // Read the full segment header to get body_section_start.
-            let (body_section_start, _) =
-                segment::read_segment_index(&fetch_path).with_context(|| {
-                    format!(
-                        "reading segment index from fetch for {}",
-                        candidate.ulid_str
-                    )
-                })?;
-
+            // body_section_start is already known from the .idx file size
+            // (carried in SegmentStats) — no need to re-parse the header.
             segment::read_extent_bodies(
                 &fetch_path,
-                body_section_start,
+                candidate.body_section_start,
                 &mut candidate.live_entries,
             )
             .with_context(|| format!("reading bodies from {}", candidate.ulid_str))?;
@@ -1171,6 +1168,7 @@ mod tests {
         fn make(total_lba_bytes: u64, live_lba_bytes: u64) -> SegmentStats {
             SegmentStats {
                 ulid_str: String::new(),
+                body_section_start: 0,
                 file_size: total_lba_bytes, // physical size irrelevant for density
                 live_lba_bytes,
                 total_lba_bytes,
@@ -1193,6 +1191,7 @@ mod tests {
         // Verify dead_lba_bytes() is available for the ≥2 case.
         let s = SegmentStats {
             ulid_str: String::new(),
+            body_section_start: 0,
             file_size: 1024 * 1024,
             live_lba_bytes: 800 * 1024,
             total_lba_bytes: 1024 * 1024,
@@ -1210,6 +1209,7 @@ mod tests {
         fn make(live_lba_bytes: u64) -> SegmentStats {
             SegmentStats {
                 ulid_str: String::new(),
+                body_section_start: 0,
                 file_size: 100,
                 live_lba_bytes,
                 total_lba_bytes: 100,
@@ -1711,6 +1711,7 @@ mod tests {
         let store = make_store();
         let candidate = SegmentStats {
             ulid_str: old_ulid.clone(),
+            body_section_start: 0,
             file_size: 17,
             live_lba_bytes: 0,
             total_lba_bytes: 17,

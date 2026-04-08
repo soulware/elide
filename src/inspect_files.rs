@@ -21,6 +21,7 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
     let (body_section_start, entries) = segment::read_segment_index(path)?;
 
     // Detect whether this is a full segment or an index-only .idx file.
+    // For .idx files, file_size == body_section_start (see idx_body_section_start).
     let file_size = std::fs::metadata(path)?.len();
     let is_idx_only = file_size == body_section_start;
 
