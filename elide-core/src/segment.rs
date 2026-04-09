@@ -165,10 +165,6 @@ bitflags! {
         const DEDUP_REF    = 0x08;
         /// Zero extent; hash field is ZERO_HASH; no bytes in this segment's body; reads as zeros.
         const ZERO         = 0x10;
-        /// Legacy flag: was used to distinguish "materialized" dedup refs from thin
-        /// dedup refs.  Now all dedup refs use the unified 57-byte entry format.
-        /// Retained for backward-compatible parsing only (treated as DedupRef).
-        const MATERIALIZED = 0x20;
     }
 }
 
@@ -617,7 +613,6 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
         let kind = if flags.contains(SegmentFlags::ZERO) {
             EntryKind::Zero
         } else if flags.contains(SegmentFlags::DEDUP_REF) {
-            // MATERIALIZED flag is legacy; both map to DedupRef.
             EntryKind::DedupRef
         } else if flags.contains(SegmentFlags::INLINE) {
             EntryKind::Inline
@@ -1522,20 +1517,5 @@ mod tests {
         assert_eq!(read_entry_count(&idx_path).unwrap(), 1);
 
         fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn legacy_materialized_flag_parsed_as_dedup_ref() {
-        // The legacy MATERIALIZED flag (0x20) combined with DEDUP_REF (0x08)
-        // should be parsed as DedupRef in the unified format.
-        let flags = SegmentFlags::DEDUP_REF | SegmentFlags::MATERIALIZED;
-        let kind = if flags.contains(SegmentFlags::ZERO) {
-            EntryKind::Zero
-        } else if flags.contains(SegmentFlags::DEDUP_REF) {
-            EntryKind::DedupRef
-        } else {
-            EntryKind::Data
-        };
-        assert_eq!(kind, EntryKind::DedupRef);
     }
 }
