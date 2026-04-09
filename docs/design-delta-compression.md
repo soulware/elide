@@ -190,6 +190,17 @@ The `--parent` flag:
 
 The new volume is a fork of the parent at the import level — not a live-write fork, but a "this is the next version of the same image" relationship. The `volume.parent` pointer is the same mechanism used by live forks; the ancestry chain, LBA map rebuild, and extent index rebuild all work identically.
 
+### Relationship to OCI layers
+
+OCI images are built from stacked layers — each layer is a tar of filesystem diffs from the Dockerfile step that produced it. Elide imports the **flattened** ext4 root partition (all layers applied), not the individual layers. The OCI layer structure is discarded at import time.
+
+This is deliberate. OCI layers answer "what common build steps do these images share?" — a build-time concern. Elide's ancestor chain answers "what has changed between version N and version N+1 of this system?" — a deployment-time concern. These are orthogonal:
+
+- Two point releases (22.04.1 → 22.04.2) may share **zero** OCI layers if the base layer was rebuilt, yet 95% of their files are byte-identical. OCI layer sharing sees no overlap; Elide's filemap path-matching sees nearly everything.
+- Two unrelated images may share every OCI layer except one, but if the differing layer touches a widely-referenced library, OCI layer sharing captures most of the overlap while the actual block-level delta between the two flattened images is small. Elide handles this naturally through dedup and delta.
+
+The two approaches compose: OCI layer sharing optimises image **distribution** (pull only new layers to the import host). Elide's ancestor chain optimises block-level **serving** (fetch only delta bytes when a host already has the prior version cached). Neither needs awareness of the other.
+
 ### Why LBA-based delta doesn't help for imports
 
 NBD live writes are block-granular (4 KiB per write). Each block becomes one segment entry. Delta works when the same LBA is overwritten with similar content.
