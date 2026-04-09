@@ -16,10 +16,11 @@
 // Key layout mirrors the coordinator's upload layout:
 //   by_id/<volume_id>/YYYYMMDD/<ulid>
 //
-// Fetch sequence per segment miss:
-//   1. Try each fork in the ancestry chain (newest first)
-//   2. On first hit: write to <segments_dir>/<ulid>.tmp, then rename
-//   3. On all-miss: return a NotFound error
+// Fetch sequence per extent miss:
+//   1. Read the local .idx to find the extent's S3 byte range
+//   2. Try each fork in the ancestry chain (newest first)
+//   3. On first hit: write body bytes into cache/<ulid>.body, set present bit
+//   4. On all-miss: return a NotFound error
 
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -177,16 +178,6 @@ impl ObjectStoreFetcher {
 }
 
 impl SegmentFetcher for ObjectStoreFetcher {
-    fn fetch(&self, segment_id: ulid::Ulid, index_dir: &Path, body_dir: &Path) -> io::Result<()> {
-        self.rt.block_on(fetch_segment(
-            &self.store,
-            &self.chain,
-            &segment_id.to_string(),
-            index_dir,
-            body_dir,
-        ))
-    }
-
     fn fetch_extent(
         &self,
         segment_id: ulid::Ulid,
@@ -223,38 +214,6 @@ fn load_chain(fork_dirs: &[PathBuf]) -> io::Result<Vec<(String, VerifyingKey)>> 
             Ok((id, vk))
         })
         .collect()
-}
-
-async fn fetch_segment(
-    store: &Arc<dyn ObjectStore>,
-    chain: &[(String, VerifyingKey)],
-    segment_id: &str,
-    index_dir: &Path,
-    body_dir: &Path,
-) -> io::Result<()> {
-    // Try volumes newest-first (reverse of oldest-first slice).
-    for (volume_id, verifying_key) in chain.iter().rev() {
-        let key = segment_key(volume_id, segment_id)?;
-        match store.get(&key).await {
-            Ok(result) => {
-                let bytes = result
-                    .bytes()
-                    .await
-                    .map_err(|e| io::Error::other(format!("reading {segment_id}: {e}")))?;
-                write_cache(index_dir, body_dir, segment_id, &bytes, verifying_key)?;
-                return Ok(());
-            }
-            Err(object_store::Error::NotFound { .. }) => continue,
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "fetching {segment_id} from by_id/{volume_id}: {e}"
-                )));
-            }
-        }
-    }
-    Err(io::Error::other(format!(
-        "segment {segment_id} not found in any ancestor"
-    )))
 }
 
 /// Parameters for fetching a single extent from storage.
@@ -392,88 +351,6 @@ async fn fetch_one_extent(
     )))
 }
 
-/// Segment header layout (first 96 bytes):
-///   0..8   magic         "ELIDSEG\x02"
-///   8..12  entry_count   u32 le
-///   12..16 index_length  u32 le
-///   16..20 inline_length u32 le
-///   20..28 body_length   u64 le
-///   28..32 delta_length  u32 le
-///   32..96 signature     Ed25519 (64 bytes)
-const SEGMENT_HEADER_LEN: usize = 96;
-const SEGMENT_MAGIC: &[u8; 8] = b"ELIDSEG\x02";
-
-/// Write the three-file cache format:
-///   `<index_dir>/<segment_id>.idx`    — header + index + inline bytes `[0, body_section_start)`
-///   `<body_dir>/<segment_id>.body`    — body bytes (body-relative; byte 0 = first body byte)
-///   `<body_dir>/<segment_id>.present` — packed bitset, one bit per index entry; all bits set
-///
-/// Verifies the segment's Ed25519 signature before writing anything to disk.
-/// Returns `InvalidData` if the signature is missing or invalid.
-///
-/// All three files are written via tmp + rename. Commit order: `.idx` first
-/// (enables rebuild on the next restart), then `.body` (enables reads), then
-/// `.present`. A crash after `.idx` but before `.body` leaves an orphan `.idx`
-/// which is harmless — it will be re-fetched on the next access.
-fn write_cache(
-    index_dir: &Path,
-    body_dir: &Path,
-    segment_id: &str,
-    bytes: &[u8],
-    verifying_key: &VerifyingKey,
-) -> io::Result<()> {
-    // Verify signature before writing anything to disk.
-    segment::verify_segment_bytes(bytes, segment_id, verifying_key)?;
-
-    if bytes.len() < SEGMENT_HEADER_LEN {
-        return Err(io::Error::other(format!(
-            "segment {segment_id}: too short to parse header ({} bytes)",
-            bytes.len()
-        )));
-    }
-    if &bytes[0..8] != SEGMENT_MAGIC {
-        return Err(io::Error::other(format!("segment {segment_id}: bad magic")));
-    }
-
-    // Parse header fields (all within the first 96 bytes, already bounds-checked).
-    let entry_count = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-    let index_length = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-    let inline_length = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-    let body_section_start = SEGMENT_HEADER_LEN + index_length as usize + inline_length as usize;
-
-    if bytes.len() < body_section_start {
-        return Err(io::Error::other(format!(
-            "segment {segment_id}: truncated before body section (need {body_section_start}, got {})",
-            bytes.len()
-        )));
-    }
-
-    let idx_bytes = &bytes[..body_section_start];
-    let body_bytes = &bytes[body_section_start..];
-
-    // Presence bitset: all bits set (full body cached in this initial implementation).
-    let bitset_len = (entry_count as usize).div_ceil(8);
-    let present_bytes = vec![0xFFu8; bitset_len];
-
-    std::fs::create_dir_all(index_dir)?;
-    std::fs::create_dir_all(body_dir)?;
-
-    let idx_tmp = index_dir.join(format!("{segment_id}.idx.tmp"));
-    let body_tmp = body_dir.join(format!("{segment_id}.body.tmp"));
-    let present_tmp = body_dir.join(format!("{segment_id}.present.tmp"));
-
-    std::fs::write(&idx_tmp, idx_bytes)?;
-    std::fs::write(&body_tmp, body_bytes)?;
-    std::fs::write(&present_tmp, &present_bytes)?;
-
-    // Commit: idx first (enables index rebuild), then body (enables reads), then present.
-    std::fs::rename(&idx_tmp, index_dir.join(format!("{segment_id}.idx")))?;
-    std::fs::rename(&body_tmp, body_dir.join(format!("{segment_id}.body")))?;
-    std::fs::rename(&present_tmp, body_dir.join(format!("{segment_id}.present")))?;
-
-    Ok(())
-}
-
 /// Build the S3 object key for a segment.
 ///
 /// Format: `by_id/<volume_id>/YYYYMMDD/<segment_ulid>`
@@ -543,80 +420,6 @@ pub fn prewarm_volume_start(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Build a minimal segment file in memory and verify that `write_cache`
-    /// produces well-formed `.idx`, `.body`, and `.present` files.
-    #[test]
-    fn write_cache_splits_correctly() {
-        use elide_core::segment::{
-            SegmentEntry, SegmentFlags, collect_idx_files, read_segment_index, write_segment,
-        };
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("elide-fetcher-test-{}-{}", std::process::id(), n));
-        let seg_path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA.full");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // Write a real segment with two data entries.
-        let data1 = vec![0x11u8; 4096];
-        let data2 = vec![0x22u8; 8192];
-        let h1 = blake3::hash(&data1);
-        let h2 = blake3::hash(&data2);
-        let mut entries = vec![
-            SegmentEntry::new_data(h1, 0, 1, SegmentFlags::empty(), data1.clone()),
-            SegmentEntry::new_data(h2, 1, 2, SegmentFlags::empty(), data2.clone()),
-        ];
-        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
-
-        // Read the full segment bytes and split them via write_cache.
-        let full_bytes = std::fs::read(&seg_path).unwrap();
-        let index_dir = dir.join("index");
-        let cache_dir = dir.join("cache");
-        let segment_id = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        write_cache(&index_dir, &cache_dir, segment_id, &full_bytes, &vk).unwrap();
-
-        // Check .idx file: should be parseable and match the original index.
-        let idx_path = index_dir.join(format!("{segment_id}.idx"));
-        let (bss2, idx_entries) = read_segment_index(&idx_path).unwrap();
-        assert_eq!(bss, bss2, "body_section_start must match");
-        assert_eq!(idx_entries.len(), 2);
-        assert_eq!(idx_entries[0].hash, h1);
-        assert_eq!(idx_entries[1].hash, h2);
-        assert_eq!(idx_entries[0].stored_offset, 0);
-        assert_eq!(idx_entries[0].stored_length, 4096);
-        assert_eq!(idx_entries[1].stored_offset, 4096);
-        assert_eq!(idx_entries[1].stored_length, 8192);
-
-        // Check .body file: should contain the body bytes (body-relative).
-        let body_path = cache_dir.join(format!("{segment_id}.body"));
-        let body_bytes = std::fs::read(&body_path).unwrap();
-        assert_eq!(
-            body_bytes.len(),
-            4096 + 8192,
-            "body must contain both extents"
-        );
-        // First extent at body-relative offset 0.
-        assert_eq!(&body_bytes[0..4096], data1.as_slice());
-        // Second extent at body-relative offset 4096.
-        assert_eq!(&body_bytes[4096..], data2.as_slice());
-
-        // Check .present file: 2 entries → ceil(2/8) = 1 byte, all bits set.
-        let present_path = cache_dir.join(format!("{segment_id}.present"));
-        let present_bytes = std::fs::read(&present_path).unwrap();
-        assert_eq!(present_bytes.len(), 1);
-        assert_eq!(present_bytes[0], 0xFF);
-
-        // Check that collect_idx_files finds the .idx file in index/.
-        let found = collect_idx_files(&index_dir).unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].file_stem().unwrap(), segment_id);
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 
     /// `fetch_extent` coalesces body-adjacent absent entries into a single
     /// range-GET.  Requesting entry 0 when entries 0 and 1 are contiguous and

@@ -221,7 +221,7 @@ impl VolumeReader {
                                 body_offset,
                                 body_length: data.len() as u32,
                                 compressed: flags.contains(writelog::WalFlags::COMPRESSED),
-                                entry_idx: None,
+                                body_source: extentindex::BodySource::Local,
                                 body_section_start: 0,
                             },
                         );
@@ -289,8 +289,8 @@ impl VolumeReader {
         };
         let loc = loc.clone();
 
-        // Per-extent demand-fetch for cached entries (have entry_idx and body_section_start).
-        if let Some(entry_idx) = loc.entry_idx {
+        // Per-extent demand-fetch for cached entries.
+        if let extentindex::BodySource::Cached(entry_idx) = loc.body_source {
             let (index_dir, body_dir) =
                 self.find_dirs_for_segment(loc.segment_id)
                     .unwrap_or_else(|| {
@@ -323,30 +323,7 @@ impl VolumeReader {
             }
         }
 
-        let path = match find_segment_file(&self.search_dirs, loc.segment_id) {
-            Ok(p) => p,
-            Err(_) if loc.entry_idx.is_none() => {
-                // Full-segment fallback: entry has no entry_idx (local segment
-                // that was evicted). Download the whole body.
-                match &self.fetcher {
-                    Some(fetcher) => {
-                        fetcher.fetch(
-                            loc.segment_id,
-                            &self.primary_index_dir,
-                            &self.primary_cache_dir,
-                        )?;
-                        find_segment_file(&self.search_dirs, loc.segment_id)?
-                    }
-                    None => {
-                        return Err(io::Error::other(format!(
-                            "segment not found: {}",
-                            loc.segment_id
-                        )));
-                    }
-                }
-            }
-            Err(e) => return Err(e),
-        };
+        let path = find_segment_file(&self.search_dirs, loc.segment_id)?;
         let is_body = path.extension().is_some_and(|e| e == "body");
         let file_base = if is_body { 0 } else { loc.body_section_start };
         let mut f = fs::File::open(path)?;

@@ -103,24 +103,15 @@ pub trait SegmentSigner: Send + Sync {
 /// `elide-core` is synchronous; async fetchers must wrap their runtime (e.g.
 /// `Runtime::block_on`) inside this interface.
 pub trait SegmentFetcher: Send + Sync {
-    /// Fetch the full segment body and write `.idx` to `index_dir` and
-    /// `.body`/`.present` to `body_dir`.
-    fn fetch(&self, segment_id: ulid::Ulid, index_dir: &Path, body_dir: &Path) -> io::Result<()>;
-
     /// Fetch a single extent and write body bytes into `body_dir/<segment_id>.body`
     /// at `extent.body_offset`, then set bit `extent.entry_idx` in `.present`.
-    ///
-    /// The default implementation fetches the entire segment body; override
-    /// for efficient per-extent range-GETs.
     fn fetch_extent(
         &self,
         segment_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
-        _extent: &ExtentFetch,
-    ) -> io::Result<()> {
-        self.fetch(segment_id, index_dir, body_dir)
-    }
+        extent: &ExtentFetch,
+    ) -> io::Result<()>;
 }
 
 /// Parameters for fetching a single extent from an object store.

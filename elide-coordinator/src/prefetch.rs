@@ -29,6 +29,7 @@ use object_store::path::Path as StorePath;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+use elide_core::signing::{self, VerifyingKey};
 use elide_core::volume::walk_ancestors;
 
 use crate::upload::derive_names;
@@ -46,10 +47,10 @@ const SEGMENT_MAGIC: &[u8; 8] = b"ELIDSEG\x02";
 /// Prefetch the index section (`.idx`) for all segments in `fork_dir` and its
 /// ancestors that are not present locally.
 ///
-/// Processes the current fork first (no branch cutoff), then each ancestor layer
-/// in order (with their respective branch-point cutoffs). For each layer, lists
+/// Processes the current fork first (no branch cutoff), then each ancestor fork
+/// in order (with their respective branch-point cutoffs). For each fork, lists
 /// S3 objects under `by_id/<volume_id>/` and downloads the header+index portion
-/// of any segment not already in `segments/` or `cache/`.
+/// of any segment not already in `index/`.
 pub async fn prefetch_indexes(
     fork_dir: &Path,
     store: &Arc<dyn ObjectStore>,
@@ -66,17 +67,22 @@ pub async fn prefetch_indexes(
     // Current fork: all its segments are valid (no branch-point cutoff).
     let current_volume_id = derive_names(fork_dir)
         .with_context(|| format!("resolving volume id for {}", fork_dir.display()))?;
-    prefetch_layer(store, fork_dir, &current_volume_id, None, &mut result).await?;
+    let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)
+        .with_context(|| format!("loading volume.pub from {}", fork_dir.display()))?;
+    prefetch_fork(store, fork_dir, &current_volume_id, None, &vk, &mut result).await?;
 
     // Ancestor forks: each has a branch-point cutoff.
-    for layer in &ancestors {
-        let volume_id = derive_names(&layer.dir)
-            .with_context(|| format!("resolving volume id for {}", layer.dir.display()))?;
-        prefetch_layer(
+    for ancestor in &ancestors {
+        let volume_id = derive_names(&ancestor.dir)
+            .with_context(|| format!("resolving volume id for {}", ancestor.dir.display()))?;
+        let ancestor_vk = signing::load_verifying_key(&ancestor.dir, signing::VOLUME_PUB_FILE)
+            .with_context(|| format!("loading volume.pub from {}", ancestor.dir.display()))?;
+        prefetch_fork(
             store,
-            &layer.dir,
+            &ancestor.dir,
             &volume_id,
-            layer.branch_ulid.as_deref(),
+            ancestor.branch_ulid.as_deref(),
+            &ancestor_vk,
             &mut result,
         )
         .await?;
@@ -85,11 +91,12 @@ pub async fn prefetch_indexes(
     Ok(result)
 }
 
-async fn prefetch_layer(
+async fn prefetch_fork(
     store: &Arc<dyn ObjectStore>,
-    layer_dir: &Path,
+    fork_dir: &Path,
     volume_id: &str,
     branch_ulid: Option<&str>,
+    verifying_key: &VerifyingKey,
     result: &mut PrefetchResult,
 ) -> Result<()> {
     let prefix = StorePath::from(format!("by_id/{volume_id}/"));
@@ -119,13 +126,13 @@ async fn prefetch_layer(
         }
 
         // Skip if the index section is already present locally.
-        let local_idx = layer_dir.join("index").join(format!("{ulid_str}.idx"));
+        let local_idx = fork_dir.join("index").join(format!("{ulid_str}.idx"));
         if local_idx.exists() {
             result.skipped += 1;
             continue;
         }
 
-        match fetch_idx(store, key, layer_dir, ulid_str).await {
+        match fetch_idx(store, key, fork_dir, ulid_str, verifying_key).await {
             Ok(()) => {
                 info!("[prefetch] fetched index: {ulid_str}");
                 result.fetched += 1;
@@ -140,13 +147,14 @@ async fn prefetch_layer(
     Ok(())
 }
 
-/// Download the index portion of one segment and write it as
-/// `<fork_dir>/index/<ulid>.idx`.
+/// Download the index portion of one segment, verify its signature, and write
+/// it as `<fork_dir>/index/<ulid>.idx`.
 async fn fetch_idx(
     store: &Arc<dyn ObjectStore>,
     key: &StorePath,
     fork_dir: &Path,
     ulid_str: &str,
+    verifying_key: &VerifyingKey,
 ) -> Result<()> {
     // Fetch the header first to determine how large the index section is.
     let header = store
@@ -170,6 +178,10 @@ async fn fetch_idx(
         .get_range(key, 0..body_section_start)
         .await
         .with_context(|| format!("fetching index section for {ulid_str}"))?;
+
+    // Verify signature before writing anything to disk.
+    elide_core::segment::verify_segment_bytes(&idx_bytes, ulid_str, verifying_key)
+        .with_context(|| format!("verifying signature for {ulid_str}"))?;
 
     // Write atomically: tmp → rename.
     let index_dir = fork_dir.join("index");
@@ -229,9 +241,19 @@ mod tests {
             SegmentFlags::empty(),
             data,
         )];
-        let (signer, _) = generate_ephemeral_signer();
+        let (signer, vk) = generate_ephemeral_signer();
         let staging = tmp.path().join(seg_ulid);
         write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
+
+        // Write volume.pub (hex-encoded) so prefetch can verify signatures.
+        let vk_hex: String = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(parent_dir.join("volume.pub"), &vk_hex).unwrap();
+        std::fs::write(child_dir.join("volume.pub"), &vk_hex).unwrap();
 
         // Create a snapshot marker in parent (branch point for child).
         let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
@@ -292,9 +314,19 @@ mod tests {
             SegmentFlags::empty(),
             data,
         )];
-        let (signer, _) = generate_ephemeral_signer();
+        let (signer, vk) = generate_ephemeral_signer();
         let staging = tmp.path().join(seg_ulid);
         write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
+
+        // Write volume.pub (hex-encoded) so prefetch can verify signatures.
+        std::fs::create_dir_all(&root_dir).unwrap();
+        let vk_hex: String = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(root_dir.join("volume.pub"), &vk_hex).unwrap();
 
         // Upload the segment to the store.
         let store_tmp = TempDir::new().unwrap();

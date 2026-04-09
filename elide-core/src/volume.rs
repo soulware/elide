@@ -36,7 +36,7 @@ pub use segment::BoxFetcher;
 use ulid::Ulid;
 
 use crate::{
-    extentindex,
+    extentindex::{self, BodySource},
     gc::{GcHandoff, GcHandoffState, HandoffLine},
     lbamap,
     segment::{self, EntryKind},
@@ -558,7 +558,7 @@ impl Volume {
                 body_offset,
                 body_length: owned_data.len() as u32,
                 compressed,
-                entry_idx: None,
+                body_source: BodySource::Local,
                 body_section_start: 0,
             },
         );
@@ -751,7 +751,7 @@ impl Volume {
                                     body_offset: entry.stored_offset,
                                     body_length: entry.stored_length,
                                     compressed: entry.compressed,
-                                    entry_idx: None,
+                                    body_source: BodySource::Local,
                                     body_section_start: new_bss,
                                 },
                             );
@@ -934,7 +934,7 @@ impl Volume {
                                 body_offset: entry.stored_offset,
                                 body_length: entry.stored_length,
                                 compressed: entry.compressed,
-                                entry_idx: None,
+                                body_source: BodySource::Local,
                                 body_section_start: new_bss,
                             },
                         );
@@ -1278,7 +1278,7 @@ impl Volume {
                             body_offset: e.stored_offset,
                             body_length: e.stored_length,
                             compressed: e.compressed,
-                            entry_idx: Some(i as u32),
+                            body_source: BodySource::Cached(i as u32),
                             body_section_start,
                         },
                     );
@@ -1541,7 +1541,7 @@ impl Volume {
                             body_offset: entry.stored_offset,
                             body_length: entry.stored_length,
                             compressed: entry.compressed,
-                            entry_idx: None,
+                            body_source: BodySource::Local,
                             body_section_start: new_bss,
                         },
                     );
@@ -1666,7 +1666,7 @@ impl Volume {
                     let canonical_path = self.find_segment_file(
                         loc.segment_id,
                         loc.body_section_start,
-                        loc.entry_idx,
+                        loc.body_source,
                     )?;
                     let file_offset = match SegmentLayout::from_path(&canonical_path) {
                         SegmentLayout::BodyOnly => loc.body_offset,
@@ -1804,7 +1804,7 @@ impl Volume {
                     body_offset: entry.stored_offset,
                     body_length: entry.stored_length,
                     compressed: entry.compressed,
-                    entry_idx: None,
+                    body_source: BodySource::Local,
                     body_section_start,
                 },
             );
@@ -1918,7 +1918,7 @@ impl Volume {
         &self,
         segment_id: Ulid,
         body_section_start: u64,
-        entry_idx: Option<u32>,
+        body_source: BodySource,
     ) -> io::Result<PathBuf> {
         find_segment_in_dirs(
             segment_id,
@@ -1926,7 +1926,7 @@ impl Volume {
             &self.ancestor_layers,
             self.fetcher.as_ref(),
             body_section_start,
-            entry_idx,
+            body_source,
         )
     }
 
@@ -2019,7 +2019,7 @@ pub(crate) fn read_extents(
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<FileCache>,
-    find_segment: impl Fn(Ulid, u64, Option<u32>) -> io::Result<PathBuf>,
+    find_segment: impl Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
 ) -> io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -2032,7 +2032,7 @@ pub(crate) fn read_extents(
 
         // Extract owned copies so the borrow of extent_index ends before
         // we mutate file_cache.
-        let (segment_id, body_offset, body_length, compressed, body_section_start, entry_idx) = {
+        let (segment_id, body_offset, body_length, compressed, body_section_start, body_source) = {
             let Some(loc) = extent_index.lookup(&er.hash) else {
                 continue; // hash not indexed — treat as unwritten
             };
@@ -2042,16 +2042,16 @@ pub(crate) fn read_extents(
                 loc.body_length,
                 loc.compressed,
                 loc.body_section_start,
-                loc.entry_idx,
+                loc.body_source,
             )
         };
 
-        // For cached entries (entry_idx.is_some()), always call find_segment to
-        // check the .present bitset — the .body file may exist but the specific
-        // entry may not yet be fetched.
+        // For cached entries, always call find_segment to check the .present
+        // bitset — the .body file may exist but the specific entry may not
+        // yet be fetched.
         let mut cache = file_cache.borrow_mut();
-        if entry_idx.is_some() || cache.get(segment_id).is_none() {
-            let path = find_segment(segment_id, body_section_start, entry_idx)?;
+        if matches!(body_source, BodySource::Cached(_)) || cache.get(segment_id).is_none() {
+            let path = find_segment(segment_id, body_section_start, body_source)?;
             let layout = SegmentLayout::from_path(&path);
             cache.insert(segment_id, layout, fs::File::open(&path)?);
         }
@@ -2078,7 +2078,7 @@ pub(crate) fn read_extents(
                 lz4_flex::decompress_size_prepended(&compressed_buf).map_err(|e| {
                     log::error!(
                         "lz4 decompression failed: lba={} segment={} layout={:?} \
-                     bss={} body_offset={} body_length={} entry_idx={:?} \
+                     bss={} body_offset={} body_length={} body_source={:?} \
                      file_body_offset={} first_bytes={:?} err={}",
                         lba,
                         segment_id,
@@ -2086,7 +2086,7 @@ pub(crate) fn read_extents(
                         body_section_start,
                         body_offset,
                         body_length,
-                        entry_idx,
+                        body_source,
                         file_body_offset,
                         &compressed_buf[..compressed_buf.len().min(16)],
                         e,
@@ -2135,8 +2135,8 @@ pub(crate) fn read_extents(
 ///   2. Ancestor forks (newest-first): `pending/`, `gc/*.applied`, `cache/<id>.body`
 ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
 ///
-/// When `entry_idx` is `Some`, a `cache/<id>.body` hit is only accepted if
-/// the corresponding bit in `cache/<id>.present` is set — otherwise the entry
+/// For `Cached` entries, a `cache/<id>.body` hit is only accepted if the
+/// corresponding bit in `cache/<id>.present` is set — otherwise the entry
 /// is not yet locally available and we fall through to the fetcher.
 ///
 /// `.idx` files live in `index/` (coordinator-written, permanent).
@@ -2150,7 +2150,7 @@ pub(crate) fn find_segment_in_dirs(
     ancestor_layers: &[AncestorLayer],
     fetcher: Option<&BoxFetcher>,
     body_section_start: u64,
-    entry_idx: Option<u32>,
+    body_source: BodySource,
 ) -> io::Result<PathBuf> {
     let sid = segment_id.to_string();
     for subdir in ["wal", "pending"] {
@@ -2170,10 +2170,13 @@ pub(crate) fn find_segment_in_dirs(
     }
     let cache_body = base_dir.join("cache").join(format!("{sid}.body"));
     if cache_body.exists() {
-        let entry_present = entry_idx.is_none_or(|idx| {
-            let present_path = base_dir.join("cache").join(format!("{sid}.present"));
-            segment::check_present_bit(&present_path, idx).unwrap_or(false)
-        });
+        let entry_present = match body_source {
+            BodySource::Local => true,
+            BodySource::Cached(idx) => {
+                let present_path = base_dir.join("cache").join(format!("{sid}.present"));
+                segment::check_present_bit(&present_path, idx).unwrap_or(false)
+            }
+        };
         if entry_present {
             return Ok(cache_body);
         }
@@ -2186,33 +2189,32 @@ pub(crate) fn find_segment_in_dirs(
         }
         let cache_body = layer.dir.join("cache").join(format!("{sid}.body"));
         if cache_body.exists() {
-            let entry_present = entry_idx.is_none_or(|idx| {
-                let present_path = layer.dir.join("cache").join(format!("{sid}.present"));
-                segment::check_present_bit(&present_path, idx).unwrap_or(false)
-            });
+            let entry_present = match body_source {
+                BodySource::Local => true,
+                BodySource::Cached(idx) => {
+                    let present_path = layer.dir.join("cache").join(format!("{sid}.present"));
+                    segment::check_present_bit(&present_path, idx).unwrap_or(false)
+                }
+            };
             if entry_present {
                 return Ok(cache_body);
             }
         }
     }
-    if let Some(fetcher) = fetcher {
+    if let (Some(fetcher), BodySource::Cached(idx)) = (fetcher, body_source) {
         let index_dir = base_dir.join("index");
         let body_dir = base_dir.join("cache");
-        if let Some(idx) = entry_idx {
-            fetcher.fetch_extent(
-                segment_id,
-                &index_dir,
-                &body_dir,
-                &segment::ExtentFetch {
-                    body_section_start,
-                    body_offset: 0,
-                    body_length: 0,
-                    entry_idx: idx,
-                },
-            )?;
-        } else {
-            fetcher.fetch(segment_id, &index_dir, &body_dir)?;
-        }
+        fetcher.fetch_extent(
+            segment_id,
+            &index_dir,
+            &body_dir,
+            &segment::ExtentFetch {
+                body_section_start,
+                body_offset: 0,
+                body_length: 0,
+                entry_idx: idx,
+            },
+        )?;
         return Ok(base_dir.join("cache").join(format!("{sid}.body")));
     }
     Err(io::Error::other(format!("segment not found: {sid}")))
@@ -2279,7 +2281,7 @@ impl ReadonlyVolume {
         &self,
         segment_id: Ulid,
         body_section_start: u64,
-        entry_idx: Option<u32>,
+        body_source: BodySource,
     ) -> io::Result<PathBuf> {
         find_segment_in_dirs(
             segment_id,
@@ -2287,7 +2289,7 @@ impl ReadonlyVolume {
             &self.ancestor_layers,
             self.fetcher.as_ref(),
             body_section_start,
-            entry_idx,
+            body_source,
         )
     }
 
@@ -2498,7 +2500,7 @@ fn recover_wal(
                         body_offset,
                         body_length,
                         compressed,
-                        entry_idx: None,
+                        body_source: BodySource::Local,
                         body_section_start: 0,
                     },
                 );
