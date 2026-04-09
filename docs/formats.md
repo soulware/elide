@@ -203,7 +203,7 @@ Each segment is a **single file** both locally and in S3. The same format is use
 
 ```
 [Header: 96 bytes]
-  magic          (8 bytes)  — "ELIDSEG\x02"
+  magic          (8 bytes)  — "ELIDSEG\x03"
   entry_count    (4 bytes)  — number of index entries (u32 le)
   index_length   (4 bytes)  — byte length of index section (u32 le)
   inline_length  (4 bytes)  — byte length of inline section (u32 le); 0 if none
@@ -242,50 +242,47 @@ delta_offset  = 96 + index_length + inline_length + body_length
 
 **Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents (`pending/` and `segments/`). LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
 
-**Planned:** zstd for delta bodies in S3 (`FLAG_HAS_DELTAS` option entries). Delta blobs are small and fetched infrequently; zstd achieves substantially better ratio at the cost of slower decompression — the tradeoff favours ratio for bandwidth-constrained S3 data. Delta compression is not yet implemented; when it is, `FLAG_COMPRESSED` will continue to apply uniformly and the algorithm will be implied by context (full-body entry vs. delta option entry).
+**Delta bodies** use zstd dictionary compression (`FLAG_HAS_DELTAS` option entries). The source extent is used as the zstd dictionary; the delta blob is much smaller than the full extent for in-place file updates. Delta blobs are computed at S3 upload time by the coordinator and appended to the segment's delta body section. `FLAG_COMPRESSED` continues to apply uniformly to full-body entries (LZ4); the algorithm is implied by context (full-body entry = LZ4, delta option = zstd).
 
 Both algorithms apply the same entropy gate (≥ 7.0 bits/byte skips compression) and minimum ratio threshold (< 1.5× skips storage).
 
 **Compression granularity:** `FLAG_COMPRESSED` applies to the full stored payload of an entry — the entire extent is compressed as a unit. There is no sub-extent compression granularity. A read of any portion of a compressed extent must decompress the full payload. This matches lsvd. The practical impact is bounded by the pre-log coalescing block limit, which caps maximum extent size at write time.
 
+The index section has two parts: fixed-size base entries, followed by a delta table.
+
+**Base entries** (`entry_count × 64 bytes`):
+
 ```
-For each extent:
-  hash          (32 bytes)  — BLAKE3 extent hash
-  start_lba     (8 bytes)   — first logical block address (u64 le)
-  lba_length    (4 bytes)   — extent length in 4KB blocks (u32 le)
-  flags         (1 byte)    — flag bits above
-
-  if FLAG_DEDUP_REF:
-    body_offset (8 bytes)   — byte offset within full body section (u64 le); zero-filled locally, filled by materialisation
-    body_length (4 bytes)   — byte length (compressed size if FLAG_COMPRESSED)
-
-  if FLAG_ZERO:
-    (no body fields — hash is ZERO_HASH; reads return lba_length × 4096 zero bytes)
-
-  if !FLAG_DEDUP_REF and !FLAG_ZERO and !FLAG_INLINE:
-    body_offset (8 bytes)   — byte offset within full body section (u64 le)
-    body_length (4 bytes)   — byte length (compressed size if FLAG_COMPRESSED)
-
-  if FLAG_INLINE:
-    inline_offset (8 bytes) — byte offset within inline section (u64 le)
-    inline_length (4 bytes) — byte length of inline data
-
-  if FLAG_HAS_DELTAS:
-    delta_count  (1 byte)   — number of delta options (≥1)
-    per delta option:
-      source_hash        (32 bytes) — BLAKE3 hash of the source extent
-      option_flags       (1 byte)   — bit 0: FLAG_DELTA_INLINE
-      if !FLAG_DELTA_INLINE:
-        delta_offset     (8 bytes)  — byte offset within delta body section (u64 le)
-        delta_length     (4 bytes)  — byte length in delta body (u32 le)
-      if FLAG_DELTA_INLINE:
-        delta_inline_offset (8 bytes) — byte offset within inline section (u64 le)
-        delta_inline_length (4 bytes) — byte length of inline delta
+For each extent (64 bytes, fixed-size):
+  hash            (32 bytes) — BLAKE3 extent hash
+  start_lba       (8 bytes)  — first logical block address (u64 le)
+  lba_length      (4 bytes)  — extent length in 4KB blocks (u32 le)
+  flags           (1 byte)   — flag bits above
+  stored_offset   (8 bytes)  — byte offset within body or inline section (u64 le)
+  stored_length   (4 bytes)  — byte length of stored data (u32 le)
+  reserved        (7 bytes)  — must be zero
 ```
 
-`lba_length × 4096` always gives the uncompressed extent size. `body_length` / `inline_length` gives the stored (possibly compressed) size.
+All entry kinds (DATA, DEDUP_REF, ZERO, INLINE) use the same 64-byte layout. `stored_offset` and `stored_length` are interpreted per kind: body-section-relative for DATA and DEDUP_REF, inline-section-relative for INLINE, zero for ZERO.
 
-**FLAG_DEDUP_REF entries** use the same 57-byte layout as DATA entries (`body_offset + body_length`). The body region is reserved at write time but zero-filled locally — reads resolve through the extent index to the canonical segment's body. Before S3 upload, `materialise_segment` fills each live DedupRef's body hole from the canonical segment, making the S3 object self-contained. Dead entries (LBA overwritten since the DedupRef was written) are zero-filled; subsequent GC repack removes them.
+**Delta table** (appended after base entries, variable-length):
+
+```
+Per entry with deltas:
+  entry_index     (4 bytes)  — index of the base entry (u32 le)
+  delta_count     (1 byte)   — number of delta options (≥1)
+  per delta option (45 bytes):
+    source_hash   (32 bytes) — BLAKE3 hash of the source extent
+    option_flags  (1 byte)   — bit 0: FLAG_DELTA_INLINE (reserved)
+    delta_offset  (8 bytes)  — byte offset within delta body section (u64 le)
+    delta_length  (4 bytes)  — byte length in delta body (u32 le)
+```
+
+The delta table is only present when at least one entry has `FLAG_HAS_DELTAS` set. Its total length is `index_length - (entry_count × 64)`. Readers that don't need delta info (LBA map rebuild, extent index rebuild) read only the first `entry_count × 64` bytes.
+
+`lba_length × 4096` always gives the uncompressed extent size. `stored_length` gives the stored (possibly compressed) size.
+
+**FLAG_DEDUP_REF entries** use the same 64-byte layout as DATA entries. The body region is reserved at write time but zero-filled locally — reads resolve through the extent index to the canonical segment's body. Before S3 upload, `materialise_segment` fills each live DedupRef's body hole from the canonical segment, making the S3 object self-contained. Dead entries (LBA overwritten since the DedupRef was written) are zero-filled; subsequent GC repack removes them.
 
 In `cache/`, `promote_to_cache` writes a `.present` bitset marking only DATA entries as present; DedupRef entries have their bit unset. Reads of DedupRef data go through the extent index to the canonical segment. If the canonical is evicted, a demand-fetch retrieves the S3 segment (which has the body filled). See architecture.md § Dedup for the full rationale.
 
@@ -303,11 +300,11 @@ In `cache/`, `promote_to_cache` writes a `.present` bitset marking only DATA ent
 
 | Configuration | Index section | Notes |
 |---|---|---|
-| No deltas | ~57KB | Base case |
-| 3 delta options, 16% of extents | ~70KB | Realistic point-release update |
-| 3 delta options, all extents | ~193KB | Worst case |
+| No deltas | ~64KB | Base case (1000 × 64B) |
+| 3 delta options, 16% of extents | ~77KB | Realistic point-release update |
+| 3 delta options, all extents | ~204KB | Worst case |
 
-Inline section size depends on the inline threshold and extent size distribution — typically small if the threshold is kept tight (e.g. ≤ a few KB per extent).
+Inline section size depends on the inline threshold (256 bytes stored size) and extent size distribution. Only genuinely tiny compressed extents inline — mostly-zero blocks, small config files. The threshold is deliberately low: at higher thresholds (e.g. 4096), compressed 4 KiB blocks from NBD writes would all inline, bloating the `.idx` and defeating demand-fetch.
 
 ### S3 object layout
 

@@ -43,7 +43,7 @@ Find the host IP from inside the VM (the default gateway), then connect and form
 HOST_IP=$(multipass exec elide-test -- ip route show default | awk '{print $3}')
 # typically 192.168.64.1 or 192.168.2.1 depending on the Multipass backend
 
-multipass exec elide-test -- sudo nbd-client $HOST_IP 10809 /dev/nbd0
+multipass exec elide-test -- sudo nbd-client -b 4096 $HOST_IP 10809 /dev/nbd0
 multipass exec elide-test -- sudo mkfs.ext4 /dev/nbd0
 multipass exec elide-test -- sudo mount /dev/nbd0 /mnt
 ```
