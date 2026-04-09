@@ -159,7 +159,7 @@ No file paths, no filemaps, no filesystem awareness. The read path is purely con
 
 **Phase 1 (this design):** LBA-based delta for live writes. Import an image, fork it, make changes via NBD, and the coordinator delta-compresses changed blocks at upload time using the parent snapshot's LBA state as dictionary source. This exercises the full delta pipeline (computation, segment format, read path) as a proof-of-concept. The benefit is modest for small manual changes (most unchanged blocks are already deduped), but it validates the end-to-end machinery.
 
-**Phase 2:** filemap-based delta for imported snapshots. Sequential import of point releases into one volume, with filemap path-matching for source selection. This is where the 94% S3 fetch savings from findings.md are realised.
+**Phase 2:** filemap-based delta for imported snapshots. Import a point-release update with `--parent` pointing at the prior import, and the coordinator uses filemap path-matching for delta source selection. This is where the 94% S3 fetch savings from findings.md are realised. See "Phase 2: import-time parent association" below.
 
 **Phase 3 (deferred):** content-similarity-based source selection for filesystem-agnostic delta. Marginal benefit over path matching for the primary workload, significantly more complex.
 
@@ -168,6 +168,49 @@ No file paths, no filemaps, no filesystem awareness. The read path is purely con
 For phase 1 (LBA-based delta), filesystem type doesn't matter — the delta source is selected purely by LBA identity, so it works for any volume with a parent snapshot.
 
 For phase 2 (filemap-based delta), volumes without an ext4 filesystem simply don't get a filemap. The import path falls back to the existing block-by-block import. Delta compression is not available — segments are stored with full extents only. This is not a degraded mode that needs handling; it's the absence of an optimisation. The read path, segment format, and GC all work identically regardless of whether deltas exist.
+
+## Phase 2: import-time parent association
+
+OCI images are opaque blobs — Ubuntu 22.04.1 and 22.04.2 are published as independent images with no parent/child relationship at the image level. The association between two versions of the same system is **operational knowledge**, not image metadata.
+
+Elide makes this explicit: the operator declares the relationship at import time.
+
+```
+elide import ubuntu-22.04.1.img --name ubuntu
+elide import ubuntu-22.04.2.img --name ubuntu --parent ubuntu
+```
+
+The `--parent` flag:
+1. Resolves the parent volume and its latest snapshot
+2. Sets `volume.parent` on the new volume, pointing at that snapshot
+3. Loads the parent's filemap (`snapshots/<ulid>.filemap`)
+4. During import, matches file paths between the two filemaps
+5. For matched files with different hashes, computes zstd deltas against the parent's extent data
+6. Writes segments with delta options referencing the parent's content hashes
+
+The new volume is a fork of the parent at the import level — not a live-write fork, but a "this is the next version of the same image" relationship. The `volume.parent` pointer is the same mechanism used by live forks; the ancestry chain, LBA map rebuild, and extent index rebuild all work identically.
+
+### Why LBA-based delta doesn't help for imports
+
+NBD live writes are block-granular (4 KiB per write). Each block becomes one segment entry. Delta works when the same LBA is overwritten with similar content.
+
+Import, by contrast, reads the ext4 image and writes file-level extents — one hash for an entire file's content. Two imports of different image versions produce entries at potentially different LBAs (ext4 may lay out files differently between builds). LBA matching finds nothing; file-path matching finds everything.
+
+This is why phase 2 requires filemaps and path-matching rather than LBA-based delta.
+
+## Read-path delta: warm hosts, not cold starts
+
+Delta options in S3 segments benefit **warm hosts** — hosts that already have the parent version's extents cached locally. The flow:
+
+1. Host runs version N — demand-fetches extents as needed, caches them in `cache/`
+2. Operator publishes version N+1 (imported with `--parent` pointing at version N)
+3. Host pulls version N+1 via `volume remote pull` — the `volume.parent` pointer is preserved in the manifest, so the ancestor chain resolves to the local version N directory
+4. Volume open rebuilds the extent index across the ancestor chain — version N's cached extents are visible
+5. Demand-fetch for version N+1's changed extents checks delta options: if `source_hash` is in the local extent index (from version N's cache), fetch the delta blob (small) instead of the full body
+
+On a **cold host** with no prior version cached, delta options are useless — no source extent is available locally, so the full body is fetched. This is correct and transparent; the delta path is purely an optimisation, never a requirement.
+
+The `prefetch_indexes` coordinator task downloads `.idx` files for all ancestors on volume discovery, so the LBA map and extent index are always complete across the ancestry chain. Only body data is demand-fetched.
 
 ## Open questions
 
