@@ -1575,6 +1575,17 @@ impl Volume {
         // body bytes zeroed before upload to S3 — deleted data must never
         // leave the local machine.  Live DedupRef entries need their body
         // holes filled from the canonical segment.
+        //
+        // Liveness is checked at two levels:
+        //  - LBA-live: this entry's start_lba still maps to this hash.
+        //  - Hash-alive: the hash is referenced by ANY LBA in the volume.
+        //
+        // An entry can be LBA-dead but hash-alive when a dedup write at a
+        // different LBA references the same content.  Such entries must keep
+        // their body data intact: GC's collect_stats keeps Data entries alive
+        // on extent+hash liveness (not just LBA liveness), so it may later
+        // fetch this body from S3.  Zeroing it would cause GC to copy zeros
+        // into its output, corrupting reads.
         let has_dedup_ref = entries
             .iter()
             .any(|e| e.kind == EntryKind::DedupRef && e.stored_length > 0);
@@ -1588,6 +1599,8 @@ impl Volume {
             return Ok(());
         }
 
+        let live_hashes = self.lbamap.live_hashes();
+
         // Copy the original segment, then patch body regions in place.
         let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
         fs::copy(&seg_path, &tmp_path)?;
@@ -1600,9 +1613,11 @@ impl Volume {
                 continue;
             }
 
-            let is_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
+            let lba_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
+            let hash_alive = live_hashes.contains(&entry.hash);
 
-            if !is_live {
+            if !lba_live && !hash_alive {
+                // Truly deleted: no LBA references this hash anywhere.
                 // Zero-fill the body region so deleted data is not uploaded.
                 let zeros = vec![0u8; entry.stored_length as usize];
                 out.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
@@ -1612,7 +1627,9 @@ impl Volume {
             }
 
             if entry.kind == EntryKind::DedupRef {
-                // Live DedupRef: fill the body hole from the canonical segment.
+                // DedupRef with live hash: fill the body hole from the
+                // canonical segment.  This covers both LBA-live refs and
+                // LBA-dead-but-hash-alive refs — GC may fetch either from S3.
                 let Some(loc) = self.extent_index.lookup(&entry.hash) else {
                     // Should not happen for a live entry, but if the extent
                     // index is stale, leave the hole zero-filled rather than
@@ -1641,7 +1658,8 @@ impl Volume {
                 out.write_all(&data)?;
                 filled += 1;
             }
-            // Live Data/Zero/Inline: body bytes are already correct from the copy.
+            // Data/Zero/Inline with live hash: body bytes are already correct
+            // from the copy.
         }
         out.sync_data()?;
         drop(out);
@@ -3864,6 +3882,113 @@ mod tests {
             seg_meta.ino(),
             mat_meta.ino(),
             "no-thin-ref materialise should hard link, not copy"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn materialise_preserves_body_for_lba_dead_but_hash_alive_entry() {
+        // Regression test: if a Data entry's LBA is overwritten but the same
+        // hash is alive at another LBA, materialise must NOT zero the body.
+        // GC's collect_stats keeps such entries via extent+hash liveness, so
+        // zeroing the body would cause GC to copy zeros into its output.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xCCu8; 4096];
+        // LBA 0 → DATA(hash=H).  Also dedup-indexed.
+        vol.write(0, &data).unwrap();
+        // LBA 1 → dedup hit → DedupRef(hash=H).  Hash H is now alive at LBAs 0 and 1.
+        vol.write(1, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let ulids = pending_ulids(&base);
+        assert_eq!(ulids.len(), 1);
+        let seg_ulid = ulids[0];
+
+        // Overwrite LBA 0 with different data.  Now the original DATA entry
+        // at LBA 0 is LBA-dead, but hash H is still alive at LBA 1.
+        let other = vec![0xDDu8; 4096];
+        vol.write(0, &other).unwrap();
+
+        // Materialise: the entry at LBA 0 must NOT be zeroed because its hash
+        // is still alive.
+        vol.materialise_segment(seg_ulid).unwrap();
+
+        let mat_path = base
+            .join("pending")
+            .join(format!("{}.materialized", seg_ulid));
+        assert!(mat_path.exists(), ".materialized must exist");
+
+        // Verify the DATA entry at LBA 0 still has real body bytes (not zeros).
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let (mat_bss, mat_entries) =
+            segment::read_and_verify_segment_index(&mat_path, &vol.verifying_key).unwrap();
+        let data_entry = mat_entries
+            .iter()
+            .find(|e| e.kind == EntryKind::Data && e.start_lba == 0)
+            .expect("should have a Data entry at LBA 0");
+        assert!(data_entry.stored_length > 0);
+
+        let mut f = fs::File::open(&mat_path).unwrap();
+        let mut body = vec![0u8; data_entry.stored_length as usize];
+        f.seek(SeekFrom::Start(mat_bss + data_entry.stored_offset))
+            .unwrap();
+        f.read_exact(&mut body).unwrap();
+        assert!(
+            body.iter().any(|&b| b != 0),
+            "materialise must NOT zero body of LBA-dead but hash-alive Data entry"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn materialise_zeros_body_when_hash_fully_dead() {
+        // When both the LBA and the hash are dead (no LBA references the hash),
+        // materialise must zero the body to prevent uploading deleted data.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = vec![0xAAu8; 4096];
+        // LBA 0 → DATA(hash=H).
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let ulids = pending_ulids(&base);
+        assert_eq!(ulids.len(), 1);
+        let seg_ulid = ulids[0];
+
+        // Overwrite LBA 0 with different data.  Hash H is no longer alive
+        // at ANY LBA.
+        let other = vec![0xBBu8; 4096];
+        vol.write(0, &other).unwrap();
+
+        vol.materialise_segment(seg_ulid).unwrap();
+
+        let mat_path = base
+            .join("pending")
+            .join(format!("{}.materialized", seg_ulid));
+        assert!(mat_path.exists(), ".materialized must exist");
+
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let (mat_bss, mat_entries) =
+            segment::read_and_verify_segment_index(&mat_path, &vol.verifying_key).unwrap();
+        let data_entry = mat_entries
+            .iter()
+            .find(|e| e.kind == EntryKind::Data && e.start_lba == 0)
+            .expect("should have a Data entry at LBA 0");
+        assert!(data_entry.stored_length > 0);
+
+        let mut f = fs::File::open(&mat_path).unwrap();
+        let mut body = vec![0u8; data_entry.stored_length as usize];
+        f.seek(SeekFrom::Start(mat_bss + data_entry.stored_offset))
+            .unwrap();
+        f.read_exact(&mut body).unwrap();
+        assert!(
+            body.iter().all(|&b| b == 0),
+            "materialise must zero body of fully-dead entry (both LBA and hash dead)"
         );
 
         fs::remove_dir_all(base).unwrap();
