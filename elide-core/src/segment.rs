@@ -352,7 +352,7 @@ pub fn write_segment(
     w.write_all(header.as_bytes())?;
     w.write_all(&index_buf)?;
 
-    // Inline section (currently empty: INLINE_THRESHOLD = 0).
+    // Inline section.
     for entry in entries.iter() {
         if entry.kind == EntryKind::Inline {
             w.write_all(&entry.data)?;
