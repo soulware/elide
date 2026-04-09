@@ -150,7 +150,7 @@ impl Default for ExtentIndex {
 ///
 /// The caller (Volume::open) inserts in-progress WAL entries on top.
 /// Canonical location semantics: when the same hash appears in multiple
-/// segments (e.g. a DATA entry and a later MaterializedRef from dedup),
+/// segments (e.g. a DATA entry and a later DedupRef from dedup),
 /// the **lowest ULID wins** — segments are processed in ascending order
 /// with first-write-wins insert (`insert_if_absent`), so the earliest
 /// segment becomes canonical.  This is correct because a DedupRef always
@@ -230,7 +230,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
 
             for entry in entries {
                 match entry.kind {
-                    EntryKind::Data | EntryKind::MaterializedRef => {}
+                    EntryKind::Data => {}
                     EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
                 }
                 index.insert_if_absent(
@@ -274,7 +274,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                 // Only index entries with body bytes in this segment.
                 // Thin DedupRef has no body (reads via extent index to canonical).
                 match entry.kind {
-                    EntryKind::Data | EntryKind::MaterializedRef => {}
+                    EntryKind::Data => {}
                     EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => continue,
                 }
                 // body_offset is body-relative: the .body file starts at byte 0
@@ -400,33 +400,22 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_indexes_materialized_ref_skips_thin_ref() {
-        // Thin DedupRef entries have no body; they must NOT be indexed (the
-        // extent index for that hash points to the canonical segment).
-        // MaterializedRef entries carry body bytes and MUST be indexed.
+    fn rebuild_indexes_data_skips_dedup_ref() {
+        // DedupRef entries have reserved body space (zero-filled) but must NOT
+        // be indexed — the extent index for that hash points to the canonical
+        // segment.  Only Data entries are indexed.
         let base = temp_dir();
         let pending = base.join("pending");
         std::fs::create_dir_all(&pending).unwrap();
         let signer = write_test_pub(&base);
 
-        let thin_hash = blake3::hash(b"thin ref body");
-        let thin_entry = SegmentEntry::new_dedup_ref(thin_hash, 0, 1);
-
-        let fat_body = b"fat body!".repeat(512)[..4096].to_vec();
-        let fat_hash = blake3::hash(&fat_body);
-        let fat_entry = SegmentEntry::new_materialized_ref(
-            fat_hash,
-            1,
-            1,
-            segment::SegmentFlags::empty(),
-            fat_body,
-        );
+        let ref_hash = blake3::hash(b"dedup ref body");
+        let ref_entry = SegmentEntry::new_dedup_ref(ref_hash, 0, 1, 4096, false);
 
         let data_body = b"real data".repeat(512)[..4096].to_vec();
         let data_hash = blake3::hash(&data_body);
         let mut entries = vec![
-            thin_entry,
-            fat_entry,
+            ref_entry,
             SegmentEntry::new_data(data_hash, 2, 1, segment::SegmentFlags::empty(), data_body),
         ];
         segment::write_segment(
@@ -437,10 +426,9 @@ mod tests {
         .unwrap();
 
         let index = rebuild(&[(base.clone(), None)]).unwrap();
-        // MaterializedRef and DATA indexed; thin DedupRef skipped.
-        assert_eq!(index.len(), 2);
-        assert!(index.lookup(&thin_hash).is_none());
-        assert!(index.lookup(&fat_hash).is_some());
+        // Only Data indexed; DedupRef skipped.
+        assert_eq!(index.len(), 1);
+        assert!(index.lookup(&ref_hash).is_none());
         assert!(index.lookup(&data_hash).is_some());
 
         std::fs::remove_dir_all(base).unwrap();

@@ -194,19 +194,20 @@ fn compact_candidates_inner(
         } else {
             (path.clone(), bss_header)
         };
-        if segment::read_extent_bodies(&body_path, bss, &mut entries).is_err() {
+        if segment::read_extent_bodies(
+            &body_path,
+            bss,
+            &mut entries,
+            segment::EntryKind::LOCAL_BODY,
+        )
+        .is_err()
+        {
             continue;
         }
         for entry in entries.drain(..) {
             if entry.kind == EntryKind::DedupRef {
-                // Thin DedupRef has no body bytes — drop from GC output.
-                // The canonical DATA entry (in another segment) carries the
-                // body. Carrying the thin ref would leave a dangling reference
-                // when the old segment is deleted.
-                continue;
-            }
-            if entry.kind == EntryKind::MaterializedRef {
-                // Fat ref — treat like DATA for liveness (LBA-based).
+                // DedupRef in S3 has body bytes (filled by materialization).
+                // Liveness is LBA-based: keep if LBA still maps to this hash.
                 let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
                 let extent_live = extent_index
                     .lookup(&entry.hash)
@@ -222,10 +223,10 @@ fn compact_candidates_inner(
             // DATA entries are content-addressed: the extent_index tracks a
             // single canonical location per hash.  When the same hash appears
             // in multiple segments (e.g. a regular write and a later
-            // materialised dedup ref), only one segment is "canonical" in the
+            // dedup ref), only one segment is "canonical" in the
             // extent_index — the other looks extent-dead even though its LBA
             // mapping is still live.  Check lba_live first (same as
-            // MaterializedRef above) so we never drop a live LBA mapping.
+            // DedupRef above) so we never drop a live LBA mapping.
             let lba_live = lba_map.hash_at(entry.start_lba) == Some(entry.hash);
             let extent_live = extent_index
                 .lookup(&entry.hash)
@@ -290,7 +291,7 @@ fn compact_candidates_inner(
     // Build Repack lines, deduplicating by hash: emit one Repack per unique
     // hash, preferring the extent-canonical source segment (lowest ULID).
     // With dedup, the same hash can appear in multiple input segments (DATA
-    // in one, MaterializedRef in another).  The extent index tracks one
+    // in one, DedupRef in another).  The extent index tracks one
     // canonical location per hash (lowest ULID wins), and apply_gc_handoffs'
     // still_at_old check compares against the single old_ulid in the handoff
     // — so we must use the canonical segment's ULID.  Non-canonical entries

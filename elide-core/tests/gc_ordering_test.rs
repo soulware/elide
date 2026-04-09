@@ -166,7 +166,7 @@ fn gc_output_loses_to_live_write_applied_after_gc() {
 }
 
 /// Regression: write-path dedup creates two segments with the same hash (one
-/// DATA, one MaterializedRef) for different LBAs.  The extent_index tracks a
+/// DATA, one DedupRef) for different LBAs.  The extent_index tracks a
 /// single canonical location per hash, so the non-canonical segment's DATA
 /// entry looks extent-dead — but its LBA mapping is still live.  GC must keep
 /// such entries via lba_live, otherwise the LBA mapping is lost on crash.
@@ -177,7 +177,7 @@ fn gc_output_loses_to_live_write_applied_after_gc() {
 ///   CoordGcLocal(2)             — G1 carries H40+H41, deletes S1+S2
 ///   Write(0, 101), Flush        — S3: LBA 0→H101 (Data)
 ///   Write(1, 101)               — becomes DedupRef (same hash H101)
-///   CoordGcLocal(2), Drain      — S4: LBA 1→H101 (MaterializedRef)
+///   CoordGcLocal(2), Drain      — S4: LBA 1→H101 (DedupRef)
 ///                                  extent_index: H101→S4 (overwrites S3)
 ///                                  GC compacts S3+S4: S3's DATA entry is
 ///                                  extent-dead → dropped without lba_live fix
@@ -226,8 +226,8 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
     let _ = common::simulate_coord_gc_local(&fork_dir, gc_ulid2, 2);
     let _ = vol.apply_gc_handoffs();
 
-    // Drain: materialise S3 (no thin refs) and S4 (DedupRef → MaterializedRef).
-    // After promote, index/ has S3.idx (Data) and S4.idx (MaterializedRef).
+    // Drain: materialise S3 (no thin refs) and S4 (DedupRef → DedupRef).
+    // After promote, index/ has S3.idx (Data) and S4.idx (DedupRef).
     // extent_index: H101 → S4 (S4 processed last, overwrites S3).
     common::drain_with_materialise(&mut vol);
 

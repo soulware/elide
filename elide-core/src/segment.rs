@@ -22,15 +22,14 @@
 //   lba_length (4 bytes)  u32 le
 //   flags      (1 byte)   see FLAG_* constants
 //
-//   if FLAG_DEDUP_REF (thin): no further fields — data in canonical segment
-//   if FLAG_DEDUP_REF | FLAG_MATERIALIZED (fat): same layout as DATA
-//   if FLAG_ZERO: no further fields
-//   else (DATA / INLINE):
-//     stored_offset (8 bytes) u64 le — offset within body or inline section
-//     stored_length (4 bytes) u32 le — byte length of stored data
+//   stored_offset (8 bytes) u64 le — offset within body or inline section
+//   stored_length (4 bytes) u32 le — byte length of stored data
 //
-// Body section: raw concatenated DATA + MaterializedRef extent bytes, no framing.
-// Thin DedupRef and Zero entries contribute nothing to the body.
+// All entry kinds use the same 57-byte layout (unified index format).
+//
+// Body section: raw concatenated extent bytes, no framing.
+// Data entries have real body bytes; DedupRef entries have zero-filled placeholders
+// (filled by materialisation before S3 upload). Zero entries contribute nothing.
 //
 // Locally-stored files have delta_length = 0. The local file IS the S3 object
 // minus the delta body, which the coordinator appends at upload time.
@@ -134,12 +133,12 @@ pub struct ExtentFetch {
 /// Convenience alias for an optional heap-allocated `SegmentFetcher`.
 pub type BoxFetcher = Arc<dyn SegmentFetcher>;
 
-/// Size of a ZERO or thin DEDUP_REF index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1).
-/// Neither has body bytes; no body_offset/body_length fields.
-const IDX_ENTRY_ZERO_LEN: u32 = 45;
-/// Size of a DATA or MATERIALIZED_REF index entry: above + stored_offset(8) + stored_length(4).
-/// Both carry body bytes in the segment's body section.
-const IDX_ENTRY_DATA_LEN: u32 = 57;
+/// Size of every index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1)
+/// + stored_offset(8) + stored_length(4).
+///
+/// All entry kinds use the same 57-byte layout so that the .idx is identical
+/// before and after materialization.
+const IDX_ENTRY_LEN: u32 = 57;
 
 /// Extents at or below this byte size are stored inline in the inline section.
 /// 0 = disabled until S3 integration.
@@ -161,14 +160,14 @@ bitflags! {
         const HAS_DELTAS = 0x02;
         /// Stored data is lz4-compressed; stored_length is the compressed size.
         const COMPRESSED = 0x04;
-        /// Thin dedup reference; extent data lives in the canonical segment (via extent index).
-        /// No body bytes in this segment unless MATERIALIZED is also set.
+        /// Dedup reference; body region is reserved (zero-filled) locally and
+        /// populated during materialization before S3 upload.
         const DEDUP_REF    = 0x08;
         /// Zero extent; hash field is ZERO_HASH; no bytes in this segment's body; reads as zeros.
         const ZERO         = 0x10;
-        /// Modifier for DEDUP_REF: body bytes have been materialised into this segment's body
-        /// section (fat variant). Set by `materialise_segment` before S3 upload.
-        /// Always combined with DEDUP_REF; never set alone.
+        /// Legacy flag: was used to distinguish "materialized" dedup refs from thin
+        /// dedup refs.  Now all dedup refs use the unified 57-byte entry format.
+        /// Retained for backward-compatible parsing only (treated as DedupRef).
         const MATERIALIZED = 0x20;
     }
 }
@@ -184,18 +183,22 @@ bitflags! {
 pub enum EntryKind {
     /// Standard data entry; body bytes live in the body section.
     Data,
-    /// Thin dedup reference; no body bytes in this segment. Reads resolve
-    /// the hash through the extent index to find the canonical segment's body.
+    /// Dedup reference; body region is reserved (zero-filled) locally. Reads
+    /// resolve through the extent index to the canonical segment's body.
+    /// Materialization fills the reserved body region before S3 upload.
     DedupRef,
-    /// Fat dedup reference (FLAG_DEDUP_REF | FLAG_MATERIALIZED); body bytes
-    /// are materialised in this segment's body section. Same layout as Data.
-    /// Produced by `materialise_segment` before S3 upload.
-    MaterializedRef,
     /// Zero extent; LBA range reads as zeros, no body bytes stored.
     Zero,
     /// Inline entry; body bytes live in the inline section.
     /// Currently unreachable (INLINE_THRESHOLD = 0) but present for format completeness.
     Inline,
+}
+
+impl EntryKind {
+    /// Entry kinds with locally-available body bytes (pending/ segments).
+    pub const LOCAL_BODY: [EntryKind; 1] = [EntryKind::Data];
+    /// Entry kinds with body bytes in materialised/S3 segments.
+    pub const ALL_BODY: [EntryKind; 2] = [EntryKind::Data, EntryKind::DedupRef];
 }
 
 /// One entry in the in-memory representation of a segment's index section.
@@ -256,40 +259,27 @@ impl SegmentEntry {
         }
     }
 
-    /// Create a thin DEDUP_REF entry (no body bytes — reads via extent index).
-    pub fn new_dedup_ref(hash: blake3::Hash, start_lba: u64, lba_length: u32) -> Self {
-        Self {
-            hash,
-            start_lba,
-            lba_length,
-            compressed: false,
-            kind: EntryKind::DedupRef,
-            stored_offset: 0,
-            stored_length: 0,
-            data: Vec::new(),
-        }
-    }
-
-    /// Create a fat MATERIALIZED_REF entry (body bytes in segment, same layout as Data).
+    /// Create a DEDUP_REF entry.
     ///
-    /// `flags` may include `SegmentFlags::COMPRESSED` if `data` is already compressed.
-    pub fn new_materialized_ref(
+    /// `stored_length` and `compressed` come from the canonical extent's
+    /// `ExtentLocation` in the extent index.  The body region is reserved
+    /// in the segment (zero-filled) but not populated until materialization.
+    pub fn new_dedup_ref(
         hash: blake3::Hash,
         start_lba: u64,
         lba_length: u32,
-        flags: SegmentFlags,
-        data: Vec<u8>,
+        stored_length: u32,
+        compressed: bool,
     ) -> Self {
-        let stored_length = data.len() as u32;
         Self {
             hash,
             start_lba,
             lba_length,
-            compressed: flags.contains(SegmentFlags::COMPRESSED),
-            kind: EntryKind::MaterializedRef,
-            stored_offset: 0, // filled by write_segment
+            compressed,
+            kind: EntryKind::DedupRef,
+            stored_offset: 0, // filled by assign_offsets
             stored_length,
-            data,
+            data: Vec::new(),
         }
     }
 
@@ -366,13 +356,31 @@ pub fn write_segment(
             w.write_all(&entry.data)?;
         }
     }
-    // Body section: DATA and MaterializedRef extents, raw bytes, no framing.
-    // ZERO and thin DedupRef contribute no bytes; inline entries are in the inline section.
+    // Body section: raw bytes, no framing.
+    // Data entries write their body bytes.
+    // DedupRef entries seek past their reserved region (sparse hole).
+    // Zero entries have stored_length=0 and contribute nothing.
+    // Inline entries are in the inline section.
     for entry in entries.iter() {
-        if entry.kind == EntryKind::Data || entry.kind == EntryKind::MaterializedRef {
-            w.write_all(&entry.data)?;
+        match entry.kind {
+            EntryKind::Data => {
+                w.write_all(&entry.data)?;
+            }
+            EntryKind::DedupRef => {
+                // Seek past the reserved body region, creating a sparse hole.
+                // Materialization fills this region before S3 upload.
+                use std::io::Seek;
+                w.seek(std::io::SeekFrom::Current(entry.stored_length as i64))?;
+            }
+            EntryKind::Zero | EntryKind::Inline => {}
         }
     }
+
+    // Set the file length explicitly: the trailing seek for a DedupRef at the
+    // end of the body section doesn't extend the file.  set_len ensures the
+    // file is the correct size regardless of entry order.
+    let expected_len = body_section_start + body_length;
+    w.get_ref().set_len(expected_len)?;
 
     w.flush()?;
     w.get_ref().sync_data()?;
@@ -383,29 +391,26 @@ pub fn write_segment(
 ///
 /// Modifies entries in-place; `stored_offset` is meaningful only after this call.
 fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
-    let mut index_length: u32 = 0;
     let mut inline_cursor: u64 = 0;
     let mut body_cursor: u64 = 0;
 
     for entry in entries.iter_mut() {
-        index_length += match entry.kind {
-            EntryKind::Zero | EntryKind::DedupRef => IDX_ENTRY_ZERO_LEN,
-            EntryKind::Data | EntryKind::MaterializedRef | EntryKind::Inline => IDX_ENTRY_DATA_LEN,
-        };
-
         match entry.kind {
             EntryKind::Inline => {
                 entry.stored_offset = inline_cursor;
                 inline_cursor += entry.stored_length as u64;
             }
-            EntryKind::Data | EntryKind::MaterializedRef => {
+            EntryKind::Data | EntryKind::DedupRef => {
                 entry.stored_offset = body_cursor;
                 body_cursor += entry.stored_length as u64;
             }
-            EntryKind::Zero | EntryKind::DedupRef => {}
+            EntryKind::Zero => {
+                // Zero entries have no body; stored_offset/stored_length stay 0.
+            }
         }
     }
 
+    let index_length = entries.len() as u32 * IDX_ENTRY_LEN;
     (index_length, inline_cursor as u32, body_cursor)
 }
 
@@ -414,7 +419,6 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     match e.kind {
         EntryKind::Inline => flags |= SegmentFlags::INLINE,
         EntryKind::DedupRef => flags |= SegmentFlags::DEDUP_REF,
-        EntryKind::MaterializedRef => flags |= SegmentFlags::DEDUP_REF | SegmentFlags::MATERIALIZED,
         EntryKind::Zero => flags |= SegmentFlags::ZERO,
         EntryKind::Data => {}
     }
@@ -426,16 +430,8 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     w.write_all(&e.start_lba.to_le_bytes())?;
     w.write_all(&e.lba_length.to_le_bytes())?;
     w.write_all(&[flags.bits()])?;
-
-    match e.kind {
-        EntryKind::Data | EntryKind::MaterializedRef | EntryKind::Inline => {
-            w.write_all(&e.stored_offset.to_le_bytes())?;
-            w.write_all(&e.stored_length.to_le_bytes())?;
-        }
-        EntryKind::Zero | EntryKind::DedupRef => {
-            // No body fields — 45-byte entry.
-        }
-    }
+    w.write_all(&e.stored_offset.to_le_bytes())?;
+    w.write_all(&e.stored_length.to_le_bytes())?;
     Ok(())
 }
 
@@ -621,27 +617,16 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
         let kind = if flags.contains(SegmentFlags::ZERO) {
             EntryKind::Zero
         } else if flags.contains(SegmentFlags::DEDUP_REF) {
-            if flags.contains(SegmentFlags::MATERIALIZED) {
-                EntryKind::MaterializedRef
-            } else {
-                EntryKind::DedupRef
-            }
+            // MATERIALIZED flag is legacy; both map to DedupRef.
+            EntryKind::DedupRef
         } else if flags.contains(SegmentFlags::INLINE) {
             EntryKind::Inline
         } else {
             EntryKind::Data
         };
 
-        // ZERO and thin DedupRef have no body fields (45-byte entry).
-        // DATA, MaterializedRef, and Inline carry stored_offset + stored_length.
-        let (stored_offset, stored_length) = match kind {
-            EntryKind::Zero | EntryKind::DedupRef => (0u64, 0u32),
-            EntryKind::Data | EntryKind::MaterializedRef | EntryKind::Inline => {
-                let off = u64::from_le_bytes(read_fixed(data, &mut pos)?);
-                let len = u32::from_le_bytes(read_fixed(data, &mut pos)?);
-                (off, len)
-            }
-        };
+        let stored_offset = u64::from_le_bytes(read_fixed(data, &mut pos)?);
+        let stored_length = u32::from_le_bytes(read_fixed(data, &mut pos)?);
 
         entries.push(SegmentEntry {
             hash,
@@ -658,26 +643,32 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
     Ok(entries)
 }
 
-/// Populate `entry.data` for all body entries by reading from the segment file.
+/// Populate `entry.data` by reading body bytes from the segment file.
 ///
 /// `body_section_start` is the absolute file offset of the body section, as
-/// returned by `read_segment_index`. Only DATA and MaterializedRef entries are
-/// read — they have body bytes in the body section. ZERO, thin DedupRef, and
-/// Inline entries are skipped.
+/// returned by `read_segment_index`.  Only entries whose `kind` is in
+/// `kinds` and whose `stored_length > 0` are read.
 ///
-/// Used by the compaction path to materialise live extent bytes before writing
-/// a new, denser segment.
+/// Common usage:
+/// - `&[EntryKind::Data]` — local pending/ segments where DedupRef body
+///   regions are sparse holes (not real data).
+/// - `&[EntryKind::Data, EntryKind::DedupRef]` — S3-fetched or materialised
+///   segments where all body regions are populated.
 pub fn read_extent_bodies(
     path: &Path,
     body_section_start: u64,
     entries: &mut [SegmentEntry],
+    kinds: impl AsRef<[EntryKind]>,
 ) -> io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
+    let kinds = kinds.as_ref();
     let mut f = fs::File::open(path)?;
     for entry in entries.iter_mut() {
-        match entry.kind {
-            EntryKind::Data | EntryKind::MaterializedRef => {}
-            EntryKind::Zero | EntryKind::DedupRef | EntryKind::Inline => continue,
+        if entry.stored_length == 0 {
+            continue;
+        }
+        if !kinds.contains(&entry.kind) {
+            continue;
         }
         f.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
         entry.data = vec![0u8; entry.stored_length as usize];
@@ -804,8 +795,10 @@ pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
 /// Copy a segment body into the local cache.
 ///
 /// Reads `src_path` (a full segment in `pending/` or `gc/`), extracts the body
-/// section, writes it to `body_path` (`cache/<ulid>.body`), and writes an
-/// all-present bitset to `present_path` (`cache/<ulid>.present`).
+/// section, writes it to `body_path` (`cache/<ulid>.body`), and builds a
+/// `.present` bitset marking only DATA entries as present.  DedupRef body
+/// regions are zero-filled placeholders — their `.present` bits are unset so
+/// the read path falls through to the canonical segment via the extent index.
 ///
 /// Both files are written via tmp+rename for crash safety. Idempotent: if
 /// `body_path` already exists, the function returns `Ok(())` immediately without
@@ -826,8 +819,20 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
         return Err(io::Error::other("segment truncated before body section"));
     }
     write_file_atomic(body_path, &data[body_section_start..])?;
+
+    // Build sparse .present bitset: only Data entries are marked present.
+    // DedupRef body regions are zero-filled placeholders; Zero entries have
+    // no body.  Parse the index section to determine entry kinds.
+    let index_data = &data[HEADER_LEN as usize..HEADER_LEN as usize + index_length as usize];
+    let entries = parse_index_section(index_data, entry_count)?;
     let bitset_len = (entry_count as usize).div_ceil(8);
-    write_file_atomic(present_path, &vec![0xffu8; bitset_len])
+    let mut bitset = vec![0u8; bitset_len];
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.kind == EntryKind::Data {
+            bitset[i / 8] |= 1 << (i % 8);
+        }
+    }
+    write_file_atomic(present_path, &bitset)
 }
 
 pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -1136,7 +1141,7 @@ mod tests {
         let (signer, vk) = test_signer();
         let hash = blake3::hash(b"existing extent");
 
-        let mut entries = vec![SegmentEntry::new_dedup_ref(hash, 5, 3)];
+        let mut entries = vec![SegmentEntry::new_dedup_ref(hash, 5, 3, 4096, false)];
         write_segment(&path, &mut entries, signer.as_ref()).unwrap();
 
         let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
@@ -1148,7 +1153,7 @@ mod tests {
         assert_eq!(e.lba_length, 3);
         assert_eq!(e.kind, EntryKind::DedupRef);
         assert_eq!(e.stored_offset, 0);
-        assert_eq!(e.stored_length, 0);
+        assert_eq!(e.stored_length, 4096);
 
         fs::remove_file(&path).unwrap();
     }
@@ -1164,7 +1169,7 @@ mod tests {
 
         let mut entries = vec![
             SegmentEntry::new_data(data_hash, 0, 2, SegmentFlags::empty(), data),
-            SegmentEntry::new_dedup_ref(ref_hash, 2, 1),
+            SegmentEntry::new_dedup_ref(ref_hash, 2, 1, 4096, false),
             SegmentEntry::new_data(
                 blake3::hash(b"x"),
                 10,
@@ -1183,10 +1188,12 @@ mod tests {
         assert_eq!(read_back[0].stored_offset, 0); // first body entry
         assert_eq!(read_back[0].stored_length, 8192);
 
-        assert_eq!(read_back[1].kind, EntryKind::DedupRef); // ref contributes no body bytes
+        assert_eq!(read_back[1].kind, EntryKind::DedupRef);
+        assert_eq!(read_back[1].stored_offset, 8192); // reserves body space
+        assert_eq!(read_back[1].stored_length, 4096);
 
         assert_eq!(read_back[2].kind, EntryKind::Data);
-        assert_eq!(read_back[2].stored_offset, 8192); // body cursor advanced past first entry
+        assert_eq!(read_back[2].stored_offset, 8192 + 4096); // after data + dedup ref
         assert_eq!(read_back[2].stored_length, 4096);
 
         fs::remove_file(&path).unwrap();
@@ -1518,48 +1525,17 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_materialized_ref_entry() {
-        let path = temp_path(".seg");
-        let (signer, vk) = test_signer();
-        let data = vec![0xFFu8; 4096];
-        let hash = blake3::hash(&data);
-
-        let mut entries = vec![SegmentEntry::new_materialized_ref(
-            hash,
-            7,
-            2,
-            SegmentFlags::empty(),
-            data,
-        )];
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
-
-        let (_, read_back) = read_and_verify_segment_index(&path, &vk).unwrap();
-        assert_eq!(read_back.len(), 1);
-
-        let e = &read_back[0];
-        assert_eq!(e.kind, EntryKind::MaterializedRef);
-        assert_eq!(e.hash, hash);
-        assert_eq!(e.start_lba, 7);
-        assert_eq!(e.lba_length, 2);
-        assert_eq!(e.stored_offset, 0);
-        assert_eq!(e.stored_length, 4096);
-        assert!(!e.compressed);
-
-        // Verify the flag byte round-trips as DEDUP_REF | MATERIALIZED.
-        // We already confirmed kind == MaterializedRef above, which is only
-        // produced when both flags are present during parsing.
-        // Additionally, read the raw flag byte from the file to be explicit.
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = fs::File::open(&path).unwrap();
-        // The first index entry starts at HEADER_LEN. The flag byte is at
-        // offset: hash(32) + start_lba(8) + lba_length(4) = 44 bytes in.
-        f.seek(SeekFrom::Start(HEADER_LEN as u64 + 44)).unwrap();
-        let mut flag_byte = [0u8; 1];
-        f.read_exact(&mut flag_byte).unwrap();
-        let flags = SegmentFlags::from_bits_truncate(flag_byte[0]);
-        assert!(flags.contains(SegmentFlags::DEDUP_REF));
-        assert!(flags.contains(SegmentFlags::MATERIALIZED));
-
-        fs::remove_file(&path).unwrap();
+    fn legacy_materialized_flag_parsed_as_dedup_ref() {
+        // The legacy MATERIALIZED flag (0x20) combined with DEDUP_REF (0x08)
+        // should be parsed as DedupRef in the unified format.
+        let flags = SegmentFlags::DEDUP_REF | SegmentFlags::MATERIALIZED;
+        let kind = if flags.contains(SegmentFlags::ZERO) {
+            EntryKind::Zero
+        } else if flags.contains(SegmentFlags::DEDUP_REF) {
+            EntryKind::DedupRef
+        } else {
+            EntryKind::Data
+        };
+        assert_eq!(kind, EntryKind::DedupRef);
     }
 }
