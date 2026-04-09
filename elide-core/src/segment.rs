@@ -8,7 +8,7 @@
 //   [Delta body: delta_length bytes]      — absent locally (delta_length = 0)
 //
 // Header (96 bytes):
-//   0..8   magic         "ELIDSEG\x02"
+//   0..8   magic         "ELIDSEG\x03"
 //   8..12  entry_count   u32 le
 //   12..16 index_length  u32 le
 //   16..20 inline_length u32 le; 0 if no inline data
@@ -16,16 +16,28 @@
 //   28..32 delta_length  u32 le; 0 for locally-stored files
 //   32..96 signature     Ed25519 sig over BLAKE3(header[0..32] || index_bytes)
 //
-// Index entry format:
-//   hash       (32 bytes) BLAKE3 extent hash
-//   start_lba  (8 bytes)  u64 le
-//   lba_length (4 bytes)  u32 le
-//   flags      (1 byte)   see FLAG_* constants
+// Index section layout:
+//   [entry_count × 64 bytes: base entries]
+//   [delta table: variable-length, only present when entries have HAS_DELTAS]
 //
-//   stored_offset (8 bytes) u64 le — offset within body or inline section
-//   stored_length (4 bytes) u32 le — byte length of stored data
+// Base entry format (64 bytes, fixed-size):
+//   hash          (32 bytes) BLAKE3 extent hash
+//   start_lba     (8 bytes)  u64 le
+//   lba_length    (4 bytes)  u32 le
+//   flags         (1 byte)   see FLAG_* constants
+//   stored_offset (8 bytes)  u64 le — offset within body or inline section
+//   stored_length (4 bytes)  u32 le — byte length of stored data
+//   reserved      (7 bytes)  must be zero
 //
-// All entry kinds use the same 57-byte layout (unified index format).
+// Delta table (appended after base entries within index section):
+//   per entry with deltas:
+//     entry_index  (4 bytes) u32 le — index of the base entry
+//     delta_count  (1 byte)  number of delta options
+//     per delta option (45 bytes):
+//       source_hash    (32 bytes) BLAKE3 hash of the dictionary extent
+//       option_flags   (1 byte)   bit 0: FLAG_DELTA_INLINE (reserved)
+//       delta_offset   (8 bytes)  u64 le — offset within delta body section
+//       delta_length   (4 bytes)  u32 le — byte length in delta body
 //
 // Body section: raw concatenated extent bytes, no framing.
 // Data entries have real body bytes; DedupRef entries have zero-filled placeholders
@@ -52,7 +64,7 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_e
 
 // --- constants ---
 
-const MAGIC: &[u8; 8] = b"ELIDSEG\x02";
+const MAGIC: &[u8; 8] = b"ELIDSEG\x03";
 const HEADER_LEN: u64 = 96;
 
 // --- on-disk header ---
@@ -133,12 +145,19 @@ pub struct ExtentFetch {
 /// Convenience alias for an optional heap-allocated `SegmentFetcher`.
 pub type BoxFetcher = Arc<dyn SegmentFetcher>;
 
-/// Size of every index entry: hash(32) + start_lba(8) + lba_length(4) + flags(1)
-/// + stored_offset(8) + stored_length(4).
+/// Size of every index entry: hash(32) + start_lba(8) + lba_length(4) +
+/// flags(1) + stored_offset(8) + stored_length(4) + reserved(7) = 64 bytes.
 ///
-/// All entry kinds use the same 57-byte layout so that the .idx is identical
-/// before and after materialization.
-const IDX_ENTRY_LEN: u32 = 57;
+/// Fixed-size, cache-line-aligned. Delta options are stored in a separate
+/// delta table appended after the base entries within the index section.
+const IDX_ENTRY_LEN: u32 = 64;
+
+/// Size of one serialized delta option in the delta table:
+/// source_hash(32) + option_flags(1) + delta_offset(8) + delta_length(4) = 45 bytes.
+const DELTA_OPTION_LEN: u32 = 45;
+
+/// Size of one delta table entry header: entry_index(4) + delta_count(1) = 5 bytes.
+const DELTA_TABLE_ENTRY_HEADER: u32 = 5;
 
 /// Extents at or below this byte size are stored inline in the inline section.
 /// 0 = disabled until S3 integration.
@@ -150,6 +169,20 @@ const IDX_ENTRY_LEN: u32 = 57;
 /// Set to one 4 KiB block: compressed single-block writes (metadata updates,
 /// journal entries) land inline; uncompressed full blocks stay in the body.
 const INLINE_THRESHOLD: usize = 4096;
+
+/// Compute the total index section byte length for a slice of entries.
+///
+/// The index section consists of `entry_count × 64` bytes of fixed-size base
+/// entries, followed by a delta table for any entries that have delta options.
+fn index_section_length(entries: &[SegmentEntry]) -> u32 {
+    let base = entries.len() as u32 * IDX_ENTRY_LEN;
+    let delta_table: u32 = entries
+        .iter()
+        .filter(|e| !e.delta_options.is_empty())
+        .map(|e| DELTA_TABLE_ENTRY_HEADER + e.delta_options.len() as u32 * DELTA_OPTION_LEN)
+        .sum();
+    base + delta_table
+}
 
 // --- flag bits ---
 
@@ -204,6 +237,22 @@ impl EntryKind {
     pub const ALL_BODY: [EntryKind; 2] = [EntryKind::Data, EntryKind::DedupRef];
 }
 
+/// A delta option attached to a segment index entry.
+///
+/// Each option records a zstd-dictionary-compressed representation of the
+/// extent body using `source_hash` as the dictionary.  Readers that already
+/// have the source extent cached locally can fetch the (much smaller) delta
+/// blob instead of the full body.
+#[derive(Debug, Clone)]
+pub struct DeltaOption {
+    /// BLAKE3 hash of the source extent used as the zstd dictionary.
+    pub source_hash: blake3::Hash,
+    /// Byte offset of the delta blob within the segment's delta body section.
+    pub delta_offset: u64,
+    /// Byte length of the delta blob in the delta body section.
+    pub delta_length: u32,
+}
+
 /// One entry in the in-memory representation of a segment's index section.
 ///
 /// Used in two contexts:
@@ -231,6 +280,10 @@ pub struct SegmentEntry {
     /// on disk). Populated by `read_extent_bodies` or during write-session
     /// accumulation.
     pub data: Option<Vec<u8>>,
+    /// Delta options for this entry (S3 segments only; empty locally).
+    /// Each option provides a zstd-dictionary-compressed alternative to the
+    /// full body, using a different source extent as dictionary.
+    pub delta_options: Vec<DeltaOption>,
 }
 
 impl SegmentEntry {
@@ -260,6 +313,7 @@ impl SegmentEntry {
             stored_offset: 0, // filled by write_segment
             stored_length,
             data: Some(data),
+            delta_options: Vec::new(),
         }
     }
 
@@ -284,6 +338,7 @@ impl SegmentEntry {
             stored_offset: 0, // filled by assign_offsets
             stored_length,
             data: None,
+            delta_options: Vec::new(),
         }
     }
 
@@ -298,6 +353,7 @@ impl SegmentEntry {
             stored_offset: 0,
             stored_length: 0,
             data: None,
+            delta_options: Vec::new(),
         }
     }
 }
@@ -325,10 +381,12 @@ pub fn write_segment(
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
 
     // Build index section into a buffer first — needed for signing.
+    // Layout: [N × 64 base entries] [delta table (if any)].
     let mut index_buf = Vec::with_capacity(index_length as usize);
     for entry in entries.iter() {
         write_index_entry(&mut index_buf, entry)?;
     }
+    write_delta_table(&mut index_buf, entries)?;
 
     // Build the header (fields only; signature filled in below).
     let mut header = SegmentHeader::new_zeroed();
@@ -418,7 +476,7 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
         }
     }
 
-    let index_length = entries.len() as u32 * IDX_ENTRY_LEN;
+    let index_length = index_section_length(entries);
     (index_length, inline_cursor as u32, body_cursor)
 }
 
@@ -433,13 +491,140 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     if e.compressed {
         flags |= SegmentFlags::COMPRESSED;
     }
+    if !e.delta_options.is_empty() {
+        flags |= SegmentFlags::HAS_DELTAS;
+    }
 
-    w.write_all(e.hash.as_bytes())?;
-    w.write_all(&e.start_lba.to_le_bytes())?;
-    w.write_all(&e.lba_length.to_le_bytes())?;
-    w.write_all(&[flags.bits()])?;
-    w.write_all(&e.stored_offset.to_le_bytes())?;
-    w.write_all(&e.stored_length.to_le_bytes())?;
+    w.write_all(e.hash.as_bytes())?; // 32
+    w.write_all(&e.start_lba.to_le_bytes())?; // 8
+    w.write_all(&e.lba_length.to_le_bytes())?; // 4
+    w.write_all(&[flags.bits()])?; // 1
+    w.write_all(&e.stored_offset.to_le_bytes())?; // 8
+    w.write_all(&e.stored_length.to_le_bytes())?; // 4
+    w.write_all(&[0u8; 7])?; // 7 reserved
+    Ok(())
+}
+
+/// Write the delta table: entries with delta options, appended after the
+/// fixed-size base entries within the index section.
+fn write_delta_table<W: Write>(w: &mut W, entries: &[SegmentEntry]) -> io::Result<()> {
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.delta_options.is_empty() {
+            continue;
+        }
+        w.write_all(&(i as u32).to_le_bytes())?; // entry_index: 4
+        w.write_all(&[entry.delta_options.len() as u8])?; // delta_count: 1
+        for opt in &entry.delta_options {
+            w.write_all(opt.source_hash.as_bytes())?; // 32
+            w.write_all(&[0u8])?; // option_flags: 1
+            w.write_all(&opt.delta_offset.to_le_bytes())?; // 8
+            w.write_all(&opt.delta_length.to_le_bytes())?; // 4
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite a segment with delta options and a delta body appended.
+///
+/// Reads the source segment (which must be a valid, signed segment — typically
+/// the `.materialized` file), attaches `delta_options` to the specified entries,
+/// and writes a new segment file at `dst_path` with:
+///   - Updated index section (base entries + delta table)
+///   - Identical inline and body sections (copied verbatim)
+///   - Delta body appended after the body section
+///   - Re-signed header (new index changes the signature)
+///
+/// `deltas` maps entry index → list of delta options for that entry.
+/// `delta_body` is the concatenated delta blobs; offsets in each `DeltaOption`
+/// are relative to the start of this buffer.
+///
+/// Returns `Ok(())` on success. The caller is responsible for cleanup of
+/// `dst_path` on error.
+pub fn rewrite_with_deltas(
+    src_path: &Path,
+    dst_path: &Path,
+    deltas: &[(usize, Vec<DeltaOption>)],
+    delta_body: &[u8],
+    signer: &dyn SegmentSigner,
+) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Read source header to get section sizes.
+    let mut src = fs::File::open(src_path)?;
+    let mut raw = [0u8; HEADER_LEN as usize];
+    src.read_exact(&mut raw)?;
+    let src_h = SegmentHeader::read_from_bytes(&raw)
+        .map_err(|_| io::Error::other("segment header size mismatch"))?;
+    if src_h.magic != *MAGIC {
+        return Err(io::Error::other("bad segment magic"));
+    }
+
+    let src_index_length = src_h.index_length.get();
+    let src_inline_length = src_h.inline_length.get();
+    let src_body_length = src_h.body_length.get();
+    let entry_count = src_h.entry_count.get();
+
+    // Parse entries from source index.
+    let mut index_buf = vec![0u8; src_index_length as usize];
+    src.read_exact(&mut index_buf)?;
+    let mut entries = parse_index_section(&index_buf, entry_count)?;
+
+    // Attach delta options to the specified entries.
+    for (idx, opts) in deltas {
+        if *idx >= entries.len() {
+            return Err(io::Error::other(format!(
+                "delta entry index {idx} out of range ({})",
+                entries.len()
+            )));
+        }
+        entries[*idx].delta_options = opts.clone();
+    }
+
+    // Build new index section (base entries + delta table).
+    let new_index_length = index_section_length(&entries);
+    let mut new_index_buf = Vec::with_capacity(new_index_length as usize);
+    for entry in &entries {
+        write_index_entry(&mut new_index_buf, entry)?;
+    }
+    write_delta_table(&mut new_index_buf, &entries)?;
+
+    // Build new header.
+    let mut header = SegmentHeader::new_zeroed();
+    header.magic.copy_from_slice(MAGIC);
+    header.entry_count.set(entry_count);
+    header.index_length.set(new_index_length);
+    header.inline_length.set(src_inline_length);
+    header.body_length.set(src_body_length);
+    header.delta_length.set(delta_body.len() as u32);
+
+    // Sign: BLAKE3(header[0..32] || new_index_bytes).
+    let sig_bytes: [u8; 64] = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&header.as_bytes()[..32]);
+        hasher.update(&new_index_buf);
+        signer.sign(hasher.finalize().as_bytes())
+    };
+    header.signature.copy_from_slice(&sig_bytes);
+
+    // Read inline + body from source (verbatim copy).
+    let inline_body_len = src_inline_length as u64 + src_body_length;
+    src.seek(SeekFrom::Start(HEADER_LEN + src_index_length as u64))?;
+    let mut inline_body = vec![0u8; inline_body_len as usize];
+    src.read_exact(&mut inline_body)?;
+
+    // Write destination file.
+    let dst = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst_path)?;
+    let mut w = BufWriter::new(dst);
+    w.write_all(header.as_bytes())?;
+    w.write_all(&new_index_buf)?;
+    w.write_all(&inline_body)?;
+    w.write_all(delta_body)?;
+    w.flush()?;
+    w.get_ref().sync_data()?;
+
     Ok(())
 }
 
@@ -636,9 +821,12 @@ pub fn read_inline_section(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentEntry>> {
-    let mut pos = 0usize;
+    let base_len = entry_count as usize * IDX_ENTRY_LEN as usize;
     let mut entries = Vec::with_capacity(entry_count as usize);
 
+    // Pass 1: parse fixed-size base entries (64 bytes each).
+    let mut pos = 0usize;
+    let mut has_deltas = false;
     for _ in 0..entry_count {
         let hash = blake3::Hash::from_bytes(read_fixed(data, &mut pos)?);
         let start_lba = u64::from_le_bytes(read_fixed(data, &mut pos)?);
@@ -646,6 +834,9 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
         let flags = SegmentFlags::from_bits_retain(read_u8(data, &mut pos)?);
 
         let compressed = flags.contains(SegmentFlags::COMPRESSED);
+        if flags.contains(SegmentFlags::HAS_DELTAS) {
+            has_deltas = true;
+        }
         let kind = if flags.contains(SegmentFlags::ZERO) {
             EntryKind::Zero
         } else if flags.contains(SegmentFlags::DEDUP_REF) {
@@ -658,6 +849,7 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
 
         let stored_offset = u64::from_le_bytes(read_fixed(data, &mut pos)?);
         let stored_length = u32::from_le_bytes(read_fixed(data, &mut pos)?);
+        let _reserved: [u8; 7] = read_fixed(data, &mut pos)?;
 
         entries.push(SegmentEntry {
             hash,
@@ -668,10 +860,51 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
             stored_offset,
             stored_length,
             data: None,
+            delta_options: Vec::new(),
         });
     }
 
+    // Pass 2: parse delta table (appended after base entries).
+    if has_deltas && pos < data.len() {
+        parse_delta_table(data, base_len, &mut entries)?;
+    }
+
     Ok(entries)
+}
+
+/// Parse the delta table from the index section, starting at `table_start`.
+///
+/// Each delta table entry: entry_index(4) + delta_count(1) + N × 45 bytes.
+fn parse_delta_table(
+    data: &[u8],
+    table_start: usize,
+    entries: &mut [SegmentEntry],
+) -> io::Result<()> {
+    let mut pos = table_start;
+    while pos < data.len() {
+        let entry_index = u32::from_le_bytes(read_fixed(data, &mut pos)?) as usize;
+        let delta_count = read_u8(data, &mut pos)? as usize;
+        if entry_index >= entries.len() {
+            return Err(io::Error::other(format!(
+                "delta table entry_index {entry_index} out of range ({})",
+                entries.len()
+            )));
+        }
+        let mut opts = Vec::with_capacity(delta_count);
+        for _ in 0..delta_count {
+            let source_hash = blake3::Hash::from_bytes(read_fixed(data, &mut pos)?);
+            let _option_flags = read_u8(data, &mut pos)?;
+            let delta_offset = u64::from_le_bytes(read_fixed(data, &mut pos)?);
+            let delta_length = u32::from_le_bytes(read_fixed(data, &mut pos)?);
+            opts.push(DeltaOption {
+                source_hash,
+                delta_offset,
+                delta_length,
+            });
+        }
+        entries[entry_index].delta_options = opts;
+    }
+    Ok(())
 }
 
 /// Populate `entry.data` by reading body bytes from the segment file.
@@ -1598,7 +1831,7 @@ mod tests {
         // Inline data lives in the inline section, not body.
         // Body section should be empty (body_length = 0 in header).
         let file_len = fs::metadata(&path).unwrap().len();
-        // file = header(96) + index(57) + inline(100) + body(0) = 253
+        // file = header(96) + index(64) + inline(100) + body(0) = 260
         assert_eq!(file_len, bss); // bss = header + index + inline; no body beyond it
 
         // Verify inline section contains the data.
@@ -1726,6 +1959,86 @@ mod tests {
         let (_, idx_entries) = read_and_verify_segment_index(&idx_path, &vk).unwrap();
         assert_eq!(idx_entries.len(), 1);
         assert_eq!(idx_entries[0].kind, EntryKind::Inline);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rewrite_with_deltas_roundtrip() {
+        // Write a segment with two DATA entries, rewrite with delta options
+        // on the first entry, read back and verify.
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let seg_path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let delta_path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA.delta");
+        let (signer, vk) = test_signer();
+
+        let data1 = vec![0xAAu8; 8192];
+        let data2 = vec![0xBBu8; 4096];
+        let hash1 = blake3::hash(&data1);
+        let hash2 = blake3::hash(&data2);
+        let mut entries = vec![
+            SegmentEntry::new_data(hash1, 0, 2, SegmentFlags::empty(), data1),
+            SegmentEntry::new_data(hash2, 2, 1, SegmentFlags::empty(), data2),
+        ];
+        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        // Fake delta blob and source hash.
+        let source_hash = blake3::hash(b"source-extent");
+        let delta_blob = b"compressed-delta-data";
+        let delta_body = delta_blob.to_vec();
+
+        let deltas = vec![(
+            0,
+            vec![DeltaOption {
+                source_hash,
+                delta_offset: 0,
+                delta_length: delta_blob.len() as u32,
+            }],
+        )];
+
+        rewrite_with_deltas(
+            &seg_path,
+            &delta_path,
+            &deltas,
+            &delta_body,
+            signer.as_ref(),
+        )
+        .unwrap();
+
+        // Read back and verify.
+        let (bss, read_entries) = read_and_verify_segment_index(&delta_path, &vk).unwrap();
+        assert_eq!(read_entries.len(), 2);
+
+        // First entry should have HAS_DELTAS and one delta option.
+        let e0 = &read_entries[0];
+        assert_eq!(e0.hash, hash1);
+        assert_eq!(e0.delta_options.len(), 1);
+        assert_eq!(e0.delta_options[0].source_hash, source_hash);
+        assert_eq!(e0.delta_options[0].delta_offset, 0);
+        assert_eq!(e0.delta_options[0].delta_length, delta_blob.len() as u32);
+
+        // Second entry should have no deltas.
+        let e1 = &read_entries[1];
+        assert_eq!(e1.hash, hash2);
+        assert!(e1.delta_options.is_empty());
+
+        // Body data should still be readable.
+        let mut read_back = read_entries;
+        read_extent_bodies(&delta_path, bss, &mut read_back, [EntryKind::Data], &[]).unwrap();
+        assert_eq!(read_back[0].data.as_deref(), Some(&[0xAAu8; 8192][..]));
+        assert_eq!(read_back[1].data.as_deref(), Some(&[0xBBu8; 4096][..]));
+
+        // Verify delta_length in header by reading raw bytes.
+        let raw_header = fs::read(&delta_path).unwrap();
+        let h = SegmentHeader::read_from_bytes(&raw_header[..HEADER_LEN as usize]).unwrap();
+        assert_eq!(h.delta_length.get(), delta_blob.len() as u32);
+
+        // Verify delta body bytes at the end of the file.
+        let file_len = fs::metadata(&delta_path).unwrap().len();
+        let delta_start = file_len - delta_blob.len() as u64;
+        let delta_bytes = &raw_header[delta_start as usize..];
+        assert_eq!(delta_bytes, delta_blob);
 
         fs::remove_dir_all(dir).unwrap();
     }

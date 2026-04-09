@@ -2185,6 +2185,7 @@ mod tests {
             stored_offset,
             stored_length,
             data: None,
+            delta_options: Vec::new(),
         }
     }
 

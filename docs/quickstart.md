@@ -91,9 +91,11 @@ Since `vm1` was just created, the coordinator will start it fresh on the next sc
 ## Connect with nbd-client
 
 ```sh
-sudo nbd-client 127.0.0.1 10809 /dev/nbd0
+sudo nbd-client -b 4096 127.0.0.1 10809 /dev/nbd0
 sudo mount /dev/nbd0 /mnt
 ```
+
+`-b 4096` sets the NBD block size to 4 KiB, matching the volume's LBA size. The default (512 bytes) causes every write to be smaller than one LBA block, which defeats compression and dedup at the block level.
 
 Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).
 

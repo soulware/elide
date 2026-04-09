@@ -1625,12 +1625,17 @@ impl Volume {
                 }
             }
 
-            // Clean up .materialized sidecar if materialise_segment produced one.
+            // Clean up sidecar files produced by materialise and delta.
             let mat_path = self
                 .base_dir
                 .join("pending")
                 .join(format!("{ulid_str}.materialized"));
             let _ = fs::remove_file(&mat_path);
+            let delta_path = self
+                .base_dir
+                .join("pending")
+                .join(format!("{ulid_str}.delta"));
+            let _ = fs::remove_file(&delta_path);
             fs::remove_file(&pending_path)?;
         } else {
             // GC path: delete index/<old>.idx for each segment consumed by this

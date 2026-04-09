@@ -28,8 +28,8 @@
 // .idx file the coordinator sees is safe to fetch from the object store.
 
 use std::path::Path;
-
 use std::sync::Arc;
+
 use tracing::warn;
 
 use anyhow::{Context, Result};
@@ -164,13 +164,25 @@ pub async fn drain_pending(
         // entries upload fine without materialisation (hard-link fast path).
         crate::control::materialise_segment(vol_dir, ulid).await;
         let mat_path = pending_dir.join(format!("{name}.materialized"));
-        let upload_path = if mat_path.exists() {
+        let after_mat_path = if mat_path.exists() {
             &mat_path
         } else {
             &segment_path
         };
 
-        match upload_segment(upload_path, name, volume_id, store).await {
+        // Compute delta options against parent snapshot LBA state.
+        // Best-effort: if delta fails, upload the non-delta segment.
+        let delta_path = pending_dir.join(format!("{name}.delta"));
+        let upload_path = match try_delta(vol_dir, after_mat_path, &delta_path) {
+            Ok(Some(p)) => p,
+            Ok(None) => after_mat_path.to_owned(),
+            Err(e) => {
+                warn!("delta computation failed for {name}: {e:#}");
+                after_mat_path.to_owned()
+            }
+        };
+
+        match upload_segment(&upload_path, name, volume_id, store).await {
             Ok(()) => {
                 // Segment confirmed in S3; promote IPC tells the controlling
                 // process (volume or import in serve phase) to write index/ +
@@ -192,6 +204,21 @@ pub async fn drain_pending(
     }
 
     Ok(DrainResult { uploaded, failed })
+}
+
+/// Attempt to compute delta options and rewrite the segment.
+///
+/// Returns `Ok(Some(delta_path))` if deltas were produced, `Ok(None)` if no
+/// deltas apply, or `Err` on failure.
+fn try_delta(
+    vol_dir: &Path,
+    segment_path: &Path,
+    delta_path: &Path,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let signer = elide_core::signing::load_signer(vol_dir, elide_core::signing::VOLUME_KEY_FILE)?;
+    let result =
+        crate::delta::try_rewrite_with_deltas(vol_dir, segment_path, delta_path, signer.as_ref())?;
+    Ok(result)
 }
 
 /// Upload volume metadata: public key, manifest.toml, and names/<name> entry.

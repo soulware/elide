@@ -161,7 +161,7 @@ forking snapshots, and uploading segments to S3 for durability.
 **Current path (NBD unix socket):**
 ```
 elide volume serve --nbd-socket ./vol/nbd.sock
-nbd-client -unix ./vol/nbd.sock /dev/nbd0
+nbd-client -b 4096 -unix ./vol/nbd.sock /dev/nbd0
 mount /dev/nbd0 /mnt/data
 ```
 Requires the `nbd` kernel module. Present in most general-purpose Linux
