@@ -32,6 +32,25 @@ use ulid::Ulid;
 use crate::segment::{self, EntryKind};
 use crate::signing;
 
+/// How the extent's body is stored locally.
+///
+/// `Local` entries live in a complete file (WAL or pending segment) — the body
+/// is always present and no demand-fetch is needed.
+///
+/// `Cached` entries live in a sparse `cache/<id>.body` file — individual
+/// extents may or may not be present and can be demand-fetched via the
+/// `.present` bitset and per-extent range-GETs.
+#[derive(Clone, Copy, Debug)]
+pub enum BodySource {
+    /// Body is in a complete local file (WAL, pending, or gc segment).
+    /// No present-bit check needed; demand-fetch is never triggered.
+    Local,
+    /// Body is in a sparse cache file. The `u32` is the 0-based entry index
+    /// in the segment's index section, used to check/set the `.present` bitset
+    /// and to compute the S3 byte range for per-extent fetching.
+    Cached(u32),
+}
+
 /// Physical location of an extent within a segment file.
 #[derive(Clone)]
 pub struct ExtentLocation {
@@ -45,10 +64,8 @@ pub struct ExtentLocation {
     pub body_length: u32,
     /// True if the payload is lz4-compressed.
     pub compressed: bool,
-    /// Position of this entry in the segment's raw index (0-based).
-    /// `Some` for entries rebuilt from `cache/*.idx`; `None` for full segments.
-    /// Used to check and update the `.present` bitset for per-extent fetching.
-    pub entry_idx: Option<u32>,
+    /// How this extent's body is stored locally.
+    pub body_source: BodySource,
     /// Absolute offset of the body section within the full segment file.
     /// 0 for WAL entries and `.body` cache files (both start at byte 0 of
     /// the body data). Non-zero for entries in `pending/` or `gc/*.applied` files.
@@ -223,7 +240,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                         body_offset: entry.stored_offset,
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
-                        entry_idx: None,
+                        body_source: BodySource::Local,
                         body_section_start,
                     },
                 );
@@ -237,18 +254,22 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                 .ok_or_else(|| io::Error::other("bad cache idx filename"))?;
             let segment_id =
                 Ulid::from_string(segment_id).map_err(|e| io::Error::other(e.to_string()))?;
-            let (body_section_start, entries) =
-                match segment::read_and_verify_segment_index(path, &vk) {
-                    Ok(v) => v,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        warn!(
-                            "segment vanished during rebuild (GC race): {}",
-                            path.display()
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
+
+            // .idx file size == body_section_start (the file is exactly the
+            // [0, body_section_start) prefix of the full segment).
+            let body_section_start = segment::idx_body_section_start(path)?;
+
+            let entries = match segment::read_and_verify_segment_index(path, &vk) {
+                Ok((_, entries)) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    warn!(
+                        "segment vanished during rebuild (GC race): {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for (raw_idx, entry) in entries.iter().enumerate() {
                 // Only index entries with body bytes in this segment.
                 // Thin DedupRef has no body (reads via extent index to canonical).
@@ -258,7 +279,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                 }
                 // body_offset is body-relative: the .body file starts at byte 0
                 // of the body section, so no adjustment needed.
-                // entry_idx and body_section_start enable per-extent range-GETs.
+                // body_source and body_section_start enable per-extent range-GETs.
                 index.insert_if_absent(
                     entry.hash,
                     ExtentLocation {
@@ -266,7 +287,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                         body_offset: entry.stored_offset,
                         body_length: entry.stored_length,
                         compressed: entry.compressed,
-                        entry_idx: Some(raw_idx as u32),
+                        body_source: BodySource::Cached(raw_idx as u32),
                         body_section_start,
                     },
                 );
@@ -330,7 +351,7 @@ mod tests {
                 body_offset: 1024,
                 body_length: 4096,
                 compressed: false,
-                entry_idx: None,
+                body_source: BodySource::Local,
                 body_section_start: 0,
             },
         );

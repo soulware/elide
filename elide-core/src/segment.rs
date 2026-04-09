@@ -102,24 +102,15 @@ pub trait SegmentSigner: Send + Sync {
 /// `elide-core` is synchronous; async fetchers must wrap their runtime (e.g.
 /// `Runtime::block_on`) inside this interface.
 pub trait SegmentFetcher: Send + Sync {
-    /// Fetch the full segment body and write `.idx` to `index_dir` and
-    /// `.body`/`.present` to `body_dir`.
-    fn fetch(&self, segment_id: ulid::Ulid, index_dir: &Path, body_dir: &Path) -> io::Result<()>;
-
     /// Fetch a single extent and write body bytes into `body_dir/<segment_id>.body`
     /// at `extent.body_offset`, then set bit `extent.entry_idx` in `.present`.
-    ///
-    /// The default implementation fetches the entire segment body; override
-    /// for efficient per-extent range-GETs.
     fn fetch_extent(
         &self,
         segment_id: ulid::Ulid,
         index_dir: &Path,
         body_dir: &Path,
-        _extent: &ExtentFetch,
-    ) -> io::Result<()> {
-        self.fetch(segment_id, index_dir, body_dir)
-    }
+        extent: &ExtentFetch,
+    ) -> io::Result<()>;
 }
 
 /// Parameters for fetching a single extent from an object store.
@@ -505,6 +496,21 @@ pub fn verify_segment_bytes(
                 format!("segment {segment_id} has invalid signature"),
             )
         })
+}
+
+/// Return `body_section_start` for a cached `.idx` file.
+///
+/// A `.idx` file contains exactly `[0, body_section_start)` of the full
+/// segment (header + index section + inline section).  Its file size **is**
+/// `body_section_start` — no header parse required.
+///
+/// This is the authoritative way to obtain `body_section_start` when you
+/// already have (or only need) the `.idx` path.  Callers that also need the
+/// parsed entries should still use [`read_segment_index`] or
+/// [`read_and_verify_segment_index`], which return the same value via the
+/// header.
+pub fn idx_body_section_start(idx_path: &Path) -> io::Result<u64> {
+    Ok(fs::metadata(idx_path)?.len())
 }
 
 /// Parse a segment index without verifying the signature.

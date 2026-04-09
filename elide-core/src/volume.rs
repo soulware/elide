@@ -36,7 +36,7 @@ pub use segment::BoxFetcher;
 use ulid::Ulid;
 
 use crate::{
-    extentindex,
+    extentindex::{self, BodySource},
     gc::{GcHandoff, GcHandoffState, HandoffLine},
     lbamap,
     segment::{self, EntryKind},
@@ -110,6 +110,146 @@ const MAX_WRITE_SIZE: usize = (u32::MAX as usize / 4096) * 4096;
 /// hash preimage resistance.
 pub const ZERO_HASH: blake3::Hash = blake3::Hash::from_bytes([0u8; 32]);
 
+/// Default capacity for the segment file handle LRU cache.
+const FILE_CACHE_CAPACITY: usize = 16;
+
+/// The on-disk layout of a cached segment file, which determines how body
+/// offsets are interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentLayout {
+    /// A full segment file (wal/, pending/, gc/). Body data starts at
+    /// `body_section_start` — callers must add it to body-relative offsets.
+    Full,
+    /// A `.body` cache file (cache/<id>.body). Contains only body bytes
+    /// starting at offset 0 — body-relative offsets are file offsets directly.
+    BodyOnly,
+}
+
+impl SegmentLayout {
+    /// Determine the layout from a file path: `.body` extension → `BodyOnly`,
+    /// everything else → `Full`.
+    fn from_path(path: &Path) -> Self {
+        if path.extension().is_some_and(|e| e == "body") {
+            Self::BodyOnly
+        } else {
+            Self::Full
+        }
+    }
+}
+
+/// Approximate-LRU cache of open segment file handles using the CLOCK algorithm.
+///
+/// Fixed-size ring buffer keyed by segment ULID. Each slot has a `referenced`
+/// bit that is set on access. On eviction the clock hand sweeps the ring,
+/// clearing referenced bits until it finds an unreferenced slot to evict.
+///
+/// The hot-path operation (`get`) is a linear scan + flag set — no data
+/// movement, no allocation, no pointer chasing.  At 16 slots the scan fits
+/// comfortably in L1 cache.
+pub(crate) struct FileCache {
+    slots: Vec<Option<FileCacheSlot>>,
+    hand: usize,
+}
+
+struct FileCacheSlot {
+    segment_id: Ulid,
+    layout: SegmentLayout,
+    file: fs::File,
+    referenced: bool,
+}
+
+impl Default for FileCache {
+    fn default() -> Self {
+        Self::new(FILE_CACHE_CAPACITY)
+    }
+}
+
+impl FileCache {
+    fn new(capacity: usize) -> Self {
+        let mut slots = Vec::with_capacity(capacity);
+        slots.resize_with(capacity, || None);
+        Self { slots, hand: 0 }
+    }
+
+    /// Look up a cached file handle by segment id.
+    /// On hit, sets the referenced bit and returns the layout and file handle.
+    fn get(&mut self, segment_id: Ulid) -> Option<(SegmentLayout, &mut fs::File)> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|s| s.segment_id == segment_id)?;
+        slot.referenced = true;
+        Some((slot.layout, &mut slot.file))
+    }
+
+    /// Insert a file handle. If the segment is already cached, replaces it
+    /// in-place. Otherwise, uses the CLOCK algorithm to find a slot to evict.
+    fn insert(&mut self, segment_id: Ulid, layout: SegmentLayout, file: fs::File) {
+        // Replace in-place if already present.
+        for slot in self.slots.iter_mut() {
+            if slot.as_ref().is_some_and(|s| s.segment_id == segment_id) {
+                *slot = Some(FileCacheSlot {
+                    segment_id,
+                    layout,
+                    file,
+                    referenced: true,
+                });
+                return;
+            }
+        }
+
+        // Fill an empty slot if one exists.
+        for slot in self.slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(FileCacheSlot {
+                    segment_id,
+                    layout,
+                    file,
+                    referenced: true,
+                });
+                return;
+            }
+        }
+
+        // CLOCK sweep: advance the hand, clearing referenced bits, until we
+        // find an unreferenced slot to evict.
+        let len = self.slots.len();
+        loop {
+            let slot = self.slots[self.hand].as_mut().expect("all slots occupied");
+            if slot.referenced {
+                slot.referenced = false;
+                self.hand = (self.hand + 1) % len;
+            } else {
+                self.slots[self.hand] = Some(FileCacheSlot {
+                    segment_id,
+                    layout,
+                    file,
+                    referenced: true,
+                });
+                self.hand = (self.hand + 1) % len;
+                return;
+            }
+        }
+    }
+
+    /// Evict all entries for a given segment.
+    pub(crate) fn evict(&mut self, segment_id: Ulid) {
+        for slot in self.slots.iter_mut() {
+            if slot.as_ref().is_some_and(|s| s.segment_id == segment_id) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Clear all entries.
+    pub(crate) fn clear(&mut self) {
+        for slot in self.slots.iter_mut() {
+            *slot = None;
+        }
+    }
+}
+
 /// Results from a single compaction run.
 #[derive(Debug, Default)]
 pub struct CompactionStats {
@@ -165,13 +305,13 @@ pub struct Volume {
     /// or `None` if no segments exist. Used by `snapshot()` to name the snapshot
     /// marker with the same ULID as the segment it covers.
     last_segment_ulid: Option<Ulid>,
-    /// Single-entry file handle cache for the read path.
+    /// LRU cache of open segment file handles for the read path.
     ///
-    /// Retains the last opened segment file across `read` calls so that
-    /// sequential reads hitting the same segment avoid repeated `open` syscalls.
+    /// Retains recently-opened segment files across `read` calls so that
+    /// reads hitting the same segments avoid repeated `open` syscalls.
     /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
     /// the cache to be updated internally.
-    file_cache: RefCell<Option<(Ulid, bool, fs::File)>>,
+    file_cache: RefCell<FileCache>,
     /// Signer for segment promotion. Every segment written by this volume
     /// (at WAL promotion and compaction) is signed with the fork's private key.
     /// See `segment::SegmentSigner`.
@@ -343,7 +483,7 @@ impl Volume {
             pending_entries,
             has_new_segments,
             last_segment_ulid,
-            file_cache: RefCell::new(None),
+            file_cache: RefCell::new(FileCache::default()),
             signer,
             verifying_key,
             fetcher: None,
@@ -424,7 +564,7 @@ impl Volume {
                 body_offset,
                 body_length: owned_data.len() as u32,
                 compressed,
-                entry_idx: None,
+                body_source: BodySource::Local,
                 body_section_start: 0,
             },
         );
@@ -619,7 +759,7 @@ impl Volume {
                                     body_offset: entry.stored_offset,
                                     body_length: entry.stored_length,
                                     compressed: entry.compressed,
-                                    entry_idx: None,
+                                    body_source: BodySource::Local,
                                     body_section_start: new_bss,
                                 },
                             );
@@ -807,7 +947,7 @@ impl Volume {
                                 body_offset: entry.stored_offset,
                                 body_length: entry.stored_length,
                                 compressed: entry.compressed,
-                                entry_idx: None,
+                                body_source: BodySource::Local,
                                 body_section_start: new_bss,
                             },
                         );
@@ -827,11 +967,9 @@ impl Volume {
             if seg_ulid_opt == Some(new_ulid) && !merged_live.is_empty() {
                 continue; // already replaced atomically above
             }
-            let mut cache = self.file_cache.borrow_mut();
-            if seg_ulid_opt.is_some() && cache.as_ref().map(|(id, _, _)| *id) == seg_ulid_opt {
-                *cache = None;
+            if let Some(ulid) = seg_ulid_opt {
+                self.file_cache.borrow_mut().evict(ulid);
             }
-            drop(cache);
             fs::remove_file(seg_path)?;
         }
 
@@ -1158,7 +1296,7 @@ impl Volume {
                             body_offset: e.stored_offset,
                             body_length: e.stored_length,
                             compressed: e.compressed,
-                            entry_idx: Some(i as u32),
+                            body_source: BodySource::Cached(i as u32),
                             body_section_start,
                         },
                     );
@@ -1485,13 +1623,14 @@ impl Volume {
                     out.write_all(&zeros)?;
                     continue;
                 };
-                let canonical_path =
-                    self.find_segment_file(loc.segment_id, loc.body_section_start, loc.entry_idx)?;
-                let is_body = canonical_path.extension().is_some_and(|e| e == "body");
-                let file_offset = if is_body {
-                    loc.body_offset
-                } else {
-                    loc.body_section_start + loc.body_offset
+                let canonical_path = self.find_segment_file(
+                    loc.segment_id,
+                    loc.body_section_start,
+                    loc.body_source,
+                )?;
+                let file_offset = match SegmentLayout::from_path(&canonical_path) {
+                    SegmentLayout::BodyOnly => loc.body_offset,
+                    SegmentLayout::Full => loc.body_section_start + loc.body_offset,
                 };
                 let mut f = fs::File::open(&canonical_path)?;
                 f.seek(SeekFrom::Start(file_offset))?;
@@ -1526,14 +1665,13 @@ impl Volume {
     ///
     /// Evict `segment_id` from the file handle cache.
     ///
-    /// The read path (`read_extents`) caches the last-opened segment fd to
-    /// amortise open syscalls across sequential block reads.  The cache key
-    /// is the segment ULID plus an `is_body` flag that controls how body
-    /// offsets are computed (`.body` files start at offset 0; full segment
-    /// files add `body_section_start`).
+    /// The read path (`read_extents`) maintains an LRU cache of open segment
+    /// fds keyed by segment ULID, with a `SegmentLayout` that controls how
+    /// body offsets are computed (`BodyOnly` files start at offset 0; `Full`
+    /// segment files add `body_section_start`).
     ///
     /// Callers must evict whenever a segment's on-disk representation changes
-    /// in a way that invalidates the cached fd or `is_body` flag:
+    /// in a way that invalidates the cached fd or layout:
     ///
     /// - **`flush_wal_to_pending`** — WAL file deleted, replaced by a
     ///   pending segment with a different byte layout.
@@ -1547,10 +1685,7 @@ impl Volume {
     /// applies `body_section_start` from the new extent index entry against
     /// the old file layout, seeking past the body section.
     fn evict_cached_segment(&self, segment_id: Ulid) {
-        let mut cache = self.file_cache.borrow_mut();
-        if cache.as_ref().map(|(id, _, _)| *id) == Some(segment_id) {
-            *cache = None;
-        }
+        self.file_cache.borrow_mut().evict(segment_id);
     }
 
     /// Does NOT open a new WAL — the caller is responsible for that.
@@ -1599,7 +1734,7 @@ impl Volume {
                     body_offset: entry.stored_offset,
                     body_length: entry.stored_length,
                     compressed: entry.compressed,
-                    entry_idx: None,
+                    body_source: BodySource::Local,
                     body_section_start,
                 },
             );
@@ -1713,7 +1848,7 @@ impl Volume {
         &self,
         segment_id: Ulid,
         body_section_start: u64,
-        entry_idx: Option<u32>,
+        body_source: BodySource,
     ) -> io::Result<PathBuf> {
         find_segment_in_dirs(
             segment_id,
@@ -1721,7 +1856,7 @@ impl Volume {
             &self.ancestor_layers,
             self.fetcher.as_ref(),
             body_section_start,
-            entry_idx,
+            body_source,
         )
     }
 
@@ -1806,15 +1941,15 @@ impl Volume {
 /// Read `lba_count` 4KB blocks starting at `lba` from the given LBA map and extent index.
 ///
 /// Unwritten blocks are returned as zeros. Written blocks are fetched extent-by-extent
-/// using `find_segment` to locate each segment file, with the last-opened file handle
-/// cached in `file_cache` to amortize `open` syscalls across sequential reads.
+/// using `find_segment` to locate each segment file, with recently-opened file handles
+/// cached in `file_cache` (LRU) to amortize `open` syscalls across reads.
 pub(crate) fn read_extents(
     lba: u64,
     lba_count: u32,
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
-    file_cache: &RefCell<Option<(Ulid, bool, fs::File)>>,
-    find_segment: impl Fn(Ulid, u64, Option<u32>) -> io::Result<PathBuf>,
+    file_cache: &RefCell<FileCache>,
+    find_segment: impl Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
 ) -> io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -1827,7 +1962,7 @@ pub(crate) fn read_extents(
 
         // Extract owned copies so the borrow of extent_index ends before
         // we mutate file_cache.
-        let (segment_id, body_offset, body_length, compressed, body_section_start, entry_idx) = {
+        let (segment_id, body_offset, body_length, compressed, body_section_start, body_source) = {
             let Some(loc) = extent_index.lookup(&er.hash) else {
                 continue; // hash not indexed — treat as unwritten
             };
@@ -1837,32 +1972,28 @@ pub(crate) fn read_extents(
                 loc.body_length,
                 loc.compressed,
                 loc.body_section_start,
-                loc.entry_idx,
+                loc.body_source,
             )
         };
 
-        // Reuse the cached file handle if it is for the same segment.
-        // For cached entries (entry_idx.is_some()), always call find_segment to
-        // check the .present bitset — the .body file may exist but the specific
-        // entry may not yet be fetched.
+        // For cached entries, always call find_segment to check the .present
+        // bitset — the .body file may exist but the specific entry may not
+        // yet be fetched.
         let mut cache = file_cache.borrow_mut();
-        let need_find =
-            cache.as_ref().map(|(id, _, _)| *id) != Some(segment_id) || entry_idx.is_some();
-        if need_find {
-            let path = find_segment(segment_id, body_section_start, entry_idx)?;
-            // .body files store body bytes starting at offset 0 (body-relative);
-            // full segment files store them starting at body_section_start.
-            let is_body = path.extension().is_some_and(|e| e == "body");
-            *cache = Some((segment_id, is_body, fs::File::open(path)?));
+        if matches!(body_source, BodySource::Cached(_)) || cache.get(segment_id).is_none() {
+            let path = find_segment(segment_id, body_section_start, body_source)?;
+            let layout = SegmentLayout::from_path(&path);
+            cache.insert(segment_id, layout, fs::File::open(&path)?);
         }
-        let (_, is_body, f) = cache.as_mut().expect("cache was just assigned Some above");
+        let (layout, f) = cache
+            .get(segment_id)
+            .expect("entry was just inserted or found");
 
         // body_offset is always body-relative (= stored_offset from the segment index).
         // For full segment files we must add body_section_start to get the file offset.
-        let file_body_offset = if *is_body {
-            body_offset
-        } else {
-            body_section_start + body_offset
+        let file_body_offset = match layout {
+            SegmentLayout::BodyOnly => body_offset,
+            SegmentLayout::Full => body_section_start + body_offset,
         };
 
         let block_count = (er.range_end - er.range_start) as usize;
@@ -1875,19 +2006,17 @@ pub(crate) fn read_extents(
             f.read_exact(&mut compressed_buf)?;
             let decompressed =
                 lz4_flex::decompress_size_prepended(&compressed_buf).map_err(|e| {
-                    let (cached_id, is_body_ref, _) = cache.as_ref().expect("cache assigned above");
                     log::error!(
-                        "lz4 decompression failed: lba={} segment={} cached_id={} is_body={} \
-                     bss={} body_offset={} body_length={} entry_idx={:?} \
+                        "lz4 decompression failed: lba={} segment={} layout={:?} \
+                     bss={} body_offset={} body_length={} body_source={:?} \
                      file_body_offset={} first_bytes={:?} err={}",
                         lba,
                         segment_id,
-                        cached_id,
-                        is_body_ref,
+                        layout,
                         body_section_start,
                         body_offset,
                         body_length,
-                        entry_idx,
+                        body_source,
                         file_body_offset,
                         &compressed_buf[..compressed_buf.len().min(16)],
                         e,
@@ -1906,14 +2035,13 @@ pub(crate) fn read_extents(
             ))?;
             if let Err(e) = f.read_exact(out_slice) {
                 let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
-                let (seg_id, is_body_ref, _) = cache.as_ref().expect("cache assigned above");
                 log::error!(
-                    "read_extents failed: lba={} segment={} is_body={} \
+                    "read_extents failed: lba={} segment={} layout={:?} \
                      bss={} body_offset={} body_length={} payload_block_offset={} \
                      file_body_offset={} read_len={} file_size={} err={}",
                     lba,
-                    seg_id,
-                    is_body_ref,
+                    segment_id,
+                    layout,
                     body_section_start,
                     body_offset,
                     body_length,
@@ -1937,8 +2065,8 @@ pub(crate) fn read_extents(
 ///   2. Ancestor forks (newest-first): `pending/`, `gc/*.applied`, `cache/<id>.body`
 ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
 ///
-/// When `entry_idx` is `Some`, a `cache/<id>.body` hit is only accepted if
-/// the corresponding bit in `cache/<id>.present` is set — otherwise the entry
+/// For `Cached` entries, a `cache/<id>.body` hit is only accepted if the
+/// corresponding bit in `cache/<id>.present` is set — otherwise the entry
 /// is not yet locally available and we fall through to the fetcher.
 ///
 /// `.idx` files live in `index/` (coordinator-written, permanent).
@@ -1952,7 +2080,7 @@ pub(crate) fn find_segment_in_dirs(
     ancestor_layers: &[AncestorLayer],
     fetcher: Option<&BoxFetcher>,
     body_section_start: u64,
-    entry_idx: Option<u32>,
+    body_source: BodySource,
 ) -> io::Result<PathBuf> {
     let sid = segment_id.to_string();
     for subdir in ["wal", "pending"] {
@@ -1972,10 +2100,13 @@ pub(crate) fn find_segment_in_dirs(
     }
     let cache_body = base_dir.join("cache").join(format!("{sid}.body"));
     if cache_body.exists() {
-        let entry_present = entry_idx.is_none_or(|idx| {
-            let present_path = base_dir.join("cache").join(format!("{sid}.present"));
-            segment::check_present_bit(&present_path, idx).unwrap_or(false)
-        });
+        let entry_present = match body_source {
+            BodySource::Local => true,
+            BodySource::Cached(idx) => {
+                let present_path = base_dir.join("cache").join(format!("{sid}.present"));
+                segment::check_present_bit(&present_path, idx).unwrap_or(false)
+            }
+        };
         if entry_present {
             return Ok(cache_body);
         }
@@ -1988,33 +2119,32 @@ pub(crate) fn find_segment_in_dirs(
         }
         let cache_body = layer.dir.join("cache").join(format!("{sid}.body"));
         if cache_body.exists() {
-            let entry_present = entry_idx.is_none_or(|idx| {
-                let present_path = layer.dir.join("cache").join(format!("{sid}.present"));
-                segment::check_present_bit(&present_path, idx).unwrap_or(false)
-            });
+            let entry_present = match body_source {
+                BodySource::Local => true,
+                BodySource::Cached(idx) => {
+                    let present_path = layer.dir.join("cache").join(format!("{sid}.present"));
+                    segment::check_present_bit(&present_path, idx).unwrap_or(false)
+                }
+            };
             if entry_present {
                 return Ok(cache_body);
             }
         }
     }
-    if let Some(fetcher) = fetcher {
+    if let (Some(fetcher), BodySource::Cached(idx)) = (fetcher, body_source) {
         let index_dir = base_dir.join("index");
         let body_dir = base_dir.join("cache");
-        if let Some(idx) = entry_idx {
-            fetcher.fetch_extent(
-                segment_id,
-                &index_dir,
-                &body_dir,
-                &segment::ExtentFetch {
-                    body_section_start,
-                    body_offset: 0,
-                    body_length: 0,
-                    entry_idx: idx,
-                },
-            )?;
-        } else {
-            fetcher.fetch(segment_id, &index_dir, &body_dir)?;
-        }
+        fetcher.fetch_extent(
+            segment_id,
+            &index_dir,
+            &body_dir,
+            &segment::ExtentFetch {
+                body_section_start,
+                body_offset: 0,
+                body_length: 0,
+                entry_idx: idx,
+            },
+        )?;
         return Ok(base_dir.join("cache").join(format!("{sid}.body")));
     }
     Err(io::Error::other(format!("segment not found: {sid}")))
@@ -2042,7 +2172,7 @@ pub struct ReadonlyVolume {
     ancestor_layers: Vec<AncestorLayer>,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
-    file_cache: RefCell<Option<(Ulid, bool, fs::File)>>,
+    file_cache: RefCell<FileCache>,
     fetcher: Option<BoxFetcher>,
 }
 
@@ -2059,7 +2189,7 @@ impl ReadonlyVolume {
             ancestor_layers,
             lbamap,
             extent_index,
-            file_cache: RefCell::new(None),
+            file_cache: RefCell::new(FileCache::default()),
             fetcher: None,
         })
     }
@@ -2081,7 +2211,7 @@ impl ReadonlyVolume {
         &self,
         segment_id: Ulid,
         body_section_start: u64,
-        entry_idx: Option<u32>,
+        body_source: BodySource,
     ) -> io::Result<PathBuf> {
         find_segment_in_dirs(
             segment_id,
@@ -2089,7 +2219,7 @@ impl ReadonlyVolume {
             &self.ancestor_layers,
             self.fetcher.as_ref(),
             body_section_start,
-            entry_idx,
+            body_source,
         )
     }
 
@@ -2300,7 +2430,7 @@ fn recover_wal(
                         body_offset,
                         body_length,
                         compressed,
-                        entry_idx: None,
+                        body_source: BodySource::Local,
                         body_section_start: 0,
                     },
                 );
@@ -5109,5 +5239,163 @@ mod tests {
         assert_eq!(vol.read(0, 1).unwrap(), data);
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- FileCache (CLOCK) tests ---
+
+    fn dummy_file() -> fs::File {
+        fs::File::open("/dev/null").unwrap()
+    }
+
+    fn ulid(n: u128) -> Ulid {
+        Ulid::from(n)
+    }
+
+    #[test]
+    fn file_cache_hit_and_miss() {
+        let mut cache = FileCache::new(4);
+        assert!(cache.get(ulid(1)).is_none());
+
+        cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
+        assert!(cache.get(ulid(1)).is_some());
+        assert!(cache.get(ulid(2)).is_none());
+    }
+
+    #[test]
+    fn file_cache_returns_correct_layout() {
+        let mut cache = FileCache::new(4);
+        cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(2), SegmentLayout::BodyOnly, dummy_file());
+
+        let (layout, _) = cache.get(ulid(1)).unwrap();
+        assert_eq!(layout, SegmentLayout::Full);
+
+        let (layout, _) = cache.get(ulid(2)).unwrap();
+        assert_eq!(layout, SegmentLayout::BodyOnly);
+    }
+
+    #[test]
+    fn file_cache_replace_in_place() {
+        let mut cache = FileCache::new(4);
+        cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(1), SegmentLayout::BodyOnly, dummy_file());
+
+        let (layout, _) = cache.get(ulid(1)).unwrap();
+        assert_eq!(layout, SegmentLayout::BodyOnly);
+    }
+
+    #[test]
+    fn file_cache_fills_empty_slots_before_evicting() {
+        let mut cache = FileCache::new(3);
+        cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(3), SegmentLayout::Full, dummy_file());
+
+        // All three should be present — no eviction yet.
+        assert!(cache.get(ulid(1)).is_some());
+        assert!(cache.get(ulid(2)).is_some());
+        assert!(cache.get(ulid(3)).is_some());
+    }
+
+    #[test]
+    fn file_cache_clock_evicts_unreferenced() {
+        let mut cache = FileCache::new(3);
+        cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(3), SegmentLayout::Full, dummy_file());
+
+        // Touch 2 and 3 so their referenced bits are set.
+        cache.get(ulid(2));
+        cache.get(ulid(3));
+
+        // Insert a 4th — should evict ulid(1) (unreferenced after insert,
+        // since insert sets referenced but the CLOCK sweep clears it).
+        // Actually: all three were inserted with referenced=true. Then we
+        // called get() on 2 and 3 (re-setting their bits). The hand starts
+        // at 0. On sweep: slot 0 (ulid 1) has referenced=true from insert,
+        // so it gets cleared and hand advances. Slot 1 (ulid 2) has
+        // referenced=true from get, cleared, hand advances. Slot 2 (ulid 3)
+        // has referenced=true from get, cleared, hand advances. Back to
+        // slot 0 (ulid 1) — now unreferenced — evicted.
+        cache.insert(ulid(4), SegmentLayout::Full, dummy_file());
+
+        assert!(
+            cache.get(ulid(1)).is_none(),
+            "ulid(1) should have been evicted"
+        );
+        assert!(cache.get(ulid(4)).is_some());
+    }
+
+    #[test]
+    fn file_cache_recently_accessed_survives_eviction() {
+        // With 3 slots, insert three entries. Access ulid(2) to refresh its
+        // referenced bit, then insert a 4th. The CLOCK sweep clears all
+        // referenced bits on the first pass, then evicts the entry at the
+        // hand position (slot 0 = ulid(1)) on the second pass.
+        // Crucially, get() on ulid(2) refreshes its bit *after* insert set it,
+        // so when the sweep clears it on the first pass, ulid(2) gets cleared
+        // like everyone else — but if we access it *between* two inserts, the
+        // second sweep finds it referenced again.
+        let mut cache = FileCache::new(3);
+        cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(3), SegmentLayout::Full, dummy_file());
+
+        // First overflow: inserts ulid(4). The sweep clears all three
+        // referenced bits (first pass), then evicts slot 0 (ulid(1)) on
+        // the second pass. Hand ends at slot 1.
+        cache.insert(ulid(4), SegmentLayout::Full, dummy_file());
+        assert!(cache.get(ulid(1)).is_none(), "ulid(1) evicted");
+
+        // Now touch ulid(2) — refreshes its referenced bit.
+        cache.get(ulid(2));
+
+        // Second overflow: inserts ulid(5). Hand is at slot 1.
+        // Slot 1 (ulid(2)) ref=true → cleared, hand→2.
+        // Slot 2 (ulid(3)) ref=false (cleared by first sweep, never re-accessed) → evicted.
+        cache.insert(ulid(5), SegmentLayout::Full, dummy_file());
+        assert!(cache.get(ulid(3)).is_none(), "ulid(3) evicted");
+        assert!(
+            cache.get(ulid(2)).is_some(),
+            "ulid(2) survived — was accessed"
+        );
+        assert!(cache.get(ulid(4)).is_some());
+        assert!(cache.get(ulid(5)).is_some());
+    }
+
+    #[test]
+    fn file_cache_evict_by_id() {
+        let mut cache = FileCache::new(4);
+        cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
+
+        cache.evict(ulid(1));
+        assert!(cache.get(ulid(1)).is_none());
+        assert!(cache.get(ulid(2)).is_some());
+    }
+
+    #[test]
+    fn file_cache_clear() {
+        let mut cache = FileCache::new(4);
+        cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
+
+        cache.clear();
+        assert!(cache.get(ulid(1)).is_none());
+        assert!(cache.get(ulid(2)).is_none());
+    }
+
+    #[test]
+    fn file_cache_evict_frees_slot_for_reuse() {
+        let mut cache = FileCache::new(2);
+        cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
+        cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
+
+        cache.evict(ulid(1));
+
+        // The freed slot should be reused without evicting ulid(2).
+        cache.insert(ulid(3), SegmentLayout::Full, dummy_file());
+        assert!(cache.get(ulid(2)).is_some());
+        assert!(cache.get(ulid(3)).is_some());
     }
 }

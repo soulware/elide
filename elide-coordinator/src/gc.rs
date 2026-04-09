@@ -99,6 +99,17 @@ pub const DONE_FILE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// this value would be a misconfiguration.
 const SWEEP_LIVE_CAP: u64 = 32 * 1024 * 1024;
 
+/// Maximum bytes per coalesced range-GET batch when fetching live bodies.
+/// Matches the cap used by the demand-fetch engine in elide-fetch.
+const RANGE_GET_MAX_BATCH: u64 = 4 * 1024 * 1024;
+
+/// Minimum wasted bytes per range-GET batch to justify targeted fetches over
+/// a single full body-section GET.  Each range-GET carries fixed overhead
+/// (round-trip latency, S3 request cost), so it must avoid downloading at
+/// least this many dead bytes to be worthwhile.  When `wasted_bytes /
+/// batch_count` falls below this threshold, a single full-GET is cheaper.
+const MIN_WASTE_PER_RANGE_GET: u64 = 128 * 1024;
+
 /// Which GC strategy was executed.
 #[derive(Debug, PartialEq)]
 pub enum GcStrategy {
@@ -545,6 +556,9 @@ const BLOCK_BYTES: u64 = 4096;
 /// Per-segment stats computed during the scan phase.
 struct SegmentStats {
     ulid_str: String,
+    /// `body_section_start` for this segment's S3 object (== .idx file size).
+    /// Used to compute absolute byte offsets for range-GETs into S3.
+    body_section_start: u64,
     /// Physical on-disk size (idx + DATA body bytes); used for small_segment_bytes threshold.
     file_size: u64,
     /// Logical live bytes: lba_length * BLOCK_BYTES summed over all live entries
@@ -631,10 +645,10 @@ fn collect_stats(
         // Read index from .idx — the only local file we need for stats.
         // Presence of .idx means the segment is confirmed in S3 (invariant:
         // .idx is written inside promote_segment IPC, after confirmed S3 PUT).
-        // body_section_start for .body files is 0 (body starts at byte 0);
-        // for full segments it is non-zero — compact_segments fetches the full
-        // segment from S3 and calls read_segment_index to get the correct value.
-        let idx_size = fs::metadata(&idx_path)?.len();
+        //
+        // idx_size == body_section_start: the .idx file is exactly the
+        // [0, body_section_start) prefix of the full S3 segment.
+        let idx_size = segment::idx_body_section_start(&idx_path)?;
         let (_, entries) = segment::read_and_verify_segment_index(&idx_path, vk)?;
 
         let mut live_lba_bytes: u64 = 0;
@@ -710,6 +724,7 @@ fn collect_stats(
         let file_size = idx_size + physical_body_bytes;
         result.push(SegmentStats {
             ulid_str,
+            body_section_start: idx_size,
             has_body_entries: physical_body_bytes > 0,
             file_size,
             live_lba_bytes,
@@ -742,6 +757,157 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// Fetch live extent body bytes from S3 into `candidate.live_entries[].data`.
+///
+/// Computes coalesced range-GET batches for the live body entries, then decides
+/// whether targeted range-GETs or a single full body-section GET is cheaper.
+/// The heuristic: range-GETs are worthwhile when the wasted bytes they avoid
+/// exceed `MIN_WASTE_PER_RANGE_GET` per batch; otherwise a single GET is
+/// cheaper despite downloading dead bytes.
+async fn fetch_live_bodies(
+    candidate: &mut SegmentStats,
+    volume_id: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<()> {
+    // Collect indices of live entries that carry body bytes.
+    let body_indices: Vec<usize> = candidate
+        .live_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(e.kind, EntryKind::Data | EntryKind::DedupRef) && e.stored_length > 0
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if body_indices.is_empty() {
+        return Ok(());
+    }
+
+    let key = segment_key(volume_id, &candidate.ulid_str)
+        .with_context(|| format!("building S3 key for {}", candidate.ulid_str))?;
+
+    // Sort live body entries by stored_offset and coalesce adjacent entries
+    // into batches.  Each batch is a contiguous byte range in the segment's
+    // body section, capped at RANGE_GET_MAX_BATCH bytes.
+    let mut sorted_indices = body_indices;
+    sorted_indices.sort_by_key(|&i| candidate.live_entries[i].stored_offset);
+
+    // batches: Vec<(batch_body_start, batch_body_end, &[sorted_index_positions])>
+    // We store start/end positions within sorted_indices rather than cloning.
+    let mut batches: Vec<(u64, u64, usize, usize)> = Vec::new(); // (body_start, body_end, si_start, si_end_inclusive)
+    {
+        let mut si = 0;
+        while si < sorted_indices.len() {
+            let first_idx = sorted_indices[si];
+            let batch_body_start = candidate.live_entries[first_idx].stored_offset;
+            let mut batch_body_end =
+                batch_body_start + candidate.live_entries[first_idx].stored_length as u64;
+            let mut si_end = si;
+
+            for (j, &idx) in sorted_indices.iter().enumerate().skip(si + 1) {
+                let e = &candidate.live_entries[idx];
+                if e.stored_offset != batch_body_end {
+                    break;
+                }
+                let new_end = batch_body_end + e.stored_length as u64;
+                if new_end - batch_body_start > RANGE_GET_MAX_BATCH {
+                    break;
+                }
+                batch_body_end = new_end;
+                si_end = j;
+            }
+
+            batches.push((batch_body_start, batch_body_end, si, si_end));
+            si = si_end + 1;
+        }
+    }
+
+    let total_body_bytes = candidate
+        .file_size
+        .saturating_sub(candidate.body_section_start);
+    let live_body_bytes: u64 = sorted_indices
+        .iter()
+        .map(|&i| candidate.live_entries[i].stored_length as u64)
+        .sum();
+    let wasted_bytes = total_body_bytes.saturating_sub(live_body_bytes);
+    let batch_count = batches.len() as u64;
+
+    let use_ranges = batch_count > 0 && wasted_bytes / batch_count >= MIN_WASTE_PER_RANGE_GET;
+
+    if use_ranges {
+        for &(batch_body_start, batch_body_end, si_start, si_end) in &batches {
+            let abs_start = (candidate.body_section_start + batch_body_start) as usize;
+            let abs_end = (candidate.body_section_start + batch_body_end) as usize;
+
+            let data = store
+                .get_range(&key, abs_start..abs_end)
+                .await
+                .with_context(|| {
+                    format!(
+                        "range-GET for {} (offset {}..{})",
+                        candidate.ulid_str, abs_start, abs_end,
+                    )
+                })?;
+
+            for &idx in &sorted_indices[si_start..=si_end] {
+                let e = &candidate.live_entries[idx];
+                let local_off = (e.stored_offset - batch_body_start) as usize;
+                let local_end = local_off + e.stored_length as usize;
+                candidate.live_entries[idx].data = data[local_off..local_end].to_vec();
+            }
+        }
+
+        tracing::info!(
+            "[gc] fetch {}: range-GET {} batch(es), fetched {} of {} body bytes (saved {}, {:.0}%)",
+            candidate.ulid_str,
+            batch_count,
+            live_body_bytes,
+            total_body_bytes,
+            wasted_bytes,
+            if total_body_bytes > 0 {
+                wasted_bytes as f64 / total_body_bytes as f64 * 100.0
+            } else {
+                0.0
+            },
+        );
+    } else {
+        // Single GET for the entire body section, slice out each live entry.
+        let body_start = candidate.body_section_start as usize;
+        let body_end = candidate.file_size as usize;
+        let body = store
+            .get_range(&key, body_start..body_end)
+            .await
+            .with_context(|| format!("fetching body section for {}", candidate.ulid_str))?;
+
+        for &idx in &sorted_indices {
+            let e = &candidate.live_entries[idx];
+            let off = e.stored_offset as usize;
+            let end = off + e.stored_length as usize;
+            candidate.live_entries[idx].data = body[off..end].to_vec();
+        }
+
+        let waste_per_batch = if batch_count > 0 {
+            wasted_bytes / batch_count
+        } else {
+            0
+        };
+        tracing::info!(
+            "[gc] fetch {}: full-body GET {} of {} body bytes \
+             (waste {}, {} batch(es) \u{2192} {}/batch < {} threshold)",
+            candidate.ulid_str,
+            total_body_bytes,
+            total_body_bytes,
+            wasted_bytes,
+            batch_count,
+            waste_per_batch,
+            MIN_WASTE_PER_RANGE_GET,
+        );
+    }
+
+    Ok(())
+}
+
 /// Read live extent bodies from each candidate, write a compacted segment,
 /// stage it in gc/, and write the gc/*.pending handoff file.
 ///
@@ -760,54 +926,17 @@ async fn compact_segments(
     let new_ulid_str = new_ulid.to_string();
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
 
-    // For each candidate: if it has live entries with bodies (DATA or REF),
-    // download the full segment from S3 to read the body bytes.  Zero extents
-    // carry no body data, so candidates with only zero extents skip the S3
-    // fetch entirely.
+    // For each candidate: fetch live extent bodies from S3 directly into
+    // memory.  Zero extents carry no body data, so candidates with only zero
+    // extents skip the S3 fetch entirely.
     // removed_hashes are already fully populated from collect_stats and need no fetch.
     let mut all_live: Vec<(String, SegmentEntry)> = Vec::new();
     let mut all_removed: Vec<(blake3::Hash, String)> = Vec::new();
     for candidate in &mut candidates {
-        let has_body_entries = candidate
-            .live_entries
-            .iter()
-            .any(|e| matches!(e.kind, EntryKind::Data | EntryKind::DedupRef));
+        fetch_live_bodies(candidate, volume_id, store)
+            .await
+            .with_context(|| format!("fetching bodies for {}", candidate.ulid_str))?;
 
-        if has_body_entries {
-            let fetch_path = gc_dir.join(format!("{}.fetch", candidate.ulid_str));
-
-            let key = segment_key(volume_id, &candidate.ulid_str)
-                .with_context(|| format!("building S3 key for {}", candidate.ulid_str))?;
-            let data = store
-                .get(&key)
-                .await
-                .with_context(|| format!("fetching segment {} from S3", candidate.ulid_str))?
-                .bytes()
-                .await
-                .with_context(|| format!("reading S3 body for {}", candidate.ulid_str))?;
-            tokio::fs::write(&fetch_path, &data)
-                .await
-                .with_context(|| format!("writing fetch file for {}", candidate.ulid_str))?;
-
-            // Read the full segment header to get body_section_start.
-            let (body_section_start, _) =
-                segment::read_segment_index(&fetch_path).with_context(|| {
-                    format!(
-                        "reading segment index from fetch for {}",
-                        candidate.ulid_str
-                    )
-                })?;
-
-            segment::read_extent_bodies(
-                &fetch_path,
-                body_section_start,
-                &mut candidate.live_entries,
-                segment::EntryKind::ALL_BODY,
-            )
-            .with_context(|| format!("reading bodies from {}", candidate.ulid_str))?;
-
-            let _ = fs::remove_file(&fetch_path);
-        }
         for entry in candidate.live_entries.drain(..) {
             all_live.push((candidate.ulid_str.clone(), entry));
         }
@@ -1148,6 +1277,7 @@ mod tests {
         fn make(total_lba_bytes: u64, live_lba_bytes: u64) -> SegmentStats {
             SegmentStats {
                 ulid_str: String::new(),
+                body_section_start: 0,
                 file_size: total_lba_bytes, // physical size irrelevant for density
                 live_lba_bytes,
                 total_lba_bytes,
@@ -1170,6 +1300,7 @@ mod tests {
         // Verify dead_lba_bytes() is available for the ≥2 case.
         let s = SegmentStats {
             ulid_str: String::new(),
+            body_section_start: 0,
             file_size: 1024 * 1024,
             live_lba_bytes: 800 * 1024,
             total_lba_bytes: 1024 * 1024,
@@ -1187,6 +1318,7 @@ mod tests {
         fn make(live_lba_bytes: u64) -> SegmentStats {
             SegmentStats {
                 ulid_str: String::new(),
+                body_section_start: 0,
                 file_size: 100,
                 live_lba_bytes,
                 total_lba_bytes: 100,
@@ -1688,6 +1820,7 @@ mod tests {
         let store = make_store();
         let candidate = SegmentStats {
             ulid_str: old_ulid.clone(),
+            body_section_start: 0,
             file_size: 17,
             live_lba_bytes: 0,
             total_lba_bytes: 17,
@@ -1958,5 +2091,225 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    // --- fetch_live_bodies tests ---
+
+    /// Helper: build a SegmentEntry with given kind, stored_offset, stored_length,
+    /// but empty data (fetch_live_bodies will populate it).
+    fn stub_entry(kind: EntryKind, stored_offset: u64, stored_length: u32) -> SegmentEntry {
+        SegmentEntry {
+            hash: blake3::hash(&stored_offset.to_le_bytes()),
+            start_lba: 0,
+            lba_length: 1,
+            compressed: false,
+            kind,
+            stored_offset,
+            stored_length,
+            data: Vec::new(),
+        }
+    }
+
+    /// Put a fake segment object in the store: `body_section_start` bytes of
+    /// zeros (index prefix) followed by `body` bytes.
+    async fn put_fake_segment(
+        store: &Arc<dyn ObjectStore>,
+        volume_id: &str,
+        ulid_str: &str,
+        body_section_start: u64,
+        body: &[u8],
+    ) {
+        let key = segment_key(volume_id, ulid_str).unwrap();
+        let mut data = vec![0u8; body_section_start as usize];
+        data.extend_from_slice(body);
+        store
+            .put(&key, bytes::Bytes::from(data).into())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_no_body_entries_skips_fetch() {
+        let store = make_store();
+        // No object in store — would fail if fetch_live_bodies tried to GET.
+        let mut candidate = SegmentStats {
+            ulid_str: Ulid::from_parts(1000, 1).to_string(),
+            body_section_start: 100,
+            file_size: 200,
+            live_lba_bytes: 0,
+            total_lba_bytes: 0,
+            has_body_entries: false,
+            live_entries: vec![
+                SegmentEntry::new_zero(0, 1),
+                SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 1, 1, 0, false),
+            ],
+            removed_hashes: Vec::new(),
+        };
+        fetch_live_bodies(&mut candidate, "vol", &store)
+            .await
+            .unwrap();
+        // No data populated (dedup_ref and zero have no body).
+        assert!(candidate.live_entries.iter().all(|e| e.data.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_full_get_when_waste_below_threshold() {
+        // Scenario: body section has 2 live entries that are nearly contiguous,
+        // so waste per batch is small → full-body GET is chosen.
+        let store = make_store();
+        let ulid_str = Ulid::from_parts(1000, 2).to_string();
+        let body_section_start: u64 = 256;
+
+        // Body: 8192 bytes total, two live entries of 4096 each at offsets 0 and 4096.
+        // No waste at all → full-GET path.
+        let body = vec![0xABu8; 8192];
+        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
+
+        let mut candidate = SegmentStats {
+            ulid_str: ulid_str.clone(),
+            body_section_start,
+            file_size: body_section_start + 8192,
+            live_lba_bytes: 8192,
+            total_lba_bytes: 8192,
+            has_body_entries: true,
+            live_entries: vec![
+                stub_entry(EntryKind::Data, 0, 4096),
+                stub_entry(EntryKind::Data, 4096, 4096),
+            ],
+            removed_hashes: Vec::new(),
+        };
+
+        fetch_live_bodies(&mut candidate, "vol", &store)
+            .await
+            .unwrap();
+
+        assert_eq!(candidate.live_entries[0].data.len(), 4096);
+        assert_eq!(candidate.live_entries[1].data.len(), 4096);
+        assert!(candidate.live_entries[0].data.iter().all(|&b| b == 0xAB));
+        assert!(candidate.live_entries[1].data.iter().all(|&b| b == 0xAB));
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_range_get_when_waste_above_threshold() {
+        // Scenario: body section is large (1MB), but live entries are small and
+        // separated by large dead gaps → range-GETs are chosen.
+        let store = make_store();
+        let ulid_str = Ulid::from_parts(1000, 3).to_string();
+        let body_section_start: u64 = 256;
+        let body_size: u64 = 1024 * 1024; // 1MB body section
+
+        // Fill body with position-dependent bytes so we can verify slicing.
+        let mut body = vec![0u8; body_size as usize];
+        // Live entry A: 4096 bytes at offset 0
+        for b in &mut body[0..4096] {
+            *b = 0xAA;
+        }
+        // Dead gap: offsets 4096..900_000
+        // Live entry B: 4096 bytes at offset 900_000
+        for b in &mut body[900_000..900_000 + 4096] {
+            *b = 0xBB;
+        }
+        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
+
+        let mut candidate = SegmentStats {
+            ulid_str: ulid_str.clone(),
+            body_section_start,
+            file_size: body_section_start + body_size,
+            live_lba_bytes: 8192,
+            total_lba_bytes: body_size,
+            has_body_entries: true,
+            live_entries: vec![
+                stub_entry(EntryKind::Data, 0, 4096),
+                stub_entry(EntryKind::Data, 900_000, 4096),
+            ],
+            removed_hashes: Vec::new(),
+        };
+
+        // Waste = 1MB - 8192 ≈ 1MB. Two batches (entries are far apart).
+        // Waste per batch = ~512KB >> 128KB threshold → range-GETs.
+        fetch_live_bodies(&mut candidate, "vol", &store)
+            .await
+            .unwrap();
+
+        assert_eq!(candidate.live_entries[0].data.len(), 4096);
+        assert_eq!(candidate.live_entries[1].data.len(), 4096);
+        assert!(candidate.live_entries[0].data.iter().all(|&b| b == 0xAA));
+        assert!(candidate.live_entries[1].data.iter().all(|&b| b == 0xBB));
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_coalesces_adjacent_entries() {
+        // Two adjacent entries should land in the same range-GET batch.
+        // We verify by checking that both get correct data from a large body
+        // with a big dead gap after them.
+        let store = make_store();
+        let ulid_str = Ulid::from_parts(1000, 4).to_string();
+        let body_section_start: u64 = 256;
+        let body_size: u64 = 1024 * 1024;
+
+        let mut body = vec![0u8; body_size as usize];
+        // Two adjacent entries at offset 0: 4096 + 4096 = 8192 bytes.
+        for b in &mut body[0..4096] {
+            *b = 0xCC;
+        }
+        for b in &mut body[4096..8192] {
+            *b = 0xDD;
+        }
+        // Rest is dead gap.
+        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
+
+        let mut candidate = SegmentStats {
+            ulid_str: ulid_str.clone(),
+            body_section_start,
+            file_size: body_section_start + body_size,
+            live_lba_bytes: 8192,
+            total_lba_bytes: body_size,
+            has_body_entries: true,
+            live_entries: vec![
+                stub_entry(EntryKind::Data, 0, 4096),
+                stub_entry(EntryKind::Data, 4096, 4096),
+            ],
+            removed_hashes: Vec::new(),
+        };
+
+        // Waste ≈ 1MB, 1 batch (adjacent → coalesced) → waste/batch ≈ 1MB >> 128KB.
+        fetch_live_bodies(&mut candidate, "vol", &store)
+            .await
+            .unwrap();
+
+        assert_eq!(candidate.live_entries[0].data, vec![0xCCu8; 4096]);
+        assert_eq!(candidate.live_entries[1].data, vec![0xDDu8; 4096]);
+    }
+
+    #[tokio::test]
+    async fn fetch_live_bodies_dedup_ref_treated_as_body() {
+        // DedupRef entries carry body bytes just like Data entries.
+        let store = make_store();
+        let ulid_str = Ulid::from_parts(1000, 5).to_string();
+        let body_section_start: u64 = 128;
+        let body_size: u64 = 1024 * 1024;
+
+        let mut body = vec![0u8; body_size as usize];
+        for b in &mut body[0..4096] {
+            *b = 0xEE;
+        }
+        put_fake_segment(&store, "vol", &ulid_str, body_section_start, &body).await;
+
+        let mut candidate = SegmentStats {
+            ulid_str: ulid_str.clone(),
+            body_section_start,
+            file_size: body_section_start + body_size,
+            live_lba_bytes: 4096,
+            total_lba_bytes: body_size,
+            has_body_entries: true,
+            live_entries: vec![stub_entry(EntryKind::DedupRef, 0, 4096)],
+            removed_hashes: Vec::new(),
+        };
+
+        fetch_live_bodies(&mut candidate, "vol", &store)
+            .await
+            .unwrap();
+
+        assert_eq!(candidate.live_entries[0].data, vec![0xEEu8; 4096]);
     }
 }
