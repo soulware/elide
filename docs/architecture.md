@@ -720,9 +720,15 @@ The consequence of pre-assignment is that `sweep_pending` — which may run whil
      includes the needed extent(s) plus neighbours for spatial locality
    - The segment index section encodes body_offset + body_length per extent,
      so the chunk boundaries can be derived precisely
-   - If a delta body is available and smaller, fetch from the delta instead
+   - If a delta body is available and smaller, fetch from the delta instead;
+     when multiple delta sources are available, prefer any source already
+     cached locally, then prefer the earliest (lowest ULID) among uncached
+     candidates — the earliest source maximises reuse because a single fetch
+     warms a base that can decode every subsequent derived version
 5. Write fetched bytes to cache/<ulid>.body; set bit in .present; decompress and return to VM
 ```
+
+**DedupRef cold read.** If the missing extent is a `DedupRef`, its own segment holds no bytes for it — the extent index resolves `hash → (canonical_segment, body_offset, body_length)` and the byte-range GET is issued against the **canonical** segment, not the referring one. This is the same code path as any other cold extent fetch; the only difference is the target segment ULID. Thin DedupRef upload (see formats.md § Segment File Format) is safe because every canonical target is pinned by construction.
 
 The kernel page cache sits above the block device and handles most hot reads. The local segment cache handles warm reads. S3 is the cold path.
 
@@ -820,16 +826,23 @@ This is **purely local and coordinator-free**: the shared filesystem layout is t
 
 Dedup scope is **all volumes on the local host**. The extent index covers the current volume's own tree (own + ancestor segments) plus, on a best-effort basis, all other volumes stored under the same common root. No remote or cross-host dedup check is performed. Dedup quality is highest for snapshot-derived volumes (ancestor segments already contain most of the data) and lower for freshly provisioned volumes; cross-volume dedup raises quality for volumes that share a common base image even without a snapshot relationship.
 
-**DedupRef entries reserve body space locally, filled before S3 upload.** When dedup fires, a REF record is written to the WAL with no body bytes — just the hash and LBA mapping. No data is duplicated at write time. The canonical-segment reference remains in the extent index and is used to serve local reads. In `pending/` segments, DedupRef entries use the same 57-byte index layout as DATA entries, with reserved body space (zero-filled via seek — a sparse hole on disk).
+**DedupRef entries carry no body bytes anywhere — local or S3.** When dedup fires, a REF record is written to the WAL with no body bytes — just the hash and LBA mapping. The canonical-segment reference remains in the extent index and is used to serve reads. In `pending/` and uploaded segments, DedupRef entries use the same 64-byte index layout as DATA entries, but the corresponding body region is a hole: sparse on disk locally and sparse on S3 after upload. No `materialise_segment` step fills the holes; the S3 object is **thin**.
 
-At S3 upload time, the segment is **materialised**: the coordinator calls `materialise_segment(ulid)` on the volume process, which copies `pending/<ulid>` and fills each live DedupRef's body hole with data from the canonical segment. Dead entries (LBA overwritten) are zero-filled — deleted data never reaches S3. The index section is unchanged; only the body section differs. The coordinator then reads the `.materialized` file and uploads it to S3.
+- **WAL / `pending/`:** DedupRef entries are index-only. The body region is a sparse hole on disk (hole-punched on platforms that support it, `seek`-past otherwise).
+- **S3:** uploaded thin — DedupRef body regions remain holes in the uploaded object. A DedupRef cold read issues a byte-range GET against the **canonical** segment, not the referring one. This is the same fetch path as any other cold extent.
+- **`cache/` (local):** `promote_to_cache` preserves the sparse body shape. The `.present` bitset marks only DATA entries as present; DedupRef entries have their bit unset. Reads of DedupRef data go through the extent index to the canonical segment.
+- **Read path (cache miss):** the read path resolves the hash through the extent index to `(canonical_segment, body_offset, body_length)` and issues the range GET against the canonical segment (see § Read Path).
+- **Extent index:** required for dedup detection at write time (`hash → canonical segment`) and for serving all DedupRef reads (`hash → canonical body location`). Thin upload makes the extent index a hard dependency of the S3 read path, not just the local read path.
+- **GC:** DATA and DedupRef entries in promoted segments both use the same 64-byte format and are treated uniformly by the coordinator with LBA-based liveness. Drain runs before GC in every coordinator tick, so `pending/` is empty when GC processes `index/*.idx`.
 
-- **WAL / `pending/`:** DedupRef entries have reserved body space (zero-filled). The `.materialized` sidecar has body holes filled for live entries. Both files share the same index section and signature.
-- **S3:** body bytes filled, segments self-contained. Each DedupRef entry has `body_offset` and `body_length` like DATA. No cross-segment GET is ever needed to read an S3 segment.
-- **`cache/` (local):** `promote_to_cache` promotes the original sparse body to `cache/`. The `.present` bitset marks only DATA entries as present; DedupRef entries have their bit unset. Reads of DedupRef data go through the extent index to the canonical segment.
-- **Read path (cache miss):** when a `.present = 0` DedupRef entry is needed, the read path resolves the hash through the extent index to the canonical segment. If the canonical is evicted, a demand-fetch retrieves the S3 segment (which has the body filled).
-- **Extent index:** required for dedup detection at write time (`hash → canonical segment`) and for serving reads from local DedupRef entries (`hash → canonical body location`).
-- **GC:** DATA and DedupRef entries in promoted segments both use the same 57-byte format and are treated uniformly by the coordinator with LBA-based liveness. Drain runs before GC in every coordinator tick, so `pending/` is empty when GC processes `index/*.idx`.
+**Pinning invariant (why thin upload is safe).** Thin DedupRef upload relies on every live DedupRef target being a segment GC is forbidden from rewriting or removing. The guarantee comes from two rules acting together:
+
+1. **Snapshot floor.** GC may not rewrite, compact, or remove any segment whose ULID is ≤ the latest snapshot ULID on that segment's owning volume. Pinned segments are stable targets for references.
+2. **First-snapshot pinning.** Any DedupRef written between snapshots targets a segment in the same live window (either a prior segment in this volume, or a segment in an already-pinned ancestor). When `snapshot()` advances the floor to the current max ULID, every segment written in that window — including every DedupRef target in this volume — becomes pinned atomically. Targets in an ancestor are already pinned by the ancestor's own snapshot floor.
+
+The invariant **"every DedupRef target ULID ≤ the snapshot floor on its owning volume"** therefore holds at all snapshot boundaries by construction. It is enforced by a `debug_assert!` in `snapshot()` and a proptest invariant in the simulation model; no runtime fallback is needed because violating it would require GC to rewrite a pinned segment, which is independently forbidden.
+
+An unsnapshotted volume may hold DedupRefs whose targets are in the same live window and not yet pinned — but such a volume has no S3 presence for those segments either, so the thin-upload question does not arise until the first snapshot, at which point the invariant is re-established.
 
 **Delta compression** is a separate concern from dedup and is **S3-only**. Local segment bodies never contain delta records — an entry in a local segment is either a full extent (DATA or REF record, data present in body) or a zero extent (ZERO record, no body, reads return zeros). At S3 upload time, extents that differ only slightly from extents in ancestor segments are stored as deltas in the delta body section of the S3 segment file (see [formats.md](formats.md)). The benefit is reduced S3 fetch size, not local storage cost. On fetch, the delta is applied and the full extent is materialised locally before being cached and served.
 
