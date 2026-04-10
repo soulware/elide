@@ -194,7 +194,7 @@ pub async fn gc_fork(
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
     let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
     let lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
-    let live_hashes = lbamap.live_hashes();
+    let live_hashes = lbamap.lba_referenced_hashes();
 
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
 
@@ -2145,7 +2145,7 @@ mod tests {
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
         let index = extentindex::rebuild(&rebuild_chain).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-        let live_hashes = lbamap.live_hashes();
+        let live_hashes = lbamap.lba_referenced_hashes();
 
         let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
 

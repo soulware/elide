@@ -399,7 +399,7 @@ pub fn simulate_coord_gc_local(
 
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
     let lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
-    let live_hashes = lba_map.live_hashes();
+    let live_hashes = lba_map.lba_referenced_hashes();
     let extent_index = extentindex::rebuild(&rebuild_chain).ok()?;
 
     compact_candidates_inner(
@@ -458,7 +458,7 @@ pub fn simulate_coord_gc_both_local(
     // Rebuild liveness snapshot once — shared by both passes.
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
     let lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
-    let live_hashes = lba_map.live_hashes();
+    let live_hashes = lba_map.lba_referenced_hashes();
     let extent_index = extentindex::rebuild(&rebuild_chain).ok()?;
 
     // Repack: first candidate (lowest priority / most likely stale).

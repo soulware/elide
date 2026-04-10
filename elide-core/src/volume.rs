@@ -634,7 +634,7 @@ impl Volume {
     pub fn repack(&mut self, min_live_ratio: f64) -> io::Result<CompactionStats> {
         use std::collections::HashSet;
 
-        let live: HashSet<blake3::Hash> = self.lbamap.live_hashes();
+        let live: HashSet<blake3::Hash> = self.lbamap.lba_referenced_hashes();
         let mut stats = CompactionStats::default();
 
         // Segments at or below the latest snapshot ULID are frozen: they may be
@@ -818,7 +818,7 @@ impl Volume {
     pub fn sweep_pending(&mut self) -> io::Result<CompactionStats> {
         use std::collections::HashSet;
 
-        let live: HashSet<blake3::Hash> = self.lbamap.live_hashes();
+        let live: HashSet<blake3::Hash> = self.lbamap.lba_referenced_hashes();
         let mut stats = CompactionStats::default();
 
         let floor: Option<Ulid> = latest_snapshot(&self.base_dir)?;
@@ -1245,7 +1245,7 @@ impl Volume {
             // was created.  Re-running it after a restart would incorrectly
             // cancel a committed handoff — the .applied state means the volume
             // already acknowledged that deleting the old segment is safe.
-            let live = self.lbamap.live_hashes();
+            let live = self.lbamap.lba_referenced_hashes();
             if !is_already_applied {
                 let stale: Vec<blake3::Hash> = old_ulid_by_hash
                     .keys()
@@ -1701,7 +1701,7 @@ impl Volume {
 
         // Any LBA-dead DATA entry whose hash is still referenced elsewhere
         // must keep its bytes. Only hash-dead entries get punched.
-        let live_hashes = self.lbamap.live_hashes();
+        let live_hashes = self.lbamap.lba_referenced_hashes();
 
         let mut out = fs::OpenOptions::new().write(true).open(&seg_path)?;
         let mut punched = 0usize;
@@ -4422,7 +4422,7 @@ mod tests {
                     use crate::{extentindex, lbamap};
                     let rebuild_chain = vec![(fork_dir.clone(), None)];
                     let lba_map = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-                    let _live_hashes = lba_map.live_hashes();
+                    let _live_hashes = lba_map.lba_referenced_hashes();
                     let extent_index = extentindex::rebuild(&rebuild_chain).unwrap();
 
                     let vk = crate::signing::load_verifying_key(
