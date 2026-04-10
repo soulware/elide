@@ -22,5 +22,6 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/design-gc-ulid-ordering.md](docs/design-gc-ulid-ordering.md) | Open design: GC ULID ordering race, single-mint invariant, proptest findings |
 | [docs/design-delta-compression.md](docs/design-delta-compression.md) | Design: delta compression via file-path matching, file-aware import, snapshot filemaps |
 | [docs/integrations.md](docs/integrations.md) | Integration targets: Docker, Firecracker, Cloud Hypervisor, Kubernetes — architecture, sequencing, open work |
+| [rfds/README.md](rfds/README.md) | Design decisions: alternatives considered, why each was rejected, and the lightweight RFD process |
 
 Start with [docs/overview.md](docs/overview.md).

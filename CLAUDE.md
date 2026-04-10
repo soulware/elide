@@ -50,7 +50,7 @@ These rules apply to all Rust code in this project. Follow them without needing 
 
 ## Documentation
 
-Design documentation is indexed in `README.md` and lives in `docs/`.
+Design documentation is indexed in `README.md` and lives in `docs/`. It captures *how the system works now*.
 
 - `docs/overview.md` — problem statement, key concepts, operation modes, empirical findings
 - `docs/findings.md` — empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification
@@ -59,6 +59,8 @@ Design documentation is indexed in `README.md` and lives in `docs/`.
 - `docs/operations.md` — GC, repacking, boot hints, filesystem metadata awareness
 - `docs/testing.md` — property-based tests: ULID monotonicity invariant, crash-recovery oracle, simulation model
 - `docs/reference.md` — lsvd reference comparison, implementation notes, open questions
+
+Design decisions — *why* the system is shaped the way it is, including alternatives considered and rejected — are recorded as short RFDs in `rfds/`. See [rfds/README.md](rfds/README.md) for the index and [RFD 0004](rfds/0004-lightweight-rfd-process.md) for the process.
 
 ## References
 
