@@ -1223,6 +1223,46 @@ pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathB
     }
 }
 
+/// Punch a hole in `file`, releasing the disk blocks backing `[offset, offset + length)`.
+///
+/// On Linux uses `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`:
+/// file size is preserved, reads of the punched range return zeros, and the
+/// underlying disk blocks are freed. On platforms without a direct equivalent
+/// (macOS, BSDs) the fallback zero-writes the range — reads still return
+/// zeros but the blocks remain allocated.
+pub fn punch_hole(file: &mut fs::File, offset: u64, length: u64) -> io::Result<()> {
+    if length == 0 {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use nix::fcntl::{FallocateFlags, fallocate};
+        fallocate(
+            file,
+            FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            offset as i64,
+            length as i64,
+        )
+        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        file.seek(SeekFrom::Start(offset))?;
+        const CHUNK: usize = 64 * 1024;
+        let chunk_size = CHUNK.min(length as usize);
+        let zeros = vec![0u8; chunk_size];
+        let mut remaining = length;
+        while remaining > 0 {
+            let n = (remaining as usize).min(chunk_size);
+            file.write_all(&zeros[..n])?;
+            remaining -= n as u64;
+        }
+        Ok(())
+    }
+}
+
 /// Collect all `.idx` files in `index_dir` whose stem is a valid ULID.
 ///
 /// Used by `lbamap` and `extentindex` during startup rebuild. The `index/`

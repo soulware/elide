@@ -1662,25 +1662,38 @@ impl Volume {
         Ok(())
     }
 
-    /// Produce `pending/<ulid>.materialized` — a copy of the segment with
-    /// DedupRef body holes filled from canonical segments.  Called by the
+    /// Produce `pending/<ulid>.materialized` — a sparse, upload-ready copy of
+    /// the segment with dead-entry body regions hole-punched.  Called by the
     /// coordinator before reading the segment for S3 upload.
     ///
-    /// The index section is identical between the original and materialized
-    /// files — only the body section differs (holes filled with real data).
-    /// The signature covers header + index, so it remains valid.
+    /// **Thin DedupRef upload.** Live `DedupRef` body regions are left as
+    /// holes: the S3 object is uploaded sparse, and DedupRef cold reads
+    /// resolve through the extent index to the canonical segment's body
+    /// (which is pinned by construction — see `snapshot()` for the invariant
+    /// and `docs/architecture.md § Dedup` for the rationale). No canonical
+    /// segment bytes are copied into this sidecar.
     ///
-    /// If the segment has no DedupRef entries, a hard link to the original
-    /// is created (zero-cost copy).
+    /// **Dead-entry hole-punching.** Entries that are both LBA-dead (no LBA
+    /// maps to their hash) and hash-dead (no live LBA references their hash
+    /// anywhere in the volume) are hole-punched with
+    /// `fallocate(FALLOC_FL_PUNCH_HOLE)` on Linux, or zero-written on other
+    /// platforms. This guarantees deleted data never leaves the local host
+    /// via S3 upload and frees the local disk blocks on Linux.
     ///
-    /// The original `pending/<ulid>` is never modified — the extent index
+    /// LBA-dead-but-hash-alive entries keep their body bytes — GC's
+    /// `collect_stats` keeps Data entries alive on extent+hash liveness (not
+    /// just LBA liveness), so it may later read this body; hole-punching it
+    /// would corrupt a future GC output.
+    ///
+    /// **Fast path.** Segments with no dead entries are served by a hard
+    /// link to the original — the original is already upload-ready.
+    ///
+    /// The original `pending/<ulid>` is never modified; the extent index
     /// stays valid and reads continue to use the original file.
     ///
     /// Idempotent: if `.materialized` already exists, returns Ok immediately.
     /// `promote_segment` cleans up `.materialized` alongside the original.
     pub fn materialise_segment(&self, ulid: Ulid) -> io::Result<()> {
-        use std::io::{Read, Seek, SeekFrom, Write};
-
         let ulid_str = ulid.to_string();
         let pending_dir = self.base_dir.join("pending");
         let seg_path = pending_dir.join(&ulid_str);
@@ -1693,115 +1706,61 @@ impl Volume {
         let (body_section_start, entries) =
             segment::read_and_verify_segment_index(&seg_path, &self.verifying_key)?;
 
-        // Classify each entry as live or dead.  Dead entries must have their
-        // body bytes zeroed before upload to S3 — deleted data must never
-        // leave the local machine.  Live DedupRef entries need their body
-        // holes filled from the canonical segment.
-        //
-        // Liveness is checked at two levels:
+        // Classify dead entries. Liveness is checked at two levels:
         //  - LBA-live: this entry's start_lba still maps to this hash.
         //  - Hash-alive: the hash is referenced by ANY LBA in the volume.
-        //
-        // An entry can be LBA-dead but hash-alive when a dedup write at a
-        // different LBA references the same content.  Such entries must keep
-        // their body data intact: GC's collect_stats keeps Data entries alive
-        // on extent+hash liveness (not just LBA liveness), so it may later
-        // fetch this body from S3.  Zeroing it would cause GC to copy zeros
-        // into its output, corrupting reads.
-        let has_dedup_ref = entries
-            .iter()
-            .any(|e| e.kind == EntryKind::DedupRef && e.stored_length > 0);
-        let has_dead = entries
-            .iter()
-            .any(|e| e.stored_length > 0 && self.lbamap.hash_at(e.start_lba) != Some(e.hash));
+        // Only entries that are both LBA-dead and hash-dead are safe to
+        // hole-punch. An LBA-dead-but-hash-alive entry is still referenced
+        // by another LBA (dedup at a different LBA) and GC may need its
+        // body bytes.
+        let live_hashes_opt: Option<std::collections::HashSet<blake3::Hash>> = {
+            let has_dead = entries
+                .iter()
+                .any(|e| e.stored_length > 0 && self.lbamap.hash_at(e.start_lba) != Some(e.hash));
+            if has_dead {
+                Some(self.lbamap.live_hashes())
+            } else {
+                None
+            }
+        };
 
-        // Fast path: no dedup refs and no dead entries — hard link the original.
-        if !has_dedup_ref && !has_dead {
+        // Fast path: no dead entries → hard-link the original. Live DedupRef
+        // entries stay as holes, which is exactly what we want to upload.
+        let Some(live_hashes) = live_hashes_opt else {
             fs::hard_link(&seg_path, &mat_path)?;
             return Ok(());
-        }
+        };
 
-        let live_hashes = self.lbamap.live_hashes();
-
-        // Copy the original segment, then patch body regions in place.
+        // Slow path: copy and hole-punch dead regions.
         let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
         fs::copy(&seg_path, &tmp_path)?;
         let mut out = fs::OpenOptions::new().write(true).open(&tmp_path)?;
 
-        let mut filled = 0usize;
-        let mut zeroed = 0usize;
+        let mut punched = 0usize;
         for entry in &entries {
-            if entry.stored_length == 0 {
+            if entry.stored_length == 0 || entry.kind == EntryKind::Inline {
                 continue;
             }
-            // Inline entries: data is in the inline section, not body.
-            // The inline section was already copied verbatim; nothing to patch.
-            if entry.kind == EntryKind::Inline {
-                continue;
-            }
-
             let lba_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
             let hash_alive = live_hashes.contains(&entry.hash);
-
-            if !lba_live && !hash_alive {
-                // Truly deleted: no LBA references this hash anywhere.
-                // Zero-fill the body region so deleted data is not uploaded.
-                let zeros = vec![0u8; entry.stored_length as usize];
-                out.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
-                out.write_all(&zeros)?;
-                zeroed += 1;
+            if lba_live || hash_alive {
                 continue;
             }
-
-            if entry.kind == EntryKind::DedupRef {
-                // DedupRef with live hash: fill the body hole from the
-                // canonical segment.  This covers both LBA-live refs and
-                // LBA-dead-but-hash-alive refs — GC may fetch either from S3.
-                let Some(loc) = self.extent_index.lookup(&entry.hash) else {
-                    // Should not happen for a live entry, but if the extent
-                    // index is stale, leave the hole zero-filled rather than
-                    // failing the entire materialisation.
-                    zeroed += 1;
-                    let zeros = vec![0u8; entry.stored_length as usize];
-                    out.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
-                    out.write_all(&zeros)?;
-                    continue;
-                };
-                out.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
-                if let Some(ref idata) = loc.inline_data {
-                    out.write_all(idata)?;
-                } else {
-                    let canonical_path = self.find_segment_file(
-                        loc.segment_id,
-                        loc.body_section_start,
-                        loc.body_source,
-                    )?;
-                    let file_offset = match SegmentLayout::from_path(&canonical_path) {
-                        SegmentLayout::BodyOnly => loc.body_offset,
-                        SegmentLayout::Full => loc.body_section_start + loc.body_offset,
-                    };
-                    let mut f = fs::File::open(&canonical_path)?;
-                    f.seek(SeekFrom::Start(file_offset))?;
-                    // io::copy uses copy_file_range/fcopyfile where available,
-                    // avoiding a userspace round-trip for the extent bytes.
-                    let n = io::copy(&mut f.take(loc.body_length as u64), &mut out)?;
-                    if n != loc.body_length as u64 {
-                        return Err(io::Error::other(
-                            "short read filling dedup ref from canonical segment",
-                        ));
-                    }
-                }
-                filled += 1;
-            }
-            // Data/Zero with live hash: body bytes are already correct
-            // from the copy.
+            // Truly dead: no LBA references this hash anywhere. Punch a hole
+            // so deleted data is neither uploaded to S3 nor kept on local disk.
+            segment::punch_hole(
+                &mut out,
+                body_section_start + entry.stored_offset,
+                entry.stored_length as u64,
+            )?;
+            punched += 1;
         }
         out.sync_data()?;
         drop(out);
 
         log::info!(
-            "materialise {ulid_str}: filled {filled} dedup-ref holes, \
-             zeroed {zeroed} dead entries, {} entries total",
+            "materialise {ulid_str}: punched {punched} dead entry holes, \
+             {} entries total (DedupRef holes preserved as thin upload)",
             entries.len()
         );
 
@@ -3971,9 +3930,11 @@ mod tests {
     }
 
     #[test]
-    fn materialise_segment_fills_dedup_ref_body_holes() {
-        // materialise_segment must fill DedupRef body holes with the canonical
-        // segment's body bytes, without changing the index section.
+    fn materialise_segment_leaves_dedup_ref_holes_thin() {
+        // materialise_segment produces a thin sidecar: DedupRef body regions
+        // are left as holes, not filled from the canonical segment. Thin
+        // upload is safe because the canonical target is pinned (see the
+        // first-snapshot pinning invariant in snapshot()).
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -4003,10 +3964,9 @@ mod tests {
             "S2 should contain a DedupRef before materialisation"
         );
 
-        // Materialise S2.
+        // Materialise S2. No dead entries → fast path hard-link to original.
         vol.materialise_segment(s2_ulid).unwrap();
 
-        // Read the .materialized file — it should have the same index as original.
         let mat_path = base
             .join("pending")
             .join(format!("{}.materialized", s2_ulid));
@@ -4014,33 +3974,89 @@ mod tests {
 
         let (mat_bss, mat_entries) =
             segment::read_and_verify_segment_index(&mat_path, &vol.verifying_key).unwrap();
-        // Index should still contain DedupRef entries (same as original).
         assert!(
             mat_entries.iter().any(|e| e.kind == EntryKind::DedupRef),
             ".materialized should still contain DedupRef entries (index unchanged)"
         );
 
-        // Verify the body bytes of the DedupRef are now filled with real data.
+        // Verify every DedupRef region in the sidecar reads as zeros — i.e.
+        // the body hole from the original was NOT filled with canonical bytes.
+        // (On the fast path this is a hard link to the original, which already
+        // has the hole.)
         use std::io::{Read, Seek, SeekFrom};
         let mut mat_file = fs::File::open(&mat_path).unwrap();
+        let mut found_dedup_ref = false;
         for entry in &mat_entries {
             if entry.kind == EntryKind::DedupRef {
-                let mut body = vec![0u8; entry.stored_length as usize];
+                found_dedup_ref = true;
+                let mut body = vec![0xFFu8; entry.stored_length as usize];
                 mat_file
                     .seek(SeekFrom::Start(mat_bss + entry.stored_offset))
                     .unwrap();
                 mat_file.read_exact(&mut body).unwrap();
-                let resolved = if entry.compressed {
-                    lz4_flex::decompress_size_prepended(&body).unwrap()
-                } else {
-                    body
-                };
-                assert_eq!(
-                    resolved, data,
-                    "DedupRef body in .materialized must match original data"
+                assert!(
+                    body.iter().all(|b| *b == 0),
+                    "DedupRef body region must remain a hole (all zeros) in thin upload"
                 );
             }
         }
+        assert!(found_dedup_ref, "expected at least one DedupRef entry");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn materialise_segment_hole_punches_dead_entries() {
+        // An entry whose LBA has been overwritten and whose hash is no longer
+        // referenced anywhere must have its body region hole-punched in the
+        // .materialized sidecar so deleted data never leaves the host.
+        // High-entropy data avoids compression below the inline threshold,
+        // guaranteeing the entry lands in the body section (not inline).
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let secret: Vec<u8> = (0..8192).map(|i| (i * 17 + 31) as u8).collect();
+        vol.write(0, &secret).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let ulids = pending_ulids(&base);
+        assert_eq!(ulids.len(), 1);
+        let seg_ulid = ulids[0];
+
+        // Overwrite LBA 0-1 with different content. Hash of `secret` is no
+        // longer referenced anywhere → fully dead. Do not promote so the
+        // overwrite stays in the WAL and the pending segment still holds the
+        // now-dead entry.
+        let replacement: Vec<u8> = (0..8192).map(|i| (i * 23 + 41) as u8).collect();
+        vol.write(0, &replacement).unwrap();
+
+        vol.materialise_segment(seg_ulid).unwrap();
+        let mat_path = base
+            .join("pending")
+            .join(format!("{}.materialized", seg_ulid));
+        assert!(mat_path.exists());
+
+        use std::io::{Read, Seek, SeekFrom};
+        let (mat_bss, mat_entries) =
+            segment::read_and_verify_segment_index(&mat_path, &vol.verifying_key).unwrap();
+        let dead_entry = mat_entries
+            .iter()
+            .find(|e| e.kind == EntryKind::Data && e.start_lba == 0)
+            .expect("should have a Data entry at LBA 0");
+        assert!(dead_entry.stored_length > 0);
+
+        // The dead region must read as zeros. On Linux it is a true sparse
+        // hole; on macOS it is a zero-write fallback — both read as zeros.
+        let mut mat_file = fs::File::open(&mat_path).unwrap();
+        let mut body = vec![0xFFu8; dead_entry.stored_length as usize];
+        mat_file
+            .seek(SeekFrom::Start(mat_bss + dead_entry.stored_offset))
+            .unwrap();
+        mat_file.read_exact(&mut body).unwrap();
+        assert!(
+            body.iter().all(|b| *b == 0),
+            "dead entry body must be punched to zeros in .materialized"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }

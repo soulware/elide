@@ -180,7 +180,7 @@ The same `rename + fsync_dir` pattern applies to all segment-creating renames: W
 8. Rename pending/<ULID> → segments/<ULID>
 ```
 
-S3 objects are **thin**: DedupRef body regions are not materialised before upload, and dead-entry body regions are hole-punched locally prior to upload so the local file and the S3 object share the same sparse shape. Dead `DedupRef` fallback regions (where the extent-index entry has been pruned since write time) are treated the same as dead `Data` entries — hole-punched, not zero-written. See § Segment File Format for why thin DedupRef upload is safe by construction.
+The local `pending/<ulid>` file is **sparse**: DedupRef body regions are not materialised before upload, and dead-entry body regions are hole-punched locally (Linux) or zero-written (other platforms). S3 itself does not understand sparse files — the uploaded object's byte count equals `body_length` regardless, and hole regions are transmitted and stored as zeros. The sparseness is a local-disk optimisation; real S3 storage savings come from GC repack dropping dead extents. See § Segment File Format — FLAG_DEDUP_REF for why thin DedupRef upload is safe by construction.
 
 Under **delta compression** the S3 object is derived from the local file (body section identical, delta body appended, header/index updated). The local file can be streamed directly.
 
@@ -285,13 +285,15 @@ The delta table is only present when at least one entry has `FLAG_HAS_DELTAS` se
 
 `lba_length × 4096` always gives the uncompressed extent size. `stored_length` gives the stored (possibly compressed) size.
 
-**FLAG_DEDUP_REF entries** use the same 64-byte layout as DATA entries. The body region is reserved at write time but not populated: locally the file is left sparse (hole-punched on platforms that support it, zero-filled otherwise), and on S3 the uploaded object is written thin — the body hole is preserved, not materialised. Reads resolve through the extent index to the canonical segment's body.
+**FLAG_DEDUP_REF entries** use the same 64-byte layout as DATA entries. The body region is reserved at write time but not populated: the file is left sparse locally (hole-punched on Linux via `fallocate(FALLOC_FL_PUNCH_HOLE)`, zero-filled elsewhere). Reads resolve through the extent index to the canonical segment's body, so nothing ever reads those bytes from the referring segment's body.
+
+**Thin upload is a local-disk optimisation, not an S3 one.** The S3 PUT reads the local file via normal I/O, so hole-punched regions transmit as zeros and S3 stores them verbatim — the uploaded object's byte count equals `body_length` either way. The wins are (1) local disk blocks freed on Linux, (2) a simpler upload pipeline that no longer fetches canonical bytes to fill DedupRef holes, and (3) dead-entry body bytes are never transmitted intact (deleted data leak prevention). Segment-level S3 storage savings come from a different mechanism: GC repack rewrites segments to drop dead extents before they accumulate, which is where dedup-driven storage wins actually materialise. A future optimisation could compact DedupRef regions out of the uploaded object by rewriting the index with new Data offsets and re-signing; deferred — see `docs/reference.md`.
 
 Thin DedupRef upload is sound because every live DedupRef points at a **pinned** segment by construction: `extent_index` rebuild only admits canonical `Data` entries, and the snapshot floor forbids GC from rewriting or removing any segment whose ULID is ≤ the latest snapshot on its owning volume. A writable fork's DedupRefs point at parent segments below the branch-point ULID (always pinned); a volume's own DedupRefs point at prior segments that will be pinned on its next snapshot. See architecture.md § Dedup for the first-snapshot pinning invariant.
 
 Dead entries (LBA overwritten since the DedupRef was written) are hole-punched alongside zero extents; subsequent GC repack removes them.
 
-In `cache/`, `promote_to_cache` writes a `.present` bitset marking only DATA entries as present; DedupRef entries have their bit unset. Reads of DedupRef data go through the extent index to the canonical segment. If the canonical is evicted, a demand-fetch issues a byte-range GET against the canonical segment (same path as any other cold extent fetch). See architecture.md § Dedup for the full rationale.
+In `cache/`, `promote_to_cache` writes a `.present` bitset marking only DATA entries as present; DedupRef entries have their bit unset and their body regions stay as holes in the cache file on Linux. Reads of DedupRef data go through the extent index to the canonical segment. If the canonical is evicted, a demand-fetch issues a byte-range GET against the canonical segment (same path as any other cold extent fetch). See architecture.md § Dedup for the full rationale.
 
 **FLAG_ZERO entries** carry only the LBA mapping with ZERO_HASH. No extent index lookup is performed for these entries — the read path returns zeros directly. Zero entries must be present in the segment index (and in the serialised manifest) to correctly mask ancestor data; they are never omitted even though they have no body bytes.
 
