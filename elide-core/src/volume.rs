@@ -1973,6 +1973,53 @@ impl Volume {
         // branch point is self-describing. Falls back to a fresh ULID only when
         // no segments exist (e.g. first snapshot on an empty fork).
         let snap_ulid = self.last_segment_ulid.unwrap_or_else(|| self.mint.next());
+
+        // First-snapshot pinning invariant (see docs/architecture.md § Dedup).
+        // Every DedupRef written in this volume resolves through the extent
+        // index to a canonical `Data` entry; the entry's segment_id is the
+        // DedupRef's target. At snapshot time, every own-volume target must
+        // have ULID <= snap_ulid so that advancing the floor pins every live
+        // DedupRef atomically. Violation would mean a future write raced the
+        // snapshot and leaked an unpinned reference — a correctness bug.
+        // Ancestor targets are pinned by their own volume's floor and are
+        // excluded from this check.
+        #[cfg(debug_assertions)]
+        {
+            let mut own_segments: std::collections::HashSet<Ulid> =
+                std::collections::HashSet::new();
+            own_segments.insert(self.wal_ulid);
+            for entry in fs::read_dir(self.base_dir.join("pending"))?.flatten() {
+                if let Some(s) = entry.file_name().to_str()
+                    && !s.contains('.')
+                    && let Ok(u) = Ulid::from_string(s)
+                {
+                    own_segments.insert(u);
+                }
+            }
+            if let Ok(idx_files) = segment::collect_idx_files(&self.base_dir.join("index")) {
+                for p in idx_files {
+                    if let Some(u) = p
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .and_then(|s| Ulid::from_string(s).ok())
+                    {
+                        own_segments.insert(u);
+                    }
+                }
+            }
+            for (_hash, loc) in self.extent_index.iter() {
+                if own_segments.contains(&loc.segment_id) {
+                    debug_assert!(
+                        loc.segment_id <= snap_ulid,
+                        "first-snapshot pinning invariant violated: extent index \
+                         references own segment {} which is > snap_ulid {}",
+                        loc.segment_id,
+                        snap_ulid,
+                    );
+                }
+            }
+        }
+
         let snap_ulid_str = snap_ulid.to_string();
         let snapshots_dir = self.base_dir.join("snapshots");
         fs::create_dir_all(&snapshots_dir)?;

@@ -129,6 +129,11 @@ impl ExtentIndex {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    /// Iterate `(hash, location)` pairs. Ordering is unspecified.
+    pub fn iter(&self) -> impl Iterator<Item = (&blake3::Hash, &ExtentLocation)> {
+        self.inner.iter()
+    }
 }
 
 impl Default for ExtentIndex {
