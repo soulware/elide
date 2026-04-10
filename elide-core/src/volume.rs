@@ -1767,9 +1767,9 @@ impl Volume {
                     out.write_all(&zeros)?;
                     continue;
                 };
-                // Canonical source may be an inline extent (data in memory).
-                let data = if let Some(ref idata) = loc.inline_data {
-                    idata.to_vec()
+                out.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
+                if let Some(ref idata) = loc.inline_data {
+                    out.write_all(idata)?;
                 } else {
                     let canonical_path = self.find_segment_file(
                         loc.segment_id,
@@ -1782,13 +1782,15 @@ impl Volume {
                     };
                     let mut f = fs::File::open(&canonical_path)?;
                     f.seek(SeekFrom::Start(file_offset))?;
-                    let mut buf = vec![0u8; loc.body_length as usize];
-                    f.read_exact(&mut buf)?;
-                    buf
-                };
-
-                out.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
-                out.write_all(&data)?;
+                    // io::copy uses copy_file_range/fcopyfile where available,
+                    // avoiding a userspace round-trip for the extent bytes.
+                    let n = io::copy(&mut f.take(loc.body_length as u64), &mut out)?;
+                    if n != loc.body_length as u64 {
+                        return Err(io::Error::other(
+                            "short read filling dedup ref from canonical segment",
+                        ));
+                    }
+                }
                 filled += 1;
             }
             // Data/Zero with live hash: body bytes are already correct
