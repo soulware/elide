@@ -9,6 +9,7 @@ arc-swap       = "1"
 bitflags       = "2"
 blake3         = "1"
 crossbeam-channel = "0.5"
+ext4-view      = { version = "0.9", features = ["std"] }
 log            = "0.4"
 ed25519-dalek  = { version = "2", features = ["rand_core"] }
 lz4_flex       = "0.11"

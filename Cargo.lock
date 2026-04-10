@@ -789,6 +789,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "ed25519-dalek",
+ "ext4-view",
  "log",
  "lz4_flex",
  "nix 0.29.0",
