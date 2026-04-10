@@ -10,8 +10,6 @@
 // Raw ext4 (--from-file):
 //   1. Import the ext4 image directly into an Elide volume via elide_core::import
 
-mod filemap;
-
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -157,7 +155,8 @@ fn run_from_file(
             }
         },
     )?;
-    filemap::generate(ext4_path, vol_dir).context("generate filemap")?;
+    // The filemap is written by import_image as a side effect of the
+    // ext4 scan (see elide_core::import).
     write_meta(vol_dir, &ext4_path.display().to_string(), "", "")?;
     serve_promote(vol_dir).context("serve promote IPC")?;
     eprintln!("Done. Volume ready at {}", vol_dir.display());
@@ -291,8 +290,7 @@ async fn run_oci(
         },
     )?;
 
-    // 8. Generate filemap (ext4 path → content hash) for delta compression
-    filemap::generate(&ext4_path, vol_dir).context("generate filemap")?;
+    // (Filemap is written as a side effect of import_image above.)
 
     // 9. Optionally save flat ext4 for boot-trace analysis
     if let Some(dst) = save_flat {
