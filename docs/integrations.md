@@ -51,6 +51,9 @@ Two pieces of infrastructure unblock all integration targets:
 
 **Rootfs:** OCI images imported via `elide import` are already usable as Docker
 images — this is the primary use case and requires no block device integration.
+The reverse direction (publishing a volume *as* an OCI image, and a containerd
+snapshotter that preserves demand-fetch end-to-end) is captured as future
+exploration in [`design-oci-export.md`](design-oci-export.md).
 
 **Data volumes (current):**
 ```
