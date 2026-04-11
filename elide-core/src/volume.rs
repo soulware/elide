@@ -690,16 +690,21 @@ impl Volume {
             let (mut live_entries, dead_entries): (Vec<_>, Vec<_>) =
                 entries.drain(..).partition(|e| match e.kind {
                     EntryKind::Zero => self.lbamap.hash_at(e.start_lba) == Some(ZERO_HASH),
-                    EntryKind::DedupRef => self.lbamap.hash_at(e.start_lba) == Some(e.hash),
+                    EntryKind::DedupRef | EntryKind::Delta => {
+                        self.lbamap.hash_at(e.start_lba) == Some(e.hash)
+                    }
                     EntryKind::Data | EntryKind::Inline => live.contains(&e.hash),
                 });
 
             // Remove dead entries from the extent index (only those pointing at
             // this segment — entries pointing elsewhere belong to another copy).
-            // Thin DedupRef and Zero entries are not in the extent index.
+            // Thin DedupRef, Zero, and Delta entries are not in the extent index.
             let mut removed = 0usize;
             for entry in &dead_entries {
-                if entry.kind == EntryKind::Zero || entry.kind == EntryKind::DedupRef {
+                if matches!(
+                    entry.kind,
+                    EntryKind::Zero | EntryKind::DedupRef | EntryKind::Delta
+                ) {
                     continue;
                 }
                 if self
@@ -779,7 +784,7 @@ impl Volume {
                                 },
                             );
                         }
-                        EntryKind::DedupRef | EntryKind::Zero => {}
+                        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => {}
                     }
                 }
             } else {
@@ -984,7 +989,7 @@ impl Volume {
                             },
                         );
                     }
-                    EntryKind::DedupRef | EntryKind::Zero => {}
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => {}
                 }
             }
         }
@@ -1800,7 +1805,7 @@ impl Volume {
         for entry in &self.pending_entries {
             match entry.kind {
                 EntryKind::Data | EntryKind::Inline => {}
-                EntryKind::DedupRef | EntryKind::Zero => continue,
+                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
             }
             let idata = if entry.kind == EntryKind::Inline {
                 entry.data.clone().map(Vec::into_boxed_slice)
@@ -1821,18 +1826,20 @@ impl Volume {
             );
         }
         {
-            let (mut data, mut refs, mut zero, mut inline) = (0usize, 0usize, 0usize, 0usize);
+            let (mut data, mut refs, mut zero, mut inline, mut delta) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
             for e in &self.pending_entries {
                 match e.kind {
                     EntryKind::Data => data += 1,
                     EntryKind::DedupRef => refs += 1,
                     EntryKind::Zero => zero += 1,
                     EntryKind::Inline => inline += 1,
+                    EntryKind::Delta => delta += 1,
                 }
             }
             log::info!(
                 "flush {segment_ulid}: {data} data, {inline} inline, {refs} dedup-ref, \
-                 {zero} zero ({} entries total)",
+                 {zero} zero, {delta} delta ({} entries total)",
                 self.pending_entries.len()
             );
         }

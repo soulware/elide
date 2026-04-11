@@ -1123,6 +1123,25 @@ async fn compact_segments(
                     e.data.take().unwrap_or_default(),
                 ));
             }
+            EntryKind::Delta => {
+                // Delta entries carry no body bytes in the thin format.
+                // Pass them through the compactor unchanged: the delta blob
+                // stays in this segment's delta body section (carried by
+                // rewrite_with_deltas elsewhere) and the source_hash is kept
+                // alive via the lba_referenced_hashes fold. Reads resolve
+                // via extent_index.lookup(source_hash) then zstd-dict
+                // decompress.
+                debug_assert!(
+                    e.stored_offset == 0 && e.stored_length == 0,
+                    "Delta entry must have zero stored_offset and stored_length"
+                );
+                new_entries.push(SegmentEntry::new_delta(
+                    e.hash,
+                    e.start_lba,
+                    e.lba_length,
+                    e.delta_options.clone(),
+                ));
+            }
         }
     }
 

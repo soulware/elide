@@ -251,7 +251,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
             for entry in entries {
                 match entry.kind {
                     EntryKind::Data | EntryKind::Inline => {}
-                    EntryKind::DedupRef | EntryKind::Zero => continue,
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
                 }
                 let idata = if entry.kind == EntryKind::Inline {
                     let start = entry.stored_offset as usize;
@@ -314,7 +314,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
             for (raw_idx, entry) in entries.iter().enumerate() {
                 match entry.kind {
                     EntryKind::Data | EntryKind::Inline => {}
-                    EntryKind::DedupRef | EntryKind::Zero => continue,
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
                 }
                 let idata = if entry.kind == EntryKind::Inline {
                     let start = entry.stored_offset as usize;

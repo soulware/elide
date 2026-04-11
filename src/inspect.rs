@@ -410,6 +410,7 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     let mut dedup_ref_count = 0usize;
     let mut zero_count = 0usize;
     let mut inline_count = 0usize;
+    let mut delta_count = 0usize;
     let mut data_body_bytes = 0u64;
     let mut dedup_ref_body_bytes = 0u64;
     for e in &entries {
@@ -424,8 +425,10 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
             }
             EntryKind::Zero => zero_count += 1,
             EntryKind::Inline => inline_count += 1,
+            EntryKind::Delta => delta_count += 1,
         }
     }
+    let _ = delta_count; // TODO: report delta-count alongside the other kinds
     let fetchable_count = data_count + dedup_ref_count;
 
     // Count set bits in .present, capped at fetchable_count to ignore padding
