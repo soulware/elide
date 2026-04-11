@@ -403,18 +403,31 @@ fn read_inline_section(seg_path: &Path, entries: &[SegmentEntry]) -> io::Result<
     Ok(buf)
 }
 
-/// Read the stored (possibly lz4-compressed) body bytes for an extent
-/// in a source volume. Handles both cache-body files and full pending
-/// segment files — the two shapes sources can be in at delta time.
+/// Read the stored (possibly lz4-compressed) bytes for a source extent.
+///
+/// Inline entries are served directly from `loc.inline_data`, which the
+/// extent-index rebuild already populates from the source segment's
+/// `.idx` inline section — the `body_offset`/`body_length` fields on
+/// an Inline location are inline-section-relative and must not be used
+/// as a body seek. For non-inline entries, seek into `cache/<id>.body`
+/// (drained sources) or the full `pending/<id>` segment file.
 fn read_source_extent(source_dir: &Path, loc: &ExtentLocation) -> io::Result<Vec<u8>> {
+    if let Some(inline) = loc.inline_data.as_deref() {
+        return Ok(inline.to_vec());
+    }
+
     let seg_id = loc.segment_id.to_string();
 
+    // A `.body` cache file contains only the body section — byte 0 of
+    // the file is byte 0 of the body data — so the seek position is
+    // `body_offset` alone. `body_section_start` on the ExtentLocation
+    // always reflects the full segment's header+index+inline prefix
+    // length, which is the correct adjustment for reads against a
+    // full segment file but must NOT be added for a `.body` read.
     let cache_body = source_dir.join("cache").join(format!("{seg_id}.body"));
     if cache_body.exists() {
         let mut f = fs::File::open(&cache_body)?;
-        // For cache/.body files, body_section_start is 0 so body_offset
-        // is the absolute file offset.
-        f.seek(SeekFrom::Start(loc.body_section_start + loc.body_offset))?;
+        f.seek(SeekFrom::Start(loc.body_offset))?;
         let mut buf = vec![0u8; loc.body_length as usize];
         f.read_exact(&mut buf)?;
         return Ok(buf);
