@@ -97,6 +97,7 @@ struct CacheInfo {
     dedup_ref_count: usize,
     zero_count: usize,
     inline_count: usize,
+    delta_count: usize,
     /// Entries with body data (Data + DedupRef) — the ones that can be fetched.
     fetchable_count: usize,
     /// How many fetchable entries have their present bit set.
@@ -128,6 +129,7 @@ struct SegInfo {
     body_bytes: u64,
     lba_blocks: u64,
     dedup_ref_count: usize,
+    delta_count: usize,
     error: Option<String>,
 }
 
@@ -235,14 +237,20 @@ fn print_totals(t: &Totals) {
         } else {
             "0%".to_owned()
         };
+        let delta_part = if t.cache_delta > 0 {
+            format!("  delta {}", fmt_commas(t.cache_delta as u64))
+        } else {
+            String::new()
+        };
         println!(
-            "Cache: {} segment{}  data {} ({})  dedup_ref {} ({})  zero {}  present {}/{} ({})  body file {} on disk",
+            "Cache: {} segment{}  data {} ({})  dedup_ref {} ({}){}  zero {}  present {}/{} ({})  body file {} on disk",
             t.cache_files,
             if t.cache_files == 1 { "" } else { "s" },
             fmt_commas(t.cache_data as u64),
             fmt_size(t.cache_data_body),
             fmt_commas(t.cache_dedup_ref as u64),
             fmt_size(t.cache_dedup_ref_body),
+            delta_part,
             fmt_commas(t.cache_zero as u64),
             fmt_commas(t.cache_present as u64),
             fmt_commas(t.cache_fetchable as u64),
@@ -320,6 +328,10 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                         .iter()
                         .filter(|e| e.kind == EntryKind::DedupRef)
                         .count();
+                    let delta_count = entries
+                        .iter()
+                        .filter(|e| e.kind == EntryKind::Delta)
+                        .count();
                     let body_bytes: u64 = entries
                         .iter()
                         .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::DedupRef))
@@ -333,6 +345,7 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                         body_bytes,
                         lba_blocks,
                         dedup_ref_count,
+                        delta_count,
                         error: None,
                     }
                 }
@@ -343,6 +356,7 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                     body_bytes: 0,
                     lba_blocks: 0,
                     dedup_ref_count: 0,
+                    delta_count: 0,
                     error: Some(e.to_string()),
                 },
             }
@@ -390,6 +404,7 @@ fn collect_cache_dir(dir: &Path) -> io::Result<Vec<CacheInfo>> {
                 dedup_ref_count: 0,
                 zero_count: 0,
                 inline_count: 0,
+                delta_count: 0,
                 fetchable_count: 0,
                 present_count: 0,
                 data_body_bytes: 0,
@@ -410,6 +425,7 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     let mut dedup_ref_count = 0usize;
     let mut zero_count = 0usize;
     let mut inline_count = 0usize;
+    let mut delta_count = 0usize;
     let mut data_body_bytes = 0u64;
     let mut dedup_ref_body_bytes = 0u64;
     for e in &entries {
@@ -424,6 +440,7 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
             }
             EntryKind::Zero => zero_count += 1,
             EntryKind::Inline => inline_count += 1,
+            EntryKind::Delta => delta_count += 1,
         }
     }
     let fetchable_count = data_count + dedup_ref_count;
@@ -454,6 +471,7 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
         dedup_ref_count,
         zero_count,
         inline_count,
+        delta_count,
         fetchable_count,
         present_count,
         data_body_bytes,
@@ -475,6 +493,7 @@ struct Totals {
     cache_data: usize,
     cache_dedup_ref: usize,
     cache_zero: usize,
+    cache_delta: usize,
     cache_fetchable: usize,
     cache_present: usize,
     cache_data_body: u64,
@@ -502,6 +521,7 @@ fn accumulate(node: &NodeInfo, t: &mut Totals) {
         t.cache_data += f.data_count;
         t.cache_dedup_ref += f.dedup_ref_count;
         t.cache_zero += f.zero_count;
+        t.cache_delta += f.delta_count;
         t.cache_fetchable += f.fetchable_count;
         t.cache_present += f.present_count;
         t.cache_data_body += f.data_body_bytes;
@@ -603,14 +623,24 @@ fn print_seg_section(label: &str, segs: &[SegInfo], prefix: &str, always_show: b
         } else {
             String::new()
         };
+        let delta_note = if s.delta_count > 0 {
+            format!(
+                ", {} delta{}",
+                s.delta_count,
+                if s.delta_count == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "{p}{}  {}  {} entries, {} body, {} LBA blocks{}",
+            "{p}{}  {}  {} entries, {} body, {} LBA blocks{}{}",
             s.ulid,
             fmt_size(s.file_size),
             s.entry_count,
             fmt_size(s.body_bytes),
             s.lba_blocks,
             ref_note,
+            delta_note,
         );
     }
 }
@@ -657,6 +687,9 @@ fn print_cache_section(cache: &[CacheInfo], prefix: &str) {
                 "{indent}inline:    {:>8}",
                 fmt_commas(f.inline_count as u64),
             );
+        }
+        if f.delta_count > 0 {
+            println!("{indent}delta:     {:>8}", fmt_commas(f.delta_count as u64),);
         }
         println!(
             "{indent}present:   {:>8} / {} fetchable ({})",

@@ -10,8 +10,6 @@
 // Raw ext4 (--from-file):
 //   1. Import the ext4 image directly into an Elide volume via elide_core::import
 
-mod filemap;
-
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -157,8 +155,10 @@ fn run_from_file(
             }
         },
     )?;
-    filemap::generate(ext4_path, vol_dir).context("generate filemap")?;
+    // The filemap is written by import_image as a side effect of the
+    // ext4 scan (see elide_core::import).
     write_meta(vol_dir, &ext4_path.display().to_string(), "", "")?;
+    run_delta_stage(vol_dir, signer.as_ref())?;
     serve_promote(vol_dir).context("serve promote IPC")?;
     eprintln!("Done. Volume ready at {}", vol_dir.display());
     Ok(())
@@ -291,8 +291,7 @@ async fn run_oci(
         },
     )?;
 
-    // 8. Generate filemap (ext4 path → content hash) for delta compression
-    filemap::generate(&ext4_path, vol_dir).context("generate filemap")?;
+    // (Filemap is written as a side effect of import_image above.)
 
     // 9. Optionally save flat ext4 for boot-trace analysis
     if let Some(dst) = save_flat {
@@ -307,10 +306,52 @@ async fn run_oci(
     // 9. Write volume metadata
     write_meta(vol_dir, image, &digest, &target_arch.to_string())?;
 
+    // 9b. File-aware delta compression against extent_index sources.
+    // Runs with the ephemeral signer still in memory so no key material
+    // leaves this process.
+    run_delta_stage(vol_dir, signer.as_ref())?;
+
     // 10. Serve promote IPC until coordinator drains all pending/ segments.
     serve_promote(vol_dir).context("serve promote IPC")?;
 
     eprintln!("Done. Volume ready at {}", vol_dir.display());
+    Ok(())
+}
+
+/// Run the filemap-based delta stage against every pending segment,
+/// rewriting matching DATA entries as thin Delta entries that reference
+/// locally-available source bodies from the extent-index lineage.
+///
+/// No-ops when the volume has no extent-index sources, no filemap, or
+/// no convertible fragments. Any failure here is logged as a warning
+/// and swallowed — delta compression is an optimisation, and a failed
+/// stage should never block the import from entering its serve phase.
+fn run_delta_stage(
+    vol_dir: &Path,
+    signer: &dyn elide_core::segment::SegmentSigner,
+) -> anyhow::Result<()> {
+    let by_id_dir = vol_dir
+        .parent()
+        .context("vol_dir has no parent; cannot resolve by_id_dir")?;
+    match elide_core::delta_compute::rewrite_pending_with_deltas(vol_dir, by_id_dir, signer) {
+        Ok(stats) if stats.entries_converted > 0 => {
+            let ratio = if stats.original_body_bytes > 0 {
+                100.0 - (stats.delta_body_bytes as f64 / stats.original_body_bytes as f64 * 100.0)
+            } else {
+                0.0
+            };
+            eprintln!(
+                "Delta: converted {} entries across {} segments, {} -> {} bytes ({:.0}% savings)",
+                stats.entries_converted,
+                stats.segments_rewritten,
+                stats.original_body_bytes,
+                stats.delta_body_bytes,
+                ratio
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("WARN: delta stage failed: {e:#}"),
+    }
     Ok(())
 }
 

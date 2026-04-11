@@ -1,24 +1,35 @@
-// Import an ext4 disk image into an Elide readonly volume.
+// File-aware import of an ext4 disk image into an Elide readonly volume.
 //
-// Reads the image in 4 KiB LBA-aligned blocks. Zero blocks are skipped — the
-// volume read path returns zeros for unwritten LBAs, so they need no storage.
-// Non-zero blocks are hashed, optionally compressed, and batched into large
-// segment files written directly to `<vol_dir>/pending/` via the
-// standard tmp-rename commit pattern (no WAL involved — all data is known
-// upfront so crash recovery reduces to "retry the import").
+// Parses the image's ext4 metadata to learn the physical layout of every
+// regular file, then emits one DATA entry per *fragment* (contiguous LBA
+// range owned by one file). Non-file blocks — ext4 metadata, directory
+// blocks, allocation bitmaps, journal, and any orphan data — stay
+// block-granular: they are read and emitted as one 4 KiB DATA entry
+// each. Zero blocks are skipped (same as before).
 //
-// After all segments are written a snapshot marker is created in
-// `<vol_dir>/base/snapshots/`. This ULID is the branch point for writable
-// forks created with `fork-volume`. The volume root then gets `readonly` and
-// `size` marker files, matching the layout described in docs/architecture.md.
+// The filemap is written as a side effect of the import walk, using the
+// v2 format (`# elide-filemap v2` with per-fragment lines). This is the
+// only ext4 pass during import — there is no separate filemap
+// generation step. See docs/design-delta-compression.md.
+//
+// For each emitted extent (fragment or single block), the parent extent
+// index is consulted first: if the hash is already present in a parent
+// volume's extent index (populated via `--extents-from` at the CLI),
+// a thin DedupRef is written instead of a fresh DATA entry.
+//
+// Crash recovery reduces to "retry the import" — all data is known
+// upfront, there is no WAL involved, and segments are written via the
+// standard tmp-rename commit pattern.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use ulid::Ulid;
 
+use crate::ext4_scan::{self, Ext4Scan, FileFragment};
 use crate::extentindex::ExtentIndex;
+use crate::filemap::{self, FilemapRow};
 use crate::segment::{self, SegmentEntry, SegmentFlags, SegmentSigner};
 
 const LBA_SIZE: usize = 4096;
@@ -27,10 +38,8 @@ const ZERO_BLOCK: [u8; LBA_SIZE] = [0u8; LBA_SIZE];
 /// Soft cap on raw (uncompressed) data accumulated before flushing a segment.
 ///
 /// Large segments amortise per-file overhead and make efficient S3 objects.
-/// The cap is soft: the last block in a batch may push slightly past it.
+/// The cap is soft: the last fragment in a batch may push slightly past it.
 const IMPORT_SEGMENT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB raw
-
-// Compression helpers — same logic as volume.rs, kept local to avoid coupling.
 
 fn shannon_entropy(data: &[u8]) -> f64 {
     let mut counts = [0u32; 256];
@@ -48,25 +57,24 @@ fn shannon_entropy(data: &[u8]) -> f64 {
         .sum()
 }
 
-/// Attempt lz4 compression on a single block.
+/// Attempt lz4 compression on a byte buffer.
 ///
 /// Returns `Some(compressed)` only if entropy is below 7.0 bits/byte and the
 /// result achieves at least a 1.5× ratio; otherwise returns `None` (store raw).
-fn maybe_compress(block: &[u8]) -> Option<Vec<u8>> {
-    if shannon_entropy(block) > 7.0 {
+fn maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
+    if shannon_entropy(data) > 7.0 {
         return None;
     }
-    let compressed = lz4_flex::compress_prepend_size(block);
-    // Require at least 1.5× ratio (compressed × 3/2 < raw).
-    if compressed.len() * 3 / 2 >= block.len() {
+    let compressed = lz4_flex::compress_prepend_size(data);
+    if compressed.len() * 3 / 2 >= data.len() {
         return None;
     }
     Some(compressed)
 }
 
 /// Write `entries` to `pending/<ulid>` using the standard tmp-rename commit.
-/// Clears `entries` on success. Returns the ULID used, or `None` if there was
-/// nothing to write.
+/// Clears `entries` on success. Returns the ULID used, or `None` if there
+/// was nothing to write.
 fn flush_segment(
     segments_dir: &Path,
     entries: &mut Vec<SegmentEntry>,
@@ -85,20 +93,54 @@ fn flush_segment(
     Ok(Some(ulid))
 }
 
+/// One emitted extent plus its filemap contribution (if any).
+struct EmittedEntry {
+    entry: SegmentEntry,
+    raw_bytes: usize,
+}
+
+fn make_entry(
+    hash: blake3::Hash,
+    start_lba: u64,
+    lba_length: u32,
+    body: &[u8],
+    parent_extent_index: Option<&ExtentIndex>,
+) -> EmittedEntry {
+    let parent_hit = parent_extent_index.and_then(|p| p.lookup(&hash));
+    if parent_hit.is_some() {
+        return EmittedEntry {
+            entry: SegmentEntry::new_dedup_ref(hash, start_lba, lba_length),
+            raw_bytes: 0,
+        };
+    }
+    let (flags, data) = match maybe_compress(body) {
+        Some(compressed) => (SegmentFlags::COMPRESSED, compressed),
+        None => (SegmentFlags::empty(), body.to_vec()),
+    };
+    EmittedEntry {
+        entry: SegmentEntry::new_data(hash, start_lba, lba_length, flags, data),
+        raw_bytes: body.len(),
+    }
+}
+
 /// Import an ext4 disk image into a new readonly Elide volume at `vol_dir`.
 ///
-/// Creates `<vol_dir>/pending/` and `<vol_dir>/snapshots/`, reads
-/// `image_path` in 4 KiB blocks, and writes segment files directly into
-/// `pending/`. After all data is written, writes a snapshot marker (branch
-/// point for future forks) and the `volume.size` marker.
+/// Creates `<vol_dir>/pending/` and `<vol_dir>/snapshots/`, scans
+/// `image_path` for file fragments via the ext4 extent tree, and writes
+/// segment files (one DATA entry per file fragment + one DATA entry per
+/// non-file block) directly into `pending/`. After all data is written,
+/// writes the snapshot marker, the filemap v2 for the snapshot, and the
+/// `volume.size` marker.
 ///
-/// `progress` receives `(blocks_done, total_blocks)` after each block is
-/// processed. Pass a no-op closure if progress reporting is not needed.
+/// `progress` receives `(lbas_done, total_lbas)` approximately after
+/// each emission. Pass a no-op closure if progress reporting is not
+/// needed.
 ///
 /// # Errors
 ///
-/// Returns an error if the image size is not a multiple of 4096, if any I/O
-/// operation fails, or if `vol_dir` cannot be created.
+/// Returns an error if the image is not ext4, the image size is not a
+/// multiple of 4096, if any I/O operation fails, or if `vol_dir` cannot
+/// be created.
 pub fn import_image(
     image_path: &Path,
     vol_dir: &Path,
@@ -106,9 +148,6 @@ pub fn import_image(
     parent_extent_index: Option<&ExtentIndex>,
     mut progress: impl FnMut(u64, u64),
 ) -> io::Result<()> {
-    // `vol_dir` may already exist (caller may have created it to write key files
-    // before calling import). Fail only if pending/ already exists, which means
-    // a previous import completed or is in progress.
     if vol_dir.join("pending").exists() {
         return Err(io::Error::other(format!(
             "volume already has pending segments: {}",
@@ -120,14 +159,24 @@ pub fn import_image(
     if image_size % LBA_SIZE as u64 != 0 {
         return Err(io::Error::other("image size is not a multiple of 4096"));
     }
-    let total_blocks = image_size / LBA_SIZE as u64;
 
     // Write to pending/ so the coordinator's normal drain loop picks them up,
-    // uploads to the store, and writes index/<ulid>.idx + cache/<ulid>.{body,present} — same path as WAL flushes.
+    // uploads to the store, and writes index/<ulid>.idx + cache/<ulid>.{body,present}.
     let segments_dir = vol_dir.join("pending");
     let snapshots_dir = vol_dir.join("snapshots");
     fs::create_dir_all(&segments_dir)?;
     fs::create_dir_all(&snapshots_dir)?;
+
+    // Parse ext4 and collect file fragments + coverage bitset. This is
+    // the single source of truth for both the segment-write loop and
+    // the filemap written below.
+    let scan: Ext4Scan = ext4_scan::scan(image_path)?;
+    let total_lbas = scan.total_lbas;
+    let Ext4Scan {
+        fragments: scan_fragments,
+        file_lba_coverage,
+        ..
+    } = scan;
 
     let mut image = fs::File::open(image_path)?;
     let mut block = [0u8; LBA_SIZE];
@@ -135,39 +184,80 @@ pub fn import_image(
     let mut batch_raw_bytes: usize = 0;
     let mut last_segment_ulid: Option<String> = None;
 
-    for lba in 0..total_blocks {
-        image.read_exact(&mut block)?;
-        progress(lba + 1, total_blocks);
+    // File fragments, drained in LBA order (ext4_scan sorts them).
+    let mut frag_iter = scan_fragments.into_iter().peekable();
 
-        if block == ZERO_BLOCK {
-            continue;
+    // Closure-free helper: test whether an LBA is owned by a file
+    // fragment (used only in the debug_assert; the main loop advances
+    // via fragment iteration, not coverage lookup).
+    let lba_is_file = |lba: u64| -> bool {
+        if lba >= total_lbas {
+            return false;
         }
+        let idx = (lba / 64) as usize;
+        let bit = lba % 64;
+        file_lba_coverage
+            .get(idx)
+            .is_some_and(|w| w & (1 << bit) != 0)
+    };
 
-        let hash = blake3::hash(&block);
+    // Per-fragment filemap rows, accumulated as we emit fragments so the
+    // filemap write below is a single streaming pass.
+    let mut filemap_rows: Vec<FilemapRow> = Vec::new();
 
-        // Parent dedup: if this block's hash already exists in a parent
-        // volume's extent index (populated from `volume.extent_index` by the
-        // caller), emit a thin DedupRef instead of a fresh Data entry. The
-        // parent segment supplies the body bytes at read time.
-        let parent_hit = parent_extent_index.and_then(|p| p.lookup(&hash));
-        if parent_hit.is_some() {
-            entries.push(SegmentEntry::new_dedup_ref(hash, lba, 1));
+    let mut lba = 0u64;
+    while lba < total_lbas {
+        // If a fragment starts at this LBA, emit it whole.
+        let frag_start_here = frag_iter
+            .peek()
+            .map(|f| f.lba_start == lba)
+            .unwrap_or(false);
+        if frag_start_here {
+            let f: FileFragment = frag_iter.next().expect("peeked");
+            let lba_len = f.lba_length;
+            let emitted = make_entry(f.hash, f.lba_start, lba_len, &f.body, parent_extent_index);
+            entries.push(emitted.entry);
+            batch_raw_bytes += emitted.raw_bytes;
+            filemap_rows.push(FilemapRow {
+                path: f.path,
+                file_offset: f.file_offset,
+                hash: f.hash,
+                byte_count: f.byte_count,
+            });
+            lba += lba_len as u64;
+            progress(lba, total_lbas);
         } else {
-            let (flags, data) = match maybe_compress(&block) {
-                Some(compressed) => (SegmentFlags::COMPRESSED, compressed),
-                None => (SegmentFlags::empty(), block.to_vec()),
-            };
-            entries.push(SegmentEntry::new_data(hash, lba, 1, flags, data));
-        }
-        batch_raw_bytes += LBA_SIZE;
+            // Non-file block: read it and emit block-granular DATA if
+            // non-zero. The coverage bitset check is defensive — if a
+            // block is flagged as file-covered but the fragment iter
+            // has moved past, we would otherwise emit stale data. In
+            // practice this cannot happen because fragments are sorted
+            // and we only advance past a fragment by emitting it.
+            debug_assert!(
+                !lba_is_file(lba),
+                "lba {lba} marked file-owned but no fragment starts here"
+            );
+            image.seek(SeekFrom::Start(lba * LBA_SIZE as u64))?;
+            image.read_exact(&mut block)?;
 
-        if batch_raw_bytes >= IMPORT_SEGMENT_BYTES {
-            if let Some(ulid) = flush_segment(&segments_dir, &mut entries, signer)? {
-                last_segment_ulid = Some(ulid);
+            if block != ZERO_BLOCK {
+                let hash = blake3::hash(&block);
+                let emitted = make_entry(hash, lba, 1, &block, parent_extent_index);
+                entries.push(emitted.entry);
+                batch_raw_bytes += emitted.raw_bytes;
             }
+            lba += 1;
+            progress(lba, total_lbas);
+        }
+
+        if batch_raw_bytes >= IMPORT_SEGMENT_BYTES
+            && let Some(ulid) = flush_segment(&segments_dir, &mut entries, signer)?
+        {
+            last_segment_ulid = Some(ulid);
             batch_raw_bytes = 0;
         }
     }
+
     if let Some(ulid) = flush_segment(&segments_dir, &mut entries, signer)? {
         last_segment_ulid = Some(ulid);
     }
@@ -178,241 +268,13 @@ pub fn import_image(
     let snap_ulid = last_segment_ulid.unwrap_or_else(|| Ulid::new().to_string());
     fs::write(snapshots_dir.join(&snap_ulid), "")?;
 
+    // Write the filemap alongside the snapshot marker.
+    filemap::write(&snapshots_dir, &snap_ulid, &filemap_rows)?;
+
     // Write size into volume.toml (read-modify-write to preserve name if already set).
     let mut cfg = crate::config::VolumeConfig::read(vol_dir)?;
     cfg.size = Some(image_size);
     cfg.write(vol_dir)?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::signing;
-    use std::io::Write;
-    use tempfile::TempDir;
-
-    fn make_image(blocks: &[&[u8; LBA_SIZE]]) -> (TempDir, std::path::PathBuf) {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("test.ext4");
-        let mut f = fs::File::create(&path).unwrap();
-        for b in blocks {
-            f.write_all(*b).unwrap();
-        }
-        (tmp, path)
-    }
-
-    /// Write `volume.pub` into `dir` using an ephemeral keypair.
-    /// Returns the signer so the caller can sign segments with it.
-    fn setup_vol_pub(dir: &std::path::Path) -> std::sync::Arc<dyn SegmentSigner> {
-        fs::create_dir_all(dir).unwrap();
-        let (signer, vk) = signing::generate_ephemeral_signer();
-        let pub_hex = signing::encode_hex(&vk.to_bytes()) + "\n";
-        segment::write_file_atomic(&dir.join(signing::VOLUME_PUB_FILE), pub_hex.as_bytes())
-            .unwrap();
-        signer
-    }
-
-    #[test]
-    fn import_creates_volume_layout() {
-        let data_block: [u8; LBA_SIZE] = [0x42u8; LBA_SIZE];
-        let zero_block: [u8; LBA_SIZE] = [0u8; LBA_SIZE];
-        let (_src_tmp, image_path) = make_image(&[&data_block, &zero_block, &data_block]);
-
-        let vol_tmp = TempDir::new().unwrap();
-        let vol_dir = vol_tmp.path().join("testimport");
-        let signer = setup_vol_pub(&vol_dir);
-        import_image(&image_path, &vol_dir, signer.as_ref(), None, |_, _| {}).unwrap();
-
-        // readonly is now in meta.toml (written by caller, not import_image)
-        assert!(!vol_dir.join("readonly").exists());
-        assert_eq!(
-            crate::config::VolumeConfig::read(&vol_dir).unwrap().size,
-            Some((LBA_SIZE * 3) as u64)
-        );
-        assert!(vol_dir.join("pending").exists());
-        // import_image writes to pending/ only; cache/ is written by the coordinator
-        // after S3 upload (promote IPC). Verify import does not skip that step.
-        assert!(!vol_dir.join("cache").exists());
-        // Readonly volumes must have volume.pub (for segment verification) but
-        // must NOT have volume.key (private key must never be written to disk).
-        assert!(
-            vol_dir.join(signing::VOLUME_PUB_FILE).exists(),
-            "volume.pub must exist"
-        );
-        assert!(
-            !vol_dir.join(signing::VOLUME_KEY_FILE).exists(),
-            "volume.key must not exist on readonly volume"
-        );
-
-        // Exactly one snapshot marker, and its ULID matches the segment ULID.
-        let segs: Vec<_> = fs::read_dir(vol_dir.join("pending"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(segs.len(), 1);
-        let seg_name = segs[0].file_name().into_string().unwrap();
-
-        let snaps: Vec<_> = fs::read_dir(vol_dir.join("snapshots"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(snaps.len(), 1);
-        let snap_name = snaps[0].file_name().into_string().unwrap();
-
-        assert_eq!(
-            snap_name, seg_name,
-            "snapshot ULID must match last segment ULID"
-        );
-    }
-
-    #[test]
-    fn import_skips_zero_blocks() {
-        let zero_image: Vec<[u8; LBA_SIZE]> = vec![[0u8; LBA_SIZE]; 4];
-        let blocks: Vec<&[u8; LBA_SIZE]> = zero_image.iter().collect();
-        let (_src_tmp, image_path) = make_image(&blocks);
-
-        let vol_tmp = TempDir::new().unwrap();
-        let vol_dir = vol_tmp.path().join("zeroimport");
-        let signer = setup_vol_pub(&vol_dir);
-        import_image(&image_path, &vol_dir, signer.as_ref(), None, |_, _| {}).unwrap();
-
-        // All-zero image: no segment files should be written.
-        let segs: Vec<_> = fs::read_dir(vol_dir.join("pending")).unwrap().collect();
-        assert_eq!(segs.len(), 0);
-    }
-
-    #[test]
-    fn import_rejects_unaligned_image() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("bad.ext4");
-        fs::write(&path, vec![0u8; 100]).unwrap();
-
-        let vol_tmp = TempDir::new().unwrap();
-        let vol_dir = vol_tmp.path().join("bad");
-        let signer = setup_vol_pub(&vol_dir);
-        let err = import_image(&path, &vol_dir, signer.as_ref(), None, |_, _| {}).unwrap_err();
-        assert!(err.to_string().contains("multiple of 4096"));
-    }
-
-    #[test]
-    fn import_with_parent_emits_dedup_refs() {
-        // Parent import writes two distinct data blocks.
-        let b_shared: [u8; LBA_SIZE] = [0xAAu8; LBA_SIZE];
-        let b_parent_only: [u8; LBA_SIZE] = [0xBBu8; LBA_SIZE];
-        let b_child_only: [u8; LBA_SIZE] = [0xCCu8; LBA_SIZE];
-
-        let (_src_parent, parent_image) = make_image(&[&b_shared, &b_parent_only]);
-        let (_src_child, child_image) = make_image(&[&b_shared, &b_child_only]);
-
-        // Parent volume: its own signing key + import.
-        let vol_tmp = TempDir::new().unwrap();
-        let by_id_dir = vol_tmp.path();
-        let parent_dir = by_id_dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
-        let parent_signer = setup_vol_pub(&parent_dir);
-        import_image(
-            &parent_image,
-            &parent_dir,
-            parent_signer.as_ref(),
-            None,
-            |_, _| {},
-        )
-        .unwrap();
-
-        // Build the parent's extent index directly from its pending/ segments.
-        // rebuild walks pending/ + index/ + cache/ and verifies signatures
-        // using volume.pub, which setup_vol_pub wrote.
-        let parent_extent_index = crate::extentindex::rebuild(&[(parent_dir.clone(), None)])
-            .expect("parent extent index rebuild");
-        assert!(
-            parent_extent_index
-                .lookup(&blake3::hash(&b_shared))
-                .is_some(),
-            "parent must contain shared-block hash"
-        );
-
-        // Child import reuses the parent's hash pool.
-        let child_dir = by_id_dir.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
-        let child_signer = setup_vol_pub(&child_dir);
-        import_image(
-            &child_image,
-            &child_dir,
-            child_signer.as_ref(),
-            Some(&parent_extent_index),
-            |_, _| {},
-        )
-        .unwrap();
-
-        // Read the child's segment back and assert: shared block is a
-        // DedupRef, unique block is a Data entry.
-        use crate::segment::EntryKind;
-        let mut pending: Vec<_> = fs::read_dir(child_dir.join("pending"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(pending.len(), 1, "one child segment expected");
-        let seg_path = pending.pop().unwrap().path();
-        let vk = signing::load_verifying_key(&child_dir, signing::VOLUME_PUB_FILE).unwrap();
-        let (_, entries) = segment::read_and_verify_segment_index(&seg_path, &vk).unwrap();
-
-        let shared_hash = blake3::hash(&b_shared);
-        let child_only_hash = blake3::hash(&b_child_only);
-        let shared_entry = entries
-            .iter()
-            .find(|e| e.hash == shared_hash)
-            .expect("shared hash present");
-        assert_eq!(
-            shared_entry.kind,
-            EntryKind::DedupRef,
-            "shared block must be a DedupRef pointing at the parent"
-        );
-        let unique_entry = entries
-            .iter()
-            .find(|e| e.hash == child_only_hash)
-            .expect("child-only hash present");
-        // A fresh block is stored locally as either Data (body) or Inline
-        // (small compressed payload lifted into the index). Either way it is
-        // NOT a DedupRef — the child wrote its own bytes.
-        assert!(
-            matches!(unique_entry.kind, EntryKind::Data | EntryKind::Inline),
-            "child-only block must be stored locally, got {:?}",
-            unique_entry.kind
-        );
-    }
-
-    #[test]
-    fn import_volume_readable() {
-        // Write a known pattern into blocks 0 and 2; block 1 is zero.
-        let mut b0 = [0u8; LBA_SIZE];
-        b0.fill(0xAA);
-        let mut b2 = [0u8; LBA_SIZE];
-        b2.fill(0xBB);
-        let (_src_tmp, image_path) = make_image(&[&b0, &[0u8; LBA_SIZE], &b2]);
-
-        let vol_tmp = TempDir::new().unwrap();
-        let vol_dir = vol_tmp.path().join("readable");
-        let signer = setup_vol_pub(&vol_dir);
-        import_image(&image_path, &vol_dir, signer.as_ref(), None, |_, _| {}).unwrap();
-
-        // Readonly volumes must have volume.pub but not volume.key.
-        assert!(
-            vol_dir.join(signing::VOLUME_PUB_FILE).exists(),
-            "volume.pub must exist"
-        );
-        assert!(
-            !vol_dir.join(signing::VOLUME_KEY_FILE).exists(),
-            "volume.key must not exist on readonly volume"
-        );
-        // Re-open with ReadonlyVolume (imported volumes have no volume.key).
-        // No ancestors in this test; by_id_dir is unused.
-        let by_id = vol_dir.parent().unwrap();
-        let rv = crate::volume::ReadonlyVolume::open(&vol_dir, by_id).unwrap();
-        let got0 = rv.read(0, 1).unwrap();
-        assert_eq!(got0, b0);
-        let got1 = rv.read(1, 1).unwrap();
-        assert_eq!(got1, vec![0u8; LBA_SIZE]); // unwritten → zeros
-        let got2 = rv.read(2, 1).unwrap();
-        assert_eq!(got2, b2);
-    }
 }

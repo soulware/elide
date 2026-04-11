@@ -61,15 +61,33 @@ struct MapEntry {
 /// Maps `start_lba → MapEntry` for every committed extent. Unwritten LBA
 /// ranges have no entry (implicitly zero, as the block device presents
 /// unwritten blocks as zeroes).
+///
+/// Also tracks the set of *delta source hashes* — BLAKE3 hashes referenced
+/// as `source_hash` by any live Delta entry in the segments this map was
+/// built from. These sources are not directly reachable via the normal
+/// `MapEntry.hash` path (a Delta entry's content hash is what's in the
+/// map; the source hash is separate), so they need their own book-keeping
+/// to keep GC's canonical-presence rule honest: a source DATA entry must
+/// stay alive as long as any Delta depends on it for decompression. See
+/// `lba_referenced_hashes()` for the fold.
+///
+/// The set is grow-only within a single map lifetime — when a Delta LBA
+/// is later overwritten, its source hash is *not* removed from the set,
+/// so GC may over-retain sources until the next rebuild. This is a
+/// bounded leak (flushed on every rebuild_segments call) and is
+/// acceptable because it degrades efficiency, not correctness. If
+/// telemetry ever shows it matters, move to a refcount.
 #[derive(Clone)]
 pub struct LbaMap {
     inner: BTreeMap<u64, MapEntry>,
+    delta_source_hashes: HashSet<blake3::Hash>,
 }
 
 impl LbaMap {
     pub fn new() -> Self {
         Self {
             inner: BTreeMap::new(),
+            delta_source_hashes: HashSet::new(),
         }
     }
 
@@ -222,19 +240,33 @@ impl LbaMap {
 
     /// Return the set of all content hashes currently referenced by any LBA
     /// range, regardless of how the LBA got its hash (DATA write, DedupRef
-    /// write, or rebuilt from a segment of any entry kind).
+    /// write, Delta write, or rebuilt from a segment of any entry kind),
+    /// *plus* every source hash of every live Delta entry (so GC keeps
+    /// the source DATA alive for decompression).
     ///
     /// **Load-bearing for the canonical-presence invariant.** GC and
     /// `redact_segment` use this to keep a DATA entry alive whenever any
     /// live LBA references its hash — including LBAs that reference the
-    /// hash via a DedupRef. The naming is deliberately precise (`lba_`-
-    /// prefixed) to discourage a future "optimisation" to a DATA-only
-    /// filter: such a filter would drop DATA entries whose only live
-    /// referrer is a sibling DedupRef, violating canonical-presence and
-    /// corrupting reads. See `docs/architecture.md § Dedup` for the
-    /// worked examples.
+    /// hash via a DedupRef (variant-b correctness; see
+    /// `docs/architecture.md § Dedup`) and Delta entries whose stored
+    /// content is decompressed against a separate `source_hash`. The
+    /// naming is deliberately precise (`lba_`-prefixed) to discourage a
+    /// future "optimisation" to a DATA-only filter: such a filter would
+    /// drop DATA entries whose only live referrer is a sibling DedupRef
+    /// or a Delta source, violating canonical-presence and corrupting
+    /// reads.
     pub fn lba_referenced_hashes(&self) -> HashSet<blake3::Hash> {
-        self.inner.values().map(|e| e.hash).collect()
+        let mut out: HashSet<blake3::Hash> = self.inner.values().map(|e| e.hash).collect();
+        out.extend(self.delta_source_hashes.iter().copied());
+        out
+    }
+
+    /// Record a delta source hash as referenced. Called for every
+    /// `DeltaOption::source_hash` on every live Delta entry fed into
+    /// the map at insert or rebuild time. See the `LbaMap` doc comment
+    /// for the grow-only semantics.
+    pub fn register_delta_source(&mut self, source_hash: blake3::Hash) {
+        self.delta_source_hashes.insert(source_hash);
     }
 
     /// Return all (start_lba, lba_length) ranges whose hash equals `target`.
@@ -359,6 +391,11 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
             };
             for entry in entries {
                 map.insert(entry.start_lba, entry.lba_length, entry.hash);
+                if entry.kind == segment::EntryKind::Delta {
+                    for opt in &entry.delta_options {
+                        map.register_delta_source(opt.source_hash);
+                    }
+                }
             }
         }
     }
@@ -631,6 +668,68 @@ mod tests {
 
         std::fs::remove_dir_all(ancestor).unwrap();
         std::fs::remove_dir_all(live).unwrap();
+    }
+
+    #[test]
+    fn rebuild_registers_delta_source_hashes() {
+        // A segment with a Delta entry must cause its source_hash(es)
+        // to appear in lba_referenced_hashes, even though the LBA map
+        // itself only stores the Delta's content hash. This is the
+        // load-bearing fold that keeps GC from collecting the source
+        // DATA body out from under a live Delta.
+        use crate::segment::{DeltaOption, SegmentEntry};
+
+        let base = temp_dir();
+        std::fs::create_dir_all(base.join("pending")).unwrap();
+        let signer = write_test_pub(&base);
+
+        let content_hash = h(7);
+        let source_a = h(11);
+        let source_b = h(13);
+        let unrelated = h(99);
+
+        let options = vec![
+            DeltaOption {
+                source_hash: source_a,
+                delta_offset: 0,
+                delta_length: 16,
+            },
+            DeltaOption {
+                source_hash: source_b,
+                delta_offset: 16,
+                delta_length: 16,
+            },
+        ];
+
+        let mut entries = vec![SegmentEntry::new_delta(content_hash, 0, 1, options)];
+        segment::write_segment(
+            &base.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+            &mut entries,
+            signer.as_ref(),
+        )
+        .unwrap();
+
+        let map = rebuild_segments(&[(base.clone(), None)]).unwrap();
+        let referenced = map.lba_referenced_hashes();
+
+        // Content hash reachable via the LBA map.
+        assert!(
+            referenced.contains(&content_hash),
+            "delta content hash missing from lba_referenced_hashes"
+        );
+        // Both source hashes folded in via register_delta_source.
+        assert!(
+            referenced.contains(&source_a),
+            "delta source A missing from lba_referenced_hashes"
+        );
+        assert!(
+            referenced.contains(&source_b),
+            "delta source B missing from lba_referenced_hashes"
+        );
+        // Unrelated hash not in the set.
+        assert!(!referenced.contains(&unrelated));
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     // --- extents_in_range tests ---

@@ -1,6 +1,5 @@
 pub mod config;
 pub mod control;
-pub mod delta;
 pub mod gc;
 pub mod prefetch;
 pub mod tasks;

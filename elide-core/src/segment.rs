@@ -5,7 +5,7 @@
 //   [Index section: index_length bytes]   — starts at byte 96
 //   [Inline section: inline_length bytes] — starts at byte 96 + index_length
 //   [Full body: body_length bytes]        — starts at byte 96 + index_length + inline_length
-//   [Delta body: delta_length bytes]      — absent locally (delta_length = 0)
+//   [Delta body: delta_length bytes]      — starts at byte 96 + index_length + inline_length + body_length
 //
 // Header (96 bytes):
 //   0..8   magic         "ELIDSEG\x04"
@@ -13,7 +13,7 @@
 //   12..16 index_length  u32 le
 //   16..20 inline_length u32 le; 0 if no inline data
 //   20..28 body_length   u64 le
-//   28..32 delta_length  u32 le; 0 for locally-stored files
+//   28..32 delta_length  u32 le; 0 if no delta body
 //   32..96 signature     Ed25519 sig over BLAKE3(header[0..32] || index_bytes)
 //
 // Index section layout:
@@ -44,8 +44,12 @@
 // to the body: they carry no body bytes and reserve no space. DedupRef reads
 // resolve through the extent index to the canonical segment's body.
 //
-// Locally-stored files have delta_length = 0. The local file IS the S3 object
-// minus the delta body, which the coordinator appends at upload time.
+// Local segment files and S3 objects use the same format. File-aware imports
+// produce segments with a populated delta body section (elide-import's Phase
+// B2 stage), which is then preserved locally by `promote_to_cache` into
+// `cache/<id>.body` as a contiguous region appended after the sparse body
+// section — the `.body` file mirrors the S3 object's `[body_offset, EOF)`
+// range byte-for-byte.
 //
 // Promotion commit ordering:
 //   1. Build entries in memory from WAL records
@@ -211,6 +215,11 @@ bitflags! {
         const DEDUP_REF    = 0x08;
         /// Zero extent; hash field is ZERO_HASH; no bytes in this segment's body; reads as zeros.
         const ZERO         = 0x10;
+        /// Thin delta entry; no body bytes. Reads decompress a delta blob from
+        /// the delta-body section against a source extent (looked up via the
+        /// extent index). Entries with this flag must carry `HAS_DELTAS` and
+        /// have at least one delta option.
+        const DELTA        = 0x20;
     }
 }
 
@@ -233,6 +242,12 @@ pub enum EntryKind {
     /// Inline entry; body bytes live in the inline section.
     /// Currently unreachable (INLINE_THRESHOLD = 0) but present for format completeness.
     Inline,
+    /// Thin delta entry; no body bytes. Content is materialised by fetching a
+    /// delta blob from the segment's delta body section and decompressing it
+    /// against a source extent body located via `extent_index.lookup(source_hash)`.
+    /// Must carry at least one `DeltaOption`. The source must resolve to a
+    /// `Data` entry — there are no delta-of-delta chains.
+    Delta,
 }
 
 impl EntryKind {
@@ -356,6 +371,44 @@ impl SegmentEntry {
             delta_options: Vec::new(),
         }
     }
+
+    /// Create a thin DELTA entry.
+    ///
+    /// Carries the extent's content hash plus one or more `DeltaOption`s
+    /// (zstd-dict-compressed alternatives). At read time the client picks
+    /// the first option whose `source_hash` resolves via the local extent
+    /// index, fetches the source body, fetches the delta blob from this
+    /// segment's delta body section, and decompresses with the source as
+    /// the zstd dictionary.
+    ///
+    /// Delta entries reserve no body space: `stored_offset` and
+    /// `stored_length` are both zero and they contribute nothing to
+    /// `body_length`. The delta options themselves (and the delta blob
+    /// bytes in the delta body section) are the entry's entire payload.
+    ///
+    /// Panics in debug builds if `delta_options` is empty.
+    pub fn new_delta(
+        hash: blake3::Hash,
+        start_lba: u64,
+        lba_length: u32,
+        delta_options: Vec<DeltaOption>,
+    ) -> Self {
+        debug_assert!(
+            !delta_options.is_empty(),
+            "new_delta requires at least one delta option"
+        );
+        Self {
+            hash,
+            start_lba,
+            lba_length,
+            compressed: false,
+            kind: EntryKind::Delta,
+            stored_offset: 0,
+            stored_length: 0,
+            data: None,
+            delta_options,
+        }
+    }
 }
 
 // --- write ---
@@ -377,6 +430,27 @@ pub fn write_segment(
     entries: &mut [SegmentEntry],
     signer: &dyn SegmentSigner,
 ) -> io::Result<u64> {
+    write_segment_with_delta_body(path, entries, &[], signer)
+}
+
+/// Write a segment file with an attached delta body section.
+///
+/// Same layout contract as [`write_segment`], plus `delta_body` is
+/// appended after the body section and `header.delta_length` is set
+/// to `delta_body.len()`. Used by thin Delta entry producers and by
+/// tests that need to construct a complete Delta-bearing segment in
+/// a single call.
+///
+/// The delta options table (written from each entry's `delta_options`
+/// vec) holds `delta_offset` values that are byte offsets *within*
+/// this `delta_body` slice. The caller is responsible for filling
+/// those in coherently before writing.
+pub fn write_segment_with_delta_body(
+    path: &Path,
+    entries: &mut [SegmentEntry],
+    delta_body: &[u8],
+    signer: &dyn SegmentSigner,
+) -> io::Result<u64> {
     let (index_length, inline_length, body_length) = assign_offsets(entries);
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
 
@@ -395,7 +469,7 @@ pub fn write_segment(
     header.index_length.set(index_length);
     header.inline_length.set(inline_length);
     header.body_length.set(body_length);
-    // delta_length = 0 (already zeroed); local files never have a delta body.
+    header.delta_length.set(delta_body.len() as u32);
 
     // Compute signature: BLAKE3(header[0..32] || index_bytes), then sign.
     let sig_bytes: [u8; 64] = {
@@ -422,7 +496,7 @@ pub fn write_segment(
     }
     // Body section: raw bytes, no framing.
     // Data entries write their body bytes.
-    // DedupRef, Zero, and Inline entries contribute nothing to the body.
+    // DedupRef, Zero, Delta, and Inline entries contribute nothing to the body.
     for entry in entries.iter() {
         match entry.kind {
             EntryKind::Data => {
@@ -430,15 +504,21 @@ pub fn write_segment(
                     w.write_all(data)?;
                 }
             }
-            EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline => {}
+            EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline | EntryKind::Delta => {}
         }
+    }
+
+    // Delta body section: raw concatenated delta blobs. Addressed by
+    // delta_offset within this slice from each entry's delta options.
+    if !delta_body.is_empty() {
+        w.write_all(delta_body)?;
     }
 
     // `body_length = Σ Data stored_length`, matching what was just written.
     // set_len is defensive: nothing above should leave the file short, but
     // keeping it makes the file size invariant explicit regardless of how
     // entries are ordered.
-    let expected_len = body_section_start + body_length;
+    let expected_len = body_section_start + body_length + delta_body.len() as u64;
     w.get_ref().set_len(expected_len)?;
 
     w.flush()?;
@@ -463,9 +543,11 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
                 entry.stored_offset = body_cursor;
                 body_cursor += entry.stored_length as u64;
             }
-            EntryKind::DedupRef | EntryKind::Zero => {
-                // DedupRef and Zero contribute nothing to the body section.
-                // stored_offset/stored_length stay 0.
+            EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => {
+                // DedupRef, Zero, and Delta contribute nothing to the body
+                // section. stored_offset/stored_length stay 0. Delta
+                // entries' bytes live in the delta body section and are
+                // addressed via `delta_options`, not `stored_offset`.
             }
         }
     }
@@ -480,6 +562,7 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
         EntryKind::Inline => flags |= SegmentFlags::INLINE,
         EntryKind::DedupRef => flags |= SegmentFlags::DEDUP_REF,
         EntryKind::Zero => flags |= SegmentFlags::ZERO,
+        EntryKind::Delta => flags |= SegmentFlags::DELTA,
         EntryKind::Data => {}
     }
     if e.compressed {
@@ -488,6 +571,10 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     if !e.delta_options.is_empty() {
         flags |= SegmentFlags::HAS_DELTAS;
     }
+    debug_assert!(
+        e.kind != EntryKind::Delta || flags.contains(SegmentFlags::HAS_DELTAS),
+        "Delta entry must carry at least one delta option"
+    );
 
     w.write_all(e.hash.as_bytes())?; // 32
     w.write_all(&e.start_lba.to_le_bytes())?; // 8
@@ -763,6 +850,39 @@ pub fn read_and_verify_segment_index(
 ///
 /// Returns `(body_section_start, index_buf, entry_count, header)`.
 /// The header is the raw 96-byte header array (32 fields + 64 signature bytes).
+/// Layout information pulled from a segment file's header, enough to
+/// locate any section (body, delta body) by absolute file offset.
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentLayoutInfo {
+    /// Absolute file offset of the body section.
+    pub body_section_start: u64,
+    /// Byte length of the body section (sum of DATA `stored_length`).
+    pub body_length: u64,
+    /// Byte length of the delta body section (may be zero).
+    pub delta_length: u32,
+}
+
+impl SegmentLayoutInfo {
+    /// Absolute file offset of the delta body section.
+    pub fn delta_body_offset(&self) -> u64 {
+        self.body_section_start + self.body_length
+    }
+}
+
+/// Read just enough of a segment file header to determine section
+/// offsets. Does not verify the signature; callers that need
+/// verification should use `read_and_verify_segment_index` instead.
+pub fn read_segment_layout(path: &Path) -> io::Result<SegmentLayoutInfo> {
+    let (body_section_start, _, _, raw) = read_segment_header(path)?;
+    let h = SegmentHeader::read_from_bytes(&raw)
+        .map_err(|_| io::Error::other("segment header size mismatch"))?;
+    Ok(SegmentLayoutInfo {
+        body_section_start,
+        body_length: h.body_length.get(),
+        delta_length: h.delta_length.get(),
+    })
+}
+
 fn read_segment_header(path: &Path) -> io::Result<(u64, Vec<u8>, u32, [u8; HEADER_LEN as usize])> {
     let mut f = fs::File::open(path)?;
 
@@ -835,6 +955,8 @@ fn parse_index_section(data: &[u8], entry_count: u32) -> io::Result<Vec<SegmentE
             EntryKind::Zero
         } else if flags.contains(SegmentFlags::DEDUP_REF) {
             EntryKind::DedupRef
+        } else if flags.contains(SegmentFlags::DELTA) {
+            EntryKind::Delta
         } else if flags.contains(SegmentFlags::INLINE) {
             EntryKind::Inline
         } else {
@@ -1076,6 +1198,14 @@ pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
 /// bitset marks only Data entries as present; reads of DedupRef ranges fall
 /// through to the canonical segment via the extent index.
 ///
+/// If the source segment has a populated delta body section
+/// (`header.delta_length > 0`), that section is appended after the sparse
+/// body region, so the `.body` file shape becomes `[body section |
+/// delta body section]`. This preserves the delta blobs a Delta entry
+/// reader needs, which would otherwise only live in the S3 object. The
+/// appended section is a single contiguous `copy_file_range` — one
+/// kernel-side copy regardless of how many delta blobs it contains.
+///
 /// Both files are written via tmp+rename for crash safety. Idempotent: if
 /// `body_path` already exists, the function returns `Ok(())` immediately without
 /// re-reading the source file.
@@ -1099,6 +1229,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
         header[20], header[21], header[22], header[23], header[24], header[25], header[26],
         header[27],
     ]);
+    let delta_length = u32::from_le_bytes([header[28], header[29], header[30], header[31]]) as u64;
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
 
     let mut index_data = vec![0u8; index_length as usize];
@@ -1119,7 +1250,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
             .create(true)
             .truncate(true)
             .open(&tmp)?;
-        dst.set_len(body_length)?;
+        dst.set_len(body_length + delta_length)?;
         for entry in &entries {
             if entry.kind != EntryKind::Data || entry.stored_length == 0 {
                 continue;
@@ -1131,6 +1262,14 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
             let n = io::copy(&mut (&mut src).take(entry.stored_length as u64), &mut dst)?;
             if n != entry.stored_length as u64 {
                 return Err(io::Error::other("short read promoting segment body"));
+            }
+        }
+        if delta_length > 0 {
+            src.seek(SeekFrom::Start(body_section_start + body_length))?;
+            dst.seek(SeekFrom::Start(body_length))?;
+            let n = io::copy(&mut (&mut src).take(delta_length), &mut dst)?;
+            if n != delta_length {
+                return Err(io::Error::other("short read promoting delta body"));
             }
         }
         dst.sync_data()?;
@@ -2129,6 +2268,122 @@ mod tests {
         let delta_start = file_len - delta_blob.len() as u64;
         let delta_bytes = &raw_header[delta_start as usize..];
         assert_eq!(delta_bytes, delta_blob);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delta_entry_roundtrip() {
+        // A thin Delta entry must roundtrip through write_segment /
+        // read_segment_index with stored_offset=0, stored_length=0, the
+        // kind preserved, and the delta options intact. It must not
+        // contribute to body_length — a segment containing a Data entry
+        // plus a Delta entry has the same body_length as a segment with
+        // just the Data entry.
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let seg_path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let (signer, vk) = test_signer();
+
+        // A normal Data entry so we have something in the body section.
+        let data_body = vec![0xAAu8; 8192];
+        let data_hash = blake3::hash(&data_body);
+
+        // A Delta entry: its own content hash (post-decompression) plus
+        // one delta option pointing at a source extent.
+        let delta_content_hash = blake3::hash(b"delta-content");
+        let source_hash = blake3::hash(b"source-extent");
+        let delta_option = DeltaOption {
+            source_hash,
+            delta_offset: 0,
+            delta_length: 128,
+        };
+
+        let mut entries = vec![
+            SegmentEntry::new_data(data_hash, 0, 2, SegmentFlags::empty(), data_body.clone()),
+            SegmentEntry::new_delta(delta_content_hash, 10, 3, vec![delta_option.clone()]),
+        ];
+        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        // body_length must include only the Data entry's bytes; the Delta
+        // entry must reserve none.
+        let raw = fs::read(&seg_path).unwrap();
+        let header = SegmentHeader::read_from_bytes(&raw[..HEADER_LEN as usize]).unwrap();
+        assert_eq!(header.body_length.get(), data_body.len() as u64);
+        assert_eq!(
+            header.delta_length.get(),
+            0,
+            "write_segment does not write a delta body"
+        );
+
+        // Roundtrip parse. Kind must be Delta, stored_offset/length both
+        // zero, and the single delta option preserved verbatim.
+        let (bss_read, read_back) = read_and_verify_segment_index(&seg_path, &vk).unwrap();
+        assert_eq!(bss_read, bss);
+        assert_eq!(read_back.len(), 2);
+
+        let data_entry = &read_back[0];
+        assert_eq!(data_entry.kind, EntryKind::Data);
+        assert_eq!(data_entry.hash, data_hash);
+
+        let delta_entry = &read_back[1];
+        assert_eq!(delta_entry.kind, EntryKind::Delta);
+        assert_eq!(delta_entry.hash, delta_content_hash);
+        assert_eq!(delta_entry.start_lba, 10);
+        assert_eq!(delta_entry.lba_length, 3);
+        assert_eq!(delta_entry.stored_offset, 0);
+        assert_eq!(delta_entry.stored_length, 0);
+        assert_eq!(delta_entry.delta_options.len(), 1);
+        assert_eq!(delta_entry.delta_options[0].source_hash, source_hash);
+        assert_eq!(delta_entry.delta_options[0].delta_offset, 0);
+        assert_eq!(delta_entry.delta_options[0].delta_length, 128);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delta_entry_supports_multiple_source_options() {
+        // Multiple delta options per entry are valid — the reader picks
+        // the first source that resolves locally (earliest-source preference
+        // applies at read time). Verify the writer/parser preserve all of
+        // them in order.
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let seg_path = dir.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+        let (signer, vk) = test_signer();
+
+        let content_hash = blake3::hash(b"multi-source-delta");
+        let options = vec![
+            DeltaOption {
+                source_hash: blake3::hash(b"source-a"),
+                delta_offset: 0,
+                delta_length: 100,
+            },
+            DeltaOption {
+                source_hash: blake3::hash(b"source-b"),
+                delta_offset: 100,
+                delta_length: 200,
+            },
+            DeltaOption {
+                source_hash: blake3::hash(b"source-c"),
+                delta_offset: 300,
+                delta_length: 50,
+            },
+        ];
+
+        let mut entries = vec![SegmentEntry::new_delta(content_hash, 0, 1, options.clone())];
+        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+
+        let (_, read_back) = read_and_verify_segment_index(&seg_path, &vk).unwrap();
+        assert_eq!(read_back.len(), 1);
+        let entry = &read_back[0];
+        assert_eq!(entry.kind, EntryKind::Delta);
+        assert_eq!(entry.delta_options.len(), 3);
+        for (orig, read) in options.iter().zip(entry.delta_options.iter()) {
+            assert_eq!(orig.source_hash, read.source_hash);
+            assert_eq!(orig.delta_offset, read.delta_offset);
+            assert_eq!(orig.delta_length, read.delta_length);
+        }
 
         fs::remove_dir_all(dir).unwrap();
     }
