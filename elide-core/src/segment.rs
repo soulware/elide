@@ -426,6 +426,27 @@ pub fn write_segment(
     entries: &mut [SegmentEntry],
     signer: &dyn SegmentSigner,
 ) -> io::Result<u64> {
+    write_segment_with_delta_body(path, entries, &[], signer)
+}
+
+/// Write a segment file with an attached delta body section.
+///
+/// Same layout contract as [`write_segment`], plus `delta_body` is
+/// appended after the body section and `header.delta_length` is set
+/// to `delta_body.len()`. Used by thin Delta entry producers and by
+/// tests that need to construct a complete Delta-bearing segment in
+/// a single call.
+///
+/// The delta options table (written from each entry's `delta_options`
+/// vec) holds `delta_offset` values that are byte offsets *within*
+/// this `delta_body` slice. The caller is responsible for filling
+/// those in coherently before writing.
+pub fn write_segment_with_delta_body(
+    path: &Path,
+    entries: &mut [SegmentEntry],
+    delta_body: &[u8],
+    signer: &dyn SegmentSigner,
+) -> io::Result<u64> {
     let (index_length, inline_length, body_length) = assign_offsets(entries);
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
 
@@ -444,7 +465,7 @@ pub fn write_segment(
     header.index_length.set(index_length);
     header.inline_length.set(inline_length);
     header.body_length.set(body_length);
-    // delta_length = 0 (already zeroed); local files never have a delta body.
+    header.delta_length.set(delta_body.len() as u32);
 
     // Compute signature: BLAKE3(header[0..32] || index_bytes), then sign.
     let sig_bytes: [u8; 64] = {
@@ -483,11 +504,17 @@ pub fn write_segment(
         }
     }
 
+    // Delta body section: raw concatenated delta blobs. Addressed by
+    // delta_offset within this slice from each entry's delta options.
+    if !delta_body.is_empty() {
+        w.write_all(delta_body)?;
+    }
+
     // `body_length = Σ Data stored_length`, matching what was just written.
     // set_len is defensive: nothing above should leave the file short, but
     // keeping it makes the file size invariant explicit regardless of how
     // entries are ordered.
-    let expected_len = body_section_start + body_length;
+    let expected_len = body_section_start + body_length + delta_body.len() as u64;
     w.get_ref().set_len(expected_len)?;
 
     w.flush()?;
@@ -819,6 +846,39 @@ pub fn read_and_verify_segment_index(
 ///
 /// Returns `(body_section_start, index_buf, entry_count, header)`.
 /// The header is the raw 96-byte header array (32 fields + 64 signature bytes).
+/// Layout information pulled from a segment file's header, enough to
+/// locate any section (body, delta body) by absolute file offset.
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentLayoutInfo {
+    /// Absolute file offset of the body section.
+    pub body_section_start: u64,
+    /// Byte length of the body section (sum of DATA `stored_length`).
+    pub body_length: u64,
+    /// Byte length of the delta body section (may be zero).
+    pub delta_length: u32,
+}
+
+impl SegmentLayoutInfo {
+    /// Absolute file offset of the delta body section.
+    pub fn delta_body_offset(&self) -> u64 {
+        self.body_section_start + self.body_length
+    }
+}
+
+/// Read just enough of a segment file header to determine section
+/// offsets. Does not verify the signature; callers that need
+/// verification should use `read_and_verify_segment_index` instead.
+pub fn read_segment_layout(path: &Path) -> io::Result<SegmentLayoutInfo> {
+    let (body_section_start, _, _, raw) = read_segment_header(path)?;
+    let h = SegmentHeader::read_from_bytes(&raw)
+        .map_err(|_| io::Error::other("segment header size mismatch"))?;
+    Ok(SegmentLayoutInfo {
+        body_section_start,
+        body_length: h.body_length.get(),
+        delta_length: h.delta_length.get(),
+    })
+}
+
 fn read_segment_header(path: &Path) -> io::Result<(u64, Vec<u8>, u32, [u8; HEADER_LEN as usize])> {
     let mut f = fs::File::open(path)?;
 

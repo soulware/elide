@@ -2097,18 +2097,7 @@ pub(crate) fn read_extents(
 
         // Extract owned copies so the borrow of extent_index ends before
         // we mutate file_cache.
-        let (
-            segment_id,
-            body_offset,
-            body_length,
-            compressed,
-            body_section_start,
-            body_source,
-            inline_data,
-        ) = {
-            let Some(loc) = extent_index.lookup(&er.hash) else {
-                continue; // hash not indexed — treat as unwritten
-            };
+        let direct = extent_index.lookup(&er.hash).map(|loc| {
             (
                 loc.segment_id,
                 loc.body_offset,
@@ -2118,6 +2107,31 @@ pub(crate) fn read_extents(
                 loc.body_source,
                 loc.inline_data.clone(),
             )
+        });
+        let (
+            segment_id,
+            body_offset,
+            body_length,
+            compressed,
+            body_section_start,
+            body_source,
+            inline_data,
+        ) = match direct {
+            Some(loc) => loc,
+            None => {
+                // No direct DATA/Inline entry. Try a Delta entry.
+                if try_read_delta_extent(
+                    &er,
+                    lba,
+                    extent_index,
+                    file_cache,
+                    &find_segment,
+                    &mut out,
+                )? {
+                    continue;
+                }
+                continue; // truly unknown — treat as unwritten
+            }
         };
 
         // Inline extents: data is held in memory, no file I/O needed.
@@ -2220,6 +2234,146 @@ pub(crate) fn read_extents(
         }
     }
     Ok(out)
+}
+
+/// Try to materialise a Delta extent for the range covered by `er`,
+/// writing decoded bytes into `out` at the appropriate offset.
+///
+/// Returns `Ok(true)` if a Delta entry was found and decompressed
+/// successfully, `Ok(false)` if no Delta entry is registered for
+/// `er.hash` (caller falls through to "unwritten" handling), or
+/// `Err` for any I/O or decompression failure.
+///
+/// Source selection uses the earliest-source preference: scan the
+/// delta options in order, pick the first one whose `source_hash`
+/// resolves via `extent_index.lookup` to a DATA/Inline location. No
+/// caching of decompressed output — each read decompresses fresh.
+/// Phase C accepts the decompression cost in exchange for
+/// implementation simplicity; a follow-up can add a content-hash-
+/// addressed materialisation cache if telemetry shows it matters.
+#[allow(clippy::too_many_arguments)]
+fn try_read_delta_extent(
+    er: &lbamap::ExtentRead,
+    lba: u64,
+    extent_index: &extentindex::ExtentIndex,
+    file_cache: &RefCell<FileCache>,
+    find_segment: &dyn Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
+    out: &mut [u8],
+) -> io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Some(delta_loc) = extent_index.lookup_delta(&er.hash) else {
+        return Ok(false);
+    };
+    let delta_segment_id = delta_loc.segment_id;
+    let delta_body_offset = delta_loc.delta_body_offset;
+    let options = delta_loc.options.clone();
+
+    // Pick the first option whose source hash resolves to a DATA/Inline
+    // location. This is the earliest-source preference in its simplest
+    // form; a more sophisticated version (prefer already-cached sources,
+    // then earliest ULID among uncached) is a follow-up once the
+    // demand-fetch path integrates.
+    let mut picked: Option<(segment::DeltaOption, extentindex::ExtentLocation)> = None;
+    for opt in &options {
+        if let Some(source_loc) = extent_index.lookup(&opt.source_hash) {
+            picked = Some((opt.clone(), source_loc.clone()));
+            break;
+        }
+    }
+    let Some((opt, source_loc)) = picked else {
+        return Err(io::Error::other(format!(
+            "delta extent {}: no source option resolved in extent index",
+            er.hash.to_hex()
+        )));
+    };
+
+    // --- Read the source body (full extent, lz4-decompressed if needed). ---
+    let source_bytes: Vec<u8> = if let Some(ref idata) = source_loc.inline_data {
+        if source_loc.compressed {
+            lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?
+        } else {
+            idata.to_vec()
+        }
+    } else {
+        let mut cache = file_cache.borrow_mut();
+        if matches!(source_loc.body_source, BodySource::Cached(_))
+            || cache.get(source_loc.segment_id).is_none()
+        {
+            let path = find_segment(
+                source_loc.segment_id,
+                source_loc.body_section_start,
+                source_loc.body_source,
+            )?;
+            let layout = SegmentLayout::from_path(&path);
+            cache.insert(source_loc.segment_id, layout, fs::File::open(&path)?);
+        }
+        let (layout, f) = cache
+            .get(source_loc.segment_id)
+            .expect("source just inserted or found");
+        let file_body_offset = match layout {
+            SegmentLayout::BodyOnly => source_loc.body_offset,
+            SegmentLayout::Full => source_loc.body_section_start + source_loc.body_offset,
+        };
+        f.seek(SeekFrom::Start(file_body_offset))?;
+        let mut buf = vec![0u8; source_loc.body_length as usize];
+        f.read_exact(&mut buf)?;
+        if source_loc.compressed {
+            lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?
+        } else {
+            buf
+        }
+    };
+
+    // --- Read the delta blob from the Delta segment's delta body section. ---
+    let delta_blob: Vec<u8> = {
+        let mut cache = file_cache.borrow_mut();
+        if cache.get(delta_segment_id).is_none() {
+            // Delta entries need access to the delta body section, which
+            // only exists in full segment files (not in `.idx`/`.body`
+            // cache pairs). Call find_segment with Local so the lookup
+            // falls through to pending/ or segments/ rather than to the
+            // cache .body file.
+            let path = find_segment(delta_segment_id, delta_body_offset, BodySource::Local)?;
+            let layout = SegmentLayout::from_path(&path);
+            cache.insert(delta_segment_id, layout, fs::File::open(&path)?);
+        }
+        let (_, f) = cache
+            .get(delta_segment_id)
+            .expect("delta segment just inserted or found");
+        f.seek(SeekFrom::Start(delta_body_offset + opt.delta_offset))?;
+        let mut buf = vec![0u8; opt.delta_length as usize];
+        f.read_exact(&mut buf)?;
+        buf
+    };
+
+    // --- Decompress the delta blob using the source as the zstd dictionary. ---
+    // The decompressed length equals the Delta entry's logical size
+    // (`lba_length * 4096`). We don't have lba_length on ExtentRead
+    // directly, but `er.range_end - er.range_start` gives the number
+    // of LBAs in the portion we need, and the delta produces bytes
+    // for the full fragment regardless of which portion we want.
+    // Use a generous upper bound and slice the result.
+    let mut decoder = zstd::bulk::Decompressor::with_dictionary(&source_bytes)
+        .map_err(|e| io::Error::other(format!("zstd dict decoder: {e}")))?;
+    // Uncompressed size bound: the Delta entry describes one fragment
+    // of a file. We don't carry the exact uncompressed size here, so
+    // pass a large enough capacity (16 MiB — the segment-size cap).
+    let decompressed = decoder
+        .decompress(&delta_blob, 16 * 1024 * 1024)
+        .map_err(|e| io::Error::other(format!("zstd decompress: {e}")))?;
+
+    // Copy the requested portion into the output buffer.
+    let block_count = (er.range_end - er.range_start) as usize;
+    let out_start = (er.range_start - lba) as usize * 4096;
+    let out_slice = &mut out[out_start..out_start + block_count * 4096];
+    let src_start = er.payload_block_offset as usize * 4096;
+    let src_end = src_start + block_count * 4096;
+    let src_slice = decompressed
+        .get(src_start..src_end)
+        .ok_or_else(|| io::Error::other("delta decompressed payload too short"))?;
+    out_slice.copy_from_slice(src_slice);
+    Ok(true)
 }
 
 /// Search for a segment file across the fork directory tree.

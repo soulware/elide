@@ -78,16 +78,40 @@ pub struct ExtentLocation {
     pub inline_data: Option<Box<[u8]>>,
 }
 
+/// Location of a thin Delta entry. Separate from `ExtentLocation`
+/// because Delta entries are materialised lazily at read time by
+/// fetching a delta blob from their owning segment's delta body
+/// section and decompressing against a source extent's bytes.
+#[derive(Clone, Debug)]
+pub struct DeltaLocation {
+    /// ULID of the segment that holds both the Delta index entry and
+    /// its delta blob in the segment's delta body section.
+    pub segment_id: Ulid,
+    /// Absolute file offset of the segment's delta body section.
+    /// (For full segment files: `body_section_start + body_length`.
+    /// For `.idx`-only cache files there is no delta body; such
+    /// entries must not be registered via this type.)
+    pub delta_body_offset: u64,
+    /// Delta options exactly as stored on disk. The reader scans them
+    /// in order: already-cached sources preferred, then earliest ULID.
+    pub options: Vec<segment::DeltaOption>,
+}
+
 /// In-memory index mapping content hash to segment location.
 #[derive(Clone)]
 pub struct ExtentIndex {
     inner: HashMap<blake3::Hash, ExtentLocation>,
+    /// Thin Delta entries, keyed by the Delta's content hash (the
+    /// hash of the bytes *after* decompression). Separate from
+    /// `inner` so the hot-path DATA lookup stays untouched.
+    deltas: HashMap<blake3::Hash, DeltaLocation>,
 }
 
 impl ExtentIndex {
     pub fn new() -> Self {
         Self {
             inner: HashMap::new(),
+            deltas: HashMap::new(),
         }
     }
 
@@ -114,9 +138,36 @@ impl ExtentIndex {
         self.inner.get(hash)
     }
 
+    /// Register a Delta entry. Inserted only if the hash is not
+    /// already present as either a DATA entry or another Delta — the
+    /// lowest-ULID-wins canonicality rule takes precedence for DATA
+    /// entries, and Delta entries are skipped when a direct DATA
+    /// already exists.
+    pub fn insert_delta_if_absent(&mut self, hash: blake3::Hash, location: DeltaLocation) -> bool {
+        if self.inner.contains_key(&hash) {
+            return false;
+        }
+        use std::collections::hash_map::Entry;
+        match self.deltas.entry(hash) {
+            Entry::Vacant(v) => {
+                v.insert(location);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Look up a Delta entry by its content hash. Returns `None` if
+    /// the hash is not registered as a Delta (either unknown, or
+    /// present as a direct DATA entry instead).
+    pub fn lookup_delta(&self, hash: &blake3::Hash) -> Option<&DeltaLocation> {
+        self.deltas.get(hash)
+    }
+
     /// Remove the entry for `hash`, if present.
     pub fn remove(&mut self, hash: &blake3::Hash) {
         self.inner.remove(hash);
+        self.deltas.remove(hash);
     }
 
     /// Number of entries in the index.
@@ -127,7 +178,7 @@ impl ExtentIndex {
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.is_empty() && self.deltas.is_empty()
     }
 
     /// Iterate `(hash, location)` pairs. Ordering is unspecified.
@@ -248,10 +299,32 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                 Vec::new()
             };
 
+            // Locate the delta body section if any Delta entries are
+            // present; only need to re-read the header when there's a
+            // Delta to register.
+            let delta_body_offset = if entries.iter().any(|e| e.kind == EntryKind::Delta) {
+                Some(segment::read_segment_layout(path)?.delta_body_offset())
+            } else {
+                None
+            };
+
             for entry in entries {
                 match entry.kind {
                     EntryKind::Data | EntryKind::Inline => {}
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+                    EntryKind::DedupRef | EntryKind::Zero => continue,
+                    EntryKind::Delta => {
+                        if let Some(delta_body_off) = delta_body_offset {
+                            index.insert_delta_if_absent(
+                                entry.hash,
+                                DeltaLocation {
+                                    segment_id,
+                                    delta_body_offset: delta_body_off,
+                                    options: entry.delta_options.clone(),
+                                },
+                            );
+                        }
+                        continue;
+                    }
                 }
                 let idata = if entry.kind == EntryKind::Inline {
                     let start = entry.stored_offset as usize;
@@ -314,7 +387,20 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
             for (raw_idx, entry) in entries.iter().enumerate() {
                 match entry.kind {
                     EntryKind::Data | EntryKind::Inline => {}
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+                    EntryKind::DedupRef | EntryKind::Zero => continue,
+                    EntryKind::Delta => {
+                        // .idx cache files do not carry the delta body
+                        // section — the delta blob lives in the full
+                        // segment on S3 (or locally in pending/ or
+                        // segments/). Registering a DeltaLocation from
+                        // an .idx-only view would point at nothing.
+                        // Delta entries cached via .idx are unreadable
+                        // until a corresponding .body or full segment
+                        // is available; this is a known Phase C gap
+                        // that will be closed when the demand-fetch
+                        // path learns to pull delta body sections.
+                        continue;
+                    }
                 }
                 let idata = if entry.kind == EntryKind::Inline {
                     let start = entry.stored_offset as usize;

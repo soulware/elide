@@ -19,6 +19,7 @@ serde          = { version = "1", features = ["derive"] }
 toml           = { version = "0.8", default-features = false, features = ["parse", "display"] }
 ulid           = "1"
 zerocopy       = { version = "0.8", features = ["derive"] }
+zstd           = "0.13"
 
 [features]
 # Gate the slow property-based test suites behind explicit features so that
