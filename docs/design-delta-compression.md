@@ -268,6 +268,25 @@ The earliest-source preference was originally scoped as a standalone Phase A. It
 
 **Phase 4 (deferred):** Content-similarity-based source selection for filesystem-agnostic delta. Marginal benefit over path matching for the primary workload, significantly more complex.
 
+## Post-B2 gap: pull-host demand-fetch of the delta body section
+
+B2 produces segments with a delta body section and uploads them to S3 correctly. The *import host* can read its own delta entries because `promote_to_cache` is extended to preserve the delta body section in `cache/<id>.body` alongside the existing body section (appended after `body_length`, so the file shape becomes `[body section | delta body section]`). The `.body` file is the local mirror of the S3 object's contiguous `[body_offset, EOF)` region, and `extent_index::rebuild` registers Delta entries against it at the cached-segment path.
+
+A **pull host** (a host that never ran the import, and obtains the segment by pulling from S3) is **not** yet covered. The current pipeline:
+
+1. Pull-host prefetch downloads the `.idx` file (header + index + inline) for the segment.
+2. `extent_index::rebuild` walks the `.idx` and finds Delta entries, but the local `.body` file either does not exist or contains only the sparse body section copied by prior fetches — no delta body section.
+3. `elide-fetch` has no awareness of `EntryKind::Delta` (it breaks only on `DedupRef` and `Inline` in its batch-scanner, and a Delta entry with `stored_length = 0` looks like a gap in the body layout). It does not know to issue a range-GET for `[body_offset + body_length, EOF)` of the S3 object.
+4. A read against a Delta LBA on a pull host therefore fails — `extent_index.lookup_delta` returns `None` (rebuild skipped the registration for lack of local delta body bytes), and the read falls through to "unwritten LBA" handling.
+
+**Closing this gap requires:**
+
+1. `elide-fetch` learns to recognise Delta entries and, on first access to any Delta LBA in a segment, fetch the segment's full delta body section (`GET [body_offset + body_length, EOF)` against the S3 object) and append those bytes to `cache/<id>.body` at offset `body_length`. After this, the file shape matches exactly what the import host produced via `promote_to_cache` extension, and all subsequent reads resolve via the same cached path.
+2. `extent_index::rebuild` for cached segments conditionally registers Delta entries when the `.body` file's length exceeds `body_length` (i.e. the delta body section is present). Today the cached-path rebuild has an explicit `continue` for Delta entries; the post-B2 extension removes that when the sidecar is available.
+3. A sentinel or per-segment marker so rebuild can distinguish "this segment has no delta body" (never had one; normal case) from "this segment has a delta body but it isn't cached yet" (pull host, fetch required). Simplest: check `delta_length > 0` in the `.idx` header — which rebuild already reads — and treat Delta entries as "present if local body file size > body_length, otherwise pending demand-fetch."
+
+This is deferred to a follow-up branch. Until it lands, delta compression is an import-host-only optimisation: the import host benefits from thin Delta entries (smaller S3 objects, 90% savings on jammy → jammy point releases), and any pull host of the same volume reads the Delta LBAs only after the demand-fetch extension lands. B2 does not break the pull-host read path — it just leaves it returning zeros for delta LBAs instead of their actual content, which will be corrected once (1)–(3) ship.
+
 ## Non-ext4 volumes
 
 For phase 2 (filemap-based delta at import) and phase 3 (snapshot coalescing), volumes without an ext4 filesystem simply don't get a filemap. The import path falls back to the existing block-by-block import. Delta compression is not available — segments are stored with full extents only. This is not a degraded mode that needs handling; it's the absence of an optimisation. The read path, segment format, and GC all work identically regardless of whether deltas exist.
