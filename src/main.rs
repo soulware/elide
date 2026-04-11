@@ -1244,13 +1244,9 @@ fn remote_pull(
     }
     .write(&vol_dir)?;
 
-    if manifest
-        .get("readonly")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        std::fs::write(vol_dir.join("volume.readonly"), "")?;
-    }
+    // Pulled volumes are readonly by construction: the private key stays on
+    // the origin host, so this copy can only serve as a fork ancestor.
+    std::fs::write(vol_dir.join("volume.readonly"), "")?;
 
     if let Some(origin) = manifest.get("origin").and_then(|v| v.as_str()) {
         std::fs::write(vol_dir.join("volume.parent"), origin)?;
