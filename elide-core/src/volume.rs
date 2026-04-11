@@ -2736,13 +2736,35 @@ fn load_lineage_or_empty(fork_dir: &Path) -> io::Result<crate::signing::Provenan
 /// the root of its fork chain; returns an empty vec. The `parent` field is
 /// in the form `<parent-ulid>/snapshots/<branch-ulid>`, validated as ULIDs
 /// at parse time.
+/// Resolve an ancestor volume directory by ULID.
+///
+/// An ancestor may live in the writable `by_id/<ulid>/` tree or in the
+/// readonly pulled tree `readonly/<ulid>/`. Prefer `by_id/` when both exist:
+/// a locally writable copy supersedes a pulled readonly skeleton.
+///
+/// Falls back to `by_id_dir.join(ulid)` when neither candidate is present so
+/// that callers (and tests) get a deterministic path they can report in errors.
+pub fn resolve_ancestor_dir(by_id_dir: &Path, ulid: &str) -> PathBuf {
+    let by_id_candidate = by_id_dir.join(ulid);
+    if by_id_candidate.exists() {
+        return by_id_candidate;
+    }
+    if let Some(parent) = by_id_dir.parent() {
+        let readonly_candidate = parent.join("readonly").join(ulid);
+        if readonly_candidate.exists() {
+            return readonly_candidate;
+        }
+    }
+    by_id_candidate
+}
+
 pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
     let lineage = load_lineage_or_empty(fork_dir)?;
     let Some(parent_entry) = lineage.parent else {
         return Ok(Vec::new());
     };
     let (parent_ulid_str, branch_ulid) = parse_lineage_entry(&parent_entry, "parent", fork_dir)?;
-    let parent_fork_dir = by_id_dir.join(parent_ulid_str);
+    let parent_fork_dir = resolve_ancestor_dir(by_id_dir, parent_ulid_str);
 
     // Recurse into the parent's fork chain first (builds oldest-first order).
     let mut ancestors = walk_ancestors(&parent_fork_dir, by_id_dir)?;
@@ -2777,7 +2799,7 @@ pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Ve
     for entry in &lineage.extent_index {
         let (source_ulid_str, snapshot_ulid) =
             parse_lineage_entry(entry, "extent_index", fork_dir)?;
-        let source_dir = by_id_dir.join(source_ulid_str);
+        let source_dir = resolve_ancestor_dir(by_id_dir, source_ulid_str);
         if layers.iter().any(|l| l.dir == source_dir) {
             continue;
         }
@@ -4843,6 +4865,54 @@ mod tests {
             ancestors[0].branch_ulid.as_deref(),
             Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
         );
+    }
+
+    #[test]
+    fn walk_ancestors_crosses_into_readonly_tree() {
+        // Simulate the fork-from-remote layout: a writable child in
+        // `by_id/<child>/` whose parent only exists as a pulled readonly
+        // skeleton in `readonly/<parent>/`. `walk_ancestors` must resolve
+        // across both trees.
+        let data_dir = temp_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let by_id = data_dir.join("by_id");
+        let readonly = data_dir.join("readonly");
+
+        let parent_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let parent_dir = readonly.join(parent_ulid);
+        let child_dir = by_id.join(child_ulid);
+
+        write_test_provenance(
+            &child_dir,
+            Some(&format!(
+                "{parent_ulid}/snapshots/01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            )),
+            &[],
+        );
+        // Create the readonly parent dir so `resolve_ancestor_dir` picks it.
+        std::fs::create_dir_all(&parent_dir).unwrap();
+
+        let ancestors = walk_ancestors(&child_dir, &by_id).unwrap();
+        assert_eq!(ancestors.len(), 1);
+        assert_eq!(
+            ancestors[0].dir, parent_dir,
+            "ancestor should resolve into the readonly/ tree"
+        );
+        assert_eq!(
+            ancestors[0].branch_ulid.as_deref(),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+    }
+
+    #[test]
+    fn resolve_ancestor_dir_prefers_by_id_over_readonly() {
+        let data_dir = temp_dir();
+        let by_id = data_dir.join("by_id");
+        let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        std::fs::create_dir_all(by_id.join(ulid)).unwrap();
+        std::fs::create_dir_all(data_dir.join("readonly").join(ulid)).unwrap();
+        assert_eq!(resolve_ancestor_dir(&by_id, ulid), by_id.join(ulid));
     }
 
     #[test]
