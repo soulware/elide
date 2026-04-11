@@ -1,6 +1,6 @@
 // Coordinator inbound socket.
 //
-// Listens on coordinator.sock for commands from the elide CLI.
+// Listens on control.sock for commands from the elide CLI.
 // Protocol: one request line per connection, one response line, then close.
 // Exception: `import attach` streams multiple response lines until done.
 //

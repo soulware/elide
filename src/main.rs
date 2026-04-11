@@ -789,7 +789,7 @@ fn main() {
 ///
 /// Returns the snapshot ULID on success.
 fn snapshot_volume(data_dir: &Path, name: &str) -> std::io::Result<String> {
-    let socket = data_dir.join("coordinator.sock");
+    let socket = data_dir.join("control.sock");
     coordinator_client::snapshot_volume(&socket, name)
 }
 

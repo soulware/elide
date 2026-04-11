@@ -37,7 +37,7 @@ sequence rather than a volume-process one-shot.
 Most of the plumbing already exists. We extend it; we do not invent a
 new transport.
 
-- The CLI already speaks to the coordinator over `coordinator.sock`
+- The CLI already speaks to the coordinator over `control.sock`
   (`elide-coordinator/src/inbound.rs`). Adding a `snapshot` verb is
   the same shape as `import`/`delete`/`evict`.
 - The coordinator already speaks to each running volume process over

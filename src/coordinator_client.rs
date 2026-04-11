@@ -1,6 +1,6 @@
 // Client for the coordinator inbound socket.
 //
-// Connects to coordinator.sock, sends one command, reads one response line.
+// Connects to control.sock, sends one command, reads one response line.
 // A new connection is made per call — the protocol is request-response-close.
 //
 // Exception: `import_attach_by_name` reads multiple lines until a terminal line.
