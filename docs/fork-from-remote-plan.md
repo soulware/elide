@@ -29,12 +29,79 @@ Key references:
 
 ## Status
 
-Phases 1a, 1b, 1c, and 2 are implemented on this branch. See
-`git log fork-from-remote ^main` for the commits. Key tests:
+Phases 1a–1c and 2 are implemented on this branch. Verified end-to-end
+manually: created a volume, wrote `hello world`, snapshotted, deleted
+locally, pulled the remote skeleton, forked from `<vol_ulid>/<snap_ulid>`,
+mounted the fork over NBD, and read the file back.
+
+A late-stage bug was also fixed: `find_segment_in_dirs` was passing the
+child volume's `base_dir/index` as `index_dir` to the fetcher
+unconditionally, so demand-fetch for ancestor-owned segments failed with
+ENOENT at `<child>/index/<sid>.idx`. It now searches self + ancestors
+for whichever volume holds the `.idx`, and routes the fetcher at that
+owner's `index/` and `cache/`. Regression test:
+`find_segment_in_dirs_routes_fetcher_at_ancestor_index_dir`.
+
+Key tests (all passing):
 - `walk_ancestors_crosses_into_readonly_tree` (elide-core)
+- `resolve_ancestor_dir_prefers_by_id_over_readonly` (elide-core)
 - `discover_volumes_scans_readonly_tree` (elide-coordinator)
 - `prefetch_indexes_writes_readonly_ancestor_idx` (elide-coordinator)
 - `fork_volume_at_pins_explicit_snapshot_without_requiring_local_marker` (elide-core)
+- `find_segment_in_dirs_routes_fetcher_at_ancestor_index_dir` (elide-core)
+- `find_segment_in_dirs_prefers_self_over_ancestor_when_self_owns_idx` (elide-core)
+
+## Not yet done (follow-ups)
+
+Known gaps that did not make this branch and should be tackled next:
+
+1. **On-demand pull in `fork --from`.** Currently `fork --from
+   <vol_ulid>/<snap_ulid>` errors if the source isn't already in
+   `by_id/` or `readonly/`; the user must run `remote pull` first.
+   Should be a single command: detect the miss, call `remote_pull`
+   internally, wait for prefetch, proceed with fork.
+
+2. **Synchronous prefetch wait at volume open.** Today, opening a
+   freshly forked volume races the coordinator's background
+   `prefetch_indexes` tick. If the fork opens before prefetch has
+   completed for every ancestor, the LBA map rebuild silently sees an
+   empty ancestor index and reads fall through as zeros — the exact
+   silent-failure mode called out in `docs/operations.md:78`. Fix
+   requires snapshot-manifest work (see below) plus a new elide-fetch
+   helper `open_volume_ensuring_ancestors` that runs prefetch
+   synchronously before `Volume::open`.
+
+3. **Snapshot completeness manifest (`.segments` file).** Proposed
+   design: a signed file `snapshots/<snap_ulid>.segments` listing every
+   segment ULID in this volume's `index/` with ULID ≤ snap_ulid (built
+   incrementally from the previous snapshot's manifest). `Volume::open`
+   would verify for each ancestor layer that the manifest exists,
+   signature-checks against the ancestor's own `volume.pub`, and that
+   every listed `.idx` is present locally. Fail-fast on any miss. This
+   gives offline-verifiable completeness and makes "ancestor fully
+   prefetched" an exact predicate, not a brittle "index/ non-empty"
+   heuristic. **Blocked on:** the snapshot flow moving into the
+   coordinator (see `docs/coordinator-driven-snapshot-plan.md`),
+   because the `.segments` write must happen *after* all pending
+   segments are drained+promoted to `index/` — which is a cross-
+   component sequencing concern.
+
+4. **Volume::open fail-fast guard.** Once `.segments` is in place,
+   `Volume::open` rejects any ancestor whose manifest is missing or
+   whose listed `.idx` files are not all present. Current behaviour
+   silently returns zeros. Invariant: *it must be impossible for a
+   volume to read zeros when it should read data due to an incomplete
+   LBA map*.
+
+5. **Snapshot ULID discoverability.** No way to list snapshots
+   available in the store for a given `<vol_ulid>`. Users currently
+   `ls` the local `snapshots/` dir before deleting; after delete, the
+   knowledge is gone. Needs `elide volume remote inspect <vol_ulid>`
+   or similar.
+
+6. **`volume delete` drain-safety.** Deletes succeed even if local
+   state has not fully drained/uploaded to the store, silently losing
+   data from the remote copy. Needs a check, or a `--force` gate.
 
 ## Phases
 
