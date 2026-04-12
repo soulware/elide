@@ -192,12 +192,21 @@ enum VolumeCommand {
     },
 
     /// Create a new volume
+    ///
+    /// With `--from`, creates a fork of an existing volume (equivalent to
+    /// `volume fork --from`).  Without `--from`, creates a fresh empty volume
+    /// and `--size` is required.
     Create {
         /// Volume name
         name: String,
-        /// Volume size (e.g. "4G", "512M")
-        #[arg(long)]
+        /// Volume size (e.g. "4G", "512M"). Required for fresh volumes;
+        /// conflicts with `--from` (size is inherited from the source).
+        #[arg(long, conflicts_with = "from")]
         size: Option<String>,
+        /// Fork from an existing volume: `<name>`, `<vol_ulid>`, or
+        /// `<vol_ulid>/<snap_ulid>`
+        #[arg(long)]
+        from: Option<String>,
         /// Port for the NBD server (exposes the volume over NBD on first start)
         #[arg(long, conflicts_with = "nbd_socket")]
         nbd_port: Option<u16>,
@@ -417,9 +426,14 @@ fn main() {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
-                if let Err(e) =
-                    create_fork(&args.data_dir, &fork_name, &from, &socket_path, &by_id_dir)
-                {
+                if let Err(e) = create_fork(
+                    &args.data_dir,
+                    &fork_name,
+                    &from,
+                    &socket_path,
+                    &by_id_dir,
+                    None,
+                ) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -428,25 +442,45 @@ fn main() {
             VolumeCommand::Create {
                 name,
                 size,
+                from,
                 nbd_port,
                 nbd_bind,
                 nbd_socket,
             } => {
-                if let Err(e) = create_volume(
-                    &args.data_dir,
-                    &name,
-                    size.as_deref(),
-                    nbd_port,
-                    nbd_bind,
-                    nbd_socket,
-                ) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-                if coordinator_client::rescan(&socket_path).is_err() {
-                    eprintln!(
-                        "warning: coordinator unreachable; volume will be picked up on next scan"
-                    );
+                let nbd = if let Some(path) = nbd_socket {
+                    Some(elide_core::config::NbdConfig {
+                        socket: Some(path),
+                        ..Default::default()
+                    })
+                } else {
+                    nbd_port.map(|port| elide_core::config::NbdConfig {
+                        port: Some(port),
+                        bind: nbd_bind,
+                        ..Default::default()
+                    })
+                };
+
+                if let Some(from) = &from {
+                    if let Err(e) = validate_volume_name(&name) {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                    if let Err(e) =
+                        create_fork(&args.data_dir, &name, from, &socket_path, &by_id_dir, nbd)
+                    {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                } else {
+                    if let Err(e) = create_volume(&args.data_dir, &name, size.as_deref(), nbd) {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                    if coordinator_client::rescan(&socket_path).is_err() {
+                        eprintln!(
+                            "warning: coordinator unreachable; volume will be picked up on next scan"
+                        );
+                    }
                 }
             }
 
@@ -557,6 +591,7 @@ fn main() {
                                 &name,
                                 &socket_path,
                                 &by_id_dir,
+                                None,
                             )
                         {
                             eprintln!("error creating fork '{fork_name}': {e}");
@@ -846,9 +881,7 @@ fn create_volume(
     data_dir: &Path,
     name: &str,
     size: Option<&str>,
-    nbd_port: Option<u16>,
-    nbd_bind: Option<String>,
-    nbd_socket: Option<PathBuf>,
+    nbd: Option<elide_core::config::NbdConfig>,
 ) -> std::io::Result<()> {
     validate_volume_name(name)?;
     let size_str =
@@ -883,19 +916,6 @@ fn create_volume(
         VOLUME_PROVENANCE_FILE,
         &elide_core::signing::ProvenanceLineage::default(),
     )?;
-
-    let nbd = if let Some(path) = nbd_socket {
-        Some(elide_core::config::NbdConfig {
-            socket: Some(path),
-            ..Default::default()
-        })
-    } else {
-        nbd_port.map(|port| elide_core::config::NbdConfig {
-            port: Some(port),
-            bind: nbd_bind,
-            ..Default::default()
-        })
-    };
 
     elide_core::config::VolumeConfig {
         name: Some(name.to_owned()),
@@ -936,6 +956,7 @@ fn create_fork(
     from: &str,
     socket_path: &Path,
     by_id_dir: &Path,
+    nbd: Option<elide_core::config::NbdConfig>,
 ) -> std::io::Result<()> {
     validate_volume_name(fork_name)?;
 
@@ -1089,7 +1110,7 @@ fn create_fork(
     if let Err(e) = (elide_core::config::VolumeConfig {
         name: Some(fork_name.to_owned()),
         size: Some(size),
-        nbd: None,
+        nbd,
     }
     .write(&new_fork_dir))
     {
