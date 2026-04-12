@@ -36,7 +36,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Supervise a single fork: spawn `elide serve-volume`, restart on exit.
 /// Runs indefinitely; cancel the task to stop supervision.
-pub async fn supervise(fork_dir: PathBuf, elide_bin: PathBuf) {
+pub async fn supervise(fork_dir: PathBuf, data_dir: PathBuf, elide_bin: PathBuf) {
     let label = fork_dir.display().to_string();
     let mut fast_failures: u32 = 0;
 
@@ -51,6 +51,39 @@ pub async fn supervise(fork_dir: PathBuf, elide_bin: PathBuf) {
         if fork_dir.join("volume.stopped").exists() {
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
+        }
+
+        // NBD endpoint conflict: lowest ULID wins, loser is stopped.
+        match elide_core::config::find_nbd_conflict(&fork_dir, &data_dir) {
+            Ok(Some(conflict)) => {
+                // If the other volume has a lower ULID (or this is an
+                // external listener with no dir), this volume loses.
+                let dominated = conflict.dir.as_ref().is_none_or(|other_dir| {
+                    let self_name = fork_dir.file_name().and_then(|n| n.to_str());
+                    let other_name = other_dir.file_name().and_then(|n| n.to_str());
+                    match (self_name, other_name) {
+                        (Some(s), Some(o)) => s > o,
+                        _ => true,
+                    }
+                });
+                if dominated {
+                    error!(
+                        "[supervisor {label}] nbd endpoint {} conflicts with '{}'; \
+                         volume stopped (lower ULID wins)",
+                        conflict.endpoint, conflict.name,
+                    );
+                    let _ = std::fs::write(fork_dir.join("volume.stopped"), "");
+                    break;
+                }
+                // We have the lower ULID — the other supervisor will stop
+                // itself. Proceed normally.
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("[supervisor {label}] nbd conflict check failed: {e}");
+                // Non-fatal: proceed with the spawn and let the bind fail
+                // naturally if there really is a conflict.
+            }
         }
 
         // Check for a running process left by a previous coordinator session.
