@@ -306,9 +306,9 @@ fn scan_inode_fragments(f: &mut File, sb: &Superblock) -> io::Result<Vec<InodeFr
 /// Walk the ext4 directory tree and return `(path → full_file_hash)`,
 /// where `full_file_hash` is `blake3(ext4_view::read(path))` — i.e.,
 /// blake3 of the file-truthful bytes.
-fn enumerate_file_paths(image: &Path) -> io::Result<HashMap<blake3::Hash, String>> {
+fn enumerate_file_paths(image: &Path) -> io::Result<HashMap<blake3::Hash, Vec<String>>> {
     let fs = Ext4::load_from_path(image).map_err(|e| io::Error::other(e.to_string()))?;
-    let mut out = HashMap::new();
+    let mut out: HashMap<blake3::Hash, Vec<String>> = HashMap::new();
     let mut queue: Vec<Ext4PathBuf> = vec![Ext4PathBuf::new("/")];
 
     while let Some(dir) = queue.pop() {
@@ -339,10 +339,7 @@ fn enumerate_file_paths(image: &Path) -> io::Result<HashMap<blake3::Hash, String
                 };
                 let hash = blake3::hash(&data);
                 if let Ok(s) = path.to_str() {
-                    // Hardlinks and exact-dup files would collide here;
-                    // last writer wins. Acceptable for delta: either
-                    // path can serve as the source.
-                    out.insert(hash, s.to_string());
+                    out.entry(hash).or_default().push(s.to_string());
                 }
             }
         }
@@ -372,14 +369,17 @@ pub fn scan(image: &Path) -> io::Result<Ext4Scan> {
 
     let sb = Superblock::read(&mut f)?;
     let inodes = scan_inode_fragments(&mut f, &sb)?;
-    let paths_by_hash = enumerate_file_paths(image)?;
+    let mut paths_by_hash = enumerate_file_paths(image)?;
 
     let mut fragments = Vec::new();
     let mut file_lba_coverage = vec![0u64; (total_lbas as usize).div_ceil(64)];
 
     for inode in inodes {
-        let path = match paths_by_hash.get(&inode.full_hash) {
-            Some(p) => p.clone(),
+        let path = match paths_by_hash.get_mut(&inode.full_hash) {
+            Some(paths) => match paths.pop() {
+                Some(p) => p,
+                None => continue, // all paths for this hash already consumed
+            },
             None => continue, // orphan inode (deleted file still in table)
         };
         for part in inode.fragments {
