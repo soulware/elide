@@ -1318,36 +1318,22 @@ fn update_volume(
 
 const STOPPED_FILE: &str = "volume.stopped";
 
-fn stop_volume(vol_dir: &Path, name: &str) -> std::io::Result<()> {
+/// Send a one-shot command to the volume's control socket and return the
+/// response line. Returns `None` if the volume is not running.
+fn control_call(vol_dir: &Path, cmd: &str) -> std::io::Result<Option<String>> {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixStream;
 
-    if vol_dir.join("volume.readonly").exists() {
-        return Err(std::io::Error::other("volume is readonly; nothing to stop"));
-    }
-    if vol_dir.join(STOPPED_FILE).exists() {
-        return Err(std::io::Error::other("volume is already stopped"));
-    }
-
-    // Write the marker before sending shutdown so the supervisor won't restart.
-    std::fs::write(vol_dir.join(STOPPED_FILE), "")?;
-
-    // Send shutdown to flush WAL and exit cleanly.
     let sock = vol_dir.join("control.sock");
     match UnixStream::connect(&sock) {
         Ok(mut stream) => {
-            writeln!(stream, "shutdown")?;
+            writeln!(stream, "{cmd}")?;
             stream.flush()?;
             stream.shutdown(std::net::Shutdown::Write)?;
             let mut reader = std::io::BufReader::new(stream);
             let mut line = String::new();
             reader.read_line(&mut line)?;
-            let line = line.trim();
-            if line != "ok" {
-                // Remove marker on failure so we don't leave a half-stopped state.
-                let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
-                return Err(std::io::Error::other(format!("shutdown failed: {line}")));
-            }
+            Ok(Some(line.trim().to_owned()))
         }
         Err(e)
             if matches!(
@@ -1355,11 +1341,40 @@ fn stop_volume(vol_dir: &Path, name: &str) -> std::io::Result<()> {
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
             ) =>
         {
-            // Already not running — marker is still written, which is correct.
+            Ok(None)
         }
-        Err(e) => {
+        Err(e) => Err(e),
+    }
+}
+
+fn stop_volume(vol_dir: &Path, name: &str) -> std::io::Result<()> {
+    if vol_dir.join("volume.readonly").exists() {
+        return Err(std::io::Error::other("volume is readonly; nothing to stop"));
+    }
+    if vol_dir.join(STOPPED_FILE).exists() {
+        return Err(std::io::Error::other("volume is already stopped"));
+    }
+
+    // Refuse to stop while an NBD client is connected.
+    if let Some(resp) = control_call(vol_dir, "connected")?
+        && resp == "ok true"
+    {
+        return Err(std::io::Error::other(
+            "nbd client is connected; disconnect it first",
+        ));
+    }
+
+    // Write the marker before sending shutdown so the supervisor won't restart.
+    std::fs::write(vol_dir.join(STOPPED_FILE), "")?;
+
+    match control_call(vol_dir, "shutdown")? {
+        Some(resp) if resp == "ok" => {}
+        Some(resp) => {
             let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
-            return Err(e);
+            return Err(std::io::Error::other(format!("shutdown failed: {resp}")));
+        }
+        None => {
+            // Already not running — marker is still written, which is correct.
         }
     }
 
