@@ -157,7 +157,11 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 // Readonly volumes (imported bases) have no live process —
                 // skip supervision so we don't crash-loop on serve-volume.
                 if !vol_dir.join("volume.readonly").exists() {
-                    tasks.spawn(supervisor::supervise(vol_dir, elide_bin.clone()));
+                    tasks.spawn(supervisor::supervise(
+                        vol_dir,
+                        data_dir.as_ref().clone(),
+                        elide_bin.clone(),
+                    ));
                 }
             }
         }

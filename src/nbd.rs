@@ -810,7 +810,8 @@ fn run_volume_ipc_only(
         .name("volume-actor".into())
         .spawn(move || _actor.run())
         .map_err(io::Error::other)?;
-    crate::control::start(dir, handle)?;
+    let nbd_connected = Arc::new(AtomicBool::new(false));
+    crate::control::start(dir, handle, nbd_connected)?;
 
     // Block until SIGTERM terminates the process.
     loop {
@@ -845,14 +846,17 @@ fn serve_volume_listener(
         .name("volume-actor".into())
         .spawn(move || actor.run())
         .map_err(io::Error::other)?;
-    crate::control::start(dir, handle.clone())?;
+    let nbd_connected = Arc::new(AtomicBool::new(false));
+    crate::control::start(dir, handle.clone(), Arc::clone(&nbd_connected))?;
 
     loop {
         let (stream, peer) = listener.accept()?;
         println!("[connected: {}]", peer);
+        nbd_connected.store(true, Ordering::Relaxed);
 
         let result = handle_volume_connection(stream, &handle, size_bytes);
 
+        nbd_connected.store(false, Ordering::Relaxed);
         match result {
             Ok(()) => println!("[disconnected]"),
             Err(e) => warn!("[connection error: {}]", e),

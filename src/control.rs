@@ -45,6 +45,10 @@
 //     the end of the inline drain step of a coordinator-driven
 //     snapshot. Returns "ok".
 //
+//   connected
+//     Returns "ok true" if an NBD client is currently connected, "ok false"
+//     otherwise. Always "ok false" for IPC-only volumes.
+//
 //   shutdown
 //     Flush WAL and exit cleanly.  Returns "ok" then terminates the process.
 //     The supervisor restarts the volume, picking up any updated config files.
@@ -52,6 +56,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use elide_core::actor::VolumeHandle;
@@ -63,31 +69,48 @@ use elide_core::actor::VolumeHandle;
 /// connection until the listener is closed.  The socket file is removed when
 /// the thread exits.
 ///
+/// `nbd_connected` is shared with the NBD accept loop: `true` while a client
+/// is connected, `false` otherwise. IPC-only volumes pass a permanently-false
+/// flag.
+///
 /// The handle is cloned onto the server thread; the caller retains its own
 /// clone.
-pub fn start(fork_dir: &Path, handle: VolumeHandle) -> std::io::Result<()> {
+pub fn start(
+    fork_dir: &Path,
+    handle: VolumeHandle,
+    nbd_connected: Arc<AtomicBool>,
+) -> std::io::Result<()> {
     let socket_path = fork_dir.join("control.sock");
     // Remove stale socket from a previous (crashed) run.
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
     thread::Builder::new()
         .name("control-server".into())
-        .spawn(move || run(listener, socket_path, handle))
+        .spawn(move || run(listener, socket_path, handle, nbd_connected))
         .map_err(std::io::Error::other)?;
     Ok(())
 }
 
-fn run(listener: UnixListener, socket_path: PathBuf, handle: VolumeHandle) {
+fn run(
+    listener: UnixListener,
+    socket_path: PathBuf,
+    handle: VolumeHandle,
+    nbd_connected: Arc<AtomicBool>,
+) {
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_connection(stream, &handle),
+            Ok(stream) => handle_connection(stream, &handle, &nbd_connected),
             Err(_) => break,
         }
     }
     let _ = std::fs::remove_file(&socket_path);
 }
 
-fn handle_connection(stream: std::os::unix::net::UnixStream, handle: &VolumeHandle) {
+fn handle_connection(
+    stream: std::os::unix::net::UnixStream,
+    handle: &VolumeHandle,
+    nbd_connected: &AtomicBool,
+) {
     let mut reader = BufReader::new(&stream);
     let mut writer = &stream;
     let mut line = String::new();
@@ -209,6 +232,9 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, handle: &VolumeHand
                 let _ = writeln!(writer, "err invalid ulid: {ulid_str}");
             }
         }
+    } else if line == "connected" {
+        let connected = nbd_connected.load(Ordering::Relaxed);
+        let _ = writeln!(writer, "ok {connected}");
     } else if line == "shutdown" {
         match handle.flush() {
             Ok(()) => {

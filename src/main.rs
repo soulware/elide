@@ -294,6 +294,18 @@ enum VolumeCommand {
         name: String,
     },
 
+    /// Stop a running volume (flushes and halts the NBD server; drain/GC continue)
+    Stop {
+        /// Volume name
+        name: String,
+    },
+
+    /// Start a previously stopped volume
+    Start {
+        /// Volume name
+        name: String,
+    },
+
     /// Interact with the remote object store
     Remote {
         #[command(subcommand)]
@@ -641,6 +653,22 @@ fn main() {
                 }
             }
 
+            VolumeCommand::Stop { name } => {
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                if let Err(e) = stop_volume(&vol_dir, &name) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+
+            VolumeCommand::Start { name } => {
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                if let Err(e) = start_volume(&vol_dir, &name, &args.data_dir, &socket_path) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+
             VolumeCommand::Remote { command } => {
                 let config = match elide_fetch::FetchConfig::load(&args.data_dir) {
                     Ok(Some(c)) => c,
@@ -830,7 +858,7 @@ enum ListFilter {
 
 fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
     let by_name_dir = data_dir.join("by_name");
-    let mut entries: Vec<(String, bool)> = Vec::new(); // (name, importing)
+    let mut entries: Vec<(String, String)> = Vec::new();
     match std::fs::read_dir(&by_name_dir) {
         Ok(dir_entries) => {
             for entry in dir_entries {
@@ -854,8 +882,22 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
                     ListFilter::Writable => !is_readonly,
                 };
                 if include {
-                    let importing = vol_dir.join("import.lock").exists();
-                    entries.push((name, importing));
+                    let suffix = if vol_dir.join(STOPPED_FILE).exists() {
+                        "  (stopped)".to_owned()
+                    } else if vol_dir.join("import.lock").exists() {
+                        "  (importing)".to_owned()
+                    } else {
+                        // Show the NBD endpoint when the volume is running.
+                        let ep = elide_core::config::VolumeConfig::read(&vol_dir)
+                            .ok()
+                            .and_then(|cfg| cfg.nbd)
+                            .and_then(|nbd| nbd.endpoint(&vol_dir));
+                        match ep {
+                            Some(ep) => format!("  ({ep})"),
+                            None => String::new(),
+                        }
+                    };
+                    entries.push((name, suffix));
                 }
             }
         }
@@ -866,12 +908,8 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
     if entries.is_empty() {
         println!("no volumes found in {}", data_dir.display());
     } else {
-        for (name, importing) in &entries {
-            if *importing {
-                println!("{name}  (importing)");
-            } else {
-                println!("{name}");
-            }
+        for (name, suffix) in &entries {
+            println!("{name}{suffix}");
         }
     }
     Ok(())
@@ -1283,6 +1321,103 @@ fn update_volume(
         Err(e) => return Err(e),
     }
 
+    Ok(())
+}
+
+const STOPPED_FILE: &str = "volume.stopped";
+
+/// Send a one-shot command to the volume's control socket and return the
+/// response line. Returns `None` if the volume is not running.
+fn control_call(vol_dir: &Path, cmd: &str) -> std::io::Result<Option<String>> {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixStream;
+
+    let sock = vol_dir.join("control.sock");
+    match UnixStream::connect(&sock) {
+        Ok(mut stream) => {
+            writeln!(stream, "{cmd}")?;
+            stream.flush()?;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            Ok(Some(line.trim().to_owned()))
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn stop_volume(vol_dir: &Path, name: &str) -> std::io::Result<()> {
+    if vol_dir.join("volume.readonly").exists() {
+        return Err(std::io::Error::other("volume is readonly; nothing to stop"));
+    }
+    if vol_dir.join(STOPPED_FILE).exists() {
+        println!("{name}: stopped");
+        return Ok(());
+    }
+
+    // Refuse to stop while an NBD client is connected.
+    if let Some(resp) = control_call(vol_dir, "connected")?
+        && resp == "ok true"
+    {
+        return Err(std::io::Error::other(
+            "nbd client is connected; disconnect it first",
+        ));
+    }
+
+    // Write the marker before sending shutdown so the supervisor won't restart.
+    std::fs::write(vol_dir.join(STOPPED_FILE), "")?;
+
+    match control_call(vol_dir, "shutdown")? {
+        Some(resp) if resp == "ok" => {}
+        Some(resp) => {
+            let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
+            return Err(std::io::Error::other(format!("shutdown failed: {resp}")));
+        }
+        None => {
+            // Already not running — marker is still written, which is correct.
+        }
+    }
+
+    println!("{name}: stopped");
+    Ok(())
+}
+
+fn start_volume(
+    vol_dir: &Path,
+    name: &str,
+    data_dir: &Path,
+    coordinator_socket: &Path,
+) -> std::io::Result<()> {
+    if !vol_dir.join(STOPPED_FILE).exists() {
+        return Err(std::io::Error::other("volume is not stopped"));
+    }
+
+    // Refuse to start if another active volume uses the same NBD endpoint.
+    if let Some(conflict) = elide_core::config::find_nbd_conflict(vol_dir, data_dir)? {
+        return Err(std::io::Error::other(format!(
+            "nbd endpoint {} conflicts with volume '{}'",
+            conflict.endpoint, conflict.name,
+        )));
+    }
+
+    std::fs::remove_file(vol_dir.join(STOPPED_FILE))?;
+
+    // Trigger an immediate rescan so the supervisor picks up the change.
+    if let Err(e) = coordinator_client::rescan(coordinator_socket) {
+        // Non-fatal: the supervisor will notice on its next poll anyway.
+        eprintln!("warning: could not notify coordinator: {e}");
+    }
+
+    println!("{name}: started");
     Ok(())
 }
 
