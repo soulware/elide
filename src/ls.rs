@@ -415,14 +415,22 @@ mod tests {
     }
 
     /// Allocate a fresh volume directory under `by_id`, create it, and write a
-    /// keypair so `Volume::open` can load `volume.key`.
+    /// keypair + default provenance so `Volume::open` can load `volume.key`
+    /// and ancestor walkers find a valid provenance file.
     fn new_vol_dir(by_id: &std::path::Path) -> PathBuf {
         let dir = new_vol_path(by_id);
         std::fs::create_dir_all(&dir).unwrap();
-        elide_core::signing::generate_keypair(
+        let key = elide_core::signing::generate_keypair(
             &dir,
             elide_core::signing::VOLUME_KEY_FILE,
             elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        elide_core::signing::write_provenance(
+            &dir,
+            &key,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            &elide_core::signing::ProvenanceLineage::default(),
         )
         .unwrap();
         dir
@@ -538,21 +546,28 @@ mod tests {
             vol.snapshot().unwrap();
         }
 
-        // Find the segment in pending/.
-        let pending_dir = vol_dir.join("pending");
-        let seg_entry = std::fs::read_dir(&pending_dir)
+        // snapshot() auto-promotes pending → index/cache. Find the segment
+        // in index/, reconstruct the full segment bytes from .idx + .body for
+        // upload, then evict the local cache to force demand-fetch.
+        let index_dir = vol_dir.join("index");
+        let cache_dir = vol_dir.join("cache");
+        let idx_entry = std::fs::read_dir(&index_dir)
             .unwrap()
             .flatten()
-            .next()
+            .find(|e| e.file_name().to_str().is_some_and(|s| s.ends_with(".idx")))
             .unwrap();
-        let seg_path = seg_entry.path();
-        let seg_id = seg_path.file_name().unwrap().to_str().unwrap().to_owned();
+        let seg_id = idx_entry
+            .file_name()
+            .to_str()
+            .unwrap()
+            .strip_suffix(".idx")
+            .unwrap()
+            .to_owned();
+        let idx_bytes = std::fs::read(idx_entry.path()).unwrap();
+        let body_bytes = std::fs::read(cache_dir.join(format!("{seg_id}.body"))).unwrap();
+        let seg_bytes = [idx_bytes.as_slice(), body_bytes.as_slice()].concat();
 
-        // Read the segment bytes and compute bss before removing the local copy.
-        let seg_bytes = std::fs::read(&seg_path).unwrap();
-        let (bss, _) = elide_core::segment::read_segment_index(&seg_path).unwrap();
-
-        // Upload the full segment to the local store, then remove the pending copy.
+        // Upload the full segment to the local store.
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_dir.path()).unwrap());
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -560,17 +575,11 @@ mod tests {
         let dt: chrono::DateTime<chrono::Utc> = seg_ulid.datetime().into();
         let date = dt.format("%Y%m%d").to_string();
         let key = StorePath::from(format!("by_id/{vol_id}/segments/{date}/{seg_id}"));
-        rt.block_on(store.put(&key, seg_bytes.clone().into()))
-            .unwrap();
-        std::fs::remove_file(&seg_path).unwrap();
-        let index_dir = vol_dir.join("index");
-        let cache_dir = vol_dir.join("cache");
-        std::fs::create_dir_all(&index_dir).unwrap();
-        std::fs::write(
-            index_dir.join(format!("{seg_id}.idx")),
-            &seg_bytes[..bss as usize],
-        )
-        .unwrap();
+        rt.block_on(store.put(&key, seg_bytes.into())).unwrap();
+
+        // Evict the local cache to simulate a cold read that must demand-fetch.
+        std::fs::remove_file(cache_dir.join(format!("{seg_id}.body"))).unwrap();
+        std::fs::remove_file(cache_dir.join(format!("{seg_id}.present"))).unwrap();
 
         // VolumeReader should configure a fetcher from fetch.toml and trigger
         // per-extent fetch on the first read_block(0).

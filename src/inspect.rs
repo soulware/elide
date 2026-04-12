@@ -801,10 +801,17 @@ mod tests {
         let by_id_dir = tmp.join("by_id");
         let vol_dir = by_id_dir.join("01JQAAAAAAAAAAAAAAAAAAAAAA");
         fs::create_dir_all(&vol_dir).unwrap();
-        elide_core::signing::generate_keypair(
+        let key = elide_core::signing::generate_keypair(
             &vol_dir,
             elide_core::signing::VOLUME_KEY_FILE,
             elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        elide_core::signing::write_provenance(
+            &vol_dir,
+            &key,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            &elide_core::signing::ProvenanceLineage::default(),
         )
         .unwrap();
 
@@ -816,8 +823,9 @@ mod tests {
 
         let node = collect_node(&vol_dir, true, false).unwrap();
         assert!(node.is_live);
-        assert_eq!(node.pending.len(), 1);
-        assert_eq!(node.pending[0].entry_count, 1);
+        // snapshot() auto-promotes pending segments to index/cache.
+        assert_eq!(node.cache.len(), 1);
+        assert_eq!(node.cache[0].entry_count, 1);
 
         fs::remove_dir_all(tmp).unwrap();
     }

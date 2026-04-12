@@ -1,6 +1,6 @@
 // Client for the coordinator inbound socket.
 //
-// Connects to coordinator.sock, sends one command, reads one response line.
+// Connects to control.sock, sends one command, reads one response line.
 // A new connection is made per call — the protocol is request-response-close.
 //
 // Exception: `import_attach_by_name` reads multiple lines until a terminal line.
@@ -135,6 +135,23 @@ pub fn evict_volume(socket_path: &Path, name: &str, ulid: Option<&str>) -> io::R
         Some(("ok", n)) => n
             .parse::<usize>()
             .map_err(|e| io::Error::other(format!("unexpected response: {resp}: {e}"))),
+        Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
+        _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
+    }
+}
+
+/// Trigger a coordinator-orchestrated snapshot of a running volume.
+///
+/// The coordinator acquires the per-volume snapshot lock, flushes the WAL
+/// via the volume control socket, runs the inline drain, triggers the
+/// signed `.manifest` file, and uploads the snapshot files. The CLI
+/// only blocks on the reply.
+///
+/// Returns the snapshot ULID on success.
+pub fn snapshot_volume(socket_path: &Path, name: &str) -> io::Result<String> {
+    let resp = call(socket_path, &format!("snapshot {name}"))?;
+    match resp.split_once(' ') {
+        Some(("ok", ulid)) => Ok(ulid.trim().to_owned()),
         Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
         _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
     }

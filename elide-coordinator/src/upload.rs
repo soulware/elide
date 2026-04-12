@@ -101,6 +101,20 @@ pub fn filemap_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
     )))
 }
 
+/// Build the object store key for a signed snapshot manifest.
+///
+/// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>.manifest`
+pub fn snapshot_manifest_key(volume_id: &str, ulid_str: &str) -> Result<StorePath> {
+    let ulid: Ulid = ulid_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid ULID '{ulid_str}': {e}"))?;
+    let dt: DateTime<Utc> = ulid.datetime().into();
+    let date = dt.format("%Y%m%d").to_string();
+    Ok(StorePath::from(format!(
+        "by_id/{volume_id}/snapshots/{date}/{ulid_str}.manifest"
+    )))
+}
+
 /// Volume manifest written to `by_id/<ulid>/manifest.toml` in the store.
 ///
 /// Contains everything a new host needs to reconstruct the local directory
@@ -202,16 +216,29 @@ pub async fn drain_pending(
     Ok(DrainResult { uploaded, failed })
 }
 
-/// Upload volume metadata: public key, manifest.toml, names/<name> entry,
-/// snapshot markers, and filemaps.
+/// Upload volume metadata: public key, signed provenance, manifest.toml,
+/// names/<name> entry, snapshot markers, and filemaps.
 ///
 /// All uploads are best-effort — failures are logged but do not abort drain.
 async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
     let pub_key_path = vol_dir.join("volume.pub");
     if pub_key_path.exists()
-        && let Err(e) = upload_pub_key(&pub_key_path, volume_id, store).await
+        && let Err(e) = upload_small_file(&pub_key_path, volume_id, "volume.pub", store).await
     {
         warn!("pub key upload failed: {e:#}");
+    }
+
+    let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
+    if provenance_path.exists()
+        && let Err(e) = upload_small_file(
+            &provenance_path,
+            volume_id,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            store,
+        )
+        .await
+    {
+        warn!("provenance upload failed: {e:#}");
     }
 
     if let Err(e) = upload_manifest(vol_dir, volume_id, store).await {
@@ -223,19 +250,20 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
     }
 }
 
-async fn upload_pub_key(
-    pub_key_path: &Path,
+async fn upload_small_file(
+    local_path: &Path,
     volume_id: &str,
+    remote_name: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
-    let data = tokio::fs::read(pub_key_path)
+    let data = tokio::fs::read(local_path)
         .await
-        .with_context(|| format!("reading pub key: {}", pub_key_path.display()))?;
-    let key = StorePath::from(format!("by_id/{volume_id}/volume.pub"));
+        .with_context(|| format!("reading {}", local_path.display()))?;
+    let key = StorePath::from(format!("by_id/{volume_id}/{remote_name}"));
     store
         .put(&key, Bytes::from(data).into())
         .await
-        .with_context(|| format!("uploading pub key to {key}"))?;
+        .with_context(|| format!("uploading {remote_name} to {key}"))?;
     Ok(())
 }
 
@@ -323,12 +351,14 @@ pub async fn upload_snapshot(
     Ok(())
 }
 
-/// Upload all snapshot markers and filemaps from `vol_dir/snapshots/` to S3.
+/// Upload all snapshot markers, filemaps, and signed segments manifests from
+/// `vol_dir/snapshots/` to S3.
 ///
 /// For each snapshot ULID found locally, uploads:
 /// - The empty snapshot marker at `snapshots/YYYYMMDD/<ulid>`
 /// - The filemap at `snapshots/YYYYMMDD/<ulid>.filemap` (if present)
-async fn upload_snapshots_and_filemaps(
+/// - The signed snapshot manifest at `snapshots/YYYYMMDD/<ulid>.manifest` (if present)
+pub async fn upload_snapshots_and_filemaps(
     vol_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
@@ -370,6 +400,19 @@ async fn upload_snapshots_and_filemaps(
                 .put(&key, Bytes::from(data).into())
                 .await
                 .with_context(|| format!("uploading filemap to {key}"))?;
+        }
+
+        // Upload signed segments manifest if present.
+        let manifest_path = snap_dir.join(format!("{name}.manifest"));
+        if manifest_path.exists() {
+            let key = snapshot_manifest_key(volume_id, name)?;
+            let data = tokio::fs::read(&manifest_path).await.with_context(|| {
+                format!("reading snapshot manifest: {}", manifest_path.display())
+            })?;
+            store
+                .put(&key, Bytes::from(data).into())
+                .await
+                .with_context(|| format!("uploading snapshot manifest to {key}"))?;
         }
     }
 
