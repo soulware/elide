@@ -182,6 +182,7 @@ pub fn import_image(
     let mut block = [0u8; LBA_SIZE];
     let mut entries: Vec<SegmentEntry> = Vec::new();
     let mut batch_raw_bytes: usize = 0;
+    let mut all_segment_ulids: Vec<Ulid> = Vec::new();
     let mut last_segment_ulid: Option<String> = None;
 
     // File fragments, drained in LBA order (ext4_scan sorts them).
@@ -253,23 +254,34 @@ pub fn import_image(
         if batch_raw_bytes >= IMPORT_SEGMENT_BYTES
             && let Some(ulid) = flush_segment(&segments_dir, &mut entries, signer)?
         {
+            all_segment_ulids
+                .push(Ulid::from_string(&ulid).expect("flush_segment returned invalid ULID"));
             last_segment_ulid = Some(ulid);
             batch_raw_bytes = 0;
         }
     }
 
     if let Some(ulid) = flush_segment(&segments_dir, &mut entries, signer)? {
+        all_segment_ulids
+            .push(Ulid::from_string(&ulid).expect("flush_segment returned invalid ULID"));
         last_segment_ulid = Some(ulid);
     }
 
     // Snapshot marker reuses the last segment's ULID so the branch point is
     // self-describing. Falls back to a fresh ULID only for all-zero images
     // where no segments were written.
-    let snap_ulid = last_segment_ulid.unwrap_or_else(|| Ulid::new().to_string());
-    fs::write(snapshots_dir.join(&snap_ulid), "")?;
+    let snap_ulid_str = last_segment_ulid.unwrap_or_else(|| Ulid::new().to_string());
+    let snap_ulid = Ulid::from_string(&snap_ulid_str)
+        .map_err(|e| io::Error::other(format!("invalid snapshot ULID: {e}")))?;
+
+    // Write the signed snapshot manifest before the marker — partial
+    // sequences leave no snapshot visible (the marker is written last).
+    crate::signing::write_snapshot_manifest(vol_dir, signer, &snap_ulid, &all_segment_ulids)?;
+
+    fs::write(snapshots_dir.join(&snap_ulid_str), "")?;
 
     // Write the filemap alongside the snapshot marker.
-    filemap::write(&snapshots_dir, &snap_ulid, &filemap_rows)?;
+    filemap::write(&snapshots_dir, &snap_ulid_str, &filemap_rows)?;
 
     // Write size into volume.toml (read-modify-write to preserve name if already set).
     let mut cfg = crate::config::VolumeConfig::read(vol_dir)?;
