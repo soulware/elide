@@ -529,6 +529,11 @@ fn volume_status(volume_name: &str, data_dir: &Path) -> String {
     // The OS follows the symlink transparently for all path ops below.
     let vol_dir = link;
 
+    // Check if intentionally stopped.
+    if vol_dir.join("volume.stopped").exists() {
+        return "ok stopped (manual)".to_string();
+    }
+
     // Check for an active import.
     if vol_dir.join(import::LOCK_FILE).exists() {
         let ulid = std::fs::read_to_string(vol_dir.join(import::LOCK_FILE))
@@ -562,6 +567,11 @@ fn delete_volume(volume_name: &str, data_dir: &Path) -> String {
         Ok(p) => p,
         Err(e) => return format!("err resolving volume dir: {e}"),
     };
+
+    // Refuse to delete a running writable volume — must be stopped first.
+    if !vol_dir.join("volume.readonly").exists() && !vol_dir.join("volume.stopped").exists() {
+        return "err volume is running; stop it first with: elide volume stop <name>".to_string();
+    }
 
     import::kill_all_for_volume(&vol_dir);
 

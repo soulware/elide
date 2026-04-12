@@ -47,6 +47,12 @@ pub async fn supervise(fork_dir: PathBuf, elide_bin: PathBuf) {
             break;
         }
 
+        // Volume intentionally stopped — wait for the marker to disappear.
+        if fork_dir.join("volume.stopped").exists() {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
+
         // Check for a running process left by a previous coordinator session.
         if let Some(pid) = read_pid(&fork_dir) {
             if is_alive(pid) {

@@ -294,6 +294,18 @@ enum VolumeCommand {
         name: String,
     },
 
+    /// Stop a running volume (flushes and halts the NBD server; drain/GC continue)
+    Stop {
+        /// Volume name
+        name: String,
+    },
+
+    /// Start a previously stopped volume
+    Start {
+        /// Volume name
+        name: String,
+    },
+
     /// Interact with the remote object store
     Remote {
         #[command(subcommand)]
@@ -641,6 +653,22 @@ fn main() {
                 }
             }
 
+            VolumeCommand::Stop { name } => {
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                if let Err(e) = stop_volume(&vol_dir, &name) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+
+            VolumeCommand::Start { name } => {
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                if let Err(e) = start_volume(&vol_dir, &name, &socket_path) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+
             VolumeCommand::Remote { command } => {
                 let config = match elide_fetch::FetchConfig::load(&args.data_dir) {
                     Ok(Some(c)) => c,
@@ -830,7 +858,7 @@ enum ListFilter {
 
 fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
     let by_name_dir = data_dir.join("by_name");
-    let mut entries: Vec<(String, bool)> = Vec::new(); // (name, importing)
+    let mut entries: Vec<(String, &str)> = Vec::new(); // (name, suffix)
     match std::fs::read_dir(&by_name_dir) {
         Ok(dir_entries) => {
             for entry in dir_entries {
@@ -854,8 +882,14 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
                     ListFilter::Writable => !is_readonly,
                 };
                 if include {
-                    let importing = vol_dir.join("import.lock").exists();
-                    entries.push((name, importing));
+                    let suffix = if vol_dir.join(STOPPED_FILE).exists() {
+                        "  (stopped)"
+                    } else if vol_dir.join("import.lock").exists() {
+                        "  (importing)"
+                    } else {
+                        ""
+                    };
+                    entries.push((name, suffix));
                 }
             }
         }
@@ -866,12 +900,8 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
     if entries.is_empty() {
         println!("no volumes found in {}", data_dir.display());
     } else {
-        for (name, importing) in &entries {
-            if *importing {
-                println!("{name}  (importing)");
-            } else {
-                println!("{name}");
-            }
+        for (name, suffix) in &entries {
+            println!("{name}{suffix}");
         }
     }
     Ok(())
@@ -1283,6 +1313,74 @@ fn update_volume(
         Err(e) => return Err(e),
     }
 
+    Ok(())
+}
+
+const STOPPED_FILE: &str = "volume.stopped";
+
+fn stop_volume(vol_dir: &Path, name: &str) -> std::io::Result<()> {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixStream;
+
+    if vol_dir.join("volume.readonly").exists() {
+        return Err(std::io::Error::other("volume is readonly; nothing to stop"));
+    }
+    if vol_dir.join(STOPPED_FILE).exists() {
+        return Err(std::io::Error::other("volume is already stopped"));
+    }
+
+    // Write the marker before sending shutdown so the supervisor won't restart.
+    std::fs::write(vol_dir.join(STOPPED_FILE), "")?;
+
+    // Send shutdown to flush WAL and exit cleanly.
+    let sock = vol_dir.join("control.sock");
+    match UnixStream::connect(&sock) {
+        Ok(mut stream) => {
+            writeln!(stream, "shutdown")?;
+            stream.flush()?;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            let line = line.trim();
+            if line != "ok" {
+                // Remove marker on failure so we don't leave a half-stopped state.
+                let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
+                return Err(std::io::Error::other(format!("shutdown failed: {line}")));
+            }
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            // Already not running — marker is still written, which is correct.
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
+            return Err(e);
+        }
+    }
+
+    println!("{name}: stopped");
+    Ok(())
+}
+
+fn start_volume(vol_dir: &Path, name: &str, coordinator_socket: &Path) -> std::io::Result<()> {
+    if !vol_dir.join(STOPPED_FILE).exists() {
+        return Err(std::io::Error::other("volume is not stopped"));
+    }
+
+    std::fs::remove_file(vol_dir.join(STOPPED_FILE))?;
+
+    // Trigger an immediate rescan so the supervisor picks up the change.
+    if let Err(e) = coordinator_client::rescan(coordinator_socket) {
+        // Non-fatal: the supervisor will notice on its next poll anyway.
+        eprintln!("warning: could not notify coordinator: {e}");
+    }
+
+    println!("{name}: started");
     Ok(())
 }
 
