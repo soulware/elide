@@ -70,7 +70,7 @@ pub fn run(dir: &Path, by_id_dir: &Path) -> io::Result<()> {
     }
 
     let latest_snap_str = latest_snap.as_ref().map(|s| s.to_string());
-    let node = collect_node(dir)?;
+    let node = collect_node(dir, by_id_dir)?;
     let ancestors = collect_ancestor_nodes(dir, by_id_dir)?;
     print_node(&node, latest_snap_str.as_deref());
     print_ancestor_nodes(&ancestors);
@@ -88,12 +88,14 @@ struct NodeInfo {
     wal_files: Vec<WalInfo>,
     pending: Vec<SegInfo>,
     cache: Vec<CacheInfo>,
+    extent_sources: Vec<(String, String)>,
 }
 
 struct AncestorNode {
     volume_ulid: String,
     branch_ulid: Option<String>,
     cache: Vec<CacheInfo>,
+    extent_sources: Vec<(String, String)>,
 }
 
 struct CacheInfo {
@@ -106,14 +108,12 @@ struct CacheInfo {
     zero_count: usize,
     inline_count: usize,
     delta_count: usize,
-    /// Entries with body data (Data + DedupRef) — the ones that can be fetched.
-    fetchable_count: usize,
-    /// How many fetchable entries have their present bit set.
+    /// Count of Data entries with their body cached locally (set bit in
+    /// `.present`). Always `<= data_count` — `promote_to_cache` only sets
+    /// bits for Data entries, so this is exactly the data-local count.
     present_count: usize,
     /// Sum of stored_length for Data entries only (the unique bytes this segment stores).
     data_body_bytes: u64,
-    /// Sum of stored_length for DedupRef entries (body bytes referenced from canonical segments).
-    dedup_ref_body_bytes: u64,
     /// Byte length of the segment's delta body section (from the segment header).
     delta_body_bytes: u64,
     /// Size of the `.idx` file on disk.
@@ -146,19 +146,44 @@ struct SegInfo {
     error: Option<String>,
 }
 
-fn collect_node(dir: &Path) -> io::Result<NodeInfo> {
+fn collect_node(dir: &Path, by_id_dir: &Path) -> io::Result<NodeInfo> {
     let is_live = dir.join("wal").is_dir();
 
     let wal_files = collect_wal_dir(&dir.join("wal"))?;
     let pending = collect_seg_dir(&dir.join("pending"))?;
     let cache = collect_cache_dir(dir)?;
+    let extent_sources = collect_extent_sources(dir, by_id_dir);
 
     Ok(NodeInfo {
         is_live,
         wal_files,
         pending,
         cache,
+        extent_sources,
     })
+}
+
+/// Read `volume.provenance`'s `extent_index` for a single layer and return
+/// each entry as a `(volume_ulid, snapshot_ulid)` pair. Errors are swallowed
+/// — a layer with an unreadable provenance file is treated as having no
+/// extent sources, matching how the read path tolerates it.
+fn collect_extent_sources(layer_dir: &Path, by_id_dir: &Path) -> Vec<(String, String)> {
+    let Ok(layers) = volume::walk_extent_ancestors(layer_dir, by_id_dir) else {
+        return Vec::new();
+    };
+    layers
+        .into_iter()
+        .map(|l| {
+            let vol_ulid = l
+                .dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_owned();
+            let snap_ulid = l.branch_ulid.unwrap_or_else(|| "?".to_owned());
+            (vol_ulid, snap_ulid)
+        })
+        .collect()
 }
 
 /// Walk the ancestry chain, newest-first, collecting each ancestor's
@@ -181,10 +206,12 @@ fn collect_ancestor_nodes(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<A
         if let Some(ref branch) = layer.branch_ulid {
             cache.retain(|c| c.ulid.as_str() <= branch.as_str());
         }
+        let extent_sources = collect_extent_sources(&layer.dir, by_id_dir);
         nodes.push(AncestorNode {
             volume_ulid,
             branch_ulid: layer.branch_ulid,
             cache,
+            extent_sources,
         });
     }
     Ok(nodes)
@@ -216,10 +243,10 @@ fn read_origin(fork_dir: &Path) -> Option<String> {
 fn print_totals(t: &Totals) {
     println!();
     if t.cache_files > 0 {
-        let pct = if t.cache_fetchable > 0 {
+        let pct = if t.cache_data > 0 {
             format!(
                 "{:.1}%",
-                100.0 * t.cache_present as f64 / t.cache_fetchable as f64
+                100.0 * t.cache_present as f64 / t.cache_data as f64
             )
         } else {
             "0%".to_owned()
@@ -241,20 +268,16 @@ fn print_totals(t: &Totals) {
             fmt_commas(t.cache_zero as u64),
         );
         println!(
-            "  data:    {} ({})",
+            "  cached:  {} / {}  ({} local)  {} present",
+            fmt_commas(t.cache_present as u64),
             fmt_commas(t.cache_data as u64),
             fmt_size(t.cache_data_body),
+            pct,
         );
         println!(
             "  delta:   {} ({})",
             fmt_commas(t.cache_delta as u64),
             fmt_size(t.cache_delta_body),
-        );
-        println!(
-            "  present: {} / {} fetchable ({})",
-            fmt_commas(t.cache_present as u64),
-            fmt_commas(t.cache_fetchable as u64),
-            pct,
         );
     }
     if t.wal_files > 0 || t.seg_entries > 0 {
@@ -420,10 +443,8 @@ fn collect_cache_dir(dir: &Path) -> io::Result<Vec<CacheInfo>> {
                 zero_count: 0,
                 inline_count: 0,
                 delta_count: 0,
-                fetchable_count: 0,
                 present_count: 0,
                 data_body_bytes: 0,
-                dedup_ref_body_bytes: 0,
                 delta_body_bytes: 0,
                 idx_file_bytes: 0,
                 body_bytes_cached: 0,
@@ -444,33 +465,31 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     let mut inline_count = 0usize;
     let mut delta_count = 0usize;
     let mut data_body_bytes = 0u64;
-    let mut dedup_ref_body_bytes = 0u64;
     for e in &entries {
         match e.kind {
             EntryKind::Data => {
                 data_count += 1;
                 data_body_bytes += e.stored_length as u64;
             }
-            EntryKind::DedupRef => {
-                dedup_ref_count += 1;
-                dedup_ref_body_bytes += e.stored_length as u64;
-            }
+            EntryKind::DedupRef => dedup_ref_count += 1,
             EntryKind::Zero => zero_count += 1,
             EntryKind::Inline => inline_count += 1,
             EntryKind::Delta => delta_count += 1,
         }
     }
-    let fetchable_count = data_count + dedup_ref_count;
 
-    // Count set bits in .present, capped at fetchable_count to ignore padding
-    // bits in the last byte (write_cache sets all bits in the final byte).
+    // `promote_to_cache` sets `.present` bits only for Data entries, so the
+    // set-bit count is exactly the number of Data entries with bodies cached
+    // locally. Capping at `data_count` both defends against any rogue bits
+    // outside `[0, entry_count)` (padding in the last byte) and makes the
+    // semantic contract explicit.
     let present_path = cache_dir.join(format!("{ulid}.present"));
     let present_bytes = fs::read(&present_path).unwrap_or_default();
     let present_count: usize = present_bytes
         .iter()
         .map(|b| b.count_ones() as usize)
         .sum::<usize>()
-        .min(fetchable_count);
+        .min(data_count);
 
     // Actual disk blocks used by the sparse .body file.
     let body_path = cache_dir.join(format!("{ulid}.body"));
@@ -497,10 +516,8 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
         zero_count,
         inline_count,
         delta_count,
-        fetchable_count,
         present_count,
         data_body_bytes,
-        dedup_ref_body_bytes,
         delta_body_bytes,
         idx_file_bytes,
         body_bytes_cached,
@@ -522,10 +539,8 @@ struct Totals {
     cache_zero: usize,
     cache_inline: usize,
     cache_delta: usize,
-    cache_fetchable: usize,
     cache_present: usize,
     cache_data_body: u64,
-    cache_dedup_ref_body: u64,
     cache_delta_body: u64,
     cache_idx_file_bytes: u64,
     cache_body_actual: u64,
@@ -560,10 +575,8 @@ fn accumulate_cache(cache: &[CacheInfo], t: &mut Totals) {
         t.cache_zero += f.zero_count;
         t.cache_inline += f.inline_count;
         t.cache_delta += f.delta_count;
-        t.cache_fetchable += f.fetchable_count;
         t.cache_present += f.present_count;
         t.cache_data_body += f.data_body_bytes;
-        t.cache_dedup_ref_body += f.dedup_ref_body_bytes;
         t.cache_delta_body += f.delta_body_bytes;
         t.cache_idx_file_bytes += f.idx_file_bytes;
         t.cache_body_actual += f.body_bytes_cached;
@@ -580,32 +593,50 @@ fn print_node(node: &NodeInfo, latest_snap: Option<&str>) {
     print_wal_section(&node.wal_files, prefix, node.is_live, latest_snap);
     print_seg_section("pending", &node.pending, prefix, node.is_live, latest_snap);
     print_cache_section(&node.cache, prefix, latest_snap, true);
+    print_extent_sources(&node.extent_sources, prefix);
 }
 
 fn print_ancestor_nodes(ancestors: &[AncestorNode]) {
     for a in ancestors {
-        if a.cache.is_empty() {
+        if a.cache.is_empty() && a.extent_sources.is_empty() {
             continue;
         }
-        let plural = if a.cache.len() == 1 { "file" } else { "files" };
-        match &a.branch_ulid {
-            Some(b) => println!(
-                "  index/ (from ancestor {} @ snap {}, {} {}):",
-                a.volume_ulid,
-                b,
-                a.cache.len(),
-                plural,
-            ),
-            None => println!(
-                "  index/ (from ancestor {}, {} {}):",
-                a.volume_ulid,
-                a.cache.len(),
-                plural,
-            ),
+        if !a.cache.is_empty() {
+            let plural = if a.cache.len() == 1 { "file" } else { "files" };
+            match &a.branch_ulid {
+                Some(b) => println!(
+                    "  index/ (from ancestor {} @ snap {}, {} {}):",
+                    a.volume_ulid,
+                    b,
+                    a.cache.len(),
+                    plural,
+                ),
+                None => println!(
+                    "  index/ (from ancestor {}, {} {}):",
+                    a.volume_ulid,
+                    a.cache.len(),
+                    plural,
+                ),
+            }
+            // Ancestor segments are by definition in a snapshot, so no
+            // post-snapshot marker applies.
+            print_cache_section(&a.cache, "  ", None, false);
         }
-        // Ancestor segments are by definition in a snapshot, so no
-        // post-snapshot marker applies.
-        print_cache_section(&a.cache, "  ", None, false);
+        print_extent_sources(&a.extent_sources, "  ");
+    }
+}
+
+/// Print the flat `extent_index` source list for a layer. These are
+/// `<vol>/<snap>` references whose extents seed hash-based lookups for
+/// dedup / delta resolution — they are not part of the read path and
+/// never appear in the LBA map. Silent when empty.
+fn print_extent_sources(sources: &[(String, String)], prefix: &str) {
+    if sources.is_empty() {
+        return;
+    }
+    println!("{prefix}extent sources ({}):", sources.len());
+    for (vol, snap) in sources {
+        println!("{prefix}  {vol} @ snap {snap}");
     }
 }
 
@@ -739,10 +770,10 @@ fn print_cache_section(
             println!("{p}{}  [error: {e}]", f.ulid);
             continue;
         }
-        let pct = if f.fetchable_count > 0 {
+        let pct = if f.data_count > 0 {
             format!(
                 "{:.1}%",
-                100.0 * f.present_count as f64 / f.fetchable_count as f64
+                100.0 * f.present_count as f64 / f.data_count as f64
             )
         } else {
             "0%".to_owned()
@@ -758,20 +789,16 @@ fn print_cache_section(
             fmt_commas(f.zero_count as u64),
         );
         println!(
-            "{indent}data:    {} ({})",
+            "{indent}cached:  {} / {}  ({} local)  {} present",
+            fmt_commas(f.present_count as u64),
             fmt_commas(f.data_count as u64),
             fmt_size(f.data_body_bytes),
+            pct,
         );
         println!(
             "{indent}delta:   {} ({})",
             fmt_commas(f.delta_count as u64),
             fmt_size(f.delta_body_bytes),
-        );
-        println!(
-            "{indent}present: {} / {} fetchable ({})",
-            fmt_commas(f.present_count as u64),
-            fmt_commas(f.fetchable_count as u64),
-            pct,
         );
     }
 }
@@ -846,7 +873,7 @@ mod tests {
         .unwrap();
         let _vol = Volume::open(&vol_dir, &by_id_dir).unwrap();
 
-        let node = collect_node(&vol_dir).unwrap();
+        let node = collect_node(&vol_dir, &by_id_dir).unwrap();
         assert!(node.is_live);
         assert_eq!(node.wal_files.len(), 1);
         assert_eq!(node.wal_files[0].record_count, 0);
@@ -880,7 +907,7 @@ mod tests {
             vol.snapshot().unwrap();
         }
 
-        let node = collect_node(&vol_dir).unwrap();
+        let node = collect_node(&vol_dir, &by_id_dir).unwrap();
         assert!(node.is_live);
         // snapshot() auto-promotes pending segments to index/cache.
         assert_eq!(node.cache.len(), 1);
@@ -892,12 +919,13 @@ mod tests {
     #[test]
     fn readonly_volume_shows_not_live() {
         let tmp = temp_vol_dir();
-        let vol_dir = tmp.join("by_id").join("01JQAAAAAAAAAAAAAAAAAAAAAA");
+        let by_id_dir = tmp.join("by_id");
+        let vol_dir = by_id_dir.join("01JQAAAAAAAAAAAAAAAAAAAAAA");
 
         fs::create_dir_all(vol_dir.join("index")).unwrap();
         fs::create_dir_all(vol_dir.join("pending")).unwrap();
 
-        let node = collect_node(&vol_dir).unwrap();
+        let node = collect_node(&vol_dir, &by_id_dir).unwrap();
         assert!(!node.is_live);
 
         fs::remove_dir_all(tmp).unwrap();
