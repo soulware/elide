@@ -171,17 +171,22 @@ enum VolumeCommand {
         name: String,
     },
 
-    /// Create a new volume branched from the latest snapshot of a source volume.
+    /// Create a new volume branched from a source volume.
     ///
-    /// `--from` accepts either a local volume name (branches from that
-    /// volume's latest snapshot) or an explicit `<vol_ulid>/<snap_ulid>`
-    /// which pins the branch point to a specific snapshot. The ULID form
-    /// resolves the source in `by_id/` first and falls back to `readonly/`,
-    /// so it works for volumes that exist only as pulled readonly ancestors.
+    /// `--from` accepts three forms:
+    ///   - `<name>` — branches from the volume's latest snapshot
+    ///   - `<vol_ulid>` — bare ULID, branches from latest snapshot
+    ///   - `<vol_ulid>/<snap_ulid>` — pins to a specific snapshot
+    ///
+    /// If the source is not found locally, the volume and its ancestor
+    /// chain are auto-pulled from the remote store before forking.
+    ///
+    /// ULID-wins: if the `--from` value parses as a valid ULID it is always
+    /// treated as a volume ID, never as a volume name.
     Fork {
         /// Name for the new volume
         fork_name: String,
-        /// Source to branch from: `<name>` or `<vol_ulid>/<snap_ulid>`
+        /// Source: `<name>`, `<vol_ulid>`, or `<vol_ulid>/<snap_ulid>`
         #[arg(long)]
         from: String,
     },
@@ -908,14 +913,23 @@ fn create_volume(
     Ok(())
 }
 
-/// Create a new volume forked from a source, specified either by name or by
-/// explicit `<vol_ulid>/<snap_ulid>`.
+/// Create a new volume forked from a source.
 ///
-/// Name form: takes an implicit snapshot of the source and branches from it.
-/// ULID form: resolves the source in `by_id/` first, then `readonly/`, and
-/// pins the branch point to the explicit snapshot ULID without taking a new
-/// snapshot of the source (required because readonly ancestors are not
-/// writable).
+/// `from` is one of:
+///   - `<vol_ulid>/<snap_ulid>` — explicit pin to a specific snapshot
+///   - `<vol_ulid>` — bare ULID, resolved by ID (snapshot chosen automatically)
+///   - `<name>` — volume name, resolved locally then by remote store
+///
+/// All three forms try local first, then fall back to the remote store
+/// (auto-pulling the volume and its ancestor chain).
+///
+/// ULID-wins rule: if `from` (or the part before `/`) parses as a valid ULID
+/// it is always treated as one, never looked up as a volume name. This
+/// prevents ambiguity when a volume is named with a ULID string.
+///
+/// For writable volumes, an implicit snapshot is taken first. For readonly
+/// volumes (pulled or already local), the latest snapshot is discovered from
+/// the remote store. For explicit pins the caller already chose a snapshot.
 fn create_fork(
     data_dir: &Path,
     fork_name: &str,
@@ -933,31 +947,79 @@ fn create_fork(
         )));
     }
 
-    // Parse `from`: either `<vol_ulid>/<snap_ulid>` (explicit pin) or a
-    // plain volume name resolved via `by_name/`.
-    let explicit_pin: Option<(ulid::Ulid, ulid::Ulid)> = if let Some((vol, snap)) =
-        from.split_once('/')
-    {
+    // Parse `from` into one of three forms.
+    enum FromSpec {
+        ExplicitPin(ulid::Ulid, ulid::Ulid),
+        BareUlid(ulid::Ulid),
+        Name,
+    }
+
+    let spec = if let Some((vol, snap)) = from.split_once('/') {
         let vol = ulid::Ulid::from_string(vol)
             .map_err(|e| std::io::Error::other(format!("invalid volume ULID in --from: {e}")))?;
         let snap = ulid::Ulid::from_string(snap)
             .map_err(|e| std::io::Error::other(format!("invalid snapshot ULID in --from: {e}")))?;
-        Some((vol, snap))
+        FromSpec::ExplicitPin(vol, snap)
+    } else if let Ok(vol) = ulid::Ulid::from_string(from) {
+        FromSpec::BareUlid(vol)
     } else {
-        None
+        FromSpec::Name
     };
 
-    let source_fork_dir = if let Some((vol_ulid, _)) = explicit_pin {
-        let ulid_str = vol_ulid.to_string();
-        let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
-        if !dir.exists() {
-            return Err(std::io::Error::other(format!(
-                "source volume {ulid_str} not found locally; run `elide volume remote pull {ulid_str}` first"
-            )));
+    // Resolve the source directory. Try local first; for ULID-based forms
+    // fall back to auto-pulling from the remote store. For names, try local
+    // `by_name/` first, then resolve the name in the remote store.
+    //
+    // `pulled_vol_ulid` is set when we auto-pulled from the store so we can
+    // discover the latest remote snapshot later.
+    let mut pulled_vol_ulid: Option<String> = None;
+
+    let source_fork_dir = match &spec {
+        FromSpec::ExplicitPin(vol_ulid, _) | FromSpec::BareUlid(vol_ulid) => {
+            let ulid_str = vol_ulid.to_string();
+            let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
+            if dir.exists() {
+                dir
+            } else {
+                let config = load_fetch_config(data_dir, &ulid_str)?;
+                eprintln!("pulling {ulid_str} from remote store...");
+                remote_pull(&config, from, data_dir, socket_path)?;
+                let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
+                if !dir.exists() {
+                    return Err(std::io::Error::other(format!(
+                        "source volume {ulid_str} not found in remote store"
+                    )));
+                }
+                pulled_vol_ulid = Some(ulid_str);
+                dir
+            }
         }
-        dir
-    } else {
-        resolve_volume_dir(data_dir, from)
+        FromSpec::Name => {
+            let local = resolve_volume_dir(data_dir, from);
+            if local.exists() {
+                local
+            } else {
+                // Name not found locally — try the remote store.
+                let config = load_fetch_config_for_name(data_dir, from)?;
+                eprintln!("pulling '{from}' from remote store...");
+                remote_pull(&config, from, data_dir, socket_path)?;
+                // remote_pull resolved the name to a ULID and pulled into
+                // readonly/<ulid>/. Find it by re-resolving the pull spec.
+                let store = config
+                    .build_store()
+                    .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
+                let rt = tokio::runtime::Runtime::new()?;
+                let ulid_str = resolve_pull_spec(&rt, &*store, from)?;
+                let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
+                if !dir.exists() {
+                    return Err(std::io::Error::other(format!(
+                        "volume '{from}' not found in remote store"
+                    )));
+                }
+                pulled_vol_ulid = Some(ulid_str);
+                dir
+            }
+        }
     };
 
     if source_fork_dir.join("import.lock").exists() {
@@ -966,13 +1028,38 @@ fn create_fork(
         )));
     }
 
-    // Take an implicit snapshot of the source so the fork branches from "now"
-    // — but only for the name-based path. For explicit ULID pins the source
-    // is typically a readonly ancestor (so snapshotting is impossible), and
-    // the caller already chose a specific snapshot ULID.
-    if explicit_pin.is_none() {
-        snapshot_volume(data_dir, from)?;
-    }
+    // Determine the snapshot ULID to branch from.
+    let snap_ulid: Option<ulid::Ulid> = match &spec {
+        FromSpec::ExplicitPin(_, snap) => Some(*snap),
+        _ if source_fork_dir.join("volume.readonly").exists() => {
+            // Readonly volume (pulled or already local): local snapshots/ may
+            // be empty (not yet prefetched by coordinator), so discover the
+            // latest snapshot from the remote store.
+            let vol_id = pulled_vol_ulid.as_deref().unwrap_or_else(|| {
+                source_fork_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("readonly dir must have a ULID name")
+            });
+            let config = load_fetch_config(data_dir, vol_id)?;
+            Some(resolve_latest_remote_snapshot(&config, vol_id)?)
+        }
+        FromSpec::BareUlid(_) => {
+            // Writable volume addressed by ULID: take an implicit snapshot.
+            // The coordinator identifies volumes by name, so read it from
+            // the volume config.
+            let name = elide_core::config::VolumeConfig::read(&source_fork_dir)?
+                .name
+                .ok_or_else(|| std::io::Error::other("source volume has no name in volume.toml"))?;
+            snapshot_volume(data_dir, &name)?;
+            None // fork_volume will use latest_snapshot()
+        }
+        FromSpec::Name => {
+            // Writable local volume addressed by name.
+            snapshot_volume(data_dir, from)?;
+            None
+        }
+    };
 
     let new_vol_ulid = ulid::Ulid::new().to_string();
     let new_fork_dir = data_dir.join("by_id").join(&new_vol_ulid);
@@ -982,9 +1069,9 @@ fn create_fork(
         let _ = std::fs::remove_dir_all(new_fork_dir);
     };
 
-    match explicit_pin {
-        Some((_, snap_ulid)) => {
-            volume::fork_volume_at(&new_fork_dir, &source_fork_dir, snap_ulid)?;
+    match snap_ulid {
+        Some(snap) => {
+            volume::fork_volume_at(&new_fork_dir, &source_fork_dir, snap)?;
         }
         None => {
             volume::fork_volume(&new_fork_dir, &source_fork_dir)?;
@@ -1033,6 +1120,83 @@ fn create_fork(
         eprintln!("warning: coordinator unreachable; volume will be picked up on next scan");
     }
     Ok(())
+}
+
+/// Load the fetch config, or return a clear error mentioning the volume ULID.
+fn load_fetch_config(data_dir: &Path, ulid_str: &str) -> std::io::Result<elide_fetch::FetchConfig> {
+    match elide_fetch::FetchConfig::load(data_dir) {
+        Ok(Some(c)) => Ok(c),
+        Ok(None) => Err(std::io::Error::other(format!(
+            "source volume {ulid_str} not found locally and no store configured for remote pull"
+        ))),
+        Err(e) => Err(std::io::Error::other(format!(
+            "source volume {ulid_str} not found locally; failed to load store config: {e}"
+        ))),
+    }
+}
+
+/// Load the fetch config, or return a clear error mentioning a volume name.
+fn load_fetch_config_for_name(
+    data_dir: &Path,
+    name: &str,
+) -> std::io::Result<elide_fetch::FetchConfig> {
+    match elide_fetch::FetchConfig::load(data_dir) {
+        Ok(Some(c)) => Ok(c),
+        Ok(None) => Err(std::io::Error::other(format!(
+            "volume '{name}' not found locally and no store configured for remote pull"
+        ))),
+        Err(e) => Err(std::io::Error::other(format!(
+            "volume '{name}' not found locally; failed to load store config: {e}"
+        ))),
+    }
+}
+
+/// Query the remote store for the latest snapshot of a volume.
+///
+/// Lists `by_id/<volume_id>/snapshots/` and returns the maximum snapshot ULID.
+/// Filemaps (filenames containing `.`) are filtered out.
+fn resolve_latest_remote_snapshot(
+    config: &elide_fetch::FetchConfig,
+    volume_id: &str,
+) -> std::io::Result<ulid::Ulid> {
+    use object_store::path::Path as StorePath;
+
+    let store = config
+        .build_store()
+        .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let prefix = StorePath::from(format!("by_id/{volume_id}/snapshots/"));
+    let objects: Vec<object_store::ObjectMeta> =
+        rt.block_on(async {
+            use futures::TryStreamExt;
+            store.list(Some(&prefix)).try_collect().await.map_err(|e| {
+                std::io::Error::other(format!("listing snapshots for {volume_id}: {e}"))
+            })
+        })?;
+
+    let mut latest: Option<ulid::Ulid> = None;
+    for obj in &objects {
+        let Some(name) = obj.location.filename() else {
+            continue;
+        };
+        if name.contains('.') {
+            continue;
+        }
+        if let Ok(ulid) = ulid::Ulid::from_string(name) {
+            latest = Some(match latest {
+                Some(prev) if ulid > prev => ulid,
+                Some(prev) => prev,
+                None => ulid,
+            });
+        }
+    }
+
+    latest.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "volume {volume_id} has no snapshots in the remote store"
+        ))
+    })
 }
 
 /// Update configuration for a volume and restart it if running.
