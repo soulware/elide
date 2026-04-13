@@ -212,6 +212,27 @@ impl LbaMap {
 
     /// Look up the extent containing `lba`.
     ///
+    /// True iff the map has an extent keyed at exactly `start_lba` that
+    /// covers `lba_length` blocks, has `payload_block_offset == 0`, and
+    /// matches `hash`.
+    ///
+    /// Used by the no-op write skip in `Volume::write`: a match means the
+    /// LBA map already records our exact content at the exact range, so
+    /// the write can return immediately without touching the WAL, segment
+    /// tree, or extent index. See `docs/design-noop-write-skip.md`.
+    ///
+    /// BLAKE3 length folding means a hash match would already imply a
+    /// length match *for whole payloads*, but an LBA map entry may be a
+    /// proper prefix of the payload (head of a split extent). The
+    /// `lba_length` and `payload_block_offset == 0` checks reject those
+    /// cases — skipping them would leave stale mappings in the tail of
+    /// the incoming range.
+    pub fn has_full_match(&self, start_lba: u64, lba_length: u32, hash: &blake3::Hash) -> bool {
+        self.inner.get(&start_lba).is_some_and(|e| {
+            e.lba_length == lba_length && e.payload_block_offset == 0 && &e.hash == hash
+        })
+    }
+
     /// Returns `(hash, block_offset)` where `block_offset` is the number of
     /// 4KB blocks from the start of the stored payload (identified by `hash`)
     /// to `lba`'s data. The byte offset into the segment body is

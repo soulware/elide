@@ -1,92 +1,104 @@
 # Design: skip no-op writes
 
-**Status:** Proposed.
+**Status:** Implemented.
 
 ## Problem
 
-`Volume::write()` (`elide-core/src/volume.rs:505`) treats every inbound block uniformly: hash, dedup-check, append WAL record, update LBA map. For a block whose content already lives at that LBA, the path still writes a ~50 byte DedupRef record and pays the durability barrier. ext4 journal replay after an unclean mount, metadata rewrites landing on identical values, page-cache double-flushes, and zero-over-zero writes during `mkfs`/`fstrim` all generate these no-op writes.
+`Volume::write()` (`elide-core/src/volume.rs:519`) treats every inbound block uniformly: hash, dedup-check, append WAL record, update LBA map. For a block whose content already lives at that LBA, the path still writes a ~50 byte DedupRef record and pays the durability barrier. ext4 journal replay after an unclean mount, metadata rewrites landing on identical values, page-cache double-flushes, and zero-over-zero writes during `mkfs`/`fstrim` all generate these no-op writes.
 
-## Proposal
+## Two-tier skip
 
-Before hashing, try a locality-gated byte-compare of the existing content. Skip the write if the bytes match.
+After computing `blake3::hash(data)`, try two checks before falling through to the normal write path. Both return `Ok(())` immediately on hit, leaving the LBA map and segment tree untouched.
 
 ```rust
-if let Some(existing) = self.try_read_local(lba, lba_length)?
-    && existing == data
-{
-    self.noop_skipped_writes += 1;
-    self.noop_skipped_bytes += data.len() as u64;
+let hash = blake3::hash(data);
+
+// Tier 1 — hash compare. Pure LBA map lookup, zero body I/O.
+if self.lbamap.has_full_match(lba, lba_length, &hash) {
+    self.noop_stats.skipped_writes += 1;
+    self.noop_stats.skipped_bytes += data.len() as u64;
     return Ok(());
 }
 
-let hash = blake3::hash(data);
-// ... existing path
+// Tier 2 — opportunistic byte compare. Only fires when every overlapping
+// body is already on host (Local or Cached-present).
+if let Some(existing) = self.try_read_local(lba, lba_length)?
+    && existing == data
+{
+    self.noop_stats.skipped_writes += 1;
+    self.noop_stats.skipped_bytes += data.len() as u64;
+    return Ok(());
+}
 ```
 
-`try_read_local` walks `lbamap.extents_in_range(lba, lba+lba_length)` and returns `Some(bytes)` only if every overlapping extent resolves through `extent_index` to a local body (`body_source == Local`, or lives in the live WAL / `pending_entries`). If any extent is remote or unwritten, it returns `None` and the caller falls through to the normal path — we never trigger a demand fetch.
+### Tier 1 — hash compare
 
-This subsumes three cases in one check: whole-extent no-op, per-block no-op inside a larger local extent, and fragmented-but-still-matching ranges. No format change, no LBA map bloat.
+`lbamap.has_full_match(lba, lba_length, &hash)` returns `true` iff the LBA map has an entry keyed at exactly `lba` with matching length, matching hash, and `payload_block_offset == 0`. A single `BTreeMap::get` plus three field comparisons. **Zero file I/O.**
 
-## Ordering: check before hash
+Correctness rests on BLAKE3 collision resistance: hash equality implies byte equality. We do not need to read the body, check `.present`, or know whether the bytes are local. Tier 1 fires for every `body_source` — `Local`, `Cached(present)`, `Cached(absent)`, S3-only — without touching the body file or the network.
 
-The skip check runs *before* `blake3::hash(data)`. On a hit, we avoid the incoming-block hash entirely.
+This is the dominant case in practice. Most no-op writes (ext4 journal replay, page-cache double-flush, metadata rewrites that land on identical values) overwrite a previously-written LBA with the same content. The LBA map already records that, and tier 1 catches it for the cost of one map lookup.
 
-Rough costs per 4 KiB, modern core:
+### Tier 2 — opportunistic byte compare
 
-| step                 | cost     |
-| -------------------- | -------- |
-| blake3 incoming      | ~1-4 µs  |
-| read warm local      | ~0.2 µs  |
-| memcmp 4 KiB         | ~0.2 µs  |
+Tier 1 cannot fire when the LBA map covers the incoming range with **multiple entries** — the new write's hash is over the whole range, and none of the per-fragment hashes match. The classic case: two adjacent 4 KiB writes at LBAs L and L+1 with different content, followed by an 8 KiB write at L whose content is exactly the concatenation. Hash-compare misses; byte-compare catches it.
 
-- **Skip hit (warm):** ~0.4 µs. No hash, no WAL, no fsync contribution.
-- **Skip miss (warm):** ~0.4 µs wasted, then the normal hashed path.
-- **Skip miss (cold local):** a real disk read wasted. Mitigation below.
+`try_read_local` walks `extents_in_range`, verifies every covered block is **on host** (not just indexed), and reads the existing bytes via the normal `read_extents` path:
 
-Byte-compare is roughly an order of magnitude cheaper per byte than blake3, so the comparison itself is in the noise. The costs that matter are the existing-body read and the avoided hash.
+- `Local` extent → on host (WAL, `pending/`, `gc/*.applied`).
+- `Cached(n)` extent → on host iff `cache/<id>.present` has bit `n` set, in either the current fork's cache or any ancestor's cache.
+- Unwritten gap, missing extent index entry, delta-only entry, or `Cached(n)` with the present bit clear → bail.
 
-Hash-compare (hash existing, compare digests) is strictly worse: hashing existing costs the same as memcmping it, and the 32-vs-4096-byte compare is lost in the noise.
+Bailing falls through silently to the normal write path. Tier 2 never triggers a demand fetch.
+
+The byte read is cheap when warm (the page cache holds recently-written segments), but the cost is real for cold data. Tier 2 is intentionally narrow: it only adds value for fragmented matches, and only when the bytes are already on host.
+
+## Coverage matrix
+
+| scenario                                    | tier 1 | tier 2 |
+| ------------------------------------------- | ------ | ------ |
+| Whole-extent match, Local                   | hit    | -      |
+| Whole-extent match, Cached present          | hit    | -      |
+| Whole-extent match, Cached absent / S3-only | hit    | -      |
+| Fragmented match, Local                     | -      | hit    |
+| Fragmented match, Cached all present        | -      | hit    |
+| Fragmented match, any extent absent         | -      | bail   |
+| Different content                           | -      | miss   |
+| Unwritten range                             | -      | bail   |
+
+The only no-op case nothing catches is a fragmented match where at least one extent's body is absent — and that case is what we explicitly want to decline, because catching it would require a demand fetch.
 
 ## Correctness
 
-**No body fetch.** `try_read_local` returns `None` for any range that would require fetching from S3 or an ancestor we don't have locally. A miss falls through silently; the skip is purely an optimisation over existing state.
+**No body fetch, ever.** Tier 1 reads only the in-memory LBA map. Tier 2 gates on `is_extent_on_host` before calling `read_extents`, and `read_extents` uses the existing `find_segment_in_dirs` path which only invokes the fetcher if no local copy is found — by then we have already verified locality.
 
-**Fork layering.** `open_read_state()` (`volume.rs:2783`) builds a flat `LbaMap` via `lbamap::rebuild_segments()` (`lbamap.rs:319`) that walks the ancestor chain oldest-first. Parent entries are flattened into `self.lbamap` at open time; lookup does no chain walking. A child fork's LBA map already surfaces inherited parent mappings, so a no-op write against an inherited LBA hits the skip path iff the parent's body is local.
+**Fork layering.** `open_read_state()` (`volume.rs:2880`) builds a flat `LbaMap` via `lbamap::rebuild_segments()` that walks the ancestor chain oldest-first. Parent entries are flattened into `self.lbamap` at open time; lookup does no chain walking. A child fork's LBA map already surfaces inherited parent mappings, so a no-op write against an inherited LBA hits tier 1 unconditionally and tier 2 if any ancestor still has the body cached present.
 
-**Snapshots.** A skipped write produces no local segment entry. The snapshot's view of that LBA is inherited from the parent — which is correct, since the content is unchanged.
+**Snapshots.** A skipped write produces no local segment entry. The snapshot's view of that LBA is inherited from whatever existing entry already covered it — exactly right, since the content is unchanged.
 
-**Durability.** The NBD layer still honours FUA/FLUSH by calling `volume.fsync()`. A skip only means *this* call adds no new WAL bytes; previously-appended WAL data still needs durable commit on flush. The skip does not change the flush contract.
+**Durability.** The NBD layer routes `NBD_CMD_FLUSH` through `VolumeHandle::flush → Volume::flush_wal`, an entirely separate path from `Volume::write`. A skip only means *this* write call adds no new WAL bytes; previously-appended WAL data still becomes durable on the next flush. The skip does not change the flush contract.
 
-**Collision concerns.** None — this is a direct byte-compare, no hash-based equality claim.
-
-## Cold-data mitigation
-
-For cold local data the wasted read on a skip miss is non-trivial. Two mitigations if measurement shows it matters:
-
-1. Only attempt the skip when every overlapping extent's body lives in the live WAL, `pending_entries`, or the most recent local segment — i.e., data the page cache is likely to hold warm.
-2. Gate the skip on a config flag defaulted on for `volume import` (where everything is warm by construction) and off elsewhere until we have numbers.
-
-Neither is needed for an initial landing; they're levers if the counters reveal a problem.
+**Hash collisions.** Tier 1 relies on BLAKE3 collision resistance, the same assumption already baked into the existing extent-index dedup path. No new trust.
 
 ## Counters
 
-Three counters on `Volume`, exposed via the existing stats surface and printed at the end of `elide volume import`:
+Three counters on `Volume`, exposed via `VolumeHandle::noop_stats()` and printed on NBD client disconnect:
 
-- `noop_skipped_writes` — number of calls that short-circuited
-- `noop_skipped_bytes` — bytes the skip avoided writing to the WAL
-- `noop_check_reads_bytes` — bytes read to perform the compare (hit and miss combined)
+- `skipped_writes` — `write()` calls short-circuited (tier 1 + tier 2 combined).
+- `skipped_bytes` — bytes the skip avoided writing to the WAL.
+- `check_reads_bytes` — bytes read by tier 2's byte compare (hit + miss). Always `0` if only tier 1 fires; non-zero only when tier 2 ran.
 
-The ratio `noop_skipped_bytes / noop_check_reads_bytes` is the effective win: the bytes we avoided writing per byte of read-side overhead. `volume import` is the primary measurement rig because it runs offline with everything local and warm.
+The disconnect line prints all three after every NBD session, so any mounted workload surfaces the hit rate without extra tooling.
 
 ## Comparison: lsvd
 
 lab47/lsvd has no write-time content dedup at all. `disk.go:681` (`WriteExtent`) buffers every incoming write unconditionally; `segment.go:538` computes entropy and compression stats but no content hash. Duplicate LBA writes overwrite previous LBA map entries and stale extents are reclaimed later by GC.
 
-Elide already diverges by doing write-time content dedup (the REF-record path). This proposal adds a cheaper, earlier check: before paying for the hash, look at what's already there.
+Elide already diverges by doing write-time content dedup (the REF-record path). This proposal extends that mechanism: the same hash that drives REF emission now also gates a free LBA-map shortcut for true no-ops, and a supplemental byte compare picks up the fragmented cases that pure hash-compare misses.
 
 ## Non-goals
 
 - Any skip that would trigger a demand fetch.
 - Any change to `write_zeroes` / `trim`, which already bypass hashing.
 - Any change to the REF-record path for cross-LBA dedup.
-- Per-block hashes stored in the LBA map or segment entries (considered and rejected as too expensive for the expected hit rate).
+- Per-block hashes stored in the LBA map or segment entries (rejected as too expensive for the expected hit rate).

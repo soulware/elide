@@ -335,14 +335,15 @@ pub struct Volume {
 /// Counters for the no-op write skip path. Reset to zero on `Volume::open`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopSkipStats {
-    /// Number of `write()` calls short-circuited because existing local
-    /// content equals the incoming data.
+    /// Number of `write()` calls short-circuited because the incoming
+    /// content already lives at the target range — either because the
+    /// LBA map's hash matches directly (tier 1) or because a byte
+    /// comparison against on-host bodies matched (tier 2).
     pub skipped_writes: u64,
     /// Total bytes of incoming data the skip avoided writing to the WAL.
     pub skipped_bytes: u64,
-    /// Total bytes read from local segments to perform the compare,
-    /// across both hits and misses. Non-zero `check_reads` with zero
-    /// `skipped` means the read was paid but did not lead to a skip.
+    /// Total bytes read from on-host bodies by tier 2's byte compare,
+    /// summed across both hits and misses. Zero if only tier 1 fires.
     pub check_reads_bytes: u64,
 }
 
@@ -532,12 +533,26 @@ impl Volume {
             ));
         }
         let lba_length = (data.len() / 4096) as u32;
+        let hash = blake3::hash(data);
 
-        // No-op skip: if every overlapping extent is already local, read the
-        // existing content and byte-compare. On a match, return Ok(()) without
-        // appending anything — the LBA map and segment tree already reflect
-        // the desired state. Never triggers a demand fetch (locality is
-        // checked first). See docs/design-noop-write-skip.md.
+        // No-op skip, tier 1 — hash compare. Pure LBA map lookup, zero
+        // body I/O. BLAKE3 collision resistance means hash equality
+        // implies byte equality, so this is safe regardless of where the
+        // body lives (Local, Cached present, Cached absent, or S3-only).
+        // See docs/design-noop-write-skip.md.
+        if self.lbamap.has_full_match(lba, lba_length, &hash) {
+            self.noop_stats.skipped_writes += 1;
+            self.noop_stats.skipped_bytes += data.len() as u64;
+            return Ok(());
+        }
+
+        // No-op skip, tier 2 — opportunistic byte compare. Only catches
+        // sub-extent / fragmented matches that tier 1 can't see (e.g. two
+        // adjacent 4 KiB extents whose concatenation equals an 8 KiB
+        // incoming write). Runs only when every overlapping extent's
+        // body is already on this host (Local, or Cached with the
+        // corresponding `.present` bit set). Never triggers a demand
+        // fetch — bails silently and falls through to the normal path.
         if let Some(existing) = self.try_read_local(lba, lba_length)? {
             self.noop_stats.check_reads_bytes += existing.len() as u64;
             if existing == data {
@@ -546,8 +561,6 @@ impl Volume {
                 return Ok(());
             }
         }
-
-        let hash = blake3::hash(data);
 
         let compressed_data = maybe_compress(data);
         let compressed = compressed_data.is_some();
@@ -666,19 +679,23 @@ impl Volume {
         self.noop_stats
     }
 
-    /// Read the current content of `[lba, lba+lba_length)` from local bodies
-    /// only — returning `Some(bytes)` if every overlapping extent resolves to
-    /// a `BodySource::Local` extent (or a `ZERO_HASH` extent), and `None`
-    /// otherwise. Never triggers a demand fetch.
+    /// Read the current content of `[lba, lba+lba_length)` from on-host
+    /// bodies only — returning `Some(bytes)` if every overlapping extent
+    /// is either `ZERO_HASH`, `BodySource::Local`, or
+    /// `BodySource::Cached(n)` with the corresponding `.present` bit
+    /// already set on this host. Returns `None` otherwise. Never
+    /// triggers a demand fetch.
     ///
-    /// Two-pass: first a cheap locality check over `extents_in_range`, then a
-    /// reuse of the normal `read_extents` path for the actual bytes. The
-    /// caller is expected to compare against the incoming write's data; see
-    /// `Volume::write`.
+    /// Two-pass: first a cheap locality check over `extents_in_range`
+    /// (extent index lookup + `.present` bit check for Cached entries),
+    /// then a reuse of the normal `read_extents` path for the actual
+    /// bytes. Tier 2 of the no-op write skip — see
+    /// `docs/design-noop-write-skip.md` and `Volume::write`.
     fn try_read_local(&self, lba: u64, lba_length: u32) -> io::Result<Option<Vec<u8>>> {
-        // Pass 1: walk the range and verify every covered block resolves to
-        // a local body. Bail on any gap, remote/cached entry, or extent the
-        // index cannot resolve directly (e.g. delta-only entries).
+        // Pass 1: walk the range and verify every covered block resolves
+        // to a body that is already on host. Bail on any gap, missing
+        // extent-index entry (e.g. delta-only), or Cached entry whose
+        // `.present` bit is clear.
         let end_lba = lba + lba_length as u64;
         let mut next_lba = lba;
         for er in self.lbamap.extents_in_range(lba, end_lba) {
@@ -686,9 +703,11 @@ impl Volume {
                 return Ok(None); // unwritten gap at next_lba
             }
             if er.hash != ZERO_HASH {
-                match self.extent_index.lookup(&er.hash) {
-                    Some(loc) if matches!(loc.body_source, BodySource::Local) => {}
-                    _ => return Ok(None),
+                let Some(loc) = self.extent_index.lookup(&er.hash) else {
+                    return Ok(None); // delta-only or unknown
+                };
+                if !self.is_extent_on_host(loc.segment_id, loc.body_source) {
+                    return Ok(None);
                 }
             }
             next_lba = er.range_end;
@@ -698,7 +717,7 @@ impl Volume {
         }
 
         // Pass 2: reuse the normal read path. Every extent was confirmed
-        // local in pass 1, so `read_extents` will not invoke the fetcher.
+        // on host in pass 1, so `read_extents` will not invoke the fetcher.
         let bytes = read_extents(
             lba,
             lba_length,
@@ -2205,6 +2224,34 @@ impl Volume {
         )
     }
 
+    /// True if the body bytes for a specific extent are already on this
+    /// host, without triggering a fetch. Used by the tier-2 byte-compare
+    /// skip path to decide whether it is safe to read the existing bytes.
+    ///
+    /// - `Local` is always on host.
+    /// - `Cached(n)` is on host iff the `.present` bit for entry index
+    ///   `n` is set in the current fork's `cache/<id>.present` file, or
+    ///   in any ancestor fork's `cache/<id>.present`.
+    fn is_extent_on_host(&self, segment_id: Ulid, body_source: BodySource) -> bool {
+        match body_source {
+            BodySource::Local => true,
+            BodySource::Cached(idx) => {
+                let sid = segment_id.to_string();
+                let self_present = self.base_dir.join("cache").join(format!("{sid}.present"));
+                if segment::check_present_bit(&self_present, idx).unwrap_or(false) {
+                    return true;
+                }
+                for layer in self.ancestor_layers.iter().rev() {
+                    let present = layer.dir.join("cache").join(format!("{sid}.present"));
+                    if segment::check_present_bit(&present, idx).unwrap_or(false) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
@@ -3479,12 +3526,13 @@ mod tests {
         assert_eq!(before.skipped_writes, 0);
         assert_eq!(before.skipped_bytes, 0);
 
-        // Same LBA, same content — should skip.
+        // Same LBA, same content — should skip via tier 1 (hash compare).
+        // Tier 1 needs no body read, so check_reads_bytes stays 0.
         vol.write(0, &data).unwrap();
         let after = vol.noop_stats();
         assert_eq!(after.skipped_writes, 1);
         assert_eq!(after.skipped_bytes, 4096);
-        assert_eq!(after.check_reads_bytes, 4096);
+        assert_eq!(after.check_reads_bytes, 0);
 
         // Data still reads back correctly.
         assert_eq!(vol.read(0, 1).unwrap(), data);
@@ -3557,6 +3605,37 @@ mod tests {
         assert_eq!(stats.skipped_writes, 1);
         assert_eq!(stats.skipped_bytes, 8 * 4096);
         assert_eq!(vol.read(32, 8).unwrap(), data);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn noop_skip_fragmented_match_via_tier2() {
+        // Tier 1 (hash compare) cannot fire when the LBA map covers the
+        // incoming range with multiple entries — the new write's hash is
+        // over the whole range, none of the per-fragment hashes match.
+        // Tier 2 (byte compare) reads the concatenated existing content
+        // and matches if the user is writing exactly that concatenation.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        let a = vec![0xa1u8; 4096];
+        let b = vec![0xb2u8; 4096];
+
+        vol.write(0, &a).unwrap();
+        vol.write(1, &b).unwrap();
+
+        // Now write 8 KiB whose content is exactly a || b at LBA 0.
+        let mut combined = Vec::with_capacity(8192);
+        combined.extend_from_slice(&a);
+        combined.extend_from_slice(&b);
+        vol.write(0, &combined).unwrap();
+
+        let stats = vol.noop_stats();
+        assert_eq!(stats.skipped_writes, 1, "tier 2 should catch the match");
+        assert_eq!(stats.skipped_bytes, 8192);
+        assert_eq!(stats.check_reads_bytes, 8192, "tier 2 reads the full range");
+        // LBA map is still split into two entries — the skip leaves
+        // existing structure untouched.
+        assert_eq!(vol.lbamap_len(), 2);
         fs::remove_dir_all(base).unwrap();
     }
 
