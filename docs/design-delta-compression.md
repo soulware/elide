@@ -1,6 +1,6 @@
 # Design: Delta compression via file-path matching
 
-Status: **Phases 1–4 landed; Phase 5 next.** See § Phases.
+Status: **Phases 1–5 Tier 1 landed; Tier 2 deferred.** See § Phases.
 
 Date: 2026-04-09 (updated 2026-04-13)
 
@@ -20,7 +20,7 @@ This requires:
 
 Both are produced at import time by parsing the ext4 image before writing segments.
 
-NBD live writes cannot meet these preconditions — every write lands as a fragmented 4 KiB block, and the drain-time coordinator has no LBA → path information. NBD-written volumes therefore get delta compression only via the GC repack path (Phase 5), which consults a previously generated snapshot filemap as a heuristic hint for which file used to live at a given LBA.
+NBD live writes cannot meet these preconditions — every write lands as a fragmented 4 KiB block, and the drain-time coordinator has no LBA → path information. NBD-written volumes therefore get delta compression via the post-snapshot delta repack path (Phase 5), which runs before drain on pending segments above the latest snapshot floor and consults the prior sealed snapshot's LBA map directly — no filemap needed for Tier 1. A filemap-driven Tier 2 for LBAs that shifted between snapshots is scoped but deferred.
 
 ## Filemap format
 
@@ -144,7 +144,8 @@ No filemap. No delta. Full extents only. The read path, segment format, and GC a
 | 2 | `extent_index` lineage + cross-import dedup | **done** |
 | 3 | File-aware import + thin Delta + filemap producer | **done** |
 | 4 | Snapshot-time filemap generation | **done** |
-| 5 | GC repack delta (heuristic LBA→path) | **next** |
+| 5 Tier 1 | Pre-drain delta (same-LBA prior extent) | **done** |
+| 5 Tier 2 | Filemap-driven cross-LBA source selection | deferred |
 | 6 | Content-similarity source selection | deferred |
 
 **Phase 1 — delta format + PoC.** Segment format v3 with delta table in the index and a coordinator-side `compute_deltas()` hooked into `drain_pending()`. Proof-of-concept that validated the end-to-end machinery; removed in Phase 3. The format itself is unchanged and still in use.
@@ -169,14 +170,20 @@ Extends filemap coverage to NBD-written volumes. Does not itself compress anythi
 
 One small exception lands as a side-effect: after Phase 4, a new import using `--extents-from <writable-volume>` can use the writable volume's snapshot filemap as a delta source. The import walks ext4 directly (target-side knowledge), Phase 4 has already generated the source filemap (source-side knowledge), and the Phase 3 producer works unchanged. Source files appearing as a single filemap row (contiguous) participate; fragmented sources are skipped.
 
-**Phase 5 — GC repack delta.** Extends the existing GC repack pass with a delta step, operating on **post-snapshot-floor segments** (drained since the most recent sealed snapshot, which GC already owns and rewrites in place). Two source-selection tiers, tried in order:
+**Phase 5 — post-snapshot delta repack.** Rewrites **post-snapshot-floor segments** (drained since the most recent sealed snapshot, not yet uploaded) with zstd-dictionary deltas against same-LBA extents in the prior snapshot. Two source-selection tiers:
 
-1. **Same-LBA prior extent.** Open a snapshot-pinned `BlockReader` on the prior sealed snapshot. For each 4 KiB target LBA, look up the fragment that occupied that LBA in the prior snapshot — `lba_map.lookup(lba) → hash → extent_index.lookup(hash)` returns the **whole fragment**, not a 4 KiB slice, so the dictionary is automatically the full containing extent (typically a multi-block file fragment). This tier needs nothing beyond the two in-memory rebuilds `BlockReader::open_snapshot` already does; no filemap lookup.
-2. **Same-path cross-LBA.** Current and prior filemaps (from Phase 4) provide path → fragment mapping. When an LBA moved between snapshots (defrag, rename-with-realloc, logrotate), Tier 1 misses: the prior snapshot's LBA map has a different or absent hash at that LBA. Tier 2 resolves the current LBA → path via the current filemap, looks the same path up in the prior filemap, and uses that fragment as the dictionary.
+1. **Tier 1 — same-LBA prior extent (landed).** Open a snapshot-pinned `BlockReader` on the prior sealed snapshot. For each 4 KiB target LBA, look up the fragment that occupied that LBA in the prior snapshot — `lba_map.lookup(lba) → hash → extent_index.lookup(hash)` returns the **whole fragment**, not a 4 KiB slice, so the dictionary is automatically the full containing extent (typically a multi-block file fragment). Needs nothing beyond the two in-memory rebuilds `BlockReader::open_snapshot` already does; no filemap lookup.
+2. **Tier 2 — same-path cross-LBA (deferred).** Current and prior filemaps (from Phase 4) provide path → fragment mapping. When an LBA moved between snapshots (defrag, rename-with-realloc, logrotate), Tier 1 misses: the prior snapshot's LBA map has a different or absent hash at that LBA. Tier 2 would resolve the current LBA → path via the current filemap, look the same path up in the prior filemap, and use that fragment as the dictionary.
 
-Tier 1 covers the dominant case — in-place file modification (package upgrades, config edits, log writes at fixed offsets) — and catches it cheaply with no filemap involvement on the read side. Tier 2 is the cleanup for the long tail where LBAs shifted. zstd dictionary compression is always correct regardless of dictionary; the heuristic only affects compression ratio. The existing `delta_length >= body_length` size check catches every miss by emitting a raw DATA entry. Correctness story: **always correct, sometimes no benefit.**
+Tier 1 covers the dominant case — in-place file modification (package upgrades, config edits, log writes at fixed offsets) — and catches it cheaply with no filemap involvement on the read side. Tier 2 is the cleanup for the long tail where LBAs shifted; it can land later without any format change. zstd dictionary compression is always correct regardless of dictionary; the heuristic only affects compression ratio. The existing `delta_length >= body_length` size check catches every miss by emitting a raw DATA entry. Correctness story: **always correct, sometimes no benefit.**
 
-No new lifecycle: post-floor segments are already GC-rewriteable, repacked outputs supersede the originals through GC's cleanup path, and the sealed snapshot providing the source state is read-only. Published snapshots remain immutable — Phase 5 never crosses the snapshot floor. This is the step that delivers delta for writable volumes and closes the drain-time LBA → path knowledge gap.
+**Pipeline position: pre-drain, not GC repack.** Tier 1 lives in `Volume::delta_repack_post_snapshot` (elide-core/src/volume.rs) and runs from the per-volume coordinator tick **before** `drain_pending` uploads to S3. Earlier drafts of this doc described it as an extension of the GC repack pass; the shipping implementation took a simpler position — the work is the same (rewrite post-floor pending segments in place) but it does not piggy-back on GC's liveness analysis. Rationale: delta repack operates on sealed segment files below the flush threshold, not on a liveness picture; sharing GC's machinery would have added coupling without benefit. The tick-loop call sits between `repack` and `drain_pending` so converted segments reach S3 as thin Delta entries on their first upload rather than going up as full bodies and being re-uploaded later.
+
+**Implementation details.** The walk iterates `pending/` segment files whose ULIDs sit above the latest sealed snapshot's ULID, skipping snapshot-frozen segments. For each post-floor segment, `delta_compute::rewrite_post_snapshot_with_prior` (elide-core/src/delta_compute.rs) walks Data entries, queries the prior snapshot's `BlockReader` for a same-LBA source fragment, computes `zstd::compress_with_dictionary(child_bytes, source_bytes)`, and rewrites the segment body in place with converted entries moved into the delta section and the body section shrunk accordingly. The extent index is refreshed for every entry in the rewritten segment (Data, Inline, and Delta) so that the actor's in-memory view matches the new on-disk layout before the next read. The source fetcher passed to `BlockReader::open_snapshot` is `Box::new(|_| None)` — delta repack is best-effort, and if a source body is evicted locally the entry is left as a Data entry rather than pulled from S3 purely to seed a dictionary.
+
+No new lifecycle: post-floor segments are already pending and will be uploaded by the next drain, the rewritten segments supersede the originals on disk via in-place replacement, and the sealed snapshot providing the source state is read-only. Published snapshots remain immutable — Phase 5 never crosses the snapshot floor. This is the step that delivers delta for writable volumes and closes the drain-time LBA → path knowledge gap.
+
+**Snapshot integrity prerequisite.** Tier 1 was the first real consumer of `BlockReader::open_snapshot` in the live coordinator loop and surfaced a latent bug: the snapshot manifest was being signed over `index/` before any in-flight GC handoffs had been applied, so `.applied` handoffs from the prior tick could still reference segments that `promote_segment` was about to delete. The next tick's delta_repack would open the manifest and fail with ENOENT on the vanished `.idx`. Fix: drain GC handoffs (`apply_gc_handoffs` IPC + `apply_done_handoffs`) inside `snapshot_volume` before `sign_snapshot_manifest`, under the snapshot lock. Same root cause reached further — the structural fix for `gc/` single-writer semantics (moving `gc/<new>` body delete into `promote_segment` and routing `.applied` → `.done` via a new `finalize_gc_handoff` IPC) landed alongside Tier 1. See the handoff protocol TLA+ comments in `specs/HandoffProtocol.tla` for the updated ownership narrative.
 
 **Phase 6 — content-similarity source selection.** Filesystem-agnostic delta via content fingerprinting. Marginal benefit over path matching for the primary workload; significantly more complex. Deferred.
 
