@@ -108,7 +108,7 @@ elide_data/                           — single root (default --data-dir)
       volume.size
       volume.key                      — Ed25519 signing key (never uploaded; absent on readonly volumes)
       volume.pub
-      volume.provenance               — signed: parent="01JQAAAAAAA/snapshots/01JQXXXXX" + empty extent_index
+      volume.provenance               — signed: parent="01JQAAAAAAA/01JQXXXXX" + empty extent_index
       volume.pid                      — PID of running volume process
       wal/                            — present = live; write target
       pending/
@@ -118,16 +118,16 @@ elide_data/                           — single root (default --data-dir)
       control.sock                    — volume process IPC socket (coordinator connects here)
     01JQCCCCCCC/
       volume.name                     — "server-2"
-      volume.provenance               — signed: parent="01JQAAAAAAA/snapshots/01JQXXXXX", extent_index empty
+      volume.provenance               — signed: parent="01JQAAAAAAA/01JQXXXXX", extent_index empty
       ...
     01JQDDDDDDD/
       volume.name                     — "server-2-experiment"
-      volume.provenance               — signed: parent="01JQCCCCCCC/snapshots/<ulid>", extent_index empty
+      volume.provenance               — signed: parent="01JQCCCCCCC/<ulid>", extent_index empty
       ...
     01JQEEEEEEE/                      — readonly import layered on ubuntu-22.04
       volume.name                     — "ubuntu-22.04.1"
       volume.readonly
-      volume.provenance               — signed: parent="", extent_index=["01JQAAAAAAA/snapshots/01JQXXXXX"]
+      volume.provenance               — signed: parent="", extent_index=["01JQAAAAAAA/01JQXXXXX"]
       ...
   by_name/
     ubuntu-22.04  ->  ../by_id/01JQAAAAAAA
@@ -141,11 +141,11 @@ Lineage lives inside `volume.provenance`, **not** in standalone `volume.parent` 
 Provenance file format:
 
 ```
-parent: 01JQAAA…/snapshots/01JQX…    # empty string if no fork parent
+parent: 01JQAAA…/01JQX…              # empty string if no fork parent
 parent_pubkey: <64 hex chars>         # embedded parent verifying key (empty if no parent)
 extent_index:
-  01JQBBB…/snapshots/01JQY…
-  01JQCCC…/snapshots/01JQZ…
+  01JQBBB…/01JQY…
+  01JQCCC…/01JQZ…
 sig: <hex-encoded 64-byte Ed25519 signature>
 ```
 
@@ -172,8 +172,8 @@ Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the s
 - `volume.key` present only on writable volumes; absent on readonly/imported volumes — `serve-volume` fails hard if it is missing and the volume is not readonly
 - `volume.provenance` present in every volume — signed lineage (`parent`, `extent_index`) + Ed25519 signature; signed by the volume's private key at creation/import time and verified by `serve-volume` using `volume.pub` on every open. Uploaded to S3 so `remote pull` can rehydrate the lineage chain. Lineage is never stored outside provenance; there are no standalone `volume.parent` / `volume.extent_index` files.
 - `wal/` present → volume is live (writable); exactly one process writes here (enforced by `volume.lock`)
-- `parent` field set → volume is a fork; value is `<parent-ulid>/snapshots/<snapshot-ulid>`; parent is merged into both the LBA map and the extent index
-- `extent_index` field non-empty → volume lists a flat union of source snapshots; one `<source-ulid>/snapshots/<snapshot-ulid>` per entry; each source is merged into the extent index only, **never** into the LBA map (no read-path fall-through, no data leak); bounded at `MAX_EXTENT_INDEX_SOURCES` entries
+- `parent` field set → volume is a fork; value is `<parent-ulid>/<snapshot-ulid>`; parent is merged into both the LBA map and the extent index
+- `extent_index` field non-empty → volume lists a flat union of source snapshots; one `<source-ulid>/<snapshot-ulid>` per entry; each source is merged into the extent index only, **never** into the LBA map (no read-path fall-through, no data leak); bounded at `MAX_EXTENT_INDEX_SOURCES` entries
 - `snapshots/<ulid>` is a plain marker file; ULID sorts after all segments present at snapshot time
 - `manifest.toml` present on OCI-imported volumes and on volumes reconstructed via `remote pull`
 - `import.lock` present while an import is in progress (write phase) or in serve phase (handling promote IPC) or was interrupted
@@ -1097,7 +1097,7 @@ elide export-volume <src-vol-dir> <new-vol-dir>
 
 Import is handled by `elide volume import <name> <oci-ref>`, which asks the coordinator to spawn the separate `elide-import` binary as a supervised short-lived process. See *Import process lifecycle* above.
 
-**Snapshot procedure:** `snapshot-volume` flushes the WAL (producing a segment in `pending/` if there are unflushed writes), then writes a new `snapshots/<ulid>` marker file. The snapshot ULID matches the ULID of the last committed segment, making the branch point self-describing. If no new segments have been committed since the latest existing snapshot, the operation is idempotent — it returns the existing snapshot ULID without writing a new marker. The volume remains live; no directory structure changes.
+**Snapshot procedure:** snapshot is a coordinator-orchestrated sequence, not an in-process volume call. The CLI (`elide volume snapshot`) sends `snapshot <name>` to the coordinator, which acquires the per-volume snapshot lock (mutual exclusion against drain/GC/eviction on that volume's tick) and runs: (1) `flush` IPC to the volume — WAL becomes a segment in `pending/`; (2) inline drain — upload each `pending/` segment to S3 and `promote` it so the volume writes `index/<ulid>.idx` and `cache/<ulid>.{body,present}`; (3) pick `snap_ulid` as the max ULID in `index/`; (4) `sign_snapshot_manifest` IPC to the volume — the volume enumerates its own `index/`, writes a signed `snapshots/<snap_ulid>.manifest` listing every segment ULID, then writes the `snapshots/<snap_ulid>` marker; (4b) regenerate `snapshots/<snap_ulid>.filemap` by walking ext4 metadata at the sealed snapshot via `BlockReader::open_snapshot` (no body reads — hashes come from the LBA map), non-ext4 volumes and parse failures skip cleanly; (5) upload manifest, marker, and filemap to S3; release the lock. The marker is written last by the volume, so a partial sequence leaves no visible snapshot. Keys never leave the volume process — signing stays inside the actor. If no new segments have been committed since the latest snapshot, the operation is idempotent and returns the existing ULID.
 
 **Import procedure:** the import path writes data directly into `<vol-dir>/pending/`, bypassing the WAL entirely, since there is no ongoing VM I/O. At the end of import, a snapshot marker `snapshots/<import-ulid>` is written; this ULID matches the last segment written. It serves as the branch point for any volumes forked from this one. The `volume.size` marker and `manifest.toml` (OCI source metadata) are written into the volume directory.
 

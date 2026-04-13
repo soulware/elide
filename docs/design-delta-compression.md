@@ -1,6 +1,6 @@
 # Design: Delta compression via file-path matching
 
-Status: **Phases 1–3 landed; Phase 4 next.** See § Phases.
+Status: **Phases 1–4 landed; Phase 5 next.** See § Phases.
 
 Date: 2026-04-09 (updated 2026-04-13)
 
@@ -143,8 +143,8 @@ No filemap. No delta. Full extents only. The read path, segment format, and GC a
 | 1 | Delta format + PoC drain-time producer | **done** (superseded) |
 | 2 | `extent_index` lineage + cross-import dedup | **done** |
 | 3 | File-aware import + thin Delta + filemap producer | **done** |
-| 4 | Snapshot-time filemap generation | **next** |
-| 5 | GC repack delta (heuristic LBA→path) | after 4 |
+| 4 | Snapshot-time filemap generation | **done** |
+| 5 | GC repack delta (heuristic LBA→path) | **next** |
 | 6 | Content-similarity source selection | deferred |
 
 **Phase 1 — delta format + PoC.** Segment format v3 with delta table in the index and a coordinator-side `compute_deltas()` hooked into `drain_pending()`. Proof-of-concept that validated the end-to-end machinery; removed in Phase 3. The format itself is unchanged and still in use.
@@ -161,7 +161,7 @@ The producer runs **in-process in `elide-import`** rather than in the coordinato
 
 Phase 3 also removed the Phase 1 PoC path at `elide-coordinator/src/delta.rs` and its `drain_pending()` hook. Two producers racing for the same entries with different source-selection rules was unnecessary complexity once the real path landed.
 
-**Phase 4 — snapshot-time filemap generation.** Coordinator-side background task, enqueued after the synchronous `snapshot_volume()` returns. Parses ext4 metadata from the frozen snapshot's segments through a `SnapshotBlockReader` (manifest's segment list + rebuilt LBA map + extent index) and emits `snapshots/<ulid>.filemap` using the existing hashes looked up by LBA range — no body reads, no rehashing. Strictly additive: produces a new file that consumers may use if it exists.
+**Phase 4 — snapshot-time filemap generation.** Runs inline as step 4b of the coordinator's snapshot sequence in `elide-coordinator/src/inbound.rs`, after `sign_snapshot_manifest` and before the S3 upload — under the per-volume snapshot lock, so it cannot race with drain, GC, or eviction. Parses ext4 metadata from the frozen snapshot's segments via `BlockReader::open_snapshot` (manifest's segment list + rebuilt LBA map + extent index) and emits `snapshots/<ulid>.filemap` using the existing hashes looked up by LBA — no body reads, no rehashing. Filemap generation failures are logged as warnings and do not fail the snapshot: Phase 4 is strictly additive, producing a new file that consumers may use if it exists.
 
 Scope is deliberately narrow: **filemap only, no coalescing of NBD-fragmented extents into file-sized extents.** The filemap records paths and fragment layouts exactly as the existing DATA entries describe them. Non-ext4 volumes and parse failures skip cleanly. Output uses write-tmp, fsync, upload, rename — the filesystem is the queue, and restart recovery re-uploads any leftover `.tmp`.
 
