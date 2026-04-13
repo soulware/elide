@@ -163,6 +163,23 @@ fn handle_connection(
                 let _ = writeln!(writer, "err invalid ratio: {ratio_str}");
             }
         }
+    } else if line == "delta_repack" {
+        match handle.delta_repack_post_snapshot() {
+            Ok(s) => {
+                let _ = writeln!(
+                    writer,
+                    "ok {} {} {} {} {}",
+                    s.segments_scanned,
+                    s.segments_rewritten,
+                    s.entries_converted,
+                    s.original_body_bytes,
+                    s.delta_body_bytes,
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(writer, "err {e}");
+            }
+        }
     } else if line == "snapshot" {
         match handle.snapshot() {
             Ok(ulid) => {
@@ -221,6 +238,20 @@ fn handle_connection(
     } else if let Some(ulid_str) = line.strip_prefix("promote ") {
         match ulid::Ulid::from_string(ulid_str.trim()) {
             Ok(ulid) => match handle.promote_segment(ulid) {
+                Ok(()) => {
+                    let _ = writeln!(writer, "ok");
+                }
+                Err(e) => {
+                    let _ = writeln!(writer, "err {e}");
+                }
+            },
+            Err(_) => {
+                let _ = writeln!(writer, "err invalid ulid: {ulid_str}");
+            }
+        }
+    } else if let Some(ulid_str) = line.strip_prefix("finalize_gc_handoff ") {
+        match ulid::Ulid::from_string(ulid_str.trim()) {
+            Ok(ulid) => match handle.finalize_gc_handoff(ulid) {
                 Ok(()) => {
                     let _ = writeln!(writer, "ok");
                 }

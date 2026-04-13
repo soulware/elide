@@ -263,6 +263,21 @@ pub struct CompactionStats {
     pub extents_removed: usize,
 }
 
+/// Stats from a single `delta_repack_post_snapshot` pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeltaRepackStats {
+    /// Number of post-snapshot segments inspected.
+    pub segments_scanned: usize,
+    /// Number of segments actually rewritten (had at least one conversion).
+    pub segments_rewritten: usize,
+    /// Total Data→Delta conversions across all rewritten segments.
+    pub entries_converted: usize,
+    /// Sum of original `stored_length` for converted entries.
+    pub original_body_bytes: u64,
+    /// Sum of delta blob sizes written.
+    pub delta_body_bytes: u64,
+}
+
 /// A fork ancestry layer used when rebuilding the LBA map and extent index.
 ///
 /// `branch_ulid` is the latest segment ULID from this fork that belongs to the
@@ -916,6 +931,163 @@ impl Volume {
             stats.segments_compacted += 1;
             stats.bytes_freed += total_bytes - live_bytes;
             stats.extents_removed += removed;
+        }
+
+        Ok(stats)
+    }
+
+    /// Phase 5 Tier 1: rewrite post-snapshot pending segments with
+    /// zstd-dictionary deltas against same-LBA extents from the prior
+    /// sealed snapshot.
+    ///
+    /// For every segment in `pending/` whose ULID is greater than the
+    /// latest sealed snapshot, walks single-block `Data` entries and
+    /// looks up the LBA in a snapshot-pinned `BlockReader` on that
+    /// snapshot. If the prior snapshot holds a different extent at
+    /// that LBA and the source body is locally available, the entry
+    /// is converted to a thin `Delta` with the prior extent as its
+    /// dictionary source.
+    ///
+    /// Runs on post-snapshot segments only — never touches segments
+    /// that are part of a sealed snapshot. No-op when there is no
+    /// sealed snapshot (nothing to source deltas from) or when no
+    /// entries match.
+    pub fn delta_repack_post_snapshot(&mut self) -> io::Result<DeltaRepackStats> {
+        use crate::block_reader::BlockReader;
+        use crate::delta_compute;
+
+        let mut stats = DeltaRepackStats::default();
+
+        // No prior snapshot → no source for deltas. Bail cleanly.
+        let Some(latest_snap) = latest_snapshot(&self.base_dir)? else {
+            return Ok(stats);
+        };
+
+        // Snapshot-pinned reader on the prior sealed snapshot. We pass
+        // a `None` fetcher: delta repack is best-effort, and if a
+        // source body is evicted locally we skip it rather than pull
+        // bytes off S3 just to seed a dictionary.
+        let prior = BlockReader::open_snapshot(&self.base_dir, &latest_snap, Box::new(|_| None))?;
+
+        let all_segs = segment::collect_segment_files(&self.base_dir.join("pending"))?;
+        let vk = self.verifying_key;
+
+        for seg_path in all_segs {
+            let seg_id = seg_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| io::Error::other("bad segment filename"))?;
+            let seg_id = Ulid::from_string(seg_id).map_err(|e| io::Error::other(e.to_string()))?;
+
+            // Skip segments at or below the latest snapshot — they are
+            // snapshot-frozen and must not be rewritten.
+            if seg_id <= latest_snap {
+                continue;
+            }
+
+            stats.segments_scanned += 1;
+
+            // Evict cached file handle before rewriting in place.
+            self.evict_cached_segment(seg_id);
+
+            let rewritten = match delta_compute::rewrite_post_snapshot_with_prior(
+                &seg_path,
+                &prior,
+                self.signer.as_ref(),
+                &vk,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!(
+                        "delta_repack: seg {seg_id} rewrite failed: {e} — leaving segment unchanged"
+                    );
+                    continue;
+                }
+            };
+            let Some((entries, new_bss, seg_stats)) = rewritten else {
+                continue;
+            };
+
+            // Refresh the in-memory extent index for every entry in the
+            // rewritten segment. Converted Delta entries need their
+            // previous Data location dropped, then re-registered under
+            // the deltas map. Non-converted Data/Inline entries need
+            // their `stored_offset` refreshed — `write_segment_with_delta_body`
+            // reassigned offsets when the body section shrank.
+            //
+            // The delta body section starts exactly at the end of the
+            // body section, which is `body_section_start + body_length`
+            // where body_length is the sum of remaining Data entries'
+            // stored_length. Compute once for all Delta entries.
+            let delta_region_body_length: u64 = entries
+                .iter()
+                .filter(|e| matches!(e.kind, EntryKind::Data))
+                .map(|e| e.stored_length as u64)
+                .sum();
+            let ei = Arc::make_mut(&mut self.extent_index);
+            for entry in entries.iter() {
+                match entry.kind {
+                    EntryKind::Data => {
+                        ei.insert(
+                            entry.hash,
+                            extentindex::ExtentLocation {
+                                segment_id: seg_id,
+                                body_offset: entry.stored_offset,
+                                body_length: entry.stored_length,
+                                compressed: entry.compressed,
+                                body_source: BodySource::Local,
+                                body_section_start: new_bss,
+                                inline_data: None,
+                            },
+                        );
+                    }
+                    EntryKind::Inline => {
+                        ei.insert(
+                            entry.hash,
+                            extentindex::ExtentLocation {
+                                segment_id: seg_id,
+                                body_offset: entry.stored_offset,
+                                body_length: entry.stored_length,
+                                compressed: entry.compressed,
+                                body_source: BodySource::Local,
+                                body_section_start: new_bss,
+                                inline_data: entry.data.clone().map(Vec::into_boxed_slice),
+                            },
+                        );
+                    }
+                    EntryKind::Delta => {
+                        // Drop any stale Data location under this hash,
+                        // then register the Delta entry so the reader
+                        // finds it via `lookup_delta`.
+                        ei.remove(&entry.hash);
+                        ei.insert_delta_if_absent(
+                            entry.hash,
+                            extentindex::DeltaLocation {
+                                segment_id: seg_id,
+                                body_source: extentindex::DeltaBodySource::Full {
+                                    body_section_start: new_bss,
+                                    body_length: delta_region_body_length,
+                                },
+                                options: entry.delta_options.clone(),
+                            },
+                        );
+                    }
+                    EntryKind::DedupRef | EntryKind::Zero => {}
+                }
+            }
+
+            log::info!(
+                "delta_repack: seg {seg_id} converted {}/{} entries, {}→{} bytes",
+                seg_stats.entries_converted,
+                entries.len(),
+                seg_stats.original_body_bytes,
+                seg_stats.delta_body_bytes,
+            );
+
+            stats.segments_rewritten += 1;
+            stats.entries_converted += seg_stats.entries_converted;
+            stats.original_body_bytes += seg_stats.original_body_bytes;
+            stats.delta_body_bytes += seg_stats.delta_body_bytes;
         }
 
         Ok(stats)
@@ -1632,8 +1804,10 @@ impl Volume {
     /// **GC path** (`gc/<ulid>` exists): also deletes `index/<old>.idx` for each
     /// segment consumed by the GC handoff (read from `gc/<ulid>.applied`).  This
     /// happens after writing the new idx so there is never a window where no idx
-    /// covers the affected LBAs.  The coordinator deletes `gc/<ulid>` itself after
-    /// receiving `ok`.
+    /// covers the affected LBAs.  The `gc/<ulid>` body file is also deleted here
+    /// — it has already been copied into `cache/<ulid>.body`, and deleting it
+    /// inside the actor (rather than from the coordinator) keeps every mutation
+    /// of `gc/` serialised with the idle-tick `apply_gc_handoffs` path.
     ///
     /// Idempotent: if `cache/<ulid>.body` already exists the function returns
     /// `Ok(())` without re-writing.
@@ -1752,7 +1926,11 @@ impl Volume {
             fs::remove_file(&pending_path)?;
         } else {
             // GC path: delete index/<old>.idx for each segment consumed by this
-            // handoff.  Parse the .applied file to find the old ULIDs.
+            // handoff, then delete the gc/<new> body. The body is safe to
+            // remove now because it has already been copied to cache/<new>.body
+            // above.  Deleting it here — inside the actor, under the same lock
+            // that the idle-tick apply_gc_handoffs runs under — means no
+            // out-of-band coordinator fs op races the actor on gc/.
             let applied_path = self.base_dir.join("gc").join(format!("{ulid_str}.applied"));
             if let Ok(content) = fs::read_to_string(&applied_path) {
                 let mut old_ulids: std::collections::HashSet<String> =
@@ -1771,8 +1949,31 @@ impl Volume {
                     let _ = fs::remove_file(index_dir.join(format!("{old_str}.idx")));
                 }
             }
+            let _ = fs::remove_file(&src_path);
         }
         Ok(())
+    }
+
+    /// Finalize a completed GC handoff by renaming `gc/<ulid>.applied`
+    /// to `gc/<ulid>.done`.
+    ///
+    /// Called by the coordinator after the new segment has been uploaded to
+    /// S3, `promote_segment` has moved it into the local cache, and the old
+    /// segments have been deleted from S3. The `.done` rename is the last
+    /// step in the handoff lifecycle and must happen AFTER the S3 delete so
+    /// that a crash between the two cannot leak old-segment objects in S3 —
+    /// the `.applied` state keeps `apply_done_handoffs` eligible to retry the
+    /// delete, and only `.done` removes that eligibility.
+    ///
+    /// Routing through the actor (rather than letting the coordinator rename
+    /// `.applied` directly) keeps every mutation of `gc/` serialised with the
+    /// idle-tick `apply_gc_handoffs` path, so there is no race between the
+    /// coordinator renaming a file and the actor reading it.
+    pub fn finalize_gc_handoff(&mut self, ulid: Ulid) -> io::Result<()> {
+        let gc_dir = self.base_dir.join("gc");
+        let applied = gc_dir.join(format!("{ulid}.applied"));
+        let done = gc_dir.join(format!("{ulid}.done"));
+        fs::rename(&applied, &done)
     }
 
     /// Hole-punch hash-dead DATA entries in `pending/<ulid>` in place, so

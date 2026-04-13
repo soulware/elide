@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use elide_core::volume::CompactionStats;
+use elide_core::volume::{CompactionStats, DeltaRepackStats};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::warn;
@@ -55,6 +55,37 @@ pub async fn sweep_pending(fork_dir: &Path) -> Option<CompactionStats> {
 pub async fn repack(fork_dir: &Path, min_live_ratio: f64) -> Option<CompactionStats> {
     let req = format!("repack {min_live_ratio}");
     parse_compaction_stats(fork_dir, call(fork_dir, &req).await)
+}
+
+/// Rewrite post-snapshot pending segments with zstd-dictionary deltas
+/// against same-LBA extents from the latest sealed snapshot. Phase 5 Tier 1.
+/// Returns delta-repack stats on success.
+/// Returns `None` and logs a warning if the socket is absent or the call fails.
+pub async fn delta_repack_post_snapshot(fork_dir: &Path) -> Option<DeltaRepackStats> {
+    let response = call(fork_dir, "delta_repack").await?;
+    let rest = match response.strip_prefix("ok ") {
+        Some(r) => r.trim(),
+        None => {
+            warn!(
+                "[control] unexpected delta_repack response for {}: {response:?}",
+                fork_dir.display()
+            );
+            return None;
+        }
+    };
+    let mut parts = rest.splitn(5, ' ');
+    let segments_scanned: usize = parts.next()?.parse().ok()?;
+    let segments_rewritten: usize = parts.next()?.parse().ok()?;
+    let entries_converted: usize = parts.next()?.parse().ok()?;
+    let original_body_bytes: u64 = parts.next()?.parse().ok()?;
+    let delta_body_bytes: u64 = parts.next()?.trim().parse().ok()?;
+    Some(DeltaRepackStats {
+        segments_scanned,
+        segments_rewritten,
+        entries_converted,
+        original_body_bytes,
+        delta_body_bytes,
+    })
 }
 
 /// Call gc_checkpoint on the volume process for `fork_dir`.
@@ -161,6 +192,32 @@ pub async fn promote_segment(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
         Some(resp) => {
             warn!(
                 "[control] promote {ulid} for {} returned unexpected response: {resp:?}",
+                fork_dir.display()
+            );
+            false
+        }
+        None => false,
+    }
+}
+
+/// Finalize a completed GC handoff by asking the volume to rename
+/// `gc/<ulid>.applied` → `gc/<ulid>.done`.
+///
+/// Called by `apply_done_handoffs` after the new segment has been promoted
+/// and the old S3 objects have been deleted. Routing the rename through the
+/// volume actor keeps every `gc/` mutation serialised with the idle-tick
+/// `apply_gc_handoffs` path, so there is no race between the coordinator
+/// renaming a `.applied` file and the actor trying to read it.
+///
+/// Returns `true` on success.  Returns `false` if the socket is absent or
+/// the call fails; the coordinator retries on the next tick.
+pub async fn finalize_gc_handoff(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
+    let req = format!("finalize_gc_handoff {ulid}");
+    match call(fork_dir, &req).await {
+        Some(resp) if resp.trim() == "ok" => true,
+        Some(resp) => {
+            warn!(
+                "[control] finalize_gc_handoff {ulid} for {} returned unexpected response: {resp:?}",
                 fork_dir.display()
             );
             false

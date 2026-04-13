@@ -31,8 +31,8 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::BoxFetcher;
 use crate::volume::{
-    AncestorLayer, CompactionStats, FileCache, NoopSkipStats, Volume, find_segment_in_dirs,
-    open_delta_body_in_dirs, read_extents,
+    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, NoopSkipStats, Volume,
+    find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
 };
 
 // ---------------------------------------------------------------------------
@@ -107,6 +107,9 @@ pub(crate) enum VolumeRequest {
         min_live_ratio: f64,
         reply: Sender<io::Result<CompactionStats>>,
     },
+    DeltaRepackPostSnapshot {
+        reply: Sender<io::Result<DeltaRepackStats>>,
+    },
     GcCheckpoint {
         reply: Sender<io::Result<(Ulid, Ulid)>>,
     },
@@ -115,6 +118,10 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<()>>,
     },
     Promote {
+        ulid: Ulid,
+        reply: Sender<io::Result<()>>,
+    },
+    FinalizeGcHandoff {
         ulid: Ulid,
         reply: Sender<io::Result<()>>,
     },
@@ -252,6 +259,13 @@ impl VolumeActor {
                             }
                             let _ = reply.send(result);
                         }
+                        VolumeRequest::DeltaRepackPostSnapshot { reply } => {
+                            let result = self.volume.delta_repack_post_snapshot();
+                            if matches!(&result, Ok(s) if s.entries_converted > 0) {
+                                self.publish_snapshot();
+                            }
+                            let _ = reply.send(result);
+                        }
                         VolumeRequest::ApplyGcHandoffs { reply } => {
                             let result = self.volume.apply_gc_handoffs();
                             if matches!(&result, Ok(n) if *n > 0) {
@@ -285,6 +299,9 @@ impl VolumeActor {
                                 self.publish_snapshot();
                             }
                             let _ = reply.send(result);
+                        }
+                        VolumeRequest::FinalizeGcHandoff { ulid, reply } => {
+                            let _ = reply.send(self.volume.finalize_gc_handoff(ulid));
                         }
                         VolumeRequest::Snapshot { reply } => {
                             let result = self.volume.snapshot().map(|u| u.to_string());
@@ -466,6 +483,19 @@ impl VolumeHandle {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
+    /// Rewrite post-snapshot pending segments with zstd-dictionary deltas
+    /// against same-LBA extents from the latest sealed snapshot.  Blocks
+    /// until the actor replies.
+    pub fn delta_repack_post_snapshot(&self) -> io::Result<DeltaRepackStats> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::DeltaRepackPostSnapshot { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
     /// Read `lba_count` blocks starting at `lba`.
     ///
     /// Resolved entirely on the calling thread using the current `ReadSnapshot`
@@ -559,6 +589,24 @@ impl VolumeHandle {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::Promote {
+                ulid,
+                reply: reply_tx,
+            })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Finalize a GC handoff by renaming `gc/<ulid>.applied` → `.done`
+    /// via the actor.  Routing the rename through the actor keeps every
+    /// mutation of `gc/` serialised with the idle-tick apply path, so the
+    /// coordinator never races the volume on `gc/` filenames.  Blocks until
+    /// the actor replies.
+    pub fn finalize_gc_handoff(&self, ulid: Ulid) -> io::Result<()> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::FinalizeGcHandoff {
                 ulid,
                 reply: reply_tx,
             })
