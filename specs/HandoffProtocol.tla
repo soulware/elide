@@ -166,6 +166,10 @@
                                     is absent; no dangling index entries after GC cleanup
     CacheOnlyAfterUpload          — cache/<new> is populated only after volume
                                     acknowledgment (handoff ∈ {"applied", "done"})
+    EvictOnlyAfterPublish (PROPERTY)
+                                  — cache/<old> is only deleted in a step where the
+                                    post-apply ReadSnapshot is live, encoding the
+                                    publish-then-evict rule in actor.rs:255-271
 
   The restart-safety modelling ensures TLC explores crash scenarios during the
   .pending phase (where old_idx_present may still be TRUE and extent can revert
@@ -243,10 +247,22 @@ VARIABLES
                   \* Only relevant when Carried # {} (repack handoffs); stays FALSE otherwise.
   new_seg_present, \* TRUE iff cache/<ulid>.body (volume-written, S3-confirmed) is present.
                    \* Set TRUE by CoordPromote (after volume responds to promote IPC).
+  old_cache_present,  \* TRUE iff cache/<old>.body and cache/<old>.present exist on the volume.
+                      \* Initially TRUE (the input segment was cached locally before GC ran).
+                      \* Set FALSE by VolumeEvictOldCache (Step 2's post-publish hook,
+                      \* implemented in actor.rs as evict_applied_gc_cache after the
+                      \* post-apply ReadSnapshot is published).  On-disk state, so survives
+                      \* VolumeCrash / VolumeRestart.
+  snapshot_published, \* TRUE iff the volume has a live in-memory ReadSnapshot reflecting
+                      \* the post-apply extent index (i.e. VolumeFinishApply has published
+                      \* after the most recent crash/restart).  In-memory only: cleared on
+                      \* VolumeCrash; re-set on VolumeRestart when handoff is already
+                      \* "applied"/"done" (rebuild reconstructs the post-apply snapshot
+                      \* from disk), or re-set when VolumeFinishApply fires.
   coord_up,       \* TRUE iff the coordinator is currently running
   vol_up          \* TRUE iff the volume is currently running
 
-vars == <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
+vars == <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, snapshot_published, coord_up, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Type correctness (checked as an invariant, useful for debugging the model)
@@ -263,6 +279,8 @@ TypeOK ==
   /\ gc_seg_signed    \in BOOLEAN
   /\ gc_s3_uploaded   \in BOOLEAN
   /\ new_seg_present  \in BOOLEAN
+  /\ old_cache_present  \in BOOLEAN
+  /\ snapshot_published \in BOOLEAN
   /\ coord_up         \in BOOLEAN
   /\ vol_up           \in BOOLEAN
 
@@ -279,6 +297,8 @@ Init ==
   /\ gc_seg_signed    = FALSE                       \* not yet re-signed by volume
   /\ gc_s3_uploaded   = FALSE                       \* gc body not yet uploaded to S3
   /\ new_seg_present  = FALSE                       \* cache/<new>.body not yet written
+  /\ old_cache_present  = TRUE                      \* input segment was previously cached locally
+  /\ snapshot_published = FALSE                     \* no post-apply ReadSnapshot yet
   /\ coord_up         = TRUE
   /\ vol_up           = TRUE
 
@@ -306,7 +326,7 @@ CoordWritePending ==
   /\ handoff = "absent"
   /\ handoff'         = "pending"
   /\ gc_seg_present'  = (Carried # {})   \* staged segment written iff there are carried entries
-  /\ UNCHANGED <<extent, old_present, old_idx_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<extent, old_present, old_idx_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, snapshot_published, coord_up, vol_up>>
 
 (*
   Step 3 Part A-1: Coordinator uploads gc/<ulid> (volume-signed) to S3.
@@ -324,7 +344,7 @@ CoordUploadGc ==
   /\ gc_seg_present /\ gc_seg_signed  \* body must be present and volume-signed
   /\ ~gc_s3_uploaded                  \* idempotency guard
   /\ gc_s3_uploaded'  = TRUE
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, old_cache_present, snapshot_published, coord_up, vol_up>>
 
 (*
   Step 3 Part A-2: Coordinator calls promote IPC; volume responds by writing
@@ -355,7 +375,7 @@ CoordPromote ==
   /\ new_seg_present'    = TRUE   \* volume writes cache/<new>.body + .present
   /\ gc_seg_present'     = FALSE  \* coordinator deletes gc/<ulid>
   /\ gc_seg_signed'      = FALSE
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_s3_uploaded, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_s3_uploaded, old_cache_present, snapshot_published, coord_up, vol_up>>
 
 (*
   Step 3 Part B: Coordinator deletes old S3 objects and finalises the handoff.
@@ -387,20 +407,20 @@ CoordApplyDone ==
   /\ ~old_idx_present                      \* ordering: .idx must be gone first
   /\ handoff'          = "done"
   /\ old_present'      = FALSE             \* old S3 object deleted (Step 3f)
-  /\ UNCHANGED <<extent, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<extent, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, snapshot_published, coord_up, vol_up>>
 
 CoordCrash ==
   /\ coord_up
   /\ coord_up'        = FALSE
   /\ gc_s3_uploaded'  = FALSE   \* no durable local record; re-upload idempotently on restart
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, new_seg_present, old_cache_present, snapshot_published, vol_up>>
 
 \* On restart the coordinator re-reads gc/ and resumes at whatever state the
 \* file is in.  No state reset is needed because the file state is persistent.
 CoordRestart ==
   /\ ~coord_up
   /\ coord_up' = TRUE
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, snapshot_published, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Volume actions
@@ -431,7 +451,7 @@ VolumeReSigns ==
   /\ gc_seg_present              \* staged segment must be present
   /\ ~gc_seg_signed              \* not yet re-signed (idempotency guard)
   /\ gc_seg_signed'   = TRUE     \* body in gc/ is now volume-signed
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_s3_uploaded, new_seg_present, old_cache_present, snapshot_published, coord_up, vol_up>>
 
 (*
   Step 2b: Volume applies one carried entry from the handoff.
@@ -455,7 +475,7 @@ VolumeApplyCarried(h) ==
   /\ gc_seg_signed               \* re-signed body must be in gc/
   /\ extent[h] = "old"           \* guard: skip if superseded by a concurrent write
   /\ extent' = [extent EXCEPT ![h] = "gc"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, snapshot_published, coord_up, vol_up>>
 
 (*
   Step 2b (removal): Volume applies one removed entry from the handoff.
@@ -470,7 +490,7 @@ VolumeApplyRemoved(h) ==
   /\ h \in Removed
   /\ extent[h] = "old"           \* guard: skip if superseded
   /\ extent' = [extent EXCEPT ![h] = "gone"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, snapshot_published, coord_up, vol_up>>
 
 (*
   Step 2d+e: Volume has visited every entry (applied or skipped due to guard),
@@ -517,12 +537,37 @@ VolumeFinishApply ==
                          ELSE extent[h]]
   /\ handoff'          = "applied"
   /\ old_idx_present'  = FALSE          \* delete index/<old>.idx before .applied rename
-  /\ UNCHANGED <<old_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<old_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, snapshot_published, coord_up, vol_up>>
+
+(*
+  Step 2 publish: actor.rs:259-263 writes a fresh ReadSnapshot reflecting the
+  post-apply extent index.  Modelled as a SEPARATE action (rather than glued
+  atomically into VolumeFinishApply) so TLC can observe the intermediate window
+  where the .applied marker is on disk but the in-memory ReadSnapshot has not
+  yet been re-published.  This is the window that the publish-then-evict rule
+  is meant to protect.
+
+  In actor.rs the publish runs in the same message handler as
+  apply_gc_handoffs and evict_applied_gc_cache, so on a crash-free path the
+  three steps are effectively contiguous — but they can interleave with
+  VolumeCrash in the model, and TLC explores those traces.
+
+  Idempotency: gated on ~snapshot_published.  After VolumeRestart the rebuild
+  may have already set snapshot_published = TRUE (because handoff is already
+  "applied"/"done"), in which case this action does not fire.
+*)
+VolumePublishPostApply ==
+  /\ vol_up
+  /\ handoff = "applied"
+  /\ ~snapshot_published
+  /\ snapshot_published' = TRUE
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up, vol_up>>
 
 VolumeCrash ==
   /\ vol_up
   /\ vol_up' = FALSE
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up>>
+  /\ snapshot_published' = FALSE   \* in-memory ReadSnapshot lost on crash
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up>>
 
 (*
   On restart the volume rebuilds its in-memory extent index from on-disk .idx
@@ -554,7 +599,53 @@ VolumeRestart ==
                   ELSE IF old_idx_present THEN "old"
                   ELSE IF h \in Carried    THEN "gc"
                   ELSE                         "gone"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up>>
+  \* On restart the rebuild reconstructs a ReadSnapshot from on-disk state.
+  \* If handoff is already "applied"/"done", the rebuilt snapshot reflects the
+  \* post-apply extent index and is therefore the publish that gates eviction.
+  \* If handoff is still "pending"/"absent", no post-apply snapshot exists yet.
+  /\ snapshot_published' = (handoff \in {"applied", "done"})
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up>>
+
+(*
+  Step 2 post-publish hook: evict cache/<old>.body and cache/<old>.present.
+
+  In the implementation (actor.rs:255-271) this runs synchronously after a
+  successful apply_gc_handoffs, AFTER the new ReadSnapshot has been published:
+
+      let result = self.volume.apply_gc_handoffs();
+      if matches!(&result, Ok(n) if *n > 0) {
+          self.snapshot.store(Arc::new(ReadSnapshot { ... }));   // publish
+          self.volume.evict_applied_gc_cache();                  // then evict
+      }
+
+  Modelled as a separate action so TLC can verify the ordering rule rather than
+  baking it in atomically.  The guards encode the invariant the implementation
+  relies on:
+
+    handoff = "applied"   — the .applied marker exists on disk (apply_gc_handoffs
+                            has completed successfully)
+    snapshot_published    — a post-apply ReadSnapshot is live (the publish step
+                            has run after the most recent restart)
+
+  A regression that moves evict_applied_gc_cache before self.snapshot.store(...)
+  would correspond to dropping the snapshot_published guard here and would
+  falsify OldCacheEvictedOnlyAfterPublish.
+
+  Note: this action models eviction of the input segment's cache.  It does not
+  affect any extent reference, since by handoff = "applied" the per-entry guard
+  has already moved every "old" entry to "gc"/"gone"/"new".
+
+  For tombstone handoffs (Hashes = {}) the logic is unchanged: the .applied
+  marker is still written, snapshot_published still flips, and the input
+  segment's cache is still evicted.
+*)
+VolumeEvictOldCache ==
+  /\ vol_up
+  /\ handoff = "applied"           \* .applied marker on disk
+  /\ snapshot_published            \* ORDERING: post-apply snapshot must be live first
+  /\ old_cache_present             \* idempotency guard
+  /\ old_cache_present' = FALSE
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, snapshot_published, coord_up, vol_up>>
 
 (*
   VolumeApplyApplied (REMOVED): in the previous design the volume could restart
@@ -598,7 +689,7 @@ VolumeRestart ==
 NewerWrite(h) ==
   /\ extent[h] \in {"old", "gc"}
   /\ extent' = [extent EXCEPT ![h] = "new"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, gc_seg_present, gc_seg_signed, gc_s3_uploaded, new_seg_present, old_cache_present, snapshot_published, coord_up, vol_up>>
 
 \* ---------------------------------------------------------------------------
 \* Specification
@@ -615,6 +706,8 @@ Next ==
   \/ \E h \in Carried : VolumeApplyCarried(h)
   \/ \E h \in Removed : VolumeApplyRemoved(h)
   \/ VolumeFinishApply
+  \/ VolumePublishPostApply
+  \/ VolumeEvictOldCache
   \/ VolumeCrash
   \/ VolumeRestart
   \/ \E h \in Hashes  : NewerWrite(h)
@@ -678,6 +771,8 @@ Spec ==
   /\ SF_vars(\E h \in Carried : VolumeApplyCarried(h))
   /\ SF_vars(\E h \in Removed : VolumeApplyRemoved(h))
   /\ SF_vars(VolumeFinishApply)
+  /\ SF_vars(VolumePublishPostApply)
+  /\ SF_vars(VolumeEvictOldCache)
 
 \* ---------------------------------------------------------------------------
 \* Safety invariants
@@ -787,6 +882,30 @@ OldIdxOnlyPresentWhenSegmentPresent ==
 *)
 CacheOnlyAfterUpload ==
   new_seg_present => (~gc_seg_present /\ handoff \in {"applied", "done"})
+
+(*
+  Eviction-ordering: cache/<old> may only be deleted in a step where the
+  post-apply ReadSnapshot is live (snapshot_published).
+
+  This encodes the rule in actor.rs:255-271 — the volume evicts the input
+  segment's local cache only after publishing the ReadSnapshot that reflects
+  the new extent index (extent[h] = "gc"/"gone").  Without this ordering,
+  in-flight readers latched on the pre-apply snapshot (extent[h] = "old")
+  could lose access to cache/<old>.body even though they still believe the
+  old segment is the canonical location.
+
+  Stated as an action property (PROPERTIES, not INVARIANTS) because
+  snapshot_published is in-memory and reverts on VolumeCrash.  A state
+  predicate "~old_cache_present => snapshot_published" would be falsified
+  by any crash that follows a successful eviction.  What we actually want
+  is the temporal claim "in the step where eviction happens,
+  snapshot_published holds" — exactly an action property.
+
+  The VolumeEvictOldCache action's guard already enforces this; the
+  property is a smoke detector for refactors that drop the guard.
+*)
+EvictOnlyAfterPublish ==
+  [][(old_cache_present /\ ~old_cache_present') => snapshot_published]_vars
 
 \* ---------------------------------------------------------------------------
 \* Liveness property
