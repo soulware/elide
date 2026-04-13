@@ -14,9 +14,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use elide_core::filemap;
 use elide_core::import::import_image;
 use elide_core::segment::{self, EntryKind};
 use elide_core::signing;
+use elide_core::volume::Volume;
 use tempfile::TempDir;
 
 mod common;
@@ -67,8 +69,19 @@ fn setup_volume_dir(tmp: &TempDir) -> (PathBuf, std::sync::Arc<dyn segment::Segm
     // only needs volume.pub for signing-identity bootstrap, but the
     // easiest way to get a matching pub-on-disk + signer pair in a
     // test is to use the keypair helper and then load the signer.
-    signing::generate_keypair(&vol_dir, signing::VOLUME_KEY_FILE, signing::VOLUME_PUB_FILE)
-        .unwrap();
+    let key =
+        signing::generate_keypair(&vol_dir, signing::VOLUME_KEY_FILE, signing::VOLUME_PUB_FILE)
+            .unwrap();
+    // Phase 4 filemap generation walks the provenance chain via
+    // BlockReader::open_snapshot, which requires volume.provenance — write
+    // an empty (root) lineage so the chain terminates immediately.
+    signing::write_provenance(
+        &vol_dir,
+        &key,
+        signing::VOLUME_PROVENANCE_FILE,
+        &signing::ProvenanceLineage::default(),
+    )
+    .unwrap();
     let signer = signing::load_signer(&vol_dir, signing::VOLUME_KEY_FILE).unwrap();
     // Volume config must exist for import_image's size-field write.
     elide_core::config::VolumeConfig {
@@ -217,6 +230,83 @@ fn import_emits_file_sized_extents_and_filemap_v2() {
         "blob should span 10 blocks ({} bytes); got lba_length={}",
         medium.len(),
         blob_entry.1.lba_length,
+    );
+}
+
+/// Phase 4: regenerate the filemap for a sealed snapshot from segments alone.
+///
+/// Imports a small ext4 image (which writes the filemap as a side effect of
+/// the import walk), drains all pending segments through the redact+promote
+/// path so they live in `index/<ulid>.idx` + `cache/<ulid>.body`, deletes the
+/// import-written filemap, then calls `filemap::generate_from_snapshot`. The
+/// regenerated filemap must match the import-written one row-for-row,
+/// including hashes — `generate_from_snapshot` looks up hashes via the LBA
+/// map, so a mismatch would mean snapshot-time hashes don't agree with what
+/// the import path stored in segment DATA entries.
+#[test]
+fn generate_from_snapshot_matches_import_filemap() {
+    let tmp = TempDir::new().unwrap();
+    let rootfs = tmp.path().join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+
+    fs::write(rootfs.join("greeting"), b"hello world\n").unwrap();
+    fs::write(rootfs.join("blob"), vec![0xABu8; 40_000]).unwrap();
+    fs::create_dir_all(rootfs.join("etc")).unwrap();
+    fs::write(rootfs.join("etc").join("hosts"), b"127.0.0.1 localhost\n").unwrap();
+
+    let image_path = tmp.path().join("image.ext4");
+    build_ext4_image(&rootfs, &image_path, 8 * 1024 * 1024);
+
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+    import_image(&image_path, &vol_dir, signer.as_ref(), None, |_, _| {}).unwrap();
+
+    let snap_dir = vol_dir.join("snapshots");
+    let snap_ulid_str = find_snapshot_ulid(&snap_dir);
+    let snap_ulid = ulid::Ulid::from_string(&snap_ulid_str).unwrap();
+    let filemap_path = snap_dir.join(format!("{snap_ulid_str}.filemap"));
+
+    // Capture the import-written filemap, then drain pending → index/cache so
+    // BlockReader::open_snapshot can rebuild from index/*.idx, then erase the
+    // filemap so we know the regenerated one came from generate_from_snapshot.
+    let import_rows = parse_filemap(&filemap_path);
+    let import_text = fs::read_to_string(&filemap_path).unwrap();
+
+    let mut vol = Volume::open(&vol_dir, vol_dir.parent().unwrap()).unwrap();
+    common::drain_with_redact(&mut vol);
+    drop(vol);
+
+    fs::remove_file(&filemap_path).unwrap();
+
+    let wrote = filemap::generate_from_snapshot(&vol_dir, &snap_ulid, Box::new(|_| None)).unwrap();
+    assert!(
+        wrote,
+        "generate_from_snapshot returned false on an ext4 image"
+    );
+    assert!(
+        filemap_path.exists(),
+        "generate_from_snapshot did not write the filemap"
+    );
+
+    let phase4_rows = parse_filemap(&filemap_path);
+    let phase4_text = fs::read_to_string(&filemap_path).unwrap();
+
+    // Row sets must be equal; rows are sorted on write so byte-equality is
+    // also a meaningful signal for "two identical filemaps from independent
+    // producers".
+    assert_eq!(
+        phase4_rows.len(),
+        import_rows.len(),
+        "row count differs:\nimport:\n{import_text}\nphase4:\n{phase4_text}"
+    );
+    for row in &import_rows {
+        assert!(
+            phase4_rows.contains(row),
+            "import row {row:?} missing from phase4 filemap:\n{phase4_text}"
+        );
+    }
+    assert_eq!(
+        phase4_text, import_text,
+        "phase4 filemap should be byte-identical to import filemap (rows are pre-sorted)"
     );
 }
 
