@@ -15,6 +15,10 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::block_reader::{BlockReader, FetcherFactory};
+use crate::config::VolumeConfig;
+use crate::ext4_scan;
+
 pub const HEADER_V2: &str = "# elide-filemap v2";
 
 #[derive(Clone, Debug)]
@@ -112,25 +116,96 @@ pub fn parse(text: &str) -> io::Result<Filemap> {
 /// Write `rows` to `snapshots/<ulid>.filemap` in v2 format. Rows are sorted
 /// by `(path, file_offset)` so two imports of similar images produce
 /// byte-identical filemaps modulo content.
+///
+/// Uses the standard tmp-rename commit pattern: write to `<ulid>.filemap.tmp`,
+/// fsync, rename. Restart recovery cleans up any leftover `.tmp`.
 pub fn write(snapshots_dir: &Path, snap_ulid: &str, rows: &[FilemapRow]) -> io::Result<()> {
     let mut sorted: Vec<&FilemapRow> = rows.iter().collect();
     sorted.sort_by(|a, b| a.path.cmp(&b.path).then(a.file_offset.cmp(&b.file_offset)));
 
-    let path = snapshots_dir.join(format!("{snap_ulid}.filemap"));
-    let mut out = fs::File::create(&path)?;
-    writeln!(out, "{HEADER_V2}")?;
-    for row in sorted {
-        writeln!(
-            out,
-            "{}\t{}\t{}\t{}",
-            row.path,
-            row.file_offset,
-            row.hash.to_hex(),
-            row.byte_count
-        )?;
+    let final_path = snapshots_dir.join(format!("{snap_ulid}.filemap"));
+    let tmp_path = snapshots_dir.join(format!("{snap_ulid}.filemap.tmp"));
+    {
+        let mut out = fs::File::create(&tmp_path)?;
+        writeln!(out, "{HEADER_V2}")?;
+        for row in sorted {
+            writeln!(
+                out,
+                "{}\t{}\t{}\t{}",
+                row.path,
+                row.file_offset,
+                row.hash.to_hex(),
+                row.byte_count
+            )?;
+        }
+        out.flush()?;
+        out.sync_all()?;
     }
-    out.flush()?;
+    fs::rename(&tmp_path, &final_path)?;
     Ok(())
+}
+
+/// Generate `snapshots/<snap_ulid>.filemap` for an existing sealed snapshot.
+///
+/// Phase 4 entrypoint: opens a snapshot-pinned `BlockReader`, walks the
+/// ext4 filesystem at the snapshot to enumerate file fragments, looks up
+/// each fragment's content hash via the volume's LBA map (no body reads,
+/// no rehashing), and writes the filemap atomically.
+///
+/// Returns `Ok(false)` and writes nothing for non-ext4 volumes or images
+/// the scanner cannot parse — Phase 4 is strictly additive, and consumers
+/// only use the filemap if it exists.
+pub fn generate_from_snapshot(
+    vol_dir: &Path,
+    snap_ulid: &ulid::Ulid,
+    mk_fetcher: Box<FetcherFactory<'_>>,
+) -> io::Result<bool> {
+    let cfg = VolumeConfig::read(vol_dir)?;
+    let image_size = cfg
+        .size
+        .ok_or_else(|| io::Error::other("volume.size not set; cannot generate filemap"))?;
+
+    let reader = BlockReader::open_snapshot(vol_dir, snap_ulid, mk_fetcher)?;
+
+    // hash_for_lba lookups need a borrow of the reader, but scan_layout_via_reader
+    // consumes a Box<dyn Ext4Read>. Open a second snapshot reader for hash lookups
+    // — both are cheap and stateless w.r.t. each other.
+    let hash_lookup = BlockReader::open_snapshot(vol_dir, snap_ulid, Box::new(|_| None))?;
+
+    let layout = match ext4_scan::scan_layout_via_reader(image_size, Box::new(reader)) {
+        Ok(l) => l,
+        Err(e) => {
+            // Non-ext4 or unparseable: skip cleanly — Phase 4 is additive.
+            log::debug!(
+                "filemap generation skipped for {} snap {}: {e}",
+                vol_dir.display(),
+                snap_ulid
+            );
+            return Ok(false);
+        }
+    };
+
+    let mut rows: Vec<FilemapRow> = Vec::with_capacity(layout.fragments.len());
+    for frag in layout.fragments {
+        let Some(hash) = hash_lookup.hash_for_lba(frag.lba_start) else {
+            // LBA was enumerated by the inode walk but the LBA map has no
+            // entry. Either the file lives entirely in unwritten LBAs (zero-
+            // hole file with i_size > 0) or the snapshot is inconsistent.
+            // Skip this fragment — better to emit a partial filemap than
+            // fail Phase 4 outright.
+            continue;
+        };
+        rows.push(FilemapRow {
+            path: frag.path,
+            file_offset: frag.file_offset,
+            hash,
+            byte_count: frag.byte_count,
+        });
+    }
+
+    let snapshots_dir = vol_dir.join("snapshots");
+    write(&snapshots_dir, &snap_ulid.to_string(), &rows)?;
+    Ok(true)
 }
 
 #[cfg(test)]

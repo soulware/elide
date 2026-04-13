@@ -1,35 +1,35 @@
-// ext4 scanning primitives for file-aware import.
+// ext4 scanning primitives for file-aware import and snapshot filemap
+// generation.
 //
-// Parses the ext4 superblock, inode table, and extent tree to produce a
-// list of `FileFragment` values describing every regular file's on-disk
-// layout: the path, the file-relative byte offset of the fragment, the
-// contiguous LBA range it occupies, and a hash of the fragment's bytes.
+// Two consumers, one walker:
+//
+// - `scan_via_reader` (and its `scan(&Path)` wrapper) reads file body
+//   bytes and computes per-fragment hashes. Used by the import path,
+//   which also needs the bodies to write segment DATA entries.
+// - `scan_layout_via_reader` produces only the fragment layout
+//   (path, file_offset, lba_start, lba_length, byte_count). Used by
+//   Phase 4 snapshot filemap generation, which fills in the per-
+//   fragment hashes from the volume's LBA map via `hash_for_lba` —
+//   no body reads, no rehashing.
+//
+// Both share the inode-table walk and the raw directory-tree walk.
+// Path↔inode joining is done by inode index (read directly from
+// directory entries), not by hashing file contents — `ext4-view`
+// does not expose inode numbers, so we walk directories ourselves.
 //
 // Fragment = one contiguous LBA range owned by a file (one ext4 leaf
 // extent, trimmed to the file's i_size). A file with N discontiguous
-// ext4 extents produces N fragments.
-//
-// Hashes cover the full allocated block range (`lba_length * 4096`
-// bytes) including any tail-block padding, so the fragment hash written
-// to a segment entry equals the fragment hash written to the filemap —
-// no split-brain between "storage hash" and "content hash". The
-// filemap's separate `byte_count` column records the file-truthful
-// byte count so downstream delta computation can cap the dictionary
-// and compressed input at the real file length.
-//
-// Path joining uses the full-file hash trick: we hash each file's
-// allocated blocks end-to-end as we walk the inode table, then walk
-// the directory tree via ext4-view to map each file's path to its
-// hash, then join the two on full-file hash. This avoids a second
-// inode lookup and matches the approach used by the analysis tooling
-// in src/extents.rs.
+// ext4 extents produces N fragments. Hashes (when computed) cover the
+// full allocated block range (`lba_length * 4096` bytes) including any
+// tail-block padding, so the fragment hash written to a segment entry
+// equals the fragment hash written to the filemap.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::Path;
 
-use ext4_view::{DirEntry, Ext4, Metadata, PathBuf as Ext4PathBuf};
+use ext4_view::Ext4Read;
 
 const LBA_SIZE: u64 = 4096;
 const SUPERBLOCK_OFFSET: u64 = 1024;
@@ -37,9 +37,19 @@ const EXT4_MAGIC: u16 = 0xef53;
 const EXTENT_MAGIC: u16 = 0xf30a;
 const INODE_FLAG_EXTENTS: u32 = 0x0008_0000;
 const S_IFREG: u16 = 0x8000;
+const S_IFDIR: u16 = 0x4000;
 const S_IFMT: u16 = 0xf000;
 const INCOMPAT_64BIT: u32 = 0x80;
 const EXTENT_ENTRY_SIZE: usize = 12;
+const EXT4_ROOT_INO: u32 = 2;
+const EXT4_FT_REG_FILE: u8 = 1;
+const EXT4_FT_DIR: u8 = 2;
+
+fn read_at(reader: &mut dyn Ext4Read, offset: u64, dst: &mut [u8]) -> io::Result<()> {
+    reader
+        .read(offset, dst)
+        .map_err(|e| io::Error::other(format!("ext4 read at {offset}: {e}")))
+}
 
 fn u16le(data: &[u8], off: usize) -> io::Result<u16> {
     data.get(off..off + 2)
@@ -68,10 +78,9 @@ struct Superblock {
 }
 
 impl Superblock {
-    fn read(f: &mut File) -> io::Result<Self> {
-        let mut buf = vec![0u8; 1024];
-        f.seek(SeekFrom::Start(SUPERBLOCK_OFFSET))?;
-        f.read_exact(&mut buf)?;
+    fn read(reader: &mut dyn Ext4Read) -> io::Result<Self> {
+        let mut buf = [0u8; 1024];
+        read_at(reader, SUPERBLOCK_OFFSET, &mut buf)?;
 
         if u16le(&buf, 0x38)? != EXT4_MAGIC {
             return Err(io::Error::other("not an ext4 image"));
@@ -113,11 +122,10 @@ impl Superblock {
     }
 }
 
-fn inode_table_block(f: &mut File, sb: &Superblock, group: u32) -> io::Result<u64> {
+fn inode_table_block(reader: &mut dyn Ext4Read, sb: &Superblock, group: u32) -> io::Result<u64> {
     let offset = sb.bgdt_start() + group as u64 * sb.bgd_size();
     let mut buf = vec![0u8; sb.bgd_size() as usize];
-    f.seek(SeekFrom::Start(offset))?;
-    f.read_exact(&mut buf)?;
+    read_at(reader, offset, &mut buf)?;
 
     let lo = u32le(&buf, 0x08)? as u64;
     let hi = if sb.is_64bit {
@@ -128,13 +136,25 @@ fn inode_table_block(f: &mut File, sb: &Superblock, group: u32) -> io::Result<u6
     Ok((hi << 32) | lo)
 }
 
+/// Compute the on-disk byte offset of inode `inode_idx` (1-based).
+fn inode_offset(reader: &mut dyn Ext4Read, sb: &Superblock, inode_idx: u32) -> io::Result<u64> {
+    if inode_idx == 0 {
+        return Err(io::Error::other("inode index 0 is reserved"));
+    }
+    let zero_based = inode_idx - 1;
+    let group = zero_based / sb.inodes_per_group;
+    let idx_in_group = zero_based % sb.inodes_per_group;
+    let table_block = inode_table_block(reader, sb, group)?;
+    Ok(table_block * sb.block_size + idx_in_group as u64 * sb.inode_size as u64)
+}
+
 /// Walk an extent-tree node (`data` holds either the inode's 60-byte
 /// embedded extent header + entries, or a full block for an index
 /// node's child). Leaf extents are appended to `out` as
 /// `(logical_block, phys_start_block, num_blocks)`.
 fn collect_extents_with_logical(
     data: &[u8],
-    f: &mut File,
+    reader: &mut dyn Ext4Read,
     sb: &Superblock,
     out: &mut Vec<(u32, u64, u16)>,
 ) -> io::Result<()> {
@@ -163,22 +183,33 @@ fn collect_extents_with_logical(
         } else {
             let child = hilo64(u16le(entry, 8)? as u32, u32le(entry, 4)?);
             let mut child_data = vec![0u8; sb.block_size as usize];
-            f.seek(SeekFrom::Start(child * sb.block_size))?;
-            f.read_exact(&mut child_data)?;
-            collect_extents_with_logical(&child_data, f, sb, out)?;
+            read_at(reader, child * sb.block_size, &mut child_data)?;
+            collect_extents_with_logical(&child_data, reader, sb, out)?;
         }
     }
 
     Ok(())
 }
 
-/// One contiguous LBA range owned by a regular file.
+/// One contiguous LBA range owned by a regular file — layout only.
 ///
-/// `file_offset` is the byte offset within the file where this
-/// fragment's data starts. `lba_start`/`lba_length` describe the
-/// physical range. `byte_count` is the file-truthful number of bytes
-/// in this fragment (≤ `lba_length * 4096`; smaller only for the last
-/// fragment of a file whose size is not a multiple of 4096).
+/// `file_offset` is the byte offset within the file where this fragment's
+/// data starts. `lba_start`/`lba_length` describe the physical range.
+/// `byte_count` is the file-truthful number of bytes in this fragment
+/// (≤ `lba_length * 4096`; smaller only for the last fragment of a file
+/// whose size is not a multiple of 4096).
+#[derive(Clone, Debug)]
+pub struct FragmentLayout {
+    pub path: String,
+    pub file_offset: u64,
+    pub lba_start: u64,
+    pub lba_length: u32,
+    pub byte_count: u64,
+}
+
+/// One contiguous LBA range owned by a regular file, plus its body and
+/// content hash. Returned by `scan_via_reader` for the import path.
+///
 /// `hash` is `blake3(fragment_disk_bytes)` — i.e., over the full
 /// `lba_length * 4096` bytes, *including* any tail-block padding.
 pub struct FileFragment {
@@ -191,37 +222,43 @@ pub struct FileFragment {
     pub body: Vec<u8>,
 }
 
-struct InodeFragments {
-    full_hash: blake3::Hash,
-    fragments: Vec<PartialFragment>,
-}
-
+/// Common per-inode partial result before path joining.
 struct PartialFragment {
     file_offset: u64,
     lba_start: u64,
     lba_length: u32,
     byte_count: u64,
-    hash: blake3::Hash,
-    body: Vec<u8>,
 }
 
-/// Scan every regular-file inode in the ext4 image, returning per-inode
-/// fragment lists. The full-file hash (blake3 of concatenated allocated
-/// block data in logical order, truncated at i_size) is included so
-/// callers can join this result with a path-indexed map from
-/// `enumerate_file_paths`.
-fn scan_inode_fragments(f: &mut File, sb: &Superblock) -> io::Result<Vec<InodeFragments>> {
+struct InodeFragments {
+    inode_idx: u32,
+    parts: Vec<PartialFragment>,
+    /// Per-fragment body bytes (only populated when `read_bodies = true`).
+    bodies: Vec<Vec<u8>>,
+    /// Per-fragment content hashes (only populated when `read_bodies = true`).
+    hashes: Vec<blake3::Hash>,
+}
+
+/// Walk every regular-file inode in the image, returning per-inode
+/// fragment lists keyed by inode index. When `read_bodies` is true, also
+/// populates the body bytes and per-fragment hash. When false, those
+/// arrays are left empty and the caller is responsible for supplying
+/// hashes from another source (e.g. the volume's LBA map).
+fn scan_inode_fragments(
+    reader: &mut dyn Ext4Read,
+    sb: &Superblock,
+    read_bodies: bool,
+) -> io::Result<Vec<InodeFragments>> {
     let mut results = Vec::new();
     let mut inode_buf = vec![0u8; sb.inode_size];
 
     for group in 0..sb.num_block_groups {
-        let table_block = inode_table_block(f, sb, group)?;
+        let table_block = inode_table_block(reader, sb, group)?;
         let table_offset = table_block * sb.block_size;
 
         for idx in 0..sb.inodes_per_group {
             let inode_offset = table_offset + idx as u64 * sb.inode_size as u64;
-            f.seek(SeekFrom::Start(inode_offset))?;
-            if f.read_exact(&mut inode_buf).is_err() {
+            if read_at(reader, inode_offset, &mut inode_buf).is_err() {
                 break;
             }
 
@@ -243,15 +280,16 @@ fn scan_inode_fragments(f: &mut File, sb: &Superblock) -> io::Result<Vec<InodeFr
 
             let i_block = inode_buf[0x28..0x28 + 60].to_vec();
             let mut raw: Vec<(u32, u64, u16)> = Vec::new();
-            collect_extents_with_logical(&i_block, f, sb, &mut raw)?;
+            collect_extents_with_logical(&i_block, reader, sb, &mut raw)?;
             if raw.is_empty() {
                 continue;
             }
 
             raw.sort_by_key(|&(logical, _, _)| logical);
 
-            let mut full_hasher = blake3::Hasher::new();
-            let mut fragments = Vec::new();
+            let mut parts = Vec::new();
+            let mut bodies = Vec::new();
+            let mut hashes = Vec::new();
             let mut bytes_remaining = i_size;
 
             for (logical, phys_block, num_blocks) in raw {
@@ -267,35 +305,34 @@ fn scan_inode_fragments(f: &mut File, sb: &Superblock) -> io::Result<Vec<InodeFr
                 let byte_count = allocated.min(bytes_remaining);
                 bytes_remaining = bytes_remaining.saturating_sub(byte_count);
 
-                let disk_start = phys_block * sb.block_size;
-                let mut body = vec![0u8; allocated as usize];
-                f.seek(SeekFrom::Start(disk_start))?;
-                f.read_exact(&mut body)?;
-
-                // Fragment hash covers the full allocated region (with
-                // padding); full-file hash covers only the file-truthful
-                // bytes so callers can join on filemap path hashes
-                // produced by enumerate_file_paths below.
-                let fragment_hash = blake3::hash(&body);
-                full_hasher.update(&body[..byte_count as usize]);
-
-                fragments.push(PartialFragment {
+                parts.push(PartialFragment {
                     file_offset,
                     lba_start: phys_block,
                     lba_length: num_blocks as u32,
                     byte_count,
-                    hash: fragment_hash,
-                    body,
                 });
+
+                if read_bodies {
+                    let disk_start = phys_block * sb.block_size;
+                    let mut body = vec![0u8; allocated as usize];
+                    read_at(reader, disk_start, &mut body)?;
+                    let hash = blake3::hash(&body);
+                    hashes.push(hash);
+                    bodies.push(body);
+                }
             }
 
-            if fragments.is_empty() {
+            if parts.is_empty() {
                 continue;
             }
 
+            // 1-based inode index: group g, slot s → inode = g * inodes_per_group + s + 1.
+            let inode_idx = group * sb.inodes_per_group + idx + 1;
             results.push(InodeFragments {
-                full_hash: full_hasher.finalize(),
-                fragments,
+                inode_idx,
+                parts,
+                bodies,
+                hashes,
             });
         }
     }
@@ -303,43 +340,122 @@ fn scan_inode_fragments(f: &mut File, sb: &Superblock) -> io::Result<Vec<InodeFr
     Ok(results)
 }
 
-/// Walk the ext4 directory tree and return `(path → full_file_hash)`,
-/// where `full_file_hash` is `blake3(ext4_view::read(path))` — i.e.,
-/// blake3 of the file-truthful bytes.
-fn enumerate_file_paths(image: &Path) -> io::Result<HashMap<blake3::Hash, Vec<String>>> {
-    let fs = Ext4::load_from_path(image).map_err(|e| io::Error::other(e.to_string()))?;
-    let mut out: HashMap<blake3::Hash, Vec<String>> = HashMap::new();
-    let mut queue: Vec<Ext4PathBuf> = vec![Ext4PathBuf::new("/")];
+/// One parsed directory entry.
+struct DirEntry {
+    inode_idx: u32,
+    file_type: u8,
+    name: String,
+}
 
-    while let Some(dir) = queue.pop() {
-        let entries = match fs.read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
+/// Parse one 4 KiB directory data block into linear directory entries.
+///
+/// Tolerates htree internals: htree root and index blocks use the
+/// rec_len chain to either skip past index data (root) or inflate a
+/// single zero-inode "fake dirent" spanning the whole block (internal
+/// nodes). Either way, only real leaf entries survive the inode!=0
+/// filter.
+fn parse_dir_block(data: &[u8]) -> Vec<DirEntry> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= data.len() {
+        let inode_idx = match u32le(data, off) {
+            Ok(v) => v,
+            Err(_) => break,
         };
-        for entry in entries {
-            let entry: DirEntry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let name = entry.file_name();
-            if name == "." || name == ".." {
-                continue;
-            }
-            let path = entry.path();
-            let metadata: Metadata = match fs.symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if metadata.file_type().is_dir() {
-                queue.push(path);
-            } else if metadata.file_type().is_regular_file() {
-                let data = match fs.read(&path) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-                let hash = blake3::hash(&data);
-                if let Ok(s) = path.to_str() {
-                    out.entry(hash).or_default().push(s.to_string());
+        let rec_len = match u16le(data, off + 4) {
+            Ok(v) => v as usize,
+            Err(_) => break,
+        };
+        if rec_len < 8 {
+            break;
+        }
+        let name_len = data[off + 6] as usize;
+        let file_type = data[off + 7];
+        let name_start = off + 8;
+        let name_end = name_start + name_len;
+        if inode_idx != 0
+            && name_len > 0
+            && name_end <= data.len()
+            && let Ok(name) = std::str::from_utf8(&data[name_start..name_end])
+        {
+            out.push(DirEntry {
+                inode_idx,
+                file_type,
+                name: name.to_owned(),
+            });
+        }
+        let next = off.saturating_add(rec_len);
+        if next <= off {
+            break;
+        }
+        off = next;
+    }
+    out
+}
+
+/// Walk the directory tree starting at the root inode and return
+/// `inode_idx → list of paths`. Paths are absolute, "/"-rooted.
+/// Multiple paths per inode means hardlinks.
+fn walk_directory_tree(
+    reader: &mut dyn Ext4Read,
+    sb: &Superblock,
+) -> io::Result<HashMap<u32, Vec<String>>> {
+    let mut out: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut visited_dirs: HashSet<u32> = HashSet::new();
+    let mut stack: Vec<(u32, String)> = vec![(EXT4_ROOT_INO, "/".to_owned())];
+
+    let mut inode_buf = vec![0u8; sb.inode_size];
+    let mut block_buf = vec![0u8; sb.block_size as usize];
+
+    while let Some((dir_inode_idx, dir_path)) = stack.pop() {
+        if !visited_dirs.insert(dir_inode_idx) {
+            continue;
+        }
+
+        let off = inode_offset(reader, sb, dir_inode_idx)?;
+        if read_at(reader, off, &mut inode_buf).is_err() {
+            continue;
+        }
+        let i_mode = u16le(&inode_buf, 0x00)?;
+        if (i_mode & S_IFMT) != S_IFDIR {
+            continue;
+        }
+        let i_flags = u32le(&inode_buf, 0x20)?;
+        if (i_flags & INODE_FLAG_EXTENTS) == 0 {
+            // Pre-extent (block-mapped) directories are not supported by the
+            // import path either — modern mkfs.ext4 always uses extents.
+            continue;
+        }
+        let i_block = inode_buf[0x28..0x28 + 60].to_vec();
+
+        let mut extents: Vec<(u32, u64, u16)> = Vec::new();
+        collect_extents_with_logical(&i_block, reader, sb, &mut extents)?;
+        extents.sort_by_key(|&(logical, _, _)| logical);
+
+        for (_logical, phys_block, num_blocks) in extents {
+            for b in 0..num_blocks as u64 {
+                let block_pos = (phys_block + b) * sb.block_size;
+                if read_at(reader, block_pos, &mut block_buf).is_err() {
+                    continue;
+                }
+                for entry in parse_dir_block(&block_buf) {
+                    if entry.name == "." || entry.name == ".." {
+                        continue;
+                    }
+                    let child_path = if dir_path == "/" {
+                        format!("/{}", entry.name)
+                    } else {
+                        format!("{}/{}", dir_path, entry.name)
+                    };
+                    match entry.file_type {
+                        EXT4_FT_REG_FILE => {
+                            out.entry(entry.inode_idx).or_default().push(child_path);
+                        }
+                        EXT4_FT_DIR => {
+                            stack.push((entry.inode_idx, child_path));
+                        }
+                        _ => {} // symlinks, devices, fifos: skip
+                    }
                 }
             }
         }
@@ -348,71 +464,23 @@ fn enumerate_file_paths(image: &Path) -> io::Result<HashMap<blake3::Hash, Vec<St
     Ok(out)
 }
 
-/// Scan the ext4 image and return the flat list of file fragments,
-/// together with a coverage bitset marking which LBAs are owned by
-/// regular file data. Callers use the bitset to emit block-granular
-/// DATA entries for metadata/directory/journal blocks (the ones with
-/// a cleared bit) during import.
-pub struct Ext4Scan {
-    pub fragments: Vec<FileFragment>,
-    pub file_lba_coverage: Vec<u64>, // bitset; bit i set → LBA i owned by a file fragment
+/// Layout-only scan output. Used by Phase 4 snapshot filemap generation,
+/// which fills in per-fragment hashes from the volume's LBA map without
+/// reading body bytes.
+pub struct Ext4Layout {
+    pub fragments: Vec<FragmentLayout>,
+    pub file_lba_coverage: Vec<u64>,
     pub total_lbas: u64,
 }
 
-pub fn scan(image: &Path) -> io::Result<Ext4Scan> {
-    let mut f = File::open(image)?;
-    let image_size = f.metadata()?.len();
-    if image_size % LBA_SIZE != 0 {
-        return Err(io::Error::other("image size is not a multiple of 4096"));
-    }
-    let total_lbas = image_size / LBA_SIZE;
-
-    let sb = Superblock::read(&mut f)?;
-    let inodes = scan_inode_fragments(&mut f, &sb)?;
-    let mut paths_by_hash = enumerate_file_paths(image)?;
-
-    let mut fragments = Vec::new();
-    let mut file_lba_coverage = vec![0u64; (total_lbas as usize).div_ceil(64)];
-
-    for inode in inodes {
-        let path = match paths_by_hash.get_mut(&inode.full_hash) {
-            Some(paths) => match paths.pop() {
-                Some(p) => p,
-                None => continue, // all paths for this hash already consumed
-            },
-            None => continue, // orphan inode (deleted file still in table)
-        };
-        for part in inode.fragments {
-            for i in 0..part.lba_length as u64 {
-                let lba = part.lba_start + i;
-                if lba < total_lbas {
-                    let idx = (lba / 64) as usize;
-                    let bit = lba % 64;
-                    file_lba_coverage[idx] |= 1 << bit;
-                }
-            }
-            fragments.push(FileFragment {
-                path: path.clone(),
-                file_offset: part.file_offset,
-                lba_start: part.lba_start,
-                lba_length: part.lba_length,
-                byte_count: part.byte_count,
-                hash: part.hash,
-                body: part.body,
-            });
-        }
-    }
-
-    // Sort by LBA so the import loop can flush in physical order and
-    // interleave metadata blocks (which are read block-by-block in LBA
-    // order) with file fragments naturally.
-    fragments.sort_by_key(|fr| fr.lba_start);
-
-    Ok(Ext4Scan {
-        fragments,
-        file_lba_coverage,
-        total_lbas,
-    })
+/// Full scan output with per-fragment bodies and hashes, plus a coverage
+/// bitset marking which LBAs are owned by regular file data. Callers use
+/// the bitset to emit block-granular DATA entries for metadata/directory/
+/// journal blocks (the ones with a cleared bit) during import.
+pub struct Ext4Scan {
+    pub fragments: Vec<FileFragment>,
+    pub file_lba_coverage: Vec<u64>,
+    pub total_lbas: u64,
 }
 
 impl Ext4Scan {
@@ -427,4 +495,147 @@ impl Ext4Scan {
             .get(idx)
             .is_some_and(|w| w & (1 << bit) != 0)
     }
+}
+
+impl Ext4Layout {
+    pub fn lba_is_file(&self, lba: u64) -> bool {
+        if lba >= self.total_lbas {
+            return false;
+        }
+        let idx = (lba / 64) as usize;
+        let bit = lba % 64;
+        self.file_lba_coverage
+            .get(idx)
+            .is_some_and(|w| w & (1 << bit) != 0)
+    }
+}
+
+/// Scan an ext4 image through `reader`, reading file body bytes and
+/// computing per-fragment hashes. Used by the import path.
+pub fn scan_via_reader(image_size: u64, mut reader: Box<dyn Ext4Read>) -> io::Result<Ext4Scan> {
+    if !image_size.is_multiple_of(LBA_SIZE) {
+        return Err(io::Error::other("image size is not a multiple of 4096"));
+    }
+    let total_lbas = image_size / LBA_SIZE;
+
+    let sb = Superblock::read(&mut *reader)?;
+    let inodes = scan_inode_fragments(&mut *reader, &sb, true)?;
+    let paths_by_inode = walk_directory_tree(&mut *reader, &sb)?;
+
+    let mut fragments = Vec::new();
+    let mut file_lba_coverage = vec![0u64; (total_lbas as usize).div_ceil(64)];
+
+    for inode in inodes {
+        let path = match path_for_inode(&paths_by_inode, inode.inode_idx) {
+            Some(p) => p,
+            None => continue, // orphan inode (deleted file still in table)
+        };
+        for (i, part) in inode.parts.into_iter().enumerate() {
+            mark_coverage(
+                &mut file_lba_coverage,
+                total_lbas,
+                part.lba_start,
+                part.lba_length,
+            );
+            fragments.push(FileFragment {
+                path: path.clone(),
+                file_offset: part.file_offset,
+                lba_start: part.lba_start,
+                lba_length: part.lba_length,
+                byte_count: part.byte_count,
+                hash: inode.hashes[i],
+                body: inode.bodies[i].clone(),
+            });
+        }
+    }
+
+    fragments.sort_by_key(|fr| fr.lba_start);
+
+    Ok(Ext4Scan {
+        fragments,
+        file_lba_coverage,
+        total_lbas,
+    })
+}
+
+/// Scan an ext4 image through `reader` for fragment layout only — no body
+/// reads, no per-fragment hashing. Used by Phase 4 snapshot filemap
+/// generation, which fills hashes from the volume's LBA map.
+pub fn scan_layout_via_reader(
+    image_size: u64,
+    mut reader: Box<dyn Ext4Read>,
+) -> io::Result<Ext4Layout> {
+    if !image_size.is_multiple_of(LBA_SIZE) {
+        return Err(io::Error::other("image size is not a multiple of 4096"));
+    }
+    let total_lbas = image_size / LBA_SIZE;
+
+    let sb = Superblock::read(&mut *reader)?;
+    let inodes = scan_inode_fragments(&mut *reader, &sb, false)?;
+    let paths_by_inode = walk_directory_tree(&mut *reader, &sb)?;
+
+    let mut fragments = Vec::new();
+    let mut file_lba_coverage = vec![0u64; (total_lbas as usize).div_ceil(64)];
+
+    for inode in inodes {
+        let path = match path_for_inode(&paths_by_inode, inode.inode_idx) {
+            Some(p) => p,
+            None => continue,
+        };
+        for part in inode.parts {
+            mark_coverage(
+                &mut file_lba_coverage,
+                total_lbas,
+                part.lba_start,
+                part.lba_length,
+            );
+            fragments.push(FragmentLayout {
+                path: path.clone(),
+                file_offset: part.file_offset,
+                lba_start: part.lba_start,
+                lba_length: part.lba_length,
+                byte_count: part.byte_count,
+            });
+        }
+    }
+
+    fragments.sort_by_key(|fr| fr.lba_start);
+
+    Ok(Ext4Layout {
+        fragments,
+        file_lba_coverage,
+        total_lbas,
+    })
+}
+
+fn path_for_inode(paths_by_inode: &HashMap<u32, Vec<String>>, inode_idx: u32) -> Option<String> {
+    // For hardlinks, deterministically pick the lexicographically-first path
+    // so two scans of the same image produce the same filemap. The full path
+    // set is preserved by emitting one fragment row per (path, hash) pair —
+    // see the loop below; for now we collapse to one path per inode to match
+    // the existing import behaviour. Hardlink expansion is tracked as an
+    // open question in docs/design-delta-compression.md.
+    let paths = paths_by_inode.get(&inode_idx)?;
+    paths.iter().min().cloned()
+}
+
+fn mark_coverage(coverage: &mut [u64], total_lbas: u64, lba_start: u64, lba_length: u32) {
+    for i in 0..lba_length as u64 {
+        let lba = lba_start + i;
+        if lba < total_lbas {
+            let idx = (lba / 64) as usize;
+            let bit = lba % 64;
+            if let Some(word) = coverage.get_mut(idx) {
+                *word |= 1 << bit;
+            }
+        }
+    }
+}
+
+/// Path-based wrapper retained for the import CLI: opens `image_path`
+/// as a `File` and runs `scan_via_reader`.
+pub fn scan(image: &Path) -> io::Result<Ext4Scan> {
+    let f = File::open(image)?;
+    let image_size = f.metadata()?.len();
+    scan_via_reader(image_size, Box::new(f))
 }

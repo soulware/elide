@@ -477,6 +477,16 @@ async fn snapshot_volume(
         return format!("err sign_snapshot_manifest {snap_ulid} failed");
     }
 
+    // 4b. Phase 4: regenerate the snapshot filemap for NBD-written volumes
+    //     that drained without one. For import-written snapshots this is a
+    //     no-op overwrite with byte-identical content (paths + LBA-map hashes
+    //     match what the import path already wrote). Inline so the upload
+    //     step below picks up the new file in the same pass; restart recovery
+    //     for crashed mid-write filemaps falls out of the .tmp+rename commit.
+    if let Err(e) = generate_snapshot_filemap(&fork_dir, snap_ulid, store.clone()).await {
+        warn!("[snapshot {volume_id}] filemap generation failed for {snap_ulid}: {e:#}");
+    }
+
     // 5. Upload the new snapshot marker and manifest.
     if let Err(e) =
         elide_coordinator::upload::upload_snapshots_and_filemaps(&fork_dir, &volume_id, store).await
@@ -486,6 +496,43 @@ async fn snapshot_volume(
 
     info!("[snapshot {volume_id}] committed {snap_ulid}");
     format!("ok {snap_ulid}")
+}
+
+/// Phase 4: regenerate `snapshots/<snap_ulid>.filemap` from the sealed
+/// snapshot's segments. Runs blocking ext4 + LBA-map walk on a worker
+/// thread so the tokio reactor stays responsive.
+///
+/// Wires an `ObjectStoreFetcher` so demand-fetch works for evicted segments
+/// — Phase 4 may run on a volume whose ext4 metadata blocks have been
+/// evicted to S3. The fetcher is constructed inside the closure (after the
+/// search-dir list is known) because each fetcher binds to a fork chain.
+async fn generate_snapshot_filemap(
+    fork_dir: &Path,
+    snap_ulid: ulid::Ulid,
+    store: Arc<dyn ObjectStore>,
+) -> std::io::Result<()> {
+    let fork_dir = fork_dir.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let store_for_factory = store.clone();
+        let mk_fetcher: Box<elide_core::block_reader::FetcherFactory<'_>> =
+            Box::new(move |search_dirs: &[PathBuf]| {
+                // ObjectStoreFetcher wants oldest-first; BlockReader hands us
+                // newest-first (fork → ancestors).
+                let oldest_first: Vec<PathBuf> = search_dirs.iter().rev().cloned().collect();
+                elide_fetch::ObjectStoreFetcher::from_store(
+                    store_for_factory,
+                    &oldest_first,
+                    elide_fetch::DEFAULT_FETCH_BATCH_BYTES,
+                )
+                .ok()
+                .map(|f| Box::new(f) as Box<dyn elide_core::segment::SegmentFetcher>)
+            });
+        let _wrote =
+            elide_core::filemap::generate_from_snapshot(&fork_dir, &snap_ulid, mk_fetcher)?;
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("filemap join: {e}")))?
 }
 
 /// Pick a snapshot ULID: the max ULID in `fork_dir/index/`, or a fresh one
