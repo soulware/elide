@@ -243,16 +243,39 @@ impl BlockReader {
         self.lbamap.lookup(lba).map(|(h, _)| h)
     }
 
-    /// Read the 4 KiB block at `lba`. Returns zeros for unwritten LBAs.
+    /// Read the 4 KiB block at `lba`.
+    ///
+    /// Dispatches on the lbamap winner for `lba`:
+    /// - unmapped → 4 KiB of zeros (LBA never written)
+    /// - `ZERO_HASH` → 4 KiB of zeros (LBA explicitly zeroed)
+    /// - hash in the data index → read the data/inline extent
+    /// - hash in the delta index → reconstruct via zstd-dict against a source
+    ///   extent
+    /// - hash in neither → hard error. This used to silently return zeros,
+    ///   which masked the missing Delta path and any future index/lbamap
+    ///   inconsistency. Loud errors are required so corruption surfaces
+    ///   instead of being read as a hole.
     pub fn read_block(&self, lba: u64) -> io::Result<[u8; 4096]> {
         let Some((hash, block_offset)) = self.lbamap.lookup(lba) else {
             return Ok([0u8; 4096]);
         };
-        let Some(loc) = self.extent_index.lookup(&hash) else {
+        if hash == volume::ZERO_HASH {
             return Ok([0u8; 4096]);
-        };
-        let loc = loc.clone();
+        }
+        if let Some(loc) = self.extent_index.lookup(&hash) {
+            return self.read_data_block(&loc.clone(), block_offset);
+        }
+        if let Some(delta_loc) = self.extent_index.lookup_delta(&hash) {
+            return self.read_delta_block(&delta_loc.clone(), block_offset);
+        }
+        Err(io::Error::other(format!(
+            "lba {lba}: hash {} present in lbamap but not in extent index (data, inline, or delta) — possible corruption",
+            hash.to_hex()
+        )))
+    }
 
+    /// Read a 4 KiB block from a Data or Inline extent location.
+    fn read_data_block(&self, loc: &ExtentLocation, block_offset: u32) -> io::Result<[u8; 4096]> {
         if let Some(ref idata) = loc.inline_data {
             let raw = if loc.compressed {
                 lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?
@@ -265,38 +288,7 @@ impl BlockReader {
             return Ok(block);
         }
 
-        if let extentindex::BodySource::Cached(entry_idx) = loc.body_source {
-            let (index_dir, body_dir) =
-                self.find_dirs_for_segment(loc.segment_id)
-                    .unwrap_or_else(|| {
-                        (
-                            self.primary_index_dir.clone(),
-                            self.primary_cache_dir.clone(),
-                        )
-                    });
-            let present_path = body_dir.join(format!("{}.present", loc.segment_id));
-            if !segment::check_present_bit(&present_path, entry_idx)? {
-                match &self.fetcher {
-                    Some(fetcher) => fetcher.fetch_extent(
-                        loc.segment_id,
-                        &index_dir,
-                        &body_dir,
-                        &segment::ExtentFetch {
-                            body_section_start: loc.body_section_start,
-                            body_offset: loc.body_offset,
-                            body_length: loc.body_length,
-                            entry_idx,
-                        },
-                    )?,
-                    None => {
-                        return Err(io::Error::other(format!(
-                            "extent {}[{}] not cached and no fetcher configured",
-                            loc.segment_id, entry_idx
-                        )));
-                    }
-                }
-            }
-        }
+        self.ensure_extent_present(loc)?;
 
         let path = find_segment_file(&self.search_dirs, loc.segment_id)?;
         let is_body = path.extension().is_some_and(|e| e == "body");
@@ -320,6 +312,181 @@ impl BlockReader {
         Ok(block)
     }
 
+    /// Read a 4 KiB block from a Delta extent.
+    ///
+    /// Picks the first `delta_loc.options` whose `source_hash` resolves via
+    /// the data index, reads the source extent body, fetches the delta blob
+    /// (from the segment file or `cache/<id>.delta`, demand-fetching the
+    /// latter on miss), zstd-decompresses against the source as dictionary,
+    /// and slices out the requested 4 KiB.
+    fn read_delta_block(
+        &self,
+        delta_loc: &DeltaLocation,
+        block_offset: u32,
+    ) -> io::Result<[u8; 4096]> {
+        let mut picked = None;
+        for opt in &delta_loc.options {
+            if let Some(source_loc) = self.extent_index.lookup(&opt.source_hash) {
+                picked = Some((opt.clone(), source_loc.clone()));
+                break;
+            }
+        }
+        let (opt, source_loc) = picked.ok_or_else(|| {
+            io::Error::other(format!(
+                "delta extent in segment {}: no source option resolved in extent index",
+                delta_loc.segment_id
+            ))
+        })?;
+
+        let source_bytes = self.read_extent_body_at(&source_loc)?;
+        let delta_blob = self.read_delta_blob(
+            delta_loc.segment_id,
+            delta_loc.body_source,
+            opt.delta_offset,
+            opt.delta_length,
+        )?;
+
+        let mut decoder = zstd::bulk::Decompressor::with_dictionary(&source_bytes)
+            .map_err(|e| io::Error::other(format!("zstd dict decoder: {e}")))?;
+        // Cap matches the segment-size cap used by the writer (16 MiB) — see
+        // `try_read_delta_extent` in volume.rs for the rationale.
+        let decompressed = decoder
+            .decompress(&delta_blob, 16 * 1024 * 1024)
+            .map_err(|e| io::Error::other(format!("zstd decompress: {e}")))?;
+
+        let src = block_offset as usize * 4096;
+        let src_end = src + 4096;
+        if decompressed.len() < src_end {
+            return Err(io::Error::other(format!(
+                "delta decompressed payload too short: got {} bytes, need {}",
+                decompressed.len(),
+                src_end
+            )));
+        }
+        let mut block = [0u8; 4096];
+        block.copy_from_slice(&decompressed[src..src_end]);
+        Ok(block)
+    }
+
+    /// Read the delta blob bytes for a single delta option.
+    ///
+    /// `Full` blobs live in a complete segment file (in `pending/` or `wal/`)
+    /// at `body_section_start + body_length + delta_offset`. `Cached` blobs
+    /// live in `cache/<segment_id>.delta` starting at byte 0; on miss they
+    /// are demand-fetched via the attached fetcher.
+    fn read_delta_blob(
+        &self,
+        segment_id: ulid::Ulid,
+        body_source: DeltaBodySource,
+        delta_offset: u64,
+        delta_length: u32,
+    ) -> io::Result<Vec<u8>> {
+        let (path, base) = match body_source {
+            DeltaBodySource::Full {
+                body_section_start,
+                body_length,
+            } => {
+                let path = find_segment_file(&self.search_dirs, segment_id)?;
+                (path, body_section_start + body_length)
+            }
+            DeltaBodySource::Cached => (self.find_delta_body(segment_id)?, 0u64),
+        };
+        let mut f = fs::File::open(path)?;
+        f.seek(SeekFrom::Start(base + delta_offset))?;
+        let mut buf = vec![0u8; delta_length as usize];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Locate `cache/<segment_id>.delta` across the fork's search dirs,
+    /// demand-fetching into the primary cache dir if not present locally.
+    fn find_delta_body(&self, segment_id: ulid::Ulid) -> io::Result<PathBuf> {
+        let sid = segment_id.to_string();
+        for dir in &self.search_dirs {
+            let p = dir.join("cache").join(format!("{sid}.delta"));
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+        if let Some(fetcher) = &self.fetcher {
+            fetcher.fetch_delta_body(
+                segment_id,
+                &self.primary_index_dir,
+                &self.primary_cache_dir,
+            )?;
+            let p = self.primary_cache_dir.join(format!("{sid}.delta"));
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("delta body not found locally and no fetcher could supply it: {sid}"),
+        ))
+    }
+
+    /// Demand-fetch the body for `loc` if it's a `Cached` extent missing its
+    /// `.present` bit. No-op for `Local` extents.
+    fn ensure_extent_present(&self, loc: &ExtentLocation) -> io::Result<()> {
+        let extentindex::BodySource::Cached(entry_idx) = loc.body_source else {
+            return Ok(());
+        };
+        let (index_dir, body_dir) =
+            self.find_dirs_for_segment(loc.segment_id)
+                .unwrap_or_else(|| {
+                    (
+                        self.primary_index_dir.clone(),
+                        self.primary_cache_dir.clone(),
+                    )
+                });
+        let present_path = body_dir.join(format!("{}.present", loc.segment_id));
+        if segment::check_present_bit(&present_path, entry_idx)? {
+            return Ok(());
+        }
+        match &self.fetcher {
+            Some(fetcher) => fetcher.fetch_extent(
+                loc.segment_id,
+                &index_dir,
+                &body_dir,
+                &segment::ExtentFetch {
+                    body_section_start: loc.body_section_start,
+                    body_offset: loc.body_offset,
+                    body_length: loc.body_length,
+                    entry_idx,
+                },
+            ),
+            None => Err(io::Error::other(format!(
+                "extent {}[{}] not cached and no fetcher configured",
+                loc.segment_id, entry_idx
+            ))),
+        }
+    }
+
+    /// Read the full plaintext body of an extent at `loc`. Used by the delta
+    /// path to materialise a source extent for zstd-dict decompression.
+    fn read_extent_body_at(&self, loc: &ExtentLocation) -> io::Result<Vec<u8>> {
+        if let Some(ref idata) = loc.inline_data {
+            return if loc.compressed {
+                lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)
+            } else {
+                Ok(idata.to_vec())
+            };
+        }
+        self.ensure_extent_present(loc)?;
+        let path = find_segment_file(&self.search_dirs, loc.segment_id)?;
+        let is_body = path.extension().is_some_and(|e| e == "body");
+        let file_base = if is_body { 0 } else { loc.body_section_start };
+        let mut f = fs::File::open(path)?;
+        f.seek(SeekFrom::Start(file_base + loc.body_offset))?;
+        let mut buf = vec![0u8; loc.body_length as usize];
+        f.read_exact(&mut buf)?;
+        if loc.compressed {
+            lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)
+        } else {
+            Ok(buf)
+        }
+    }
+
     /// Read the full plaintext bytes of the extent with content hash `hash`.
     ///
     /// Returns the decompressed body of the whole extent — not a 4 KiB slice.
@@ -334,60 +501,7 @@ impl BlockReader {
             .lookup(hash)
             .ok_or_else(|| io::Error::other(format!("extent {hash} not in index")))?
             .clone();
-
-        if let Some(ref idata) = loc.inline_data {
-            return if loc.compressed {
-                lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)
-            } else {
-                Ok(idata.to_vec())
-            };
-        }
-
-        if let extentindex::BodySource::Cached(entry_idx) = loc.body_source {
-            let (index_dir, body_dir) =
-                self.find_dirs_for_segment(loc.segment_id)
-                    .unwrap_or_else(|| {
-                        (
-                            self.primary_index_dir.clone(),
-                            self.primary_cache_dir.clone(),
-                        )
-                    });
-            let present_path = body_dir.join(format!("{}.present", loc.segment_id));
-            if !segment::check_present_bit(&present_path, entry_idx)? {
-                match &self.fetcher {
-                    Some(fetcher) => fetcher.fetch_extent(
-                        loc.segment_id,
-                        &index_dir,
-                        &body_dir,
-                        &segment::ExtentFetch {
-                            body_section_start: loc.body_section_start,
-                            body_offset: loc.body_offset,
-                            body_length: loc.body_length,
-                            entry_idx,
-                        },
-                    )?,
-                    None => {
-                        return Err(io::Error::other(format!(
-                            "extent {}[{}] not cached and no fetcher configured",
-                            loc.segment_id, entry_idx
-                        )));
-                    }
-                }
-            }
-        }
-
-        let path = find_segment_file(&self.search_dirs, loc.segment_id)?;
-        let is_body = path.extension().is_some_and(|e| e == "body");
-        let file_base = if is_body { 0 } else { loc.body_section_start };
-        let mut f = fs::File::open(path)?;
-        f.seek(SeekFrom::Start(file_base + loc.body_offset))?;
-        let mut buf = vec![0u8; loc.body_length as usize];
-        f.read_exact(&mut buf)?;
-        if loc.compressed {
-            lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)
-        } else {
-            Ok(buf)
-        }
+        self.read_extent_body_at(&loc)
     }
 
     fn find_dirs_for_segment(&self, segment_id: ulid::Ulid) -> Option<(PathBuf, PathBuf)> {

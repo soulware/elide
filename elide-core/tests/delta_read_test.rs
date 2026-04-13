@@ -21,6 +21,7 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use elide_core::block_reader::BlockReader;
 use elide_core::config::VolumeConfig;
 use elide_core::segment::{
     DeltaOption, ExtentFetch, SegmentEntry, SegmentFetcher, SegmentFlags, SegmentSigner,
@@ -375,5 +376,103 @@ fn delta_entry_demand_fetch_from_pull_host() {
         calls.calls.load(Ordering::SeqCst),
         1,
         "second read must not re-invoke the fetcher"
+    );
+}
+
+/// Regression for the `BlockReader::read_block` delta dispatch bug
+/// (April 2026). `BlockReader` is the read path used by `volume ls`,
+/// `volume inspect`, and Phase 4 snapshot filemap generation — it is
+/// *separate* from `ReadonlyVolume::read` (covered by the tests above).
+///
+/// The original bug: `read_block` looked the lbamap winner up only in
+/// `extent_index.inner` (data/inline), missed delta-only hashes, and
+/// silently returned 4 KiB of zeros. The concrete symptom was a
+/// post-snapshot delta at ext4 group 0's inode-table block (LBA 145):
+/// the root inode disappeared, the ext4 scan silently walked nothing,
+/// and Phase 4 wrote a header-only filemap.
+///
+/// This test builds that exact shape — parent DATA at LBA 0, Delta
+/// entry at LBA 10 — and asserts via `BlockReader::open_live` that
+/// the delta LBA decompresses back to the child bytes, the data LBA
+/// still round-trips, and an unmapped LBA still reads as zeros.
+#[test]
+fn block_reader_read_block_dispatches_to_delta() {
+    let tmp = TempDir::new().unwrap();
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+
+    let parent_bytes = vec![0x55u8; 4096];
+    let parent_hash = blake3::hash(&parent_bytes);
+
+    let mut child_bytes = vec![0x55u8; 4096];
+    for (i, byte) in child_bytes.iter_mut().enumerate().take(256) {
+        *byte = i as u8;
+    }
+    let child_hash = blake3::hash(&child_bytes);
+
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
+    let delta_blob = compressor.compress(&child_bytes).unwrap();
+
+    // Parent DATA segment at LBA 0.
+    let parent_seg_ulid = Ulid::new();
+    let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
+    let mut parent_entries = vec![SegmentEntry::new_data(
+        parent_hash,
+        0,
+        1,
+        SegmentFlags::empty(),
+        parent_bytes.clone(),
+    )];
+    write_segment(&parent_seg_path, &mut parent_entries, signer.as_ref()).unwrap();
+
+    // Delta segment with a Delta entry at LBA 10, source = parent_hash.
+    let delta_seg_ulid = Ulid::new();
+    assert!(delta_seg_ulid > parent_seg_ulid);
+    let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
+    let delta_option = DeltaOption {
+        source_hash: parent_hash,
+        delta_offset: 0,
+        delta_length: delta_blob.len() as u32,
+    };
+    let mut delta_entries = vec![SegmentEntry::new_delta(
+        child_hash,
+        10,
+        1,
+        vec![delta_option],
+    )];
+    write_segment_with_delta_body(
+        &delta_seg_path,
+        &mut delta_entries,
+        &delta_blob,
+        signer.as_ref(),
+    )
+    .unwrap();
+
+    fs::write(vol_dir.join(format!("snapshots/{delta_seg_ulid}")), "").unwrap();
+
+    let reader = BlockReader::open_live(&vol_dir, Box::new(|_| None)).unwrap();
+
+    // Delta dispatch: the lbamap winner for LBA 10 is `child_hash`, which
+    // only lives in `extent_index.deltas`. Pre-fix this silently returned
+    // zeros.
+    let delta_block = reader.read_block(10).unwrap();
+    assert_eq!(
+        &delta_block[..],
+        &child_bytes[..],
+        "read_block must decompress the delta entry, not return zeros"
+    );
+
+    // Data dispatch: ensure the data path still works.
+    let data_block = reader.read_block(0).unwrap();
+    assert_eq!(
+        &data_block[..],
+        &parent_bytes[..],
+        "read_block must still resolve DATA entries"
+    );
+
+    // Unmapped LBA: still reads as zeros.
+    let zero_block = reader.read_block(999).unwrap();
+    assert!(
+        zero_block.iter().all(|&b| b == 0),
+        "unmapped LBA must read as zeros"
     );
 }

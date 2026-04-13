@@ -51,6 +51,15 @@ fn read_at(reader: &mut dyn Ext4Read, offset: u64, dst: &mut [u8]) -> io::Result
         .map_err(|e| io::Error::other(format!("ext4 read at {offset}: {e}")))
 }
 
+/// Probe whether `reader` points at an ext4 image by reading just the
+/// superblock magic. Used by layout scans to distinguish "not ext4"
+/// (skip cleanly) from "ext4 but unreadable" (propagate error).
+fn probe_ext4(reader: &mut dyn Ext4Read) -> io::Result<bool> {
+    let mut magic_buf = [0u8; 2];
+    read_at(reader, SUPERBLOCK_OFFSET + 0x38, &mut magic_buf)?;
+    Ok(u16::from_le_bytes(magic_buf) == EXT4_MAGIC)
+}
+
 fn u16le(data: &[u8], off: usize) -> io::Result<u16> {
     data.get(off..off + 2)
         .and_then(|s| s.try_into().ok())
@@ -412,12 +421,24 @@ fn walk_directory_tree(
             continue;
         }
 
+        let is_root = dir_inode_idx == EXT4_ROOT_INO;
+
         let off = inode_offset(reader, sb, dir_inode_idx)?;
-        if read_at(reader, off, &mut inode_buf).is_err() {
+        if let Err(e) = read_at(reader, off, &mut inode_buf) {
+            if is_root {
+                return Err(io::Error::other(format!(
+                    "ext4 root inode {EXT4_ROOT_INO} unreadable at offset {off}: {e} — image corrupt or read path broken",
+                )));
+            }
             continue;
         }
         let i_mode = u16le(&inode_buf, 0x00)?;
         if (i_mode & S_IFMT) != S_IFDIR {
+            if is_root {
+                return Err(io::Error::other(format!(
+                    "ext4 root inode {EXT4_ROOT_INO} has mode {i_mode:#06x}, expected directory (S_IFDIR={S_IFDIR:#06x}) — image corrupt or read path broken",
+                )));
+            }
             continue;
         }
         let i_flags = u32le(&inode_buf, 0x20)?;
@@ -561,14 +582,23 @@ pub fn scan_via_reader(image_size: u64, mut reader: Box<dyn Ext4Read>) -> io::Re
 /// Scan an ext4 image through `reader` for fragment layout only — no body
 /// reads, no per-fragment hashing. Used by Phase 4 snapshot filemap
 /// generation, which fills hashes from the volume's LBA map.
+///
+/// Returns `Ok(None)` when the image is not ext4 (missing superblock
+/// magic) so callers can skip cleanly. Any other parse failure — a valid
+/// superblock that leads to an unreadable root inode, truncated inode
+/// tables, etc. — is propagated as `Err`.
 pub fn scan_layout_via_reader(
     image_size: u64,
     mut reader: Box<dyn Ext4Read>,
-) -> io::Result<Ext4Layout> {
+) -> io::Result<Option<Ext4Layout>> {
     if !image_size.is_multiple_of(LBA_SIZE) {
         return Err(io::Error::other("image size is not a multiple of 4096"));
     }
     let total_lbas = image_size / LBA_SIZE;
+
+    if !probe_ext4(&mut *reader)? {
+        return Ok(None);
+    }
 
     let sb = Superblock::read(&mut *reader)?;
     let inodes = scan_inode_fragments(&mut *reader, &sb, false)?;
@@ -601,11 +631,11 @@ pub fn scan_layout_via_reader(
 
     fragments.sort_by_key(|fr| fr.lba_start);
 
-    Ok(Ext4Layout {
+    Ok(Some(Ext4Layout {
         fragments,
         file_lba_coverage,
         total_lbas,
-    })
+    }))
 }
 
 fn path_for_inode(paths_by_inode: &HashMap<u32, Vec<String>>, inode_idx: u32) -> Option<String> {

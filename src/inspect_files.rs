@@ -79,17 +79,13 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
         }
     );
 
-    let data_entries: Vec<_> = entries
-        .iter()
-        .filter(|e| e.kind != EntryKind::DedupRef && e.kind != EntryKind::Inline)
-        .collect();
+    let data_entries: Vec<_> = entries.iter().collect();
     if data_entries.is_empty() {
         return Ok(());
     }
 
-    // Sort by stored_offset for a clear body layout view.
     let mut sorted = data_entries.clone();
-    sorted.sort_by_key(|e| e.stored_offset);
+    sorted.sort_by_key(|e| e.start_lba);
 
     let max_end = sorted
         .last()
@@ -117,9 +113,16 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
             Some(bs) if end > bs => "OVERFLOW",
             _ => "ok",
         };
+        let kind_str = match e.kind {
+            EntryKind::Data => "data",
+            EntryKind::Inline => "inline",
+            EntryKind::DedupRef => "dedup",
+            EntryKind::Zero => "zero",
+            EntryKind::Delta => "delta",
+        };
         println!(
             "{:<6}  {:<14}  {:>10}  {:>8}  {:<4}  {}",
-            "data",
+            kind_str,
             format!("[{}+{})", e.start_lba, e.lba_length),
             e.stored_offset,
             e.stored_length,

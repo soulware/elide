@@ -152,9 +152,11 @@ pub fn write(snapshots_dir: &Path, snap_ulid: &str, rows: &[FilemapRow]) -> io::
 /// each fragment's content hash via the volume's LBA map (no body reads,
 /// no rehashing), and writes the filemap atomically.
 ///
-/// Returns `Ok(false)` and writes nothing for non-ext4 volumes or images
-/// the scanner cannot parse — Phase 4 is strictly additive, and consumers
-/// only use the filemap if it exists.
+/// Returns `Ok(false)` and writes nothing for non-ext4 volumes — Phase 4
+/// is strictly additive, and consumers only use the filemap if it exists.
+/// Any scan failure on a valid ext4 image (broken root inode, truncated
+/// tables, etc.) is propagated as `Err` so the coordinator surfaces it
+/// rather than silently writing a header-only filemap.
 pub fn generate_from_snapshot(
     vol_dir: &Path,
     snap_ulid: &ulid::Ulid,
@@ -172,18 +174,23 @@ pub fn generate_from_snapshot(
     // — both are cheap and stateless w.r.t. each other.
     let hash_lookup = BlockReader::open_snapshot(vol_dir, snap_ulid, Box::new(|_| None))?;
 
-    let layout = match ext4_scan::scan_layout_via_reader(image_size, Box::new(reader)) {
-        Ok(l) => l,
-        Err(e) => {
-            // Non-ext4 or unparseable: skip cleanly — Phase 4 is additive.
-            log::debug!(
-                "filemap generation skipped for {} snap {}: {e}",
-                vol_dir.display(),
-                snap_ulid
-            );
-            return Ok(false);
-        }
+    let Some(layout) = ext4_scan::scan_layout_via_reader(image_size, Box::new(reader))? else {
+        // Not ext4: skip cleanly — Phase 4 is additive.
+        log::debug!(
+            "filemap generation skipped for {} snap {}: not an ext4 image",
+            vol_dir.display(),
+            snap_ulid
+        );
+        return Ok(false);
     };
+
+    if layout.fragments.is_empty() {
+        return Err(io::Error::other(format!(
+            "filemap generation for {} snap {}: ext4 scan returned zero fragments — refusing to write a header-only filemap",
+            vol_dir.display(),
+            snap_ulid
+        )));
+    }
 
     let mut rows: Vec<FilemapRow> = Vec::with_capacity(layout.fragments.len());
     for frag in layout.fragments {
