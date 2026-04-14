@@ -911,7 +911,11 @@ fn handle_volume_connection(
                 opt_reply(&mut s, option, NBD_REP_INFO, &info)?;
 
                 // Block size: minimum=512, preferred=4096, maximum=4MB.
-                // We handle sub-4096 writes internally via read-modify-write.
+                // Modern nbd-client and kernels honour the 4096 preferred
+                // block size, so sub-4096 I/O is not produced in practice.
+                // The minimum=512 advertisement and the read-modify-write
+                // path in NBD_CMD_WRITE remain as a correctness fallback
+                // for older clients that ignore the hint.
                 let mut bsz = Vec::new();
                 bsz.extend_from_slice(&NBD_INFO_BLOCK_SIZE.to_be_bytes());
                 bsz.extend_from_slice(&512u32.to_be_bytes());

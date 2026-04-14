@@ -50,6 +50,28 @@ multipass exec elide-test -- sudo mount /dev/nbd0 /mnt
 
 Format with `mkfs.ext4` on first use only; subsequent mounts skip this step.
 
+## Tune the NBD queue (recommended)
+
+The default kernel queue limits for `/dev/nbd0` are conservative: on a typical Ubuntu VM, `max_sectors_kb` is 128 and `read_ahead_kb` is 128, so every NBD request on the wire carries at most 128 KiB (32 blocks) and sequential readahead fills only one request ahead. The volume advertises a 4 MiB maximum block size during handshake, and `max_hw_sectors_kb` on the driver is 32 MiB, so there is significant headroom.
+
+Raising both values lets sequential reads and writes coalesce into larger NBD requests, which amortises per-request overhead (extent index lookups, decompression frames, segment fetches) across larger windows:
+
+```sh
+multipass exec elide-test -- sudo bash -c '
+    echo 4096 > /sys/block/nbd0/queue/max_sectors_kb
+    echo 4096 > /sys/block/nbd0/queue/read_ahead_kb
+'
+```
+
+These settings reset when `/dev/nbd0` is disconnected and must be re-applied after each `nbd-client` run. To confirm the current values:
+
+```sh
+multipass exec elide-test -- \
+    cat /sys/block/nbd0/queue/{max_sectors_kb,max_hw_sectors_kb,read_ahead_kb,logical_block_size}
+```
+
+`logical_block_size` should read `4096` on current kernels; if it reads `512`, the client is ignoring the server's preferred-block-size hint and the volume falls back to a read-modify-write path for sub-4 KiB writes (correct but slower).
+
 ## Write data
 
 ```sh

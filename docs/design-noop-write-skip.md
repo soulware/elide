@@ -102,3 +102,18 @@ Elide already diverges by doing write-time content dedup (the REF-record path). 
 - Any change to `write_zeroes` / `trim`, which already bypass hashing.
 - Any change to the REF-record path for cross-LBA dedup.
 - Per-block hashes stored in the LBA map or segment entries (rejected as too expensive for the expected hit rate).
+
+## Scope: client-intent writes only
+
+The two tiers above are a correct optimisation for writes whose *caller's intent* is to change observable LBA content — i.e. normal NBD client writes, where a same-bytes-already-present outcome is genuinely redundant work.
+
+They are **not** correct for internal rewrite paths whose caller's intent is to change the *representation* while preserving observable content. The motivating case is file-aware defrag / entry-level reclamation (see `design-file-aware-defrag.md`): the volume reads live bytes from a fragmented or partially-dead payload and writes them back as fresh contiguous entries. By construction the incoming content equals the existing bytes at those LBAs, so tier 2 would classify the write as a no-op and silently drop it — defeating the whole operation.
+
+Tier 1 is safe for internal rewrites. It only fires when a map entry *already binds this exact hash directly to these LBAs with `payload_block_offset == 0`*, which is precisely the post-rematerialisation steady state. Running reclamation a second time over an already-merged range therefore hits tier 1 and skips correctly, giving idempotent convergence for free without any termination bookkeeping.
+
+Internal rewrite paths should use a write entry point that runs tier 1 but bypasses tier 2. The split encodes the distinction between the two legitimate motivations for a write:
+
+- **Client-origin write** — caller wanted observable bytes to change; both tiers fire.
+- **Internal-origin write** — caller wanted the representation to change even though observable bytes are unchanged; only tier 1 fires.
+
+This split is intentional design surface, not an edge case: it is the mechanism that lets reclamation reuse the full write pipeline (compression, dedup lookup, WAL append, LBA map update) with a single switch.

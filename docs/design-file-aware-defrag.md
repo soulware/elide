@@ -66,6 +66,37 @@ There is also a synergy: a merged file extent is exactly the granularity Phase 5
 
 **5. Write amplification.** Every defrag pass rewrites file bytes that were already on disk. The amplification budget needs to be set against the read-amplification savings — for read-heavy workloads it pays back quickly; for write-heavy workloads it might not. Real measurement required before committing to thresholds.
 
+## Adjacent: per-entry body live-fraction
+
+File-aware defrag targets **LBA-range fragmentation** — how many distinct map entries cover a given LBA range. A related but distinct metric is **body live-fraction**: of the N blocks in a stored payload, how many are still referenced by any LBA map entry.
+
+Because `LbaMap::insert` splits overlapping entries and uses `payload_block_offset` to alias the tail into the middle of the original payload without rewriting it (`elide-core/src/lbamap.rs:100`), light fragmentation is essentially free. A single 4 KiB overwrite against a 100-block extent leaves the body 99% live; one decompression still serves 99 blocks. The pathological case is the opposite: a 100-block body with 1 live block pays full-frame decompression on every access to discard 99 blocks, and wastes the rest as dead bytes inside the segment until GC visits.
+
+The two metrics are correlated — a mostly-dead payload implies its original LBA range has been overwritten by many other entries — but they are not identical, and they suggest different remedies. File-aware defrag merges scattered LBAs back into one extent; that fixes range fragmentation but is orthogonal to whether old bodies get reclaimed. Coordinator GC at segment level reclaims bodies, but only when a whole segment crosses its threshold; a single bloated entry inside an otherwise-healthy segment never trips it. An entry-level compaction pass — rewrite one entry when its live-fraction drops below X — would close that gap and could share infrastructure with file-aware defrag.
+
+Measurement before mechanism: a diagnostic that reports the distribution of per-entry live-fractions on a real aged volume would show whether segment-level GC already handles the long tail in practice, or whether an entry-level trigger is needed.
+
+## Execution model: volume-side internal write
+
+Whichever trigger picks the LBA ranges — file boundaries or per-entry live-fraction — the *execution* is the same operation: read the chosen range through the volume's normal read path, compute fresh hashes over the materialised live bytes, and append the result as new `Data` (or `DedupRef` on a dedup hit) entries via the regular write pipeline.
+
+That makes it a **volume operation, not a coordinator/GC operation.** Coordinator GC today stays narrow on purpose: it preserves the hash-content relationship, moves bodies around, and redirects the extent index via the handoff protocol (`elide-coordinator/src/gc.rs:1206`). A reclamation pass has to *retire* old hashes, compute *new* hashes, append new WAL entries, and rewrite LBA map entries — all of which require the single-writer volume lock, the volume's read path (including `payload_block_offset` resolution, which the coordinator's `fetch_live_bodies` does not know about), and the WAL → pending → promote pipeline. None of that is coordinator territory.
+
+A clean division of labour follows:
+
+- **Coordinator detects.** Walk segments, compute per-entry live-fraction (cheap — derivable from the LBA map snapshot the coordinator already has for GC decisions), emit hints for bloated entries.
+- **Volume executes.** Consume hints on its own tick, take the single-writer lock, materialise live ranges, append new entries, update the LBA map.
+
+File-aware defrag fits the same shape: the trigger is the filemap (generated volume-side at snapshot time), and the execution is the same rematerialise-and-append. One mechanism, two triggers.
+
+### Interaction with the no-op write skip path
+
+There is one specific mechanical constraint this execution model has to navigate. A reclamation write, by construction, carries bytes that already equal the current observable content at the target LBAs — that is precisely why it is a representation change and not a content change. The existing no-op write skip path (`design-noop-write-skip.md`) has two tiers, and tier 2 is a byte-compare against the local read path that would classify this write as redundant and silently drop it.
+
+Tier 1 is fine — it only fires when the map already directly binds the incoming hash to these LBAs with `payload_block_offset == 0`, which is the post-reclamation steady state, not the pre-reclamation one. Tier 1 actually delivers idempotent convergence for free: a second reclamation pass over an already-merged range hits tier 1 and skips correctly without any termination tracking.
+
+The resolution is that reclamation writes flow through a write entry point that runs tier 1 but bypasses tier 2 — an *internal-origin* write, distinct from a client-origin NBD write. Everything else in the write pipeline (compression, dedup lookup, WAL append, LBA map update) is shared. See `design-noop-write-skip.md § Scope: client-intent writes only`.
+
 ## Selection heuristic
 
 A file is a defrag candidate when *all* of:
@@ -85,7 +116,7 @@ All thresholds are placeholders pending measurement. The right values depend on 
 - **DedupRef-aware bracketing.** Is the complexity of skipping over DedupRef runs justified, or is "skip files above a dedup threshold" sufficient?
 - **Interaction with the no-op write skip path** (`design-noop-write-skip.md`). The merged extent is, by definition, content-identical to the bytes already on disk. Does the dedup-by-hash cache short-circuit anything useful here, or is it inert because we are creating one new aggregate hash from many small ones?
 - **Filemap regeneration vs incremental update.** Position A requires either rewriting the filemap row in place after defrag or re-running filemap generation. In-place row rewrite is cheaper but couples defrag to filemap format internals.
-- **Diagnostic visibility.** Per-file fragmentation is currently invisible. Even before implementing defrag, exposing it via `inspect-segment` or a new `inspect-filemap` would help reason about whether this is a real problem on real workloads.
+- **Diagnostic visibility.** Neither per-file fragmentation nor per-entry live-fraction is currently observable. Before implementing any pass, exposing both — via `inspect-segment`, a new `inspect-filemap`, or a dedicated `volume inspect --fragmentation` — would let us measure whether either is a real problem on real workloads.
 
 ## Relationship to existing passes
 
