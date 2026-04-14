@@ -1284,17 +1284,21 @@ impl Volume {
         }
 
         // Evict and delete input candidates. The max-ULID candidate was already
-        // replaced atomically by the output rename above; skip re-deleting it.
+        // replaced atomically by the output rename above; skip re-deleting it,
+        // but still evict its cached fd — the rename unlinked the old inode
+        // and a surviving cached handle would continue to serve bytes from
+        // the old layout, seeking with the new body_section_start into the
+        // old index section.
         for seg_path in &candidate_paths {
             let seg_ulid_opt = seg_path
                 .file_name()
                 .and_then(|s| s.to_str())
                 .and_then(|s| Ulid::from_string(s).ok());
-            if seg_ulid_opt == Some(new_ulid) && !merged_live.is_empty() {
-                continue; // already replaced atomically above
-            }
             if let Some(ulid) = seg_ulid_opt {
                 self.file_cache.borrow_mut().evict(ulid);
+            }
+            if seg_ulid_opt == Some(new_ulid) && !merged_live.is_empty() {
+                continue; // already replaced atomically above
             }
             fs::remove_file(seg_path)?;
         }
@@ -4689,6 +4693,41 @@ mod tests {
         );
 
         assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_multi_block_inplace_overwrite_same_wal() {
+        // Regression: two multi-block DATA writes at the same LBA range in the
+        // same WAL flush. Both land as DATA entries (different hashes) in one
+        // pending segment. sweep_pending then partitions entries into live/dead,
+        // rewrites the segment, and updates the extent index — the surviving
+        // live entry must read back correctly from the rewritten segment.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // High-entropy so neither payload is inlined and both stay in the
+        // body section. Eight 4 KiB blocks each.
+        let payload_a: Vec<u8> = (0..8 * 4096usize).map(|i| (i * 7 + 13) as u8).collect();
+        let payload_b: Vec<u8> = (0..8 * 4096usize).map(|i| (i * 11 + 3) as u8).collect();
+        assert_ne!(payload_a, payload_b);
+
+        vol.write(24, &payload_a).unwrap();
+        vol.write(24, &payload_b).unwrap();
+        vol.flush_wal().unwrap();
+        assert_eq!(
+            vol.read(24, 8).unwrap(),
+            payload_b,
+            "pre-sweep read must return the second write"
+        );
+
+        vol.sweep_pending().unwrap();
+        assert_eq!(
+            vol.read(24, 8).unwrap(),
+            payload_b,
+            "post-sweep read must still return the second write"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }
