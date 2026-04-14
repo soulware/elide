@@ -265,6 +265,25 @@ enum VolumeCommand {
         name: String,
     },
 
+    /// Reclaim fragmented storage via alias-merge extent rewriting.
+    ///
+    /// Scans the volume for hashes whose stored payload has detectable
+    /// dead weight (from in-place overwrites that split the original
+    /// entry) and rewrites them as fresh compact entries via the
+    /// internal-origin write path. The old bloated bodies are left
+    /// orphaned for coordinator GC to reclaim on its next pass.
+    ///
+    /// Runs entirely on the volume; heavy work (read + hash + compress)
+    /// happens off the actor thread so NBD writes are not blocked for
+    /// the full duration of the pass.
+    ///
+    /// Safe on any running volume. Idempotent — re-running against
+    /// already-compact state is a fast no-op.
+    Reclaim {
+        /// Volume name
+        name: String,
+    },
+
     /// Stop all processes for a volume and remove its directory
     Delete {
         /// Volume name
@@ -618,6 +637,41 @@ fn main() {
                     Ok(n) => {
                         let label = if n == 1 { "segment" } else { "segments" };
                         println!("evicted {n} {label}");
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            VolumeCommand::Reclaim { name } => {
+                match coordinator_client::reclaim_volume(&socket_path, &name) {
+                    Ok(stats) => {
+                        if stats.candidates_scanned == 0 {
+                            println!("nothing to reclaim");
+                        } else {
+                            println!(
+                                "reclaimed {} run{} ({} bytes) from {} candidate{}{}",
+                                stats.runs_rewritten,
+                                if stats.runs_rewritten == 1 { "" } else { "s" },
+                                stats.bytes_rewritten,
+                                stats.candidates_scanned,
+                                if stats.candidates_scanned == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                },
+                                if stats.discarded > 0 {
+                                    format!(
+                                        " ({} discarded due to concurrent writes)",
+                                        stats.discarded
+                                    )
+                                } else {
+                                    String::new()
+                                },
+                            );
+                        }
                     }
                     Err(e) => {
                         eprintln!("error: {e}");

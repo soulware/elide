@@ -45,6 +45,12 @@
 //     the end of the inline drain step of a coordinator-driven
 //     snapshot. Returns "ok".
 //
+//   reclaim
+//     Run a full alias-merge extent reclamation pass: scan for bloated-hash
+//     candidates, then process each via the three-phase primitive. Uses
+//     default thresholds. Returns
+//     "ok <candidates_scanned> <runs_rewritten> <bytes_rewritten> <discarded>".
+//
 //   connected
 //     Returns "ok true" if an NBD client is currently connected, "ok false"
 //     otherwise. Always "ok false" for IPC-only volumes.
@@ -262,6 +268,47 @@ fn handle_connection(
             Err(_) => {
                 let _ = writeln!(writer, "err invalid ulid: {ulid_str}");
             }
+        }
+    } else if line == "reclaim" {
+        // End-to-end alias-merge pass over the whole volume:
+        //   1. Scan the current snapshot for bloated-hash candidates.
+        //   2. Reclaim each candidate (most-wasteful-first) via the
+        //      three-phase primitive.
+        // No args: the volume uses default thresholds. No locks taken
+        // by this handler thread — the primitive does its own
+        // short-critical-section work on the actor thread.
+        //
+        // Returns "ok <candidates_scanned> <runs_rewritten> <bytes_rewritten> <discarded>".
+        let candidates =
+            handle.reclaim_candidates(elide_core::volume::ReclaimThresholds::default());
+        let scanned = candidates.len();
+        let mut total_runs: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut discarded: u64 = 0;
+        let mut io_err: Option<std::io::Error> = None;
+        for c in candidates {
+            match handle.reclaim_alias_merge(c.start_lba, c.lba_length) {
+                Ok(outcome) => {
+                    if outcome.discarded {
+                        discarded += 1;
+                    } else {
+                        total_runs += outcome.runs_rewritten as u64;
+                        total_bytes += outcome.bytes_rewritten;
+                    }
+                }
+                Err(e) => {
+                    io_err = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = io_err {
+            let _ = writeln!(writer, "err {e}");
+        } else {
+            let _ = writeln!(
+                writer,
+                "ok {scanned} {total_runs} {total_bytes} {discarded}"
+            );
         }
     } else if line == "connected" {
         let connected = nbd_connected.load(Ordering::Relaxed);
