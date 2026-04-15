@@ -713,6 +713,15 @@ fn find_segment_file(search_dirs: &[PathBuf], segment_id: ulid::Ulid) -> io::Res
         if body.exists() {
             return Ok(body);
         }
+        // A gc/<sid> body is only a legitimate read source once the volume
+        // has re-signed it and written gc/<sid>.applied — that marker is
+        // what flips the LBA map / extent index to route reads here, and
+        // it's the same precondition `collect_gc_applied_segment_files`
+        // uses when seeding the extent index during rebuild.
+        let gc_body = dir.join("gc").join(&sid);
+        if gc_body.exists() && dir.join("gc").join(format!("{sid}.applied")).exists() {
+            return Ok(gc_body);
+        }
     }
     Err(io::Error::other(format!("segment not found: {sid}")))
 }
