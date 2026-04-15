@@ -168,8 +168,9 @@
                             and the S3 upload (handoff ∈ {"bare", "cleaned"} ∧
                             gc_s3_uploaded)
 
-    EventuallyDone        — under fair scheduling, every handoff eventually
-                            reaches handoff = "cleaned"
+    EventuallyDone        — under fair scheduling AND a bounded number of
+                            crashes (see CONSTANT MaxCrashes), every handoff
+                            eventually reaches handoff = "cleaned"
 
   HOW TO READ THIS
   ----------------
@@ -198,16 +199,29 @@
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
-  Carried,   \* set of hashes whose extents are moved to GCOutput (repack entries)
-  Removed,   \* set of hashes whose extent entries are deleted    (remove entries)
-  Dead       \* TRUE iff this is a tombstone handoff (all-dead input).
-             \* For standard handoffs instantiate with FALSE.
-             \* For tombstone handoffs instantiate with TRUE; Carried and Removed must be {}.
+  Carried,    \* set of hashes whose extents are moved to GCOutput (repack entries)
+  Removed,    \* set of hashes whose extent entries are deleted    (remove entries)
+  Dead,       \* TRUE iff this is a tombstone handoff (all-dead input).
+              \* For standard handoffs instantiate with FALSE.
+              \* For tombstone handoffs instantiate with TRUE; Carried and Removed must be {}.
+  MaxCrashes  \* Bound on the total number of CoordCrash + VolumeCrash events.
+              \* TLC needs this to model bounded-crash liveness: under unbounded
+              \* crashes, the adversary can interleave VolumeCrash and CoordCrash
+              \* such that the two processes are never simultaneously up at the
+              \* moment CoordPromote is enabled, so EventuallyDone fails as a
+              \* matter of fairness theory rather than a real bug. Bounding
+              \* crashes lets TLC explore all sequences up to MaxCrashes and
+              \* then forces the system into a quiescent phase where SF on the
+              \* progress actions guarantees handoff = "cleaned" is reached.
+              \* MaxCrashes = 3 is enough to cover the interesting interleavings
+              \* (including 2 vol + 1 coord, 1 vol + 2 coord, and the cycle TLC
+              \* identified) without blowing up the state space.
 
 \* Pairwise disjoint; at least one must contribute to the handoff.
 ASSUME Carried \cap Removed = {}
 ASSUME Dead => (Carried = {} /\ Removed = {})
 ASSUME Carried \cup Removed # {} \/ Dead
+ASSUME MaxCrashes \in Nat
 
 VARIABLES
   handoff,        \* on-disk state of the GC handoff:
@@ -257,9 +271,12 @@ VARIABLES
                       \* reader can still need cache/<old>.
 
   coord_up,       \* TRUE iff the coordinator is currently running
-  vol_up          \* TRUE iff the volume is currently running
+  vol_up,         \* TRUE iff the volume is currently running
+  crashes_remaining  \* CoordCrash and VolumeCrash decrement this; they are
+                     \* disabled at zero. See the rationale on the CONSTANT
+                     \* MaxCrashes above.
 
-vars == <<handoff, extent, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up, vol_up>>
+vars == <<handoff, extent, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up, vol_up, crashes_remaining>>
 
 \* ---------------------------------------------------------------------------
 \* Type correctness (checked as an invariant, useful for debugging the model)
@@ -278,6 +295,7 @@ TypeOK ==
   /\ old_cache_present \in BOOLEAN
   /\ coord_up         \in BOOLEAN
   /\ vol_up           \in BOOLEAN
+  /\ crashes_remaining \in 0..MaxCrashes
 
 \* ---------------------------------------------------------------------------
 \* Initial state
@@ -294,6 +312,7 @@ Init ==
   /\ old_cache_present = TRUE                       \* input segment was previously cached
   /\ coord_up         = TRUE
   /\ vol_up           = TRUE
+  /\ crashes_remaining = MaxCrashes
 
 \* ---------------------------------------------------------------------------
 \* Coordinator actions
@@ -314,7 +333,7 @@ CoordWriteStaged ==
   /\ coord_up
   /\ handoff = "absent"
   /\ handoff' = "staged"
-  /\ UNCHANGED <<extent, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up, vol_up>>
+  /\ UNCHANGED <<extent, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up, vol_up, crashes_remaining>>
 
 (*
   Step 3a: Coordinator uploads the volume-signed bare body to S3.
@@ -333,7 +352,7 @@ CoordUploadGc ==
   /\ bare_present
   /\ ~gc_s3_uploaded
   /\ gc_s3_uploaded' = TRUE
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, bare_present, new_seg_present, old_cache_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, bare_present, new_seg_present, old_cache_present, coord_up, vol_up, crashes_remaining>>
 
 (*
   Step 3b: Coordinator sends promote_segment IPC. The volume's handler:
@@ -363,7 +382,7 @@ CoordPromote ==
   /\ old_idx_present                  \* idempotency: only the first call clears
   /\ new_seg_present' = (Carried # {})
   /\ old_idx_present' = FALSE
-  /\ UNCHANGED <<handoff, extent, old_present, bare_present, gc_s3_uploaded, old_cache_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, bare_present, gc_s3_uploaded, old_cache_present, coord_up, vol_up, crashes_remaining>>
 
 (*
   Step 3c + 3d: Coordinator deletes the old S3 objects, then sends
@@ -396,12 +415,14 @@ CoordFinalize ==
   /\ old_present' = FALSE                        \* delete old S3 objects
   /\ bare_present' = FALSE                       \* finalize_gc_handoff IPC
   /\ handoff' = "cleaned"
-  /\ UNCHANGED <<extent, old_idx_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up, vol_up>>
+  /\ UNCHANGED <<extent, old_idx_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up, vol_up, crashes_remaining>>
 
 CoordCrash ==
   /\ coord_up
+  /\ crashes_remaining > 0
   /\ coord_up' = FALSE
   /\ gc_s3_uploaded' = FALSE   \* no durable local record; re-upload idempotently
+  /\ crashes_remaining' = crashes_remaining - 1
   /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, bare_present, new_seg_present, old_cache_present, vol_up>>
 
 \* On restart the coordinator re-reads gc/ and resumes at whatever state the
@@ -409,7 +430,7 @@ CoordCrash ==
 CoordRestart ==
   /\ ~coord_up
   /\ coord_up' = TRUE
-  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, vol_up>>
+  /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, vol_up, crashes_remaining>>
 
 \* ---------------------------------------------------------------------------
 \* Volume actions
@@ -458,11 +479,13 @@ VolumeFinishApply ==
   /\ handoff'           = "bare"
   /\ bare_present'      = TRUE              \* rename .tmp → bare
   /\ old_cache_present' = FALSE             \* evict input cache files at commit
-  /\ UNCHANGED <<old_present, old_idx_present, gc_s3_uploaded, new_seg_present, coord_up, vol_up>>
+  /\ UNCHANGED <<old_present, old_idx_present, gc_s3_uploaded, new_seg_present, coord_up, vol_up, crashes_remaining>>
 
 VolumeCrash ==
   /\ vol_up
+  /\ crashes_remaining > 0
   /\ vol_up' = FALSE
+  /\ crashes_remaining' = crashes_remaining - 1
   /\ UNCHANGED <<handoff, extent, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up>>
 
 (*
@@ -532,7 +555,7 @@ VolumeRestart ==
                     IF bare_present THEN "gone"
                     ELSE IF old_idx_present THEN "old"
                     ELSE "gone"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up>>
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up, crashes_remaining>>
 
 \* ---------------------------------------------------------------------------
 \* Environment: concurrent writes
@@ -561,7 +584,7 @@ VolumeRestart ==
 NewerWrite(h) ==
   /\ extent[h] \in {"old", "gc"}
   /\ extent' = [extent EXCEPT ![h] = "new"]
-  /\ UNCHANGED <<handoff, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up, vol_up>>
+  /\ UNCHANGED <<handoff, old_present, old_idx_present, bare_present, gc_s3_uploaded, new_seg_present, old_cache_present, coord_up, vol_up, crashes_remaining>>
 
 \* ---------------------------------------------------------------------------
 \* Specification
