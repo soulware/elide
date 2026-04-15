@@ -389,11 +389,24 @@ async fn reclaim_volume(vol_name: &str, data_dir: &Path) -> String {
     if !fork_dir.join("control.sock").exists() {
         return format!("err volume '{vol_name}' is not running — start it first");
     }
+    info!("[reclaim {vol_name}] starting pass");
     match elide_coordinator::control::reclaim(&fork_dir).await {
-        Some(stats) => format!(
-            "ok {} {} {} {}",
-            stats.candidates_scanned, stats.runs_rewritten, stats.bytes_rewritten, stats.discarded
-        ),
+        Some(stats) => {
+            info!(
+                "[reclaim {vol_name}] done: scanned={} runs_rewritten={} bytes_rewritten={} discarded={}",
+                stats.candidates_scanned,
+                stats.runs_rewritten,
+                stats.bytes_rewritten,
+                stats.discarded,
+            );
+            format!(
+                "ok {} {} {} {}",
+                stats.candidates_scanned,
+                stats.runs_rewritten,
+                stats.bytes_rewritten,
+                stats.discarded
+            )
+        }
         None => format!("err reclaim IPC failed for volume '{vol_name}'"),
     }
 }

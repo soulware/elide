@@ -66,6 +66,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use tracing::{debug, info};
+
 use elide_core::actor::VolumeHandle;
 
 /// Start the control socket server for `fork_dir`.
@@ -282,18 +284,31 @@ fn handle_connection(
         let candidates =
             handle.reclaim_candidates(elide_core::volume::ReclaimThresholds::default());
         let scanned = candidates.len();
+        info!("[reclaim] scan found {scanned} candidate(s)");
         let mut total_runs: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut discarded: u64 = 0;
         let mut io_err: Option<std::io::Error> = None;
         for c in candidates {
+            debug!(
+                "[reclaim] candidate lba={} len={} dead_blocks={} live_blocks={} stored_bytes={}",
+                c.start_lba, c.lba_length, c.dead_blocks, c.live_blocks, c.stored_bytes,
+            );
             match handle.reclaim_alias_merge(c.start_lba, c.lba_length) {
                 Ok(outcome) => {
                     if outcome.discarded {
                         discarded += 1;
+                        debug!(
+                            "[reclaim] candidate lba={} discarded (concurrent mutation)",
+                            c.start_lba
+                        );
                     } else {
                         total_runs += outcome.runs_rewritten as u64;
                         total_bytes += outcome.bytes_rewritten;
+                        debug!(
+                            "[reclaim] candidate lba={} committed runs={} bytes={}",
+                            c.start_lba, outcome.runs_rewritten, outcome.bytes_rewritten
+                        );
                     }
                 }
                 Err(e) => {
@@ -305,6 +320,10 @@ fn handle_connection(
         if let Some(e) = io_err {
             let _ = writeln!(writer, "err {e}");
         } else {
+            info!(
+                "[reclaim] done: scanned={scanned} runs_rewritten={total_runs} \
+                 bytes_rewritten={total_bytes} discarded={discarded}"
+            );
             let _ = writeln!(
                 writer,
                 "ok {scanned} {total_runs} {total_bytes} {discarded}"
