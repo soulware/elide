@@ -290,13 +290,12 @@ impl BlockReader {
 
         self.ensure_extent_present(loc)?;
 
-        let path = find_segment_file(&self.search_dirs, loc.segment_id)?;
-        let is_body = path.extension().is_some_and(|e| e == "body");
-        let file_base = if is_body { 0 } else { loc.body_section_start };
+        let (path, layout) = find_segment_file(&self.search_dirs, loc.segment_id)?;
+        let seek = layout.body_seek(loc);
         let mut f = fs::File::open(path)?;
         let mut block = [0u8; 4096];
         if loc.compressed {
-            f.seek(SeekFrom::Start(file_base + loc.body_offset))?;
+            f.seek(SeekFrom::Start(seek))?;
             let mut buf = vec![0u8; loc.body_length as usize];
             f.read_exact(&mut buf)?;
             let decompressed =
@@ -304,9 +303,7 @@ impl BlockReader {
             let src = block_offset as usize * 4096;
             block.copy_from_slice(&decompressed[src..src + 4096]);
         } else {
-            f.seek(SeekFrom::Start(
-                file_base + loc.body_offset + block_offset as u64 * 4096,
-            ))?;
+            f.seek(SeekFrom::Start(seek + block_offset as u64 * 4096))?;
             f.read_exact(&mut block)?;
         }
         Ok(block)
@@ -386,8 +383,10 @@ impl BlockReader {
                 body_section_start,
                 body_length,
             } => {
-                let path = find_segment_file(&self.search_dirs, segment_id)?;
-                (path, body_section_start + body_length)
+                let (path, layout) = find_segment_file(&self.search_dirs, segment_id)?;
+                // Delta body sits right after the body section.
+                let base = layout.body_section_file_offset(body_section_start) + body_length;
+                (path, base)
             }
             DeltaBodySource::Cached => (self.find_delta_body(segment_id)?, 0u64),
         };
@@ -473,11 +472,9 @@ impl BlockReader {
             };
         }
         self.ensure_extent_present(loc)?;
-        let path = find_segment_file(&self.search_dirs, loc.segment_id)?;
-        let is_body = path.extension().is_some_and(|e| e == "body");
-        let file_base = if is_body { 0 } else { loc.body_section_start };
+        let (path, layout) = find_segment_file(&self.search_dirs, loc.segment_id)?;
         let mut f = fs::File::open(path)?;
-        f.seek(SeekFrom::Start(file_base + loc.body_offset))?;
+        f.seek(SeekFrom::Start(layout.body_seek(loc)))?;
         let mut buf = vec![0u8; loc.body_length as usize];
         f.read_exact(&mut buf)?;
         if loc.compressed {
@@ -627,19 +624,17 @@ fn apply_snapshot_layer(
     Ok(())
 }
 
-fn find_segment_file(search_dirs: &[PathBuf], segment_id: ulid::Ulid) -> io::Result<PathBuf> {
-    let sid = segment_id.to_string();
+fn find_segment_file(
+    search_dirs: &[PathBuf],
+    segment_id: ulid::Ulid,
+) -> io::Result<(PathBuf, crate::segment::SegmentBodyLayout)> {
     for dir in search_dirs {
-        for subdir in ["wal", "pending"] {
-            let path = dir.join(subdir).join(&sid);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-        let body = dir.join("cache").join(format!("{sid}.body"));
-        if body.exists() {
-            return Ok(body);
+        if let Some(hit) = crate::segment::locate_segment_body(dir, segment_id) {
+            return Ok(hit);
         }
     }
-    Err(io::Error::other(format!("segment not found: {sid}")))
+    Err(io::Error::other(format!(
+        "segment not found: {}",
+        segment_id
+    )))
 }

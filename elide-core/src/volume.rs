@@ -3330,6 +3330,28 @@ pub(crate) fn open_delta_body_in_dirs(
     ))
 }
 
+/// Gate a `cache/<id>.body` hit on the `.present` bit for `Cached` entries.
+/// Returns true for any non-cache layout (wal/pending/gc) and for cache hits
+/// on `Local` entries. For `Cached` cache hits, checks the corresponding
+/// `cache/<id>.present` bit alongside the `.body` file in `dir`.
+fn cache_hit_allowed(
+    layout: segment::SegmentBodyLayout,
+    dir: &Path,
+    sid: &str,
+    body_source: BodySource,
+) -> bool {
+    if layout != segment::SegmentBodyLayout::BodyOnly {
+        return true;
+    }
+    match body_source {
+        BodySource::Local => true,
+        BodySource::Cached(idx) => {
+            let present_path = dir.join("cache").join(format!("{sid}.present"));
+            segment::check_present_bit(&present_path, idx).unwrap_or(false)
+        }
+    }
+}
+
 /// Search for a segment file across the fork directory tree.
 ///
 /// Search order:
@@ -3355,52 +3377,25 @@ pub(crate) fn find_segment_in_dirs(
     body_source: BodySource,
 ) -> io::Result<PathBuf> {
     let sid = segment_id.to_string();
-    for subdir in ["wal", "pending"] {
-        let path = base_dir.join(subdir).join(&sid);
-        if path.exists() {
-            return Ok(path);
-        }
+    // Self dir: full canonical precedence (wal → pending → gc/.applied → cache).
+    // The `.applied` GC branch matters here because the extent index flips to the
+    // new segment_id the moment the volume writes `.applied`, before the
+    // coordinator has promoted the body to `pending/`.
+    if let Some((path, layout)) = segment::locate_segment_body(base_dir, segment_id)
+        && cache_hit_allowed(layout, base_dir, &sid, body_source)
+    {
+        return Ok(path);
     }
-    // During the .applied GC handoff window the new segment body lives in gc/
-    // (volume-signed, awaiting coordinator upload to S3).  The extent index
-    // already points at this segment_id, so reads must be able to find it here.
-    // The .applied marker distinguishes a volume-signed body from a coordinator-
-    // staged body (.pending) which is not yet safe to read.
-    let gc_body = base_dir.join("gc").join(&sid);
-    if gc_body.exists() && base_dir.join("gc").join(format!("{sid}.applied")).exists() {
-        return Ok(gc_body);
-    }
-    let cache_body = base_dir.join("cache").join(format!("{sid}.body"));
-    if cache_body.exists() {
-        let entry_present = match body_source {
-            BodySource::Local => true,
-            BodySource::Cached(idx) => {
-                let present_path = base_dir.join("cache").join(format!("{sid}.present"));
-                segment::check_present_bit(&present_path, idx).unwrap_or(false)
-            }
-        };
-        if entry_present {
-            return Ok(cache_body);
-        }
-        // Entry not yet fetched — fall through to fetcher below.
-    }
+    // Ancestor layers: segments here are always fork-parent state. They cannot
+    // be mid-GC-handoff from this child's perspective, and they have no live
+    // wal/, but pending/ and cache/<id>.body can both appear — the same helper
+    // yields the right path; we just re-gate cache hits on the layer's own
+    // `.present` file.
     for layer in ancestor_layers.iter().rev() {
-        let path = layer.dir.join("pending").join(&sid);
-        if path.exists() {
+        if let Some((path, layout)) = segment::locate_segment_body(&layer.dir, segment_id)
+            && cache_hit_allowed(layout, &layer.dir, &sid, body_source)
+        {
             return Ok(path);
-        }
-        let cache_body = layer.dir.join("cache").join(format!("{sid}.body"));
-        if cache_body.exists() {
-            let entry_present = match body_source {
-                BodySource::Local => true,
-                BodySource::Cached(idx) => {
-                    let present_path = layer.dir.join("cache").join(format!("{sid}.present"));
-                    segment::check_present_bit(&present_path, idx).unwrap_or(false)
-                }
-            };
-            if entry_present {
-                return Ok(cache_body);
-            }
         }
     }
     if let (Some(fetcher), BodySource::Cached(idx)) = (fetcher, body_source) {

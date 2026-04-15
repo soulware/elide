@@ -279,6 +279,108 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
 }
 
 #[test]
+fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
+    // Regression: if an ancestor volume's source segment is sitting in
+    // the `gc/<id>.applied` handoff window (volume-signed GC output,
+    // awaiting coordinator upload/promote), `read_source_extent` must
+    // still find it. Prior to the fix the lookup only checked
+    // `cache/<id>.body` and `pending/<id>`, so the delta conversion was
+    // silently skipped under concurrent GC on the source.
+    let tmp = TempDir::new().unwrap();
+    let by_id_dir = tmp.path().join("by_id");
+    fs::create_dir_all(&by_id_dir).unwrap();
+
+    // Use a body-section-sized payload so the seek arithmetic (which
+    // depends on body_section_start for a FullSegment layout) is
+    // actually exercised — an inline source would short-circuit before
+    // `read_source_extent`'s seek path.
+    let mut parent_bytes = Vec::with_capacity(8192);
+    for i in 0..8192 {
+        parent_bytes.push((i % 251) as u8);
+    }
+    let parent_hash = blake3::hash(&parent_bytes);
+    let parent_stored = compress_prepend_size(&parent_bytes);
+    assert!(parent_stored.len() >= 256, "must land in body section");
+
+    let (source_ulid, source_dir, source_signer) =
+        make_readonly_volume(&by_id_dir, &ProvenanceLineage::default());
+    let source_seg_ulid = Ulid::new();
+    let source_seg_path = source_dir.join("pending").join(source_seg_ulid.to_string());
+    let mut source_entries = vec![SegmentEntry::new_data(
+        parent_hash,
+        0,
+        2,
+        SegmentFlags::COMPRESSED,
+        parent_stored,
+    )];
+    assert_eq!(source_entries[0].kind, EntryKind::Data);
+    write_segment(
+        &source_seg_path,
+        &mut source_entries,
+        source_signer.as_ref(),
+    )
+    .unwrap();
+    write_snapshot_and_filemap(
+        &source_dir,
+        source_seg_ulid,
+        "/blob",
+        parent_hash,
+        parent_bytes.len() as u64,
+    );
+
+    // Simulate mid-GC-handoff: segment body lives in `gc/<id>` with an
+    // `.applied` marker, not in `pending/`. This is the exact state the
+    // coordinator produces between `apply_gc_handoffs` and
+    // `promote_segment`.
+    let gc_dir = source_dir.join("gc");
+    fs::create_dir_all(&gc_dir).unwrap();
+    let gc_body = gc_dir.join(source_seg_ulid.to_string());
+    fs::rename(&source_seg_path, &gc_body).unwrap();
+    fs::write(gc_dir.join(format!("{source_seg_ulid}.applied")), b"").unwrap();
+
+    // Child with a twisted copy of the source bytes — delta-compressible.
+    let mut child_bytes = parent_bytes.clone();
+    for byte in child_bytes.iter_mut().take(512) {
+        *byte ^= 0x55;
+    }
+    let child_hash = blake3::hash(&child_bytes);
+
+    let child_lineage = ProvenanceLineage {
+        parent: None,
+        extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
+    };
+    let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
+    let child_seg_ulid = write_single_entry_segment(
+        &child_dir,
+        child_signer.as_ref(),
+        child_hash,
+        0,
+        2,
+        child_bytes.clone(),
+    );
+    write_snapshot_and_filemap(
+        &child_dir,
+        child_seg_ulid,
+        "/blob",
+        child_hash,
+        child_bytes.len() as u64,
+    );
+
+    let stats =
+        delta_compute::rewrite_pending_with_deltas(&child_dir, &by_id_dir, child_signer.as_ref())
+            .expect("rewrite_pending_with_deltas must read gc/.applied source body");
+    assert_eq!(
+        stats.entries_converted, 1,
+        "source segment in gc/<id>.applied should still resolve"
+    );
+
+    let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
+    let (_, entries) = segment::read_segment_index(&rewritten).unwrap();
+    assert_eq!(entries[0].kind, EntryKind::Delta);
+    assert_eq!(entries[0].delta_options[0].source_hash, parent_hash);
+}
+
+#[test]
 fn rewrite_pending_with_deltas_handles_inline_source() {
     // Regression: a highly-compressible 4 KiB source block lands as an
     // Inline entry (compressed bytes < 256). The delta stage must read

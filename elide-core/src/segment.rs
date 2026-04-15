@@ -1342,6 +1342,76 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
     Ok(())
 }
 
+/// Layout of the file that holds a segment's body bytes, telling the
+/// caller how to compute an absolute seek from an entry-relative
+/// `body_offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentBodyLayout {
+    /// Full segment file: byte 0 is the segment header. Body and delta
+    /// sections sit after the header+index+inline prefix of length
+    /// `body_section_start`. Used by `wal/<id>`, `pending/<id>`, and
+    /// `gc/<id>` (post-`.applied`).
+    FullSegment,
+    /// Body-only file: byte 0 is body byte 0. The full segment's
+    /// header+index+inline prefix is not present. Used by
+    /// `cache/<id>.body`.
+    BodyOnly,
+}
+
+impl SegmentBodyLayout {
+    /// File offset at which the body section begins in this file.
+    /// Callers compose this with intra-section offsets:
+    ///   - extent body: `body_section_file_offset(bss) + body_offset`
+    ///   - delta body : `body_section_file_offset(bss) + body_length + delta_offset`
+    #[inline]
+    pub fn body_section_file_offset(self, body_section_start: u64) -> u64 {
+        match self {
+            Self::FullSegment => body_section_start,
+            Self::BodyOnly => 0,
+        }
+    }
+}
+
+/// Resolve a segment's body location within a single fork directory,
+/// following the canonical lifecycle precedence:
+///
+///   1. `wal/<id>`                       — live, being written
+///   2. `pending/<id>`                   — sealed, awaiting upload
+///   3. `gc/<id>` iff `gc/<id>.applied`  — GC output, awaiting upload
+///   4. `cache/<id>.body`                — drained or demand-fetched
+///
+/// Returns `None` if the segment body is not present in any of those
+/// locations. Does not consult `.present` bits, ancestor forks, or
+/// fetchers — callers layer those concerns on top.
+///
+/// The `.applied` marker is the gate on `gc/<id>`. A bare `gc/<id>` (or
+/// one with only `.pending`) is coordinator-staged and not yet safe to
+/// read; the volume's re-sign step writes `.applied` exactly when the
+/// body becomes readable under its new ULID.
+pub fn locate_segment_body(
+    base_dir: &Path,
+    segment_id: ulid::Ulid,
+) -> Option<(PathBuf, SegmentBodyLayout)> {
+    let sid = segment_id.to_string();
+    let wal = base_dir.join("wal").join(&sid);
+    if wal.exists() {
+        return Some((wal, SegmentBodyLayout::FullSegment));
+    }
+    let pending = base_dir.join("pending").join(&sid);
+    if pending.exists() {
+        return Some((pending, SegmentBodyLayout::FullSegment));
+    }
+    let gc_body = base_dir.join("gc").join(&sid);
+    if gc_body.exists() && base_dir.join("gc").join(format!("{sid}.applied")).exists() {
+        return Some((gc_body, SegmentBodyLayout::FullSegment));
+    }
+    let cache_body = base_dir.join("cache").join(format!("{sid}.body"));
+    if cache_body.exists() {
+        return Some((cache_body, SegmentBodyLayout::BodyOnly));
+    }
+    None
+}
+
 pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     match fs::read_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -2441,5 +2511,79 @@ mod tests {
         }
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn locate_segment_body_precedence_and_gc_gate() {
+        // Confirms the canonical lifecycle precedence
+        //   wal → pending → gc/.applied → cache/.body
+        // and that `gc/<id>` is ignored without the `.applied` marker.
+        let dir = temp_dir();
+        for sub in ["wal", "pending", "gc", "cache"] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let sid = ulid::Ulid::new();
+        let sid_s = sid.to_string();
+
+        // No file anywhere → None.
+        assert!(locate_segment_body(&dir, sid).is_none());
+
+        // cache/.body only → BodyOnly hit.
+        let cache_body = dir.join("cache").join(format!("{sid_s}.body"));
+        fs::write(&cache_body, b"cache").unwrap();
+        assert_eq!(
+            locate_segment_body(&dir, sid),
+            Some((cache_body.clone(), SegmentBodyLayout::BodyOnly))
+        );
+
+        // gc/<id> without .applied is ignored → still cache.
+        let gc_body = dir.join("gc").join(&sid_s);
+        fs::write(&gc_body, b"gc-staged").unwrap();
+        assert_eq!(
+            locate_segment_body(&dir, sid),
+            Some((cache_body.clone(), SegmentBodyLayout::BodyOnly))
+        );
+
+        // .applied marker flips gc/ into play → FullSegment hit,
+        // ranking above cache/.body.
+        let applied = dir.join("gc").join(format!("{sid_s}.applied"));
+        fs::write(&applied, b"").unwrap();
+        assert_eq!(
+            locate_segment_body(&dir, sid),
+            Some((gc_body.clone(), SegmentBodyLayout::FullSegment))
+        );
+
+        // pending/ wins over gc/.applied.
+        let pending = dir.join("pending").join(&sid_s);
+        fs::write(&pending, b"pending").unwrap();
+        assert_eq!(
+            locate_segment_body(&dir, sid),
+            Some((pending.clone(), SegmentBodyLayout::FullSegment))
+        );
+
+        // wal/ wins over everything.
+        let wal = dir.join("wal").join(&sid_s);
+        fs::write(&wal, b"wal").unwrap();
+        assert_eq!(
+            locate_segment_body(&dir, sid),
+            Some((wal.clone(), SegmentBodyLayout::FullSegment))
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn body_section_file_offset_composes_seek_arithmetic() {
+        let full = SegmentBodyLayout::FullSegment;
+        let body = SegmentBodyLayout::BodyOnly;
+        let bss = 128u64;
+        let body_offset = 40u64;
+        let body_length = 1024u64;
+        // Body read: bss + body_offset (full) vs body_offset (body-only).
+        assert_eq!(full.body_section_file_offset(bss) + body_offset, 168);
+        assert_eq!(body.body_section_file_offset(bss) + body_offset, 40);
+        // Delta read: delta section starts at body_section_start + body_length.
+        assert_eq!(full.body_section_file_offset(bss) + body_length, 1152);
+        assert_eq!(body.body_section_file_offset(bss) + body_length, 1024);
     }
 }

@@ -78,6 +78,23 @@ pub struct ExtentLocation {
     pub inline_data: Option<Box<[u8]>>,
 }
 
+// Inherent impl on SegmentBodyLayout that needs ExtentLocation. Lives here
+// (rather than in segment.rs) so `segment` stays free of a back-reference to
+// `extentindex`.
+impl segment::SegmentBodyLayout {
+    /// Absolute file offset to seek to when reading the body bytes of
+    /// the extent at `loc` from a file of this layout.
+    ///
+    /// For a `FullSegment` file this is `body_section_start + body_offset`;
+    /// for a `BodyOnly` (`cache/<id>.body`) file the body section sits at
+    /// byte 0, so it collapses to `body_offset` — even when the stored
+    /// `loc.body_section_start` reflects the full segment's prefix.
+    #[inline]
+    pub fn body_seek(self, loc: &ExtentLocation) -> u64 {
+        self.body_section_file_offset(loc.body_section_start) + loc.body_offset
+    }
+}
+
 /// Where a Delta entry's delta blob lives locally.
 ///
 /// Delta blobs are tiny — typically sub-KB post-zstd-dict — but they

@@ -410,43 +410,29 @@ fn read_inline_section(seg_path: &Path, entries: &[SegmentEntry]) -> io::Result<
 /// extent-index rebuild already populates from the source segment's
 /// `.idx` inline section — the `body_offset`/`body_length` fields on
 /// an Inline location are inline-section-relative and must not be used
-/// as a body seek. For non-inline entries, seek into `cache/<id>.body`
-/// (drained sources) or the full `pending/<id>` segment file.
+/// as a body seek. For non-inline entries, resolve the segment body
+/// via `segment::locate_segment_body` (canonical precedence wal →
+/// pending → gc/.applied → cache/.body) and pick the seek arithmetic
+/// from the returned layout: body-only files seek at `body_offset`
+/// alone, full segment files seek at `body_section_start + body_offset`.
 fn read_source_extent(source_dir: &Path, loc: &ExtentLocation) -> io::Result<Vec<u8>> {
     if let Some(inline) = loc.inline_data.as_deref() {
         return Ok(inline.to_vec());
     }
 
-    let seg_id = loc.segment_id.to_string();
-
-    // A `.body` cache file contains only the body section — byte 0 of
-    // the file is byte 0 of the body data — so the seek position is
-    // `body_offset` alone. `body_section_start` on the ExtentLocation
-    // always reflects the full segment's header+index+inline prefix
-    // length, which is the correct adjustment for reads against a
-    // full segment file but must NOT be added for a `.body` read.
-    let cache_body = source_dir.join("cache").join(format!("{seg_id}.body"));
-    if cache_body.exists() {
-        let mut f = fs::File::open(&cache_body)?;
-        f.seek(SeekFrom::Start(loc.body_offset))?;
-        let mut buf = vec![0u8; loc.body_length as usize];
-        f.read_exact(&mut buf)?;
-        return Ok(buf);
-    }
-
-    let pending = source_dir.join("pending").join(&seg_id);
-    if pending.exists() {
-        let mut f = fs::File::open(&pending)?;
-        f.seek(SeekFrom::Start(loc.body_section_start + loc.body_offset))?;
-        let mut buf = vec![0u8; loc.body_length as usize];
-        f.read_exact(&mut buf)?;
-        return Ok(buf);
-    }
-
-    Err(io::Error::other(format!(
-        "source extent segment {seg_id} not found under {}",
-        source_dir.display()
-    )))
+    let (path, layout) =
+        segment::locate_segment_body(source_dir, loc.segment_id).ok_or_else(|| {
+            io::Error::other(format!(
+                "source extent segment {} not found under {}",
+                loc.segment_id,
+                source_dir.display()
+            ))
+        })?;
+    let mut f = fs::File::open(&path)?;
+    f.seek(SeekFrom::Start(layout.body_seek(loc)))?;
+    let mut buf = vec![0u8; loc.body_length as usize];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 fn decompress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
