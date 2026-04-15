@@ -1,6 +1,7 @@
 # Design: self-describing GC handoff (no manifest sidecar)
 
-Status: **proposed**
+Status: **accepted**, implemented in commits `196735f..cd9c4f9` on
+branch `gc-self-describing-handoff` (April 2026).
 
 Date: 2026-04-15
 

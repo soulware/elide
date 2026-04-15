@@ -18,44 +18,39 @@
 //     Mirrors lsvd SweepSmallSegments and volume sweep_pending().
 //
 // Both strategies run in the same tick if both find candidates, each producing
-// an independent output segment with its own ULID.  They operate on disjoint
-// input sets (repack owns the single least-dense segment; sweep owns the
-// remaining small high-density segments), so they could be parallelised with
-// tokio::join! in a future optimisation.
+// an independent output segment with its own ULID. They operate on disjoint
+// input sets, so they could be parallelised with tokio::join! in a future
+// optimisation. Per-tick work is bounded in both cases.
 //
-// Per-tick work is bounded in both cases: repack processes one segment;
-// sweep is capped at 32 MiB of live data.
+// Handoff protocol (self-describing, crash-safe, filesystem-only coordination —
+// see docs/design-gc-self-describing-handoff.md for the full design):
 //
-// Handoff protocol (crash-safe, filesystem-only coordination):
+//   1. Coordinator writes the compacted segment to gc/<new-ulid>.staged via
+//      tmp+rename. The segment carries the sorted list of input ULIDs in its
+//      own header (`inputs_length` field). Signed with an ephemeral key —
+//      coordinator does not hold the volume's private key.
 //
-//   1. Coordinator writes the compacted segment to gc/<new-ulid> (signed with
-//      an ephemeral key — coordinator does not hold the volume's private key),
-//      then writes gc/<new-ulid>.pending (via tmp + rename for atomicity):
-//        <hash_hex> <old_segment_ulid> <new_segment_ulid> <new_absolute_offset>
+//   2. Volume (idle tick) reads gc/<new-ulid>.staged, walks each input's
+//      index/<input>.idx to derive the extent-index updates, writes a
+//      re-signed copy to gc/<new-ulid>.tmp, renames .tmp → bare gc/<new-ulid>
+//      (the atomic commit point), removes .staged.
 //
-//   2. Volume re-signs gc/<new-ulid> with its own key, moves it to
-//      segments/<new-ulid>, applies extent index patches, renames
-//      gc/<new-ulid>.pending → gc/<new-ulid>.applied.
+//   3. Coordinator (next GC tick) sees the bare file: uploads it to S3, sends
+//      promote_segment IPC (volume writes index/<new>.idx + cache/<new>.body
+//      and deletes index/<input>.idx for each input), deletes old S3 objects,
+//      sends finalize_gc_handoff IPC (volume deletes the bare body).
 //
-//   3. Coordinator (next GC tick) sees .applied: uploads segments/<new-ulid>
-//      (the volume-signed version) to S3, deletes old S3 objects and old local
-//      segment files, renames → gc/<new-ulid>.done.
+//   Crash recovery is content-resolved (no extra filename states): stale .tmp
+//   and .staged.tmp are swept on every apply pass; .staged alone re-runs
+//   apply (deterministic, byte-identical output); .staged + bare → bare wins.
 //
-//   Crash at any step:
-//   - Before step 1 completes: no .pending file; coordinator retries next tick.
-//   - After step 1, before step 2: volume re-applies on next idle tick (idempotent).
-//   - After step 2, before step 3: coordinator re-runs upload + cleanup
-//     (S3 put and 404-on-delete are both idempotent).
+//   All-dead and removal-only handoffs collapse into a zero-entry GC output
+//   with a non-empty inputs list. promote_segment recognises this shape and
+//   skips writing index/<new>.idx / cache/<new>.body — the bare file is then
+//   deleted via finalize_gc_handoff the same as a live output.
 //
-//   All-dead segments (no live entries, no extent index references) use a
-//   tombstone handoff: the coordinator writes a .pending file with only
-//   "dead <ulid>" lines.  The volume acknowledges (no-op), writes .applied,
-//   and the coordinator deletes on the next tick.  Direct deletion is unsafe
-//   because the coordinator's liveness view (on-disk .idx files) may lag the
-//   volume's in-memory LBA map.
-//
-// A pass is deferred if any .pending files already exist (at most one
-// outstanding GC result per fork at a time).
+// A pass is deferred if any .staged or bare gc/<ulid> files already exist
+// (at most one outstanding GC result per fork at a time).
 //
 // Blocking IO note: index rebuild and segment reads are synchronous. For the
 // first pass these are called on the async task thread; move to spawn_blocking
@@ -82,10 +77,9 @@ use elide_core::volume::{ZERO_HASH, latest_snapshot};
 use crate::config::GcConfig;
 use crate::upload::segment_key;
 
-/// Retention window for `.done` GC handoff files.
-///
-/// `.done` files are kept for this duration after completion for post-mortem
-/// debugging, then removed by `cleanup_done_handoffs`.
+/// Legacy retention window kept for call-site compatibility with the
+/// `cleanup_done_handoffs` no-op stub. The self-describing GC handoff
+/// protocol leaves no `.done` files to prune.
 pub const DONE_FILE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Maximum total live bytes included in one small-segment sweep pass.
@@ -341,14 +335,17 @@ pub async fn gc_fork(
     }
 }
 
-/// Process `.applied` GC handoff files: delete old S3 objects and local
-/// segment files, then rename each `.applied` file to `.done`.
+/// Process volume-applied GC handoffs: walk bare `gc/<ulid>` files, upload
+/// each to S3, send `promote_segment` IPC, delete the corresponding old S3
+/// objects, then send `finalize_gc_handoff` IPC so the volume removes the
+/// bare body.
 ///
 /// Called at the start of every `gc_loop` tick so that old S3 objects are
-/// cleaned up promptly after the volume acknowledges each handoff.  Any
-/// `.applied` files that survive a coordinator crash are processed on the
-/// next startup tick — the rename-to-`.done` is idempotent with respect to
-/// S3 (a 404 on delete is treated as success) and safe to retry.
+/// cleaned up promptly after the volume acknowledges each handoff. Any bare
+/// files that survive a coordinator crash are processed on the next startup
+/// tick — every step is idempotent (S3 PUT is idempotent; 404 on delete is
+/// treated as success; `finalize_gc_handoff` is a no-op if the bare file is
+/// already gone).
 ///
 /// Returns the number of handoffs completed.
 pub async fn apply_done_handoffs(
@@ -569,8 +566,9 @@ impl SegmentStats {
 /// are excluded.
 ///
 /// Segments are sorted using `sort_for_rebuild` semantics: GC outputs (those
-/// with a `.pending` or `.applied` handoff) come first (lower priority);
-/// regular segments come last (higher priority).  This ordering is critical for
+/// with an in-flight `.staged` file or a bare `gc/<ulid>` file) come first
+/// (lower priority); regular segments come last (higher priority). This is
+/// critical for
 /// `compact_segments`: when entries for the same LBA appear in multiple input
 /// segments, the last-processed segment's entry wins in the output.  Using
 /// sort_for_rebuild order ensures newer regular segments (even if they have a
@@ -890,13 +888,15 @@ async fn fetch_live_bodies(
     Ok(())
 }
 
-/// Read live extent bodies from each candidate, write a compacted segment,
-/// stage it in gc/, and write the gc/*.pending handoff file.
+/// Read live extent bodies from each candidate, write a compacted self-
+/// describing segment to `gc/<new-ulid>.staged` (with the consumed input
+/// ULID list embedded in the segment header — the volume's apply path
+/// derives the extent-index updates from this field, no manifest sidecar).
 ///
 /// For each candidate, the full segment is downloaded from S3 to a temporary
-/// `gc/<ulid>.fetch` file.  This guarantees the body is complete regardless of
+/// `gc/<ulid>.fetch` file. This guarantees the body is complete regardless of
 /// demand-fetch state, and keeps the fetch consistent with other full-segment
-/// files in gc/.  The `.fetch` file is deleted after the body is read.
+/// files in gc/. The `.fetch` file is deleted after the body is read.
 async fn compact_segments(
     mut candidates: Vec<SegmentStats>,
     gc_dir: &Path,
