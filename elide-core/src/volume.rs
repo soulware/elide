@@ -1854,6 +1854,31 @@ impl Volume {
                 .map(|bp| segment::read_and_verify_segment_index(bp, &self.verifying_key))
                 .transpose()?;
 
+            // Step 3 parity check (self-describing GC handoff): the segment's
+            // `inputs` header field must list exactly the same set of old
+            // segment ULIDs that the plaintext manifest references. This is
+            // a necessary condition for step 4 (deriving the apply set from
+            // the segment instead of the manifest). A subset means the derive
+            // path would miss inputs; a superset means it would see extras.
+            //
+            // Skipped for tombstone/removal-only handoffs (segment_index is
+            // None) — those write no segment body and have no inputs field
+            // to compare; step 4 will design a separate signal for them.
+            #[cfg(test)]
+            if let Some((_, _, ref inputs_from_header)) = segment_index
+                && !inputs_from_header.is_empty()
+            {
+                let header_ulids: HashSet<Ulid> = inputs_from_header.iter().copied().collect();
+                let mut manifest_ulids: HashSet<Ulid> =
+                    old_ulid_by_hash.values().copied().collect();
+                manifest_ulids.extend(dead_ulids.iter().copied());
+                assert_eq!(
+                    header_ulids, manifest_ulids,
+                    "derive-at-apply parity for handoff {name}: segment header inputs \
+                     != manifest ulids\n  header: {header_ulids:?}\n  manifest: {manifest_ulids:?}",
+                );
+            }
+
             // First pass: build carried_hashes WITHOUT touching the extent
             // index.  We must know the full set before the Bug B check below,
             // because the check must run before any extent index mutations —

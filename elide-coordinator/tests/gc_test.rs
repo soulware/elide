@@ -270,7 +270,7 @@ async fn drain_pending_to_store(
 }
 
 fn drain_pending(fork_dir: &std::path::Path) {
-    const HEADER_LEN: usize = 96;
+    const HEADER_LEN: usize = elide_core::segment::HEADER_LEN as usize;
     let pending_dir = fork_dir.join("pending");
     let index_dir = fork_dir.join("index");
     let cache_dir = fork_dir.join("cache");

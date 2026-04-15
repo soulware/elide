@@ -71,8 +71,8 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_e
 
 // --- constants ---
 
-const MAGIC: &[u8; 8] = b"ELIDSEG\x05";
-const HEADER_LEN: u64 = 100;
+pub const MAGIC: &[u8; 8] = b"ELIDSEG\x05";
+pub const HEADER_LEN: u64 = 100;
 /// Number of header bytes covered by the signature, excluding the signature field itself.
 const HEADER_SIGNED_PREFIX: usize = 36;
 /// Size of a single input ULID in the inputs table.
