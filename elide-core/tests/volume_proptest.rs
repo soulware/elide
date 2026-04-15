@@ -150,6 +150,16 @@ enum SimOp {
     /// LBAs 32..40 are disjoint from Write (0..8), WriteZeroes (8..16),
     /// PopulateFetched (16..24), WriteLarge (24..32), and ReadUnwritten (64).
     SameContentWrite { lba: u8, seed: u8 },
+    /// Run alias-merge extent reclamation over a range. Exercises the
+    /// full three-phase primitive (phase 1 snapshot, phase 2 compute
+    /// outside the lock, phase 3 pointer-precondition commit) directly
+    /// on the volume. Single-threaded, so phase 3 never discards — the
+    /// discard path is covered by deterministic unit tests in
+    /// `volume.rs`. What this covers in properties is the hard
+    /// invariant that after a reclaim pass every LBA still reads back
+    /// its oracle value, both immediately and across subsequent
+    /// GC/crash combinations.
+    ReclaimRange { start_lba: u8, lba_count: u8 },
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -183,7 +193,82 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         (8u8..16).prop_map(|lba| SimOp::WriteZeroes { lba }),
         (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::WriteLarge { lba, seed }),
         (0u8..8, 0u8..128u8).prop_map(|(lba, seed)| SimOp::SameContentWrite { lba, seed }),
+        (0u8..8, 1u8..8u8).prop_map(|(start_lba, lba_count)| SimOp::ReclaimRange {
+            start_lba,
+            lba_count,
+        }),
     ]
+}
+
+/// Minimal op set for the reclaim-focused proptest. Deliberately does
+/// **not** include `PopulateFetched` or `CoordGcLocalBoth`: the former
+/// drives on-disk cache files that are only visible via rebuild (not
+/// through the in-memory map), and expanding into it from a reclaim
+/// test leaks orthogonal crash-recovery invariants; the latter needs a
+/// specific prefix setup that would dilute the reclaim coverage.
+///
+/// The goal of this enum is one hard invariant: **reclaim never corrupts
+/// observable content**. Every op here leaves the volume in a state where
+/// `vol.read(lba, 1)` is authoritative against the oracle.
+#[derive(Debug, Clone)]
+enum ReclaimOp {
+    /// Single-block write — seeds 0..=127, bit 7 clear.
+    Write {
+        lba: u8,
+        seed: u8,
+    },
+    /// 8-block write of incompressible body-section data at
+    /// `24 + lba` (disjoint from the 1-block Write range 0..8).
+    /// This is the shape that actually exposes bloat: large bodies
+    /// get split by subsequent overwrites.
+    WriteLargeMulti {
+        lba: u8,
+        seed: u8,
+    },
+    /// Write `[seed; 4096]` to `lba_a`, then same bytes to `lba_b`
+    /// (triggers DedupRef on the second).
+    DedupWrite {
+        lba_a: u8,
+        lba_b: u8,
+        seed: u8,
+    },
+    Flush,
+    DrainWithRedact,
+    SweepPending,
+    Repack,
+    /// Alias-merge reclaim over a sub-range of the Write/WriteLargeMulti area.
+    ReclaimRange {
+        start_lba: u8,
+        lba_count: u8,
+    },
+    Crash,
+}
+
+fn arb_reclaim_op() -> impl Strategy<Value = ReclaimOp> {
+    prop_oneof![
+        3 => (0u8..8, 0u8..128u8).prop_map(|(lba, seed)| ReclaimOp::Write { lba, seed }),
+        3 => (0u8..6, 0u8..128u8).prop_map(|(lba, seed)| ReclaimOp::WriteLargeMulti { lba, seed }),
+        2 => (0u8..4, 4u8..8, 0u8..128u8).prop_map(|(lba_a, lba_b, seed)| ReclaimOp::DedupWrite {
+            lba_a,
+            lba_b,
+            seed,
+        }),
+        1 => Just(ReclaimOp::Flush),
+        1 => Just(ReclaimOp::DrainWithRedact),
+        1 => Just(ReclaimOp::SweepPending),
+        1 => Just(ReclaimOp::Repack),
+        // Weight reclaim higher so sequences hit it multiple times against
+        // progressively more fragmented state.
+        4 => (24u8..32, 1u8..8u8)
+            .prop_map(|(start_lba, lba_count)| ReclaimOp::ReclaimRange { start_lba, lba_count }),
+        4 => (0u8..8, 1u8..8u8)
+            .prop_map(|(start_lba, lba_count)| ReclaimOp::ReclaimRange { start_lba, lba_count }),
+        1 => Just(ReclaimOp::Crash),
+    ]
+}
+
+fn arb_reclaim_ops() -> impl Strategy<Value = Vec<ReclaimOp>> {
+    prop::collection::vec(arb_reclaim_op(), 1..30)
 }
 
 fn arb_sim_ops() -> impl Strategy<Value = Vec<SimOp>> {
@@ -570,6 +655,18 @@ proptest! {
                          (skipped_writes mid={mid} after={after})"
                     );
                 }
+                SimOp::ReclaimRange { start_lba, lba_count } => {
+                    // Reclaim only writes to the WAL via write_internal; no
+                    // new segment ULIDs appear, so there is nothing extra
+                    // to check for ULID monotonicity. The content-preservation
+                    // invariant is covered by `reclaim_crash_recovery` and
+                    // `crash_recovery_oracle`.
+                    let plan = vol.reclaim_snapshot(*start_lba as u64, *lba_count as u32);
+                    let proposed = plan
+                        .compute_rewrites(|lba, len| vol.read(lba, len))
+                        .unwrap_or_default();
+                    let _ = vol.reclaim_commit(plan, proposed);
+                }
             }
         }
     }
@@ -726,6 +823,18 @@ proptest! {
                     );
                     oracle.insert(actual_lba, data);
                 }
+                SimOp::ReclaimRange { start_lba, lba_count } => {
+                    // Reclaim preserves observable content by construction.
+                    // Per-op oracle check is intentionally skipped here because
+                    // PopulateFetched writes on-disk files that are only visible
+                    // via the rebuilt lbamap after Crash. The next Crash handler
+                    // will verify reclaim's contribution alongside everything else.
+                    let plan = vol.reclaim_snapshot(*start_lba as u64, *lba_count as u32);
+                    let proposed = plan
+                        .compute_rewrites(|lba, len| vol.read(lba, len))
+                        .unwrap_or_default();
+                    let _ = vol.reclaim_commit(plan, proposed);
+                }
             }
         }
     }
@@ -864,6 +973,113 @@ proptest! {
                     );
                     oracle.insert(actual_lba, data);
                 }
+                SimOp::ReclaimRange { start_lba, lba_count } => {
+                    // Same reason as `crash_recovery_oracle` for not checking
+                    // the oracle per-op: PopulateFetched leaves in-memory
+                    // lbamap stale until Crash rebuilds it.
+                    let plan = vol.reclaim_snapshot(*start_lba as u64, *lba_count as u32);
+                    let proposed = plan
+                        .compute_rewrites(|lba, len| vol.read(lba, len))
+                        .unwrap_or_default();
+                    let _ = vol.reclaim_commit(plan, proposed);
+                }
+            }
+        }
+    }
+
+    /// Dedicated reclaim correctness property.
+    ///
+    /// Drives a simplified op set (see `ReclaimOp`) that is deliberately
+    /// narrower than `SimOp`: the existing `crash_recovery_oracle` already
+    /// covers the broad set of state transitions. This proptest is about
+    /// the single extra invariant reclamation brings:
+    ///
+    ///   **After alias-merge rewrites LBA map entries through internal-origin
+    ///   writes, every LBA still reads back the bytes last written to it —
+    ///   both immediately and across subsequent crash + rebuild.**
+    ///
+    /// Unlike `crash_recovery_oracle`, this asserts the oracle *after every
+    /// single op*, not just at `Crash`. That is only safe because `ReclaimOp`
+    /// excludes the direct-on-disk `PopulateFetched` path: every op here
+    /// mutates state through the in-memory lbamap, so `vol.read` is always
+    /// authoritative against the oracle.
+    #[test]
+    fn reclaim_crash_recovery(ops in arb_reclaim_ops()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fork_dir = dir.path();
+        common::write_test_keypair(fork_dir);
+        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+        let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
+            std::collections::HashMap::new();
+
+        for op in &ops {
+            match op {
+                ReclaimOp::Write { lba, seed } => {
+                    let data = [*seed; 4096];
+                    let _ = vol.write(*lba as u64, &data);
+                    oracle.insert(*lba as u64, data);
+                }
+                ReclaimOp::WriteLargeMulti { lba, seed } => {
+                    let mut payload = Vec::with_capacity(8 * 4096);
+                    for i in 0..8 {
+                        payload.extend_from_slice(&incompressible_block(
+                            seed.wrapping_add(i as u8),
+                        ));
+                    }
+                    let start = 24 + *lba as u64;
+                    if vol.write(start, &payload).is_ok() {
+                        for i in 0..8 {
+                            let mut block = [0u8; 4096];
+                            block.copy_from_slice(&payload[i * 4096..(i + 1) * 4096]);
+                            oracle.insert(start + i as u64, block);
+                        }
+                    }
+                }
+                ReclaimOp::DedupWrite { lba_a, lba_b, seed } => {
+                    let data = [*seed; 4096];
+                    let _ = vol.write(*lba_a as u64, &data);
+                    let _ = vol.write(*lba_b as u64, &data);
+                    oracle.insert(*lba_a as u64, data);
+                    oracle.insert(*lba_b as u64, data);
+                }
+                ReclaimOp::Flush => {
+                    let _ = vol.flush_wal();
+                }
+                ReclaimOp::DrainWithRedact => {
+                    common::drain_with_redact(&mut vol);
+                }
+                ReclaimOp::SweepPending => {
+                    let _ = vol.sweep_pending();
+                }
+                ReclaimOp::Repack => {
+                    let _ = vol.repack(0.9);
+                }
+                ReclaimOp::ReclaimRange { start_lba, lba_count } => {
+                    let plan = vol.reclaim_snapshot(*start_lba as u64, *lba_count as u32);
+                    let proposed = plan
+                        .compute_rewrites(|lba, len| vol.read(lba, len))
+                        .unwrap_or_default();
+                    let outcome = vol.reclaim_commit(plan, proposed).unwrap();
+                    // Single-threaded driver: phase 3 never discards.
+                    prop_assert!(!outcome.discarded);
+                }
+                ReclaimOp::Crash => {
+                    drop(vol);
+                    vol = Volume::open(fork_dir, fork_dir).unwrap();
+                }
+            }
+
+            // Hard invariant: every op (including reclaim) must preserve
+            // every oracle LBA exactly.
+            for (&lba, expected) in &oracle {
+                let actual = vol.read(lba, 1).unwrap();
+                prop_assert_eq!(
+                    actual.as_slice(),
+                    expected.as_slice(),
+                    "lba {} wrong after {:?}",
+                    lba,
+                    op
+                );
             }
         }
     }

@@ -290,6 +290,16 @@ impl LbaMap {
         self.delta_source_hashes.insert(source_hash);
     }
 
+    /// Iterate every entry in the map as
+    /// `(start_lba, lba_length, hash, payload_block_offset)`, sorted by
+    /// `start_lba`. Used by the extent-reclamation candidate scanner to
+    /// fold LBA map state into per-hash run lists in a single O(n) pass.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (u64, u32, blake3::Hash, u32)> + '_ {
+        self.inner
+            .iter()
+            .map(|(&lba, e)| (lba, e.lba_length, e.hash, e.payload_block_offset))
+    }
+
     /// Return all (start_lba, lba_length) ranges whose hash equals `target`.
     ///
     /// Used for diagnostics only (linear scan).
@@ -298,6 +308,27 @@ impl LbaMap {
             .iter()
             .filter(|(_, e)| &e.hash == target)
             .map(|(&lba, e)| (lba, e.lba_length))
+            .collect()
+    }
+
+    /// Return all `(start_lba, lba_length, payload_block_offset)` runs
+    /// whose hash equals `target`.
+    ///
+    /// Extent reclamation uses this for two checks:
+    /// - **Containment**: every run must fall inside a given target range
+    ///   before we can safely rewrite the hash (otherwise a rewrite in
+    ///   isolation would strand out-of-range references on the bloated
+    ///   body).
+    /// - **Bloat detection**: any run with `payload_block_offset != 0`
+    ///   is evidence that a prior write split the original payload, and
+    ///   dead bytes exist inside the stored body.
+    ///
+    /// Linear scan over the full map.
+    pub fn runs_for_hash(&self, target: &blake3::Hash) -> Vec<(u64, u32, u32)> {
+        self.inner
+            .iter()
+            .filter(|(_, e)| &e.hash == target)
+            .map(|(&lba, e)| (lba, e.lba_length, e.payload_block_offset))
             .collect()
     }
 

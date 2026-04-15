@@ -200,6 +200,57 @@ pub async fn promote_segment(fork_dir: &Path, ulid: ulid::Ulid) -> bool {
     }
 }
 
+/// Stats from a single `reclaim` IPC call to the volume's control socket.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReclaimIpcStats {
+    /// Number of candidates the scanner identified (upper bound on reclaim attempts).
+    pub candidates_scanned: usize,
+    /// Total contiguous runs rewritten across all attempted candidates.
+    pub runs_rewritten: u64,
+    /// Total bytes committed to fresh compact entries.
+    pub bytes_rewritten: u64,
+    /// Number of candidates whose phase-3 commit discarded (unrelated
+    /// concurrent mutation). Discarded candidates are not retried here —
+    /// the next tick / call will re-observe them if still bloated.
+    pub discarded: usize,
+}
+
+/// Run a full alias-merge extent reclamation pass on the volume.
+///
+/// The volume-side handler does the complete scan-and-execute sequence
+/// against the current ArcSwap snapshot: no arguments, default thresholds,
+/// most-wasteful candidates first. Heavy work (fetch / hash / compress)
+/// runs outside the actor thread, so NBD writes are not blocked for
+/// the full duration of the pass.
+///
+/// Returns `Some(stats)` on success. Returns `None` if the socket is
+/// absent (volume not running) or the call fails — callers decide
+/// whether to surface that as an error or a "nothing to reclaim".
+pub async fn reclaim(fork_dir: &Path) -> Option<ReclaimIpcStats> {
+    let response = call(fork_dir, "reclaim").await?;
+    let rest = match response.strip_prefix("ok ") {
+        Some(r) => r.trim(),
+        None => {
+            warn!(
+                "[control] unexpected reclaim response for {}: {response:?}",
+                fork_dir.display()
+            );
+            return None;
+        }
+    };
+    let mut parts = rest.splitn(4, ' ');
+    let candidates_scanned: usize = parts.next()?.parse().ok()?;
+    let runs_rewritten: u64 = parts.next()?.parse().ok()?;
+    let bytes_rewritten: u64 = parts.next()?.parse().ok()?;
+    let discarded: usize = parts.next()?.trim().parse().ok()?;
+    Some(ReclaimIpcStats {
+        candidates_scanned,
+        runs_rewritten,
+        bytes_rewritten,
+        discarded,
+    })
+}
+
 /// Finalize a completed GC handoff by asking the volume to rename
 /// `gc/<ulid>.applied` → `gc/<ulid>.done`.
 ///

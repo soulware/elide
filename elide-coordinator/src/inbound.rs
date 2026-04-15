@@ -224,6 +224,13 @@ async fn dispatch(
             snapshot_volume(args, data_dir, snapshot_locks, store).await
         }
 
+        "reclaim" => {
+            if args.is_empty() {
+                return "err usage: reclaim <volume>".to_string();
+            }
+            reclaim_volume(args, data_dir).await
+        }
+
         _ => {
             warn!("[inbound] unexpected op: {op:?}");
             format!("err unknown op: {op}")
@@ -356,6 +363,51 @@ async fn stream_import_by_name(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+    }
+}
+
+// ── Volume reclaim ───────────────────────────────────────────────────────────
+
+/// Run an alias-merge extent reclamation pass on a named volume.
+///
+/// The coordinator's only job is to resolve the volume name to a fork
+/// directory and relay a `reclaim` IPC to the volume's control.sock.
+/// No coordinator state is involved — reclaim never touches S3, GC state,
+/// or the snapshot lock. The volume-side handler does scan + execute
+/// against its current snapshot with default thresholds.
+///
+/// Returns
+/// "ok <candidates_scanned> <runs_rewritten> <bytes_rewritten> <discarded>"
+/// on success, or "err <message>" if the volume is not running or the
+/// underlying IPC fails.
+async fn reclaim_volume(vol_name: &str, data_dir: &Path) -> String {
+    let link = data_dir.join("by_name").join(vol_name);
+    let fork_dir = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(_) => return format!("err volume not found: {vol_name}"),
+    };
+    if !fork_dir.join("control.sock").exists() {
+        return format!("err volume '{vol_name}' is not running — start it first");
+    }
+    info!("[reclaim {vol_name}] starting pass");
+    match elide_coordinator::control::reclaim(&fork_dir).await {
+        Some(stats) => {
+            info!(
+                "[reclaim {vol_name}] done: scanned={} runs_rewritten={} bytes_rewritten={} discarded={}",
+                stats.candidates_scanned,
+                stats.runs_rewritten,
+                stats.bytes_rewritten,
+                stats.discarded,
+            );
+            format!(
+                "ok {} {} {} {}",
+                stats.candidates_scanned,
+                stats.runs_rewritten,
+                stats.bytes_rewritten,
+                stats.discarded
+            )
+        }
+        None => format!("err reclaim IPC failed for volume '{vol_name}'"),
     }
 }
 
