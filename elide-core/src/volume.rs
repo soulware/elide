@@ -126,7 +126,7 @@ enum SegmentLayout {
 
 /// Outcome of applying one `.staged` GC handoff via the derive-at-apply path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StagedApply {
+pub enum StagedApply {
     /// The staged segment was applied; extent index updated, body re-signed
     /// and renamed to bare, `.staged` file removed.
     Applied,
@@ -358,13 +358,13 @@ pub struct Volume {
 }
 
 // ---------------------------------------------------------------------------
-// Promote offload types
+// Worker offload types
 // ---------------------------------------------------------------------------
 
-/// Data needed by the flusher thread to write a pending segment.
+/// Data needed by the worker thread to write a pending segment.
 ///
 /// Produced by [`Volume::prepare_promote`] on the actor thread, consumed by
-/// the flusher thread which calls [`segment::write_and_commit`].  All fields
+/// the worker thread which calls [`segment::write_and_commit`].  All fields
 /// are `Send` so the struct can cross a thread boundary.
 pub struct PromoteJob {
     pub segment_ulid: Ulid,
@@ -378,7 +378,7 @@ pub struct PromoteJob {
     pub pending_dir: PathBuf,
 }
 
-/// Result returned by the flusher thread after writing the segment.
+/// Result returned by the worker thread after writing the segment.
 ///
 /// Consumed by [`Volume::apply_promote`] on the actor thread.
 pub struct PromoteResult {
@@ -393,7 +393,7 @@ pub struct PromoteResult {
 /// Result of the GC checkpoint prep phase.
 ///
 /// Carries the pre-minted ULIDs and an optional promote job.  The actor
-/// dispatches the job to the flusher and stashes the reply.  When `job`
+/// dispatches the job to the worker and stashes the reply.  When `job`
 /// is `None` the WAL was empty and the checkpoint completes immediately.
 pub struct GcCheckpointPrep {
     pub u_repack: Ulid,
@@ -402,6 +402,57 @@ pub struct GcCheckpointPrep {
     /// GC promote's `PromoteComplete` among other in-flight promotes.
     pub u_flush: Ulid,
     pub job: Option<PromoteJob>,
+}
+
+/// Data needed by the worker thread to re-sign a GC handoff segment.
+///
+/// Produced by the actor's scan phase (directory listing of `gc/*.staged`).
+/// The worker reads the staged segment, reads each input's `.idx` file,
+/// re-signs the segment with the volume key, and returns a
+/// [`GcHandoffResult`] for the actor to apply.
+pub struct GcHandoffJob {
+    pub staged_path: PathBuf,
+    pub new_ulid: Ulid,
+    pub gc_dir: PathBuf,
+    pub index_dir: PathBuf,
+    pub signer: Arc<dyn segment::SegmentSigner>,
+    pub verifying_key: ed25519_dalek::VerifyingKey,
+}
+
+/// Result returned by the worker thread after re-signing a GC handoff.
+///
+/// The actor derives the action set (to_remove, stale_cancel, carried
+/// updates) against the **current** extent index and lbamap — not the
+/// state at dispatch time — to handle concurrent writes correctly.
+pub struct GcHandoffResult {
+    pub new_ulid: Ulid,
+    pub staged_path: PathBuf,
+    pub gc_dir: PathBuf,
+    pub new_bss: u64,
+    pub entries: Vec<segment::SegmentEntry>,
+    pub inputs: Vec<Ulid>,
+    /// Body-owning entries from each input's `.idx` file.
+    /// `(hash, kind, input_ulid)` — used by the apply phase to build the
+    /// to_remove and stale_cancel sets against the current extent index.
+    pub input_old_entries: Vec<(blake3::Hash, segment::EntryKind, Ulid)>,
+    /// Inline bytes from the staged segment, needed for building
+    /// `inline_data` in extent locations during the apply phase.
+    pub handoff_inline: Vec<u8>,
+}
+
+/// Job dispatched from the actor to the worker thread.
+pub enum WorkerJob {
+    Promote(PromoteJob),
+    GcHandoff(GcHandoffJob),
+}
+
+/// Result returned by the worker thread to the actor.
+///
+/// Each variant wraps its own `io::Result` so the actor can distinguish
+/// which job type failed.
+pub enum WorkerResult {
+    Promote(io::Result<PromoteResult>),
+    GcHandoff(io::Result<GcHandoffResult>),
 }
 
 /// Snapshot captured at reclaim phase 1. Carries the target range, a
@@ -851,7 +902,7 @@ impl Volume {
 
         // Promote every non-latest WAL to a fresh segment so the volume
         // returns to its "one active WAL" invariant before we open the
-        // actor. This path fires when a crash or the off-actor flusher
+        // actor. This path fires when a crash or the off-actor worker
         // (Landing 3) leaves multiple WAL files behind; in normal single-
         // WAL operation the loop body never executes.
         //
@@ -859,7 +910,7 @@ impl Volume {
         // segment_floor (mint monotonicity), so it never collides with an
         // existing file. Entries use the same CAS apply path as the online
         // `flush_wal_to_pending_as` flow — safe even when an orphan pending
-        // segment from the pre-crash flusher has already repopulated the
+        // segment from the pre-crash worker has already repopulated the
         // same hashes.
         let wal_files_to_promote: Vec<PathBuf> = if wal_files.len() > 1 {
             let split = wal_files.len() - 1;
@@ -1873,6 +1924,203 @@ impl Volume {
         self.apply_all_staged_handoffs(&gc_dir)
     }
 
+    /// Build a [`GcHandoffJob`] for dispatch to the worker thread.
+    pub fn build_gc_handoff_job(&self, staged_path: PathBuf, new_ulid: Ulid) -> GcHandoffJob {
+        GcHandoffJob {
+            staged_path,
+            new_ulid,
+            gc_dir: self.base_dir.join("gc"),
+            index_dir: self.base_dir.join("index"),
+            signer: Arc::clone(&self.signer),
+            verifying_key: self.verifying_key,
+        }
+    }
+
+    /// Scan `gc/` for staged handoff files that need processing.
+    ///
+    /// Sweeps stale `.tmp` files, applies bare-wins shortcuts, and returns
+    /// a list of `(staged_path, new_ulid)` pairs to dispatch to the worker.
+    /// Also returns a count of handoffs that were already applied (bare wins).
+    ///
+    /// This is the prep phase of the GC handoff offload — cheap directory
+    /// listing that runs on the actor thread.
+    pub fn scan_staged_handoffs(&self) -> io::Result<(Vec<(PathBuf, Ulid)>, usize)> {
+        let gc_dir = self.base_dir.join("gc");
+        if !gc_dir.try_exists()? {
+            return Ok((Vec::new(), 0));
+        }
+
+        // Pass 1: sweep stale `.tmp` files (incomplete writes).
+        for entry in fs::read_dir(&gc_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.ends_with(".tmp") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+
+        // Pass 2: collect `.staged` files.
+        let mut staged: Vec<(String, Ulid)> = fs::read_dir(&gc_dir)?
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().into_string().ok()?;
+                let stem = name.strip_suffix(".staged")?;
+                let ulid = Ulid::from_string(stem).ok()?;
+                Some((name, ulid))
+            })
+            .collect();
+        staged.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        let mut to_process = Vec::new();
+        let mut already_applied = 0usize;
+        for (staged_name, new_ulid) in staged {
+            let staged_path = gc_dir.join(&staged_name);
+            let bare_path = gc_dir.join(new_ulid.to_string());
+
+            // Crash recovery: `.staged` + bare → bare wins, drop `.staged`.
+            if bare_path.try_exists()? {
+                let _ = fs::remove_file(&staged_path);
+                already_applied += 1;
+                continue;
+            }
+
+            to_process.push((staged_path, new_ulid));
+        }
+
+        Ok((to_process, already_applied))
+    }
+
+    /// Apply a GC handoff result that was processed by the worker thread.
+    ///
+    /// Re-derives the action set (to_remove, stale_cancel, carried updates)
+    /// against the **current** extent index and lbamap to handle concurrent
+    /// writes that may have arrived while the worker was running.
+    ///
+    /// Returns `Applied` if the handoff was committed, `Cancelled` if the
+    /// stale-liveness check failed.
+    pub fn apply_gc_handoff_result(&mut self, result: &GcHandoffResult) -> io::Result<StagedApply> {
+        use std::collections::HashSet;
+
+        // Build carried_hashes: body-owning entries in the GC output.
+        let carried_hashes: HashSet<blake3::Hash> = result
+            .entries
+            .iter()
+            .filter(|e| e.kind != segment::EntryKind::DedupRef)
+            .map(|e| e.hash)
+            .collect();
+
+        // Walk input old entries, check extent index for each.
+        let live = self.lbamap.lba_referenced_hashes();
+        let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
+        let mut stale_cancel: Vec<blake3::Hash> = Vec::new();
+
+        for &(hash, kind, input_ulid) in &result.input_old_entries {
+            if !matches!(kind, segment::EntryKind::Data | segment::EntryKind::Inline) {
+                continue;
+            }
+            let still_at_input = self
+                .extent_index
+                .lookup(&hash)
+                .is_some_and(|loc| loc.segment_id == input_ulid);
+            if !still_at_input {
+                continue;
+            }
+            if carried_hashes.contains(&hash) {
+                continue; // will be updated below
+            }
+            // Not carried: will be removed. If LBA-live, cancel.
+            if live.contains(&hash) {
+                stale_cancel.push(hash);
+            }
+            to_remove.push((hash, input_ulid));
+        }
+
+        if !stale_cancel.is_empty() {
+            log::warn!(
+                "gc staged {}: stale-liveness cancellation — {} hash(es) live in \
+                 volume but absent from coordinator output; removing staged file \
+                 and tmp",
+                result.staged_path.display(),
+                stale_cancel.len(),
+            );
+            let _ = fs::remove_file(&result.staged_path);
+            let tmp_path = result.gc_dir.join(format!("{}.tmp", result.new_ulid));
+            let _ = fs::remove_file(&tmp_path);
+            return Ok(StagedApply::Cancelled);
+        }
+
+        // Update extent index for carried entries.
+        for (i, e) in result.entries.iter().enumerate() {
+            if e.kind == segment::EntryKind::DedupRef {
+                continue;
+            }
+            let still_at_input = self
+                .extent_index
+                .lookup(&e.hash)
+                .is_some_and(|loc| result.inputs.contains(&loc.segment_id));
+            if !still_at_input {
+                continue;
+            }
+            let idata = if e.kind == segment::EntryKind::Inline {
+                let start = e.stored_offset as usize;
+                let end = start + e.stored_length as usize;
+                if end <= result.handoff_inline.len() {
+                    Some(result.handoff_inline[start..end].into())
+                } else {
+                    continue;
+                }
+            } else {
+                None
+            };
+            Arc::make_mut(&mut self.extent_index).insert(
+                e.hash,
+                extentindex::ExtentLocation {
+                    segment_id: result.new_ulid,
+                    body_offset: e.stored_offset,
+                    body_length: e.stored_length,
+                    compressed: e.compressed,
+                    body_source: BodySource::Cached(i as u32),
+                    body_section_start: result.new_bss,
+                    inline_data: idata,
+                },
+            );
+        }
+
+        // Remove extent index entries for hashes no longer carried.
+        for (hash, old_ulid) in &to_remove {
+            if self
+                .extent_index
+                .lookup(hash)
+                .is_some_and(|loc| loc.segment_id == *old_ulid)
+            {
+                Arc::make_mut(&mut self.extent_index).remove(hash);
+            }
+        }
+
+        // Clean up pending/ files for consumed inputs.
+        let pending_dir = self.base_dir.join("pending");
+        for input in &result.inputs {
+            let _ = fs::remove_file(pending_dir.join(input.to_string()));
+        }
+
+        // Commit: rename tmp → bare.
+        let tmp_path = result.gc_dir.join(format!("{}.tmp", result.new_ulid));
+        let bare_path = result.gc_dir.join(result.new_ulid.to_string());
+        fs::rename(&tmp_path, &bare_path)?;
+        let _ = fs::remove_file(&result.staged_path);
+
+        // Evict cache for consumed inputs.
+        let cache_dir = self.base_dir.join("cache");
+        for input in &result.inputs {
+            let s = input.to_string();
+            let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
+            let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
+        }
+
+        Ok(StagedApply::Applied)
+    }
+
     /// Walk `gc/` for `.staged` entries and apply each via the
     /// self-describing derive-at-apply path.
     ///
@@ -2632,7 +2880,7 @@ impl Volume {
         // is the authoritative body source for both reads and crash recovery.
         //
         // Delete the old WAL file. `segment::write_and_commit` leaves the WAL
-        // alone so the off-actor flusher (Landing 3) can defer this delete
+        // alone so the off-actor worker (Landing 3) can defer this delete
         // until after the actor's publish_snapshot; on the current actor-
         // inline path we just delete immediately. With a fresh segment ULID
         // (not reusing `old_wal_ulid`), a stale cold-cache reader that still
@@ -3077,7 +3325,7 @@ impl Volume {
     /// WAL.  Returns `None` if the WAL is empty (nothing to promote).
     ///
     /// After this call the volume is ready to accept new writes on the
-    /// fresh WAL.  The returned [`PromoteJob`] is sent to the flusher
+    /// fresh WAL.  The returned [`PromoteJob`] is sent to the worker
     /// thread for the heavy segment-write work.
     pub fn prepare_promote(&mut self) -> io::Result<Option<PromoteJob>> {
         if self.pending_entries.is_empty() {
@@ -3123,7 +3371,7 @@ impl Volume {
     }
 
     /// Apply phase of the off-actor promote.  Runs on the actor thread
-    /// after the flusher has written the segment.
+    /// after the worker has written the segment.
     ///
     /// Updates the extent index (CAS), deletes the old WAL, and evicts
     /// the cached file descriptor.  The caller must call `publish_snapshot`
@@ -5415,7 +5663,7 @@ mod tests {
     fn recovery_replays_all_wals_promoting_non_latest() {
         // Multiple WAL files on disk — e.g. left by a crash between
         // `segment::write_and_commit` and the old-WAL unlink, or
-        // produced by the upcoming off-actor flusher — must be
+        // produced by the upcoming off-actor worker — must be
         // collapsed back to a single active WAL before `Volume::open`
         // returns. Every non-latest WAL is promoted to a fresh pending
         // segment; the highest-ULID WAL stays active.
