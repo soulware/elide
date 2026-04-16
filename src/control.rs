@@ -140,6 +140,15 @@ fn handle_connection(
                 let _ = writeln!(writer, "err {e}");
             }
         }
+    } else if line == "promote_wal" {
+        match handle.promote_wal() {
+            Ok(()) => {
+                let _ = writeln!(writer, "ok");
+            }
+            Err(e) => {
+                let _ = writeln!(writer, "err {e}");
+            }
+        }
     } else if line == "sweep_pending" {
         match handle.sweep_pending() {
             Ok(s) => {
@@ -333,7 +342,7 @@ fn handle_connection(
         let connected = nbd_connected.load(Ordering::Relaxed);
         let _ = writeln!(writer, "ok {connected}");
     } else if line == "shutdown" {
-        match handle.flush() {
+        match handle.promote_wal() {
             Ok(()) => {
                 let _ = writeln!(writer, "ok");
             }

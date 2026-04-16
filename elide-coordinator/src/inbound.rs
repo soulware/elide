@@ -501,9 +501,9 @@ async fn snapshot_volume(
     let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir).await;
     let _guard = lock.lock_owned().await;
 
-    // 1. Flush WAL into pending/.
-    if !elide_coordinator::control::flush(&fork_dir).await {
-        return "err flush failed or volume unreachable".to_string();
+    // 1. Promote WAL into pending/.
+    if !elide_coordinator::control::promote_wal(&fork_dir).await {
+        return "err promote_wal failed or volume unreachable".to_string();
     }
 
     // 2. Inline drain: upload every pending segment, promote each, then

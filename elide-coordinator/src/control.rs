@@ -27,7 +27,8 @@ use tokio::net::UnixStream;
 use tracing::warn;
 use ulid::Ulid;
 
-/// Flush the volume WAL.  Returns `true` on success.
+/// Fsync the volume WAL.  Durability barrier only — does not promote.
+/// Returns `true` on success.
 /// Returns `false` and logs a warning if the socket is absent or the call fails.
 pub async fn flush(fork_dir: &Path) -> bool {
     match call(fork_dir, "flush").await {
@@ -35,6 +36,23 @@ pub async fn flush(fork_dir: &Path) -> bool {
         Some(resp) => {
             warn!(
                 "[control] flush for {} returned unexpected response: {resp:?}",
+                fork_dir.display()
+            );
+            false
+        }
+        None => false,
+    }
+}
+
+/// Promote the volume WAL to a `pending/` segment.  Blocks until the
+/// segment is on disk.  Returns `true` on success.
+/// Returns `false` and logs a warning if the socket is absent or the call fails.
+pub async fn promote_wal(fork_dir: &Path) -> bool {
+    match call(fork_dir, "promote_wal").await {
+        Some(resp) if resp.trim() == "ok" => true,
+        Some(resp) => {
+            warn!(
+                "[control] promote_wal for {} returned unexpected response: {resp:?}",
                 fork_dir.display()
             );
             false

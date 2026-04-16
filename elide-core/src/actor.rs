@@ -32,8 +32,8 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::{self, BoxFetcher};
 use crate::volume::{
-    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, NoopSkipStats, PromoteJob,
-    PromoteResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan, ReclaimProposed,
+    AncestorLayer, CompactionStats, DeltaRepackStats, FileCache, GcCheckpointPrep, NoopSkipStats,
+    PromoteJob, PromoteResult, ReclaimCandidate, ReclaimOutcome, ReclaimPlan, ReclaimProposed,
     ReclaimThresholds, Volume, find_segment_in_dirs, open_delta_body_in_dirs, read_extents,
     scan_reclaim_candidates,
 };
@@ -113,6 +113,12 @@ pub(crate) enum VolumeRequest {
     DeltaRepackPostSnapshot {
         reply: Sender<io::Result<DeltaRepackStats>>,
     },
+    /// Promote the current WAL to a `pending/` segment via the flusher
+    /// thread.  Reply is sent once `pending/<ulid>` is on disk.
+    /// No-op (immediate reply) if the WAL is empty.
+    PromoteWal {
+        reply: Sender<io::Result<()>>,
+    },
     GcCheckpoint {
         reply: Sender<io::Result<(Ulid, Ulid)>>,
     },
@@ -185,8 +191,29 @@ pub struct VolumeActor {
     /// Join handle for the flusher thread, joined on shutdown.
     flusher_handle: Option<JoinHandle<()>>,
     /// Number of promote jobs dispatched but not yet applied.
-    /// Used by the future GC drain gate (step 8).
     promotes_in_flight: usize,
+    /// Parked GC checkpoint: the reply sender and GC ULIDs, waiting for
+    /// the GC promote (`u_flush`) to complete on the flusher.  `None`
+    /// when no GC checkpoint is in progress.
+    parked_gc: Option<ParkedGcCheckpoint>,
+    /// Parked `PromoteWal` replies waiting for their specific promote to
+    /// complete.  Multiple can be parked if several `PromoteWal` requests
+    /// arrive while the flusher is busy.
+    parked_promote_wal: Vec<ParkedPromoteWal>,
+}
+
+/// State stashed while a `PromoteWal` promote is in flight.
+struct ParkedPromoteWal {
+    segment_ulid: Ulid,
+    reply: Sender<io::Result<()>>,
+}
+
+/// State stashed while a GC checkpoint's promote is in flight.
+struct ParkedGcCheckpoint {
+    u_repack: Ulid,
+    u_sweep: Ulid,
+    u_flush: Ulid,
+    reply: Sender<io::Result<(Ulid, Ulid)>>,
 }
 
 /// Idle period after which the actor promotes a non-empty WAL to a pending
@@ -234,6 +261,56 @@ impl VolumeActor {
                 return;
             }
             self.promotes_in_flight += 1;
+        }
+    }
+
+    /// Run the GC checkpoint prep and dispatch the promote to the flusher.
+    ///
+    /// Mints ULIDs, opens the fresh WAL immediately (writes resume),
+    /// and dispatches the GC promote.  If the WAL is empty, completes
+    /// immediately.  The reply is parked until `PromoteComplete` for
+    /// `u_flush` arrives so that `pending/<u_flush>` is on disk before
+    /// the coordinator runs `gc_fork`.
+    fn start_gc_checkpoint(&mut self, reply: Sender<io::Result<(Ulid, Ulid)>>) {
+        let prep = match self.volume.prepare_gc_checkpoint() {
+            Ok(prep) => prep,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+
+        let GcCheckpointPrep {
+            u_repack,
+            u_sweep,
+            u_flush,
+            job,
+        } = prep;
+
+        if let Some(job) = job {
+            // Dispatch to flusher, park the reply.
+            self.parked_gc = Some(ParkedGcCheckpoint {
+                u_repack,
+                u_sweep,
+                u_flush,
+                reply,
+            });
+            if let Some(tx) = &self.flusher_tx {
+                if let Err(e) = tx.send(job) {
+                    warn!("flusher channel closed during gc_checkpoint: {e}");
+                    if let Some(parked) = self.parked_gc.take() {
+                        let _ = parked.reply.send(Err(io::Error::other(
+                            "flusher channel closed during gc_checkpoint",
+                        )));
+                    }
+                    return;
+                }
+                self.promotes_in_flight += 1;
+            }
+        } else {
+            // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
+            self.publish_snapshot();
+            let _ = reply.send(Ok((u_repack, u_sweep)));
         }
     }
 
@@ -308,6 +385,34 @@ impl VolumeActor {
                             let result = self.volume.wal_fsync();
                             let _ = reply.send(result);
                         }
+                        VolumeRequest::PromoteWal { reply } => {
+                            // Promote the WAL to a pending/ segment via the
+                            // flusher.  Reply once the segment is on disk.
+                            match self.volume.prepare_promote() {
+                                Ok(Some(job)) => {
+                                    let ulid = job.segment_ulid;
+                                    if let Some(tx) = &self.flusher_tx {
+                                        if let Err(e) = tx.send(job) {
+                                            let _ = reply.send(Err(io::Error::other(
+                                                format!("flusher channel closed: {e}"),
+                                            )));
+                                        } else {
+                                            self.promotes_in_flight += 1;
+                                            self.parked_promote_wal.push(
+                                                ParkedPromoteWal { segment_ulid: ulid, reply },
+                                            );
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    // WAL empty — nothing to promote.
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(e));
+                                }
+                            }
+                        }
                         VolumeRequest::Trim {
                             start_lba,
                             lba_count,
@@ -362,11 +467,14 @@ impl VolumeActor {
                             let _ = reply.send(result);
                         }
                         VolumeRequest::GcCheckpoint { reply } => {
-                            let result = self.volume.gc_checkpoint();
-                            if result.is_ok() {
-                                self.publish_snapshot();
+                            if self.parked_gc.is_some() {
+                                // Concurrent GC checkpoint is an error.
+                                let _ = reply.send(Err(io::Error::other(
+                                    "concurrent gc_checkpoint not allowed",
+                                )));
+                            } else {
+                                self.start_gc_checkpoint(reply);
                             }
-                            let _ = reply.send(result);
                         }
                         VolumeRequest::RedactSegment { ulid, reply } => {
                             let _ = reply.send(self.volume.redact_segment(ulid));
@@ -420,18 +528,45 @@ impl VolumeActor {
                     }
                 }
                 recv(self.flusher_rx) -> msg => {
-                    match msg {
+                    let completed_ulid = match msg {
                         Ok(Ok(result)) => {
                             self.promotes_in_flight -= 1;
+                            let ulid = result.segment_ulid;
                             self.volume.apply_promote(&result);
                             self.publish_snapshot();
+                            Some(ulid)
                         }
                         Ok(Err(e)) => {
                             self.promotes_in_flight -= 1;
                             warn!("flusher promote failed: {e}");
+                            None
                         }
                         Err(_) => {
                             warn!("flusher result channel closed unexpectedly");
+                            None
+                        }
+                    };
+                    // Complete any parked operations waiting for this ULID.
+                    if let Some(ulid) = completed_ulid {
+                        // GC checkpoint.
+                        let is_gc = self
+                            .parked_gc
+                            .as_ref()
+                            .is_some_and(|p| ulid == p.u_flush);
+                        if is_gc {
+                            let parked = self.parked_gc.take().unwrap();
+                            let _ =
+                                parked.reply.send(Ok((parked.u_repack, parked.u_sweep)));
+                        }
+                        // PromoteWal callers.
+                        let mut i = 0;
+                        while i < self.parked_promote_wal.len() {
+                            if self.parked_promote_wal[i].segment_ulid == ulid {
+                                let parked = self.parked_promote_wal.swap_remove(i);
+                                let _ = parked.reply.send(Ok(()));
+                            } else {
+                                i += 1;
+                            }
                         }
                     }
                 }
@@ -554,11 +689,24 @@ impl VolumeHandle {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))
     }
 
-    /// Flush the WAL to a pending segment.  Blocks until the actor replies.
+    /// Fsync the WAL.  Durability barrier — data survives a crash after
+    /// this returns.  Does not promote the WAL to a segment.
     pub fn flush(&self) -> io::Result<()> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::Flush { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Promote the WAL to a `pending/` segment.  Blocks until the segment
+    /// is on disk.  No-op if the WAL is empty.
+    pub fn promote_wal(&self) -> io::Result<()> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::PromoteWal { reply: reply_tx })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()
@@ -924,6 +1072,8 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeHandle) {
         flusher_rx: flusher_result_rx,
         flusher_handle: Some(flusher_handle),
         promotes_in_flight: 0,
+        parked_gc: None,
+        parked_promote_wal: Vec::new(),
     };
 
     let handle = VolumeHandle {
