@@ -440,19 +440,82 @@ pub struct GcHandoffResult {
     pub handoff_inline: Vec<u8>,
 }
 
+/// Data needed by the worker thread to promote a confirmed-in-S3 segment
+/// from `pending/<ulid>` (drain path) or `gc/<ulid>` (GC path) into
+/// `cache/<ulid>.{body,present}` + `index/<ulid>.idx`.
+///
+/// Produced by [`Volume::prepare_promote_segment`] on the actor thread.
+/// The worker reads and verifies the segment index once, then writes idx
+/// and cache body (both operations idempotent on retry), and returns the
+/// parsed state the actor's apply phase needs for extent-index updates.
+pub struct PromoteSegmentJob {
+    pub ulid: Ulid,
+    /// Full path of the source segment — `pending/<ulid>` if `is_drain`,
+    /// otherwise `gc/<ulid>`.
+    pub src_path: PathBuf,
+    /// True when the source is in `pending/`, false when in `gc/`.
+    /// Selects the apply-phase branch (Local→Cached CAS + pending delete
+    /// vs input-idx cleanup).
+    pub is_drain: bool,
+    pub body_path: PathBuf,
+    pub present_path: PathBuf,
+    pub idx_path: PathBuf,
+    pub verifying_key: ed25519_dalek::VerifyingKey,
+}
+
+/// Result returned by the worker after a `PromoteSegmentJob`.
+///
+/// Consumed by [`Volume::apply_promote_segment_result`] on the actor
+/// thread. Reuses the parsed segment index so the apply phase never
+/// re-reads the segment file.
+pub struct PromoteSegmentResult {
+    pub ulid: Ulid,
+    pub is_drain: bool,
+    pub body_section_start: u64,
+    pub entries: Vec<segment::SegmentEntry>,
+    /// Consumed input ULIDs for the GC path. Empty on drain.
+    pub inputs: Vec<Ulid>,
+    /// Inline section bytes. Populated only when the drain path has
+    /// Inline entries; empty otherwise.
+    pub inline: Vec<u8>,
+    /// True when the worker took the GC tombstone shortcut (zero-entry
+    /// output with a non-empty inputs list). Apply phase deletes the
+    /// input idx files and stops — no idx/body was written.
+    pub tombstone: bool,
+}
+
+/// Prep-phase outcome for `promote_segment`.
+///
+/// `AlreadyPromoted` short-circuits the apply phase: both `pending/<ulid>`
+/// and `gc/<ulid>` are absent but `cache/<ulid>.body` exists, meaning an
+/// earlier call already completed. `Job` carries the work for the worker
+/// thread to execute — boxed because `PromoteSegmentJob` is large compared
+/// to the unit `AlreadyPromoted` variant.
+pub enum PromoteSegmentPrep {
+    Job(Box<PromoteSegmentJob>),
+    AlreadyPromoted,
+}
+
 /// Job dispatched from the actor to the worker thread.
 pub enum WorkerJob {
     Promote(PromoteJob),
     GcHandoff(GcHandoffJob),
+    PromoteSegment(PromoteSegmentJob),
 }
 
 /// Result returned by the worker thread to the actor.
 ///
 /// Each variant wraps its own `io::Result` so the actor can distinguish
-/// which job type failed.
+/// which job type failed.  `PromoteSegment` carries the target ULID
+/// out-of-band so the actor can match a failed job to its parked reply
+/// (the `Err` path otherwise has no ULID to match on).
 pub enum WorkerResult {
     Promote(io::Result<PromoteResult>),
     GcHandoff(io::Result<GcHandoffResult>),
+    PromoteSegment {
+        ulid: Ulid,
+        result: io::Result<PromoteSegmentResult>,
+    },
 }
 
 /// Snapshot captured at reclaim phase 1. Carries the target range, a
@@ -2433,98 +2496,113 @@ impl Volume {
     /// inside the actor (rather than from the coordinator) keeps every mutation
     /// of `gc/` serialised with the idle-tick `apply_gc_handoffs` path.
     ///
-    /// Idempotent: if `cache/<ulid>.body` already exists the function returns
-    /// `Ok(())` without re-writing.
+    /// Idempotent: if `cache/<ulid>.body` already exists and no source
+    /// remains in `pending/` or `gc/` the function returns `Ok(())` without
+    /// re-writing.
     pub fn promote_segment(&mut self, ulid: Ulid) -> io::Result<()> {
+        let job = match self.prepare_promote_segment(ulid)? {
+            PromoteSegmentPrep::AlreadyPromoted => return Ok(()),
+            PromoteSegmentPrep::Job(job) => *job,
+        };
+        let result = crate::actor::execute_promote_segment(job)?;
+        self.apply_promote_segment_result(result)
+    }
+
+    /// Prep phase of `promote_segment`. Pure function of the on-disk
+    /// layout — runs on the actor thread in microseconds.
+    ///
+    /// Selects the source segment (`pending/<ulid>` > `gc/<ulid>` >
+    /// body-exists early-return) and builds a [`PromoteSegmentJob`] for
+    /// the worker. The source-preference ordering is load-bearing: if a
+    /// previous promote committed its idx/body but crashed before the
+    /// apply phase, `pending/<ulid>` (or `gc/<ulid>`) will still exist
+    /// and the retry must take the full path, not the idempotent
+    /// early-return. See `promote_segment_recovers_mid_apply_crash`
+    /// regression test.
+    ///
+    /// Ensures `index/` and `cache/` exist so the worker never touches
+    /// the directory structure.
+    pub fn prepare_promote_segment(&self, ulid: Ulid) -> io::Result<PromoteSegmentPrep> {
         let ulid_str = ulid.to_string();
         let cache_dir = self.base_dir.join("cache");
         let body_path = cache_dir.join(format!("{ulid_str}.body"));
         let present_path = cache_dir.join(format!("{ulid_str}.present"));
-
-        // Determine the source: pending/ (drain) or gc/ (GC).
         let pending_path = self.base_dir.join("pending").join(&ulid_str);
         let gc_path = self.base_dir.join("gc").join(&ulid_str);
+        let index_dir = self.base_dir.join("index");
+        let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+
         let (src_path, is_drain) = if pending_path.try_exists()? {
-            (pending_path.clone(), true)
+            (pending_path, true)
         } else if gc_path.try_exists()? {
             (gc_path, false)
         } else if body_path.try_exists()? {
-            // Already promoted on a prior attempt; idempotent success.
-            return Ok(());
+            return Ok(PromoteSegmentPrep::AlreadyPromoted);
         } else {
             return Err(io::Error::other(format!(
                 "promote {ulid_str}: segment not found in pending/ or gc/"
             )));
         };
 
-        // Tombstone GC outputs (zero entries, non-empty inputs list) carry no
-        // body and leave no idx — they exist only to acknowledge that the
-        // input segments are safe to delete. Detect them up front so we skip
-        // the idx + cache writes entirely and just clean up the input idxs.
-        if !is_drain {
-            let (_, gc_entries, gc_inputs) =
-                segment::read_and_verify_segment_index(&src_path, &self.verifying_key)?;
-            if gc_entries.is_empty() && !gc_inputs.is_empty() {
-                let index_dir = self.base_dir.join("index");
-                for old_ulid in &gc_inputs {
-                    let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
-                }
-                return Ok(());
-            }
-        }
-
-        // Write index/<ulid>.idx now — after confirmed S3 upload — so that
-        // idx presence ↔ segment confirmed in S3 (restored invariant).
-        // This must happen before deleting old idx files (GC path below) so
-        // there is no window where no idx covers the affected LBAs.
-        //
-        // The .idx is extracted from the original segment.  redact_segment
-        // hole-punches dead DATA regions in place but leaves the index
-        // section untouched, so the extract is correct either way.
-        let index_dir = self.base_dir.join("index");
         fs::create_dir_all(&index_dir)?;
-        let idx_path = index_dir.join(format!("{ulid_str}.idx"));
-        segment::extract_idx(&src_path, &idx_path)?;
-
-        // Promote the original body to cache/.  DedupRef entries contribute
-        // no bytes and the .present bitset marks only Data entries as
-        // present.  Reads of DedupRef data go through the extent index to
-        // the canonical segment.
         fs::create_dir_all(&cache_dir)?;
-        segment::promote_to_cache(&src_path, &body_path, &present_path)?;
 
-        // Evict any cached fd for this segment so the next read opens the new
-        // cache/<ulid>.body instead of reusing a stale handle to the deleted
-        // pending file.
-        if is_drain {
-            self.evict_cached_segment(ulid);
+        Ok(PromoteSegmentPrep::Job(Box::new(PromoteSegmentJob {
+            ulid,
+            src_path,
+            is_drain,
+            body_path,
+            present_path,
+            idx_path,
+            verifying_key: self.verifying_key,
+        })))
+    }
+
+    /// Apply phase of `promote_segment`. Consumes the worker's result.
+    ///
+    /// Drain path: transitions extent-index entries from
+    /// `BodySource::Local` (pointing at `pending/<ulid>`) to
+    /// `BodySource::Cached(n)` (pointing at the new `cache/<ulid>.body`).
+    /// The CAS check (`segment_id == ulid`) makes the rewrite a no-op for
+    /// any entry a concurrent write has already superseded. Then evicts
+    /// the segment's cached fd, deletes the delta sidecar if present,
+    /// and deletes `pending/<ulid>`.
+    ///
+    /// GC tombstone path: deletes `index/<old>.idx` for every consumed
+    /// input. No extent-index updates (tombstones carry no entries).
+    ///
+    /// GC carried path: same as tombstone plus the extent-index state
+    /// stays untouched — the `apply_gc_handoffs` step already rewrote
+    /// the extent index to `BodySource::Cached` against the fresh ULID.
+    pub fn apply_promote_segment_result(&mut self, result: PromoteSegmentResult) -> io::Result<()> {
+        let PromoteSegmentResult {
+            ulid,
+            is_drain,
+            body_section_start,
+            entries,
+            inputs,
+            inline,
+            tombstone,
+        } = result;
+        let index_dir = self.base_dir.join("index");
+
+        if tombstone {
+            for old_ulid in &inputs {
+                let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
+            }
+            return Ok(());
         }
 
         if is_drain {
-            // Update extent index: entries transition from BodySource::Local
-            // (full pending file with header) to BodySource::Cached (sparse
-            // cache file).  Without this, eviction of the cache body leaves
-            // stale BodySource::Local entries that bypass demand-fetch, causing
-            // "segment not found" errors on read.
-            //
-            // body_section_start is preserved (not zeroed): reads from
-            // BodyOnly cache files ignore it (SegmentLayout::BodyOnly path),
-            // but demand-fetch needs the original value to compute the S3
-            // range-GET offset.
-            let (promote_bss, entries, _inputs) =
-                segment::read_and_verify_segment_index(&src_path, &self.verifying_key)?;
-            // Read inline section for any inline entries being promoted.
-            let promote_inline = if entries.iter().any(|e| e.kind == EntryKind::Inline) {
-                segment::read_inline_section(&src_path)?
-            } else {
-                Vec::new()
-            };
+            // Evict before the CAS so readers arriving post-publish
+            // open the new cache body, not a stale handle to the
+            // soon-to-be-deleted pending file.
+            self.evict_cached_segment(ulid);
+
             for (i, entry) in entries.iter().enumerate() {
                 if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
                     continue;
                 }
-                // Only update if the extent index still points to this segment
-                // (a concurrent write may have superseded it).
                 if self
                     .extent_index
                     .lookup(&entry.hash)
@@ -2533,8 +2611,8 @@ impl Volume {
                     let idata = if entry.kind == EntryKind::Inline {
                         let start = entry.stored_offset as usize;
                         let end = start + entry.stored_length as usize;
-                        if end <= promote_inline.len() {
-                            Some(promote_inline[start..end].into())
+                        if end <= inline.len() {
+                            Some(inline[start..end].into())
                         } else {
                             continue;
                         }
@@ -2549,34 +2627,23 @@ impl Volume {
                             body_length: entry.stored_length,
                             compressed: entry.compressed,
                             body_source: BodySource::Cached(i as u32),
-                            body_section_start: promote_bss,
+                            body_section_start,
                             inline_data: idata,
                         },
                     );
                 }
             }
 
-            // Clean up the delta sidecar if the coordinator produced one.
-            // No materialise sidecar — redact_segment works in place.
+            let ulid_str = ulid.to_string();
             let delta_path = self
                 .base_dir
                 .join("pending")
                 .join(format!("{ulid_str}.delta"));
             let _ = fs::remove_file(&delta_path);
+            let pending_path = self.base_dir.join("pending").join(&ulid_str);
             fs::remove_file(&pending_path)?;
         } else {
-            // GC path: delete index/<old>.idx for each consumed input segment.
-            // The list of consumed inputs is read from the new segment's own
-            // `inputs` field (written by the coordinator in `compact_segments`)
-            // — no sidecar manifest to parse.
-            //
-            // The gc/<new> body itself is NOT deleted here. Under the
-            // self-describing handoff protocol it is deleted by the
-            // coordinator's `apply_done_handoffs` after S3 upload + this
-            // promote + old-S3 deletes all succeed. Legacy `.applied` files
-            // (from the manifest path) are cleaned up separately.
-            let (_, _, inputs) =
-                segment::read_and_verify_segment_index(&src_path, &self.verifying_key)?;
+            // GC carried path: delete each consumed input's idx.
             for old_ulid in &inputs {
                 let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
             }
@@ -8913,6 +8980,89 @@ mod tests {
         // Reads still correct after repack.
         assert_eq!(vol.read(0, 1).unwrap(), d2);
         assert_eq!(vol.read(1, 1).unwrap(), d1);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Simulates a crash window in `promote_segment`: the segment's cache body
+    /// and idx have been committed on disk, but the extent-index CAS + pending
+    /// delete have not run (in the offloaded design these live in a separate
+    /// actor-side apply phase). The next `promote_segment` call for the same
+    /// ULID must complete the half-done work — delete `pending/<ulid>` and
+    /// transition extent-index entries to `BodySource::Cached` — not silently
+    /// early-return.
+    ///
+    /// Today (synchronous in-actor `promote_segment`) the window is narrow but
+    /// still observable because `extract_idx` and `promote_to_cache` commit
+    /// their files via atomic rename before the pending delete runs. Under the
+    /// planned worker offload the window widens, so this test is also a
+    /// regression guard for the offload landing.
+    #[test]
+    fn promote_segment_recovers_mid_apply_crash() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let data = [42u8; 4096];
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let pending_dir = base.join("pending");
+        let ulid_str = fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .find_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                (!name.contains('.')).then_some(name)
+            })
+            .unwrap();
+        let ulid = Ulid::from_string(&ulid_str).unwrap();
+        let pending_path = pending_dir.join(&ulid_str);
+
+        // Perform only the "worker" half of promote_segment — extract_idx +
+        // promote_to_cache. Skip the extent-index CAS + pending delete.
+        let cache_dir = base.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let body_path = cache_dir.join(format!("{ulid_str}.body"));
+        let present_path = cache_dir.join(format!("{ulid_str}.present"));
+        let index_dir = base.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
+        let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+        segment::extract_idx(&pending_path, &idx_path).unwrap();
+        segment::promote_to_cache(&pending_path, &body_path, &present_path).unwrap();
+
+        assert!(pending_path.exists(), "precondition: pending survives");
+        assert!(body_path.exists(), "precondition: cache body committed");
+        assert!(idx_path.exists(), "precondition: idx committed");
+
+        // Simulate the process crash: drop and reopen.
+        drop(vol);
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Coordinator retries promote_segment on its next tick.
+        vol.promote_segment(ulid).unwrap();
+
+        // Invariant 1: pending/<ulid> is gone after the retry.
+        assert!(
+            !pending_path.exists(),
+            "pending/<ulid> survived retry — half-done promote not recovered",
+        );
+
+        // Invariant 2: the extent-index entry for the written hash now points
+        // at Cached, not Local.
+        let hash = blake3::hash(&data);
+        let loc = vol
+            .extent_index
+            .lookup(&hash)
+            .expect("hash still present in extent index");
+        assert!(
+            matches!(loc.body_source, BodySource::Cached(_)),
+            "extent-index entry still BodySource::Local after retry: {:?}",
+            loc.body_source
+        );
+
+        // Invariant 3: data still reads back correctly.
+        let actual = vol.read(0, 1).unwrap();
+        assert_eq!(actual.as_slice(), data.as_slice(), "data readback wrong");
 
         fs::remove_dir_all(base).unwrap();
     }
