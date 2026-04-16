@@ -524,6 +524,16 @@ proptest! {
                     common::drain_with_redact(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
+                    // A complete GC pass invalidates any previously-stashed
+                    // `GcCheckpoint` ULIDs. Production enforces one GC pass
+                    // per tick; the stash-then-apply split is for writes
+                    // during a single GC window, not for another full GC
+                    // running in between. Without this clear, the stashed
+                    // low ULID would be used later for an output whose
+                    // content is post-`CoordGcLocal`, breaking the
+                    // rebuild-ordering invariant in
+                    // docs/design-gc-ulid-ordering.md.
+                    pending_gc = None;
                     let (gc_ulid, gc_ulid2) = vol.gc_checkpoint().unwrap();
                     // Core invariant: the volume mint must have advanced past both
                     // GC ULIDs, so the next WAL flush produces a segment that sorts
@@ -569,6 +579,9 @@ proptest! {
                     }
                 }
                 SimOp::CoordGcLocalBoth => {
+                    // See `CoordGcLocal` — one GC pass invalidates any
+                    // previously-stashed `GcCheckpoint` ULIDs.
+                    pending_gc = None;
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
                     // Same mint-advancement invariant as CoordGcLocal — diff against
                     // post-checkpoint state so only W_new2 (> sweep_ulid) appears.
@@ -763,6 +776,9 @@ proptest! {
                     common::drain_with_redact(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
+                    // See ulid_monotonicity's CoordGcLocal — a full GC
+                    // pass invalidates any stashed `GcCheckpoint`.
+                    pending_gc = None;
                     let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
@@ -779,6 +795,7 @@ proptest! {
                     }
                 }
                 SimOp::CoordGcLocalBoth => {
+                    pending_gc = None;
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
                     let gc_result =
                         common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid);
@@ -960,6 +977,9 @@ proptest! {
                     common::drain_with_redact(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
+                    // See ulid_monotonicity's CoordGcLocal — a full GC
+                    // pass invalidates any stashed `GcCheckpoint`.
+                    pending_gc = None;
                     let (gc_ulid, _) = vol.gc_checkpoint().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
@@ -976,6 +996,7 @@ proptest! {
                     }
                 }
                 SimOp::CoordGcLocalBoth => {
+                    pending_gc = None;
                     let (repack_ulid, sweep_ulid) = vol.gc_checkpoint().unwrap();
                     let gc_result =
                         common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid);
