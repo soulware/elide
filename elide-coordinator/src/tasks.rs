@@ -228,7 +228,7 @@ pub async fn run_volume_tasks(
         // During an import serve phase, control.sock is bound by the import
         // process which only handles promote IPC.
         if fork_dir.join("control.sock").exists() && !fork_dir.join("volume.readonly").exists() {
-            control::flush(&fork_dir).await;
+            control::promote_wal(&fork_dir).await;
 
             if let Some(s) = control::sweep_pending(&fork_dir).await
                 && s.segments_compacted > 0

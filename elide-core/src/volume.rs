@@ -390,6 +390,20 @@ pub struct PromoteResult {
     pub pre_promote_offsets: Vec<Option<u64>>,
 }
 
+/// Result of the GC checkpoint prep phase.
+///
+/// Carries the pre-minted ULIDs and an optional promote job.  The actor
+/// dispatches the job to the flusher and stashes the reply.  When `job`
+/// is `None` the WAL was empty and the checkpoint completes immediately.
+pub struct GcCheckpointPrep {
+    pub u_repack: Ulid,
+    pub u_sweep: Ulid,
+    /// Segment ULID used for the promoted WAL.  Used to identify the
+    /// GC promote's `PromoteComplete` among other in-flight promotes.
+    pub u_flush: Ulid,
+    pub job: Option<PromoteJob>,
+}
+
 /// Snapshot captured at reclaim phase 1. Carries the target range, a
 /// clone of the current `Arc<LbaMap>` (used as the precondition token in
 /// phase 3 and as the read source for bloat detection in phase 2), and
@@ -3183,6 +3197,83 @@ impl Volume {
             );
         }
         self.evict_cached_segment(result.old_wal_ulid);
+    }
+
+    // ------------------------------------------------------------------
+    // Off-actor GC checkpoint: prep + complete
+    // ------------------------------------------------------------------
+
+    /// Prep phase of the off-actor GC checkpoint.
+    ///
+    /// Mints four ULIDs (`u_repack < u_sweep < u_flush < u_wal`), fsyncs
+    /// the WAL, snapshots CAS tokens, takes entries, builds a
+    /// [`PromoteJob`] using `u_flush` as the segment ULID, and opens
+    /// a fresh WAL at `u_wal`.  Writes resume immediately on the fresh
+    /// WAL — no deferral needed.
+    ///
+    /// Returns `None` inside the `job` field if the WAL is empty (no
+    /// segment to promote).  The checkpoint completes immediately in
+    /// that case.
+    pub fn prepare_gc_checkpoint(&mut self) -> io::Result<GcCheckpointPrep> {
+        let u_repack = self.mint.next();
+        let u_sweep = self.mint.next();
+        let u_flush = self.mint.next();
+        let u_wal = self.mint.next();
+
+        self.wal.fsync()?;
+
+        if self.pending_entries.is_empty() {
+            // Empty WAL — delete the WAL file, open fresh WAL at u_wal.
+            fs::remove_file(&self.wal_path)?;
+            let (wal, wal_ulid, wal_path, _) = create_fresh_wal(&self.base_dir.join("wal"), u_wal)?;
+            self.wal = wal;
+            self.wal_ulid = wal_ulid;
+            self.wal_path = wal_path;
+            return Ok(GcCheckpointPrep {
+                u_repack,
+                u_sweep,
+                u_flush,
+                job: None,
+            });
+        }
+
+        let old_wal_ulid = self.wal_ulid;
+        let old_wal_path = self.wal_path.clone();
+
+        let pre_promote_offsets: Vec<Option<u64>> = self
+            .pending_entries
+            .iter()
+            .map(|e| match e.kind {
+                EntryKind::Data | EntryKind::Inline => {
+                    self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
+                }
+                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
+            })
+            .collect();
+
+        let entries = std::mem::take(&mut self.pending_entries);
+        let pending_dir = self.base_dir.join("pending");
+
+        // Open fresh WAL at u_wal — writes resume immediately.
+        let (wal, wal_ulid, wal_path, _) = create_fresh_wal(&self.base_dir.join("wal"), u_wal)?;
+        self.wal = wal;
+        self.wal_ulid = wal_ulid;
+        self.wal_path = wal_path;
+
+        Ok(GcCheckpointPrep {
+            u_repack,
+            u_sweep,
+            u_flush,
+            job: Some(PromoteJob {
+                segment_ulid: u_flush,
+                old_wal_ulid,
+                old_wal_path,
+                entries,
+                pre_promote_offsets,
+                signer: Arc::clone(&self.signer),
+                pending_dir,
+            }),
+        })
     }
 }
 
