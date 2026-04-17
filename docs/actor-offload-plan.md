@@ -1,8 +1,18 @@
 # Plan: offload heavy work from the volume actor
 
-**Status:** Partially landed. Steps 1–4 (CAS inserts, WAL promote offload, `apply_gc_handoffs` offload, `promote_segment` offload) are merged on `main`. Step 4 (`promote_segment`) landed out-of-sequence with the original plan because write-tail latency on a live dd workload prioritised the per-upload actor stalls over the segment-index cache. Step 5 (segment-index cache) is now fully landed — the cache covers the worker-thread `promote_segment` path, the actor-thread sweep/repack loops, and `delta_compute::rewrite_post_snapshot_with_prior` (plumbed as part of step 6c). Steps 6a (`sweep_pending` offload), 6b (`repack` offload), and 6c (`delta_repack_post_snapshot` offload) have all landed. Step 7 (`sign_snapshot_manifest` offload + dead-code deletion of `VolumeRequest::Snapshot`) has landed in PR #68; see [snapshot-offload-plan.md](snapshot-offload-plan.md). The plan is complete.
+**Status:** Complete. All seven steps are merged on `main`:
 
-The flusher thread introduced in step 2 has since been generalized into a single long-lived **worker thread** that dispatches jobs via a `WorkerJob` enum (currently `Promote`, `GcHandoff`, `PromoteSegment`, `Sweep`, `Repack`, and `DeltaRepack`). Further offloads add new `WorkerJob` variants rather than spawning new threads.
+- Step 1 — CAS inserts on `extent_index` (PR #51).
+- Step 2 — WAL promote offload + worker thread (PRs #55, #56, #57); WAL fsync itself moved onto the worker in PR #67.
+- Step 3 — `apply_gc_handoffs` offload (PR #58).
+- Step 4 — `promote_segment` offload (PR #59, landed out-of-sequence to prioritise per-upload actor stalls on a live dd workload).
+- Step 5 — shared `SegmentIndexCache` (PR #61), now covering all worker-thread segment reads and the actor-thread compact_pending scan.
+- Step 6 — `sweep_pending` (PR #62, 6a), `repack` (PR #64, 6b), `delta_repack_post_snapshot` (PR #65, 6c).
+- Step 7 — `sign_snapshot_manifest` offload + deletion of the dead `VolumeRequest::Snapshot` (PR #68); see [snapshot-offload-plan.md](snapshot-offload-plan.md).
+
+The only remaining follow-ups are noted in-line: per-segment parallelism for delta_repack, and the out-of-scope coordinator-side blocking-GC issue at the bottom of this doc.
+
+The flusher thread introduced in step 2 has since been generalized into a single long-lived **worker thread** that dispatches jobs via a `WorkerJob` enum (currently `Promote`, `GcHandoff`, `PromoteSegment`, `Sweep`, `Repack`, `DeltaRepack`, and `SignSnapshotManifest`). Further offloads would add new `WorkerJob` variants rather than spawning new threads.
 
 ## Problem
 
@@ -75,7 +85,7 @@ The liveness set is computed at prep time and is necessarily a *subset* of true 
 
 `Volume::sweep_pending(&mut self)` is preserved as a thin synchronous wrapper (`prepare_sweep` + `execute_sweep` + `apply_sweep_result`) so existing tests and any inline callers still compile against the same signature; the actor uses the offload path directly with parked replies and a `parked_sweep` slot that rejects concurrent requests.
 
-**Follow-up: candidate selection.** The current `size < 8 MiB` test produces a long tail of slightly-too-large segments (two 7 MiB inputs → one 14 MiB output → permanently ineligible). Switch to an opportunistic-packing rule that targets *filling* output segments toward 32 MiB rather than just evicting the very-small ones. See the TODO under "Pending compaction" in `operations.md`.
+**Candidate selection: LANDED in PR #63.** The old `size < 8 MiB` test was replaced with an opportunistic bin-packing rule that targets filling output segments toward 32 MiB live bytes, plus a filler tier. Both `sweep_pending` (volume) and `gc_fork` (coordinator) use the new rule.
 
 ### 3b. `repack` *(LANDED)*
 
