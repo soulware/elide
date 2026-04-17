@@ -19,7 +19,7 @@ The same offload path is used by `gc_checkpoint`, which previously synchronously
 - **Flush** = `wal.fsync()`. Durability barrier. The WAL is the durability boundary — after fsync, data survives a crash. This is what `NBD_CMD_FLUSH` requires.
 - **Promote** = serialize WAL entries into a `pending/<ulid>` segment, update the extent index to segment-relative offsets, delete the old WAL, open a fresh WAL. Housekeeping for the segment lifecycle.
 
-The offload separates these. `VolumeRequest::Flush` is a WAL fsync + immediate reply — no segment I/O, no blocking on the flusher. Promotion is triggered independently by the threshold check (`needs_promote()`) and the idle tick, dispatched asynchronously to the flusher thread.
+The offload separates these. `VolumeRequest::Flush` is a WAL fsync of the current WAL plus (if a promote is in flight) a park on the promote generation counter. No segment I/O, no *actor* blocking on the worker — the FLUSH caller waits, but new writes queued on the channel are still served onto the fresh WAL. Promotion itself is triggered independently by the threshold check (`needs_promote()`) and the idle tick, dispatched asynchronously to the flusher thread, and the *old* WAL's `fsync()` runs as the first step of the worker job rather than on the actor.
 
 Callers that need data in `pending/` before proceeding (the coordinator's snapshot path, `gc_checkpoint`) depend on promote completion, not flush. Those callers use `Snapshot` or `GcCheckpoint` IPC, which wait for any in-flight promote before proceeding.
 
@@ -117,38 +117,51 @@ When a promote completes, the actor walks both structures and resolves any reply
 `dispatch_promote()` calls `Volume::prepare_promote()`:
 
 1. Return `Ok(None)` immediately if `pending_entries` is empty.
-2. `self.wal.fsync()` — durability barrier for WAL data.
-3. Snapshot CAS tokens: `pre_promote_offsets` from the extent index for each Data/Inline entry.
-4. `let old_wal_ulid = self.wal_ulid;`
-5. `let old_wal_path = self.wal_path.clone();`
-6. `let entries = std::mem::take(&mut self.pending_entries);`
-7. `let segment_ulid = self.mint.next();` — **fresh ULID, not the WAL ULID**.
-8. Open fresh WAL: `create_fresh_wal(&wal_dir, self.mint.next())`. Volume's `wal_ulid` / `wal_path` / `pending_entries` are now the fresh WAL's. New writes start flowing immediately.
-9. Return `Ok(Some(PromoteJob { .. }))`.
+2. Snapshot CAS tokens: `pre_promote_offsets` from the extent index for each Data/Inline entry.
+3. `let old_wal_ulid = self.wal_ulid;`
+4. `let old_wal_path = self.wal_path.clone();`
+5. `let entries = std::mem::take(&mut self.pending_entries);`
+6. `let segment_ulid = self.mint.next();` — **fresh ULID, not the WAL ULID**.
+7. Open fresh WAL: `create_fresh_wal(&wal_dir, self.mint.next())`. Volume's `wal_ulid` / `wal_path` / `pending_entries` are now the fresh WAL's. New writes start flowing immediately.
+8. Return `Ok(Some(PromoteJob { .. }))`.
 
-The actor sends the job to the flusher channel, increments `promotes_in_flight`, and returns to the select loop. If `needs_promote()` fires again before the first promote completes, the actor preps and dispatches another job — multiple promotes can be queued on the flusher channel.
+The actor sends the job to the flusher channel, increments `promotes_in_flight`, bumps `promote_gen`, pushes `old_wal_path` onto `inflight_old_wals`, and returns to the select loop. If `needs_promote()` fires again before the first promote completes, the actor preps and dispatches another job — multiple promotes can be queued on the flusher channel.
+
+**The old WAL's `fsync()` no longer runs on the actor.** It is now the first step of the worker's `execute_promote` below. This matches the way a real block device keeps accepting commands while a FLUSH is in flight at the controller: the volume actor keeps processing writes onto the fresh WAL while the worker makes the old one durable in parallel. NBD `Flush` parks on `promote_gen` / `completed_gen` so the client still sees a strict durability barrier (see *Flush parking* below).
 
 #### Flusher: heavy middle
 
-1. `let body_section_start = segment::write_and_commit(&pending_dir, segment_ulid, &mut entries, signer)?;`
+1. `std::fs::File::open(&old_wal_path)?.sync_data()?` — the old-WAL durability barrier that `prepare_promote` used to run on the actor.
+2. `let body_section_start = segment::write_and_commit(&pending_dir, segment_ulid, &mut entries, signer)?;`
    - Writes `pending/<segment_ulid>.tmp` via `write_segment`. `write_segment` reassigns each entry's `stored_offset` to segment-relative.
    - Renames to `pending/<segment_ulid>`.
    - `fsync_dir`.
    - **Does not delete the old WAL** — that is the actor's responsibility in the apply phase.
-2. Send `Ok(PromoteResult { .. })` on the result channel.
+3. Send `Ok(PromoteResult { .. })` on the result channel.
 
 `segment::write_and_commit` (Landing 1): `segment::promote` minus the final `fs::remove_file(wal_path)`.
 
 #### Actor: apply phase (on flusher result channel)
 
-1. If the result is an error: log, decrement `promotes_in_flight`. **Do not touch** the old WAL or extent index (the old WAL still exists on disk, its entries still point at it at WAL-relative offsets, so reads continue to work). Return to the select loop. The old WAL is drained on restart via the multi-WAL recovery path.
-2. On success, call `Volume::apply_promote(&result)`:
+1. If the result is an error: log, decrement `promotes_in_flight`, pop the FIFO head of `inflight_old_wals`, and perform a fallback `sync_data()` on that path on the actor thread — the worker may have failed before or after its own fsync ran, so the actor guarantees durability itself before bumping `completed_gen` and resolving any parked flushes. **Do not touch** the old WAL or extent index otherwise (the old WAL still exists on disk, its entries still point at it at WAL-relative offsets, so reads continue to work). Return to the select loop. The old WAL is drained on restart via the multi-WAL recovery path.
+2. On success, pop the FIFO head of `inflight_old_wals`, bump `completed_gen`, resolve any parked flushes whose `needed_gen <= completed_gen`, and call `Volume::apply_promote(&result)`:
    a. Set `has_new_segments = true`, `last_segment_ulid = Some(result.segment_ulid)`.
    b. **CAS loop** — for each Data/Inline entry, paired with the corresponding `pre_promote_offsets` token: call `extent_index.replace_if_matches(hash, old_wal_ulid, old_wal_offset, new_location)`. Only rewrites the entry if it currently matches `(segment_id == old_wal_ulid && body_offset == pre_promote_offset)`. If a concurrent write, a GC handoff, or a later promote's apply has already superseded it, leave it alone.
    c. Log entry counts.
    d. Delete the old WAL: `fs::remove_file(&old_wal_path)`. Evict the cached file descriptor.
 3. `publish_snapshot()` — bumps `flush_gen`. Readers loading the new snapshot see segment-relative offsets pointing at `pending/<segment_ulid>`.
 4. Resolve any parked operations waiting for this segment ULID (see Parking structures above).
+
+#### Actor: NBD `Flush` parking
+
+`VolumeRequest::Flush` is split into two phases on the actor:
+
+1. `self.volume.wal_fsync()` — fsync the *current* (fresh) WAL. This is identical to the previous behaviour: `Flush` on its own never blocks on the worker's promote.
+2. `park_or_resolve_flush(reply)` — if `completed_gen >= promote_gen`, reply `Ok` immediately (no promote is in flight). Otherwise push a `ParkedFlush { needed_gen: promote_gen, reply }` onto `parked_flushes` and return to the select loop. The actor keeps processing writes and other requests while the flush is parked.
+
+Every `WorkerResult::Promote` (success or error) bumps `completed_gen` and runs `resolve_parked_flushes`, which drains any entry whose `needed_gen <= completed_gen` and sends `Ok` (or the error from the fallback fsync on the error path). On shutdown, `shutdown_worker` drains the worker results the same way, so parked flushes resolve as long as their promote has a result to report; any flushes still parked after the channel closes have their reply senders dropped (caller sees `RecvError`).
+
+This preserves NBD's FLUSH contract — every write ack'd before the flush is durable by the time the flush reply arrives — without blocking the actor on disk I/O. The analogy is a real block device: the controller keeps accepting commands while a FLUSH is in flight; only the caller of FLUSH waits.
 
 ### Sequencing: `PromoteWal` (explicit promote)
 
@@ -163,9 +176,8 @@ When `GcCheckpoint` arrives:
 1. If `parked_gc` is already `Some`, return an error (concurrent GC checkpoint).
 2. Call `Volume::prepare_gc_checkpoint()`:
    a. Mint `u_repack`, `u_sweep`, `u_flush`, `u_wal` in order.
-   b. `self.wal.fsync()`.
-   c. If `pending_entries` is empty: delete the old WAL, open fresh WAL at `u_wal`, return `GcCheckpointPrep { job: None }`.
-   d. Otherwise: snapshot entries and CAS tokens, open fresh WAL at `u_wal` (writes resume immediately), return `GcCheckpointPrep { job: Some(PromoteJob { segment_ulid: u_flush, .. }) }`.
+   b. If `pending_entries` is empty: delete the old WAL, open fresh WAL at `u_wal`, return `GcCheckpointPrep { job: None }`. No fsync — an empty WAL is just a MAGIC header being deleted.
+   c. Otherwise: snapshot entries and CAS tokens, open fresh WAL at `u_wal` (writes resume immediately), return `GcCheckpointPrep { job: Some(PromoteJob { segment_ulid: u_flush, .. }) }`. The old WAL's `fsync()` runs on the worker as the first step of `execute_promote`, identical to the write-path promote — the parked GC reply won't resolve until the worker finishes, so the coordinator still observes a durable old WAL before acting on `(u_repack, u_sweep)`.
 3. If `job` is `Some`: dispatch to flusher, park the reply in `parked_gc`.
 4. If `job` is `None`: `publish_snapshot()`, send `Ok((u_repack, u_sweep))` immediately.
 
@@ -296,7 +308,7 @@ The conditional-replace check is the load-bearing invariant. Its precondition �
 
 - Multiple `PromoteJob`s can be queued on the bounded flusher channel (capacity 4).
 - The flusher is a single thread — jobs are processed in FIFO order, completions arrive in dispatch order.
-- `VolumeRequest::Flush` fsyncs the WAL and replies immediately. It does not interact with the flusher.
+- `VolumeRequest::Flush` fsyncs the current WAL and parks the reply on `promote_gen`/`completed_gen` if a promote dispatched before the flush has not yet completed. The actor returns to the select loop immediately — queued writes continue to be processed onto the fresh WAL while the FLUSH caller waits for the worker's old-WAL fsync.
 - `VolumeRequest::PromoteWal` dispatches a promote and parks the reply until the segment is on disk. Multiple can be parked simultaneously.
 - `GcCheckpoint` opens a fresh WAL immediately (no write pause), dispatches the GC promote, and parks the reply until `u_flush` completes.
 - The legacy single-shot `VolumeRequest::Snapshot` has been retired (no live wire sender); the coordinator drives snapshot end-to-end via `PromoteWal` / per-segment `Promote` / `ApplyGcHandoffs` / `SignSnapshotManifest`, all offloaded. Direct-`Volume::snapshot()` survives for in-process tests and never runs on the actor.
@@ -308,7 +320,8 @@ Under sustained write load, the flusher queue depth is bounded by `write_through
 
 If the flusher reports an error:
 
-- The old WAL is still on disk, fsynced, and still referenced by extent index entries at WAL-relative offsets. Reads against the old hashes continue to work — the WAL file is still reachable at its path.
+- The old WAL is still on disk and still referenced by extent index entries at WAL-relative offsets. Reads against the old hashes continue to work — the WAL file is still reachable at its path.
+- The actor performs a fallback `sync_data()` on the old WAL on the error path before bumping `completed_gen`, so any parked NBD `Flush` waiting on this promote's generation still receives a correct durability guarantee — either `Ok` (fallback fsync succeeded; the worker's attempt may or may not have landed, but the actor's did) or `Err` (fallback fsync also failed; caller must retry).
 - The pending segment is either absent, a stale `.tmp` (swept on startup), or renamed. A renamed segment at a fresh ULID with no extent index references is a wasted segment that sweep will clean up.
 - `pending_entries` for the batch have been moved into the job and are gone from memory.
 - Writes continue on the current active WAL.
