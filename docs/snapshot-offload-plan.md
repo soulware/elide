@@ -1,6 +1,6 @@
 # Plan: offload `sign_snapshot_manifest` off the volume actor
 
-**Status:** Not started. Step 7 of [actor-offload-plan.md](actor-offload-plan.md). Reuses the worker-thread infrastructure established by [promote-offload-plan.md](promote-offload-plan.md) and extended through steps 2–6.
+**Status:** Landed in PR #68 (`edea025`). Step 7 of [actor-offload-plan.md](actor-offload-plan.md). Reuses the worker-thread infrastructure established by [promote-offload-plan.md](promote-offload-plan.md) and extended through steps 2–6.
 
 ## Goal
 
