@@ -1193,6 +1193,44 @@ pub fn read_extent_bodies(
     Ok(())
 }
 
+/// Verify that `body` hashes to `entry.hash`.
+///
+/// `body` is the stored bytes as they appear in the segment — if the entry
+/// is marked compressed, `body` is lz4-compressed and is decompressed here
+/// before hashing. The declared hash is always computed over the 4 KiB-
+/// aligned uncompressed block content (see `Volume::write`).
+///
+/// Non-body kinds (`DedupRef`, `Zero`, `Delta`) return `Ok(())` — they carry
+/// no body and their integrity is guaranteed by the segment signature.
+///
+/// Returns `io::ErrorKind::InvalidData` on mismatch so callers can
+/// distinguish corruption from unrelated I/O failures.
+pub fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> io::Result<()> {
+    if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
+        return Ok(());
+    }
+    let computed = if entry.compressed {
+        let decompressed = lz4_flex::decompress_size_prepended(body).map_err(io::Error::other)?;
+        blake3::hash(&decompressed)
+    } else {
+        blake3::hash(body)
+    };
+    if computed == entry.hash {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "body hash mismatch at lba={} len={}B: declared={} computed={}",
+                entry.start_lba,
+                body.len(),
+                &entry.hash.to_hex()[..16],
+                &computed.to_hex()[..16],
+            ),
+        ))
+    }
+}
+
 // --- promotion ---
 
 /// Write a pending segment from the accumulated WAL entries and durably
@@ -2803,5 +2841,63 @@ mod tests {
         // Delta read: delta section starts at body_section_start + body_length.
         assert_eq!(full.body_section_file_offset(bss) + body_length, 1152);
         assert_eq!(body.body_section_file_offset(bss) + body_length, 1024);
+    }
+
+    // --- verify_body_hash ---
+
+    #[test]
+    fn verify_body_hash_accepts_matching_uncompressed_body() {
+        let data = vec![0xABu8; 4096];
+        let hash = blake3::hash(&data);
+        let entry = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), data.clone());
+        assert!(verify_body_hash(&entry, &data).is_ok());
+    }
+
+    #[test]
+    fn verify_body_hash_rejects_zero_filled_body() {
+        let data = vec![0xABu8; 4096];
+        let hash = blake3::hash(&data);
+        let entry = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), data);
+        let zeros = vec![0u8; 4096];
+        let err = verify_body_hash(&entry, &zeros).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn verify_body_hash_accepts_matching_compressed_body() {
+        let data = vec![0x55u8; 4096];
+        let hash = blake3::hash(&data);
+        let compressed = lz4_flex::compress_prepend_size(&data);
+        let entry =
+            SegmentEntry::new_data(hash, 0, 1, SegmentFlags::COMPRESSED, compressed.clone());
+        assert!(verify_body_hash(&entry, &compressed).is_ok());
+    }
+
+    #[test]
+    fn verify_body_hash_rejects_compressed_with_wrong_plaintext() {
+        let declared_data = vec![0x55u8; 4096];
+        let declared_hash = blake3::hash(&declared_data);
+        let other_data = vec![0xAAu8; 4096];
+        let other_compressed = lz4_flex::compress_prepend_size(&other_data);
+        let entry = SegmentEntry::new_data(
+            declared_hash,
+            0,
+            1,
+            SegmentFlags::COMPRESSED,
+            other_compressed.clone(),
+        );
+        let err = verify_body_hash(&entry, &other_compressed).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn verify_body_hash_skips_non_body_kinds() {
+        let fake_hash = blake3::hash(b"anything");
+        let deduping = SegmentEntry::new_dedup_ref(fake_hash, 0, 1);
+        let zero = SegmentEntry::new_zero(0, 1);
+        // Arbitrary bytes that do not hash to `fake_hash` — should still pass.
+        assert!(verify_body_hash(&deduping, &[]).is_ok());
+        assert!(verify_body_hash(&zero, &[]).is_ok());
     }
 }

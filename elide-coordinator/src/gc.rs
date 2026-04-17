@@ -961,6 +961,24 @@ async fn compact_segments(
             .await
             .with_context(|| format!("fetching bodies for {}", candidate.ulid_str))?;
 
+        // Verify every fetched body hashes to its declared hash before we
+        // carry it forward. A mismatch indicates an already-poisoned input
+        // segment (e.g. from the pre-308f778 stale-liveness bug) — propagating
+        // it would corrupt the compacted output and, once inputs are dropped,
+        // any surviving LBA that resolves to this hash.
+        for entry in &candidate.live_entries {
+            if matches!(entry.kind, EntryKind::Data | EntryKind::Inline)
+                && let Some(bytes) = entry.data.as_deref()
+            {
+                segment::verify_body_hash(entry, bytes).with_context(|| {
+                    format!(
+                        "body integrity check failed for input segment {}",
+                        candidate.ulid_str
+                    )
+                })?;
+            }
+        }
+
         for entry in candidate.live_entries.drain(..) {
             all_live.push((candidate.ulid_str.clone(), entry));
         }
