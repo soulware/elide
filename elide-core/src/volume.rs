@@ -2383,6 +2383,27 @@ impl Volume {
             [EntryKind::Data, EntryKind::DedupRef, EntryKind::Inline],
             &handoff_inline,
         )?;
+
+        // Verify each body hashes to its declared hash before re-signing.
+        // Without this check, a poisoned input (e.g. zero-filled body carried
+        // forward from a pre-308f778 GC round) would be re-signed with our
+        // key, promoted to `gc/<ulid>`, and evict the remaining good copies.
+        // Cancel the whole handoff on any mismatch — safer to re-GC later
+        // than to commit corrupt bytes.
+        for e in &entries {
+            if matches!(e.kind, EntryKind::Data | EntryKind::Inline)
+                && let Some(body) = e.data.as_deref()
+                && let Err(err) = segment::verify_body_hash(e, body)
+            {
+                log::warn!(
+                    "gc staged {}: body integrity check failed ({err}); removing staged file",
+                    staged_path.display(),
+                );
+                let _ = fs::remove_file(staged_path);
+                return Ok(StagedApply::Cancelled);
+            }
+        }
+
         let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
         segment::write_gc_segment(&tmp_path, &mut entries, &inputs, self.signer.as_ref())?;
 

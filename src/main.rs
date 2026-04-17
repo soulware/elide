@@ -10,7 +10,7 @@ use elide_core::volume;
 
 use elide::{
     coordinator_client, extents, inspect, inspect_files, ls, nbd, parse_size, resolve_volume_dir,
-    resolve_volume_size, validate_volume_name,
+    resolve_volume_size, validate_volume_name, verify,
 };
 
 /// Elide volume management and analysis tools.
@@ -152,6 +152,17 @@ enum VolumeCommand {
 
     /// Show a human-readable summary of a volume
     Info {
+        /// Volume name
+        name: String,
+    },
+
+    /// Verify every extent's stored body hashes to its declared hash.
+    ///
+    /// Walks `index/*.idx`, reads each Data/Inline body from its local
+    /// location (wal, pending, gc, or cache), and reports any extent whose
+    /// body does not match. Evicted bodies are skipped (reported as
+    /// skipped). Exit code: 0 clean, 1 if any mismatches, 2 on scan errors.
+    Verify {
         /// Volume name
         name: String,
     },
@@ -433,6 +444,19 @@ fn main() {
                 if let Err(e) = inspect::run(&vol_dir, &by_id_dir) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
+                }
+            }
+
+            VolumeCommand::Verify { name } => {
+                let vol_dir = resolve_volume_dir(&args.data_dir, &name);
+                match verify::run(&vol_dir) {
+                    Ok(counts) if counts.mismatches == 0 && counts.scan_errors == 0 => {}
+                    Ok(counts) if counts.mismatches > 0 => std::process::exit(1),
+                    Ok(_) => std::process::exit(2),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(2);
+                    }
                 }
             }
 

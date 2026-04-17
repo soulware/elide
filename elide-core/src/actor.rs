@@ -1981,6 +1981,18 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
             [segment::EntryKind::Data, segment::EntryKind::Inline],
             &inline_bytes,
         )?;
+        // Verify each body matches its declared hash before it's carried
+        // into the merged output. See apply_staged_handoff for background.
+        for entry in &c.live_part {
+            if let Some(body) = entry.data.as_deref() {
+                segment::verify_body_hash(entry, body).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("sweep: input segment {}: {e}", c.seg_ulid),
+                    )
+                })?;
+            }
+        }
         for entry in std::mem::take(&mut c.live_part) {
             let source_body_offset = entry.stored_offset;
             merged_live.push(SweptLiveEntry {
@@ -2152,6 +2164,18 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 [segment::EntryKind::Data, segment::EntryKind::Inline],
                 &inline_bytes,
             )?;
+
+            // Verify bodies hash to their declared hash. Without this, a
+            // poisoned segment (zero-filled body) would be silently
+            // rewritten under the same extent index, surviving eviction of
+            // the only good copy.
+            for entry in &live_entries {
+                if let Some(body) = entry.data.as_deref() {
+                    segment::verify_body_hash(entry, body).map_err(|e| {
+                        io::Error::new(e.kind(), format!("repack: input segment {seg_id}: {e}"))
+                    })?;
+                }
+            }
 
             // Capture pre-write offsets — `write_segment` reassigns
             // `stored_offset` to the new body positions.
