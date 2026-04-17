@@ -2110,7 +2110,7 @@ impl Volume {
         // Walk input old entries, check extent index for each.
         let live = self.lbamap.lba_referenced_hashes();
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
-        let mut stale_cancel: Vec<blake3::Hash> = Vec::new();
+        let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
 
         for &(hash, kind, input_ulid) in &result.input_old_entries {
             if !matches!(kind, segment::EntryKind::Data | segment::EntryKind::Inline) {
@@ -2128,7 +2128,7 @@ impl Volume {
             }
             // Not carried: will be removed. If LBA-live, cancel.
             if live.contains(&hash) {
-                stale_cancel.push(hash);
+                stale_cancel.push((hash, input_ulid));
             }
             to_remove.push((hash, input_ulid));
         }
@@ -2137,9 +2137,10 @@ impl Volume {
             log::warn!(
                 "gc staged {}: stale-liveness cancellation — {} hash(es) live in \
                  volume but absent from coordinator output; removing staged file \
-                 and tmp",
+                 and tmp [{}]",
                 result.staged_path.display(),
                 stale_cancel.len(),
+                describe_stale_cancel(&stale_cancel, &self.lbamap),
             );
             let _ = fs::remove_file(&result.staged_path);
             let tmp_path = result.gc_dir.join(format!("{}.tmp", result.new_ulid));
@@ -2222,8 +2223,10 @@ impl Volume {
     /// self-describing derive-at-apply path.
     ///
     /// Also handles crash-recovery filename states:
-    /// - `<ulid>.tmp` / `<ulid>.staged.tmp` — stale from a crashed write.
-    ///   Remove on sight.
+    /// - `<ulid>.tmp` — volume-owned apply scratch from a crashed write.
+    ///   Remove on sight. Coordinator-owned `<ulid>.staged.tmp` scratch
+    ///   is left alone (the coord may be actively writing it; the coord
+    ///   cleans its own stale scratch at the start of each GC pass).
     /// - `<ulid>.staged` alone — apply normally.
     /// - `<ulid>.staged` + bare `<ulid>` — bare wins (previous apply
     ///   committed before cleanup); remove the `.staged`.
@@ -2233,12 +2236,21 @@ impl Volume {
             return Ok(0);
         }
 
-        // Pass 1: sweep stale `.tmp` files (incomplete writes).
+        // Pass 1: sweep stale volume-owned `<ulid>.tmp` scratch files
+        // (incomplete apply writes). The suffix must be exactly `.tmp`
+        // on a valid Ulid stem — this deliberately excludes the
+        // coordinator's `<ulid>.staged.tmp` compaction scratch, which
+        // the coord may still be writing in a concurrent tick. Deleting
+        // it here would race `tokio::fs::rename` to ENOENT and fail the
+        // compaction handoff.
         for entry in fs::read_dir(gc_dir)? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.ends_with(".tmp") {
+            let Some(stem) = name.strip_suffix(".tmp") else {
+                continue;
+            };
+            if Ulid::from_string(stem).is_ok() {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -2322,7 +2334,7 @@ impl Volume {
         let index_dir = self.base_dir.join("index");
         let live = self.lbamap.lba_referenced_hashes();
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
-        let mut stale_cancel: Vec<blake3::Hash> = Vec::new();
+        let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
         for input_ulid in &inputs {
             let idx_path = index_dir.join(format!("{input_ulid}.idx"));
             let parsed = match segment::read_segment_index(&idx_path) {
@@ -2351,7 +2363,7 @@ impl Volume {
                 }
                 // Not carried: will be removed. If LBA-live, cancel.
                 if live.contains(&e.hash) {
-                    stale_cancel.push(e.hash);
+                    stale_cancel.push((e.hash, *input_ulid));
                 }
                 to_remove.push((e.hash, *input_ulid));
             }
@@ -2360,9 +2372,10 @@ impl Volume {
         if !stale_cancel.is_empty() {
             log::warn!(
                 "gc staged {}: stale-liveness cancellation — {} hash(es) live in \
-                 volume but absent from coordinator output; removing staged file",
+                 volume but absent from coordinator output; removing staged file [{}]",
                 staged_path.display(),
                 stale_cancel.len(),
+                describe_stale_cancel(&stale_cancel, &self.lbamap),
             );
             let _ = fs::remove_file(staged_path);
             return Ok(StagedApply::Cancelled);
@@ -4106,6 +4119,30 @@ pub(crate) fn find_segment_in_dirs(
         return Ok(body_dir.join(format!("{sid}.body")));
     }
     Err(io::Error::other(format!("segment not found: {sid}")))
+}
+
+/// Render a diagnostic summary of the stale-liveness hashes so the log
+/// pinpoints which hash diverged and how it stays live in this volume.
+/// Caps at the first 3 entries; trailing `...+N` indicates more.
+fn describe_stale_cancel(stale: &[(blake3::Hash, Ulid)], lbamap: &lbamap::LbaMap) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (i, (hash, input_ulid)) in stale.iter().take(3).enumerate() {
+        if i > 0 {
+            out.push_str("; ");
+        }
+        let lbas = lbamap.lbas_for_hash(hash);
+        let delta_refcount = lbamap.delta_source_refcount(hash);
+        let _ = write!(
+            out,
+            "hash={} input={input_ulid} lbas={lbas:?} delta_src_refcount={delta_refcount}",
+            hash.to_hex(),
+        );
+    }
+    if stale.len() > 3 {
+        let _ = write!(out, "; ...+{} more", stale.len() - 3);
+    }
+    out
 }
 
 /// Acquire an exclusive non-blocking flock on `<dir>/volume.lock`.
@@ -8538,24 +8575,30 @@ mod tests {
 
     #[test]
     fn gc_staged_sweeps_stale_tmp_files() {
-        // Stray `<ulid>.tmp` and `<ulid>.staged.tmp` files from crashed writes
-        // are removed at the start of the apply pass.
+        // Stray volume-owned `<ulid>.tmp` files from crashed apply writes
+        // are swept at the start of the apply pass. Coordinator-owned
+        // `<ulid>.staged.tmp` scratch is deliberately preserved — the
+        // coord may still be writing to it, and deleting it here would
+        // race its compaction rename to ENOENT.
         let base = keyed_temp_dir();
         let vol = Volume::open(&base, &base).unwrap();
         let gc_dir = base.join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
 
         let ulid = Ulid::new();
-        let tmp1 = gc_dir.join(format!("{ulid}.tmp"));
-        let tmp2 = gc_dir.join(format!("{ulid}.staged.tmp"));
-        fs::write(&tmp1, b"garbage").unwrap();
-        fs::write(&tmp2, b"garbage").unwrap();
+        let volume_tmp = gc_dir.join(format!("{ulid}.tmp"));
+        let coord_tmp = gc_dir.join(format!("{ulid}.staged.tmp"));
+        fs::write(&volume_tmp, b"garbage").unwrap();
+        fs::write(&coord_tmp, b"coord in-flight").unwrap();
 
         let mut vol = vol;
         let count = vol.apply_gc_handoffs().unwrap();
         assert_eq!(count, 0);
-        assert!(!tmp1.exists(), ".tmp must be swept");
-        assert!(!tmp2.exists(), ".staged.tmp must be swept");
+        assert!(!volume_tmp.exists(), "<ulid>.tmp must be swept");
+        assert!(
+            coord_tmp.exists(),
+            "<ulid>.staged.tmp must be preserved (coord may still be writing)"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }

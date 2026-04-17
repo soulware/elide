@@ -178,6 +178,12 @@ pub async fn gc_fork(
     // deleting them unconditionally is safe.
     cleanup_fetch_files(&gc_dir);
 
+    // Clean up stale `<ulid>.staged.tmp` scratch from a prior crashed
+    // compaction. Safe to remove unconditionally: the current pass mints
+    // a fresh ULID via `gc_checkpoint`, so no in-flight write targets
+    // any existing stale scratch.
+    cleanup_staging_files(&gc_dir);
+
     // Pending segments created by WAL auto-flush during drain are safe to
     // ignore here: collect_stats (below) only considers index/<ulid>.idx files,
     // so un-promoted segments (no .idx yet) are never GC candidates.
@@ -544,6 +550,31 @@ fn cleanup_fetch_files(gc_dir: &Path) {
             && let Err(e) = fs::remove_file(entry.path())
         {
             error!("[gc] failed to delete stale fetch file {name_str}: {e}");
+        }
+    }
+}
+
+/// Delete any `gc/<ulid>.staged.tmp` scratch files left by a crashed
+/// `compact_segments` between the `write_gc_segment` call and the rename
+/// to `<ulid>.staged`. The next pass mints a fresh ULID so the stale
+/// scratch is inert, but it must be removed to avoid unbounded disk
+/// growth and to let `create_new` succeed on any later re-use.
+///
+/// Coordinator-owned — the volume's apply-path sweeper deliberately
+/// skips this suffix to avoid racing an in-flight write.
+fn cleanup_staging_files(gc_dir: &Path) {
+    let Ok(entries) = fs::read_dir(gc_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.ends_with(".staged.tmp")
+            && let Err(e) = fs::remove_file(entry.path())
+        {
+            error!("[gc] failed to delete stale staging file {name_str}: {e}");
         }
     }
 }

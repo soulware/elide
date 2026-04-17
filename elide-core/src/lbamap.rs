@@ -435,6 +435,14 @@ impl LbaMap {
             .collect()
     }
 
+    /// Refcount of `target` as a live Delta source hash. Returns 0 when the
+    /// hash is not referenced by any live Delta entry. Used for diagnostics
+    /// alongside [`lbas_for_hash`] to explain why a hash shows up in
+    /// [`lba_referenced_hashes`].
+    pub fn delta_source_refcount(&self, target: &blake3::Hash) -> u32 {
+        self.delta_source_counts.get(target).copied().unwrap_or(0)
+    }
+
     /// Return the content hash mapped to `lba`, if any entry covers it.
     ///
     /// Used by GC to check whether a dedup-ref entry is still live: the ref
