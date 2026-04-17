@@ -17,9 +17,10 @@
 // lives in the separate extent index. This means GC repacking never touches the
 // LBA map.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use log::warn;
 
@@ -62,8 +63,8 @@ struct MapEntry {
 /// ranges have no entry (implicitly zero, as the block device presents
 /// unwritten blocks as zeroes).
 ///
-/// Also tracks the set of *delta source hashes* — BLAKE3 hashes referenced
-/// as `source_hash` by any live Delta entry in the segments this map was
+/// Also tracks *delta source hashes* — BLAKE3 hashes referenced as
+/// `source_hash` by any live Delta entry in the segments this map was
 /// built from. These sources are not directly reachable via the normal
 /// `MapEntry.hash` path (a Delta entry's content hash is what's in the
 /// map; the source hash is separate), so they need their own book-keeping
@@ -71,23 +72,71 @@ struct MapEntry {
 /// stay alive as long as any Delta depends on it for decompression. See
 /// `lba_referenced_hashes()` for the fold.
 ///
-/// The set is grow-only within a single map lifetime — when a Delta LBA
-/// is later overwritten, its source hash is *not* removed from the set,
-/// so GC may over-retain sources until the next rebuild. This is a
-/// bounded leak (flushed on every rebuild_segments call) and is
-/// acceptable because it degrades efficiency, not correctness. If
-/// telemetry ever shows it matters, move to a refcount.
+/// Source tracking is refcounted: `delta_sources_by_lba` records the
+/// source list attached to each Delta LBA entry, and `delta_source_counts`
+/// holds a per-hash refcount equal to the number of live LBA entries
+/// whose source list contains that hash. When an LBA entry is trimmed,
+/// split, or overwritten, the refcounts are updated in lockstep. A hash
+/// with refcount zero is removed from the map, so `lba_referenced_hashes`
+/// never reports stale sources.
 #[derive(Clone)]
 pub struct LbaMap {
     inner: BTreeMap<u64, MapEntry>,
-    delta_source_hashes: HashSet<blake3::Hash>,
+    /// Source hashes attached to each live Delta LBA entry. A key here
+    /// always corresponds to a key in `inner` whose origin was a Delta
+    /// segment entry; splits of a Delta LBA range share the same `Arc`.
+    delta_sources_by_lba: BTreeMap<u64, Arc<[blake3::Hash]>>,
+    /// Refcounts for delta source hashes. Invariant: for every `h` in any
+    /// `delta_sources_by_lba[k]`, `delta_source_counts[h]` exists and
+    /// equals the number of keys in `delta_sources_by_lba` whose value
+    /// contains `h`. Zero-count entries are removed eagerly.
+    delta_source_counts: HashMap<blake3::Hash, u32>,
 }
 
 impl LbaMap {
     pub fn new() -> Self {
         Self {
             inner: BTreeMap::new(),
-            delta_source_hashes: HashSet::new(),
+            delta_sources_by_lba: BTreeMap::new(),
+            delta_source_counts: HashMap::new(),
+        }
+    }
+
+    fn incref(&mut self, h: blake3::Hash) {
+        *self.delta_source_counts.entry(h).or_insert(0) += 1;
+    }
+
+    fn decref(&mut self, h: &blake3::Hash) {
+        match self.delta_source_counts.get_mut(h) {
+            Some(c) if *c == 1 => {
+                self.delta_source_counts.remove(h);
+            }
+            Some(c) => *c -= 1,
+            None => debug_assert!(false, "decref of untracked delta source"),
+        }
+    }
+
+    /// Remove the entry at `key` from `inner` and decref any attached
+    /// Delta sources. Returns the removed entry if one existed.
+    fn remove_entry(&mut self, key: u64) -> Option<MapEntry> {
+        let entry = self.inner.remove(&key)?;
+        if let Some(srcs) = self.delta_sources_by_lba.remove(&key) {
+            for h in srcs.iter() {
+                self.decref(h);
+            }
+        }
+        Some(entry)
+    }
+
+    /// Insert `(key, entry)` into `inner`, optionally attaching Delta
+    /// sources. Increments refcounts for each source in the list.
+    fn add_entry(&mut self, key: u64, entry: MapEntry, sources: Option<Arc<[blake3::Hash]>>) {
+        self.inner.insert(key, entry);
+        if let Some(srcs) = sources {
+            for h in srcs.iter() {
+                self.incref(*h);
+            }
+            self.delta_sources_by_lba.insert(key, srcs);
         }
     }
 
@@ -98,6 +147,29 @@ impl LbaMap {
     /// startup rebuild. New entries always have `payload_block_offset = 0`;
     /// non-zero offsets arise only in the split/tail entries created internally.
     pub fn insert(&mut self, start_lba: u64, lba_length: u32, hash: blake3::Hash) {
+        self.insert_inner(start_lba, lba_length, hash, None);
+    }
+
+    /// Insert a Delta extent. Same as [`insert`] but attaches `source_hashes`
+    /// to the new LBA entry and refcounts each source. Splits propagate the
+    /// source list (each surviving split contributes to the refcount).
+    pub fn insert_delta(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        hash: blake3::Hash,
+        source_hashes: Arc<[blake3::Hash]>,
+    ) {
+        self.insert_inner(start_lba, lba_length, hash, Some(source_hashes));
+    }
+
+    fn insert_inner(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        hash: blake3::Hash,
+        sources: Option<Arc<[blake3::Hash]>>,
+    ) {
         let new_end = start_lba + lba_length as u64;
 
         // Step 1: Handle a predecessor entry that starts before `start_lba`
@@ -105,20 +177,22 @@ impl LbaMap {
         if let Some((&pred_start, &pred)) = self.inner.range(..start_lba).next_back() {
             let pred_end = pred_start + pred.lba_length as u64;
             if pred_end > start_lba {
-                self.inner.remove(&pred_start);
+                let pred_sources = self.delta_sources_by_lba.get(&pred_start).cloned();
+                self.remove_entry(pred_start);
                 // Prefix [pred_start, start_lba): same payload_block_offset.
-                self.inner.insert(
+                self.add_entry(
                     pred_start,
                     MapEntry {
                         lba_length: (start_lba - pred_start) as u32,
                         hash: pred.hash,
                         payload_block_offset: pred.payload_block_offset,
                     },
+                    pred_sources.clone(),
                 );
                 // Suffix [new_end, pred_end): only present in the "hole punch"
                 // case. payload_block_offset advances by (new_end - pred_start).
                 if pred_end > new_end {
-                    self.inner.insert(
+                    self.add_entry(
                         new_end,
                         MapEntry {
                             lba_length: (pred_end - new_end) as u32,
@@ -126,6 +200,7 @@ impl LbaMap {
                             payload_block_offset: pred.payload_block_offset
                                 + (new_end - pred_start) as u32,
                         },
+                        pred_sources,
                     );
                 }
             }
@@ -140,33 +215,69 @@ impl LbaMap {
             .map(|(&k, _)| k)
             .collect();
         for key in overlapping {
+            let e_sources = self.delta_sources_by_lba.get(&key).cloned();
             // Key was found in range query above; remove cannot fail.
-            let Some(e) = self.inner.remove(&key) else {
+            let Some(e) = self.remove_entry(key) else {
                 continue;
             };
             let entry_end = key + e.lba_length as u64;
             if entry_end > new_end {
                 // Entry extends past the new range; preserve its tail.
                 // payload_block_offset advances by (new_end - key).
-                self.inner.insert(
+                self.add_entry(
                     new_end,
                     MapEntry {
                         lba_length: (entry_end - new_end) as u32,
                         hash: e.hash,
                         payload_block_offset: e.payload_block_offset + (new_end - key) as u32,
                     },
+                    e_sources,
                 );
             }
         }
 
-        self.inner.insert(
+        self.add_entry(
             start_lba,
             MapEntry {
                 lba_length,
                 hash,
                 payload_block_offset: 0,
             },
+            sources,
         );
+    }
+
+    /// Attach (or replace) the Delta source list for the LBA entry starting
+    /// at `start_lba`, but only if the entry's content hash matches
+    /// `expected_hash`. Returns `true` if updated, `false` if the LBA has no
+    /// entry or its hash no longer matches (i.e. a concurrent overwrite
+    /// raced the caller).
+    ///
+    /// Used by post-flush Data→Delta conversions (`delta_repack`) where the
+    /// segment file is rewritten with Delta entries but the LBA map's
+    /// content hash is unchanged.
+    pub fn set_delta_sources_if_matches(
+        &mut self,
+        start_lba: u64,
+        expected_hash: blake3::Hash,
+        source_hashes: Arc<[blake3::Hash]>,
+    ) -> bool {
+        let Some(entry) = self.inner.get(&start_lba) else {
+            return false;
+        };
+        if entry.hash != expected_hash {
+            return false;
+        }
+        if let Some(old) = self.delta_sources_by_lba.remove(&start_lba) {
+            for h in old.iter() {
+                self.decref(h);
+            }
+        }
+        for h in source_hashes.iter() {
+            self.incref(*h);
+        }
+        self.delta_sources_by_lba.insert(start_lba, source_hashes);
+        true
     }
 
     /// Iterate over all extents that overlap `[start_lba, end_lba)`, in ascending LBA order.
@@ -278,16 +389,8 @@ impl LbaMap {
     /// reads.
     pub fn lba_referenced_hashes(&self) -> HashSet<blake3::Hash> {
         let mut out: HashSet<blake3::Hash> = self.inner.values().map(|e| e.hash).collect();
-        out.extend(self.delta_source_hashes.iter().copied());
+        out.extend(self.delta_source_counts.keys().copied());
         out
-    }
-
-    /// Record a delta source hash as referenced. Called for every
-    /// `DeltaOption::source_hash` on every live Delta entry fed into
-    /// the map at insert or rebuild time. See the `LbaMap` doc comment
-    /// for the grow-only semantics.
-    pub fn register_delta_source(&mut self, source_hash: blake3::Hash) {
-        self.delta_source_hashes.insert(source_hash);
     }
 
     /// Iterate every entry in the map as
@@ -442,11 +545,12 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
                 Err(e) => return Err(e),
             };
             for entry in entries {
-                map.insert(entry.start_lba, entry.lba_length, entry.hash);
                 if entry.kind == segment::EntryKind::Delta {
-                    for opt in &entry.delta_options {
-                        map.register_delta_source(opt.source_hash);
-                    }
+                    let sources: Arc<[blake3::Hash]> =
+                        entry.delta_options.iter().map(|o| o.source_hash).collect();
+                    map.insert_delta(entry.start_lba, entry.lba_length, entry.hash, sources);
+                } else {
+                    map.insert(entry.start_lba, entry.lba_length, entry.hash);
                 }
             }
         }
@@ -769,7 +873,7 @@ mod tests {
             referenced.contains(&content_hash),
             "delta content hash missing from lba_referenced_hashes"
         );
-        // Both source hashes folded in via register_delta_source.
+        // Both source hashes folded in via insert_delta's refcount.
         assert!(
             referenced.contains(&source_a),
             "delta source A missing from lba_referenced_hashes"
@@ -782,6 +886,110 @@ mod tests {
         assert!(!referenced.contains(&unrelated));
 
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- delta source refcount tests ---
+
+    #[test]
+    fn delta_source_removed_when_lba_overwritten() {
+        let mut map = LbaMap::new();
+        let src = h(11);
+        map.insert_delta(0, 4, h(1), Arc::from([src]));
+        assert!(map.lba_referenced_hashes().contains(&src));
+
+        // Overwrite the entire Delta range with a plain Data write.
+        map.insert(0, 4, h(2));
+        let referenced = map.lba_referenced_hashes();
+        assert!(
+            !referenced.contains(&src),
+            "delta source should be removed after the Delta LBA is overwritten"
+        );
+    }
+
+    #[test]
+    fn delta_source_survives_split_and_drops_when_last_half_overwritten() {
+        let mut map = LbaMap::new();
+        let src = h(11);
+        // Delta at [0, 10) with source src.
+        map.insert_delta(0, 10, h(1), Arc::from([src]));
+        // Hole-punch in the middle: splits into [0, 3) and [5, 10), both still Delta.
+        map.insert(3, 2, h(2));
+        assert!(
+            map.lba_referenced_hashes().contains(&src),
+            "source must stay live while any split of the Delta remains"
+        );
+        // Overwrite the first half.
+        map.insert(0, 3, h(3));
+        assert!(
+            map.lba_referenced_hashes().contains(&src),
+            "source must stay live while the other split remains"
+        );
+        // Overwrite the second half.
+        map.insert(5, 5, h(4));
+        assert!(
+            !map.lba_referenced_hashes().contains(&src),
+            "source must drop once all splits are gone"
+        );
+    }
+
+    #[test]
+    fn delta_source_refcount_tracks_multiple_deltas_per_source() {
+        let mut map = LbaMap::new();
+        let src = h(11);
+        // Two independent Delta LBAs share the same source.
+        map.insert_delta(0, 1, h(1), Arc::from([src]));
+        map.insert_delta(100, 1, h(2), Arc::from([src]));
+
+        assert!(map.lba_referenced_hashes().contains(&src));
+        // Overwrite the first Delta — source should remain live (refcount 1).
+        map.insert(0, 1, h(3));
+        assert!(
+            map.lba_referenced_hashes().contains(&src),
+            "source alive while another Delta still references it"
+        );
+        // Overwrite the second — refcount hits zero.
+        map.insert(100, 1, h(4));
+        assert!(!map.lba_referenced_hashes().contains(&src));
+    }
+
+    #[test]
+    fn set_delta_sources_if_matches_updates_and_replaces_refcounts() {
+        let mut map = LbaMap::new();
+        let content = h(1);
+        let old_src = h(11);
+        let new_src = h(13);
+
+        // Start with a plain Data entry — no delta sources.
+        map.insert(0, 1, content);
+        assert!(!map.lba_referenced_hashes().contains(&old_src));
+
+        // Attach an initial source.
+        assert!(map.set_delta_sources_if_matches(0, content, Arc::from([old_src])));
+        assert!(map.lba_referenced_hashes().contains(&old_src));
+
+        // Replace with a new source list — old must go away, new must appear.
+        assert!(map.set_delta_sources_if_matches(0, content, Arc::from([new_src])));
+        let referenced = map.lba_referenced_hashes();
+        assert!(!referenced.contains(&old_src));
+        assert!(referenced.contains(&new_src));
+    }
+
+    #[test]
+    fn set_delta_sources_if_matches_rejects_hash_mismatch() {
+        let mut map = LbaMap::new();
+        let content = h(1);
+        let other = h(2);
+        let src = h(11);
+
+        map.insert(0, 1, content);
+        // Concurrent overwrite changed the hash.
+        map.insert(0, 1, other);
+
+        assert!(
+            !map.set_delta_sources_if_matches(0, content, Arc::from([src])),
+            "must reject when LBA hash no longer matches"
+        );
+        assert!(!map.lba_referenced_hashes().contains(&src));
     }
 
     // --- extents_in_range tests ---

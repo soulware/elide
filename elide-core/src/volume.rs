@@ -1712,6 +1712,13 @@ impl Volume {
                                 options: post.delta_options.clone(),
                             },
                         );
+                        let sources: Arc<[blake3::Hash]> =
+                            post.delta_options.iter().map(|o| o.source_hash).collect();
+                        Arc::make_mut(&mut self.lbamap).set_delta_sources_if_matches(
+                            post.start_lba,
+                            post.hash,
+                            sources,
+                        );
                     }
                     (EntryKind::Delta, EntryKind::Delta) => {
                         // Pre-existing delta: re-register so a reader
@@ -1729,6 +1736,13 @@ impl Volume {
                                 },
                                 options: post.delta_options.clone(),
                             },
+                        );
+                        let sources: Arc<[blake3::Hash]> =
+                            post.delta_options.iter().map(|o| o.source_hash).collect();
+                        Arc::make_mut(&mut self.lbamap).set_delta_sources_if_matches(
+                            post.start_lba,
+                            post.hash,
+                            sources,
                         );
                     }
                     (EntryKind::DedupRef, _) | (EntryKind::Zero, _) => {}

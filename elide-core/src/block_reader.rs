@@ -573,11 +573,12 @@ fn apply_snapshot_layer(
 
         for (raw_idx, entry) in entries.iter().enumerate() {
             // LBA map: every entry contributes its range → content hash.
-            lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
             if entry.kind == EntryKind::Delta {
-                for opt in &entry.delta_options {
-                    lbamap.register_delta_source(opt.source_hash);
-                }
+                let sources: std::sync::Arc<[blake3::Hash]> =
+                    entry.delta_options.iter().map(|o| o.source_hash).collect();
+                lbamap.insert_delta(entry.start_lba, entry.lba_length, entry.hash, sources);
+            } else {
+                lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
             }
 
             match entry.kind {
