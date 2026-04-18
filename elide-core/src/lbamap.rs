@@ -483,6 +483,33 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
     let mut map = LbaMap::new();
 
     for (fork_dir, branch_ulid) in layers {
+        // Read pending/ and gc/ *before* index/ to close a narrow race: when a
+        // volume is live (e.g. external tools like `block_reader::open_live`
+        // call this while the flusher may be promoting a segment), promote
+        // writes `index/<ulid>.idx` and then removes the source file in
+        // `pending/<ulid>` or `gc/<ulid>`. If index/ is listed first and the
+        // source dir last, a segment could be missed from both lists — it
+        // wasn't in index/ at the first read and had been removed from its
+        // source by the time the second read happened.
+        //
+        // Reading the source dirs first is sufficient: the source file is only
+        // removed *after* the .idx has been written, so any segment captured
+        // by neither the first read (still in source) nor the second (now in
+        // index) is impossible by construction.
+        //
+        // Matches the ordering in `extentindex::rebuild` for the same reason.
+        //
+        // pending/: in-flight WAL flushes (highest priority — most recent writes).
+        let mut pending_paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
+        pending_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+        // gc/*.applied: GC output bodies awaiting coordinator upload to S3.
+        // These are produced BEFORE the WAL flush that follows gc_checkpoint
+        // (u_repack < u_flush), so they are lower priority than index/*.idx
+        // entries — a WAL flush promoted to index/ after GC ran must win.
+        let mut gc_paths = segment::collect_gc_applied_segment_files(fork_dir)?;
+        gc_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+
         // index/*.idx: committed segments (evicted to two-file format; permanent LBA index).
         let mut cache_paths = segment::collect_idx_files(&fork_dir.join("index"))?;
         cache_paths.sort_unstable_by(|a, b| a.file_stem().cmp(&b.file_stem()));
@@ -494,17 +521,6 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
                     .unwrap_or(false)
             });
         }
-
-        // gc/*.applied: GC output bodies awaiting coordinator upload to S3.
-        // These are produced BEFORE the WAL flush that follows gc_checkpoint
-        // (u_repack < u_flush), so they are lower priority than index/*.idx
-        // entries — a WAL flush promoted to index/ after GC ran must win.
-        let mut gc_paths = segment::collect_gc_applied_segment_files(fork_dir)?;
-        gc_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
-
-        // pending/: in-flight WAL flushes (highest priority — most recent writes).
-        let mut pending_paths = segment::collect_segment_files(&fork_dir.join("pending"))?;
-        pending_paths.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
 
         if let Some(cutoff) = branch_ulid {
             gc_paths.retain(|p| {
@@ -553,6 +569,13 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
                 Err(e) => return Err(e),
             };
             for entry in entries {
+                // CanonicalBody entries carry a body for dedup resolution
+                // via the extent index but make no LBA claim on rebuild.
+                // Skip them here so their stale start_lba (zeroed by the
+                // emitter) never mutates the map.  See SegmentFlags::CANONICAL_ONLY.
+                if entry.canonical_only {
+                    continue;
+                }
                 if entry.kind == segment::EntryKind::Delta {
                     let sources: Arc<[blake3::Hash]> =
                         entry.delta_options.iter().map(|o| o.source_hash).collect();

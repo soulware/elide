@@ -253,6 +253,16 @@ bitflags! {
         /// extent index). Entries with this flag must carry `HAS_DELTAS` and
         /// have at least one delta option.
         const DELTA        = 0x20;
+        /// Canonical-body-only: this entry carries a body for its hash (read
+        /// via `extent_index.lookup`), but makes **no LBA claim** on rebuild.
+        /// `start_lba` / `lba_length` are serialised as zero and the entry is
+        /// skipped by `lbamap::rebuild_segments`. Emitted by GC when a
+        /// DATA/INLINE entry's original LBA has been overwritten but the
+        /// hash is still referenced elsewhere via a DedupRef — preserves
+        /// the canonical body without shadowing the live LBA mapping.
+        /// Co-exists with `INLINE` (body in inline section) or without it
+        /// (body in body section). See `docs/formats.md`.
+        const CANONICAL_ONLY = 0x40;
     }
 }
 
@@ -341,6 +351,14 @@ pub struct SegmentEntry {
     /// Each option provides a zstd-dictionary-compressed alternative to the
     /// full body, using a different source extent as dictionary.
     pub delta_options: Vec<DeltaOption>,
+    /// Canonical-body-only: this entry carries body bytes (its hash is
+    /// canonical in this segment) but makes **no LBA claim** on rebuild —
+    /// `lbamap::rebuild_segments` skips entries with this flag. Zeroed
+    /// `start_lba` / `lba_length` are expected (and enforced on write).
+    /// Emitted by GC when carrying forward a hash that's still referenced
+    /// elsewhere via a DedupRef after its original LBA was overwritten.
+    /// Only valid for kinds that carry body bytes: `Data` and `Inline`.
+    pub canonical_only: bool,
 }
 
 impl SegmentEntry {
@@ -371,6 +389,7 @@ impl SegmentEntry {
             stored_length,
             data: Some(data),
             delta_options: Vec::new(),
+            canonical_only: false,
         }
     }
 
@@ -391,6 +410,7 @@ impl SegmentEntry {
             stored_length: 0,
             data: None,
             delta_options: Vec::new(),
+            canonical_only: false,
         }
     }
 
@@ -406,6 +426,7 @@ impl SegmentEntry {
             stored_length: 0,
             data: None,
             delta_options: Vec::new(),
+            canonical_only: false,
         }
     }
 
@@ -444,6 +465,7 @@ impl SegmentEntry {
             stored_length: 0,
             data: None,
             delta_options,
+            canonical_only: false,
         }
     }
 }
@@ -631,6 +653,17 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
 
 fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     let mut flags = SegmentFlags::empty();
+    if e.canonical_only {
+        debug_assert!(
+            matches!(e.kind, EntryKind::Data | EntryKind::Inline),
+            "canonical_only is only valid for body-bearing kinds (Data/Inline)"
+        );
+        debug_assert!(
+            e.start_lba == 0 && e.lba_length == 0,
+            "canonical_only entries must have zero start_lba and lba_length"
+        );
+        flags |= SegmentFlags::CANONICAL_ONLY;
+    }
     match e.kind {
         EntryKind::Inline => flags |= SegmentFlags::INLINE,
         EntryKind::DedupRef => flags |= SegmentFlags::DEDUP_REF,
@@ -1073,6 +1106,7 @@ fn parse_index_section(
         } else {
             EntryKind::Data
         };
+        let canonical_only = flags.contains(SegmentFlags::CANONICAL_ONLY);
 
         let stored_offset = u64::from_le_bytes(read_fixed(entries_data, &mut pos)?);
         let stored_length = u32::from_le_bytes(read_fixed(entries_data, &mut pos)?);
@@ -1088,6 +1122,7 @@ fn parse_index_section(
             stored_length,
             data: None,
             delta_options: Vec::new(),
+            canonical_only,
         });
     }
 

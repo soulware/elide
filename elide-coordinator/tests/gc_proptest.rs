@@ -107,6 +107,13 @@ enum SimOp {
     /// Write [seed; 4096] to lba_a then lba_b (disjoint ranges 0..4 / 4..8).
     /// Because the data is identical, lba_b's WAL entry is a DEDUP_REF.
     DedupWrite { lba_a: u8, lba_b: u8, seed: u8 },
+    /// Like `DedupWrite`, but with a flush between the two writes so the
+    /// canonical DATA and the DedupRef land in *separate* segments. This
+    /// is the precondition for the bug H class: once a later `Write`
+    /// overwrites `lba_a`, the DATA's segment has a dead LBA whose hash
+    /// is still live via `lba_b` — `collect_stats` must demote the entry
+    /// to `canonical_only` rather than preserve it at its original LBA.
+    SplitDedupWrite { lba_a: u8, lba_b: u8, seed: u8 },
     /// Flush the WAL to a pending/ segment.
     Flush,
     /// Run the full real coordinator GC round-trip, then assert the oracle.
@@ -140,6 +147,8 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             lba_b,
             seed
         }),
+        2 => (0u8..4, 4u8..8, any::<u8>())
+            .prop_map(|(lba_a, lba_b, seed)| SimOp::SplitDedupWrite { lba_a, lba_b, seed }),
         2 => Just(SimOp::Flush),
         1 => Just(SimOp::GcSweep),
         1 => Just(SimOp::Restart),
@@ -201,6 +210,13 @@ proptest! {
                     let data = [*seed; 4096];
                     let _ = vol.write(*lba_a as u64, &data);
                     let _ = vol.write(*lba_b as u64, &data);
+                }
+                SimOp::SplitDedupWrite { lba_a, lba_b, seed } => {
+                    let data = [*seed; 4096];
+                    let _ = vol.write(*lba_a as u64, &data);
+                    let _ = vol.flush_wal();
+                    let _ = vol.write(*lba_b as u64, &data);
+                    let _ = vol.flush_wal();
                 }
                 SimOp::Flush => {
                     let _ = vol.flush_wal();
@@ -344,6 +360,15 @@ proptest! {
                     let data = [*seed; 4096];
                     let _ = vol.write(*lba_a as u64, &data);
                     let _ = vol.write(*lba_b as u64, &data);
+                    oracle.insert(*lba_a as u64, data);
+                    oracle.insert(*lba_b as u64, data);
+                }
+                SimOp::SplitDedupWrite { lba_a, lba_b, seed } => {
+                    let data = [*seed; 4096];
+                    let _ = vol.write(*lba_a as u64, &data);
+                    let _ = vol.flush_wal();
+                    let _ = vol.write(*lba_b as u64, &data);
+                    let _ = vol.flush_wal();
                     oracle.insert(*lba_a as u64, data);
                     oracle.insert(*lba_b as u64, data);
                 }
