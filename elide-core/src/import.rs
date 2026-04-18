@@ -37,9 +37,11 @@ const ZERO_BLOCK: [u8; LBA_SIZE] = [0u8; LBA_SIZE];
 
 /// Soft cap on raw (uncompressed) data accumulated before flushing a segment.
 ///
-/// Large segments amortise per-file overhead and make efficient S3 objects.
-/// The cap is soft: the last fragment in a batch may push slightly past it.
-const IMPORT_SEGMENT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB raw
+/// Matches the runtime WAL flush threshold and GC sweep live-bytes target so
+/// imported volumes produce the same segment granularity as everything else —
+/// uniform eviction, demand-fetch, and bin-packing behaviour. The cap is soft:
+/// the last fragment in a batch may push slightly past it.
+const IMPORT_SEGMENT_BYTES: usize = 32 * 1024 * 1024; // 32 MiB raw
 
 fn shannon_entropy(data: &[u8]) -> f64 {
     let mut counts = [0u32; 256];
