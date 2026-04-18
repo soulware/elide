@@ -274,6 +274,20 @@ fn compact_candidates_inner(
         {
             continue;
         }
+        // Mirror the production body-hash verify (PR #70 / commit 000d3b0):
+        // every Data/Inline body read from an input segment must hash to
+        // its declared hash before we carry it forward.  Abort the whole
+        // pass on mismatch — the real coordinator (compact_segments) and
+        // volume (apply_staged_handoff) both cancel on this, so the
+        // oracle must too or it would silently disagree on bad inputs.
+        for entry in &entries {
+            if matches!(entry.kind, EntryKind::Data | EntryKind::Inline)
+                && let Some(body) = entry.data.as_deref()
+                && segment::verify_body_hash(entry, body).is_err()
+            {
+                return None;
+            }
+        }
         for entry in entries.drain(..) {
             // Liveness check: keep when the LBA still maps to this hash, or
             // when this segment is still the extent-canonical location for a

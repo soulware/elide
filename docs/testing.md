@@ -148,9 +148,17 @@ Key additions over the volume-level proptest:
 
 The test seeds two segments, then runs a reader thread (500 read-all iterations) concurrently with a coordinator thread running one GC pass, asserting the reader's error list stays empty. The failure mode was confirmed by running once with inline deletion (before handoff apply), which reproduced `segment not found` for cold LBAs; the fix — returning paths for deferred deletion — made it pass.
 
-## Formal model: TLA+ handoff protocol
+## Formal model: TLA+ specs
 
-`specs/HandoffProtocol.tla` is a TLA+ model of the GC handoff protocol, checked with TLC. The model still describes the pre-self-describing three-state lifecycle (`absent → pending → applied → done`) and remains an accurate model of the safety invariants — the new on-disk shape is `absent → staged → bare → absent` but the same correctness properties hold (no segment is deleted without acknowledgment, no extent references a missing segment). Updating the TLA+ model to the new lifecycle is tracked as an open item.
+Two TLA+ models checked with TLC:
+
+- `specs/HandoffProtocol.tla` — GC handoff protocol.
+- `specs/GCCheckpointOrdering.tla` — `u_repack < u_sweep < u_wal < new_wal_ulid` ordering invariant enforced by the three-ULID pre-mint in `gc_checkpoint`.
+- `specs/WorkerOffload.tla` — actor ↔ worker offload protocol. Models the prep/middle/apply three-phase shape every offloaded maintenance op shares (sweep, repack, delta_repack, promote, gc_handoff, sign_snapshot_manifest) using one canonical op. Checks the CAS-loser survival invariant that proptest cannot cover (a single-threaded test cannot interleave a write between prep and apply on the same actor), and the post-crash no-permanent-park invariant that is structurally invisible to proptest (the actor is dropped along with its parked slots).
+
+### HandoffProtocol
+
+The model still describes the pre-self-describing three-state lifecycle (`absent → pending → applied → done`) and remains an accurate model of the safety invariants — the new on-disk shape is `absent → staged → bare → absent` but the same correctness properties hold (no segment is deleted without acknowledgment, no extent references a missing segment). Updating the TLA+ model to the new lifecycle is tracked as an open item.
 
 **Safety invariants:**
 
@@ -166,6 +174,14 @@ tlc specs/HandoffProtocol.tla -config specs/HandoffProtocol.cfg
 ```
 
 Or via VS Code (`tlaplus.tlaplus`). Requires a JRE. The `.cfg` uses two carried hashes and one removed hash — enough to exercise all branches while keeping the state space small.
+
+### WorkerOffload
+
+```
+tlc specs/WorkerOffload.tla -config specs/WorkerOffload.cfg
+```
+
+`MAX_WRITES = 3` is the default bound — every state-relevant interleaving is reachable at that size. Invariants checked: `NoCorruption`, `NoPermanentPark`, `OneInFlight`, and the temporal property `CasLoserSurvives`. To observe the bug the CAS guards against, drop the `extent_index = worker_job.src` check from the `Apply` action; TLC produces a `Write → StartPromote → Write → WorkerProduce → Apply` counterexample where the concurrent Write is clobbered.
 
 ## Future: deeper concurrency verification
 

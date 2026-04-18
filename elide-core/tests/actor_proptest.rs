@@ -71,6 +71,20 @@ enum ActorOp {
     /// post-commit snapshot republish. After the call, every oracle LBA
     /// must still read back its written value (reclaim preserves content).
     Reclaim { start_lba: u8, lba_count: u8 },
+    /// Seal a snapshot via `handle.sign_snapshot_manifest` over the current
+    /// `index/` set. Exercises the offloaded `WorkerJob::SignSnapshotManifest`
+    /// path: parked-reply dispatch, manifest fsync on the worker, apply-phase
+    /// `has_new_segments` flip on the actor. After the call, every oracle LBA
+    /// must still read correctly (signing must not touch data paths).
+    Snapshot,
+    /// Run `handle.delta_repack_post_snapshot` — exercises the offloaded
+    /// `WorkerJob::DeltaRepack` path and the three-way CAS apply phase.
+    /// Covers Data-to-Data via `replace_if_matches`, Data-to-Delta via
+    /// `remove_if_matches` paired with `insert_delta_if_absent`, and
+    /// pre-existing Delta via `insert_delta_if_absent` alone. No-op when
+    /// no sealed snapshot exists — needs a prior `Snapshot` op. After
+    /// the call, every oracle LBA must still read correctly.
+    DeltaRepack,
 }
 
 fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
@@ -84,6 +98,8 @@ fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
         1 => Just(ActorOp::Crash),
         1 => (0u8..8, 1u8..8u8)
             .prop_map(|(start_lba, lba_count)| ActorOp::Reclaim { start_lba, lba_count }),
+        1 => Just(ActorOp::Snapshot),
+        1 => Just(ActorOp::DeltaRepack),
     ]
 }
 
@@ -229,6 +245,60 @@ proptest! {
                             actual.as_slice(),
                             expected.as_slice(),
                             "lba {} wrong after reclaim_alias_merge via actor",
+                            lba
+                        );
+                    }
+                }
+                ActorOp::Snapshot => {
+                    // Pick a snap_ulid covering the current index/ set:
+                    //   * max(index) when non-empty — matches the
+                    //     coordinator's "latest segment at lock time" rule.
+                    //   * fresh ulid when empty — the sign path still runs
+                    //     and produces a degenerate manifest with zero segs.
+                    //
+                    // The prior `DrainLocal` in the op sequence is what
+                    // actually drains pending → index/; Snapshot just seals.
+                    let index_dir = fork_dir.join("index");
+                    let snap_ulid = std::fs::read_dir(&index_dir)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .filter_map(|e| {
+                            let name = e.file_name();
+                            let s = name.to_str()?;
+                            let stem = s.strip_suffix(".idx")?;
+                            ulid::Ulid::from_string(stem).ok()
+                        })
+                        .max()
+                        .unwrap_or_else(ulid::Ulid::new);
+                    // Offload path: parked_sign_snapshot_manifest + worker.
+                    // has_new_segments flips on apply; verify reads are
+                    // unaffected (snapshot does not touch the data path).
+                    let _ = handle.sign_snapshot_manifest(snap_ulid);
+                    for (&lba, expected) in &oracle {
+                        let actual = handle.read(lba, 1).unwrap();
+                        prop_assert_eq!(
+                            actual.as_slice(),
+                            expected.as_slice(),
+                            "lba {} wrong after sign_snapshot_manifest via actor",
+                            lba
+                        );
+                    }
+                }
+                ActorOp::DeltaRepack => {
+                    // Offload path: parked_delta_repack + worker.  Apply
+                    // walks the three-way CAS (Data→Data, Data→Delta,
+                    // Delta→Delta); we assert every oracle LBA survives.
+                    // No-op when no sealed snapshot exists — the prep
+                    // phase returns None and the call is a nil op.
+                    let _ = handle.delta_repack_post_snapshot();
+                    for (&lba, expected) in &oracle {
+                        let actual = handle.read(lba, 1).unwrap();
+                        prop_assert_eq!(
+                            actual.as_slice(),
+                            expected.as_slice(),
+                            "lba {} wrong after delta_repack_post_snapshot via actor",
                             lba
                         );
                     }
