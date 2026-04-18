@@ -30,15 +30,3 @@ Three phases, of which only the middle is heavy. See `docs/design-noop-write-ski
 `scan_reclaim_candidates` walks the live lbamap and extent index and produces `ReclaimCandidate { start_lba, lba_length, dead_blocks, live_blocks, stored_bytes }` entries for hashes with detectable bloat (controlled by `ReclaimThresholds`, all defaults placeholder values).
 
 `elide volume reclaim <name>` calls the scanner, then calls the primitive once per candidate. It exists so the primitive can be exercised end-to-end — this is not a customer-facing operation.
-
-## What's not here
-
-Everything about when or how reclamation should happen in production:
-
-- No scheduler. No coordinator-driven invocation. No drain loop.
-- No hint stream. No hint durability model.
-- No interaction with snapshot, fork, or evict.
-- No tuning for the thresholds — the defaults in `ReclaimThresholds` are placeholders.
-- No measurement infrastructure to tell us whether any of this matters on real workloads.
-
-These are open questions, not a plan. They should only be answered if and when evidence says reclamation needs automation.
