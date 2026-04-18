@@ -1,8 +1,7 @@
 // Single-volume coordinator tasks: drain pending segments to S3, run GC,
 // and prefetch indexes on startup.
 //
-// Called by both the multi-volume coordinator daemon (once per discovered
-// volume) and standalone single-volume mode (`elide volume up`).
+// Spawned once per volume by the coordinator daemon.
 //
 // Per-tick sequencing:
 //   1. Upload pending/ segments to S3 (drain_pending)
