@@ -21,7 +21,7 @@ use elide_core::{
 use ulid::Ulid;
 
 /// Create `dir` and write a fresh Ed25519 keypair into it, plus a default
-/// (root) `volume.provenance`. Matches production `volume up` behaviour: a
+/// (root) `volume.provenance`. Matches production volume-setup behaviour: a
 /// fresh writable volume has both a keypair and a provenance file, even
 /// when it has no parent. Required before `Volume::open` in tests that
 /// construct their own directories.

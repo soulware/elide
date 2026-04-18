@@ -4777,7 +4777,7 @@ mod tests {
             crate::signing::VOLUME_PUB_FILE,
         )
         .unwrap();
-        // Match production `volume up` behaviour: a fresh writable volume
+        // Match production volume-setup behaviour: a fresh writable volume
         // also gets a default (root) `volume.provenance`. Skipping this
         // makes `Volume::open` fail in the ancestor walk when another
         // volume forks from this one, because the child's provenance
