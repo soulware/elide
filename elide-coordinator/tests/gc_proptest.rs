@@ -114,6 +114,17 @@ enum SimOp {
     /// is still live via `lba_b` — `collect_stats` must demote the entry
     /// to `canonical_only` rather than preserve it at its original LBA.
     SplitDedupWrite { lba_a: u8, lba_b: u8, seed: u8 },
+    /// Write a multi-LBA Zero over [start_lba..start_lba+span), flush, then
+    /// overwrite one interior LBA with Data and flush. The Zero entry's
+    /// LBA span straddles a later Data hole — `collect_stats` must split
+    /// the Zero into surviving ZERO_HASH sub-runs rather than re-emit the
+    /// whole span at the GC-output ULID (bug I).
+    ZeroThenPartialWrite {
+        start_lba: u8,
+        span: u8,
+        inner_off: u8,
+        seed: u8,
+    },
     /// Flush the WAL to a pending/ segment.
     Flush,
     /// Run the full real coordinator GC round-trip, then assert the oracle.
@@ -149,6 +160,14 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         }),
         2 => (0u8..4, 4u8..8, any::<u8>())
             .prop_map(|(lba_a, lba_b, seed)| SimOp::SplitDedupWrite { lba_a, lba_b, seed }),
+        2 => (0u8..4, 2u8..=4, 1u8..=3, any::<u8>()).prop_map(
+            |(start_lba, span, inner_off, seed)| SimOp::ZeroThenPartialWrite {
+                start_lba,
+                span,
+                inner_off,
+                seed,
+            },
+        ),
         2 => Just(SimOp::Flush),
         1 => Just(SimOp::GcSweep),
         1 => Just(SimOp::Restart),
@@ -216,6 +235,18 @@ proptest! {
                     let _ = vol.write(*lba_a as u64, &data);
                     let _ = vol.flush_wal();
                     let _ = vol.write(*lba_b as u64, &data);
+                    let _ = vol.flush_wal();
+                }
+                SimOp::ZeroThenPartialWrite {
+                    start_lba,
+                    span,
+                    inner_off,
+                    seed,
+                } => {
+                    let _ = vol.write_zeroes(*start_lba as u64, *span as u32);
+                    let _ = vol.flush_wal();
+                    let inner = (*start_lba as u64) + (*inner_off as u64).min(*span as u64 - 1);
+                    let _ = vol.write(inner, &[*seed; 4096]);
                     let _ = vol.flush_wal();
                 }
                 SimOp::Flush => {
@@ -371,6 +402,25 @@ proptest! {
                     let _ = vol.flush_wal();
                     oracle.insert(*lba_a as u64, data);
                     oracle.insert(*lba_b as u64, data);
+                }
+                SimOp::ZeroThenPartialWrite {
+                    start_lba,
+                    span,
+                    inner_off,
+                    seed,
+                } => {
+                    let _ = vol.write_zeroes(*start_lba as u64, *span as u32);
+                    let _ = vol.flush_wal();
+                    let zeros = [0u8; 4096];
+                    let end = *start_lba as u64 + *span as u64;
+                    for lba in (*start_lba as u64)..end {
+                        oracle.insert(lba, zeros);
+                    }
+                    let inner = (*start_lba as u64) + (*inner_off as u64).min(*span as u64 - 1);
+                    let data = [*seed; 4096];
+                    let _ = vol.write(inner, &data);
+                    let _ = vol.flush_wal();
+                    oracle.insert(inner, data);
                 }
                 SimOp::Flush => {
                     let _ = vol.flush_wal();

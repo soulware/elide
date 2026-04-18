@@ -715,17 +715,26 @@ fn collect_stats(
             total_lba_bytes += lba_bytes;
 
             // Zero extents have no body bytes and use ZERO_HASH as a sentinel
-            // (never in the extent index). Liveness is determined by LBA-map
-            // ownership: the entry is live if the LBA still maps to ZERO_HASH.
-            // Without this check, zero entries would fall into the DATA path,
-            // where index.lookup(ZERO_HASH) always returns None, causing live
-            // zero extents to be silently dropped from GC output — allowing
-            // ancestor data to bleed through after compaction in forked volumes.
+            // (never in the extent index). Liveness is LBA-map ownership: a
+            // sub-range of the entry is live iff the lbamap still maps it to
+            // ZERO_HASH. A Zero entry can span thousands of LBAs (e.g. whole
+            // mkfs TRIM), any subset of which may have since been overwritten
+            // by later writes. Re-emitting the original span at the GC-output
+            // ULID would shadow those later writes on rebuild — so split the
+            // entry into sub-Zeros covering only the surviving ZERO_HASH runs.
             if entry.kind == EntryKind::Zero {
-                let lba_live = lba_map.hash_at(entry.start_lba) == Some(ZERO_HASH);
-                if lba_live {
-                    live_lba_bytes += lba_bytes;
-                    live_entries.push(entry);
+                let end = entry.start_lba + entry.lba_length as u64;
+                for ext in lba_map.extents_in_range(entry.start_lba, end) {
+                    if ext.hash != ZERO_HASH {
+                        continue;
+                    }
+                    let run_len = (ext.range_end - ext.range_start) as u32;
+                    let run_bytes = run_len as u64 * BLOCK_BYTES;
+                    live_lba_bytes += run_bytes;
+                    let mut live = entry.clone();
+                    live.start_lba = ext.range_start;
+                    live.lba_length = run_len;
+                    live_entries.push(live);
                     live_entry_indices.push(entry_idx);
                 }
                 continue;
@@ -2044,6 +2053,129 @@ mod tests {
                     entry.start_lba,
                     entry.hash.to_hex(),
                     lba_hash.map(|h| h.to_hex().to_string()),
+                );
+            }
+        }
+    }
+
+    /// Bug I reproduction (DIRECT collect_stats level):
+    ///
+    /// `collect_stats` samples Zero-entry liveness with a single
+    /// `hash_at(start_lba)` point query. A Zero entry written as one large
+    /// TRIM (e.g. 4096 blocks) can have its **middle** overwritten by a
+    /// later Data write while the first LBA still reads ZERO_HASH. The
+    /// current check sees the whole Zero entry as live and re-emits it
+    /// unchanged at the GC-output ULID — which is higher than both the
+    /// original Zero segment and whichever segment now carries the real
+    /// Data. On disk rebuild the re-emitted Zero shadows the real Data.
+    ///
+    /// Scenario:
+    ///   - S1: Zero[0..4096). lbamap covers 0..4096 with ZERO_HASH.
+    ///   - S2: Data h1 at LBA 2000. lbamap splits: 0..2000 → ZERO,
+    ///     2000..2001 → h1, 2001..4096 → ZERO.
+    ///
+    /// Expected (post-fix): S1's live_entries contains Zero sub-runs only
+    /// for the surviving ZERO_HASH ranges — no single entry spans LBA 2000
+    /// where the current mapping is h1.
+    ///
+    /// Current (buggy) behaviour: S1's live_entries contains one Zero
+    /// entry at start_lba=0, lba_length=4096 — covering LBA 2000 where
+    /// lbamap says h1. Test assertion fails until the fix lands.
+    #[test]
+    fn collect_stats_trims_zero_entry_to_surviving_subranges() {
+        let dir = TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let vk =
+            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+
+        let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+
+        let mut h1_bytes = [0u8; 4096];
+        for (i, b) in h1_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(59).wrapping_add(11);
+        }
+        let h1 = blake3::hash(&h1_bytes);
+
+        // S1: large Zero covering LBAs 0..4096.
+        vol.write_zeroes(0, 4096).unwrap();
+        vol.flush_wal().unwrap();
+
+        // S2: Data h1 at LBA 2000 — punches a hole in the middle of S1's Zero.
+        vol.write(2000, &h1_bytes).unwrap();
+        vol.flush_wal().unwrap();
+
+        // Drain pending → index/+cache/.
+        let pending_dir = fork_dir.join("pending");
+        let mut ulids: Vec<ulid::Ulid> = Vec::new();
+        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap();
+            if name_str.contains('.') {
+                continue;
+            }
+            if let Ok(ulid) = ulid::Ulid::from_string(name_str) {
+                ulids.push(ulid);
+            }
+        }
+        ulids.sort();
+        for ulid in &ulids {
+            vol.redact_segment(*ulid).unwrap();
+            vol.promote_segment(*ulid).unwrap();
+        }
+        let s1_ulid = ulids[0].to_string();
+
+        // Rebuild state + compute stats.
+        let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let live_hashes = lbamap.lba_referenced_hashes();
+
+        // Preconditions.
+        assert_eq!(
+            lbamap.hash_at(0),
+            Some(elide_core::volume::ZERO_HASH),
+            "LBA 0 must still be zero"
+        );
+        assert_eq!(lbamap.hash_at(2000), Some(h1), "LBA 2000 must be h1");
+        assert_eq!(
+            lbamap.hash_at(3000),
+            Some(elide_core::volume::ZERO_HASH),
+            "LBA 3000 must still be zero"
+        );
+
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+
+        let s1_stats = stats
+            .iter()
+            .find(|s| s.ulid_str == s1_ulid)
+            .expect("S1 must be in collect_stats output");
+
+        // For every Zero live_entry in S1, the *entire* covered range must
+        // still map to ZERO_HASH in the lbamap. Before the fix, the single
+        // Zero entry spans LBA 2000 where lbamap = h1 — assertion fails.
+        for entry in &s1_stats.live_entries {
+            if entry.kind != EntryKind::Zero {
+                continue;
+            }
+            let end = entry.start_lba + entry.lba_length as u64;
+            for lba in entry.start_lba..end {
+                assert_eq!(
+                    lbamap.hash_at(lba),
+                    Some(elide_core::volume::ZERO_HASH),
+                    "S1 Zero entry [{}+{}) covers LBA {} whose current mapping \
+                     is {:?} — would shadow the correct binding on rebuild (bug I).",
+                    entry.start_lba,
+                    entry.lba_length,
+                    lba,
+                    lbamap.hash_at(lba).map(|h| h.to_hex().to_string()),
                 );
             }
         }
