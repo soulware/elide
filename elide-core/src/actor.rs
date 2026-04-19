@@ -1974,7 +1974,7 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
             &c.seg_path,
             c.body_section_start,
             &mut c.live_part,
-            [segment::EntryKind::Data, segment::EntryKind::Inline],
+            segment::EntryKind::ALL_WITH_BODY,
             &inline_bytes,
         )?;
         // Verify each body matches its declared hash before it's carried
