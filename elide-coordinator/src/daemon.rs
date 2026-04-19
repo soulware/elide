@@ -73,7 +73,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     let import_registry = import::new_registry();
 
     // Per-fork eviction channel registry.
-    let evict_registry: EvictRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let evict_registry: EvictRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     // Per-fork snapshot lock registry (shared by the snapshot inbound handler
     // and every per-volume tick loop via try_lock).
@@ -142,7 +142,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 let (evict_tx, evict_rx) = tokio::sync::mpsc::channel(4);
                 evict_registry
                     .lock()
-                    .await
+                    .expect("evict registry poisoned")
                     .insert(vol_dir.clone(), evict_tx);
 
                 tasks.spawn(elide_coordinator::tasks::run_volume_tasks(

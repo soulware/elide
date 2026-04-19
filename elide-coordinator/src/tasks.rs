@@ -209,7 +209,7 @@ pub async fn run_volume_tasks(
         // snapshot handler holds this lock for its full sequence (flush →
         // drain → sign manifest → upload); racing the tick loop against it
         // would reorder pending/ uploads against the manifest's index view.
-        let snap_lock = snapshot_lock_for(&snapshot_locks, &fork_dir).await;
+        let snap_lock = snapshot_lock_for(&snapshot_locks, &fork_dir);
         let _tick_guard = match snap_lock.try_lock() {
             Ok(g) => g,
             Err(_) => {
@@ -332,16 +332,16 @@ pub async fn run_volume_tasks(
                 info!("[gc {volume_id}] volume applied {handoffs_applied} GC handoff(s)");
             }
 
-            match gc::gc_fork(
-                &fork_dir,
-                &volume_id,
-                &store,
-                &gc_config,
-                repack_ulid,
-                sweep_ulid,
-            )
-            .await
-            {
+            let gc_result = {
+                let fork_dir = fork_dir.clone();
+                let gc_config = gc_config.clone();
+                tokio::task::spawn_blocking(move || {
+                    gc::gc_fork(&fork_dir, &gc_config, repack_ulid, sweep_ulid)
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("gc task panicked: {e}")))
+            };
+            match gc_result {
                 Ok(gc::GcStats {
                     strategy: gc::GcStrategy::Repack,
                     bytes_freed,

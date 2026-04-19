@@ -8,9 +8,9 @@ pub mod upload;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 /// Registry of per-fork eviction channels.
 ///
@@ -22,16 +22,18 @@ pub type EvictRegistry =
 
 /// Registry of per-fork snapshot locks.
 ///
-/// Held by the coordinator snapshot inbound handler for the full duration of
-/// a snapshot sequence (flush → inline drain → sign manifest → upload). The
-/// per-volume tick loop `try_lock`s this before running drain/GC/eviction
-/// for that fork and skips the volume for that tick if the lock is held.
+/// The outer `Mutex` guards the HashMap and is never held across `.await`.
+/// The inner `AsyncMutex` is held by the snapshot inbound handler for the
+/// full duration of a snapshot sequence (flush → inline drain → sign
+/// manifest → upload) across multiple `.await`s, so it must be a tokio
+/// mutex. The per-volume tick loop `try_lock`s the inner mutex before
+/// running drain/GC/eviction and skips the volume for that tick if held.
 ///
 /// The lock exists only to keep the coordinator's own background tick loop
 /// off a volume mid-snapshot. Volume-actor commands are already serialised
 /// through the actor channel, so intra-volume commands never race regardless
 /// of this lock.
-pub type SnapshotLockRegistry = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
+pub type SnapshotLockRegistry = Arc<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>>;
 
 /// Construct an empty `SnapshotLockRegistry`.
 pub fn new_snapshot_lock_registry() -> SnapshotLockRegistry {
@@ -39,12 +41,12 @@ pub fn new_snapshot_lock_registry() -> SnapshotLockRegistry {
 }
 
 /// Get or create the per-fork snapshot lock for `fork_dir`.
-pub async fn snapshot_lock_for(
+pub fn snapshot_lock_for(
     registry: &SnapshotLockRegistry,
     fork_dir: &std::path::Path,
-) -> Arc<Mutex<()>> {
-    let mut map = registry.lock().await;
+) -> Arc<AsyncMutex<()>> {
+    let mut map = registry.lock().expect("snapshot lock registry poisoned");
     map.entry(fork_dir.to_owned())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
         .clone()
 }

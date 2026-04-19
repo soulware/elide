@@ -14,11 +14,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::Notify;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -223,21 +223,27 @@ impl ImportJob {
         })
     }
 
-    async fn append(&self, line: String) {
-        self.lines.lock().await.push(line);
+    fn append(&self, line: String) {
+        self.lines
+            .lock()
+            .expect("import job lines poisoned")
+            .push(line);
     }
 
-    async fn finish(&self, state: ImportState) {
-        *self.state.write().await = state;
+    fn finish(&self, state: ImportState) {
+        *self.state.write().expect("import job state poisoned") = state;
     }
 
     /// Return output lines starting from `offset`.
-    pub async fn read_from(&self, offset: usize) -> Vec<String> {
-        self.lines.lock().await[offset..].to_vec()
+    pub fn read_from(&self, offset: usize) -> Vec<String> {
+        self.lines.lock().expect("import job lines poisoned")[offset..].to_vec()
     }
 
-    pub async fn state(&self) -> ImportState {
-        self.state.read().await.clone()
+    pub fn state(&self) -> ImportState {
+        self.state
+            .read()
+            .expect("import job state poisoned")
+            .clone()
     }
 }
 
@@ -348,7 +354,7 @@ pub async fn spawn_import(
     let job = ImportJob::new(vol_dir.clone(), pid);
     registry
         .lock()
-        .await
+        .expect("import registry poisoned")
         .insert(import_ulid.clone(), job.clone());
 
     // Watch for the import to enter the serve phase (control.sock appears) and
@@ -377,7 +383,7 @@ pub async fn spawn_import(
         if let Some(stderr) = child.stderr.take() {
             let mut lines = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                job.append(line).await;
+                job.append(line);
             }
         }
 
@@ -403,7 +409,7 @@ pub async fn spawn_import(
             }
         };
 
-        job.finish(final_state).await;
+        job.finish(final_state);
         let _ = std::fs::remove_file(vol_dir.join(LOCK_FILE));
         let _ = std::fs::remove_file(vol_dir.join(PID_FILE));
     });

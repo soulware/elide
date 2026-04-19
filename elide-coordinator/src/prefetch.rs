@@ -214,19 +214,13 @@ async fn fetch_idx(
 
     // Write atomically: tmp → rename.
     let index_dir = fork_dir.join("index");
-    tokio::fs::create_dir_all(&index_dir)
-        .await
-        .context("creating index dir")?;
+    std::fs::create_dir_all(&index_dir).context("creating index dir")?;
 
     let tmp_path = index_dir.join(format!("{ulid_str}.idx.tmp"));
     let final_path = index_dir.join(format!("{ulid_str}.idx"));
 
-    tokio::fs::write(&tmp_path, &idx_bytes)
-        .await
-        .context("writing idx.tmp")?;
-    tokio::fs::rename(&tmp_path, &final_path)
-        .await
-        .context("renaming idx.tmp")?;
+    std::fs::write(&tmp_path, &idx_bytes).context("writing idx.tmp")?;
+    std::fs::rename(&tmp_path, &final_path).context("renaming idx.tmp")?;
 
     Ok(())
 }
@@ -269,16 +263,12 @@ async fn prefetch_snapshots(
             .await
             .with_context(|| format!("reading {}", obj.location))?;
 
-        tokio::fs::create_dir_all(&snap_dir)
-            .await
-            .context("creating snapshots dir")?;
+        std::fs::create_dir_all(&snap_dir).context("creating snapshots dir")?;
 
         let tmp_path = snap_dir.join(format!("{filename}.tmp"));
-        tokio::fs::write(&tmp_path, &data)
-            .await
+        std::fs::write(&tmp_path, &data)
             .with_context(|| format!("writing {}", tmp_path.display()))?;
-        tokio::fs::rename(&tmp_path, &local_path)
-            .await
+        std::fs::rename(&tmp_path, &local_path)
             .with_context(|| format!("renaming to {}", local_path.display()))?;
 
         info!("[prefetch] fetched snapshot artifact: {filename}");
