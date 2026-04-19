@@ -129,14 +129,14 @@ pub async fn gc_checkpoint(fork_dir: &Path) -> Option<(Ulid, Ulid)> {
     }
 }
 
-/// Apply pending/applied GC handoffs on the volume process for `fork_dir`.
+/// Apply staged GC handoffs on the volume process for `fork_dir`.
 ///
 /// Called by the coordinator before `apply_done_handoffs` to ensure the
-/// volume's in-memory extent index reflects all committed GC decisions.  This
+/// volume's in-memory extent index reflects all committed GC decisions. This
 /// is critical for restart safety: after a restart the volume rebuilds its
 /// extent index from on-disk `.idx` files (which still point to old segments),
-/// so `.applied` handoffs from a previous session must be re-applied before old
-/// segments are deleted.
+/// so any `.staged` handoffs from a previous session must be re-applied before
+/// old segments are deleted.
 ///
 /// Returns the number of handoffs processed.  Returns 0 if the socket is
 /// absent or the call fails (non-fatal: the next idle tick will retry).
@@ -269,14 +269,15 @@ pub async fn reclaim(fork_dir: &Path) -> Option<ReclaimIpcStats> {
     })
 }
 
-/// Finalize a completed GC handoff by asking the volume to rename
-/// `gc/<ulid>.applied` → `gc/<ulid>.done`.
+/// Finalize a completed GC handoff by asking the volume to delete the
+/// bare `gc/<ulid>` file (the volume-applied, coordinator-upload-pending
+/// marker under the self-describing handoff protocol).
 ///
 /// Called by `apply_done_handoffs` after the new segment has been promoted
-/// and the old S3 objects have been deleted. Routing the rename through the
+/// and the old S3 objects have been deleted. Routing the delete through the
 /// volume actor keeps every `gc/` mutation serialised with the idle-tick
 /// `apply_gc_handoffs` path, so there is no race between the coordinator
-/// renaming a `.applied` file and the actor trying to read it.
+/// removing a file and the actor trying to read it.
 ///
 /// Returns `true` on success.  Returns `false` if the socket is absent or
 /// the call fails; the coordinator retries on the next tick.

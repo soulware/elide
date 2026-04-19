@@ -73,7 +73,7 @@ The worker is a single long-lived thread with bounded channels (capacity 4). Mul
 
 **Landed in PR #58.** The re-sign (read the coordinator-staged body, read the inputs' `.idx` files, rewrite with the volume key) now runs on the worker thread as `WorkerJob::GcHandoff`.
 
-Prep phase on the actor enumerates `gc/*.staged` files and builds a `GcHandoffJob` per entry. The worker reads the staged segment, collects body-owning entries from each input's `.idx`, reads inline + body data, re-signs, and writes `gc/<ulid>.tmp`. Apply phase on the actor runs `Volume::apply_gc_handoff_result`: conditional extent-index rewrites (CAS-compatible), rename `.tmp` → `.applied`, `publish_snapshot`. Batches dispatch one handoff at a time; the next is sent after the previous result applies.
+Prep phase on the actor enumerates `gc/*.staged` files and builds a `GcHandoffJob` per entry. The worker reads the staged segment, collects body-owning entries from each input's `.idx`, reads inline + body data, re-signs, and writes `gc/<ulid>.tmp`. Apply phase on the actor runs `Volume::apply_gc_handoff_result`: conditional extent-index rewrites (CAS-compatible), rename `.tmp` → bare `<ulid>` (the commit point of apply), `publish_snapshot`. Batches dispatch one handoff at a time; the next is sent after the previous result applies.
 
 ### 3a. `sweep_pending` *(LANDED)*
 

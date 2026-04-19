@@ -68,9 +68,10 @@ pub struct ExtentLocation {
     pub body_source: BodySource,
     /// Absolute offset of the body section within the full segment file.
     /// 0 for WAL entries and `.body` cache files (both start at byte 0 of
-    /// the body data). Non-zero for entries in `pending/` or `gc/*.applied` files.
-    /// The actual seek position for a read is `body_section_start + body_offset`.
-    /// Also used to compute the store range-GET start for per-extent fetching.
+    /// the body data). Non-zero for entries in `pending/` or bare `gc/<id>`
+    /// files. The actual seek position for a read is
+    /// `body_section_start + body_offset`. Also used to compute the store
+    /// range-GET start for per-extent fetching.
     pub body_section_start: u64,
     /// For inline extents: the raw payload bytes held in memory.
     /// Reads return this directly with zero file I/O.  `None` for non-inline

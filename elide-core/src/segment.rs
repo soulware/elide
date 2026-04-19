@@ -1618,7 +1618,7 @@ pub enum SegmentBodyLayout {
     /// Full segment file: byte 0 is the segment header. Body and delta
     /// sections sit after the header+index+inline prefix of length
     /// `body_section_start`. Used by `wal/<id>`, `pending/<id>`, and
-    /// `gc/<id>` (post-`.applied`).
+    /// bare `gc/<id>` (volume-applied, awaiting coordinator upload).
     FullSegment,
     /// Body-only file: byte 0 is body byte 0. The full segment's
     /// header+index+inline prefix is not present. Used by
@@ -1702,8 +1702,8 @@ pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
 }
 
-/// Collect volume-signed GC output bodies from `gc/` that are in `.applied`
-/// state (awaiting coordinator upload to S3).
+/// Collect bare-named volume-signed GC output bodies from `gc/` (files
+/// whose presence means "volume-applied, awaiting coordinator upload").
 ///
 /// These are segments that the volume has applied and re-signed within `gc/`
 /// but that the coordinator has not yet uploaded to S3 and written
@@ -1711,11 +1711,9 @@ pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// rebuild at lower priority than `index/*.idx` entries so the original input
 /// segments (still in `index/`) win for any LBA they cover.
 ///
-/// Under the self-describing GC handoff protocol, a bare `gc/<id>` means
-/// "volume-applied, awaiting coordinator upload." Bodies with a `.pending`
-/// sibling (legacy coordinator-signed staged state) or a `.staged` sibling
-/// (step 4 coordinator-staged state) are excluded — the old input segments
-/// referenced by `index/` are still authoritative until the volume applies.
+/// Bodies with a `.staged` sibling are excluded — `.staged` is the
+/// coordinator's pre-apply staging state, meaning the volume has not yet
+/// re-signed the body.
 pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let gc_dir = fork_dir.join("gc");
     match fs::read_dir(&gc_dir) {
@@ -1725,7 +1723,7 @@ pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathB
             let mut paths = Vec::new();
             for entry in entries {
                 let path = entry?.path();
-                // Skip sidecar files (.pending, .applied, .done, .staged, .tmp).
+                // Skip sidecar files (.staged, .tmp).
                 if path.extension().is_some() {
                     continue;
                 }
@@ -1736,13 +1734,9 @@ pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathB
                 if ulid::Ulid::from_string(name).is_err() {
                     continue;
                 }
-                // Exclude bodies still in a coordinator-staged state:
-                // `.pending` (legacy manifest path) or `.staged` (step 4
-                // derive path). Either sibling means the volume has not yet
-                // re-signed the body.
-                if gc_dir.join(format!("{name}.pending")).exists()
-                    || gc_dir.join(format!("{name}.staged")).exists()
-                {
+                // Exclude bodies still in the coordinator's `.staged` state —
+                // the volume has not yet re-signed the body.
+                if gc_dir.join(format!("{name}.staged")).exists() {
                     continue;
                 }
                 paths.push(path);

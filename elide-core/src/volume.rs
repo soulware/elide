@@ -5,7 +5,8 @@
 //   <base>/pending/   — promoted segments awaiting S3 upload
 //   <base>/index/     — coordinator-written LBA index files (*.idx); permanent; never evicted
 //   <base>/cache/     — coordinator-written body cache (*.body, *.present); evictable
-//   <base>/gc/        — coordinator GC handoff files (*.pending → *.applied → *.done)
+//   <base>/gc/        — GC handoff files (coordinator-written `.staged`, volume-
+//                       applied bare `<ulid>`; see docs/design-gc-self-describing-handoff.md)
 //
 // Write path:
 //   1. Volume::write(lba, data) — hashes data, appends to WAL, updates LBA map
@@ -16,7 +17,7 @@
 // Read path:
 //   1. lbamap.lookup(lba) → (hash, block_offset)
 //   2. extent_index.lookup(hash) → ExtentLocation (segment_id, body_offset, body_length)
-//   3. find_segment_file (wal/ → pending/ → gc/*.applied → cache/<id>.body) → open file, seek, read
+//   3. find_segment_file (wal/ → pending/ → bare gc/<id> → cache/<id>.body) → open file, seek, read
 //
 // Recovery:
 //   Volume::open() calls lbamap::rebuild_segments() (segments only), then
@@ -1127,8 +1128,9 @@ impl Volume {
                 last_segment_ulid = Some(ulid);
             }
         }
-        // A GC output in .applied state has a ULID = max(inputs).increment(),
-        // which may be the highest known ULID — include it so the mint floor is correct.
+        // A volume-applied GC output (bare `gc/<ulid>`) has ULID =
+        // max(inputs).increment(), which may be the highest known ULID —
+        // include it so the mint floor is correct.
         for p in segment::collect_gc_applied_segment_files(base_dir)? {
             if let Some(ulid) = p
                 .file_name()
@@ -1999,30 +2001,27 @@ impl Volume {
         Ok((u_repack, u_sweep))
     }
 
-    /// Apply pending GC handoff files written by the coordinator.
+    /// Apply staged GC handoff files written by the coordinator.
     ///
-    /// The coordinator writes the compacted segment to `gc/<new-ulid>` (staged,
-    /// signed with an ephemeral key) and then writes `gc/<new-ulid>.pending`.
-    /// This method re-signs `gc/<new-ulid>` in-place with the volume's own key,
-    /// updates the in-memory extent index, and renames the handoff file to
-    /// `gc/<new-ulid>.applied`.  The coordinator then uploads the segment to S3
-    /// and sends a `promote <new-ulid>` IPC.  The `promote_segment` handler writes
-    /// `index/<new-ulid>.idx` and `cache/<new-ulid>.{body,present}`, and deletes
-    /// `index/<old>.idx` for each consumed segment.
+    /// Under the self-describing handoff protocol, the coordinator writes the
+    /// compacted segment to `gc/<new-ulid>.staged` (signed with an ephemeral
+    /// key; the `inputs` list is embedded in the segment header). This method
+    /// walks `gc/` for `.staged` entries, reads each segment's `inputs`, diffs
+    /// those inputs' `.idx` files against the new segment's entries to build
+    /// the extent-index updates, re-signs the body with the volume key, and
+    /// renames `<ulid>.tmp → <ulid>` (the bare name — an atomic commit point
+    /// meaning "volume-applied, awaiting coordinator upload"), then removes
+    /// `<ulid>.staged`. The coordinator subsequently uploads the segment to
+    /// S3 and sends a `promote <new-ulid>` IPC; `promote_segment` writes
+    /// `index/<new-ulid>.idx` and `cache/<new-ulid>.{body,present}` and
+    /// deletes `index/<old>.idx` for each consumed input. Input
+    /// `cache/<input>.{body,present}` files are deleted by the coordinator
+    /// during `apply_done_handoffs`, not here.
     ///
     /// This two-phase approach preserves the invariant: **`index/<ulid>.idx`
-    /// present ↔ segment confirmed in S3**.  The idx is never written before the
+    /// present ↔ segment confirmed in S3**. The idx is never written before the
     /// coordinator confirms the upload, so a segment in `gc/` or `pending/` with
     /// no idx is never mistaken for an S3-confirmed segment.
-    ///
-    /// **`.pending` handoffs** (normal path):
-    /// Walks `gc/` for `.staged` entries and applies each via the
-    /// derive-at-apply path: read `inputs` from the segment header, diff
-    /// each input's `.idx` against the new segment's entries to build the
-    /// extent-index updates, re-sign the body with the volume key, rename
-    /// `<ulid>.tmp → <ulid>` (atomic commit), then remove `<ulid>.staged`.
-    /// Input `cache/<input>.{body,present}` files are deleted by the
-    /// coordinator during `apply_done_handoffs`, not here.
     ///
     /// Returns the number of handoff files processed. Returns `Ok(0)` if
     /// the `gc/` directory does not exist yet.
@@ -2544,13 +2543,14 @@ impl Volume {
     /// **Drain path** (`pending/<ulid>` exists): also deletes `pending/<ulid>`.
     /// The coordinator never deletes `pending/` directly.
     ///
-    /// **GC path** (`gc/<ulid>` exists): also deletes `index/<old>.idx` for each
-    /// segment consumed by the GC handoff (read from `gc/<ulid>.applied`).  This
-    /// happens after writing the new idx so there is never a window where no idx
-    /// covers the affected LBAs.  The `gc/<ulid>` body file is also deleted here
-    /// — it has already been copied into `cache/<ulid>.body`, and deleting it
-    /// inside the actor (rather than from the coordinator) keeps every mutation
-    /// of `gc/` serialised with the idle-tick `apply_gc_handoffs` path.
+    /// **GC path** (bare `gc/<ulid>` exists): also deletes `index/<old>.idx` for
+    /// each segment consumed by the GC handoff (read from the bare `gc/<ulid>`
+    /// segment header's `inputs` field). This happens after writing the new idx
+    /// so there is never a window where no idx covers the affected LBAs.  The
+    /// `gc/<ulid>` body file is also deleted here — it has already been copied
+    /// into `cache/<ulid>.body`, and deleting it inside the actor (rather than
+    /// from the coordinator) keeps every mutation of `gc/` serialised with the
+    /// idle-tick `apply_gc_handoffs` path.
     ///
     /// Idempotent: if `cache/<ulid>.body` already exists and no source
     /// remains in `pending/` or `gc/` the function returns `Ok(())` without
@@ -2708,28 +2708,20 @@ impl Volume {
         Ok(())
     }
 
-    /// Finalize a completed GC handoff by renaming `gc/<ulid>.applied`
-    /// to `gc/<ulid>.done`.
+    /// Finalize a completed GC handoff by deleting the bare `gc/<ulid>` file.
     ///
     /// Called by the coordinator after the new segment has been uploaded to
     /// S3, `promote_segment` has moved it into the local cache, and the old
-    /// segments have been deleted from S3. The `.done` rename is the last
-    /// step in the handoff lifecycle and must happen AFTER the S3 delete so
-    /// that a crash between the two cannot leak old-segment objects in S3 —
-    /// the `.applied` state keeps `apply_done_handoffs` eligible to retry the
-    /// delete, and only `.done` removes that eligibility.
+    /// segments have been deleted from S3. This is the last step in the
+    /// handoff lifecycle and must happen AFTER the S3 delete so that a crash
+    /// between the two cannot leak old-segment objects in S3 — the bare file's
+    /// presence keeps `apply_done_handoffs` eligible to retry the delete, and
+    /// only removing the bare file removes that eligibility.
     ///
     /// Routing through the actor (rather than letting the coordinator unlink
     /// `gc/<ulid>` directly) keeps every mutation of `gc/` serialised with the
     /// idle-tick `apply_gc_handoffs` path, so there is no race between the
     /// coordinator removing a file and the actor reading it.
-    ///
-    /// Under the self-describing GC handoff protocol this deletes the bare
-    /// `gc/<ulid>` file — the file whose presence previously signalled
-    /// "volume applied, coordinator upload pending." Once the coordinator has
-    /// uploaded the segment to S3, invoked `promote_segment` (which populates
-    /// `cache/<ulid>.body` + `index/<ulid>.idx`), and deleted the old S3
-    /// objects, this call reclaims the last on-disk copy.
     pub fn finalize_gc_handoff(&mut self, ulid: Ulid) -> io::Result<()> {
         let gc_dir = self.base_dir.join("gc");
         let bare = gc_dir.join(ulid.to_string());
@@ -3251,15 +3243,15 @@ impl Volume {
     /// ancestry chain.
     ///
     /// Search order:
-    ///   1. Current fork: `wal/`, `pending/`, `gc/*.applied`, `cache/<id>.body`
-    ///   2. Ancestor forks (newest first): `pending/`, `gc/*.applied`, `cache/<id>.body`
+    ///   1. Current fork: `wal/`, `pending/`, bare `gc/<id>`, `cache/<id>.body`
+    ///   2. Ancestor forks (newest first): `pending/`, bare `gc/<id>`, `cache/<id>.body`
     ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
     ///
-    /// For full segment files (`wal/`, `pending/`, `gc/*.applied`), body reads use
-    /// absolute file offsets (`ExtentLocation.body_offset`). For cached body
-    /// files (`cache/<id>.body`), the file IS the body section, so reads use
-    /// body-relative offsets — consistent with how `extentindex::rebuild` stores
-    /// offsets for cached entries.
+    /// For full segment files (`wal/`, `pending/`, bare `gc/<id>`), body reads
+    /// use absolute file offsets (`ExtentLocation.body_offset`). For cached
+    /// body files (`cache/<id>.body`), the file IS the body section, so reads
+    /// use body-relative offsets — consistent with how `extentindex::rebuild`
+    /// stores offsets for cached entries.
     fn find_segment_file(
         &self,
         segment_id: Ulid,
@@ -4054,8 +4046,8 @@ fn cache_hit_allowed(
 /// Search for a segment file across the fork directory tree.
 ///
 /// Search order:
-///   1. Current fork: `wal/`, `pending/`, `gc/*.applied`, `cache/<id>.body`
-///   2. Ancestor forks (newest-first): `pending/`, `gc/*.applied`, `cache/<id>.body`
+///   1. Current fork: `wal/`, `pending/`, bare `gc/<id>`, `cache/<id>.body`
+///   2. Ancestor forks (newest-first): `pending/`, bare `gc/<id>`, `cache/<id>.body`
 ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
 ///
 /// For `Cached` entries, a `cache/<id>.body` hit is only accepted if the
@@ -4076,10 +4068,11 @@ pub(crate) fn find_segment_in_dirs(
     body_source: BodySource,
 ) -> io::Result<PathBuf> {
     let sid = segment_id.to_string();
-    // Self dir: full canonical precedence (wal → pending → gc/.applied → cache).
-    // The `.applied` GC branch matters here because the extent index flips to the
-    // new segment_id the moment the volume writes `.applied`, before the
-    // coordinator has promoted the body to `pending/`.
+    // Self dir: full canonical precedence (wal → pending → bare gc/<id> → cache).
+    // The bare-`gc/<id>` branch matters here because the extent index flips to
+    // the new segment_id the moment the volume renames `<id>.tmp → <id>` (the
+    // commit point of apply), before the coordinator has promoted the body to
+    // `cache/`.
     if let Some((path, layout)) = segment::locate_segment_body(base_dir, segment_id)
         && cache_hit_allowed(layout, base_dir, &sid, body_source)
     {

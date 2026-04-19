@@ -519,13 +519,13 @@ async fn snapshot_volume(
     }
 
     // 3. Drain any outstanding GC handoffs so `index/` is in a stable
-    //    post-GC state before the manifest is signed. Without this, an
-    //    `.applied` handoff left over from a prior tick still references
-    //    segments that `promote_segment` is about to delete from `index/`
-    //    (and from S3 via `apply_done_handoffs`). The signed manifest
-    //    would then point at segments that vanish seconds later, and any
-    //    reader — delta_repack, fork, restart — would fail with ENOENT
-    //    on the missing `.idx` file.
+    //    post-GC state before the manifest is signed. Without this, a
+    //    volume-applied handoff (bare `gc/<ulid>`) left over from a prior
+    //    tick still references segments that `promote_segment` is about to
+    //    delete from `index/` (and from S3 via `apply_done_handoffs`). The
+    //    signed manifest would then point at segments that vanish seconds
+    //    later, and any reader — delta_repack, fork, restart — would fail
+    //    with ENOENT on the missing `.idx` file.
     //
     //    Safe under the snapshot lock: the tick loop's GC path
     //    `try_lock`s the same lock and skips the tick while we hold it,

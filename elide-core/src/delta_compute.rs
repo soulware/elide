@@ -405,7 +405,7 @@ fn read_inline_section(seg_path: &Path, entries: &[SegmentEntry]) -> io::Result<
 /// an Inline location are inline-section-relative and must not be used
 /// as a body seek. For non-inline entries, resolve the segment body
 /// via `segment::locate_segment_body` (canonical precedence wal →
-/// pending → gc/.applied → cache/.body) and pick the seek arithmetic
+/// pending → bare gc/<id> → cache/.body) and pick the seek arithmetic
 /// from the returned layout: body-only files seek at `body_offset`
 /// alone, full segment files seek at `body_section_start + body_offset`.
 fn read_source_extent(source_dir: &Path, loc: &ExtentLocation) -> io::Result<Vec<u8>> {

@@ -141,7 +141,7 @@ impl BlockReader {
     /// Open a snapshot-pinned view of `dir` at `snap_ulid`. The view includes
     /// exactly the segments listed in `dir`'s signed `snapshots/<snap_ulid>.manifest`
     /// plus every ancestor's snapshot manifest reached via the `parent_pubkey`
-    /// chain in the provenance. No WAL replay, no `pending/`, no `gc/.applied`.
+    /// chain in the provenance. No WAL replay, no `pending/`, no bare `gc/`.
     ///
     /// This is the correct view for tools that need to parse the volume at a
     /// specific sealed snapshot — notably Phase 4 filemap generation, which
@@ -547,7 +547,7 @@ struct SnapshotLayer {
 ///
 /// Mirrors the `index/*.idx` branch of `extentindex::rebuild` (the post-
 /// eviction two-file format), restricted to the exact segment set listed in
-/// `layer.segs`. Snapshot mode never sees `pending/` or `gc/.applied` — those
+/// `layer.segs`. Snapshot mode never sees `pending/` or bare `gc/` — those
 /// are in-flight states that only exist on live forks.
 fn apply_snapshot_layer(
     lbamap: &mut lbamap::LbaMap,
