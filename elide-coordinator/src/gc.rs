@@ -144,10 +144,8 @@ impl GcStats {
 /// strategy.  Both must be pre-resolved via `gc_checkpoint` IPC before
 /// calling this function — they originate from the volume process so that
 /// ULID ordering is consistent with the volume's write clock.
-pub async fn gc_fork(
+pub fn gc_fork(
     fork_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
     config: &GcConfig,
     repack_ulid: Ulid,
     sweep_ulid: Ulid,
@@ -250,17 +248,8 @@ pub async fn gc_fork(
             dead_count,
             dead_ulids.join(", "),
         );
-        compact_segments(
-            dead_segments,
-            &gc_dir,
-            volume_id,
-            store,
-            repack_ulid,
-            &index,
-            &live_hashes,
-        )
-        .await
-        .context("dead segment pre-pass")?;
+        compact_segments(dead_segments, &gc_dir, repack_ulid, &live_hashes)
+            .context("dead segment pre-pass")?;
         true
     } else {
         false
@@ -286,17 +275,8 @@ pub async fn gc_fork(
             candidate.live_entries.len(),
             candidate.removed_hashes.len(),
         );
-        compact_segments(
-            vec![candidate],
-            &gc_dir,
-            volume_id,
-            store,
-            repack_ulid,
-            &index,
-            &live_hashes,
-        )
-        .await
-        .context("density compaction")?;
+        compact_segments(vec![candidate], &gc_dir, repack_ulid, &live_hashes)
+            .context("density compaction")?;
         true
     } else {
         false
@@ -370,17 +350,8 @@ pub async fn gc_fork(
             sweep_live_entries,
             sweep_removed_hashes,
         );
-        compact_segments(
-            bucket,
-            &gc_dir,
-            volume_id,
-            store,
-            sweep_ulid,
-            &index,
-            &live_hashes,
-        )
-        .await
-        .context("small-segment sweep")?;
+        compact_segments(bucket, &gc_dir, sweep_ulid, &live_hashes)
+            .context("small-segment sweep")?;
         Some((sweep_candidates, sweep_bytes))
     } else {
         None
@@ -518,8 +489,7 @@ pub async fn apply_done_handoffs(
         // bytes and `promote_segment` short-circuits on cache body presence.
         let key = segment_key(volume_id, &new_ulid_str)
             .with_context(|| format!("building key for {new_ulid_str}"))?;
-        let data = tokio::fs::read(&gc_body)
-            .await
+        let data = std::fs::read(&gc_body)
             .with_context(|| format!("reading compacted segment {new_ulid_str}"))?;
         store
             .put(&key, Bytes::from(data).into())
@@ -981,13 +951,10 @@ fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
 /// assembles and signs the output segment, and renames tmp → bare. See
 /// `docs/design-gc-plan-handoff.md`.
 ///
-async fn compact_segments(
+fn compact_segments(
     candidates: Vec<SegmentStats>,
     gc_dir: &Path,
-    _volume_id: &str,
-    _store: &Arc<dyn ObjectStore>,
     new_ulid: Ulid,
-    _extent_index: &ExtentIndex,
     live_hashes: &HashSet<blake3::Hash>,
 ) -> Result<()> {
     let new_ulid_str = new_ulid.to_string();
@@ -1531,9 +1498,7 @@ mod tests {
         };
         let sweep_ulid = Ulid::new();
         let repack_ulid = Ulid::new();
-        let stats = gc_fork(dir, "test-vol", &store, &config, repack_ulid, sweep_ulid)
-            .await
-            .unwrap();
+        let stats = gc_fork(dir, &config, repack_ulid, sweep_ulid).unwrap();
         assert!(
             stats.candidates >= 2,
             "GC should have compacted at least 2 segments (S1 + S2), got {}",
@@ -1630,9 +1595,7 @@ mod tests {
         };
         let sweep_ulid = Ulid::new();
         let repack_ulid = Ulid::new();
-        gc_fork(dir, "test-vol", &store, &config, repack_ulid, sweep_ulid)
-            .await
-            .unwrap();
+        gc_fork(dir, &config, repack_ulid, sweep_ulid).unwrap();
 
         // Find the emitted GC plan in gc/. Under the plan handoff protocol
         // the coordinator writes `gc/<ulid>.plan` instead of a signed
@@ -2395,9 +2358,7 @@ mod tests {
         };
         let sweep_ulid = Ulid::new();
         let repack_ulid = Ulid::new();
-        let stats = gc_fork(dir, "test-vol", &store, &config, repack_ulid, sweep_ulid)
-            .await
-            .unwrap();
+        let stats = gc_fork(dir, &config, repack_ulid, sweep_ulid).unwrap();
         assert_eq!(
             stats.deferred, 0,
             "Delta partial-death must be expanded in-band, not deferred"
@@ -2496,9 +2457,7 @@ mod tests {
         };
         let sweep_ulid = Ulid::new();
         let repack_ulid = Ulid::new();
-        let stats = gc_fork(dir, "test-vol", &store, &config, repack_ulid, sweep_ulid)
-            .await
-            .unwrap();
+        let stats = gc_fork(dir, &config, repack_ulid, sweep_ulid).unwrap();
         assert!(
             stats.candidates >= 2,
             "GC should compact ≥2 segments, got {}",

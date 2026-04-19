@@ -285,11 +285,15 @@ async fn import_status_by_name(name: &str, data_dir: &Path, registry: &ImportReg
         }
         return format!("err no active import for: {name}");
     };
-    let job = registry.lock().await.get(&ulid).cloned();
+    let job = registry
+        .lock()
+        .expect("import registry poisoned")
+        .get(&ulid)
+        .cloned();
     match job {
         // import.lock exists but not in registry (coordinator restarted mid-import)
         None => "ok running".to_string(),
-        Some(job) => match job.state().await {
+        Some(job) => match job.state() {
             ImportState::Running => "ok running".to_string(),
             ImportState::Done => "ok done".to_string(),
             ImportState::Failed(msg) => format!("err failed: {msg}"),
@@ -324,7 +328,11 @@ async fn stream_import_by_name(
         return;
     };
 
-    let job = registry.lock().await.get(&ulid).cloned();
+    let job = registry
+        .lock()
+        .expect("import registry poisoned")
+        .get(&ulid)
+        .cloned();
     let Some(job) = job else {
         // import.lock exists but not in registry (coordinator restarted mid-import).
         // We can't stream output we never buffered; just report running.
@@ -336,7 +344,7 @@ async fn stream_import_by_name(
 
     let mut offset = 0;
     loop {
-        let lines = job.read_from(offset).await;
+        let lines = job.read_from(offset);
         for line in &lines {
             if writer
                 .write_all(format!("{line}\n").as_bytes())
@@ -348,7 +356,7 @@ async fn stream_import_by_name(
         }
         offset += lines.len();
 
-        match job.state().await {
+        match job.state() {
             ImportState::Done => {
                 let _ = writer.write_all(b"ok done\n").await;
                 return;
@@ -439,7 +447,11 @@ async fn evict_volume(
     let fork_dir = data_dir.join("by_id").join(ulid_component);
 
     // Look up the fork's evict sender.
-    let sender = evict_registry.lock().await.get(&fork_dir).cloned();
+    let sender = evict_registry
+        .lock()
+        .expect("evict registry poisoned")
+        .get(&fork_dir)
+        .cloned();
     let Some(sender) = sender else {
         return format!("err volume not managed by coordinator: {vol_name}");
     };
@@ -498,7 +510,7 @@ async fn snapshot_volume(
         Err(e) => return format!("err deriving volume id: {e}"),
     };
 
-    let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir).await;
+    let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir);
     let _guard = lock.lock_owned().await;
 
     // 1. Promote WAL into pending/.

@@ -165,14 +165,14 @@ pub async fn drain_pending(
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
     upload_volume_metadata(vol_dir, volume_id, store).await;
 
-    let mut entries = tokio::fs::read_dir(&pending_dir)
-        .await
+    let entries = std::fs::read_dir(&pending_dir)
         .with_context(|| format!("opening pending dir: {}", pending_dir.display()))?;
 
     let mut uploaded = 0usize;
     let mut failed = 0usize;
 
-    while let Some(entry) = entries.next_entry().await? {
+    for entry in entries {
+        let entry = entry.context("reading pending dir entry")?;
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
             continue;
@@ -256,9 +256,8 @@ async fn upload_small_file(
     remote_name: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
-    let data = tokio::fs::read(local_path)
-        .await
-        .with_context(|| format!("reading {}", local_path.display()))?;
+    let data =
+        std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
     let key = StorePath::from(format!("by_id/{volume_id}/{remote_name}"));
     store
         .put(&key, Bytes::from(data).into())
@@ -287,15 +286,11 @@ async fn upload_manifest(
 
     let readonly = vol_dir.join("volume.readonly").exists();
 
-    let origin_raw = tokio::fs::read_to_string(vol_dir.join("volume.parent"))
-        .await
-        .ok();
+    let origin_raw = std::fs::read_to_string(vol_dir.join("volume.parent")).ok();
     let origin = origin_raw.as_deref().map(str::trim);
 
     // Read OCI source metadata from local meta.toml if present.
-    let meta_raw = tokio::fs::read_to_string(vol_dir.join("meta.toml"))
-        .await
-        .ok();
+    let meta_raw = std::fs::read_to_string(vol_dir.join("meta.toml")).ok();
     let meta_table: Option<toml::Table> = meta_raw.as_deref().and_then(|s| toml::from_str(s).ok());
     let source = meta_table.as_ref().and_then(|t| {
         let image = t.get("source")?.as_str()?;
@@ -364,13 +359,14 @@ pub async fn upload_snapshots_and_filemaps(
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let snap_dir = vol_dir.join("snapshots");
-    let mut entries = match tokio::fs::read_dir(&snap_dir).await {
+    let entries = match std::fs::read_dir(&snap_dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
 
-    while let Some(entry) = entries.next_entry().await? {
+    for entry in entries {
+        let entry = entry.context("reading snapshots dir entry")?;
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
             continue;
@@ -393,8 +389,7 @@ pub async fn upload_snapshots_and_filemaps(
         let filemap_path = snap_dir.join(format!("{name}.filemap"));
         if filemap_path.exists() {
             let key = filemap_key(volume_id, name)?;
-            let data = tokio::fs::read(&filemap_path)
-                .await
+            let data = std::fs::read(&filemap_path)
                 .with_context(|| format!("reading filemap: {}", filemap_path.display()))?;
             store
                 .put(&key, Bytes::from(data).into())
@@ -406,7 +401,7 @@ pub async fn upload_snapshots_and_filemaps(
         let manifest_path = snap_dir.join(format!("{name}.manifest"));
         if manifest_path.exists() {
             let key = snapshot_manifest_key(volume_id, name)?;
-            let data = tokio::fs::read(&manifest_path).await.with_context(|| {
+            let data = std::fs::read(&manifest_path).with_context(|| {
                 format!("reading snapshot manifest: {}", manifest_path.display())
             })?;
             store
@@ -427,9 +422,7 @@ async fn upload_segment(
 ) -> Result<()> {
     let key = segment_key(volume_id, ulid_str)?;
 
-    let data = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("reading segment {ulid_str}"))?;
+    let data = std::fs::read(path).with_context(|| format!("reading segment {ulid_str}"))?;
 
     store
         .put(&key, Bytes::from(data).into())
