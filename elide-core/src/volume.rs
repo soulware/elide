@@ -5,7 +5,8 @@
 //   <base>/pending/   — promoted segments awaiting S3 upload
 //   <base>/index/     — coordinator-written LBA index files (*.idx); permanent; never evicted
 //   <base>/cache/     — coordinator-written body cache (*.body, *.present); evictable
-//   <base>/gc/        — coordinator GC handoff files (*.pending → *.applied → *.done)
+//   <base>/gc/        — GC handoff files (coordinator-written `.staged`, volume-
+//                       applied bare `<ulid>`; see docs/design-gc-self-describing-handoff.md)
 //
 // Write path:
 //   1. Volume::write(lba, data) — hashes data, appends to WAL, updates LBA map
@@ -16,7 +17,7 @@
 // Read path:
 //   1. lbamap.lookup(lba) → (hash, block_offset)
 //   2. extent_index.lookup(hash) → ExtentLocation (segment_id, body_offset, body_length)
-//   3. find_segment_file (wal/ → pending/ → gc/*.applied → cache/<id>.body) → open file, seek, read
+//   3. find_segment_file (wal/ → pending/ → bare gc/<id> → cache/<id>.body) → open file, seek, read
 //
 // Recovery:
 //   Volume::open() calls lbamap::rebuild_segments() (segments only), then
@@ -36,6 +37,7 @@ pub use segment::BoxFetcher;
 use ulid::Ulid;
 
 use crate::{
+    delta_compute,
     extentindex::{self, BodySource},
     lbamap,
     segment::{self, EntryKind},
@@ -1127,8 +1129,9 @@ impl Volume {
                 last_segment_ulid = Some(ulid);
             }
         }
-        // A GC output in .applied state has a ULID = max(inputs).increment(),
-        // which may be the highest known ULID — include it so the mint floor is correct.
+        // A volume-applied GC output (bare `gc/<ulid>`) has ULID =
+        // max(inputs).increment(), which may be the highest known ULID —
+        // include it so the mint floor is correct.
         for p in segment::collect_gc_applied_segment_files(base_dir)? {
             if let Some(ulid) = p
                 .file_name()
@@ -1183,7 +1186,10 @@ impl Volume {
             let pre_promote_offsets: Vec<Option<u64>> = entries
                 .iter()
                 .map(|e| match e.kind {
-                    EntryKind::Data | EntryKind::Inline => {
+                    EntryKind::Data
+                    | EntryKind::Inline
+                    | EntryKind::CanonicalData
+                    | EntryKind::CanonicalInline => {
                         extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
                     }
                     EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
@@ -1198,13 +1204,16 @@ impl Volume {
             )?;
             for (entry, old_wal_offset) in entries.iter().zip(pre_promote_offsets.iter().copied()) {
                 match entry.kind {
-                    EntryKind::Data | EntryKind::Inline => {}
+                    EntryKind::Data
+                    | EntryKind::Inline
+                    | EntryKind::CanonicalData
+                    | EntryKind::CanonicalInline => {}
                     EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
                 }
                 let Some(old_wal_offset) = old_wal_offset else {
                     continue;
                 };
-                let idata = if entry.kind == EntryKind::Inline {
+                let idata = if entry.kind.is_inline() {
                     entry.data.clone().map(Vec::into_boxed_slice)
                 } else {
                     None
@@ -1559,8 +1568,10 @@ impl Volume {
                 for live in &seg.live {
                     let entry = &live.entry;
                     let inline_data = match entry.kind {
-                        EntryKind::Data => None,
-                        EntryKind::Inline => entry.data.clone().map(Vec::into_boxed_slice),
+                        EntryKind::Data | EntryKind::CanonicalData => None,
+                        EntryKind::Inline | EntryKind::CanonicalInline => {
+                            entry.data.clone().map(Vec::into_boxed_slice)
+                        }
                         EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
                     };
                     Arc::make_mut(&mut self.extent_index).replace_if_matches(
@@ -1895,8 +1906,10 @@ impl Volume {
             for live in &merged_live {
                 let entry = &live.entry;
                 let inline_data = match entry.kind {
-                    EntryKind::Data => None,
-                    EntryKind::Inline => entry.data.clone().map(Vec::into_boxed_slice),
+                    EntryKind::Data | EntryKind::CanonicalData => None,
+                    EntryKind::Inline | EntryKind::CanonicalInline => {
+                        entry.data.clone().map(Vec::into_boxed_slice)
+                    }
                     EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
                 };
                 Arc::make_mut(&mut self.extent_index).replace_if_matches(
@@ -1989,30 +2002,27 @@ impl Volume {
         Ok((u_repack, u_sweep))
     }
 
-    /// Apply pending GC handoff files written by the coordinator.
+    /// Apply staged GC handoff files written by the coordinator.
     ///
-    /// The coordinator writes the compacted segment to `gc/<new-ulid>` (staged,
-    /// signed with an ephemeral key) and then writes `gc/<new-ulid>.pending`.
-    /// This method re-signs `gc/<new-ulid>` in-place with the volume's own key,
-    /// updates the in-memory extent index, and renames the handoff file to
-    /// `gc/<new-ulid>.applied`.  The coordinator then uploads the segment to S3
-    /// and sends a `promote <new-ulid>` IPC.  The `promote_segment` handler writes
-    /// `index/<new-ulid>.idx` and `cache/<new-ulid>.{body,present}`, and deletes
-    /// `index/<old>.idx` for each consumed segment.
+    /// Under the self-describing handoff protocol, the coordinator writes the
+    /// compacted segment to `gc/<new-ulid>.staged` (signed with an ephemeral
+    /// key; the `inputs` list is embedded in the segment header). This method
+    /// walks `gc/` for `.staged` entries, reads each segment's `inputs`, diffs
+    /// those inputs' `.idx` files against the new segment's entries to build
+    /// the extent-index updates, re-signs the body with the volume key, and
+    /// renames `<ulid>.tmp → <ulid>` (the bare name — an atomic commit point
+    /// meaning "volume-applied, awaiting coordinator upload"), then removes
+    /// `<ulid>.staged`. The coordinator subsequently uploads the segment to
+    /// S3 and sends a `promote <new-ulid>` IPC; `promote_segment` writes
+    /// `index/<new-ulid>.idx` and `cache/<new-ulid>.{body,present}` and
+    /// deletes `index/<old>.idx` for each consumed input. Input
+    /// `cache/<input>.{body,present}` files are deleted by the coordinator
+    /// during `apply_done_handoffs`, not here.
     ///
     /// This two-phase approach preserves the invariant: **`index/<ulid>.idx`
-    /// present ↔ segment confirmed in S3**.  The idx is never written before the
+    /// present ↔ segment confirmed in S3**. The idx is never written before the
     /// coordinator confirms the upload, so a segment in `gc/` or `pending/` with
     /// no idx is never mistaken for an S3-confirmed segment.
-    ///
-    /// **`.pending` handoffs** (normal path):
-    /// Walks `gc/` for `.staged` entries and applies each via the
-    /// derive-at-apply path: read `inputs` from the segment header, diff
-    /// each input's `.idx` against the new segment's entries to build the
-    /// extent-index updates, re-sign the body with the volume key, rename
-    /// `<ulid>.tmp → <ulid>` (atomic commit), then remove `<ulid>.staged`.
-    /// Input `cache/<input>.{body,present}` files are deleted by the
-    /// coordinator during `apply_done_handoffs`, not here.
     ///
     /// Returns the number of handoff files processed. Returns `Ok(0)` if
     /// the `gc/` directory does not exist yet.
@@ -2114,7 +2124,7 @@ impl Volume {
         let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
 
         for &(hash, kind, input_ulid) in &result.input_old_entries {
-            if !matches!(kind, segment::EntryKind::Data | segment::EntryKind::Inline) {
+            if !kind.has_body_bytes() {
                 continue;
             }
             let still_at_input = self
@@ -2165,14 +2175,21 @@ impl Volume {
             if e.kind == segment::EntryKind::DedupRef {
                 continue;
             }
-            let still_at_input = self
-                .extent_index
-                .lookup(&e.hash)
-                .is_some_and(|loc| result.inputs.contains(&loc.segment_id));
-            if !still_at_input {
+            // Update for entries whose hash is at an input (carry-forward) or
+            // absent entirely (fresh hash from partial-death sub-run slicing).
+            // Skip entries whose hash is at a non-input segment.
+            let current = self.extent_index.lookup(&e.hash);
+            let should_update = match current {
+                None => true,
+                Some(loc) => result.inputs.contains(&loc.segment_id),
+            };
+            if !should_update {
                 continue;
             }
-            let idata = if e.kind == segment::EntryKind::Inline {
+            let idata = if matches!(
+                e.kind,
+                segment::EntryKind::Inline | segment::EntryKind::CanonicalInline
+            ) {
                 let start = e.stored_offset as usize;
                 let end = start + e.stored_length as usize;
                 if end <= result.handoff_inline.len() {
@@ -2359,7 +2376,7 @@ impl Volume {
             for e in &old_entries {
                 // Body-owning kinds only. DedupRef/Zero/Delta carry no
                 // responsibility for this segment's body cleanup.
-                if !matches!(e.kind, EntryKind::Data | EntryKind::Inline) {
+                if !e.kind.has_body_bytes() {
                     continue;
                 }
                 // Only touch entries still pointed at by the extent index.
@@ -2411,13 +2428,7 @@ impl Volume {
         // don't carry delta entries (the common case) but will need to be
         // preserved when delta-rewrite interacts with GC compaction.
         let handoff_inline = segment::read_inline_section(staged_path)?;
-        segment::read_extent_bodies(
-            staged_path,
-            bss,
-            &mut entries,
-            [EntryKind::Data, EntryKind::DedupRef, EntryKind::Inline],
-            &handoff_inline,
-        )?;
+        segment::read_extent_bodies(staged_path, bss, &mut entries, &handoff_inline)?;
 
         // Verify each body hashes to its declared hash before re-signing.
         // Without this check, a poisoned input (e.g. zero-filled body carried
@@ -2426,7 +2437,7 @@ impl Volume {
         // Cancel the whole handoff on any mismatch — safer to re-GC later
         // than to commit corrupt bytes.
         for e in &entries {
-            if matches!(e.kind, EntryKind::Data | EntryKind::Inline)
+            if e.kind.has_body_bytes()
                 && let Some(body) = e.data.as_deref()
                 && let Err(err) = segment::verify_body_hash(e, body)
             {
@@ -2450,15 +2461,21 @@ impl Volume {
             if e.kind == EntryKind::DedupRef {
                 continue;
             }
-            // Only update if still pointed at one of the inputs.
-            let still_at_input = self
-                .extent_index
-                .lookup(&e.hash)
-                .is_some_and(|loc| inputs.contains(&loc.segment_id));
-            if !still_at_input {
+            // Update for entries whose hash is at an input (standard carry-
+            // forward — move the location from input → new output) or absent
+            // entirely (fresh hash produced by partial-death compaction's
+            // sub-run slicing — insert). Skip hashes already pointed at a
+            // non-input segment: something else owns them and the
+            // coordinator's output has no authority to overwrite.
+            let current = self.extent_index.lookup(&e.hash);
+            let should_update = match current {
+                None => true,
+                Some(loc) => inputs.contains(&loc.segment_id),
+            };
+            if !should_update {
                 continue;
             }
-            let idata = if e.kind == EntryKind::Inline {
+            let idata = if matches!(e.kind, EntryKind::Inline | EntryKind::CanonicalInline) {
                 let start = e.stored_offset as usize;
                 let end = start + e.stored_length as usize;
                 if end <= handoff_inline.len() {
@@ -2527,13 +2544,14 @@ impl Volume {
     /// **Drain path** (`pending/<ulid>` exists): also deletes `pending/<ulid>`.
     /// The coordinator never deletes `pending/` directly.
     ///
-    /// **GC path** (`gc/<ulid>` exists): also deletes `index/<old>.idx` for each
-    /// segment consumed by the GC handoff (read from `gc/<ulid>.applied`).  This
-    /// happens after writing the new idx so there is never a window where no idx
-    /// covers the affected LBAs.  The `gc/<ulid>` body file is also deleted here
-    /// — it has already been copied into `cache/<ulid>.body`, and deleting it
-    /// inside the actor (rather than from the coordinator) keeps every mutation
-    /// of `gc/` serialised with the idle-tick `apply_gc_handoffs` path.
+    /// **GC path** (bare `gc/<ulid>` exists): also deletes `index/<old>.idx` for
+    /// each segment consumed by the GC handoff (read from the bare `gc/<ulid>`
+    /// segment header's `inputs` field). This happens after writing the new idx
+    /// so there is never a window where no idx covers the affected LBAs.  The
+    /// `gc/<ulid>` body file is also deleted here — it has already been copied
+    /// into `cache/<ulid>.body`, and deleting it inside the actor (rather than
+    /// from the coordinator) keeps every mutation of `gc/` serialised with the
+    /// idle-tick `apply_gc_handoffs` path.
     ///
     /// Idempotent: if `cache/<ulid>.body` already exists and no source
     /// remains in `pending/` or `gc/` the function returns `Ok(())` without
@@ -2640,7 +2658,7 @@ impl Volume {
             self.evict_cached_segment(ulid);
 
             for (i, entry) in entries.iter().enumerate() {
-                if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
+                if !entry.kind.has_body_bytes() {
                     continue;
                 }
                 if self
@@ -2648,7 +2666,7 @@ impl Volume {
                     .lookup(&entry.hash)
                     .is_some_and(|loc| loc.segment_id == ulid)
                 {
-                    let idata = if entry.kind == EntryKind::Inline {
+                    let idata = if entry.kind.is_inline() {
                         let start = entry.stored_offset as usize;
                         let end = start + entry.stored_length as usize;
                         if end <= inline.len() {
@@ -2691,28 +2709,20 @@ impl Volume {
         Ok(())
     }
 
-    /// Finalize a completed GC handoff by renaming `gc/<ulid>.applied`
-    /// to `gc/<ulid>.done`.
+    /// Finalize a completed GC handoff by deleting the bare `gc/<ulid>` file.
     ///
     /// Called by the coordinator after the new segment has been uploaded to
     /// S3, `promote_segment` has moved it into the local cache, and the old
-    /// segments have been deleted from S3. The `.done` rename is the last
-    /// step in the handoff lifecycle and must happen AFTER the S3 delete so
-    /// that a crash between the two cannot leak old-segment objects in S3 —
-    /// the `.applied` state keeps `apply_done_handoffs` eligible to retry the
-    /// delete, and only `.done` removes that eligibility.
+    /// segments have been deleted from S3. This is the last step in the
+    /// handoff lifecycle and must happen AFTER the S3 delete so that a crash
+    /// between the two cannot leak old-segment objects in S3 — the bare file's
+    /// presence keeps `apply_done_handoffs` eligible to retry the delete, and
+    /// only removing the bare file removes that eligibility.
     ///
     /// Routing through the actor (rather than letting the coordinator unlink
     /// `gc/<ulid>` directly) keeps every mutation of `gc/` serialised with the
     /// idle-tick `apply_gc_handoffs` path, so there is no race between the
     /// coordinator removing a file and the actor reading it.
-    ///
-    /// Under the self-describing GC handoff protocol this deletes the bare
-    /// `gc/<ulid>` file — the file whose presence previously signalled
-    /// "volume applied, coordinator upload pending." Once the coordinator has
-    /// uploaded the segment to S3, invoked `promote_segment` (which populates
-    /// `cache/<ulid>.body` + `index/<ulid>.idx`), and deleted the old S3
-    /// objects, this call reclaims the last on-disk copy.
     pub fn finalize_gc_handoff(&mut self, ulid: Ulid) -> io::Result<()> {
         let gc_dir = self.base_dir.join("gc");
         let bare = gc_dir.join(ulid.to_string());
@@ -2767,7 +2777,7 @@ impl Volume {
         // Cheap pre-scan: is there any DATA entry whose LBA no longer maps
         // to its hash? If not, there's nothing for redact to do.
         let has_lba_dead_data = entries.iter().any(|e| {
-            e.kind == EntryKind::Data
+            e.kind.is_data()
                 && e.stored_length > 0
                 && self.lbamap.hash_at(e.start_lba) != Some(e.hash)
         });
@@ -2784,7 +2794,7 @@ impl Volume {
         let mut punched_bytes: u64 = 0;
         let mut punched_hashes: Vec<blake3::Hash> = Vec::new();
         for entry in &entries {
-            if entry.kind != EntryKind::Data || entry.stored_length == 0 {
+            if !entry.kind.is_data() || entry.stored_length == 0 {
                 continue;
             }
             let lba_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
@@ -2909,7 +2919,10 @@ impl Volume {
             .pending_entries
             .iter()
             .map(|e| match e.kind {
-                EntryKind::Data | EntryKind::Inline => {
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {
                     self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
                 }
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
@@ -2932,7 +2945,10 @@ impl Volume {
             .zip(pre_promote_offsets.iter().copied())
         {
             match entry.kind {
-                EntryKind::Data | EntryKind::Inline => {}
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {}
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
             }
             let Some(old_wal_offset) = old_wal_offset else {
@@ -2943,7 +2959,7 @@ impl Volume {
                 // flush — treat it like a failed CAS and leave it alone.
                 continue;
             };
-            let idata = if entry.kind == EntryKind::Inline {
+            let idata = if entry.kind.is_inline() {
                 entry.data.clone().map(Vec::into_boxed_slice)
             } else {
                 None
@@ -2964,8 +2980,8 @@ impl Volume {
             );
         }
         {
-            let (mut data, mut refs, mut zero, mut inline, mut delta) =
-                (0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut data, mut refs, mut zero, mut inline, mut delta, mut canonical) =
+                (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
             for e in &self.pending_entries {
                 match e.kind {
                     EntryKind::Data => data += 1,
@@ -2973,8 +2989,10 @@ impl Volume {
                     EntryKind::Zero => zero += 1,
                     EntryKind::Inline => inline += 1,
                     EntryKind::Delta => delta += 1,
+                    EntryKind::CanonicalData | EntryKind::CanonicalInline => canonical += 1,
                 }
             }
+            let _ = canonical; // unused in this flush-path log (user writes never produce canonicals); present to keep the match exhaustive.
             log::info!(
                 "flush {segment_ulid} (from WAL {old_wal_ulid}): {data} data, {inline} inline, \
                  {refs} dedup-ref, {zero} zero, {delta} delta ({} entries total)",
@@ -3226,15 +3244,15 @@ impl Volume {
     /// ancestry chain.
     ///
     /// Search order:
-    ///   1. Current fork: `wal/`, `pending/`, `gc/*.applied`, `cache/<id>.body`
-    ///   2. Ancestor forks (newest first): `pending/`, `gc/*.applied`, `cache/<id>.body`
+    ///   1. Current fork: `wal/`, `pending/`, bare `gc/<id>`, `cache/<id>.body`
+    ///   2. Ancestor forks (newest first): `pending/`, bare `gc/<id>`, `cache/<id>.body`
     ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
     ///
-    /// For full segment files (`wal/`, `pending/`, `gc/*.applied`), body reads use
-    /// absolute file offsets (`ExtentLocation.body_offset`). For cached body
-    /// files (`cache/<id>.body`), the file IS the body section, so reads use
-    /// body-relative offsets — consistent with how `extentindex::rebuild` stores
-    /// offsets for cached entries.
+    /// For full segment files (`wal/`, `pending/`, bare `gc/<id>`), body reads
+    /// use absolute file offsets (`ExtentLocation.body_offset`). For cached
+    /// body files (`cache/<id>.body`), the file IS the body section, so reads
+    /// use body-relative offsets — consistent with how `extentindex::rebuild`
+    /// stores offsets for cached entries.
     fn find_segment_file(
         &self,
         segment_id: Ulid,
@@ -3424,7 +3442,10 @@ impl Volume {
             .pending_entries
             .iter()
             .map(|e| match e.kind {
-                EntryKind::Data | EntryKind::Inline => {
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {
                     self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
                 }
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
@@ -3472,13 +3493,16 @@ impl Volume {
             .zip(result.pre_promote_offsets.iter().copied())
         {
             match entry.kind {
-                EntryKind::Data | EntryKind::Inline => {}
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {}
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
             }
             let Some(old_wal_offset) = old_wal_offset else {
                 continue;
             };
-            let idata = if entry.kind == EntryKind::Inline {
+            let idata = if entry.kind.is_inline() {
                 entry.data.clone().map(Vec::into_boxed_slice)
             } else {
                 None
@@ -3501,8 +3525,8 @@ impl Volume {
 
         // Log entry counts.
         {
-            let (mut data, mut refs, mut zero, mut inline, mut delta) =
-                (0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut data, mut refs, mut zero, mut inline, mut delta, mut canonical) =
+                (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
             for e in &result.entries {
                 match e.kind {
                     EntryKind::Data => data += 1,
@@ -3510,8 +3534,10 @@ impl Volume {
                     EntryKind::Zero => zero += 1,
                     EntryKind::Inline => inline += 1,
                     EntryKind::Delta => delta += 1,
+                    EntryKind::CanonicalData | EntryKind::CanonicalInline => canonical += 1,
                 }
             }
+            let _ = canonical;
             log::info!(
                 "flush {} (from WAL {}): {data} data, {inline} inline, {refs} dedup-ref, \
                  {zero} zero, {delta} delta ({} entries total)",
@@ -3587,7 +3613,10 @@ impl Volume {
             .pending_entries
             .iter()
             .map(|e| match e.kind {
-                EntryKind::Data | EntryKind::Inline => {
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {
                     self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
                 }
                 EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
@@ -3922,21 +3951,10 @@ fn try_read_delta_extent(
         }
     };
 
-    // --- Decompress the delta blob using the source as the zstd dictionary. ---
-    // The decompressed length equals the Delta entry's logical size
-    // (`lba_length * 4096`). We don't have lba_length on ExtentRead
-    // directly, but `er.range_end - er.range_start` gives the number
-    // of LBAs in the portion we need, and the delta produces bytes
-    // for the full fragment regardless of which portion we want.
-    // Use a generous upper bound and slice the result.
-    let mut decoder = zstd::bulk::Decompressor::with_dictionary(&source_bytes)
-        .map_err(|e| io::Error::other(format!("zstd dict decoder: {e}")))?;
-    // Uncompressed size bound: the Delta entry describes one fragment
-    // of a file. We don't carry the exact uncompressed size here, so
-    // pass a large enough capacity (16 MiB — the segment-size cap).
-    let decompressed = decoder
-        .decompress(&delta_blob, 16 * 1024 * 1024)
-        .map_err(|e| io::Error::other(format!("zstd decompress: {e}")))?;
+    // Reconstruct the full fragment bytes. We slice out the requested
+    // portion below; the decompressor returns every byte the delta was
+    // computed over, regardless of which LBA sub-range we want.
+    let decompressed = delta_compute::apply_delta(&source_bytes, &delta_blob)?;
 
     // Copy the requested portion into the output buffer.
     let block_count = (er.range_end - er.range_start) as usize;
@@ -4018,8 +4036,8 @@ fn cache_hit_allowed(
 /// Search for a segment file across the fork directory tree.
 ///
 /// Search order:
-///   1. Current fork: `wal/`, `pending/`, `gc/*.applied`, `cache/<id>.body`
-///   2. Ancestor forks (newest-first): `pending/`, `gc/*.applied`, `cache/<id>.body`
+///   1. Current fork: `wal/`, `pending/`, bare `gc/<id>`, `cache/<id>.body`
+///   2. Ancestor forks (newest-first): `pending/`, bare `gc/<id>`, `cache/<id>.body`
 ///   3. Demand-fetch via fetcher (writes three-file format to `cache/`)
 ///
 /// For `Cached` entries, a `cache/<id>.body` hit is only accepted if the
@@ -4040,10 +4058,11 @@ pub(crate) fn find_segment_in_dirs(
     body_source: BodySource,
 ) -> io::Result<PathBuf> {
     let sid = segment_id.to_string();
-    // Self dir: full canonical precedence (wal → pending → gc/.applied → cache).
-    // The `.applied` GC branch matters here because the extent index flips to the
-    // new segment_id the moment the volume writes `.applied`, before the
-    // coordinator has promoted the body to `pending/`.
+    // Self dir: full canonical precedence (wal → pending → bare gc/<id> → cache).
+    // The bare-`gc/<id>` branch matters here because the extent index flips to
+    // the new segment_id the moment the volume renames `<id>.tmp → <id>` (the
+    // commit point of apply), before the coordinator has promoted the body to
+    // `cache/`.
     if let Some((path, layout)) = segment::locate_segment_body(base_dir, segment_id)
         && cache_hit_allowed(layout, base_dir, &sid, body_source)
     {
@@ -6697,7 +6716,7 @@ mod tests {
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let dead_entry = entries
             .iter()
-            .find(|e| e.kind == EntryKind::Data && e.start_lba == 0)
+            .find(|e| e.kind.is_data() && e.start_lba == 0)
             .expect("should have a Data entry at LBA 0");
         assert!(dead_entry.stored_length > 0);
 
@@ -6759,8 +6778,8 @@ mod tests {
         assert!(present_path.exists(), ".present must exist after promote");
         for (i, entry) in idx_entries.iter().enumerate() {
             let present = segment::check_present_bit(&present_path, i as u32).unwrap_or(false);
-            if entry.kind == EntryKind::Data {
-                assert!(present, "Data entry {i} should be marked present");
+            if entry.kind.is_data() {
+                assert!(present, "Data-shaped entry {i} should be marked present");
             } else if entry.kind == EntryKind::DedupRef {
                 assert!(!present, "DedupRef entry {i} should NOT be marked present");
             }
@@ -6907,7 +6926,7 @@ mod tests {
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let data_entry = entries
             .iter()
-            .find(|e| e.kind == EntryKind::Data && e.start_lba == 0)
+            .find(|e| e.kind.is_data() && e.start_lba == 0)
             .expect("should have a Data entry at LBA 0");
         assert!(data_entry.stored_length > 0);
 
@@ -6953,7 +6972,7 @@ mod tests {
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         let data_entry = entries
             .iter()
-            .find(|e| e.kind == EntryKind::Data && e.start_lba == 0)
+            .find(|e| e.kind.is_data() && e.start_lba == 0)
             .expect("should have a Data entry at LBA 0");
         assert!(data_entry.stored_length > 0);
 
@@ -7274,14 +7293,8 @@ mod tests {
                             continue;
                         };
                         let body_path = fork_dir.join("cache").join(format!("{}.body", ulid));
-                        if segment::read_extent_bodies(
-                            &body_path,
-                            0,
-                            &mut seg_entries,
-                            segment::EntryKind::LOCAL_BODY,
-                            &[],
-                        )
-                        .is_err()
+                        if segment::read_body_section_bodies(&body_path, 0, &mut seg_entries)
+                            .is_err()
                         {
                             continue;
                         }
@@ -8551,14 +8564,7 @@ mod tests {
         let (_old_bss, mut entries, _) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
         let inline_bytes = segment::read_inline_section(&idx_path).unwrap();
-        segment::read_extent_bodies(
-            &body_path,
-            0,
-            &mut entries,
-            [segment::EntryKind::Data, segment::EntryKind::Inline],
-            &inline_bytes,
-        )
-        .unwrap();
+        segment::read_extent_bodies(&body_path, 0, &mut entries, &inline_bytes).unwrap();
 
         let (new_ulid, _) = vol.gc_checkpoint().unwrap();
         let new_ulid_str = new_ulid.to_string();
@@ -8719,14 +8725,7 @@ mod tests {
         let (_old_bss, mut entries, _) =
             segment::read_and_verify_segment_index(&idx_b, &vol.verifying_key).unwrap();
         let inline_bytes = segment::read_inline_section(&idx_b).unwrap();
-        segment::read_extent_bodies(
-            &body_b,
-            0,
-            &mut entries,
-            [segment::EntryKind::Data, segment::EntryKind::Inline],
-            &inline_bytes,
-        )
-        .unwrap();
+        segment::read_extent_bodies(&body_b, 0, &mut entries, &inline_bytes).unwrap();
 
         let (new_ulid, _) = vol.gc_checkpoint().unwrap();
         let new_ulid_str = new_ulid.to_string();

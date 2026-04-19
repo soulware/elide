@@ -23,7 +23,8 @@ use crate::extentindex::{self, ExtentIndex, ExtentLocation};
 use crate::filemap::{self, Filemap};
 use crate::segment::{
     self, DeltaOption, EntryKind, SegmentEntry, SegmentFlags, SegmentSigner,
-    read_and_verify_segment_index, read_extent_bodies, write_segment_with_delta_body,
+    populate_inline_bodies, read_and_verify_segment_index, read_body_section_bodies,
+    write_segment_with_delta_body,
 };
 use crate::segment_cache::SegmentIndexCache;
 use crate::signing::{self, VerifyingKey};
@@ -33,6 +34,29 @@ use crate::volume;
 /// import time and fetched infrequently; a middling level is a good
 /// tradeoff between ratio and import latency.
 const ZSTD_LEVEL: i32 = 3;
+
+/// Upper bound on the uncompressed size of a delta-dict decompression.
+/// Matches the 16 MiB segment-size cap — a single extent cannot be
+/// larger, and the decoder needs a capacity bound to protect against
+/// corrupt / adversarial delta blobs.
+pub const DELTA_DECOMPRESS_CAP: usize = 16 * 1024 * 1024;
+
+/// Apply a delta blob to its base body, reconstructing the composite
+/// body bytes. Uses the base as a zstd dictionary.
+///
+/// `base_body` is the uncompressed bytes of the source extent that the
+/// delta was computed against (via `zstd::bulk::Compressor::with_dictionary`
+/// in the write path). `delta_blob` is the compressed payload stored in
+/// the delta body section of the Delta entry's segment.
+///
+/// Decompression output is capped at [`DELTA_DECOMPRESS_CAP`].
+pub fn apply_delta(base_body: &[u8], delta_blob: &[u8]) -> io::Result<Vec<u8>> {
+    let mut decoder = zstd::bulk::Decompressor::with_dictionary(base_body)
+        .map_err(|e| io::Error::other(format!("zstd dict decoder: {e}")))?;
+    decoder
+        .decompress(delta_blob, DELTA_DECOMPRESS_CAP)
+        .map_err(|e| io::Error::other(format!("zstd decompress: {e}")))
+}
 
 /// Summary of delta work performed for a single pending volume.
 #[derive(Debug, Default)]
@@ -263,15 +287,12 @@ fn maybe_rewrite_segment(
         return Ok(SegmentDeltaStats::default());
     }
 
-    // Load body bytes for all Data entries so the rewrite can copy
-    // unconverted bodies through verbatim.
-    read_extent_bodies(
-        seg_path,
-        body_section_start,
-        &mut entries,
-        [EntryKind::Data],
-        &[],
-    )?;
+    // Load body bytes for all body-section entries so the rewrite can copy
+    // unconverted bodies through verbatim. `DATA_KINDS` covers Data and
+    // CanonicalData; delta_compute inputs are fresh imports today so
+    // canonical variants don't appear in practice, but the filter aligns
+    // with `is_data()` so any future canonical inputs are handled.
+    read_body_section_bodies(seg_path, body_section_start, &mut entries)?;
 
     let mut delta_body: Vec<u8> = Vec::new();
     let mut stats = SegmentDeltaStats::default();
@@ -352,16 +373,10 @@ fn maybe_rewrite_segment(
     }
     // Re-read inline bodies if any are present (separate pass because
     // inline bodies live in the inline section, not the body section).
-    let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+    let has_inline = entries.iter().any(|e| e.kind.is_inline());
     if has_inline {
         let inline_bytes = read_inline_section(seg_path, &entries)?;
-        read_extent_bodies(
-            seg_path,
-            body_section_start,
-            &mut entries,
-            [EntryKind::Inline],
-            &inline_bytes,
-        )?;
+        populate_inline_bodies(&mut entries, &inline_bytes);
     }
 
     // Write to a tmp sibling then rename atomically.
@@ -386,12 +401,12 @@ fn maybe_rewrite_segment(
 /// length comes from the header. Returned bytes are passed to
 /// `read_extent_bodies` as `inline_bytes`.
 fn read_inline_section(seg_path: &Path, entries: &[SegmentEntry]) -> io::Result<Vec<u8>> {
-    // Inline section length = sum of stored_length of Inline entries.
-    // Position = body_section_start - inline_length.
+    // Inline section length = sum of stored_length of Inline / CanonicalInline
+    // entries. Position = body_section_start - inline_length.
     let layout = segment::read_segment_layout(seg_path)?;
     let inline_length: u64 = entries
         .iter()
-        .filter(|e| e.kind == EntryKind::Inline)
+        .filter(|e| e.kind.is_inline())
         .map(|e| e.stored_length as u64)
         .sum();
     if inline_length == 0 {
@@ -413,7 +428,7 @@ fn read_inline_section(seg_path: &Path, entries: &[SegmentEntry]) -> io::Result<
 /// an Inline location are inline-section-relative and must not be used
 /// as a body seek. For non-inline entries, resolve the segment body
 /// via `segment::locate_segment_body` (canonical precedence wal →
-/// pending → gc/.applied → cache/.body) and pick the seek arithmetic
+/// pending → bare gc/<id> → cache/.body) and pick the seek arithmetic
 /// from the returned layout: body-only files seek at `body_offset`
 /// alone, full segment files seek at `body_section_start + body_offset`.
 fn read_source_extent(source_dir: &Path, loc: &ExtentLocation) -> io::Result<Vec<u8>> {
@@ -518,16 +533,10 @@ pub fn rewrite_post_snapshot_with_prior(
         return Ok(None);
     }
 
-    // Load all Data bodies — both the ones we might convert and the
-    // ones we need to re-emit verbatim. Same pattern as
+    // Load all body-section bodies — both the ones we might convert and
+    // the ones we need to re-emit verbatim. Same pattern as
     // `maybe_rewrite_segment`.
-    read_extent_bodies(
-        seg_path,
-        body_section_start,
-        &mut entries,
-        [EntryKind::Data],
-        &[],
-    )?;
+    read_body_section_bodies(seg_path, body_section_start, &mut entries)?;
 
     let mut delta_body: Vec<u8> = Vec::new();
     let mut stats = SegmentDeltaStats::default();
@@ -617,16 +626,10 @@ pub fn rewrite_post_snapshot_with_prior(
             )));
         }
     }
-    let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+    let has_inline = entries.iter().any(|e| e.kind.is_inline());
     if has_inline {
         let inline_bytes = read_inline_section(seg_path, &entries)?;
-        read_extent_bodies(
-            seg_path,
-            body_section_start,
-            &mut entries,
-            [EntryKind::Inline],
-            &inline_bytes,
-        )?;
+        populate_inline_bodies(&mut entries, &inline_bytes);
     }
 
     let tmp_path = {

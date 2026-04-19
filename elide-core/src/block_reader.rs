@@ -141,7 +141,7 @@ impl BlockReader {
     /// Open a snapshot-pinned view of `dir` at `snap_ulid`. The view includes
     /// exactly the segments listed in `dir`'s signed `snapshots/<snap_ulid>.manifest`
     /// plus every ancestor's snapshot manifest reached via the `parent_pubkey`
-    /// chain in the provenance. No WAL replay, no `pending/`, no `gc/.applied`.
+    /// chain in the provenance. No WAL replay, no `pending/`, no bare `gc/`.
     ///
     /// This is the correct view for tools that need to parse the volume at a
     /// specific sealed snapshot — notably Phase 4 filemap generation, which
@@ -343,13 +343,7 @@ impl BlockReader {
             opt.delta_length,
         )?;
 
-        let mut decoder = zstd::bulk::Decompressor::with_dictionary(&source_bytes)
-            .map_err(|e| io::Error::other(format!("zstd dict decoder: {e}")))?;
-        // Cap matches the segment-size cap used by the writer (16 MiB) — see
-        // `try_read_delta_extent` in volume.rs for the rationale.
-        let decompressed = decoder
-            .decompress(&delta_blob, 16 * 1024 * 1024)
-            .map_err(|e| io::Error::other(format!("zstd decompress: {e}")))?;
+        let decompressed = crate::delta_compute::apply_delta(&source_bytes, &delta_blob)?;
 
         let src = block_offset as usize * 4096;
         let src_end = src + 4096;
@@ -547,7 +541,7 @@ struct SnapshotLayer {
 ///
 /// Mirrors the `index/*.idx` branch of `extentindex::rebuild` (the post-
 /// eviction two-file format), restricted to the exact segment set listed in
-/// `layer.segs`. Snapshot mode never sees `pending/` or `gc/.applied` — those
+/// `layer.segs`. Snapshot mode never sees `pending/` or bare `gc/` — those
 /// are in-flight states that only exist on live forks.
 fn apply_snapshot_layer(
     lbamap: &mut lbamap::LbaMap,
@@ -564,7 +558,9 @@ fn apply_snapshot_layer(
         let (_bss, entries, _inputs) =
             segment::read_and_verify_segment_index(&idx_path, &layer.vk)?;
 
-        let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+        let has_inline = entries
+            .iter()
+            .any(|e| matches!(e.kind, EntryKind::Inline | EntryKind::CanonicalInline));
         let inline_bytes = if has_inline {
             segment::read_inline_section(&idx_path)?
         } else {
@@ -572,17 +568,24 @@ fn apply_snapshot_layer(
         };
 
         for (raw_idx, entry) in entries.iter().enumerate() {
-            // LBA map: every entry contributes its range → content hash.
-            if entry.kind == EntryKind::Delta {
-                let sources: std::sync::Arc<[blake3::Hash]> =
-                    entry.delta_options.iter().map(|o| o.source_hash).collect();
-                lbamap.insert_delta(entry.start_lba, entry.lba_length, entry.hash, sources);
-            } else {
-                lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+            // LBA map: every non-canonical entry contributes its range →
+            // content hash. Canonical entries carry body for dedup resolution
+            // only and make no LBA claim.
+            if !entry.kind.is_canonical_only() {
+                if entry.kind == EntryKind::Delta {
+                    let sources: std::sync::Arc<[blake3::Hash]> =
+                        entry.delta_options.iter().map(|o| o.source_hash).collect();
+                    lbamap.insert_delta(entry.start_lba, entry.lba_length, entry.hash, sources);
+                } else {
+                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+                }
             }
 
             match entry.kind {
-                EntryKind::Data | EntryKind::Inline => {}
+                EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline => {}
                 EntryKind::DedupRef | EntryKind::Zero => continue,
                 EntryKind::Delta => {
                     extent_index.insert_delta_if_absent(
@@ -597,7 +600,7 @@ fn apply_snapshot_layer(
                 }
             }
 
-            let idata = if entry.kind == EntryKind::Inline {
+            let idata = if entry.kind.is_inline() {
                 let start = entry.stored_offset as usize;
                 let end = start + entry.stored_length as usize;
                 if end <= inline_bytes.len() {

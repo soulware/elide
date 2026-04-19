@@ -239,7 +239,7 @@ Under the offload, crash windows can leave the volume with **multiple WAL files*
 3. List wal_files in the wal directory, sort ascending by ULID.
 4. Apply the legacy dedup-retain loop (same-ULID wal vs pending) — a no-op
    for volumes written by the offload path, handles legacy state.
-5. Compute last_segment_ulid from pending/, index/*.idx, gc/*.applied.
+5. Compute last_segment_ulid from pending/, index/*.idx, bare gc/<id>.
 6. Compute mint floor = max(segment_floor, wal_floor). Seed UlidMint.
 7. For each wal file except the last (in ULID ascending order):
      - replay_wal_records(wal_path, &mut lbamap, &mut extent_index)

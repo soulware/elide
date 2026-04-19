@@ -1474,11 +1474,10 @@ impl VolumeHandle {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Finalize a GC handoff by renaming `gc/<ulid>.applied` → `.done`
-    /// via the actor.  Routing the rename through the actor keeps every
-    /// mutation of `gc/` serialised with the idle-tick apply path, so the
-    /// coordinator never races the volume on `gc/` filenames.  Blocks until
-    /// the actor replies.
+    /// Finalize a GC handoff by deleting bare `gc/<ulid>` via the actor.
+    /// Routing the delete through the actor keeps every mutation of `gc/`
+    /// serialised with the idle-tick apply path, so the coordinator never
+    /// races the volume on `gc/` filenames. Blocks until the actor replies.
     pub fn finalize_gc_handoff(&self, ulid: Ulid) -> io::Result<()> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
@@ -1759,17 +1758,7 @@ fn execute_gc_handoff(job: GcHandoffJob) -> io::Result<GcHandoffResult> {
 
     // 3. Read inline + body data from the staged segment.
     let handoff_inline = segment::read_inline_section(&job.staged_path)?;
-    segment::read_extent_bodies(
-        &job.staged_path,
-        bss,
-        &mut entries,
-        [
-            segment::EntryKind::Data,
-            segment::EntryKind::DedupRef,
-            segment::EntryKind::Inline,
-        ],
-        &handoff_inline,
-    )?;
+    segment::read_extent_bodies(&job.staged_path, bss, &mut entries, &handoff_inline)?;
 
     // 4. Re-sign and write gc/<ulid>.tmp.
     let tmp_path = job.gc_dir.join(format!("{}.tmp", job.new_ulid));
@@ -1978,7 +1967,6 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
             &c.seg_path,
             c.body_section_start,
             &mut c.live_part,
-            [segment::EntryKind::Data, segment::EntryKind::Inline],
             &inline_bytes,
         )?;
         // Verify each body matches its declared hash before it's carried
@@ -2094,12 +2082,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
 
         let total_bytes: u64 = entries
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    segment::EntryKind::Data | segment::EntryKind::Inline
-                )
-            })
+            .filter(|e| e.kind.has_body_bytes())
             .map(|e| e.stored_length as u64)
             .sum();
 
@@ -2109,12 +2092,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
 
         let live_bytes: u64 = entries
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    segment::EntryKind::Data | segment::EntryKind::Inline
-                ) && live.contains(&e.hash)
-            })
+            .filter(|e| e.kind.has_body_bytes() && live.contains(&e.hash))
             .map(|e| e.stored_length as u64)
             .sum();
 
@@ -2130,7 +2108,14 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 segment::EntryKind::DedupRef | segment::EntryKind::Delta => {
                     job.lbamap.hash_at(e.start_lba) == Some(e.hash)
                 }
-                segment::EntryKind::Data | segment::EntryKind::Inline => live.contains(&e.hash),
+                // Body-bearing kinds (Data, Inline, CanonicalData,
+                // CanonicalInline): kept whenever their hash is still
+                // referenced anywhere in the volume. Canonical-only entries
+                // already have no LBA claim; non-canonical entries might
+                // have been LBA-overwritten but their body still backs a
+                // DedupRef or Delta source somewhere.
+                k if k.has_body_bytes() => live.contains(&e.hash),
+                _ => unreachable!("EntryKind::{:?} not covered in partition", e.kind),
             });
 
         let mut dead: Vec<RepackedDeadEntry> = Vec::new();
@@ -2161,7 +2146,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 seg_path,
                 body_section_start,
                 &mut live_entries,
-                [segment::EntryKind::Data, segment::EntryKind::Inline],
                 &inline_bytes,
             )?;
 

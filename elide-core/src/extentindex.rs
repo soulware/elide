@@ -68,9 +68,10 @@ pub struct ExtentLocation {
     pub body_source: BodySource,
     /// Absolute offset of the body section within the full segment file.
     /// 0 for WAL entries and `.body` cache files (both start at byte 0 of
-    /// the body data). Non-zero for entries in `pending/` or `gc/*.applied` files.
-    /// The actual seek position for a read is `body_section_start + body_offset`.
-    /// Also used to compute the store range-GET start for per-extent fetching.
+    /// the body data). Non-zero for entries in `pending/` or bare `gc/<id>`
+    /// files. The actual seek position for a read is
+    /// `body_section_start + body_offset`. Also used to compute the store
+    /// range-GET start for per-extent fetching.
     pub body_section_start: u64,
     /// For inline extents: the raw payload bytes held in memory.
     /// Reads return this directly with zero file I/O.  `None` for non-inline
@@ -383,8 +384,9 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                     Err(e) => return Err(e),
                 };
 
-            // Read inline section lazily: only when at least one Inline entry exists.
-            let has_inline = entries.iter().any(|e| e.kind == EntryKind::Inline);
+            // Read inline section lazily: only when at least one inline-kind
+            // entry exists (Inline or CanonicalInline).
+            let has_inline = entries.iter().any(|e| e.kind.is_inline());
             let inline_bytes = if has_inline {
                 segment::read_inline_section(path)?
             } else {
@@ -433,7 +435,10 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
 
             for (raw_idx, entry) in entries.iter().enumerate() {
                 match entry.kind {
-                    EntryKind::Data | EntryKind::Inline => {}
+                    EntryKind::Data
+                    | EntryKind::Inline
+                    | EntryKind::CanonicalData
+                    | EntryKind::CanonicalInline => {}
                     EntryKind::DedupRef | EntryKind::Zero => continue,
                     EntryKind::Delta => {
                         index.insert_delta_if_absent(
@@ -447,7 +452,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                         continue;
                     }
                 }
-                let idata = if entry.kind == EntryKind::Inline {
+                let idata = if entry.kind.is_inline() {
                     let start = entry.stored_offset as usize;
                     let end = start + entry.stored_length as usize;
                     if end <= inline_bytes.len() {

@@ -115,7 +115,7 @@ Order-sensitive interactions we need to verify are still safe:
 | Interleaving | Safe? |
 |---|---|
 | `WorkerJob::Promote` (WAL) completes → apply → actor processes a later `WorkerJob::PromoteSegment` for a segment the WAL promote superseded | Safe. Apply phase CAS skips entries whose extent-index entry no longer points at this segment. |
-| `WorkerJob::GcHandoff` writes `gc/<ulid>.tmp` → rename `.applied` → coordinator later dispatches `PromoteSegment(ulid)` for the `gc/<ulid>` body | Safe. The GC handoff renames `.tmp` → `.applied` → (finalize) `gc/<ulid>`. `PromoteSegment` only reads the bare `gc/<ulid>` path, which exists by the time the coordinator calls `promote_segment`. |
+| `WorkerJob::GcHandoff` writes `gc/<ulid>.tmp` → renames to bare `gc/<ulid>` → coordinator later dispatches `PromoteSegment(ulid)` for the `gc/<ulid>` body | Safe. The GC handoff's `.tmp` → bare-`<ulid>` rename is the apply commit point. `PromoteSegment` only reads the bare `gc/<ulid>` path, which exists by the time the coordinator calls `promote_segment`. |
 | Two `PromoteSegment` for the same ULID (coordinator retry) | First completes; second sees `body_path` exists in the prep phase and replies immediately. |
 | `PromoteSegment` drain path runs while a write for the same hash lands on the fresh WAL | Safe. The new write inserts an extent-index entry pointing at the *new* WAL; the apply phase's CAS leaves it alone. |
 

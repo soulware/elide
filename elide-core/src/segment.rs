@@ -282,8 +282,9 @@ pub enum EntryKind {
     DedupRef,
     /// Zero extent; LBA range reads as zeros, no body bytes stored.
     Zero,
-    /// Inline entry; body bytes live in the inline section.
-    /// Currently unreachable (INLINE_THRESHOLD = 0) but present for format completeness.
+    /// Inline entry; body bytes live in the inline section. Produced when a
+    /// write's stored size falls below `INLINE_THRESHOLD` (small, highly
+    /// compressible payloads such as all-zero blocks).
     Inline,
     /// Thin delta entry; no body bytes. Content is materialised by fetching a
     /// delta blob from the segment's delta body section and decompressing it
@@ -291,13 +292,47 @@ pub enum EntryKind {
     /// Must carry at least one `DeltaOption`. The source must resolve to a
     /// `Data` entry — there are no delta-of-delta chains.
     Delta,
+    /// Canonical-body-only (body in body section): carries body bytes whose
+    /// hash is canonical in this segment, but makes **no LBA claim** on rebuild.
+    /// Emitted by GC when carrying forward a hash that's still referenced
+    /// elsewhere (via DedupRef or Delta base) after its original LBA has
+    /// been overwritten. `start_lba` / `lba_length` are always zero.
+    CanonicalData,
+    /// Canonical-body-only (body in inline section). Same semantics as
+    /// `CanonicalData` but the body lives in the inline section — emitted
+    /// when demoting an `Inline` entry.
+    CanonicalInline,
 }
 
 impl EntryKind {
-    /// Entry kinds with locally-available body bytes (pending/ segments).
-    pub const LOCAL_BODY: [EntryKind; 1] = [EntryKind::Data];
-    /// Entry kinds with body bytes in materialised/S3 segments.
-    pub const ALL_BODY: [EntryKind; 2] = [EntryKind::Data, EntryKind::DedupRef];
+    /// True for entries that carry no LBA claim on rebuild.
+    pub fn is_canonical_only(self) -> bool {
+        matches!(self, EntryKind::CanonicalData | EntryKind::CanonicalInline)
+    }
+
+    /// True for entries whose body bytes live in the body section — `Data`
+    /// and its canonical-only demotion `CanonicalData`. Use this predicate
+    /// at any site that handles "a data-shaped entry," regardless of
+    /// whether it still claims an LBA.
+    pub fn is_data(self) -> bool {
+        matches!(self, EntryKind::Data | EntryKind::CanonicalData)
+    }
+
+    /// True for entries whose body bytes live in the inline section —
+    /// `Inline` and its canonical-only demotion `CanonicalInline`. Use
+    /// this predicate at any site that handles "an inline-shaped entry,"
+    /// regardless of LBA-claim status.
+    pub fn is_inline(self) -> bool {
+        matches!(self, EntryKind::Inline | EntryKind::CanonicalInline)
+    }
+
+    /// True for entries that carry body bytes (in either the body section
+    /// or the inline section): `Data`, `Inline`, `CanonicalData`,
+    /// `CanonicalInline`. Excludes `DedupRef`, `Zero`, and `Delta`, which
+    /// carry no body bytes of their own.
+    pub fn has_body_bytes(self) -> bool {
+        self.is_data() || self.is_inline()
+    }
 }
 
 /// A delta option attached to a segment index entry.
@@ -351,14 +386,6 @@ pub struct SegmentEntry {
     /// Each option provides a zstd-dictionary-compressed alternative to the
     /// full body, using a different source extent as dictionary.
     pub delta_options: Vec<DeltaOption>,
-    /// Canonical-body-only: this entry carries body bytes (its hash is
-    /// canonical in this segment) but makes **no LBA claim** on rebuild —
-    /// `lbamap::rebuild_segments` skips entries with this flag. Zeroed
-    /// `start_lba` / `lba_length` are expected (and enforced on write).
-    /// Emitted by GC when carrying forward a hash that's still referenced
-    /// elsewhere via a DedupRef after its original LBA was overwritten.
-    /// Only valid for kinds that carry body bytes: `Data` and `Inline`.
-    pub canonical_only: bool,
 }
 
 impl SegmentEntry {
@@ -389,7 +416,6 @@ impl SegmentEntry {
             stored_length,
             data: Some(data),
             delta_options: Vec::new(),
-            canonical_only: false,
         }
     }
 
@@ -410,7 +436,6 @@ impl SegmentEntry {
             stored_length: 0,
             data: None,
             delta_options: Vec::new(),
-            canonical_only: false,
         }
     }
 
@@ -426,8 +451,23 @@ impl SegmentEntry {
             stored_length: 0,
             data: None,
             delta_options: Vec::new(),
-            canonical_only: false,
         }
+    }
+
+    /// Create a CANONICAL_DATA / CANONICAL_INLINE entry from an existing
+    /// body-bearing entry whose LBA claim has been superseded but whose
+    /// hash must survive for dedup resolution (DedupRef or Delta base).
+    ///
+    /// Chooses `CanonicalInline` if the source was `Inline`, `CanonicalData`
+    /// otherwise. `start_lba` / `lba_length` are zeroed.
+    pub fn into_canonical(mut self) -> Self {
+        self.kind = match self.kind {
+            EntryKind::Inline | EntryKind::CanonicalInline => EntryKind::CanonicalInline,
+            _ => EntryKind::CanonicalData,
+        };
+        self.start_lba = 0;
+        self.lba_length = 0;
+        self
     }
 
     /// Create a thin DELTA entry.
@@ -465,7 +505,6 @@ impl SegmentEntry {
             stored_length: 0,
             data: None,
             delta_options,
-            canonical_only: false,
         }
     }
 }
@@ -583,23 +622,27 @@ pub fn write_segment_full(
 
     // Inline section.
     for entry in entries.iter() {
-        if entry.kind == EntryKind::Inline
+        if entry.kind.is_inline()
             && let Some(data) = &entry.data
         {
             w.write_all(data)?;
         }
     }
     // Body section: raw bytes, no framing.
-    // Data entries write their body bytes.
-    // DedupRef, Zero, Delta, and Inline entries contribute nothing to the body.
+    // Data and CanonicalData entries write their body bytes.
+    // DedupRef, Zero, Delta, Inline, and CanonicalInline contribute nothing.
     for entry in entries.iter() {
         match entry.kind {
-            EntryKind::Data => {
+            EntryKind::Data | EntryKind::CanonicalData => {
                 if let Some(data) = &entry.data {
                     w.write_all(data)?;
                 }
             }
-            EntryKind::DedupRef | EntryKind::Zero | EntryKind::Inline | EntryKind::Delta => {}
+            EntryKind::DedupRef
+            | EntryKind::Zero
+            | EntryKind::Inline
+            | EntryKind::CanonicalInline
+            | EntryKind::Delta => {}
         }
     }
 
@@ -630,11 +673,11 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
 
     for entry in entries.iter_mut() {
         match entry.kind {
-            EntryKind::Inline => {
+            EntryKind::Inline | EntryKind::CanonicalInline => {
                 entry.stored_offset = inline_cursor;
                 inline_cursor += entry.stored_length as u64;
             }
-            EntryKind::Data => {
+            EntryKind::Data | EntryKind::CanonicalData => {
                 entry.stored_offset = body_cursor;
                 body_cursor += entry.stored_length as u64;
             }
@@ -653,23 +696,19 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
 
 fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     let mut flags = SegmentFlags::empty();
-    if e.canonical_only {
-        debug_assert!(
-            matches!(e.kind, EntryKind::Data | EntryKind::Inline),
-            "canonical_only is only valid for body-bearing kinds (Data/Inline)"
-        );
+    if e.kind.is_canonical_only() {
         debug_assert!(
             e.start_lba == 0 && e.lba_length == 0,
-            "canonical_only entries must have zero start_lba and lba_length"
+            "canonical-only entries must have zero start_lba and lba_length"
         );
         flags |= SegmentFlags::CANONICAL_ONLY;
     }
     match e.kind {
-        EntryKind::Inline => flags |= SegmentFlags::INLINE,
+        EntryKind::Inline | EntryKind::CanonicalInline => flags |= SegmentFlags::INLINE,
         EntryKind::DedupRef => flags |= SegmentFlags::DEDUP_REF,
         EntryKind::Zero => flags |= SegmentFlags::ZERO,
         EntryKind::Delta => flags |= SegmentFlags::DELTA,
-        EntryKind::Data => {}
+        EntryKind::Data | EntryKind::CanonicalData => {}
     }
     if e.compressed {
         flags |= SegmentFlags::COMPRESSED;
@@ -1095,18 +1134,23 @@ fn parse_index_section(
         if flags.contains(SegmentFlags::HAS_DELTAS) {
             has_deltas = true;
         }
+        let canonical_only = flags.contains(SegmentFlags::CANONICAL_ONLY);
+        let inline = flags.contains(SegmentFlags::INLINE);
         let kind = if flags.contains(SegmentFlags::ZERO) {
             EntryKind::Zero
         } else if flags.contains(SegmentFlags::DEDUP_REF) {
             EntryKind::DedupRef
         } else if flags.contains(SegmentFlags::DELTA) {
             EntryKind::Delta
-        } else if flags.contains(SegmentFlags::INLINE) {
+        } else if canonical_only && inline {
+            EntryKind::CanonicalInline
+        } else if canonical_only {
+            EntryKind::CanonicalData
+        } else if inline {
             EntryKind::Inline
         } else {
             EntryKind::Data
         };
-        let canonical_only = flags.contains(SegmentFlags::CANONICAL_ONLY);
 
         let stored_offset = u64::from_le_bytes(read_fixed(entries_data, &mut pos)?);
         let stored_length = u32::from_le_bytes(read_fixed(entries_data, &mut pos)?);
@@ -1122,7 +1166,6 @@ fn parse_index_section(
             stored_length,
             data: None,
             delta_options: Vec::new(),
-            canonical_only,
         });
     }
 
@@ -1178,46 +1221,51 @@ fn parse_delta_table(
     Ok(())
 }
 
-/// Populate `entry.data` by reading body bytes from the segment file.
+/// Populate `entry.data` for every body-bearing entry in `entries`:
+/// `Data`, `CanonicalData` bytes come from the body section of the file
+/// at `path`; `Inline`, `CanonicalInline` bytes are sliced from the
+/// pre-read `inline_bytes` buffer.
 ///
-/// `body_section_start` is the absolute file offset of the body section, as
-/// returned by `read_segment_index`.  Only entries whose `kind` is in
-/// `kinds` and whose `stored_length > 0` are read.
+/// `body_section_start` is the absolute file offset of the body section,
+/// as returned by `read_segment_index`. `inline_bytes` should be the
+/// segment's inline section (see `read_inline_section`); pass `&[]` if
+/// the caller knows the entry list contains no inline kinds, or if it
+/// deliberately wants inline entries skipped. Entries with
+/// `stored_length == 0` (DedupRef / Zero / Delta) are skipped.
 ///
-/// For `EntryKind::Inline` entries, pass the inline section bytes via
-/// `inline_bytes`.  Inline data is sliced from this buffer rather than read
-/// from the body section.  When `inline_bytes` is empty and `kinds` includes
-/// `Inline`, inline entries are silently skipped.
-///
-/// Common usage:
-/// - `&[EntryKind::Data]` — local pending/ segments where DedupRef body
-///   regions are sparse holes (not real data).
-/// - `&[EntryKind::Data, EntryKind::DedupRef]` — S3-fetched or materialised
-///   segments where all body regions are populated.
-/// - `&[EntryKind::Data, EntryKind::Inline]` — repack with inline data.
+/// Combines body-section I/O and inline slicing in one pass. Callers that
+/// only want one of the two can use `read_body_section_bodies` or
+/// `populate_inline_bodies` instead.
 pub fn read_extent_bodies(
     path: &Path,
     body_section_start: u64,
     entries: &mut [SegmentEntry],
-    kinds: impl AsRef<[EntryKind]>,
     inline_bytes: &[u8],
 ) -> io::Result<()> {
+    read_body_section_bodies(path, body_section_start, entries)?;
+    populate_inline_bodies(entries, inline_bytes);
+    Ok(())
+}
+
+/// Populate `entry.data` for `Data` / `CanonicalData` entries by reading
+/// the body section of `path`. Entries of other kinds, and entries with
+/// `stored_length == 0`, are skipped. No file I/O beyond the body section
+/// reads.
+pub fn read_body_section_bodies(
+    path: &Path,
+    body_section_start: u64,
+    entries: &mut [SegmentEntry],
+) -> io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let kinds = kinds.as_ref();
+    if !entries
+        .iter()
+        .any(|e| e.kind.is_data() && e.stored_length > 0)
+    {
+        return Ok(());
+    }
     let mut f = fs::File::open(path)?;
     for entry in entries.iter_mut() {
-        if entry.stored_length == 0 {
-            continue;
-        }
-        if !kinds.contains(&entry.kind) {
-            continue;
-        }
-        if entry.kind == EntryKind::Inline {
-            let start = entry.stored_offset as usize;
-            let end = start + entry.stored_length as usize;
-            if end <= inline_bytes.len() {
-                entry.data = Some(inline_bytes[start..end].to_vec());
-            }
+        if entry.stored_length == 0 || !entry.kind.is_data() {
             continue;
         }
         f.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
@@ -1226,6 +1274,24 @@ pub fn read_extent_bodies(
         entry.data = Some(buf);
     }
     Ok(())
+}
+
+/// Populate `entry.data` for `Inline` / `CanonicalInline` entries by
+/// slicing `inline_bytes`. No file I/O — `inline_bytes` is the inline
+/// section already in memory (see `read_inline_section`). Entries whose
+/// slice would overflow `inline_bytes` are silently skipped, matching
+/// the tolerance of `read_extent_bodies` for truncated inline sections.
+pub fn populate_inline_bodies(entries: &mut [SegmentEntry], inline_bytes: &[u8]) {
+    for entry in entries.iter_mut() {
+        if entry.stored_length == 0 || !entry.kind.is_inline() {
+            continue;
+        }
+        let start = entry.stored_offset as usize;
+        let end = start + entry.stored_length as usize;
+        if end <= inline_bytes.len() {
+            entry.data = Some(inline_bytes[start..end].to_vec());
+        }
+    }
 }
 
 /// Verify that `body` hashes to `entry.hash`.
@@ -1241,7 +1307,10 @@ pub fn read_extent_bodies(
 /// Returns `io::ErrorKind::InvalidData` on mismatch so callers can
 /// distinguish corruption from unrelated I/O failures.
 pub fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> io::Result<()> {
-    if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
+    if !matches!(
+        entry.kind,
+        EntryKind::Data | EntryKind::Inline | EntryKind::CanonicalData | EntryKind::CanonicalInline
+    ) {
         return Ok(());
     }
     let computed = if entry.compressed {
@@ -1478,7 +1547,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
             .open(&body_tmp)?;
         dst.set_len(body_length)?;
         for entry in &entries {
-            if entry.kind != EntryKind::Data || entry.stored_length == 0 {
+            if !entry.kind.is_data() || entry.stored_length == 0 {
                 continue;
             }
             src.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
@@ -1526,7 +1595,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
     let bitset_len = (entry_count as usize).div_ceil(8);
     let mut bitset = vec![0u8; bitset_len];
     for (i, entry) in entries.iter().enumerate() {
-        if entry.kind == EntryKind::Data {
+        if entry.kind.is_data() {
             bitset[i / 8] |= 1 << (i % 8);
         }
     }
@@ -1549,7 +1618,7 @@ pub enum SegmentBodyLayout {
     /// Full segment file: byte 0 is the segment header. Body and delta
     /// sections sit after the header+index+inline prefix of length
     /// `body_section_start`. Used by `wal/<id>`, `pending/<id>`, and
-    /// `gc/<id>` (post-`.applied`).
+    /// bare `gc/<id>` (volume-applied, awaiting coordinator upload).
     FullSegment,
     /// Body-only file: byte 0 is body byte 0. The full segment's
     /// header+index+inline prefix is not present. Used by
@@ -1633,8 +1702,8 @@ pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
 }
 
-/// Collect volume-signed GC output bodies from `gc/` that are in `.applied`
-/// state (awaiting coordinator upload to S3).
+/// Collect bare-named volume-signed GC output bodies from `gc/` (files
+/// whose presence means "volume-applied, awaiting coordinator upload").
 ///
 /// These are segments that the volume has applied and re-signed within `gc/`
 /// but that the coordinator has not yet uploaded to S3 and written
@@ -1642,11 +1711,9 @@ pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// rebuild at lower priority than `index/*.idx` entries so the original input
 /// segments (still in `index/`) win for any LBA they cover.
 ///
-/// Under the self-describing GC handoff protocol, a bare `gc/<id>` means
-/// "volume-applied, awaiting coordinator upload." Bodies with a `.pending`
-/// sibling (legacy coordinator-signed staged state) or a `.staged` sibling
-/// (step 4 coordinator-staged state) are excluded — the old input segments
-/// referenced by `index/` are still authoritative until the volume applies.
+/// Bodies with a `.staged` sibling are excluded — `.staged` is the
+/// coordinator's pre-apply staging state, meaning the volume has not yet
+/// re-signed the body.
 pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let gc_dir = fork_dir.join("gc");
     match fs::read_dir(&gc_dir) {
@@ -1656,7 +1723,7 @@ pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathB
             let mut paths = Vec::new();
             for entry in entries {
                 let path = entry?.path();
-                // Skip sidecar files (.pending, .applied, .done, .staged, .tmp).
+                // Skip sidecar files (.staged, .tmp).
                 if path.extension().is_some() {
                     continue;
                 }
@@ -1667,13 +1734,9 @@ pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathB
                 if ulid::Ulid::from_string(name).is_err() {
                     continue;
                 }
-                // Exclude bodies still in a coordinator-staged state:
-                // `.pending` (legacy manifest path) or `.staged` (step 4
-                // derive path). Either sibling means the volume has not yet
-                // re-signed the body.
-                if gc_dir.join(format!("{name}.pending")).exists()
-                    || gc_dir.join(format!("{name}.staged")).exists()
-                {
+                // Exclude bodies still in the coordinator's `.staged` state —
+                // the volume has not yet re-signed the body.
+                if gc_dir.join(format!("{name}.staged")).exists() {
                     continue;
                 }
                 paths.push(path);
@@ -2617,21 +2680,14 @@ mod tests {
 
         // Body data is readable via read_extent_bodies.
         let (bss, mut entries2, _) = read_and_verify_segment_index(&path, &vk).unwrap();
-        read_extent_bodies(&path, bss, &mut entries2, [EntryKind::Data], &[]).unwrap();
+        read_body_section_bodies(&path, bss, &mut entries2).unwrap();
         assert_eq!(entries2[1].data.as_deref(), Some(large.as_slice()));
         // Inline entry data is NOT populated by body read (empty inline_bytes).
         assert!(entries2[0].data.is_none());
 
         // Now read with inline bytes too.
         let (_, mut entries3, _) = read_and_verify_segment_index(&path, &vk).unwrap();
-        read_extent_bodies(
-            &path,
-            bss,
-            &mut entries3,
-            [EntryKind::Data, EntryKind::Inline],
-            &inline_bytes,
-        )
-        .unwrap();
+        read_extent_bodies(&path, bss, &mut entries3, &inline_bytes).unwrap();
         assert_eq!(entries3[0].data.as_deref(), Some(small.as_slice()));
         assert_eq!(entries3[1].data.as_deref(), Some(large.as_slice()));
 
@@ -2768,7 +2824,7 @@ mod tests {
 
         // Body data should still be readable.
         let mut read_back = read_entries;
-        read_extent_bodies(&delta_path, bss, &mut read_back, [EntryKind::Data], &[]).unwrap();
+        read_body_section_bodies(&delta_path, bss, &mut read_back).unwrap();
         assert_eq!(read_back[0].data.as_deref(), Some(&[0xAAu8; 8192][..]));
         assert_eq!(read_back[1].data.as_deref(), Some(&[0xBBu8; 4096][..]));
 
