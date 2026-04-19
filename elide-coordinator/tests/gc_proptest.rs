@@ -141,6 +141,26 @@ enum SimOp {
         seed_big: u8,
         seed_small: u8,
     },
+    /// Write multi-LBA Data `[seed_big; span*4096]` at [0..span), flush,
+    /// then write the same bytes at [4..4+span) — because the hash is
+    /// already in extent_index this second write produces a multi-LBA
+    /// *DedupRef*. A single-LBA `[seed_small; 4096]` write at
+    /// `4 + overlap_off` then punches a hole in the DedupRef's span,
+    /// creating a partial-LBA-death DedupRef.
+    ///
+    /// Under step 3a of `docs/design-gc-partial-death-compaction.md`,
+    /// `collect_stats` routes this into `partial_death_runs` (not the
+    /// segment-level defer) and `expand_partial_death` resolves the
+    /// composite body via `resolve_body_by_hash` on the DedupRef's own
+    /// hash — the canonical lives in the first segment. Sub-runs are
+    /// re-emitted, with hashes matching the extent_index so each becomes
+    /// a fresh single-LBA DedupRef pointing at the canonical.
+    MultiLbaDedupRefOverwrite {
+        span: u8,
+        overlap_off: u8,
+        seed_big: u8,
+        seed_small: u8,
+    },
     /// Flush the WAL to a pending/ segment.
     Flush,
     /// Run the full real coordinator GC round-trip, then assert the oracle.
@@ -188,6 +208,16 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             |(start_lba, span, overlap_off, seed_big, seed_small)| {
                 SimOp::MultiLbaWriteThenOverwrite {
                     start_lba,
+                    span,
+                    overlap_off,
+                    seed_big,
+                    seed_small,
+                }
+            },
+        ),
+        2 => (2u8..=3, 0u8..=2, any::<u8>(), any::<u8>()).prop_map(
+            |(span, overlap_off, seed_big, seed_small)| {
+                SimOp::MultiLbaDedupRefOverwrite {
                     span,
                     overlap_off,
                     seed_big,
@@ -288,6 +318,25 @@ proptest! {
                     let _ = vol.flush_wal();
                     let hit =
                         (*start_lba as u64) + (*overlap_off as u64).min(*span as u64 - 1);
+                    let _ = vol.write(hit, &[*seed_small; 4096]);
+                    let _ = vol.flush_wal();
+                }
+                SimOp::MultiLbaDedupRefOverwrite {
+                    span,
+                    overlap_off,
+                    seed_big,
+                    seed_small,
+                } => {
+                    let big = vec![*seed_big; *span as usize * 4096];
+                    // Original multi-LBA Data at [0..span).
+                    let _ = vol.write(0, &big);
+                    let _ = vol.flush_wal();
+                    // Same bytes at [4..4+span) — extent_index already has
+                    // the hash, so this produces a multi-LBA DedupRef.
+                    let _ = vol.write(4, &big);
+                    let _ = vol.flush_wal();
+                    // Overwrite a single LBA inside the DedupRef's range.
+                    let hit = 4u64 + (*overlap_off as u64).min(*span as u64 - 1);
                     let _ = vol.write(hit, &[*seed_small; 4096]);
                     let _ = vol.flush_wal();
                 }
@@ -491,6 +540,33 @@ proptest! {
                     }
                     let hit =
                         (*start_lba as u64) + (*overlap_off as u64).min(*span as u64 - 1);
+                    let small = [*seed_small; 4096];
+                    let _ = vol.write(hit, &small);
+                    let _ = vol.flush_wal();
+                    oracle.insert(hit, small);
+                }
+                SimOp::MultiLbaDedupRefOverwrite {
+                    span,
+                    overlap_off,
+                    seed_big,
+                    seed_small,
+                } => {
+                    let big = vec![*seed_big; *span as usize * 4096];
+                    let big_block = [*seed_big; 4096];
+                    // Original multi-LBA Data at [0..span).
+                    let _ = vol.write(0, &big);
+                    let _ = vol.flush_wal();
+                    for lba in 0..(*span as u64) {
+                        oracle.insert(lba, big_block);
+                    }
+                    // Same bytes at [4..4+span) — multi-LBA DedupRef.
+                    let _ = vol.write(4, &big);
+                    let _ = vol.flush_wal();
+                    for lba in 4..(4 + *span as u64) {
+                        oracle.insert(lba, big_block);
+                    }
+                    // Overwrite a single LBA inside the DedupRef's range.
+                    let hit = 4u64 + (*overlap_off as u64).min(*span as u64 - 1);
                     let small = [*seed_small; 4096];
                     let _ = vol.write(hit, &small);
                     let _ = vol.flush_wal();
