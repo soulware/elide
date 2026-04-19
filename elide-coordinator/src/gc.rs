@@ -214,12 +214,13 @@ pub async fn gc_fork(
         .context("collecting segment stats")?;
     let total_segments = all_stats.len();
 
-    // Segments with at least one partially-LBA-dead entry are ineligible
-    // for compaction this pass: re-emitting their bloated LBA claim at the
-    // GC output's higher ULID would shadow or erase later writes on rebuild.
-    // Leave them in place at their original (low) ULID; the next rebuild
-    // applies them in order and lbamap-insert's split logic handles the
-    // overlap correctly. See `docs/design-gc-overlap-correctness.md`.
+    // Segments with at least one partially-LBA-dead DedupRef or Delta
+    // entry are ineligible for compaction this pass: expanding those
+    // would require resolving the composite body from elsewhere (extent
+    // index or delta reconstruction). Data/Inline partial death is
+    // handled in-band in `compact_segments` via `expand_partial_death`
+    // and does not defer the segment. See
+    // `docs/design-gc-partial-death-compaction.md`.
     let (deferred, all_stats): (Vec<SegmentStats>, Vec<SegmentStats>) =
         all_stats.into_iter().partition(|s| s.has_partial_death);
     let deferred_count = deferred.len();
@@ -229,7 +230,7 @@ pub async fn gc_fork(
             .map(|s| s.ulid_str[..8].to_string())
             .collect();
         tracing::info!(
-            "[gc] deferring {} segment(s) with partial-LBA-death entries: [{}]",
+            "[gc] deferring {} segment(s) with partial-LBA-death DedupRef/Delta entries: [{}]",
             deferred_count,
             deferred_ulids.join(", ")
         );
@@ -265,6 +266,7 @@ pub async fn gc_fork(
             store,
             repack_ulid,
             &index,
+            &live_hashes,
         )
         .await
         .context("dead segment pre-pass")?;
@@ -300,6 +302,7 @@ pub async fn gc_fork(
             store,
             repack_ulid,
             &index,
+            &live_hashes,
         )
         .await
         .context("density compaction")?;
@@ -361,9 +364,17 @@ pub async fn gc_fork(
     let ran_sweep = if bucket.len() >= 2 {
         let sweep_candidates = bucket.len();
         let sweep_bytes: u64 = bucket.iter().map(|s| s.dead_lba_bytes()).sum();
-        compact_segments(bucket, &gc_dir, volume_id, store, sweep_ulid, &index)
-            .await
-            .context("small-segment sweep")?;
+        compact_segments(
+            bucket,
+            &gc_dir,
+            volume_id,
+            store,
+            sweep_ulid,
+            &index,
+            &live_hashes,
+        )
+        .await
+        .context("small-segment sweep")?;
         Some((sweep_candidates, sweep_bytes))
     } else {
         None
@@ -642,15 +653,19 @@ struct SegmentStats {
     /// The volume must remove these from its extent index when applying the
     /// handoff, since the old segment files will be deleted.
     removed_hashes: Vec<blake3::Hash>,
-    /// True if at least one body-bearing entry in this segment has a partial
-    /// LBA-death — part of its claimed range is still live at its hash but
-    /// another part has been overwritten. Such segments must not be
-    /// compacted this pass (see `docs/design-gc-overlap-correctness.md`):
-    /// re-emitting the bloated (start_lba, lba_length) claim at the GC
-    /// output's higher ULID would shadow or erase the overwriter on
-    /// rebuild. Leaving the segment in place preserves correctness
-    /// because the original low-ULID claim is split correctly at
-    /// lbamap-insert time by subsequent segments.
+    /// Parallel to `live_entries`: for Data/Inline entries with partial LBA
+    /// death, the list of live sub-runs (filtered to `r.hash == entry.hash`)
+    /// used by `compact_segments` to expand the entry into `CanonicalData`
+    /// (when externally referenced) plus one fresh entry per sub-run. `None`
+    /// for non-partial entries. See `docs/design-gc-partial-death-compaction.md`.
+    partial_death_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>>,
+    /// True if at least one `DedupRef` or `Delta` entry in this segment is
+    /// partial-LBA-death. Those cases still need body resolution beyond this
+    /// segment to expand (DedupRef → canonical body elsewhere; Delta →
+    /// reconstruct against base), so the current pass defers the whole
+    /// segment via the same skip rule PR #77 introduced. Data/Inline partial
+    /// death is handled in-band via `partial_death_runs` and does not set
+    /// this flag.
     has_partial_death: bool,
 }
 
@@ -742,6 +757,7 @@ fn collect_stats(
         let mut physical_body_bytes: u64 = 0;
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
         let mut live_entry_indices: Vec<u32> = Vec::new();
+        let mut partial_death_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>> = Vec::new();
         let mut removed_hashes: Vec<blake3::Hash> = Vec::new();
         let mut has_partial_death = false;
 
@@ -781,6 +797,7 @@ fn collect_stats(
                     live.lba_length = run_len;
                     live_entries.push(live);
                     live_entry_indices.push(entry_idx);
+                    partial_death_runs.push(None);
                 }
                 continue;
             }
@@ -803,6 +820,7 @@ fn collect_stats(
                     live_lba_bytes += lba_bytes;
                     live_entries.push(entry);
                     live_entry_indices.push(entry_idx);
+                    partial_death_runs.push(None);
                 } else if extent_live {
                     removed_hashes.push(entry.hash);
                 }
@@ -851,6 +869,7 @@ fn collect_stats(
                 live_lba_bytes += lba_bytes;
                 live_entries.push(entry);
                 live_entry_indices.push(entry_idx);
+                partial_death_runs.push(None);
             } else if matching_blocks == 0 {
                 if extent_live && live_hashes.contains(&entry.hash) {
                     // Fully LBA-dead but hash still externally live.
@@ -858,20 +877,50 @@ fn collect_stats(
                     // body preserved for dedup resolution, LBA claim dropped.
                     live_entries.push(entry.into_canonical());
                     live_entry_indices.push(entry_idx);
+                    partial_death_runs.push(None);
                 } else if extent_live {
                     // Fully dead.
                     removed_hashes.push(entry.hash);
                 }
             } else {
-                // Partially alive: mark the segment ineligible for this
-                // compaction pass. Keep the original entry in live_entries
-                // so density accounting reflects reality (partial live),
-                // but `has_partial_death = true` will cause gc_fork to
-                // exclude this segment from repack/sweep.
+                // Partially alive. For Data/Inline the source segment owns the
+                // composite body, so `compact_segments` can expand the entry
+                // into `CanonicalData` (if the hash is externally referenced)
+                // plus one fresh entry per live sub-run — no segment-level
+                // deferral needed. See `docs/design-gc-partial-death-compaction.md`.
+                //
+                // DedupRef and Delta partial-death still defer: they'd need to
+                // resolve the body elsewhere (extent-index lookup / delta
+                // reconstruction) before they can be expanded. That belongs in
+                // a follow-up pass; for now set `has_partial_death` so
+                // `gc_fork` skips the whole segment, matching PR #77's
+                // behaviour for those kinds.
                 live_lba_bytes += matching_blocks * BLOCK_BYTES;
-                live_entries.push(entry);
-                live_entry_indices.push(entry_idx);
-                has_partial_death = true;
+                match entry.kind {
+                    EntryKind::Data | EntryKind::Inline => {
+                        let live_runs: Arc<[lbamap::ExtentRead]> =
+                            runs.into_iter().filter(|r| r.hash == entry.hash).collect();
+                        live_entries.push(entry);
+                        live_entry_indices.push(entry_idx);
+                        partial_death_runs.push(Some(live_runs));
+                    }
+                    EntryKind::DedupRef | EntryKind::Delta => {
+                        live_entries.push(entry);
+                        live_entry_indices.push(entry_idx);
+                        partial_death_runs.push(None);
+                        has_partial_death = true;
+                    }
+                    _ => {
+                        // Zero is pre-split above; CanonicalData/CanonicalInline
+                        // never reach this loop (they carry no LBA claim, so
+                        // their `lba_length` is 0 and the earlier `total_lba_bytes`
+                        // accounting zero-passes them). Treat as fully alive
+                        // to stay safe.
+                        live_entries.push(entry);
+                        live_entry_indices.push(entry_idx);
+                        partial_death_runs.push(None);
+                    }
+                }
             }
         }
 
@@ -888,6 +937,7 @@ fn collect_stats(
             total_lba_bytes,
             live_entries,
             live_entry_indices,
+            partial_death_runs,
             removed_hashes,
             has_partial_death,
         });
@@ -1166,13 +1216,130 @@ async fn fetch_live_bodies(
 /// `gc/<ulid>.fetch` file. This guarantees the body is complete regardless of
 /// demand-fetch state, and keeps the fetch consistent with other full-segment
 /// files in gc/. The `.fetch` file is deleted after the body is read.
+/// Expand a Data/Inline entry with partial LBA-death into:
+/// 1. `CanonicalData` / `CanonicalInline` preserving the composite body
+///    when the hash is externally referenced (any `DedupRef.hash` or
+///    `Delta.base_hash` equals `entry.hash`, tracked via `live_hashes`).
+///    Otherwise the composite body is dropped.
+/// 2. One fresh entry per live sub-run (filtered runs where
+///    `r.hash == entry.hash`). Each sub-run is hashed against
+///    `extent_index`: a matching hash produces a whole-body `DedupRef`;
+///    otherwise a fresh `Data` entry holding the slice bytes.
+///
+/// Sub-run bodies are emitted uncompressed. Compression of fresh
+/// sub-runs is a size-tuning opportunity for a follow-up; partial-death
+/// compaction is rare enough that the write-amp cost is bounded.
+///
+/// See `docs/design-gc-partial-death-compaction.md`.
+fn expand_partial_death(
+    entry: SegmentEntry,
+    sub_runs: &[lbamap::ExtentRead],
+    source_ulid: &str,
+    live_hashes: &HashSet<blake3::Hash>,
+    extent_index: &ExtentIndex,
+    all_live: &mut Vec<(String, SegmentEntry)>,
+) -> Result<()> {
+    // Decompress the composite body once so sub-run slicing is a plain
+    // byte-range operation regardless of the source's compression state.
+    let stored = entry.data.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "partial-death entry missing body bytes (source={source_ulid}, hash={})",
+            entry.hash.to_hex()
+        )
+    })?;
+    let uncompressed: Vec<u8> = if entry.compressed {
+        lz4_flex::decompress_size_prepended(stored).map_err(|e| {
+            anyhow::anyhow!(
+                "decompressing partial-death body (source={source_ulid}, hash={}): {e}",
+                entry.hash.to_hex()
+            )
+        })?
+    } else {
+        stored.to_vec()
+    };
+    let expected_len = entry.lba_length as usize * BLOCK_BYTES as usize;
+    if uncompressed.len() != expected_len {
+        return Err(anyhow::anyhow!(
+            "partial-death composite body size mismatch: source={source_ulid} \
+             hash={} lba_length={} got={}B expected={}B",
+            entry.hash.to_hex(),
+            entry.lba_length,
+            uncompressed.len(),
+            expected_len,
+        ));
+    }
+
+    // Step 2 of the design: if the composite hash has any external
+    // reference (DedupRef or Delta base), preserve the composite body
+    // as a canonical-only entry so those references keep resolving. The
+    // source-segment entry is rebuilt from the uncompressed body via
+    // `new_data` (which picks Data or Inline based on stored size) and
+    // then demoted via `into_canonical`. Writing as uncompressed is
+    // consistent with the sub-run path below.
+    if live_hashes.contains(&entry.hash) {
+        let canon = SegmentEntry::new_data(
+            entry.hash,
+            0,
+            0,
+            segment::SegmentFlags::empty(),
+            uncompressed.clone(),
+        );
+        all_live.push((source_ulid.to_owned(), canon.into_canonical()));
+    }
+
+    // Step 3+4: one entry per live sub-run. Hash the slice, check the
+    // extent index — hit → whole-body DedupRef, miss → fresh Data.
+    for run in sub_runs {
+        let run_len = (run.range_end - run.range_start) as u32;
+        if run_len == 0 {
+            continue;
+        }
+        let start_byte = run.payload_block_offset as usize * BLOCK_BYTES as usize;
+        let end_byte = start_byte + run_len as usize * BLOCK_BYTES as usize;
+        if end_byte > uncompressed.len() {
+            return Err(anyhow::anyhow!(
+                "partial-death sub-run out of range: source={source_ulid} \
+                 composite_hash={} run=[{}..{}) payload_offset={} run_len={}B body_len={}B",
+                entry.hash.to_hex(),
+                run.range_start,
+                run.range_end,
+                run.payload_block_offset,
+                run_len as usize * BLOCK_BYTES as usize,
+                uncompressed.len(),
+            ));
+        }
+        let slice = &uncompressed[start_byte..end_byte];
+        let run_hash = blake3::hash(slice);
+        if extent_index.lookup(&run_hash).is_some() {
+            all_live.push((
+                source_ulid.to_owned(),
+                SegmentEntry::new_dedup_ref(run_hash, run.range_start, run_len),
+            ));
+        } else {
+            all_live.push((
+                source_ulid.to_owned(),
+                SegmentEntry::new_data(
+                    run_hash,
+                    run.range_start,
+                    run_len,
+                    segment::SegmentFlags::empty(),
+                    slice.to_vec(),
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 async fn compact_segments(
     mut candidates: Vec<SegmentStats>,
     gc_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
     new_ulid: Ulid,
-    _extent_index: &ExtentIndex,
+    extent_index: &ExtentIndex,
+    live_hashes: &HashSet<blake3::Hash>,
 ) -> Result<()> {
     let new_ulid_str = new_ulid.to_string();
     fs::create_dir_all(gc_dir).context("creating gc dir")?;
@@ -1213,8 +1380,25 @@ async fn compact_segments(
             }
         }
 
-        for entry in candidate.live_entries.drain(..) {
-            all_live.push((candidate.ulid_str.clone(), entry));
+        let partial_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>> =
+            candidate.partial_death_runs.drain(..).collect();
+        for (entry, sub_runs) in candidate
+            .live_entries
+            .drain(..)
+            .zip(partial_runs.into_iter())
+        {
+            if let Some(sub_runs) = sub_runs {
+                expand_partial_death(
+                    entry,
+                    &sub_runs,
+                    &candidate.ulid_str,
+                    live_hashes,
+                    extent_index,
+                    &mut all_live,
+                )?;
+            } else {
+                all_live.push((candidate.ulid_str.clone(), entry));
+            }
         }
         for hash in candidate.removed_hashes.drain(..) {
             all_removed.push((hash, candidate.ulid_str.clone()));
@@ -1583,6 +1767,7 @@ mod tests {
                 live_entries: vec![data_entry()],
                 live_entry_indices: vec![0],
                 removed_hashes: Vec::new(),
+                partial_death_runs: Vec::new(),
                 has_partial_death: false,
             }
         }
@@ -1608,6 +1793,7 @@ mod tests {
             live_entries: Vec::new(),
             live_entry_indices: Vec::new(),
             removed_hashes: Vec::new(),
+            partial_death_runs: Vec::new(),
             has_partial_death: false,
         };
         assert_eq!(s.dead_lba_bytes(), 224 * 1024);
@@ -1628,6 +1814,7 @@ mod tests {
                 live_entries: Vec::new(),
                 live_entry_indices: Vec::new(),
                 removed_hashes: Vec::new(),
+                partial_death_runs: Vec::new(),
                 has_partial_death: false,
             }
         }
@@ -2275,25 +2462,25 @@ mod tests {
 
     /// Helper: assert the two rebuild invariants for S1 after collect_stats.
     ///
-    /// If `has_partial_death` is set, the segment is excluded from this
-    /// GC pass by `gc_fork`: it stays on disk with its original entries
-    /// intact, and rebuild applies it in ULID order correctly. No further
-    /// checks needed.
+    /// If `has_partial_death` is set (DedupRef / Delta partial-death), the
+    /// segment is excluded from this GC pass by `gc_fork`: it stays on disk
+    /// with its original entries intact, and rebuild applies it in ULID order
+    /// correctly. No further checks needed.
     ///
-    /// Otherwise two invariants must hold over `live_entries`:
+    /// Otherwise two invariants must hold across **post-expansion output** —
+    /// for Data/Inline partial-death, the bloated live entry is replaced by
+    /// `compact_segments` with a canonical-only + one sub-run entry per
+    /// `partial_death_runs` slot, so the check consults those sub-runs
+    /// instead of the original entry's `(start_lba, lba_length)`:
     ///
-    /// 1. **Shadow.** Every emitted live entry's LBA claim must match the
-    ///    current lbamap across its full range. Otherwise rebuild at a
-    ///    higher ULID re-asserts a stale mapping and overwrites the
-    ///    correct binding.
+    /// 1. **Shadow.** Every entry that will be emitted at the output ULID
+    ///    must agree with the current lbamap across its claimed range.
+    ///    Otherwise rebuild at a higher ULID re-asserts a stale mapping and
+    ///    overwrites the correct binding.
     ///
     /// 2. **Loss.** Every LBA within S1's original range that currently
-    ///    resolves to S1's hash must be covered by some emitted
-    ///    non-canonical-only entry with that hash. Otherwise rebuild
-    ///    produces a hole where a binding used to exist (particularly
-    ///    important when the old segment is consumed and a surviving
-    ///    `payload_block_offset`-aliased tail has no first-class claim
-    ///    left on disk).
+    ///    resolves to S1's hash must be covered by some emitted non-
+    ///    canonical-only entry with that hash.
     fn assert_no_shadow_or_loss_on_rebuild(
         s1_stats: &SegmentStats,
         lbamap: &elide_core::lbamap::LbaMap,
@@ -2305,7 +2492,11 @@ mod tests {
             return;
         }
         // Invariant 1: no shadow.
-        for entry in &s1_stats.live_entries {
+        for (entry, sub_runs) in s1_stats
+            .live_entries
+            .iter()
+            .zip(s1_stats.partial_death_runs.iter())
+        {
             if !matches!(
                 entry.kind,
                 EntryKind::Data | EntryKind::Inline | EntryKind::Delta
@@ -2313,6 +2504,30 @@ mod tests {
                 continue;
             }
             if entry.kind.is_canonical_only() || entry.lba_length == 0 {
+                continue;
+            }
+            if let Some(runs) = sub_runs {
+                // Partial-death Data/Inline: `compact_segments` will replace
+                // this entry with the listed sub-runs (each hashed to its
+                // own slice). Check shadow against each sub-run's claim.
+                for run in runs.iter() {
+                    for lba in run.range_start..run.range_end {
+                        assert_eq!(
+                            lbamap.hash_at(lba),
+                            Some(run.hash),
+                            "[{shape}] shadow in partial-death sub-run: S1 entry \
+                             at [{}+{}) → sub-run [{}+{}) hash={} claims LBA {} \
+                             whose current lbamap mapping is {:?}",
+                            entry.start_lba,
+                            entry.lba_length,
+                            run.range_start,
+                            run.range_end - run.range_start,
+                            run.hash.to_hex(),
+                            lba,
+                            lbamap.hash_at(lba).map(|h| h.to_hex().to_string()),
+                        );
+                    }
+                }
                 continue;
             }
             let end = entry.start_lba + entry.lba_length as u64;
@@ -2333,10 +2548,29 @@ mod tests {
             }
         }
 
-        // Invariant 2: no loss.
+        // Invariant 2: no loss. Count emitted claims for `original_hash`
+        // from both non-partial live entries and the sub-runs that will
+        // replace partial-death ones.
         let mut claimed = std::collections::HashSet::new();
-        for entry in &s1_stats.live_entries {
-            if entry.kind.is_canonical_only() || entry.hash != original_hash {
+        for (entry, sub_runs) in s1_stats
+            .live_entries
+            .iter()
+            .zip(s1_stats.partial_death_runs.iter())
+        {
+            if entry.kind.is_canonical_only() {
+                continue;
+            }
+            if let Some(runs) = sub_runs {
+                for run in runs.iter() {
+                    if run.hash == original_hash {
+                        for lba in run.range_start..run.range_end {
+                            claimed.insert(lba);
+                        }
+                    }
+                }
+                continue;
+            }
+            if entry.hash != original_hash {
                 continue;
             }
             if !matches!(
@@ -2548,6 +2782,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            partial_death_runs: Vec::new(),
             has_partial_death: false,
         };
         let tmp = TempDir::new().unwrap();
@@ -2584,6 +2819,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            partial_death_runs: Vec::new(),
             has_partial_death: false,
         };
 
@@ -2647,6 +2883,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            partial_death_runs: Vec::new(),
             has_partial_death: false,
         };
 
@@ -2711,6 +2948,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            partial_death_runs: Vec::new(),
             has_partial_death: false,
         };
 
@@ -2753,6 +2991,7 @@ mod tests {
             live_entries: vec![stub_entry(EntryKind::DedupRef, 0, 0)],
             live_entry_indices: vec![0],
             removed_hashes: Vec::new(),
+            partial_death_runs: Vec::new(),
             has_partial_death: false,
         };
 
@@ -2805,6 +3044,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            partial_death_runs: Vec::new(),
             has_partial_death: false,
         };
 
@@ -2866,6 +3106,7 @@ mod tests {
             ],
             live_entry_indices: vec![0, 1],
             removed_hashes: Vec::new(),
+            partial_death_runs: Vec::new(),
             has_partial_death: false,
         };
 

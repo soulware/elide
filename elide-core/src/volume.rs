@@ -2177,6 +2177,7 @@ impl Volume {
             }
             // Update for entries whose hash is at an input (carry-forward) or
             // absent entirely (fresh hash from partial-death sub-run slicing).
+            // Skip entries whose hash is at a non-input segment.
             let current = self.extent_index.lookup(&e.hash);
             let should_update = match current {
                 None => true,
