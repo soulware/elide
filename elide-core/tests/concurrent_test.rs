@@ -138,3 +138,85 @@ fn coordinator_gc_does_not_create_read_failures() {
     handle.shutdown();
     actor_thread.join().unwrap();
 }
+
+/// Regression: two `apply_gc_handoffs` calls arriving close together must
+/// not drop either reply channel.
+///
+/// The actor's internal `idle_tick` also calls `start_gc_handoffs` (with
+/// `reply=None`), so an IPC caller's reply can collide with it in exactly
+/// the same way two IPC callers collide. Prior to the fix, the second
+/// invocation unconditionally overwrote `self.parked_handoffs`, dropping
+/// the first caller's reply sender — the receiver saw
+/// `"volume actor reply channel closed"`, matching the coordinator warning
+/// users observed on a running volume with a pending handoff.
+///
+/// The fix rejects a concurrent call when a batch is already in flight;
+/// the first caller always gets `Ok(n)`. The second caller sees either
+/// `Ok(n)` (if its message arrived after the first batch drained) or an
+/// `"apply_gc_handoffs already in progress"` error (the coordinator
+/// retries next tick). What must never happen is "reply channel closed".
+#[test]
+fn concurrent_apply_gc_handoffs_does_not_drop_replies() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    let (actor, handle) = spawn(vol);
+    let actor_thread = thread::spawn(move || actor.run());
+
+    // Seed two committed segments in index/ so the GC simulator has
+    // candidates. Each segment comes from: write → promote_wal (WAL →
+    // pending/) → drain_via_handle (pending/ → index/ + cache/).
+    for lba in 0u64..4 {
+        let data = vec![(lba as u8).wrapping_mul(11); 4096];
+        handle.write(lba, data).unwrap();
+    }
+    handle.promote_wal().unwrap();
+    common::drain_via_handle(&handle, &fork_dir);
+
+    for lba in 4u64..8 {
+        let data = vec![(lba as u8).wrapping_mul(13); 4096];
+        handle.write(lba, data).unwrap();
+    }
+    handle.promote_wal().unwrap();
+    common::drain_via_handle(&handle, &fork_dir);
+
+    // Stage a GC handoff (gc/<new>.plan) without applying it yet — the
+    // coordinator-side plan emitter runs, but no one has called
+    // apply_gc_handoffs on the volume.
+    let (gc_ulid, _) = handle.gc_checkpoint().unwrap();
+    common::simulate_coord_gc_local(&fork_dir, gc_ulid, 2)
+        .expect("GC simulation must produce a plan");
+
+    // Two threads race to apply the handoff. Before the fix, the second
+    // call would drop the first caller's reply sender.
+    let h1 = handle.clone();
+    let h2 = handle.clone();
+    let t1 = thread::spawn(move || h1.apply_gc_handoffs());
+    let t2 = thread::spawn(move || h2.apply_gc_handoffs());
+
+    let r1 = t1.join().expect("thread 1 panicked");
+    let r2 = t2.join().expect("thread 2 panicked");
+
+    for (label, result) in [("r1", &r1), ("r2", &r2)] {
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("reply channel closed"),
+                "{label} saw dropped reply: {msg}"
+            );
+            assert!(
+                msg.contains("already in progress"),
+                "{label} got unexpected error: {msg}"
+            );
+        }
+    }
+    assert!(
+        r1.is_ok() || r2.is_ok(),
+        "at least one apply_gc_handoffs must succeed: r1={r1:?} r2={r2:?}"
+    );
+
+    handle.shutdown();
+    actor_thread.join().unwrap();
+}
