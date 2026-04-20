@@ -14,36 +14,24 @@ A volume-side primitive that rewrites bloated multi-LBA extent bodies into compa
 
 Three phases, of which only the middle is heavy. See `docs/design-noop-write-skip.md` for why rewrite writes pass cleanly through the no-op skip path.
 
-1. **Snapshot** (`Volume::reclaim_snapshot`). Under the actor lock, clone `Arc<LbaMap>` and capture the extents over the target LBA range. Cheap — O(log n) range query plus an Arc bump. Returns a `ReclaimPlan`.
+1. **Prepare** (`Volume::prepare_reclaim`). Under the actor lock, clone `Arc<LbaMap>` + `Arc<ExtentIndex>`, capture the extents over the target LBA range, mint the output segment ULID, and package the directory + signer state into a `ReclaimJob`. Cheap — O(log n) range query plus two Arc bumps plus a mint.
 
-2. **Compute rewrites** (`ReclaimPlan::compute_rewrites`). Runs without the actor lock. For each non-zero-hash extent in the plan, two gates decide whether it's worth rewriting:
+2. **Execute** (`actor::execute_reclaim` on the worker thread). Walks the plan off-actor. For each non-zero-hash extent in the plan, two gates decide whether it's worth rewriting:
    - **Containment.** Every run of the hash in the current lbamap must sit inside the target range. Rewriting a hash whose body is referenced outside the target would leave those outside references pointing at the now-bloated body and make things worse.
    - **Bloat.** At least one run of the hash must have `payload_block_offset != 0`, indicating a prior split that left dead bytes inside the stored body.
-   Extents that pass both gates have their live bytes read through the normal read path, re-hashed, and compressed. The output is a list of `ReclaimProposed { start_lba, data, hash }`.
+   Hashes that pass both gates have their stored body fetched via the captured extent-index snapshot (no actor round-trips), sliced to the live sub-range, re-hashed, and compressed. The output is a list of `SegmentEntry` values — Data/Inline for fresh hashes, DedupRef when the new hash is already indexed — written as a single signed segment in `pending/<segment_ulid>` via `segment::write_and_commit`. Delta-bodied hashes are skipped (see open questions).
 
-3. **Commit** (`Volume::reclaim_commit`). Under the actor lock, check `Arc::ptr_eq(plan.lbamap_snapshot, self.lbamap)`. If the pointers differ, something mutated the lbamap between phase 1 and now — return `ReclaimOutcome { discarded: true, .. }` without doing anything. Otherwise assemble the proposals into a single pending segment (via `segment::write_and_commit`) under a fresh mint ULID — the segment rename is the durability commit point — then splice the resulting entries into the live lbamap + extent index. The WAL is not touched: reclaim's output is fully derivable from durable state, so a crash before rename leaves nothing to recover and a crash between rename and splice leaves an orphan segment that GC classifies as all-dead on the next pass. Proposals already present at their target LBA with the same hash are absorbed by the no-op skip check; proposals whose hash is already indexed elsewhere emit thin DedupRef entries rather than duplicate bodies.
+3. **Apply** (`Volume::apply_reclaim_result`). Back on the actor, check `Arc::ptr_eq(result.lbamap_snapshot, self.lbamap)`. If the pointers differ, something mutated the lbamap while the worker was running — delete the orphan `pending/<segment_ulid>` and return `ReclaimOutcome { discarded: true, .. }`. Otherwise splice the worker's entries into the live lbamap + extent index. The segment rename was the durability commit point, same pattern `repack` uses. The WAL is not touched: reclaim's output is fully derivable from durable state, so a crash before rename leaves nothing to recover and a crash between rename and apply leaves an orphan segment that GC classifies as all-dead on the next pass.
 
-### The test hook
+### Entry points
 
-`VolumeHandle::reclaim_alias_merge(start_lba, lba_length)` ties the three phases together in the simplest possible way: snapshot, compute, commit, return the outcome.
+`VolumeHandle::reclaim_alias_merge(start_lba, lba_length)` is the production API: one actor round-trip, the heavy middle runs on the worker, the apply parks the reply until the worker returns.
+
+`Volume::reclaim_alias_merge(start_lba, lba_length)` is the synchronous in-process wrapper (`prepare → execute → apply` on the calling thread), used by tests and offline tooling.
 
 `scan_reclaim_candidates` walks the live lbamap and extent index and produces `ReclaimCandidate { start_lba, lba_length, dead_blocks, live_blocks, stored_bytes }` entries for hashes with detectable bloat (controlled by `ReclaimThresholds`, all defaults placeholder values).
 
 `elide volume reclaim <name>` calls the scanner, then calls the primitive once per candidate. It exists so the primitive can be exercised end-to-end — this is not a customer-facing operation.
-
-## Proposed: worker-thread offload and coordinator wiring
-
-Stage A — landed. The three-phase structure above is the current behaviour: phase 3 assembles one pending segment instead of looping `write_with_hash`, and the WAL is bypassed. What remains is moving phase 2 off the caller thread onto the worker, and wiring reclaim into the coordinator tick loop.
-
-### Phase mapping
-
-| Phase | Today (Stage A) | Stage B |
-| --- | --- | --- |
-| 1. Prepare | `reclaim_snapshot` on actor (Arc-clone lbamap + range query) | unchanged |
-| 2. Middle | `compute_rewrites` on caller thread; reads round-trip through actor IPC via `VolumeHandle::read` | `WorkerJob::Reclaim`; reads resolve against the held snapshot directly (no channel round-trips); worker assembles + writes the segment file |
-| 3. Apply | `reclaim_commit` on actor: one lock, `Arc::ptr_eq` guard, splice rewrites into lbamap + extent index, one segment rename as commit point | `apply_reclaim_result` on actor: identical shape, just consumes the worker's pre-built `ReclaimResult` |
-
-Stage A captured the dominant latency win (N WAL fsyncs → 1 segment rename, no loop of `write_with_hash`). Stage B captures the remaining win: phase 2's reads no longer contend with writes on the actor channel.
 
 ### Why bypassing the WAL is safe
 
@@ -51,9 +39,9 @@ WAL records exist to make writes crash-replayable before they reach a segment. R
 
 ### Discard window
 
-`Arc::ptr_eq(plan.lbamap_snapshot, self.lbamap)` today spans (snapshot → compute_rewrites → commit) on the caller thread. Stage B widens it to (snapshot → worker done → apply), which increases the chance of a concurrent mutation voiding the plan on a high-churn volume. Repack has the same property and it hasn't been a problem; the fallback is a clean discard, not a retry-in-place, so the next scheduled pass picks up whatever state now exists.
+`Arc::ptr_eq(result.lbamap_snapshot, self.lbamap)` spans (prepare → worker done → apply). Any concurrent mutation voids the plan and the worker's orphan segment is deleted. Repack has the same property and it hasn't been a problem; the fallback is a clean discard, not a retry-in-place, so the next scheduled pass picks up whatever state now exists.
 
-### Coordinator wiring
+## Coordinator wiring (open)
 
 Two options once the primitive is worker-offloaded:
 
@@ -80,4 +68,4 @@ Like repack and delta_repack, reclaim takes a `parked_reclaim: Option<Sender<...
   - **Cross-volume DedupRef/Delta:** not tracked by any refcount. Also not relevant to reclaim's cost accounting — reclaim mutates only this volume's lbamap and writes a new segment; other volumes' consumers pin their sources via their own `extent_index` against S3 segments, which reclaim doesn't touch.
 
   Translation to threshold logic: `delta_source_refcount(H) > 0` ⇒ H will survive demotion, apply a stricter cost-benefit bar (need sufficiently high dead-ratio to offset `sizeof(H')`). Otherwise H is orphaned post-reclaim and dropped next GC, and the looser bar is correct.
-- **Reclaiming a Delta-bodied hash.** Distinct from the source-hash case above: if H itself is a `Delta` entry (not DATA), rewriting it re-materialises it as DATA and loses the delta saving on this volume. `compute_rewrites` should skip Delta-bodied hashes, or the rewrite must preserve the delta shape.
+- **Reclaiming a Delta-bodied hash.** Distinct from the source-hash case above: if H itself is a `Delta` entry (not DATA), rewriting it would re-materialise it as DATA and lose the delta saving on this volume. `execute_reclaim` currently skips Delta-bodied hashes via `read_reclaim_extent_body` returning `Ok(None)` on `lookup_delta` hits — pragmatic for a first wiring, but if Delta bloat ever turns out to be significant on real aged volumes the rewrite path needs to preserve the delta shape rather than skip.

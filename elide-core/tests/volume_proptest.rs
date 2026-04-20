@@ -673,14 +673,10 @@ proptest! {
                     );
                 }
                 SimOp::ReclaimRange { start_lba, lba_count } => {
-                    // Reclaim now writes directly to pending/ under a fresh
+                    // Reclaim writes directly to pending/ under a fresh
                     // mint ULID (bypassing the WAL), so it must preserve
                     // ULID monotonicity like any other segment-producing op.
-                    let plan = vol.reclaim_snapshot(*start_lba as u64, *lba_count as u32);
-                    let proposed = plan
-                        .compute_rewrites(|lba, len| vol.read(lba, len))
-                        .unwrap_or_default();
-                    let _ = vol.reclaim_commit(plan, proposed);
+                    let _ = vol.reclaim_alias_merge(*start_lba as u64, *lba_count as u32);
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
                         prop_assert!(
@@ -874,11 +870,7 @@ proptest! {
                     // PopulateFetched writes on-disk files that are only visible
                     // via the rebuilt lbamap after Crash. The next Crash handler
                     // will verify reclaim's contribution alongside everything else.
-                    let plan = vol.reclaim_snapshot(*start_lba as u64, *lba_count as u32);
-                    let proposed = plan
-                        .compute_rewrites(|lba, len| vol.read(lba, len))
-                        .unwrap_or_default();
-                    let _ = vol.reclaim_commit(plan, proposed);
+                    let _ = vol.reclaim_alias_merge(*start_lba as u64, *lba_count as u32);
                 }
             }
         }
@@ -1038,11 +1030,7 @@ proptest! {
                     // Same reason as `crash_recovery_oracle` for not checking
                     // the oracle per-op: PopulateFetched leaves in-memory
                     // lbamap stale until Crash rebuilds it.
-                    let plan = vol.reclaim_snapshot(*start_lba as u64, *lba_count as u32);
-                    let proposed = plan
-                        .compute_rewrites(|lba, len| vol.read(lba, len))
-                        .unwrap_or_default();
-                    let _ = vol.reclaim_commit(plan, proposed);
+                    let _ = vol.reclaim_alias_merge(*start_lba as u64, *lba_count as u32);
                 }
             }
         }
@@ -1116,12 +1104,10 @@ proptest! {
                     let _ = vol.repack(0.9);
                 }
                 ReclaimOp::ReclaimRange { start_lba, lba_count } => {
-                    let plan = vol.reclaim_snapshot(*start_lba as u64, *lba_count as u32);
-                    let proposed = plan
-                        .compute_rewrites(|lba, len| vol.read(lba, len))
-                        .unwrap_or_default();
-                    let outcome = vol.reclaim_commit(plan, proposed).unwrap();
-                    // Single-threaded driver: phase 3 never discards.
+                    let outcome = vol
+                        .reclaim_alias_merge(*start_lba as u64, *lba_count as u32)
+                        .unwrap();
+                    // Single-threaded driver: apply never discards.
                     prop_assert!(!outcome.discarded);
                 }
                 ReclaimOp::Crash => {
