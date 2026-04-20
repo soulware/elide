@@ -3301,8 +3301,9 @@ impl Volume {
     }
 
     /// Phase 3 of extent reclamation: verify the LBA map has not changed
-    /// since the plan was captured, then apply each proposed rewrite through
-    /// the internal-origin write path.
+    /// since the plan was captured, assemble the proposed rewrites into a
+    /// single pending segment, and splice the resulting entries into the
+    /// live lbamap + extent index.
     ///
     /// The precondition check is `Arc::ptr_eq(plan.lbamap_snapshot, self.lbamap)`.
     /// Any mutation between phase 1 and this call would have called
@@ -3313,6 +3314,14 @@ impl Volume {
     /// A discard leaves all Volume state completely unchanged; the caller
     /// can retry on the next quiet window. The wasted work is whatever
     /// phase 2 did (reads, hashing) — never any WAL or map state.
+    ///
+    /// The output is written as a single segment in `pending/` under a
+    /// fresh mint ULID — the segment rename is the durability commit point,
+    /// same pattern `repack` uses. The WAL is not touched: reclaim's
+    /// output is fully derivable from durable state (the source hashes
+    /// are live in existing segments), so a crash before rename leaves
+    /// nothing to recover; a crash between rename and splice leaves an
+    /// orphan segment that GC classifies as all-dead on the next pass.
     pub fn reclaim_commit(
         &mut self,
         plan: ReclaimPlan,
@@ -3324,13 +3333,114 @@ impl Volume {
                 ..Default::default()
             });
         }
-        let mut outcome = ReclaimOutcome::default();
-        for p in proposed {
-            let bytes = p.data.len() as u64;
-            if self.write_with_hash(p.start_lba, &p.data, p.hash)? {
-                outcome.runs_rewritten += 1;
-                outcome.bytes_rewritten += bytes;
+
+        // Build the segment's entry list. Each proposal becomes either a
+        // no-op (already at this LBA), a DedupRef (hash exists somewhere),
+        // or a fresh Data/Inline entry. Uncompressed byte counts are
+        // captured alongside so bytes_rewritten reflects logical size.
+        let mut entries: Vec<segment::SegmentEntry> = Vec::with_capacity(proposed.len());
+        let mut uncompressed_bytes: Vec<u64> = Vec::with_capacity(proposed.len());
+        for p in &proposed {
+            let lba_length = (p.data.len() / 4096) as u32;
+            if self.lbamap.has_full_match(p.start_lba, lba_length, &p.hash) {
+                continue;
             }
+            if self.extent_index.lookup(&p.hash).is_some() {
+                entries.push(segment::SegmentEntry::new_dedup_ref(
+                    p.hash,
+                    p.start_lba,
+                    lba_length,
+                ));
+                uncompressed_bytes.push(p.data.len() as u64);
+                continue;
+            }
+            let (body, flags) = match maybe_compress(&p.data) {
+                Some(c) => (c, segment::SegmentFlags::COMPRESSED),
+                None => (p.data.clone(), segment::SegmentFlags::empty()),
+            };
+            entries.push(segment::SegmentEntry::new_data(
+                p.hash,
+                p.start_lba,
+                lba_length,
+                flags,
+                body,
+            ));
+            uncompressed_bytes.push(p.data.len() as u64);
+        }
+
+        if entries.is_empty() {
+            return Ok(ReclaimOutcome::default());
+        }
+
+        // Fresh ULID monotonically above any prior segment or open WAL.
+        let segment_ulid = self.mint.next();
+        let body_section_start = segment::write_and_commit(
+            &self.base_dir.join("pending"),
+            segment_ulid,
+            &mut entries,
+            self.signer.as_ref(),
+        )?;
+        self.has_new_segments = true;
+        self.last_segment_ulid = Some(segment_ulid);
+
+        // Splice into live lbamap + extent index. Runs on the actor under
+        // the actor lock; no CAS needed because the Arc::ptr_eq guard
+        // above already proved no concurrent mutation happened.
+        let lbamap = Arc::make_mut(&mut self.lbamap);
+        for entry in &entries {
+            lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
+        }
+        let extent_index = Arc::make_mut(&mut self.extent_index);
+        for entry in &entries {
+            match entry.kind {
+                EntryKind::Data => {
+                    extent_index.insert(
+                        entry.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: segment_ulid,
+                            body_offset: entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                            body_source: BodySource::Local,
+                            body_section_start,
+                            inline_data: None,
+                        },
+                    );
+                }
+                EntryKind::Inline => {
+                    extent_index.insert(
+                        entry.hash,
+                        extentindex::ExtentLocation {
+                            segment_id: segment_ulid,
+                            body_offset: entry.stored_offset,
+                            body_length: entry.stored_length,
+                            compressed: entry.compressed,
+                            body_source: BodySource::Local,
+                            body_section_start,
+                            inline_data: entry.data.clone().map(Vec::into_boxed_slice),
+                        },
+                    );
+                }
+                EntryKind::DedupRef => {
+                    // canonical body already indexed — nothing to insert.
+                }
+                EntryKind::CanonicalData
+                | EntryKind::CanonicalInline
+                | EntryKind::Zero
+                | EntryKind::Delta => {
+                    unreachable!(
+                        "reclaim output produces only Data/Inline/DedupRef, got {:?}",
+                        entry.kind
+                    );
+                }
+            }
+        }
+
+        let mut outcome = ReclaimOutcome::default();
+        for (entry, bytes) in entries.iter().zip(uncompressed_bytes.iter()) {
+            let _ = entry;
+            outcome.runs_rewritten += 1;
+            outcome.bytes_rewritten += *bytes;
         }
         Ok(outcome)
     }

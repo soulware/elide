@@ -673,16 +673,21 @@ proptest! {
                     );
                 }
                 SimOp::ReclaimRange { start_lba, lba_count } => {
-                    // Reclaim only writes to the WAL via write_with_hash; no
-                    // new segment ULIDs appear, so there is nothing extra
-                    // to check for ULID monotonicity. The content-preservation
-                    // invariant is covered by `reclaim_crash_recovery` and
-                    // `crash_recovery_oracle`.
+                    // Reclaim now writes directly to pending/ under a fresh
+                    // mint ULID (bypassing the WAL), so it must preserve
+                    // ULID monotonicity like any other segment-producing op.
                     let plan = vol.reclaim_snapshot(*start_lba as u64, *lba_count as u32);
                     let proposed = plan
                         .compute_rewrites(|lba, len| vol.read(lba, len))
                         .unwrap_or_default();
                     let _ = vol.reclaim_commit(plan, proposed);
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            *u > max_before,
+                            "reclaim produced ULID {u} ≤ existing max {max_before}"
+                        );
+                    }
                 }
                 SimOp::HalfPromotePending => {
                     // Produces no new ULIDs — idx + cache body keep the
