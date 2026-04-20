@@ -298,6 +298,17 @@ struct ParkedGcHandoffs {
     applied_count: usize,
 }
 
+/// Outcome of a single call to [`VolumeActor::dispatch_next_handoff`].
+enum HandoffDispatch {
+    /// A job was sent to the worker; the caller must retain the parked
+    /// batch in `self.parked_handoffs` so the worker result can drive it.
+    Dispatched,
+    /// The batch is complete — either every entry was skipped, the last
+    /// worker result fired the reply, or an error fired the reply. The
+    /// caller must drop the parked batch, not store it.
+    Finished,
+}
+
 /// Idle period after which the actor promotes a non-empty WAL to a pending
 /// segment even without an explicit flush request.  10 seconds is a
 /// conservative value chosen for observability during development; it can be
@@ -502,7 +513,20 @@ impl VolumeActor {
     /// running it on the actor would block concurrent reads/writes. If
     /// `reply` is `Some`, the reply fires once all handoffs in this batch
     /// have been applied (or immediately if there are none).
+    ///
+    /// At most one batch runs at a time. If a batch is already in flight,
+    /// IPC callers are told to retry; internal callers (idle tick) silently
+    /// defer — the running batch will cover whatever is on disk.
     fn start_gc_handoffs(&mut self, reply: Option<Sender<io::Result<usize>>>) {
+        if self.parked_handoffs.is_some() {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(io::Error::other(
+                    "apply_gc_handoffs already in progress",
+                )));
+            }
+            return;
+        }
+
         let (to_process, already_applied) = match self.volume.scan_plan_handoffs() {
             Ok(v) => v,
             Err(e) => {
@@ -531,16 +555,26 @@ impl VolumeActor {
             applied_count: already_applied,
         };
 
-        self.dispatch_next_handoff(&mut parked);
-        self.parked_handoffs = Some(parked);
+        if matches!(
+            self.dispatch_next_handoff(&mut parked),
+            HandoffDispatch::Dispatched
+        ) {
+            self.parked_handoffs = Some(parked);
+        }
     }
 
     /// Pop the next plan handoff from the parked batch and dispatch it.
     ///
+    /// Returns [`HandoffDispatch::Dispatched`] when a job is on the worker
+    /// and the caller should retain `parked` in `self.parked_handoffs`.
+    /// Returns [`HandoffDispatch::Finished`] when the batch is done — every
+    /// remaining entry was skipped (`prepare_plan_apply` returned `None`)
+    /// or a fatal error fired the reply — and the caller must drop `parked`.
+    ///
     /// Skips entries whose `prepare_plan_apply` rejects them (parse failure,
     /// ULID mismatch, empty inputs) — those plans were already removed
     /// inside `prepare_plan_apply`, so the batch continues with the next.
-    fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) {
+    fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) -> HandoffDispatch {
         while let Some((plan_path, new_ulid)) = parked.remaining.pop() {
             let job = match self.volume.prepare_plan_apply(plan_path, new_ulid) {
                 Ok(Some(job)) => job,
@@ -550,22 +584,32 @@ impl VolumeActor {
                     if let Some(reply) = parked.reply.take() {
                         let _ = reply.send(Err(e));
                     }
-                    return;
+                    return HandoffDispatch::Finished;
                 }
             };
-            if let Some(tx) = &self.worker_tx {
-                if let Err(e) = tx.send(WorkerJob::GcPlan(job)) {
-                    warn!("worker channel closed during gc plan dispatch: {e}");
-                    return;
+            let Some(tx) = &self.worker_tx else {
+                warn!("gc plan dispatch skipped: worker channel absent");
+                if let Some(reply) = parked.reply.take() {
+                    let _ = reply.send(Err(io::Error::other("worker channel closed")));
                 }
-                self.handoff_in_flight = true;
+                return HandoffDispatch::Finished;
+            };
+            if let Err(e) = tx.send(WorkerJob::GcPlan(job)) {
+                warn!("worker channel closed during gc plan dispatch: {e}");
+                if let Some(reply) = parked.reply.take() {
+                    let _ =
+                        reply.send(Err(io::Error::other(format!("worker channel closed: {e}"))));
+                }
+                return HandoffDispatch::Finished;
             }
-            return;
+            self.handoff_in_flight = true;
+            return HandoffDispatch::Dispatched;
         }
         // No more plans — finalise the batch.
         if let Some(reply) = parked.reply.take() {
             let _ = reply.send(Ok(parked.applied_count));
         }
+        HandoffDispatch::Finished
     }
 
     /// Run the sweep prep on the actor and dispatch the heavy middle to
@@ -1063,8 +1107,10 @@ impl VolumeActor {
                                     if let Some(reply) = parked.reply {
                                         let _ = reply.send(Ok(parked.applied_count));
                                     }
-                                } else {
-                                    self.dispatch_next_handoff(&mut parked);
+                                } else if matches!(
+                                    self.dispatch_next_handoff(&mut parked),
+                                    HandoffDispatch::Dispatched
+                                ) {
                                     self.parked_handoffs = Some(parked);
                                 }
                             }
