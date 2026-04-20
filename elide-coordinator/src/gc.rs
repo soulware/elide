@@ -1,57 +1,54 @@
 // Coordinator-side S3 segment GC.
 //
-// Two strategies, matching lsvd's StartGC / SweepSmallSegments model and the
-// volume's repack() / sweep_pending() split:
+// Single per-tick selection that bin-packs eligible segments into one output
+// plan (≤ SWEEP_LIVE_CAP = 32 MiB live bytes rewritten per tick). Replaces
+// the former dead/repack/sweep three-pass split with one rule:
 //
-//   Repack pass:
-//     Find the single least-dense segment (lowest live_bytes/file_bytes ratio).
-//     If it is below the density threshold, repack it into one output segment.
-//     Processes one segment per tick — the next tick handles the next one.
-//     Mirrors lsvd StartGC and volume repack().
+//   Eligibility:
+//     * dead input — live_lba_bytes == 0, includable at zero rewrite cost
+//       (contributes to the output's `inputs` list, not its body).
+//     * small     — live_lba_bytes ≤ SWEEP_SMALL_THRESHOLD (16 MiB), any
+//       density. Consolidation candidate.
+//     * sparse    — density < density_threshold, any size. Reclamation
+//       candidate.
+//   Snapshot-floor segments are ineligible.
 //
-//   Sweep:
-//     Bin-pack high-density segments toward SWEEP_LIVE_CAP (32 MiB live).
-//     Tier 1 sorts segments with live_lba_bytes <= SWEEP_SMALL_THRESHOLD
-//     (16 MiB) ascending and greedy-includes them. Tier 2 picks at most
-//     one larger filler that fits the remaining headroom. Sweep candidates
-//     must have density >= density_threshold; lower-density segments are
-//     owned by repack and excluded here. Selection is purely about packing,
-//     not dead-data removal — repack handles that, gated on density.
-//     Mirrors lsvd SweepSmallSegments and volume sweep_pending().
+//   Packing:
+//     1. All tombstone-like inputs fold in for free.
+//     2. Smalls sort ascending by live_lba_bytes and greedy-fill the 32 MiB
+//        live budget.
+//     3. One filler may top up the remaining headroom — chosen from the
+//        sparse-large set (live_lba_bytes > 16 MiB AND density < threshold).
+//        Among candidates that fit, prefer lowest density (maximum dead-
+//        byte reclamation); ties broken by largest live bytes (best fit).
 //
-// Both strategies run in the same tick if both find candidates, each producing
-// an independent output segment with its own ULID. They operate on disjoint
-// input sets, so they could be parallelised with tokio::join! in a future
-// optimisation. Per-tick work is bounded in both cases.
+// Produces one output segment per tick under `u_gc`, or nothing if no
+// eligible input exists. Per-tick work is bounded by the 32 MiB live cap
+// plus O(1)-per-input tombstone bookkeeping on the apply side.
 //
-// Handoff protocol (self-describing, crash-safe, filesystem-only coordination —
-// see docs/design-gc-self-describing-handoff.md for the full design):
+// Handoff protocol (plan-based, crash-safe, filesystem-only coordination —
+// see docs/design-gc-plan-handoff.md for the full design):
 //
-//   1. Coordinator writes the compacted segment to gc/<new-ulid>.staged via
-//      tmp+rename. The segment carries the sorted list of input ULIDs in its
-//      own header (`inputs_length` field). Signed with an ephemeral key —
-//      coordinator does not hold the volume's private key.
+//   1. Coordinator writes a plaintext plan to gc/<new-ulid>.plan via
+//      tmp+rename. The plan lists the transformation for each input's
+//      entries (Keep / Canonical / ZeroSplit / Run / Drop).
 //
-//   2. Volume (idle tick) reads gc/<new-ulid>.staged, walks each input's
-//      index/<input>.idx to derive the extent-index updates, writes a
-//      re-signed copy to gc/<new-ulid>.tmp, renames .tmp → bare gc/<new-ulid>
-//      (the atomic commit point), removes .staged.
+//   2. Volume (idle tick) reads the plan, resolves bodies via its own
+//      BlockReader, assembles the output segment signed with the volume's
+//      key, writes gc/<new-ulid>.tmp, renames .tmp → bare gc/<new-ulid>
+//      (the atomic commit point), removes the plan.
 //
 //   3. Coordinator (next GC tick) sees the bare file: uploads it to S3, sends
 //      promote_segment IPC (volume writes index/<new>.idx + cache/<new>.body
 //      and deletes index/<input>.idx for each input), deletes old S3 objects,
 //      sends finalize_gc_handoff IPC (volume deletes the bare body).
 //
-//   Crash recovery is content-resolved (no extra filename states): stale .tmp
-//   and .staged.tmp are swept on every apply pass; .staged alone re-runs
-//   apply (deterministic, byte-identical output); .staged + bare → bare wins.
-//
 //   All-dead and removal-only handoffs collapse into a zero-entry GC output
 //   with a non-empty inputs list. promote_segment recognises this shape and
 //   skips writing index/<new>.idx / cache/<new>.body — the bare file is then
 //   deleted via finalize_gc_handoff the same as a live output.
 //
-// A pass is deferred if any .staged or bare gc/<ulid> files already exist
+// A pass is deferred if any .plan or bare gc/<ulid> files already exist
 // (at most one outstanding GC result per fork at a time).
 //
 // Blocking IO note: index rebuild and segment reads are synchronous. For the
@@ -97,12 +94,8 @@ const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_LIVE_CAP / 2;
 pub enum GcStrategy {
     /// No work done this pass; see [`NoneReason`] for why.
     None(NoneReason),
-    /// Repacked the single least-dense segment.
-    Repack,
-    /// Swept multiple small segments into one.
-    Sweep,
-    /// Both repack and sweep ran in the same tick.
-    Both,
+    /// Compacted one or more eligible segments into a single output.
+    Compact,
 }
 
 /// Why a pass returned without compacting any segment.
@@ -110,7 +103,7 @@ pub enum GcStrategy {
 /// Distinguishes the three early-exit paths so the coordinator can log
 /// them differently: `NoIndex` / `PendingHandoffs` are transient bail-outs
 /// where `total_segments` is not a real count, while `NoCandidates` is
-/// the genuine "all at or above density threshold" idle.
+/// the genuine "nothing eligible this tick" idle.
 #[derive(Debug, PartialEq)]
 pub enum NoneReason {
     /// `index/` dir does not exist yet (volume has no segments).
@@ -118,8 +111,8 @@ pub enum NoneReason {
     /// A prior pass's `.plan` or bare handoff has not cleared yet;
     /// `gc_fork` bails before `collect_stats` runs.
     PendingHandoffs,
-    /// Density and sweep passes ran; no segment met the selection
-    /// criteria. `total_segments` is the real count here.
+    /// Selection ran; no segment met the eligibility rule.
+    /// `total_segments` is the real count here.
     NoCandidates,
 }
 
@@ -155,15 +148,15 @@ impl GcStats {
 
 /// Run one GC pass for a single fork.
 ///
-/// Both repack and sweep run in the same tick if both find candidates.
-/// Returns `GcStrategy::None(reason)` if neither finds candidates; the
-/// reason distinguishes genuine idle (`NoCandidates`) from transient
-/// bail-outs (`NoIndex`, `PendingHandoffs`).
+/// Selects up to one bucket of eligible segments (dead | small | sparse)
+/// via the rules documented at the top of this module, and emits a single
+/// plan under `u_gc`. Returns `GcStrategy::None(reason)` if nothing was
+/// eligible; the reason distinguishes genuine idle (`NoCandidates`) from
+/// transient bail-outs (`NoIndex`, `PendingHandoffs`).
 ///
-/// `repack_ulid` and `sweep_ulid` are the output segment names for each
-/// strategy.  Both must be pre-resolved via `gc_checkpoint` IPC before
-/// calling this function — they originate from the volume process so that
-/// ULID ordering is consistent with the volume's write clock.
+/// `u_gc` must be pre-resolved via `gc_checkpoint` IPC before calling this
+/// function — it originates from the volume process so that ULID ordering
+/// is consistent with the volume's write clock.
 ///
 /// `by_id_dir` is the data-dir root that houses `<volume_ulid>/` fork
 /// directories (plus an optional `readonly/` sibling tree). Passed so that
@@ -174,8 +167,7 @@ pub fn gc_fork(
     fork_dir: &Path,
     by_id_dir: &Path,
     config: &GcConfig,
-    repack_ulid: Ulid,
-    sweep_ulid: Ulid,
+    u_gc: Ulid,
 ) -> Result<GcStats> {
     let index_dir = fork_dir.join("index");
     if !index_dir.exists() {
@@ -263,104 +255,106 @@ pub fn gc_fork(
         );
     }
 
-    // Pre-pass: extract fully-dead segments (no live entries, no extent index
-    // refs).  These are the cheapest possible GC: the handoff is tombstone-only
-    // (just `dead` lines), no S3 fetch, no segment write, no upload — the
-    // coordinator just DELETEs the old S3 objects.  Batch all of them into a
-    // single tombstone handoff under repack_ulid.
-    let mut dead_segments: Vec<SegmentStats> = Vec::new();
-    let mut remaining: Vec<SegmentStats> = Vec::new();
+    // Partition the stats into three disjoint buckets by shape:
+    //   * dead  — no live entries, no removed hashes (tombstone-only input).
+    //   * small — live_lba_bytes ≤ SWEEP_SMALL_THRESHOLD.
+    //   * large — everything else above the snapshot floor.
+    //
+    // Dead inputs are "free" packing candidates: they contribute to the
+    // output's inputs list and let promote_segment drop the stale .idx at
+    // apply time, without writing any body bytes for them.
+    //
+    // Smalls admit any entry kind (DATA, DEDUP_REF, Delta, Zero) — under
+    // the plan-handoff protocol the volume materialises the output, so
+    // consolidating e.g. several DEDUP_REF-only segments into one is a
+    // legitimate reclamation of S3 object count even without any physical
+    // body bytes to rewrite.
+    let mut dead_inputs: Vec<SegmentStats> = Vec::new();
+    let mut small_inputs: Vec<SegmentStats> = Vec::new();
+    let mut large_inputs: Vec<SegmentStats> = Vec::new();
     for s in all_stats {
         if s.live_entries.is_empty() && s.removed_hashes.is_empty() {
-            dead_segments.push(s);
+            dead_inputs.push(s);
+        } else if s.live_lba_bytes <= SWEEP_SMALL_THRESHOLD {
+            small_inputs.push(s);
         } else {
-            remaining.push(s);
+            large_inputs.push(s);
         }
     }
-    let mut all_stats = remaining;
-    let dead_count = dead_segments.len();
-    let repack_consumed_by_dead = if dead_count > 0 {
-        let dead_ulids: Vec<String> = dead_segments.iter().map(|s| s.ulid_str.clone()).collect();
-        tracing::info!(
-            "[gc] dead pre-pass: {} fully-dead segment(s) → tombstone {repack_ulid}: [{}]",
-            dead_count,
-            dead_ulids.join(", "),
-        );
-        compact_segments(dead_segments, &gc_dir, repack_ulid, &live_hashes)
-            .context("dead segment pre-pass")?;
-        true
-    } else {
-        false
-    };
 
-    // Repack: density pass — extract the single least-dense segment.
-    // Removes it from all_stats so sweep only sees the remainder.
-    // Skipped when the pre-pass consumed repack_ulid.
-    let mut repack_bytes: u64 = 0;
-    let ran_repack = if repack_consumed_by_dead {
-        false
-    } else if let Some(pos) = find_least_dense(&all_stats, config.density_threshold) {
-        let candidate = all_stats.remove(pos);
-        repack_bytes = candidate.dead_lba_bytes();
-        tracing::info!(
-            "[gc] repack: {} → {} density={:.3} live_lba={} dead_lba={} \
-             live_entries={} removed_hashes={}",
-            candidate.ulid_str,
-            repack_ulid,
-            candidate.density(),
-            candidate.live_lba_bytes,
-            candidate.dead_lba_bytes(),
-            candidate.live_entries.len(),
-            candidate.removed_hashes.len(),
-        );
-        compact_segments(vec![candidate], &gc_dir, repack_ulid, &live_hashes)
-            .context("density compaction")?;
-        true
-    } else {
-        false
-    };
-
-    // Sweep: bin-pack high-density segments toward SWEEP_LIVE_CAP.
-    //
-    // Tier 1 — smalls (live_lba_bytes ≤ SWEEP_SMALL_THRESHOLD), sorted
-    // ascending. Greedy include into the bucket until the next won't fit.
-    // Tier 2 — at most one filler (live > SWEEP_SMALL_THRESHOLD) chosen
-    // best-fit against the remaining headroom, only if the bucket already
-    // has at least one small. The filler trades the cost of rewriting a
-    // larger segment for one-fewer total segment, worth it only when
-    // there's already a small bucket to attach to.
-    //
-    // Selection is purely about packing, not dead-data removal. Repack
-    // owns dead-data (gated on `density_threshold`); low-density segments
-    // are filtered out here so they go to repack instead. Sweep clears
-    // dead entries within its selected inputs as a side-effect.
-    let (smalls, fillers): (Vec<_>, Vec<_>) = all_stats
+    // Sparse-large candidates eligible to fill remaining headroom. Both
+    // density and dead-bytes-present gates mirror what the old per-pass
+    // repack enforced so a dense-large segment is never rewritten solely
+    // for consolidation — the only benefit would be one fewer S3 object,
+    // at the cost of rewriting ~16+ MiB of live bytes. `has_data_content`
+    // excludes DEDUP_REF-only / Zero-only segments where rewriting
+    // reclaims no physical body.
+    let density_threshold = config.density_threshold;
+    let sparse_large: Vec<SegmentStats> = large_inputs
         .into_iter()
-        .filter(|s| s.density() >= config.density_threshold)
-        .partition(|s| s.live_lba_bytes <= SWEEP_SMALL_THRESHOLD);
+        .filter(|s| {
+            s.density() < density_threshold && s.dead_lba_bytes() > 0 && s.has_data_content()
+        })
+        .collect();
 
-    let mut smalls = smalls;
-    smalls.sort_by_key(|s| s.live_lba_bytes);
+    // Smalls sorted ascending by live bytes for tightest bin-pack.
+    small_inputs.sort_by_key(|s| s.live_lba_bytes);
 
     let mut bucket: Vec<SegmentStats> = Vec::new();
     let mut budget = SWEEP_LIVE_CAP;
-    for s in smalls {
+
+    // Tier 0 — tombstone inputs. Free in body bytes; no budget effect.
+    bucket.append(&mut dead_inputs);
+
+    // Tier 1 — smalls, ascending. Greedy until the next won't fit.
+    for s in small_inputs {
         if s.live_lba_bytes <= budget {
             budget -= s.live_lba_bytes;
             bucket.push(s);
         }
     }
-    if !bucket.is_empty()
-        && budget > 0
-        && let Some(pos) = fillers
+
+    // Tier 2 — at most one sparse-large filler. Prefer lowest density
+    // (maximum dead-byte reclamation per rewritten byte); tie-break by
+    // largest live_lba_bytes (best fit for the remaining headroom).
+    if budget > 0
+        && let Some((pos, _)) = sparse_large
             .iter()
             .enumerate()
             .filter(|(_, s)| s.live_lba_bytes <= budget)
-            .max_by_key(|(_, s)| s.live_lba_bytes)
-            .map(|(i, _)| i)
+            .min_by(|(_, a), (_, b)| {
+                a.density()
+                    .partial_cmp(&b.density())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.live_lba_bytes.cmp(&a.live_lba_bytes))
+            })
     {
-        let mut fillers = fillers;
-        bucket.push(fillers.remove(pos));
+        let mut sparse_large = sparse_large;
+        bucket.push(sparse_large.remove(pos));
+    }
+
+    // Skip a pass that has no reclamation benefit. A bucket is worth
+    // emitting only if:
+    //   * it folds in at least one tombstone (a DELETE either way), or
+    //   * it folds in a sparse segment (rewrite reclaims dead bytes), or
+    //   * it consolidates ≥ 2 inputs (one fewer S3 object per pack).
+    // A single dense small input on its own is a pointless rewrite.
+    let has_dead = bucket
+        .iter()
+        .any(|s| s.live_entries.is_empty() && s.removed_hashes.is_empty());
+    let has_sparse = bucket.iter().any(|s| s.density() < density_threshold);
+    if !has_dead && !has_sparse && bucket.len() < 2 {
+        if deferred_count > 0 {
+            return Ok(GcStats {
+                strategy: GcStrategy::None(NoneReason::NoCandidates),
+                candidates: 0,
+                bytes_freed: 0,
+                dead_cleaned: 0,
+                deferred: deferred_count,
+                total_segments,
+            });
+        }
+        return Ok(GcStats::none(NoneReason::NoCandidates, total_segments));
     }
 
     // Sort the bucket back into ULID order before handing it to
@@ -368,70 +362,37 @@ pub fn gc_fork(
     // input segments cover the same LBA the latest source wins).
     bucket.sort_by(|a, b| a.ulid_str.cmp(&b.ulid_str));
 
-    // Single-input sweep is a no-op rewrite — skip. Repack handles
-    // single-segment dead-data cleanup.
-    let ran_sweep = if bucket.len() >= 2 {
-        let sweep_candidates = bucket.len();
-        let sweep_live_bytes: u64 = bucket.iter().map(|s| s.live_lba_bytes).sum();
-        let sweep_bytes: u64 = bucket.iter().map(|s| s.dead_lba_bytes()).sum();
-        let sweep_live_entries: usize = bucket.iter().map(|s| s.live_entries.len()).sum();
-        let sweep_removed_hashes: usize = bucket.iter().map(|s| s.removed_hashes.len()).sum();
-        let sweep_inputs: Vec<&str> = bucket.iter().map(|s| s.ulid_str.as_str()).collect();
-        tracing::info!(
-            "[gc] sweep: [{}] → {} inputs={} live_lba={} dead_lba={} \
-             live_entries={} removed_hashes={}",
-            sweep_inputs.join(", "),
-            sweep_ulid,
-            sweep_candidates,
-            sweep_live_bytes,
-            sweep_bytes,
-            sweep_live_entries,
-            sweep_removed_hashes,
-        );
-        compact_segments(bucket, &gc_dir, sweep_ulid, &live_hashes)
-            .context("small-segment sweep")?;
-        Some((sweep_candidates, sweep_bytes))
-    } else {
-        None
-    };
+    let candidates = bucket.len();
+    let bytes_freed: u64 = bucket.iter().map(|s| s.dead_lba_bytes()).sum();
+    let live_bytes: u64 = bucket.iter().map(|s| s.live_lba_bytes).sum();
+    let live_entries: usize = bucket.iter().map(|s| s.live_entries.len()).sum();
+    let removed_hashes: usize = bucket.iter().map(|s| s.removed_hashes.len()).sum();
+    let dead_cleaned = bucket
+        .iter()
+        .filter(|s| s.live_entries.is_empty() && s.removed_hashes.is_empty())
+        .count();
+    let input_ulids: Vec<&str> = bucket.iter().map(|s| s.ulid_str.as_str()).collect();
+    tracing::info!(
+        "[gc] compact: [{}] → {u_gc} inputs={} live_lba={} dead_lba={} \
+         live_entries={} removed_hashes={} dead_folded={}",
+        input_ulids.join(", "),
+        candidates,
+        live_bytes,
+        bytes_freed,
+        live_entries,
+        removed_hashes,
+        dead_cleaned,
+    );
+    compact_segments(bucket, &gc_dir, u_gc, &live_hashes).context("gc compaction")?;
 
-    match (ran_repack, ran_sweep) {
-        (false, None) if dead_count == 0 && deferred_count == 0 => {
-            Ok(GcStats::none(NoneReason::NoCandidates, total_segments))
-        }
-        (false, None) => Ok(GcStats {
-            strategy: GcStrategy::None(NoneReason::NoCandidates),
-            candidates: 0,
-            bytes_freed: 0,
-            dead_cleaned: dead_count,
-            deferred: deferred_count,
-            total_segments,
-        }),
-        (true, None) => Ok(GcStats {
-            strategy: GcStrategy::Repack,
-            candidates: 1,
-            bytes_freed: repack_bytes,
-            dead_cleaned: dead_count,
-            deferred: deferred_count,
-            total_segments,
-        }),
-        (false, Some((n, sweep_bytes))) => Ok(GcStats {
-            strategy: GcStrategy::Sweep,
-            candidates: n,
-            bytes_freed: sweep_bytes,
-            dead_cleaned: dead_count,
-            deferred: deferred_count,
-            total_segments,
-        }),
-        (true, Some((n, sweep_bytes))) => Ok(GcStats {
-            strategy: GcStrategy::Both,
-            candidates: 1 + n,
-            bytes_freed: repack_bytes + sweep_bytes,
-            dead_cleaned: dead_count,
-            deferred: deferred_count,
-            total_segments,
-        }),
-    }
+    Ok(GcStats {
+        strategy: GcStrategy::Compact,
+        candidates,
+        bytes_freed,
+        dead_cleaned,
+        deferred: deferred_count,
+        total_segments,
+    })
 }
 
 /// Process volume-applied GC handoffs: walk bare `gc/<ulid>` files, upload
@@ -1101,27 +1062,6 @@ fn collect_stats(
     Ok(result)
 }
 
-/// Return the index of the least-dense segment whose density is below
-/// `threshold`, or `None` if no segment qualifies.
-fn find_least_dense(stats: &[SegmentStats], threshold: f64) -> Option<usize> {
-    stats
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| {
-            // Exclude segments with no dead LBA bytes: nothing to reclaim.
-            // Exclude segments with no body content: compacting a segment of
-            // only zero extents writes an equivalent output with no physical
-            // storage savings and no extent index changes — skip.
-            s.density() < threshold && s.dead_lba_bytes() > 0 && s.has_data_content()
-        })
-        .min_by(|(_, a), (_, b)| {
-            a.density()
-                .partial_cmp(&b.density())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(i, _)| i)
-}
-
 /// Classify each candidate's live entries and emit a `gc/<new-ulid>.plan`
 /// file describing the desired output. The volume picks up the plan on its
 /// next idle tick, resolves bodies through its own ancestor-aware BlockReader,
@@ -1457,78 +1397,6 @@ mod tests {
         assert!(!has_pending_results(&gc_dir).unwrap());
     }
 
-    #[test]
-    fn find_least_dense_picks_sparsest_below_threshold() {
-        // A fake DATA entry — stored_length > 0 so has_data_content() returns true.
-        fn data_entry() -> SegmentEntry {
-            SegmentEntry::new_data(
-                blake3::hash(b"x"),
-                0,
-                1,
-                segment::SegmentFlags::empty(),
-                vec![0u8; 4096],
-            )
-        }
-        fn make(total_lba_bytes: u64, live_lba_bytes: u64) -> SegmentStats {
-            SegmentStats {
-                ulid_str: String::new(),
-                live_lba_bytes,
-                total_lba_bytes,
-                has_body_entries: true,
-                live_entries: vec![data_entry()],
-                live_entry_indices: vec![0],
-                removed_hashes: Vec::new(),
-                partial_death_runs: Vec::new(),
-                has_partial_death: false,
-            }
-        }
-
-        // density: 0.8, 0.5, 0.6 — only 0.5 and 0.6 are below 0.7
-        let stats = vec![make(100, 80), make(100, 50), make(100, 60)];
-        assert_eq!(find_least_dense(&stats, 0.7), Some(1)); // 0.5 is least dense
-    }
-
-    #[test]
-    fn sweep_skips_single_small_segment() {
-        // Repack owns single-segment compaction (by density). By the time
-        // sweep runs, a lone small segment — whether all-live or sparsely
-        // live — has density >= threshold and is not worth a standalone GC pass.
-        // Verify dead_lba_bytes() is available for the ≥2 case.
-        let s = SegmentStats {
-            ulid_str: String::new(),
-            live_lba_bytes: 800 * 1024,
-            total_lba_bytes: 1024 * 1024,
-            has_body_entries: true,
-            live_entries: Vec::new(),
-            live_entry_indices: Vec::new(),
-            removed_hashes: Vec::new(),
-            partial_death_runs: Vec::new(),
-            has_partial_death: false,
-        };
-        assert_eq!(s.dead_lba_bytes(), 224 * 1024);
-        // density = 0.78 >= 0.70 threshold: repack would have caught it if below.
-        assert!(s.density() >= 0.70);
-    }
-
-    #[test]
-    fn find_least_dense_returns_none_when_all_above_threshold() {
-        fn make(live_lba_bytes: u64) -> SegmentStats {
-            SegmentStats {
-                ulid_str: String::new(),
-                live_lba_bytes,
-                total_lba_bytes: 100,
-                has_body_entries: true,
-                live_entries: Vec::new(),
-                live_entry_indices: Vec::new(),
-                removed_hashes: Vec::new(),
-                partial_death_runs: Vec::new(),
-                has_partial_death: false,
-            }
-        }
-        let stats = vec![make(80), make(90), make(100)];
-        assert_eq!(find_least_dense(&stats, 0.7), None);
-    }
-
     /// Redact, upload to store, and promote all pending segments.
     /// Mirrors the real coordinator path: redact → S3 PUT → promote.
     async fn drain_with_redact(
@@ -1673,9 +1541,8 @@ mod tests {
             density_threshold: 0.0,
             interval_secs: 0,
         };
-        let sweep_ulid = Ulid::new();
-        let repack_ulid = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, repack_ulid, sweep_ulid).unwrap();
+        let u_gc = Ulid::new();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
         assert!(
             stats.candidates >= 2,
             "GC should have compacted at least 2 segments (S1 + S2), got {}",
@@ -1770,9 +1637,8 @@ mod tests {
             density_threshold: 0.0,
             interval_secs: 0,
         };
-        let sweep_ulid = Ulid::new();
-        let repack_ulid = Ulid::new();
-        gc_fork(dir, dir.parent().unwrap(), &config, repack_ulid, sweep_ulid).unwrap();
+        let u_gc = Ulid::new();
+        gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
 
         // Find the emitted GC plan in gc/. Under the plan handoff protocol
         // the coordinator writes `gc/<ulid>.plan` instead of a signed
@@ -2533,9 +2399,8 @@ mod tests {
             density_threshold: 0.0,
             interval_secs: 0,
         };
-        let sweep_ulid = Ulid::new();
-        let repack_ulid = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, repack_ulid, sweep_ulid).unwrap();
+        let u_gc = Ulid::new();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
         assert_eq!(
             stats.deferred, 0,
             "Delta partial-death must be expanded in-band, not deferred"
@@ -2632,9 +2497,8 @@ mod tests {
             density_threshold: 0.0,
             interval_secs: 0,
         };
-        let sweep_ulid = Ulid::new();
-        let repack_ulid = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, repack_ulid, sweep_ulid).unwrap();
+        let u_gc = Ulid::new();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
         assert!(
             stats.candidates >= 2,
             "GC should compact ≥2 segments, got {}",

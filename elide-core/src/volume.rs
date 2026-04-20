@@ -414,24 +414,22 @@ pub struct PromoteResult {
     pub pre_promote_offsets: Vec<Option<u64>>,
 }
 
-/// The three ULIDs needed for a GC checkpoint, minted atomically in order.
+/// The two ULIDs needed for a GC checkpoint, minted atomically in order.
 ///
-/// Ordering invariant: `u_repack < u_sweep < u_flush`.  All three come
-/// from the volume's own monotonic mint (never from an external clock),
-/// and `UlidMint` guarantees strict monotonicity even within the same
-/// millisecond.  Minting all three up front — before any I/O — is what
-/// makes the ordering self-documenting and crash-safe: the WAL segment
-/// flushed at `u_flush` is guaranteed > `u_sweep`, so rebuild applies
-/// the GC output before the flushed WAL segment.
+/// Ordering invariant: `u_gc < u_flush`.  Both come from the volume's own
+/// monotonic mint (never from an external clock), and `UlidMint` guarantees
+/// strict monotonicity even within the same millisecond.  Minting both up
+/// front — before any I/O — is what makes the ordering self-documenting and
+/// crash-safe: the WAL segment flushed at `u_flush` is guaranteed > `u_gc`,
+/// so rebuild applies the GC output before the flushed WAL segment.
 ///
 /// No `u_wal` is pre-minted for the *next* WAL. Any future `mint.next()`
-/// that opens a WAL is monotonically > `u_flush > u_sweep > u_repack` by
-/// construction, so the "new WAL above GC output" invariant holds
-/// without reservation. Deferring WAL open to first-write is what avoids
-/// per-tick WAL churn on idle volumes.
+/// that opens a WAL is monotonically > `u_flush > u_gc` by construction, so
+/// the "new WAL above GC output" invariant holds without reservation.
+/// Deferring WAL open to first-write is what avoids per-tick WAL churn on
+/// idle volumes.
 struct GcCheckpointUlids {
-    u_repack: Ulid,
-    u_sweep: Ulid,
+    u_gc: Ulid,
     u_flush: Ulid,
 }
 
@@ -441,8 +439,7 @@ struct GcCheckpointUlids {
 /// dispatches the job to the worker and stashes the reply.  When `job`
 /// is `None` the WAL was empty and the checkpoint completes immediately.
 pub struct GcCheckpointPrep {
-    pub u_repack: Ulid,
-    pub u_sweep: Ulid,
+    pub u_gc: Ulid,
     /// Segment ULID used for the promoted WAL.  Used to identify the
     /// GC promote's `PromoteComplete` among other in-flight promotes.
     pub u_flush: Ulid,
@@ -2033,37 +2030,32 @@ impl Volume {
 
     /// Inline, test-only variant of the GC checkpoint.
     ///
-    /// Mints the three ULIDs (`u_repack < u_sweep < u_flush`) and flushes
-    /// the current WAL to `pending/<u_flush>` synchronously on the caller's
-    /// thread.  Returns `(u_repack, u_sweep)`.  The post-flush WAL is left
-    /// unopened — the next write lazily opens a fresh one (see `Volume::wal`).
+    /// Mints the two ULIDs (`u_gc < u_flush`) and flushes the current WAL
+    /// to `pending/<u_flush>` synchronously on the caller's thread.
+    /// Returns `u_gc`.  The post-flush WAL is left unopened — the next
+    /// write lazily opens a fresh one (see `Volume::wal`).
     ///
     /// **Production uses [`Volume::prepare_gc_checkpoint`] instead**, which
     /// splits mint+rotate (actor thread) from the old-WAL fsync (worker
     /// thread) so writes aren't blocked.  This method keeps both on one
     /// thread for tests that want a synchronous checkpoint without spinning
-    /// up the actor machinery.  See [`GcCheckpointUlids`] for why the three
+    /// up the actor machinery.  See [`GcCheckpointUlids`] for why both
     /// ULIDs are minted before any I/O.
-    pub fn gc_checkpoint_for_test(&mut self) -> io::Result<(Ulid, Ulid)> {
-        let GcCheckpointUlids {
-            u_repack,
-            u_sweep,
-            u_flush,
-        } = self.mint_gc_checkpoint_ulids();
+    pub fn gc_checkpoint_for_test(&mut self) -> io::Result<Ulid> {
+        let GcCheckpointUlids { u_gc, u_flush } = self.mint_gc_checkpoint_ulids();
         // Flush the current WAL to pending/ under u_flush. If the WAL is
         // empty (or absent), the file is deleted/skipped and u_flush is unused.
         self.flush_wal_to_pending_as(u_flush)?;
-        Ok((u_repack, u_sweep))
+        Ok(u_gc)
     }
 
-    /// Mint the three ULIDs for a GC checkpoint, in ordering-invariant order.
+    /// Mint the two ULIDs for a GC checkpoint, in ordering-invariant order.
     ///
-    /// See [`GcCheckpointUlids`] for the ordering invariant and why all three
+    /// See [`GcCheckpointUlids`] for the ordering invariant and why both
     /// are minted before any I/O.
     fn mint_gc_checkpoint_ulids(&mut self) -> GcCheckpointUlids {
         GcCheckpointUlids {
-            u_repack: self.mint.next(),
-            u_sweep: self.mint.next(),
+            u_gc: self.mint.next(),
             u_flush: self.mint.next(),
         }
     }
@@ -3542,18 +3534,18 @@ impl Volume {
 
     /// Prep phase of the off-actor GC checkpoint.
     ///
-    /// Mints three ULIDs (`u_repack < u_sweep < u_flush`), snapshots CAS
+    /// Mints two ULIDs (`u_gc < u_flush`), snapshots CAS
     /// tokens, takes entries, and builds a [`PromoteJob`] using `u_flush`
     /// as the segment ULID. No fresh WAL is opened here — the next write
     /// lazily opens one at `mint.next()`, which is guaranteed >
-    /// `u_flush > u_sweep > u_repack` by monotonicity. This avoids
-    /// churning a new empty WAL file on every idle GC tick.
+    /// `u_flush > u_gc` by monotonicity. This avoids churning a new
+    /// empty WAL file on every idle GC tick.
     ///
     /// The old WAL's `fsync()` is deferred to the worker thread (see
     /// `execute_promote`), identical to the write-path promote offload.
     /// The parked GC reply only resolves after the worker returns, so
     /// the caller of `GcCheckpoint` still observes a durable old WAL
-    /// before acting on `(u_repack, u_sweep)`.
+    /// before acting on `u_gc`.
     ///
     /// Returns `job: None` when the WAL was empty or absent (no segment
     /// to promote). The checkpoint completes immediately in that case.
@@ -3565,11 +3557,7 @@ impl Volume {
     /// disable GC. We still run GC on every tick; we only stop creating
     /// a new WAL file when there is nothing to promote.
     pub fn prepare_gc_checkpoint(&mut self) -> io::Result<GcCheckpointPrep> {
-        let GcCheckpointUlids {
-            u_repack,
-            u_sweep,
-            u_flush,
-        } = self.mint_gc_checkpoint_ulids();
+        let GcCheckpointUlids { u_gc, u_flush } = self.mint_gc_checkpoint_ulids();
 
         if self.pending_entries.is_empty() {
             // Empty or absent WAL — delete any lingering file, leave wal None.
@@ -3577,8 +3565,7 @@ impl Volume {
                 fs::remove_file(&open.path)?;
             }
             return Ok(GcCheckpointPrep {
-                u_repack,
-                u_sweep,
+                u_gc,
                 u_flush,
                 job: None,
             });
@@ -3610,8 +3597,7 @@ impl Volume {
         let pending_dir = self.base_dir.join("pending");
 
         Ok(GcCheckpointPrep {
-            u_repack,
-            u_sweep,
+            u_gc,
             u_flush,
             job: Some(PromoteJob {
                 segment_ulid: u_flush,
@@ -7096,7 +7082,7 @@ mod tests {
 
         // PopulateFetched: write different data to cache for LBA 0,
         // overwriting the extent index entry for the original hash.
-        let (pop_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
+        let pop_ulid = vol.gc_checkpoint_for_test().unwrap();
         {
             // Use the common helper pattern from tests/common/mod.rs.
             let index_dir = fork_dir.join("index");
@@ -7181,7 +7167,7 @@ mod tests {
 
         // CoordGcLocal: run GC.
         {
-            let (gc_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
+            let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
             vol.flush_wal().unwrap();
             // Need at least 2 segments for GC; use all available.
             let idx_files = segment::collect_idx_files(&fork_dir.join("index")).unwrap();
@@ -8495,7 +8481,7 @@ mod tests {
         let (_bss, entries, _) =
             segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
 
-        let (new_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
+        let new_ulid = vol.gc_checkpoint_for_test().unwrap();
         let new_ulid_str = new_ulid.to_string();
 
         let gc_dir = fork_dir.join("gc");
@@ -8653,7 +8639,7 @@ mod tests {
         let (_bss, entries_b, _) =
             segment::read_and_verify_segment_index(&idx_b, &vol.verifying_key).unwrap();
 
-        let (new_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
+        let new_ulid = vol.gc_checkpoint_for_test().unwrap();
         let new_ulid_str = new_ulid.to_string();
 
         let gc_dir = fork_dir.join("gc");

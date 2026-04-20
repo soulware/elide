@@ -8,18 +8,19 @@ Date: 2026-03-30
 
 > **Note (April 2026):** the historical handoff filename references in
 > this document — `.pending`, `.applied`, `.done`, removal-only handoffs
-> as plaintext manifest lines — are out of date. The self-describing GC
-> handoff protocol (see `docs/design-gc-self-describing-handoff.md`)
-> replaces the manifest sidecar entirely; the on-disk lifecycle is now
-> `gc/<ulid>.staged` → bare `gc/<ulid>` → deleted, with the consumed
-> input ULID list carried in the segment header. The ULID ordering
-> invariants this document records are unchanged: GC outputs still get
-> `max(inputs).increment()` and `gc_checkpoint` still pre-mints
-> `(u_repack, u_sweep, u_flush)` in one shot for crash-recovery
-> correctness. The post-checkpoint WAL is opened lazily on the next
-> write rather than pre-minted as a fourth `u_wal`, because
-> `mint.next()` is strictly monotonic — any future mint is already
-> above `u_flush`, so no reservation is needed.
+> as plaintext manifest lines — are out of date. The plan-handoff GC
+> protocol (see `docs/design-gc-plan-handoff.md` and
+> `docs/design-gc-self-describing-handoff.md`) replaces the manifest
+> sidecar entirely; the on-disk lifecycle is now `gc/<ulid>.plan` →
+> bare `gc/<ulid>` → deleted, with the consumed input ULID list carried
+> in the segment header. The ULID ordering invariants this document
+> records are unchanged, but the specific ULIDs minted at checkpoint
+> time have collapsed from three to two: `gc_checkpoint` now pre-mints
+> `(u_gc, u_flush)` in one shot, under the unified GC pass that
+> replaced the dead/repack/sweep split. The post-checkpoint WAL is
+> opened lazily on the next write rather than pre-minted as a third
+> `u_wal`, because `mint.next()` is strictly monotonic — any future
+> mint is already above `u_flush`, so no reservation is needed.
 
 ---
 

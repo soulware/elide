@@ -22,7 +22,7 @@
 //
 //   gc_checkpoint
 //     Flush WAL and return two ULIDs for GC output segments.
-//     Returns "ok <repack_ulid> <sweep_ulid>".
+//     Returns "ok <gc_ulid>".
 //
 //   apply_gc_handoffs
 //     Apply any pending or applied GC handoffs (updates in-memory extent index).
@@ -195,8 +195,8 @@ fn handle_connection(
         }
     } else if line == "gc_checkpoint" {
         match handle.gc_checkpoint() {
-            Ok((u1, u2)) => {
-                let _ = writeln!(writer, "ok {u1} {u2}");
+            Ok(u) => {
+                let _ = writeln!(writer, "ok {u}");
             }
             Err(e) => {
                 let _ = writeln!(writer, "err {e}");

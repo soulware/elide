@@ -126,7 +126,7 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<()>>,
     },
     GcCheckpoint {
-        reply: Sender<io::Result<(Ulid, Ulid)>>,
+        reply: Sender<io::Result<Ulid>>,
     },
     RedactSegment {
         ulid: Ulid,
@@ -281,10 +281,9 @@ struct ParkedPromoteSegment {
 
 /// State stashed while a GC checkpoint's promote is in flight.
 struct ParkedGcCheckpoint {
-    u_repack: Ulid,
-    u_sweep: Ulid,
+    u_gc: Ulid,
     u_flush: Ulid,
-    reply: Sender<io::Result<(Ulid, Ulid)>>,
+    reply: Sender<io::Result<Ulid>>,
 }
 
 /// State for an in-progress batch of GC plan handoff applications.
@@ -460,7 +459,7 @@ impl VolumeActor {
     /// immediately.  The reply is parked until `PromoteComplete` for
     /// `u_flush` arrives so that `pending/<u_flush>` is on disk before
     /// the coordinator runs `gc_fork`.
-    fn start_gc_checkpoint(&mut self, reply: Sender<io::Result<(Ulid, Ulid)>>) {
+    fn start_gc_checkpoint(&mut self, reply: Sender<io::Result<Ulid>>) {
         let prep = match self.volume.prepare_gc_checkpoint() {
             Ok(prep) => prep,
             Err(e) => {
@@ -469,18 +468,12 @@ impl VolumeActor {
             }
         };
 
-        let GcCheckpointPrep {
-            u_repack,
-            u_sweep,
-            u_flush,
-            job,
-        } = prep;
+        let GcCheckpointPrep { u_gc, u_flush, job } = prep;
 
         if let Some(job) = job {
             // Dispatch to worker, park the reply.
             self.parked_gc = Some(ParkedGcCheckpoint {
-                u_repack,
-                u_sweep,
+                u_gc,
                 u_flush,
                 reply,
             });
@@ -502,7 +495,7 @@ impl VolumeActor {
         } else {
             // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
             self.publish_snapshot();
-            let _ = reply.send(Ok((u_repack, u_sweep)));
+            let _ = reply.send(Ok(u_gc));
         }
     }
 
@@ -1142,8 +1135,7 @@ impl VolumeActor {
                                 .is_some_and(|p| ulid == p.u_flush);
                             if is_gc {
                                 let parked = self.parked_gc.take().unwrap();
-                                let _ =
-                                    parked.reply.send(Ok((parked.u_repack, parked.u_sweep)));
+                                let _ = parked.reply.send(Ok(parked.u_gc));
                             }
                             // PromoteWal callers.
                             let mut i = 0;
@@ -1483,11 +1475,10 @@ impl VolumeHandle {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Establish a GC checkpoint: flush the WAL and return two fresh ULIDs for
-    /// GC output segments (repack and sweep).  The two ULIDs are strictly
-    /// ordered and sort before the fresh WAL's ULID.  Blocks until the
-    /// actor replies.
-    pub fn gc_checkpoint(&self) -> io::Result<(Ulid, Ulid)> {
+    /// Establish a GC checkpoint: flush the WAL and return a fresh ULID for
+    /// the GC output segment.  The ULID is strictly ordered below the fresh
+    /// WAL's ULID.  Blocks until the actor replies.
+    pub fn gc_checkpoint(&self) -> io::Result<Ulid> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::GcCheckpoint { reply: reply_tx })
