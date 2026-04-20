@@ -322,7 +322,7 @@ pub async fn run_volume_tasks(
                 continue;
             }
 
-            let Some((repack_ulid, sweep_ulid)) = control::gc_checkpoint(&fork_dir).await else {
+            let Some(u_gc) = control::gc_checkpoint(&fork_dir).await else {
                 last_gc = Instant::now();
                 continue;
             };
@@ -337,79 +337,40 @@ pub async fn run_volume_tasks(
                 let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_path_buf();
                 let gc_config = gc_config.clone();
                 tokio::task::spawn_blocking(move || {
-                    gc::gc_fork(&fork_dir, &by_id_dir, &gc_config, repack_ulid, sweep_ulid)
+                    gc::gc_fork(&fork_dir, &by_id_dir, &gc_config, u_gc)
                 })
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("gc task panicked: {e}")))
             };
             match gc_result {
                 Ok(gc::GcStats {
-                    strategy: gc::GcStrategy::Repack,
-                    bytes_freed,
-                    dead_cleaned,
-                    ..
-                }) => {
-                    gc_was_active = true;
-                    if dead_cleaned > 0 {
-                        info!("[gc {volume_id}] cleaned {dead_cleaned} dead segment(s)");
-                    }
-                    info!(
-                        "[gc {volume_id}] density: compacted 1 segment, ~{bytes_freed} bytes freed"
-                    );
-                }
-                Ok(gc::GcStats {
-                    strategy: gc::GcStrategy::Sweep,
+                    strategy: gc::GcStrategy::Compact,
                     candidates,
                     bytes_freed,
                     dead_cleaned,
                     ..
                 }) => {
                     gc_was_active = true;
-                    if dead_cleaned > 0 {
-                        info!("[gc {volume_id}] cleaned {dead_cleaned} dead segment(s)");
-                    }
                     info!(
-                        "[gc {volume_id}] sweep: packed {candidates} small segment(s), ~{bytes_freed} bytes freed"
-                    );
-                }
-                Ok(gc::GcStats {
-                    strategy: gc::GcStrategy::Both,
-                    candidates,
-                    bytes_freed,
-                    dead_cleaned,
-                    ..
-                }) => {
-                    gc_was_active = true;
-                    if dead_cleaned > 0 {
-                        info!("[gc {volume_id}] cleaned {dead_cleaned} dead segment(s)");
-                    }
-                    info!(
-                        "[gc {volume_id}] repack+sweep: {candidates} segment(s) compacted, ~{bytes_freed} bytes freed"
+                        "[gc {volume_id}] compact: {candidates} input(s) ({dead_cleaned} dead), \
+                         ~{bytes_freed} bytes freed"
                     );
                 }
                 Ok(gc::GcStats {
                     strategy: gc::GcStrategy::None(reason),
                     total_segments,
-                    dead_cleaned,
                     ..
                 }) => {
-                    if dead_cleaned > 0 {
-                        gc_was_active = true;
-                        info!("[gc {volume_id}] cleaned {dead_cleaned} dead segment(s)");
-                    }
                     // Only the NoCandidates reason reflects a real idle-pass
                     // result. NoIndex and PendingHandoffs are transient bail-outs
                     // that do not advance the active→idle state — another tick
                     // will re-evaluate once the bail condition clears. The
                     // "volume applied" / "completed N handoff(s)" logs already
                     // cover PendingHandoffs visibility.
-                    if matches!(reason, gc::NoneReason::NoCandidates)
-                        && gc_was_active
-                        && dead_cleaned == 0
-                    {
+                    if matches!(reason, gc::NoneReason::NoCandidates) && gc_was_active {
                         info!(
                             "[gc {volume_id}] idle — {total_segments} segment(s), \
-                             all at or above density threshold ({:.2})",
+                             nothing eligible (threshold {:.2})",
                             gc_config.density_threshold
                         );
                         gc_was_active = false;

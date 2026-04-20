@@ -97,9 +97,6 @@ enum SimOp {
     /// using `n` segments as input. Exercises ULID monotonicity and
     /// crash-recovery invariants for the coordinator GC path.
     CoordGcLocal { n: usize },
-    /// Simulate coordinator GC running both repack and sweep in the same tick.
-    /// Requires ≥ 3 segments in index/; no-ops otherwise.
-    CoordGcLocalBoth,
     /// Phase 1 of split GC: flush WAL, mint GC ULIDs, open fresh WAL.
     /// Stashes ULIDs — any Write/Flush ops before the matching GcApply
     /// model writes that arrive during the coordinator's GC window.
@@ -196,7 +193,6 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::Repack),
         Just(SimOp::DrainWithRedact),
         (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
-        Just(SimOp::CoordGcLocalBoth),
         Just(SimOp::GcCheckpoint),
         (2usize..=5).prop_map(|n| SimOp::GcApply { n }),
         Just(SimOp::Crash),
@@ -220,11 +216,9 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
 }
 
 /// Minimal op set for the reclaim-focused proptest. Deliberately does
-/// **not** include `PopulateFetched` or `CoordGcLocalBoth`: the former
-/// drives on-disk cache files that are only visible via rebuild (not
-/// through the in-memory map), and expanding into it from a reclaim
-/// test leaks orthogonal crash-recovery invariants; the latter needs a
-/// specific prefix setup that would dilute the reclaim coverage.
+/// **not** include `PopulateFetched`: it drives on-disk cache files that are
+/// only visible via rebuild (not through the in-memory map), and expanding
+/// into it from a reclaim test leaks orthogonal crash-recovery invariants.
 ///
 /// The goal of this enum is one hard invariant: **reclaim never corrupts
 /// observable content**. Every op here leaves the volume in a state where
@@ -372,11 +366,13 @@ fn multi_segment_prefix() -> Vec<SimOp> {
 }
 
 /// One low-density segment + two small high-density segments — sets up state
-/// where both repack and sweep have candidates simultaneously.
+/// where the merged GC pass packs a sparse large with small fully-live
+/// segments in one bucket.
 ///
 /// S1 (LBA 0 = 0xAA) is overwritten by S2 (LBA 0 = 0xBB), making S1
 /// low-density.  S3 (LBA 1) and S4 (LBA 2) are small and fully live.
-/// CoordGcLocalBoth can fire: S1 → repack, S2+S3+S4 → sweep.
+/// CoordGcLocal can fire on all four: S1 is the sparse-large filler,
+/// S2+S3+S4 are smalls.
 fn repack_and_sweep_prefix() -> Vec<SimOp> {
     vec![
         SimOp::Write { lba: 0, seed: 0x14 },
@@ -428,7 +424,8 @@ fn arb_gc_interleaved_ops() -> impl Strategy<Value = Vec<SimOp>> {
         arb_sim_ops().prop_map(|ops| with_prefix(multi_segment_prefix(), ops)),
         // Post-GC: one GC pass already applied, tests second-round GC path.
         arb_sim_ops().prop_map(|ops| with_prefix(post_gc_prefix(), ops)),
-        // One low-density + two small dense segments: CoordGcLocalBoth can fire.
+        // One low-density + two small dense segments: the merged pass can
+        // pack all four into a single bucket (sparse-large filler + smalls).
         arb_sim_ops().prop_map(|ops| with_prefix(repack_and_sweep_prefix(), ops)),
         // Dedup + redact + GC: exercises the redact → drain → GC pipeline with thin DedupRefs.
         arb_sim_ops().prop_map(|ops| with_prefix(dedup_redact_gc_prefix(), ops)),
@@ -447,7 +444,7 @@ proptest! {
         // Tracks the latest snapshot ULID; segments at or below this are frozen.
         let mut snapshot_floor: Option<Ulid> = None;
         // Pending GcCheckpoint ULIDs awaiting GcApply.
-        let mut pending_gc: Option<(Ulid, Ulid)> = None;
+        let mut pending_gc: Option<Ulid> = None;
 
         for op in &ops {
             let ulids_before = all_segment_ulids(fork_dir);
@@ -534,24 +531,24 @@ proptest! {
                     // rebuild-ordering invariant in
                     // docs/design-gc-ulid-ordering.md.
                     pending_gc = None;
-                    let (gc_ulid, gc_ulid2) = vol.gc_checkpoint_for_test().unwrap();
-                    // Core invariant: the volume mint must have advanced past both
-                    // GC ULIDs, so the next WAL flush produces a segment that sorts
-                    // above them.  This is the property the pre-fix bug violated —
-                    // the actor used Ulid::new() (system clock) instead of the
+                    let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
+                    // Core invariant: the volume mint must have advanced past the
+                    // GC output ULID, so the next WAL flush produces a segment that
+                    // sorts above it.  This is the property the pre-fix bug violated
+                    // — the actor used Ulid::new() (system clock) instead of the
                     // volume's mint, so WAL segments could sort below GC outputs.
                     //
                     // Diff against post-checkpoint state (not ulids_before) so that
                     // W_new — the WAL opened inside gc_checkpoint with ULID between
-                    // W_old and u1 — is excluded.  Only the WAL opened by *this*
-                    // flush_wal (W_new2, which must be > u2) appears in the diff.
+                    // W_old and u_gc — is excluded.  Only the WAL opened by *this*
+                    // flush_wal (W_new2, which must be > u_gc) appears in the diff.
                     let ulids_after_checkpoint = all_segment_ulids(fork_dir);
                     vol.flush_wal().unwrap();
                     let after_flush = all_segment_ulids(fork_dir);
                     for u in after_flush.difference(&ulids_after_checkpoint) {
                         prop_assert!(
-                            *u > gc_ulid2,
-                            "WAL segment after gc_checkpoint sorts below GC output: {u} ≤ {gc_ulid2}"
+                            *u > gc_ulid,
+                            "WAL segment after gc_checkpoint sorts below GC output: {u} ≤ {gc_ulid}"
                         );
                     }
                     let to_delete = if let Some((consumed, produced, paths)) =
@@ -578,53 +575,9 @@ proptest! {
                         }
                     }
                 }
-                SimOp::CoordGcLocalBoth => {
-                    // See `CoordGcLocal` — one GC pass invalidates any
-                    // previously-stashed `GcCheckpoint` ULIDs.
-                    pending_gc = None;
-                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();
-                    // Same mint-advancement invariant as CoordGcLocal — diff against
-                    // post-checkpoint state so only W_new2 (> sweep_ulid) appears.
-                    let ulids_after_checkpoint = all_segment_ulids(fork_dir);
-                    vol.flush_wal().unwrap();
-                    let after_flush = all_segment_ulids(fork_dir);
-                    for u in after_flush.difference(&ulids_after_checkpoint) {
-                        prop_assert!(
-                            *u > sweep_ulid,
-                            "WAL segment after gc_checkpoint sorts below GC output: {u} ≤ {sweep_ulid}"
-                        );
-                    }
-                    if let Some(((r_consumed, r_produced, r_paths), (s_consumed, s_produced, s_paths))) =
-                        common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid)
-                    {
-                        let r_max = r_consumed.iter().copied().max().unwrap();
-                        prop_assert!(
-                            r_produced > r_max,
-                            "coord_gc_both repack produced {r_produced} ≤ consumed max {r_max}"
-                        );
-                        let s_max = s_consumed.iter().copied().max().unwrap();
-                        prop_assert!(
-                            s_produced > s_max,
-                            "coord_gc_both sweep produced {s_produced} ≤ consumed max {s_max}"
-                        );
-                        // Delete each pass's input paths only if that specific
-                        // pass was applied.  Bug B may cancel one pass while the
-                        // other succeeds; checking applied > 0 on the combined
-                        // count would incorrectly delete the cancelled pass's
-                        // inputs, breaking subsequent reads and crash+rebuild.
-                        let gc_dir = fork_dir.join("gc");
-                        let _ = vol.apply_gc_handoffs().unwrap_or(0);
-                        if gc_dir.join(format!("{}.applied", r_produced)).exists() {
-                            for path in &r_paths { let _ = std::fs::remove_file(path); }
-                        }
-                        if gc_dir.join(format!("{}.applied", s_produced)).exists() {
-                            for path in &s_paths { let _ = std::fs::remove_file(path); }
-                        }
-                    }
-                }
                 SimOp::GcCheckpoint => {
-                    let (u1, u2) = vol.gc_checkpoint_for_test().unwrap();
-                    pending_gc = Some((u1, u2));
+                    let u_gc = vol.gc_checkpoint_for_test().unwrap();
+                    pending_gc = Some(u_gc);
                 }
                 SimOp::GcApply { n } => {
                     // Apply the stashed checkpoint. Between GcCheckpoint and
@@ -635,7 +588,7 @@ proptest! {
                     // minted earlier, so segments created between checkpoint
                     // and apply may have higher ULIDs. The stale-liveness
                     // check inside apply_gc_handoffs is the real guard.
-                    if let Some((gc_ulid, _)) = pending_gc.take() {
+                    if let Some(gc_ulid) = pending_gc.take() {
                         let to_delete = if let Some((_, _, paths)) =
                             common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                         {
@@ -682,7 +635,7 @@ proptest! {
                     // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
                     // Bits 6-4 encode lba (0..7), bits 3-0 vary within the lba slot.
                     let effective_seed = 0x80u8 | ((*lba & 0x07) << 4) | (*seed & 0x0F);
-                    let (ulid, _) = vol.gc_checkpoint_for_test().unwrap();
+                    let ulid = vol.gc_checkpoint_for_test().unwrap();
                     common::populate_cache(fork_dir, ulid, 16 + *lba as u64, effective_seed);
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
@@ -754,7 +707,7 @@ proptest! {
         let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
-        let mut pending_gc: Option<(Ulid, Ulid)> = None;
+        let mut pending_gc: Option<Ulid> = None;
 
         for op in &ops {
             match op {
@@ -779,7 +732,7 @@ proptest! {
                     // See ulid_monotonicity's CoordGcLocal — a full GC
                     // pass invalidates any stashed `GcCheckpoint`.
                     pending_gc = None;
-                    let (gc_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
+                    let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                     {
@@ -794,28 +747,12 @@ proptest! {
                         }
                     }
                 }
-                SimOp::CoordGcLocalBoth => {
-                    pending_gc = None;
-                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();
-                    let gc_result =
-                        common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid);
-                    let _ = vol.apply_gc_handoffs().unwrap_or(0);
-                    let gc_dir = fork_dir.join("gc");
-                    if let Some(((_, r_produced, r_paths), (_, s_produced, s_paths))) = gc_result {
-                        if gc_dir.join(format!("{r_produced}.applied")).exists() {
-                            for path in &r_paths { let _ = std::fs::remove_file(path); }
-                        }
-                        if gc_dir.join(format!("{s_produced}.applied")).exists() {
-                            for path in &s_paths { let _ = std::fs::remove_file(path); }
-                        }
-                    }
-                }
                 SimOp::GcCheckpoint => {
-                    let (u1, u2) = vol.gc_checkpoint_for_test().unwrap();
-                    pending_gc = Some((u1, u2));
+                    let u_gc = vol.gc_checkpoint_for_test().unwrap();
+                    pending_gc = Some(u_gc);
                 }
                 SimOp::GcApply { n } => {
-                    if let Some((gc_ulid, _)) = pending_gc.take() {
+                    if let Some(gc_ulid) = pending_gc.take() {
                         let to_delete = if let Some((_, _, paths)) =
                             common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                         {
@@ -888,7 +825,7 @@ proptest! {
                     // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
                     // Bits 6-4 encode lba (0..7), bits 3-0 vary within the lba slot.
                     let effective_seed = 0x80u8 | ((*lba & 0x07) << 4) | (*seed & 0x0F);
-                    let (ulid, _) = vol.gc_checkpoint_for_test().unwrap();
+                    let ulid = vol.gc_checkpoint_for_test().unwrap();
                     common::populate_cache(fork_dir, ulid, actual_lba, effective_seed);
                     oracle.insert(actual_lba, [effective_seed; 4096]);
                 }
@@ -955,7 +892,7 @@ proptest! {
         let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
-        let mut pending_gc: Option<(Ulid, Ulid)> = None;
+        let mut pending_gc: Option<Ulid> = None;
 
         for op in &ops {
             match op {
@@ -980,7 +917,7 @@ proptest! {
                     // See ulid_monotonicity's CoordGcLocal — a full GC
                     // pass invalidates any stashed `GcCheckpoint`.
                     pending_gc = None;
-                    let (gc_ulid, _) = vol.gc_checkpoint_for_test().unwrap();
+                    let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                     {
@@ -995,28 +932,12 @@ proptest! {
                         }
                     }
                 }
-                SimOp::CoordGcLocalBoth => {
-                    pending_gc = None;
-                    let (repack_ulid, sweep_ulid) = vol.gc_checkpoint_for_test().unwrap();
-                    let gc_result =
-                        common::simulate_coord_gc_both_local(fork_dir, repack_ulid, sweep_ulid);
-                    let _ = vol.apply_gc_handoffs().unwrap_or(0);
-                    let gc_dir = fork_dir.join("gc");
-                    if let Some(((_, r_produced, r_paths), (_, s_produced, s_paths))) = gc_result {
-                        if gc_dir.join(format!("{r_produced}.applied")).exists() {
-                            for path in &r_paths { let _ = std::fs::remove_file(path); }
-                        }
-                        if gc_dir.join(format!("{s_produced}.applied")).exists() {
-                            for path in &s_paths { let _ = std::fs::remove_file(path); }
-                        }
-                    }
-                }
                 SimOp::GcCheckpoint => {
-                    let (u1, u2) = vol.gc_checkpoint_for_test().unwrap();
-                    pending_gc = Some((u1, u2));
+                    let u_gc = vol.gc_checkpoint_for_test().unwrap();
+                    pending_gc = Some(u_gc);
                 }
                 SimOp::GcApply { n } => {
-                    if let Some((gc_ulid, _)) = pending_gc.take() {
+                    if let Some(gc_ulid) = pending_gc.take() {
                         let to_delete = if let Some((_, _, paths)) =
                             common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
                         {
@@ -1071,7 +992,7 @@ proptest! {
                     // effective_seed always has bit 7 set (128..=255) so it never
                     // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
                     let effective_seed = 0x80u8 | ((*lba & 0x07) << 4) | (*seed & 0x0F);
-                    let (ulid, _) = vol.gc_checkpoint_for_test().unwrap();
+                    let ulid = vol.gc_checkpoint_for_test().unwrap();
                     common::populate_cache(fork_dir, ulid, actual_lba, effective_seed);
                     oracle.insert(actual_lba, [effective_seed; 4096]);
                 }

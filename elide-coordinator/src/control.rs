@@ -12,7 +12,7 @@
 //   flush                      →  "ok"
 //   sweep_pending              →  "ok <segs> <bytes> <extents>"
 //   repack <min_live_ratio>    →  "ok <segs> <bytes> <extents>"
-//   gc_checkpoint              →  "ok <repack_ulid> <sweep_ulid>"
+//   gc_checkpoint              →  "ok <gc_ulid>"
 //   apply_gc_handoffs          →  "ok <n>"
 //   promote <ulid>             →  "ok"
 //
@@ -108,18 +108,15 @@ pub async fn delta_repack_post_snapshot(fork_dir: &Path) -> Option<DeltaRepackSt
 
 /// Call gc_checkpoint on the volume process for `fork_dir`.
 ///
-/// Returns `Some((repack_ulid, sweep_ulid))` on success.
+/// Returns `Some(gc_ulid)` on success.
 /// Returns `None` and logs a warning if the socket is absent (volume not
 /// running) or if the call fails for any reason.
-pub async fn gc_checkpoint(fork_dir: &Path) -> Option<(Ulid, Ulid)> {
+pub async fn gc_checkpoint(fork_dir: &Path) -> Option<Ulid> {
     let response = call(fork_dir, "gc_checkpoint").await?;
     let rest = response.strip_prefix("ok ")?;
-    let mut parts = rest.splitn(2, ' ');
-    let u1 = parts.next()?.trim();
-    let u2 = parts.next()?.trim();
-    match (Ulid::from_string(u1), Ulid::from_string(u2)) {
-        (Ok(u1), Ok(u2)) => Some((u1, u2)),
-        _ => {
+    match Ulid::from_string(rest.trim()) {
+        Ok(u) => Some(u),
+        Err(_) => {
             warn!(
                 "[control] gc_checkpoint for {} returned malformed response",
                 fork_dir.display()

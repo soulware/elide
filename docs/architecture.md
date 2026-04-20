@@ -409,10 +409,10 @@ The volume process listens on `<vol-dir>/control.sock`. The coordinator connects
 | Flush WAL | `flush` | `ok` |
 | Sweep small pending segments | `sweep_pending` | `ok <segs> <new_segs> <bytes> <extents>` |
 | Repack sparse pending segments | `repack <min_live_ratio>` | `ok <segs> <new_segs> <bytes> <extents>` |
-| GC checkpoint | `gc_checkpoint` | `ok <repack_ulid> <sweep_ulid>` |
+| GC checkpoint | `gc_checkpoint` | `ok <gc_ulid>` |
 | Promote segment to cache | `promote <ulid>` | `ok` |
 
-**`gc_checkpoint` detail:** flushes the WAL (so all in-flight writes are in `pending/` and visible to the coordinator), then mints two ULIDs 2ms apart using the volume's own clock, and returns them as `repack_ulid` and `sweep_ulid`. The coordinator uses these as the output segment ULIDs for its repack and sweep GC passes respectively. Using ULIDs from the volume's clock (not the coordinator's) is deliberate — it ensures the GC output ULIDs are always in the correct order relative to the volume's write history regardless of clock skew between hosts.
+**`gc_checkpoint` detail:** pre-mints two ULIDs from the volume's monotonic mint — `u_gc` and `u_flush` — flushes the current WAL under `u_flush` (so all in-flight writes are in `pending/` and visible to the coordinator), and returns `u_gc` as the output segment ULID for the single GC pass. Using the volume's mint (not the coordinator's clock) is deliberate — it ensures the GC output ULID is always in the correct order relative to the volume's write history regardless of clock skew between hosts.
 
 **`promote <ulid>` detail:** called by the coordinator after confirming a segment has been uploaded to S3 (drain path) or after uploading a GC output. The volume copies the body section from `pending/<ulid>` (drain path) or `gc/<ulid>` (GC path) into `cache/<ulid>.body` and writes an all-present bitset to `cache/<ulid>.present`. On the drain path the volume also deletes `pending/<ulid>` — the coordinator never deletes it. On the GC path the coordinator deletes `gc/<ulid>` after receiving `ok` (see GC cleanup ordering below). If the volume is not running, the coordinator defers promote: on the drain path it leaves `pending/<ulid>` in place and retries on the next tick; on the GC path it proceeds without populating the local cache.
 
