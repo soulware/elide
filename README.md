@@ -18,7 +18,6 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/reference-lsvd.md](docs/reference-lsvd.md) | lab47/lsvd design decisions and comparison to Elide |
 | [docs/reference-nydus.md](docs/reference-nydus.md) | nydus-snapshotter: lazy loading, RAFS format, NRI optimizer, boot hints |
 | [docs/vm-boot.md](docs/vm-boot.md) | Booting a VM from an Elide volume with QEMU direct kernel boot |
-| [docs/status-2026-03-30.md](docs/status-2026-03-30.md) | Implementation status snapshot: what's built, remaining work, lsvd deviations (2026-03-30) |
 | [docs/design-gc-ulid-ordering.md](docs/design-gc-ulid-ordering.md) | Open design: GC ULID ordering race, single-mint invariant, proptest findings |
 | [docs/design-gc-overlap-correctness.md](docs/design-gc-overlap-correctness.md) | Design: GC skips partial-LBA-death entries to avoid shadow/loss on rebuild when multi-LBA entries have been partially overwritten |
 | [docs/design-gc-partial-death-compaction.md](docs/design-gc-partial-death-compaction.md) | Design: decouple composite body from surviving sub-runs of partial-LBA-death entries so normal GC can subsequently reclaim each piece independently |
@@ -29,5 +28,16 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/actor-offload-plan.md](docs/actor-offload-plan.md) | Plan: offload heavy maintenance work off the volume actor to isolate write tail latency |
 | [docs/promote-offload-plan.md](docs/promote-offload-plan.md) | Plan: offload WAL promotion onto the worker thread (first step of actor-offload-plan) |
 | [docs/promote-segment-offload-plan.md](docs/promote-segment-offload-plan.md) | Plan: offload `promote_segment` IPC handler to the worker thread (step 6 of actor-offload-plan) |
+
+## Status updates
+
+Dated waypoints — each file summarises major changes, bug fixes, and
+remaining work relative to the previous status.  Latest first.
+
+| Date | Document |
+|---|---|
+| 2026-04-20 | [docs/status-2026-04-20.md](docs/status-2026-04-20.md) |
+| 2026-04-09 | [docs/status-2026-04-09.md](docs/status-2026-04-09.md) |
+| 2026-03-30 | [docs/status-2026-03-30.md](docs/status-2026-03-30.md) |
 
 Start with [docs/overview.md](docs/overview.md).
