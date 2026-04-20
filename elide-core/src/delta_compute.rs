@@ -331,6 +331,7 @@ fn maybe_rewrite_segment(
 
         let delta_offset = delta_body.len() as u64;
         let delta_length = delta_blob.len() as u32;
+        let delta_hash = blake3::hash(&delta_blob);
         delta_body.extend_from_slice(&delta_blob);
 
         stats.original_body_bytes += entry.stored_length as u64;
@@ -348,6 +349,7 @@ fn maybe_rewrite_segment(
             source_hash: conv.source_hash,
             delta_offset,
             delta_length,
+            delta_hash,
         });
     }
 
@@ -593,6 +595,7 @@ pub fn rewrite_post_snapshot_with_prior(
 
         let delta_offset = delta_body.len() as u64;
         let delta_length = delta_blob.len() as u32;
+        let delta_hash = blake3::hash(&delta_blob);
         delta_body.extend_from_slice(&delta_blob);
 
         stats.original_body_bytes += entry.stored_length as u64;
@@ -608,6 +611,7 @@ pub fn rewrite_post_snapshot_with_prior(
             source_hash,
             delta_offset,
             delta_length,
+            delta_hash,
         });
     }
 

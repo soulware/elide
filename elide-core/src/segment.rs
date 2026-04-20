@@ -40,6 +40,9 @@
 //       option_flags   (1 byte)   bit 0: FLAG_DELTA_INLINE (reserved)
 //       delta_offset   (8 bytes)  u64 le — offset within delta body section
 //       delta_length   (4 bytes)  u32 le — byte length in delta body
+//       delta_hash     (32 bytes) blake3 hash of the compressed delta blob
+//                                 (authenticates the bytes in the delta body
+//                                 section; verified on demand-fetch)
 //
 // Body section: raw concatenated extent bytes, no framing.
 // Data entries have real body bytes. DedupRef and Zero entries contribute nothing
@@ -186,8 +189,9 @@ pub type BoxFetcher = Arc<dyn SegmentFetcher>;
 const IDX_ENTRY_LEN: u32 = 64;
 
 /// Size of one serialized delta option in the delta table:
-/// source_hash(32) + option_flags(1) + delta_offset(8) + delta_length(4) = 45 bytes.
-const DELTA_OPTION_LEN: u32 = 45;
+/// source_hash(32) + option_flags(1) + delta_offset(8) + delta_length(4) +
+/// delta_hash(32) = 77 bytes.
+const DELTA_OPTION_LEN: u32 = 77;
 
 /// Size of one delta table entry header: entry_index(4) + delta_count(1) = 5 bytes.
 const DELTA_TABLE_ENTRY_HEADER: u32 = 5;
@@ -349,6 +353,12 @@ pub struct DeltaOption {
     pub delta_offset: u64,
     /// Byte length of the delta blob in the delta body section.
     pub delta_length: u32,
+    /// BLAKE3 hash of the compressed delta blob at
+    /// `[delta_offset, delta_offset + delta_length)` in the delta body
+    /// section. Authenticates the delta bytes (which are otherwise outside
+    /// the signed region) so demand-fetch can verify what it pulls from the
+    /// object store before writing to the local cache.
+    pub delta_hash: blake3::Hash,
 }
 
 /// One entry in the in-memory representation of a segment's index section.
@@ -745,6 +755,7 @@ fn write_delta_table<W: Write>(w: &mut W, entries: &[SegmentEntry]) -> io::Resul
             w.write_all(&[0u8])?; // option_flags: 1
             w.write_all(&opt.delta_offset.to_le_bytes())?; // 8
             w.write_all(&opt.delta_length.to_le_bytes())?; // 4
+            w.write_all(opt.delta_hash.as_bytes())?; // 32
         }
     }
     Ok(())
@@ -1188,7 +1199,8 @@ fn parse_index_section(
 
 /// Parse the delta table from the index section, starting at `table_start`.
 ///
-/// Each delta table entry: entry_index(4) + delta_count(1) + N × 45 bytes.
+/// Each delta table entry: entry_index(4) + delta_count(1) + N × 77 bytes
+/// (see `DELTA_OPTION_LEN`).
 fn parse_delta_table(
     data: &[u8],
     table_start: usize,
@@ -1210,10 +1222,12 @@ fn parse_delta_table(
             let _option_flags = read_u8(data, &mut pos)?;
             let delta_offset = u64::from_le_bytes(read_fixed(data, &mut pos)?);
             let delta_length = u32::from_le_bytes(read_fixed(data, &mut pos)?);
+            let delta_hash = blake3::Hash::from_bytes(read_fixed(data, &mut pos)?);
             opts.push(DeltaOption {
                 source_hash,
                 delta_offset,
                 delta_length,
+                delta_hash,
             });
         }
         entries[entry_index].delta_options = opts;
@@ -1306,6 +1320,32 @@ pub fn populate_inline_bodies(entries: &mut [SegmentEntry], inline_bytes: &[u8])
 ///
 /// Returns `io::ErrorKind::InvalidData` on mismatch so callers can
 /// distinguish corruption from unrelated I/O failures.
+/// Verify a delta blob against the signed `delta_hash` from a `DeltaOption`.
+///
+/// The delta body section is outside the segment signature, so the
+/// `delta_hash` carried in each (signed) `DeltaOption` is the sole
+/// authentication of the compressed delta bytes. Call this on every delta
+/// blob retrieved from an untrusted source (e.g. on demand-fetch) before
+/// admitting the bytes to the local cache.
+///
+/// Returns `io::ErrorKind::InvalidData` on mismatch.
+pub fn verify_delta_blob_hash(option: &DeltaOption, blob: &[u8]) -> io::Result<()> {
+    let computed = blake3::hash(blob);
+    if computed == option.delta_hash {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "delta blob hash mismatch len={}B: declared={} computed={}",
+                blob.len(),
+                &option.delta_hash.to_hex()[..16],
+                &computed.to_hex()[..16],
+            ),
+        ))
+    }
+}
+
 pub fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> io::Result<()> {
     if !matches!(
         entry.kind,
@@ -2838,6 +2878,7 @@ mod tests {
         let source_hash = blake3::hash(b"source-extent");
         let delta_blob = b"compressed-delta-data";
         let delta_body = delta_blob.to_vec();
+        let delta_hash = blake3::hash(delta_blob);
 
         let deltas = vec![(
             0,
@@ -2845,6 +2886,7 @@ mod tests {
                 source_hash,
                 delta_offset: 0,
                 delta_length: delta_blob.len() as u32,
+                delta_hash,
             }],
         )];
 
@@ -2919,6 +2961,7 @@ mod tests {
             source_hash,
             delta_offset: 0,
             delta_length: 128,
+            delta_hash: blake3::hash(b"delta-blob-bytes"),
         };
 
         let mut entries = vec![
@@ -2980,16 +3023,19 @@ mod tests {
                 source_hash: blake3::hash(b"source-a"),
                 delta_offset: 0,
                 delta_length: 100,
+                delta_hash: blake3::hash(b"blob-a"),
             },
             DeltaOption {
                 source_hash: blake3::hash(b"source-b"),
                 delta_offset: 100,
                 delta_length: 200,
+                delta_hash: blake3::hash(b"blob-b"),
             },
             DeltaOption {
                 source_hash: blake3::hash(b"source-c"),
                 delta_offset: 300,
                 delta_length: 50,
+                delta_hash: blake3::hash(b"blob-c"),
             },
         ];
 
