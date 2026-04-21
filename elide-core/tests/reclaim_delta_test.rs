@@ -433,3 +433,106 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
         "H gains two delta-source refs from reclaim outputs"
     );
 }
+
+/// When H lives in a snapshot-pinned segment (segment_id <= snapshot
+/// floor), the body is permanent for as long as the snapshot lives —
+/// GC cannot drop it. Reclaim must therefore emit thin Deltas against
+/// H rather than fresh Data entries, even when no other entry is
+/// currently using H as a delta source. A fresh Data output adds a
+/// new body on top of the permanently-retained H body; a Delta output
+/// adds ~300 bytes of dict reference for the same retention cost.
+///
+/// Construction:
+///   - DATA segment for H at LBA [0, 8). ULID `parent_ulid`.
+///   - `snapshots/<parent_ulid>` marker — H's segment is now at/below
+///     the snapshot floor, so `segment_id <= snapshot_floor_ulid`.
+///   - No Delta entry references H; `delta_source_refcount(H) == 0`.
+///   - Middle-overwrite [2, 4) to split H and trip the bloat gate.
+///
+/// Assertions:
+///   - Both head and tail output entries are thin Deltas pointing at H.
+///   - `delta_source_refcount(H) == 2` post-reclaim (only the new
+///     outputs contribute), confirming the pre-snapshot guard — not
+///     the refcount guard — is what fired.
+#[test]
+fn reclaim_emits_delta_when_h_is_snapshot_pinned() {
+    let tmp = TempDir::new().unwrap();
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+
+    // Parent DATA H at LBA [0, 8). Structured bytes so a sub-range slice
+    // is a literal substring of H — zstd-dict compression resolves to a
+    // near-zero dict reference.
+    let parent_bytes = structured_payload(0xE0, 8);
+    let parent_hash = blake3::hash(&parent_bytes);
+
+    let parent_ulid = Ulid::new();
+    let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
+    let mut parent_entries = vec![SegmentEntry::new_data(
+        parent_hash,
+        0,
+        8,
+        SegmentFlags::empty(),
+        parent_bytes.clone(),
+    )];
+    write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
+
+    // Snapshot marker AT parent_ulid — H's segment is now snapshot-pinned.
+    fs::write(vol_dir.join(format!("snapshots/{parent_ulid}")), "").unwrap();
+
+    // No Delta entry referencing H. `delta_source_refcount(H)` stays 0.
+
+    let mut vol = Volume::open(&vol_dir, &vol_dir).unwrap();
+
+    // Precondition: the pre-snapshot guard is the only signal firing.
+    let (lbamap_pre, _) = vol.snapshot_maps();
+    assert_eq!(
+        lbamap_pre.delta_source_refcount(&parent_hash),
+        0,
+        "fixture must have no pre-existing delta sources"
+    );
+    drop(lbamap_pre);
+
+    // Split H with a middle overwrite.
+    let overwrite = vec![0x77u8; 2 * 4096];
+    vol.write(2, &overwrite).unwrap();
+
+    // Reclaim the full range.
+    let outcome = vol.reclaim_alias_merge(0, 8).unwrap();
+    assert!(!outcome.discarded);
+    assert_eq!(outcome.runs_rewritten, 2);
+
+    // Oracle: head from H, middle overwrite, tail from H.
+    let mut expected = Vec::with_capacity(8 * 4096);
+    expected.extend_from_slice(&parent_bytes[..2 * 4096]);
+    expected.extend_from_slice(&overwrite);
+    expected.extend_from_slice(&parent_bytes[4 * 4096..]);
+    assert_eq!(vol.read(0, 8).unwrap(), expected);
+
+    let (lbamap_post, extent_index) = vol.snapshot_maps();
+
+    let head_hash = blake3::hash(&parent_bytes[..2 * 4096]);
+    let tail_hash = blake3::hash(&parent_bytes[4 * 4096..]);
+
+    // Both outputs are thin Deltas against H — the pre-snapshot guard
+    // fired even though no existing Delta was sourcing from H.
+    for (hash, label) in [(head_hash, "head"), (tail_hash, "tail")] {
+        let loc = extent_index
+            .lookup_delta(&hash)
+            .unwrap_or_else(|| panic!("{label} must be emitted as a Delta"));
+        assert_eq!(loc.options.len(), 1);
+        assert_eq!(loc.options[0].source_hash, parent_hash);
+        assert!(
+            extent_index.lookup(&hash).is_none(),
+            "{label} must not also appear as a DATA entry"
+        );
+    }
+
+    // Only our two outputs contribute to H's delta-source refcount —
+    // confirming that the pre-snapshot guard, not the refcount guard,
+    // is what triggered the Delta output shape.
+    assert_eq!(
+        lbamap_post.delta_source_refcount(&parent_hash),
+        2,
+        "only the new reclaim outputs should pin H via delta-source refs"
+    );
+}

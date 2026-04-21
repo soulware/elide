@@ -705,7 +705,13 @@ impl VolumeActor {
         lba_length: u32,
         reply: Sender<io::Result<ReclaimOutcome>>,
     ) {
-        let job = self.volume.prepare_reclaim(start_lba, lba_length);
+        let job = match self.volume.prepare_reclaim(start_lba, lba_length) {
+            Ok(j) => j,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
         if let Some(tx) = &self.worker_tx {
             if let Err(e) = tx.send(WorkerJob::Reclaim(job)) {
                 warn!("worker channel closed during reclaim: {e}");
@@ -2878,23 +2884,45 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                     continue;
                 }
 
-                // When H (= er.hash) is already a delta source for some
-                // other live entry, GC must keep H's body alive regardless
-                // of this reclaim — so emitting a thin Delta against H is
-                // a strict win over a fresh body: the sliced sub-range is
+                // When H's body is going to stick around regardless of
+                // this reclaim, emitting a thin Delta against H is a
+                // strict win over a fresh body: the sliced sub-range is
                 // a literal substring of H, so `zstd_compress(sub, dict=H)`
                 // is typically a few hundred bytes (a dict reference)
-                // versus a few KB for a fresh lz4'd body. When H has no
-                // delta-source references, it would have been orphaned by
-                // this reclaim, and pinning it via our own Delta would
-                // trade "drop H's body" for "keep it forever" — net loss.
+                // versus a few KB for a fresh lz4'd body.
+                //
+                // Two independent signals that H will stick around:
+                // 1. H's segment is pinned by the current snapshot
+                //    (segment_id <= snapshot_floor_ulid). Snapshot-
+                //    referenced segments cannot be rewritten or dropped
+                //    for the lifetime of the snapshot — a much stickier
+                //    pin than delta-source refcount, which dynamically
+                //    tracks live Delta LBAs.
+                // 2. H is already serving as a delta source for some
+                //    other live entry (delta_source_refcount > 0).
+                //    `lba_referenced_hashes` keeps H alive as long as
+                //    any such Delta remains on the volume.
+                //
+                // If neither holds, H would be orphaned by this reclaim
+                // and GC would drop its body on the next pass; pinning
+                // H via our own Delta would trade "drop H's body" for
+                // "keep it forever" — net loss.
                 //
                 // Size guard: if zstd isn't smaller than the raw sub-range,
                 // fall through to Data. The guard also protects against
                 // pathological inputs where the sub-range and H's body
                 // happen to be the same bytes (zero bloat, no reclaim
                 // should have been attempted).
-                if job.lbamap_snapshot.delta_source_refcount(&er.hash) > 0 {
+                let pre_snapshot_h = match (
+                    job.snapshot_floor_ulid,
+                    job.extent_index_snapshot.lookup(&er.hash),
+                ) {
+                    (Some(floor), Some(loc)) => loc.segment_id <= floor,
+                    _ => false,
+                };
+                let source_pinned =
+                    pre_snapshot_h || job.lbamap_snapshot.delta_source_refcount(&er.hash) > 0;
+                if source_pinned {
                     let delta_blob =
                         zstd::bulk::Compressor::with_dictionary(RECLAIM_ZSTD_LEVEL, body)
                             .map_err(|e| {

@@ -793,6 +793,13 @@ pub struct ReclaimJob {
     /// `pending/<segment_ulid>` without needing access to the mint.
     pub segment_ulid: Ulid,
     pub signer: Arc<dyn segment::SegmentSigner>,
+    /// Latest sealed snapshot ULID for this fork at prepare time, or
+    /// `None` if no snapshots exist. A hash whose segment is `<=` this
+    /// floor lives in a snapshot-pinned segment and cannot be dropped
+    /// for the lifetime of the snapshot — reclaim treats that as
+    /// indefinite retention and prefers a thin Delta output over a
+    /// fresh body (the body is already permanent either way).
+    pub snapshot_floor_ulid: Option<Ulid>,
 }
 
 /// A rewritten entry placed in the reclaim output segment, paired with
@@ -3236,7 +3243,7 @@ impl Volume {
         start_lba: u64,
         lba_length: u32,
     ) -> io::Result<ReclaimOutcome> {
-        let job = self.prepare_reclaim(start_lba, lba_length);
+        let job = self.prepare_reclaim(start_lba, lba_length)?;
         let result = crate::actor::execute_reclaim(job)?;
         self.apply_reclaim_result(result)
     }
@@ -3253,7 +3260,7 @@ impl Volume {
     /// Search dirs are the fork directory followed by ancestor layers
     /// in the same order `BlockReader` uses — the worker's read helper
     /// walks them to find segment body files.
-    pub fn prepare_reclaim(&mut self, start_lba: u64, lba_length: u32) -> ReclaimJob {
+    pub fn prepare_reclaim(&mut self, start_lba: u64, lba_length: u32) -> io::Result<ReclaimJob> {
         let end_lba = start_lba + lba_length as u64;
         let entries = self.lbamap.extents_in_range(start_lba, end_lba);
 
@@ -3265,8 +3272,9 @@ impl Volume {
         }
 
         let segment_ulid = self.mint.next();
+        let snapshot_floor_ulid = latest_snapshot(&self.base_dir)?;
 
-        ReclaimJob {
+        Ok(ReclaimJob {
             target_start_lba: start_lba,
             target_lba_length: lba_length,
             entries,
@@ -3276,7 +3284,8 @@ impl Volume {
             pending_dir: self.base_dir.join("pending"),
             segment_ulid,
             signer: Arc::clone(&self.signer),
-        }
+            snapshot_floor_ulid,
+        })
     }
 
     /// Apply phase of reclaim — runs on the actor thread after the
@@ -5167,7 +5176,7 @@ mod tests {
         let hole = [0x11u8; 4096];
         vol.write(203, &hole).unwrap();
 
-        let job = vol.prepare_reclaim(200, 8);
+        let job = vol.prepare_reclaim(200, 8).unwrap();
         let result = crate::actor::execute_reclaim(job).unwrap();
         // The worker must have produced at least one rewrite.
         assert!(result.segment_written);
