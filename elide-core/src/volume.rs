@@ -5493,6 +5493,69 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// Coordinator tick semantics: when the IPC handler is called with
+    /// `cap = 1` every tick (as `tasks.rs::run_volume_tasks` does), a
+    /// backlog of bloated hashes drains to zero over successive calls.
+    /// Simulates that loop against the Volume API directly.
+    #[test]
+    fn reclaim_cap_one_per_call_converges_to_zero_candidates() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Three independent bloated hashes at disjoint LBA ranges.
+        // Each gets a middle overwrite to split it and trip the
+        // scanner's dead-block criterion.
+        for (seed, base_lba) in [(0xA1u8, 100u64), (0xB2, 200), (0xC3, 300)] {
+            vol.write(base_lba, &reclaim_payload(seed, 8)).unwrap();
+            vol.write(base_lba + 3, &[0xFFu8; 4096]).unwrap();
+        }
+
+        let thresholds = scanner_thresholds_permissive();
+
+        // Scanner starts with three candidates.
+        let (lbamap, ei) = vol.snapshot_maps();
+        let initial = crate::volume::scan_reclaim_candidates(&lbamap, &ei, thresholds);
+        assert_eq!(
+            initial.len(),
+            3,
+            "expected 3 initial candidates, got {initial:?}"
+        );
+        drop(lbamap);
+        drop(ei);
+
+        // Simulate the tick loop: each "tick" scans and processes at
+        // most one candidate. Bound iterations so a regression can't
+        // infinite-loop the test.
+        let mut tick_count = 0usize;
+        for _ in 0..10 {
+            let (lbamap, ei) = vol.snapshot_maps();
+            let mut candidates = crate::volume::scan_reclaim_candidates(&lbamap, &ei, thresholds);
+            drop(lbamap);
+            drop(ei);
+            if candidates.is_empty() {
+                break;
+            }
+            let c = candidates.remove(0);
+            let outcome = vol.reclaim_alias_merge(c.start_lba, c.lba_length).unwrap();
+            assert!(!outcome.discarded);
+            assert!(outcome.runs_rewritten > 0);
+            tick_count += 1;
+        }
+
+        // Exactly three productive ticks for three initial candidates.
+        assert_eq!(tick_count, 3);
+
+        // Rescan: converged.
+        let (lbamap, ei) = vol.snapshot_maps();
+        let remaining = crate::volume::scan_reclaim_candidates(&lbamap, &ei, thresholds);
+        assert!(
+            remaining.is_empty(),
+            "converged scan must be empty, got {remaining:?}"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn write_rejects_empty() {
         let base = keyed_temp_dir();
