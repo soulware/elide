@@ -908,16 +908,17 @@ pub struct ReclaimCandidate {
 /// actor round-trip. Returned candidates are sorted by `dead_blocks`
 /// descending (the most wasteful rewrites first).
 ///
-/// **Dead-block detection:** for each hash H we compute
-/// `live_blocks = sum(run.length)` and
-/// `max_payload_end = max(run.offset + run.length)` across all runs.
-/// For uncompressed payloads the exact logical length is
-/// `body_length / 4096` and `dead_blocks = logical_length - live_blocks`.
-/// For compressed payloads the exact logical length is unknown without
-/// decompressing, so we use `max_payload_end - live_blocks` — a lower
-/// bound that never produces false positives but may miss dead bytes
-/// past the last observed run. Zero-extents, hashes absent from the
-/// extent index, and delta-source hashes are skipped.
+/// **Dead-block detection:** for each hash H we compute `live_blocks =
+/// sum(run.length)` and `max_payload_end = max(run.offset + run.length)`
+/// across all runs. For uncompressed payloads the exact logical length
+/// is `body_length / 4096` and `dead_blocks = logical_length -
+/// live_blocks`. For compressed payloads and thin Delta entries the
+/// exact logical length is unknown without decompressing, so we use
+/// `max_payload_end - live_blocks` — a lower bound that never produces
+/// false positives but may miss dead bytes past the last observed run.
+///
+/// Zero-extents, Inline entries, and hashes absent from both the Data
+/// and Delta tables are skipped.
 pub fn scan_reclaim_candidates(
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
@@ -963,34 +964,57 @@ pub fn scan_reclaim_candidates(
 
     let mut candidates = Vec::new();
     for (hash, agg) in &per_hash {
-        let Some(loc) = extent_index.lookup(hash) else {
-            continue;
-        };
-        // Inline entries are small by construction and do not benefit
-        // from compaction — their bytes already live in the .idx, not
-        // the body section.
-        if loc.inline_data.is_some() {
-            continue;
-        }
+        // Resolve the hash as either a Data/Inline or Delta entry.
+        // Determines how we bound logical body size and what counts as
+        // stored bytes for the `min_stored_bytes` threshold.
+        //
+        // Returns:
+        // - `logical_blocks`: upper/exact bound on the payload's
+        //   logical size in 4 KiB blocks.
+        // - `is_lower_bound`: true when `logical_blocks` is a lower
+        //   bound (compressed Data, Delta), false when exact.
+        // - `stored_bytes`: bytes on disk that rewriting would
+        //   orphan — body_length for Data, decompressed-size estimate
+        //   for Delta.
+        let (logical_blocks, is_lower_bound, stored_bytes) =
+            if let Some(loc) = extent_index.lookup(hash) {
+                // Inline entries are small by construction and do not
+                // benefit from compaction — their bytes live in the
+                // .idx, not the body section.
+                if loc.inline_data.is_some() {
+                    continue;
+                }
+                if loc.compressed {
+                    (agg.max_offset_end, true, loc.body_length as u64)
+                } else {
+                    (loc.body_length as u64 / 4096, false, loc.body_length as u64)
+                }
+            } else if extent_index.lookup_delta(hash).is_some() {
+                // Delta-backed: the logical fragment size is not
+                // recorded on disk (the Delta entry's stored_length
+                // is zero — the delta blob is accessed via the
+                // separate delta body section). Use `max_offset_end`
+                // as a lower bound and approximate stored_bytes as
+                // the implied logical body size. Catches middle
+                // splits; misses pure tail overwrites of a Delta
+                // fragment (rare — Delta fragments are emitted at
+                // import or post-snapshot delta-repack, and partial
+                // overwrites of their tail specifically are atypical).
+                (agg.max_offset_end, true, agg.max_offset_end * 4096)
+            } else {
+                continue;
+            };
 
-        // Determine the payload's logical block count. For uncompressed
-        // payloads it's exact; for compressed we use the highest observed
-        // payload offset as a lower bound.
-        let (logical_blocks, is_lower_bound) = if loc.compressed {
-            (agg.max_offset_end, true)
-        } else {
-            (loc.body_length as u64 / 4096, false)
-        };
         if logical_blocks < agg.live_blocks {
-            // Can happen for compressed payloads when max_offset_end
-            // underestimates — treat as "no detectable bloat".
+            // Can happen for compressed/delta payloads when the lower
+            // bound underestimates — treat as "no detectable bloat".
             continue;
         }
         let dead_blocks = logical_blocks - agg.live_blocks;
         if dead_blocks < u64::from(thresholds.min_dead_blocks) {
             continue;
         }
-        if (loc.body_length as u64) < thresholds.min_stored_bytes {
+        if stored_bytes < thresholds.min_stored_bytes {
             continue;
         }
         let dead_ratio = dead_blocks as f64 / logical_blocks as f64;
@@ -1007,7 +1031,7 @@ pub fn scan_reclaim_candidates(
             lba_length: lba_length as u32,
             dead_blocks: dead_blocks.min(u32::MAX as u64) as u32,
             live_blocks: agg.live_blocks.min(u32::MAX as u64) as u32,
-            stored_bytes: loc.body_length as u64,
+            stored_bytes,
             dead_count_is_lower_bound: is_lower_bound,
         });
     }
@@ -5402,6 +5426,69 @@ mod tests {
         let outcome = vol.reclaim_alias_merge(400, 4).unwrap();
         assert_eq!(outcome.runs_rewritten, 0);
         assert!(!outcome.discarded);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A pure tail overwrite leaves the surviving run with
+    /// `payload_block_offset == 0` even though the stored body has a
+    /// dead tail. Historically the primitive silently rejected this
+    /// shape (its gate required at least one run with `offset != 0`)
+    /// while the scanner flagged it — causing "0 runs from N
+    /// candidates" on `elide volume reclaim`. Regression for the
+    /// wider gate in `execute_reclaim` that matches the scanner's
+    /// `live_blocks < logical_blocks` criterion.
+    #[test]
+    fn reclaim_alias_merge_rewrites_tail_overwrite() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // 8-block incompressible write at LBA 600.
+        let big = reclaim_payload(0xB1, 8);
+        vol.write(600, &big).unwrap();
+
+        // Overwrite LBAs [606, 608) — the last 2 blocks of the extent.
+        // Surviving run is [600, 606) with `payload_block_offset = 0`.
+        let tail = [0x44u8; 2 * 4096];
+        vol.write(606, &tail).unwrap();
+
+        // Precondition: exactly one surviving run of the original hash
+        // and its offset is zero — the shape the old gate missed.
+        let (lbamap_pre, _) = vol.snapshot_maps();
+        let original_hash = blake3::hash(&big);
+        let runs_pre = lbamap_pre.runs_for_hash(&original_hash);
+        assert_eq!(runs_pre.len(), 1);
+        assert_eq!(
+            runs_pre[0].2, 0,
+            "surviving tail-overwrite run has offset 0"
+        );
+        drop(lbamap_pre);
+
+        // Oracle.
+        let mut expected = Vec::with_capacity(8 * 4096);
+        expected.extend_from_slice(&big[..6 * 4096]);
+        expected.extend_from_slice(&tail);
+        assert_eq!(vol.read(600, 8).unwrap(), expected);
+
+        let outcome = vol.reclaim_alias_merge(600, 8).unwrap();
+        assert!(!outcome.discarded);
+        assert_eq!(
+            outcome.runs_rewritten, 1,
+            "tail-overwrite must rewrite the surviving head run"
+        );
+        assert_eq!(vol.read(600, 8).unwrap(), expected);
+
+        // Rescan: no residual candidates.
+        let (lbamap_post, extent_index_post) = vol.snapshot_maps();
+        let candidates = crate::volume::scan_reclaim_candidates(
+            &lbamap_post,
+            &extent_index_post,
+            scanner_thresholds_permissive(),
+        );
+        assert!(
+            candidates.is_empty(),
+            "post-reclaim rescan must be empty, got {candidates:?}"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }

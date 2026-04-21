@@ -32,7 +32,7 @@ use elide_core::segment::{
     write_segment_with_delta_body,
 };
 use elide_core::signing;
-use elide_core::volume::Volume;
+use elide_core::volume::{ReclaimThresholds, Volume, scan_reclaim_candidates};
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -534,5 +534,126 @@ fn reclaim_emits_delta_when_h_is_snapshot_pinned() {
         lbamap_post.delta_source_refcount(&parent_hash),
         2,
         "only the new reclaim outputs should pin H via delta-source refs"
+    );
+}
+
+/// `scan_reclaim_candidates` historically only consulted the Data/Inline
+/// extent-index table, so a bloated Delta fragment was invisible to the
+/// scanner. The primitive could still reclaim it when invoked directly,
+/// but the CLI's scanner-driven pass silently missed it. After the
+/// scanner extension, a middle-overwritten Delta fragment surfaces as
+/// a candidate and round-trips through the primitive cleanly.
+#[test]
+fn scanner_surfaces_bloated_delta_hash() {
+    let tmp = TempDir::new().unwrap();
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+
+    // Parent DATA source at LBA [0, 8).
+    let parent_bytes = structured_payload(0xD0, 8);
+    let parent_hash = blake3::hash(&parent_bytes);
+
+    // Child Delta at LBA [10, 18), source = parent_hash, 8-block
+    // fragment (so there's something to bloat by splitting).
+    let child_bytes = structured_payload(0xD1, 8);
+    let child_hash = blake3::hash(&child_bytes);
+    let delta_blob = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes)
+        .unwrap()
+        .compress(&child_bytes)
+        .unwrap();
+
+    let parent_ulid = Ulid::new();
+    let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
+    let mut parent_entries = vec![SegmentEntry::new_data(
+        parent_hash,
+        0,
+        8,
+        SegmentFlags::empty(),
+        parent_bytes.clone(),
+    )];
+    write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
+
+    let delta_ulid = Ulid::new();
+    assert!(delta_ulid > parent_ulid);
+    let delta_path = vol_dir.join(format!("pending/{delta_ulid}"));
+    let mut delta_entries = vec![SegmentEntry::new_delta(
+        child_hash,
+        10,
+        8,
+        vec![DeltaOption {
+            source_hash: parent_hash,
+            delta_offset: 0,
+            delta_length: delta_blob.len() as u32,
+            delta_hash: blake3::hash(&delta_blob),
+        }],
+    )];
+    write_segment_with_delta_body(
+        &delta_path,
+        &mut delta_entries,
+        &delta_blob,
+        signer.as_ref(),
+    )
+    .unwrap();
+    fs::write(vol_dir.join(format!("snapshots/{delta_ulid}")), "").unwrap();
+
+    let mut vol = Volume::open(&vol_dir, &vol_dir).unwrap();
+
+    // Split the Delta with a middle overwrite to create bloat.
+    let overwrite = vec![0xEEu8; 2 * 4096];
+    vol.write(12, &overwrite).unwrap();
+
+    // Scanner must surface the bloated child_hash as a candidate. Use
+    // permissive thresholds so the scanner doesn't gate on byte size.
+    let (lbamap, extent_index) = vol.snapshot_maps();
+    let candidates = scan_reclaim_candidates(
+        &lbamap,
+        &extent_index,
+        ReclaimThresholds {
+            min_dead_blocks: 1,
+            min_dead_ratio: 0.0,
+            min_stored_bytes: 0,
+        },
+    );
+    drop(lbamap);
+    drop(extent_index);
+
+    // Exactly one candidate: the bloated Delta fragment. The parent
+    // DATA at [0, 8) has no overwrites, so it's not flagged.
+    assert_eq!(
+        candidates.len(),
+        1,
+        "scanner must surface the split Delta fragment, got {candidates:?}"
+    );
+    let c = candidates[0];
+    assert_eq!(c.start_lba, 10);
+    assert_eq!(c.lba_length, 8);
+    assert!(
+        c.dead_count_is_lower_bound,
+        "delta-backed candidates carry a lower-bound dead count"
+    );
+
+    // Round-trip the candidate through the primitive. The primitive
+    // handles Delta-backed bloat by emitting thin Deltas pointing at
+    // the same source (covered in detail by earlier tests).
+    let outcome = vol.reclaim_alias_merge(c.start_lba, c.lba_length).unwrap();
+    assert!(!outcome.discarded);
+    assert!(
+        outcome.runs_rewritten > 0,
+        "scanner-proposed candidate must round-trip through the primitive"
+    );
+
+    // Rescan: no residual candidates.
+    let (lbamap, extent_index) = vol.snapshot_maps();
+    let candidates_after = scan_reclaim_candidates(
+        &lbamap,
+        &extent_index,
+        ReclaimThresholds {
+            min_dead_blocks: 1,
+            min_dead_ratio: 0.0,
+            min_stored_bytes: 0,
+        },
+    );
+    assert!(
+        candidates_after.is_empty(),
+        "post-reclaim rescan must find nothing, got {candidates_after:?}"
     );
 }

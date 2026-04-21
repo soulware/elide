@@ -2835,7 +2835,34 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
             if !contained {
                 return false;
             }
-            runs.iter().any(|(_, _, offset)| *offset != 0)
+            // Bloat: at least one block inside the hash's logical body is
+            // no longer referenced by any live LBA. Mirror the scanner's
+            // criterion (`scan_reclaim_candidates`) so the two agree on
+            // "worth rewriting" — the previous `any run with
+            // payload_block_offset != 0` gate only caught middle
+            // overwrites and silently rejected tail overwrites that the
+            // scanner flagged.
+            let live_blocks: u64 = runs.iter().map(|(_, len, _)| *len as u64).sum();
+            let max_offset_end: u64 = runs
+                .iter()
+                .map(|(_, len, off)| *off as u64 + *len as u64)
+                .max()
+                .unwrap_or(0);
+            let logical_blocks = match job.extent_index_snapshot.lookup(&er.hash) {
+                Some(loc) if loc.inline_data.is_none() && !loc.compressed => {
+                    // Uncompressed Data: body_length is the exact logical
+                    // size in bytes. Divide to get blocks. Catches tail
+                    // overwrites where max_offset_end == live_blocks.
+                    loc.body_length as u64 / 4096
+                }
+                // Compressed Data, Inline, Delta-backed, or missing from
+                // the index: we don't have an exact logical-size signal,
+                // so max_offset_end is a conservative lower bound.
+                // Catches middle splits; misses pure tail overwrites of
+                // these shapes (rare in practice).
+                _ => max_offset_end,
+            };
+            live_blocks < logical_blocks
         });
         if !should_rewrite {
             continue;
