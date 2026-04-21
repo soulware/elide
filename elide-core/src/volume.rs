@@ -815,6 +815,12 @@ pub struct ReclaimResult {
     pub lbamap_snapshot: Arc<lbamap::LbaMap>,
     pub segment_ulid: Ulid,
     pub body_section_start: u64,
+    /// Sum of `stored_length` for body-section entries in the written
+    /// segment. Needed by apply to build
+    /// [`extentindex::DeltaBodySource::Full`] for any Delta outputs, whose
+    /// delta blobs live at `body_section_start + body_length` in the
+    /// pending file.
+    pub body_length: u64,
     pub entries: Vec<ReclaimedEntry>,
     pub segment_written: bool,
     pub pending_dir: PathBuf,
@@ -3310,14 +3316,12 @@ impl Volume {
         self.last_segment_ulid = Some(result.segment_ulid);
 
         let lbamap = Arc::make_mut(&mut self.lbamap);
-        for re in &result.entries {
-            lbamap.insert(re.entry.start_lba, re.entry.lba_length, re.entry.hash);
-        }
         let extent_index = Arc::make_mut(&mut self.extent_index);
         for re in &result.entries {
             let entry = &re.entry;
             match entry.kind {
                 EntryKind::Data => {
+                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
                     extent_index.insert(
                         entry.hash,
                         extentindex::ExtentLocation {
@@ -3332,6 +3336,7 @@ impl Volume {
                     );
                 }
                 EntryKind::Inline => {
+                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
                     extent_index.insert(
                         entry.hash,
                         extentindex::ExtentLocation {
@@ -3346,14 +3351,40 @@ impl Volume {
                     );
                 }
                 EntryKind::DedupRef => {
-                    // canonical body already indexed — nothing to insert.
+                    // Canonical body already indexed — nothing to insert
+                    // in extent_index; lbamap just claims the LBA run.
+                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash);
                 }
-                EntryKind::CanonicalData
-                | EntryKind::CanonicalInline
-                | EntryKind::Zero
-                | EntryKind::Delta => {
+                EntryKind::Delta => {
+                    // Thin Delta: claim the LBA run with its source
+                    // list attached (so GC's `lba_referenced_hashes`
+                    // fold keeps the source alive), and register the
+                    // delta in the extent_index. `body_length` is the
+                    // tail of the body section; the delta region
+                    // begins at `body_section_start + body_length`.
+                    let source_hashes: Arc<[blake3::Hash]> =
+                        entry.delta_options.iter().map(|o| o.source_hash).collect();
+                    lbamap.insert_delta(
+                        entry.start_lba,
+                        entry.lba_length,
+                        entry.hash,
+                        source_hashes,
+                    );
+                    extent_index.insert_delta_if_absent(
+                        entry.hash,
+                        extentindex::DeltaLocation {
+                            segment_id: result.segment_ulid,
+                            body_source: extentindex::DeltaBodySource::Full {
+                                body_section_start: result.body_section_start,
+                                body_length: result.body_length,
+                            },
+                            options: entry.delta_options.clone(),
+                        },
+                    );
+                }
+                EntryKind::CanonicalData | EntryKind::CanonicalInline | EntryKind::Zero => {
                     unreachable!(
-                        "reclaim output produces only Data/Inline/DedupRef, got {:?}",
+                        "reclaim output produces only Data/Inline/DedupRef/Delta, got {:?}",
                         entry.kind
                     );
                 }
