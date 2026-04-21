@@ -23,5 +23,6 @@
 /refs/
 
 # Local data and object store directories (default dev paths)
+coordinator.toml
 /elide_data/
 /elide_store/
