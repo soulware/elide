@@ -15,6 +15,11 @@
 //   # endpoint = "https://s3.amazonaws.com"  # optional; omit for AWS default
 //   # region   = "us-east-1"                 # optional; falls back to AWS_DEFAULT_REGION
 //   #
+//   # Multipart upload tuning for segment bodies (all optional):
+//   # multipart_part_size_mb = 5    # part size in MiB (min 5, S3 rule)
+//   # request_timeout_secs   = 300  # per-HTTP-request timeout
+//   # connect_timeout_secs   = 5    # TCP+TLS connect timeout
+//   #
 //   # Access keys are NOT configured here — they are read from the usual
 //   # AWS env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) by both
 //   # the coordinator and the spawned volume subprocesses. The coordinator
@@ -32,11 +37,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
-use object_store::ObjectStore;
+use anyhow::{Context, Result, bail};
+use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
+use object_store::path::Path as StorePath;
+use object_store::{ClientOptions, ObjectStore};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -103,20 +111,66 @@ fn sibling_bin(name: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct StoreSection {
     /// Use a local directory as the object store (for testing).
     /// Mutually exclusive with `bucket`.
+    #[serde(default)]
     pub local_path: Option<PathBuf>,
 
     /// S3 bucket name.
+    #[serde(default)]
     pub bucket: Option<String>,
 
     /// S3-compatible endpoint URL (optional; omit for AWS default).
+    #[serde(default)]
     pub endpoint: Option<String>,
 
     /// AWS region (optional; falls back to AWS_DEFAULT_REGION env var).
+    #[serde(default)]
     pub region: Option<String>,
+
+    /// Multipart upload part size in MiB for segment bodies. Must be at
+    /// least 5 (S3 minimum part size, except the final part). Larger parts
+    /// amortise request overhead; smaller parts retry faster on failure.
+    /// Default: 5.
+    #[serde(default = "default_multipart_part_size_mb")]
+    pub multipart_part_size_mb: u64,
+
+    /// Per-request timeout, in seconds. Covers the full HTTP request
+    /// lifetime (DNS + connect + TLS + body transfer + response). Must be
+    /// long enough for a single multipart part to upload on the slowest
+    /// link the coordinator is expected to run on. Default: 300.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+
+    /// TCP+TLS connection-establishment timeout, in seconds. Default: 5.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+}
+
+fn default_multipart_part_size_mb() -> u64 {
+    5
+}
+fn default_request_timeout_secs() -> u64 {
+    300
+}
+fn default_connect_timeout_secs() -> u64 {
+    5
+}
+
+impl Default for StoreSection {
+    fn default() -> Self {
+        Self {
+            local_path: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            multipart_part_size_mb: default_multipart_part_size_mb(),
+            request_timeout_secs: default_request_timeout_secs(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+        }
+    }
 }
 
 impl StoreSection {
@@ -144,6 +198,74 @@ impl StoreSection {
         env
     }
 
+    /// Multipart part size in bytes, clamped to the S3 minimum of 5 MiB.
+    pub fn multipart_part_size_bytes(&self) -> usize {
+        (self.multipart_part_size_mb.max(5) * 1024 * 1024) as usize
+    }
+
+    /// `reqwest` client options (timeouts) derived from config.
+    fn client_options(&self) -> ClientOptions {
+        ClientOptions::default()
+            .with_timeout(Duration::from_secs(self.request_timeout_secs))
+            .with_connect_timeout(Duration::from_secs(self.connect_timeout_secs))
+    }
+
+    /// One-line human-readable summary of the configured object store, for
+    /// startup logs. Does not include secrets.
+    pub fn describe(&self) -> String {
+        if let Some(path) = &self.local_path {
+            format!("local {}", path.display())
+        } else if let Some(bucket) = &self.bucket {
+            let mut s = format!("s3 bucket={bucket}");
+            if let Some(ep) = &self.endpoint {
+                s.push_str(&format!(" endpoint={ep}"));
+            }
+            if let Some(region) = &self.region {
+                s.push_str(&format!(" region={region}"));
+            }
+            s.push_str(&format!(
+                " part={}MiB req_timeout={}s connect_timeout={}s",
+                self.multipart_part_size_mb.max(5),
+                self.request_timeout_secs,
+                self.connect_timeout_secs,
+            ));
+            s
+        } else {
+            "local elide_store (default)".to_owned()
+        }
+    }
+
+    /// Verify that the store is reachable with the configured credentials.
+    /// Fails fast at startup so operators see "bad credentials" once rather
+    /// than as a spinning retry in every per-volume task.
+    ///
+    /// For S3 stores, bails immediately if `AWS_ACCESS_KEY_ID` is unset —
+    /// without that, the object_store client falls back to the EC2 IMDS
+    /// credential provider and spends ~11s per call on retries. Then issues
+    /// a single `list` request against the configured bucket to surface
+    /// auth/permission errors (e.g. 403) with clean context.
+    ///
+    /// For local stores, issues the same `list` request as a minimal
+    /// readability check on the store root.
+    pub async fn probe(&self, store: &dyn ObjectStore) -> Result<()> {
+        if self.bucket.is_some() && std::env::var_os("AWS_ACCESS_KEY_ID").is_none() {
+            bail!(
+                "object store configured for S3 (bucket={}) but AWS_ACCESS_KEY_ID \
+                 is not set in the environment; set AWS_ACCESS_KEY_ID and \
+                 AWS_SECRET_ACCESS_KEY before starting the coordinator",
+                self.bucket.as_deref().unwrap_or("?"),
+            );
+        }
+        let prefix = StorePath::from("by_id/");
+        let mut stream = store.list(Some(&prefix));
+        match stream.next().await {
+            None | Some(Ok(_)) => Ok(()),
+            Some(Err(e)) => {
+                Err(anyhow::Error::new(e).context(format!("probing store ({})", self.describe())))
+            }
+        }
+    }
+
     pub fn build(&self) -> Result<Arc<dyn ObjectStore>> {
         if let Some(path) = &self.local_path {
             std::fs::create_dir_all(path)
@@ -152,7 +274,9 @@ impl StoreSection {
                 LocalFileSystem::new_with_prefix(path).context("building local store")?,
             ))
         } else if let Some(bucket) = &self.bucket {
-            let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+            let mut builder = AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .with_client_options(self.client_options());
             if let Some(ep) = &self.endpoint {
                 builder = builder
                     .with_endpoint(ep)
@@ -283,6 +407,7 @@ mod tests {
             endpoint: Some("https://t3.storage.dev".into()),
             region: Some("auto".into()),
             local_path: None,
+            ..StoreSection::default()
         };
         let env = store.child_env();
         assert_eq!(
@@ -302,6 +427,7 @@ mod tests {
             endpoint: None,
             region: None,
             local_path: None,
+            ..StoreSection::default()
         };
         let env = store.child_env();
         assert_eq!(env, vec![("ELIDE_S3_BUCKET", "elide-test".to_owned())]);
