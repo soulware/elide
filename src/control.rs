@@ -296,7 +296,11 @@ fn handle_connection(
         let candidates =
             handle.reclaim_candidates(elide_core::volume::ReclaimThresholds::default());
         let scanned = candidates.len();
-        info!("[reclaim] scan found {scanned} candidate(s), cap={cap:?}");
+        if scanned > 0 {
+            info!("[reclaim] scan found {scanned} candidate(s), cap={cap:?}");
+        } else {
+            debug!("[reclaim] scan found 0 candidate(s), cap={cap:?}");
+        }
         let to_process: Vec<_> = match cap {
             Some(n) => candidates.into_iter().take(n).collect(),
             None => candidates,
@@ -336,10 +340,17 @@ fn handle_connection(
         if let Some(e) = io_err {
             let _ = writeln!(writer, "err {e}");
         } else {
-            info!(
-                "[reclaim] done: scanned={scanned} runs_rewritten={total_runs} \
-                 bytes_rewritten={total_bytes} discarded={discarded}"
-            );
+            if total_runs > 0 || discarded > 0 {
+                info!(
+                    "[reclaim] done: scanned={scanned} runs_rewritten={total_runs} \
+                     bytes_rewritten={total_bytes} discarded={discarded}"
+                );
+            } else {
+                debug!(
+                    "[reclaim] done: scanned={scanned} runs_rewritten={total_runs} \
+                     bytes_rewritten={total_bytes} discarded={discarded}"
+                );
+            }
             let _ = writeln!(
                 writer,
                 "ok {scanned} {total_runs} {total_bytes} {discarded}"
