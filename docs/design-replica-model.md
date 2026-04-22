@@ -145,6 +145,48 @@ to retire all of that when `materialize` lands, but not before — the
 alternative is a shipped binary that can't cover the dead-host recovery
 case at all.
 
+## Proposed: Tigris snapshots as the materialize read source
+
+Tigris exposes point-in-time bucket snapshots as a native primitive: a
+snapshot is O(1) to take, references (not copies) existing object
+versions, and is readable from the live bucket by passing the returned
+`X-Tigris-Snapshot-Version` header on GETs. This is a candidate stable
+read source for the `materialize` implementation — it eliminates the
+upstream-GC race for the duration of the operation without requiring a
+scratch bucket or a writable fork.
+
+Rough shape:
+
+1. Take a snapshot of the source bucket at the start of materialize.
+2. Read all source extents through the snapshot (version-pinned GETs).
+3. Re-emit new segments, owned solely by the target volume, into the
+   live bucket.
+4. Release the snapshot on completion.
+
+Open questions / things to experiment with:
+
+- Does the Rust S3 SDK we use permit injecting the
+  `X-Tigris-Snapshot-Version` header per-request cleanly, or does it
+  require a custom signer / middleware layer?
+- Snapshot scope: bucket-wide only, or can it be scoped to a prefix?
+  Cost and retention implications if it has to be bucket-wide.
+- Is an intra-Tigris `CopyObject` from a snapshot-pinned source key to
+  a live-bucket destination key metadata-only (reference bump) or a
+  full byte copy? If the former, whole-segment re-parenting is
+  effectively free at the storage layer and changes the shape of
+  materialize from "re-emit segments" to "retarget object pointers".
+- How does snapshot release interact with segments that have been
+  copied out into the live bucket under new keys — is there any
+  reference-count coupling we need to understand?
+
+This is Tigris-specific. A plain-S3 `materialize` path is still
+required and would rely on either (a) the coordinator pinning segment
+deletes for the duration of the operation, or (b) S3 object-versioning
+semantics where the backend supports them. The object-store trait
+should keep snapshot-based and pin-based strategies behind the same
+interface so the choice is per-backend and doesn't leak into the
+materialize driver.
+
 ## Relationship to existing CLI
 
 **Landed:**
