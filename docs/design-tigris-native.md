@@ -7,6 +7,26 @@ Elide looks like if Tigris is treated as a first-class backend rather
 than as one of several S3-compatible object stores sitting behind a
 common trait.
 
+**Update (2026-04-24).** The two premises that drove most of the
+retention-related subsystem implications below have been invalidated:
+
+- **Bucket snapshots retain write history with no physical deletion.**
+  A snapshot-enabled Tigris bucket accumulates every write forever;
+  storage cost grows monotonically regardless of snapshot cadence or
+  retention policy. This defeats Elide's GC/repack cost model, which
+  assumes superseded bytes become reclaimable.
+- **Per-object versioning is the same mechanism at finer granularity**
+  — same unbounded-growth property.
+
+Consequence: retention cannot be delegated to Tigris. Elide owns
+retention via application-managed pending-delete markers (see
+`design-replica-model.md`). That decision removes the load-bearing
+Tigris-native primitive for the *Snapshots*, *GC / retention*, and
+*Disaster recovery* subsystems below. Those subsections are
+individually annotated; the rest of the doc (dedup, credentials, the
+`CopyObject` exploration, mapping choice between one-volume-per-bucket
+and grouped) stands on its own merits and is unaffected.
+
 ## Premise
 
 The current design treats Tigris as *an* S3-compatible backend. This
@@ -96,6 +116,12 @@ through before picking.
 
 ### Snapshots
 
+**Status: invalidated by 2026-04-24 update.** Both mappings below
+assume Tigris bucket snapshots are a bounded primitive; they aren't.
+Elide snapshots remain application-level manifest pointers as they are
+today, and retention is handled by pending-delete markers rather than
+by delegating to a native snapshot primitive.
+
 Today an Elide snapshot is a `<vol_ulid, snap_ulid>` manifest pointer.
 The manifest bookkeeping exists to give volume-level atomicity on top
 of individually-versioned S3 objects.
@@ -145,6 +171,12 @@ within segments. They are orthogonal and complementary. Dedup stays.
 
 ### GC
 
+**Status: retention half invalidated by 2026-04-24 update.** The
+"delegate retention to Tigris lifecycle + snapshot pinning" idea
+depends on native snapshots being bounded — they aren't. Retention
+stays in Elide via pending-delete markers. Compaction was always
+going to stay in Elide and is unaffected.
+
 Today the coordinator runs per-segment liveness analysis across
 volumes, compacts partially-live segments, deletes unreferenced
 segments, and manages TTL.
@@ -178,6 +210,13 @@ With Tigris native:
   property.
 
 ### Disaster recovery
+
+**Status: invalidated by 2026-04-24 update.** This section assumed
+Tigris's always-on versioning would give implicit backup at bounded
+cost. It doesn't (storage grows monotonically). DR remains operator-
+layered for all backends; the replica model gives a cheaper cross-host
+recovery path than "restore a backup" for the in-fleet case, but
+genuine external backup is still out of scope.
 
 Today DR is "bring your own backup strategy" — the S3 bucket is the
 only artefact.
