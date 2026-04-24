@@ -297,7 +297,7 @@ fn read_pattern(dev_id: i32, offset: u64, len: usize) -> Vec<u8> {
 /// Distinguishable 4K pattern: byte i = (i ^ seed) & 0xff. Makes
 /// mismatches easy to spot when they happen.
 fn pattern(seed: u8) -> Vec<u8> {
-    (0..BLOCK).map(|i| ((i as u8) ^ seed)).collect()
+    (0..BLOCK).map(|i| (i as u8) ^ seed).collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
