@@ -78,29 +78,47 @@ store), a bare volume ULID, or an explicit `<vol_ulid>/<snap_ulid>` pin.
 The explicit-pin form is forward-compatible — see
 [design-replica-model.md](design-replica-model.md).
 
-## Serve over NBD
+## Serve the volume
 
-By default the coordinator runs volumes in IPC-only mode (no NBD listener). To expose a volume over NBD, write the desired port to `nbd.port` in the volume directory. The supervisor reads this file at spawn time:
+By default the coordinator runs volumes in IPC-only mode (no host-visible
+block device). Pick one of two transports — they are mutually exclusive per
+volume. See `docs/operations.md` for the full comparison and prereqs.
+
+### NBD (any host)
+
+Either pass `--nbd-port` at create time, or update the running volume:
 
 ```sh
-echo 10809 > elide_data/by_name/vm1/nbd.port
-```
-
-Since `vm1` was just created, the coordinator will start it fresh on the next scan and pick up the port. Check status:
-
-```sh
-./target/debug/elide volume status vm1
+./target/debug/elide volume update vm1 --nbd-port 10809
 # vm1: running
 ```
 
-## Connect with nbd-client
+This writes a `[nbd]` section to `vm1/volume.toml` and asks the supervisor to
+restart the volume process. Connect with:
 
 ```sh
 sudo nbd-client -b 4096 127.0.0.1 10809 /dev/nbd0
 sudo mount /dev/nbd0 /mnt
 ```
 
-`-b 4096` sets the NBD block size to 4 KiB, matching the volume's LBA size. The default (512 bytes) causes every write to be smaller than one LBA block, which defeats compression and dedup at the block level.
+`-b 4096` sets the NBD block size to 4 KiB, matching the volume's LBA size.
+The default (512 bytes) causes every write to be smaller than one LBA block,
+which defeats compression and dedup at the block level.
+
+### ublk (Linux only, preferred for host-local)
+
+```sh
+sudo modprobe ublk_drv     # one-time kernel module load
+./target/debug/elide volume update vm1 --ublk
+```
+
+This writes `[ublk]` to `volume.toml`; the kernel auto-allocates a device id
+on first start (persisted in `vm1/ublk.id` for crash recovery). Pin a
+specific id with `--ublk-id N` if you need stable `/dev/ublkbN` paths. Then:
+
+```sh
+sudo mount /dev/ublkb0 /mnt
+```
 
 Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).
 

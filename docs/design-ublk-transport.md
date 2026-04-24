@@ -108,7 +108,7 @@ First PR is the spike only. Later steps are sequenced separately, each on its ow
 2b. **Depth > 1 (landed).** `queue_depth = 64` via uring-registered eventfd bridging from a per-queue worker pool. See Async model above for the dead-end we avoided.
 3. **USER_RECOVERY_REISSUE (landed).** Added with `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE` by default; sysfs-scan-based add/recover routing at serve startup; `START_USER_RECOVERY` issued before the recovery builder, `END_USER_RECOVERY` via libublk's internal `start_dev` path. Crash-injection integration test is a follow-up.
 4. **Zero-copy (optional, future).** `UBLK_F_AUTO_BUF_REG` on WRITE. Benchmark. Requires root — likely a separate "privileged" tier.
-5. **Config + CLI.** First-class `ublk` section in `volume.toml` (mutually exclusive with `nbd`), coordinator lifecycle integration, docs.
+5. **Config + CLI (landed).** `[ublk]` section in `volume.toml` (mutually exclusive with `[nbd]`, enforced at parse time). `volume create` / `volume update` grew `--ublk` / `--ublk-id` / `--no-ublk` flags. Supervisor reads `[ublk]` and passes `--ublk` / `--ublk-id` to `serve-volume`; `find_ublk_conflict` mirrors `find_nbd_conflict` (lowest-ULID-wins by `dev_id`). Operator docs in `operations.md` and `quickstart.md`.
 
 ## References
 

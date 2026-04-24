@@ -5,10 +5,12 @@
 // (setsid) so it is not affected by the coordinator's lifetime — the volume
 // keeps serving if the coordinator is restarted or upgraded.
 //
-// NBD binding:
-//   By default no NBD server is started (IPC-only mode). To expose a fork over
-//   NBD, write the desired port number to `nbd.port` in the fork directory.
-//   The supervisor reads this file at spawn time and passes `--port <n>`.
+// Transport binding:
+//   By default no block-device transport is started (IPC-only mode). To expose
+//   a fork, add a `[nbd]` or `[ublk]` section to `volume.toml`. The supervisor
+//   reads volume.toml at spawn time and passes the matching `--port` /
+//   `--socket` (NBD) or `--ublk` / `--ublk-id` (ublk) flags. The two
+//   transports are mutually exclusive per volume.
 //
 // State files written to the fork directory:
 //   volume.pid  — PID of the running volume process; absent when not running
@@ -97,6 +99,33 @@ pub async fn supervise(
             }
         }
 
+        // ublk dev-id conflict: same lowest-ULID-wins rule, by dev_id rather
+        // than endpoint. Auto-allocated devices (dev_id absent) skip this
+        // check — the kernel resolves them at start time.
+        match elide_core::config::find_ublk_conflict(&fork_dir, &data_dir) {
+            Ok(Some(conflict)) => {
+                let self_name = fork_dir.file_name().and_then(|n| n.to_str());
+                let other_name = conflict.dir.file_name().and_then(|n| n.to_str());
+                let dominated = match (self_name, other_name) {
+                    (Some(s), Some(o)) => s > o,
+                    _ => true,
+                };
+                if dominated {
+                    error!(
+                        "[supervisor {label}] ublk dev id {} conflicts with '{}'; \
+                         volume stopped (lower ULID wins)",
+                        conflict.dev_id, conflict.name,
+                    );
+                    let _ = std::fs::write(fork_dir.join("volume.stopped"), "");
+                    break;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("[supervisor {label}] ublk conflict check failed: {e}");
+            }
+        }
+
         // Check for a running process left by a previous coordinator session.
         if let Some(pid) = read_pid(&fork_dir) {
             if is_alive(pid) {
@@ -153,22 +182,27 @@ fn spawn_volume(
         cmd.env(k, v);
     }
 
-    if let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir)
-        && let Some(nbd) = cfg.nbd
-    {
-        if let Some(socket) = nbd.socket {
-            // Resolve relative paths against the volume directory so that
-            // "./nbd.sock" means <vol_dir>/nbd.sock regardless of cwd.
-            let socket = if socket.is_absolute() {
-                socket
-            } else {
-                fork_dir.join(socket)
-            };
-            cmd.arg("--socket").arg(socket);
-        } else if let Some(port) = nbd.port {
-            cmd.arg("--port").arg(port.to_string());
-            if let Some(bind) = nbd.bind {
-                cmd.arg("--bind").arg(bind);
+    if let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir) {
+        if let Some(nbd) = cfg.nbd {
+            if let Some(socket) = nbd.socket {
+                // Resolve relative paths against the volume directory so that
+                // "./nbd.sock" means <vol_dir>/nbd.sock regardless of cwd.
+                let socket = if socket.is_absolute() {
+                    socket
+                } else {
+                    fork_dir.join(socket)
+                };
+                cmd.arg("--socket").arg(socket);
+            } else if let Some(port) = nbd.port {
+                cmd.arg("--port").arg(port.to_string());
+                if let Some(bind) = nbd.bind {
+                    cmd.arg("--bind").arg(bind);
+                }
+            }
+        } else if let Some(ublk) = cfg.ublk {
+            cmd.arg("--ublk");
+            if let Some(id) = ublk.dev_id {
+                cmd.arg("--ublk-id").arg(id.to_string());
             }
         }
     }

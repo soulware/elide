@@ -39,7 +39,7 @@ fn make_readonly_volume(
     elide_core::config::VolumeConfig {
         name: Some(vol_ulid.to_string()),
         size: Some(1024 * 1024),
-        nbd: None,
+        ..Default::default()
     }
     .write(&vol_dir)
     .unwrap();

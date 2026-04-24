@@ -48,7 +48,7 @@ fn setup_volume_dir(tmp: &TempDir) -> (std::path::PathBuf, Arc<dyn SegmentSigner
     VolumeConfig {
         name: Some("test".to_owned()),
         size: Some(1024 * 1024),
-        nbd: None,
+        ..Default::default()
     }
     .write(&vol_dir)
     .unwrap();

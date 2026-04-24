@@ -94,7 +94,7 @@ pub async fn pull_volume_skeleton(
     elide_core::config::VolumeConfig {
         name,
         size: Some(size as u64),
-        nbd: None,
+        ..Default::default()
     }
     .write(&vol_dir)
     .with_context(|| format!("writing volume.toml for {volume_id}"))?;
