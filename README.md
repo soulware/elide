@@ -31,7 +31,7 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 | [docs/actor-offload-plan.md](docs/actor-offload-plan.md) | Plan: offload heavy maintenance work off the volume actor to isolate write tail latency |
 | [docs/promote-offload-plan.md](docs/promote-offload-plan.md) | Plan: offload WAL promotion onto the worker thread (first step of actor-offload-plan) |
 | [docs/promote-segment-offload-plan.md](docs/promote-segment-offload-plan.md) | Plan: offload `promote_segment` IPC handler to the worker thread (step 6 of actor-offload-plan) |
-| [docs/design-ublk-transport.md](docs/design-ublk-transport.md) | Exploration: ublk as preferred host-local transport alongside NBD; architecture, crash recovery via WAL idempotence, phased rollout |
+| [docs/design-ublk-transport.md](docs/design-ublk-transport.md) | Design: ublk as preferred host-local transport alongside NBD — multi-queue async handler, USER_RECOVERY_REISSUE crash recovery, phased rollout (steps 1–3 landed, 4–5 open) |
 
 ## Status updates
 
