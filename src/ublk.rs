@@ -348,8 +348,8 @@ mod imp {
         loop {
             let iod = *q.get_iod(tag);
             let op = iod.op_flags & 0xff;
-            let off = (iod.start_sector << 9) as u64;
-            let bytes = (iod.nr_sectors << 9) as u32;
+            let off = iod.start_sector << 9;
+            let bytes = iod.nr_sectors << 9;
 
             let buf_slice = buf.as_slice();
             let res = if (bytes as usize) <= buf_slice.len() {
@@ -590,6 +590,179 @@ mod imp {
         }
         ids.sort_unstable();
         Ok(ids)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use elide_core::actor::{VolumeClient, VolumeReader};
+        use elide_core::volume::Volume;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        fn temp_dir() -> std::path::PathBuf {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut p = std::env::temp_dir();
+            p.push(format!("elide-ublk-test-{}-{}", std::process::id(), n));
+            std::fs::create_dir_all(&p).unwrap();
+            elide_core::signing::generate_keypair(
+                &p,
+                elide_core::signing::VOLUME_KEY_FILE,
+                elide_core::signing::VOLUME_PUB_FILE,
+            )
+            .unwrap();
+            p
+        }
+
+        /// Build a live VolumeClient + VolumeReader backed by a scratch volume
+        /// so tests can drive `dispatch` exactly as the per-queue worker does.
+        /// Returns the temp dir, client (kept alive so the actor thread stays
+        /// up), and reader. Drop order: reader → client → dir.
+        fn spawn_volume() -> (std::path::PathBuf, VolumeClient, VolumeReader) {
+            let dir = temp_dir();
+            let volume = Volume::open(&dir, &dir).unwrap();
+            let (actor, client) = elide_core::actor::spawn(volume);
+            std::thread::Builder::new()
+                .name("ublk-test-actor".into())
+                .spawn(move || actor.run())
+                .unwrap();
+            let reader = client.reader();
+            (dir, client, reader)
+        }
+
+        #[test]
+        fn pick_nr_queues_clamped_to_max() {
+            let n = pick_nr_queues();
+            assert!(n >= 1);
+            assert!(n <= MAX_QUEUES);
+        }
+
+        #[test]
+        fn eventfd_roundtrip() {
+            let efd = make_eventfd().unwrap();
+            let counter: u64 = 1;
+            let n = unsafe {
+                libc::write(
+                    efd.as_raw_fd(),
+                    &counter as *const u64 as *const libc::c_void,
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            assert_eq!(n, std::mem::size_of::<u64>() as isize);
+
+            // First drain consumes the counter.
+            drain_eventfd(efd.as_raw_fd());
+
+            // Second drain would block (EAGAIN) because EFD_NONBLOCK is set;
+            // drain_eventfd silently swallows WouldBlock, so this must not
+            // panic or log.
+            drain_eventfd(efd.as_raw_fd());
+        }
+
+        #[test]
+        fn dispatch_unwritten_read_returns_zeros() {
+            let (dir, client, reader) = spawn_volume();
+            let mut buf = [0xabu8; BLOCK as usize];
+            let res = dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK as u32, &mut buf);
+            assert_eq!(res, BLOCK as i32);
+            assert!(buf.iter().all(|&b| b == 0));
+            drop(reader);
+            client.shutdown();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn dispatch_write_then_read_roundtrip() {
+            let (dir, client, reader) = spawn_volume();
+            let data: Vec<u8> = (0..BLOCK as u16).map(|i| (i & 0xff) as u8).collect();
+            let mut wbuf = data.clone();
+            let res = dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK as u32, &mut wbuf);
+            assert_eq!(res, BLOCK as i32);
+
+            let mut rbuf = vec![0u8; BLOCK as usize];
+            let res = dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK as u32, &mut rbuf);
+            assert_eq!(res, BLOCK as i32);
+            assert_eq!(rbuf, data);
+
+            drop(reader);
+            client.shutdown();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn dispatch_flush_returns_zero() {
+            let (dir, client, reader) = spawn_volume();
+            let mut buf = [0u8; 0];
+            let res = dispatch(&reader, UBLK_IO_OP_FLUSH, 0, 0, &mut buf);
+            assert_eq!(res, 0);
+            drop(reader);
+            client.shutdown();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn dispatch_discard_clears_block() {
+            let (dir, client, reader) = spawn_volume();
+            let mut wbuf = vec![0xcdu8; BLOCK as usize];
+            assert_eq!(
+                dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK as u32, &mut wbuf),
+                BLOCK as i32
+            );
+
+            let mut dbuf = [0u8; 0];
+            let res = dispatch(&reader, UBLK_IO_OP_DISCARD, 0, BLOCK as u32, &mut dbuf);
+            assert_eq!(res, BLOCK as i32);
+
+            let mut rbuf = vec![0xffu8; BLOCK as usize];
+            assert_eq!(
+                dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK as u32, &mut rbuf),
+                BLOCK as i32
+            );
+            assert!(rbuf.iter().all(|&b| b == 0));
+
+            drop(reader);
+            client.shutdown();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn dispatch_write_zeroes_clears_block() {
+            let (dir, client, reader) = spawn_volume();
+            let mut wbuf = vec![0xcdu8; BLOCK as usize];
+            assert_eq!(
+                dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK as u32, &mut wbuf),
+                BLOCK as i32
+            );
+
+            let mut zbuf = [0u8; 0];
+            let res = dispatch(&reader, UBLK_IO_OP_WRITE_ZEROES, 0, BLOCK as u32, &mut zbuf);
+            assert_eq!(res, BLOCK as i32);
+
+            let mut rbuf = vec![0xffu8; BLOCK as usize];
+            assert_eq!(
+                dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK as u32, &mut rbuf),
+                BLOCK as i32
+            );
+            assert!(rbuf.iter().all(|&b| b == 0));
+
+            drop(reader);
+            client.shutdown();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn dispatch_unknown_op_returns_einval() {
+            let (dir, client, reader) = spawn_volume();
+            let mut buf = [0u8; BLOCK as usize];
+            // 0xff is not any of the UBLK_IO_OP_* values we handle.
+            let res = dispatch(&reader, 0xff, 0, BLOCK as u32, &mut buf);
+            assert_eq!(res, -libc::EINVAL);
+            drop(reader);
+            client.shutdown();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }
 
