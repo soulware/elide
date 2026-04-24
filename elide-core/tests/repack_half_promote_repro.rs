@@ -44,7 +44,6 @@ fn incompressible_block(seed: u8) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "pre-existing bug: repack-after-half-promote leaves sibling .idx/.body stale (see file header)"]
 fn repack_after_half_promote_preserves_oracle_across_crash() {
     let tmp = TempDir::new().unwrap();
     let fork_dir = tmp.path();

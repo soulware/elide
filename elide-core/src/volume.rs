@@ -2706,91 +2706,115 @@ impl Volume {
         Ok(())
     }
 
-    /// Hole-punch hash-dead DATA entries in `pending/<ulid>` in place, so
-    /// that deleted data never leaves the local host via S3 upload. Called
-    /// by the coordinator just before the segment is read for upload.
+    /// Drop hash-dead DATA entries from `pending/<ulid>`, so that deleted
+    /// data never leaves the local host via S3 upload. Called by the
+    /// coordinator just before the segment is read for upload.
     ///
     /// A DATA entry is **hash-dead** when:
     /// - Its LBA no longer maps to this hash (LBA-dead), and
     /// - No other live LBA in the volume references this hash.
     ///
     /// Such an entry has no readers (by construction) and its bytes are
-    /// safe to free. LBA-dead-but-hash-alive entries keep their bytes —
-    /// they're still referenced via dedup from a different LBA, and GC may
-    /// later repack them.
+    /// safe to drop. LBA-dead-but-hash-alive entries are kept — their
+    /// bytes still back a DedupRef or Delta source somewhere. DedupRef,
+    /// Zero, Inline, Canonical*, and Delta entries are kept untouched.
     ///
-    /// DedupRef, Zero, and Inline entries are skipped — they carry no
-    /// bytes in the body section.
+    /// Implementation: the pending segment is rewritten via tmp+rename
+    /// with the dropped entries removed from the index and their body
+    /// bytes excluded. Removing the entries (rather than only
+    /// hole-punching their bodies) is required for correctness: on
+    /// crash+rebuild, `extent_index::rebuild` walks segments in ULID
+    /// ascending order and takes the first insert per hash; a stale
+    /// hash-dead entry surviving in a lower-ULID .idx would shadow the
+    /// same hash's live body in a later segment.
     ///
-    /// The operation is **in place** on `pending/<ulid>`: no sidecar file,
-    /// no copy, no rename. Only the physical storage of dead DATA regions
-    /// is freed; the file size, `body_length`, index section, and
-    /// signature are all unchanged. `fallocate(FALLOC_FL_PUNCH_HOLE)` on
-    /// Linux; zero-write on other platforms.
+    /// Idempotent: a second call is a no-op because the first call
+    /// already dropped every hash-dead entry.
     ///
-    /// Idempotent: a second call is a no-op because the first call already
-    /// freed all hash-dead regions.
-    ///
-    /// Fast path: if no hash-dead DATA entries exist, the function opens
-    /// nothing and returns immediately.
+    /// Fast path: if no hash-dead DATA entries exist, the function
+    /// returns without rewriting.
     pub fn redact_segment(&mut self, ulid: Ulid) -> io::Result<()> {
         let ulid_str = ulid.to_string();
         let pending_dir = self.base_dir.join("pending");
         let seg_path = pending_dir.join(&ulid_str);
 
-        let (body_section_start, entries, _inputs) =
+        let (body_section_start, entries, inputs) =
             segment::read_and_verify_segment_index(&seg_path, &self.verifying_key)?;
 
-        // Cheap pre-scan: is there any DATA entry whose LBA no longer maps
-        // to its hash? If not, there's nothing for redact to do.
-        let has_lba_dead_data = entries.iter().any(|e| {
-            e.kind.is_data()
-                && e.stored_length > 0
-                && self.lbamap.hash_at(e.start_lba) != Some(e.hash)
-        });
-        if !has_lba_dead_data {
+        let live_hashes = self.lbamap.lba_referenced_hashes();
+        let is_hash_dead = |entry: &segment::SegmentEntry| -> bool {
+            if !entry.kind.is_data() || entry.stored_length == 0 {
+                return false;
+            }
+            let lba_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
+            !lba_live && !live_hashes.contains(&entry.hash)
+        };
+
+        if !entries.iter().any(&is_hash_dead) {
             return Ok(());
         }
 
-        // Any LBA-dead DATA entry whose hash is still referenced elsewhere
-        // must keep its bytes. Only hash-dead entries get punched.
-        let live_hashes = self.lbamap.lba_referenced_hashes();
+        // Partition: dropped hashes (for extent-index cleanup) vs
+        // surviving entries (rewritten into the new segment).
+        let (mut kept_entries, dropped_entries): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|e| !is_hash_dead(e));
+        let dropped_count = dropped_entries.len();
+        let dropped_bytes: u64 = dropped_entries.iter().map(|e| e.stored_length as u64).sum();
+        let dropped_hashes: Vec<blake3::Hash> =
+            dropped_entries.into_iter().map(|e| e.hash).collect();
 
-        let mut out = fs::OpenOptions::new().write(true).open(&seg_path)?;
-        let mut punched = 0usize;
-        let mut punched_bytes: u64 = 0;
-        let mut punched_hashes: Vec<blake3::Hash> = Vec::new();
-        for entry in &entries {
-            if !entry.kind.is_data() || entry.stored_length == 0 {
-                continue;
-            }
-            let lba_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
-            if lba_live || live_hashes.contains(&entry.hash) {
-                continue;
-            }
-            segment::punch_hole(
-                &mut out,
-                body_section_start + entry.stored_offset,
-                entry.stored_length as u64,
-            )?;
-            punched += 1;
-            punched_bytes += entry.stored_length as u64;
-            punched_hashes.push(entry.hash);
-        }
-        out.sync_data()?;
-        drop(out);
+        // Load live body bytes + inline section + delta body verbatim.
+        let inline_bytes = segment::read_inline_section(&seg_path)?;
+        segment::read_extent_bodies(
+            &seg_path,
+            body_section_start,
+            &mut kept_entries,
+            &inline_bytes,
+        )?;
+        let delta_body = segment::read_delta_body_section(&seg_path)?;
 
-        // Invalidate extent-index entries for every hash whose body we just
-        // destroyed, but only if the index still points at this segment. A
-        // later GC/repack may have moved the canonical location elsewhere,
-        // in which case another segment holds the real body.
+        // Rewrite via tmp+rename. `write_segment_full` reassigns
+        // `stored_offset` for surviving entries based on the compacted
+        // body layout, so new offsets may shift downward.
+        let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
+        // `create_new` inside write_segment_full requires no stale .tmp.
+        let _ = fs::remove_file(&tmp_path);
+        segment::write_segment_full(
+            &tmp_path,
+            &mut kept_entries,
+            &delta_body,
+            &inputs,
+            self.signer.as_ref(),
+        )?;
+        fs::rename(&tmp_path, &seg_path)?;
+        segment::fsync_dir(&seg_path)?;
+
+        // If a previous drain crashed mid-promote, this segment may
+        // have sibling `index/<u>.idx` + `cache/<u>.{body,present,delta}`
+        // files left over from the pre-redact layout. Those now point
+        // at stale body offsets — `promote_segment`'s idempotence guard
+        // would keep them. Remove them so the following promote rewrites
+        // them from the freshly-redacted pending body.
+        crate::actor::invalidate_promote_siblings(
+            &self.base_dir.join("index"),
+            &self.base_dir.join("cache"),
+            ulid,
+        )?;
+
+        // Body offsets and the file's inode contents both changed — any
+        // cached fd for this segment must be dropped.
+        self.evict_cached_segment(ulid);
+
+        // Clear extent-index entries for dropped hashes if they still
+        // point at this segment. A later GC/repack may have already
+        // moved the canonical location elsewhere; leave those alone.
         //
-        // Without this, the dedup write shortcut (`write_commit`) would see
-        // a surviving extent-index entry for the punched hash and emit a
-        // thin DedupRef whose canonical body is now zeros.
-        if !punched_hashes.is_empty() {
+        // Without this, the dedup write shortcut (`write_commit`) would
+        // see a surviving extent-index entry for the dropped hash and
+        // emit a thin DedupRef whose canonical body is gone.
+        if !dropped_hashes.is_empty() {
             let index = Arc::make_mut(&mut self.extent_index);
-            for hash in &punched_hashes {
+            for hash in &dropped_hashes {
                 if index.lookup(hash).is_some_and(|loc| loc.segment_id == ulid) {
                     index.remove(hash);
                 }
@@ -2798,7 +2822,7 @@ impl Volume {
         }
 
         log::info!(
-            "redact {ulid_str}: punched {punched} hash-dead DATA regions ({punched_bytes} bytes)"
+            "redact {ulid_str}: dropped {dropped_count} hash-dead DATA entries ({dropped_bytes} bytes)"
         );
 
         Ok(())
@@ -7015,11 +7039,12 @@ mod tests {
     }
 
     #[test]
-    fn redact_segment_punches_hash_dead_data_in_place() {
+    fn redact_segment_drops_hash_dead_data_entry() {
         // An entry whose LBA has been overwritten and whose hash is no longer
-        // referenced anywhere must have its body region hole-punched in place
-        // on pending/<ulid> so deleted data never leaves the host. No sidecar
-        // is produced; the original file is modified directly.
+        // referenced anywhere must be dropped from `pending/<ulid>`'s index
+        // entirely so deleted data never leaves the host. The surviving
+        // segment contains only live entries; the dropped entry's body is
+        // not in the file at all.
         // High-entropy data avoids compression below the inline threshold,
         // guaranteeing the entry lands in the body section (not inline).
         let base = keyed_temp_dir();
@@ -7040,39 +7065,38 @@ mod tests {
         let replacement: Vec<u8> = (0..8192).map(|i| (i * 23 + 41) as u8).collect();
         vol.write(0, &replacement).unwrap();
 
+        let secret_hash = blake3::hash(&secret);
+
         vol.redact_segment(seg_ulid).unwrap();
 
-        // No sidecar — the original pending file is modified in place.
+        // No tmp leftovers — rewrite is tmp+rename.
         let seg_path = base.join("pending").join(seg_ulid.to_string());
         assert!(seg_path.exists(), "pending/<ulid> must still exist");
         assert!(
             !base
                 .join("pending")
-                .join(format!("{}.materialized", seg_ulid))
+                .join(format!("{}.tmp", seg_ulid))
                 .exists(),
-            "no .materialized sidecar should be produced"
+            "no .tmp should survive redact"
         );
 
-        use std::io::{Read, Seek, SeekFrom};
-        let (bss, entries, _) =
+        let (_, entries, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
-        let dead_entry = entries
-            .iter()
-            .find(|e| e.kind.is_data() && e.start_lba == 0)
-            .expect("should have a Data entry at LBA 0");
-        assert!(dead_entry.stored_length > 0);
-
-        // The dead region must read as zeros. On Linux it is a true sparse
-        // hole; on macOS it is a zero-write fallback — both read as zeros.
-        let mut f = fs::File::open(&seg_path).unwrap();
-        let mut body = vec![0xFFu8; dead_entry.stored_length as usize];
-        f.seek(SeekFrom::Start(bss + dead_entry.stored_offset))
-            .unwrap();
-        f.read_exact(&mut body).unwrap();
         assert!(
-            body.iter().all(|b| *b == 0),
-            "dead entry body must be punched to zeros in place"
+            entries.iter().all(|e| e.hash != secret_hash),
+            "redact must drop the hash-dead entry from the index"
         );
+
+        // The dropped secret's high-entropy bytes must not be findable
+        // anywhere in the rewritten segment.
+        let bytes = fs::read(&seg_path).unwrap();
+        let needle: &[u8] = &secret[..64];
+        assert!(
+            bytes.windows(needle.len()).all(|w| w != needle),
+            "dropped entry body bytes must not remain in the segment file"
+        );
+
+        let _ = replacement; // replacement is never flushed; used only to update lbamap
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -7286,9 +7310,10 @@ mod tests {
     }
 
     #[test]
-    fn redact_punches_body_when_hash_fully_dead() {
+    fn redact_drops_entry_when_hash_fully_dead() {
         // When both the LBA and the hash are dead (no LBA references the hash),
-        // redact must punch the body to prevent uploading deleted data.
+        // redact must drop the entry from the index. The dropped hash's body
+        // bytes do not appear anywhere in the resulting pending file.
         // Uses high-entropy data that won't compress below INLINE_THRESHOLD.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
@@ -7306,26 +7331,24 @@ mod tests {
         let other: Vec<u8> = (0..8192).map(|i| (i * 11 + 3) as u8).collect();
         vol.write(0, &other).unwrap();
 
+        let dead_hash = blake3::hash(&data);
+
         vol.redact_segment(seg_ulid).unwrap();
 
-        use std::io::{Read as _, Seek as _, SeekFrom};
         let seg_path = base.join("pending").join(seg_ulid.to_string());
-        let (bss, entries, _) =
+        let (_, entries, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
-        let data_entry = entries
-            .iter()
-            .find(|e| e.kind.is_data() && e.start_lba == 0)
-            .expect("should have a Data entry at LBA 0");
-        assert!(data_entry.stored_length > 0);
-
-        let mut f = fs::File::open(&seg_path).unwrap();
-        let mut body = vec![0u8; data_entry.stored_length as usize];
-        f.seek(SeekFrom::Start(bss + data_entry.stored_offset))
-            .unwrap();
-        f.read_exact(&mut body).unwrap();
         assert!(
-            body.iter().all(|&b| b == 0),
-            "redact must punch body of fully-dead entry (both LBA and hash dead)"
+            entries.iter().all(|e| e.hash != dead_hash),
+            "redact must drop the fully-dead entry from the index"
+        );
+
+        // The original body bytes must not be findable in the segment file.
+        let bytes = fs::read(&seg_path).unwrap();
+        let needle: &[u8] = &data[..64];
+        assert!(
+            bytes.windows(needle.len()).all(|w| w != needle),
+            "dead entry body bytes must not remain in the segment file"
         );
 
         fs::remove_dir_all(base).unwrap();

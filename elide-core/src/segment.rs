@@ -1133,6 +1133,23 @@ pub fn read_inline_section(path: &Path) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Read the delta body section bytes from a full segment file.
+///
+/// Returns an empty `Vec` when `delta_length == 0`. Reads `delta_length`
+/// bytes starting at `body_section_start + body_length`.
+pub fn read_delta_body_section(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let layout = read_segment_layout(path)?;
+    if layout.delta_length == 0 {
+        return Ok(Vec::new());
+    }
+    let mut f = fs::File::open(path)?;
+    f.seek(SeekFrom::Start(layout.delta_body_offset()))?;
+    let mut buf = vec![0u8; layout.delta_length as usize];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
 fn parse_index_section(
     data: &[u8],
     entry_count: u32,
