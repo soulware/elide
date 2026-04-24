@@ -348,8 +348,8 @@ mod imp {
         loop {
             let iod = *q.get_iod(tag);
             let op = iod.op_flags & 0xff;
-            let off = (iod.start_sector << 9) as u64;
-            let bytes = (iod.nr_sectors << 9) as u32;
+            let off = iod.start_sector << 9;
+            let bytes = iod.nr_sectors << 9;
 
             let buf_slice = buf.as_slice();
             let res = if (bytes as usize) <= buf_slice.len() {
