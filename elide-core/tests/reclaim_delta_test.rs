@@ -235,26 +235,26 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
     // Finally: the reclaim output segment's sole entries in the index
     // section are Data (none), DedupRef (none) + Delta (both) — no
     // body_section bytes. Read the segment back and verify.
+    // `prepare_reclaim` flushes the WAL before minting the reclaim output
+    // ULID, so pending/ may also contain a flushed-WAL segment in addition
+    // to the fixture parent/delta and the reclaim output. The reclaim
+    // output is always the highest-ULID segment.
     let outcome_seg_ulid = {
-        let entries: Vec<_> = fs::read_dir(vol_dir.join("pending"))
+        let mut hits: Vec<Ulid> = fs::read_dir(vol_dir.join("pending"))
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                let n = e.file_name();
-                let s = n.to_string_lossy();
-                !s.ends_with(".tmp")
-                    && Ulid::from_string(&s).is_ok()
-                    && Ulid::from_string(&s).unwrap() != parent_ulid
-                    && Ulid::from_string(&s).unwrap() != delta_ulid
+            .filter_map(|e| {
+                let n = e.file_name().into_string().ok()?;
+                if n.contains('.') {
+                    return None;
+                }
+                Ulid::from_string(&n).ok()
             })
+            .filter(|u| *u != parent_ulid && *u != delta_ulid)
             .collect();
-        assert_eq!(
-            entries.len(),
-            1,
-            "exactly one reclaim-output pending segment, got {}: {entries:?}",
-            entries.len()
-        );
-        Ulid::from_string(&entries[0].file_name().to_string_lossy()).unwrap()
+        hits.sort();
+        hits.pop()
+            .expect("reclaim must have produced a pending segment")
     };
     let out_path = vol_dir.join(format!("pending/{outcome_seg_ulid}"));
     let vk = signing::load_verifying_key(&vol_dir, signing::VOLUME_PUB_FILE).unwrap();
