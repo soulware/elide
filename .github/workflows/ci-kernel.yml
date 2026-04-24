@@ -1,28 +1,21 @@
-name: ci-kernel (prototype)
+name: ci-kernel
 
-# Prototype of "Lane C" — kernel-feature integration tests that need ublk_drv
-# / nbd. GitHub's hosted runners deny modprobe for arbitrary modules on the
-# host kernel, so we boot a nested KVM VM with an Ubuntu 24.04 cloud image
-# and run the kernel-dependent tests inside the guest.
+# "Lane C" — kernel-feature integration tests that need ublk_drv / nbd.
+# GitHub's hosted runners deny modprobe for arbitrary modules on the host
+# kernel, so we boot a nested KVM VM with an Ubuntu 24.04 cloud image and
+# run the kernel-dependent tests inside the guest.
 #
 # Compilation happens on the *host* runner (fast CPUs, simple caching via
 # Swatinem/rust-cache). The guest only ever runs the pre-built test binaries,
 # reading them from the workspace via a 9p share. Host and guest are both
 # Ubuntu 24.04, so binaries are ABI-compatible.
-#
-# Status: prototype. Triggered manually or by applying the `ci:kernel` label.
 
 on:
   workflow_dispatch:
   pull_request:
-    types: [labeled, synchronize]
 
 jobs:
   kernel-tests:
-    if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'ci:kernel')
-      || (github.event_name == 'pull_request' && github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'ci:kernel'))
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -182,7 +175,7 @@ jobs:
           time $SSH "$GUEST_BIN nbd:: --nocapture"
           echo "::endgroup::"
           echo "::group::ublk tests"
-          time $SSH "$GUEST_BIN ublk:: --nocapture" || true
+          time $SSH "$GUEST_BIN ublk:: --nocapture"
           echo "::endgroup::"
 
       - name: Artifacts — prepare qemu serial log
