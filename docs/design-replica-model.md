@@ -6,10 +6,12 @@
   <name> --from <source>` — the two commands were already semantically
   identical, so this is a pure cleanup.
 - **Deferred:** Tightening `--from` to require an explicit
-  `<vol_ulid>/<snap_ulid>` pin, and introducing `volume materialize`, both
-  wait on TTL specifics for the object store (see below). The existing
-  `--force-snapshot` flag on `create --from` stays in place as the
-  interim mechanism for branching past the most recent snapshot.
+  `<vol_ulid>/<snap_ulid>` pin, and introducing `volume materialize`. These
+  previously waited on TTL specifics for the object store; that gap is now
+  resolved by application-managed pending-delete markers (see below), so
+  the blocker is implementation, not design. The existing `--force-snapshot`
+  flag on `create --from` stays in place as the interim mechanism for
+  branching past the most recent snapshot.
 
 ## The framing
 
@@ -112,40 +114,144 @@ The first two modes don't need TTL at all. TTL is only load-bearing when a
 replica is catching up from farther back than the upstream's current
 working set.
 
-## What TTL buys us and what is still open
+## What TTL buys us
 
 The object store's deletion semantics determine what happens in the race
 window between an upstream GC deleting a segment and a replica reading it.
-The clean model is:
+The required model is:
 
-- A deletion creates a tombstone with a bounded retention window T.
-- Within T, `GET key` still returns bytes.
-- After T, the object is unreachable.
-- Listings can optionally expose tombstones (for replica-side race
-  detection) or hide them (for upstream-side cleanliness).
+- A deletion creates a **pending-delete marker** with a bounded retention
+  window T.
+- Within T, `GET key` on the canonical object still returns bytes.
+- After T, a reaper physically deletes the canonical object (and the
+  marker); subsequent `GET`s 404.
+- Readers never consult the pending-delete prefix — they read canonical
+  keys only, and treat 404 as "past T, gone."
 
-This needs to be pinned down against Tigris's actual behaviour before the
-`materialize` implementation can commit to error semantics. Open questions:
+Rather than depending on any backend's native lifecycle, versioning, or
+snapshot features, Elide owns this mechanism directly in the coordinator.
+This keeps all backends symmetric (Tigris, R2, AWS S3, MinIO), avoids a
+per-backend retention API, and lets us define the semantics precisely —
+what T is, when it starts, how restart works. See *Pending-delete
+markers* below.
 
-- Is deletion soft (object-lock / lifecycle-delay) or hard (immediate),
-  configurable per-bucket?
-- Does `GET` on a soft-deleted object succeed, or does the replica need
-  version-aware reads? If version-aware, the manifest needs to record
-  version IDs.
-- What T is available, and is it configurable?
-- How does this interact with S3 versioning semantics on Tigris
-  specifically?
+`--force-snapshot` and its supporting machinery
+(`create_readonly_snapshot_now`, the attestation keypair, the
+`ParentRef.manifest_pubkey` field) stay in place until `materialize`
+lands; they're then retired.
 
-Until those are answered, `materialize` is a designed but unimplemented
-command. PR #98/#99's `--force-snapshot` flag and its supporting
-machinery (`create_readonly_snapshot_now`, the attestation keypair, the
-`ParentRef.manifest_pubkey` field) are left in place as the interim
-mechanism for the "branch past the latest snapshot" case. The intent is
-to retire all of that when `materialize` lands, but not before — the
-alternative is a shipped binary that can't cover the dead-host recovery
-case at all.
+## Proposed: application-managed pending-delete markers
 
-## Proposed: Tigris snapshots as the materialize read source
+Elide adds a `pending-delete/` prefix under each volume's S3 root. When
+the coordinator's handoff protocol would physically delete an S3 object
+(GC input deletion, per the coordinator-driven handoff described in
+`operations.md` and `architecture.md`), it instead writes a
+pending-delete marker and leaves the canonical object in place. A
+periodic reaper on the owning coordinator physically deletes targets
+(and their markers) whose retention window has elapsed.
+
+### Marker record
+
+Each marker is a small structured record containing:
+
+- **Target key(s)** — one marker may cover multiple related objects
+  retired together (e.g. a GC output's idx plus any auxiliary files).
+  Listed explicitly; no wildcard rules.
+- **Creation ULID** — both the marker's identifier and the zero point
+  for the reap deadline. ULID-derived time matches how handoff ordering
+  is already reasoned about; wall-clock is not load-bearing.
+- **Reason** — enum: `gc-input`, `superseded`, `volume-delete-tail`,
+  etc. For diagnostics and audit, not for reader logic.
+
+Marker path: `by_id/<vol_ulid>/pending-delete/<marker_ulid>`. Concrete
+format TBD (`.manifest` precedent argues for a readable form).
+
+### Reader semantics
+
+Readers never list or open `pending-delete/`. They read canonical paths
+and treat 404 as the authoritative "reaped past T" signal. Replicas
+that want to guarantee success discipline their own reads: capture the
+upstream's latest `.manifest` as the reference set, then complete all
+referenced segment fetches within T of that capture.
+
+### Rebuild semantics
+
+Unaffected. Local rebuild reads `index/*.idx` — pending-delete markers
+live in a different prefix and are invisible. If a from-S3 rebuild
+codepath is ever added, it can scan canonical `segments/` / `index/`
+keys and ignore `pending-delete/` entirely: any GC input still
+physically present during its retention window is correctly superseded
+by the higher-ULID GC output's `inputs` list, so its presence is
+harmless to the extent-index view.
+
+### Reaper
+
+Runs as a periodic task on the coordinator that owns the volume. Lists
+`pending-delete/`, decides which markers are past T using their
+creation ULID, then for each expired marker:
+
+1. Delete each listed target key (idempotent; a 404 is fine).
+2. Delete the marker.
+
+Order matters: targets first, marker second. A restarted reaper
+re-listing the prefix will see any marker whose targets are already
+gone, 404 its way through them, and finish by deleting the marker.
+Reversing the order would leave orphaned targets that no reaper ever
+revisits.
+
+The owning coordinator is the sole writer to its volume's S3 prefix;
+replicas reading from this bucket have no write authority and do not
+participate in reaping.
+
+### The invariant
+
+**Every physical delete of a canonical S3 object goes through a
+pending-delete marker.** This is what lets a replica trust "present now
+⟹ present for at least T." Breaking this invariant even once breaks
+the replica guarantee, silently.
+
+Whole-volume deletion is the one exception: when a volume is being
+torn down entirely, a replica following it has no contract that
+survives the teardown. Volume delete can drop the prefix directly.
+
+### Retention window T
+
+T is a deployment parameter, not a hardcoded constant. Sizing depends
+on:
+
+- Realistic time to copy the upstream's post-snapshot tail across a
+  WAN (seconds to hours depending on size).
+- Upstream snapshot cadence — a tight cadence shrinks the tail,
+  making T less load-bearing.
+- Storage cost of the retained canonical bytes during T.
+
+Default TBD. An operator knob exposed through the volume (or
+coordinator) config is the right shape; the coordinator applies it
+when minting markers and when reaping.
+
+### Naming clarification
+
+"Tombstone" already means something specific in Elide: a zero-entry GC
+output carrying only an `inputs` list, used to supersede fully-dead
+segments without producing new extents (see `operations.md`). These
+GC-layer tombstones are orthogonal to the S3-layer pending-delete
+markers described here. When a GC tombstone handoff retires its input
+segments, the coordinator mints a pending-delete marker for those
+inputs as part of the same handoff — two different mechanisms
+cooperating, not the same one named twice.
+
+## Rejected: Tigris snapshots as the materialize read source
+
+**Status: rejected (2026-04-24).** Tigris bucket snapshots retain full
+write history with no physical deletion — storage grows monotonically
+with write volume. That defeats Elide's GC / repack cost model: every
+superseded segment and every GC compaction input would accrue
+permanent storage cost, not bounded cost. The retention-window problem
+this section tried to solve is instead addressed by application-managed
+pending-delete markers (see *What TTL buys us* and *Proposed:
+application-managed pending-delete markers* above); those are
+backend-agnostic and don't bill for history in perpetuity. Kept below
+for historical context.
 
 Tigris exposes point-in-time bucket snapshots as a native primitive: a
 snapshot is O(1) to take, references (not copies) existing object
@@ -187,7 +293,14 @@ should keep snapshot-based and pin-based strategies behind the same
 interface so the choice is per-backend and doesn't leak into the
 materialize driver.
 
-## Proposed: historical materialize via Tigris versioning
+## Rejected: historical materialize via Tigris versioning
+
+**Status: rejected (2026-04-24).** This builds on the same always-on
+versioning that makes Tigris bucket snapshots unbounded — the same
+monotonic-growth cost problem at per-object granularity. PITR between
+Elide-level snapshots is a non-goal; if it ever becomes a goal, a
+longer retention window T on pending-delete markers gives a cost-bounded
+(if coarser) path. Kept below for historical context.
 
 Tigris's always-on per-object versioning plus explicit bucket snapshots
 give two tiers of time-travel read:
@@ -241,7 +354,7 @@ Open questions:
   it accepts today — a volume name, a bare volume ULID, or an explicit
   `<vol_ulid>/<snap_ulid>` pin — and `--force-snapshot` stays in place.
 
-**Pending (blocked on TTL resolution):**
+**Pending (blocked on implementation of pending-delete markers + `materialize`):**
 
 - Tighten `--from` to require the explicit `<vol_ulid>/<snap_ulid>` pin
   form. Bare name and bare ULID become errors. This change waits on
