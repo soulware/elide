@@ -149,7 +149,7 @@ jobs:
           SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
           SSH="ssh $SSH_OPTS ci@localhost"
           echo "::group::cargo build (workspace + ublk feature)"
-          time $SSH 'source ~/.cargo/env && cd /repo && cargo build --workspace --features ublk 2>&1 | tail -40'
+          time $SSH 'set -o pipefail; source ~/.cargo/env && export CARGO_TARGET_DIR=$HOME/target && cd /repo && cargo build --workspace --features ublk 2>&1 | tail -40'
           echo "::endgroup::"
 
       - name: Guest — kernel-lane tests
@@ -157,11 +157,15 @@ jobs:
           SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
           SSH="ssh $SSH_OPTS ci@localhost"
           echo "::group::cargo test nbd"
-          time $SSH 'source ~/.cargo/env && cd /repo && cargo test -p elide --lib nbd:: -- --nocapture 2>&1 | tail -100'
+          time $SSH 'set -o pipefail; source ~/.cargo/env && export CARGO_TARGET_DIR=$HOME/target && cd /repo && cargo test -p elide --lib nbd:: -- --nocapture 2>&1 | tail -100'
           echo "::endgroup::"
           echo "::group::cargo test ublk"
-          time $SSH 'source ~/.cargo/env && cd /repo && cargo test -p elide --lib --features ublk ublk:: -- --nocapture 2>&1 | tail -100' || true
+          time $SSH 'set -o pipefail; source ~/.cargo/env && export CARGO_TARGET_DIR=$HOME/target && cd /repo && cargo test -p elide --lib --features ublk ublk:: -- --nocapture 2>&1 | tail -100' || true
           echo "::endgroup::"
+
+      - name: Artifacts — prepare qemu serial log
+        if: always()
+        run: sudo chown "$USER:" qemu-serial.log || true
 
       - name: Artifacts — qemu serial log
         if: always()
