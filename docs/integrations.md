@@ -173,7 +173,8 @@ kernels; may be absent in stripped-down microVM images.
 **Target path (ublk):**
 
 ublk replaces `nbd-client` with a direct io_uring block device. No kernel
-module required beyond the ublk driver (Linux 5.19+). Elide spawns the ublk
+module required beyond the ublk driver (Linux 6.0+ for `CONFIG_BLK_DEV_UBLK`;
+6.5+ for unprivileged mode, which is what Elide uses). Elide spawns the ublk
 device itself; `/dev/ublkb0` appears as a regular block device. The in-VM case
 is identical to the host-side case — ublk work done for any target immediately
 benefits this one.
@@ -194,7 +195,7 @@ benefits this one.
 
 **Constraints:**
 
-- Requires `nbd` kernel module (today) or Linux 5.19+ (ublk target).
+- Requires `nbd` kernel module (NBD path) or Linux 6.5+ with `CONFIG_BLK_DEV_UBLK` (ublk path, unprivileged mode).
 - `CAP_SYS_ADMIN` is needed to attach the block device (`nbd-client` or ublk).
   This is standard for any block-device operation and is available to root
   inside most VMs.
@@ -230,7 +231,7 @@ Elide's fork model maps directly to CSI snapshots — `CreateSnapshot` is
 essentially free given the existing data model.
 
 The node plugin needs `CAP_SYS_ADMIN` and either the nbd kernel module or a
-Linux 5.19+ kernel for ublk.
+Linux 6.5+ kernel with `CONFIG_BLK_DEV_UBLK` for unprivileged ublk.
 
 ## Sequencing
 

@@ -45,7 +45,7 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 - **A (spike, step 1, landed).** libublk-rs synchronous handler — one `io_uring` per queue, single queue, `queue_depth = 1`, synchronous `VolumeClient` call inline. Acceptable for proving plumbing; no head-of-line concern at depth 1.
 - **B (step 2, landed).** `nr_hw_queues = min(num_cpus, 4)` at `queue_depth = 1`, synchronous handler per queue. Concurrency comes from multiple queue threads running independently with their own `VolumeReader`. A slow backend call on one queue (e.g. demand-fetch from S3) stalls only that queue, not its siblings.
-- **2b (follow-up, not landed).** Raise `queue_depth` > 1 with async per-tag handling. **A naive `smol::LocalExecutor` + `blocking::unblock` offload does not work** — it was tried and reverted. The problem: `blocking` wakes futures on its own thread pool, and that wake cannot interrupt `io_uring::submit_and_wait` on the queue thread, so every I/O waits for a kernel event or the ring's idle timeout. Observable symptom: `mount /dev/ublkb0` hangs for 20–30 s per metadata read. A correct implementation requires either (a) a uring-registered eventfd wired into the async waker path so blocking-pool completions interrupt the queue's uring wait, or (b) a worker-pool model where backend threads submit completion SQEs back into the queue's ring. Either route is a real piece of engineering — do it as its own PR with an fio-backed before/after.
+- **2b (landed).** `queue_depth = 64` with an async per-tag handler, backend work offloaded to a per-queue worker pool of 8 threads. The earlier `smol::LocalExecutor` + `blocking::unblock` attempt was reverted: `blocking` wakes futures on its own thread pool and that wake cannot interrupt `io_uring::submit_and_wait` on the queue thread, so every I/O waited for a kernel event or the ring's idle timeout (`mount /dev/ublkb0` hung 20–30 s per metadata read). The shipped design uses route (a): each tag's task submits a `PollAdd` SQE on the queue's own ring watching an eventfd; the worker writes the eventfd on completion, producing a CQE on the queue thread's ring so the smol executor wakes directly — no cross-thread waker stall.
 
 **Why not C (hand-rolled sync io_uring loop).** Considered and rejected:
 
@@ -73,10 +73,12 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 ## Crash recovery
 
-- `UBLK_F_USER_RECOVERY_REISSUE`: kernel holds in-flight I/O across a daemon restart and re-issues to the new daemon.
+- `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`: on unclean daemon exit the kernel transitions the device to QUIESCED instead of tearing it down, buffers in-flight I/O, and reissues it once a new daemon attaches.
 - Safe because WAL + lowest-ULID-wins already handles duplicate writes (same LBA, same or newer ULID — idempotent).
-- **Enabled by default.** Crash → coordinator respawns → kernel reissues → clean recovery. NBD cannot do this.
-- Paired with a crash-injection test in the rollout (step 3) to validate before we rely on it operationally.
+- **Enabled unconditionally.** Both flags are set on every `ADD_DEV`. There is no non-recoverable mode.
+- **Add vs recover decision.** `run_volume_ublk` inspects `/sys/class/ublk-char/ublkc<id>` at startup: entry present → `UBLK_DEV_F_RECOVER_DEV` + `START_USER_RECOVERY` + `run_target` (which finishes with `END_USER_RECOVERY`); absent → `UBLK_DEV_F_ADD_DEV`. Recovery requires `--ublk-id` to be set; without a pinned id we cannot identify the prior device.
+- **Clean vs crash exit.** SIGINT/SIGTERM/SIGHUP → signal handler `kill_dev` → queue threads exit → `run_target` returns → `del_dev`. Sysfs entry is gone, next serve performs ADD. Crash (SIGKILL, OOM, panic) → kernel observes uring_cmd fds closing → device QUIESCED, sysfs entry stays, next serve performs RECOVER.
+- **Crash-injection test follow-up.** A kernel-lane integration test that drives an actual write → SIGKILL → respawn → read-back loop is tracked as a follow-up; the plumbing lands here so step 5 (coordinator supervision) can rely on it.
 
 ## Dependencies & platform gating
 
@@ -97,8 +99,8 @@ First PR is the spike only. Later steps are sequenced separately, each on its ow
 
 1. **Spike (landed).** Port NBD handler logic to a `libublk` handler. Single queue, depth 1, no zero-copy, no recovery. Prove plumbing.
 2. **Multi-queue, depth 1 (landed).** `nr_hw_queues = min(num_cpus, 4)`, sync handler per queue. Lifecycle cleanup: signal-thread `kill_dev` + post-`run_target` `del_dev` so devices do not leak across serve restarts. `elide ublk list` / `elide ublk delete` diagnostic CLI.
-2b. **Depth > 1 (not started).** Correct async integration — uring-registered eventfd waker, or worker-pool returning via completion SQEs. fio before/after. See Async model above for the dead-end we avoided.
-3. **USER_RECOVERY_REISSUE.** Coordinator calls `START_USER_RECOVERY` on respawn. Crash-injection test. Enabled by default once validated.
+2b. **Depth > 1 (landed).** `queue_depth = 64` via uring-registered eventfd bridging from a per-queue worker pool. See Async model above for the dead-end we avoided.
+3. **USER_RECOVERY_REISSUE (landed).** Added with `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE` by default; sysfs-scan-based add/recover routing at serve startup; `START_USER_RECOVERY` issued before the recovery builder, `END_USER_RECOVERY` via libublk's internal `start_dev` path. Crash-injection integration test is a follow-up.
 4. **Zero-copy (optional, future).** `UBLK_F_AUTO_BUF_REG` on WRITE. Benchmark. Requires root — likely a separate "privileged" tier.
 5. **Config + CLI.** First-class `ublk` section in `volume.toml` (mutually exclusive with `nbd`), coordinator lifecycle integration, docs.
 

@@ -28,8 +28,19 @@
 //! thread's* ring, so the smol executor never sleeps past a ready waker.
 //! That was the defect in the earlier `blocking::unblock` attempt.
 //!
-//! `UBLK_F_USER_RECOVERY_REISSUE` and zero-copy (`UBLK_F_AUTO_BUF_REG`) are
-//! follow-up steps. See docs/design-ublk-transport.md.
+//! **Crash recovery.** The device is always added with
+//! `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`. If the daemon
+//! exits without a clean `STOP_DEV`/`DEL_DEV` (SIGKILL, OOM, panic), the
+//! kernel transitions the device to QUIESCED and holds in-flight I/O.
+//! Re-running `elide serve --ublk --ublk-id N` with the same id sees the
+//! existing `/sys/class/ublk-char/ublkcN` entry, issues
+//! `START_USER_RECOVERY`, reattaches fresh queue rings, and completes with
+//! `END_USER_RECOVERY` — the kernel then reissues buffered I/O to the new
+//! daemon. WAL idempotence + lowest-ULID-wins already handles duplicate
+//! writes, so reissue is safe.
+//!
+//! Zero-copy (`UBLK_F_AUTO_BUF_REG`) is a follow-up step. See
+//! docs/design-ublk-transport.md.
 //!
 //! On non-Linux targets, and on Linux without the `ublk` cargo feature, this
 //! module compiles to a stub that errors when the transport is invoked.
@@ -119,6 +130,30 @@ mod imp {
 
         let nr_queues = pick_nr_queues();
 
+        // Recover when the caller pinned a dev_id and the kernel still has
+        // the device registered. That is exactly the state the kernel leaves
+        // behind after an unclean daemon exit — the device is QUIESCED with
+        // in-flight I/O buffered. If no dev_id was supplied, or the device
+        // was cleanly removed, we can only ADD.
+        let recover_id = dev_id.filter(|id| ublk_device_exists(*id));
+        if let Some(id) = recover_id {
+            let simple = UblkCtrl::new_simple(id).map_err(|e| {
+                io::Error::other(format!("ublk open ctrl for recovery of dev {id}: {e}"))
+            })?;
+            simple
+                .start_user_recover()
+                .map_err(|e| io::Error::other(format!("ublk start_user_recover {id}: {e}")))?;
+            println!("[ublk dev {id}: resuming from QUIESCED — reissuing buffered I/O]");
+        }
+
+        let dev_lifecycle = if recover_id.is_some() {
+            UblkFlags::UBLK_DEV_F_RECOVER_DEV
+        } else {
+            UblkFlags::UBLK_DEV_F_ADD_DEV
+        };
+        let ctrl_flags = (libublk::sys::UBLK_F_USER_RECOVERY
+            | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64;
+
         let ctrl = Arc::new(
             UblkCtrlBuilder::default()
                 .name("elide")
@@ -126,7 +161,8 @@ mod imp {
                 .nr_queues(nr_queues)
                 .depth(QUEUE_DEPTH)
                 .io_buf_bytes(IO_BUF_BYTES)
-                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+                .ctrl_flags(ctrl_flags)
+                .dev_flags(dev_lifecycle)
                 .build()
                 .map_err(|e| io::Error::other(format!("ublk ctrl build: {e}")))?,
         );
@@ -568,6 +604,15 @@ mod imp {
         Ok(())
     }
 
+    /// True when `/sys/class/ublk-char/ublkc<id>` is present — i.e. the
+    /// kernel still has a device registered under that id. The entry
+    /// outlives an unclean daemon exit because the kernel transitions to
+    /// QUIESCED instead of tearing the device down, which is the signal
+    /// for USER_RECOVERY_REISSUE to kick in on respawn.
+    fn ublk_device_exists(id: i32) -> bool {
+        std::path::Path::new(&format!("/sys/class/ublk-char/ublkc{id}")).exists()
+    }
+
     /// Scan `/sys/class/ublk-char` for `ublkcN` entries and return the ids.
     /// This mirrors what `libublk::ctrl::UblkCtrl::for_each_dev_id` does
     /// internally, but without its `Fn + Clone + 'static` closure bound that
@@ -630,6 +675,15 @@ mod imp {
                 .unwrap();
             let reader = client.reader();
             (dir, client, reader)
+        }
+
+        #[test]
+        fn ublk_device_exists_false_for_absent_id() {
+            // i32::MAX is vastly larger than any real device id the kernel
+            // would allocate, so /sys/class/ublk-char/ublkc<MAX> never
+            // exists — gives us a robust "missing" case that works on any
+            // host, ublk loaded or not.
+            assert!(!ublk_device_exists(i32::MAX));
         }
 
         #[test]
