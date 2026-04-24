@@ -76,8 +76,14 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 - `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`: on unclean daemon exit the kernel transitions the device to QUIESCED instead of tearing it down, buffers in-flight I/O, and reissues it once a new daemon attaches.
 - Safe because WAL + lowest-ULID-wins already handles duplicate writes (same LBA, same or newer ULID — idempotent).
 - **Enabled unconditionally.** Both flags are set on every `ADD_DEV`. There is no non-recoverable mode.
-- **Add vs recover decision.** `run_volume_ublk` inspects `/sys/class/ublk-char/ublkc<id>` at startup: entry present → `UBLK_DEV_F_RECOVER_DEV` + `START_USER_RECOVERY` + `run_target` (which finishes with `END_USER_RECOVERY`); absent → `UBLK_DEV_F_ADD_DEV`. Recovery requires `--ublk-id` to be set; without a pinned id we cannot identify the prior device.
-- **Clean vs crash exit.** SIGINT/SIGTERM/SIGHUP → signal handler `kill_dev` → queue threads exit → `run_target` returns → `del_dev`. Sysfs entry is gone, next serve performs ADD. Crash (SIGKILL, OOM, panic) → kernel observes uring_cmd fds closing → device QUIESCED, sysfs entry stays, next serve performs RECOVER.
+- **Volume ↔ device binding.** The kernel's sysfs entry alone does not identify which volume a QUIESCED device belongs to. Reissuing one volume's buffered writes into a different volume's WAL is silent corruption, so every successful ADD records the kernel-assigned id in `<volume>/ublk.id` (per-host runtime state). On clean shutdown the file is removed; on crash it survives, which is how the next serve recognises the device as ours to recover.
+- **Startup routing.** Let `P = read(ublk.id)`, `C = --ublk-id`, `sysfs(id)` = `/sys/class/ublk-char/ublkc<id>` exists. Decision table:
+  - `P` and `C` both set and disagree → refuse with "volume bound to X, got Y".
+  - `target = P.or(C)`. If `target` is none → ADD, let the kernel auto-allocate.
+  - If `sysfs(target)` is false → ADD with `target` (rebind the slot).
+  - If `sysfs(target)` is true and `P == Some(target)` → `START_USER_RECOVERY` + `RECOVER_DEV`; `run_target` finishes with `END_USER_RECOVERY`.
+  - If `sysfs(target)` is true and `P` is none → refuse with "ublk dev N exists but this volume is not bound to it".
+- **Clean vs crash exit.** SIGINT/SIGTERM/SIGHUP → signal handler `kill_dev` → queue threads exit → `run_target` returns → `del_dev` → clear `ublk.id`. Sysfs entry and binding file are both gone, next serve performs ADD. Crash (SIGKILL, OOM, panic) → kernel observes uring_cmd fds closing → device QUIESCED, sysfs entry stays, `ublk.id` stays, next serve performs RECOVER against the bound id.
 - **Crash-injection test follow-up.** A kernel-lane integration test that drives an actual write → SIGKILL → respawn → read-back loop is tracked as a follow-up; the plumbing lands here so step 5 (coordinator supervision) can rely on it.
 
 ## Dependencies & platform gating

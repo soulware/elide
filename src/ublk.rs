@@ -39,6 +39,15 @@
 //! daemon. WAL idempotence + lowest-ULID-wins already handles duplicate
 //! writes, so reissue is safe.
 //!
+//! **Volume ↔ device binding.** A sysfs `ublkcN` entry on its own does not
+//! identify which volume the device was serving. To keep recovery from
+//! reissuing one volume's buffered writes into a *different* volume's WAL,
+//! each successful ADD records the kernel-assigned id in `<volume>/ublk.id`
+//! (per-host runtime state, cleared on clean shutdown). On subsequent
+//! serve: if `ublk.id` and `--ublk-id` disagree, refuse; if the sysfs
+//! entry exists for an id the volume never bound to, refuse; otherwise
+//! route to RECOVER (bound + sysfs present) or ADD (bound or absent).
+//!
 //! Zero-copy (`UBLK_F_AUTO_BUF_REG`) is a follow-up step. See
 //! docs/design-ublk-transport.md.
 //!
@@ -104,6 +113,55 @@ mod imp {
     const UBLK_IO_OP_DISCARD: u32 = libublk::sys::UBLK_IO_OP_DISCARD;
     const UBLK_IO_OP_WRITE_ZEROES: u32 = libublk::sys::UBLK_IO_OP_WRITE_ZEROES;
 
+    /// Startup decision: what the serve should do given the persisted
+    /// volume↔device binding, the CLI `--ublk-id`, and whether a kernel
+    /// sysfs entry already exists.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Route {
+        /// No prior binding that matches a live kernel device. ADD with
+        /// `target_id` (letting the kernel auto-allocate when `None`).
+        Add { target_id: Option<i32> },
+        /// Bound to an id whose sysfs entry is present — the kernel is
+        /// holding a QUIESCED device for us. RECOVER.
+        Recover { id: i32 },
+        /// `--ublk-id` contradicts what `ublk.id` says this volume is
+        /// bound to. Refusing is the whole point of persisting the binding.
+        BoundMismatch { persisted: i32, cli: i32 },
+        /// A sysfs entry exists for an id this volume never bound to —
+        /// probably another volume's QUIESCED device, or a stale entry
+        /// from a daemon that died before recording its binding. Reissuing
+        /// someone else's buffered writes into this volume's WAL would be
+        /// silent corruption; refuse.
+        ForeignDevice { id: i32 },
+    }
+
+    fn plan_route(
+        persisted: Option<i32>,
+        cli: Option<i32>,
+        sysfs_has: impl Fn(i32) -> bool,
+    ) -> Route {
+        if let (Some(p), Some(c)) = (persisted, cli)
+            && p != c
+        {
+            return Route::BoundMismatch {
+                persisted: p,
+                cli: c,
+            };
+        }
+        let Some(id) = persisted.or(cli) else {
+            return Route::Add { target_id: None };
+        };
+        if !sysfs_has(id) {
+            return Route::Add {
+                target_id: Some(id),
+            };
+        }
+        match persisted {
+            Some(p) if p == id => Route::Recover { id },
+            _ => Route::ForeignDevice { id },
+        }
+    }
+
     pub fn run_volume_ublk(
         dir: &Path,
         size_bytes: u64,
@@ -130,13 +188,26 @@ mod imp {
 
         let nr_queues = pick_nr_queues();
 
-        // Recover when the caller pinned a dev_id and the kernel still has
-        // the device registered. That is exactly the state the kernel leaves
-        // behind after an unclean daemon exit — the device is QUIESCED with
-        // in-flight I/O buffered. If no dev_id was supplied, or the device
-        // was cleanly removed, we can only ADD.
-        let recover_id = dev_id.filter(|id| ublk_device_exists(*id));
-        if let Some(id) = recover_id {
+        let persisted_id = read_ublk_id(dir)?;
+        let (target_id, recovering) = match plan_route(persisted_id, dev_id, ublk_device_exists) {
+            Route::Add { target_id } => (target_id, false),
+            Route::Recover { id } => (Some(id), true),
+            Route::BoundMismatch { persisted, cli } => {
+                return Err(io::Error::other(format!(
+                    "volume bound to ublk dev {persisted}; refusing to serve with --ublk-id {cli}. \
+                     pass --ublk-id {persisted}, or clear the binding after a clean shutdown"
+                )));
+            }
+            Route::ForeignDevice { id } => {
+                return Err(io::Error::other(format!(
+                    "ublk dev {id} exists but this volume is not bound to it. \
+                     run `elide ublk delete {id}` to remove the stale device, or use a different --ublk-id"
+                )));
+            }
+        };
+
+        if recovering {
+            let id = target_id.expect("Recover route always sets target_id");
             let simple = UblkCtrl::new_simple(id).map_err(|e| {
                 io::Error::other(format!("ublk open ctrl for recovery of dev {id}: {e}"))
             })?;
@@ -146,7 +217,7 @@ mod imp {
             println!("[ublk dev {id}: resuming from QUIESCED — reissuing buffered I/O]");
         }
 
-        let dev_lifecycle = if recover_id.is_some() {
+        let dev_lifecycle = if recovering {
             UblkFlags::UBLK_DEV_F_RECOVER_DEV
         } else {
             UblkFlags::UBLK_DEV_F_ADD_DEV
@@ -157,7 +228,7 @@ mod imp {
         let ctrl = Arc::new(
             UblkCtrlBuilder::default()
                 .name("elide")
-                .id(dev_id.unwrap_or(-1))
+                .id(target_id.unwrap_or(-1))
                 .nr_queues(nr_queues)
                 .depth(QUEUE_DEPTH)
                 .io_buf_bytes(IO_BUF_BYTES)
@@ -217,12 +288,20 @@ mod imp {
             }
         };
 
+        // `wait_hook` runs once the kernel has transitioned the device to
+        // LIVE. That is the earliest safe moment to record the binding:
+        // the kernel has committed to this id, and the file will only ever
+        // be deleted on a clean shutdown below (or by the operator). An
+        // unclean daemon exit leaves `ublk.id` in place, which is how the
+        // next serve recognises the device is ours to recover.
+        let binding_dir: std::path::PathBuf = dir.to_path_buf();
         let wait_hook = move |d_ctrl: &UblkCtrl| {
             d_ctrl.dump();
-            println!(
-                "[ublk device ready: /dev/ublkb{}]",
-                d_ctrl.dev_info().dev_id
-            );
+            let id = d_ctrl.dev_info().dev_id as i32;
+            if let Err(e) = write_ublk_id(&binding_dir, id) {
+                tracing::error!("ublk record binding for dev {id} failed: {e}");
+            }
+            println!("[ublk device ready: /dev/ublkb{id}]");
         };
 
         let run_result = ctrl
@@ -236,6 +315,14 @@ mod imp {
         // was already removed out-of-band.
         if let Err(e) = ctrl.del_dev() {
             tracing::debug!("ublk del_dev on shutdown returned: {e}");
+        }
+
+        // Clean shutdown: the device is gone, so the binding is no longer
+        // meaningful. Clear the file so a subsequent serve starts fresh.
+        // On crash this line is never reached — the file survives, which
+        // is exactly what recovery needs.
+        if let Err(e) = clear_ublk_id(dir) {
+            tracing::error!("ublk clear binding failed: {e}");
         }
 
         run_result?;
@@ -613,6 +700,47 @@ mod imp {
         std::path::Path::new(&format!("/sys/class/ublk-char/ublkc{id}")).exists()
     }
 
+    const UBLK_ID_FILE: &str = "ublk.id";
+
+    /// Read the persisted ublk dev id bound to this volume, if any. The
+    /// file is a single line of decimal digits followed by an optional
+    /// newline. A missing file means the volume is not currently bound to
+    /// any device (fresh serve, or prior clean shutdown).
+    fn read_ublk_id(dir: &Path) -> io::Result<Option<i32>> {
+        let path = dir.join(UBLK_ID_FILE);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let trimmed = raw.trim();
+        trimmed
+            .parse::<i32>()
+            .map(Some)
+            .map_err(|e| io::Error::other(format!("parse {}: {e}", path.display())))
+    }
+
+    /// Atomically record the bound dev id. tmp-then-rename so a crashed
+    /// write never leaves a half-written file that would fail the next
+    /// parse. fsync is not required: the file is runtime state, rebuilt
+    /// on every ADD; losing it across a power failure is harmless (next
+    /// serve just does a fresh ADD with whatever the caller requests).
+    fn write_ublk_id(dir: &Path, id: i32) -> io::Result<()> {
+        let tmp = dir.join(format!("{UBLK_ID_FILE}.tmp"));
+        let final_path = dir.join(UBLK_ID_FILE);
+        std::fs::write(&tmp, format!("{id}\n"))?;
+        std::fs::rename(&tmp, &final_path)
+    }
+
+    /// Drop the binding file. Absent file is fine — shutdown is idempotent.
+    fn clear_ublk_id(dir: &Path) -> io::Result<()> {
+        match std::fs::remove_file(dir.join(UBLK_ID_FILE)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Scan `/sys/class/ublk-char` for `ublkcN` entries and return the ids.
     /// This mirrors what `libublk::ctrl::UblkCtrl::for_each_dev_id` does
     /// internally, but without its `Fn + Clone + 'static` closure bound that
@@ -684,6 +812,108 @@ mod imp {
             // exists — gives us a robust "missing" case that works on any
             // host, ublk loaded or not.
             assert!(!ublk_device_exists(i32::MAX));
+        }
+
+        #[test]
+        fn plan_route_add_when_no_prior_state() {
+            assert_eq!(
+                plan_route(None, None, |_| false),
+                Route::Add { target_id: None }
+            );
+            assert_eq!(
+                plan_route(None, Some(3), |_| false),
+                Route::Add { target_id: Some(3) }
+            );
+        }
+
+        #[test]
+        fn plan_route_recover_on_bound_and_present() {
+            // Persisted == CLI and sysfs has it: canonical recover case
+            // after the daemon crashed.
+            assert_eq!(
+                plan_route(Some(5), Some(5), |id| id == 5),
+                Route::Recover { id: 5 }
+            );
+            // CLI omitted but persisted id is present: recover without
+            // needing the operator to re-type the id.
+            assert_eq!(
+                plan_route(Some(5), None, |id| id == 5),
+                Route::Recover { id: 5 }
+            );
+        }
+
+        #[test]
+        fn plan_route_add_rebinds_to_persisted_when_sysfs_gone() {
+            // ublk.id says "this volume is dev 5", but the kernel entry
+            // is gone (e.g. operator ran `elide ublk delete 5`). ADD with
+            // the persisted id so the volume reclaims its slot.
+            assert_eq!(
+                plan_route(Some(5), None, |_| false),
+                Route::Add { target_id: Some(5) }
+            );
+        }
+
+        #[test]
+        fn plan_route_bound_mismatch_refuses() {
+            // The whole point of persisting the binding.
+            assert_eq!(
+                plan_route(Some(5), Some(7), |_| true),
+                Route::BoundMismatch {
+                    persisted: 5,
+                    cli: 7,
+                }
+            );
+            // Mismatch still refuses even if the CLI id has no sysfs
+            // entry — catch the operator mistake early, don't let them
+            // silently drift off the persisted binding.
+            assert_eq!(
+                plan_route(Some(5), Some(7), |_| false),
+                Route::BoundMismatch {
+                    persisted: 5,
+                    cli: 7,
+                }
+            );
+        }
+
+        #[test]
+        fn plan_route_foreign_device_refuses() {
+            // No persisted binding, CLI says id 5, and ublkc5 already
+            // exists — probably another volume's QUIESCED device.
+            // Reissuing someone else's writes into this volume's WAL
+            // would corrupt; refuse.
+            assert_eq!(
+                plan_route(None, Some(5), |_| true),
+                Route::ForeignDevice { id: 5 }
+            );
+        }
+
+        #[test]
+        fn ublk_id_roundtrip() {
+            let dir = temp_dir();
+            assert_eq!(read_ublk_id(&dir).unwrap(), None);
+
+            write_ublk_id(&dir, 3).unwrap();
+            assert_eq!(read_ublk_id(&dir).unwrap(), Some(3));
+
+            // Overwrite atomically — later id wins.
+            write_ublk_id(&dir, 7).unwrap();
+            assert_eq!(read_ublk_id(&dir).unwrap(), Some(7));
+
+            clear_ublk_id(&dir).unwrap();
+            assert_eq!(read_ublk_id(&dir).unwrap(), None);
+
+            // Clearing an already-absent binding is idempotent.
+            clear_ublk_id(&dir).unwrap();
+
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn ublk_id_rejects_garbage() {
+            let dir = temp_dir();
+            std::fs::write(dir.join(UBLK_ID_FILE), "not-a-number").unwrap();
+            assert!(read_ublk_id(&dir).is_err());
+            std::fs::remove_dir_all(dir).unwrap();
         }
 
         #[test]
