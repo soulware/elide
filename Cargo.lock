@@ -1063,6 +1063,7 @@ dependencies = [
  "elide-fetch",
  "ext4-view",
  "futures",
+ "io-uring",
  "libc",
  "libublk",
  "lz4_flex",
