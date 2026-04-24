@@ -11,8 +11,14 @@ name: ci-kernel
 # Ubuntu 24.04, so binaries are ABI-compatible.
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-kernel-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   kernel-tests:
