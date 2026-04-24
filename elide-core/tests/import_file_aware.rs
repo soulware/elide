@@ -86,8 +86,7 @@ fn setup_volume_dir(tmp: &TempDir) -> (PathBuf, std::sync::Arc<dyn segment::Segm
     // Volume config must exist for import_image's size-field write.
     elide_core::config::VolumeConfig {
         name: Some("test".to_owned()),
-        size: None,
-        nbd: None,
+        ..Default::default()
     }
     .write(&vol_dir)
     .unwrap();

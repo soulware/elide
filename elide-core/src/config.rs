@@ -26,6 +26,8 @@ pub struct VolumeConfig {
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nbd: Option<NbdConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ublk: Option<UblkConfig>,
 }
 
 /// NBD server configuration within `volume.toml`.
@@ -40,6 +42,21 @@ pub struct NbdConfig {
     /// Unix socket path. Mutually exclusive with `port`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket: Option<PathBuf>,
+}
+
+/// ublk server configuration within `volume.toml`.
+///
+/// The presence of the `[ublk]` section means "serve this volume over ublk
+/// instead of NBD". The two transports are mutually exclusive per volume; a
+/// `volume.toml` containing both `[nbd]` and `[ublk]` is rejected at parse
+/// time.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct UblkConfig {
+    /// Explicit ublk device id (maps to `/dev/ublkb<id>`). If omitted the
+    /// kernel auto-allocates on first start; the chosen id is then persisted
+    /// in `<vol>/ublk.id` for crash recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_id: Option<i32>,
 }
 
 /// Resolved NBD endpoint for conflict detection.
@@ -97,12 +114,18 @@ impl VolumeConfig {
     /// not exist (e.g. volume predates the consolidated config).
     pub fn read(dir: &Path) -> io::Result<Self> {
         let path = dir.join(CONFIG_FILE);
-        match std::fs::read_to_string(&path) {
+        let cfg: Self = match std::fs::read_to_string(&path) {
             Ok(s) => toml::from_str(&s)
-                .map_err(|e| io::Error::other(format!("invalid {CONFIG_FILE}: {e}"))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
+                .map_err(|e| io::Error::other(format!("invalid {CONFIG_FILE}: {e}")))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e),
+        };
+        if cfg.nbd.is_some() && cfg.ublk.is_some() {
+            return Err(io::Error::other(format!(
+                "invalid {CONFIG_FILE}: [nbd] and [ublk] are mutually exclusive — pick one transport"
+            )));
         }
+        Ok(cfg)
     }
 
     /// Write `volume.toml` to `dir` atomically (via temp-file rename).
@@ -201,4 +224,164 @@ pub fn find_nbd_conflict(vol_dir: &Path, data_dir: &Path) -> io::Result<Option<N
     }
 
     Ok(None)
+}
+
+/// Details of a ublk dev-id conflict.
+pub struct UblkConflict {
+    pub dev_id: i32,
+    /// Human-readable name of the conflicting volume.
+    pub name: String,
+    pub dir: PathBuf,
+}
+
+/// Check whether `vol_dir`'s ublk dev-id collides with another active volume.
+///
+/// Only volumes that pin an explicit `dev_id` participate — auto-allocated
+/// devices (no `dev_id` in `[ublk]`) are resolved by the kernel at start time
+/// and cannot conflict ahead of spawn.
+///
+/// Returns `Ok(Some(conflict))` on conflict, `Ok(None)` otherwise.
+pub fn find_ublk_conflict(vol_dir: &Path, data_dir: &Path) -> io::Result<Option<UblkConflict>> {
+    let cfg = VolumeConfig::read(vol_dir)?;
+    let dev_id = match cfg.ublk.as_ref().and_then(|u| u.dev_id) {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
+    let canonical = std::fs::canonicalize(vol_dir)?;
+
+    let by_id = data_dir.join("by_id");
+    let entries = match std::fs::read_dir(&by_id) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    for entry in entries.flatten() {
+        let other = entry.path();
+        if !other.is_dir() {
+            continue;
+        }
+        if let Ok(other_canon) = std::fs::canonicalize(&other)
+            && other_canon == canonical
+        {
+            continue;
+        }
+        if other.join("volume.stopped").exists() || other.join("volume.readonly").exists() {
+            continue;
+        }
+        let other_cfg = match VolumeConfig::read(&other) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if let Some(other_ublk) = other_cfg.ublk.as_ref()
+            && other_ublk.dev_id == Some(dev_id)
+        {
+            let name = other_cfg.name.unwrap_or_else(|| {
+                other
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+            return Ok(Some(UblkConflict {
+                dev_id,
+                name,
+                dir: other,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_config(dir: &Path, contents: &str) {
+        std::fs::write(dir.join(CONFIG_FILE), contents).unwrap();
+    }
+
+    #[test]
+    fn ublk_section_with_no_keys_parses_as_enabled() {
+        let tmp = TempDir::new().unwrap();
+        write_config(tmp.path(), "[ublk]\n");
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        let ublk = cfg.ublk.expect("ublk section should be present");
+        assert_eq!(ublk.dev_id, None);
+    }
+
+    #[test]
+    fn ublk_dev_id_roundtrips() {
+        let tmp = TempDir::new().unwrap();
+        write_config(tmp.path(), "[ublk]\ndev_id = 7\n");
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        assert_eq!(cfg.ublk.unwrap().dev_id, Some(7));
+    }
+
+    #[test]
+    fn nbd_and_ublk_together_are_rejected() {
+        let tmp = TempDir::new().unwrap();
+        write_config(tmp.path(), "[nbd]\nport = 10809\n\n[ublk]\n");
+        let err = VolumeConfig::read(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "expected mutex error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn find_ublk_conflict_detects_dev_id_collision() {
+        let tmp = TempDir::new().unwrap();
+        let data = tmp.path();
+        let by_id = data.join("by_id");
+        std::fs::create_dir_all(&by_id).unwrap();
+
+        let a = by_id.join("01J000000000000000000000A0");
+        let b = by_id.join("01J000000000000000000000B0");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        write_config(&a, "name = \"alpha\"\n[ublk]\ndev_id = 3\n");
+        write_config(&b, "name = \"beta\"\n[ublk]\ndev_id = 3\n");
+
+        let conflict = find_ublk_conflict(&a, data).unwrap().expect("conflict");
+        assert_eq!(conflict.dev_id, 3);
+        assert_eq!(conflict.name, "beta");
+    }
+
+    #[test]
+    fn find_ublk_conflict_ignores_auto_alloc() {
+        let tmp = TempDir::new().unwrap();
+        let data = tmp.path();
+        let by_id = data.join("by_id");
+        std::fs::create_dir_all(&by_id).unwrap();
+
+        let a = by_id.join("01J000000000000000000000A0");
+        let b = by_id.join("01J000000000000000000000B0");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        write_config(&a, "[ublk]\n");
+        write_config(&b, "[ublk]\n");
+
+        assert!(find_ublk_conflict(&a, data).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_ublk_conflict_skips_stopped_volume() {
+        let tmp = TempDir::new().unwrap();
+        let data = tmp.path();
+        let by_id = data.join("by_id");
+        std::fs::create_dir_all(&by_id).unwrap();
+
+        let a = by_id.join("01J000000000000000000000A0");
+        let b = by_id.join("01J000000000000000000000B0");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        write_config(&a, "[ublk]\ndev_id = 4\n");
+        write_config(&b, "[ublk]\ndev_id = 4\n");
+        std::fs::write(b.join("volume.stopped"), "").unwrap();
+
+        assert!(find_ublk_conflict(&a, data).unwrap().is_none());
+    }
 }

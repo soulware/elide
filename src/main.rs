@@ -226,15 +226,23 @@ enum VolumeCommand {
         #[arg(long)]
         from: Option<String>,
         /// Port for the NBD server (exposes the volume over NBD on first start)
-        #[arg(long, conflicts_with = "nbd_socket")]
+        #[arg(long, conflicts_with_all = ["nbd_socket", "ublk", "ublk_id"])]
         nbd_port: Option<u16>,
         /// Address to bind the NBD server (default: 127.0.0.1)
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["ublk", "ublk_id"])]
         nbd_bind: Option<String>,
         /// Unix socket path for the NBD server. Omit the path to use the
         /// default (nbd.sock inside the volume directory).
-        #[arg(long, conflicts_with = "nbd_port", num_args = 0..=1, default_missing_value = "nbd.sock")]
+        #[arg(long, conflicts_with_all = ["nbd_port", "ublk", "ublk_id"], num_args = 0..=1, default_missing_value = "nbd.sock")]
         nbd_socket: Option<PathBuf>,
+        /// Serve this volume over ublk (Linux userspace block device) instead
+        /// of NBD. Mutually exclusive with the --nbd-* flags.
+        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket"])]
+        ublk: bool,
+        /// Pin an explicit ublk device id (maps to /dev/ublkb<id>). If
+        /// omitted, the kernel auto-allocates on first start. Implies --ublk.
+        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket"])]
+        ublk_id: Option<i32>,
         /// When forking: upload a new "now" snapshot marker to the remote
         /// store and branch from it, instead of relying on an existing
         /// snapshot. Required when the source has no snapshot (e.g.
@@ -249,19 +257,30 @@ enum VolumeCommand {
         /// Volume name
         name: String,
         /// Change the NBD server port (restarts the volume process)
-        #[arg(long, conflicts_with = "nbd_socket")]
+        #[arg(long, conflicts_with_all = ["nbd_socket", "ublk", "ublk_id", "no_ublk"])]
         nbd_port: Option<u16>,
         /// Change the NBD bind address (restarts the volume process)
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["ublk", "ublk_id", "no_ublk"])]
         nbd_bind: Option<String>,
         /// Set or change the Unix socket path for the NBD server. Omit the
         /// path to use the default (nbd.sock inside the volume directory).
         /// Restarts the volume process.
-        #[arg(long, conflicts_with = "nbd_port", num_args = 0..=1, default_missing_value = "nbd.sock")]
+        #[arg(long, conflicts_with_all = ["nbd_port", "ublk", "ublk_id", "no_ublk"], num_args = 0..=1, default_missing_value = "nbd.sock")]
         nbd_socket: Option<PathBuf>,
-        /// Disable NBD serving (removes nbd.port, nbd.bind, nbd.socket; restarts the volume process)
-        #[arg(long)]
+        /// Disable NBD serving (removes the [nbd] section; restarts the volume process)
+        #[arg(long, conflicts_with_all = ["ublk", "ublk_id", "no_ublk"])]
         no_nbd: bool,
+        /// Switch this volume to ublk transport (writes [ublk] section;
+        /// restarts the volume process). Mutually exclusive with the --nbd-* flags.
+        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket", "no_nbd"])]
+        ublk: bool,
+        /// Pin an explicit ublk device id. Implies --ublk. Restarts the
+        /// volume process.
+        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket", "no_nbd"])]
+        ublk_id: Option<i32>,
+        /// Disable ublk serving (removes the [ublk] section; restarts the volume process)
+        #[arg(long, conflicts_with_all = ["nbd_port", "nbd_bind", "nbd_socket", "no_nbd", "ublk", "ublk_id"])]
+        no_ublk: bool,
     },
 
     /// Show the running status of a volume
@@ -482,6 +501,8 @@ fn main() {
                 nbd_port,
                 nbd_bind,
                 nbd_socket,
+                ublk,
+                ublk_id,
                 force_snapshot,
             } => {
                 let nbd = if let Some(path) = nbd_socket {
@@ -496,6 +517,11 @@ fn main() {
                         ..Default::default()
                     })
                 };
+                let ublk_cfg = if ublk || ublk_id.is_some() {
+                    Some(elide_core::config::UblkConfig { dev_id: ublk_id })
+                } else {
+                    None
+                };
 
                 if let Some(from) = &from {
                     if let Err(e) = validate_volume_name(&name) {
@@ -509,13 +535,16 @@ fn main() {
                         &socket_path,
                         &by_id_dir,
                         nbd,
+                        ublk_cfg,
                         force_snapshot,
                     ) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
                 } else {
-                    if let Err(e) = create_volume(&args.data_dir, &name, size.as_deref(), nbd) {
+                    if let Err(e) =
+                        create_volume(&args.data_dir, &name, size.as_deref(), nbd, ublk_cfg)
+                    {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
@@ -533,9 +562,14 @@ fn main() {
                 nbd_bind,
                 nbd_socket,
                 no_nbd,
+                ublk,
+                ublk_id,
+                no_ublk,
             } => {
                 let vol_dir = resolve_volume_dir(&args.data_dir, &name);
-                if let Err(e) = update_volume(&vol_dir, nbd_port, nbd_bind, nbd_socket, no_nbd) {
+                if let Err(e) = update_volume(
+                    &vol_dir, nbd_port, nbd_bind, nbd_socket, no_nbd, ublk, ublk_id, no_ublk,
+                ) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -634,6 +668,7 @@ fn main() {
                                 &name,
                                 &socket_path,
                                 &by_id_dir,
+                                None,
                                 None,
                                 false,
                             )
@@ -989,6 +1024,7 @@ fn create_volume(
     name: &str,
     size: Option<&str>,
     nbd: Option<elide_core::config::NbdConfig>,
+    ublk: Option<elide_core::config::UblkConfig>,
 ) -> std::io::Result<()> {
     validate_volume_name(name)?;
     let size_str =
@@ -1028,6 +1064,7 @@ fn create_volume(
         name: Some(name.to_owned()),
         size: Some(bytes),
         nbd,
+        ublk,
     }
     .write(&vol_dir)?;
 
@@ -1061,6 +1098,7 @@ fn create_volume(
 /// `force_snapshot` (readonly sources only): upload a new "now" snapshot
 /// marker to the remote store and branch from it. Needed when the source
 /// has no existing snapshot. Conflicts with an explicit pin.
+#[allow(clippy::too_many_arguments)]
 fn create_fork(
     data_dir: &Path,
     fork_name: &str,
@@ -1068,6 +1106,7 @@ fn create_fork(
     socket_path: &Path,
     by_id_dir: &Path,
     nbd: Option<elide_core::config::NbdConfig>,
+    ublk: Option<elide_core::config::UblkConfig>,
     force_snapshot: bool,
 ) -> std::io::Result<()> {
     validate_volume_name(fork_name)?;
@@ -1261,6 +1300,7 @@ fn create_fork(
         name: Some(fork_name.to_owned()),
         size: Some(size),
         nbd,
+        ublk,
     }
     .write(&new_fork_dir))
     {
@@ -1634,15 +1674,20 @@ fn create_readonly_snapshot_now(
 
 /// Update configuration for a volume and restart it if running.
 ///
-/// Writes or removes nbd.port / nbd.bind / nbd.socket, then sends `shutdown`
-/// to the volume's control socket. The supervisor restarts the process, picking
-/// up the new config.
+/// Writes or removes the [nbd]/[ublk] sections, then sends `shutdown` to the
+/// volume's control socket. The supervisor restarts the process, picking up
+/// the new config. NBD and ublk are mutually exclusive: switching transports
+/// also clears the section for the other transport.
+#[allow(clippy::too_many_arguments)]
 fn update_volume(
     vol_dir: &Path,
     nbd_port: Option<u16>,
     nbd_bind: Option<String>,
     nbd_socket: Option<PathBuf>,
     no_nbd: bool,
+    ublk: bool,
+    ublk_id: Option<i32>,
+    no_ublk: bool,
 ) -> std::io::Result<()> {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixStream;
@@ -1655,6 +1700,7 @@ fn update_volume(
             socket: Some(path),
             ..Default::default()
         });
+        cfg.ublk = None;
     } else if nbd_port.is_some() || nbd_bind.is_some() {
         let existing = cfg.nbd.get_or_insert_with(Default::default);
         if let Some(port) = nbd_port {
@@ -1664,7 +1710,16 @@ fn update_volume(
         if let Some(bind) = nbd_bind {
             existing.bind = Some(bind);
         }
+        cfg.ublk = None;
     }
+
+    if no_ublk {
+        cfg.ublk = None;
+    } else if ublk || ublk_id.is_some() {
+        cfg.ublk = Some(elide_core::config::UblkConfig { dev_id: ublk_id });
+        cfg.nbd = None;
+    }
+
     cfg.write(vol_dir)?;
 
     // Restart the volume process so it picks up the new config.
@@ -2059,7 +2114,7 @@ fn pull_one_readonly(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned()),
         size: Some(size as u64),
-        nbd: None,
+        ..Default::default()
     }
     .write(&vol_dir)?;
     std::fs::write(vol_dir.join("volume.readonly"), "")?;

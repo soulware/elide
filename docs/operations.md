@@ -125,6 +125,56 @@ An imported volume is readonly. Two ways to handle writes (not mutually exclusiv
 
 `discover_volumes` skips ULID directories with neither `pending/` nor `index/`. Deleting both entirely hides the volume — fix with `mkdir <vol_dir>/index`.
 
+## Transports: NBD vs ublk
+
+A writable volume is served on exactly one host-visible transport: NBD (TCP or
+Unix socket) or ublk (Linux userspace block device). The two are mutually
+exclusive per volume — `volume.toml` containing both `[nbd]` and `[ublk]` is
+rejected at parse time.
+
+Choose by adding the corresponding section to `volume.toml`, or — easier — by
+passing the relevant flag to `volume create` / `volume update`.
+
+### NBD
+
+```toml
+[nbd]
+port = 10809          # or socket = "nbd.sock"
+bind = "127.0.0.1"
+```
+
+NBD works on Linux and macOS; ideal for guests inside a VM and for remote
+access where ublk is not an option.
+
+### ublk
+
+```toml
+[ublk]
+# dev_id = 7          # optional; omit to let the kernel auto-allocate
+```
+
+Linux-only. Preferred for host-local block access — 2–4× IOPS over
+`nbd-client` on loopback, lower tail latency, real `blk-mq` semantics
+(partitions, `blkdiscard`, `fstrim`, `O_DIRECT`).
+
+Prereqs:
+
+- Kernel 6.0+ with `CONFIG_BLK_DEV_UBLK` (Fedora 37+, Debian 12+,
+  Ubuntu 22.10+, RHEL 9+); load with `sudo modprobe ublk_drv`.
+- Kernel 6.5+ for unprivileged operation (`UBLK_F_UNPRIVILEGED_DEV`);
+  otherwise `elide serve-volume` must run as root.
+- udev rules granting your user access to `/dev/ublk-control` and
+  `/dev/ublkc<N>` for unprivileged use.
+
+Crash recovery is enabled unconditionally
+(`UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`). The kernel-assigned
+device id is persisted in `<vol>/ublk.id` so the next supervisor restart
+re-attaches to the same `/dev/ublkb<N>` and reissues buffered I/O — see
+`docs/design-ublk-transport.md` for the full lifecycle.
+
+Diagnostic CLI: `elide ublk list` and `elide ublk delete <id>` /
+`elide ublk delete --all` for inspecting and tearing down stray devices.
+
 ## Diagnostic tools
 
 Two read-only commands inspect raw on-disk formats:
