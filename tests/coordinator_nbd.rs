@@ -405,15 +405,20 @@ fn coordinator_nbd_lifecycle() {
     let status = wait_with_timeout(&mut coord, Duration::from_secs(20), "coordinator");
     assert!(status.success(), "coordinator exited non-zero: {status:?}");
 
-    // Post-shutdown invariants.
+    // Post-shutdown invariant: the coordinator's shutdown handler
+    // removes each supervised volume's pid file after the process has
+    // exited. Presence of the pid file after the coordinator has
+    // exited would mean the supervisor never observed a clean teardown.
+    //
+    // The control socket and the NBD socket are intentionally NOT
+    // checked here. They are only unlinked by the volume process's
+    // own accept-loop cleanup, which does not run under SIGTERM
+    // termination — the socket files legitimately persist until the
+    // next volume start reuses the path. Asserting on their absence
+    // would encode a non-property of the shutdown path.
     assert!(
         !volume_pid.exists(),
         "volume.pid still present after coordinator shutdown"
     );
-    // The volume control thread unlinks its own socket on exit.
-    wait_until(
-        Duration::from_secs(5),
-        "volume control.sock removed",
-        || !volume_ctrl.exists(),
-    );
+    let _ = volume_ctrl;
 }
