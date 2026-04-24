@@ -13,11 +13,14 @@ name: ci-kernel (prototype)
 on:
   workflow_dispatch:
   pull_request:
-    types: [labeled]
+    types: [labeled, synchronize]
 
 jobs:
   kernel-tests:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.label.name == 'ci:kernel')
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'ci:kernel')
+      || (github.event_name == 'pull_request' && github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'ci:kernel'))
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -84,7 +87,7 @@ jobs:
             -cpu host \
             -smp 4 \
             -m 8192 \
-            -nographic \
+            -display none \
             -serial file:qemu-serial.log \
             -drive file=vm.qcow2,if=virtio,format=qcow2 \
             -drive file=seed.img,if=virtio,format=raw \
