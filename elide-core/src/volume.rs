@@ -25,7 +25,6 @@
 //   replays entries into the LBA map, extent index, and pending_entries.
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -131,7 +130,7 @@ const SEGMENT_INDEX_CACHE_CAPACITY: usize = 64;
 /// The on-disk layout of a cached segment file, which determines how body
 /// offsets are interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SegmentLayout {
+pub(crate) enum SegmentLayout {
     /// A full segment file (wal/, pending/, gc/). Body data starts at
     /// `body_section_start` — callers must add it to body-relative offsets.
     Full,
@@ -180,7 +179,10 @@ pub(crate) struct FileCache {
 struct FileCacheSlot {
     segment_id: Ulid,
     layout: SegmentLayout,
-    file: fs::File,
+    /// `Arc<File>` so a cache hit can return the handle by clone and release
+    /// the mutex before issuing I/O. `pread(2)` is thread-safe and touches no
+    /// per-file state, so concurrent reads on the same segment are fine.
+    file: Arc<fs::File>,
     referenced: bool,
 }
 
@@ -198,20 +200,21 @@ impl FileCache {
     }
 
     /// Look up a cached file handle by segment id.
-    /// On hit, sets the referenced bit and returns the layout and file handle.
-    fn get(&mut self, segment_id: Ulid) -> Option<(SegmentLayout, &mut fs::File)> {
+    /// On hit, sets the referenced bit and returns the layout and an `Arc` clone
+    /// of the file handle, so the caller can release the lock before doing I/O.
+    pub(crate) fn get(&mut self, segment_id: Ulid) -> Option<(SegmentLayout, Arc<fs::File>)> {
         let slot = self
             .slots
             .iter_mut()
             .flatten()
             .find(|s| s.segment_id == segment_id)?;
         slot.referenced = true;
-        Some((slot.layout, &mut slot.file))
+        Some((slot.layout, Arc::clone(&slot.file)))
     }
 
     /// Insert a file handle. If the segment is already cached, replaces it
     /// in-place. Otherwise, uses the CLOCK algorithm to find a slot to evict.
-    fn insert(&mut self, segment_id: Ulid, layout: SegmentLayout, file: fs::File) {
+    pub(crate) fn insert(&mut self, segment_id: Ulid, layout: SegmentLayout, file: Arc<fs::File>) {
         // Replace in-place if already present.
         for slot in self.slots.iter_mut() {
             if slot.as_ref().is_some_and(|s| s.segment_id == segment_id) {
@@ -359,9 +362,11 @@ pub struct Volume {
     ///
     /// Retains recently-opened segment files across `read` calls so that
     /// reads hitting the same segments avoid repeated `open` syscalls.
-    /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
-    /// the cache to be updated internally.
-    file_cache: RefCell<FileCache>,
+    /// `Mutex` lets reads stay logically `&self` and — more importantly — lets
+    /// transports share a single cache across threads. Cached entries are
+    /// `Arc<File>`, so the mutex is held only for lookup/insert; the `pread(2)`
+    /// that follows happens on the cloned `Arc<File>` with the lock released.
+    file_cache: std::sync::Mutex<FileCache>,
     /// Signer for segment promotion. Every segment written by this volume
     /// (at WAL promotion and compaction) is signed with the fork's private key.
     /// See `segment::SegmentSigner`.
@@ -1293,7 +1298,7 @@ impl Volume {
             pending_entries,
             has_new_segments,
             last_segment_ulid,
-            file_cache: RefCell::new(FileCache::default()),
+            file_cache: std::sync::Mutex::new(FileCache::default()),
             signer,
             verifying_key,
             fetcher: None,
@@ -1988,7 +1993,10 @@ impl Volume {
                 .and_then(|s| s.to_str())
                 .and_then(|s| Ulid::from_string(s).ok());
             if let Some(ulid) = seg_ulid_opt {
-                self.file_cache.borrow_mut().evict(ulid);
+                self.file_cache
+                    .lock()
+                    .expect("file cache poisoned")
+                    .evict(ulid);
             }
             if seg_ulid_opt == new_ulid {
                 // Already replaced atomically by the worker's rename;
@@ -2832,7 +2840,10 @@ impl Volume {
     /// applies `body_section_start` from the new extent index entry against
     /// the old file layout, seeking past the body section.
     fn evict_cached_segment(&self, segment_id: Ulid) {
-        self.file_cache.borrow_mut().evict(segment_id);
+        self.file_cache
+            .lock()
+            .expect("file cache poisoned")
+            .evict(segment_id);
     }
 
     /// Flush the current WAL to a fresh `pending/<segment_ulid>` and leave
@@ -3741,11 +3752,11 @@ pub(crate) fn read_extents(
     lba_count: u32,
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
-    file_cache: &RefCell<FileCache>,
+    file_cache: &std::sync::Mutex<FileCache>,
     find_segment: impl Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
     open_delta_body: impl Fn(Ulid) -> io::Result<fs::File>,
 ) -> io::Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::FileExt;
 
     let mut out = vec![0u8; lba_count as usize * 4096];
     for er in lbamap.extents_in_range(lba, lba + lba_count as u64) {
@@ -3817,15 +3828,17 @@ pub(crate) fn read_extents(
         // For cached entries, always call find_segment to check the .present
         // bitset — the .body file may exist but the specific entry may not
         // yet be fetched.
-        let mut cache = file_cache.borrow_mut();
-        if matches!(body_source, BodySource::Cached(_)) || cache.get(segment_id).is_none() {
-            let path = find_segment(segment_id, body_section_start, body_source)?;
-            let layout = SegmentLayout::from_path(&path);
-            cache.insert(segment_id, layout, fs::File::open(&path)?);
-        }
-        let (layout, f) = cache
-            .get(segment_id)
-            .expect("entry was just inserted or found");
+        let (layout, f) = {
+            let mut cache = file_cache.lock().expect("file cache poisoned");
+            if matches!(body_source, BodySource::Cached(_)) || cache.get(segment_id).is_none() {
+                let path = find_segment(segment_id, body_section_start, body_source)?;
+                let layout = SegmentLayout::from_path(&path);
+                cache.insert(segment_id, layout, Arc::new(fs::File::open(&path)?));
+            }
+            cache
+                .get(segment_id)
+                .expect("entry was just inserted or found")
+        };
 
         // body_offset is always body-relative (= stored_offset from the segment index).
         // For full segment files we must add body_section_start to get the file offset.
@@ -3839,9 +3852,8 @@ pub(crate) fn read_extents(
         let out_slice = &mut out[out_start..out_start + block_count * 4096];
 
         if compressed {
-            f.seek(SeekFrom::Start(file_body_offset))?;
             let mut compressed_buf = vec![0u8; body_length as usize];
-            f.read_exact(&mut compressed_buf)?;
+            f.read_exact_at(&mut compressed_buf, file_body_offset)?;
             let decompressed =
                 lz4_flex::decompress_size_prepended(&compressed_buf).map_err(|e| {
                     log::error!(
@@ -3868,10 +3880,8 @@ pub(crate) fn read_extents(
             })?;
             out_slice.copy_from_slice(src_slice);
         } else {
-            f.seek(SeekFrom::Start(
-                file_body_offset + er.payload_block_offset as u64 * 4096,
-            ))?;
-            if let Err(e) = f.read_exact(out_slice) {
+            let read_off = file_body_offset + er.payload_block_offset as u64 * 4096;
+            if let Err(e) = f.read_exact_at(out_slice, read_off) {
                 let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
                 log::error!(
                     "read_extents failed: lba={} segment={} layout={:?} \
@@ -3916,12 +3926,13 @@ fn try_read_delta_extent(
     er: &lbamap::ExtentRead,
     lba: u64,
     extent_index: &extentindex::ExtentIndex,
-    file_cache: &RefCell<FileCache>,
+    file_cache: &std::sync::Mutex<FileCache>,
     find_segment: &dyn Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
     open_delta_body: &dyn Fn(Ulid) -> io::Result<fs::File>,
     out: &mut [u8],
 ) -> io::Result<bool> {
     use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::FileExt;
 
     let Some(delta_loc) = extent_index.lookup_delta(&er.hash) else {
         return Ok(false);
@@ -3957,28 +3968,33 @@ fn try_read_delta_extent(
             idata.to_vec()
         }
     } else {
-        let mut cache = file_cache.borrow_mut();
-        if matches!(source_loc.body_source, BodySource::Cached(_))
-            || cache.get(source_loc.segment_id).is_none()
-        {
-            let path = find_segment(
-                source_loc.segment_id,
-                source_loc.body_section_start,
-                source_loc.body_source,
-            )?;
-            let layout = SegmentLayout::from_path(&path);
-            cache.insert(source_loc.segment_id, layout, fs::File::open(&path)?);
-        }
-        let (layout, f) = cache
-            .get(source_loc.segment_id)
-            .expect("source just inserted or found");
+        let (layout, f) = {
+            let mut cache = file_cache.lock().expect("file cache poisoned");
+            if matches!(source_loc.body_source, BodySource::Cached(_))
+                || cache.get(source_loc.segment_id).is_none()
+            {
+                let path = find_segment(
+                    source_loc.segment_id,
+                    source_loc.body_section_start,
+                    source_loc.body_source,
+                )?;
+                let layout = SegmentLayout::from_path(&path);
+                cache.insert(
+                    source_loc.segment_id,
+                    layout,
+                    Arc::new(fs::File::open(&path)?),
+                );
+            }
+            cache
+                .get(source_loc.segment_id)
+                .expect("source just inserted or found")
+        };
         let file_body_offset = match layout {
             SegmentLayout::BodyOnly => source_loc.body_offset,
             SegmentLayout::Full => source_loc.body_section_start + source_loc.body_offset,
         };
-        f.seek(SeekFrom::Start(file_body_offset))?;
         let mut buf = vec![0u8; source_loc.body_length as usize];
-        f.read_exact(&mut buf)?;
+        f.read_exact_at(&mut buf, file_body_offset)?;
         if source_loc.compressed {
             lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?
         } else {
@@ -4000,20 +4016,19 @@ fn try_read_delta_extent(
             body_section_start: delta_bss,
             body_length: delta_body_length,
         } => {
-            let mut cache = file_cache.borrow_mut();
-            if cache.get(delta_segment_id).is_none() {
-                let path = find_segment(delta_segment_id, delta_bss, BodySource::Local)?;
-                let layout = SegmentLayout::from_path(&path);
-                cache.insert(delta_segment_id, layout, fs::File::open(&path)?);
-            }
-            let (_layout, f) = cache
-                .get(delta_segment_id)
-                .expect("delta segment just inserted or found");
-            f.seek(SeekFrom::Start(
-                delta_bss + delta_body_length + opt.delta_offset,
-            ))?;
+            let (_layout, f) = {
+                let mut cache = file_cache.lock().expect("file cache poisoned");
+                if cache.get(delta_segment_id).is_none() {
+                    let path = find_segment(delta_segment_id, delta_bss, BodySource::Local)?;
+                    let layout = SegmentLayout::from_path(&path);
+                    cache.insert(delta_segment_id, layout, Arc::new(fs::File::open(&path)?));
+                }
+                cache
+                    .get(delta_segment_id)
+                    .expect("delta segment just inserted or found")
+            };
             let mut buf = vec![0u8; opt.delta_length as usize];
-            f.read_exact(&mut buf)?;
+            f.read_exact_at(&mut buf, delta_bss + delta_body_length + opt.delta_offset)?;
             buf
         }
         extentindex::DeltaBodySource::Cached => {
@@ -4301,7 +4316,7 @@ pub struct ReadonlyVolume {
     ancestor_layers: Vec<AncestorLayer>,
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
-    file_cache: RefCell<FileCache>,
+    file_cache: std::sync::Mutex<FileCache>,
     fetcher: Option<BoxFetcher>,
 }
 
@@ -4318,7 +4333,7 @@ impl ReadonlyVolume {
             ancestor_layers,
             lbamap,
             extent_index,
-            file_cache: RefCell::new(FileCache::default()),
+            file_cache: std::sync::Mutex::new(FileCache::default()),
             fetcher: None,
         })
     }
@@ -9253,8 +9268,8 @@ mod tests {
 
     // --- FileCache (CLOCK) tests ---
 
-    fn dummy_file() -> fs::File {
-        fs::File::open("/dev/null").unwrap()
+    fn dummy_file() -> Arc<fs::File> {
+        Arc::new(fs::File::open("/dev/null").unwrap())
     }
 
     fn ulid(n: u128) -> Ulid {

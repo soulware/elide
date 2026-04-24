@@ -46,9 +46,17 @@ tempfile = "3"
 # src/ublk.rs compiles to a stub that errors if the transport is requested.
 # Default is off while the spike lands; we will flip to default-on for Linux
 # once the integration is exercised.
+#
+# `smol` is libublk's async runtime (transitive via libublk 0.4 but pulled in
+# directly so src/ublk.rs can spawn its own `LocalExecutor` and drive the
+# queue). `blocking` provides `unblock` — thread-pool offload for the
+# synchronous `VolumeClient` calls invoked from inside each queue's smol
+# executor.
 [features]
 default = []
-ublk = ["dep:libublk"]
+ublk = ["dep:libublk", "dep:smol", "dep:blocking"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libublk = { version = "0.4", optional = true }
+smol = { version = "2", optional = true }
+blocking = { version = "1", optional = true }

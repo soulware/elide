@@ -1021,7 +1021,7 @@ fn reply_with_data(writer: &WriterMutex, error: u32, handle: u64, data: &[u8]) -
 
 fn run_write_queue(
     rx: crossbeam_channel::Receiver<WriteJob>,
-    volume: elide_core::actor::VolumeReader,
+    volume: elide_core::actor::VolumeClient,
     writer: WriterMutex,
 ) -> io::Result<()> {
     while let Ok(job) = rx.recv() {
@@ -1096,7 +1096,7 @@ fn run_write_queue(
 
 fn run_read_worker(
     rx: crossbeam_channel::Receiver<ReadJob>,
-    volume: elide_core::actor::VolumeReader,
+    volume: elide_core::actor::VolumeClient,
     writer: WriterMutex,
 ) -> io::Result<()> {
     while let Ok(ReadJob {
@@ -1283,7 +1283,7 @@ fn handle_volume_connection(
 
     let write_thread = {
         let writer = Arc::clone(&writer);
-        let reader = volume.reader();
+        let reader = volume.clone();
         std::thread::Builder::new()
             .name("nbd-write".into())
             .spawn(move || run_write_queue(write_rx, reader, writer))
@@ -1293,7 +1293,7 @@ fn handle_volume_connection(
     let mut read_threads = Vec::with_capacity(READ_WORKERS_PER_CONN);
     for i in 0..READ_WORKERS_PER_CONN {
         let writer = Arc::clone(&writer);
-        let reader = volume.reader();
+        let reader = volume.clone();
         let rx = read_rx.clone();
         let t = std::thread::Builder::new()
             .name(format!("nbd-read-{i}"))

@@ -1,6 +1,8 @@
 # ublk as an alternative transport
 
-Status: exploration / pre-implementation reference. Captures the plan before any code changes.
+Status: steps 1–2 landed. Multi-queue (up to 4) with queue depth 64 runs on
+real Linux hosts behind the `ublk` cargo feature. Steps 3–5 pending; see
+"Phased rollout" below.
 
 ## Framing
 
@@ -39,12 +41,9 @@ The sub-4K RMW path (src/nbd.rs:1049) is NBD-only noise — ublk's `SET_PARAMS` 
 
 ## Async model
 
-ublk's I/O transport is io_uring — async is inherent. But the async surface is **scoped to `src/ublk.rs`**; `VolumeClient`/`VolumeReader` and the rest of the core stay synchronous.
+ublk's I/O transport is io_uring — async is inherent. But the async surface is **scoped to `src/ublk.rs`**; `VolumeClient` and the rest of the core stay synchronous.
 
-**Plan: A → B.**
-
-- **A (spike, step 1).** libublk-rs as designed — one `io_uring` per queue, `smol::LocalExecutor` per queue thread, per-tag handler is `async fn` that `await`s FETCH_REQ, calls the volume client/reader synchronously, `await`s COMMIT_AND_FETCH_REQ. At `queue_depth = 1` a blocking backend call stalls only that queue's one in-flight op — acceptable for proving plumbing.
-- **B (step 2).** Raise `queue_depth` and wrap backend calls in `spawn_blocking` (via the `blocking` crate) so the queue's executor can progress other tags in parallel. The actor already serialises at its mailbox, so concurrent blocking calls from N threads just queue up — same shape as today's NBD-per-connection threading.
+**Shape (as implemented in step 2).** libublk-rs as designed — one `io_uring` per queue, `smol::LocalExecutor` per queue thread. For each tag, an async task loops: await FETCH_REQ, run the backend call, await COMMIT_AND_FETCH_REQ. Backend calls go through `blocking::unblock` (smol's thread-pool offload), so a stalled backend call on one tag does not block the queue's executor from progressing other tags. The actor serialises writes at its mailbox, so concurrent blocking calls from the smol pool just queue up — same shape as today's NBD-per-connection threading.
 
 **Why not C (hand-rolled sync io_uring loop).** Considered and rejected:
 
@@ -55,12 +54,11 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 **Runtime coexistence.** libublk-rs uses `smol`; we already use `tokio` in the coordinator. No conflict — smol here is a thread-local executor, not a global runtime.
 
-**Handle Send/Sync shape.** `VolumeHandle` was split into two types ahead of step 2:
+**Handle Send/Sync shape.** The transport boundary uses one type:
 
-- `VolumeClient` (Send+Sync+Clone): mailbox channel, atomic snapshot pointer, immutable config. No per-thread state.
-- `VolumeReader` (Send, !Sync): owns the per-thread file-fd cache; derefs to `VolumeClient` so it can also issue writes/flushes.
+- `VolumeClient` (Send+Sync+Clone): mailbox channel, atomic snapshot pointer, immutable config, and a shared volume-level file-FD cache (`Arc<Mutex<FileCache>>`) + shared flush-generation counter. All read/write/flush methods live here. No per-thread state.
 
-`actor::spawn` returns a `VolumeClient`; each thread calls `client.reader()` to get its reader. The queue-handler closure captures a `VolumeClient` directly (satisfies libublk's `Send + Sync + Clone + 'static` bound) and constructs a per-queue `VolumeReader` on entry. No `Arc<Mutex<>>` is needed at the transport boundary.
+Each queue thread captures a `VolumeClient` by clone; each tag's async task captures its own clone from that, and moves it through `blocking::unblock` closures. The shared cache holds ~16 segment FDs total per volume, regardless of queue count or depth — `pread(2)` lets concurrent readers share an `Arc<File>` safely, and the mutex is held only for the lookup/insert. (An earlier iteration split this into a separate `VolumeReader` per worker thread with its own `RefCell`-protected cache, but the per-thread split inflated FD count without measurably improving hit rate: all readers on a volume see the same workload and converge on the same hot set. PR #107 added the split as step-2 prep; step 2 removed it in favour of the volume-scoped design.)
 
 ## Control plane
 
@@ -92,10 +90,10 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 ## Phased rollout
 
-First PR is the spike only. Later steps are sequenced separately, each on its own PR.
+Each step lands on its own PR.
 
-1. **Spike (first PR).** Port NBD handler logic to a `libublk` handler. Single queue, depth 1, no zero-copy, no recovery. Against a ramdisk volume. Prove plumbing. (~1 day.)
-2. **Multi-queue + depth.** Raise `nr_hw_queues` and `queue_depth`, verify under `fio`. Latency win should show here.
+1. **Spike (landed — PR #105).** Port NBD handler logic to a `libublk` handler. Single queue, depth 1, synchronous dispatch, no zero-copy, no recovery. Proves plumbing against a ramdisk volume.
+2. **Multi-queue + depth (landed).** `nr_hw_queues = min(num_cpus, 4)`, `queue_depth = 64`, `max_io_buf_bytes = 1 MiB`. Per-queue `smol::LocalExecutor` with one async task per tag; backend calls via `blocking::unblock` so the executor progresses other tags while any one tag is waiting on the actor/WAL/S3. File-FD cache promoted to a volume-level `Mutex<FileCache>` of `Arc<File>`s so concurrent readers share one hot set; reads use `pread(2)` so the mutex is held only for lookup/insert. `fio` validation pending on a real host.
 3. **USER_RECOVERY_REISSUE.** Coordinator calls `START_USER_RECOVERY` on respawn. Crash-injection test. Enabled by default once validated.
 4. **Zero-copy (optional, future).** `UBLK_F_AUTO_BUF_REG` on WRITE. Benchmark. Requires root — likely a separate "privileged" tier.
 5. **Config + CLI.** First-class `ublk` section in `volume.toml` (mutually exclusive with `nbd`), coordinator lifecycle integration, docs.

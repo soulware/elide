@@ -1054,6 +1054,7 @@ name = "elide"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "blocking",
  "chrono",
  "clap",
  "crossbeam-channel",
@@ -1069,6 +1070,7 @@ dependencies = [
  "object_store",
  "rustls",
  "serde",
+ "smol",
  "tempfile",
  "tokio",
  "toml",

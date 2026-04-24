@@ -1,10 +1,18 @@
 //! ublk transport (Linux userspace block device).
 //!
-//! Step-1 spike: single queue, depth 1, no zero-copy, no user-recovery. The
-//! handler is synchronous — one in-flight op per queue, so a blocking
-//! `VolumeClient` call only stalls its own queue. Multi-queue, higher depth,
-//! `spawn_blocking` offload, and `UBLK_F_USER_RECOVERY_REISSUE` are follow-up
-//! steps. See docs/design-ublk-transport.md.
+//! Each queue runs a `smol::LocalExecutor` pinned to one thread (libublk
+//! spawns one thread per queue). The executor hosts `depth` per-tag async
+//! tasks; each task loops FETCH → dispatch → COMMIT. Backend calls into
+//! `VolumeClient` are synchronous, so they go through `blocking::unblock` to
+//! run on smol's thread pool — letting the queue's executor progress other
+//! tags while one is waiting on the actor mailbox / WAL / a segment read.
+//!
+//! `VolumeClient` is `Send + Sync + Clone`: each tag's async task holds its
+//! own clone, and the shared volume-level file cache lives behind it, so
+//! concurrent reads across tags resolve against one hot set of open segment
+//! FDs rather than per-tag duplicates.
+//!
+//! See docs/design-ublk-transport.md for the phased rollout.
 //!
 //! On non-Linux targets, and on Linux without the `ublk` cargo feature, this
 //! module compiles to a stub that errors when the transport is invoked.
@@ -20,12 +28,13 @@ mod imp {
     use std::sync::Arc;
 
     use libublk::BufDesc;
+    use libublk::UblkError;
     use libublk::UblkFlags;
-    use libublk::UblkIORes;
     use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
-    use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
+    use libublk::helpers::IoBuf;
+    use libublk::io::{UblkDev, UblkQueue};
 
-    use elide_core::actor::{VolumeClient, VolumeReader};
+    use elide_core::actor::VolumeClient;
     use elide_core::volume::Volume;
 
     const BLOCK: u64 = 4096;
@@ -33,6 +42,12 @@ mod imp {
     const PHYSICAL_BS_SHIFT: u8 = 12;
     const IO_MIN_SHIFT: u8 = 12;
     const IO_OPT_SHIFT: u8 = 12;
+
+    /// Step 2 starting point per design doc: multi-queue, depth 64, 1 MiB
+    /// buffer. Tuned further after fio on a real host.
+    const MAX_QUEUES: usize = 4;
+    const QUEUE_DEPTH: u16 = 64;
+    const IO_BUF_BYTES: u32 = 1 << 20;
 
     const UBLK_IO_OP_READ: u32 = libublk::sys::UBLK_IO_OP_READ;
     const UBLK_IO_OP_WRITE: u32 = libublk::sys::UBLK_IO_OP_WRITE;
@@ -64,12 +79,18 @@ mod imp {
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         crate::control::start(dir, client.clone(), Arc::clone(&connected))?;
 
+        let nr_queues: u16 = std::thread::available_parallelism()
+            .map(|n| n.get().min(MAX_QUEUES))
+            .unwrap_or(1)
+            .try_into()
+            .unwrap_or(1);
+
         let ctrl = UblkCtrlBuilder::default()
             .name("elide")
             .id(dev_id.unwrap_or(-1))
-            .nr_queues(1)
-            .depth(1)
-            .io_buf_bytes(1 << 20)
+            .nr_queues(nr_queues)
+            .depth(QUEUE_DEPTH)
+            .io_buf_bytes(IO_BUF_BYTES)
             .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
             .build()
             .map_err(|e| io::Error::other(format!("ublk ctrl build: {e}")))?;
@@ -79,12 +100,10 @@ mod imp {
             Ok(())
         };
 
-        // VolumeClient is Send + Sync + Clone, so it satisfies run_target's
-        // queue-handler bound directly. Each queue thread constructs its own
-        // VolumeReader (Send, !Sync) to hold a per-thread file-descriptor
-        // cache for reads.
+        // `VolumeClient` is Send + Sync + Clone; libublk hands a clone to each
+        // queue thread where it is further cloned into per-tag async tasks.
         let q_handler = move |qid, dev: &UblkDev| {
-            q_fn(qid, dev, client.reader());
+            queue_thread(qid, dev, client.clone());
         };
 
         let wait_hook = move |d_ctrl: &UblkCtrl| {
@@ -129,82 +148,122 @@ mod imp {
         };
     }
 
-    fn q_fn(qid: u16, dev: &UblkDev, reader: VolumeReader) {
-        let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
-        let bufs = bufs_rc.clone();
+    /// Entry point for libublk's queue thread. Builds a queue, a local
+    /// executor, and one async task per tag; then drives the io_uring reactor.
+    ///
+    /// Based on the `q_a_fn` pattern in `libublk/examples/loop.rs`.
+    fn queue_thread(qid: u16, dev: &UblkDev, client: VolumeClient) {
+        let queue = match UblkQueue::new(qid, dev) {
+            Ok(q) => Rc::new(q),
+            Err(e) => {
+                tracing::error!("[ublk queue {qid} setup failed: {e}]");
+                return;
+            }
+        };
+        let depth = dev.dev_info.queue_depth;
+        let exec = Rc::new(smol::LocalExecutor::new());
 
-        let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+        let mut tasks = Vec::with_capacity(depth as usize);
+        for tag in 0..depth {
+            let q = queue.clone();
+            let c = client.clone();
+            tasks.push(exec.spawn(async move {
+                if let Err(e) = io_task(&q, tag, c).await {
+                    if !matches!(e, UblkError::QueueIsDown) {
+                        tracing::error!("[ublk io_task qid={qid} tag={tag} failed: {e}]");
+                    }
+                }
+            }));
+        }
+
+        let run_ops = || while exec.try_tick() {};
+        let done = || tasks.iter().all(|t| t.is_finished());
+
+        smol::block_on(exec.run(async move {
+            if let Err(e) =
+                libublk::wait_and_handle_io_events(&queue, Some(20), run_ops, done).await
+            {
+                tracing::error!("[ublk wait_and_handle_io_events qid={qid}: {e}]");
+            }
+        }));
+    }
+
+    /// Per-tag async loop. Submits the initial FETCH, then repeats
+    /// dispatch → COMMIT_AND_FETCH until the queue is torn down.
+    async fn io_task(q: &UblkQueue<'_>, tag: u16, client: VolumeClient) -> Result<(), UblkError> {
+        let buf_size = q.dev.dev_info.max_io_buf_bytes as usize;
+        let mut buf = IoBuf::<u8>::new(buf_size);
+
+        // Initial FETCH_REQ: tells the kernel "this tag is idle; send me the
+        // next I/O". `submit_io_prep_cmd` also registers the IoBuf.
+        q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+            .await?;
+
+        loop {
             let iod = q.get_iod(tag);
             let op = iod.op_flags & 0xff;
             let off = (iod.start_sector << 9) as u64;
             let bytes = (iod.nr_sectors << 9) as u32;
 
-            let iob = &bufs[tag as usize];
-            let reg_slice = iob.as_slice();
-            // SAFETY: each tag owns a unique IoBuf allocation. The sync
-            // handler is called serially per tag with no concurrent access,
-            // and the kernel has already copied WRITE payload into the buffer
-            // by the time the handler runs. libublk's own loop.rs example
-            // does the same `as_ptr() as *mut u8` cast.
-            let slice: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(reg_slice.as_ptr() as *mut u8, reg_slice.len())
-            };
+            let res = run_dispatch(&client, op, off, bytes, &mut buf).await;
 
-            let res = if (bytes as usize) <= slice.len() {
-                dispatch(&reader, op, off, bytes, &mut slice[..bytes as usize])
-            } else {
-                -libc::EINVAL
-            };
-
-            if let Err(e) = q.complete_io_cmd_unified(
-                tag,
-                BufDesc::Slice(reg_slice),
-                Ok(UblkIORes::Result(res)),
-            ) {
-                tracing::error!("ublk complete_io_cmd_unified failed: {e}");
-            }
-        };
-
-        let queue = match UblkQueue::new(qid, dev)
-            .and_then(|q| q.submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs_rc))))
-        {
-            Ok(q) => q,
-            Err(e) => {
-                tracing::error!("ublk queue setup failed: {e}");
-                return;
-            }
-        };
-
-        queue.wait_and_handle_io(io_handler);
+            // COMMIT_AND_FETCH_REQ: hand back the result for this tag and
+            // await the next I/O in one round trip.
+            q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
+                .await?;
+        }
     }
 
-    /// Translate one ublk I/O into a `VolumeReader` / `VolumeClient` call.
-    /// Returns the kernel completion status: bytes on success, negative errno
-    /// on failure.
-    fn dispatch(reader: &VolumeReader, op: u32, offset: u64, length: u32, buf: &mut [u8]) -> i32 {
+    /// Move the synchronous backend call onto smol's blocking thread pool so
+    /// the queue's executor stays free to progress other tags. Result is the
+    /// kernel completion status (bytes on success, negative errno on failure).
+    async fn run_dispatch(
+        client: &VolumeClient,
+        op: u32,
+        offset: u64,
+        length: u32,
+        buf: &mut IoBuf<u8>,
+    ) -> i32 {
         // ublk SET_PARAMS pinned logical_bs_shift=12, so offset and length
         // are always 4K-aligned — no RMW path needed.
         debug_assert!(offset.is_multiple_of(BLOCK));
         debug_assert!((length as u64).is_multiple_of(BLOCK));
 
+        if (length as usize) > buf.as_slice().len() {
+            return -libc::EINVAL;
+        }
+
         let start_lba = offset / BLOCK;
         let lba_count = (length as u64 / BLOCK) as u32;
 
         match op {
-            UBLK_IO_OP_READ => match reader.read(start_lba, lba_count) {
-                Ok(data) => {
-                    let len = data.len().min(length as usize);
-                    buf[..len].copy_from_slice(&data[..len]);
-                    len as i32
+            UBLK_IO_OP_READ => {
+                let client = client.clone();
+                match blocking::unblock(move || client.read(start_lba, lba_count)).await {
+                    Ok(data) => {
+                        let len = data.len().min(length as usize);
+                        let slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                buf.as_slice().as_ptr() as *mut u8,
+                                buf.as_slice().len(),
+                            )
+                        };
+                        slice[..len].copy_from_slice(&data[..len]);
+                        len as i32
+                    }
+                    Err(e) => {
+                        tracing::error!("[ublk read error offset={offset} len={length}: {e}]");
+                        -libc::EIO
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("[ublk read error offset={offset} len={length}: {e}]");
-                    -libc::EIO
-                }
-            },
+            }
             UBLK_IO_OP_WRITE => {
-                let data = buf[..length as usize].to_vec();
-                match reader.write(start_lba, data) {
+                // Copy the payload out of the shared IoBuf into an owned
+                // Vec so the `blocking::unblock` closure (which must be
+                // 'static) can take ownership.
+                let data = buf.as_slice()[..length as usize].to_vec();
+                let client = client.clone();
+                match blocking::unblock(move || client.write(start_lba, data)).await {
                     Ok(()) => length as i32,
                     Err(e) => {
                         tracing::error!("[ublk write error offset={offset} len={length}: {e}]");
@@ -212,27 +271,38 @@ mod imp {
                     }
                 }
             }
-            UBLK_IO_OP_FLUSH => match reader.flush() {
-                Ok(()) => 0,
-                Err(e) => {
-                    tracing::error!("[ublk flush error: {e}]");
-                    -libc::EIO
+            UBLK_IO_OP_FLUSH => {
+                let client = client.clone();
+                match blocking::unblock(move || client.flush()).await {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        tracing::error!("[ublk flush error: {e}]");
+                        -libc::EIO
+                    }
                 }
-            },
-            UBLK_IO_OP_DISCARD => match reader.trim(start_lba, lba_count) {
-                Ok(()) => length as i32,
-                Err(e) => {
-                    tracing::error!("[ublk discard error offset={offset} len={length}: {e}]");
-                    -libc::EIO
+            }
+            UBLK_IO_OP_DISCARD => {
+                let client = client.clone();
+                match blocking::unblock(move || client.trim(start_lba, lba_count)).await {
+                    Ok(()) => length as i32,
+                    Err(e) => {
+                        tracing::error!("[ublk discard error offset={offset} len={length}: {e}]");
+                        -libc::EIO
+                    }
                 }
-            },
-            UBLK_IO_OP_WRITE_ZEROES => match reader.write_zeroes(start_lba, lba_count) {
-                Ok(()) => length as i32,
-                Err(e) => {
-                    tracing::error!("[ublk write-zeroes error offset={offset} len={length}: {e}]");
-                    -libc::EIO
+            }
+            UBLK_IO_OP_WRITE_ZEROES => {
+                let client = client.clone();
+                match blocking::unblock(move || client.write_zeroes(start_lba, lba_count)).await {
+                    Ok(()) => length as i32,
+                    Err(e) => {
+                        tracing::error!(
+                            "[ublk write-zeroes error offset={offset} len={length}: {e}]"
+                        );
+                        -libc::EIO
+                    }
                 }
-            },
+            }
             _ => -libc::EINVAL,
         }
     }
@@ -257,8 +327,8 @@ mod imp {
 
 /// Serve a volume over ublk. Creates `/dev/ublkbN` and runs the I/O loop.
 ///
-/// Step-1 spike: single queue, depth 1. `dev_id = None` lets the kernel
-/// auto-allocate. See docs/design-ublk-transport.md.
+/// Multi-queue (up to 4) with queue depth 64 per step 2 of the design doc.
+/// `dev_id = None` lets the kernel auto-allocate.
 pub fn run_volume_ublk(
     dir: &Path,
     size_bytes: u64,
