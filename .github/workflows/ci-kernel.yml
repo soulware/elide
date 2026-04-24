@@ -68,10 +68,6 @@ jobs:
             - curl
             - git
             - nbd-client
-            - linux-modules-extra-$(uname -r)
-          runcmd:
-            - [ sh, -c, 'modprobe ublk_drv || true' ]
-            - [ sh, -c, 'modprobe nbd || true' ]
           EOF
           cat > meta-data <<EOF
           instance-id: ci-vm
@@ -116,6 +112,15 @@ jobs:
 
           echo "::group::cloud-init wait"
           ssh $SSH_OPTS ci@localhost 'sudo cloud-init status --wait || true'
+          echo "::endgroup::"
+
+      - name: Guest — install kernel modules-extra
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_vm -p 2222"
+          SSH="ssh $SSH_OPTS ci@localhost"
+          echo "::group::apt install linux-modules-extra"
+          $SSH 'sudo apt-get update -qq'
+          $SSH 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-modules-extra-$(uname -r)'
           echo "::endgroup::"
 
       - name: Guest — kernel surface smoke test
