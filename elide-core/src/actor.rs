@@ -2300,6 +2300,54 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
     })
 }
 
+/// Remove any stale promote siblings (`index/<u>.idx`, `cache/<u>.body`,
+/// `cache/<u>.present`, `cache/<u>.delta`) that a crashed half-promote may
+/// have left alongside a pending segment whose body is about to be
+/// rewritten.
+///
+/// Called by `execute_repack` before rewriting or deleting a pending
+/// segment, and by `execute_promote_segment` as a no-op (siblings don't
+/// normally coexist with a committed pending segment). Each file is
+/// removed best-effort — `NotFound` is not an error.
+///
+/// Fsyncs the parent directories after removal so the absence survives
+/// a crash immediately after return.
+pub(crate) fn invalidate_promote_siblings(
+    index_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+    ulid: Ulid,
+) -> io::Result<()> {
+    let ulid_str = ulid.to_string();
+    let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+    let body_path = cache_dir.join(format!("{ulid_str}.body"));
+    let present_path = cache_dir.join(format!("{ulid_str}.present"));
+    let delta_path = cache_dir.join(format!("{ulid_str}.delta"));
+
+    let mut touched_index = false;
+    let mut touched_cache = false;
+    for path in [&idx_path] {
+        match std::fs::remove_file(path) {
+            Ok(()) => touched_index = true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    for path in [&body_path, &present_path, &delta_path] {
+        match std::fs::remove_file(path) {
+            Ok(()) => touched_cache = true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if touched_index && index_dir.try_exists()? {
+        segment::fsync_dir(&idx_path)?;
+    }
+    if touched_cache && cache_dir.try_exists()? {
+        segment::fsync_dir(&body_path)?;
+    }
+    Ok(())
+}
+
 /// Execute a repack job: iterate every non-floor segment in `pending/`,
 /// compute liveness against the captured `lbamap`, and rewrite (in place,
 /// reusing the input ULID) any segment whose live ratio is below
@@ -2311,6 +2359,12 @@ pub(crate) fn execute_sweep(job: SweepJob) -> io::Result<SweepResult> {
 pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     let seg_paths = segment::collect_segment_files(&job.pending_dir)?;
     let live: std::collections::HashSet<blake3::Hash> = job.lbamap.lba_referenced_hashes();
+    // pending_dir is `<base>/pending`; its parent is `<base>`.
+    let base_dir = job.pending_dir.parent().ok_or_else(|| {
+        io::Error::other("repack: pending_dir has no parent; cannot locate index/ or cache/")
+    })?;
+    let index_dir = base_dir.join("index");
+    let cache_dir = base_dir.join("cache");
 
     let mut stats = CompactionStats::default();
     let mut segments: Vec<RepackedSegment> = Vec::new();
@@ -2396,6 +2450,18 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         let mut repacked_live: Vec<RepackedLiveEntry> = Vec::new();
         let mut new_body_section_start = 0u64;
         let mut all_dead_deleted = false;
+
+        // Before rewriting or deleting `pending/<seg_id>`, invalidate any
+        // sibling files that a prior half-crashed promote may have left
+        // behind. Under normal flow a pending segment has no siblings —
+        // `promote_segment` writes `index/<u>.idx` + `cache/<u>.body` +
+        // `cache/<u>.present` only after the pending body is immutable
+        // and deletes `pending/<u>` on apply. A crash between those two
+        // steps leaves the siblings referencing the pre-repack layout;
+        // rewriting the pending body without removing them produces an
+        // inconsistent segment view on rebuild. Best-effort: each file
+        // may or may not exist.
+        invalidate_promote_siblings(&index_dir, &cache_dir, seg_id)?;
 
         if !live_entries.is_empty() {
             let inline_bytes = segment::read_inline_section(seg_path)?;

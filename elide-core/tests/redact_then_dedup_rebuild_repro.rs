@@ -65,7 +65,6 @@ fn write_large_multi_payload(seed: u8) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "pre-existing bug: redact leaves .idx entry metadata intact; rebuild's lowest-ULID-wins resurrects hole-punched body (see file header)"]
 fn redact_hole_punched_hash_not_resurrected_by_rebuild() {
     let tmp = TempDir::new().unwrap();
     let fork_dir = tmp.path();
