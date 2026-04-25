@@ -5,10 +5,11 @@ Create a blank writable volume, mount it from a Linux VM, write data, and let th
 ## Prerequisites
 
 - Rust toolchain (`cargo`)
-- A Linux VM with `nbd-client` available (Multipass is convenient; any VM with host network access works)
+- A Linux VM with `nbd-client` available. The repo ships [`elide-dev.yaml`](../elide-dev.yaml), a [Lima](https://lima-vm.io/) config that provisions Ubuntu 24.04 with `nbd-client` and the `nbd` and `ublk_drv` modules pre-loaded; any VM with host network access works.
 
 ```sh
-multipass launch --name elide-test   # if you don't have one already
+limactl start --name=elide-dev ./elide-dev.yaml   # first time only
+limactl start elide-dev                            # subsequent boots
 ```
 
 ## Build and start the coordinator
@@ -37,15 +38,12 @@ echo 10809 > elide_data/by_name/data-vol/nbd.port
 
 ## Connect from the VM
 
-Find the host IP from inside the VM (the default gateway), then connect and format:
+Lima exposes the host as `host.lima.internal` from inside the VM, so no gateway lookup is needed:
 
 ```sh
-HOST_IP=$(multipass exec elide-test -- ip route show default | awk '{print $3}')
-# typically 192.168.64.1 or 192.168.2.1 depending on the Multipass backend
-
-multipass exec elide-test -- sudo nbd-client -b 4096 $HOST_IP 10809 /dev/nbd0
-multipass exec elide-test -- sudo mkfs.ext4 /dev/nbd0
-multipass exec elide-test -- sudo mount /dev/nbd0 /mnt
+limactl shell elide-dev sudo nbd-client -b 4096 host.lima.internal 10809 /dev/nbd0
+limactl shell elide-dev sudo mkfs.ext4 /dev/nbd0
+limactl shell elide-dev sudo mount /dev/nbd0 /mnt
 ```
 
 Format with `mkfs.ext4` on first use only; subsequent mounts skip this step.
@@ -57,7 +55,7 @@ The default kernel queue limits for `/dev/nbd0` are conservative: on a typical U
 Raising both values lets sequential reads and writes coalesce into larger NBD requests, which amortises per-request overhead (extent index lookups, decompression frames, segment fetches) across larger windows:
 
 ```sh
-multipass exec elide-test -- sudo bash -c '
+limactl shell elide-dev sudo bash -c '
     echo 4096 > /sys/block/nbd0/queue/max_sectors_kb
     echo 4096 > /sys/block/nbd0/queue/read_ahead_kb
 '
@@ -66,7 +64,7 @@ multipass exec elide-test -- sudo bash -c '
 These settings reset when `/dev/nbd0` is disconnected and must be re-applied after each `nbd-client` run. To confirm the current values:
 
 ```sh
-multipass exec elide-test -- \
+limactl shell elide-dev \
     cat /sys/block/nbd0/queue/{max_sectors_kb,max_hw_sectors_kb,read_ahead_kb,logical_block_size}
 ```
 
@@ -75,7 +73,7 @@ multipass exec elide-test -- \
 ## Write data
 
 ```sh
-multipass exec elide-test -- \
+limactl shell elide-dev \
     sudo bash -c 'dd if=/dev/urandom of=/mnt/bigfile bs=1M count=80 && sync'
 ```
 
@@ -116,8 +114,8 @@ elide_data/by_id/<ulid>/
 ## Disconnect
 
 ```sh
-multipass exec elide-test -- sudo umount /mnt
-multipass exec elide-test -- sudo nbd-client -d /dev/nbd0
+limactl shell elide-dev sudo umount /mnt
+limactl shell elide-dev sudo nbd-client -d /dev/nbd0
 ```
 
 The coordinator keeps the volume process running after disconnect. Reconnect with `nbd-client` at any time.
@@ -127,8 +125,8 @@ The coordinator keeps the volume process running after disconnect. Reconnect wit
 **`nbd-client -d` leaves the device in a bad state:**
 
 ```sh
-multipass exec elide-test -- sudo rmmod nbd
-multipass exec elide-test -- sudo modprobe nbd
+limactl shell elide-dev sudo rmmod nbd
+limactl shell elide-dev sudo modprobe nbd
 ```
 
 **Stale lock file** (if the volume process crashed and the coordinator has not yet restarted it):
