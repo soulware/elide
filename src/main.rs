@@ -1041,8 +1041,8 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
         .unwrap_or(9)
         .max(9);
     println!(
-        "{:<name_w$}  {:<state_w$}  {:<transport_w$}  {}",
-        "NAME", "STATE", "TRANSPORT", "PID"
+        "{:<name_w$}  {:<state_w$}  {:<transport_w$}  PID",
+        "NAME", "STATE", "TRANSPORT"
     );
     for r in &rows {
         println!(
