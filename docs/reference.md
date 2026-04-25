@@ -11,7 +11,7 @@ Background reading, implementation notes, and open questions.
 
 ## Implementation Notes
 
-**The NBD server is a development and testing tool.** The production block device frontend will be ublk (Linux, io_uring-based). NBD is kept for development convenience and macOS compatibility during local testing. This is architecturally identical to the lab47/lsvd reference implementation, which also exposes an NBD device. Elide's NBD server listens on TCP rather than a Unix socket purely for convenience during dev/test (e.g. connecting a VM running under Multipass or QEMU without configuring shared sockets). No design decisions should be made to optimise the NBD path at the expense of the ublk path.
+**The NBD server is a development and testing tool.** The production block device frontend will be ublk (Linux, io_uring-based). NBD is kept for development convenience and macOS compatibility during local testing. This is architecturally identical to the lab47/lsvd reference implementation, which also exposes an NBD device. Elide's NBD server listens on TCP rather than a Unix socket purely for convenience during dev/test (e.g. connecting a VM running under Lima or QEMU without configuring shared sockets). No design decisions should be made to optimise the NBD path at the expense of the ublk path.
 
 **S3 upload is implemented via `elide-coordinator`.** The coordinator daemon drains `pending/` to the object store automatically on each tick, renaming each segment to `segments/` on success. Both local (`object_store::LocalFileSystem`) and real S3-compatible stores are supported with no code change.
 
