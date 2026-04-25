@@ -481,3 +481,474 @@ impl Volume {
         Ok(outcome)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use std::fs;
+
+    // ---------- extent reclamation (alias-merge) ----------
+
+    /// Produce a 4096-byte block whose bytes depend on `seed` and `block_idx`,
+    /// giving incompressible, distinct content per block so that splitting an
+    /// originally-contiguous payload exposes the fragmentation clearly.
+    fn reclaim_block(seed: u8, block_idx: usize) -> [u8; 4096] {
+        let mut buf = [0u8; 4096];
+        let key = [seed; 32];
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        hasher.update(&(block_idx as u64).to_le_bytes());
+        let mut xof = hasher.finalize_xof();
+        xof.fill(&mut buf);
+        buf
+    }
+
+    fn reclaim_payload(seed: u8, n_blocks: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n_blocks * 4096);
+        for i in 0..n_blocks {
+            out.extend_from_slice(&reclaim_block(seed, i));
+        }
+        out
+    }
+
+    /// Write a single 8-block entry, overwrite the middle 2 blocks with a
+    /// smaller (1-block) entry so the original is split prefix/tail, then
+    /// run alias-merge over the whole range. The split-tail entry has
+    /// `payload_block_offset != 0`, so the primitive should detect bloat
+    /// and rewrite both the prefix and the tail as fresh compact entries.
+    #[test]
+    fn reclaim_alias_merge_rewrites_split_entry() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Big 8-block write at LBA 100.
+        let big = reclaim_payload(0xA1, 8);
+        vol.write(100, &big).unwrap();
+        // Overwrite LBA 103 (1 block, middle) with unrelated content. The map
+        // now has [100,103)@0 (hash A) + [103,104)@0 (hash B) + [104,108)@4 (hash A).
+        let hole = [0x77u8; 4096];
+        vol.write(103, &hole).unwrap();
+
+        // Oracle expected bytes at [100, 108).
+        let mut expected = vec![0u8; 8 * 4096];
+        expected[..3 * 4096].copy_from_slice(&big[..3 * 4096]);
+        expected[3 * 4096..4 * 4096].copy_from_slice(&hole);
+        expected[4 * 4096..].copy_from_slice(&big[4 * 4096..]);
+        assert_eq!(vol.read(100, 8).unwrap(), expected);
+
+        // Before: 3 entries.
+        assert_eq!(vol.lbamap_len(), 3);
+
+        // Sync prep+execute+apply via the in-process wrapper.
+        let outcome = vol.reclaim_alias_merge(100, 8).unwrap();
+        // Two rewrites: prefix run [100,103) and tail run [104,108). The
+        // middle [103,104) is a clean single-block entry with offset=0 —
+        // its hash has no `offset != 0` run anywhere, so it's left alone.
+        assert!(!outcome.discarded);
+        assert_eq!(outcome.runs_rewritten, 2);
+        assert_eq!(outcome.bytes_rewritten, (3 + 4) * 4096);
+
+        // Readback still matches.
+        assert_eq!(vol.read(100, 8).unwrap(), expected);
+
+        // Second pass is an idempotent no-op: hashes are now stable, every
+        // rewrite the worker would propose hits the lbamap noop-skip.
+        let outcome2 = vol.reclaim_alias_merge(100, 8).unwrap();
+        assert!(!outcome2.discarded);
+        assert_eq!(outcome2.runs_rewritten, 0);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Query range that slices mid-way through a hash's span: the prefix of
+    /// the big write is outside the query. Containment check must refuse to
+    /// rewrite — doing so would strand the outside references on the bloated
+    /// body and *introduce* fragmentation.
+    #[test]
+    fn reclaim_alias_merge_skips_non_contained_hash() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Map state: [100, 150) → H/offset=0 (single big entry).
+        let big = reclaim_payload(0x3C, 50);
+        vol.write(100, &big).unwrap();
+
+        // Query only the tail half — H's first 25 blocks live outside.
+        // Containment fails: H has a run [100, 150) which starts at 100,
+        // outside the query [125, 150). Nothing to rewrite.
+        let outcome = vol.reclaim_alias_merge(125, 25).unwrap();
+        assert!(!outcome.discarded);
+        assert_eq!(outcome.runs_rewritten, 0);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// When the LBA map is mutated between prepare and apply, the apply
+    /// phase must discard cleanly — orphan-cleaning the worker's output
+    /// segment — with no state change to the live lbamap.
+    #[test]
+    fn reclaim_alias_merge_discards_on_concurrent_mutation() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let big = reclaim_payload(0x5E, 8);
+        vol.write(200, &big).unwrap();
+        let hole = [0x11u8; 4096];
+        vol.write(203, &hole).unwrap();
+
+        let job = vol.prepare_reclaim(200, 8).unwrap();
+        let result = crate::actor::execute_reclaim(job).unwrap();
+        // The worker must have produced at least one rewrite.
+        assert!(result.segment_written);
+        let segment_path = result.pending_dir.join(result.segment_ulid.to_string());
+        assert!(segment_path.exists(), "worker segment should be on disk");
+
+        // Simulate concurrent mutation: any write bumps the lbamap Arc and
+        // breaks the pointer-equality precondition.
+        vol.write(500, &reclaim_payload(0x77, 1)).unwrap();
+
+        // Apply must detect the mutation, discard, and delete the orphan.
+        let outcome = vol.apply_reclaim_result(result).unwrap();
+        assert!(outcome.discarded);
+        assert_eq!(outcome.runs_rewritten, 0);
+        assert_eq!(outcome.bytes_rewritten, 0);
+        assert!(
+            !segment_path.exists(),
+            "apply must remove the orphan segment on discard"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Zero extents carry no body and must never be rewritten by alias-merge.
+    #[test]
+    fn reclaim_alias_merge_skips_zero_extents() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write_zeroes(300, 10).unwrap();
+        // Split the zero extent with an unrelated data write so the tail
+        // ends up with payload_block_offset != 0. Our rule would normally
+        // treat that as "bloat" for any non-zero hash, but ZERO_HASH is
+        // always skipped.
+        vol.write(304, &[0xABu8; 4096]).unwrap();
+
+        let outcome = vol.reclaim_alias_merge(300, 10).unwrap();
+        assert!(!outcome.discarded);
+        assert_eq!(outcome.runs_rewritten, 0);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // ---------- reclaim candidate scanner ----------
+
+    fn scanner_thresholds_permissive() -> crate::volume::ReclaimThresholds {
+        // Loose thresholds so tests can use small payloads while still
+        // exercising the scanner's detection logic.
+        crate::volume::ReclaimThresholds {
+            min_dead_blocks: 1,
+            min_dead_ratio: 0.0,
+            min_stored_bytes: 0,
+        }
+    }
+
+    /// A clean volume with a single compact write produces no candidates.
+    #[test]
+    fn scan_reclaim_candidates_no_bloat() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(100, &reclaim_payload(0x11, 8)).unwrap();
+
+        let (lbamap, extent_index) = vol.snapshot_maps();
+        let candidates = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            scanner_thresholds_permissive(),
+        );
+        assert!(
+            candidates.is_empty(),
+            "fresh compact entry should not be a candidate, got {candidates:?}"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Write an 8-block entry, overwrite the middle 2 blocks with a
+    /// 2-block entry. The original's payload now has dead bytes (blocks
+    /// 3..4 are LBA-overwritten). The scanner should flag exactly one
+    /// candidate covering the full extent of the original hash's
+    /// surviving runs.
+    #[test]
+    fn scan_reclaim_candidates_flags_split_entry() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Big incompressible 8-block write so payload lives in the body.
+        vol.write(200, &reclaim_payload(0x22, 8)).unwrap();
+        // Overwrite the middle 2 blocks with unrelated content.
+        let hole: Vec<u8> = (0..2).flat_map(|_| [0x77u8; 4096]).collect();
+        vol.write(203, &hole).unwrap();
+
+        let (lbamap, extent_index) = vol.snapshot_maps();
+        let candidates = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            scanner_thresholds_permissive(),
+        );
+        assert_eq!(
+            candidates.len(),
+            1,
+            "expected exactly one candidate for the bloated hash, got {candidates:?}"
+        );
+        let c = candidates[0];
+        // Tight LBA bound: the hash's first live run starts at 200, its
+        // last live run ends at 208.
+        assert_eq!(c.start_lba, 200);
+        assert_eq!(c.lba_length, 8);
+        // Live: 3 prefix + 3 tail = 6. Dead: 2 (the hole in the middle).
+        assert_eq!(c.live_blocks, 6);
+        assert_eq!(c.dead_blocks, 2);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Thresholds are respected: bumping `min_dead_blocks` above the
+    /// actual dead count drops the candidate.
+    #[test]
+    fn scan_reclaim_candidates_respects_min_dead_blocks() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(300, &reclaim_payload(0x33, 8)).unwrap();
+        vol.write(303, &[0x99u8; 4096]).unwrap(); // 1 block hole
+
+        let (lbamap, extent_index) = vol.snapshot_maps();
+
+        // With min_dead_blocks=1 the 1-block hole qualifies.
+        let loose = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            crate::volume::ReclaimThresholds {
+                min_dead_blocks: 1,
+                min_dead_ratio: 0.0,
+                min_stored_bytes: 0,
+            },
+        );
+        assert_eq!(loose.len(), 1);
+
+        // With min_dead_blocks=2 it does not.
+        let strict = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            crate::volume::ReclaimThresholds {
+                min_dead_blocks: 2,
+                min_dead_ratio: 0.0,
+                min_stored_bytes: 0,
+            },
+        );
+        assert!(strict.is_empty());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Candidates produced by the scanner must always be valid inputs
+    /// to `reclaim_alias_merge` — round-trip through the primitive
+    /// rewrites the hash and a rescan produces no further candidates
+    /// for it.
+    #[test]
+    fn scan_reclaim_candidates_round_trip_through_primitive() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(400, &reclaim_payload(0x44, 8)).unwrap();
+        vol.write(404, &[0x11u8; 4096]).unwrap();
+
+        // Oracle: bytes at [400, 408) after the second write.
+        let expected = {
+            let mut buf = vec![0u8; 8 * 4096];
+            let orig = reclaim_payload(0x44, 8);
+            buf[..4 * 4096].copy_from_slice(&orig[..4 * 4096]);
+            buf[4 * 4096..5 * 4096].fill(0x11);
+            buf[5 * 4096..].copy_from_slice(&orig[5 * 4096..]);
+            buf
+        };
+        assert_eq!(vol.read(400, 8).unwrap(), expected);
+
+        let (lbamap, extent_index) = vol.snapshot_maps();
+        let candidates = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            scanner_thresholds_permissive(),
+        );
+        assert_eq!(candidates.len(), 1);
+        let c = candidates[0];
+
+        // Drop the snapshot clones before mutating Volume state, so
+        // Arc::make_mut in the primitive doesn't reallocate.
+        drop(lbamap);
+        drop(extent_index);
+
+        let outcome = vol.reclaim_alias_merge(c.start_lba, c.lba_length).unwrap();
+        assert!(!outcome.discarded);
+        assert!(outcome.runs_rewritten > 0);
+
+        // Content preserved.
+        assert_eq!(vol.read(400, 8).unwrap(), expected);
+
+        // Rescan: the old hash is gone from the LBA map, the new
+        // compact ones have no bloat — zero candidates.
+        let (lbamap2, extent_index2) = vol.snapshot_maps();
+        let candidates2 = crate::volume::scan_reclaim_candidates(
+            &lbamap2,
+            &extent_index2,
+            scanner_thresholds_permissive(),
+        );
+        assert!(
+            candidates2.is_empty(),
+            "rescan after reclaim should find nothing, got {candidates2:?}"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Idempotent-convergence property: a reclaim pass over an
+    /// already-optimal range produces no rewrites at all.
+    #[test]
+    fn reclaim_alias_merge_optimal_range_is_noop() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(400, &reclaim_payload(0x7A, 4)).unwrap();
+
+        let outcome = vol.reclaim_alias_merge(400, 4).unwrap();
+        assert_eq!(outcome.runs_rewritten, 0);
+        assert!(!outcome.discarded);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A pure tail overwrite leaves the surviving run with
+    /// `payload_block_offset == 0` even though the stored body has a
+    /// dead tail. Historically the primitive silently rejected this
+    /// shape (its gate required at least one run with `offset != 0`)
+    /// while the scanner flagged it — causing "0 runs from N
+    /// candidates" on `elide volume reclaim`. Regression for the
+    /// wider gate in `execute_reclaim` that matches the scanner's
+    /// `live_blocks < logical_blocks` criterion.
+    #[test]
+    fn reclaim_alias_merge_rewrites_tail_overwrite() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // 8-block incompressible write at LBA 600.
+        let big = reclaim_payload(0xB1, 8);
+        vol.write(600, &big).unwrap();
+
+        // Overwrite LBAs [606, 608) — the last 2 blocks of the extent.
+        // Surviving run is [600, 606) with `payload_block_offset = 0`.
+        let tail = [0x44u8; 2 * 4096];
+        vol.write(606, &tail).unwrap();
+
+        // Precondition: exactly one surviving run of the original hash
+        // and its offset is zero — the shape the old gate missed.
+        let (lbamap_pre, _) = vol.snapshot_maps();
+        let original_hash = blake3::hash(&big);
+        let runs_pre = lbamap_pre.runs_for_hash(&original_hash);
+        assert_eq!(runs_pre.len(), 1);
+        assert_eq!(
+            runs_pre[0].2, 0,
+            "surviving tail-overwrite run has offset 0"
+        );
+        drop(lbamap_pre);
+
+        // Oracle.
+        let mut expected = Vec::with_capacity(8 * 4096);
+        expected.extend_from_slice(&big[..6 * 4096]);
+        expected.extend_from_slice(&tail);
+        assert_eq!(vol.read(600, 8).unwrap(), expected);
+
+        let outcome = vol.reclaim_alias_merge(600, 8).unwrap();
+        assert!(!outcome.discarded);
+        assert_eq!(
+            outcome.runs_rewritten, 1,
+            "tail-overwrite must rewrite the surviving head run"
+        );
+        assert_eq!(vol.read(600, 8).unwrap(), expected);
+
+        // Rescan: no residual candidates.
+        let (lbamap_post, extent_index_post) = vol.snapshot_maps();
+        let candidates = crate::volume::scan_reclaim_candidates(
+            &lbamap_post,
+            &extent_index_post,
+            scanner_thresholds_permissive(),
+        );
+        assert!(
+            candidates.is_empty(),
+            "post-reclaim rescan must be empty, got {candidates:?}"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Coordinator tick semantics: when the IPC handler is called with
+    /// `cap = 1` every tick (as `tasks.rs::run_volume_tasks` does), a
+    /// backlog of bloated hashes drains to zero over successive calls.
+    /// Simulates that loop against the Volume API directly.
+    #[test]
+    fn reclaim_cap_one_per_call_converges_to_zero_candidates() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Three independent bloated hashes at disjoint LBA ranges.
+        // Each gets a middle overwrite to split it and trip the
+        // scanner's dead-block criterion.
+        for (seed, base_lba) in [(0xA1u8, 100u64), (0xB2, 200), (0xC3, 300)] {
+            vol.write(base_lba, &reclaim_payload(seed, 8)).unwrap();
+            vol.write(base_lba + 3, &[0xFFu8; 4096]).unwrap();
+        }
+
+        let thresholds = scanner_thresholds_permissive();
+
+        // Scanner starts with three candidates.
+        let (lbamap, ei) = vol.snapshot_maps();
+        let initial = crate::volume::scan_reclaim_candidates(&lbamap, &ei, thresholds);
+        assert_eq!(
+            initial.len(),
+            3,
+            "expected 3 initial candidates, got {initial:?}"
+        );
+        drop(lbamap);
+        drop(ei);
+
+        // Simulate the tick loop: each "tick" scans and processes at
+        // most one candidate. Bound iterations so a regression can't
+        // infinite-loop the test.
+        let mut tick_count = 0usize;
+        for _ in 0..10 {
+            let (lbamap, ei) = vol.snapshot_maps();
+            let mut candidates = crate::volume::scan_reclaim_candidates(&lbamap, &ei, thresholds);
+            drop(lbamap);
+            drop(ei);
+            if candidates.is_empty() {
+                break;
+            }
+            let c = candidates.remove(0);
+            let outcome = vol.reclaim_alias_merge(c.start_lba, c.lba_length).unwrap();
+            assert!(!outcome.discarded);
+            assert!(outcome.runs_rewritten > 0);
+            tick_count += 1;
+        }
+
+        // Exactly three productive ticks for three initial candidates.
+        assert_eq!(tick_count, 3);
+
+        // Rescan: converged.
+        let (lbamap, ei) = vol.snapshot_maps();
+        let remaining = crate::volume::scan_reclaim_candidates(&lbamap, &ei, thresholds);
+        assert!(
+            remaining.is_empty(),
+            "converged scan must be empty, got {remaining:?}"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+}

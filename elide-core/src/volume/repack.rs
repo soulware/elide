@@ -677,3 +677,511 @@ impl Volume {
         Ok(stats)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use std::fs;
+
+    // --- compaction tests ---
+
+    #[test]
+    fn repack_noop_when_all_live() {
+        // Write two blocks, promote, compact — nothing should be compacted
+        // since all data is still referenced.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.write(1, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.repack(0.7).unwrap();
+        assert_eq!(stats.segments_compacted, 0);
+        assert_eq!(stats.bytes_freed, 0);
+        assert_eq!(stats.extents_removed, 0);
+
+        // Data still readable.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x11u8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn repack_reclaims_overwritten_extent() {
+        // Write block A, promote, overwrite block A with B, promote.
+        // First segment now has a dead extent; compaction should reclaim it.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let original = vec![0x11u8; 4096];
+        let replacement = vec![0x22u8; 4096];
+
+        vol.write(0, &original).unwrap();
+        vol.promote_for_test().unwrap();
+
+        vol.write(0, &replacement).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Two segments: first is 100% dead, second is live.
+        let stats = vol.repack(0.7).unwrap();
+        assert_eq!(
+            stats.segments_compacted, 1,
+            "first segment should be compacted"
+        );
+        assert!(stats.bytes_freed > 0);
+        assert_eq!(stats.extents_removed, 1);
+
+        // Data still reads back correctly after compaction.
+        assert_eq!(vol.read(0, 1).unwrap(), replacement);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn repack_reads_back_correctly_after_reopen() {
+        // Verify that the compacted segment is a valid segment that survives
+        // a volume reopen (LBA map rebuild + extent index rebuild).
+        let base = keyed_temp_dir();
+
+        {
+            let mut vol = Volume::open(&base, &base).unwrap();
+            vol.write(0, &vec![0xAAu8; 4096]).unwrap();
+            vol.promote_for_test().unwrap();
+            vol.write(0, &vec![0xBBu8; 4096]).unwrap(); // overwrite
+            vol.promote_for_test().unwrap();
+            vol.repack(0.7).unwrap();
+        }
+
+        let vol = Volume::open(&base, &base).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0xBBu8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn repack_partial_segment() {
+        // Segment has two extents; one is overwritten (dead), one is live.
+        // Compaction should rewrite the segment keeping only the live extent.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap(); // will be overwritten
+        vol.write(1, &vec![0x22u8; 4096]).unwrap(); // stays live
+        vol.promote_for_test().unwrap();
+
+        vol.write(0, &vec![0x33u8; 4096]).unwrap(); // overwrites LBA 0
+        vol.promote_for_test().unwrap();
+
+        // First segment is 50% dead — above default threshold of 30% dead (0.7 live).
+        let stats = vol.repack(0.7).unwrap();
+        assert_eq!(stats.segments_compacted, 1);
+        assert!(stats.bytes_freed > 0);
+
+        // Both LBAs read back correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x33u8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn repack_respects_min_live_ratio() {
+        // With a strict ratio (1.0), any dead byte triggers compaction.
+        // With a lenient ratio (0.0), nothing is ever compacted.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap(); // LBA 0 now dead in seg 1
+        vol.promote_for_test().unwrap();
+
+        // Lenient threshold: first segment is 100% dead but ratio=0.0 → nothing compacted.
+        let stats = vol.repack(0.0).unwrap();
+        assert_eq!(stats.segments_compacted, 0);
+
+        // Strict threshold: compact anything with any dead bytes.
+        let stats = vol.repack(1.0).unwrap();
+        assert_eq!(stats.segments_compacted, 1);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn repack_does_not_touch_pre_snapshot_segments() {
+        // Write and overwrite a block, then snapshot. The dead segment is
+        // pre-snapshot and must not be compacted — it is frozen by the floor.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Snapshot freezes both segments (floor = latest segment ULID).
+        vol.snapshot().unwrap();
+
+        // Even with a strict threshold the pre-snapshot segments must be skipped.
+        let stats = vol.repack(1.0).unwrap();
+        assert_eq!(
+            stats.segments_compacted, 0,
+            "pre-snapshot segments must not be compacted"
+        );
+
+        // Data still readable.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn repack_only_touches_post_snapshot_segments() {
+        // Pre-snapshot dead segment: frozen. Post-snapshot dead segment: compactable.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Pre-snapshot: write and overwrite LBA 0.
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        vol.snapshot().unwrap();
+
+        // Post-snapshot: write and overwrite LBA 1.
+        vol.write(1, &vec![0x33u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(1, &vec![0x44u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // One pre-snapshot dead segment (frozen) + one post-snapshot dead segment (eligible).
+        let stats = vol.repack(1.0).unwrap();
+        assert_eq!(
+            stats.segments_compacted, 1,
+            "exactly the post-snapshot dead segment should be compacted"
+        );
+
+        // Both LBAs read back correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0x44u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn repack_does_not_touch_uploaded_segments() {
+        // Simulate an uploaded segment (promoted to cache/ by the coordinator).
+        // repack() must not touch it even if its extents are dead.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Simulate coordinator upload + promote IPC: pending → index/ + cache/.
+        simulate_upload(&mut vol);
+
+        // Overwrite LBA 0 — the uploaded segment's extent is now dead.
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Strict threshold: repack anything with dead bytes.
+        let stats = vol.repack(1.0).unwrap();
+        assert_eq!(
+            stats.segments_compacted, 0,
+            "repack must not touch uploaded (cache/) segments"
+        );
+
+        // Data still reads correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- sweep_pending tests ---
+
+    #[test]
+    fn sweep_pending_noop_when_all_live() {
+        // Single pending segment with no dead extents: sweep_pending must not
+        // rewrite it. Rewriting a single all-live small segment is a no-op that
+        // only wastes IO — merging only makes sense when >=2 segments combine or
+        // dead space is reclaimed.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.write(1, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.sweep_pending().unwrap();
+        assert_eq!(stats.segments_compacted, 0);
+        assert_eq!(stats.new_segments, 0);
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x11u8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_removes_dead_extents() {
+        // Write LBA 0, promote, overwrite LBA 0, promote.
+        // sweep_pending should remove the dead extent from the first segment.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.sweep_pending().unwrap();
+        assert!(stats.segments_compacted >= 1);
+        assert!(stats.bytes_freed > 0);
+        assert_eq!(stats.extents_removed, 1);
+
+        // Current value of LBA 0 must be the replacement.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_only_scans_pending_not_uploaded() {
+        // Upload a segment (simulate coordinator promoting pending → cache/).
+        // sweep_pending must not touch uploaded segments.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Simulate coordinator upload + promote IPC: pending → index/ + cache/.
+        simulate_upload(&mut vol);
+
+        // Now overwrite LBA 0 and promote — creates a new pending segment.
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.sweep_pending().unwrap();
+        // The old dead extent is in cache/ — sweep_pending doesn't touch it.
+        assert_eq!(stats.extents_removed, 0);
+        // The new pending segment is small and all-live: single segment, no
+        // dead extents, so sweep_pending correctly leaves it alone.
+        assert_eq!(stats.segments_compacted, 0);
+
+        // Data still reads correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_respects_snapshot_floor() {
+        // Segments at or below the snapshot ULID must not be touched.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Write and promote before snapshot.
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        vol.snapshot().unwrap();
+
+        // The two pre-snapshot segments are now frozen.
+        let stats = vol.sweep_pending().unwrap();
+        assert_eq!(
+            stats.segments_compacted, 0,
+            "pre-snapshot segments must not be touched"
+        );
+
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_multi_block_inplace_overwrite_same_wal() {
+        // Regression: two multi-block DATA writes at the same LBA range in the
+        // same WAL flush. Both land as DATA entries (different hashes) in one
+        // pending segment. sweep_pending then partitions entries into live/dead,
+        // rewrites the segment, and updates the extent index — the surviving
+        // live entry must read back correctly from the rewritten segment.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // High-entropy so neither payload is inlined and both stay in the
+        // body section. Eight 4 KiB blocks each.
+        let payload_a: Vec<u8> = (0..8 * 4096usize).map(|i| (i * 7 + 13) as u8).collect();
+        let payload_b: Vec<u8> = (0..8 * 4096usize).map(|i| (i * 11 + 3) as u8).collect();
+        assert_ne!(payload_a, payload_b);
+
+        vol.write(24, &payload_a).unwrap();
+        vol.write(24, &payload_b).unwrap();
+        vol.flush_wal().unwrap();
+        assert_eq!(
+            vol.read(24, 8).unwrap(),
+            payload_b,
+            "pre-sweep read must return the second write"
+        );
+
+        vol.sweep_pending().unwrap();
+        assert_eq!(
+            vol.read(24, 8).unwrap(),
+            payload_b,
+            "post-sweep read must still return the second write"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_merges_multiple_small_segments() {
+        // Three separate promotes → three small pending segments.
+        // sweep_pending should merge them into one.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(0, &vec![0xaau8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(1, &vec![0xbbu8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(2, &vec![0xccu8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.sweep_pending().unwrap();
+        assert_eq!(stats.segments_compacted, 3);
+        assert_eq!(stats.new_segments, 1);
+
+        // All three LBAs must still read back correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0xaau8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0xbbu8; 4096]);
+        assert_eq!(vol.read(2, 1).unwrap(), vec![0xccu8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Build a 4 KiB block whose first byte is `seed` and the rest are
+    /// pseudo-random — high entropy so compression stays a no-op.
+    fn unique_block(seed: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        let s = seed as u64;
+        for (i, b) in buf.iter_mut().enumerate() {
+            // Distinct per-(seed,i) using a cheap hash. Coprime multipliers
+            // keep the byte distribution uniform.
+            *b = ((s.wrapping_mul(0x9E37_79B9).wrapping_add(i as u64)) ^ (i as u64 * 31)) as u8;
+        }
+        buf
+    }
+
+    /// Promote `block_count` distinct 4 KiB blocks into one pending segment.
+    fn promote_segment_with_blocks(vol: &mut Volume, base_lba: u64, block_count: u64, tag: u32) {
+        for i in 0..block_count {
+            // Mix `tag` into the seed so different segments don't dedup.
+            let block = unique_block(tag.wrapping_mul(0x10001).wrapping_add(i as u32));
+            vol.write(base_lba + i, &block).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_packs_small_with_filler() {
+        // One small (~4 KiB live) + one large filler (~17 MiB live).
+        // Tier 1 picks up the small; tier 2 sees ~32 MiB - 4 KiB headroom
+        // and pulls in the 17 MiB filler. Output is one ~17 MiB segment.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Small segment: 1 block.
+        promote_segment_with_blocks(&mut vol, 0, 1, 1);
+        // Filler: 17 MiB live (4352 blocks of 4 KiB).
+        // Above the 16 MiB SWEEP_SMALL_THRESHOLD so it's filler material,
+        // not a small. Must fit in the 32 MiB budget after the small.
+        promote_segment_with_blocks(&mut vol, 1, 4352, 2);
+
+        let stats = vol.sweep_pending().unwrap();
+        assert_eq!(
+            stats.segments_compacted, 2,
+            "tier 2 must pull the filler in alongside the small"
+        );
+        assert_eq!(stats.new_segments, 1);
+
+        // Both ranges must still read back correctly.
+        assert_eq!(vol.read(0, 1).unwrap(), unique_block(0x10001));
+        assert_eq!(vol.read(1, 1).unwrap(), unique_block(0x10001 * 2));
+        assert_eq!(
+            vol.read(4352, 1).unwrap(),
+            unique_block(0x10001u32.wrapping_mul(2).wrapping_add(4351))
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_respects_entry_cap() {
+        // Three pending segments, each carrying 4096 DedupRef entries
+        // (live_bytes = 0 — DedupRef has no body cost) plus one tiny
+        // DATA segment, total 12_289 entries. Without an entry cap,
+        // tier-1 packing would admit all three (byte budget never bites
+        // on 0-live_bytes inputs) and produce a 12_289-entry output —
+        // far past the WAL's flush cap. With SWEEP_ENTRY_CAP = 8192,
+        // tier 1 admits exactly two of the dedup segments (8192 entries)
+        // and stops; the third dedup segment and the lone DATA are left
+        // for a later pass.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Anchor segment: a single DATA entry establishing the dedup hash.
+        let payload = unique_block(0xCAFE);
+        vol.write(0, &payload).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Two dedup-only pending segments, 4096 DedupRef entries each.
+        for i in 1..=4096u64 {
+            vol.write(i, &payload).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+        for i in 100_000..(100_000u64 + 4096) {
+            vol.write(i, &payload).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+
+        // Plus another dedup-only segment so the cap actually has to
+        // refuse one of them.
+        for i in 200_000..(200_000u64 + 4096) {
+            vol.write(i, &payload).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+
+        let stats = vol.sweep_pending().unwrap();
+        assert_eq!(
+            stats.segments_compacted, 2,
+            "sweep must stop at SWEEP_ENTRY_CAP — exactly two of the \
+             three dedup segments fit (8192 entries), the third is left \
+             for a later pass"
+        );
+        assert_eq!(stats.new_segments, 1);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sweep_pending_skips_lone_filler() {
+        // A single filler (~17 MiB live, no small to pair with) must
+        // not be rewritten — sweep is for packing, not for moving large
+        // segments around. Repack is what handles single-segment cleanup.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        promote_segment_with_blocks(&mut vol, 0, 4352, 1);
+
+        let stats = vol.sweep_pending().unwrap();
+        assert_eq!(stats.segments_compacted, 0);
+        assert_eq!(stats.new_segments, 0);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+}

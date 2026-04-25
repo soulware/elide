@@ -3007,4 +3007,6 @@ fn acquire_lock(dir: &Path) -> io::Result<nix::fcntl::Flock<fs::File>> {
 }
 
 #[cfg(test)]
+pub(in crate::volume) mod test_util;
+#[cfg(test)]
 mod tests;
