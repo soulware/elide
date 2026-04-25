@@ -164,6 +164,9 @@ enum VolumeCommand {
         /// List only writable volumes
         #[arg(long)]
         rw: bool,
+        /// Also include pulled ancestors (no name, no by_name/ symlink)
+        #[arg(long)]
+        all: bool,
     },
 
     /// Show a human-readable summary of a volume
@@ -444,7 +447,7 @@ fn main() {
 
     match args.command {
         Command::Volume { command } => match command {
-            VolumeCommand::List { ro, rw } => {
+            VolumeCommand::List { ro, rw, all } => {
                 let filter = if ro {
                     ListFilter::Readonly
                 } else if rw {
@@ -452,7 +455,7 @@ fn main() {
                 } else {
                     ListFilter::All
                 };
-                if let Err(e) = list_volumes(&args.data_dir, &socket_path, filter) {
+                if let Err(e) = list_volumes(&args.data_dir, &socket_path, filter, all) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -996,10 +999,17 @@ struct VolumeRow {
     pid: String,
 }
 
-fn list_volumes(data_dir: &Path, socket_path: &Path, filter: ListFilter) -> std::io::Result<()> {
+fn list_volumes(
+    data_dir: &Path,
+    socket_path: &Path,
+    filter: ListFilter,
+    include_ancestors: bool,
+) -> std::io::Result<()> {
     let coordinator_up = coordinator_client::is_reachable(socket_path);
     let by_name_dir = data_dir.join("by_name");
+    let by_id_dir = data_dir.join("by_id");
     let mut rows: Vec<VolumeRow> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     match std::fs::read_dir(&by_name_dir) {
         Ok(dir_entries) => {
             for entry in dir_entries {
@@ -1016,6 +1026,9 @@ fn list_volumes(data_dir: &Path, socket_path: &Path, filter: ListFilter) -> std:
                         }
                     })
                     .unwrap_or_else(|| entry.path());
+                if let Ok(canonical) = std::fs::canonicalize(&vol_dir) {
+                    seen.insert(canonical);
+                }
                 let is_readonly = vol_dir.join("volume.readonly").exists();
                 let include = match filter {
                     ListFilter::All => true,
@@ -1031,7 +1044,43 @@ fn list_volumes(data_dir: &Path, socket_path: &Path, filter: ListFilter) -> std:
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    if include_ancestors && !matches!(filter, ListFilter::Writable) {
+        match std::fs::read_dir(&by_id_dir) {
+            Ok(dir_entries) => {
+                for entry in dir_entries {
+                    let entry = entry?;
+                    let vol_dir = entry.path();
+                    if !vol_dir.is_dir() {
+                        continue;
+                    }
+                    let Some(ulid_str) = vol_dir.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if ulid::Ulid::from_string(ulid_str).is_err() {
+                        continue;
+                    }
+                    let canonical =
+                        std::fs::canonicalize(&vol_dir).unwrap_or_else(|_| vol_dir.clone());
+                    if seen.contains(&canonical) {
+                        continue;
+                    }
+                    if !vol_dir.join("volume.readonly").exists() {
+                        continue;
+                    }
+                    rows.push(volume_row("-".to_owned(), &vol_dir, true, coordinator_up));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // Named volumes first (alphabetical), pulled ancestors at the bottom (by ULID).
+    rows.sort_by(|a, b| match (a.name.as_str(), b.name.as_str()) {
+        ("-", "-") => a.ulid.cmp(&b.ulid),
+        ("-", _) => std::cmp::Ordering::Greater,
+        (_, "-") => std::cmp::Ordering::Less,
+        _ => a.name.cmp(&b.name),
+    });
     if rows.is_empty() {
         println!("no volumes found in {}", data_dir.display());
         if !coordinator_up {
@@ -1092,6 +1141,19 @@ fn volume_row(name: String, vol_dir: &Path, is_readonly: bool, coordinator_up: b
         .map(|u| u.to_string())
         .unwrap_or_else(|| "-".to_owned());
     let mode = if is_readonly { "ro" } else { "rw" };
+    // Pulled ancestors (no by_name/ symlink, no volume.name) are never
+    // supervised — render a static "ancestor" state instead of inferring
+    // lifecycle from markers that don't apply.
+    if name == "-" && is_readonly {
+        return VolumeRow {
+            name,
+            ulid,
+            mode,
+            state: "ancestor",
+            transport,
+            pid: "-".to_owned(),
+        };
+    }
     if !coordinator_up {
         return VolumeRow {
             name,
