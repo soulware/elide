@@ -362,9 +362,10 @@ enum RemoteCommand {
     ///
     /// Accepts either a volume name (resolved via `names/<name>` in the store)
     /// or an explicit `<vol_ulid>[/<snap_ulid>]`. Pulled volumes land under
-    /// `readonly/<vol_ulid>/` and are never supervised locally — they exist
-    /// only as fork ancestors. The full ancestor chain is walked and every
-    /// ancestor not already present locally is pulled too.
+    /// `by_id/<vol_ulid>/` with no `volume.name` and no `by_name/` symlink —
+    /// they are never supervised locally and exist only as fork ancestors.
+    /// The full ancestor chain is walked and every ancestor not already
+    /// present locally is pulled too.
     Pull {
         /// Volume spec: `<name>` or `<vol_ulid>` or `<vol_ulid>/<snap_ulid>`
         spec: String,
@@ -1301,7 +1302,7 @@ fn create_fork(
                 eprintln!("pulling '{from}' from remote store...");
                 remote_pull(&config, from, data_dir, socket_path)?;
                 // remote_pull resolved the name to a ULID and pulled into
-                // readonly/<ulid>/. Find it by re-resolving the pull spec.
+                // by_id/<ulid>/. Find it by re-resolving the pull spec.
                 let store = elide::build_object_store(&config)
                     .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
                 let rt = tokio::runtime::Runtime::new()?;
@@ -1657,16 +1658,18 @@ fn remote_list(config: &elide_fetch::FetchConfig) -> std::io::Result<()> {
 ///     is what gets pulled — the snapshot ULID is retained for the caller
 ///     that wants to pin provenance, e.g. `volume create --from`)
 ///
-/// Each pulled volume lands under `data_dir/readonly/<vol_ulid>/` with
-/// `volume.readonly`, `volume.pub`, `volume.provenance`, and an empty
-/// `index/` dir. The coordinator's next rescan then runs `prefetch_indexes`
-/// which downloads the signed `.idx` files into each volume's own `index/`
-/// directory (signature verification uses that volume's own `volume.pub`).
+/// Each pulled volume lands under `data_dir/by_id/<vol_ulid>/` with
+/// `volume.readonly`, `volume.pub`, `volume.provenance`, an empty `index/`
+/// dir, and a `volume.toml` with no name (the absent name and absent
+/// `by_name/` symlink mark this as a pulled ancestor). The coordinator's
+/// next rescan then runs `prefetch_indexes` which downloads the signed
+/// `.idx` files into each volume's own `index/` directory (signature
+/// verification uses that volume's own `volume.pub`).
 ///
 /// The ancestor chain is walked via the downloaded `volume.provenance`:
-/// for every parent ULID not already present in `by_id/` or `readonly/`,
-/// its skeleton is pulled too. Encountering a mid-chain ancestor that is
-/// already local terminates the walk — the local copy is authoritative.
+/// for every parent ULID not already present in `by_id/`, its ancestor
+/// entry is pulled too. Encountering a mid-chain ancestor that is already
+/// local terminates the walk — the local copy is authoritative.
 fn remote_pull(
     config: &elide_fetch::FetchConfig,
     spec: &str,
@@ -1680,11 +1683,11 @@ fn remote_pull(
     // Step 1: parse `spec` and resolve to a root ULID to pull.
     let root_ulid = resolve_pull_spec(&rt, &*store, spec)?;
 
-    // Step 2: walk the ancestor chain, pulling each skeleton that isn't
+    // Step 2: walk the ancestor chain, pulling each ancestor that isn't
     // already local. Start from the requested volume; after each pull, parse
     // its downloaded provenance to find the next parent. The actual write
     // is delegated to the coordinator's `pull-readonly` IPC so the
-    // root-owned readonly tree is created by the coordinator process, not
+    // root-owned by_id/ tree is written by the coordinator process, not
     // the (possibly non-root) CLI.
     let mut pulled: Vec<String> = Vec::new();
     let mut next: Option<String> = Some(root_ulid);
@@ -1707,7 +1710,7 @@ fn remote_pull(
     }
 
     // Step 3: signal coordinator to rescan (best-effort) so it picks up the
-    // new readonly volumes and kicks off prefetch_indexes on each.
+    // new ancestor entries and kicks off prefetch_indexes on each.
     if coordinator_client::rescan(socket_path).is_err() {
         eprintln!("warning: coordinator unreachable; volume will be picked up on next scan");
     }
@@ -1761,10 +1764,9 @@ fn resolve_pull_spec(
     Ok(parsed.to_string())
 }
 
-/// Return `true` if a local copy of `<ulid>` exists in either tree.
+/// Return `true` if a local copy of `<ulid>` exists.
 fn ancestor_exists_locally(data_dir: &Path, ulid_str: &str) -> bool {
     data_dir.join("by_id").join(ulid_str).exists()
-        || data_dir.join("readonly").join(ulid_str).exists()
 }
 
 fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
