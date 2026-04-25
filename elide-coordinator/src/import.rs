@@ -547,12 +547,7 @@ pub fn kill_all_for_volume(vol_dir: &Path) {
     std::thread::sleep(Duration::from_millis(500));
 }
 
-fn is_alive(pid: u32) -> bool {
-    let Ok(raw) = i32::try_from(pid) else {
-        return false;
-    };
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None).is_ok()
-}
+use elide_core::process::pid_is_alive as is_alive;
 
 fn sigterm(pid: u32) {
     if let Ok(raw) = i32::try_from(pid) {

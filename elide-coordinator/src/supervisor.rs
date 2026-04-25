@@ -261,15 +261,7 @@ async fn poll_until_dead(pid: u32) {
     }
 }
 
-/// Returns true if the process exists and we have permission to signal it.
-fn is_alive(pid: u32) -> bool {
-    // Pid::from_raw takes i32; reject u32 values that would overflow.
-    let Ok(raw) = i32::try_from(pid) else {
-        return false;
-    };
-    // kill(pid, None) sends signal 0: checks existence without delivering a signal.
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None).is_ok()
-}
+use elide_core::process::pid_is_alive as is_alive;
 
 fn read_pid(fork_dir: &Path) -> Option<u32> {
     let text = std::fs::read_to_string(fork_dir.join(PID_FILE)).ok()?;
@@ -318,20 +310,6 @@ mod tests {
         assert_eq!(read_pid(tmp.path()), Some(pid));
         remove_pid(tmp.path());
         assert_eq!(read_pid(tmp.path()), None);
-    }
-
-    #[test]
-    fn is_alive_current_process() {
-        assert!(is_alive(std::process::id()));
-    }
-
-    #[test]
-    fn is_alive_returns_false_for_nonexistent_pid() {
-        // PID 0 is the kernel idle process and not a real user process;
-        // sending it signal 0 typically fails with EPERM (not ESRCH) since
-        // we don't own it. Use u32::MAX as a pid that almost certainly
-        // does not exist on any system.
-        assert!(!is_alive(u32::MAX));
     }
 
     #[test]

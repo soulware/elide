@@ -85,6 +85,16 @@ fn parse_toml_response<T: for<'de> Deserialize<'de>>(raw: &str) -> io::Result<T>
     }
 }
 
+/// Returns true if the coordinator is currently listening on `socket_path`.
+///
+/// A successful `connect()` is sufficient evidence — we don't send a command
+/// (no waste of an inbound slot) and we don't need to interpret a response.
+/// Failure modes that mean "down": socket file missing, ECONNREFUSED (stale
+/// socket file but no listener), or any other connect error.
+pub fn is_reachable(socket_path: &Path) -> bool {
+    UnixStream::connect(socket_path).is_ok()
+}
+
 /// Ask the coordinator for its non-secret store config (bucket, endpoint,
 /// region, or local_path). This is the static counterpart to
 /// `get_store_creds`.

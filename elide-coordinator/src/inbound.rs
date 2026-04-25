@@ -31,6 +31,7 @@ use tracing::{info, warn};
 use crate::import::{self, ImportRegistry, ImportState};
 use elide_coordinator::config::StoreSection;
 use elide_coordinator::{EvictRegistry, SnapshotLockRegistry};
+use elide_core::process::pid_is_alive;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
@@ -1666,15 +1667,6 @@ fn start_volume_op(volume_name: &str, data_dir: &Path, rescan: &Notify) -> Strin
     rescan.notify_one();
     info!("[inbound] started volume {volume_name}");
     "ok".to_string()
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn pid_is_alive(pid: u32) -> bool {
-    let Ok(raw) = i32::try_from(pid) else {
-        return false;
-    };
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None).is_ok()
 }
 
 #[cfg(test)]

@@ -451,7 +451,7 @@ fn main() {
                 } else {
                     ListFilter::Writable
                 };
-                if let Err(e) = list_volumes(&args.data_dir, filter) {
+                if let Err(e) = list_volumes(&args.data_dir, &socket_path, filter) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -993,7 +993,8 @@ struct VolumeRow {
     pid: String,
 }
 
-fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
+fn list_volumes(data_dir: &Path, socket_path: &Path, filter: ListFilter) -> std::io::Result<()> {
+    let coordinator_up = coordinator_client::is_reachable(socket_path);
     let by_name_dir = data_dir.join("by_name");
     let mut rows: Vec<VolumeRow> = Vec::new();
     match std::fs::read_dir(&by_name_dir) {
@@ -1021,7 +1022,7 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
                 if !include {
                     continue;
                 }
-                rows.push(volume_row(name, &vol_dir));
+                rows.push(volume_row(name, &vol_dir, coordinator_up));
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1030,6 +1031,9 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     if rows.is_empty() {
         println!("no volumes found in {}", data_dir.display());
+        if !coordinator_up {
+            println!("coordinator is not running ({})", socket_path.display());
+        }
         return Ok(());
     }
     let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
@@ -1050,26 +1054,53 @@ fn list_volumes(data_dir: &Path, filter: ListFilter) -> std::io::Result<()> {
             r.name, r.state, r.transport, r.pid
         );
     }
+    if !coordinator_up {
+        println!();
+        println!("coordinator is not running ({})", socket_path.display());
+    }
     Ok(())
 }
 
 /// Gather per-volume display state: lifecycle, transport summary, and pid.
-fn volume_row(name: String, vol_dir: &Path) -> VolumeRow {
+///
+/// State labels mirror the coordinator's IPC `volume_status`
+/// (`elide-coordinator/src/inbound.rs`) when the coordinator is reachable:
+///
+/// - `running`          — `volume.pid` present and the process is alive.
+/// - `importing`        — an import lock is held.
+/// - `stopped (manual)` — `volume.stopped` is set; the coordinator will not
+///   auto-start this volume.
+/// - `stopped`          — neither a live pid nor a manual-stop marker.
+///
+/// When `coordinator_up` is false, lifecycle inference from on-disk markers is
+/// suppressed and STATE/PID render as `-`. The volume's behaviour without a
+/// running coordinator is "paused pending coordinator restart" regardless of
+/// which marker happens to be on disk, so collapsing to `-` plus a footer line
+/// (printed by the caller) keeps the table honest. Transport stays populated
+/// — it reflects static config, not lifecycle.
+fn volume_row(name: String, vol_dir: &Path, coordinator_up: bool) -> VolumeRow {
+    let transport = transport_summary(vol_dir);
+    if !coordinator_up {
+        return VolumeRow {
+            name,
+            state: "-",
+            transport,
+            pid: "-".to_owned(),
+        };
+    }
+    let live_pid = read_volume_pid(vol_dir).filter(|&p| elide_core::process::pid_is_alive(p));
     let state = if vol_dir.join(STOPPED_FILE).exists() {
-        "stopped"
+        "stopped (manual)"
     } else if vol_dir.join("import.lock").exists() {
         "importing"
-    } else {
+    } else if live_pid.is_some() {
         "running"
-    };
-    let transport = transport_summary(vol_dir);
-    let pid = if state == "running" {
-        read_volume_pid(vol_dir)
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".to_owned())
     } else {
-        "-".to_owned()
+        "stopped"
     };
+    let pid = live_pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "-".to_owned());
     VolumeRow {
         name,
         state,
