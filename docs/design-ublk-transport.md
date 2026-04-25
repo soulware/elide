@@ -94,6 +94,29 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 - Zero-copy will continue to require root even after the unprivileged flag lands — the kernel gates `UBLK_F_AUTO_BUF_REG` on `CAP_SYS_ADMIN`. Deferred to step 4.
 - Document `modprobe ublk_drv` + udev rules prereq in `docs/operations.md`.
 
+## Deployment modes
+
+`UBLK_F_UNPRIVILEGED_DEV` and zero-copy aren't independent toggles — they correspond to two coherent deployment tiers with different trust models. Treat them as a single mode choice, not two unrelated knobs.
+
+### Multi-tenant tier — unprivileged, no zero-copy
+
+Default for any deployment that serves volumes to workloads under a different trust boundary than the operator (hosted VMs, customer-isolated containers, anything where guest I/O comes from a hostile principal).
+
+- `UBLK_F_UNPRIVILEGED_DEV` on. Per-tenant uid for each `serve-volume` daemon. The kernel records the creating uid on the device and DAC-checks the per-device char node, so tenant A's daemon cannot issue control commands against tenant B's `/dev/ublkc<N>` — kernel-enforced cross-tenant isolation, not just convention.
+- Zero-copy off. The daemon copies guest I/O into its own buffers, so a memory-safety bug triggered by a hostile guest corrupts a private userspace allocation, not kernel-owned bio pages. The cache/dedup/decompression layers already touch data in userspace, which bounds the upside of zero-copy here regardless.
+- Composes with the rest of the sandbox stack: seccomp, user namespaces, cgroup limits, minimal bind mounts. `CAP_SYS_ADMIN` would bypass most of that, so this is the only configuration where the sandbox story actually holds.
+- Compromise blast radius: one tenant's uid, one volume. No reach into the coordinator, other tenants' daemons, mount/cgroup operations, or host root.
+
+### Single-tenant / first-party tier — privileged, optional zero-copy
+
+For deployments where the daemon and the workload sit inside the same trust boundary (operator running their own VMs on their own hardware, embedded use, dev/test).
+
+- Privileged daemon. `CAP_SYS_ADMIN` available for control-plane ops.
+- Zero-copy optionally on (`UBLK_F_AUTO_BUF_REG`, kernel 6.10+) once benchmarks justify the I/O-path rework described in step 4. Mutually exclusive with `UBLK_F_UNPRIVILEGED_DEV` at device-add time, so opting into zero-copy is opting out of the multi-tenant tier — not a partial step.
+- Trust boundary is collapsed onto the operator anyway, so the additional kernel-page exposure from zero-copy doesn't change the threat model in a meaningful way.
+
+The capability check for zero-copy isn't really "do we trust this user" in our deployment — the operator daemon already has the capability. It's the kernel's way of saying "this device exposes more of itself to userspace; do not combine with the unprivileged path." Honour that boundary as a deployment-mode constraint, not a footnote.
+
 ## Testing
 
 - Not runnable in `cargo test` sandbox — needs `/dev/ublk-control`, kernel module, udev perms. Treat like `nbd::tests`: sandbox-incompatible, run on a real Linux host.
