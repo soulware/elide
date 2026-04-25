@@ -60,10 +60,13 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, warn};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use object_store::ObjectStore;
+use object_store::path::Path as StorePath;
 use ulid::Ulid;
 
 use elide_core::extentindex::{self, ExtentIndex};
@@ -73,6 +76,7 @@ use elide_core::segment::{self, EntryKind, SegmentEntry};
 use elide_core::volume::{ZERO_HASH, latest_snapshot};
 
 use crate::config::GcConfig;
+use crate::pending_delete::{PendingDeleteMarker, Reason, marker_key};
 use crate::upload::segment_key;
 
 /// Maximum total live bytes included in one small-segment sweep pass.
@@ -423,12 +427,18 @@ pub fn gc_fork(
 /// treated as success; `finalize_gc_handoff` is a no-op if the bare file is
 /// already gone).
 ///
+/// `pending_delete_retention` is stamped into each pending-delete marker
+/// minted by this function (one marker per handoff, listing the consumed
+/// input segment keys). The reaper later acts on those markers — see
+/// `pending_delete::reaper` and `docs/design-replica-model.md`.
+///
 /// Returns the number of handoffs completed.
 pub async fn apply_done_handoffs(
     fork_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
     part_size_bytes: usize,
+    pending_delete_retention: Duration,
 ) -> Result<usize> {
     let gc_dir = fork_dir.join("gc");
     if !gc_dir.try_exists().context("checking gc dir")? {
@@ -521,22 +531,39 @@ pub async fn apply_done_handoffs(
             continue;
         }
 
-        // Delete old S3 objects for each consumed input. 404 means the
-        // object is already gone (idempotent across restart).
+        // Write a pending-delete marker that lists the consumed input
+        // segment keys. The reaper deletes those keys (and the marker)
+        // after the configured retention window — replicas that were
+        // already reading these inputs get a guaranteed grace period.
+        // See `docs/design-replica-model.md` for the full design.
+        //
+        // Idempotency: marker_ulid is derived deterministically from
+        // new_ulid (`new_ulid.increment()`), so re-running this loop
+        // after a crash re-PUTs the same marker key with the same body.
+        let mut targets = Vec::with_capacity(inputs.len());
         for old_ulid in &inputs {
-            let old_ulid_str = old_ulid.to_string();
-            let key = segment_key(volume_id, &old_ulid_str)
-                .with_context(|| format!("building key for {old_ulid_str}"))?;
-            match store.delete(&key).await {
-                Ok(_) => {}
-                Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => {
-                    return Err(
-                        anyhow::anyhow!(e).context(format!("deleting S3 object {old_ulid_str}"))
-                    );
-                }
-            }
+            let key = segment_key(volume_id, &old_ulid.to_string())
+                .with_context(|| format!("building key for {old_ulid}"))?;
+            targets.push(key.to_string());
         }
+        let marker_ulid = new_ulid.increment().ok_or_else(|| {
+            anyhow::anyhow!("ulid overflow incrementing {new_ulid_str} for marker")
+        })?;
+        let volume_ulid = Ulid::from_string(volume_id)
+            .map_err(|e| anyhow::anyhow!("invalid volume_id '{volume_id}': {e}"))?;
+        let marker = PendingDeleteMarker {
+            retention: pending_delete_retention,
+            reason: Reason::GcInput,
+            targets,
+        };
+        let body = marker
+            .to_toml()
+            .with_context(|| format!("serialising pending-delete marker for {new_ulid_str}"))?;
+        let key: StorePath = marker_key(volume_ulid, marker_ulid);
+        store
+            .put(&key, Bytes::from(body).into())
+            .await
+            .with_context(|| format!("writing pending-delete marker {marker_ulid}"))?;
 
         // Drop each consumed input's local cache. Safe here: promote_segment
         // already published cache/<new>.body and index/<new>.idx, and deleted
@@ -1485,6 +1512,7 @@ mod tests {
             "vol",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
+            Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -1501,6 +1529,7 @@ mod tests {
             "vol",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
+            Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -1521,6 +1550,7 @@ mod tests {
             "vol",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
+            Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -1592,6 +1622,7 @@ mod tests {
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
         let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
@@ -1616,6 +1647,7 @@ mod tests {
             "test-vol",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
+            Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -1695,6 +1727,7 @@ mod tests {
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
         gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
@@ -2458,6 +2491,7 @@ mod tests {
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
         let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
@@ -2556,6 +2590,7 @@ mod tests {
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
         let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
@@ -2578,6 +2613,7 @@ mod tests {
             "test-vol",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
+            Duration::from_secs(60),
         )
         .await
         .unwrap();

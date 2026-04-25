@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use elide_coordinator::config::GcConfig;
 use elide_coordinator::gc::{GcStrategy, apply_done_handoffs, gc_fork};
@@ -272,6 +273,7 @@ proptest! {
         let gc_config = GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..GcConfig::default()
         };
 
         let cache_dir = fork_dir.join("cache");
@@ -386,6 +388,7 @@ proptest! {
                         "test-vol",
                         &store,
                         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+                        Duration::from_secs(60),
                     ));
 
                     if let Ok(stats) = gc_stats
@@ -485,6 +488,7 @@ proptest! {
         let gc_config = GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..GcConfig::default()
         };
 
         for op in &ops {
@@ -608,6 +612,7 @@ proptest! {
                         "test-vol",
                         &store,
                         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+                        Duration::from_secs(60),
                     ));
 
                     // Assert: every oracle LBA still reads its expected value.
@@ -702,6 +707,7 @@ fn gc_oracle_repro_bug_h() {
     let gc_config = GcConfig {
         density_threshold: 0.0,
         interval_secs: 0,
+        ..GcConfig::default()
     };
 
     // DedupWrite: lba 3 gets DATA, lba 6 gets thin DEDUP_REF (same hash).
@@ -723,6 +729,7 @@ fn gc_oracle_repro_bug_h() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        Duration::from_secs(60),
     ));
     // Read both LBAs to populate file cache with the pending/ segment.
     assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
@@ -746,6 +753,7 @@ fn gc_oracle_repro_bug_h() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        Duration::from_secs(60),
     ));
 
     // These reads triggered "failed to fill whole buffer" before the fix.
@@ -786,6 +794,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     let gc_config = GcConfig {
         density_threshold: 0.0,
         interval_secs: 0,
+        ..GcConfig::default()
     };
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
@@ -811,6 +820,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        Duration::from_secs(60),
     ));
     eprintln!(
         "index/ after sweep 1: [{}]",
@@ -845,6 +855,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        Duration::from_secs(60),
     ));
     let final_idx = list_dir(&index_dir);
     eprintln!("index/ final: [{}]", final_idx.join(", "));

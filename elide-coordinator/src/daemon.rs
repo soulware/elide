@@ -110,6 +110,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         let snap_locks = snapshot_locks.clone();
         let store = store.clone();
         let issuer = issuer.clone();
+        let pending_delete_retention = gc_config.pending_delete_retention;
         tokio::spawn(async move {
             inbound::serve(
                 &socket_path,
@@ -122,12 +123,22 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                 store,
                 store_config,
                 part_size_bytes,
+                pending_delete_retention,
                 root_key,
                 issuer,
             )
             .await;
         });
     }
+
+    // Coordinator-wide pending-delete reaper. One ticker fans out
+    // per-owned-volume reap operations (non-blocking spawn). Cadence is
+    // derived from the configured retention; see GcConfig::reaper_cadence.
+    elide_coordinator::reaper::start(
+        store.clone(),
+        config.data_dir.clone(),
+        gc_config.reaper_cadence(),
+    );
 
     // Maps each known volume path to its directory inode.  The inode detects
     // delete-and-recreate: if the same path reappears with a different inode

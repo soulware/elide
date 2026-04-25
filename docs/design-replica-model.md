@@ -152,19 +152,35 @@ periodic reaper on the owning coordinator physically deletes targets
 
 ### Marker record
 
-Each marker is a small structured record containing:
+Path: `by_id/<vol_ulid>/pending-delete/<marker_ulid>.toml`
 
-- **Target key(s)** — one marker may cover multiple related objects
-  retired together (e.g. a GC output's idx plus any auxiliary files).
-  Listed explicitly; no wildcard rules.
-- **Creation ULID** — both the marker's identifier and the zero point
-  for the reap deadline. ULID-derived time matches how handoff ordering
-  is already reasoned about; wall-clock is not load-bearing.
-- **Reason** — enum: `gc-input`, `superseded`, `volume-delete-tail`,
-  etc. For diagnostics and audit, not for reader logic.
+```toml
+retention = "24h"
+reason = "gc-input"
 
-Marker path: `by_id/<vol_ulid>/pending-delete/<marker_ulid>`. Concrete
-format TBD (`.manifest` precedent argues for a readable form).
+targets = [
+  "by_id/01J.../segments/2026/04/25/01J....seg",
+  "by_id/01J.../index/01J....idx",
+]
+```
+
+- **`retention`** — humantime duration, stamped at creation from the
+  coordinator's config. The reaper derives the deadline as
+  `ulid_timestamp(marker_ulid) + retention`; live config changes never
+  affect existing markers.
+- **`reason`** — string enum. v1 has a single value, `gc-input`,
+  emitted by the coordinator's GC handoff. Audit/diagnostic only; the
+  reaper ignores it. Additional reasons can be added later as new
+  call sites need them; the enum is open by design.
+- **`targets`** — flat array of S3 keys retired together. Listed
+  explicitly, no wildcards. The reaper deletes every target before
+  deleting the marker (see *Reaper* below).
+
+The marker filename is the creation ULID — the sole source of truth
+for when the marker was minted, consistent with how handoff ordering
+is already reasoned about. No creation-timestamp field, no deadline
+field (derivable), no schema-version field, no volume ULID (implicit
+in path).
 
 ### Reader semantics
 
@@ -190,8 +206,11 @@ Runs as a periodic task on the coordinator that owns the volume. Lists
 `pending-delete/`, decides which markers are past T using their
 creation ULID, then for each expired marker:
 
-1. Delete each listed target key (idempotent; a 404 is fine).
-2. Delete the marker.
+1. Parse and validate every target key (see *Target validation* below).
+   Reject the entire marker on any failure — log loudly, leave the
+   marker in place, do not partially reap.
+2. Delete each listed target key (idempotent; a 404 is fine).
+3. Delete the marker.
 
 Order matters: targets first, marker second. A restarted reaper
 re-listing the prefix will see any marker whose targets are already
@@ -203,6 +222,90 @@ The owning coordinator is the sole writer to its volume's S3 prefix;
 replicas reading from this bucket have no write authority and do not
 participate in reaping.
 
+#### Scope
+
+The reaper runs only for volumes the local coordinator owns as a
+writer — i.e. volumes the coordinator is currently driving GC and
+drain for. Read-only references (cheap-reference replicas of an
+upstream) have no reaper because they have no S3 write authority on
+the upstream's prefix; the upstream's own coordinator is responsible
+for reaping there.
+
+#### Cadence and dispatch
+
+A single coordinator-wide ticker fires on the cadence
+`max(retention / 10, 1s)`. On each tick, the coordinator iterates the
+volumes it owns and spawns a non-blocking reap operation per volume.
+Operations are independent: a slow or failing S3 call on one volume
+does not delay the others. One global ticker plus per-volume spawns
+keeps the resource shape simple at the small volume counts a single
+coordinator manages.
+
+The `1s` floor exists for tests with short retention values; in
+production T is on the order of hours, so the cadence floor never
+binds.
+
+#### Target validation
+
+The volume identity flows through the reaper as a ground-truth input,
+not as a parsed value. Three independent checkpoints must all agree on
+the same `vol_ulid` before any deletion happens:
+
+1. **Invocation.** The reaper is invoked per-volume. The caller passes
+   the volume's ULID explicitly; the reaper lists
+   `by_id/<vol_ulid>/pending-delete/` under that ULID. This ULID is the
+   ground truth for the run.
+2. **Marker path.** For each listed marker, the reaper parses the
+   volume component out of the marker's own key and asserts it equals
+   the invocation ULID. A mismatch means the listing returned a key
+   from a different prefix — log loudly and skip.
+3. **Target.** The target parser receives the invocation ULID as
+   `expected_vol` and emits a `ReapTarget` only when the target's
+   volume component matches.
+
+Each target string is parsed into a typed `ReapTarget` enum with one
+variant per allowed shape. v1 ships a single variant matching the
+only reason currently emitted (`gc-input`):
+
+- `by_id/<vol_ulid>/segments/YYYYMMDD/<seg_ulid>` — segment body
+
+Future variants (snapshot presence marker
+`by_id/<vol_ulid>/snapshots/YYYYMMDD/<snap_ulid>`, snapshot filemap
+`...<snap_ulid>.filemap`, snapshot manifest `...<snap_ulid>.manifest`)
+land alongside their writer call sites if/when those reasons are
+introduced.
+
+Anything that doesn't match an enum variant is rejected. In
+particular:
+
+- **No path weirdness.** No `..`, no `.`, no double slashes, no leading
+  or trailing slash, no embedded NUL. ULIDs and date components are
+  parsed through their typed parsers (`Ulid::from_string`, fixed-width
+  date), not pattern-matched as raw strings.
+- **Default-deny on file class.** `manifest.toml`, `volume.pub`, and
+  anything under `pending-delete/` are not in the enum and therefore
+  unreapable. Adding a new reapable file class is a deliberate code
+  change, not a marker-content change.
+- **Bounded target count per marker.** A hard cap (e.g. 1024) on
+  `targets.len()` rejects malformed or runaway markers before any
+  delete fires. Realistic GC handoffs sit well below the cap; anything
+  near it is a bug or tampering signal.
+
+A rejected marker becomes an operator signal, not silent data loss.
+
+This three-checkpoint flow is deliberate. A parser bug in any single
+layer cannot cause cross-volume reaping on its own — the bug would
+have to corrupt the invocation ULID, the marker-path parse, and the
+target parse identically. The dominant risk we're defending against
+isn't a sophisticated attacker; it's an internal bug that misroutes a
+delete to the wrong volume's data. Three independent agreements on
+the same ULID make that class of bug structurally hard to trigger.
+
+The validation step also defends against the narrow split-IAM threat
+model from *Authenticity* above: an attacker with PutObject but not
+DeleteObject who plants a marker pointing at `manifest.toml` produces
+a noisy reject, not a deletion.
+
 ### The invariant
 
 **Every physical delete of a canonical S3 object goes through a
@@ -213,6 +316,15 @@ the replica guarantee, silently.
 Whole-volume deletion is the one exception: when a volume is being
 torn down entirely, a replica following it has no contract that
 survives the teardown. Volume delete can drop the prefix directly.
+
+### Authenticity
+
+Markers are written exclusively by the volume's owning coordinator —
+the same actor that already holds write authority on the prefix and
+drives all S3 deletions through the GC handoff. They are unsigned;
+authenticity derives from the sole-writer ACL on the prefix. An
+attacker able to write a marker is by construction also able to delete
+canonical objects directly, so signing would not raise the bar.
 
 ### Retention window T
 

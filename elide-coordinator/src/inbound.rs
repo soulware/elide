@@ -47,6 +47,7 @@ pub async fn serve(
     store: Arc<dyn ObjectStore>,
     store_config: Arc<StoreSection>,
     part_size_bytes: usize,
+    pending_delete_retention: Duration,
     root_key: [u8; 32],
     issuer: Arc<dyn CredentialIssuer>,
 ) {
@@ -104,6 +105,7 @@ pub async fn serve(
                     store,
                     store_cfg,
                     part_size_bytes,
+                    pending_delete_retention,
                     root_key,
                     issuer,
                 ));
@@ -125,6 +127,7 @@ async fn handle(
     store: Arc<dyn ObjectStore>,
     store_config: Arc<StoreSection>,
     part_size_bytes: usize,
+    pending_delete_retention: Duration,
     root_key: [u8; 32],
     issuer: Arc<dyn CredentialIssuer>,
 ) {
@@ -165,6 +168,7 @@ async fn handle(
         &store,
         &store_config,
         part_size_bytes,
+        pending_delete_retention,
         &root_key,
         issuer.as_ref(),
         peer_pid,
@@ -185,6 +189,7 @@ async fn dispatch(
     store: &Arc<dyn ObjectStore>,
     store_config: &StoreSection,
     part_size_bytes: usize,
+    pending_delete_retention: Duration,
     root_key: &[u8; 32],
     issuer: &dyn CredentialIssuer,
     peer_pid: Option<i32>,
@@ -335,7 +340,15 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: snapshot <volume>".to_string();
             }
-            snapshot_volume(args, data_dir, snapshot_locks, store, part_size_bytes).await
+            snapshot_volume(
+                args,
+                data_dir,
+                snapshot_locks,
+                store,
+                part_size_bytes,
+                pending_delete_retention,
+            )
+            .await
         }
 
         "reclaim" => {
@@ -716,6 +729,7 @@ async fn snapshot_volume(
     snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
     part_size_bytes: usize,
+    pending_delete_retention: Duration,
 ) -> String {
     let link = data_dir.join("by_name").join(vol_name);
     let fork_dir = match std::fs::canonicalize(&link) {
@@ -769,9 +783,14 @@ async fn snapshot_volume(
     //    `try_lock`s the same lock and skips the tick while we hold it,
     //    so there is no race with a concurrent apply_done_handoffs.
     let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
-    if let Err(e) =
-        elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, store, part_size_bytes)
-            .await
+    if let Err(e) = elide_coordinator::gc::apply_done_handoffs(
+        &fork_dir,
+        &volume_id,
+        store,
+        part_size_bytes,
+        pending_delete_retention,
+    )
+    .await
     {
         return format!("err draining gc handoffs: {e:#}");
     }

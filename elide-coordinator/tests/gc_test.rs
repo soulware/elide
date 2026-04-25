@@ -79,6 +79,7 @@
 
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use elide_coordinator::config::GcConfig;
 use elide_coordinator::gc::{apply_done_handoffs, gc_fork};
@@ -276,6 +277,7 @@ fn make_gc_config() -> GcConfig {
     GcConfig {
         density_threshold: 0.0,
         interval_secs: 0,
+        ..GcConfig::default()
     }
 }
 
@@ -421,6 +423,7 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        Duration::from_secs(60),
     ))
     .unwrap();
 
@@ -457,6 +460,7 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        Duration::from_secs(60),
     ))
     .unwrap();
 
@@ -566,6 +570,7 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        Duration::from_secs(60),
     ))
     .unwrap();
 
@@ -686,6 +691,7 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        Duration::from_secs(60),
     ))
     .unwrap();
 
@@ -836,6 +842,7 @@ fn drain_failure_skips_gc_and_data_survives() {
         "test-vol",
         &good_store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        Duration::from_secs(60),
     ))
     .unwrap();
 
@@ -964,6 +971,7 @@ fn gc_restart_safety_applied_handoff() {
         "test-vol",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+        Duration::from_secs(60),
     ))
     .unwrap();
 
@@ -1151,6 +1159,7 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
             "test-vol",
             &store,
             elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+            Duration::from_secs(60),
         ));
     };
 
@@ -1311,6 +1320,7 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
             "test-vol",
             &store,
             elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+            Duration::from_secs(60),
         ));
     };
 
@@ -1483,6 +1493,7 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
             "test-vol",
             &store,
             elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
+            Duration::from_secs(60),
         ));
     };
 
@@ -1616,6 +1627,7 @@ fn gc_bug_h_canonical_body_shadows_live_lba() {
     let gc_config = GcConfig {
         density_threshold: 0.9,
         interval_secs: 0,
+        ..GcConfig::default()
     };
 
     // Drive GC round end-to-end: checkpoint, gc_fork, apply staged

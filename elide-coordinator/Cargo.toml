@@ -17,6 +17,7 @@ elide-core   = { path = "../elide-core" }
 lz4_flex     = "0.11"
 elide-fetch  = { path = "../elide-fetch" }
 futures      = "0.3"
+humantime-serde = "1"
 nix          = { version = "0.31", features = ["process", "signal", "user"] }
 rand_core    = { version = "0.6", features = ["getrandom"] }
 object_store = { version = "0.11", features = ["aws"] }
@@ -41,4 +42,8 @@ tempfile    = "3"
 
 [[test]]
 name = "gc_proptest"
+required-features = ["proptest"]
+
+[[test]]
+name = "pending_delete_proptest"
 required-features = ["proptest"]
