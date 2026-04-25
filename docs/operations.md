@@ -161,10 +161,15 @@ Prereqs:
 
 - Kernel 6.0+ with `CONFIG_BLK_DEV_UBLK` (Fedora 37+, Debian 12+,
   Ubuntu 22.10+, RHEL 9+); load with `sudo modprobe ublk_drv`.
-- Kernel 6.5+ for unprivileged operation (`UBLK_F_UNPRIVILEGED_DEV`);
-  otherwise `elide serve-volume` must run as root.
-- udev rules granting your user access to `/dev/ublk-control` and
-  `/dev/ublkc<N>` for unprivileged use.
+- **Today, `elide serve-volume --ublk` must run as root** (or with
+  `CAP_SYS_ADMIN`). The kernel exposes `/dev/ublk-control` and
+  `/dev/ublkc<N>` as root-only by default, and Elide does not yet set
+  `UBLK_F_UNPRIVILEGED_DEV`. Without root you will see
+  `PermissionDenied (os error 13)` at startup.
+- Unprivileged operation (`UBLK_F_UNPRIVILEGED_DEV`, kernel 6.5+) plus
+  udev rules granting your user access to `/dev/ublk-control` and
+  `/dev/ublkc<N>` is on the roadmap but not yet wired up — see
+  `docs/design-ublk-transport.md` step 1.
 
 Crash recovery is enabled unconditionally
 (`UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`). The kernel-assigned

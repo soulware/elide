@@ -90,7 +90,8 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 - Linux-only. New `libublk` dep behind `#[cfg(target_os = "linux")]` + cargo feature `ublk` (on by default on Linux, off elsewhere).
 - Requires kernel 6.0+ with `CONFIG_BLK_DEV_UBLK` (module shipped by Fedora 37+, Debian 12+, Ubuntu 22.10+, RHEL 9+; `modprobe ublk_drv` on demand).
-- Default mode: `UBLK_F_UNPRIVILEGED_DEV` (kernel 6.5+) so we don't demand `CAP_SYS_ADMIN`. Zero-copy still requires root and is deferred as a future optional enhancement (step 4).
+- **Current state:** the ublk control flags are `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE` only; `UBLK_F_UNPRIVILEGED_DEV` is *not* set, so `serve-volume --ublk` requires root today. Wiring up the unprivileged-default path (kernel 6.5+, plus a documented udev rule) is tracked as part of step 1's hardening; `operations.md` flags this for operators.
+- Zero-copy will continue to require root even after the unprivileged flag lands — the kernel gates `UBLK_F_AUTO_BUF_REG` on `CAP_SYS_ADMIN`. Deferred to step 4.
 - Document `modprobe ublk_drv` + udev rules prereq in `docs/operations.md`.
 
 ## Testing
@@ -107,7 +108,7 @@ First PR is the spike only. Later steps are sequenced separately, each on its ow
 2. **Multi-queue, depth 1 (landed).** `nr_hw_queues = min(num_cpus, 4)`, sync handler per queue. Lifecycle cleanup: signal-thread `kill_dev` + post-`run_target` `del_dev` so devices do not leak across serve restarts. `elide ublk list` / `elide ublk delete` diagnostic CLI.
 2b. **Depth > 1 (landed).** `queue_depth = 64` via uring-registered eventfd bridging from a per-queue worker pool. See Async model above for the dead-end we avoided.
 3. **USER_RECOVERY_REISSUE (landed).** Added with `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE` by default; sysfs-scan-based add/recover routing at serve startup; `START_USER_RECOVERY` issued before the recovery builder, `END_USER_RECOVERY` via libublk's internal `start_dev` path. Crash-injection integration test is a follow-up.
-4. **Zero-copy (optional, future).** `UBLK_F_AUTO_BUF_REG` on WRITE. Benchmark. Requires root — likely a separate "privileged" tier.
+4. **Zero-copy (optional, future).** `UBLK_F_AUTO_BUF_REG` on WRITE. Benchmark. Beyond the obvious cost — root is required (`CAP_SYS_ADMIN`) and the kernel floor lifts to 6.10+ for `AUTO_BUF_REG` — the real cost is that the synchronous `VolumeReader` model in *Async model* breaks. Zero-copy hands the daemon a kernel-registered buffer index per tag; reads must land directly in that buffer via io_uring SQEs against the queue's ring, not via a sync `pread` into an arbitrary `&mut [u8]`. The backend either reworks its I/O path to issue ring-targeted ops, or copies into the registered buffer at the boundary and gives up the win. Internal copies (cache, dedup, decompression) further bound the upside, so this should be measured before committing. Likely a separate "privileged" tier.
 5. **Config + CLI (landed).** `[ublk]` section in `volume.toml` (mutually exclusive with `[nbd]`, enforced at parse time). `volume create` / `volume update` grew `--ublk` / `--ublk-id` / `--no-ublk` flags. Supervisor reads `[ublk]` and passes `--ublk` / `--ublk-id` to `serve-volume`; `find_ublk_conflict` mirrors `find_nbd_conflict` (lowest-ULID-wins by `dev_id`). Operator docs in `operations.md` and `quickstart.md`.
 
 ## References
