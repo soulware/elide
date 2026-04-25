@@ -4,7 +4,7 @@
 // exercised here is totality: no byte string can panic the parser,
 // every Ok parse round-trips through the canonical renderer.
 
-use elide_coordinator::pending_delete::{parse_marker_body, parse_marker_key, render_marker};
+use elide_coordinator::retention::{parse_marker_body, parse_marker_key, render_marker};
 use proptest::prelude::*;
 use ulid::Ulid;
 

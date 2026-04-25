@@ -1,11 +1,11 @@
-// Pending-delete reaper.
+// Retention-marker reaper.
 //
 // Coordinator-wide ticker that walks each owned volume's
 // `retention/` prefix, validates each marker, and deletes the
 // referenced input segments + the marker itself when the retention
 // window has elapsed.
 //
-// Marker shape and validation rules: see `crate::pending_delete` and
+// Marker shape and validation rules: see `crate::retention` and
 // `docs/design-replica-model.md` (Reaper / Target validation /
 // Cadence and dispatch).
 
@@ -19,13 +19,13 @@ use object_store::path::Path as StorePath;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
-use crate::pending_delete::{parse_marker_body, parse_marker_key, segment_key_for};
+use crate::retention::{parse_marker_body, parse_marker_key, segment_key_for};
 
 /// Spawn the coordinator-wide reaper ticker.
 ///
 /// Cadence is `gc_config.reaper_cadence()` (= `max(retention/10, 1s)`).
 /// `retention` is read on each tick so that operator changes to the
-/// `pending_delete_retention` config apply immediately to all in-flight
+/// `retention_window` config apply immediately to all in-flight
 /// markers — see `docs/design-replica-model.md` (*Marker record*) for
 /// why we derive rather than stamp.
 pub fn start(
@@ -205,7 +205,7 @@ fn volume_ulid(vol_dir: &Path) -> anyhow::Result<Ulid> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pending_delete::{marker_key, render_marker};
+    use crate::retention::{marker_key, render_marker};
     use bytes::Bytes;
     use object_store::PutPayload;
     use object_store::memory::InMemory;

@@ -1,4 +1,4 @@
-// Pending-delete markers.
+// Retention markers.
 //
 // See `docs/design-replica-model.md` for the surrounding design. This
 // module defines the on-disk record and parsing primitives. The reaper
@@ -12,7 +12,7 @@
 // cross-reference to `segments/<date>/<gc_output_ulid>` (the GC output
 // itself in S3) and makes re-uploading the same handoff fully
 // idempotent. The retention deadline is *derived* from the filename
-// ULID's timestamp plus the coordinator's current `pending_delete_retention`
+// ULID's timestamp plus the coordinator's current `retention_retention`
 // (see `operations.md` *gc_checkpoint — the pre-mint pattern* for why
 // `ulid_timestamp(gc_output_ulid)` reliably tracks handoff wall-clock).
 

@@ -1,11 +1,11 @@
 pub mod config;
 pub mod control;
 pub mod gc;
-pub mod pending_delete;
 pub mod prefetch;
 pub mod pull;
 pub mod range_fetcher;
 pub mod reaper;
+pub mod retention;
 pub mod tasks;
 pub mod upload;
 

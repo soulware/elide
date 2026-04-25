@@ -75,7 +75,7 @@ use elide_core::segment::{self, EntryKind, SegmentEntry};
 use elide_core::volume::{ZERO_HASH, latest_snapshot};
 
 use crate::config::GcConfig;
-use crate::pending_delete::{marker_key, render_marker};
+use crate::retention::{marker_key, render_marker};
 
 /// Maximum total live bytes included in one small-segment sweep pass.
 /// Matches the volume's FLUSH_THRESHOLD to keep output segment size bounded.
@@ -532,7 +532,7 @@ pub async fn apply_done_handoffs(
         // Write a retention marker at `retention/<gc_output_ulid>` listing
         // the consumed input ULIDs. The reaper deletes those inputs from
         // S3 (and the marker) once `ulid_timestamp(<gc_output_ulid>) +
-        // pending_delete_retention` has passed — giving replicas a
+        // retention_retention` has passed — giving replicas a
         // guaranteed grace period. See `docs/design-replica-model.md`.
         //
         // Idempotency: the marker key is the GC output ULID, so re-running

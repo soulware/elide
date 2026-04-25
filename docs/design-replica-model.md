@@ -8,7 +8,7 @@
 - **Deferred:** Tightening `--from` to require an explicit
   `<vol_ulid>/<snap_ulid>` pin, and introducing `volume materialize`. These
   previously waited on TTL specifics for the object store; that gap is now
-  resolved by application-managed pending-delete markers (see below), so
+  resolved by application-managed retention markers (see below), so
   the blocker is implementation, not design. The existing `--force-snapshot`
   flag on `create --from` stays in place as the interim mechanism for
   branching past the most recent snapshot.
@@ -120,7 +120,7 @@ The object store's deletion semantics determine what happens in the race
 window between an upstream GC deleting a segment and a replica reading it.
 The required model is:
 
-- A deletion creates a **pending-delete marker** with a bounded retention
+- A deletion creates a **retention markers** with a bounded retention
   window T.
 - Within T, `GET key` on the canonical object still returns bytes.
 - After T, a reaper physically deletes the canonical object (and the
@@ -132,21 +132,21 @@ Rather than depending on any backend's native lifecycle, versioning, or
 snapshot features, Elide owns this mechanism directly in the coordinator.
 This keeps all backends symmetric (Tigris, R2, AWS S3, MinIO), avoids a
 per-backend retention API, and lets us define the semantics precisely —
-what T is, when it starts, how restart works. See *Pending-delete
-markers* below.
+what T is, when it starts, how restart works. See *Marker record*
+below.
 
 `--force-snapshot` and its supporting machinery
 (`create_readonly_snapshot_now`, the attestation keypair, the
 `ParentRef.manifest_pubkey` field) stay in place until `materialize`
 lands; they're then retired.
 
-## Proposed: application-managed pending-delete markers
+## Proposed: application-managed retention markers
 
 Elide adds a `retention/` prefix under each volume's S3 root. When
 the coordinator's handoff protocol would physically delete an S3 object
 (GC input deletion, per the coordinator-driven handoff described in
 `operations.md` and `architecture.md`), it instead writes a
-pending-delete marker and leaves the canonical object in place. A
+retention marker and leaves the canonical object in place. A
 periodic reaper on the owning coordinator physically deletes targets
 (and their markers) whose retention window has elapsed.
 
@@ -312,7 +312,7 @@ deletion of unrelated data.
 ### The invariant
 
 **Every physical delete of a canonical S3 object goes through a
-pending-delete marker.** This is what lets a replica trust "present now
+retention markers.** This is what lets a replica trust "present now
 ⟹ present for at least T." Breaking this invariant even once breaks
 the replica guarantee, silently.
 
@@ -367,7 +367,7 @@ live_data + post_compaction_outputs + (C × T)
 
 | Knob | Effect on retention overhead |
 |---|---|
-| `pending_delete_retention` (T) | Linear. Halving T halves the in-flight term. Lower bound is whatever replicas need to catch up; below that the guarantee is meaningless. |
+| `retention_window` (T) | Linear. Halving T halves the in-flight term. Lower bound is whatever replicas need to catch up; below that the guarantee is meaningless. |
 | `gc.density_threshold` | Indirect, via what's worth compacting. A lower threshold (compact only mostly-dead) means input bytes >> output bytes — savings dominate retention overhead. A higher threshold (compact mostly-live) means input ≈ output — retention overhead is ~2× the throughput for marginal savings. |
 | `gc.interval_secs` | Batch granularity only. Steady-state retention overhead is unchanged. |
 
@@ -397,9 +397,9 @@ against the volume's tolerance for dead-byte accumulation in `live_data`.
 "Tombstone" already means something specific in Elide: a zero-entry GC
 output carrying only an `inputs` list, used to supersede fully-dead
 segments without producing new extents (see `operations.md`). These
-GC-layer tombstones are orthogonal to the S3-layer pending-delete
-markers described here. When a GC tombstone handoff retires its input
-segments, the coordinator mints a pending-delete marker for those
+GC-layer tombstones are orthogonal to the S3-layer retention markers
+described here. When a GC tombstone handoff retires its input
+segments, the coordinator mints a retention marker for those
 inputs as part of the same handoff — two different mechanisms
 cooperating, not the same one named twice.
 
@@ -411,8 +411,8 @@ with write volume. That defeats Elide's GC / repack cost model: every
 superseded segment and every GC compaction input would accrue
 permanent storage cost, not bounded cost. The retention-window problem
 this section tried to solve is instead addressed by application-managed
-pending-delete markers (see *What TTL buys us* and *Proposed:
-application-managed pending-delete markers* above); those are
+retention markers (see *What TTL buys us* and *Proposed:
+application-managed retention markers* above); those are
 backend-agnostic and don't bill for history in perpetuity. Kept below
 for historical context.
 
@@ -462,7 +462,7 @@ materialize driver.
 versioning that makes Tigris bucket snapshots unbounded — the same
 monotonic-growth cost problem at per-object granularity. PITR between
 Elide-level snapshots is a non-goal; if it ever becomes a goal, a
-longer retention window T on pending-delete markers gives a cost-bounded
+longer retention window T on retention markers gives a cost-bounded
 (if coarser) path. Kept below for historical context.
 
 Tigris's always-on per-object versioning plus explicit bucket snapshots
@@ -517,7 +517,7 @@ Open questions:
   it accepts today — a volume name, a bare volume ULID, or an explicit
   `<vol_ulid>/<snap_ulid>` pin — and `--force-snapshot` stays in place.
 
-**Pending (blocked on implementation of pending-delete markers + `materialize`):**
+**Pending (blocked on implementation of retention markers + `materialize`):**
 
 - Tighten `--from` to require the explicit `<vol_ulid>/<snap_ulid>` pin
   form. Bare name and bare ULID become errors. This change waits on

@@ -337,13 +337,14 @@ pub struct GcConfig {
     #[serde(default = "default_gc_interval")]
     pub interval_secs: u64,
 
-    /// Retention window for pending-delete markers. Inputs of a successful
-    /// GC handoff are not deleted from S3 immediately; instead the
-    /// coordinator writes a marker that the reaper acts on after this
-    /// window has elapsed. Accepts humantime-style strings like `"24h"`,
-    /// `"30s"`, `"5m"`. Default: `24h`.
-    #[serde(default = "default_pending_delete_retention", with = "humantime_serde")]
-    pub pending_delete_retention: Duration,
+    /// Retention window for GC input segments. After a successful GC
+    /// handoff, inputs are not deleted from S3 immediately; the
+    /// coordinator writes a retention marker at
+    /// `by_id/<vol>/retention/<gc_output_ulid>` and the reaper deletes
+    /// the inputs once this window has elapsed. Accepts humantime-style
+    /// strings like `"24h"`, `"30s"`, `"5m"`. Default: `24h`.
+    #[serde(default = "default_retention_window", with = "humantime_serde")]
+    pub retention_window: Duration,
 }
 
 fn default_gc_density() -> f64 {
@@ -352,7 +353,7 @@ fn default_gc_density() -> f64 {
 fn default_gc_interval() -> u64 {
     10
 }
-fn default_pending_delete_retention() -> Duration {
+fn default_retention_window() -> Duration {
     Duration::from_secs(24 * 60 * 60)
 }
 
@@ -361,7 +362,7 @@ impl GcConfig {
     /// floor exists for tests with very short retention; production T is
     /// hours, so the floor never binds in real deployments.
     pub fn reaper_cadence(&self) -> Duration {
-        let derived = self.pending_delete_retention / 10;
+        let derived = self.retention_window / 10;
         derived.max(Duration::from_secs(1))
     }
 }
@@ -371,7 +372,7 @@ impl Default for GcConfig {
         Self {
             density_threshold: default_gc_density(),
             interval_secs: default_gc_interval(),
-            pending_delete_retention: default_pending_delete_retention(),
+            retention_window: default_retention_window(),
         }
     }
 }

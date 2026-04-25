@@ -45,5 +45,5 @@ name = "gc_proptest"
 required-features = ["proptest"]
 
 [[test]]
-name = "pending_delete_proptest"
+name = "retention_marker_proptest"
 required-features = ["proptest"]

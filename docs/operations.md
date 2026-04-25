@@ -220,7 +220,7 @@ Each GC tick selects one bucket of eligible segments and emits one output plan p
 
 Per-tick work is bounded by the 32 MiB live cap, the 8192-entry cap, and O(1)-per-input tombstone bookkeeping on the apply side. "Repack-multi" falls out for free: multiple sparse smalls can land in one bucket. The entry cap matches the WAL flush cap (see *Pending compaction*) so GC outputs sit at the same scale as freshly-flushed segments — without it, packing many thin-entry inputs (DedupRef, Zero, small Inline) could produce a single output with an over-large index region.
 
-**Retention interaction.** Compacted input segments are not deleted from S3 immediately — they're held for the configured retention window (`pending_delete_retention`) before the reaper removes them. This means GC during the retention window *defers* space reclamation rather than driving it. The peak storage cost of running GC at compaction throughput C with retention T is `live_data + post_compaction_outputs + (C × T)`. Tuning `density_threshold` and T together is what controls overall storage efficiency; see `docs/design-replica-model.md` *Retention economics* for the full model.
+**Retention interaction.** Compacted input segments are not deleted from S3 immediately — they're held for the configured retention window (`retention_window`) before the reaper removes them. This means GC during the retention window *defers* space reclamation rather than driving it. The peak storage cost of running GC at compaction throughput C with retention T is `live_data + post_compaction_outputs + (C × T)`. Tuning `density_threshold` and T together is what controls overall storage efficiency; see `docs/design-replica-model.md` *Retention economics* for the full model.
 
 **Local-first fetch.** Before issuing any S3 GET, `fetch_live_bodies` checks whether the input's body is already resolvable from `cache/<ulid>.body`. A cache hit requires (a) the body file exists and (b) every live DATA entry's bit is set in `cache/<ulid>.present`. On a full hit, the body is read from the local file and sliced per-entry; S3 is not touched. On any partial state (missing file, missing bit, short read) the path falls through to the existing range-GET / full-body-GET logic. This is safe without locks because `cache/` is append-only from the volume's perspective (the coordinator is the sole deleter), `.present` bits are durable before they are published, and bodies covered by a set bit are immutable until the file is unlinked. The hash-verification step in `compact_segments` remains the correctness backstop regardless of fetch source. Self-written-and-promoted segments — where the volume copied the full body from `pending/` into `cache/` at promote time — are the common hit case; partially demand-fetched segments fall back to S3.
 
@@ -248,7 +248,7 @@ past.
 2. *GC output ULID timestamp ≈ handoff wall-clock.* Anything that
    needs "when did this GC output appear in the volume's timeline"
    can read `ulid_timestamp(gc_output)` directly. In particular,
-   pending-delete retention deadlines for input segments are
+   retention deadlines for input segments are
    derived as `ulid_timestamp(gc_output) + retention` — accurate to
    ~1 ms in the absence of clock skew, and bounded by `UlidMint`'s
    monotonic increment when skew occurs.

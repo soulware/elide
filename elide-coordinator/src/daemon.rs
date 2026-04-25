@@ -137,7 +137,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         store.clone(),
         config.data_dir.clone(),
         gc_config.reaper_cadence(),
-        gc_config.pending_delete_retention,
+        gc_config.retention_window,
     );
 
     // Maps each known volume path to its directory inode.  The inode detects
