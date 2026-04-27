@@ -367,53 +367,48 @@ mod imp {
         std::thread::Builder::new()
             .name("ublk-signal".into())
             .spawn(move || {
-                let mut shutting_down = false;
-                loop {
-                    match sfd.read_signal() {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            tracing::error!(
-                                "ublk-signal: signalfd read returned None on a blocking fd"
-                            );
-                            std::process::exit(130);
-                        }
-                        Err(e) => {
-                            tracing::error!("ublk-signal: signalfd read failed: {e}");
-                            std::process::exit(130);
-                        }
-                    }
-                    if shutting_down {
-                        // Second signal (Ctrl-C twice / repeated SIGTERM).
-                        // The flush is already in progress in the main
-                        // path of this thread; it has not returned, so
-                        // we are stuck somewhere. Honour "just die."
+                // Single-shot: block until any of the masked signals
+                // arrives, then run the bounded flush and exit. The
+                // watchdog spawned below caps total shutdown time at
+                // SHUTDOWN_FLUSH_TIMEOUT, so a second signal isn't
+                // needed to escape — and a second signal couldn't be
+                // serviced inline anyway, since `client.flush()` blocks
+                // this thread.
+                match sfd.read_signal() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        tracing::error!(
+                            "ublk-signal: signalfd read returned None on a blocking fd"
+                        );
                         std::process::exit(130);
                     }
-                    shutting_down = true;
-
-                    // Watchdog: if the flush stalls (actor wedged, disk
-                    // unresponsive), force-exit after a bounded wait so
-                    // the kernel can park the device on its own. The
-                    // watchdog races the flush below; whichever calls
-                    // process::exit first wins.
-                    let _watchdog = std::thread::Builder::new()
-                        .name("ublk-shutdown-watchdog".into())
-                        .spawn(|| {
-                            std::thread::sleep(SHUTDOWN_FLUSH_TIMEOUT);
-                            tracing::warn!(
-                                "ublk shutdown flush did not complete within {:?}; \
-                                 exiting anyway — kernel will park the device on \
-                                 daemon-exit detection",
-                                SHUTDOWN_FLUSH_TIMEOUT
-                            );
-                            std::process::exit(0);
-                        });
-
-                    if let Err(e) = client.flush() {
-                        tracing::warn!("ublk shutdown flush: {e}");
+                    Err(e) => {
+                        tracing::error!("ublk-signal: signalfd read failed: {e}");
+                        std::process::exit(130);
                     }
-                    std::process::exit(0);
                 }
+
+                // Watchdog: if the flush stalls (actor wedged, disk
+                // unresponsive), force-exit after a bounded wait so the
+                // kernel can park the device on its own. Races the flush
+                // below; whichever calls process::exit first wins.
+                let _watchdog = std::thread::Builder::new()
+                    .name("ublk-shutdown-watchdog".into())
+                    .spawn(|| {
+                        std::thread::sleep(SHUTDOWN_FLUSH_TIMEOUT);
+                        tracing::warn!(
+                            "ublk shutdown flush did not complete within {:?}; \
+                             exiting anyway — kernel will park the device on \
+                             daemon-exit detection",
+                            SHUTDOWN_FLUSH_TIMEOUT
+                        );
+                        std::process::exit(0);
+                    });
+
+                if let Err(e) = client.flush() {
+                    tracing::warn!("ublk shutdown flush: {e}");
+                }
+                std::process::exit(0);
             })
             .map_err(io::Error::other)
     }
@@ -1000,15 +995,6 @@ mod imp {
         std::fs::rename(&tmp, &final_path)
     }
 
-    /// Drop the binding file. Absent file is fine — shutdown is idempotent.
-    fn clear_ublk_id(dir: &Path) -> io::Result<()> {
-        match std::fs::remove_file(dir.join(UBLK_ID_FILE)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Scan `/sys/class/ublk-char` for `ublkcN` entries and return the ids.
     /// This mirrors what `libublk::ctrl::UblkCtrl::for_each_dev_id` does
     /// internally, but without its `Fn + Clone + 'static` closure bound that
@@ -1166,12 +1152,6 @@ mod imp {
             // Overwrite atomically — later id wins.
             write_ublk_id(&dir, 7).unwrap();
             assert_eq!(read_ublk_id(&dir).unwrap(), Some(7));
-
-            clear_ublk_id(&dir).unwrap();
-            assert_eq!(read_ublk_id(&dir).unwrap(), None);
-
-            // Clearing an already-absent binding is idempotent.
-            clear_ublk_id(&dir).unwrap();
 
             std::fs::remove_dir_all(dir).unwrap();
         }
