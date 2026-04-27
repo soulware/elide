@@ -93,7 +93,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     // sweep handles the residual cases where the volume directory has
     // been removed out-of-band, the host has rebooted (sysfs cleared but
     // ublk.id remains), or an operator manually deleted a device.
-    crate::ublk_sweep::reconcile(&data_dir, &elide_bin).await;
+    crate::ublk_sweep::reconcile(&data_dir).await;
 
     // Shared notify: inbound socket triggers this to request an immediate rescan.
     let rescan_notify = Arc::new(Notify::new());

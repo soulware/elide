@@ -12,8 +12,9 @@
 //
 //   1. Enumerate `/sys/class/ublk-char/ublkc<N>` to get the set of live ids.
 //   2. Walk `<data_dir>/by_id/*/ublk.id` to get the set of bound ids.
-//   3. Live id with no matching binding → orphan: shell out to
-//      `elide ublk delete <id>` (bounded subprocess with a per-id timeout).
+//   3. Live id with no matching binding → orphan: kill_dev + del_dev via
+//      libublk on a `tokio::task::spawn_blocking` thread (bounded by a
+//      per-device timeout).
 //   4. Binding pointing at a non-existent live id → stale: remove the file.
 //      The next serve sees no binding + no sysfs entry and does a fresh ADD.
 //
@@ -22,22 +23,24 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use tokio::process::Command;
 use tracing::{info, warn};
 
 const SYSFS_UBLK_CHAR: &str = "/sys/class/ublk-char";
-/// Per-device timeout for `elide ublk delete`. The CLI's `del_dev` blocks in
-/// the kernel until every reference on the ublk_device is released; a stale
-/// orphan should not have any holders, but bound the call so a misbehaving
-/// kernel state does not block coordinator startup indefinitely.
-const PER_DEV_DELETE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-device timeout for libublk's `kill_dev` + `del_dev`. The kernel's
+/// `del_dev` blocks until every reference on the ublk_device is released; a
+/// stale orphan should not have any holders, but bound the call so a
+/// misbehaving kernel state does not block coordinator startup indefinitely.
+/// On timeout the spawn_blocking task is detached — the syscall finishes (or
+/// not) on its own; the coordinator does not wait further.
+#[cfg(target_os = "linux")]
+const PER_DEV_DELETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run the reconciliation sweep. Logs but never fails — the coordinator must
 /// keep starting even if a kernel device cannot be deleted (operator can
 /// retry via `elide ublk delete --all`).
-pub async fn reconcile(data_dir: &Path, elide_bin: &Path) {
+pub async fn reconcile(data_dir: &Path) {
     let live = match scan_sysfs() {
         Ok(set) => set,
         Err(e) => {
@@ -62,8 +65,8 @@ pub async fn reconcile(data_dir: &Path, elide_bin: &Path) {
 
     for id in orphans {
         info!("[ublk-sweep] deleting orphan kernel device ublk{id} (no matching volume binding)");
-        if let Err(e) = delete_device(elide_bin, id).await {
-            warn!("[ublk-sweep] elide ublk delete {id}: {e}");
+        if let Err(e) = delete_device(id).await {
+            warn!("[ublk-sweep] del_dev ublk{id}: {e}");
         }
     }
 
@@ -155,27 +158,44 @@ fn diff(live: &HashSet<i32>, bindings: &HashMap<PathBuf, i32>) -> (Vec<i32>, Vec
     (orphans, stale)
 }
 
-/// Spawn `elide ublk delete <id>` and bound it with a per-device timeout. The
-/// CLI internally does `kill_dev` + `del_dev`, both of which can block in the
-/// kernel; the timeout ensures one stuck device does not block startup.
-async fn delete_device(elide_bin: &Path, id: i32) -> std::io::Result<()> {
-    let mut child = Command::new(elide_bin)
-        .arg("ublk")
-        .arg("delete")
-        .arg(id.to_string())
-        .kill_on_drop(true)
-        .spawn()?;
-    match tokio::time::timeout(PER_DEV_DELETE_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => Err(std::io::Error::other(format!("exit {status}"))),
-        Ok(Err(e)) => Err(e),
-        Err(_) => {
-            let _ = child.start_kill();
-            Err(std::io::Error::other(format!(
-                "timed out after {PER_DEV_DELETE_TIMEOUT:?}"
-            )))
-        }
+/// Open a fresh `new_simple` control device and issue `kill_dev` + `del_dev`
+/// against it, on a `spawn_blocking` thread (libublk's control ioctls are
+/// synchronous). Bounded by `PER_DEV_DELETE_TIMEOUT`. On timeout the blocking
+/// task is detached: cancelling a kernel `wait_event` from outside is not
+/// possible, so the underlying syscall finishes on its own when the kernel's
+/// last reference drops, and the leak is bounded by process lifetime.
+#[cfg(target_os = "linux")]
+async fn delete_device(id: i32) -> std::io::Result<()> {
+    let task = tokio::task::spawn_blocking(move || {
+        let ctrl = libublk::ctrl::UblkCtrl::new_simple(id)
+            .map_err(|e| std::io::Error::other(format!("open ctrl for dev {id}: {e}")))?;
+        // kill_dev is the documented safe-from-anywhere stop; del_dev then
+        // removes the kernel entry and libublk's json file. del_dev on a
+        // for-add ctrl deadlocks (see libublk Drop), but we built a
+        // new_simple ctrl above so this is safe.
+        let _ = ctrl.kill_dev();
+        ctrl.del_dev()
+            .map_err(|e| std::io::Error::other(format!("del_dev {id}: {e}")))?;
+        Ok::<(), std::io::Error>(())
+    });
+    match tokio::time::timeout(PER_DEV_DELETE_TIMEOUT, task).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(e)) => Err(std::io::Error::other(format!("blocking task: {e}"))),
+        Err(_) => Err(std::io::Error::other(format!(
+            "timed out after {PER_DEV_DELETE_TIMEOUT:?}"
+        ))),
     }
+}
+
+/// Non-Linux stub. The sweep never reaches here because `scan_sysfs` returns
+/// `NotFound` and the function exits early, but the symbol must exist for the
+/// caller to compile cross-platform.
+#[cfg(not(target_os = "linux"))]
+async fn delete_device(_id: i32) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "ublk del_dev not supported on this platform",
+    ))
 }
 
 #[cfg(test)]
