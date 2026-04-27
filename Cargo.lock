@@ -1096,6 +1096,7 @@ dependencies = [
  "elide-fetch",
  "futures",
  "humantime-serde",
+ "libublk",
  "lz4_flex",
  "nix",
  "object_store",
