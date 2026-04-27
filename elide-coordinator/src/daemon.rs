@@ -261,10 +261,11 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
 /// Poll until all pids have exited or the timeout elapses. After the
 /// SIGTERM grace window, escalate to SIGKILL on any stragglers and wait
-/// briefly for them to die. Under shutdown-park, volume daemons no longer
-/// del_dev on shutdown, so this escalation is a safety net for a daemon
-/// that fails to STOP_DEV the kernel device promptly (e.g. a queue thread
-/// blocked unwinding).
+/// briefly for them to die. Under shutdown-park, volume daemons exit
+/// directly via `process::exit` after a bounded WAL flush — neither
+/// del_dev nor STOP_DEV is involved — so the SIGKILL escalation is
+/// purely defensive against a daemon that ignores SIGTERM or is wedged
+/// somewhere outside the signal watcher.
 async fn wait_for_pids(pids: &[u32], grace: Duration) {
     let still_alive = poll_until_exit_or_deadline(pids, grace).await;
     if still_alive.is_empty() {
