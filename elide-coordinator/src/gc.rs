@@ -1387,11 +1387,6 @@ mod tests {
                             std::fs::remove_file(&src).ok();
                         }
                         let _ = is_drain;
-                    } else if let Some(ulid_str) = line.strip_prefix("finalize_gc_handoff ") {
-                        let ulid_str = ulid_str.to_owned();
-                        let applied = dir.join("gc").join(format!("{ulid_str}.applied"));
-                        let done = dir.join("gc").join(format!("{ulid_str}.done"));
-                        std::fs::rename(&applied, &done).ok();
                     }
                     w.write_all(b"ok\n").await.ok();
                 });
@@ -1518,13 +1513,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn done_ignores_non_applied_files() {
+    async fn done_ignores_files_with_extensions() {
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
-        // .pending and .done files should be ignored.
-        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.pending"), "").unwrap();
-        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done"), "").unwrap();
+        // apply_done_handoffs only processes bare-named gc/<ulid> files.
+        // Anything with an extension (`.plan` from the coord, `.staged`
+        // mid-apply, `.tmp` scratch) must be ignored.
+        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.plan"), "").unwrap();
+        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.staged"), "").unwrap();
         let store = make_store();
         let n = apply_done_handoffs(
             tmp.path(),
@@ -1536,8 +1533,8 @@ mod tests {
         .unwrap();
         assert_eq!(n, 0);
         // Files should be untouched.
-        assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.pending").exists());
-        assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done").exists());
+        assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.plan").exists());
+        assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.staged").exists());
     }
 
     // --- DEDUP_REF regression test ---
@@ -1620,7 +1617,8 @@ mod tests {
         drop(vol);
 
         // Step 5: coordinator completes the handoff — uploads to S3, sends
-        // promote IPC to volume (mock), deletes gc/<new>, renames .applied → .done.
+        // promote IPC (mock copies body to cache and deletes the bare gc/<new>),
+        // then finalize_gc_handoff (mock acks; bare file is already gone).
         let _mock = spawn_mock_socket(dir.to_owned()).await;
         let done = apply_done_handoffs(
             dir,

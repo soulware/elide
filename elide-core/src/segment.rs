@@ -2077,12 +2077,11 @@ pub fn set_present_bit(path: &Path, entry_idx: u32, entry_count: u32) -> io::Res
 
 /// Sort segment paths for rebuild, with GC output segments first.
 ///
-/// GC output segments — identified by a corresponding
-/// `gc/<ulid>.{pending,applied,done}` handoff file — are processed before
-/// non-GC segments.  Within each group, segments are sorted by ULID
-/// (oldest first).  This ensures that any non-GC segment (a direct volume
-/// write) overwrites a GC output's entry for the same LBA range, because
-/// the non-GC segment is processed later and its insert replaces the
+/// GC output segments — identified by their parent directory (`gc/`) — are
+/// processed before non-GC segments.  Within each group, segments are sorted
+/// by ULID (oldest first).  This ensures that any non-GC segment (a direct
+/// volume write) overwrites a GC output's entry for the same LBA range,
+/// because the non-GC segment is processed later and its insert replaces the
 /// GC-derived entry in the LBA map.
 ///
 /// Without this ordering, a GC output whose ULID exceeds a concurrent
@@ -2724,13 +2723,12 @@ mod tests {
 
     #[test]
     fn sort_for_rebuild_gc_dir_path_is_gc_output() {
-        // A path in gc/ is treated as a GC output (lower priority) regardless
-        // of which sidecar files exist.  The source directory is the signal.
+        // A path in gc/ is treated as a GC output (lower priority); the
+        // source directory is the only signal sort_for_rebuild looks at.
         let (_tmp, fork_dir) = make_fork_dir();
         let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
         let path = gc_path(&fork_dir, ulid);
         fs::write(&path, b"").unwrap();
-        fs::write(fork_dir.join("gc").join(format!("{ulid}.applied")), b"").unwrap();
 
         let mut paths = vec![path.clone()];
         sort_for_rebuild(&fork_dir, &mut paths);
@@ -2740,14 +2738,11 @@ mod tests {
 
     #[test]
     fn sort_for_rebuild_pending_dir_path_is_not_gc_output() {
-        // A path in pending/ is always regular (higher priority), even if a
-        // .done sidecar exists in gc/ — .done means the handoff is complete and
-        // the old inputs are already gone.
+        // A path in pending/ is always regular (higher priority).
         let (_tmp, fork_dir) = make_fork_dir();
         let ulid = "01AAAAAAAAAAAAAAAAAAAAAAAB";
         let path = seg_path(&fork_dir, ulid);
         fs::write(&path, b"").unwrap();
-        fs::write(fork_dir.join("gc").join(format!("{ulid}.done")), b"").unwrap();
 
         let mut paths = vec![path.clone()];
         sort_for_rebuild(&fork_dir, &mut paths);
@@ -2764,7 +2759,6 @@ mod tests {
         let path_reg = seg_path(&fork_dir, reg_ulid);
         fs::write(&path_gc, b"").unwrap();
         fs::write(&path_reg, b"").unwrap();
-        fs::write(fork_dir.join("gc").join(format!("{gc_ulid}.applied")), b"").unwrap();
 
         let mut paths = vec![path_gc.clone(), path_reg.clone()];
         sort_for_rebuild(&fork_dir, &mut paths);

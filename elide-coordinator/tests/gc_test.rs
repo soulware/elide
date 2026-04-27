@@ -23,7 +23,7 @@
 //   Bug C — gc_checkpoint mints GC output ULIDs before opening a new WAL.
 //            When the WAL is empty at checkpoint time flush_wal is a no-op,
 //            so the active WAL ULID stays below the minted GC output ULIDs.
-//            After the GC output lands in segments/, a subsequent WAL flush
+//            After the GC output is committed to disk, a subsequent WAL flush
 //            creates a segment with a lower ULID; on crash-recovery rebuild
 //            the GC output sorts after and wins, returning stale data.
 //            Fixed by always opening a new WAL after minting in gc_checkpoint.
@@ -33,26 +33,26 @@
 //            existing ULID before minting the GC output ULIDs.  The WAL's ULID
 //            was assigned when the WAL was opened (before the mint), so the
 //            resulting pending segment has ULID < GC output ULIDs.  When that
-//            segment is drained to segments/ and crash-recovery rebuild runs,
-//            the GC output (higher ULID) wins for the affected LBAs, returning
+//            segment is later drained and crash-recovery rebuild runs, the
+//            GC output (higher ULID) wins for the affected LBAs, returning
 //            stale data.
 //            Fixed by minting all three ULIDs (repack, sweep, pending-segment)
 //            before flushing, so the flushed WAL segment gets a ULID > sweep.
 //            Covered by: gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery (below)
 //
-//   Bug E — GC restart-safety gap: apply_gc_handoffs only processed .pending
-//            files, not .applied files.  After a coordinator/volume restart the
-//            volume rebuilds its extent index from .idx files (pointing to old
-//            segments).  If apply_done_handoffs then deletes the old segment
-//            before apply_gc_handoffs has re-applied the .applied handoff, the
-//            extent index becomes stale and all reads for the affected hashes
-//            fail with "segment not found".
-//            Fixed by:
-//              1. apply_gc_handoffs now also processes .applied files (re-applies
-//                 extent index updates idempotently, skips re-signing/rename).
-//              2. The coordinator daemon calls apply_gc_handoffs (IPC) immediately
-//                 before apply_done_handoffs on every GC tick, guaranteeing the
-//                 volume's extent index is consistent before old segments are deleted.
+//   Bug E — GC restart-safety gap (now structurally resolved by the
+//            self-describing handoff protocol). Originally `apply_gc_handoffs`
+//            only processed `.pending` files; after a restart the volume's
+//            extent index was rebuilt from `index/*.idx` (still pointing at
+//            old segments) and the freshly-applied handoff file was ignored,
+//            so a subsequent `apply_done_handoffs` deleted segments the
+//            extent index still referenced.
+//            Under the current protocol the apply step renames `.staged` to
+//            a bare `gc/<ulid>` file, and `Volume::open` rebuild picks it up
+//            directly via `collect_gc_applied_segment_files` — the extent
+//            index points at the new segment without a re-apply. The
+//            coordinator's pre-done apply_gc_handoffs IPC remains as a
+//            cheap idempotent safety net.
 //            Covered by: gc_restart_safety_applied_handoff (below)
 //
 //   Bug F — Write-path dedup creates two segments with the same hash: one
@@ -358,8 +358,9 @@ fn drain_pending(fork_dir: &std::path::Path) {
 ///
 /// The fix: in apply_gc_handoffs, scan for stale liveness (hash in
 /// old_ulid_by_hash, not carried, but live in lbamap) BEFORE any extent index
-/// mutations.  If found, cancel the GC output (delete .pending and body) so
-/// gc_fork can re-run with correct liveness data on the next tick.
+/// mutations.  If found, cancel the GC output (drop the .staged file and any
+/// associated body) so gc_fork can re-run with correct liveness data on the
+/// next tick.
 #[test]
 fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -416,12 +417,12 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     vol.write(5, &d0).unwrap();
 
     // Step 6: apply_gc_handoffs — the fix detects that H0 is live in the LBA
-    // map but not carried, cancels the GC output (deletes .pending and body),
-    // and returns without writing .applied.  The old segments survive.
+    // map but not carried, cancels the GC output (drops the `.staged` file
+    // without renaming it to bare `gc/<new>`).  The old segments survive.
     vol.apply_gc_handoffs().unwrap();
 
-    // Step 7: apply_done_handoffs — no .applied file exists (cancelled), so
-    // nothing is deleted.
+    // Step 7: apply_done_handoffs — no bare `gc/<new>` exists (cancelled),
+    // so nothing is uploaded or deleted.
     rt.block_on(apply_done_handoffs(
         fork_dir,
         "00000000000000000000000000",
@@ -874,28 +875,27 @@ fn drain_failure_skips_gc_and_data_survives() {
 
 /// Regression test for Bug E: GC restart-safety gap.
 ///
-/// `apply_gc_handoffs` previously only processed `.pending` files.  After a
-/// coordinator/volume restart the volume rebuilds its extent index from on-disk
-/// `.idx` files, which still point to the old segment (the old `.idx` is present
-/// until `apply_done_handoffs` deletes it).  When `apply_done_handoffs` then
-/// deletes the old segment, reads fail with "segment not found" because the
-/// extent index was never updated to point to the new GC output.
+/// Under the current self-describing handoff protocol, `vol.apply_gc_handoffs`
+/// renames `gc/<new>.staged` to bare `gc/<new>`. On restart the volume's
+/// extent-index rebuild picks the bare file up directly via
+/// `collect_gc_applied_segment_files`, so the extent index already points
+/// at the new segment before any re-apply runs. This test exercises that
+/// restart path: the second `apply_gc_handoffs` is a no-op, and a subsequent
+/// `apply_done_handoffs` can safely delete the old `.idx` files.
 ///
-/// Sequence that exposes the bug:
+/// Sequence:
 ///
 ///   1. Write D0 to lba=0 and D1 to lba=1, flush, drain → old segment S1.
 ///   2. Overwrite lba=0 with D2, flush, drain → old segment S2.
-///   3. gc_checkpoint + gc_fork → gc/<new>.pending (S1 and S2 compacted).
-///   4. vol.apply_gc_handoffs() → gc/<new>.applied; extent index updated to
-///      point to new segment in this Volume instance.
-///   5. [RESTART] — drop Volume and reopen.  Extent index rebuilt from
-///      index/*.idx (old segments S1, S2 still have .idx files).
-///      apply_gc_handoffs() returns 0 (only saw .pending, not .applied).
-///   6. apply_done_handoffs() — deletes S1, S2 (bodies and .idx files),
-///      moves gc/<new> → segments/<new>.
-///   7. Without fix: reads fail — extent index → S1 → deleted → "not found".
-///      With fix: apply_gc_handoffs re-applies the .applied handoff → extent
-///      index → new segment → reads succeed.
+///   3. gc_checkpoint + gc_fork → gc/<new>.plan (coord-emitted plan).
+///   4. vol.apply_gc_handoffs() → bare gc/<new>; extent index updated to
+///      point to the new segment in this Volume instance.
+///   5. [RESTART] — drop Volume and reopen. Extent-index rebuild reads the
+///      bare gc/<new> file and points at the new segment directly.
+///   6. apply_gc_handoffs() returns 0 — no work to do.
+///   7. apply_done_handoffs() — uploads + promotes the new segment, deletes
+///      old S1, S2 .idx files. Reads succeed because the extent index
+///      already points at the new segment.
 #[test]
 fn gc_restart_safety_applied_handoff() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -948,22 +948,22 @@ fn gc_restart_safety_applied_handoff() {
         &store,
     ));
 
-    // Step 3: GC pass — gc_checkpoint mints ULIDs, gc_fork compacts the two
-    // input segments into one GC output in gc/<new>.pending.
+    // Step 3: GC pass — gc_checkpoint mints ULIDs, gc_fork emits the coord
+    // plan at gc/<new>.plan describing how to compact S1 and S2.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
     gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
 
-    // Step 4: apply_gc_handoffs — re-signs gc/<new>, updates extent index in
-    // THIS Volume instance to point to the new segment, renames .pending →
-    // .applied.  The old segments still exist on disk at this point.
+    // Step 4: apply_gc_handoffs — materialises the plan: writes
+    // gc/<new>.staged, signs it, renames to bare gc/<new>, and updates the
+    // extent index in this Volume instance to point at the new segment.
+    // The old segments still exist on disk at this point.
     let applied = vol.apply_gc_handoffs().unwrap();
     assert_eq!(applied, 1, "one handoff should be applied");
 
-    // Step 5: simulate coordinator/volume restart — drop the volume and reopen.
-    // Volume::open rebuilds the extent index from index/*.idx files; the old
-    // segments still have their .idx files so the extent index points to the
-    // OLD segment ULIDs.  The .applied handoff file exists but apply_gc_handoffs
-    // previously returned 0 (only processed .pending files).
+    // Step 5: simulate coordinator/volume restart — drop the volume and
+    // reopen. Volume::open's rebuild picks up the bare gc/<new> file via
+    // collect_gc_applied_segment_files, so the extent index already points
+    // at the new segment.
     drop(vol);
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
 
@@ -982,9 +982,11 @@ fn gc_restart_safety_applied_handoff() {
          rebuild — no re-apply needed"
     );
 
-    // Step 7: apply_done_handoffs — deletes old segment bodies and .idx files,
-    // moves gc/<new> → segments/<new>.  Safe because the extent index now
-    // points to the new segment.
+    // Step 7: apply_done_handoffs — uploads the bare gc/<new> to S3, drives
+    // promote_segment IPC (writes index/<new>.idx + cache/<new>.body, deletes
+    // old <input>.idx files), and removes the bare gc/<new> via
+    // finalize_gc_handoff. Safe because the extent index already points at
+    // the new segment.
     rt.block_on(apply_done_handoffs(
         fork_dir,
         "00000000000000000000000000",
@@ -1141,41 +1143,17 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
         }
     };
 
-    // Helper: promote GC outputs (gc/<ulid> → cache) and evict old cache.
-    let promote_gc = |vol: &mut Volume| {
-        let gc_dir = fork_dir.join("gc");
-        if let Ok(entries) = fs::read_dir(&gc_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name_str) = name.to_str() else {
-                    continue;
-                };
-                if !name_str.ends_with(".applied") {
-                    continue;
-                }
-                let Some(ulid_str) = name_str.strip_suffix(".applied") else {
-                    continue;
-                };
-                if let Ok(ulid) = ulid::Ulid::from_string(ulid_str) {
-                    let gc_body = gc_dir.join(ulid_str);
-                    if gc_body.exists() {
-                        let _ = vol.promote_segment(ulid);
-                        let _ = fs::remove_file(&gc_body);
-                    }
-                }
-            }
-        }
-        simulate_coord_cache_evict(fork_dir);
-    };
-
-    // Helper: run a full GC sweep (drain + checkpoint + gc_fork + handoff +
-    // promote + done).
+    // Helper: run a full GC sweep (drain + checkpoint + gc_fork + apply +
+    // input cache eviction + coordinator done-handoff).
+    //
+    // Reads after apply succeed against bare `gc/<new>` directly via
+    // `find_segment_in_dirs`; no simulated `promote_segment` IPC is needed.
     let gc_sweep = |vol: &mut Volume| {
         drain(vol);
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
         let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc);
         let _ = vol.apply_gc_handoffs();
-        promote_gc(vol);
+        simulate_coord_cache_evict(fork_dir);
         let _ = rt.block_on(apply_done_handoffs(
             fork_dir,
             "00000000000000000000000000",
@@ -1304,38 +1282,12 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
         }
     };
 
-    let promote_gc = |vol: &mut Volume| {
-        let gc_dir = fork_dir.join("gc");
-        if let Ok(entries) = fs::read_dir(&gc_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name_str) = name.to_str() else {
-                    continue;
-                };
-                if !name_str.ends_with(".applied") {
-                    continue;
-                }
-                let Some(ulid_str) = name_str.strip_suffix(".applied") else {
-                    continue;
-                };
-                if let Ok(ulid) = ulid::Ulid::from_string(ulid_str) {
-                    let gc_body = gc_dir.join(ulid_str);
-                    if gc_body.exists() {
-                        let _ = vol.promote_segment(ulid);
-                        let _ = fs::remove_file(&gc_body);
-                    }
-                }
-            }
-        }
-        simulate_coord_cache_evict(fork_dir);
-    };
-
     let gc_sweep = |vol: &mut Volume| {
         drain(vol);
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
         let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc);
         let _ = vol.apply_gc_handoffs();
-        promote_gc(vol);
+        simulate_coord_cache_evict(fork_dir);
         let _ = rt.block_on(apply_done_handoffs(
             fork_dir,
             "00000000000000000000000000",
@@ -1476,38 +1428,12 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
         }
     };
 
-    let promote_gc = |vol: &mut Volume| {
-        let gc_dir = fork_dir.join("gc");
-        if let Ok(entries) = fs::read_dir(&gc_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name_str) = name.to_str() else {
-                    continue;
-                };
-                if !name_str.ends_with(".applied") {
-                    continue;
-                }
-                let Some(ulid_str) = name_str.strip_suffix(".applied") else {
-                    continue;
-                };
-                if let Ok(ulid) = ulid::Ulid::from_string(ulid_str) {
-                    let gc_body = gc_dir.join(ulid_str);
-                    if gc_body.exists() {
-                        let _ = vol.promote_segment(ulid);
-                        let _ = fs::remove_file(&gc_body);
-                    }
-                }
-            }
-        }
-        simulate_coord_cache_evict(fork_dir);
-    };
-
     let gc_sweep = |vol: &mut Volume| {
         drain(vol);
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
         let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc);
         let _ = vol.apply_gc_handoffs();
-        promote_gc(vol);
+        simulate_coord_cache_evict(fork_dir);
         let _ = rt.block_on(apply_done_handoffs(
             fork_dir,
             "00000000000000000000000000",

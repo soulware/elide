@@ -176,10 +176,12 @@ enum SimOp {
     GcSweep,
     /// Simulate a coordinator/volume restart.
     ///
-    /// Drops the current Volume and reopens it from disk (rebuilding the extent
-    /// index from .idx files).  Mirrors the production invariant: the coordinator
-    /// calls apply_gc_handoffs (IPC) immediately after restart to re-apply any
-    /// .applied handoffs before apply_done_handoffs can delete old segments.
+    /// Drops the current Volume and reopens it from disk (rebuilding the
+    /// extent index from .idx files plus any bare gc/<ulid> apply outputs).
+    /// Mirrors the production invariant: the coordinator calls
+    /// apply_gc_handoffs (IPC) immediately after restart as a cheap
+    /// idempotent safety net before apply_done_handoffs can delete old
+    /// segments.
     ///
     /// After reopen, asserts that all oracle LBAs are still readable.  This
     /// catches the Bug E class: extent index rebuilt to stale state, then old
@@ -448,10 +450,11 @@ proptest! {
                 }
                 SimOp::Restart => {
                     // Drop and reopen the volume, mirroring a coordinator/volume
-                    // restart.  Volume::open rebuilds the extent index from .idx
-                    // files; apply_gc_handoffs then re-applies any .applied
-                    // handoffs (Bug E fix).  No oracle mutation: restart is
-                    // invisible to the logical data model.
+                    // restart.  Volume::open's rebuild folds in any bare
+                    // gc/<ulid> apply outputs alongside .idx files;
+                    // apply_gc_handoffs then runs as an idempotent safety net
+                    // (Bug E class).  No oracle mutation: restart is invisible
+                    // to the logical data model.
                     drop(vol);
                     vol = Volume::open(fork_dir, fork_dir).unwrap();
                     let _ = vol.apply_gc_handoffs();
@@ -633,10 +636,11 @@ proptest! {
                 }
                 SimOp::Restart => {
                     // Drop and reopen the volume, mirroring a coordinator/volume
-                    // restart.  Volume::open rebuilds the extent index from .idx
-                    // files; apply_gc_handoffs then re-applies any .applied
-                    // handoffs (Bug E fix) before any subsequent GcSweep can
-                    // call apply_done_handoffs and delete old segments.
+                    // restart.  Volume::open's rebuild folds in any bare
+                    // gc/<ulid> apply outputs alongside .idx files;
+                    // apply_gc_handoffs runs as an idempotent safety net
+                    // (Bug E class) before any subsequent GcSweep can call
+                    // apply_done_handoffs and delete old segments.
                     drop(vol);
                     vol = Volume::open(fork_dir, fork_dir).unwrap();
                     let _ = vol.apply_gc_handoffs();

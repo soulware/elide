@@ -281,7 +281,7 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
 #[test]
 fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
     // Regression: if an ancestor volume's source segment is sitting in
-    // the `gc/<id>.applied` handoff window (volume-signed GC output,
+    // the bare `gc/<id>` handoff window (volume-signed GC output,
     // awaiting coordinator upload/promote), `read_source_extent` must
     // still find it. Prior to the fix the lookup only checked
     // `cache/<id>.body` and `pending/<id>`, so the delta conversion was
@@ -328,15 +328,15 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
         parent_bytes.len() as u64,
     );
 
-    // Simulate mid-GC-handoff: segment body lives in `gc/<id>` with an
-    // `.applied` marker, not in `pending/`. This is the exact state the
-    // coordinator produces between `apply_gc_handoffs` and
-    // `promote_segment`.
+    // Simulate mid-GC-handoff: segment body lives in bare `gc/<id>`,
+    // not in `pending/`. This is the state the volume produces when
+    // `apply_gc_handoffs` renames `<id>.staged` → `<id>` — the body is
+    // committed but the coordinator has not yet uploaded and promoted
+    // it into `cache/`.
     let gc_dir = source_dir.join("gc");
     fs::create_dir_all(&gc_dir).unwrap();
     let gc_body = gc_dir.join(source_seg_ulid.to_string());
     fs::rename(&source_seg_path, &gc_body).unwrap();
-    fs::write(gc_dir.join(format!("{source_seg_ulid}.applied")), b"").unwrap();
 
     // Child with a twisted copy of the source bytes — delta-compressible.
     let mut child_bytes = parent_bytes.clone();
@@ -368,10 +368,10 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
 
     let stats =
         delta_compute::rewrite_pending_with_deltas(&child_dir, &by_id_dir, child_signer.as_ref())
-            .expect("rewrite_pending_with_deltas must read gc/.applied source body");
+            .expect("rewrite_pending_with_deltas must read bare gc/<id> source body");
     assert_eq!(
         stats.entries_converted, 1,
-        "source segment in gc/<id>.applied should still resolve"
+        "source segment in bare gc/<id> should still resolve"
     );
 
     let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
