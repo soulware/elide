@@ -795,11 +795,33 @@ fn main() {
             }
 
             VolumeCommand::Start { name } => {
-                if let Err(e) = coordinator_client::start_volume(&socket_path, &name) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
+                use coordinator_client::StartOutcome;
+                match coordinator_client::start_volume(&socket_path, &name) {
+                    Ok(StartOutcome::Started) => {
+                        println!("{name}: started");
+                    }
+                    Ok(StartOutcome::NeedsClaim {
+                        released_vol_ulid,
+                        handoff_snapshot,
+                    }) => {
+                        if let Err(e) = claim_released_name(
+                            &args.data_dir,
+                            &name,
+                            &released_vol_ulid,
+                            handoff_snapshot.as_deref(),
+                            &socket_path,
+                            &by_id_dir,
+                        ) {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                        println!("{name}: claimed and started");
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
                 }
-                println!("{name}: started");
             }
 
             VolumeCommand::Release { name } => {
@@ -1503,6 +1525,78 @@ fn create_fork(
     )?;
     let new_fork_dir = by_id_dir.join(&new_vol_ulid);
     println!("{}", new_fork_dir.display());
+    Ok(())
+}
+
+/// CLI orchestration of `volume start` against a `Released` name.
+///
+/// Composes existing fork-creation plumbing with the coordinator's
+/// `claim` IPC:
+///   1. Build the source pin from `released_vol_ulid` + `handoff_snapshot`.
+///   2. Pull the source if not local (via the existing `remote_pull`).
+///   3. Mint a fresh local fork via `fork-create` IPC.
+///   4. Issue `claim <name> <new_vol_ulid>` to atomically rebind the
+///      bucket-side name to the new fork. The conditional PUT inside
+///      `claim` resolves races: if another coordinator wins, our local
+///      fork is left in place as a usable orphan and the user is told.
+fn claim_released_name(
+    data_dir: &Path,
+    name: &str,
+    released_vol_ulid: &str,
+    handoff_snapshot: Option<&str>,
+    socket_path: &Path,
+    by_id_dir: &Path,
+) -> std::io::Result<()> {
+    let snap = handoff_snapshot.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "name '{name}' is Released but has no handoff snapshot recorded — \
+             the releasing coordinator did not publish one (older release?). \
+             Manual recovery required: see docs/operations.md"
+        ))
+    })?;
+    let from = format!("{released_vol_ulid}/{snap}");
+
+    // Refuse if a stale by_name/<name> symlink already exists. Clean
+    // recovery from a previous local-owned-then-released volume needs
+    // a follow-up commit; for now the operator removes the stale
+    // pointer manually.
+    let symlink = data_dir.join("by_name").join(name);
+    if symlink.exists() || symlink.symlink_metadata().is_ok() {
+        return Err(std::io::Error::other(format!(
+            "by_name/{name} already exists locally; \
+             remove it manually before claiming the released name"
+        )));
+    }
+
+    // Pull source if not local.
+    let source_dir = volume::resolve_ancestor_dir(by_id_dir, released_vol_ulid);
+    if !source_dir.exists() {
+        let config = load_fetch_config(socket_path, data_dir, released_vol_ulid)?;
+        eprintln!("pulling {released_vol_ulid} from remote store...");
+        remote_pull(&config, &from, data_dir, socket_path)?;
+        if !volume::resolve_ancestor_dir(by_id_dir, released_vol_ulid).exists() {
+            return Err(std::io::Error::other(format!(
+                "source volume {released_vol_ulid} not found in remote store"
+            )));
+        }
+    }
+
+    // Mint a fresh local fork. fork-create writes by_id/<new_ulid>/
+    // and the by_name/<name> symlink, returns the new vol_ulid.
+    let new_vol_ulid = coordinator_client::fork_create(
+        socket_path,
+        name,
+        released_vol_ulid,
+        Some(snap),
+        None,
+        &[],
+    )?;
+
+    // Atomically rebind the bucket-side name to our new fork. If the
+    // conditional PUT loses to another coordinator, surface the
+    // resulting error — the local fork is left in place for the
+    // operator to repurpose under a different name.
+    coordinator_client::claim_volume(socket_path, name, &new_vol_ulid)?;
     Ok(())
 }
 

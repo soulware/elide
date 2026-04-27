@@ -263,6 +263,84 @@ pub async fn mark_live(
     Ok(MarkLiveOutcome::Resumed)
 }
 
+/// Outcome of a `mark_claimed` call (the claim-from-released path of
+/// `volume start`).
+#[derive(Debug)]
+pub enum MarkClaimedOutcome {
+    /// `names/<name>` was updated from `Released` to `Live`, with
+    /// `vol_ulid` rewritten to `new_vol_ulid` and the previous fork's
+    /// `<vol_ulid>/<handoff_snapshot>` recorded as `parent`.
+    Claimed,
+    /// `names/<name>` did not exist in the bucket; nothing to claim.
+    /// Callers handling a `volume start` should treat this as the
+    /// "no record yet" path, not the claim-from-released path.
+    Absent,
+    /// `names/<name>` is not in `Released` state. Includes the
+    /// observed state so callers can produce a clear error.
+    NotReleased { observed: NameState },
+}
+
+/// Atomically claim a `Released` name for this coordinator and rebind
+/// it to a fresh fork. Conditional PUT under the ETag observed at
+/// read time, so two coordinators racing to claim the same released
+/// name resolve cleanly: one wins, the other gets `PreconditionFailed`
+/// (returned as `LifecycleError::Store(NameStoreError::PreconditionFailed)`).
+///
+/// Caller responsibilities (orchestrated externally — typically the
+/// CLI for `volume start`):
+///   1. Mint `new_vol_ulid` locally.
+///   2. Materialise a fork at `by_id/<new_vol_ulid>/` whose provenance
+///      points at the released ancestor's
+///      `<previous_vol_ulid>/<handoff_snapshot>`.
+///   3. Call `mark_claimed` to atomically rebind the name.
+///   4. Spawn the volume daemon.
+///
+/// On success the name now points at `new_vol_ulid`, state is `Live`,
+/// `coordinator_id` is this coordinator's, and `parent` records the
+/// previous fork's pin.
+pub async fn mark_claimed(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    root_key: &[u8; 32],
+    new_vol_ulid: Ulid,
+) -> Result<MarkClaimedOutcome, LifecycleError> {
+    let coord_id = portable::format_coordinator_id(&portable::coordinator_id(root_key));
+
+    let Some((existing, version)) = name_store::read_name_record(store, name).await? else {
+        return Ok(MarkClaimedOutcome::Absent);
+    };
+
+    if existing.state != NameState::Released {
+        return Ok(MarkClaimedOutcome::NotReleased {
+            observed: existing.state,
+        });
+    }
+
+    // The released record carries the handoff snapshot; together with
+    // the previous fork's ULID it forms the parent pin for our new
+    // fork. The fork itself was materialised by the caller before this
+    // call; we just record the linkage in the name record.
+    let parent_pin = existing
+        .handoff_snapshot
+        .map(|snap| format!("{}/{}", existing.vol_ulid, snap));
+
+    let new_record = elide_core::name_record::NameRecord {
+        version: elide_core::name_record::NameRecord::CURRENT_VERSION,
+        vol_ulid: new_vol_ulid,
+        coordinator_id: Some(coord_id),
+        state: NameState::Live,
+        parent: parent_pin,
+        acquired_at: Some(chrono::Utc::now().to_rfc3339()),
+        hostname: current_hostname(),
+        // The new fork hasn't published a handoff snapshot of its own
+        // yet; that field is reset for the new ownership episode.
+        handoff_snapshot: None,
+    };
+
+    name_store::update_name_record(store, name, &new_record, version).await?;
+    Ok(MarkClaimedOutcome::Claimed)
+}
+
 /// Reconcile the local `volume.stopped` marker against
 /// `names/<name>.state`. S3 is authoritative — the local marker is a
 /// host-side cache.
@@ -618,6 +696,100 @@ mod tests {
         // B reconciles; A's record must not affect B's local state.
         reconcile_marker(&s, &vol_dir, "vol", &key_b()).await;
         assert!(!vol_dir.join("volume.stopped").exists());
+    }
+
+    fn other_ulid() -> Ulid {
+        Ulid::from_string("01J2222222222222222222222V").unwrap()
+    }
+
+    #[tokio::test]
+    async fn mark_claimed_returns_absent_when_record_missing() {
+        let s = store();
+        let outcome = mark_claimed(&s, "missing", &key_b(), other_ulid())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MarkClaimedOutcome::Absent));
+    }
+
+    #[tokio::test]
+    async fn mark_claimed_refuses_non_released_record() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        // A owns + Live.
+        mark_stopped(&s, "vol", &key_a()).await.unwrap();
+        mark_live(&s, "vol", &key_a()).await.unwrap();
+
+        let outcome = mark_claimed(&s, "vol", &key_b(), other_ulid())
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            MarkClaimedOutcome::NotReleased {
+                observed: NameState::Live
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_claimed_rebinds_released_record() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+
+        // B claims A's released name with a freshly-minted ULID.
+        let outcome = mark_claimed(&s, "vol", &key_b(), other_ulid())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MarkClaimedOutcome::Claimed));
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.state, NameState::Live);
+        assert_eq!(got.vol_ulid, other_ulid());
+        // parent records the released ancestor + handoff snapshot.
+        assert_eq!(
+            got.parent.as_deref(),
+            Some(format!("{}/{}", sample_ulid(), snap()).as_str()),
+        );
+        // handoff_snapshot is reset for the new ownership episode.
+        assert!(got.handoff_snapshot.is_none());
+        // coordinator_id flips to the claimant (B).
+        let b_id = portable::format_coordinator_id(&portable::coordinator_id(&key_b()));
+        assert_eq!(got.coordinator_id.as_deref(), Some(b_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn mark_claimed_resolves_concurrent_races_to_one_winner() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+
+        let key_b_buf = key_b();
+        let key_c = [0xEFu8; 32];
+        let ulid_b = other_ulid();
+        let ulid_c = Ulid::from_string("01J3333333333333333333333V").unwrap();
+        let (b_outcome, c_outcome) = tokio::join!(
+            mark_claimed(&s, "vol", &key_b_buf, ulid_b),
+            mark_claimed(&s, "vol", &key_c, ulid_c),
+        );
+
+        // Exactly one wins via the conditional PUT; the other observes
+        // either NotReleased (loser read after winner committed) or a
+        // PreconditionFailed (loser read before, wrote after).
+        let outcomes = [b_outcome, c_outcome];
+        let claimed = outcomes
+            .iter()
+            .filter(|r| matches!(r, Ok(MarkClaimedOutcome::Claimed)))
+            .count();
+        assert_eq!(
+            claimed, 1,
+            "exactly one claim should win, got: {outcomes:?}"
+        );
     }
 
     #[tokio::test]

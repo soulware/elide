@@ -180,11 +180,21 @@ on the bucket-capability probe from Phase 0 — see Phase 4.
   already own it as Live (covers daemon-restart races).
 - [x] **Refusal paths** — foreign-owner records refuse with
   pointer at `--force-takeover` (Phase 3).
-- [ ] **Claim-from-released path** — `state == "released"`. Currently
-  errors with "claim-from-released path is not yet implemented".
-  Implementation requires fork creation (mint new ULID + keypair,
-  pull handoff snapshot, materialise local fork, conditional PUT
-  to claim) — lands as a separate commit.
+- [x] **Claim-from-released path** — `state == "released"`.
+  Coordinator's `start` op returns `released <vol_ulid> <snap_ulid>`;
+  the CLI orchestrates the claim:
+  1. Pull the released ancestor if not local (via existing
+     `remote_pull`).
+  2. Mint a fresh local fork via the existing `fork-create` IPC.
+  3. Issue new `claim <name> <new_vol_ulid>` IPC →
+     `lifecycle::mark_claimed` does a conditional PUT rebinding
+     `names/<name>` to the new fork.
+  Concurrent claims resolve cleanly via the conditional-PUT race;
+  the loser's local fork is left as a usable orphan with a clear
+  error message.
+- [ ] **Stale-symlink recovery for re-claim** — if `by_name/<name>`
+  already points at a previously-released ULID, the claim refuses
+  with a manual-cleanup hint. Auto-handling lands in a follow-up.
 
 #### Other Phase 2 work
 

@@ -288,6 +288,21 @@ async fn dispatch(
             .await
         }
 
+        "claim" => {
+            // claim <name> <new_vol_ulid>
+            //
+            // Atomically rebind a `Released` name to a freshly-minted
+            // local fork. The CLI orchestrates fork creation
+            // (mint ULID + keypair, materialise by_id/<new_ulid>/);
+            // this op handles only the conditional names/<name>
+            // mutation and notifies the supervisor.
+            let (name, new_ulid_str) = match args.split_once(' ') {
+                Some((n, u)) => (n.trim(), u.trim()),
+                None => return "err usage: claim <volume> <new_vol_ulid>".to_string(),
+            };
+            claim_volume_op(name, new_ulid_str, data_dir, store, root_key, &rescan).await
+        }
+
         "start" => {
             if args.is_empty() {
                 return "err usage: start <volume>".to_string();
@@ -1851,6 +1866,94 @@ async fn release_volume_op(
     }
 }
 
+/// Claim a `Released` name for a freshly-minted local fork.
+///
+/// Pre-conditions enforced here:
+/// - `by_id/<new_vol_ulid>/` must exist locally (the CLI created it
+///   before calling).
+/// - `by_name/<name>` must point at it (or be absent — we create it
+///   if missing).
+/// - `names/<name>` must be in `Released` state and the CLI's
+///   conditional-PUT must succeed.
+///
+/// On success the name's S3 record is rebound to the new fork and
+/// the supervisor is notified to launch the daemon.
+async fn claim_volume_op(
+    volume_name: &str,
+    new_ulid_str: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    root_key: &[u8; 32],
+    rescan: &Notify,
+) -> String {
+    let new_ulid = match ulid::Ulid::from_string(new_ulid_str) {
+        Ok(u) => u,
+        Err(e) => return format!("err invalid new_vol_ulid: {e}"),
+    };
+
+    // The new fork directory must already exist locally — the CLI is
+    // responsible for materialising it before invoking `claim`.
+    let new_dir = data_dir.join("by_id").join(new_ulid.to_string());
+    if !new_dir.exists() {
+        return format!(
+            "err new fork directory not found at {} — \
+             the CLI must materialise the fork before calling claim",
+            new_dir.display()
+        );
+    }
+
+    // Ensure by_name/<name> points at the new fork. Create it if absent;
+    // otherwise verify it already targets the right ULID. The supervisor
+    // task spawning depends on a discoverable directory, and the
+    // coordinator's reconcile_by_name pass also relies on this symlink.
+    let symlink_path = data_dir.join("by_name").join(volume_name);
+    let target = std::path::PathBuf::from(format!("../by_id/{new_ulid}"));
+    match std::fs::read_link(&symlink_path) {
+        Ok(existing) if existing == target => {}
+        Ok(other) => {
+            return format!(
+                "err by_name/{volume_name} already points at {} (expected ../by_id/{new_ulid})",
+                other.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            if let Err(e) = std::os::unix::fs::symlink(&target, &symlink_path) {
+                return format!("err creating by_name/{volume_name} symlink: {e}");
+            }
+        }
+        Err(e) => return format!("err reading by_name/{volume_name}: {e}"),
+    }
+
+    use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome, mark_claimed};
+    match mark_claimed(store, volume_name, root_key, new_ulid).await {
+        Ok(MarkClaimedOutcome::Claimed) => {
+            rescan.notify_one();
+            info!("[inbound] claimed name {volume_name} for new fork {new_ulid}");
+            format!("ok {new_ulid}")
+        }
+        Ok(MarkClaimedOutcome::Absent) => {
+            format!("err names/{volume_name} does not exist; nothing to claim")
+        }
+        Ok(MarkClaimedOutcome::NotReleased { observed }) => {
+            format!(
+                "err names/{volume_name} is in state {observed:?}, not Released; \
+                 cannot claim"
+            )
+        }
+        Err(LifecycleError::Store(e)) => format!("err claim failed: {e}"),
+        Err(LifecycleError::OwnershipConflict { held_by }) => {
+            format!(
+                "err name '{volume_name}' raced with another claim ({held_by} won); \
+                 your local fork at {new_ulid} can be re-purposed manually"
+            )
+        }
+        Err(LifecycleError::InvalidTransition { from, .. }) => {
+            format!("err names/{volume_name} is in state {from:?}; cannot claim")
+        }
+    }
+}
+
 async fn start_volume_op(
     volume_name: &str,
     data_dir: &Path,
@@ -1888,10 +1991,23 @@ async fn start_volume_op(
             // next `drain_pending` will publish an initial Live record.
         }
         Ok(MarkLiveOutcome::Released) => {
-            return format!(
-                "err name '{volume_name}' is in state Released; \
-                 claim-from-released path is not yet implemented"
-            );
+            // Surface the released ancestor pin so the CLI can orchestrate
+            // the claim-from-released path: pull the ancestor (if not
+            // local), materialise a fresh fork, then call `claim <name>
+            // <new_vol_ulid>` to atomically rebind the name. mark_live
+            // does not return the record; re-read to extract the pin.
+            return match elide_coordinator::name_store::read_name_record(store, volume_name).await {
+                Ok(Some((rec, _))) => {
+                    let snap = rec
+                        .handoff_snapshot
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "_".to_string());
+                    format!("released {} {}", rec.vol_ulid, snap)
+                }
+                Ok(None) | Err(_) => {
+                    format!("err name '{volume_name}' is Released but record is unreadable")
+                }
+            };
         }
         Err(LifecycleError::OwnershipConflict { held_by }) => {
             return format!(

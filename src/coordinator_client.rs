@@ -394,13 +394,56 @@ pub fn release_volume(socket_path: &Path, name: &str) -> io::Result<String> {
     }
 }
 
+/// Outcome of a `start_volume` call. The coordinator routes by the
+/// bucket-side `names/<name>` state; the response distinguishes the
+/// local-only path from the claim-from-released path that needs CLI
+/// orchestration.
+pub enum StartOutcome {
+    /// Daemon was started locally (state was Stopped, ours; or Live, ours;
+    /// or no S3 record yet).
+    Started,
+    /// Name is in `Released` state — the CLI needs to orchestrate fork
+    /// creation, then call `claim_volume` with the new ULID.
+    NeedsClaim {
+        released_vol_ulid: String,
+        handoff_snapshot: Option<String>,
+    },
+}
+
 /// Start a previously-stopped volume. Coordinator clears `volume.stopped`
-/// and triggers a rescan so the supervisor relaunches the process.
-pub fn start_volume(socket_path: &Path, name: &str) -> io::Result<()> {
+/// and triggers a rescan so the supervisor relaunches the process. If
+/// the bucket-side state is `Released`, returns `NeedsClaim` so the CLI
+/// can run the claim-from-released path.
+pub fn start_volume(socket_path: &Path, name: &str) -> io::Result<StartOutcome> {
     let resp = call(socket_path, &format!("start {name}"))?;
+    if resp == "ok" {
+        return Ok(StartOutcome::Started);
+    }
+    if let Some(rest) = resp.strip_prefix("released ") {
+        let mut parts = rest.split_whitespace();
+        let vol = parts
+            .next()
+            .ok_or_else(|| io::Error::other(format!("malformed released response: {resp}")))?;
+        let snap = parts.next();
+        return Ok(StartOutcome::NeedsClaim {
+            released_vol_ulid: vol.to_owned(),
+            handoff_snapshot: snap.filter(|s| *s != "_").map(str::to_owned),
+        });
+    }
+    if let Some(msg) = resp.strip_prefix("err ") {
+        return Err(io::Error::other(msg.to_owned()));
+    }
+    Err(io::Error::other(format!("unexpected response: {resp}")))
+}
+
+/// Atomically rebind a `Released` name to a freshly-minted local fork.
+/// The CLI must have already materialised `by_id/<new_vol_ulid>/` before
+/// calling this. Returns the new ULID on success.
+pub fn claim_volume(socket_path: &Path, name: &str, new_vol_ulid: &str) -> io::Result<String> {
+    let resp = call(socket_path, &format!("claim {name} {new_vol_ulid}"))?;
     match resp.split_once(' ') {
+        Some(("ok", ulid)) => Ok(ulid.trim().to_owned()),
         Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
-        _ if resp == "ok" => Ok(()),
         _ => Err(io::Error::other(format!("unexpected response: {resp}"))),
     }
 }
