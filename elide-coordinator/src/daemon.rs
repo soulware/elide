@@ -252,10 +252,44 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     Ok(())
 }
 
-/// Poll until all pids have exited or the timeout elapses.
-///
-/// Logs a warning if any processes are still alive after the timeout.
-async fn wait_for_pids(pids: &[u32], timeout: Duration) {
+/// Poll until all pids have exited or the timeout elapses. After the
+/// SIGTERM grace window, escalate to SIGKILL on any stragglers and wait
+/// briefly for them to die. A wedged volume process (e.g. a ublk daemon
+/// blocked in a kernel `wait_event` for udev to release `/dev/ublkb<N>`)
+/// would otherwise survive coordinator shutdown and hold its ublk device
+/// indefinitely; SIGKILL releases the process's fds and lets the kernel
+/// finalize cleanup.
+async fn wait_for_pids(pids: &[u32], grace: Duration) {
+    let still_alive = poll_until_exit_or_deadline(pids, grace).await;
+    if still_alive.is_empty() {
+        return;
+    }
+    warn!(
+        "[coordinator] shutdown grace expired; SIGKILL {} process(es): {:?}",
+        still_alive.len(),
+        still_alive
+    );
+    for &pid in &still_alive {
+        if let Ok(raw) = i32::try_from(pid) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(raw),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+    let leftover = poll_until_exit_or_deadline(&still_alive, Duration::from_secs(2)).await;
+    if !leftover.is_empty() {
+        warn!(
+            "[coordinator] {} process(es) still alive after SIGKILL: {:?}",
+            leftover.len(),
+            leftover
+        );
+    }
+}
+
+/// Returns the pids that are still alive when the deadline elapses
+/// (empty if everything exited).
+async fn poll_until_exit_or_deadline(pids: &[u32], timeout: Duration) -> Vec<u32> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let still_alive: Vec<u32> = pids
@@ -269,17 +303,11 @@ async fn wait_for_pids(pids: &[u32], timeout: Duration) {
                 }
             })
             .collect();
-
         if still_alive.is_empty() {
-            break;
+            return Vec::new();
         }
         if tokio::time::Instant::now() >= deadline {
-            warn!(
-                "[coordinator] shutdown timed out; {} process(es) still running: {:?}",
-                still_alive.len(),
-                still_alive
-            );
-            break;
+            return still_alive;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
