@@ -34,7 +34,7 @@
 //   [gc]
 //   density_threshold = 0.70   # compact when live_bytes/file_bytes < threshold
 //   interval          = "10s"  # how often GC runs per fork
-//   retention_window  = "24h"  # how long GC inputs are retained in S3
+//   retention_window  = "10m"  # how long GC inputs are retained in S3
 //
 // All duration fields use humantime ("5s", "30m", "24h").
 
@@ -346,7 +346,7 @@ pub struct GcConfig {
     /// coordinator writes a retention marker at
     /// `by_id/<vol>/retention/<gc_output_ulid>` and the reaper deletes
     /// the inputs once this window has elapsed. Accepts humantime-style
-    /// strings like `"24h"`, `"30s"`, `"5m"`. Default: `24h`.
+    /// strings like `"24h"`, `"30s"`, `"5m"`. Default: `10m`.
     #[serde(default = "default_retention_window", with = "humantime_serde")]
     pub retention_window: Duration,
 }
@@ -358,7 +358,7 @@ fn default_gc_interval() -> Duration {
     Duration::from_secs(10)
 }
 fn default_retention_window() -> Duration {
-    Duration::from_secs(24 * 60 * 60)
+    Duration::from_secs(10 * 60)
 }
 
 impl GcConfig {
@@ -415,7 +415,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 [gc]
 # density_threshold = 0.70    # compact when live_bytes / file_bytes < threshold
 # interval          = "10s"   # how often GC runs per fork
-# retention_window  = "24h"   # how long GC inputs stay in S3 before reaping
+# retention_window  = "10m"   # how long GC inputs stay in S3 before reaping
 "#;
 
 /// Load and parse a `coordinator.toml` file.

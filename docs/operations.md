@@ -33,7 +33,7 @@ scan_interval  = "30s"
 [gc]
 density_threshold = 0.70             # repack rewrites segments below this density
 interval          = "10s"
-retention_window  = "24h"            # how long GC inputs stay in S3 before reaping
+retention_window  = "10m"            # how long GC inputs stay in S3 before reaping
 ```
 
 The coordinator scans `<data_dir>/by_id/` for ULID subdirectories and spawns a `fork_loop` task per fork; supervision runs for writable volumes only (readonly volumes are discovered for drain and prefetch).
