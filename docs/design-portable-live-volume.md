@@ -81,11 +81,48 @@ mutated by anyone else. The only mutable thing in the bucket is
 ```toml
 vol_ulid = "<current_fork_ulid>"
 coordinator_id = "<owner-coordinator-id>"
-state = "live"            # or "stopped"
+state = "live"            # or "stopped" or "released"
 parent = "<prev_ulid>/<prev_snap_ulid>"   # absent on the root
 acquired_at = "<rfc3339>"
 hostname = "<owner-host-at-acquire-time>"  # advisory only
 ```
+
+### Three states, two intents
+
+The lifecycle distinguishes "I want this volume's process down for a
+bit" (host maintenance, daemon restart) from "I'm done; someone else
+can have this name". Conflating them is a source of surprise — a
+coordinator that goes into maintenance and writes `state=stopped`
+should not be racing other coordinators for its own volume on the
+way back up. Three states make the intent explicit:
+
+| State | `coordinator_id` | Same coordinator can `start` | Other coordinator can `start` |
+|---|---|---|---|
+| `live` | this | n/a (already running) | only via `--force-takeover` |
+| `stopped` | this | yes | only via `--force-takeover` |
+| `released` | last-owner (historical) | yes | yes |
+
+Verbs and their state transitions:
+
+- **`volume stop`** — local stop, retain ownership. `live → stopped`.
+  WAL is fsynced; daemon halts; `state` flips to `stopped` via
+  conditional PUT. **No handoff snapshot.** Other coordinators are
+  refused.
+- **`volume release`** — relinquish ownership. `live → released` or
+  `stopped → released`. Drains WAL → publishes handoff snapshot →
+  flips `state` to `released` via conditional PUT (and clears
+  `coordinator_id` to historical). Any coordinator may now `start`.
+- **`volume stop --release`** — convenience for `stop` then
+  `release` in one verb.
+- **`volume start <name>`** — claim. Allowed when:
+  (a) `state=stopped` and `coordinator_id=self` (local resume),
+  (b) `state=released` (any coordinator).
+  Rejected with a clear error otherwise; `--force-takeover` is the
+  documented override.
+- **Coordinator graceful shutdown / crash** — does not change
+  `state`. A coordinator coming back up sees its own
+  `coordinator_id` in `live` or `stopped` records and resumes; no
+  `release` happens implicitly.
 
 All transitions are conditional PUTs (`If-Match` on ETag, supported
 by S3 and Tigris). Conditional-write atomicity on this single object
@@ -188,53 +225,85 @@ clients re-auth anyway.
 
 ## Flows
 
-### `volume stop <name>` — explicit relinquish
+### `volume stop <name>` — local stop, retain ownership
 
-1. Stop accepting client writes (close NBD/ublk transport).
-2. Drain WAL: promote pending records into segments, finish in-flight
-   uploads.
-3. Publish a handoff snapshot covering everything published. Record
-   handoff metadata: outgoing `coordinator_id`, hostname,
+1. Refuse if a client (NBD/ublk) is connected.
+2. Issue the existing `shutdown` RPC: WAL fsync, daemon halts.
+3. Conditional PUT to `names/<name>` flipping `state` from `live`
+   to `stopped`. `vol_ulid` and `coordinator_id` unchanged.
+4. Local artefacts (cache, index, WAL, signing key) **stay in
+   place**. The same coordinator can `volume start` later and
+   resume from local state.
+
+No handoff snapshot, no fork. The volume is reserved for this
+coordinator. Other coordinators are refused (without
+`--force-takeover`).
+
+### `volume release <name>` — relinquish ownership
+
+1. If currently `live`, do everything `volume stop` does first
+   (refuse if client connected, shutdown).
+2. Drain WAL: promote pending records into segments, finish
+   in-flight uploads.
+3. Publish a handoff snapshot covering everything published.
+   Record handoff metadata: releasing `coordinator_id`, hostname,
    `acquired_at` of the current episode.
-4. Conditional PUT to `names/<name>` setting `state = "stopped"`,
-   keeping `vol_ulid` pointing at the now-frozen fork and
-   recording the handoff snapshot.
+4. Conditional PUT to `names/<name>` setting `state = "released"`,
+   keeping `vol_ulid` pointing at the now-frozen fork and recording
+   the handoff snapshot. `coordinator_id` is preserved as a
+   *historical* record of the last owner.
 5. The local `by_id/<vol_ulid>/` directory may be discarded (it's
-   reproducible from S3) or kept as cache for fast reacquisition by
-   the same coordinator. **Never** keep the WAL — there is none past
-   the published snapshot, by construction.
+   reproducible from S3) or kept as cache for fast reacquisition.
+   **Never** keep the WAL — there is none past the published
+   snapshot, by construction.
+
+`volume stop --release` is the convenience composition.
 
 ### `volume start <name>` — claim ownership
 
-1. Read `names/<name>`. If `state = "live"` and `coordinator_id != self`,
-   refuse (use `--force-takeover` to override).
-2. Mint a fresh `<new_ulid>` and generate a fresh Ed25519 keypair.
-3. Create `by_id/<new_ulid>/` locally, with provenance pointing at
-   the previous fork's `<vol_ulid>/<handoff_snap_ulid>`. Publish the
-   new `volume.pub` and signed provenance.
-4. Conditional PUT to `names/<name>`: `vol_ulid = <new_ulid>`,
-   `coordinator_id = self`, `state = "live"`, `parent = <previous>`.
-   This is the atomic ownership claim.
-5. Begin serving. Reads fall through to the parent fork's prefix as
-   normal fork reads do.
+1. Read `names/<name>`. Allowed when:
+   - record is absent, or
+   - `state == "released"` (any coordinator may claim), or
+   - `state == "stopped"` and `coordinator_id == self` (local
+     resume), or
+   - `state == "live"` and `coordinator_id == self` (idempotent —
+     already running here).
 
-### `volume stop` is not coordinator shutdown
+   Otherwise refuse with a clear error pointing at
+   `--force-takeover`.
 
-`volume stop` is an **explicit relinquish of ownership**, not what
-happens when the daemon exits. The two paths are very different:
+2. **Local-resume path** (`stopped`, this coordinator): reuse the
+   existing local fork; flip `state` back to `live` via conditional
+   PUT; restart the daemon. No new ULID, no snapshot, no fork.
+
+3. **Claim-from-released path**: mint a fresh `<new_ulid>`,
+   generate a fresh Ed25519 keypair, create `by_id/<new_ulid>/`
+   locally with provenance pointing at the released fork's
+   `<vol_ulid>/<handoff_snap_ulid>`, publish `volume.pub` and signed
+   provenance. Conditional PUT to `names/<name>`:
+   `vol_ulid = <new_ulid>`, `coordinator_id = self`, `state = "live"`,
+   `parent = <previous>`. Begin serving.
+
+The "magic feel" property holds: one verb, the right thing happens
+based on state.
+
+### `volume stop` and `volume release` are not coordinator shutdown
+
+The lifecycle verbs are explicit operator intent. Coordinator
+process exit (graceful or crash) is something else entirely:
 
 | Event | `names/<name>` | WAL | Snapshot taken | Recovery path |
 |---|---|---|---|---|
-| `volume stop <name>` | rewritten to `state=stopped` | drained, then discarded | yes — handoff snapshot | another coordinator may `volume start` |
-| Coordinator graceful shutdown (SIGTERM, Ctrl-C) | unchanged — still names this coordinator | fsynced, retained on disk | no | this coordinator restarts, sees its own `coordinator_id`, replays WAL, resumes |
+| `volume stop <name>` | flipped to `state=stopped`, same `coordinator_id` | fsynced, retained on disk | no | this coordinator restarts and `volume start`s; other coordinators refused |
+| `volume release <name>` | flipped to `state=released`, `coordinator_id` preserved as historical | drained, then discarded | yes — handoff snapshot | any coordinator may `volume start` |
+| Coordinator graceful shutdown (SIGTERM, Ctrl-C) | unchanged | fsynced, retained on disk | no | this coordinator restarts, sees its own `coordinator_id`, replays WAL, resumes serving — `state` was never flipped to `stopped`, so volumes that were `live` come back `live` |
 | Coordinator crash (SIGKILL, hardware) | unchanged | retained, possibly with unsynced tail | no | same as graceful — restart replays WAL. Unsynced tail is lost (matches the existing crash-recovery contract) |
 | `--force-takeover` from elsewhere | rewritten by new coordinator without conditional check | abandoned (the dead coordinator's WAL is unreachable) | no — takeover forks from the previous handoff snapshot | new coordinator serves; any post-snapshot writes from the old owner that didn't reach S3 are lost |
 
-A coordinator that is coming back keeps its volumes and its WAL.
-Snapshots happen on explicit `stop` (and on the existing snapshot
-cadence), not on every daemon restart. Otherwise every Ctrl-C would
-mint N handoff snapshots for N live volumes — slow, wasteful, and
-noisy in the audit history.
+A coordinator that is coming back keeps its volumes, its WAL, and
+its `state=live` records. The only implicit transitions are
+operator-driven (`stop`, `release`, `start`) or operator-explicit
+(`--force-takeover`). Daemon lifecycle does not move state.
 
 This matches the shape of `design-ublk-shutdown-park.md`: graceful
 exit fsyncs and parks state for the same daemon to resume; deletion
@@ -244,29 +313,33 @@ is a separate, explicit verb.
 
 Used when the previous owner is not coming back (machine gone,
 `root_key` deleted, partition with no expected recovery). Skips the
-conditional check on `names/<name>` — the new coordinator forks from
-the last published snapshot, mints its own ULID and key, and
-overwrites the name pointer. Any writes the previous owner accepted
-after that snapshot but didn't publish are lost. The operator is
-asserting that loss is acceptable.
+"who owns this name" check — claim proceeds even when the record
+says `live` or `stopped` and `coordinator_id != self`. The new
+coordinator forks from the last published handoff snapshot (or the
+last published *user* snapshot if no handoff exists — see Phase 3
+open question), mints its own ULID and key, and overwrites the name
+pointer. Any writes the previous owner accepted after that snapshot
+but didn't publish are lost. The operator is asserting that loss is
+acceptable.
 
 ## Snapshots: user vs handoff
 
-The stop/start protocol works because every `stop` publishes a
-snapshot — the receiving fork pins to it as its parent. So
+The release/start protocol works because every `volume release`
+publishes a snapshot — the next fork pins to it as its parent. So
 portability does not introduce a new state-transfer mechanism; it
-reuses snapshots, and the user just sees `stop` / `start`.
+reuses snapshots, and the user just sees `release` / `start`.
 
 Two kinds of snapshot, one on-disk shape:
 
 - **User snapshots** — minted by an explicit user/coordinator
   action. Pin retention, anchor replicas (`create --from
   <vol_ulid>/<snap_ulid>`), bound catchup windows.
-- **Handoff snapshots** — minted automatically by `volume stop` to
-  give the next fork a parent pin. Carry extra metadata: the
+- **Handoff snapshots** — minted automatically by `volume release`
+  to give the next fork a parent pin. Carry extra metadata: the
   releasing `coordinator_id`, hostname, episode `acquired_at`, and
   the snapshot ULID itself. Anchored under the *outgoing* fork's
-  prefix.
+  prefix. **`volume stop` does not mint a handoff snapshot** — it
+  retains ownership locally, no fork is needed.
 
 Decisions for now:
 
@@ -331,10 +404,12 @@ The mapping:
 What's left as a real distinction is **eligibility**, not
 locality:
 
-- `state = stopped` → eligible to start.
+- `state = released` → eligible to start (any coordinator).
+- `state = stopped, coordinator_id = self` → eligible to start
+  (local resume).
 - `state = live, coordinator_id = self` → already running here.
-- `state = live, coordinator_id = other` → not eligible without
-  `--force-takeover`.
+- `state ∈ {live, stopped}, coordinator_id = other` → not eligible
+  without `--force-takeover`.
 
 `volume list` surfaces this directly. There is no second namespace
 to learn.

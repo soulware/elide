@@ -1747,9 +1747,12 @@ fn remote_list(config: &elide_fetch::FetchConfig) -> std::io::Result<()> {
                 .bytes()
                 .await
                 .map_err(|e| std::io::Error::other(format!("reading names/{name}: {e}")))?;
-            std::str::from_utf8(&bytes)
-                .map(|s| s.trim().to_owned())
-                .map_err(|e| std::io::Error::other(format!("names/{name} is not valid utf-8: {e}")))
+            let body = std::str::from_utf8(&bytes).map_err(|e| {
+                std::io::Error::other(format!("names/{name} is not valid utf-8: {e}"))
+            })?;
+            elide_core::name_record::NameRecord::from_toml(body)
+                .map(|r| r.vol_ulid.to_string())
+                .map_err(|e| std::io::Error::other(format!("parsing names/{name}: {e}")))
         })?;
 
         // Check for snapshot availability (determines if this volume can be pulled).
@@ -1879,12 +1882,11 @@ fn resolve_pull_spec(
             .await
             .map_err(|e| std::io::Error::other(format!("reading names/{spec}: {e}")))
     })?;
-    let ulid_str = std::str::from_utf8(&raw)
-        .map_err(|e| std::io::Error::other(format!("names/{spec}: {e}")))?
-        .trim();
-    let parsed = ulid::Ulid::from_string(ulid_str)
-        .map_err(|e| std::io::Error::other(format!("names/{spec} contains invalid ULID: {e}")))?;
-    Ok(parsed.to_string())
+    let body = std::str::from_utf8(&raw)
+        .map_err(|e| std::io::Error::other(format!("names/{spec}: {e}")))?;
+    let record = elide_core::name_record::NameRecord::from_toml(body)
+        .map_err(|e| std::io::Error::other(format!("parsing names/{spec}: {e}")))?;
+    Ok(record.vol_ulid.to_string())
 }
 
 /// Return `true` if a local copy of `<ulid>` exists.

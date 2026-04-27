@@ -91,26 +91,50 @@ tests pass.
 Promote `names/<name>` from a plain-text ULID to structured TOML:
 
 ```toml
+version = 1
 vol_ulid = "<current_fork_ulid>"
-coordinator_id = "<owner-coordinator-id>"
-state = "live"            # or "stopped"
-parent = "<prev_ulid>/<prev_snap_ulid>"   # absent on the root
-acquired_at = "<rfc3339>"
-hostname = "<owner-host-at-acquire-time>"  # advisory only
+coordinator_id = "<owner-coordinator-id>"        # optional in Phase 1
+state = "live"                                    # "live" | "stopped" | "released"
+parent = "<prev_ulid>/<prev_snap_ulid>"           # absent on the root
+acquired_at = "<rfc3339>"                         # optional in Phase 1
+hostname = "<owner-host-at-acquire-time>"         # advisory only
 ```
 
-- [ ] Define a `NameRecord` type in `elide-core` with parse/serialise
-  (TOML) and explicit version field for future evolution.
-- [ ] Replace all callers reading/writing `names/<name>` to use
-  `NameRecord`. The old call sites that expect a plain-text ULID
-  must be updated to use `record.vol_ulid` instead.
-- [ ] Document on a new bucket that the schema is versioned and any
-  future change is also a fresh-bucket-only break (consistent with
-  decision 1).
+`state` is **three-valued** (see design doc § "Three states, two
+intents"):
 
-**Phase exit criteria:** `names/<name>` reads and writes go through
-`NameRecord`. Single-coordinator workflows (create, list, etc.)
-behave identically to before, just with structured records.
+- `live` — held by `coordinator_id`, daemon serving.
+- `stopped` — held by `coordinator_id`, daemon down on this host.
+  Other coordinators cannot claim without `--force-takeover`.
+- `released` — no current owner; any coordinator may `volume start`.
+  `coordinator_id` is preserved as historical metadata.
+
+Phase 1 scope:
+
+- [x] Define a `NameRecord` type in `elide-core::name_record` with
+  parse/serialise (TOML), explicit `version` field, and a
+  `NameState` enum covering `Live` / `Stopped` / `Released`.
+  `from_toml` rejects unknown versions; `live_minimal()` constructor
+  for Phase 1 writers.
+- [x] Replace `names/<name>` readers in `src/main.rs` (`remote_list`,
+  `resolve_pull_spec`) to parse `NameRecord` and extract
+  `record.vol_ulid` instead of treating the body as plain ULID text.
+- [x] Update `upload_volume_metadata` in
+  `elide-coordinator/src/upload.rs` to write
+  `NameRecord::live_minimal(vol_ulid)` serialised as TOML with
+  content-type `application/toml`. Optional fields
+  (`coordinator_id`, `acquired_at`, `hostname`) stay unpopulated;
+  Phase 2 lifecycle verbs will populate them on state transitions.
+- [x] Enable `ulid` `serde` feature in `elide-core/Cargo.toml` so
+  `Ulid` round-trips through TOML directly.
+- [x] 7 unit tests in `name_record::tests` cover round-trip
+  (minimal + full), each `NameState` variant, version rejection,
+  malformed TOML, missing required fields, and lowercase wire
+  format.
+
+**Phase exit criteria:** met. `names/<name>` reads and writes go
+through `NameRecord`; bucket schema is fresh-bucket-only — old
+plain-text records are not parseable and are not migrated.
 
 ---
 
@@ -119,44 +143,64 @@ behave identically to before, just with structured records.
 This is where portability becomes real. Gate the new verb behaviour
 on the bucket-capability probe from Phase 0 — see Phase 4.
 
-- [ ] **`volume stop` extension.** When stopping a volume this
-  coordinator owns:
-  1. Refuse if a client (NBD/ublk) is connected (existing check).
-  2. Issue the existing `shutdown` RPC, but extend its semantics:
-     drain WAL → promote pending → publish handoff snapshot covering
-     everything published.
-  3. Conditional PUT to `names/<name>` setting `state = "stopped"`,
-     keeping `vol_ulid`, recording the handoff snapshot ULID and
-     metadata (releasing `coordinator_id`, hostname,
-     `acquired_at`).
-  4. Local: keep or delete the directory at operator discretion;
-     do **not** keep WAL.
-- [ ] **`volume start` extension — name held here.** Existing local
-  start path; extra startup reconcile against `names/<name>` to
-  confirm `coordinator_id == self` and `state` matches local
-  `volume.stopped` marker.
-- [ ] **`volume start <name>` — name held elsewhere or stopped.**
-  1. Read `names/<name>`. Refuse if `state == "live"` and
-     `coordinator_id != self` (without `--force-takeover`).
-  2. Mint `<new_ulid>` and generate a fresh Ed25519 keypair.
-  3. Create `by_id/<new_ulid>/` locally with `provenance.parent =
-     <names_record.vol_ulid>/<names_record.handoff_snap_ulid>`,
-     publish `volume.pub` and signed provenance.
-  4. Conditional PUT to `names/<name>` claiming ownership
-     (`If-Match` against the ETag we read in step 1).
-  5. Begin serving via the existing supervisor path.
+#### `volume stop` (local stop, retain ownership)
+
+- [ ] Refuse if a client (NBD/ublk) is connected (existing check).
+- [ ] Issue the existing `shutdown` RPC: WAL fsync, daemon halts.
+- [ ] Conditional PUT to `names/<name>` flipping `state` from `live`
+  to `stopped`. `vol_ulid` and `coordinator_id` unchanged. **No
+  handoff snapshot.**
+- [ ] Local artefacts (cache, index, WAL, signing key) stay in place.
+
+#### `volume release` (relinquish ownership)
+
+- [ ] If currently `live`, do `volume stop`'s pre-flight (refuse if
+  client connected, issue shutdown).
+- [ ] Drain WAL: promote pending records into segments, finish
+  in-flight uploads.
+- [ ] Publish a handoff snapshot with handoff metadata (releasing
+  `coordinator_id`, hostname, episode `acquired_at`).
+- [ ] Conditional PUT to `names/<name>` setting `state = "released"`,
+  keeping `vol_ulid` and recording the handoff snapshot ULID.
+  `coordinator_id` preserved as historical.
+- [ ] Discard WAL locally; keep `by_id/<vol_ulid>/` as cache or
+  delete at operator discretion.
+- [ ] `volume stop --release` as the convenience composition.
+
+#### `volume start <name>` — claim ownership
+
+Existing local start (when `state == "live"` or absent and the local
+volume directory exists) keeps working. New paths:
+
+- [ ] **Local-resume path** — `state == "stopped"` and
+  `coordinator_id == self`. Conditional PUT flipping `state` back to
+  `live`; restart the daemon. No new ULID, no fork, no snapshot.
+- [ ] **Claim-from-released path** — `state == "released"`. Mint
+  `<new_ulid>` and a fresh Ed25519 keypair; create
+  `by_id/<new_ulid>/` locally with `provenance.parent =
+  <released_vol_ulid>/<released_handoff_snap_ulid>`; publish
+  `volume.pub` and signed provenance; conditional PUT to
+  `names/<name>` claiming ownership. Begin serving.
+- [ ] **Refusal paths** — `state ∈ {live, stopped}` with
+  `coordinator_id != self`. Clear error pointing at
+  `--force-takeover`.
+
+#### Other Phase 2 work
+
 - [ ] **`volume.stopped` marker rule.** On coordinator startup,
   reconcile each local volume directory against `names/<name>`. If
-  the local marker disagrees with S3, S3 wins; update the marker
-  to match.
-- [ ] **Tests:** unit tests for the new `start` flow; an integration
-  test exercising stop-on-A then start-on-B against a real bucket
-  (Tigris in CI); proptest covering interleaved
-  stop/start/concurrent-claim sequences.
+  the local marker disagrees with S3, S3 wins; update the marker to
+  match.
+- [ ] **Tests:** unit tests for each state transition; integration
+  test exercising stop-on-A → start-on-A (local resume) and
+  release-on-A → start-on-B (cross-coordinator) against a real
+  bucket (Tigris in CI); proptest covering interleaved
+  stop/start/release/concurrent-claim sequences.
 
 **Phase exit criteria:** a name can move cleanly between two
-coordinators sharing a bucket. Crash recovery for the same
-coordinator still works as today.
+coordinators when explicitly released, and stays put across a stop
+on its current owner. Crash recovery for the same coordinator still
+works as today.
 
 ---
 

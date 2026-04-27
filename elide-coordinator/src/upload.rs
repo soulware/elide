@@ -450,20 +450,29 @@ async fn upload_manifest(
         }
     }
 
-    // The names/<name> → ULID entry is immutable for a given (name, ULID)
-    // pair; a rename produces a brand new key. We still gate on content so
-    // the uploaded/ copy is verifiable against what would be uploaded now.
-    let name_bytes = volume_id.as_bytes();
+    // The names/<name> record is mutable across lifecycle transitions
+    // (live ↔ stopped ↔ released — see docs/design-portable-live-volume.md),
+    // but Phase 1 only writes the initial "live" record at create time.
+    // Subsequent writes from lifecycle verbs land in Phase 2. We still
+    // gate on content so the uploaded/ sentinel is verifiable against
+    // what would be uploaded now.
+    let vol_ulid = ulid::Ulid::from_string(volume_id)
+        .with_context(|| format!("invalid volume ULID: {volume_id}"))?;
+    let name_record = elide_core::name_record::NameRecord::live_minimal(vol_ulid);
+    let name_record_toml = name_record
+        .to_toml()
+        .context("serialising NameRecord")?
+        .into_bytes();
     let names_sentinel = upload_sentinel(vol_dir, &format!("names_{name}"));
-    if !is_already_uploaded(&names_sentinel, name_bytes) {
+    if !is_already_uploaded(&names_sentinel, &name_record_toml) {
         let name_key = StorePath::from(format!("names/{name}"));
-        let name_len = name_bytes.len();
+        let name_len = name_record_toml.len();
         let started = Instant::now();
         put_with_content_type(
             store,
             &name_key,
-            Bytes::copy_from_slice(name_bytes),
-            MIME_TEXT,
+            Bytes::copy_from_slice(&name_record_toml),
+            MIME_TOML,
         )
         .await
         .with_context(|| format!("uploading name entry to {name_key}"))?;
@@ -471,7 +480,7 @@ async fn upload_manifest(
             "[upload] {name_key} ({name_len} bytes in {:.2?})",
             started.elapsed()
         );
-        if let Err(e) = mark_uploaded(&names_sentinel, name_bytes) {
+        if let Err(e) = mark_uploaded(&names_sentinel, &name_record_toml) {
             warn!("failed to mark names_{name} sentinel: {e}");
         }
     }
@@ -903,11 +912,15 @@ mod tests {
         assert_eq!(table["size"].as_integer(), Some(8192));
         assert_eq!(table["readonly"].as_bool(), Some(true));
 
-        // names/<name> should contain the ULID
+        // names/<name> should be a NameRecord TOML pointing at this volume.
         let name_key = StorePath::from("names/my-vol");
         let got = store.get(&name_key).await.expect("name entry not in store");
-        let ulid_bytes = got.bytes().await.unwrap();
-        assert_eq!(std::str::from_utf8(&ulid_bytes).unwrap(), VOL_ULID);
+        let body = got.bytes().await.unwrap();
+        let name_toml = std::str::from_utf8(&body).unwrap();
+        let record = elide_core::name_record::NameRecord::from_toml(name_toml)
+            .expect("names/<name> must round-trip through NameRecord");
+        assert_eq!(record.vol_ulid.to_string(), VOL_ULID);
+        assert_eq!(record.state, elide_core::name_record::NameState::Live);
 
         // uploaded/ holds verbatim copies of the uploaded bytes — diff-able
         // with standard tools against the store objects.
@@ -918,7 +931,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(uploaded.join("names_my-vol")).unwrap(),
-            VOL_ULID
+            name_toml
         );
     }
 
