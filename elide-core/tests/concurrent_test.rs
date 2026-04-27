@@ -27,9 +27,10 @@ mod common;
 ///
 /// Seeds two segments of data, then runs a coordinator thread (GC pass) and a
 /// reader thread (continuous reads of seeded LBAs) concurrently.  The
-/// coordinator GC produces a compacted segment and a `gc/*.pending` handoff
-/// file; the reader must never observe a file-not-found error regardless of
-/// when the handoff is applied relative to the deletion of the old files.
+/// coordinator GC emits a `gc/<new>.plan` handoff which the volume materialises
+/// into a bare `gc/<new>` segment; the reader must never observe a
+/// file-not-found error regardless of when the handoff is applied relative to
+/// the deletion of the old files.
 #[test]
 fn coordinator_gc_does_not_create_read_failures() {
     let dir = tempfile::TempDir::new().unwrap();

@@ -1988,8 +1988,8 @@ fn ulid_cutoff_overwrite_stays_invisible() {
 // --- apply_gc_handoffs tests ---
 //
 // These tests simulate the coordinator GC workflow:
-//   write → flush → drain (pending→cache + index) → coordinator compacts
-//   into new segment + writes gc/*.pending → volume applies handoff.
+//   write → flush → drain (pending→cache + index) → coordinator emits
+//   gc/<new>.plan → volume applies handoff (writes .staged → bare gc/<new>).
 
 #[test]
 fn gc_handoff_applies_and_renames() {

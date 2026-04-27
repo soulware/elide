@@ -1513,13 +1513,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn done_ignores_non_applied_files() {
+    async fn done_ignores_files_with_extensions() {
         let tmp = TempDir::new().unwrap();
         let gc_dir = tmp.path().join("gc");
         fs::create_dir_all(&gc_dir).unwrap();
-        // .pending and .done files should be ignored.
-        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.pending"), "").unwrap();
-        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done"), "").unwrap();
+        // apply_done_handoffs only processes bare-named gc/<ulid> files.
+        // Anything with an extension (`.plan` from the coord, `.staged`
+        // mid-apply, `.tmp` scratch) must be ignored.
+        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.plan"), "").unwrap();
+        fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.staged"), "").unwrap();
         let store = make_store();
         let n = apply_done_handoffs(
             tmp.path(),
@@ -1531,8 +1533,8 @@ mod tests {
         .unwrap();
         assert_eq!(n, 0);
         // Files should be untouched.
-        assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.pending").exists());
-        assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.done").exists());
+        assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.plan").exists());
+        assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.staged").exists());
     }
 
     // --- DEDUP_REF regression test ---

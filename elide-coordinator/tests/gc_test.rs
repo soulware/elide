@@ -358,8 +358,9 @@ fn drain_pending(fork_dir: &std::path::Path) {
 ///
 /// The fix: in apply_gc_handoffs, scan for stale liveness (hash in
 /// old_ulid_by_hash, not carried, but live in lbamap) BEFORE any extent index
-/// mutations.  If found, cancel the GC output (delete .pending and body) so
-/// gc_fork can re-run with correct liveness data on the next tick.
+/// mutations.  If found, cancel the GC output (drop the .staged file and any
+/// associated body) so gc_fork can re-run with correct liveness data on the
+/// next tick.
 #[test]
 fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     let dir = tempfile::TempDir::new().unwrap();

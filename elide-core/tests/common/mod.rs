@@ -305,7 +305,7 @@ fn compact_candidates_inner(
 /// Picks the `n_candidates` lowest-priority segments (sort_for_rebuild order)
 /// from `index/*.idx`, compacts their entries, writes a new segment with the
 /// given `new_ulid` (obtained from `gc_checkpoint` which flushes the volume's
-/// WAL first), and writes `gc/<new_ulid>.pending`.
+/// WAL first), and writes a `gc/<new_ulid>.plan` describing the apply.
 ///
 /// The input segment files are **not** deleted inline.  The caller receives
 /// the consumed paths and is responsible for deleting them — after calling

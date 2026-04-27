@@ -175,7 +175,7 @@ proptest! {
                     let Ok(gc_ulid) = handle.gc_checkpoint() else {
                         continue;
                     };
-                    // Simulate one coordinator GC pass (writes gc/*.pending).
+                    // Simulate one coordinator GC pass (writes gc/<new>.plan).
                     // Returns paths to delete — we hold them until after the
                     // handoff is applied, matching the real coordinator's ordering.
                     let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
