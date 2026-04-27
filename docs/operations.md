@@ -220,6 +220,8 @@ Each GC tick selects one bucket of eligible segments and emits one output plan p
 
 Per-tick work is bounded by the 32 MiB live cap, the 8192-entry cap, and O(1)-per-input tombstone bookkeeping on the apply side. "Repack-multi" falls out for free: multiple sparse smalls can land in one bucket. The entry cap matches the WAL flush cap (see *Pending compaction*) so GC outputs sit at the same scale as freshly-flushed segments — without it, packing many thin-entry inputs (DedupRef, Zero, small Inline) could produce a single output with an over-large index region.
 
+**Retention interaction.** Compacted input segments are not deleted from S3 immediately — they're held for the configured retention window (`retention_window`) before the reaper removes them. This means GC during the retention window *defers* space reclamation rather than driving it. The peak storage cost of running GC at compaction throughput C with retention T is `live_data + post_compaction_outputs + (C × T)`. Tuning `density_threshold` and T together is what controls overall storage efficiency; see `docs/design-replica-model.md` *Retention economics* for the full model.
+
 **Local-first fetch.** Before issuing any S3 GET, `fetch_live_bodies` checks whether the input's body is already resolvable from `cache/<ulid>.body`. A cache hit requires (a) the body file exists and (b) every live DATA entry's bit is set in `cache/<ulid>.present`. On a full hit, the body is read from the local file and sliced per-entry; S3 is not touched. On any partial state (missing file, missing bit, short read) the path falls through to the existing range-GET / full-body-GET logic. This is safe without locks because `cache/` is append-only from the volume's perspective (the coordinator is the sole deleter), `.present` bits are durable before they are published, and bodies covered by a set bit are immutable until the file is unlinked. The hash-verification step in `compact_segments` remains the correctness backstop regardless of fetch source. Self-written-and-promoted segments — where the volume copied the full body from `pending/` into `cache/` at promote time — are the common hit case; partially demand-fetched segments fall back to S3.
 
 **Liveness** — an entry is live only if both (a) the reconstructed extent index still points to this input segment for that hash, and (b) `lbamap.hash_at(lba) == Some(hash)`. The coordinator rebuilds liveness from on-disk files only — in-memory WAL entries are not visible. Worst case is a small space leak (an extent carried into the output that will be dead once the WAL flushes), never corruption. Dedup-ref entries are carried only if the start LBA still maps to the hash — unconditional carry or drop both corrupt data (see `docs/testing.md` bug E). Snapshot-floor segments are skipped. LBA-dead extents that aren't carried into the output are simply absent from the new segment; the volume's apply path sees them in the input `.idx` files but not in the output and removes the corresponding extent-index entries.
@@ -228,7 +230,34 @@ Per-tick work is bounded by the 32 MiB live cap, the 8192-entry cap, and O(1)-pe
 
 Before each GC pass the coordinator calls `gc_checkpoint` on the volume. The volume mints two ULIDs in one shot from its monotonic clock — `u_gc` and `u_flush` — flushes the current WAL under `u_flush`, and leaves the volume in a no-WAL state (the next write lazily opens a fresh WAL via `ensure_wal_open`). The coordinator receives `u_gc` as the output ULID for the GC pass. Pre-minting both together encodes the required ordering (`u_gc < u_flush < next_write_wal_ulid`) in advance and is essential for crash-recovery correctness — without it, a WAL flushed at checkpoint time would keep its older ULID and get shadowed by the GC output on rebuild. The post-checkpoint WAL is not pre-minted: because the mint is strictly monotonic, any future `mint.next()` is already above `u_flush`, so no reservation is needed. This also eliminates per-tick WAL churn on idle volumes. ULIDs are always minted by the volume, so coordinator clock skew cannot corrupt segment ordering. See `docs/testing.md` bugs C and D for regressions.
 
-The GC output ULID is `max(inputs).increment()`. Because input segments have already drained (timestamps seconds to minutes behind wall-clock), any concurrent write gets a ULID far ahead of the output and wins at rebuild — no locking needed, and a missed concurrent write is at worst a space leak.
+The GC output ULID comes from `UlidMint::next()` (see
+`elide-core/src/ulid_mint.rs`): wall-clock if the clock is ahead of
+the mint's last-seen ULID, otherwise `last.increment()`. For an
+active volume this means the GC output ULID timestamp tracks
+**handoff time**, not max-input timestamp. Monotonicity vs inputs is
+preserved because either we used a clock value that was already past
+all inputs, or we incremented from `last` which was itself already
+past.
+
+**Load-bearing properties.** Two things rely on this minting:
+
+1. *Concurrent-writes-always-win at rebuild.* Any write happening
+   during compaction gets a ULID at least as fresh as the GC
+   output's, so it cannot be shadowed at rebuild. Worst case from a
+   missed concurrent write is a space leak, never corruption.
+2. *GC output ULID timestamp ≈ handoff wall-clock.* Anything that
+   needs "when did this GC output appear in the volume's timeline"
+   can read `ulid_timestamp(gc_output)` directly. In particular,
+   retention deadlines for input segments are
+   derived as `ulid_timestamp(gc_output) + retention` — accurate to
+   ~1 ms in the absence of clock skew, and bounded by `UlidMint`'s
+   monotonic increment when skew occurs.
+
+A change to GC ULID minting (e.g. reverting to a pure
+`max(inputs).increment()` form) would break property 2 silently for
+idle-then-burst volumes — the output ULID would carry the max input
+timestamp, which can be hours or days old, and any retention scheme
+using it as the grace anchor would mis-fire.
 
 ### Self-describing handoff
 

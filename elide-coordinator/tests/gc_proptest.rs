@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use elide_coordinator::config::GcConfig;
 use elide_coordinator::gc::{GcStrategy, apply_done_handoffs, gc_fork};
@@ -272,6 +273,7 @@ proptest! {
         let gc_config = GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..GcConfig::default()
         };
 
         let cache_dir = fork_dir.join("cache");
@@ -383,10 +385,10 @@ proptest! {
                     // apply_done_handoffs skips the upload+promote branch.
                     let _ = rt.block_on(apply_done_handoffs(
                         fork_dir,
-                        "test-vol",
+                        "00000000000000000000000000",
                         &store,
                         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
-                    ));
+                                            ));
 
                     if let Ok(stats) = gc_stats
                         && !matches!(stats.strategy, GcStrategy::None(_))
@@ -485,6 +487,7 @@ proptest! {
         let gc_config = GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..GcConfig::default()
         };
 
         for op in &ops {
@@ -605,10 +608,10 @@ proptest! {
                     // Step 4: upload new segment to S3, delete old S3 objects.
                     let _ = rt.block_on(apply_done_handoffs(
                         fork_dir,
-                        "test-vol",
+                        "00000000000000000000000000",
                         &store,
                         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
-                    ));
+                                            ));
 
                     // Assert: every oracle LBA still reads its expected value.
                     for (&lba, expected) in &oracle {
@@ -702,6 +705,7 @@ fn gc_oracle_repro_bug_h() {
     let gc_config = GcConfig {
         density_threshold: 0.0,
         interval_secs: 0,
+        ..GcConfig::default()
     };
 
     // DedupWrite: lba 3 gets DATA, lba 6 gets thin DEDUP_REF (same hash).
@@ -720,7 +724,7 @@ fn gc_oracle_repro_bug_h() {
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(
         fork_dir,
-        "test-vol",
+        "00000000000000000000000000",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
@@ -743,7 +747,7 @@ fn gc_oracle_repro_bug_h() {
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(
         fork_dir,
-        "test-vol",
+        "00000000000000000000000000",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
@@ -786,6 +790,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     let gc_config = GcConfig {
         density_threshold: 0.0,
         interval_secs: 0,
+        ..GcConfig::default()
     };
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
@@ -808,7 +813,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(
         fork_dir,
-        "test-vol",
+        "00000000000000000000000000",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
@@ -842,7 +847,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(
         fork_dir,
-        "test-vol",
+        "00000000000000000000000000",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));

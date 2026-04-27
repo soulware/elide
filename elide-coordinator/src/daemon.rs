@@ -129,6 +129,17 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
         });
     }
 
+    // Coordinator-wide retention reaper. One ticker fans out
+    // per-owned-volume reap operations (non-blocking spawn). Cadence is
+    // derived from the configured retention; see GcConfig::reaper_cadence.
+    // Retention is read on each tick from the captured config.
+    elide_coordinator::reaper::start(
+        store.clone(),
+        config.data_dir.clone(),
+        gc_config.reaper_cadence(),
+        gc_config.retention_window,
+    );
+
     // Maps each known volume path to its directory inode.  The inode detects
     // delete-and-recreate: if the same path reappears with a different inode
     // (e.g. `volume delete` followed by `volume remote pull` of the same ULID),

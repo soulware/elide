@@ -8,7 +8,7 @@
 - **Deferred:** Tightening `--from` to require an explicit
   `<vol_ulid>/<snap_ulid>` pin, and introducing `volume materialize`. These
   previously waited on TTL specifics for the object store; that gap is now
-  resolved by application-managed pending-delete markers (see below), so
+  resolved by application-managed retention markers (see below), so
   the blocker is implementation, not design. The existing `--force-snapshot`
   flag on `create --from` stays in place as the interim mechanism for
   branching past the most recent snapshot.
@@ -120,55 +120,79 @@ The object store's deletion semantics determine what happens in the race
 window between an upstream GC deleting a segment and a replica reading it.
 The required model is:
 
-- A deletion creates a **pending-delete marker** with a bounded retention
+- A deletion creates a **retention markers** with a bounded retention
   window T.
 - Within T, `GET key` on the canonical object still returns bytes.
 - After T, a reaper physically deletes the canonical object (and the
   marker); subsequent `GET`s 404.
-- Readers never consult the pending-delete prefix — they read canonical
+- Readers never consult the `retention/` prefix — they read canonical
   keys only, and treat 404 as "past T, gone."
 
 Rather than depending on any backend's native lifecycle, versioning, or
 snapshot features, Elide owns this mechanism directly in the coordinator.
 This keeps all backends symmetric (Tigris, R2, AWS S3, MinIO), avoids a
 per-backend retention API, and lets us define the semantics precisely —
-what T is, when it starts, how restart works. See *Pending-delete
-markers* below.
+what T is, when it starts, how restart works. See *Marker record*
+below.
 
 `--force-snapshot` and its supporting machinery
 (`create_readonly_snapshot_now`, the attestation keypair, the
 `ParentRef.manifest_pubkey` field) stay in place until `materialize`
 lands; they're then retired.
 
-## Proposed: application-managed pending-delete markers
+## Proposed: application-managed retention markers
 
-Elide adds a `pending-delete/` prefix under each volume's S3 root. When
+Elide adds a `retention/` prefix under each volume's S3 root. When
 the coordinator's handoff protocol would physically delete an S3 object
 (GC input deletion, per the coordinator-driven handoff described in
 `operations.md` and `architecture.md`), it instead writes a
-pending-delete marker and leaves the canonical object in place. A
+retention marker and leaves the canonical object in place. A
 periodic reaper on the owning coordinator physically deletes targets
 (and their markers) whose retention window has elapsed.
 
 ### Marker record
 
-Each marker is a small structured record containing:
+Path: `by_id/<vol_ulid>/retention/<gc_output_ulid>`
 
-- **Target key(s)** — one marker may cover multiple related objects
-  retired together (e.g. a GC output's idx plus any auxiliary files).
-  Listed explicitly; no wildcard rules.
-- **Creation ULID** — both the marker's identifier and the zero point
-  for the reap deadline. ULID-derived time matches how handoff ordering
-  is already reasoned about; wall-clock is not load-bearing.
-- **Reason** — enum: `gc-input`, `superseded`, `volume-delete-tail`,
-  etc. For diagnostics and audit, not for reader logic.
+The marker filename **is** the GC output ULID — the segment whose
+handoff produced this marker. Cross-reference: `segments/<date>/<gc_output_ulid>`
+(the GC output itself, in S3) and `retention/<gc_output_ulid>`
+(its retention record) name each other. Re-running the upload of the
+same GC handoff re-PUTs the marker key with the same content — fully
+idempotent.
 
-Marker path: `by_id/<vol_ulid>/pending-delete/<marker_ulid>`. Concrete
-format TBD (`.manifest` precedent argues for a readable form).
+Content: plain text, one input segment ULID per line, no trailing
+metadata.
+
+```
+01K7QXAB1JNZSCK4KKY5888AJ
+01K7QXAB1JNZSCK4KKY5888BR
+01K7QXAB1JNZSCK4KKY5888CW
+```
+
+That's the whole record. No retention field, no reason field, no
+schema version, no volume ULID:
+
+- **Retention is derived, not stamped.** Deadline =
+  `ulid_timestamp(<gc_output_ulid>) + current_config.T`. This relies
+  on the load-bearing property documented in *operations.md* under
+  *gc_checkpoint — the pre-mint pattern*: GC output ULIDs come from
+  `UlidMint::next` (clock-if-ahead-else-`last.increment()`), so their
+  timestamps track wall-clock at handoff. Operator changes to T apply
+  to all markers immediately — the intuitive behavior for an
+  operational knob.
+- **Reason is implicit.** v1 has one writer (the GC handoff), and the
+  GC output's segment header already identifies it as a GC output
+  (non-empty `inputs_length`). A diagnostic field would duplicate
+  that.
+- **Volume scope is structural.** The volume ULID is in the path; the
+  marker content is a list of input ULIDs that the reaper reconstructs
+  into S3 keys *under the invocation volume*. There's no shape an
+  input ULID can take that escapes the volume's prefix.
 
 ### Reader semantics
 
-Readers never list or open `pending-delete/`. They read canonical paths
+Readers never list or open `retention/`. They read canonical paths
 and treat 404 as the authoritative "reaped past T" signal. Replicas
 that want to guarantee success discipline their own reads: capture the
 upstream's latest `.manifest` as the reference set, then complete all
@@ -176,10 +200,10 @@ referenced segment fetches within T of that capture.
 
 ### Rebuild semantics
 
-Unaffected. Local rebuild reads `index/*.idx` — pending-delete markers
-live in a different prefix and are invisible. If a from-S3 rebuild
+Unaffected. Local rebuild reads `index/*.idx` — retention markers
+live in a different S3 prefix and are invisible. If a from-S3 rebuild
 codepath is ever added, it can scan canonical `segments/` / `index/`
-keys and ignore `pending-delete/` entirely: any GC input still
+keys and ignore `retention/` entirely: any GC input still
 physically present during its retention window is correctly superseded
 by the higher-ULID GC output's `inputs` list, so its presence is
 harmless to the extent-index view.
@@ -187,11 +211,14 @@ harmless to the extent-index view.
 ### Reaper
 
 Runs as a periodic task on the coordinator that owns the volume. Lists
-`pending-delete/`, decides which markers are past T using their
+`retention/`, decides which markers are past T using their
 creation ULID, then for each expired marker:
 
-1. Delete each listed target key (idempotent; a 404 is fine).
-2. Delete the marker.
+1. Parse and validate every target key (see *Target validation* below).
+   Reject the entire marker on any failure — log loudly, leave the
+   marker in place, do not partially reap.
+2. Delete each listed target key (idempotent; a 404 is fine).
+3. Delete the marker.
 
 Order matters: targets first, marker second. A restarted reaper
 re-listing the prefix will see any marker whose targets are already
@@ -203,16 +230,104 @@ The owning coordinator is the sole writer to its volume's S3 prefix;
 replicas reading from this bucket have no write authority and do not
 participate in reaping.
 
+#### Scope
+
+The reaper runs only for volumes the local coordinator owns as a
+writer — i.e. volumes the coordinator is currently driving GC and
+drain for. Read-only references (cheap-reference replicas of an
+upstream) have no reaper because they have no S3 write authority on
+the upstream's prefix; the upstream's own coordinator is responsible
+for reaping there.
+
+#### Cadence and dispatch
+
+A single coordinator-wide ticker fires on the cadence
+`max(retention / 10, 1s)`. On each tick, the coordinator iterates the
+volumes it owns and spawns a non-blocking reap operation per volume.
+Operations are independent: a slow or failing S3 call on one volume
+does not delay the others. One global ticker plus per-volume spawns
+keeps the resource shape simple at the small volume counts a single
+coordinator manages.
+
+The `1s` floor exists for tests with short retention values; in
+production T is on the order of hours, so the cadence floor never
+binds.
+
+#### Target validation
+
+The volume identity flows through the reaper as a ground-truth input,
+not as a parsed value. Three independent checkpoints must all agree on
+the same `vol_ulid` before any deletion happens:
+
+1. **Invocation.** The reaper is invoked per-volume. The caller passes
+   the volume's ULID explicitly; the reaper lists
+   `by_id/<vol_ulid>/retention/` under that ULID. This ULID is the
+   ground truth for the run.
+2. **Marker path.** For each listed marker, the reaper parses the
+   volume component out of the marker's own key and asserts it equals
+   the invocation ULID. A mismatch means the listing returned a key
+   from a different prefix — log loudly and skip.
+3. **Input ULID.** Each line of the marker body is parsed as a ULID
+   via `Ulid::from_string`. The reaper reconstructs the segment key as
+   `by_id/<invocation_vol>/segments/<YYYYMMDD>/<input_ulid>`. There is
+   no shape an input ULID can take that escapes the invocation
+   volume's prefix — the prefix is constructed from the trusted
+   invocation ULID, not from anything in the marker.
+
+A line that doesn't parse as a ULID is rejected. In particular:
+
+- **Bounded line count.** A hard cap (e.g. 1024) on input lines
+  rejects malformed or runaway markers before any delete fires.
+  Realistic GC handoffs sit well below the cap; anything near it is a
+  bug or tampering signal.
+- **No empty lines, no whitespace, no trailing data on the line.** A
+  malformed line aborts the whole marker — log loudly, skip, do not
+  partially reap.
+
+A rejected marker becomes an operator signal, not silent data loss.
+
+This three-checkpoint flow is deliberate. A parser bug in any single
+layer cannot cause cross-volume reaping on its own — the bug would
+have to corrupt the invocation ULID, the marker-path parse, and the
+input-line parse identically. The dominant risk we're defending
+against isn't a sophisticated attacker; it's an internal bug that
+misroutes a delete to the wrong volume's data. Three independent
+agreements on the same ULID make that class of bug structurally hard
+to trigger.
+
+Volume scope was previously enforced via a typed `ReapTarget` enum
+that pattern-matched the full S3 key. Under the simplified
+ULID-per-line shape, the enum collapses to "is this a valid ULID?";
+volume scope and key shape both come from the invocation. This is
+strictly safer — a malformed marker can produce at worst an extra 404
+DELETE under the invocation volume's prefix, never a delete in
+another volume's prefix.
+
+The validation step also defends against the narrow split-IAM threat
+model from *Authenticity* above: an attacker with PutObject but not
+DeleteObject who plants a marker pointing at non-segment ULIDs
+produces 404s on DELETE (those keys aren't real segments), not silent
+deletion of unrelated data.
+
 ### The invariant
 
 **Every physical delete of a canonical S3 object goes through a
-pending-delete marker.** This is what lets a replica trust "present now
+retention markers.** This is what lets a replica trust "present now
 ⟹ present for at least T." Breaking this invariant even once breaks
 the replica guarantee, silently.
 
 Whole-volume deletion is the one exception: when a volume is being
 torn down entirely, a replica following it has no contract that
 survives the teardown. Volume delete can drop the prefix directly.
+
+### Authenticity
+
+Markers are written exclusively by the volume's owning coordinator —
+the same actor that already holds write authority on the prefix and
+drives all S3 deletions through the GC handoff. They are unsigned;
+authenticity derives from the sole-writer ACL on the prefix. An
+attacker able to write a marker is by construction also able to delete
+canonical objects directly, so signing would not raise the bar.
 
 ### Retention window T
 
@@ -229,14 +344,62 @@ Default TBD. An operator knob exposed through the volume (or
 coordinator) config is the right shape; the coordinator applies it
 when minting markers and when reaping.
 
+### Retention economics
+
+A counterintuitive consequence: GC during the retention window
+*defers* space reclamation rather than driving it. An input segment
+compacted at time t becomes reapable at t + T, not t. Throughout
+[t, t+T] the input exists alongside its compacted output, so total
+storage briefly carries both.
+
+**Steady state.** If GC consumes input bytes at rate C (bytes/sec),
+there is `C × T` bytes of in-flight retained inputs at any moment.
+This term is invariant to GC frequency: doubling the frequency at
+the same per-batch size doubles C and the retention term; halving
+per-batch size at the same frequency keeps C constant. Total storage
+is approximately:
+
+```
+live_data + post_compaction_outputs + (C × T)
+```
+
+**How the knobs interact:**
+
+| Knob | Effect on retention overhead |
+|---|---|
+| `retention_window` (T) | Linear. Halving T halves the in-flight term. Lower bound is whatever replicas need to catch up; below that the guarantee is meaningless. |
+| `gc.density_threshold` | Indirect, via what's worth compacting. A lower threshold (compact only mostly-dead) means input bytes >> output bytes — savings dominate retention overhead. A higher threshold (compact mostly-live) means input ≈ output — retention overhead is ~2× the throughput for marginal savings. |
+| `gc.interval_secs` | Batch granularity only. Steady-state retention overhead is unchanged. |
+
+**Tombstone handoffs are the optimal case.** A 100%-dead input
+compacted to a zero-entry GC output has input bytes ≈ retention
+overhead and post-T reclamation = 100% of the input. The bytes that
+would have been retained anyway are retained *explicitly*, with no
+new compaction-output cost added.
+
+**The small-segment branch** of the current GC strategy
+(`docs/operations.md` *Per-tick selection*) admits small segments at
+any density to consolidate into 32 MiB outputs. Under retention
+semantics, that pays retention overhead for marginal compaction
+savings when the small segments are dense. The tradeoff is workload-
+dependent — not a correctness issue, just economics.
+
+**The intuitive "GC frees space" model is wrong** during the retention
+window. Under retention, GC's role is more like a smoothing filter
+between dead-byte accumulation and physical deletion: dead bytes
+accumulate at rate D, GC moves them through the retention pipeline at
+rate C ≥ D, the pipeline holds `C × T` bytes, and reclamation happens
+at rate C lagged by T. Tuning is about balancing the pipeline depth
+against the volume's tolerance for dead-byte accumulation in `live_data`.
+
 ### Naming clarification
 
 "Tombstone" already means something specific in Elide: a zero-entry GC
 output carrying only an `inputs` list, used to supersede fully-dead
 segments without producing new extents (see `operations.md`). These
-GC-layer tombstones are orthogonal to the S3-layer pending-delete
-markers described here. When a GC tombstone handoff retires its input
-segments, the coordinator mints a pending-delete marker for those
+GC-layer tombstones are orthogonal to the S3-layer retention markers
+described here. When a GC tombstone handoff retires its input
+segments, the coordinator mints a retention marker for those
 inputs as part of the same handoff — two different mechanisms
 cooperating, not the same one named twice.
 
@@ -248,8 +411,8 @@ with write volume. That defeats Elide's GC / repack cost model: every
 superseded segment and every GC compaction input would accrue
 permanent storage cost, not bounded cost. The retention-window problem
 this section tried to solve is instead addressed by application-managed
-pending-delete markers (see *What TTL buys us* and *Proposed:
-application-managed pending-delete markers* above); those are
+retention markers (see *What TTL buys us* and *Proposed:
+application-managed retention markers* above); those are
 backend-agnostic and don't bill for history in perpetuity. Kept below
 for historical context.
 
@@ -299,7 +462,7 @@ materialize driver.
 versioning that makes Tigris bucket snapshots unbounded — the same
 monotonic-growth cost problem at per-object granularity. PITR between
 Elide-level snapshots is a non-goal; if it ever becomes a goal, a
-longer retention window T on pending-delete markers gives a cost-bounded
+longer retention window T on retention markers gives a cost-bounded
 (if coarser) path. Kept below for historical context.
 
 Tigris's always-on per-object versioning plus explicit bucket snapshots
@@ -354,7 +517,7 @@ Open questions:
   it accepts today — a volume name, a bare volume ULID, or an explicit
   `<vol_ulid>/<snap_ulid>` pin — and `--force-snapshot` stays in place.
 
-**Pending (blocked on implementation of pending-delete markers + `materialize`):**
+**Pending (blocked on implementation of retention markers + `materialize`):**
 
 - Tighten `--from` to require the explicit `<vol_ulid>/<snap_ulid>` pin
   form. Bare name and bare ULID become errors. This change waits on

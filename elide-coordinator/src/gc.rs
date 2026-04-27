@@ -63,7 +63,9 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use object_store::ObjectStore;
+use object_store::path::Path as StorePath;
 use ulid::Ulid;
 
 use elide_core::extentindex::{self, ExtentIndex};
@@ -73,7 +75,7 @@ use elide_core::segment::{self, EntryKind, SegmentEntry};
 use elide_core::volume::{ZERO_HASH, latest_snapshot};
 
 use crate::config::GcConfig;
-use crate::upload::segment_key;
+use crate::retention::{marker_key, render_marker};
 
 /// Maximum total live bytes included in one small-segment sweep pass.
 /// Matches the volume's FLUSH_THRESHOLD to keep output segment size bounded.
@@ -423,6 +425,12 @@ pub fn gc_fork(
 /// treated as success; `finalize_gc_handoff` is a no-op if the bare file is
 /// already gone).
 ///
+/// Each successful handoff writes a retention marker at
+/// `retention/<gc_output_ulid>` listing the consumed input ULIDs. The
+/// coordinator's reaper deletes those inputs from S3 after the
+/// configured retention window — see `crate::reaper` and
+/// `docs/design-replica-model.md`.
+///
 /// Returns the number of handoffs completed.
 pub async fn apply_done_handoffs(
     fork_dir: &Path,
@@ -521,22 +529,22 @@ pub async fn apply_done_handoffs(
             continue;
         }
 
-        // Delete old S3 objects for each consumed input. 404 means the
-        // object is already gone (idempotent across restart).
-        for old_ulid in &inputs {
-            let old_ulid_str = old_ulid.to_string();
-            let key = segment_key(volume_id, &old_ulid_str)
-                .with_context(|| format!("building key for {old_ulid_str}"))?;
-            match store.delete(&key).await {
-                Ok(_) => {}
-                Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => {
-                    return Err(
-                        anyhow::anyhow!(e).context(format!("deleting S3 object {old_ulid_str}"))
-                    );
-                }
-            }
-        }
+        // Write a retention marker at `retention/<gc_output_ulid>` listing
+        // the consumed input ULIDs. The reaper deletes those inputs from
+        // S3 (and the marker) once `ulid_timestamp(<gc_output_ulid>) +
+        // retention_retention` has passed — giving replicas a
+        // guaranteed grace period. See `docs/design-replica-model.md`.
+        //
+        // Idempotency: the marker key is the GC output ULID, so re-running
+        // this loop after a crash re-PUTs the same key with the same body.
+        let volume_ulid = Ulid::from_string(volume_id)
+            .map_err(|e| anyhow::anyhow!("invalid volume_id '{volume_id}': {e}"))?;
+        let body = render_marker(&inputs);
+        let key: StorePath = marker_key(volume_ulid, new_ulid);
+        store
+            .put(&key, Bytes::from(body).into())
+            .await
+            .with_context(|| format!("writing retention marker {new_ulid_str}"))?;
 
         // Drop each consumed input's local cache. Safe here: promote_segment
         // already published cache/<new>.body and index/<new>.idx, and deleted
@@ -1326,6 +1334,7 @@ fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut LbaMap) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upload::segment_key;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
@@ -1574,14 +1583,14 @@ mod tests {
         // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
         vol.write(0, &content).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         // Step 2: write the same content to lba 1, flush, redact, drain.
         // Same hash H_aa → the write path emits DedupRef(lba=1, H_aa) in S2,
         // carried through unchanged by the thin-DedupRef format.
         vol.write(1, &content).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         drop(vol);
 
@@ -1592,6 +1601,7 @@ mod tests {
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
         let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
@@ -1613,7 +1623,7 @@ mod tests {
         let _mock = spawn_mock_socket(dir.to_owned()).await;
         let done = apply_done_handoffs(
             dir,
-            "test-vol",
+            "00000000000000000000000000",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
         )
@@ -1664,11 +1674,11 @@ mod tests {
         // Two distinct payloads so each drain produces its own segment.
         vol.write(0, &[0x11u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         vol.write(1, &[0x22u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
         drop(vol);
 
         // Capture the input segment ULIDs from index/ before GC runs — those
@@ -1695,6 +1705,7 @@ mod tests {
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
         gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
@@ -2416,7 +2427,7 @@ mod tests {
         let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
         vol.write(0, &parent_bytes).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         // ── S2: multi-LBA Delta at LBA 100..104, hand-crafted. The child
         //        body is zstd-dict compressed against the parent as
@@ -2440,7 +2451,7 @@ mod tests {
         )
         .unwrap();
         let bytes = fs::read(&delta_pending).unwrap();
-        let key = segment_key("test-vol", &delta_ulid.to_string()).unwrap();
+        let key = segment_key("00000000000000000000000000", &delta_ulid.to_string()).unwrap();
         store
             .put(&key, bytes::Bytes::from(bytes).into())
             .await
@@ -2450,7 +2461,7 @@ mod tests {
         // ── S3: single-LBA overwrite at LBA 102, via the normal path.
         vol.write(102, &overwrite_bytes).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         drop(vol);
 
@@ -2458,6 +2469,7 @@ mod tests {
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
         let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
@@ -2542,13 +2554,13 @@ mod tests {
         let block = [0xBBu8; 4096];
         vol.write(0, &block).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         // Write a second segment so GC has ≥2 candidates to sweep.
         let block2 = [0xCCu8; 4096];
         vol.write(1, &block2).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         drop(vol);
 
@@ -2556,6 +2568,7 @@ mod tests {
         let config = crate::config::GcConfig {
             density_threshold: 0.0,
             interval_secs: 0,
+            ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
         let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
@@ -2575,7 +2588,7 @@ mod tests {
         let _mock = spawn_mock_socket(dir.to_owned()).await;
         let done = apply_done_handoffs(
             dir,
-            "test-vol",
+            "00000000000000000000000000",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
         )

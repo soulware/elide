@@ -336,6 +336,15 @@ pub struct GcConfig {
     /// How often (seconds) to run a GC pass per fork. Default: 10.
     #[serde(default = "default_gc_interval")]
     pub interval_secs: u64,
+
+    /// Retention window for GC input segments. After a successful GC
+    /// handoff, inputs are not deleted from S3 immediately; the
+    /// coordinator writes a retention marker at
+    /// `by_id/<vol>/retention/<gc_output_ulid>` and the reaper deletes
+    /// the inputs once this window has elapsed. Accepts humantime-style
+    /// strings like `"24h"`, `"30s"`, `"5m"`. Default: `24h`.
+    #[serde(default = "default_retention_window", with = "humantime_serde")]
+    pub retention_window: Duration,
 }
 
 fn default_gc_density() -> f64 {
@@ -344,12 +353,26 @@ fn default_gc_density() -> f64 {
 fn default_gc_interval() -> u64 {
     10
 }
+fn default_retention_window() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
+impl GcConfig {
+    /// Cadence at which the reaper ticks: `max(retention / 10, 1s)`. The 1s
+    /// floor exists for tests with very short retention; production T is
+    /// hours, so the floor never binds in real deployments.
+    pub fn reaper_cadence(&self) -> Duration {
+        let derived = self.retention_window / 10;
+        derived.max(Duration::from_secs(1))
+    }
+}
 
 impl Default for GcConfig {
     fn default() -> Self {
         Self {
             density_threshold: default_gc_density(),
             interval_secs: default_gc_interval(),
+            retention_window: default_retention_window(),
         }
     }
 }

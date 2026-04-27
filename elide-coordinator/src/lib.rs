@@ -4,6 +4,8 @@ pub mod gc;
 pub mod prefetch;
 pub mod pull;
 pub mod range_fetcher;
+pub mod reaper;
+pub mod retention;
 pub mod tasks;
 pub mod upload;
 
