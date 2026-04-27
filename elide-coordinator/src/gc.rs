@@ -1583,14 +1583,14 @@ mod tests {
         // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
         vol.write(0, &content).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         // Step 2: write the same content to lba 1, flush, redact, drain.
         // Same hash H_aa → the write path emits DedupRef(lba=1, H_aa) in S2,
         // carried through unchanged by the thin-DedupRef format.
         vol.write(1, &content).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         drop(vol);
 
@@ -1623,7 +1623,7 @@ mod tests {
         let _mock = spawn_mock_socket(dir.to_owned()).await;
         let done = apply_done_handoffs(
             dir,
-            "test-vol",
+            "00000000000000000000000000",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
         )
@@ -1674,11 +1674,11 @@ mod tests {
         // Two distinct payloads so each drain produces its own segment.
         vol.write(0, &[0x11u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         vol.write(1, &[0x22u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
         drop(vol);
 
         // Capture the input segment ULIDs from index/ before GC runs — those
@@ -2427,7 +2427,7 @@ mod tests {
         let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
         vol.write(0, &parent_bytes).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         // ── S2: multi-LBA Delta at LBA 100..104, hand-crafted. The child
         //        body is zstd-dict compressed against the parent as
@@ -2451,7 +2451,7 @@ mod tests {
         )
         .unwrap();
         let bytes = fs::read(&delta_pending).unwrap();
-        let key = segment_key("test-vol", &delta_ulid.to_string()).unwrap();
+        let key = segment_key("00000000000000000000000000", &delta_ulid.to_string()).unwrap();
         store
             .put(&key, bytes::Bytes::from(bytes).into())
             .await
@@ -2461,7 +2461,7 @@ mod tests {
         // ── S3: single-LBA overwrite at LBA 102, via the normal path.
         vol.write(102, &overwrite_bytes).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         drop(vol);
 
@@ -2554,13 +2554,13 @@ mod tests {
         let block = [0xBBu8; 4096];
         vol.write(0, &block).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         // Write a second segment so GC has ≥2 candidates to sweep.
         let block2 = [0xCCu8; 4096];
         vol.write(1, &block2).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_redact(&mut vol, dir, "test-vol", &store).await;
+        drain_with_redact(&mut vol, dir, "00000000000000000000000000", &store).await;
 
         drop(vol);
 
@@ -2588,7 +2588,7 @@ mod tests {
         let _mock = spawn_mock_socket(dir.to_owned()).await;
         let done = apply_done_handoffs(
             dir,
-            "test-vol",
+            "00000000000000000000000000",
             &store,
             crate::upload::DEFAULT_PART_SIZE_BYTES,
         )

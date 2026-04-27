@@ -385,7 +385,7 @@ proptest! {
                     // apply_done_handoffs skips the upload+promote branch.
                     let _ = rt.block_on(apply_done_handoffs(
                         fork_dir,
-                        "test-vol",
+                        "00000000000000000000000000",
                         &store,
                         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
                                             ));
@@ -608,7 +608,7 @@ proptest! {
                     // Step 4: upload new segment to S3, delete old S3 objects.
                     let _ = rt.block_on(apply_done_handoffs(
                         fork_dir,
-                        "test-vol",
+                        "00000000000000000000000000",
                         &store,
                         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
                                             ));
@@ -724,7 +724,7 @@ fn gc_oracle_repro_bug_h() {
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(
         fork_dir,
-        "test-vol",
+        "00000000000000000000000000",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
@@ -747,7 +747,7 @@ fn gc_oracle_repro_bug_h() {
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(
         fork_dir,
-        "test-vol",
+        "00000000000000000000000000",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
@@ -813,7 +813,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(
         fork_dir,
-        "test-vol",
+        "00000000000000000000000000",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
@@ -847,7 +847,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(
         fork_dir,
-        "test-vol",
+        "00000000000000000000000000",
         &store,
         elide_coordinator::upload::DEFAULT_PART_SIZE_BYTES,
     ));
