@@ -487,27 +487,55 @@ mod imp {
         // Either path can stall in the kernel: `del_dev` blocks in
         // `wait_event` until every reference on the ublk_device struct is
         // released, and udev/systemd transiently opens `/dev/ublkb<N>`
-        // when the device appears. To prevent a shutdown signal from
-        // leaving us wedged in the kernel, both paths run on a worker
-        // thread bounded by a timeout. On timeout we leave `ublk.id` in
-        // place: the next serve sees the sysfs entry has cleared (or will
-        // have, once the kernel finishes the deferred deletion) and re-adds
-        // at the same id via `Route::Add { target_id: Some(id) }`.
+        // when the device appears. The cleanup runs on the main thread
+        // because libublk's control ring is thread-local and was
+        // initialized here at startup; a watchdog thread bounds the
+        // total time before forcing the process to exit. On timeout
+        // `ublk.id` is left in place — the next serve sees sysfs cleared
+        // (or will, once the kernel finishes the deferred deletion) and
+        // re-adds at the same id via `Route::Add { target_id: Some(id) }`.
         let dev_id_for_cleanup = ctrl.dev_info().dev_id as i32;
-        match del_dev_with_timeout(ctrl, recovering, dev_id_for_cleanup, DEL_DEV_TIMEOUT) {
-            DelDevOutcome::Done => {
-                if let Err(e) = clear_ublk_id(dir) {
-                    tracing::error!("ublk clear binding failed: {e}");
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let _watchdog = std::thread::Builder::new()
+            .name("ublk-del-watchdog".into())
+            .spawn(move || {
+                if done_rx.recv_timeout(DEL_DEV_TIMEOUT).is_err() {
+                    tracing::warn!(
+                        "ublk del_dev for dev {dev_id_for_cleanup} did not return within {:?}; \
+                         exiting — kernel will finalize deletion when other holders release \
+                         the device, and the next serve will reclaim the id",
+                        DEL_DEV_TIMEOUT
+                    );
+                    std::process::exit(0);
+                }
+            })
+            .map_err(io::Error::other)?;
+
+        drop(ctrl);
+        if recovering {
+            match UblkCtrl::new_simple(dev_id_for_cleanup) {
+                Ok(simple) => {
+                    if let Err(e) = simple.del_dev() {
+                        tracing::debug!("ublk del_dev on shutdown returned: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "ublk new_simple({dev_id_for_cleanup}) for shutdown del_dev failed: {e}"
+                    );
                 }
             }
-            DelDevOutcome::TimedOut => {
-                tracing::warn!(
-                    "ublk del_dev for dev {dev_id_for_cleanup} did not return within {:?}; \
-                     exiting — kernel will finalize deletion when other holders release \
-                     the device, and the next serve will reclaim the id",
-                    DEL_DEV_TIMEOUT
-                );
-            }
+        }
+
+        // Stand the watchdog down before any post-cleanup work that we
+        // do want to complete (clear the binding file, propagate the
+        // `run_target` result). A racing watchdog firing after this point
+        // would only trigger on the binding-file write itself, which is
+        // fast and bounded.
+        let _ = done_tx.send(());
+
+        if let Err(e) = clear_ublk_id(dir) {
+            tracing::error!("ublk clear binding failed: {e}");
         }
 
         run_result?;
@@ -519,53 +547,6 @@ mod imp {
     /// can stall arbitrarily long if udev/systemd is slow to close the
     /// `/dev/ublkb<N>` fd it opened during device-add probing.
     const DEL_DEV_TIMEOUT: Duration = Duration::from_secs(3);
-
-    enum DelDevOutcome {
-        Done,
-        TimedOut,
-    }
-
-    fn del_dev_with_timeout(
-        ctrl: Arc<UblkCtrl>,
-        recovering: bool,
-        dev_id: i32,
-        timeout: Duration,
-    ) -> DelDevOutcome {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let spawn_result = std::thread::Builder::new()
-            .name("ublk-del".into())
-            .spawn(move || {
-                // ADD path: dropping the for-add Arc triggers libublk's
-                // Drop, which synchronously issues DEL_DEV.
-                // RECOVER path: Drop does NOT auto-delete; drop first to
-                // release /dev/ublk-control, then open a fresh new_simple
-                // ctrl and call del_dev on that.
-                drop(ctrl);
-                if recovering {
-                    match UblkCtrl::new_simple(dev_id) {
-                        Ok(simple) => {
-                            if let Err(e) = simple.del_dev() {
-                                tracing::debug!("ublk del_dev on shutdown returned: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "ublk new_simple({dev_id}) for shutdown del_dev failed: {e}"
-                            );
-                        }
-                    }
-                }
-                let _ = tx.send(());
-            });
-        if let Err(e) = spawn_result {
-            tracing::error!("ublk-del thread spawn failed: {e}");
-            return DelDevOutcome::TimedOut;
-        }
-        match rx.recv_timeout(timeout) {
-            Ok(()) => DelDevOutcome::Done,
-            Err(_) => DelDevOutcome::TimedOut,
-        }
-    }
 
     fn pick_nr_queues() -> u16 {
         let cpus = std::thread::available_parallelism()
