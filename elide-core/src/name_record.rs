@@ -8,6 +8,55 @@
 //! The record is mutated only via S3 conditional PUTs; conditional-write
 //! atomicity on this single key carries name uniqueness, ownership
 //! transfer, and the explicit-skip semantics of `--force-takeover`.
+//!
+//! # Wire format
+//!
+//! TOML, content-type `application/toml; charset=utf-8`. Optional fields
+//! are omitted on serialise via `skip_serializing_if = "Option::is_none"`.
+//!
+//! ## Phase 1 writer output (`NameRecord::live_minimal(vol_ulid)`)
+//!
+//! ```toml
+//! version = 1
+//! vol_ulid = "01J0000000000000000000000V"
+//! state = "live"
+//! ```
+//!
+//! Three lines. `coordinator_id`, `parent`, `acquired_at`, `hostname`
+//! are all `None` and skipped.
+//!
+//! ## Phase 2 fully-populated record (after lifecycle verbs land)
+//!
+//! ```toml
+//! version = 1
+//! vol_ulid = "01J0000000000000000000000V"
+//! coordinator_id = "01ABCDEFGHJKMNPQRSTVWXYZ23"
+//! state = "stopped"
+//! parent = "01XYZ000000000000000000000/01SNP000000000000000000000"
+//! acquired_at = "2026-04-27T12:34:56Z"
+//! hostname = "host-a"
+//! ```
+//!
+//! # Field semantics
+//!
+//! - `version` — schema version. Always `1` for this build. `from_toml`
+//!   rejects unknown values; schema changes are fresh-bucket-only.
+//! - `vol_ulid` — ULID of the fork currently bound to this name.
+//!   Crockford-Base32; round-trips through `ulid::Ulid` directly via
+//!   the `serde` feature on the `ulid` crate.
+//! - `coordinator_id` — derived from `coordinator.root_key` via
+//!   `blake3::derive_key("elide coordinator-id v1", &root_key)`,
+//!   formatted as a 26-char Crockford-Base32 ULID-shape (see
+//!   `elide_coordinator::portable::format_coordinator_id`). Owner when
+//!   `state ∈ {Live, Stopped}`; *historical* (last owner) when
+//!   `state = Released`.
+//! - `state` — `"live"` | `"stopped"` | `"released"` on the wire
+//!   (lowercase). See § "Three states, two intents" in the design doc.
+//! - `parent` — `"<prev_vol_ulid>/<prev_snap_ulid>"`, the handoff
+//!   snapshot the current fork was minted from. Present on forks born
+//!   from a released ancestor; absent on root volumes.
+//! - `acquired_at` — RFC3339, when the current ownership episode began.
+//! - `hostname` — advisory only; never compared for ownership decisions.
 
 use std::fmt;
 
