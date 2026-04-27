@@ -344,12 +344,14 @@ proptest! {
 /// Regression test for the lbamap rebuild ordering bug:
 ///
 /// After gc_checkpoint flushes the WAL (lba:7→hash1) to pending/u_flush2, then
-/// drain_local promotes u_flush2 to index/, then crash+rebuild processes gc/*.applied
-/// (u_repack2, carrying lba:7→hash0) AFTER index/*.idx (u_flush2.idx, carrying
-/// lba:7→hash1), the gc output was overwriting the correct value.
+/// drain_local promotes u_flush2 to index/, then crash+rebuild processes the
+/// bare `gc/<ulid>` apply outputs (u_repack2, carrying lba:7→hash0) AFTER
+/// index/*.idx (u_flush2.idx, carrying lba:7→hash1), the gc output was
+/// overwriting the correct value.
 ///
-/// Fixed by processing gc/*.applied first (lowest priority), then index/*.idx, then
-/// pending/ — so the post-GC WAL flush in index/ correctly shadows the GC entry.
+/// Fixed by processing bare gc/<ulid> first (lowest priority), then
+/// index/*.idx, then pending/ — so the post-GC WAL flush in index/ correctly
+/// shadows the GC entry.
 #[test]
 fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     use std::collections::HashMap;
@@ -410,8 +412,9 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     // Step 8: CoordGcLocal{2}
     //   gc_checkpoint flushes (DEDUP_REF lba:1, DATA lba:7→hash1) to pending/u_flush2.
     //   simulate_coord_gc_local finds S1.idx + u_flush1.idx as candidates (2 files),
-    //   compacts them into gc/u_repack2, writes gc/u_repack2.pending.
-    //   apply_gc_handoffs re-signs and renames to .applied; updates extent_index.
+    //   compacts them into gc/u_repack2.plan.
+    //   apply_gc_handoffs materialises the plan: writes gc/u_repack2.staged,
+    //   renames to bare gc/u_repack2; updates extent_index.
     //   to_delete removes index/S1.idx + index/u_flush1.idx.
     let gc_ulid2 = handle.gc_checkpoint().unwrap();
     let to_delete2 = common::simulate_coord_gc_local(fork_dir, gc_ulid2, 2)
@@ -426,9 +429,10 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     common::drain_via_handle(&handle, fork_dir);
 
     // Step 10: Crash — drop+reopen triggers lbamap + extentindex rebuild from disk.
-    //   Bug: lbamap rebuild processed gc/*.applied (u_repack2, lba:7→hash0) AFTER
-    //   index/*.idx (u_flush2.idx, lba:7→hash1), causing gc output to overwrite the
-    //   correct value → lba:7 read back [0;4096] instead of [1;4096].
+    //   Bug: lbamap rebuild processed bare gc/<ulid> apply outputs (u_repack2,
+    //   lba:7→hash0) AFTER index/*.idx (u_flush2.idx, lba:7→hash1), causing the gc
+    //   output to overwrite the correct value → lba:7 read back [0;4096] instead
+    //   of [1;4096].
     handle.shutdown();
     actor_thread.join().unwrap();
 

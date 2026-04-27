@@ -7,9 +7,10 @@
 // file-not-found error.
 //
 // The fix: the coordinator must not delete old local segment files until after
-// the volume has acknowledged the handoff (renamed gc/<ulid>.pending to
-// gc/<ulid>.applied).  That rename signals that the volume's extent index now
-// points at the new compacted segment, making the old files safe to delete.
+// the volume has acknowledged the handoff. Under the self-describing handoff
+// protocol the ack is the rename of `gc/<ulid>.staged` to bare `gc/<ulid>` —
+// that rename is the commit point at which the volume's extent index has
+// flipped to the new compacted segment, making the old files safe to delete.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
