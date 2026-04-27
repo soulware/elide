@@ -192,9 +192,11 @@ on the bucket-capability probe from Phase 0 — see Phase 4.
   Concurrent claims resolve cleanly via the conditional-PUT race;
   the loser's local fork is left as a usable orphan with a clear
   error message.
-- [ ] **Stale-symlink recovery for re-claim** — if `by_name/<name>`
-  already points at a previously-released ULID, the claim refuses
-  with a manual-cleanup hint. Auto-handling lands in a follow-up.
+- [x] **Stale-symlink recovery for re-claim** — `claim_released_name`
+  inspects an existing `by_name/<name>` and removes it when it
+  points at the released ancestor (we previously owned and
+  released this name) or is dangling. Refuses cleanly when the
+  symlink targets an unrelated local ULID.
 
 #### Other Phase 2 work
 

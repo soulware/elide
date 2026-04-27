@@ -1528,6 +1528,51 @@ fn create_fork(
     Ok(())
 }
 
+/// Classification of a `by_name/<name>` symlink for the
+/// claim-from-released path. Determines whether the CLI may safely
+/// remove the existing symlink before fork-create writes a fresh one.
+#[derive(Debug, PartialEq, Eq)]
+enum SymlinkState {
+    /// No `by_name/<name>` entry exists.
+    Absent,
+    /// Symlink points at `by_id/<released_vol_ulid>` (the released
+    /// ancestor we're about to claim from), or the target no longer
+    /// exists. Either way, this host's record of the name is stale
+    /// and the entry can be removed safely.
+    Stale,
+    /// Symlink points at a different ULID that exists locally. Could
+    /// be a different volume sharing the name on this host. Refuse —
+    /// the operator must resolve manually.
+    PointsElsewhere { target: String },
+}
+
+/// Inspect `by_name/<name>` and decide how to handle it before
+/// claiming a released name.
+///
+/// Read the symlink target without following it; resolve to a ULID
+/// by extracting the final path component. The expected target shape
+/// is `../by_id/<ulid>` (relative) or `<data_dir>/by_id/<ulid>`
+/// (absolute).
+fn classify_symlink_for_claim(symlink: &Path, released_vol_ulid: &str) -> SymlinkState {
+    let target = match std::fs::read_link(symlink) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SymlinkState::Absent,
+        // Symlink exists but read_link failed — treat as stale.
+        Err(_) => return SymlinkState::Stale,
+    };
+
+    let target_ulid = target.file_name().and_then(|n| n.to_str());
+    let target_exists = symlink.exists();
+
+    match (target_ulid, target_exists) {
+        (Some(u), _) if u == released_vol_ulid => SymlinkState::Stale,
+        (_, false) => SymlinkState::Stale,
+        _ => SymlinkState::PointsElsewhere {
+            target: target.display().to_string(),
+        },
+    }
+}
+
 /// CLI orchestration of `volume start` against a `Released` name.
 ///
 /// Composes existing fork-creation plumbing with the coordinator's
@@ -1556,16 +1601,30 @@ fn claim_released_name(
     })?;
     let from = format!("{released_vol_ulid}/{snap}");
 
-    // Refuse if a stale by_name/<name> symlink already exists. Clean
-    // recovery from a previous local-owned-then-released volume needs
-    // a follow-up commit; for now the operator removes the stale
-    // pointer manually.
+    // Stale-symlink recovery: if `by_name/<name>` already points at the
+    // released ancestor (this host previously owned the name and
+    // released it), or at a target that no longer exists (broken link
+    // from a deleted ULID dir), remove it. fork-create will write a
+    // fresh symlink pointing at the new ULID.
+    //
+    // Refuse if the symlink points at something else — that's split-
+    // brain or an unrelated volume, and the operator needs to
+    // resolve it manually.
     let symlink = data_dir.join("by_name").join(name);
-    if symlink.exists() || symlink.symlink_metadata().is_ok() {
-        return Err(std::io::Error::other(format!(
-            "by_name/{name} already exists locally; \
-             remove it manually before claiming the released name"
-        )));
+    match classify_symlink_for_claim(&symlink, released_vol_ulid) {
+        SymlinkState::Absent => {}
+        SymlinkState::Stale => {
+            std::fs::remove_file(&symlink).map_err(|e| {
+                std::io::Error::other(format!("removing stale by_name/{name}: {e}"))
+            })?;
+            eprintln!("[claim] removed stale by_name/{name} (previous local fork)");
+        }
+        SymlinkState::PointsElsewhere { target } => {
+            return Err(std::io::Error::other(format!(
+                "by_name/{name} points at {target} which is not the released ancestor; \
+                 refusing to clobber a different volume — remove the symlink manually if intended"
+            )));
+        }
     }
 
     // Pull source if not local.
@@ -2050,4 +2109,77 @@ fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod claim_symlink_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    const RELEASED: &str = "01J0000000000000000000000V";
+    const OTHER: &str = "01J9999999999999999999999V";
+
+    fn setup() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+        let by_name = tmp.path().join("by_name");
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::fs::create_dir_all(&by_name).unwrap();
+        (tmp, by_id, by_name)
+    }
+
+    #[test]
+    fn absent_when_symlink_missing() {
+        let (_t, _id, by_name) = setup();
+        assert_eq!(
+            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
+            SymlinkState::Absent,
+        );
+    }
+
+    #[test]
+    fn stale_when_target_matches_released() {
+        let (_t, by_id, by_name) = setup();
+        std::fs::create_dir_all(by_id.join(RELEASED)).unwrap();
+        symlink(format!("../by_id/{RELEASED}"), by_name.join("vol")).unwrap();
+        assert_eq!(
+            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
+            SymlinkState::Stale,
+        );
+    }
+
+    #[test]
+    fn stale_when_target_missing() {
+        let (_t, _id, by_name) = setup();
+        // Symlink dangling: target by_id directory does not exist.
+        symlink(format!("../by_id/{RELEASED}"), by_name.join("vol")).unwrap();
+        assert_eq!(
+            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
+            SymlinkState::Stale,
+        );
+    }
+
+    #[test]
+    fn stale_when_dangling_to_other_ulid() {
+        let (_t, _id, by_name) = setup();
+        // Dangling link to a non-released ULID also classifies as
+        // Stale (target doesn't exist; safe to remove).
+        symlink(format!("../by_id/{OTHER}"), by_name.join("vol")).unwrap();
+        assert_eq!(
+            classify_symlink_for_claim(&by_name.join("vol"), RELEASED),
+            SymlinkState::Stale,
+        );
+    }
+
+    #[test]
+    fn points_elsewhere_when_target_is_different_ulid() {
+        let (_t, by_id, by_name) = setup();
+        std::fs::create_dir_all(by_id.join(OTHER)).unwrap();
+        symlink(format!("../by_id/{OTHER}"), by_name.join("vol")).unwrap();
+        match classify_symlink_for_claim(&by_name.join("vol"), RELEASED) {
+            SymlinkState::PointsElsewhere { .. } => {}
+            other => panic!("expected PointsElsewhere, got {other:?}"),
+        }
+    }
 }
