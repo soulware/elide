@@ -380,13 +380,92 @@ pub fn stop_volume(socket_path: &Path, name: &str) -> io::Result<()> {
     }
 }
 
+/// Outcome of a `resolve_handoff_key` call.
+///
+/// Drives the claim-from-released path's choice of `parent-key` for
+/// the new fork's `volume.provenance`. For `Normal` manifests the
+/// CLI uses the source volume's own `volume.pub`; for `Recovery` it
+/// embeds the recovering coordinator's pubkey so the new fork's
+/// open-time ancestor walk verifies the synthesised handoff snapshot
+/// against the right key.
+#[derive(Debug, Clone)]
+pub enum HandoffKey {
+    /// Manifest is signed by the source volume's own key.
+    Normal,
+    /// Manifest is a synthesised handoff snapshot signed by a
+    /// recovering coordinator. The carried hex string is the
+    /// already-verified Ed25519 pubkey, ready to pass to
+    /// `fork-create` as `parent-key=<hex>`.
+    Recovery { manifest_pubkey_hex: String },
+}
+
+/// Ask the coordinator to resolve which Ed25519 key the snapshot
+/// manifest at `by_id/<vol_ulid>/snapshots/.../<snap_ulid>.manifest`
+/// is signed by. Returns `HandoffKey::Recovery { hex }` for
+/// synthesised handoff snapshots minted by `volume release --force`,
+/// or `HandoffKey::Normal` for ordinary manifests.
+///
+/// The coordinator verifies the manifest signature and the
+/// recovering coordinator's pub binding before returning a
+/// `Recovery` result, so the CLI can use the returned hex as a
+/// trusted `parent-key` for `fork-create`.
+pub fn resolve_handoff_key(
+    socket_path: &Path,
+    vol_ulid: &str,
+    snap_ulid: &str,
+) -> io::Result<HandoffKey> {
+    let resp = call(
+        socket_path,
+        &format!("resolve-handoff-key {vol_ulid} {snap_ulid}"),
+    )?;
+    if resp == "ok normal" {
+        return Ok(HandoffKey::Normal);
+    }
+    if let Some(rest) = resp.strip_prefix("ok recovery ") {
+        return Ok(HandoffKey::Recovery {
+            manifest_pubkey_hex: rest.trim().to_owned(),
+        });
+    }
+    if let Some(msg) = resp.strip_prefix("err ") {
+        return Err(io::Error::other(msg.to_owned()));
+    }
+    Err(io::Error::other(format!("unexpected response: {resp}")))
+}
+
+/// Options for `release_volume`.
+#[derive(Default, Clone, Debug)]
+pub struct ReleaseOpts<'a> {
+    /// `--force`: override foreign ownership of `names/<name>`.
+    /// Skips the local drain (the dead owner's WAL is unreachable),
+    /// synthesises a handoff snapshot from S3-visible segments, signs
+    /// it with the local coordinator's identity key, and
+    /// unconditionally flips `names/<name>` to `released` (or
+    /// `reserved` if `to` is set).
+    pub force: bool,
+    /// `--to <coord_id>`: targeted handoff. Final state is `reserved`
+    /// for the named coordinator instead of `released`. Composes with
+    /// `force`.
+    pub to: Option<&'a str>,
+}
+
 /// Release a volume's name back to the pool so any other coordinator can
 /// claim it via `volume start`. Drains WAL, publishes a handoff snapshot,
 /// halts the daemon, and flips `names/<name>` to `state=released` with
 /// the snapshot ULID recorded so the next claimant can fork from it.
 /// Returns the handoff snapshot ULID on success.
-pub fn release_volume(socket_path: &Path, name: &str) -> io::Result<String> {
-    let resp = call(socket_path, &format!("release {name}"))?;
+///
+/// With `opts.force`, skips ownership and drain (used when the
+/// previous owner is unreachable). With `opts.to`, the final state is
+/// `reserved` for the named coordinator. Both compose.
+pub fn release_volume(socket_path: &Path, name: &str, opts: ReleaseOpts<'_>) -> io::Result<String> {
+    let mut cmd = format!("release {name}");
+    if opts.force {
+        cmd.push_str(" --force");
+    }
+    if let Some(target) = opts.to {
+        cmd.push_str(&format!(" --to {target}"));
+    }
+    let resp = call(socket_path, &cmd)?;
     match resp.split_once(' ') {
         Some(("ok", snap)) => Ok(snap.trim().to_owned()),
         Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),
@@ -410,12 +489,21 @@ pub enum StartOutcome {
     },
 }
 
-/// Start a previously-stopped volume. Coordinator clears `volume.stopped`
-/// and triggers a rescan so the supervisor relaunches the process. If
-/// the bucket-side state is `Released`, returns `NeedsClaim` so the CLI
-/// can run the claim-from-released path.
-pub fn start_volume(socket_path: &Path, name: &str) -> io::Result<StartOutcome> {
-    let resp = call(socket_path, &format!("start {name}"))?;
+/// Start a volume.
+///
+/// Defaults to **local-only**: if `<name>` has no local state on the
+/// coordinator's data dir, returns an error pointing the operator at
+/// `--remote`. With `remote = true`, the IPC reads `names/<name>` from
+/// the bucket; if the record is `Released` (or `Reserved` for this
+/// coordinator), returns `NeedsClaim` so the CLI can pull, fork, and
+/// claim. Bucket reads only happen when `remote` is set.
+pub fn start_volume(socket_path: &Path, name: &str, remote: bool) -> io::Result<StartOutcome> {
+    let cmd = if remote {
+        format!("start {name} --remote")
+    } else {
+        format!("start {name}")
+    };
+    let resp = call(socket_path, &cmd)?;
     if resp == "ok" {
         return Ok(StartOutcome::Started);
     }

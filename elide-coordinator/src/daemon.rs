@@ -32,10 +32,10 @@ use tracing::{info, warn};
 
 use crate::config::CoordinatorConfig;
 use crate::credential::{CredentialIssuer, SharedKeyPassthrough};
-use crate::identity::CoordinatorIdentity;
 use crate::import;
 use crate::inbound;
 use crate::supervisor;
+use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::{EvictRegistry, SnapshotLockRegistry, new_snapshot_lock_registry};
 
 pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Result<()> {
@@ -73,7 +73,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     // macaroon MAC root in-memory from the private half, and publish
     // the pubkey to S3 so other coordinators can verify signatures by
     // `coordinator_id` lookup.
-    let identity = CoordinatorIdentity::load_or_generate(&config.data_dir)?;
+    let identity = Arc::new(CoordinatorIdentity::load_or_generate(&config.data_dir)?);
     info!(
         "[coordinator] coordinator_id: {}",
         identity.coordinator_id_str()
@@ -134,6 +134,7 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
             part_size_bytes,
             coord_id: coord_id_str.clone(),
             macaroon_root,
+            identity: identity.clone(),
             issuer: issuer.clone(),
         };
         tokio::spawn(async move {

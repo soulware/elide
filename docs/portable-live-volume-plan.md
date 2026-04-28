@@ -93,9 +93,10 @@ Internal additions; no behaviour change. **Landed** in
   large (~10 methods) so this is deferred until we have an actual
   non-conformant backend in CI to validate against. Real-bucket
   validation against Tigris/MinIO lives in Phase 5.
-- [ ] **Open:** wire `coordinator_id()` into `daemon::run()` so
-  diagnostic output (`elide coordinator status` or similar) can show
-  the id. Pure plumbing; deferred until a caller needs it.
+- [x] **`coordinator_id()` wired to `daemon::run()`.** Logged at
+  startup (`info!("[coordinator] coordinator_id: {id}")`) and
+  threaded through `IpcContext` for inbound handlers; landed as
+  part of Phase 1.5 (`d1a9364`).
 
 **Phase exit criteria:** met. New APIs land in `portable` module;
 no caller uses them yet; full coordinator builds clean and the new
@@ -175,48 +176,22 @@ Ed25519 keypair held on the coordinator host. Required by Phase 3
 Also retrofits Phase 0's `coordinator_id` derivation to derive from
 the public key.
 
-- [ ] **Generate / load `coordinator.key` + `coordinator.pub`.** New
-  module `elide-coordinator/src/identity.rs` (or extend
-  `credential.rs`): on first start, generate a fresh Ed25519 keypair
-  with `ed25519_dalek::SigningKey::generate`, write
-  `<data_dir>/coordinator.key` (mode 0600) and
-  `<data_dir>/coordinator.pub` (mode 0644). On subsequent starts,
-  load from disk and verify the pub matches the key.
-- [ ] **Re-root `coordinator_id` on the public key.** Change
-  `portable::coordinator_id` to take the pubkey bytes and derive via
-  `blake3::derive_key("elide coordinator-id v1", &pub_bytes)`.
-  Update `format_coordinator_id` callers; update unit tests.
-- [ ] **Derive macaroon root from the private key in-memory.**
-  In `daemon::run`, replace `load_or_generate_root_key` with
-  `load_or_generate_keypair` + an in-memory derivation:
-  `let macaroon_root = blake3::derive_key("elide macaroon-root v1",
-  &priv_bytes);`. The 32-byte result feeds the existing
-  `macaroon::mint` / `macaroon::verify` callers unchanged.
-- [ ] **Publish `coordinator.pub` to S3 on startup.** Conditional
-  PUT to `coordinators/<coordinator_id>/coordinator.pub` using the
-  `put_if_absent` helper from Phase 0. If a record already exists,
-  read it and compare against the local pub: equal → no-op, mismatch
-  → fail startup with a clear error (different coordinator already
-  claimed this id, which only happens if `coordinator_id` derivation
-  collides — vanishingly improbable for a 32-byte derivation, but
-  fail loudly rather than silently overwrite).
-- [ ] **Pubkey fetcher.** `fetch_coordinator_pub(store,
-  coordinator_id) -> Result<VerifyingKey>` reads the bucket pub,
-  verifies the embedded pub really derives to that `coordinator_id`
-  (recompute and compare), returns the `VerifyingKey`. Refuse on
-  mismatch.
-- [ ] **Migration / clean-break handling.** On startup, if
-  `coordinator.root_key` exists but `coordinator.key` does not,
-  generate the new keypair and **leave** the old root_key file in
-  place untouched (it's no longer read). Log a one-line warning
-  noting the file is now ignored. The new `coordinator_id` will
-  differ from any old one — Phase 2/3 lifecycle verbs handle stale
-  pointers via `release --force`.
-- [ ] **Tests:** keypair round-trip; `coordinator_id` derives
-  identically across restarts of the same install; pub publishing
-  is idempotent; pubkey fetcher rejects a tampered pub whose
-  derivation doesn't match the path; macaroon mint/verify still
-  work end-to-end against the in-memory-derived root.
+- [x] **Generate / load `coordinator.key` + `coordinator.pub`.**
+  Landed in `elide-coordinator/src/identity.rs` (`d1a9364`).
+- [x] **Re-root `coordinator_id` on the public key.**
+- [x] **Derive macaroon root from the private key in-memory.**
+- [x] **Publish `coordinator.pub` to S3 on startup**
+  (`identity::publish_pub`).
+- [x] **Pubkey fetcher** (`identity::fetch_coordinator_pub`) —
+  reads the bucket pub, recomputes `coordinator_id` from the bytes
+  and refuses on mismatch.
+- [x] **Migration / clean-break handling** — on first start of new
+  code, the coordinator generates `coordinator.key` /
+  `coordinator.pub` if absent, derives a new `coordinator_id` from
+  the new pub, and stops trusting any existing
+  `coordinator.root_key` file.
+- [x] **Tests** — round-trip, derivation determinism across
+  restarts, pub publish idempotency, tampered-pub rejection.
 
 **Phase exit criteria:** every coordinator has a verifiable Ed25519
 identity reachable from the bucket. `coordinator_id` is
@@ -254,8 +229,9 @@ on the bucket-capability probe from Phase 0 — see Phase 4.
   `handoff_snapshot = <snap_ulid>`, `coordinator_id` preserved as
   historical.
 - [x] CLI: `elide volume release <name>`.
-- [ ] `volume stop --release` convenience composition (deferred to
-  a follow-up commit; the two underlying verbs already exist).
+- [x] `volume stop --release` convenience composition (landed in
+  `41f73d3`; the `--to <coord_id>` form composes with `--release` for
+  targeted handoff).
 
 #### `volume start <name>` — claim ownership
 
@@ -275,6 +251,16 @@ consulted when `--remote` is passed. The override path lives on
   `mark_reclaimed_local` flips back to `live` keeping the same ULID.
 - [x] **Refusal paths** — foreign-owner records refuse with a
   pointer at `volume release --force` (Phase 3).
+- [x] **`start --remote` against `Reserved` records.** When
+  `start_volume_op` reads a `Reserved` record with no local fork:
+  if `coordinator_id == self`, route through the same claim flow
+  as `Released` (returns `released <vol_ulid> <snap>` so the CLI
+  uses the existing `claim_released_name` path). The
+  `mark_claimed` lifecycle helper's `Reserved → Live` arm
+  (cb6b099) handles the actual flip atomically; non-target
+  claimants get `OwnershipConflict { held_by: <target> }` before
+  the conditional PUT. Foreign-target Reserved records refuse with
+  a clear error naming the intended claimer.
 - [x] **Claim-from-released path** — `state == "released"`,
   no local data. Currently runs on bare `volume start`; **needs to
   move behind `--remote`**. Coordinator's `start` op returns
@@ -293,18 +279,22 @@ consulted when `--remote` is passed. The override path lives on
   points at the released ancestor (we previously owned and
   released this name) or is dangling. Refuses cleanly when the
   symlink targets an unrelated local ULID.
-- [ ] **Gate claim-from-released behind `--remote`.** Bare
+- [x] **Gate claim-from-released behind `--remote`.** Bare
   `volume start <name>` with no local data refuses with
-  `volume 'mydb' not found locally; to claim from bucket, run: elide
-  volume start --remote mydb`. The `--remote` flag opts into the
-  S3 path above.
+  `volume 'mydb' not found locally; to claim it from the bucket,
+  run: elide volume start --remote mydb`. The `--remote` flag is
+  parsed in the IPC verb (`start <name> [--remote]`) and only when
+  set does `start_volume_op` reach into S3 to read `names/<name>`.
+  Without it, the coordinator never touches the bucket — surprise
+  S3 pulls are now operator-explicit.
 
 #### Other Phase 2 work
 
-- [ ] **`volume.stopped` marker rule.** On coordinator startup,
-  reconcile each local volume directory against `names/<name>`. If
-  the local marker disagrees with S3, S3 wins; update the marker to
-  match.
+- [x] **`volume.stopped` marker rule.** `lifecycle::reconcile_marker`
+  runs in the coordinator's discovery pass (`daemon.rs`):
+  `state == Stopped` and marker absent → write the marker;
+  `state == Live` and marker present → remove. Best-effort, scoped to
+  records this coordinator owns, ignores foreign-owned records.
 - [ ] **Tests:** unit tests for each state transition (15 lifecycle
   tests landed); integration test exercising stop-on-A → start-on-A
   (local resume) and release-on-A → start-on-B (cross-coordinator)
@@ -341,58 +331,116 @@ the post-release race window: instead of `released` (anyone may
 claim), the record goes to `reserved` (only the named coordinator
 may claim). Composes with `--force`.
 
-- [ ] **`Reserved` state in `NameRecord`.** New variant in
-  `NameState`; round-trip + version tests; `mark_released_to`
-  lifecycle helper; reader changes in `start`/`status`.
-- [ ] **Synthesised handoff snapshot record shape.** Extend the
-  snapshot record with three optional fields, all populated only on
-  the synthesised path:
-  - `synthesised_from_recovery: bool` (default false)
+- [x] **`Reserved` state in `NameRecord`.** New variant in
+  `NameState`; round-trip + lowercase wire tests landed.
+  `mark_released_to(name, releasing_coord, target_coord, snap)`
+  flips `Live`/`Stopped` → `Reserved` with the target written into
+  `coordinator_id` (intended claimer). `mark_claimed` gains a
+  `Reserved → Live` arm gated on `coordinator_id == self`; foreign
+  claimants surface `OwnershipConflict { held_by: <target> }` before
+  the conditional PUT, closing the post-release race window.
+  Reserved is refused cleanly by `mark_stopped`, `mark_live`, and
+  `mark_reclaimed_local`. Reader changes in `start`/`status`
+  deferred to the `--remote` wiring task.
+- [x] **Synthesised handoff snapshot record shape.** Extended the
+  snapshot manifest format in `elide-core::signing` with three optional
+  fields populated only on the synthesised path:
+  - `synthesised_from_recovery: true`
   - `recovering_coordinator_id: <coord_id>`
   - `recovered_at: <rfc3339>`
 
-  Wire signature is over the canonical record bytes including these
-  fields. Tooling (`volume status`, `inspect-segment`, etc.) shows
-  the flag prominently when set.
-- [ ] **Segment-listing replay.** New helper in
-  `elide-coordinator/src/recovery.rs` (or similar): given a dead
-  fork's `vol_ulid`, list all segment objects under
-  `by_id/<vol_ulid>/...`, fetch each segment's header + index
-  section (not the body), verify the Ed25519 signature against the
-  dead fork's `volume.pub` (also fetched from S3), and return a
-  sorted-by-ULID list of `(segment_ulid, etag, segment_size)` for
-  segments that pass verification. Segments failing signature check
-  are dropped with a per-segment warning.
-- [ ] **Synthesise + sign the handoff snapshot.** Mint a fresh
-  ULID, build the snapshot record naming the verified segment set
-  with the recovery metadata fields populated, sign with
-  `coordinator.key`, write to
-  `by_id/<dead_vol_ulid>/snapshots/<new_snap_ulid>` via conditional
-  PUT (the path is fresh, so `put_if_absent`).
-- [ ] **`--force` flag on `volume release`.** Skip the foreign-owner
-  refusal. Run segment-listing replay → mint synthesised handoff
-  snapshot → unconditional Overwrite of `names/<name>` flipping to
-  `released` with the synthesised snapshot ULID recorded in
-  `handoff_snapshot`. Do **not** drain the previous owner's WAL.
-- [ ] **`--to <coordinator_id>` flag on `volume release`.** Same
-  drain + handoff path as bare `release`, but writes
-  `state=reserved` with `coordinator_id=<X>` instead of `released`
-  with cleared identity. Composes with `--force` (which then skips
-  the foreign-owner check too and uses the synthesised snapshot
-  path). `mark_claimed` gains a `Reserved → Live` arm that requires
-  `coordinator_id == self`; refusal for foreign-target reservations
-  happens before the conditional PUT, with an error naming the
-  intended claimer.
-- [ ] **Synthesised-snapshot verification on `start --remote`.**
-  When a `released` / `reserved` record's `handoff_snapshot` points
-  at a snapshot record carrying `synthesised_from_recovery=true`,
-  the claiming coordinator: (i) fetches the recovering coordinator's
-  pubkey from `coordinators/<recovering_coordinator_id>/coordinator.pub`,
-  (ii) verifies the snapshot's Ed25519 signature against it,
-  (iii) recomputes `coordinator_id` from the fetched pub and confirms
-  the path matches. Any failure refuses the claim with a clear error.
-  Non-synthesised handoff snapshots use the existing per-volume
-  signature path unchanged.
+  `write_snapshot_manifest` gained an `Option<&SnapshotManifestRecovery>`
+  parameter; `read_snapshot_manifest` now returns a `SnapshotManifest`
+  struct carrying `segment_ulids` plus optional `recovery`. The signing
+  input is **domain-separated** when recovery metadata is present —
+  `"elide-snapshot-recovery-v1\0"` prefix + `coord_id\0recovered_at\0\0` —
+  so a non-recovery sig can't validate a manifest mutated to claim
+  recovery, and vice versa. 5 new tests cover round-trip, empty
+  segments, cross-class tamper, stripped-fields tamper, and partial
+  metadata. Existing 4 writers and 3 readers updated. Tooling display
+  of the flag is deferred to the verification-on-`start --remote`
+  task.
+- [x] **Segment-listing replay.** Landed in
+  `elide-coordinator/src/recovery.rs`. `list_and_verify_segments`
+  lists `by_id/<vol_ulid>/segments/`, range-fetches each segment's
+  `header + [0, body_section_start)` (matching `prefetch::fetch_idx`),
+  and verifies the Ed25519 signature against the dead fork's
+  `volume.pub` via `elide_core::segment::verify_segment_bytes`.
+  Returns `RecoveredSegments { segments: Vec<VerifiedSegment>,
+  dropped: usize }` where `VerifiedSegment` carries
+  `(segment_ulid, etag, size)` and the list is sorted by ULID.
+  Segments failing verification (bad magic, invalid signature,
+  truncated, foreign-signed) are dropped with a per-segment
+  `warn!`. Non-ULID keys (stray `.tmp` uploads) are silently
+  skipped, not counted as drops. `fetch_volume_pub` is the
+  companion helper for pulling the dead fork's pubkey from S3.
+  8 unit tests against `InMemory`.
+- [x] **Synthesise + sign the handoff snapshot.** Landed as
+  `recovery::mint_and_publish_synthesised_snapshot`. Mints a fresh
+  ULID, builds the manifest via the new
+  `elide_core::signing::build_snapshot_manifest_bytes` (extracted
+  from `write_snapshot_manifest` so callers can publish the bytes
+  somewhere other than a local volume directory), signs with the
+  caller's `SegmentSigner` (the recovering coordinator's
+  `coordinator.key`), and conditionally PUTs to
+  `by_id/<dead_vol_ulid>/snapshots/YYYYMMDD/<snap>.manifest` via
+  `portable::put_if_absent`. Returns
+  `PublishedSynthesisedSnapshot { snap_ulid, key }` on success;
+  `PublishSnapshotError::AlreadyExists { key }` on the (vanishingly
+  improbable) ULID-collision path. 3 new tests verify the round
+  trip via the existing `read_snapshot_manifest`, cross-class key
+  rejection, and the conditional-create precondition.
+- [x] **`--force` flag on `volume release`.** Wired through the
+  CLI (`volume release <name> --force`), the IPC verb (`release
+  <name> --force`), and a new `force_release_volume_op` in
+  `inbound.rs`. The op composes the existing recovery primitives:
+  read current `names/<name>` for the dead `vol_ulid`, fetch the
+  dead fork's `volume.pub`, run `list_and_verify_segments`, mint
+  the synthesised handoff snapshot via
+  `mint_and_publish_synthesised_snapshot` (signed with the local
+  `CoordinatorIdentity`, which now `impl SegmentSigner`), then
+  unconditionally rewrite `names/<name>` via
+  `lifecycle::mark_released_force` (built on a new
+  `name_store::overwrite_name_record` helper). No local symlink,
+  drain, or daemon manipulation. 7 new lifecycle tests cover the
+  force/force-to transitions including `Reserved`/`Released`/`Readonly`
+  refusal arms.
+- [x] **`--to <coordinator_id>` flag on `volume release`.** Wired
+  through the CLI (`volume release <name> --to <id>` and
+  `volume stop --release --to <id>`), the IPC verb (`release <name>
+  --to <id>`), and a new `release_to_volume_op` in `inbound.rs`.
+  The drain → snapshot → halt path is shared with bare `release`
+  via a refactored `release_with_final_flip` helper; only the final
+  state-flip step differs (`mark_released_to` vs `mark_released`).
+  Composes with `--force` for the unreachable-owner case, where the
+  unconditional rewrite produces a `Reserved` record bound to the
+  named target.
+- [x] **Synthesised-snapshot verification on `start --remote`.**
+  Three layers:
+  - `elide_core::signing::peek_snapshot_manifest_recovery` and
+    `read_snapshot_manifest_from_bytes` — bytes-based helpers so
+    callers can detect synthesis and verify without going via a
+    file. 5 new tests cover round-trip, peek, and wrong-key rejection.
+  - `recovery::resolve_handoff_verifier(store, vol_ulid, snap_ulid)`
+    — fetches the manifest, peeks for recovery metadata, fetches
+    the recovering coordinator's `coordinator.pub` via the existing
+    `identity::fetch_coordinator_pub` (which path-binds the pub to
+    its derived id), and re-verifies the signature under that pub.
+    Returns `HandoffVerifier::Normal` or `Synthesised { ..,
+    manifest_pubkey }`. 4 new tests including pub-missing and
+    manifest-missing refusal paths.
+  - `resolve-handoff-key` IPC verb + `coordinator_client::resolve_handoff_key`
+    + `claim_released_name` plumbing: when the resolver returns
+    `Recovery { manifest_pubkey_hex }`, the CLI passes it to
+    `fork-create` as `parent-key=<hex>`. The new fork's open-time
+    ancestor walk (`block_reader.rs`) then verifies the synthesised
+    manifest under the recovering coordinator's pubkey via the
+    existing `parent_manifest_pubkey` provenance field.
+
+  `identity` module promoted to the library (`pub mod identity` in
+  `lib.rs`) so `recovery` can call `fetch_coordinator_pub`. Callers
+  in binary-only files updated from `crate::identity::...` to
+  `elide_coordinator::identity::...`.
 - [ ] **Tests:** force-release after simulated coordinator death
   (kill the writing process between segment uploads and
   `names/<name>` rewrite, then `release --force` + `start --remote`
@@ -418,14 +466,10 @@ is independently verifiable from bucket-public material.
 
 The "feels like magic" UX work. Depends on Phase 0–3.
 
-- [ ] **`volume list` stays local.**
-  - View: names this coordinator owns or has materialised data for.
-    Never lists `names/` in S3 — bucket may hold thousands of names
-    and unbounded enumeration is not a useful default.
-  - `--all` keeps its existing local-only meaning (include ancestor
-    forks); it does **not** reach S3.
-  - Columns: `name`, `vol_ulid`, `mode`, `state`, `transport`,
-    `pid` (current shape).
+- [x] **`volume list` stays local.** Already implemented this way:
+  reads `by_name/` and (with `--all`) `by_id/`, never reaches S3.
+  Columns are `name`, `vol_ulid`, `mode`, `state`, `transport`,
+  `pid` per the existing shape.
 - [ ] **`volume status <name>` gains `--remote`.**
   - Default: local — what this coordinator knows about `<name>`.
   - `--remote`: fetches `names/<name>` from S3 and prints the

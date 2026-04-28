@@ -347,12 +347,28 @@ enum VolumeCommand {
         /// `volume start`. Equivalent to `volume release <name>`.
         #[arg(long)]
         release: bool,
+        /// With `--release`: hand off to a specific coordinator
+        /// (`names/<name>` flips to `reserved` rather than `released`).
+        /// Only the named coordinator may then claim. Equivalent to
+        /// `volume release --to <coord_id>`.
+        #[arg(long, value_name = "COORD_ID", requires = "release")]
+        to: Option<String>,
     },
 
-    /// Start a previously stopped volume
+    /// Start a previously stopped volume.
+    ///
+    /// Defaults to local-only: refuses if `<name>` has no local state
+    /// on this host. Use `--remote` to claim a released or reserved
+    /// name from the bucket — that path pulls the source fork's
+    /// ancestor chain, mints a fresh local fork, and atomically
+    /// rebinds `names/<name>`.
     Start {
         /// Volume name
         name: String,
+        /// Reach into the bucket to claim a released or reserved name.
+        /// Without this, bare `volume start` is local-only.
+        #[arg(long)]
+        remote: bool,
     },
 
     /// Release a volume's name back to the pool. Drains the WAL, publishes
@@ -364,6 +380,23 @@ enum VolumeCommand {
     Release {
         /// Volume name
         name: String,
+        /// Override foreign ownership when the previous owner is
+        /// unreachable. The recovering coordinator synthesises a
+        /// handoff snapshot from S3-visible segments under the dead
+        /// fork's prefix, signs it with its own coordinator key, and
+        /// unconditionally rewrites `names/<name>`.
+        ///
+        /// Skips local drain (the dead owner's WAL is unreachable).
+        /// Data-loss boundary: writes the dead owner accepted but
+        /// never promoted to S3.
+        #[arg(long)]
+        force: bool,
+        /// Targeted handoff: hand off to a specific coordinator.
+        /// `names/<name>` flips to `reserved` rather than `released`,
+        /// so only the named coordinator may then claim. Composes
+        /// with `--force`.
+        #[arg(long, value_name = "COORD_ID")]
+        to: Option<String>,
     },
 
     /// Interact with the remote object store
@@ -774,12 +807,19 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Stop { name, release } => {
+            VolumeCommand::Stop { name, release, to } => {
                 if release {
-                    match coordinator_client::release_volume(&socket_path, &name) {
-                        Ok(snap) => {
-                            println!("{name}: released at handoff snapshot {snap}");
-                        }
+                    let opts = coordinator_client::ReleaseOpts {
+                        force: false,
+                        to: to.as_deref(),
+                    };
+                    match coordinator_client::release_volume(&socket_path, &name, opts) {
+                        Ok(snap) => match to.as_deref() {
+                            Some(target) => {
+                                println!("{name}: released to {target} at handoff snapshot {snap}")
+                            }
+                            None => println!("{name}: released at handoff snapshot {snap}"),
+                        },
                         Err(e) => {
                             eprintln!("error: {e}");
                             std::process::exit(1);
@@ -794,9 +834,9 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Start { name } => {
+            VolumeCommand::Start { name, remote } => {
                 use coordinator_client::StartOutcome;
-                match coordinator_client::start_volume(&socket_path, &name) {
+                match coordinator_client::start_volume(&socket_path, &name, remote) {
                     Ok(StartOutcome::Started) => {
                         println!("{name}: started");
                     }
@@ -804,6 +844,11 @@ fn main() {
                         released_vol_ulid,
                         handoff_snapshot,
                     }) => {
+                        // The IPC only emits NeedsClaim when --remote
+                        // was set, so we know we're allowed to reach
+                        // into S3 here. Without --remote the IPC
+                        // refused with NotFoundLocally and we hit the
+                        // Err arm below.
                         if let Err(e) = claim_released_name(
                             &args.data_dir,
                             &name,
@@ -824,10 +869,26 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Release { name } => {
-                match coordinator_client::release_volume(&socket_path, &name) {
+            VolumeCommand::Release { name, force, to } => {
+                let opts = coordinator_client::ReleaseOpts {
+                    force,
+                    to: to.as_deref(),
+                };
+                match coordinator_client::release_volume(&socket_path, &name, opts) {
                     Ok(snap) => {
-                        println!("{name}: released at handoff snapshot {snap}");
+                        let kind = match (force, to.as_deref()) {
+                            (false, None) => format!("released at handoff snapshot {snap}"),
+                            (false, Some(t)) => {
+                                format!("released to {t} at handoff snapshot {snap}")
+                            }
+                            (true, None) => {
+                                format!("force-released at synthesised handoff snapshot {snap}")
+                            }
+                            (true, Some(t)) => format!(
+                                "force-released to {t} at synthesised handoff snapshot {snap}"
+                            ),
+                        };
+                        println!("{name}: {kind}");
                     }
                     Err(e) => {
                         eprintln!("error: {e}");
@@ -1651,6 +1712,33 @@ fn claim_released_name(
         }
     }
 
+    // Resolve which Ed25519 key the handoff snapshot manifest is
+    // signed by: ordinary handoff snapshots use the source volume's
+    // own `volume.pub` (the regular block-reader path), but
+    // synthesised handoff snapshots minted by `volume release
+    // --force` are signed by the recovering coordinator's
+    // `coordinator.pub`. The coordinator already verifies the
+    // manifest signature and the recovering coordinator's pub
+    // binding before answering `recovery <hex>`, so we can pass the
+    // hex through to `fork-create` as `parent-key=` and the new
+    // fork's open-time ancestor walk will verify under the right
+    // key.
+    let parent_key_hex = match coordinator_client::resolve_handoff_key(
+        socket_path,
+        released_vol_ulid,
+        snap,
+    )? {
+        coordinator_client::HandoffKey::Normal => None,
+        coordinator_client::HandoffKey::Recovery {
+            manifest_pubkey_hex,
+        } => {
+            eprintln!(
+                "[claim] handoff snapshot {snap} is synthesised — verifying under recovering coordinator's key"
+            );
+            Some(manifest_pubkey_hex)
+        }
+    };
+
     // Mint a fresh local fork. fork-create writes by_id/<new_ulid>/
     // and the by_name/<name> symlink, returns the new vol_ulid.
     // The bucket record already exists in `Released` state; the
@@ -1662,7 +1750,7 @@ fn claim_released_name(
         name,
         released_vol_ulid,
         Some(snap),
-        None,
+        parent_key_hex.as_deref(),
         &[],
         true,
     )?;
