@@ -35,21 +35,26 @@ use elide_coordinator::config::StoreSection;
 use elide_coordinator::{EvictRegistry, SnapshotLockRegistry};
 use elide_core::process::pid_is_alive;
 
-#[allow(clippy::too_many_arguments)]
-pub async fn serve(
-    socket_path: &Path,
-    data_dir: Arc<PathBuf>,
-    rescan: Arc<Notify>,
-    registry: ImportRegistry,
-    elide_import_bin: Arc<PathBuf>,
-    evict_registry: EvictRegistry,
-    snapshot_locks: SnapshotLockRegistry,
-    store: Arc<dyn ObjectStore>,
-    store_config: Arc<StoreSection>,
-    part_size_bytes: usize,
-    root_key: [u8; 32],
-    issuer: Arc<dyn CredentialIssuer>,
-) {
+/// Shared coordinator state threaded through every inbound op.
+///
+/// All fields are cheap to clone (Arc-wrapped or Copy), so per-connection
+/// fan-out in `serve` is a flat clone rather than a long argument list.
+#[derive(Clone)]
+pub struct IpcContext {
+    pub data_dir: Arc<PathBuf>,
+    pub rescan: Arc<Notify>,
+    pub registry: ImportRegistry,
+    pub elide_import_bin: Arc<PathBuf>,
+    pub evict_registry: EvictRegistry,
+    pub snapshot_locks: SnapshotLockRegistry,
+    pub store: Arc<dyn ObjectStore>,
+    pub store_config: Arc<StoreSection>,
+    pub part_size_bytes: usize,
+    pub root_key: [u8; 32],
+    pub issuer: Arc<dyn CredentialIssuer>,
+}
+
+pub async fn serve(socket_path: &Path, ctx: IpcContext) {
     let _ = std::fs::remove_file(socket_path);
 
     let listener = match UnixListener::bind(socket_path) {
@@ -84,50 +89,14 @@ pub async fn serve(
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let data_dir = data_dir.clone();
-                let rescan = rescan.clone();
-                let registry = registry.clone();
-                let bin = elide_import_bin.clone();
-                let evict_reg = evict_registry.clone();
-                let snap_locks = snapshot_locks.clone();
-                let store = store.clone();
-                let store_cfg = store_config.clone();
-                let issuer = issuer.clone();
-                tokio::spawn(handle(
-                    stream,
-                    data_dir,
-                    rescan,
-                    registry,
-                    bin,
-                    evict_reg,
-                    snap_locks,
-                    store,
-                    store_cfg,
-                    part_size_bytes,
-                    root_key,
-                    issuer,
-                ));
+                tokio::spawn(handle(stream, ctx.clone()));
             }
             Err(e) => warn!("[inbound] accept error: {e}"),
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle(
-    stream: tokio::net::UnixStream,
-    data_dir: Arc<PathBuf>,
-    rescan: Arc<Notify>,
-    registry: ImportRegistry,
-    elide_import_bin: Arc<PathBuf>,
-    evict_registry: EvictRegistry,
-    snapshot_locks: SnapshotLockRegistry,
-    store: Arc<dyn ObjectStore>,
-    store_config: Arc<StoreSection>,
-    part_size_bytes: usize,
-    root_key: [u8; 32],
-    issuer: Arc<dyn CredentialIssuer>,
-) {
+async fn handle(stream: tokio::net::UnixStream, ctx: IpcContext) {
     // Capture peer credentials before splitting the stream — needed for
     // SO_PEERCRED on the `register` and `credentials` ops. Other ops
     // ignore the peer pid; capturing once here keeps the code symmetric
@@ -150,45 +119,15 @@ async fn handle(
     // `import attach` is the one streaming operation — it keeps the connection
     // open and writes lines until the import completes.
     if let Some(name) = line.strip_prefix("import attach ") {
-        stream_import_by_name(name.trim(), &data_dir, &mut writer, &registry).await;
+        stream_import_by_name(name.trim(), &ctx.data_dir, &mut writer, &ctx.registry).await;
         return;
     }
 
-    let response = dispatch(
-        &line,
-        &data_dir,
-        rescan,
-        &registry,
-        &elide_import_bin,
-        &evict_registry,
-        &snapshot_locks,
-        &store,
-        &store_config,
-        part_size_bytes,
-        &root_key,
-        issuer.as_ref(),
-        peer_pid,
-    )
-    .await;
+    let response = dispatch(&line, &ctx, peer_pid).await;
     let _ = writer.write_all(format!("{response}\n").as_bytes()).await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn dispatch(
-    line: &str,
-    data_dir: &Path,
-    rescan: Arc<Notify>,
-    registry: &ImportRegistry,
-    elide_import_bin: &Path,
-    evict_registry: &EvictRegistry,
-    snapshot_locks: &SnapshotLockRegistry,
-    store: &Arc<dyn ObjectStore>,
-    store_config: &StoreSection,
-    part_size_bytes: usize,
-    root_key: &[u8; 32],
-    issuer: &dyn CredentialIssuer,
-    peer_pid: Option<i32>,
-) -> String {
+async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String {
     if line.is_empty() {
         return "err empty request".to_string();
     }
@@ -200,7 +139,7 @@ async fn dispatch(
 
     match op {
         "rescan" => {
-            rescan.notify_one();
+            ctx.rescan.notify_one();
             "ok".to_string()
         }
 
@@ -208,7 +147,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: status <volume>".to_string();
             }
-            volume_status(args, data_dir)
+            volume_status(args, &ctx.data_dir)
         }
 
         "import" => {
@@ -221,7 +160,7 @@ async fn dispatch(
                     if sub_args.is_empty() {
                         return "err usage: import status <name>".to_string();
                     }
-                    import_status_by_name(sub_args, data_dir, registry).await
+                    import_status_by_name(sub_args, &ctx.data_dir, &ctx.registry).await
                 }
                 _ => {
                     // `import <name> <oci-ref> [extents:<name>[,<name>…]]`:
@@ -251,11 +190,11 @@ async fn dispatch(
                             oci_ref,
                             extents_from: &extents_from,
                         },
-                        data_dir,
-                        elide_import_bin,
-                        registry,
-                        store,
-                        &rescan,
+                        &ctx.data_dir,
+                        &ctx.elide_import_bin,
+                        &ctx.registry,
+                        &ctx.store,
+                        &ctx.rescan,
                     )
                     .await
                 }
@@ -266,14 +205,14 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: delete <volume>".to_string();
             }
-            delete_volume(args, data_dir)
+            delete_volume(args, &ctx.data_dir)
         }
 
         "stop" => {
             if args.is_empty() {
                 return "err usage: stop <volume>".to_string();
             }
-            stop_volume_op(args, data_dir, store, root_key).await
+            stop_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key).await
         }
 
         "release" => {
@@ -282,12 +221,12 @@ async fn dispatch(
             }
             release_volume_op(
                 args,
-                data_dir,
-                snapshot_locks,
-                store,
-                part_size_bytes,
-                root_key,
-                &rescan,
+                &ctx.data_dir,
+                &ctx.snapshot_locks,
+                &ctx.store,
+                ctx.part_size_bytes,
+                &ctx.root_key,
+                &ctx.rescan,
             )
             .await
         }
@@ -304,14 +243,22 @@ async fn dispatch(
                 Some((n, u)) => (n.trim(), u.trim()),
                 None => return "err usage: claim <volume> <new_vol_ulid>".to_string(),
             };
-            claim_volume_op(name, new_ulid_str, data_dir, store, root_key, &rescan).await
+            claim_volume_op(
+                name,
+                new_ulid_str,
+                &ctx.data_dir,
+                &ctx.store,
+                &ctx.root_key,
+                &ctx.rescan,
+            )
+            .await
         }
 
         "start" => {
             if args.is_empty() {
                 return "err usage: start <volume>".to_string();
             }
-            start_volume_op(args, data_dir, store, root_key, &rescan).await
+            start_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key, &ctx.rescan).await
         }
 
         "create" => {
@@ -319,7 +266,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: create <name> <size_bytes> [flags...]".to_string();
             }
-            create_volume_op(args, data_dir, store, root_key, &rescan).await
+            create_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key, &ctx.rescan).await
         }
 
         "update" => {
@@ -327,7 +274,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: update <volume> [flags...]".to_string();
             }
-            update_volume_op(args, data_dir).await
+            update_volume_op(args, &ctx.data_dir).await
         }
 
         "pull-readonly" => {
@@ -335,7 +282,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: pull-readonly <vol_ulid>".to_string();
             }
-            pull_readonly_op(args, data_dir, store).await
+            pull_readonly_op(args, &ctx.data_dir, &ctx.store).await
         }
 
         "force-snapshot-now" => {
@@ -343,7 +290,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: force-snapshot-now <vol_ulid>".to_string();
             }
-            force_snapshot_now_op(args, data_dir, store).await
+            force_snapshot_now_op(args, &ctx.data_dir, &ctx.store).await
         }
 
         "fork-create" => {
@@ -351,7 +298,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string();
             }
-            fork_create_op(args, data_dir, store, root_key, &rescan).await
+            fork_create_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key, &ctx.rescan).await
         }
 
         "evict" => {
@@ -362,28 +309,35 @@ async fn dispatch(
                 Some((name, ulid)) => (name, Some(ulid.trim().to_owned())),
                 None => (args, None),
             };
-            evict_volume(vol_name, ulid_str, data_dir, evict_registry).await
+            evict_volume(vol_name, ulid_str, &ctx.data_dir, &ctx.evict_registry).await
         }
 
         "snapshot" => {
             if args.is_empty() {
                 return "err usage: snapshot <volume>".to_string();
             }
-            snapshot_volume(args, data_dir, snapshot_locks, store, part_size_bytes).await
+            snapshot_volume(
+                args,
+                &ctx.data_dir,
+                &ctx.snapshot_locks,
+                &ctx.store,
+                ctx.part_size_bytes,
+            )
+            .await
         }
 
         "reclaim" => {
             if args.is_empty() {
                 return "err usage: reclaim <volume>".to_string();
             }
-            reclaim_volume(args, data_dir).await
+            reclaim_volume(args, &ctx.data_dir).await
         }
 
         // Vend the non-secret `[store]` config so CLI read operations
         // (remote list, remote pull, volume create --from) can build an
         // S3 client that matches the coordinator's. Returned as TOML so
         // the caller can round-trip through toml::from_str.
-        "get-store-config" => render_store_config(store_config),
+        "get-store-config" => render_store_config(&ctx.store_config),
 
         // Vend S3 credentials from the coordinator's env. Today this is
         // the long-lived AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; the
@@ -398,7 +352,7 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: register <volume-ulid>".to_string();
             }
-            register_volume(args, data_dir, peer_pid, root_key)
+            register_volume(args, &ctx.data_dir, peer_pid, &ctx.root_key)
         }
 
         // Macaroon-authenticated credential issuance. Verifies the MAC,
@@ -408,7 +362,13 @@ async fn dispatch(
             if args.is_empty() {
                 return "err usage: credentials <macaroon>".to_string();
             }
-            issue_credentials(args, data_dir, peer_pid, root_key, issuer)
+            issue_credentials(
+                args,
+                &ctx.data_dir,
+                peer_pid,
+                &ctx.root_key,
+                ctx.issuer.as_ref(),
+            )
         }
 
         _ => {

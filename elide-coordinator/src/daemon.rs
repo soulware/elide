@@ -113,30 +113,21 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
 
     // Spawn the inbound socket server.
     {
-        let data_dir = data_dir.clone();
-        let notify = rescan_notify.clone();
-        let registry = import_registry.clone();
-        let bin = elide_import_bin.clone();
-        let evict_reg = evict_registry.clone();
-        let snap_locks = snapshot_locks.clone();
-        let store = store.clone();
-        let issuer = issuer.clone();
+        let ctx = inbound::IpcContext {
+            data_dir: data_dir.clone(),
+            rescan: rescan_notify.clone(),
+            registry: import_registry.clone(),
+            elide_import_bin: elide_import_bin.clone(),
+            evict_registry: evict_registry.clone(),
+            snapshot_locks: snapshot_locks.clone(),
+            store: store.clone(),
+            store_config,
+            part_size_bytes,
+            root_key,
+            issuer: issuer.clone(),
+        };
         tokio::spawn(async move {
-            inbound::serve(
-                &socket_path,
-                data_dir,
-                notify,
-                registry,
-                bin,
-                evict_reg,
-                snap_locks,
-                store,
-                store_config,
-                part_size_bytes,
-                root_key,
-                issuer,
-            )
-            .await;
+            inbound::serve(&socket_path, ctx).await;
         });
     }
 
