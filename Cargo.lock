@@ -1092,6 +1092,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "elide-core",
  "elide-fetch",
  "futures",

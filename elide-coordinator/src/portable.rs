@@ -17,14 +17,19 @@ use bytes::Bytes;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, PutMode, PutResult, UpdateVersion};
 
-/// Derive the public coordinator identity from `coordinator.root_key`.
+/// Derive the public coordinator identity from `coordinator.pub`.
 ///
-/// Domain-separated via `blake3::derive_key`; the raw key never leaves
-/// the coordinator. The same `root_key` always derives the same id;
-/// rotating or deleting the key produces a new identity (which is the
-/// documented escape hatch in `design-portable-live-volume.md`).
-pub fn coordinator_id(root_key: &[u8; 32]) -> [u8; 32] {
-    blake3::derive_key("elide coordinator-id v1", root_key)
+/// Domain-separated via `blake3::derive_key`. Input is the 32-byte
+/// Ed25519 public key — `coordinator_id` is therefore intrinsically
+/// bound to the published `coordinator.pub`: any reader can recompute
+/// `derive_key("elide coordinator-id v1", &fetched_pub)` and refuse a
+/// record where the derivation doesn't match the bucket path.
+///
+/// Generating a new keypair (deleting `coordinator.key` /
+/// `coordinator.pub`) produces a new identity; this is the documented
+/// escape hatch in `design-portable-live-volume.md`.
+pub fn coordinator_id(coord_pub: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("elide coordinator-id v1", coord_pub)
 }
 
 /// Format a coordinator id as a stable Crockford-Base32 ULID-shaped

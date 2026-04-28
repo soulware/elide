@@ -50,7 +50,12 @@ pub struct IpcContext {
     pub store: Arc<dyn ObjectStore>,
     pub store_config: Arc<StoreSection>,
     pub part_size_bytes: usize,
-    pub root_key: [u8; 32],
+    /// Crockford-Base32 ULID-shaped coordinator id, derived once at
+    /// startup from `coordinator.pub`. Cheap to clone (26 bytes).
+    pub coord_id: String,
+    /// 32-byte MAC root for `macaroon::mint` / `macaroon::verify`,
+    /// derived in-memory from `coordinator.key` at startup.
+    pub macaroon_root: [u8; 32],
     pub issuer: Arc<dyn CredentialIssuer>,
 }
 
@@ -212,7 +217,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             if args.is_empty() {
                 return "err usage: stop <volume>".to_string();
             }
-            stop_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key).await
+            stop_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.coord_id).await
         }
 
         "release" => {
@@ -225,7 +230,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 &ctx.snapshot_locks,
                 &ctx.store,
                 ctx.part_size_bytes,
-                &ctx.root_key,
+                &ctx.coord_id,
                 &ctx.rescan,
             )
             .await
@@ -248,7 +253,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 new_ulid_str,
                 &ctx.data_dir,
                 &ctx.store,
-                &ctx.root_key,
+                &ctx.coord_id,
                 &ctx.rescan,
             )
             .await
@@ -258,7 +263,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             if args.is_empty() {
                 return "err usage: start <volume>".to_string();
             }
-            start_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key, &ctx.rescan).await
+            start_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.coord_id, &ctx.rescan).await
         }
 
         "create" => {
@@ -266,7 +271,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             if args.is_empty() {
                 return "err usage: create <name> <size_bytes> [flags...]".to_string();
             }
-            create_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key, &ctx.rescan).await
+            create_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.coord_id, &ctx.rescan).await
         }
 
         "update" => {
@@ -298,7 +303,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             if args.is_empty() {
                 return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string();
             }
-            fork_create_op(args, &ctx.data_dir, &ctx.store, &ctx.root_key, &ctx.rescan).await
+            fork_create_op(args, &ctx.data_dir, &ctx.store, &ctx.coord_id, &ctx.rescan).await
         }
 
         "evict" => {
@@ -352,7 +357,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             if args.is_empty() {
                 return "err usage: register <volume-ulid>".to_string();
             }
-            register_volume(args, &ctx.data_dir, peer_pid, &ctx.root_key)
+            register_volume(args, &ctx.data_dir, peer_pid, &ctx.macaroon_root)
         }
 
         // Macaroon-authenticated credential issuance. Verifies the MAC,
@@ -366,7 +371,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 args,
                 &ctx.data_dir,
                 peer_pid,
-                &ctx.root_key,
+                &ctx.macaroon_root,
                 ctx.issuer.as_ref(),
             )
         }
@@ -1017,7 +1022,7 @@ async fn create_volume_op(
     args: &str,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-    root_key: &[u8; 32],
+    coord_id: &str,
     rescan: &Notify,
 ) -> String {
     // First two whitespace-separated tokens: name, size_bytes. Remainder is flags.
@@ -1091,7 +1096,7 @@ async fn create_volume_op(
     // `volume create <name>` concurrently — the loser sees
     // `AlreadyExists` and refuses, leaving no partial local artefacts.
     use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
-    match mark_initial(store, name, root_key, vol_ulid).await {
+    match mark_initial(store, name, coord_id, vol_ulid).await {
         Ok(MarkInitialOutcome::Claimed) => {}
         Ok(MarkInitialOutcome::AlreadyExists {
             existing_vol_ulid,
@@ -1527,7 +1532,7 @@ async fn fork_create_op(
     args: &str,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-    root_key: &[u8; 32],
+    coord_id: &str,
     rescan: &Notify,
 ) -> String {
     let mut iter = args.splitn(3, ' ').map(str::trim);
@@ -1636,7 +1641,7 @@ async fn fork_create_op(
     // local materialisation here.
     if !for_claim {
         use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
-        match mark_initial(store, new_name, root_key, new_vol_ulid_value).await {
+        match mark_initial(store, new_name, coord_id, new_vol_ulid_value).await {
             Ok(MarkInitialOutcome::Claimed) => {}
             Ok(MarkInitialOutcome::AlreadyExists {
                 existing_vol_ulid,
@@ -1751,7 +1756,7 @@ async fn stop_volume_op(
     volume_name: &str,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-    root_key: &[u8; 32],
+    coord_id: &str,
 ) -> String {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
@@ -1784,7 +1789,7 @@ async fn stop_volume_op(
     // fine — the volume may not yet have been drained to S3, in which
     // case the local stop proceeds and the S3 update is a no-op.
     use elide_coordinator::lifecycle::{LifecycleError, mark_stopped};
-    match mark_stopped(store, volume_name, root_key).await {
+    match mark_stopped(store, volume_name, coord_id).await {
         Ok(_) => {}
         Err(LifecycleError::OwnershipConflict { held_by }) => {
             return format!(
@@ -1956,7 +1961,7 @@ async fn release_volume_op(
     snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
     part_size_bytes: usize,
-    root_key: &[u8; 32],
+    coord_id: &str,
     rescan: &Notify,
 ) -> String {
     let link = data_dir.join("by_name").join(volume_name);
@@ -2021,10 +2026,8 @@ async fn release_volume_op(
     use elide_core::name_record::NameState;
     match elide_coordinator::name_store::read_name_record(store, volume_name).await {
         Ok(Some((rec, _))) => {
-            use elide_coordinator::portable::{coordinator_id, format_coordinator_id};
-            let self_id = format_coordinator_id(&coordinator_id(root_key));
             if let Some(existing) = rec.coordinator_id.as_deref()
-                && existing != self_id
+                && existing != coord_id
             {
                 return format!(
                     "err name '{volume_name}' is owned by coordinator {existing}; \
@@ -2093,7 +2096,7 @@ async fn release_volume_op(
 
     // Final step: flip names/<name> to Released, recording the handoff
     // snapshot. From this point any coordinator may claim the name.
-    match lifecycle::mark_released(store, volume_name, root_key, snap_ulid).await {
+    match lifecycle::mark_released(store, volume_name, coord_id, snap_ulid).await {
         Ok(_) => {
             info!("[inbound] released volume {volume_name} at handoff snapshot {snap_ulid}");
             format!("ok {snap_ulid}")
@@ -2126,7 +2129,7 @@ async fn claim_volume_op(
     new_ulid_str: &str,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-    root_key: &[u8; 32],
+    coord_id: &str,
     rescan: &Notify,
 ) -> String {
     let new_ulid = match ulid::Ulid::from_string(new_ulid_str) {
@@ -2169,7 +2172,7 @@ async fn claim_volume_op(
     }
 
     use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome, mark_claimed};
-    match mark_claimed(store, volume_name, root_key, new_ulid).await {
+    match mark_claimed(store, volume_name, coord_id, new_ulid).await {
         Ok(MarkClaimedOutcome::Claimed) => {
             rescan.notify_one();
             info!("[inbound] claimed name {volume_name} for new fork {new_ulid}");
@@ -2201,7 +2204,7 @@ async fn start_volume_op(
     volume_name: &str,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-    root_key: &[u8; 32],
+    coord_id: &str,
     rescan: &Notify,
 ) -> String {
     let link = data_dir.join("by_name").join(volume_name);
@@ -2247,7 +2250,7 @@ async fn start_volume_op(
     // record refuses; a Released record routes to the claim path
     // (not yet implemented — point the operator at it).
     use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome, mark_live};
-    match mark_live(store, volume_name, root_key).await {
+    match mark_live(store, volume_name, coord_id).await {
         Ok(MarkLiveOutcome::Resumed) | Ok(MarkLiveOutcome::AlreadyLive) => {}
         Ok(MarkLiveOutcome::Absent) => {
             // No S3 record yet — proceed with the local-only start. The
@@ -2275,7 +2278,7 @@ async fn start_volume_op(
             };
 
             use elide_coordinator::lifecycle::{MarkReclaimedLocalOutcome, mark_reclaimed_local};
-            match mark_reclaimed_local(store, volume_name, root_key, local_vol_ulid).await {
+            match mark_reclaimed_local(store, volume_name, coord_id, local_vol_ulid).await {
                 Ok(MarkReclaimedLocalOutcome::Reclaimed) => {
                     // Fall through to clear `volume.stopped` and
                     // notify the supervisor.
@@ -2390,7 +2393,7 @@ fn register_volume(
     volume_ulid: &str,
     data_dir: &Path,
     peer_pid: Option<i32>,
-    root_key: &[u8; 32],
+    macaroon_root: &[u8; 32],
 ) -> String {
     // Parse the ULID at the boundary so we never thread a raw string to the
     // caveat or the filesystem path.
@@ -2407,7 +2410,7 @@ fn register_volume(
         Err(e) => return e,
     };
     let m = macaroon::mint(
-        root_key,
+        macaroon_root,
         vec![
             Caveat::Volume(ulid),
             Caveat::Scope(Scope::Credentials),
@@ -2421,14 +2424,14 @@ fn issue_credentials(
     macaroon_str: &str,
     data_dir: &Path,
     peer_pid: Option<i32>,
-    root_key: &[u8; 32],
+    macaroon_root: &[u8; 32],
     issuer: &dyn CredentialIssuer,
 ) -> String {
     let m = match Macaroon::parse(macaroon_str) {
         Ok(m) => m,
         Err(e) => return format!("err parse macaroon: {e}"),
     };
-    if !macaroon::verify(root_key, &m) {
+    if !macaroon::verify(macaroon_root, &m) {
         // Generic message — don't help an attacker distinguish "wrong key"
         // from "tampered caveats".
         return "err invalid macaroon".to_string();

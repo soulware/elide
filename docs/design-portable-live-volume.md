@@ -153,12 +153,14 @@ Verbs and their state transitions:
   coordinator**. The override path for "the previous owner is gone
   and not coming back". Skips the `If-Match` precondition on the
   `names/<name>` PUT and does **not** drain the previous owner's WAL
-  (it isn't reachable). The handoff snapshot is pinned to the
-  previous fork's last published handoff snapshot — any post-snapshot
-  writes the dead owner didn't get to S3 are lost. After
-  `release --force`, a normal `volume start --remote <name>` claims
-  the now-released name via the conditional-PUT path; concurrent
-  claimers race cleanly.
+  (it isn't reachable). *(Proposed)* the recovering coordinator
+  synthesises a fresh handoff snapshot from segments observable in
+  S3, signed by its own `coordinator.key`. The data-loss boundary is
+  "writes the dead owner accepted but never promoted to S3" — same
+  as the crash-recovery contract. After `release --force`, a normal
+  `volume start --remote <name>` claims the now-released name via
+  the conditional-PUT path; concurrent claimers race cleanly. See
+  the dedicated section below.
 - **`volume release --force --to <coordinator_id>`** — composes the
   two: unconditional override of foreign ownership *and* targeted
   reservation in a single PUT. The post-force record is `reserved`,
@@ -303,32 +305,95 @@ relocation — which is exactly today's escape hatch. This is honest:
 on a backend that can't carry portability, we don't pretend it can;
 we point users at the verb that actually works.
 
-### `coordinator_id` derivation
+### Coordinator identity *(Proposed)*
 
-`coordinator_id` derives from the existing
-`<data_dir>/coordinator.root_key`:
+A coordinator's identity is rooted in a single Ed25519 keypair held
+on the coordinator host. Mirroring the per-volume key convention:
+
+- `<data_dir>/coordinator.key` — Ed25519 private key (32-byte seed),
+  mode 0600. Generated on first start if absent. Never leaves the
+  host.
+- `<data_dir>/coordinator.pub` — Ed25519 public key. Mirrored to S3
+  at `coordinators/<coordinator_id>/coordinator.pub` on coordinator
+  startup so any other coordinator can verify signatures by
+  `coordinator_id` lookup.
+
+Everything else — `coordinator_id`, the macaroon MAC root — derives
+from the keypair via domain-separated `blake3::derive_key`. There is
+no separate `coordinator.root_key` file; that secret is derived
+in-memory at startup.
 
 ```rust
+// coordinator_id is a stable function of the *public* key:
+// self-authenticating against the published coordinator.pub.
 let coordinator_id = blake3::derive_key(
     "elide coordinator-id v1",
-    &root_key,
+    coord_pub.as_bytes(),
+);
+
+// macaroon MAC root is derived in-memory from the *private* key
+// at startup; never written to disk.
+let macaroon_root = blake3::derive_key(
+    "elide macaroon-root v1",
+    coord_priv.as_bytes(),
 );
 ```
 
-Domain-separated, no new on-disk state, raw key never leaves the
-coordinator. Two coordinators on the same machine are distinct
-identities; one coordinator moved between machines is the same
-identity. Hostname is recorded as a debugging hint only — never
-compared for ownership decisions.
+Properties:
 
-**Operational consequence:** deleting `coordinator.root_key` (or
-losing the data dir) ends that coordinator's identity. Volumes whose
-`names/<name>` pointer names the old coordinator can only be
-reclaimed via `volume release --force`. This is the right behaviour
-and doubles as an explicit escape hatch for a misbehaving
-coordinator — delete the root key, restart, then `release --force`
-+ `start --remote` from a clean identity. The old key's macaroons
-become unverifiable at the same moment, so clients re-auth anyway.
+- **Self-authenticating identity.** Anyone fetching
+  `coordinators/<coordinator_id>/coordinator.pub` can recompute
+  `derive_key("elide coordinator-id v1", pub) == coordinator_id` and
+  refuse a record where the pub doesn't match the id. The binding
+  between id and pubkey is intrinsic; a bucket-writer cannot pose
+  as `coordinator_id = X` while publishing a pubkey they actually
+  control.
+- **Single on-disk secret.** `coordinator.key` is the sole root —
+  one artefact to protect, one to back up, one to lose.
+- **Domain-separated reuse.** Sharing seed material between Ed25519
+  signing and BLAKE3 MAC is safe because the derivation contexts
+  are distinct; standard cryptographic hygiene.
+- **No independent rotation, by design.** The signing key, the
+  macaroon root, and `coordinator_id` rotate together (which is to
+  say: they don't rotate today). Rotation would require a
+  generational suffix and a retention story for old keys; defer
+  until a concrete need appears.
+
+**Operational consequence:** deleting `coordinator.key` (or losing
+the data dir) ends that coordinator's identity. A new keypair gives
+a new `coordinator_id`. Volumes whose `names/<name>` pointer names
+the old coordinator can only be reclaimed via
+`volume release --force`. This is the right behaviour and doubles
+as an explicit escape hatch for a misbehaving coordinator — delete
+the keypair, restart, then `release --force` + `start --remote`
+from a clean identity. The old key's macaroons become unverifiable
+at the same moment, so clients re-auth anyway.
+
+**Trust model:** the `coordinators/<coordinator_id>/coordinator.pub`
+write is gated by S3 write ACL — the same boundary that already
+gates `release --force` itself. Verification of a synthesised
+handoff snapshot: read the snapshot, look up
+`coordinators/<recovering_coordinator_id>/coordinator.pub`, verify
+the Ed25519 signature, recompute `coordinator_id` from the pub and
+confirm it matches the path. A malicious party with bucket-write
+could publish their own coordinator pubkey, but at that point they
+already have full bucket-mutation authority and the trust story is
+the bucket's, not Elide's.
+
+**Migration from existing deployments.** Previous versions stored a
+symmetric `coordinator.root_key` on disk and derived
+`coordinator_id` from it. Per the project's "no backward compat by
+default" stance, the upgrade path is a clean break: on first start
+of new code, the coordinator generates `coordinator.key` /
+`coordinator.pub` if absent, derives a new `coordinator_id` from
+the new pub, and stops trusting any existing `coordinator.root_key`
+file. Volumes whose `names/<name>` pointed at the old coord_id
+recover via `volume release --force`. Outstanding macaroons issued
+under the old root are invalidated; clients re-auth.
+
+Future use cases for `coordinator.key` are likely (signed lifecycle
+events, coordinator-attested operations) but the initial scope is
+just synthesised handoff snapshots.
 
 ## Flows
 
@@ -429,7 +494,7 @@ process exit (graceful or crash) is something else entirely:
 | `volume release --to <X> <name>` | flipped to `state=reserved`; `coordinator_id=<X>`; `claimed_at`/`hostname` cleared | drained, then discarded | yes — handoff snapshot | only `<X>` may `volume start --remote`; others refused |
 | Coordinator graceful shutdown (SIGTERM, Ctrl-C) | unchanged | fsynced, retained on disk | no | this coordinator restarts, sees its own `coordinator_id`, replays WAL, resumes serving — `state` was never flipped to `stopped`, so volumes that were `live` come back `live` |
 | Coordinator crash (SIGKILL, hardware) | unchanged | retained, possibly with unsynced tail | no | same as graceful — restart replays WAL. Unsynced tail is lost (matches the existing crash-recovery contract) |
-| `volume release --force` from elsewhere | rewritten without conditional check; flipped to `released`, identity cleared | abandoned (the dead coordinator's WAL is unreachable) | no new snapshot — handoff is pinned to the previous fork's last published snapshot | a subsequent `volume start --remote` claims it normally; any post-snapshot writes from the old owner that didn't reach S3 are lost |
+| `volume release --force` from elsewhere | rewritten without conditional check; flipped to `released`, identity cleared | abandoned (the dead coordinator's WAL is unreachable) | yes — synthesised handoff snapshot covering all S3-visible signature-valid segments, signed by the recovering coordinator's `coordinator.key` *(Proposed)* | a subsequent `volume start --remote` claims it normally; any writes the old owner accepted but never promoted to S3 are lost |
 
 A coordinator that is coming back keeps its volumes, its WAL, and
 its `state=live` records. The only implicit transitions are
@@ -443,21 +508,50 @@ is a separate, explicit verb.
 ### `volume release --force`
 
 Used when the previous owner is not coming back (machine gone,
-`root_key` deleted, partition with no expected recovery). Skips the
+`coordinator.key` deleted, partition with no expected recovery).
+Skips the
 "who owns this name" check on `volume release` — the unconditional
 PUT proceeds even when the record says `live` or `stopped` and
 `coordinator_id != self`. No drain happens (the dead owner's WAL is
-unreachable); the handoff snapshot is pinned to the previous fork's
-last published handoff snapshot (or the last published *user*
-snapshot if no handoff exists — see Phase 3 open question). Any
-writes the previous owner accepted after that snapshot but didn't
-publish are lost. The operator is asserting that loss is acceptable.
+unreachable).
+
+**Proposed:** the handoff snapshot is **synthesised at force-release
+time from the segments observable in S3**, not pinned to the previous
+fork's last published handoff snapshot. The recovering coordinator B:
+
+1. Lists `by_id/<dead_vol_ulid>/segments/` (or the date-sharded
+   layout under that prefix).
+2. Fetches each segment header + index section (cheap; not the body).
+3. Verifies each segment's Ed25519 signature against the dead fork's
+   `volume.pub` from S3. Segments that fail verification (partial
+   uploads, torn objects) are dropped.
+4. Mints a synthesised handoff snapshot at
+   `by_id/<dead_vol_ulid>/snapshots/<new_snap_ulid>` naming the
+   verified segment set, with metadata fields:
+   - `synthesised_from_recovery = true`
+   - `recovering_coordinator_id = <B>`
+   - `recovered_at = <timestamp>`
+5. Signs the synthesised snapshot with B's **coordinator signing
+   key** (`coordinator.key`; see "Coordinator signing key" below).
+6. Unconditional PUT to `names/<name>` flipping to `released` (or
+   `reserved` with `--to`), recording the synthesised snapshot ULID.
+
+The data-loss boundary is "writes that were fsync'd locally on the
+dead owner but never made it to S3" — identical to the crash-
+recovery contract elsewhere. Strictly better than pinning to the
+last handoff snapshot. Works equally well when the dead owner never
+published a snapshot at all, because segments are self-describing
+(see `docs/overview.md`: "the manifest is always derivable from the
+segments"). The snapshot manifest is an optimisation, not a
+correctness requirement.
 
 After `release --force`, the name is in the normal `released` state
 and the next claimant — including this same coordinator — runs
 `volume start --remote <name>` through the standard conditional-PUT
-path. Concurrent `start --remote` callers race cleanly through
-`If-Match` on the released etag; the loser sees a clean error.
+path. The claimant verifies the synthesised handoff snapshot using
+B's published coordinator pubkey before forking from it. Concurrent
+`start --remote` callers race cleanly through `If-Match` on the
+released etag; the loser sees a clean error.
 
 Why split it into two verbs (`release --force` then `start --remote`)
 instead of folding the override into `start`?
