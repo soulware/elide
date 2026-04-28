@@ -36,7 +36,10 @@ use tracing::warn;
 use ulid::Ulid;
 
 use elide_core::segment::{HEADER_LEN, MAGIC, SegmentSigner};
-use elide_core::signing::{SnapshotManifestRecovery, build_snapshot_manifest_bytes};
+use elide_core::signing::{
+    SnapshotManifestRecovery, build_snapshot_manifest_bytes, peek_snapshot_manifest_recovery,
+    read_snapshot_manifest_from_bytes,
+};
 
 use crate::portable::{self, ConditionalPutError};
 use crate::upload::snapshot_manifest_key;
@@ -301,6 +304,136 @@ pub async fn mint_and_publish_synthesised_snapshot(
             anyhow::Error::new(e).context("publishing synthesised snapshot manifest"),
         )),
     }
+}
+
+/// Outcome of [`resolve_handoff_verifier`]: which Ed25519 key a
+/// claimant should use to verify the snapshot manifest at
+/// `by_id/<vol_ulid>/snapshots/.../<snap_ulid>.manifest`.
+///
+/// For ordinary handoff snapshots the claimant uses the dead fork's
+/// own `volume.pub` (the regular block-reader path). For
+/// **synthesised** handoff snapshots minted by `volume release
+/// --force`, verification must use the recovering coordinator's
+/// `coordinator.pub`, fetched from
+/// `coordinators/<recovering_coordinator_id>/coordinator.pub` and
+/// path-bound to its derived id.
+#[derive(Debug)]
+pub enum HandoffVerifier {
+    /// Manifest is signed by the source volume's own key. Claimants
+    /// take the standard block-reader path: load `volume.pub` and
+    /// verify there.
+    Normal,
+    /// Manifest is a synthesised handoff snapshot signed by a
+    /// recovering coordinator. The contained key is the
+    /// already-verified pub the manifest was signed by, ready to
+    /// embed in the new fork's `provenance.parent_manifest_pubkey`.
+    /// The pub is boxed because `VerifyingKey` is ~160 bytes
+    /// (compressed + decompressed point cache), and the `Normal`
+    /// variant is zero-sized — boxing keeps the overall enum size
+    /// small.
+    Synthesised {
+        recovering_coordinator_id: String,
+        recovered_at: String,
+        manifest_pubkey: Box<VerifyingKey>,
+    },
+}
+
+/// Errors from [`resolve_handoff_verifier`].
+#[derive(Debug)]
+pub enum ResolveHandoffError {
+    /// The snapshot manifest could not be read from the bucket.
+    ManifestRead(anyhow::Error),
+    /// The manifest parsed but its recovery metadata is malformed
+    /// (e.g. partial fields, invalid version).
+    ManifestParse(std::io::Error),
+    /// The synthesised manifest names a recovering coordinator whose
+    /// `coordinator.pub` is missing, malformed, or doesn't bind back
+    /// to the named id.
+    PubkeyResolution(std::io::Error),
+    /// The manifest's signature does not verify under the resolved
+    /// pubkey. Could indicate a tampered or wrong-fork manifest.
+    SignatureInvalid(std::io::Error),
+}
+
+impl std::fmt::Display for ResolveHandoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ManifestRead(e) => write!(f, "reading snapshot manifest: {e:#}"),
+            Self::ManifestParse(e) => write!(f, "parsing snapshot manifest: {e}"),
+            Self::PubkeyResolution(e) => write!(f, "resolving recovering coordinator pubkey: {e}"),
+            Self::SignatureInvalid(e) => write!(f, "verifying snapshot manifest: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveHandoffError {}
+
+/// Decide which Ed25519 key a claimant should use to verify the
+/// snapshot manifest at `by_id/<vol_ulid>/snapshots/.../<snap_ulid>.manifest`.
+///
+/// Pipeline:
+///   1. Fetch the manifest bytes from S3.
+///   2. [`peek_snapshot_manifest_recovery`] to detect whether this
+///      is a synthesised handoff snapshot.
+///   3. If synthesised: fetch the recovering coordinator's pub via
+///      [`crate::identity::fetch_coordinator_pub`] (which path-binds
+///      the pub to its derived id), then run
+///      [`read_snapshot_manifest_from_bytes`] to verify the
+///      signature under that pub. Returns
+///      [`HandoffVerifier::Synthesised`] on success.
+///   4. Otherwise: returns [`HandoffVerifier::Normal`]. The caller
+///      uses the source volume's own `volume.pub` (the regular
+///      block-reader path).
+///
+/// Failures at any step refuse cleanly with a typed
+/// [`ResolveHandoffError`] so the caller can surface a clear error
+/// to the operator.
+pub async fn resolve_handoff_verifier(
+    store: &Arc<dyn ObjectStore>,
+    vol_ulid: Ulid,
+    snap_ulid: Ulid,
+) -> Result<HandoffVerifier, ResolveHandoffError> {
+    let key = snapshot_manifest_key(&vol_ulid.to_string(), &snap_ulid.to_string())
+        .map_err(|e| ResolveHandoffError::ManifestRead(e.context("computing manifest key")))?;
+    let bytes = store
+        .get(&key)
+        .await
+        .map_err(|e| {
+            ResolveHandoffError::ManifestRead(
+                anyhow::Error::new(e).context(format!("fetching snapshot manifest at {key}")),
+            )
+        })?
+        .bytes()
+        .await
+        .map_err(|e| {
+            ResolveHandoffError::ManifestRead(
+                anyhow::Error::new(e)
+                    .context(format!("reading snapshot manifest bytes from {key}")),
+            )
+        })?;
+
+    let recovery =
+        peek_snapshot_manifest_recovery(&bytes).map_err(ResolveHandoffError::ManifestParse)?;
+    let Some(recovery) = recovery else {
+        return Ok(HandoffVerifier::Normal);
+    };
+
+    let manifest_pubkey =
+        crate::identity::fetch_coordinator_pub(store.as_ref(), &recovery.recovering_coordinator_id)
+            .await
+            .map_err(ResolveHandoffError::PubkeyResolution)?;
+
+    // Verify the manifest signature under the resolved pubkey. This
+    // re-validates the signing input including the recovery metadata
+    // — a tampered manifest will fail here.
+    read_snapshot_manifest_from_bytes(&bytes, &manifest_pubkey, &snap_ulid)
+        .map_err(ResolveHandoffError::SignatureInvalid)?;
+
+    Ok(HandoffVerifier::Synthesised {
+        recovering_coordinator_id: recovery.recovering_coordinator_id,
+        recovered_at: recovery.recovered_at,
+        manifest_pubkey: Box::new(manifest_pubkey),
+    })
 }
 
 #[cfg(test)]
@@ -708,5 +841,119 @@ mod tests {
             .await
             .expect_err("expected precondition-failed");
         assert!(matches!(err, ConditionalPutError::PreconditionFailed));
+    }
+
+    // ── resolve_handoff_verifier ───────────────────────────────────────
+
+    /// Stand up a coordinator-published `coordinators/<id>/coordinator.pub`
+    /// using a fresh CoordinatorIdentity, returning the identity so the
+    /// caller can sign manifests with it.
+    async fn coordinator_with_published_pub(
+        store: &Arc<dyn ObjectStore>,
+    ) -> Arc<crate::identity::CoordinatorIdentity> {
+        let dir = tempfile::tempdir().unwrap();
+        let identity =
+            Arc::new(crate::identity::CoordinatorIdentity::load_or_generate(dir.path()).unwrap());
+        identity.publish_pub(store.as_ref()).await.unwrap();
+        identity
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_normal_for_non_recovery_manifest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dead_vol = Ulid::new();
+        // Sign the manifest with the dead fork's volume key (the
+        // normal handoff path).
+        let (signer, _vk) = make_signer();
+        let snap_ulid = Ulid::new();
+        let bytes = elide_core::signing::build_snapshot_manifest_bytes(
+            signer.as_ref(),
+            &[Ulid::new()],
+            None,
+        );
+        let key = snapshot_manifest_key(&dead_vol.to_string(), &snap_ulid.to_string()).unwrap();
+        store.put(&key, PutPayload::from(bytes)).await.unwrap();
+
+        let outcome = resolve_handoff_verifier(&store, dead_vol, snap_ulid)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, HandoffVerifier::Normal));
+    }
+
+    #[tokio::test]
+    async fn resolve_verifies_synthesised_manifest_under_coordinator_pub() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dead_vol = Ulid::new();
+        let identity = coordinator_with_published_pub(&store).await;
+
+        // Mint and publish a synthesised manifest signed by the
+        // coordinator's identity key.
+        let published = mint_and_publish_synthesised_snapshot(
+            &store,
+            dead_vol,
+            &[Ulid::new(), Ulid::new()],
+            identity.as_ref(),
+            identity.coordinator_id_str(),
+        )
+        .await
+        .unwrap();
+
+        let outcome = resolve_handoff_verifier(&store, dead_vol, published.snap_ulid)
+            .await
+            .unwrap();
+        match outcome {
+            HandoffVerifier::Synthesised {
+                recovering_coordinator_id,
+                manifest_pubkey,
+                ..
+            } => {
+                assert_eq!(recovering_coordinator_id, identity.coordinator_id_str());
+                assert_eq!(
+                    manifest_pubkey.to_bytes(),
+                    identity.verifying_key().to_bytes(),
+                );
+            }
+            HandoffVerifier::Normal => {
+                panic!("expected Synthesised verifier for a recovery manifest")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_refuses_when_recovering_coordinator_pub_is_missing() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dead_vol = Ulid::new();
+        // Mint a manifest signed by an identity whose pub is NOT
+        // published to the bucket.
+        let dir = tempfile::tempdir().unwrap();
+        let unpublished =
+            crate::identity::CoordinatorIdentity::load_or_generate(dir.path()).unwrap();
+
+        let published = mint_and_publish_synthesised_snapshot(
+            &store,
+            dead_vol,
+            &[Ulid::new()],
+            &unpublished,
+            unpublished.coordinator_id_str(),
+        )
+        .await
+        .unwrap();
+
+        let err = resolve_handoff_verifier(&store, dead_vol, published.snap_ulid)
+            .await
+            .expect_err("missing coordinator.pub must refuse");
+        assert!(
+            matches!(err, ResolveHandoffError::PubkeyResolution(_)),
+            "expected PubkeyResolution, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_refuses_when_manifest_object_is_missing() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let err = resolve_handoff_verifier(&store, Ulid::new(), Ulid::new())
+            .await
+            .expect_err("missing manifest must refuse");
+        assert!(matches!(err, ResolveHandoffError::ManifestRead(_)));
     }
 }

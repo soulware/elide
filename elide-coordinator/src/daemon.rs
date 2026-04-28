@@ -32,10 +32,10 @@ use tracing::{info, warn};
 
 use crate::config::CoordinatorConfig;
 use crate::credential::{CredentialIssuer, SharedKeyPassthrough};
-use crate::identity::CoordinatorIdentity;
 use crate::import;
 use crate::inbound;
 use crate::supervisor;
+use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::{EvictRegistry, SnapshotLockRegistry, new_snapshot_lock_registry};
 
 pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Result<()> {

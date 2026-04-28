@@ -60,7 +60,7 @@ pub struct IpcContext {
     /// when minting synthesised handoff snapshots during
     /// `volume release --force`. Arc-shared so per-connection clones
     /// stay cheap.
-    pub identity: Arc<crate::identity::CoordinatorIdentity>,
+    pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
     pub issuer: Arc<dyn CredentialIssuer>,
 }
 
@@ -335,6 +335,28 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 return "err usage: fork-create <name> <source_ulid> [snap=<ulid>] [parent-key=<hex>] [flags...]".to_string();
             }
             fork_create_op(args, &ctx.data_dir, &ctx.store, &ctx.coord_id, &ctx.rescan).await
+        }
+
+        "resolve-handoff-key" => {
+            // resolve-handoff-key <vol_ulid> <snap_ulid>
+            //
+            // Used by the CLI's claim-from-released path to decide
+            // which Ed25519 pubkey to verify the handoff snapshot
+            // manifest under. Returns:
+            //   ok normal              -- regular manifest, use the
+            //                             source volume's volume.pub
+            //   ok recovery <hex_pub>  -- synthesised manifest, the
+            //                             named pubkey has already
+            //                             been verified to derive to
+            //                             the recording coordinator id
+            //   err <message>          -- manifest missing, malformed,
+            //                             or signature verification
+            //                             failed
+            let (vol_str, snap_str) = match args.split_once(' ') {
+                Some((v, s)) => (v.trim(), s.trim()),
+                None => return "err usage: resolve-handoff-key <vol_ulid> <snap_ulid>".to_string(),
+            };
+            resolve_handoff_key_op(vol_str, snap_str, &ctx.store).await
         }
 
         "evict" => {
@@ -1420,6 +1442,41 @@ async fn pull_readonly_op(args: &str, data_dir: &Path, store: &Arc<dyn ObjectSto
 /// uploads the snapshot marker, verifies pinned segments are still in S3,
 /// and writes a signed manifest under an ephemeral key in the ancestor's
 /// directory. Returns `<snap_ulid> <ephemeral_pubkey_hex>`.
+/// Implementation of the `resolve-handoff-key` IPC verb. See the
+/// dispatch comment for the wire format.
+async fn resolve_handoff_key_op(
+    vol_str: &str,
+    snap_str: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> String {
+    use elide_coordinator::recovery::{HandoffVerifier, resolve_handoff_verifier};
+
+    let vol_ulid = match ulid::Ulid::from_string(vol_str) {
+        Ok(u) => u,
+        Err(e) => return format!("err invalid vol_ulid {vol_str:?}: {e}"),
+    };
+    let snap_ulid = match ulid::Ulid::from_string(snap_str) {
+        Ok(u) => u,
+        Err(e) => return format!("err invalid snap_ulid {snap_str:?}: {e}"),
+    };
+
+    match resolve_handoff_verifier(store, vol_ulid, snap_ulid).await {
+        Ok(HandoffVerifier::Normal) => "ok normal".to_owned(),
+        Ok(HandoffVerifier::Synthesised {
+            manifest_pubkey, ..
+        }) => {
+            let hex: String = manifest_pubkey
+                .as_ref()
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("ok recovery {hex}")
+        }
+        Err(e) => format!("err {e}"),
+    }
+}
+
 async fn force_snapshot_now_op(
     args: &str,
     data_dir: &Path,
@@ -2038,7 +2095,7 @@ async fn force_release_volume_op(
     volume_name: &str,
     target: Option<&str>,
     store: &Arc<dyn ObjectStore>,
-    identity: &Arc<crate::identity::CoordinatorIdentity>,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> String {
     use elide_coordinator::lifecycle::{self, ForceReleaseOutcome};
     use elide_coordinator::recovery;

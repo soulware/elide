@@ -1697,6 +1697,33 @@ fn claim_released_name(
         }
     }
 
+    // Resolve which Ed25519 key the handoff snapshot manifest is
+    // signed by: ordinary handoff snapshots use the source volume's
+    // own `volume.pub` (the regular block-reader path), but
+    // synthesised handoff snapshots minted by `volume release
+    // --force` are signed by the recovering coordinator's
+    // `coordinator.pub`. The coordinator already verifies the
+    // manifest signature and the recovering coordinator's pub
+    // binding before answering `recovery <hex>`, so we can pass the
+    // hex through to `fork-create` as `parent-key=` and the new
+    // fork's open-time ancestor walk will verify under the right
+    // key.
+    let parent_key_hex = match coordinator_client::resolve_handoff_key(
+        socket_path,
+        released_vol_ulid,
+        snap,
+    )? {
+        coordinator_client::HandoffKey::Normal => None,
+        coordinator_client::HandoffKey::Recovery {
+            manifest_pubkey_hex,
+        } => {
+            eprintln!(
+                "[claim] handoff snapshot {snap} is synthesised — verifying under recovering coordinator's key"
+            );
+            Some(manifest_pubkey_hex)
+        }
+    };
+
     // Mint a fresh local fork. fork-create writes by_id/<new_ulid>/
     // and the by_name/<name> symlink, returns the new vol_ulid.
     // The bucket record already exists in `Released` state; the
@@ -1708,7 +1735,7 @@ fn claim_released_name(
         name,
         released_vol_ulid,
         Some(snap),
-        None,
+        parent_key_hex.as_deref(),
         &[],
         true,
     )?;

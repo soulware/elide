@@ -683,9 +683,9 @@ pub fn build_snapshot_manifest_bytes(
     serialize_snapshot_manifest(&sorted, recovery, &sig).into_bytes()
 }
 
-/// Read and verify a snapshot manifest, returning its sorted segment
-/// ULIDs and (for synthesised handoff snapshots) the recovery
-/// metadata.
+/// Read and verify a snapshot manifest from disk, returning its
+/// sorted segment ULIDs and (for synthesised handoff snapshots) the
+/// recovery metadata.
 ///
 /// `verifying_key` is the Ed25519 verifying key that signed the
 /// manifest:
@@ -693,10 +693,11 @@ pub fn build_snapshot_manifest_bytes(
 ///     ancestor verification this comes from the child's
 ///     `volume.provenance`, not the ancestor directory's `volume.pub`);
 ///   - for synthesised handoff snapshots, the recovering coordinator's
-///     `coordinator.pub`. Callers identify this case by reading the
-///     manifest first (via this function with the wrong key), or by
-///     consulting the surrounding context — typically the
-///     `names/<name>` record points the caller at the right pubkey.
+///     `coordinator.pub`. Callers identify this case via
+///     [`peek_snapshot_manifest_recovery`] before fetching the right
+///     pubkey, or by consulting the surrounding context — typically
+///     the `names/<name>` record points the caller at the right
+///     pubkey.
 ///
 /// Fails if the file is missing, unparseable, the signature does not
 /// match, or the ULIDs are not in strictly ascending order.
@@ -713,8 +714,31 @@ pub fn read_snapshot_manifest(
             vol_dir.display()
         ))
     })?;
+    read_snapshot_manifest_from_bytes(content.as_bytes(), verifying_key, snap_ulid)
+}
 
-    let parsed = parse_snapshot_manifest(&content, &filename)?;
+/// Read and verify a snapshot manifest from raw bytes, returning its
+/// sorted segment ULIDs and (for synthesised handoff snapshots) the
+/// recovery metadata.
+///
+/// Same semantics as [`read_snapshot_manifest`] but takes a byte
+/// slice directly. Used by callers that fetch a manifest from S3
+/// rather than a local volume directory — notably the
+/// claimant-side verification step of `volume start --remote`
+/// against a synthesised handoff snapshot.
+///
+/// `snap_ulid` is used only for diagnostic strings; signature
+/// verification is over the canonical content bytes.
+pub fn read_snapshot_manifest_from_bytes(
+    content: &[u8],
+    verifying_key: &VerifyingKey,
+    snap_ulid: &ulid::Ulid,
+) -> io::Result<SnapshotManifest> {
+    let filename = snapshot_manifest_filename(snap_ulid);
+    let content_str = std::str::from_utf8(content)
+        .map_err(|e| io::Error::other(format!("{filename} not valid utf-8: {e}")))?;
+
+    let parsed = parse_snapshot_manifest(content_str, &filename)?;
     let sig_arr: [u8; 64] = parsed.sig.try_into().map_err(|_| {
         io::Error::other(format!("{filename} sig wrong length (expected 64 bytes)"))
     })?;
@@ -748,6 +772,29 @@ pub fn read_snapshot_manifest(
         segment_ulids: out,
         recovery: parsed.recovery,
     })
+}
+
+/// Inspect a snapshot manifest's recovery metadata **without
+/// verifying the signature**. Used by claimants on
+/// `volume start --remote` to decide which pubkey to verify the
+/// manifest under: regular volume identity key vs. recovering
+/// coordinator's `coordinator.pub`.
+///
+/// Callers MUST verify under the chosen pubkey before trusting any
+/// content (segments or recovery metadata) — peek alone is not safe
+/// to act on, and the signing input is domain-separated so a
+/// non-recovery sig cannot validate a recovery manifest and vice
+/// versa.
+///
+/// Returns `Ok(None)` for ordinary (non-recovery) manifests,
+/// `Ok(Some(recovery))` for synthesised handoff snapshots.
+pub fn peek_snapshot_manifest_recovery(
+    content: &[u8],
+) -> io::Result<Option<SnapshotManifestRecovery>> {
+    let content_str = std::str::from_utf8(content)
+        .map_err(|e| io::Error::other(format!("manifest not valid utf-8: {e}")))?;
+    let parsed = parse_snapshot_manifest(content_str, "<manifest>")?;
+    Ok(parsed.recovery)
 }
 
 /// Signing input for a snapshot manifest.
@@ -1212,6 +1259,146 @@ mod tests {
         assert!(
             err.to_string().contains("inconsistent recovery metadata"),
             "expected inconsistent-recovery error, got: {err}"
+        );
+    }
+
+    // ── peek_snapshot_manifest_recovery / read_from_bytes ──────────────
+
+    #[test]
+    fn peek_returns_none_for_non_recovery_manifest() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+
+        let raw_key = SigningKey::generate(&mut OsRng);
+        let key = signer_from(raw_key);
+        let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        write_snapshot_manifest(
+            tmp.path(),
+            &key,
+            &snap,
+            &[make_ulid("01BX5ZZKJKTSV4RRFFQ69G5FAV")],
+            None,
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(
+            tmp.path()
+                .join("snapshots")
+                .join(snapshot_manifest_filename(&snap)),
+        )
+        .unwrap();
+        assert!(peek_snapshot_manifest_recovery(&bytes).unwrap().is_none());
+    }
+
+    #[test]
+    fn peek_returns_recovery_metadata_for_synthesised_manifest() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+
+        let raw_key = SigningKey::generate(&mut OsRng);
+        let key = signer_from(raw_key);
+        let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let rec = SnapshotManifestRecovery {
+            recovering_coordinator_id: "01ABCDEFGHJKMNPQRSTVWXYZ23".to_owned(),
+            recovered_at: "2026-04-28T12:34:56Z".to_owned(),
+        };
+        write_snapshot_manifest(tmp.path(), &key, &snap, &[], Some(&rec)).unwrap();
+
+        let bytes = std::fs::read(
+            tmp.path()
+                .join("snapshots")
+                .join(snapshot_manifest_filename(&snap)),
+        )
+        .unwrap();
+        let got = peek_snapshot_manifest_recovery(&bytes).unwrap().unwrap();
+        assert_eq!(got, rec);
+    }
+
+    #[test]
+    fn read_from_bytes_round_trips_normal_manifest() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+
+        let raw_key = SigningKey::generate(&mut OsRng);
+        let verifying = raw_key.verifying_key();
+        let key = signer_from(raw_key);
+        let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let segs = vec![
+            make_ulid("01BX5ZZKJKTSV4RRFFQ69G5FAV"),
+            make_ulid("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+        ];
+        write_snapshot_manifest(tmp.path(), &key, &snap, &segs, None).unwrap();
+
+        let bytes = std::fs::read(
+            tmp.path()
+                .join("snapshots")
+                .join(snapshot_manifest_filename(&snap)),
+        )
+        .unwrap();
+        let got = read_snapshot_manifest_from_bytes(&bytes, &verifying, &snap).unwrap();
+        let mut expected = segs;
+        expected.sort();
+        assert_eq!(got.segment_ulids, expected);
+        assert!(got.recovery.is_none());
+    }
+
+    #[test]
+    fn read_from_bytes_verifies_synthesised_manifest_under_correct_key() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+
+        let raw_key = SigningKey::generate(&mut OsRng);
+        let verifying = raw_key.verifying_key();
+        let key = signer_from(raw_key);
+        let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let rec = SnapshotManifestRecovery {
+            recovering_coordinator_id: "01ABCDEFGHJKMNPQRSTVWXYZ23".to_owned(),
+            recovered_at: "2026-04-28T12:34:56Z".to_owned(),
+        };
+        write_snapshot_manifest(
+            tmp.path(),
+            &key,
+            &snap,
+            &[make_ulid("01BX5ZZKJKTSV4RRFFQ69G5FAV")],
+            Some(&rec),
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(
+            tmp.path()
+                .join("snapshots")
+                .join(snapshot_manifest_filename(&snap)),
+        )
+        .unwrap();
+        let got = read_snapshot_manifest_from_bytes(&bytes, &verifying, &snap).unwrap();
+        assert_eq!(got.recovery, Some(rec));
+    }
+
+    #[test]
+    fn read_from_bytes_rejects_synthesised_manifest_under_wrong_key() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+
+        let raw_key = SigningKey::generate(&mut OsRng);
+        let key = signer_from(raw_key);
+        let snap = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let rec = SnapshotManifestRecovery {
+            recovering_coordinator_id: "01ABCDEFGHJKMNPQRSTVWXYZ23".to_owned(),
+            recovered_at: "2026-04-28T12:34:56Z".to_owned(),
+        };
+        write_snapshot_manifest(tmp.path(), &key, &snap, &[], Some(&rec)).unwrap();
+
+        let bytes = std::fs::read(
+            tmp.path()
+                .join("snapshots")
+                .join(snapshot_manifest_filename(&snap)),
+        )
+        .unwrap();
+        let unrelated = SigningKey::generate(&mut OsRng).verifying_key();
+        let err = read_snapshot_manifest_from_bytes(&bytes, &unrelated, &snap).unwrap_err();
+        assert!(
+            err.to_string().contains("signature invalid"),
+            "expected sig failure, got: {err}"
         );
     }
 }

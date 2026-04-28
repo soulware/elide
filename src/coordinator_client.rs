@@ -380,6 +380,58 @@ pub fn stop_volume(socket_path: &Path, name: &str) -> io::Result<()> {
     }
 }
 
+/// Outcome of a `resolve_handoff_key` call.
+///
+/// Drives the claim-from-released path's choice of `parent-key` for
+/// the new fork's `volume.provenance`. For `Normal` manifests the
+/// CLI uses the source volume's own `volume.pub`; for `Recovery` it
+/// embeds the recovering coordinator's pubkey so the new fork's
+/// open-time ancestor walk verifies the synthesised handoff snapshot
+/// against the right key.
+#[derive(Debug, Clone)]
+pub enum HandoffKey {
+    /// Manifest is signed by the source volume's own key.
+    Normal,
+    /// Manifest is a synthesised handoff snapshot signed by a
+    /// recovering coordinator. The carried hex string is the
+    /// already-verified Ed25519 pubkey, ready to pass to
+    /// `fork-create` as `parent-key=<hex>`.
+    Recovery { manifest_pubkey_hex: String },
+}
+
+/// Ask the coordinator to resolve which Ed25519 key the snapshot
+/// manifest at `by_id/<vol_ulid>/snapshots/.../<snap_ulid>.manifest`
+/// is signed by. Returns `HandoffKey::Recovery { hex }` for
+/// synthesised handoff snapshots minted by `volume release --force`,
+/// or `HandoffKey::Normal` for ordinary manifests.
+///
+/// The coordinator verifies the manifest signature and the
+/// recovering coordinator's pub binding before returning a
+/// `Recovery` result, so the CLI can use the returned hex as a
+/// trusted `parent-key` for `fork-create`.
+pub fn resolve_handoff_key(
+    socket_path: &Path,
+    vol_ulid: &str,
+    snap_ulid: &str,
+) -> io::Result<HandoffKey> {
+    let resp = call(
+        socket_path,
+        &format!("resolve-handoff-key {vol_ulid} {snap_ulid}"),
+    )?;
+    if resp == "ok normal" {
+        return Ok(HandoffKey::Normal);
+    }
+    if let Some(rest) = resp.strip_prefix("ok recovery ") {
+        return Ok(HandoffKey::Recovery {
+            manifest_pubkey_hex: rest.trim().to_owned(),
+        });
+    }
+    if let Some(msg) = resp.strip_prefix("err ") {
+        return Err(io::Error::other(msg.to_owned()));
+    }
+    Err(io::Error::other(format!("unexpected response: {resp}")))
+}
+
 /// Options for `release_volume`.
 #[derive(Default, Clone, Debug)]
 pub struct ReleaseOpts<'a> {

@@ -425,16 +425,32 @@ may claim). Composes with `--force`.
   Composes with `--force` for the unreachable-owner case, where the
   unconditional rewrite produces a `Reserved` record bound to the
   named target.
-- [ ] **Synthesised-snapshot verification on `start --remote`.**
-  When a `released` / `reserved` record's `handoff_snapshot` points
-  at a snapshot record carrying `synthesised_from_recovery=true`,
-  the claiming coordinator: (i) fetches the recovering coordinator's
-  pubkey from `coordinators/<recovering_coordinator_id>/coordinator.pub`,
-  (ii) verifies the snapshot's Ed25519 signature against it,
-  (iii) recomputes `coordinator_id` from the fetched pub and confirms
-  the path matches. Any failure refuses the claim with a clear error.
-  Non-synthesised handoff snapshots use the existing per-volume
-  signature path unchanged.
+- [x] **Synthesised-snapshot verification on `start --remote`.**
+  Three layers:
+  - `elide_core::signing::peek_snapshot_manifest_recovery` and
+    `read_snapshot_manifest_from_bytes` — bytes-based helpers so
+    callers can detect synthesis and verify without going via a
+    file. 5 new tests cover round-trip, peek, and wrong-key rejection.
+  - `recovery::resolve_handoff_verifier(store, vol_ulid, snap_ulid)`
+    — fetches the manifest, peeks for recovery metadata, fetches
+    the recovering coordinator's `coordinator.pub` via the existing
+    `identity::fetch_coordinator_pub` (which path-binds the pub to
+    its derived id), and re-verifies the signature under that pub.
+    Returns `HandoffVerifier::Normal` or `Synthesised { ..,
+    manifest_pubkey }`. 4 new tests including pub-missing and
+    manifest-missing refusal paths.
+  - `resolve-handoff-key` IPC verb + `coordinator_client::resolve_handoff_key`
+    + `claim_released_name` plumbing: when the resolver returns
+    `Recovery { manifest_pubkey_hex }`, the CLI passes it to
+    `fork-create` as `parent-key=<hex>`. The new fork's open-time
+    ancestor walk (`block_reader.rs`) then verifies the synthesised
+    manifest under the recovering coordinator's pubkey via the
+    existing `parent_manifest_pubkey` provenance field.
+
+  `identity` module promoted to the library (`pub mod identity` in
+  `lib.rs`) so `recovery` can call `fetch_coordinator_pub`. Callers
+  in binary-only files updated from `crate::identity::...` to
+  `elide_coordinator::identity::...`.
 - [ ] **Tests:** force-release after simulated coordinator death
   (kill the writing process between segment uploads and
   `names/<name>` rewrite, then `release --force` + `start --remote`
