@@ -11,8 +11,25 @@ Implements [`design-portable-live-volume.md`](design-portable-live-volume.md).
 - **`volume remote` is a clean break.** No aliases. The new
   shape (`volume list --all`, `volume start <name>`) replaces it
   entirely.
-- **Force-takeover fallback semantics stay open** — see Phase 3 and
-  related recovery questions about implicit "now" snapshots.
+
+**Decisions locked in 2026-04-28:**
+
+- **Force-release recovers to "now", not the last handoff snapshot.**
+  The recovering coordinator lists S3 segments under the dead fork's
+  prefix, verifies each segment's signature against the dead fork's
+  `volume.pub`, and synthesises a fresh handoff snapshot covering
+  the verified set. Data-loss boundary is "writes the dead owner
+  accepted but never promoted to S3" — same as the crash-recovery
+  contract. Works even if the dead owner never published a snapshot.
+  Closes Phase 3's prior open question on fallback semantics.
+- **Coordinator identity is an Ed25519 keypair.** `coordinator.key`
+  / `coordinator.pub` (mirroring `volume.key` / `volume.pub`) are
+  the sole on-disk identity artefacts. `coordinator_id` derives
+  from the **public** key (self-authenticating), and the macaroon
+  MAC root derives from the private key in-memory at startup —
+  there is no separate `coordinator.root_key` file. Existing
+  deployments take a clean break: new keypair, new `coordinator_id`,
+  affected volumes recover via `volume release --force`.
 
 ## How it fits with existing `volume stop`/`volume start`
 
@@ -150,6 +167,64 @@ plain-text records are not parseable and are not migrated.
 
 ---
 
+### Phase 1.5 — Coordinator identity keypair
+
+Replace the symmetric `coordinator.root_key` foundation with an
+Ed25519 keypair held on the coordinator host. Required by Phase 3
+(synthesised handoff snapshots are signed by `coordinator.key`).
+Also retrofits Phase 0's `coordinator_id` derivation to derive from
+the public key.
+
+- [ ] **Generate / load `coordinator.key` + `coordinator.pub`.** New
+  module `elide-coordinator/src/identity.rs` (or extend
+  `credential.rs`): on first start, generate a fresh Ed25519 keypair
+  with `ed25519_dalek::SigningKey::generate`, write
+  `<data_dir>/coordinator.key` (mode 0600) and
+  `<data_dir>/coordinator.pub` (mode 0644). On subsequent starts,
+  load from disk and verify the pub matches the key.
+- [ ] **Re-root `coordinator_id` on the public key.** Change
+  `portable::coordinator_id` to take the pubkey bytes and derive via
+  `blake3::derive_key("elide coordinator-id v1", &pub_bytes)`.
+  Update `format_coordinator_id` callers; update unit tests.
+- [ ] **Derive macaroon root from the private key in-memory.**
+  In `daemon::run`, replace `load_or_generate_root_key` with
+  `load_or_generate_keypair` + an in-memory derivation:
+  `let macaroon_root = blake3::derive_key("elide macaroon-root v1",
+  &priv_bytes);`. The 32-byte result feeds the existing
+  `macaroon::mint` / `macaroon::verify` callers unchanged.
+- [ ] **Publish `coordinator.pub` to S3 on startup.** Conditional
+  PUT to `coordinators/<coordinator_id>/coordinator.pub` using the
+  `put_if_absent` helper from Phase 0. If a record already exists,
+  read it and compare against the local pub: equal → no-op, mismatch
+  → fail startup with a clear error (different coordinator already
+  claimed this id, which only happens if `coordinator_id` derivation
+  collides — vanishingly improbable for a 32-byte derivation, but
+  fail loudly rather than silently overwrite).
+- [ ] **Pubkey fetcher.** `fetch_coordinator_pub(store,
+  coordinator_id) -> Result<VerifyingKey>` reads the bucket pub,
+  verifies the embedded pub really derives to that `coordinator_id`
+  (recompute and compare), returns the `VerifyingKey`. Refuse on
+  mismatch.
+- [ ] **Migration / clean-break handling.** On startup, if
+  `coordinator.root_key` exists but `coordinator.key` does not,
+  generate the new keypair and **leave** the old root_key file in
+  place untouched (it's no longer read). Log a one-line warning
+  noting the file is now ignored. The new `coordinator_id` will
+  differ from any old one — Phase 2/3 lifecycle verbs handle stale
+  pointers via `release --force`.
+- [ ] **Tests:** keypair round-trip; `coordinator_id` derives
+  identically across restarts of the same install; pub publishing
+  is idempotent; pubkey fetcher rejects a tampered pub whose
+  derivation doesn't match the path; macaroon mint/verify still
+  work end-to-end against the in-memory-derived root.
+
+**Phase exit criteria:** every coordinator has a verifiable Ed25519
+identity reachable from the bucket. `coordinator_id` is
+self-authenticating against the published pub. The legacy
+`coordinator.root_key` file is no longer consulted.
+
+---
+
 ### Phase 2 — Lifecycle verbs (cross-coordinator)
 
 This is where portability becomes real. Gate the new verb behaviour
@@ -248,10 +323,15 @@ works as today.
 The override path is split into two normal verbs:
 
 1. `volume release --force <name>` — unconditionally flip foreign
-   `live`/`stopped` records to `released`, no drain, handoff pinned
-   to the previous fork's last published snapshot.
+   `live`/`stopped` records to `released`. Synthesises a fresh
+   handoff snapshot covering all S3-visible signature-valid segments
+   under the dead fork's prefix, signed by the recovering
+   coordinator's `coordinator.key`. No drain (the dead owner's WAL
+   is unreachable).
 2. `volume start --remote <name>` — claim the now-released name
-   through the standard conditional-PUT path.
+   through the standard conditional-PUT path. Verifies the
+   synthesised handoff snapshot's signature against the recovering
+   coordinator's published pubkey before forking from it.
 
 This keeps `volume start` always-safe (never overrides another
 coordinator) and makes the dangerous step explicit and auditable.
@@ -264,43 +344,73 @@ may claim). Composes with `--force`.
 - [ ] **`Reserved` state in `NameRecord`.** New variant in
   `NameState`; round-trip + version tests; `mark_released_to`
   lifecycle helper; reader changes in `start`/`status`.
+- [ ] **Synthesised handoff snapshot record shape.** Extend the
+  snapshot record with three optional fields, all populated only on
+  the synthesised path:
+  - `synthesised_from_recovery: bool` (default false)
+  - `recovering_coordinator_id: <coord_id>`
+  - `recovered_at: <rfc3339>`
+
+  Wire signature is over the canonical record bytes including these
+  fields. Tooling (`volume status`, `inspect-segment`, etc.) shows
+  the flag prominently when set.
+- [ ] **Segment-listing replay.** New helper in
+  `elide-coordinator/src/recovery.rs` (or similar): given a dead
+  fork's `vol_ulid`, list all segment objects under
+  `by_id/<vol_ulid>/...`, fetch each segment's header + index
+  section (not the body), verify the Ed25519 signature against the
+  dead fork's `volume.pub` (also fetched from S3), and return a
+  sorted-by-ULID list of `(segment_ulid, etag, segment_size)` for
+  segments that pass verification. Segments failing signature check
+  are dropped with a per-segment warning.
+- [ ] **Synthesise + sign the handoff snapshot.** Mint a fresh
+  ULID, build the snapshot record naming the verified segment set
+  with the recovery metadata fields populated, sign with
+  `coordinator.key`, write to
+  `by_id/<dead_vol_ulid>/snapshots/<new_snap_ulid>` via conditional
+  PUT (the path is fresh, so `put_if_absent`).
 - [ ] **`--force` flag on `volume release`.** Skip the foreign-owner
-  refusal. Skip the `If-Match` precondition on the `names/<name>`
-  PUT (unconditional Overwrite). Do **not** drain the previous
-  owner's WAL — it's unreachable. The `handoff_snapshot` field on
-  the released record is set to the previous fork's last published
-  handoff snapshot (walk back through `parent` if the current fork
-  never published).
+  refusal. Run segment-listing replay → mint synthesised handoff
+  snapshot → unconditional Overwrite of `names/<name>` flipping to
+  `released` with the synthesised snapshot ULID recorded in
+  `handoff_snapshot`. Do **not** drain the previous owner's WAL.
 - [ ] **`--to <coordinator_id>` flag on `volume release`.** Same
   drain + handoff path as bare `release`, but writes
   `state=reserved` with `coordinator_id=<X>` instead of `released`
   with cleared identity. Composes with `--force` (which then skips
-  the foreign-owner check too). `mark_claimed` gains a
-  `Reserved → Live` arm that requires `coordinator_id == self`;
-  refusal for foreign-target reservations happens before the
-  conditional PUT, with an error naming the intended claimer.
-- [ ] **Open question (carried, not resolved by this plan):**
-  what's the parent pin when the current `names/<name>` value points
-  at a fork that exists in S3 but has *never published a handoff
-  snapshot* (coordinator crashed mid-`start`)? Two candidates:
-  (a) walk back to the *grandparent* — i.e. the last fork that did
-  publish a handoff snapshot — losing the orphan's writes;
-  (b) treat the orphan as live and require the operator to specify
-  an explicit pin.
-  This connects to the broader recovery question of an implicit
-  "now" snapshot. Track separately; do not block Phase 3 on it —
-  ship with option (a) as the default and document it.
+  the foreign-owner check too and uses the synthesised snapshot
+  path). `mark_claimed` gains a `Reserved → Live` arm that requires
+  `coordinator_id == self`; refusal for foreign-target reservations
+  happens before the conditional PUT, with an error naming the
+  intended claimer.
+- [ ] **Synthesised-snapshot verification on `start --remote`.**
+  When a `released` / `reserved` record's `handoff_snapshot` points
+  at a snapshot record carrying `synthesised_from_recovery=true`,
+  the claiming coordinator: (i) fetches the recovering coordinator's
+  pubkey from `coordinators/<recovering_coordinator_id>/coordinator.pub`,
+  (ii) verifies the snapshot's Ed25519 signature against it,
+  (iii) recomputes `coordinator_id` from the fetched pub and confirms
+  the path matches. Any failure refuses the claim with a clear error.
+  Non-synthesised handoff snapshots use the existing per-volume
+  signature path unchanged.
 - [ ] **Tests:** force-release after simulated coordinator death
-  (kill the writing process between snapshot publication and
+  (kill the writing process between segment uploads and
   `names/<name>` rewrite, then `release --force` + `start --remote`
-  from a second coordinator); force-release when the previous fork
-  has no published snapshots (option (a) fallback path);
-  `release --to <X>` followed by `start --remote` on X (succeeds)
-  and on Y (refused before conditional PUT).
+  from a second coordinator); force-release when the dead fork
+  never published a snapshot (segment-listing replay covers it);
+  force-release skips a tampered segment whose signature fails
+  verification; `release --to <X>` followed by `start --remote` on
+  X (succeeds) and on Y (refused before conditional PUT);
+  `start --remote` against a synthesised snapshot signed by a
+  pubkey whose derivation doesn't match the bucket path (refused);
+  `start --remote` against a synthesised snapshot whose signing
+  coordinator's pub is missing from the bucket (refused with a
+  clear error).
 
 **Phase exit criteria:** an operator can recover a name from a dead
-coordinator. The "no published snapshot" fallback behaviour is
-documented.
+coordinator and the recovered fork includes every segment the dead
+owner successfully promoted to S3. The synthesised handoff snapshot
+is independently verifiable from bucket-public material.
 
 ---
 
@@ -380,20 +490,24 @@ state.
 These don't block any single phase but want a tracked answer before
 the work fully closes:
 
-1. **Force-takeover fallback semantics** (Phase 3 open question).
-   Connects to broader recovery questions about implicit "now"
-   snapshots.
-2. **Garbage collection across migration-driven fork chains.** The
+1. **Garbage collection across migration-driven fork chains.** The
    existing GC and dedup paths handle ancestry; whether they handle
    the *traffic pattern* of frequent migrations (long thin chains
    with small per-fork tails) is worth a focused look. Probably a
    real exercise in Phase 5 testing.
-3. **`volume materialize` ergonomics for chain compaction.** Already
+2. **`volume materialize` ergonomics for chain compaction.** Already
    exists (`design-replica-model.md`) but is "deferred". Frequent
    migrations will accelerate the case for landing it; track
    separately.
-4. **Bucket-capability probe failure modes.** If the probe itself
+3. **Bucket-capability probe failure modes.** If the probe itself
    fails (transient network error, unrelated S3 error), do we fail
    closed (refuse portable verbs) or fail open? Probably fail closed
    with a clear "couldn't determine bucket capabilities" error.
    Decide before Phase 4 ships.
+4. **Coordinator pubkey caching / refresh.** The
+   `coordinators/<coord_id>/coordinator.pub` write is one-shot at
+   coordinator startup; readers fetch fresh on each verification.
+   Decide whether claimants should cache pubs locally and how often
+   they refresh. Not blocking — fresh-fetch on every verification
+   is correct and the cost is one small GET per `start --remote`
+   against a synthesised snapshot.
