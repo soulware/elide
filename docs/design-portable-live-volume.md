@@ -132,11 +132,18 @@ Verbs and their state transitions:
   `start`.
 - **`volume stop --release`** — convenience for `stop` then
   `release` in one verb.
-- **`volume start <name>`** — claim. Allowed when:
-  (a) `state=stopped` and `coordinator_id=self` (local resume),
-  (b) `state=released` (any coordinator).
-  Rejected with a clear error otherwise; `--force-takeover` is the
-  documented override.
+- **`volume start <name>`** — claim. Defaults to **local-only**:
+  the coordinator must already have local state for `<name>`
+  (a `by_name/<name>` symlink with usable on-disk data). Allowed
+  local cases: (a) record absent locally but a stopped fork exists
+  for resume, (b) prior in-place reclaim of a `released` record this
+  host last owned. Names with no local data are refused with a
+  pointer to `volume start --remote <name>`. **`--remote`** opts
+  into the S3 claim-from-released path: pulls the released fork's
+  ancestor chain and mints a fresh local fork. Defaulting local
+  avoids surprising network pulls and unintended cross-host
+  takeovers; `--force-takeover` (which implies `--remote`) is the
+  override for non-released states.
 - **Coordinator graceful shutdown / crash** — does not change
   `state`. A coordinator coming back up sees its own
   `coordinator_id` in `live` or `stopped` records and resumes; no
@@ -326,31 +333,48 @@ coordinator. Other coordinators are refused (without
 
 ### `volume start <name>` — claim ownership
 
-1. Read `names/<name>`. Allowed when:
-   - record is absent, or
-   - `state == "released"` (any coordinator may claim), or
-   - `state == "stopped"` and `coordinator_id == self` (local
-     resume), or
-   - `state == "live"` and `coordinator_id == self` (idempotent —
-     already running here).
+`volume start` defaults to **local-only**. It will not reach into
+S3 unless `--remote` (or `--force-takeover`, which implies
+`--remote`) is passed. Defaulting local avoids surprising network
+pulls and unintended cross-host takeovers — the user must signal
+intent to claim a name from the bucket.
 
-   Otherwise refuse with a clear error pointing at
-   `--force-takeover`.
+1. **Local resolution.** Look up `<name>` against this
+   coordinator's local state (`by_name/<name>` plus any locally
+   known record). Allowed local cases:
+   - already running here (`state=live`, `coordinator_id=self`) —
+     idempotent no-op,
+   - local resume (`state=stopped`, `coordinator_id=self`) — reuse
+     the existing fork; flip `state` back to `live` via conditional
+     PUT; restart the daemon. No new ULID, no snapshot, no fork.
+   - in-place reclaim (record was `released` but the released
+     `vol_ulid` matches a local fork this host still has) — flip
+     to `live` via `mark_reclaimed_local` keeping the same ULID.
 
-2. **Local-resume path** (`stopped`, this coordinator): reuse the
-   existing local fork; flip `state` back to `live` via conditional
-   PUT; restart the daemon. No new ULID, no snapshot, no fork.
+2. **No local state for `<name>`.** Refuse with a clear error:
+   ```
+   error: volume 'mydb' not found locally.
+     to claim it from the bucket, run: elide volume start --remote mydb
+   ```
+   Do **not** reach into S3.
 
-3. **Claim-from-released path**: mint a fresh `<new_ulid>`,
-   generate a fresh Ed25519 keypair, create `by_id/<new_ulid>/`
-   locally with provenance pointing at the released fork's
+3. **`--remote` (claim-from-released).** Read `names/<name>`. If
+   `state == "released"`, mint a fresh `<new_ulid>`, generate a
+   fresh Ed25519 keypair, create `by_id/<new_ulid>/` locally with
+   provenance pointing at the released fork's
    `<vol_ulid>/<handoff_snap_ulid>`, publish `volume.pub` and signed
    provenance. Conditional PUT to `names/<name>`:
    `vol_ulid = <new_ulid>`, `coordinator_id = self`, `state = "live"`,
-   `parent = <previous>`. Begin serving.
+   `parent = <previous>`. Begin serving. If `state` is anything
+   other than `released`, refuse and point at `--force-takeover`.
 
-The "magic feel" property holds: one verb, the right thing happens
-based on state.
+4. **`--force-takeover`** is the override for non-released states
+   (e.g. claiming a name still marked `live` by an unreachable
+   coordinator). Implies `--remote`.
+
+One verb, three intents made explicit through flags: bare = local,
+`--remote` = claim from bucket, `--force-takeover` = override an
+existing owner.
 
 ### `volume stop` and `volume release` are not coordinator shutdown
 
@@ -429,11 +453,11 @@ Portability does not change the local symlink shape, but the
 view. `by_name/` becomes a per-host cache of "names this host knows
 about and currently has materialised data for".
 
-`volume list` gains an `owner` column with values like `self`,
-`<other-coordinator-id> (host: <hostname>)`, `stopped`,
-`stale (last seen <coordinator-id>)`.
+`volume list` stays a local-only view — it does not reach S3.
+Per-name authoritative state lives in `names/<name>` and is
+queried via `volume status --remote <name>` (see below).
 
-### `volume remote` collapses into `volume`
+### `volume remote` goes away
 
 Today the CLI has a separate `volume remote` namespace
 (`remote list`, `remote pull`) for operations against volumes that
@@ -445,23 +469,26 @@ ever materialised it locally.
 
 The mapping:
 
-- `volume remote list` → folds into `volume list`, but the default
-  stays **local-only**: only volumes this coordinator currently owns
-  or has local data for. A flag (e.g. `--all` or `--remote`)
-  expands the view to **every** name in `names/`, including ones
-  currently held by another coordinator. Eligibility is shown as
-  a column, not used to filter — operators want visibility into
-  "host-B currently holds this name" for diagnostics, even though
-  they couldn't `start` it without `--force-takeover`. Columns
-  apply to both views: `local data: yes/no`, `owner`, `state`, and
-  `eligible: yes/no`.
-- `volume remote pull` → no longer a distinct verb. `volume start
-  <name>` is sufficient: it forks from the most recent published
-  snapshot, fetches what it needs lazily through the existing
-  demand-fetch path, and warms the local cache as reads happen.
-  Operators who want eager hydration can compose with `volume
-  materialize` (already in the replica model) — orthogonal to
-  start.
+- `volume remote list` → **removed**, not folded in. Listing every
+  name in `names/` does not scale (a bucket may hold thousands of
+  named volumes), and an unbounded enumeration is not a useful
+  default. `volume list` stays strictly local: names this
+  coordinator currently owns or has local data for. The `--all`
+  flag keeps its existing local-only meaning (include ancestor
+  forks); it does **not** reach S3.
+- `volume status <name>` is the per-name query. The default is
+  local: it reports what this coordinator knows about `<name>` from
+  its own state. With `--remote`, it fetches `names/<name>` from S3
+  and reports the authoritative record (`vol_ulid`, `state`,
+  `coordinator_id`, `hostname`, `claimed_at`, eligibility for this
+  coordinator). The user must already know the name — there is no
+  discovery path through the CLI.
+- `volume remote pull` → removed. `volume start <name>` is
+  sufficient: it forks from the most recent published snapshot,
+  fetches what it needs lazily through the existing demand-fetch
+  path, and warms the local cache as reads happen. Operators who
+  want eager hydration can compose with `volume materialize`
+  (already in the replica model) — orthogonal to start.
 - `volume create --from <vol_ulid>/<snap_ulid>` is unchanged: the
   way to fork a *new logical volume* off a snapshot stays distinct
   from claiming an existing name.
@@ -476,8 +503,8 @@ locality:
 - `state ∈ {live, stopped}, coordinator_id = other` → not eligible
   without `--force-takeover`.
 
-`volume list` surfaces this directly. There is no second namespace
-to learn.
+`volume status --remote <name>` surfaces this for a single name.
+There is no second namespace to learn, and no unbounded listing.
 
 ### Replica model
 

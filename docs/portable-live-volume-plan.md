@@ -178,17 +178,26 @@ on the bucket-capability probe from Phase 0 — see Phase 4.
 
 #### `volume start <name>` — claim ownership
 
+`volume start` defaults to **local-only**; the bucket is only
+consulted when `--remote` (or `--force-takeover`) is passed.
+Defaulting local avoids surprising network pulls and unintended
+cross-host takeovers.
+
 - [x] **Local-resume path** — `state == "stopped"` and
   `coordinator_id == self`. `lifecycle::mark_live` flips `state` back
   to `live`; existing local-restart logic clears the marker and
   notifies the supervisor. No new ULID, no fork, no snapshot.
 - [x] **Already-live path** — idempotent OK if record says we
   already own it as Live (covers daemon-restart races).
+- [x] **In-place reclaim** — `state == "released"` and the released
+  `vol_ulid` matches a local fork still on this host;
+  `mark_reclaimed_local` flips back to `live` keeping the same ULID.
 - [x] **Refusal paths** — foreign-owner records refuse with
   pointer at `--force-takeover` (Phase 3).
-- [x] **Claim-from-released path** — `state == "released"`.
-  Coordinator's `start` op returns `released <vol_ulid> <snap_ulid>`;
-  the CLI orchestrates the claim:
+- [x] **Claim-from-released path** — `state == "released"`,
+  no local data. Currently runs on bare `volume start`; **needs to
+  move behind `--remote`**. Coordinator's `start` op returns
+  `released <vol_ulid> <snap_ulid>`; the CLI orchestrates the claim:
   1. Pull the released ancestor if not local (via existing
      `remote_pull`).
   2. Mint a fresh local fork via the existing `fork-create` IPC.
@@ -203,6 +212,11 @@ on the bucket-capability probe from Phase 0 — see Phase 4.
   points at the released ancestor (we previously owned and
   released this name) or is dangling. Refuses cleanly when the
   symlink targets an unrelated local ULID.
+- [ ] **Gate claim-from-released behind `--remote`.** Bare
+  `volume start <name>` with no local data refuses with
+  `volume 'mydb' not found locally; to claim from bucket, run: elide
+  volume start --remote mydb`. The `--remote` flag opts into the
+  S3 path above.
 
 #### Other Phase 2 work
 
@@ -225,8 +239,9 @@ works as today.
 
 ### Phase 3 — Force takeover
 
-- [ ] **`--force-takeover` flag on `volume start`.** Same flow as the
-  cross-coordinator start path, but:
+- [ ] **`--force-takeover` flag on `volume start`.** Implies
+  `--remote` (always reaches S3). Same flow as the cross-coordinator
+  start path, but:
   - Skip the `state == "live"` refusal.
   - Skip the `If-Match` precondition on the `names/<name>` PUT
     (use `If-None-Match: *` if the record is gone, otherwise
@@ -258,14 +273,21 @@ documented.
 
 The "feels like magic" UX work. Depends on Phase 0–3.
 
-- [ ] **`volume list` redesign.**
-  - Default view: local-only — names this coordinator owns or has
-    materialised data for. No S3 listing on the routine path.
-  - `--all` flag: enumerate every entry in `names/`. Eligibility
-    shown as a column, not used to filter.
-  - Columns: `name`, `vol_ulid`, `local_data` (yes/no),
-    `owner` (`self` / `<other-coordinator-id> (host: <hostname>)` /
-    `stopped`), `state`, `eligible`.
+- [ ] **`volume list` stays local.**
+  - View: names this coordinator owns or has materialised data for.
+    Never lists `names/` in S3 — bucket may hold thousands of names
+    and unbounded enumeration is not a useful default.
+  - `--all` keeps its existing local-only meaning (include ancestor
+    forks); it does **not** reach S3.
+  - Columns: `name`, `vol_ulid`, `mode`, `state`, `transport`,
+    `pid` (current shape).
+- [ ] **`volume status <name>` gains `--remote`.**
+  - Default: local — what this coordinator knows about `<name>`.
+  - `--remote`: fetches `names/<name>` from S3 and prints the
+    authoritative record (`vol_ulid`, `state`, `coordinator_id`,
+    `hostname`, `claimed_at`) plus eligibility for this
+    coordinator. Errors clearly if `<name>` is not present in the
+    bucket.
 - [ ] **Hard-remove `volume remote`.** Delete the `Remote`
   subcommand and `RemoteCommand` enum from `src/main.rs`. Delete
   `remote_list` and `remote_pull` helpers and their callers. Remove
@@ -277,12 +299,13 @@ The "feels like magic" UX work. Depends on Phase 0–3.
   refuse with the documented error pointing the user at `volume
   create --from <vol_ulid>/<snap_ulid>`. (Phase 0 wiring; surfaced
   here.)
-- [ ] **Tests:** golden-file tests for `volume list` output in
-  the default and `--all` modes; integration test for the
+- [ ] **Tests:** golden-file tests for `volume list` (local) and
+  `volume status --remote` output; integration test for the
   non-portable-bucket error path.
 
 **Phase exit criteria:** the CLI is unified. `volume remote` no
-longer exists. Default `volume list` is fast and offline.
+longer exists. `volume list` is fast and offline; per-name S3
+lookups go through `volume status --remote`.
 
 ---
 
