@@ -54,6 +54,18 @@ pub struct CoordinatorIdentity {
     macaroon_root: [u8; 32],
 }
 
+/// Treat the coordinator's identity keypair as a `SegmentSigner` so
+/// it can sign synthesised handoff snapshots produced by
+/// `volume release --force`. The signing input is identical to any
+/// other Ed25519 signature; the key is the coordinator's identity
+/// rather than a per-volume key.
+impl elide_core::segment::SegmentSigner for CoordinatorIdentity {
+    fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        self.signing_key.sign(msg).to_bytes()
+    }
+}
+
 impl std::fmt::Debug for CoordinatorIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoordinatorIdentity")
@@ -107,16 +119,6 @@ impl CoordinatorIdentity {
     /// Public (verifying) half of the keypair.
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
-    }
-
-    /// Sign a message with the coordinator's private key.
-    ///
-    /// Used by Phase 3 to sign synthesised handoff snapshots produced
-    /// during `volume release --force` recovery.
-    #[allow(dead_code)]
-    pub fn sign(&self, message: &[u8]) -> ed25519_dalek::Signature {
-        use ed25519_dalek::Signer;
-        self.signing_key.sign(message)
     }
 
     /// Publish `coordinator.pub` to S3 at
@@ -454,11 +456,13 @@ mod tests {
 
     #[test]
     fn sign_produces_signature_verifiable_against_published_pub() {
+        use ed25519_dalek::{Signature, Verifier};
+        use elide_core::segment::SegmentSigner;
+
         let tmp = TempDir::new().unwrap();
         let id = CoordinatorIdentity::load_or_generate(tmp.path()).unwrap();
         let msg = b"synthesised handoff snapshot test";
-        let sig = id.sign(msg);
-        use ed25519_dalek::Verifier;
+        let sig = Signature::from_bytes(&id.sign(msg));
         id.verifying_key()
             .verify(msg, &sig)
             .expect("sig verifies against own pubkey");

@@ -56,6 +56,11 @@ pub struct IpcContext {
     /// 32-byte MAC root for `macaroon::mint` / `macaroon::verify`,
     /// derived in-memory from `coordinator.key` at startup.
     pub macaroon_root: [u8; 32],
+    /// The coordinator's identity bundle, used as a `SegmentSigner`
+    /// when minting synthesised handoff snapshots during
+    /// `volume release --force`. Arc-shared so per-connection clones
+    /// stay cheap.
+    pub identity: Arc<crate::identity::CoordinatorIdentity>,
     pub issuer: Arc<dyn CredentialIssuer>,
 }
 
@@ -222,18 +227,44 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
 
         "release" => {
             if args.is_empty() {
-                return "err usage: release <volume>".to_string();
+                return "err usage: release <volume> [--force] [--to <coord_id>]".to_string();
             }
-            release_volume_op(
-                args,
-                &ctx.data_dir,
-                &ctx.snapshot_locks,
-                &ctx.store,
-                ctx.part_size_bytes,
-                &ctx.coord_id,
-                &ctx.rescan,
-            )
-            .await
+            let parsed = match parse_release_args(args) {
+                Ok(p) => p,
+                Err(msg) => return format!("err {msg}"),
+            };
+            if parsed.force {
+                force_release_volume_op(
+                    parsed.name,
+                    parsed.target.as_deref(),
+                    &ctx.store,
+                    &ctx.identity,
+                )
+                .await
+            } else if let Some(target) = parsed.target.as_deref() {
+                release_to_volume_op(
+                    parsed.name,
+                    target,
+                    &ctx.data_dir,
+                    &ctx.snapshot_locks,
+                    &ctx.store,
+                    ctx.part_size_bytes,
+                    &ctx.coord_id,
+                    &ctx.rescan,
+                )
+                .await
+            } else {
+                release_volume_op(
+                    parsed.name,
+                    &ctx.data_dir,
+                    &ctx.snapshot_locks,
+                    &ctx.store,
+                    ctx.part_size_bytes,
+                    &ctx.coord_id,
+                    &ctx.rescan,
+                )
+                .await
+            }
         }
 
         "claim" => {
@@ -1945,6 +1976,208 @@ async fn wait_for_control_sock(vol_dir: &Path, timeout: std::time::Duration) -> 
     false
 }
 
+/// Parsed shape of a `release` IPC line.
+///
+/// Wire format (after the leading `release` verb): `<name> [--force]
+/// [--to <coord_id>]`. Order of the two flags is irrelevant; both,
+/// either, or neither may be present.
+struct ParsedReleaseArgs<'a> {
+    name: &'a str,
+    force: bool,
+    target: Option<String>,
+}
+
+fn parse_release_args(args: &str) -> Result<ParsedReleaseArgs<'_>, String> {
+    let mut tokens = args.split_whitespace();
+    let name = tokens
+        .next()
+        .ok_or_else(|| "usage: release <volume> [--force] [--to <coord_id>]".to_owned())?;
+    let mut force = false;
+    let mut target: Option<String> = None;
+    while let Some(tok) = tokens.next() {
+        match tok {
+            "--force" => {
+                if force {
+                    return Err("--force specified twice".to_owned());
+                }
+                force = true;
+            }
+            "--to" => {
+                if target.is_some() {
+                    return Err("--to specified twice".to_owned());
+                }
+                let id = tokens
+                    .next()
+                    .ok_or_else(|| "--to requires a coord_id argument".to_owned())?;
+                target = Some(id.to_owned());
+            }
+            other => return Err(format!("unrecognised release flag: {other}")),
+        }
+    }
+    Ok(ParsedReleaseArgs {
+        name,
+        force,
+        target,
+    })
+}
+
+/// `volume release --force [--to <coord_id>]`.
+///
+/// Override path for an unreachable previous owner: synthesise a
+/// fresh handoff snapshot from S3-visible segments under the dead
+/// fork's prefix, sign it with this coordinator's identity key, and
+/// unconditionally rewrite `names/<name>` to `Released` (or
+/// `Reserved` if `target` is set).
+///
+/// Does **not** require a local symlink, does **not** drain any WAL
+/// (the dead owner's WAL is unreachable), does **not** halt or touch
+/// any local volume daemon. The data-loss boundary is "writes the
+/// dead owner accepted but never promoted to S3" — same as the
+/// crash-recovery contract elsewhere.
+async fn force_release_volume_op(
+    volume_name: &str,
+    target: Option<&str>,
+    store: &Arc<dyn ObjectStore>,
+    identity: &Arc<crate::identity::CoordinatorIdentity>,
+) -> String {
+    use elide_coordinator::lifecycle::{self, ForceReleaseOutcome};
+    use elide_coordinator::recovery;
+
+    // Read the current record to learn which dead fork to recover from.
+    let dead_vol_ulid =
+        match elide_coordinator::name_store::read_name_record(store, volume_name).await {
+            Ok(Some((rec, _))) => {
+                use elide_core::name_record::NameState;
+                match rec.state {
+                    NameState::Live | NameState::Stopped => rec.vol_ulid,
+                    other => {
+                        return format!(
+                            "err names/{volume_name} is in state {other:?}; \
+                         force-release only overrides Live or Stopped records"
+                        );
+                    }
+                }
+            }
+            Ok(None) => return format!("err name '{volume_name}' has no S3 record"),
+            Err(e) => return format!("err reading names/{volume_name}: {e}"),
+        };
+
+    // Recovery pipeline: fetch dead fork's pubkey, list+verify
+    // segments, mint+sign+publish synthesised handoff snapshot.
+    let dead_pub = match recovery::fetch_volume_pub(store, dead_vol_ulid).await {
+        Ok(k) => k,
+        Err(e) => {
+            return format!("err fetching volume.pub for dead fork {dead_vol_ulid}: {e:#}");
+        }
+    };
+    let recovered = match recovery::list_and_verify_segments(store, dead_vol_ulid, &dead_pub).await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return format!("err listing/verifying segments for dead fork {dead_vol_ulid}: {e:#}");
+        }
+    };
+    let segment_ulids: Vec<ulid::Ulid> =
+        recovered.segments.iter().map(|s| s.segment_ulid).collect();
+    info!(
+        "[inbound] force-release {volume_name}: recovered {} segments \
+         ({} dropped) from dead fork {dead_vol_ulid}",
+        segment_ulids.len(),
+        recovered.dropped,
+    );
+
+    let published = match recovery::mint_and_publish_synthesised_snapshot(
+        store,
+        dead_vol_ulid,
+        &segment_ulids,
+        identity.as_ref(),
+        identity.coordinator_id_str(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => return format!("err publishing synthesised snapshot: {e}"),
+    };
+
+    // Unconditional flip of names/<name>.
+    let outcome = if let Some(target_id) = target {
+        lifecycle::mark_released_force_to(store, volume_name, target_id, published.snap_ulid).await
+    } else {
+        lifecycle::mark_released_force(store, volume_name, published.snap_ulid).await
+    };
+    match outcome {
+        Ok(ForceReleaseOutcome::Overwritten { dead_vol_ulid: d }) => {
+            let kind = if target.is_some() {
+                "reserved"
+            } else {
+                "released"
+            };
+            info!(
+                "[inbound] force-{kind} volume {volume_name} (dead fork {d}) at \
+                 synthesised handoff snapshot {}",
+                published.snap_ulid,
+            );
+            format!("ok {}", published.snap_ulid)
+        }
+        Ok(ForceReleaseOutcome::Absent) => {
+            // Race: record disappeared between our read and our write.
+            format!("err names/{volume_name} vanished between read and force-write")
+        }
+        Ok(ForceReleaseOutcome::InvalidState { observed }) => {
+            // Race: state changed under us. The synthesised snapshot
+            // is still published (harmless); operator can retry.
+            format!("err names/{volume_name} changed underneath us; now in state {observed:?}")
+        }
+        Err(e) => format!(
+            "err force-release flip failed (synthesised snapshot {} already published): {e}",
+            published.snap_ulid
+        ),
+    }
+}
+
+/// `volume release --to <coord_id>` — targeted handoff.
+///
+/// Identical to `release_volume_op` (drain, halt, snapshot) but the
+/// final step is `mark_released_to` instead of `mark_released`. The
+/// resulting record is `Reserved` for `target_coord_id`, closing the
+/// post-release race window so only the named coordinator can claim.
+async fn release_to_volume_op(
+    volume_name: &str,
+    target_coord_id: &str,
+    data_dir: &Path,
+    snapshot_locks: &SnapshotLockRegistry,
+    store: &Arc<dyn ObjectStore>,
+    part_size_bytes: usize,
+    coord_id: &str,
+    rescan: &Notify,
+) -> String {
+    // Reuse the bare release path up through the snapshot publish, then
+    // route to mark_released_to instead of mark_released. To avoid
+    // duplicating ~150 lines of careful drain+shutdown logic, we factor
+    // the final state flip out via a small enum.
+    release_with_final_flip(
+        volume_name,
+        ReleaseFinalFlip::Reserved {
+            target_coord_id: target_coord_id.to_owned(),
+        },
+        data_dir,
+        snapshot_locks,
+        store,
+        part_size_bytes,
+        coord_id,
+        rescan,
+    )
+    .await
+}
+
+/// Final-step variant for `release_with_final_flip`.
+enum ReleaseFinalFlip {
+    /// Plain release: flip to `Released`, clear identity fields.
+    Released,
+    /// Targeted release: flip to `Reserved` for `target_coord_id`.
+    Reserved { target_coord_id: String },
+}
+
 /// Relinquish ownership of `<volume_name>` so any other coordinator can
 /// `volume start` it. Composes the existing snapshot path:
 ///
@@ -1961,6 +2194,33 @@ async fn wait_for_control_sock(vol_dir: &Path, timeout: std::time::Duration) -> 
 ///    recording the handoff snapshot ULID.
 async fn release_volume_op(
     volume_name: &str,
+    data_dir: &Path,
+    snapshot_locks: &SnapshotLockRegistry,
+    store: &Arc<dyn ObjectStore>,
+    part_size_bytes: usize,
+    coord_id: &str,
+    rescan: &Notify,
+) -> String {
+    release_with_final_flip(
+        volume_name,
+        ReleaseFinalFlip::Released,
+        data_dir,
+        snapshot_locks,
+        store,
+        part_size_bytes,
+        coord_id,
+        rescan,
+    )
+    .await
+}
+
+/// Implementation behind both `release_volume_op` (final flip =
+/// `Released`) and `release_to_volume_op` (final flip = `Reserved`
+/// for a specific target). The drain → snapshot → halt path is
+/// identical; only the final `mark_*` call differs.
+async fn release_with_final_flip(
+    volume_name: &str,
+    final_flip: ReleaseFinalFlip,
     data_dir: &Path,
     snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
@@ -2098,11 +2358,31 @@ async fn release_volume_op(
         }
     }
 
-    // Final step: flip names/<name> to Released, recording the handoff
-    // snapshot. From this point any coordinator may claim the name.
-    match lifecycle::mark_released(store, volume_name, coord_id, snap_ulid).await {
-        Ok(_) => {
-            info!("[inbound] released volume {volume_name} at handoff snapshot {snap_ulid}");
+    // Final step: flip names/<name> to Released or Reserved,
+    // recording the handoff snapshot. From this point the next
+    // claimant (any coordinator for `Released`, the named one for
+    // `Reserved`) may claim the name.
+    let flip_result = match &final_flip {
+        ReleaseFinalFlip::Released => {
+            lifecycle::mark_released(store, volume_name, coord_id, snap_ulid)
+                .await
+                .map(|_| ())
+        }
+        ReleaseFinalFlip::Reserved { target_coord_id } => {
+            lifecycle::mark_released_to(store, volume_name, coord_id, target_coord_id, snap_ulid)
+                .await
+                .map(|_| ())
+        }
+    };
+    match flip_result {
+        Ok(()) => {
+            let kind = match &final_flip {
+                ReleaseFinalFlip::Released => "released".to_owned(),
+                ReleaseFinalFlip::Reserved { target_coord_id } => {
+                    format!("released-to {target_coord_id}")
+                }
+            };
+            info!("[inbound] {kind} volume {volume_name} at handoff snapshot {snap_ulid}");
             format!("ok {snap_ulid}")
         }
         Err(e) => {

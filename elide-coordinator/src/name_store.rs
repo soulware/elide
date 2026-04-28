@@ -145,6 +145,27 @@ pub async fn update_name_record(
     Ok(put_result_to_version(r))
 }
 
+/// **Unconditionally** overwrite `names/<name>`, ignoring any
+/// existing record's ETag. Used by `volume release --force` when
+/// the previous owner is unreachable: there is no
+/// "expected current state" to condition on, because the override is
+/// the whole point of the verb. All other writers MUST use
+/// `create_name_record` or `update_name_record` so concurrent claims
+/// resolve cleanly through conditional PUT.
+pub async fn overwrite_name_record(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    record: &NameRecord,
+) -> Result<UpdateVersion, NameStoreError> {
+    let body = serialise(record)?;
+    let key = name_key(name);
+    let r = store
+        .put(&key, body.into())
+        .await
+        .map_err(NameStoreError::Store)?;
+    Ok(put_result_to_version(r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

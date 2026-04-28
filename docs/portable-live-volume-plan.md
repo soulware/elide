@@ -400,20 +400,31 @@ may claim). Composes with `--force`.
   improbable) ULID-collision path. 3 new tests verify the round
   trip via the existing `read_snapshot_manifest`, cross-class key
   rejection, and the conditional-create precondition.
-- [ ] **`--force` flag on `volume release`.** Skip the foreign-owner
-  refusal. Run segment-listing replay → mint synthesised handoff
-  snapshot → unconditional Overwrite of `names/<name>` flipping to
-  `released` with the synthesised snapshot ULID recorded in
-  `handoff_snapshot`. Do **not** drain the previous owner's WAL.
-- [ ] **`--to <coordinator_id>` flag on `volume release`.** Same
-  drain + handoff path as bare `release`, but writes
-  `state=reserved` with `coordinator_id=<X>` instead of `released`
-  with cleared identity. Composes with `--force` (which then skips
-  the foreign-owner check too and uses the synthesised snapshot
-  path). `mark_claimed` gains a `Reserved → Live` arm that requires
-  `coordinator_id == self`; refusal for foreign-target reservations
-  happens before the conditional PUT, with an error naming the
-  intended claimer.
+- [x] **`--force` flag on `volume release`.** Wired through the
+  CLI (`volume release <name> --force`), the IPC verb (`release
+  <name> --force`), and a new `force_release_volume_op` in
+  `inbound.rs`. The op composes the existing recovery primitives:
+  read current `names/<name>` for the dead `vol_ulid`, fetch the
+  dead fork's `volume.pub`, run `list_and_verify_segments`, mint
+  the synthesised handoff snapshot via
+  `mint_and_publish_synthesised_snapshot` (signed with the local
+  `CoordinatorIdentity`, which now `impl SegmentSigner`), then
+  unconditionally rewrite `names/<name>` via
+  `lifecycle::mark_released_force` (built on a new
+  `name_store::overwrite_name_record` helper). No local symlink,
+  drain, or daemon manipulation. 7 new lifecycle tests cover the
+  force/force-to transitions including `Reserved`/`Released`/`Readonly`
+  refusal arms.
+- [x] **`--to <coordinator_id>` flag on `volume release`.** Wired
+  through the CLI (`volume release <name> --to <id>` and
+  `volume stop --release --to <id>`), the IPC verb (`release <name>
+  --to <id>`), and a new `release_to_volume_op` in `inbound.rs`.
+  The drain → snapshot → halt path is shared with bare `release`
+  via a refactored `release_with_final_flip` helper; only the final
+  state-flip step differs (`mark_released_to` vs `mark_released`).
+  Composes with `--force` for the unreachable-owner case, where the
+  unconditional rewrite produces a `Reserved` record bound to the
+  named target.
 - [ ] **Synthesised-snapshot verification on `start --remote`.**
   When a `released` / `reserved` record's `handoff_snapshot` points
   at a snapshot record carrying `synthesised_from_recovery=true`,

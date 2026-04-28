@@ -380,13 +380,40 @@ pub fn stop_volume(socket_path: &Path, name: &str) -> io::Result<()> {
     }
 }
 
+/// Options for `release_volume`.
+#[derive(Default, Clone, Debug)]
+pub struct ReleaseOpts<'a> {
+    /// `--force`: override foreign ownership of `names/<name>`.
+    /// Skips the local drain (the dead owner's WAL is unreachable),
+    /// synthesises a handoff snapshot from S3-visible segments, signs
+    /// it with the local coordinator's identity key, and
+    /// unconditionally flips `names/<name>` to `released` (or
+    /// `reserved` if `to` is set).
+    pub force: bool,
+    /// `--to <coord_id>`: targeted handoff. Final state is `reserved`
+    /// for the named coordinator instead of `released`. Composes with
+    /// `force`.
+    pub to: Option<&'a str>,
+}
+
 /// Release a volume's name back to the pool so any other coordinator can
 /// claim it via `volume start`. Drains WAL, publishes a handoff snapshot,
 /// halts the daemon, and flips `names/<name>` to `state=released` with
 /// the snapshot ULID recorded so the next claimant can fork from it.
 /// Returns the handoff snapshot ULID on success.
-pub fn release_volume(socket_path: &Path, name: &str) -> io::Result<String> {
-    let resp = call(socket_path, &format!("release {name}"))?;
+///
+/// With `opts.force`, skips ownership and drain (used when the
+/// previous owner is unreachable). With `opts.to`, the final state is
+/// `reserved` for the named coordinator. Both compose.
+pub fn release_volume(socket_path: &Path, name: &str, opts: ReleaseOpts<'_>) -> io::Result<String> {
+    let mut cmd = format!("release {name}");
+    if opts.force {
+        cmd.push_str(" --force");
+    }
+    if let Some(target) = opts.to {
+        cmd.push_str(&format!(" --to {target}"));
+    }
+    let resp = call(socket_path, &cmd)?;
     match resp.split_once(' ') {
         Some(("ok", snap)) => Ok(snap.trim().to_owned()),
         Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),

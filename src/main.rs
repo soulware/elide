@@ -347,6 +347,12 @@ enum VolumeCommand {
         /// `volume start`. Equivalent to `volume release <name>`.
         #[arg(long)]
         release: bool,
+        /// With `--release`: hand off to a specific coordinator
+        /// (`names/<name>` flips to `reserved` rather than `released`).
+        /// Only the named coordinator may then claim. Equivalent to
+        /// `volume release --to <coord_id>`.
+        #[arg(long, value_name = "COORD_ID", requires = "release")]
+        to: Option<String>,
     },
 
     /// Start a previously stopped volume
@@ -364,6 +370,23 @@ enum VolumeCommand {
     Release {
         /// Volume name
         name: String,
+        /// Override foreign ownership when the previous owner is
+        /// unreachable. The recovering coordinator synthesises a
+        /// handoff snapshot from S3-visible segments under the dead
+        /// fork's prefix, signs it with its own coordinator key, and
+        /// unconditionally rewrites `names/<name>`.
+        ///
+        /// Skips local drain (the dead owner's WAL is unreachable).
+        /// Data-loss boundary: writes the dead owner accepted but
+        /// never promoted to S3.
+        #[arg(long)]
+        force: bool,
+        /// Targeted handoff: hand off to a specific coordinator.
+        /// `names/<name>` flips to `reserved` rather than `released`,
+        /// so only the named coordinator may then claim. Composes
+        /// with `--force`.
+        #[arg(long, value_name = "COORD_ID")]
+        to: Option<String>,
     },
 
     /// Interact with the remote object store
@@ -774,12 +797,19 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Stop { name, release } => {
+            VolumeCommand::Stop { name, release, to } => {
                 if release {
-                    match coordinator_client::release_volume(&socket_path, &name) {
-                        Ok(snap) => {
-                            println!("{name}: released at handoff snapshot {snap}");
-                        }
+                    let opts = coordinator_client::ReleaseOpts {
+                        force: false,
+                        to: to.as_deref(),
+                    };
+                    match coordinator_client::release_volume(&socket_path, &name, opts) {
+                        Ok(snap) => match to.as_deref() {
+                            Some(target) => {
+                                println!("{name}: released to {target} at handoff snapshot {snap}")
+                            }
+                            None => println!("{name}: released at handoff snapshot {snap}"),
+                        },
                         Err(e) => {
                             eprintln!("error: {e}");
                             std::process::exit(1);
@@ -824,10 +854,26 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Release { name } => {
-                match coordinator_client::release_volume(&socket_path, &name) {
+            VolumeCommand::Release { name, force, to } => {
+                let opts = coordinator_client::ReleaseOpts {
+                    force,
+                    to: to.as_deref(),
+                };
+                match coordinator_client::release_volume(&socket_path, &name, opts) {
                     Ok(snap) => {
-                        println!("{name}: released at handoff snapshot {snap}");
+                        let kind = match (force, to.as_deref()) {
+                            (false, None) => format!("released at handoff snapshot {snap}"),
+                            (false, Some(t)) => {
+                                format!("released to {t} at handoff snapshot {snap}")
+                            }
+                            (true, None) => {
+                                format!("force-released at synthesised handoff snapshot {snap}")
+                            }
+                            (true, Some(t)) => format!(
+                                "force-released to {t} at synthesised handoff snapshot {snap}"
+                            ),
+                        };
+                        println!("{name}: {kind}");
                     }
                     Err(e) => {
                         eprintln!("error: {e}");
