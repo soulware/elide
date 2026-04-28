@@ -262,6 +262,7 @@ pub fn new_registry() -> ImportRegistry {
 /// writes `volume.name`, `volume.readonly`, and `import.lock`, then spawns
 /// `elide-import`. On success, creates the `<data_dir>/by_name/<vol_name>`
 /// symlink. Returns the import job ULID.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_import(
     vol_name: &str,
     oci_ref: &str,

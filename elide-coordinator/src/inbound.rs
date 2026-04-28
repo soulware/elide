@@ -495,6 +495,7 @@ fn toml_quote(s: &str) -> String {
 
 // ── Import operations ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn start_import(
     vol_name: &str,
     oci_ref: &str,
@@ -916,6 +917,9 @@ fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<ulid::Ulid> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
+    // `Ulid::default()` is the nil ULID, not a fresh one — we explicitly
+    // want a freshly minted ULID when the index is empty.
+    #[allow(clippy::unwrap_or_default)]
     Ok(latest.unwrap_or_else(ulid::Ulid::new))
 }
 
@@ -1869,27 +1873,14 @@ async fn stop_volume_op(
     }
 }
 
-/// Relinquish ownership of `<volume_name>` so any other coordinator can
-/// `volume start` it. Composes the existing snapshot path:
+/// RAII guard that restores the original local state on drop.
 ///
-///   1. Refuse if the volume is readonly (no exclusive owner to release)
-///      or an NBD client is connected (must disconnect cleanly first).
-///   2. If the volume is `stopped`, transparently bring it back up
-///      (clear the marker, notify the supervisor, wait for
-///      `control.sock`) — the drain step needs a running daemon.
-///   3. Verify S3 ownership before doing the expensive drain.
-///   4. Drain WAL → publish handoff snapshot via `snapshot_volume`.
-///   5. Send shutdown RPC to halt the daemon.
-///   6. Write `volume.stopped` marker so the supervisor won't restart.
-///   7. Conditional PUT to `names/<name>` setting state=Released and
-///      recording the handoff snapshot ULID.
-/// RAII guard that restores the original local state on drop. Used by
-/// `release_volume_op` when it transparently restarts a stopped
-/// volume to perform the drain: the marker is cleaned up regardless
-/// of which exit path the function takes (success, error, panic),
-/// and on failure paths the `volume.stopped` marker is re-written so
-/// the volume returns to its pre-release state instead of being left
-/// running.
+/// Used by `release_volume_op` when it transparently restarts a
+/// stopped volume to perform the drain: the marker is cleaned up
+/// regardless of which exit path the function takes (success, error,
+/// panic), and on failure paths the `volume.stopped` marker is
+/// re-written so the volume returns to its pre-release state instead
+/// of being left running.
 struct DrainingMarkerGuard {
     vol_dir: std::path::PathBuf,
     /// Set to `true` once the release has reached a point where the
@@ -1988,6 +1979,20 @@ async fn wait_for_control_sock(vol_dir: &Path, timeout: std::time::Duration) -> 
     false
 }
 
+/// Relinquish ownership of `<volume_name>` so any other coordinator can
+/// `volume start` it. Composes the existing snapshot path:
+///
+/// 1. Refuse if the volume is readonly (no exclusive owner to release)
+///    or an NBD client is connected (must disconnect cleanly first).
+/// 2. If the volume is `stopped`, transparently bring it back up
+///    (clear the marker, notify the supervisor, wait for
+///    `control.sock`) — the drain step needs a running daemon.
+/// 3. Verify S3 ownership before doing the expensive drain.
+/// 4. Drain WAL → publish handoff snapshot via `snapshot_volume`.
+/// 5. Send shutdown RPC to halt the daemon.
+/// 6. Write `volume.stopped` marker so the supervisor won't restart.
+/// 7. Conditional PUT to `names/<name>` setting state=Released and
+///    recording the handoff snapshot ULID.
 async fn release_volume_op(
     volume_name: &str,
     data_dir: &Path,
