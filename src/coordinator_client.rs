@@ -523,6 +523,7 @@ pub fn fork_create(
     snap: Option<&str>,
     parent_key_hex: Option<&str>,
     flags: &[String],
+    for_claim: bool,
 ) -> io::Result<String> {
     let mut line = format!("fork-create {new_name} {source_ulid}");
     if let Some(s) = snap {
@@ -530,6 +531,13 @@ pub fn fork_create(
     }
     if let Some(k) = parent_key_hex {
         line.push_str(&format!(" parent-key={k}"));
+    }
+    if for_claim {
+        // Tell the coordinator to skip the `mark_initial` step: this
+        // fork-create is the materialise step of a claim-from-
+        // released flow. The CLI's subsequent `claim` IPC rebinds the
+        // existing `Released` record to the new fork.
+        line.push_str(" for-claim");
     }
     for f in flags {
         line.push(' ');

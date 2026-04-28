@@ -1532,6 +1532,7 @@ fn create_fork(
         snap_str.as_deref(),
         parent_key_hex.as_deref(),
         flags,
+        false, // brand-new name → mark_initial claims it
     )?;
     let new_fork_dir = by_id_dir.join(&new_vol_ulid);
     println!("{}", new_fork_dir.display());
@@ -1652,6 +1653,10 @@ fn claim_released_name(
 
     // Mint a fresh local fork. fork-create writes by_id/<new_ulid>/
     // and the by_name/<name> symlink, returns the new vol_ulid.
+    // The bucket record already exists in `Released` state; the
+    // `for_claim=true` flag tells the coordinator to skip
+    // `mark_initial` so we don't trip the AlreadyExists guard. The
+    // `claim` IPC below rebinds the record via `mark_claimed`.
     let new_vol_ulid = coordinator_client::fork_create(
         socket_path,
         name,
@@ -1659,6 +1664,7 @@ fn claim_released_name(
         Some(snap),
         None,
         &[],
+        true,
     )?;
 
     // Atomically rebind the bucket-side name to our new fork. If the

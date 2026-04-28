@@ -1587,10 +1587,17 @@ async fn fork_create_op(
         return format!("err invalid source ULID: {source_ulid_str}");
     }
 
-    // Pull off `snap=<ulid>` and `parent-key=<hex>` first; remaining tokens
-    // go to the transport-flag parser.
+    // Pull off `snap=<ulid>`, `parent-key=<hex>`, and `for-claim` first;
+    // remaining tokens go to the transport-flag parser. `for-claim`
+    // marks this fork-create as the materialise step of a
+    // claim-from-released flow: the name already exists in the bucket
+    // as `Released`, so we must NOT call `mark_initial` (which would
+    // fail with `AlreadyExists`). The CLI's subsequent `claim` IPC
+    // calls `mark_claimed` to atomically rebind the name to the new
+    // fork.
     let mut snap: Option<ulid::Ulid> = None;
     let mut parent_key: Option<elide_core::signing::VerifyingKey> = None;
+    let mut for_claim = false;
     let mut flag_tokens: Vec<&str> = Vec::new();
     for tok in rest.split_whitespace() {
         if let Some(v) = tok.strip_prefix("snap=") {
@@ -1607,6 +1614,8 @@ async fn fork_create_op(
                 Ok(k) => parent_key = Some(k),
                 Err(e) => return format!("err parent-key not a valid Ed25519 pubkey: {e}"),
             }
+        } else if tok == "for-claim" {
+            for_claim = true;
         } else {
             flag_tokens.push(tok);
         }
@@ -1656,45 +1665,55 @@ async fn fork_create_op(
     let new_vol_ulid = new_vol_ulid_value.to_string();
     let new_fork_dir = by_id_dir.join(&new_vol_ulid);
 
-    // Claim the name in S3 *before* materialising the fork. Same
-    // pattern as `create_volume_op`: lose the race cleanly with no
-    // partial local state if another coordinator already holds the
-    // name, and roll back the bucket-side claim if local fork-out
-    // fails.
-    use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
-    match mark_initial(store, new_name, root_key, new_vol_ulid_value).await {
-        Ok(MarkInitialOutcome::Claimed) => {}
-        Ok(MarkInitialOutcome::AlreadyExists {
-            existing_vol_ulid,
-            existing_state,
-            existing_owner,
-        }) => {
-            let owner = existing_owner.as_deref().unwrap_or("<unowned>");
-            return format!(
-                "err name '{new_name}' already exists in bucket \
-                 (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
-                 owner={owner})"
-            );
-        }
-        Err(LifecycleError::Store(e)) => {
-            return format!("err claiming name in bucket: {e}");
-        }
-        Err(LifecycleError::OwnershipConflict { held_by }) => {
-            return format!("err name held by another coordinator: {held_by}");
-        }
-        Err(LifecycleError::InvalidTransition { from, .. }) => {
-            return format!("err names/<name> is in unexpected state {from:?}");
+    // For brand-new names, claim in S3 *before* materialising the
+    // fork: lose the race cleanly with no partial local state if
+    // another coordinator already holds the name, and roll back the
+    // bucket-side claim if local fork-out fails. For the
+    // claim-from-released path (`for-claim` flag), the bucket record
+    // already exists as `Released` and the CLI's subsequent `claim`
+    // IPC handles the rebind via `mark_claimed`; we only do the
+    // local materialisation here.
+    if !for_claim {
+        use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
+        match mark_initial(store, new_name, root_key, new_vol_ulid_value).await {
+            Ok(MarkInitialOutcome::Claimed) => {}
+            Ok(MarkInitialOutcome::AlreadyExists {
+                existing_vol_ulid,
+                existing_state,
+                existing_owner,
+            }) => {
+                let owner = existing_owner.as_deref().unwrap_or("<unowned>");
+                return format!(
+                    "err name '{new_name}' already exists in bucket \
+                     (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
+                     owner={owner})"
+                );
+            }
+            Err(LifecycleError::Store(e)) => {
+                return format!("err claiming name in bucket: {e}");
+            }
+            Err(LifecycleError::OwnershipConflict { held_by }) => {
+                return format!("err name held by another coordinator: {held_by}");
+            }
+            Err(LifecycleError::InvalidTransition { from, .. }) => {
+                return format!("err names/<name> is in unexpected state {from:?}");
+            }
         }
     }
 
     // Local-only rollback. After a successful `mark_initial` claim,
     // every error-return path below also rolls back the bucket-side
-    // claim via `delete_name_claim` so the name is free to retry.
+    // claim via `rollback_claim` so the name is free to retry. In the
+    // `for-claim` path no such record was created here, so
+    // `rollback_claim` is a no-op.
     let cleanup = |fork_dir: &Path, link: &Path| {
         let _ = std::fs::remove_file(link);
         let _ = std::fs::remove_dir_all(fork_dir);
     };
     let rollback_claim = async || {
+        if for_claim {
+            return;
+        }
         let key = object_store::path::Path::from(format!("names/{new_name}"));
         if let Err(e) = store.delete(&key).await {
             warn!(
