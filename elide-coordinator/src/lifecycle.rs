@@ -281,6 +281,83 @@ pub async fn mark_live(
     Ok(MarkLiveOutcome::Resumed)
 }
 
+/// Outcome of a `mark_reclaimed_local` call.
+#[derive(Debug)]
+pub enum MarkReclaimedLocalOutcome {
+    /// `names/<name>` was updated from `Released` to `Live`, keeping
+    /// the existing `vol_ulid`. The caller (this coordinator) had the
+    /// matching local fork on disk so no new fork is needed.
+    Reclaimed,
+    /// `names/<name>` did not exist in the bucket. The caller should
+    /// fall back to the local-only start path.
+    Absent,
+    /// `names/<name>` is not `Released` — the caller asked for the
+    /// in-place reclaim path but the record is in some other state.
+    /// Includes the observed state and vol_ulid so the caller can
+    /// route to the right verb.
+    NotReleased {
+        observed_state: NameState,
+        observed_vol_ulid: Ulid,
+    },
+    /// `names/<name>` is `Released` but its `vol_ulid` does not match
+    /// the local fork the caller offered. The caller must take the
+    /// cross-coordinator claim path (mint a new fork, `mark_claimed`),
+    /// because the released ancestor is foreign content.
+    ForkMismatch {
+        local_vol_ulid: Ulid,
+        released_vol_ulid: Ulid,
+    },
+}
+
+/// In-place reclaim of a `Released` name when the local fork is the
+/// same one the record points at — i.e. the previous owner was *us*
+/// and the local fork is still on disk. Transitions
+/// `Released → Live` keeping the existing `vol_ulid`, repopulating
+/// `coordinator_id`/`claimed_at`/`hostname`, and clearing
+/// `handoff_snapshot` (it was the last published handoff; the new
+/// claim episode hasn't published one yet).
+///
+/// This is the natural path for `volume stop --release` followed by
+/// `volume start` on the same coordinator: nothing changed locally,
+/// nothing needs to be re-forked, the symlink stays where it is.
+/// Cross-coordinator claim (different host, no local fork) still
+/// goes through `mark_claimed` which mints a new `vol_ulid`.
+pub async fn mark_reclaimed_local(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    root_key: &[u8; 32],
+    local_vol_ulid: Ulid,
+) -> Result<MarkReclaimedLocalOutcome, LifecycleError> {
+    let coord_id = portable::format_coordinator_id(&portable::coordinator_id(root_key));
+
+    let Some((mut record, version)) = name_store::read_name_record(store, name).await? else {
+        return Ok(MarkReclaimedLocalOutcome::Absent);
+    };
+
+    if record.state != NameState::Released {
+        return Ok(MarkReclaimedLocalOutcome::NotReleased {
+            observed_state: record.state,
+            observed_vol_ulid: record.vol_ulid,
+        });
+    }
+
+    if record.vol_ulid != local_vol_ulid {
+        return Ok(MarkReclaimedLocalOutcome::ForkMismatch {
+            local_vol_ulid,
+            released_vol_ulid: record.vol_ulid,
+        });
+    }
+
+    record.state = NameState::Live;
+    record.coordinator_id = Some(coord_id);
+    record.claimed_at = Some(chrono::Utc::now().to_rfc3339());
+    record.hostname = current_hostname();
+    record.handoff_snapshot = None;
+
+    name_store::update_name_record(store, name, &record, version).await?;
+    Ok(MarkReclaimedLocalOutcome::Reclaimed)
+}
+
 /// Outcome of a `mark_initial` call (the create-time claim of a fresh
 /// name).
 #[derive(Debug)]
@@ -1068,6 +1145,99 @@ mod tests {
             a.coordinator_id, b.coordinator_id,
             "different root keys produce different coordinator ids"
         );
+    }
+
+    // ── mark_reclaimed_local ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_reclaimed_local_flips_released_to_live_keeping_vol_ulid() {
+        let s = store();
+        // Set up: claim via mark_initial, release.
+        mark_initial(&s, "vol", &key_a(), sample_ulid())
+            .await
+            .unwrap();
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+
+        // Reclaim in-place.
+        let outcome = mark_reclaimed_local(&s, "vol", &key_a(), sample_ulid())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MarkReclaimedLocalOutcome::Reclaimed));
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.state, NameState::Live);
+        assert_eq!(got.vol_ulid, sample_ulid(), "vol_ulid preserved");
+        assert!(got.coordinator_id.is_some());
+        assert!(got.claimed_at.is_some());
+        // handoff_snapshot was set on release; cleared on reclaim.
+        assert!(got.handoff_snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_reclaimed_local_returns_absent_when_record_missing() {
+        let s = store();
+        let outcome = mark_reclaimed_local(&s, "missing", &key_a(), sample_ulid())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MarkReclaimedLocalOutcome::Absent));
+    }
+
+    #[tokio::test]
+    async fn mark_reclaimed_local_reports_not_released_for_live_record() {
+        let s = store();
+        mark_initial(&s, "vol", &key_a(), sample_ulid())
+            .await
+            .unwrap();
+
+        let outcome = mark_reclaimed_local(&s, "vol", &key_a(), sample_ulid())
+            .await
+            .unwrap();
+        match outcome {
+            MarkReclaimedLocalOutcome::NotReleased {
+                observed_state,
+                observed_vol_ulid,
+            } => {
+                assert_eq!(observed_state, NameState::Live);
+                assert_eq!(observed_vol_ulid, sample_ulid());
+            }
+            _ => panic!("expected NotReleased, got {outcome:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_reclaimed_local_reports_fork_mismatch_for_foreign_release() {
+        // A different vol_ulid than the local fork → caller must use
+        // the cross-coordinator claim path, not the in-place reclaim.
+        let s = store();
+        mark_initial(&s, "vol", &key_a(), sample_ulid())
+            .await
+            .unwrap();
+        mark_released(&s, "vol", &key_a(), snap()).await.unwrap();
+
+        let other_local_ulid = snap(); // different from sample_ulid()
+        let outcome = mark_reclaimed_local(&s, "vol", &key_b(), other_local_ulid)
+            .await
+            .unwrap();
+        match outcome {
+            MarkReclaimedLocalOutcome::ForkMismatch {
+                local_vol_ulid,
+                released_vol_ulid,
+            } => {
+                assert_eq!(local_vol_ulid, other_local_ulid);
+                assert_eq!(released_vol_ulid, sample_ulid());
+            }
+            _ => panic!("expected ForkMismatch, got {outcome:?}"),
+        }
+
+        // The bucket record was not touched.
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.state, NameState::Released);
     }
 
     // ── mark_initial_readonly ───────────────────────────────────────────

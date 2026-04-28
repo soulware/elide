@@ -2105,23 +2105,72 @@ async fn start_volume_op(
             // next `drain_pending` will publish an initial Live record.
         }
         Ok(MarkLiveOutcome::Released) => {
-            // Surface the released ancestor pin so the CLI can orchestrate
-            // the claim-from-released path: pull the ancestor (if not
-            // local), materialise a fresh fork, then call `claim <name>
-            // <new_vol_ulid>` to atomically rebind the name. mark_live
-            // does not return the record; re-read to extract the pin.
-            return match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-                Ok(Some((rec, _))) => {
-                    let snap = rec
-                        .handoff_snapshot
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "_".to_string());
-                    format!("released {} {}", rec.vol_ulid, snap)
-                }
-                Ok(None) | Err(_) => {
-                    format!("err name '{volume_name}' is Released but record is unreadable")
-                }
+            // Two sub-cases:
+            //   1. Local reclaim: the released vol_ulid matches the
+            //      ULID this `by_name/<name>` symlink already points
+            //      at — i.e. this coordinator owned the volume,
+            //      released it, and is now re-claiming. Nothing
+            //      changed locally; just flip the S3 state back to
+            //      Live with the same vol_ulid.
+            //   2. Cross-coordinator claim: the released vol_ulid is
+            //      foreign content. Surface the pin so the CLI can
+            //      pull, materialise a fresh fork, and `claim`.
+            let local_vol_ulid = match vol_dir.file_name().and_then(|n| n.to_str()) {
+                Some(s) => match ulid::Ulid::from_string(s) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        return format!("err local fork dir name '{s}' is not a valid ULID: {e}");
+                    }
+                },
+                None => return "err resolving local fork ULID".to_string(),
             };
+
+            use elide_coordinator::lifecycle::{MarkReclaimedLocalOutcome, mark_reclaimed_local};
+            match mark_reclaimed_local(store, volume_name, root_key, local_vol_ulid).await {
+                Ok(MarkReclaimedLocalOutcome::Reclaimed) => {
+                    // Fall through to clear `volume.stopped` and
+                    // notify the supervisor.
+                }
+                Ok(MarkReclaimedLocalOutcome::ForkMismatch {
+                    released_vol_ulid, ..
+                }) => {
+                    // The released record points at a different fork
+                    // than ours — this is the cross-coordinator path.
+                    // Re-read to extract the handoff snapshot.
+                    return match elide_coordinator::name_store::read_name_record(store, volume_name)
+                        .await
+                    {
+                        Ok(Some((rec, _))) => {
+                            let snap = rec
+                                .handoff_snapshot
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "_".to_string());
+                            format!("released {released_vol_ulid} {snap}")
+                        }
+                        Ok(None) | Err(_) => {
+                            format!("err name '{volume_name}' is Released but record is unreadable")
+                        }
+                    };
+                }
+                Ok(MarkReclaimedLocalOutcome::Absent) => {
+                    // No S3 record — proceed local-only (matches
+                    // MarkLiveOutcome::Absent above).
+                }
+                Ok(MarkReclaimedLocalOutcome::NotReleased { observed_state, .. }) => {
+                    // Race: state changed between mark_live (saw Released)
+                    // and our read here. Surface the new state cleanly.
+                    return format!(
+                        "err names/<name> changed underneath us; now in state {observed_state:?}"
+                    );
+                }
+                Err(LifecycleError::Store(e)) => {
+                    return format!("err in-place reclaim of {volume_name} failed: {e}");
+                }
+                Err(LifecycleError::OwnershipConflict { .. })
+                | Err(LifecycleError::InvalidTransition { .. }) => {
+                    return format!("err in-place reclaim of {volume_name} refused");
+                }
+            }
         }
         Err(LifecycleError::OwnershipConflict { held_by }) => {
             return format!(
