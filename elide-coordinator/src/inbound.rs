@@ -2552,10 +2552,11 @@ async fn start_volume_op(
 ) -> String {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        // No local fork. The only valid path here is cross-coordinator
-        // claim of a `Released` name: read `names/<name>` from S3 and,
-        // if it's `Released`, surface the pin so the CLI can pull,
-        // fork, and `claim`. Anything else is an error.
+        // No local fork. The only valid paths here are cross-coordinator
+        // claims of a `Released` name (any coordinator may claim) or a
+        // `Reserved` name where this coordinator is the named target
+        // (only the target may claim). Both surface the pin so the CLI
+        // can pull, fork, and `claim`. Anything else is an error.
         return match elide_coordinator::name_store::read_name_record(store, volume_name).await {
             Ok(Some((rec, _))) => match rec.state {
                 elide_core::name_record::NameState::Released => {
@@ -2564,6 +2565,29 @@ async fn start_volume_op(
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "_".to_string());
                     format!("released {} {}", rec.vol_ulid, snap)
+                }
+                elide_core::name_record::NameState::Reserved => {
+                    match rec.coordinator_id.as_deref() {
+                        Some(target) if target == coord_id => {
+                            // This coordinator is the named target —
+                            // route through the same claim flow as
+                            // Released. mark_claimed will rebind the
+                            // record from Reserved to Live.
+                            let snap = rec
+                                .handoff_snapshot
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "_".to_string());
+                            format!("released {} {}", rec.vol_ulid, snap)
+                        }
+                        Some(target) => format!(
+                            "err name '{volume_name}' is reserved for coordinator {target}; \
+                             only that coordinator may claim it"
+                        ),
+                        None => format!(
+                            "err name '{volume_name}' is in state Reserved with no \
+                             target coordinator (malformed record)"
+                        ),
+                    }
                 }
                 elide_core::name_record::NameState::Readonly => {
                     format!(

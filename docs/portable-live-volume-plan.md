@@ -275,6 +275,16 @@ consulted when `--remote` is passed. The override path lives on
   `mark_reclaimed_local` flips back to `live` keeping the same ULID.
 - [x] **Refusal paths** — foreign-owner records refuse with a
   pointer at `volume release --force` (Phase 3).
+- [x] **`start --remote` against `Reserved` records.** When
+  `start_volume_op` reads a `Reserved` record with no local fork:
+  if `coordinator_id == self`, route through the same claim flow
+  as `Released` (returns `released <vol_ulid> <snap>` so the CLI
+  uses the existing `claim_released_name` path). The
+  `mark_claimed` lifecycle helper's `Reserved → Live` arm
+  (cb6b099) handles the actual flip atomically; non-target
+  claimants get `OwnershipConflict { held_by: <target> }` before
+  the conditional PUT. Foreign-target Reserved records refuse with
+  a clear error naming the intended claimer.
 - [x] **Claim-from-released path** — `state == "released"`,
   no local data. Currently runs on bare `volume start`; **needs to
   move behind `--remote`**. Coordinator's `start` op returns
