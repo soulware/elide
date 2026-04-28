@@ -116,12 +116,18 @@ pub struct BucketCapabilities {
 /// Probe a bucket for conditional-PUT support. Idempotent and safe to
 /// re-run on every coordinator start.
 ///
-/// Mechanism: write a probe object with `PutMode::Create`, then attempt
-/// the same write again with the same mode and expect `AlreadyExists`.
-/// A backend that silently overwrites (last-write-wins, or no
-/// conditional-PUT support) will succeed both times — we read that as
-/// "no support". The probe key is best-effort cleaned up regardless of
-/// outcome.
+/// The lifecycle verbs need both:
+///   * `If-None-Match: *` (`PutMode::Create`) — used to claim a name
+///     without overwriting an existing record;
+///   * `If-Match: <etag>` (`PutMode::Update`) — used to flip
+///     `state` on `names/<name>` while detecting concurrent writers.
+///
+/// `AmazonS3` supports the first unconditionally but only the second
+/// when `with_conditional_put(S3ConditionalPut::ETagMatch)` was set on
+/// the builder. So the probe exercises *both*: write with `Create`,
+/// re-write with `Update(etag)`. Either step returning
+/// `NotImplemented` means the backend can't safely host the lifecycle
+/// state machine. The probe object is best-effort cleaned up.
 pub async fn probe_capabilities(
     store: &dyn ObjectStore,
     probe_key: &StorePath,
@@ -130,28 +136,50 @@ pub async fn probe_capabilities(
 
     let body = Bytes::from_static(b"elide-cap-probe");
 
-    if let Err(e) = store
+    let create_result = match store
         .put_opts(probe_key, body.clone().into(), PutMode::Create.into())
         .await
     {
-        if matches!(e, object_store::Error::NotImplemented) {
+        Ok(r) => r,
+        Err(object_store::Error::NotImplemented) => {
             return Ok(BucketCapabilities {
                 conditional_put: false,
             });
         }
-        return Err(e);
-    }
+        Err(e) => return Err(e),
+    };
 
-    let conditional_put = matches!(
+    // Re-create must reject — confirms `If-None-Match: *` is honoured.
+    let create_rejects_duplicate = matches!(
         store
-            .put_opts(probe_key, body.into(), PutMode::Create.into())
+            .put_opts(probe_key, body.clone().into(), PutMode::Create.into())
             .await,
         Err(object_store::Error::AlreadyExists { .. })
     );
 
+    // `If-Match: <etag>` must succeed — this is the path that returns
+    // `NotImplemented` on AmazonS3 unless `S3ConditionalPut` is set.
+    let update_supported = match store
+        .put_opts(
+            probe_key,
+            body.into(),
+            PutMode::Update(UpdateVersion::from(create_result)).into(),
+        )
+        .await
+    {
+        Ok(_) => true,
+        Err(object_store::Error::NotImplemented) => false,
+        Err(e) => {
+            let _ = store.delete(probe_key).await;
+            return Err(e);
+        }
+    };
+
     let _ = store.delete(probe_key).await;
 
-    Ok(BucketCapabilities { conditional_put })
+    Ok(BucketCapabilities {
+        conditional_put: create_rejects_duplicate && update_supported,
+    })
 }
 
 #[cfg(test)]
