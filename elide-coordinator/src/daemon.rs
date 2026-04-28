@@ -31,7 +31,8 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::config::CoordinatorConfig;
-use crate::credential::{self, CredentialIssuer, SharedKeyPassthrough};
+use crate::credential::{CredentialIssuer, SharedKeyPassthrough};
+use crate::identity::CoordinatorIdentity;
 use crate::import;
 use crate::inbound;
 use crate::supervisor;
@@ -67,13 +68,21 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
     std::fs::create_dir_all(data_dir.join("by_name"))
         .with_context(|| format!("creating by_name dir under {}", data_dir.display()))?;
 
-    // Load (or generate on first start) the macaroon root key and select
-    // the credential issuer. Both are needed by the inbound socket to
-    // serve `register` and `credentials`.
-    let root_key = credential::load_or_generate_root_key(&config.data_dir)?;
-    let coordinator_id_str =
-        crate::portable::format_coordinator_id(&crate::portable::coordinator_id(&root_key));
-    info!("[coordinator] coordinator_id: {coordinator_id_str}");
+    // Load (or generate on first start) the coordinator's Ed25519
+    // keypair, derive `coordinator_id` from the public half, derive the
+    // macaroon MAC root in-memory from the private half, and publish
+    // the pubkey to S3 so other coordinators can verify signatures by
+    // `coordinator_id` lookup.
+    let identity = CoordinatorIdentity::load_or_generate(&config.data_dir)?;
+    info!(
+        "[coordinator] coordinator_id: {}",
+        identity.coordinator_id_str()
+    );
+    if let Err(e) = identity.publish_pub(store.as_ref()).await {
+        return Err(anyhow::anyhow!("publish coordinator.pub: {e}"));
+    }
+    let coord_id_str: String = identity.coordinator_id_str().to_owned();
+    let macaroon_root: [u8; 32] = *identity.macaroon_root();
     let issuer: Arc<dyn CredentialIssuer> = Arc::new(SharedKeyPassthrough::new_with_warning());
 
     info!(
@@ -123,7 +132,8 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
             store: store.clone(),
             store_config,
             part_size_bytes,
-            root_key,
+            coord_id: coord_id_str.clone(),
+            macaroon_root,
             issuer: issuer.clone(),
         };
         tokio::spawn(async move {
@@ -189,7 +199,10 @@ pub async fn run(config: CoordinatorConfig, store: Arc<dyn ObjectStore>) -> Resu
                     && let Some(name) = elide_coordinator::tasks::read_volume_name(&vol_dir)
                 {
                     elide_coordinator::lifecycle::reconcile_marker(
-                        &store, &vol_dir, &name, &root_key,
+                        &store,
+                        &vol_dir,
+                        &name,
+                        &coord_id_str,
                     )
                     .await;
                 }
