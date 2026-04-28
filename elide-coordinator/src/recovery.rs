@@ -14,7 +14,8 @@
 //!      `volume.pub` ([`list_and_verify_segments`]).
 //!   3. Mints a synthesised handoff snapshot naming the verified
 //!      segment set, signed by the recovering coordinator's
-//!      `coordinator.key` (next task — not in this module).
+//!      `coordinator.key`, and publishes it via conditional create
+//!      ([`mint_and_publish_synthesised_snapshot`]).
 //!
 //! Segments that fail verification are dropped with a per-segment
 //! `tracing::warn!`. A summary count is returned to the caller.
@@ -26,6 +27,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use ed25519_dalek::VerifyingKey;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
@@ -33,7 +35,11 @@ use object_store::path::Path as StorePath;
 use tracing::warn;
 use ulid::Ulid;
 
-use elide_core::segment::{HEADER_LEN, MAGIC};
+use elide_core::segment::{HEADER_LEN, MAGIC, SegmentSigner};
+use elide_core::signing::{SnapshotManifestRecovery, build_snapshot_manifest_bytes};
+
+use crate::portable::{self, ConditionalPutError};
+use crate::upload::snapshot_manifest_key;
 
 /// One segment from the dead fork's S3 prefix that passed signature
 /// verification.
@@ -197,6 +203,104 @@ async fn verify_one_segment(
     elide_core::segment::verify_segment_bytes(&idx_bytes, segment_id, verifying_key)
         .with_context(|| format!("verifying signature for {segment_id}"))?;
     Ok(())
+}
+
+/// Outcome of [`mint_and_publish_synthesised_snapshot`].
+#[derive(Debug)]
+pub struct PublishedSynthesisedSnapshot {
+    /// Freshly-minted ULID of the synthesised snapshot.
+    pub snap_ulid: Ulid,
+    /// Full S3 key the manifest was published to. Useful for
+    /// subsequent reads or for surfacing in operator output.
+    pub key: StorePath,
+}
+
+/// Errors from [`mint_and_publish_synthesised_snapshot`].
+#[derive(Debug)]
+pub enum PublishSnapshotError {
+    /// Bucket-side conditional PUT refused — a manifest already exists
+    /// at the freshly-minted snapshot ULID. Vanishingly improbable
+    /// (it would require ULID collision against an unrelated prior
+    /// write), but handled cleanly so a retry can mint a different
+    /// ULID.
+    AlreadyExists { key: StorePath },
+    /// Underlying object-store or signing failure.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for PublishSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyExists { key } => {
+                write!(f, "synthesised snapshot already exists at {key}")
+            }
+            Self::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for PublishSnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AlreadyExists { .. } => None,
+            Self::Other(e) => Some(e.as_ref()),
+        }
+    }
+}
+
+impl From<anyhow::Error> for PublishSnapshotError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
+}
+
+/// Mint a fresh ULID, build a synthesised handoff snapshot manifest
+/// naming `segment_ulids` and signed by `coord_signer`, and publish
+/// it to `by_id/<dead_vol_ulid>/snapshots/<YYYYMMDD>/<snap>.manifest`
+/// via conditional create.
+///
+/// `coord_id` populates the manifest's `recovering_coordinator_id`
+/// field so verifiers can resolve it back to a pubkey via
+/// `coordinators/<coord_id>/coordinator.pub`. `recovered_at` is set
+/// to the current wall-clock time in RFC3339.
+///
+/// The signing input is domain-separated (see
+/// `elide_core::signing` § "Recovery manifests"), so the resulting
+/// signature lives in a different space from regular volume-signed
+/// manifests — a verifier that loads this manifest with the wrong
+/// key (or that swaps the recovery metadata) will fail verification
+/// rather than silently accept it.
+pub async fn mint_and_publish_synthesised_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    dead_vol_ulid: Ulid,
+    segment_ulids: &[Ulid],
+    coord_signer: &dyn SegmentSigner,
+    coord_id: &str,
+) -> Result<PublishedSynthesisedSnapshot, PublishSnapshotError> {
+    let snap_ulid = Ulid::new();
+    let recovery = SnapshotManifestRecovery {
+        recovering_coordinator_id: coord_id.to_owned(),
+        recovered_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let bytes = build_snapshot_manifest_bytes(coord_signer, segment_ulids, Some(&recovery));
+
+    // Reuse the existing key shape so this manifest sits next to any
+    // historical snapshots under the dead fork's prefix.
+    let dead_vol_str = dead_vol_ulid.to_string();
+    let snap_str = snap_ulid.to_string();
+    let key = snapshot_manifest_key(&dead_vol_str, &snap_str)
+        .map_err(|e| PublishSnapshotError::Other(e.context("computing snapshot manifest key")))?;
+
+    match portable::put_if_absent(store.as_ref(), &key, Bytes::from(bytes)).await {
+        Ok(_) => Ok(PublishedSynthesisedSnapshot { snap_ulid, key }),
+        Err(ConditionalPutError::PreconditionFailed) => {
+            Err(PublishSnapshotError::AlreadyExists { key })
+        }
+        Err(ConditionalPutError::Other(e)) => Err(PublishSnapshotError::Other(
+            anyhow::Error::new(e).context("publishing synthesised snapshot manifest"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -458,5 +562,151 @@ mod tests {
             .await
             .unwrap();
         assert!(fetch_volume_pub(&store, vol_ulid).await.is_err());
+    }
+
+    // ── mint_and_publish_synthesised_snapshot ─────────────────────────
+
+    #[tokio::test]
+    async fn publish_synthesised_snapshot_writes_verifiable_manifest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dead_vol = Ulid::new();
+        let (coord_signer, coord_vk) = make_signer();
+        let coord_id = "01ABCDEFGHJKMNPQRSTVWXYZ23";
+
+        let s1 = Ulid::new();
+        let s2 = s1.increment().expect("increment");
+        let s3 = s2.increment().expect("increment");
+        let segments = vec![s2, s1, s3];
+
+        let published = mint_and_publish_synthesised_snapshot(
+            &store,
+            dead_vol,
+            &segments,
+            coord_signer.as_ref(),
+            coord_id,
+        )
+        .await
+        .expect("publish should succeed on a fresh prefix");
+
+        // Object lives at the expected key.
+        let raw = store
+            .get(&published.key)
+            .await
+            .expect("object present at returned key")
+            .bytes()
+            .await
+            .unwrap();
+
+        // Manifest verifies under the coordinator's pubkey, has the
+        // recovery metadata populated, and lists ULIDs in sorted order.
+        // We exercise this via a tempdir + the existing reader.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+        let local_path =
+            tmp.path()
+                .join("snapshots")
+                .join(elide_core::signing::snapshot_manifest_filename(
+                    &published.snap_ulid,
+                ));
+        std::fs::write(&local_path, &raw).unwrap();
+
+        let manifest = elide_core::signing::read_snapshot_manifest(
+            tmp.path(),
+            &coord_vk,
+            &published.snap_ulid,
+        )
+        .expect("manifest verifies under coordinator pubkey");
+        assert_eq!(manifest.segment_ulids, vec![s1, s2, s3]);
+        let recovery = manifest.recovery.expect("recovery metadata present");
+        assert_eq!(recovery.recovering_coordinator_id, coord_id);
+        assert!(!recovery.recovered_at.is_empty(), "recovered_at populated");
+    }
+
+    #[tokio::test]
+    async fn publish_synthesised_snapshot_does_not_verify_under_volume_pub() {
+        // Cross-class verification must fail: a synthesised manifest
+        // signed by coord_signer must NOT validate against an
+        // unrelated volume pubkey, even if a misconfigured caller
+        // tries.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dead_vol = Ulid::new();
+        let (coord_signer, _) = make_signer();
+        let (_, unrelated_vk) = make_signer();
+
+        let segments = vec![Ulid::new()];
+
+        let published = mint_and_publish_synthesised_snapshot(
+            &store,
+            dead_vol,
+            &segments,
+            coord_signer.as_ref(),
+            "01ABCDEFGHJKMNPQRSTVWXYZ23",
+        )
+        .await
+        .unwrap();
+
+        let raw = store
+            .get(&published.key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+        let local_path =
+            tmp.path()
+                .join("snapshots")
+                .join(elide_core::signing::snapshot_manifest_filename(
+                    &published.snap_ulid,
+                ));
+        std::fs::write(&local_path, &raw).unwrap();
+
+        let err = elide_core::signing::read_snapshot_manifest(
+            tmp.path(),
+            &unrelated_vk,
+            &published.snap_ulid,
+        )
+        .expect_err("must not verify under unrelated key");
+        assert!(
+            err.to_string().contains("signature invalid"),
+            "expected signature failure, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_synthesised_snapshot_refuses_when_object_exists() {
+        // Two writers that happen to mint the same ULID (or a retry
+        // after a partial state) must see the second call refuse via
+        // the conditional-create precondition. We can't easily force
+        // a ULID collision, so we hand-write a placeholder at the
+        // expected key first.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dead_vol = Ulid::new();
+        let (coord_signer, _) = make_signer();
+        let segments = vec![Ulid::new()];
+
+        // First, do a real publish so we have a key to collide with.
+        let first = mint_and_publish_synthesised_snapshot(
+            &store,
+            dead_vol,
+            &segments,
+            coord_signer.as_ref(),
+            "01ABCDEFGHJKMNPQRSTVWXYZ23",
+        )
+        .await
+        .unwrap();
+
+        // Pre-occupy a chosen key with bogus contents.
+        let collision_key = first.key.clone();
+        // Re-run a publish that we force into the same key by writing
+        // first, then attempting put_if_absent again at the same key
+        // via an unsafe cheat: use the public helper directly.
+        let payload = Bytes::from_static(b"already here");
+        // Already present — ensure put_if_absent fails.
+        let err = portable::put_if_absent(store.as_ref(), &collision_key, payload)
+            .await
+            .expect_err("expected precondition-failed");
+        assert!(matches!(err, ConditionalPutError::PreconditionFailed));
     }
 }

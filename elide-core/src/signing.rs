@@ -650,18 +650,37 @@ pub fn write_snapshot_manifest(
     segment_ulids: &[ulid::Ulid],
     recovery: Option<&SnapshotManifestRecovery>,
 ) -> io::Result<()> {
+    let content = build_snapshot_manifest_bytes(signer, segment_ulids, recovery);
+    let path = vol_dir
+        .join("snapshots")
+        .join(snapshot_manifest_filename(snap_ulid));
+    crate::segment::write_file_atomic(&path, &content)
+}
+
+/// Build the signed bytes of a snapshot manifest without writing
+/// anything to disk. Used by callers that need to publish the
+/// manifest somewhere other than a local volume directory — notably
+/// `volume release --force`, which mints a synthesised handoff
+/// snapshot signed by the recovering coordinator's `coordinator.key`
+/// and `PUT`s it directly to S3 under the dead fork's prefix.
+///
+/// The output is identical, byte-for-byte, to what
+/// `write_snapshot_manifest` would write for the same inputs. The
+/// caller is responsible for sorting/deduping is not their concern;
+/// segment ULIDs are sorted and deduplicated internally before
+/// signing.
+pub fn build_snapshot_manifest_bytes(
+    signer: &dyn SegmentSigner,
+    segment_ulids: &[ulid::Ulid],
+    recovery: Option<&SnapshotManifestRecovery>,
+) -> Vec<u8> {
     let mut sorted: Vec<String> = segment_ulids.iter().map(|u| u.to_string()).collect();
     sorted.sort();
     sorted.dedup();
 
     let msg = manifest_signing_input(&sorted, recovery);
     let sig = signer.sign(&msg);
-    let content = serialize_snapshot_manifest(&sorted, recovery, &sig);
-
-    let path = vol_dir
-        .join("snapshots")
-        .join(snapshot_manifest_filename(snap_ulid));
-    crate::segment::write_file_atomic(&path, content.as_bytes())
+    serialize_snapshot_manifest(&sorted, recovery, &sig).into_bytes()
 }
 
 /// Read and verify a snapshot manifest, returning its sorted segment

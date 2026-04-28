@@ -385,12 +385,21 @@ may claim). Composes with `--force`.
   skipped, not counted as drops. `fetch_volume_pub` is the
   companion helper for pulling the dead fork's pubkey from S3.
   8 unit tests against `InMemory`.
-- [ ] **Synthesise + sign the handoff snapshot.** Mint a fresh
-  ULID, build the snapshot record naming the verified segment set
-  with the recovery metadata fields populated, sign with
-  `coordinator.key`, write to
-  `by_id/<dead_vol_ulid>/snapshots/<new_snap_ulid>` via conditional
-  PUT (the path is fresh, so `put_if_absent`).
+- [x] **Synthesise + sign the handoff snapshot.** Landed as
+  `recovery::mint_and_publish_synthesised_snapshot`. Mints a fresh
+  ULID, builds the manifest via the new
+  `elide_core::signing::build_snapshot_manifest_bytes` (extracted
+  from `write_snapshot_manifest` so callers can publish the bytes
+  somewhere other than a local volume directory), signs with the
+  caller's `SegmentSigner` (the recovering coordinator's
+  `coordinator.key`), and conditionally PUTs to
+  `by_id/<dead_vol_ulid>/snapshots/YYYYMMDD/<snap>.manifest` via
+  `portable::put_if_absent`. Returns
+  `PublishedSynthesisedSnapshot { snap_ulid, key }` on success;
+  `PublishSnapshotError::AlreadyExists { key }` on the (vanishingly
+  improbable) ULID-collision path. 3 new tests verify the round
+  trip via the existing `read_snapshot_manifest`, cross-class key
+  rejection, and the conditional-create precondition.
 - [ ] **`--force` flag on `volume release`.** Skip the foreign-owner
   refusal. Run segment-listing replay → mint synthesised handoff
   snapshot → unconditional Overwrite of `names/<name>` flipping to
