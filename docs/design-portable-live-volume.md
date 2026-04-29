@@ -160,7 +160,10 @@ Verbs and their state transitions:
   as the crash-recovery contract. After `release --force`, a normal
   `volume start --remote <name>` claims the now-released name via
   the conditional-PUT path; concurrent claimers race cleanly. See
-  the dedicated section below.
+  the dedicated section below. The previous-owner side (split-brain
+  safety when `--force` is run against a live coordinator) is
+  covered in
+  [`design-force-release-fencing.md`](design-force-release-fencing.md).
 - **`volume release --force --to <coordinator_id>`** — composes the
   two: unconditional override of foreign ownership *and* targeted
   reservation in a single PUT. The post-force record is `reserved`,
