@@ -906,11 +906,16 @@ async fn snapshot_volume(
     }
 
     // 5. Upload the new snapshot marker and manifest.
+    let upload_started = std::time::Instant::now();
     if let Err(e) =
         elide_coordinator::upload::upload_snapshots_and_filemaps(&fork_dir, &volume_id, store).await
     {
         return format!("err uploading snapshot files: {e:#}");
     }
+    info!(
+        "[snapshot {volume_id}] upload_snapshots_and_filemaps took {:.2?}",
+        upload_started.elapsed()
+    );
 
     info!("[snapshot {volume_id}] committed {snap_ulid}");
     format!("ok {snap_ulid}")
