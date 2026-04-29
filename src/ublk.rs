@@ -431,13 +431,11 @@ mod imp {
             .map_err(|e| io::Error::other(format!("block shutdown signals: {e}")))?;
 
         let by_id_dir = dir.parent().unwrap_or(dir);
-        // TODO(portable-live-volume): switch to
-        // `crate::volume_open::open_volume_with_retry` once the
-        // testing work on the portable-live-volume branch lands. The
-        // NBD path already retries on missing ancestor artifacts
-        // (prefetch racing the supervisor); ublk has the same race
-        // window. Tracked in docs/portable-live-volume-plan.md.
-        let mut volume = Volume::open(dir, by_id_dir)?;
+        // Coordinator prefetch races supervisor spawn on freshly-claimed
+        // forks: ancestor `.idx` files may not yet be on disk when this
+        // process starts. The retry helper absorbs the NotFound window;
+        // anything else propagates. NBD uses the same helper.
+        let mut volume = crate::volume_open::open_volume_with_retry(dir, by_id_dir)?;
 
         if let Some(config) = fetch_config {
             let fetcher = elide_fetch::RemoteFetcher::new(&config, &volume.fork_dirs())?;
