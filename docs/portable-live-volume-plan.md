@@ -574,3 +574,10 @@ the work fully closes:
    they refresh. Not blocking — fresh-fetch on every verification
    is correct and the cost is one small GET per `start --remote`
    against a synthesised snapshot.
+5. **ublk volume-open retry.** `src/ublk.rs:434` calls
+   `Volume::open` directly. The NBD path uses
+   `crate::volume_open::open_volume_with_retry` to absorb the
+   coordinator-prefetch / supervisor-spawn race on freshly-claimed
+   forks; ublk has the same race window. Switch ublk to the helper
+   once the current testing work lands. TODO comment at the call
+   site mirrors this note.
