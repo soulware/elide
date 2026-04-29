@@ -138,6 +138,10 @@ pub fn rewrite_pending_with_deltas(
             .join("snapshots")
             .join(format!("{source_snap}.filemap"));
         if !source_filemap_path.exists() {
+            // Snapshot-time filemap generation no longer runs at release
+            // time. Operators wanting delta compression must run
+            // `elide volume generate-filemap <source>` first; without a
+            // source filemap there is nothing to match against, so skip.
             continue;
         }
         let source_filemap = filemap::read(&source_filemap_path)?;
