@@ -295,11 +295,22 @@ consulted when `--remote` is passed. The override path lives on
   `state == Stopped` and marker absent → write the marker;
   `state == Live` and marker present → remove. Best-effort, scoped to
   records this coordinator owns, ignores foreign-owned records.
-- [ ] **Tests:** unit tests for each state transition (15 lifecycle
-  tests landed); integration test exercising stop-on-A → start-on-A
-  (local resume) and release-on-A → start-on-B (cross-coordinator)
-  against a real bucket (Tigris in CI); proptest covering
-  interleaved stop/start/release/concurrent-claim sequences.
+- [x] **Inbound-op composer tests.** 11 unit tests for the IPC
+  verb dispatchers — `force_release_volume_op` (5),
+  `claim_volume_op` (4), `start_volume_op --remote` routing (7) —
+  exercising the composition of `recovery::` + `lifecycle::` +
+  `name_store::` end-to-end against `InMemory`.
+- [x] **Two-coordinator state-machine proptest** at
+  `elide-coordinator/tests/portable_proptest.rs`: random sequences
+  drawn from `{Create, Release, ReleaseTo, ForceRelease,
+  ClaimReleased}` between two simulated coordinators sharing an
+  `InMemory` bucket. 256 cases. Asserts six bucket-level invariants
+  including signature verification of every handoff snapshot
+  (volume.pub for normal manifests, recovering coordinator's
+  `coordinator.pub` for synthesised handoff snapshots).
+- [ ] **Real-bucket integration test** exercising stop-on-A →
+  start-on-A (local resume) and release-on-A → start-on-B
+  (cross-coordinator) against Tigris in CI. Phase 5.
 
 **Phase exit criteria:** a name can move cleanly between two
 coordinators when explicitly released, and stays put across a stop

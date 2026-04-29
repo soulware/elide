@@ -3344,4 +3344,528 @@ mod tests {
         assert!(resp.contains("state = \"readonly\""), "{resp}");
         assert!(resp.contains("eligibility = \"readonly\""), "{resp}");
     }
+
+    // ── force_release_volume_op ───────────────────────────────────────────
+    //
+    // Verify the inbound op composes recovery + lifecycle + name_store
+    // correctly. The lower-level helpers each have unit coverage already;
+    // these tests exercise the IPC verb's end-to-end path: read current
+    // record → fetch dead pubkey → list+verify segments → publish
+    // synthesised snapshot → unconditionally rewrite names/<name>.
+
+    use elide_coordinator::identity::CoordinatorIdentity;
+    use elide_coordinator::name_store as ns;
+    use elide_core::name_record::{NameRecord, NameState};
+    use elide_core::segment::{SegmentEntry, SegmentFlags, SegmentSigner, write_segment};
+    use elide_core::signing::generate_ephemeral_signer;
+    use object_store::PutPayload;
+    use object_store::path::Path as StorePath;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Upload a `volume.pub` for the dead fork at the canonical path.
+    async fn upload_dead_pub(
+        store: &Arc<dyn ObjectStore>,
+        vol_ulid: ulid::Ulid,
+        vk: &ed25519_dalek::VerifyingKey,
+    ) {
+        let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+        let body = format!("{}\n", hex(&vk.to_bytes()));
+        store
+            .put(&key, PutPayload::from(body.into_bytes()))
+            .await
+            .unwrap();
+    }
+
+    /// Build a single-entry signed segment via the canonical writer and
+    /// upload it under `by_id/<vol_ulid>/segments/<seg_ulid>`.
+    async fn upload_signed_segment(
+        store: &Arc<dyn ObjectStore>,
+        vol_ulid: ulid::Ulid,
+        seg_ulid: ulid::Ulid,
+        signer: &dyn SegmentSigner,
+        body: &[u8],
+    ) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seg");
+        let hash = blake3::hash(body);
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            body.to_vec(),
+        )];
+        write_segment(&path, &mut entries, signer).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let key = StorePath::from(format!("by_id/{vol_ulid}/segments/{seg_ulid}"));
+        store.put(&key, PutPayload::from(bytes)).await.unwrap();
+    }
+
+    /// Fixture: a name in `Live` state pointing at a dead fork that has
+    /// `volume.pub` and one signed segment in S3, plus a fresh
+    /// `CoordinatorIdentity` for the recovering coordinator.
+    async fn force_release_fixture(
+        name: &str,
+    ) -> (
+        Arc<dyn ObjectStore>,
+        Arc<CoordinatorIdentity>,
+        ulid::Ulid,
+        ulid::Ulid,
+        TempDir,
+    ) {
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let dead_vol = ulid::Ulid::new();
+        let seg_ulid = ulid::Ulid::new();
+
+        let (signer, vk) = generate_ephemeral_signer();
+        upload_dead_pub(&store, dead_vol, &vk).await;
+        upload_signed_segment(&store, dead_vol, seg_ulid, signer.as_ref(), b"data").await;
+
+        // names/<name> = Live, owned by some "previous" coordinator id.
+        let mut rec = NameRecord::live_minimal(dead_vol);
+        rec.coordinator_id = Some("dead-owner".into());
+        ns::create_name_record(&store, name, &rec).await.unwrap();
+
+        // Recovering coordinator's identity, rooted in a tempdir.
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        (store, identity, dead_vol, seg_ulid, coord_dir)
+    }
+
+    #[tokio::test]
+    async fn force_release_op_overwrites_live_to_released() {
+        let (store, identity, dead_vol, _seg, _td) = force_release_fixture("vol").await;
+
+        let resp = force_release_volume_op("vol", None, &store, &identity).await;
+
+        assert!(resp.starts_with("ok "), "{resp}");
+        let snap_str = resp.strip_prefix("ok ").unwrap();
+        let snap_ulid = ulid::Ulid::from_string(snap_str).expect("snapshot ULID");
+
+        // names/<vol> is now Released, references the dead fork.
+        let (rec, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(rec.state, NameState::Released);
+        assert_eq!(rec.vol_ulid, dead_vol);
+        assert_eq!(rec.handoff_snapshot, Some(snap_ulid));
+
+        // Synthesised manifest landed under the dead fork's snapshots/ prefix.
+        let snap_prefix = StorePath::from(format!("by_id/{dead_vol}/snapshots/"));
+        use futures::TryStreamExt;
+        let listed: Vec<_> = store.list(Some(&snap_prefix)).try_collect().await.unwrap();
+        assert_eq!(listed.len(), 1, "exactly one synthesised snapshot");
+        assert!(
+            listed[0]
+                .location
+                .as_ref()
+                .ends_with(&format!("{snap_ulid}.manifest")),
+            "manifest path is {}",
+            listed[0].location.as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_to_overwrites_live_to_reserved_for_target() {
+        let (store, identity, _dead, _seg, _td) = force_release_fixture("vol").await;
+
+        let resp = force_release_volume_op("vol", Some("coord-target"), &store, &identity).await;
+
+        assert!(resp.starts_with("ok "), "{resp}");
+
+        let (rec, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(rec.state, NameState::Reserved);
+        assert_eq!(rec.coordinator_id.as_deref(), Some("coord-target"));
+    }
+
+    #[tokio::test]
+    async fn force_release_op_refuses_already_released_record() {
+        let (store, identity, _dead, _seg, _td) = force_release_fixture("vol").await;
+
+        // Pre-flip names/<vol> to Released so the op refuses.
+        let (mut rec, v) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        rec.state = NameState::Released;
+        rec.coordinator_id = None;
+        ns::update_name_record(&store, "vol", &rec, v)
+            .await
+            .unwrap();
+
+        let resp = force_release_volume_op("vol", None, &store, &identity).await;
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(
+            resp.contains("force-release only overrides Live or Stopped"),
+            "{resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_op_refuses_absent_name() {
+        let store = mem_store();
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        let resp = force_release_volume_op("ghost", None, &store, &identity).await;
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(resp.contains("no S3 record"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn force_release_op_errors_when_dead_pub_missing() {
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let dead_vol = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(dead_vol);
+        rec.coordinator_id = Some("dead-owner".into());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        let resp = force_release_volume_op("vol", None, &store, &identity).await;
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(
+            resp.contains("fetching volume.pub"),
+            "expected pubkey fetch error, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_op_drops_tampered_segment_but_succeeds() {
+        // A tampered segment must be dropped (signature failure) without
+        // failing the verb. The published snapshot covers only the
+        // verified segments; the operator can still recover the name.
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let dead_vol = ulid::Ulid::new();
+        let (signer, vk) = generate_ephemeral_signer();
+        upload_dead_pub(&store, dead_vol, &vk).await;
+
+        // One good segment, one tampered.
+        let good_id = ulid::Ulid::new();
+        upload_signed_segment(&store, dead_vol, good_id, signer.as_ref(), b"good").await;
+        let bad_id = ulid::Ulid::new();
+        // Build a valid segment then flip a byte inside the index section.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seg");
+        let hash = blake3::hash(b"bad");
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            b"bad".to_vec(),
+        )];
+        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Header is 100 bytes; first index entry starts at offset 100.
+        bytes[104] ^= 0xff;
+        let bad_key = StorePath::from(format!("by_id/{dead_vol}/segments/{bad_id}"));
+        store.put(&bad_key, PutPayload::from(bytes)).await.unwrap();
+
+        let mut rec = NameRecord::live_minimal(dead_vol);
+        rec.coordinator_id = Some("dead-owner".into());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        let resp = force_release_volume_op("vol", None, &store, &identity).await;
+        assert!(resp.starts_with("ok "), "{resp}");
+
+        // Verify the synthesised manifest contains exactly one segment ULID
+        // — the good one. Read the manifest body and look for both ids.
+        let snap_str = resp.strip_prefix("ok ").unwrap();
+        use futures::TryStreamExt;
+        let snap_prefix = StorePath::from(format!("by_id/{dead_vol}/snapshots/"));
+        let listed: Vec<_> = store.list(Some(&snap_prefix)).try_collect().await.unwrap();
+        let entry = listed
+            .into_iter()
+            .find(|m| {
+                m.location
+                    .as_ref()
+                    .ends_with(&format!("{snap_str}.manifest"))
+            })
+            .expect("synthesised manifest exists");
+        let manifest_body = store
+            .get(&entry.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&manifest_body).unwrap();
+        assert!(
+            body_str.contains(&good_id.to_string()),
+            "good segment present"
+        );
+        assert!(
+            !body_str.contains(&bad_id.to_string()),
+            "tampered segment must not appear in manifest"
+        );
+    }
+
+    // ── claim_volume_op ────────────────────────────────────────────────────
+
+    /// Materialise an empty `by_id/<ulid>/` directory for a fresh fork.
+    fn make_local_fork(data_dir: &Path, ulid: ulid::Ulid) {
+        let dir = data_dir.join("by_id").join(ulid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_op_happy_path_releases_to_live() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(data_dir.path().join("by_name")).unwrap();
+
+        // names/<vol> = Released for a previous fork; the new local fork
+        // will rebind it.
+        let prev_fork = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(prev_fork);
+        rec.state = NameState::Released;
+        rec.handoff_snapshot = Some(ulid::Ulid::new());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let new_fork = ulid::Ulid::new();
+        make_local_fork(data_dir.path(), new_fork);
+
+        let rescan = Notify::new();
+        let resp = claim_volume_op(
+            "vol",
+            &new_fork.to_string(),
+            data_dir.path(),
+            &store,
+            "coord-self",
+            &rescan,
+        )
+        .await;
+
+        assert_eq!(resp, format!("ok {new_fork}"));
+
+        // Symlink created.
+        let link = data_dir.path().join("by_name").join("vol");
+        let target = std::fs::read_link(&link).unwrap();
+        assert_eq!(
+            target,
+            std::path::PathBuf::from(format!("../by_id/{new_fork}"))
+        );
+
+        // names/<vol> rebound to the new fork as Live.
+        let (got, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(got.state, NameState::Live);
+        assert_eq!(got.vol_ulid, new_fork);
+        assert_eq!(got.coordinator_id.as_deref(), Some("coord-self"));
+    }
+
+    #[tokio::test]
+    async fn claim_op_refuses_when_local_fork_dir_missing() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let new_fork = ulid::Ulid::new();
+        // Deliberately do NOT materialise by_id/<new_fork>/.
+
+        let rescan = Notify::new();
+        let resp = claim_volume_op(
+            "vol",
+            &new_fork.to_string(),
+            data_dir.path(),
+            &store,
+            "coord-self",
+            &rescan,
+        )
+        .await;
+
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(resp.contains("not found"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn claim_op_refuses_when_record_not_released() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(data_dir.path().join("by_name")).unwrap();
+
+        // names/<vol> is Live, not Released — claim must refuse.
+        let mut rec = NameRecord::live_minimal(ulid::Ulid::new());
+        rec.coordinator_id = Some("coord-other".into());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let new_fork = ulid::Ulid::new();
+        make_local_fork(data_dir.path(), new_fork);
+
+        let rescan = Notify::new();
+        let resp = claim_volume_op(
+            "vol",
+            &new_fork.to_string(),
+            data_dir.path(),
+            &store,
+            "coord-self",
+            &rescan,
+        )
+        .await;
+
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(
+            resp.contains("not Released") || resp.contains("OwnershipConflict"),
+            "{resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_op_refuses_reserved_for_another_coordinator() {
+        // The plan §3 invariant: `release --to <X>` produces a Reserved
+        // record bound to X, and any non-X claimant must be refused
+        // before the conditional PUT.
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(data_dir.path().join("by_name")).unwrap();
+
+        let mut rec = NameRecord::live_minimal(ulid::Ulid::new());
+        rec.state = NameState::Reserved;
+        rec.coordinator_id = Some("coord-target".into());
+        rec.handoff_snapshot = Some(ulid::Ulid::new());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let new_fork = ulid::Ulid::new();
+        make_local_fork(data_dir.path(), new_fork);
+
+        let rescan = Notify::new();
+        let resp = claim_volume_op(
+            "vol",
+            &new_fork.to_string(),
+            data_dir.path(),
+            &store,
+            "coord-other-not-target",
+            &rescan,
+        )
+        .await;
+
+        assert!(resp.starts_with("err "), "{resp}");
+        // The record must still be Reserved (untouched).
+        let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(still.state, NameState::Reserved);
+        assert_eq!(still.coordinator_id.as_deref(), Some("coord-target"));
+    }
+
+    // ── start_volume_op (--remote routing) ────────────────────────────────
+
+    #[tokio::test]
+    async fn start_op_no_local_fork_no_remote_points_at_remote_flag() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let rescan = Notify::new();
+
+        let resp =
+            start_volume_op("vol", false, data_dir.path(), &store, "coord-self", &rescan).await;
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(resp.contains("--remote"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn start_remote_against_released_returns_claim_pin() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let rescan = Notify::new();
+
+        let dead_vol = ulid::Ulid::new();
+        let snap = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(dead_vol);
+        rec.state = NameState::Released;
+        rec.handoff_snapshot = Some(snap);
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp =
+            start_volume_op("vol", true, data_dir.path(), &store, "coord-self", &rescan).await;
+        assert_eq!(resp, format!("released {dead_vol} {snap}"));
+    }
+
+    #[tokio::test]
+    async fn start_remote_against_reserved_for_self_returns_claim_pin() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let rescan = Notify::new();
+
+        let dead_vol = ulid::Ulid::new();
+        let snap = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(dead_vol);
+        rec.state = NameState::Reserved;
+        rec.coordinator_id = Some("coord-self".into());
+        rec.handoff_snapshot = Some(snap);
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp =
+            start_volume_op("vol", true, data_dir.path(), &store, "coord-self", &rescan).await;
+        assert_eq!(resp, format!("released {dead_vol} {snap}"));
+    }
+
+    #[tokio::test]
+    async fn start_remote_against_reserved_for_other_refuses() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let rescan = Notify::new();
+
+        let mut rec = NameRecord::live_minimal(ulid::Ulid::new());
+        rec.state = NameState::Reserved;
+        rec.coordinator_id = Some("coord-target".into());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp =
+            start_volume_op("vol", true, data_dir.path(), &store, "coord-self", &rescan).await;
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(
+            resp.contains("reserved for coordinator coord-target"),
+            "{resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_remote_against_readonly_refuses_with_pull_hint() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let rescan = Notify::new();
+
+        let mut rec = NameRecord::live_minimal(ulid::Ulid::new());
+        rec.state = NameState::Readonly;
+        ns::create_name_record(&store, "img", &rec).await.unwrap();
+
+        let resp =
+            start_volume_op("img", true, data_dir.path(), &store, "coord-self", &rescan).await;
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(resp.contains("readonly"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn start_remote_against_foreign_live_refuses() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let rescan = Notify::new();
+
+        let mut rec = NameRecord::live_minimal(ulid::Ulid::new());
+        rec.coordinator_id = Some("coord-other".into());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let resp =
+            start_volume_op("vol", true, data_dir.path(), &store, "coord-self", &rescan).await;
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(resp.contains("held in state Live"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn start_remote_against_absent_name_refuses() {
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let rescan = Notify::new();
+
+        let resp = start_volume_op(
+            "ghost",
+            true,
+            data_dir.path(),
+            &store,
+            "coord-self",
+            &rescan,
+        )
+        .await;
+        assert!(resp.starts_with("err "), "{resp}");
+        assert!(resp.contains("not found"), "{resp}");
+    }
 }
