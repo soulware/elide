@@ -500,14 +500,7 @@ pub async fn upload_snapshots_and_filemaps(
         Err(e) => return Err(e.into()),
     };
 
-    let fn_started = Instant::now();
-    let mut iter_count = 0usize;
-    let mut skipped_dotted = 0usize;
-    let mut skipped_non_ulid = 0usize;
-    let mut skipped_sentinel = 0usize;
-    let mut processed = 0usize;
     for entry in entries {
-        iter_count += 1;
         let entry = entry.context("reading snapshots dir entry")?;
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
@@ -515,12 +508,10 @@ pub async fn upload_snapshots_and_filemaps(
         };
         // Skip filemap files — they are uploaded alongside their snapshot marker.
         if name.contains('.') {
-            skipped_dotted += 1;
             continue;
         }
         // Validate as ULID.
         if ulid::Ulid::from_string(name).is_err() {
-            skipped_non_ulid += 1;
             continue;
         }
 
@@ -530,12 +521,8 @@ pub async fn upload_snapshots_and_filemaps(
         // .manifest pair is already inspectable under `snapshots/<ulid>.*`.
         let sentinel = upload_sentinel(vol_dir, &format!("snapshots/{name}"));
         if is_already_uploaded(&sentinel, &[]) {
-            skipped_sentinel += 1;
             continue;
         }
-        processed += 1;
-        let entry_started = Instant::now();
-        info!("[upload-snaps] processing snapshot {name} (iter #{iter_count})");
 
         let mut all_ok = true;
 
@@ -584,22 +571,11 @@ pub async fn upload_snapshots_and_filemaps(
             }
         }
 
-        let mark_started = Instant::now();
         if all_ok && let Err(e) = mark_uploaded(&sentinel, &[]) {
             warn!("failed to mark snapshot {name} sentinel: {e}");
         }
-        info!(
-            "[upload-snaps] snapshot {name} done in {:.2?} (mark_uploaded {:.2?})",
-            entry_started.elapsed(),
-            mark_started.elapsed()
-        );
     }
 
-    info!(
-        "[upload-snaps] loop done in {:.2?}: iter={iter_count} dotted={skipped_dotted} \
-         non_ulid={skipped_non_ulid} sentinel={skipped_sentinel} processed={processed}",
-        fn_started.elapsed()
-    );
     Ok(())
 }
 
