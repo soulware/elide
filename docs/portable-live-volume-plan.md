@@ -452,19 +452,22 @@ may claim). Composes with `--force`.
   `lib.rs`) so `recovery` can call `fetch_coordinator_pub`. Callers
   in binary-only files updated from `crate::identity::...` to
   `elide_coordinator::identity::...`.
-- [ ] **Tests:** force-release after simulated coordinator death
-  (kill the writing process between segment uploads and
-  `names/<name>` rewrite, then `release --force` + `start --remote`
-  from a second coordinator); force-release when the dead fork
-  never published a snapshot (segment-listing replay covers it);
-  force-release skips a tampered segment whose signature fails
-  verification; `release --to <X>` followed by `start --remote` on
-  X (succeeds) and on Y (refused before conditional PUT);
-  `start --remote` against a synthesised snapshot signed by a
-  pubkey whose derivation doesn't match the bucket path (refused);
-  `start --remote` against a synthesised snapshot whose signing
-  coordinator's pub is missing from the bucket (refused with a
-  clear error).
+- [x] **Tests at the helper / inbound-op layer:** tampered-segment
+  drop (`force_release_op_drops_tampered_segment_but_succeeds`);
+  `release --to <X>` then `start --remote` on X
+  (`start_remote_against_reserved_for_self_returns_claim_pin`) and
+  on Y (`start_remote_against_reserved_for_other_refuses`,
+  `claim_op_refuses_reserved_for_another_coordinator`);
+  synthesised-snapshot mismatched-pubkey and missing-pub refusal
+  paths covered at the `recovery::resolve_handoff_verifier` layer;
+  empty-segment-list recovery exercised in `recovery::tests` and
+  the two-coordinator proptest.
+- [ ] **Process-level recovery test:** force-release after a real
+  simulated coordinator death (kill the writing process between
+  segment uploads and `names/<name>` rewrite, then
+  `release --force` + `start --remote` from a second coordinator).
+  Belongs alongside the kernel-lane CI tests; heavier than the
+  inbound-op coverage above.
 
 **Phase exit criteria:** an operator can recover a name from a dead
 coordinator and the recovered fork includes every segment the dead
