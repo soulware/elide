@@ -126,7 +126,6 @@ mod imp {
     use libublk::uring_async::ublk_submit_sqe_async;
 
     use elide_core::actor::{VolumeClient, VolumeReader};
-    use elide_core::volume::Volume;
 
     const BLOCK: u64 = 4096;
     const LOGICAL_BS_SHIFT: u8 = 12;
