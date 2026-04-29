@@ -295,11 +295,22 @@ consulted when `--remote` is passed. The override path lives on
   `state == Stopped` and marker absent → write the marker;
   `state == Live` and marker present → remove. Best-effort, scoped to
   records this coordinator owns, ignores foreign-owned records.
-- [ ] **Tests:** unit tests for each state transition (15 lifecycle
-  tests landed); integration test exercising stop-on-A → start-on-A
-  (local resume) and release-on-A → start-on-B (cross-coordinator)
-  against a real bucket (Tigris in CI); proptest covering
-  interleaved stop/start/release/concurrent-claim sequences.
+- [x] **Inbound-op composer tests.** 11 unit tests for the IPC
+  verb dispatchers — `force_release_volume_op` (5),
+  `claim_volume_op` (4), `start_volume_op --remote` routing (7) —
+  exercising the composition of `recovery::` + `lifecycle::` +
+  `name_store::` end-to-end against `InMemory`.
+- [x] **Two-coordinator state-machine proptest** at
+  `elide-coordinator/tests/portable_proptest.rs`: random sequences
+  drawn from `{Create, Release, ReleaseTo, ForceRelease,
+  ClaimReleased}` between two simulated coordinators sharing an
+  `InMemory` bucket. 256 cases. Asserts six bucket-level invariants
+  including signature verification of every handoff snapshot
+  (volume.pub for normal manifests, recovering coordinator's
+  `coordinator.pub` for synthesised handoff snapshots).
+- [ ] **Real-bucket integration test** exercising stop-on-A →
+  start-on-A (local resume) and release-on-A → start-on-B
+  (cross-coordinator) against Tigris in CI. Phase 5.
 
 **Phase exit criteria:** a name can move cleanly between two
 coordinators when explicitly released, and stays put across a stop
@@ -441,19 +452,22 @@ may claim). Composes with `--force`.
   `lib.rs`) so `recovery` can call `fetch_coordinator_pub`. Callers
   in binary-only files updated from `crate::identity::...` to
   `elide_coordinator::identity::...`.
-- [ ] **Tests:** force-release after simulated coordinator death
-  (kill the writing process between segment uploads and
-  `names/<name>` rewrite, then `release --force` + `start --remote`
-  from a second coordinator); force-release when the dead fork
-  never published a snapshot (segment-listing replay covers it);
-  force-release skips a tampered segment whose signature fails
-  verification; `release --to <X>` followed by `start --remote` on
-  X (succeeds) and on Y (refused before conditional PUT);
-  `start --remote` against a synthesised snapshot signed by a
-  pubkey whose derivation doesn't match the bucket path (refused);
-  `start --remote` against a synthesised snapshot whose signing
-  coordinator's pub is missing from the bucket (refused with a
-  clear error).
+- [x] **Tests at the helper / inbound-op layer:** tampered-segment
+  drop (`force_release_op_drops_tampered_segment_but_succeeds`);
+  `release --to <X>` then `start --remote` on X
+  (`start_remote_against_reserved_for_self_returns_claim_pin`) and
+  on Y (`start_remote_against_reserved_for_other_refuses`,
+  `claim_op_refuses_reserved_for_another_coordinator`);
+  synthesised-snapshot mismatched-pubkey and missing-pub refusal
+  paths covered at the `recovery::resolve_handoff_verifier` layer;
+  empty-segment-list recovery exercised in `recovery::tests` and
+  the two-coordinator proptest.
+- [ ] **Process-level recovery test:** force-release after a real
+  simulated coordinator death (kill the writing process between
+  segment uploads and `names/<name>` rewrite, then
+  `release --force` + `start --remote` from a second coordinator).
+  Belongs alongside the kernel-lane CI tests; heavier than the
+  inbound-op coverage above.
 
 **Phase exit criteria:** an operator can recover a name from a dead
 coordinator and the recovered fork includes every segment the dead
@@ -470,18 +484,26 @@ The "feels like magic" UX work. Depends on Phase 0–3.
   reads `by_name/` and (with `--all`) `by_id/`, never reaches S3.
   Columns are `name`, `vol_ulid`, `mode`, `state`, `transport`,
   `pid` per the existing shape.
-- [ ] **`volume status <name>` gains `--remote`.**
-  - Default: local — what this coordinator knows about `<name>`.
-  - `--remote`: fetches `names/<name>` from S3 and prints the
-    authoritative record (`vol_ulid`, `state`, `coordinator_id`,
-    `hostname`, `claimed_at`) plus eligibility for this
-    coordinator. Errors clearly if `<name>` is not present in the
-    bucket.
-- [ ] **Hard-remove `volume remote`.** Delete the `Remote`
-  subcommand and `RemoteCommand` enum from `src/main.rs`. Delete
-  `remote_list` and `remote_pull` helpers and their callers. Remove
-  the `volume remote` documentation surface. Pre-existing scripts
-  break — clean break per decision 2.
+- [x] **`volume status <name>` gains `--remote`.** Local-only by
+  default; with `--remote` the new `status-remote` IPC verb fetches
+  `names/<name>` from the bucket and returns a TOML body carrying
+  `state`, `vol_ulid`, `coordinator_id`, `hostname`, `claimed_at`,
+  `parent`, `handoff_snapshot`, plus an `eligibility` field
+  (`owned` / `foreign` / `released-claimable` / `reserved-for-self`
+  / `reserved-for-other` / `readonly`) computed against this
+  coordinator's id. Absent records surface a clear error before any
+  parsing. 6 new unit tests against `InMemory` cover each
+  eligibility class plus the absent-name path.
+- [x] **Hard-remove `volume remote`.** Deleted the `Remote` subcommand
+  and `RemoteCommand` enum from `src/main.rs`, the dispatch arm, and
+  `remote_list`. **`remote_pull` is retained** — it is the canonical
+  helper used by `fork --from` (`FromSpec::ExplicitPin` /
+  `FromSpec::BareUlid` / `FromSpec::Name`) and the
+  `claim_released_name` path; deleting it would break shipped
+  functionality. Doc surface updated in `docs/operations.md`,
+  `docs/architecture.md`, `docs/formats.md` (the `volume remote list`
+  / `volume remote pull` rows are replaced by `volume status --remote`
+  and `volume start --remote` respectively).
 - [ ] **Error path for non-portable buckets.** When `volume start
   <name>` is invoked against a name not held by this coordinator,
   *and* the bucket-capability probe says no conditional PUT,
@@ -555,3 +577,10 @@ the work fully closes:
    they refresh. Not blocking — fresh-fetch on every verification
    is correct and the cost is one small GET per `start --remote`
    against a synthesised snapshot.
+5. **ublk volume-open retry.** `src/ublk.rs:434` calls
+   `Volume::open` directly. The NBD path uses
+   `crate::volume_open::open_volume_with_retry` to absorb the
+   coordinator-prefetch / supervisor-spawn race on freshly-claimed
+   forks; ublk has the same race window. Switch ublk to the helper
+   once the current testing work lands. TODO comment at the call
+   site mirrors this note.
