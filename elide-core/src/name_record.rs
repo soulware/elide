@@ -49,11 +49,10 @@
 //!   via `blake3::derive_key("elide coordinator-id v1", &pub_bytes)`,
 //!   formatted as a 26-char Crockford-Base32 ULID-shape (see
 //!   `elide_coordinator::portable::format_coordinator_id`). Owner when
-//!   `state ∈ {Live, Stopped}`; *intended claimer* when
-//!   `state = Reserved`; cleared when `state ∈ {Released, Readonly}`.
-//! - `state` — `"live"` | `"stopped"` | `"released"` | `"reserved"` |
-//!   `"readonly"` on the wire (lowercase). See § "Five states, three
-//!   intents" in the design doc.
+//!   `state ∈ {Live, Stopped}`; cleared when
+//!   `state ∈ {Released, Readonly}`.
+//! - `state` — `"live"` | `"stopped"` | `"released"` | `"readonly"`
+//!   on the wire (lowercase). See § "Four states" in the design doc.
 //! - `parent` — `"<prev_vol_ulid>/<prev_snap_ulid>"`, the handoff
 //!   snapshot the current fork was minted from. Present on forks born
 //!   from a released ancestor; absent on root volumes.
@@ -84,8 +83,8 @@ pub fn current_hostname() -> Option<String> {
 
 /// Lifecycle state of a named volume.
 ///
-/// See the design doc § "Five states, three intents" for the operator
-/// model behind these values.
+/// See the design doc § "Four states" for the operator model behind
+/// these values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NameState {
@@ -95,19 +94,10 @@ pub enum NameState {
     /// Held by `coordinator_id`; daemon down on this host. Other
     /// coordinators cannot claim without `--force`.
     Stopped,
-    /// No current owner. Any coordinator may `volume start` to claim.
+    /// No current owner. Any coordinator may `volume claim` to claim.
     /// `coordinator_id`, `claimed_at`, and `hostname` are cleared on
     /// release so the record's populated fields match the state.
     Released,
-    /// Released to a specific coordinator (`volume release --to <X>`).
-    /// `coordinator_id` carries the *intended claimer* (X), not a
-    /// current owner; `claimed_at` and `hostname` stay empty until X
-    /// claims via `mark_claimed`. Only X may transition this record
-    /// to `Live`; other coordinators are refused before the
-    /// conditional PUT, closing the post-release race window. The
-    /// previous owner has already drained and published a handoff
-    /// snapshot, exactly as for `Released`.
-    Reserved,
     /// Name points at immutable content (e.g. an imported OCI image).
     /// No exclusive owner; multiple coordinators may pull and serve
     /// the same name concurrently. Lifecycle verbs (`stop` / `release`
@@ -284,7 +274,6 @@ mod tests {
             NameState::Live,
             NameState::Stopped,
             NameState::Released,
-            NameState::Reserved,
             NameState::Readonly,
         ] {
             let r = NameRecord {
@@ -333,19 +322,6 @@ vol_ulid = "01J0000000000000000000000V"
         assert!(
             toml.contains("state = \"released\""),
             "expected lowercase state, got: {toml}"
-        );
-    }
-
-    #[test]
-    fn reserved_serialises_lowercase() {
-        let r = NameRecord {
-            state: NameState::Reserved,
-            ..NameRecord::live_minimal(sample_ulid())
-        };
-        let toml = r.to_toml().unwrap();
-        assert!(
-            toml.contains("state = \"reserved\""),
-            "expected lowercase reserved, got: {toml}"
         );
     }
 }

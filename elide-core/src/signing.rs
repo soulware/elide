@@ -724,7 +724,7 @@ pub fn read_snapshot_manifest(
 /// Same semantics as [`read_snapshot_manifest`] but takes a byte
 /// slice directly. Used by callers that fetch a manifest from S3
 /// rather than a local volume directory — notably the
-/// claimant-side verification step of `volume start --remote`
+/// claimant-side verification step of `volume claim`
 /// against a synthesised handoff snapshot.
 ///
 /// `snap_ulid` is used only for diagnostic strings; signature
@@ -776,7 +776,7 @@ pub fn read_snapshot_manifest_from_bytes(
 
 /// Inspect a snapshot manifest's recovery metadata **without
 /// verifying the signature**. Used by claimants on
-/// `volume start --remote` to decide which pubkey to verify the
+/// `volume claim` to decide which pubkey to verify the
 /// manifest under: regular volume identity key vs. recovering
 /// coordinator's `coordinator.pub`.
 ///

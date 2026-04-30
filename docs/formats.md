@@ -447,7 +447,7 @@ Content: the volume ULID, plain text. Written (or atomically overwritten) at imp
 
 Benefits of this layout:
 - `LIST by_id/<ulid>/YYYYMMDD/` returns all segments for a volume on a given day — useful for GC audit
-- `LIST by_id/<ulid>/snapshots/` returns all branch points — used during the `start --remote` claim path's ancestry walk
+- `LIST by_id/<ulid>/snapshots/` returns all branch points — used during the `volume claim` ancestry walk
 - `LIST names/` returns all named volumes (operator-side enumeration; the CLI no longer exposes a list verb after the `volume remote` removal)
 - `by_id/` and `names/` are distinct top-level prefixes; ULIDs and human names can never collide
 

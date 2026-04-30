@@ -110,7 +110,7 @@ pub async fn mark_stopped(
     match record.state {
         NameState::Live => {}
         NameState::Stopped => return Ok(MarkStoppedOutcome::AlreadyStopped),
-        NameState::Released | NameState::Reserved | NameState::Readonly => {
+        NameState::Released | NameState::Readonly => {
             return Err(LifecycleError::InvalidTransition {
                 from: record.state,
                 verb: "stop",
@@ -188,7 +188,7 @@ pub async fn mark_released(
     match record.state {
         NameState::Live | NameState::Stopped => {}
         NameState::Released => return Ok(MarkReleasedOutcome::AlreadyReleased),
-        NameState::Reserved | NameState::Readonly => {
+        NameState::Readonly => {
             return Err(LifecycleError::InvalidTransition {
                 from: record.state,
                 verb: "release",
@@ -206,93 +206,7 @@ pub async fn mark_released(
     Ok(MarkReleasedOutcome::Updated)
 }
 
-/// Outcome of a `mark_released_to` call (targeted handoff).
-#[derive(Debug)]
-pub enum MarkReservedOutcome {
-    /// `names/<name>` was updated to `Reserved` for `target_coord_id`,
-    /// recording `handoff_snapshot` so the named claimant can fork.
-    Updated,
-    /// `names/<name>` did not exist in the bucket. Targeted handoff
-    /// requires a published record (something to hand off); callers
-    /// should treat this as an error.
-    Absent,
-    /// `names/<name>` was already `Reserved` for the same target with
-    /// a matching `handoff_snapshot`. Idempotent success — typically a
-    /// retry after a flaky network exchange.
-    AlreadyReserved,
-}
-
-/// Transition `names/<name>` from `Live` or `Stopped` to `Reserved`
-/// for a specific coordinator, recording the handoff snapshot. The
-/// target coordinator is written into `coordinator_id` *as the
-/// intended claimer*, not as the current owner; `claimed_at` and
-/// `hostname` stay empty until the target invokes `mark_claimed`.
-///
-/// Closes the post-release race window of plain `mark_released`:
-/// because the record is `Reserved` and not `Released`, only the
-/// named coordinator can transition it to `Live`. Other claimants
-/// see `OwnershipConflict { held_by: <target> }` from `mark_claimed`
-/// before any conditional PUT runs.
-///
-/// Caller responsibilities mirror `mark_released`: drain the WAL,
-/// publish a handoff snapshot covering everything drained, then call
-/// this with the resulting `snap_ulid`.
-pub async fn mark_released_to(
-    store: &Arc<dyn ObjectStore>,
-    name: &str,
-    coord_id: &str,
-    target_coord_id: &str,
-    handoff_snapshot: Ulid,
-) -> Result<MarkReservedOutcome, LifecycleError> {
-    let Some((mut record, version)) = name_store::read_name_record(store, name).await? else {
-        return Ok(MarkReservedOutcome::Absent);
-    };
-
-    if let Some(existing) = record.coordinator_id.as_deref()
-        && existing != coord_id
-        && record.state != NameState::Reserved
-    {
-        return Err(LifecycleError::OwnershipConflict {
-            held_by: existing.to_owned(),
-        });
-    }
-
-    match record.state {
-        NameState::Live | NameState::Stopped => {}
-        NameState::Reserved => {
-            // Idempotent success only when the prior reservation
-            // matches this call exactly: same target + same snapshot.
-            // Anything else is a transition we won't silently take.
-            let same_target = record.coordinator_id.as_deref() == Some(target_coord_id);
-            let same_snap = record.handoff_snapshot == Some(handoff_snapshot);
-            if same_target && same_snap {
-                return Ok(MarkReservedOutcome::AlreadyReserved);
-            }
-            return Err(LifecycleError::InvalidTransition {
-                from: NameState::Reserved,
-                verb: "release --to",
-            });
-        }
-        NameState::Released | NameState::Readonly => {
-            return Err(LifecycleError::InvalidTransition {
-                from: record.state,
-                verb: "release --to",
-            });
-        }
-    }
-
-    record.state = NameState::Reserved;
-    record.handoff_snapshot = Some(handoff_snapshot);
-    record.coordinator_id = Some(target_coord_id.to_owned());
-    // Claim metadata is empty until the target runs mark_claimed.
-    record.claimed_at = None;
-    record.hostname = None;
-
-    name_store::update_name_record(store, name, &record, version).await?;
-    Ok(MarkReservedOutcome::Updated)
-}
-
-/// Outcome of `mark_released_force` / `mark_released_force_to`.
+/// Outcome of `mark_released_force`.
 #[derive(Debug)]
 pub enum ForceReleaseOutcome {
     /// `names/<name>` was unconditionally rewritten to the new state.
@@ -304,7 +218,7 @@ pub enum ForceReleaseOutcome {
     /// recover from.
     Absent,
     /// `names/<name>` exists but is in a state where force-release
-    /// must refuse: `Released`, `Reserved`, or `Readonly`. Force is
+    /// must refuse: `Released` or `Readonly`. Force is
     /// the override path for an unreachable owner; it must not flip
     /// states whose semantics make no sense for the verb.
     InvalidState { observed: NameState },
@@ -324,9 +238,8 @@ pub enum ForceReleaseOutcome {
 /// fork's `vol_ulid` is preserved on the record so claimants know
 /// which prefix to fork from.
 ///
-/// Refuses to operate on `Released` (already released — no-op),
-/// `Reserved` (different override flow), or `Readonly` (no exclusive
-/// owner to override).
+/// Refuses to operate on `Released` (already released — no-op) or
+/// `Readonly` (no exclusive owner to override).
 pub async fn mark_released_force(
     store: &Arc<dyn ObjectStore>,
     name: &str,
@@ -338,7 +251,7 @@ pub async fn mark_released_force(
 
     match current.state {
         NameState::Live | NameState::Stopped => {}
-        other @ (NameState::Released | NameState::Reserved | NameState::Readonly) => {
+        other @ (NameState::Released | NameState::Readonly) => {
             return Ok(ForceReleaseOutcome::InvalidState { observed: other });
         }
     }
@@ -352,47 +265,6 @@ pub async fn mark_released_force(
         coordinator_id: None,
         state: NameState::Released,
         // Preserve provenance so the chain stays walkable.
-        parent: current.parent,
-        claimed_at: None,
-        hostname: None,
-        handoff_snapshot: Some(handoff_snapshot),
-    };
-
-    name_store::overwrite_name_record(store, name, &new).await?;
-    Ok(ForceReleaseOutcome::Overwritten {
-        dead_vol_ulid: current.vol_ulid,
-    })
-}
-
-/// **Unconditionally** rewrite `names/<name>` to `Reserved` for
-/// `target_coord_id`. The targeted-handoff variant of
-/// `mark_released_force`: closes the post-force race window so only
-/// the named coordinator can claim.
-///
-/// Same caveats as `mark_released_force`: the caller must already
-/// have published the synthesised handoff snapshot.
-pub async fn mark_released_force_to(
-    store: &Arc<dyn ObjectStore>,
-    name: &str,
-    target_coord_id: &str,
-    handoff_snapshot: Ulid,
-) -> Result<ForceReleaseOutcome, LifecycleError> {
-    let Some((current, _version)) = name_store::read_name_record(store, name).await? else {
-        return Ok(ForceReleaseOutcome::Absent);
-    };
-
-    match current.state {
-        NameState::Live | NameState::Stopped => {}
-        other @ (NameState::Released | NameState::Reserved | NameState::Readonly) => {
-            return Ok(ForceReleaseOutcome::InvalidState { observed: other });
-        }
-    }
-
-    let new = elide_core::name_record::NameRecord {
-        version: elide_core::name_record::NameRecord::CURRENT_VERSION,
-        vol_ulid: current.vol_ulid,
-        coordinator_id: Some(target_coord_id.to_owned()),
-        state: NameState::Reserved,
         parent: current.parent,
         claimed_at: None,
         hostname: None,
@@ -444,7 +316,7 @@ pub async fn mark_live(
         NameState::Live => return Ok(MarkLiveOutcome::AlreadyLive),
         NameState::Stopped => {}
         NameState::Released => return Ok(MarkLiveOutcome::Released),
-        NameState::Reserved | NameState::Readonly => {
+        NameState::Readonly => {
             return Err(LifecycleError::InvalidTransition {
                 from: record.state,
                 verb: "start",
@@ -497,15 +369,12 @@ pub enum MarkReclaimedLocalOutcome {
 
 /// In-place reclaim of a `Released` name when the local fork is the
 /// same one the record points at — i.e. the previous owner was *us*
-/// and the local fork is still on disk. Transitions
-/// `Released → Live` keeping the existing `vol_ulid`, repopulating
+/// and the local fork is still on disk. Transitions `Released` to the
+/// requested `target_state` (`Live` for `start --claim`, `Stopped` for
+/// `claim`), keeping the existing `vol_ulid`, repopulating
 /// `coordinator_id`/`claimed_at`/`hostname`, and clearing
-/// `handoff_snapshot` (it was the last published handoff; the new
-/// claim episode hasn't published one yet).
+/// `handoff_snapshot`.
 ///
-/// This is the natural path for `volume stop --release` followed by
-/// `volume start` on the same coordinator: nothing changed locally,
-/// nothing needs to be re-forked, the symlink stays where it is.
 /// Cross-coordinator claim (different host, no local fork) still
 /// goes through `mark_claimed` which mints a new `vol_ulid`.
 pub async fn mark_reclaimed_local(
@@ -513,7 +382,10 @@ pub async fn mark_reclaimed_local(
     name: &str,
     coord_id: &str,
     local_vol_ulid: Ulid,
+    target_state: NameState,
 ) -> Result<MarkReclaimedLocalOutcome, LifecycleError> {
+    debug_assert!(matches!(target_state, NameState::Live | NameState::Stopped));
+
     let Some((mut record, version)) = name_store::read_name_record(store, name).await? else {
         return Ok(MarkReclaimedLocalOutcome::Absent);
     };
@@ -532,7 +404,7 @@ pub async fn mark_reclaimed_local(
         });
     }
 
-    record.state = NameState::Live;
+    record.state = target_state;
     record.coordinator_id = Some(coord_id.to_owned());
     record.claimed_at = Some(chrono::Utc::now().to_rfc3339());
     record.hostname = current_hostname();
@@ -674,93 +546,61 @@ pub async fn mark_initial_readonly(
 }
 
 /// Outcome of a `mark_claimed` call (the claim-from-released path of
-/// `volume start`).
+/// `volume claim`).
 #[derive(Debug)]
 pub enum MarkClaimedOutcome {
-    /// `names/<name>` was updated from `Released` (or `Reserved` when
-    /// the caller is the intended claimer) to `Live`, with `vol_ulid`
-    /// rewritten to `new_vol_ulid` and the previous fork's
+    /// `names/<name>` was updated from `Released` to the requested
+    /// state (`Live` or `Stopped`), with `vol_ulid` rewritten to
+    /// `new_vol_ulid` and the previous fork's
     /// `<vol_ulid>/<handoff_snapshot>` recorded as `parent`.
     Claimed,
     /// `names/<name>` did not exist in the bucket; nothing to claim.
-    /// Callers handling a `volume start` should treat this as the
-    /// "no record yet" path, not the claim-from-released path.
+    /// Callers handling `volume claim` should treat this as the
+    /// "no record yet" path.
     Absent,
     /// `names/<name>` is not in a claimable state. Includes the
     /// observed state so callers can produce a clear error.
-    /// `Reserved` records observed by a non-target claimer surface
-    /// as `LifecycleError::OwnershipConflict` (named-for-someone-else)
-    /// rather than this outcome — see the helper for that distinction.
     NotReleased { observed: NameState },
 }
 
-/// Atomically claim a `Released` (or `Reserved`-for-self) name for
-/// this coordinator and rebind it to a fresh fork. Conditional PUT
-/// under the ETag observed at read time, so two coordinators racing
-/// to claim the same released name resolve cleanly: one wins, the
-/// other gets `PreconditionFailed`
+/// Atomically claim a `Released` name for this coordinator and rebind
+/// it to a fresh fork. Conditional PUT under the ETag observed at
+/// read time, so two coordinators racing to claim the same released
+/// name resolve cleanly: one wins, the other gets `PreconditionFailed`
 /// (returned as `LifecycleError::Store(NameStoreError::PreconditionFailed)`).
 ///
-/// `Reserved` records carry an intended claimer in `coordinator_id`.
-/// `mark_claimed` permits the claim only when `coordinator_id == self`;
-/// any other coordinator observing a `Reserved` record receives
-/// `OwnershipConflict { held_by: <intended claimer> }` and is refused
-/// before the conditional PUT, closing the post-release race window.
+/// `target_state` selects the post-claim state: `Live` for
+/// `volume start --claim` (composed claim+start), `Stopped` for
+/// `volume claim` (claim only, leave daemon halted). Any other state
+/// is a programmer error.
 ///
 /// Caller responsibilities (orchestrated externally — typically the
-/// CLI for `volume start`):
+/// CLI for `volume claim`):
 ///   1. Mint `new_vol_ulid` locally.
 ///   2. Materialise a fork at `by_id/<new_vol_ulid>/` whose provenance
 ///      points at the released ancestor's
 ///      `<previous_vol_ulid>/<handoff_snapshot>`.
 ///   3. Call `mark_claimed` to atomically rebind the name.
-///   4. Spawn the volume daemon.
-///
-/// On success the name now points at `new_vol_ulid`, state is `Live`,
-/// `coordinator_id` is this coordinator's, and `parent` records the
-/// previous fork's pin.
+///   4. (Optional) Spawn the volume daemon.
 pub async fn mark_claimed(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     coord_id: &str,
     new_vol_ulid: Ulid,
+    target_state: NameState,
 ) -> Result<MarkClaimedOutcome, LifecycleError> {
+    debug_assert!(matches!(target_state, NameState::Live | NameState::Stopped));
+
     let Some((existing, version)) = name_store::read_name_record(store, name).await? else {
         return Ok(MarkClaimedOutcome::Absent);
     };
 
-    match existing.state {
-        NameState::Released => {}
-        NameState::Reserved => {
-            // Targeted handoff: only the named coordinator may claim.
-            // Refuse before the conditional PUT for foreign claimants.
-            match existing.coordinator_id.as_deref() {
-                Some(target) if target == coord_id => {}
-                Some(target) => {
-                    return Err(LifecycleError::OwnershipConflict {
-                        held_by: target.to_owned(),
-                    });
-                }
-                // A `Reserved` record with no coordinator_id is a
-                // protocol violation by the writer (the whole point
-                // of Reserved is to name a target). Surface it as a
-                // generic NotReleased so the operator notices.
-                None => {
-                    return Ok(MarkClaimedOutcome::NotReleased {
-                        observed: NameState::Reserved,
-                    });
-                }
-            }
-        }
-        other => {
-            return Ok(MarkClaimedOutcome::NotReleased { observed: other });
-        }
+    if existing.state != NameState::Released {
+        return Ok(MarkClaimedOutcome::NotReleased {
+            observed: existing.state,
+        });
     }
 
-    // The released record carries the handoff snapshot; together with
-    // the previous fork's ULID it forms the parent pin for our new
-    // fork. The fork itself was materialised by the caller before this
-    // call; we just record the linkage in the name record.
     let parent_pin = existing
         .handoff_snapshot
         .map(|snap| format!("{}/{}", existing.vol_ulid, snap));
@@ -769,12 +609,10 @@ pub async fn mark_claimed(
         version: elide_core::name_record::NameRecord::CURRENT_VERSION,
         vol_ulid: new_vol_ulid,
         coordinator_id: Some(coord_id.to_owned()),
-        state: NameState::Live,
+        state: target_state,
         parent: parent_pin,
         claimed_at: Some(chrono::Utc::now().to_rfc3339()),
         hostname: current_hostname(),
-        // The new fork hasn't published a handoff snapshot of its own
-        // yet; that field is reset for the new ownership episode.
         handoff_snapshot: None,
     };
 
@@ -1187,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn mark_claimed_returns_absent_when_record_missing() {
         let s = store();
-        let outcome = mark_claimed(&s, "missing", &id_b(), other_ulid())
+        let outcome = mark_claimed(&s, "missing", &id_b(), other_ulid(), NameState::Live)
             .await
             .unwrap();
         assert!(matches!(outcome, MarkClaimedOutcome::Absent));
@@ -1202,7 +1040,7 @@ mod tests {
         mark_stopped(&s, "vol", &id_a()).await.unwrap();
         mark_live(&s, "vol", &id_a()).await.unwrap();
 
-        let outcome = mark_claimed(&s, "vol", &id_b(), other_ulid())
+        let outcome = mark_claimed(&s, "vol", &id_b(), other_ulid(), NameState::Live)
             .await
             .unwrap();
         assert!(matches!(
@@ -1221,7 +1059,7 @@ mod tests {
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
 
         // B claims A's released name with a freshly-minted ULID.
-        let outcome = mark_claimed(&s, "vol", &id_b(), other_ulid())
+        let outcome = mark_claimed(&s, "vol", &id_b(), other_ulid(), NameState::Live)
             .await
             .unwrap();
         assert!(matches!(outcome, MarkClaimedOutcome::Claimed));
@@ -1256,8 +1094,8 @@ mod tests {
         let ulid_b = other_ulid();
         let ulid_c = Ulid::from_string("01J3333333333333333333333V").unwrap();
         let (b_outcome, c_outcome) = tokio::join!(
-            mark_claimed(&s, "vol", &id_b, ulid_b),
-            mark_claimed(&s, "vol", &id_c, ulid_c),
+            mark_claimed(&s, "vol", &id_b, ulid_b, NameState::Live),
+            mark_claimed(&s, "vol", &id_c, ulid_c, NameState::Live),
         );
 
         // Exactly one wins via the conditional PUT; the other observes
@@ -1377,7 +1215,7 @@ mod tests {
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
 
         // Reclaim in-place.
-        let outcome = mark_reclaimed_local(&s, "vol", &id_a(), sample_ulid())
+        let outcome = mark_reclaimed_local(&s, "vol", &id_a(), sample_ulid(), NameState::Live)
             .await
             .unwrap();
         assert!(matches!(outcome, MarkReclaimedLocalOutcome::Reclaimed));
@@ -1397,7 +1235,7 @@ mod tests {
     #[tokio::test]
     async fn mark_reclaimed_local_returns_absent_when_record_missing() {
         let s = store();
-        let outcome = mark_reclaimed_local(&s, "missing", &id_a(), sample_ulid())
+        let outcome = mark_reclaimed_local(&s, "missing", &id_a(), sample_ulid(), NameState::Live)
             .await
             .unwrap();
         assert!(matches!(outcome, MarkReclaimedLocalOutcome::Absent));
@@ -1410,7 +1248,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = mark_reclaimed_local(&s, "vol", &id_a(), sample_ulid())
+        let outcome = mark_reclaimed_local(&s, "vol", &id_a(), sample_ulid(), NameState::Live)
             .await
             .unwrap();
         match outcome {
@@ -1436,7 +1274,7 @@ mod tests {
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
 
         let other_local_ulid = snap(); // different from sample_ulid()
-        let outcome = mark_reclaimed_local(&s, "vol", &id_b(), other_local_ulid)
+        let outcome = mark_reclaimed_local(&s, "vol", &id_b(), other_local_ulid, NameState::Live)
             .await
             .unwrap();
         match outcome {
@@ -1588,7 +1426,9 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = mark_claimed(&s, "vol", &id_a(), snap()).await.unwrap();
+        let outcome = mark_claimed(&s, "vol", &id_a(), snap(), NameState::Live)
+            .await
+            .unwrap();
         assert!(matches!(
             outcome,
             MarkClaimedOutcome::NotReleased {
@@ -1597,307 +1437,7 @@ mod tests {
         ));
     }
 
-    // ── mark_released_to (targeted handoff) ─────────────────────────────
-
-    #[tokio::test]
-    async fn mark_released_to_returns_absent_when_record_missing() {
-        let s = store();
-        let r = mark_released_to(&s, "missing", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-        assert!(matches!(r, MarkReservedOutcome::Absent));
-    }
-
-    #[tokio::test]
-    async fn mark_released_to_flips_live_to_reserved_with_target() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-
-        let outcome = mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-        assert!(matches!(outcome, MarkReservedOutcome::Updated));
-
-        let (got, _) = name_store::read_name_record(&s, "vol")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.state, NameState::Reserved);
-        // coordinator_id carries the *intended claimer* (B), not A.
-        assert_eq!(got.coordinator_id.as_deref(), Some(id_b().as_str()));
-        // Claim metadata stays empty until B actually claims.
-        assert!(got.claimed_at.is_none());
-        assert!(got.hostname.is_none());
-        assert_eq!(got.handoff_snapshot, Some(snap()));
-        assert_eq!(got.vol_ulid, sample_ulid());
-    }
-
-    #[tokio::test]
-    async fn mark_released_to_flips_stopped_to_reserved() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-        mark_stopped(&s, "vol", &id_a()).await.unwrap();
-
-        let outcome = mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-        assert!(matches!(outcome, MarkReservedOutcome::Updated));
-    }
-
-    #[tokio::test]
-    async fn mark_released_to_refuses_other_owners_record() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-
-        // C tries to release-to-B a record owned by A.
-        let id_c = portable::format_coordinator_id(&portable::coordinator_id(&[0xEFu8; 32]));
-        let err = mark_released_to(&s, "vol", &id_c, &id_b(), snap())
-            .await
-            .expect_err("foreign owner must be refused");
-        assert!(matches!(err, LifecycleError::OwnershipConflict { .. }));
-    }
-
-    #[tokio::test]
-    async fn mark_released_to_refuses_released_record() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-        mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
-
-        // Released → Reserved isn't a valid transition (the record is
-        // already openly claimable; targeted handoff happens at release
-        // time, not after).
-        let err = mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .expect_err("released → reserved is not a valid transition");
-        assert!(matches!(
-            err,
-            LifecycleError::InvalidTransition {
-                from: NameState::Released,
-                verb: "release --to"
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn mark_released_to_refuses_readonly_record() {
-        let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid())
-            .await
-            .unwrap();
-
-        let err = mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .expect_err("readonly cannot be reserved");
-        assert!(matches!(
-            err,
-            LifecycleError::InvalidTransition {
-                from: NameState::Readonly,
-                verb: "release --to"
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn mark_released_to_is_idempotent_for_same_target_and_snapshot() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-
-        mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-        // A retries with the same target + snapshot — record is already
-        // Reserved, so the previous owner's record-write call is gone
-        // but the operator-facing meaning is unchanged. We expect
-        // AlreadyReserved. Note the ownership check carves out Reserved
-        // (the original owner's id isn't in the record any more) so the
-        // retry has to come from the *same operator path*; in practice
-        // the second call here doesn't match the read-modify-write
-        // contract of S3, so we exercise the state-level idempotency
-        // by calling from coord_id matching the new record holder
-        // (none — coordinator_id is the *target*). The actual check is
-        // that calling with same target and same snap returns
-        // AlreadyReserved.
-        let outcome = mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-        assert!(matches!(outcome, MarkReservedOutcome::AlreadyReserved));
-    }
-
-    #[tokio::test]
-    async fn mark_released_to_refuses_re_reservation_with_different_target() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-        mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-
-        // Attempting to re-reserve to a different target is not idempotent;
-        // it's a state we won't silently take.
-        let id_c = portable::format_coordinator_id(&portable::coordinator_id(&[0xEFu8; 32]));
-        let err = mark_released_to(&s, "vol", &id_a(), &id_c, snap())
-            .await
-            .expect_err("re-reserving to a different target must refuse");
-        assert!(matches!(
-            err,
-            LifecycleError::InvalidTransition {
-                from: NameState::Reserved,
-                verb: "release --to"
-            }
-        ));
-    }
-
-    // ── mark_claimed against Reserved ──────────────────────────────────
-
-    #[tokio::test]
-    async fn mark_claimed_lets_target_claim_reserved_record() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-        mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-
-        // B is the intended claimer; mark_claimed succeeds.
-        let outcome = mark_claimed(&s, "vol", &id_b(), other_ulid())
-            .await
-            .unwrap();
-        assert!(matches!(outcome, MarkClaimedOutcome::Claimed));
-
-        let (got, _) = name_store::read_name_record(&s, "vol")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.state, NameState::Live);
-        assert_eq!(got.vol_ulid, other_ulid());
-        assert_eq!(got.coordinator_id.as_deref(), Some(id_b().as_str()));
-        // parent records the previous fork pinned at the handoff snapshot.
-        assert_eq!(
-            got.parent.as_deref(),
-            Some(format!("{}/{}", sample_ulid(), snap()).as_str()),
-        );
-    }
-
-    #[tokio::test]
-    async fn mark_claimed_refuses_non_target_for_reserved_record() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-        mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-
-        // C tries to claim a record reserved for B — refused before
-        // the conditional PUT, with held_by naming B.
-        let id_c = portable::format_coordinator_id(&portable::coordinator_id(&[0xEFu8; 32]));
-        let err = mark_claimed(&s, "vol", &id_c, other_ulid())
-            .await
-            .expect_err("non-target must be refused on reserved record");
-        match err {
-            LifecycleError::OwnershipConflict { held_by } => {
-                assert_eq!(held_by, id_b());
-            }
-            other => panic!("expected OwnershipConflict, got {other:?}"),
-        }
-
-        // Record is unchanged.
-        let (got, _) = name_store::read_name_record(&s, "vol")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.state, NameState::Reserved);
-        assert_eq!(got.vol_ulid, sample_ulid());
-    }
-
-    // ── Other lifecycle verbs refuse Reserved cleanly ──────────────────
-
-    #[tokio::test]
-    async fn mark_stopped_refuses_reserved_record() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-        mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-
-        // Even from B (the intended claimer), mark_stopped on a Reserved
-        // record is not a valid transition — claim → Live → Stopped is
-        // the path.
-        let err = mark_stopped(&s, "vol", &id_b())
-            .await
-            .expect_err("reserved record cannot be stopped");
-        assert!(matches!(
-            err,
-            LifecycleError::InvalidTransition {
-                from: NameState::Reserved,
-                verb: "stop"
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn mark_live_refuses_reserved_record() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-        mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-
-        // mark_live is the local-resume path, not the claim path.
-        // Reserved must route through mark_claimed.
-        let err = mark_live(&s, "vol", &id_b())
-            .await
-            .expect_err("reserved record cannot be locally resumed");
-        assert!(matches!(
-            err,
-            LifecycleError::InvalidTransition {
-                from: NameState::Reserved,
-                verb: "start"
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn mark_reclaimed_local_reports_not_released_for_reserved() {
-        // mark_reclaimed_local accepts only Released; Reserved surfaces
-        // through the existing NotReleased path.
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-        mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-
-        let outcome = mark_reclaimed_local(&s, "vol", &id_b(), sample_ulid())
-            .await
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            MarkReclaimedLocalOutcome::NotReleased {
-                observed_state: NameState::Reserved,
-                ..
-            }
-        ));
-    }
-
-    // ── mark_released_force / mark_released_force_to ──────────────────
+    // ── mark_released_force ───────────────────────────────────────────
 
     #[tokio::test]
     async fn mark_released_force_returns_absent_when_record_missing() {
@@ -1966,25 +1506,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_released_force_refuses_reserved_record() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-        mark_released_to(&s, "vol", &id_a(), &id_b(), snap())
-            .await
-            .unwrap();
-
-        let outcome = mark_released_force(&s, "vol", snap()).await.unwrap();
-        match outcome {
-            ForceReleaseOutcome::InvalidState { observed } => {
-                assert_eq!(observed, NameState::Reserved);
-            }
-            other => panic!("expected InvalidState, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn mark_released_force_refuses_readonly_record() {
         let s = store();
         mark_initial_readonly(&s, "vol", sample_ulid())
@@ -1998,35 +1519,5 @@ mod tests {
             }
             other => panic!("expected InvalidState, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn mark_released_force_to_writes_reserved_with_target() {
-        let s = store();
-        // A owns Live.
-        mark_initial(&s, "vol", &id_a(), sample_ulid())
-            .await
-            .unwrap();
-
-        // C force-releases targeted at B.
-        let id_c = portable::format_coordinator_id(&portable::coordinator_id(&[0xEFu8; 32]));
-        let _ = id_c;
-        let outcome = mark_released_force_to(&s, "vol", &id_b(), snap())
-            .await
-            .unwrap();
-        assert!(matches!(outcome, ForceReleaseOutcome::Overwritten { .. }));
-
-        let (got, _) = name_store::read_name_record(&s, "vol")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.state, NameState::Reserved);
-        // coordinator_id is the *target* (B), not anyone else.
-        assert_eq!(got.coordinator_id.as_deref(), Some(id_b().as_str()));
-        assert_eq!(got.vol_ulid, sample_ulid(), "dead vol_ulid preserved");
-        assert_eq!(got.handoff_snapshot, Some(snap()));
-        // Claim metadata empty until B claims.
-        assert!(got.claimed_at.is_none());
-        assert!(got.hostname.is_none());
     }
 }
