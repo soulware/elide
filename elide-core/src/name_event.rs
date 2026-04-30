@@ -112,10 +112,6 @@ pub enum EventKind {
         handoff_snapshot: Ulid,
         displaced_coordinator_id: String,
     },
-    /// `names/<name>` transitioned `Stopped → Live`.
-    Started,
-    /// `names/<name>` transitioned `Live → Stopped`.
-    Stopped,
     /// This name was created as a fork of another name's snapshot.
     /// Emitted on the *new* name's log only; the source name's log
     /// is not updated (see `design-name-event-log.md` open question
@@ -149,8 +145,6 @@ impl EventKind {
             Self::Claimed => "claimed",
             Self::Released { .. } => "released",
             Self::ForceReleased { .. } => "force_released",
-            Self::Started => "started",
-            Self::Stopped => "stopped",
             Self::ForkedFrom { .. } => "forked_from",
             Self::RenamedTo { .. } => "renamed_to",
             Self::RenamedFrom { .. } => "renamed_from",
@@ -266,7 +260,7 @@ impl NameEvent {
         }
         push_field(&mut buf, "kind", self.kind.as_str());
         match &self.kind {
-            EventKind::Created | EventKind::Claimed | EventKind::Started | EventKind::Stopped => {}
+            EventKind::Created | EventKind::Claimed => {}
             EventKind::Released { handoff_snapshot } => {
                 push_field(&mut buf, "handoff_snapshot", &handoff_snapshot.to_string());
             }
@@ -413,8 +407,6 @@ mod tests {
         let kinds = vec![
             EventKind::Created,
             EventKind::Claimed,
-            EventKind::Started,
-            EventKind::Stopped,
             EventKind::Released {
                 handoff_snapshot: snap_ulid(),
             },
@@ -458,7 +450,7 @@ mod tests {
         // Two events identical except for `signature` must produce
         // identical signing payloads — the pre-image cannot depend
         // on its own output.
-        let mut ev = sample_event(EventKind::Stopped);
+        let mut ev = sample_event(EventKind::Claimed);
         let payload_a = ev.signing_payload();
         ev.signature = Some("ff".repeat(64));
         let payload_b = ev.signing_payload();
@@ -470,11 +462,11 @@ mod tests {
 
     #[test]
     fn signing_payload_changes_with_kind() {
-        // A signature on a Stopped event must not validate as a
-        // Started event — the canonical form must differ on `kind`.
-        let stopped = sample_event(EventKind::Stopped).signing_payload();
-        let started = sample_event(EventKind::Started).signing_payload();
-        assert_ne!(stopped, started);
+        // A signature on a Claimed event must not validate as a
+        // Created event — the canonical form must differ on `kind`.
+        let claimed = sample_event(EventKind::Claimed).signing_payload();
+        let created = sample_event(EventKind::Created).signing_payload();
+        assert_ne!(claimed, created);
     }
 
     #[test]
@@ -528,12 +520,12 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let verifying = key.verifying_key();
 
-        let mut ev = sample_event(EventKind::Stopped);
+        let mut ev = sample_event(EventKind::Claimed);
         let sig = key.sign(&ev.signing_payload());
         ev.signature = Some(crate::signing::encode_hex(&sig.to_bytes()));
 
         // Tamper with the kind after signing.
-        ev.kind = EventKind::Started;
+        ev.kind = EventKind::Created;
         let sig_bytes: [u8; 64] = crate::signing::decode_hex(ev.signature.as_deref().unwrap())
             .expect("hex")
             .try_into()
@@ -562,7 +554,7 @@ mod tests {
     fn rejects_at_ulid_mismatch() {
         // Hand-edit `at` to a different second; the parser must
         // refuse to accept the event.
-        let ev = sample_event(EventKind::Stopped);
+        let ev = sample_event(EventKind::Claimed);
         let mut toml = ev.to_toml().expect("serialise");
         let original = ev.at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let tampered = (ev.at + chrono::Duration::seconds(1))
@@ -577,7 +569,7 @@ mod tests {
 
     #[test]
     fn at_derived_from_event_ulid() {
-        let ev = sample_event(EventKind::Started);
+        let ev = sample_event(EventKind::Claimed);
         let ulid_ms = ev.event_ulid.timestamp_ms();
         assert_eq!(ev.at.timestamp_millis() as u64, ulid_ms);
     }

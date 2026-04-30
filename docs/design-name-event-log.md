@@ -98,27 +98,33 @@ signature = "<ed25519-sig-over-canonical-form>"
 
 ## Event kinds
 
-The catalogue tracks **transitions of the name's lifecycle**, not
-every internal volume operation. Segment publication and ordinary
-snapshots stay out — they belong to the fork's local history, not
-the name's. Adding them later is additive; starting narrow keeps the
-log readable.
+The catalogue tracks **transitions of the name's identity or
+ownership**, not every internal volume operation. Segment
+publication, ordinary snapshots, and pure daemon-state changes
+(`start`/`stop` flipping `Live ↔ Stopped` under the same owner)
+stay out — they belong to the fork's local history, not the name's.
+Adding them later is additive; starting narrow keeps the log
+readable.
 
 | Kind | Emitter | When |
 |---|---|---|
 | `created` | first creator | initial `names/<name>` write (writable or readonly) |
-| `claimed` | acquiring coordinator | after `released → stopped` CAS succeeds |
+| `claimed` | acquiring coordinator | after `released → stopped/live` CAS succeeds |
 | `released` | releasing coordinator | after `live/stopped → released` CAS succeeds |
 | `force_released` | recovering coordinator | after `release --force` rewrites the pointer |
-| `started` | owner | after `stopped → live` CAS succeeds |
-| `stopped` | owner | after `live → stopped` CAS succeeds |
-| `forked_to` | source coordinator | when `volume create --from` produces a new name from this one |
+| `forked_from` | new fork's coordinator | when this name was created via `volume create --from` (emitted on the *new* name's log only — see open question 1) |
 | `renamed_to` | owner | terminal event when this name is renamed away (see Rename) |
 | `renamed_from` | owner | opening event when this name was just renamed in (see Rename) |
 
-Snapshot publication is intentionally absent. Handoff snapshots are
-embedded in `released` / `force_released` events; user snapshots are
-a fork-local concern. If we later want a richer log, we add events;
+Daemon `start`/`stop` are deliberately absent: they don't move
+ownership, don't change `vol_ulid`, and their durable record is
+already "this coordinator is the listed owner". Surfacing them as
+events would multiply the log volume for no auditable signal that
+isn't already in the pointer.
+
+Snapshot publication is also absent. Handoff snapshots are embedded
+in `released` / `force_released` events; user snapshots are a
+fork-local concern. If we later want a richer log, we add events;
 old readers that don't recognise a kind treat it as opaque.
 
 ## Rename
