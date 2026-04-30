@@ -277,6 +277,7 @@ pub async fn spawn_import(
     registry: &ImportRegistry,
     store: Arc<dyn ObjectStore>,
     rescan_notify: Arc<Notify>,
+    identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> std::io::Result<String> {
     let ImportRequest {
         vol_name,
@@ -314,7 +315,16 @@ pub async fn spawn_import(
     // uniqueness: two coordinators racing to import the same name
     // resolve cleanly (one wins, the other gets `AlreadyExists`).
     match mark_initial_readonly(&store, vol_name, vol_ulid_value).await {
-        Ok(MarkInitialOutcome::Claimed) => {}
+        Ok(MarkInitialOutcome::Claimed) => {
+            elide_coordinator::name_event_store::emit_best_effort(
+                &store,
+                identity.as_ref(),
+                vol_name,
+                elide_core::name_event::EventKind::Created,
+                vol_ulid_value,
+            )
+            .await;
+        }
         Ok(MarkInitialOutcome::AlreadyExists {
             existing_vol_ulid,
             existing_state,

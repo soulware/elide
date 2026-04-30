@@ -216,6 +216,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                         &ctx.registry,
                         &ctx.store,
                         &ctx.rescan,
+                        &ctx.identity,
                     )
                     .await
                 }
@@ -259,7 +260,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                     &ctx.snapshot_locks,
                     &ctx.store,
                     ctx.part_size_bytes,
-                    &ctx.coord_id,
+                    &ctx.identity,
                     &ctx.rescan,
                 )
                 .await
@@ -283,7 +284,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 new_ulid_str,
                 &ctx.data_dir,
                 &ctx.store,
-                &ctx.coord_id,
+                &ctx.identity,
                 &ctx.rescan,
                 &ctx.prefetch_tracker,
             )
@@ -313,7 +314,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             if tokens.next().is_some() {
                 return "err usage: claim <volume>".to_string();
             }
-            claim_volume_bucket_op(name, &ctx.data_dir, &ctx.store, &ctx.coord_id).await
+            claim_volume_bucket_op(name, &ctx.data_dir, &ctx.store, &ctx.identity).await
         }
 
         "start" => {
@@ -342,7 +343,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
             if args.is_empty() {
                 return "err usage: create <name> <size_bytes> [flags...]".to_string();
             }
-            create_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.coord_id, &ctx.rescan).await
+            create_volume_op(args, &ctx.data_dir, &ctx.store, &ctx.identity, &ctx.rescan).await
         }
 
         "update" => {
@@ -393,7 +394,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 args,
                 &ctx.data_dir,
                 &ctx.store,
-                &ctx.coord_id,
+                &ctx.identity,
                 &ctx.rescan,
                 &ctx.prefetch_tracker,
             )
@@ -589,6 +590,7 @@ async fn start_import(
     registry: &ImportRegistry,
     store: &Arc<dyn ObjectStore>,
     rescan: &Arc<Notify>,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> String {
     match import::spawn_import(
         req,
@@ -597,6 +599,7 @@ async fn start_import(
         registry,
         store.clone(),
         rescan.clone(),
+        identity.clone(),
     )
     .await
     {
@@ -1258,9 +1261,10 @@ async fn create_volume_op(
     args: &str,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-    coord_id: &str,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     rescan: &Notify,
 ) -> String {
+    let coord_id = identity.coordinator_id_str();
     // First two whitespace-separated tokens: name, size_bytes. Remainder is flags.
     let mut iter = args.splitn(3, ' ').map(str::trim);
     let name = match iter.next() {
@@ -1371,7 +1375,16 @@ async fn create_volume_op(
     // is always possible from here on.
     use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
     match mark_initial(store, name, coord_id, vol_ulid).await {
-        Ok(MarkInitialOutcome::Claimed) => {}
+        Ok(MarkInitialOutcome::Claimed) => {
+            elide_coordinator::name_event_store::emit_best_effort(
+                store,
+                identity.as_ref(),
+                name,
+                elide_core::name_event::EventKind::Created,
+                vol_ulid,
+            )
+            .await;
+        }
         Ok(MarkInitialOutcome::AlreadyExists {
             existing_vol_ulid,
             existing_state,
@@ -1881,10 +1894,11 @@ async fn fork_create_op(
     args: &str,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-    coord_id: &str,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     rescan: &Notify,
     prefetch_tracker: &PrefetchTracker,
 ) -> String {
+    let coord_id = identity.coordinator_id_str();
     let mut iter = args.splitn(3, ' ').map(str::trim);
     let new_name = match iter.next() {
         Some(s) if !s.is_empty() => s,
@@ -2047,6 +2061,14 @@ async fn fork_create_op(
         match mark_initial(store, new_name, coord_id, new_vol_ulid_value).await {
             Ok(MarkInitialOutcome::Claimed) => {
                 name_claimed_in_bucket = true;
+                elide_coordinator::name_event_store::emit_best_effort(
+                    store,
+                    identity.as_ref(),
+                    new_name,
+                    elide_core::name_event::EventKind::Created,
+                    new_vol_ulid_value,
+                )
+                .await;
             }
             Ok(MarkInitialOutcome::AlreadyExists {
                 existing_vol_ulid,
@@ -2492,12 +2514,30 @@ async fn force_release_volume_op(
     // Unconditional flip of names/<name>.
     let outcome = lifecycle::mark_released_force(store, volume_name, published.snap_ulid).await;
     match outcome {
-        Ok(ForceReleaseOutcome::Overwritten { dead_vol_ulid: d }) => {
+        Ok(ForceReleaseOutcome::Overwritten {
+            dead_vol_ulid: d,
+            displaced_coordinator_id,
+        }) => {
             info!(
                 "[inbound] force-released volume {volume_name} (released fork {d}) at \
                  synthesised handoff snapshot {}",
                 published.snap_ulid,
             );
+
+            // Best-effort journal entry recording the override.
+            elide_coordinator::name_event_store::emit_best_effort(
+                store,
+                identity.as_ref(),
+                volume_name,
+                elide_core::name_event::EventKind::ForceReleased {
+                    handoff_snapshot: published.snap_ulid,
+                    displaced_coordinator_id: displaced_coordinator_id
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                },
+                d,
+            )
+            .await;
+
             format!("ok {}", published.snap_ulid)
         }
         Ok(ForceReleaseOutcome::Absent) => {
@@ -2548,9 +2588,10 @@ async fn release_volume_op(
     snapshot_locks: &SnapshotLockRegistry,
     store: &Arc<dyn ObjectStore>,
     part_size_bytes: usize,
-    coord_id: &str,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     rescan: &Notify,
 ) -> String {
+    let coord_id = identity.coordinator_id_str();
     let started = std::time::Instant::now();
     info!("[release {volume_name}] start");
 
@@ -2623,7 +2664,7 @@ async fn release_volume_op(
                 "[release {volume_name}] fast path: reusing snapshot {snap_ulid} \
                  (clean stopped volume, no daemon restart needed)"
             );
-            let result = perform_release_flip(volume_name, store, coord_id, snap_ulid).await;
+            let result = perform_release_flip(volume_name, store, identity, snap_ulid).await;
             info!(
                 "[release {volume_name}] complete in {:.2?}",
                 started.elapsed()
@@ -2738,7 +2779,7 @@ async fn release_volume_op(
         }
     }
 
-    let result = perform_release_flip(volume_name, store, coord_id, snap_ulid).await;
+    let result = perform_release_flip(volume_name, store, identity, snap_ulid).await;
     info!(
         "[release {volume_name}] complete in {:.2?}",
         started.elapsed()
@@ -2750,21 +2791,40 @@ async fn release_volume_op(
 async fn perform_release_flip(
     volume_name: &str,
     store: &Arc<dyn ObjectStore>,
-    coord_id: &str,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     snap_ulid: ulid::Ulid,
 ) -> String {
-    use elide_coordinator::lifecycle;
+    use elide_coordinator::lifecycle::{self, MarkReleasedOutcome};
     let flip_started = std::time::Instant::now();
     info!(
         "[release {volume_name}] flipping names/<name> -> Released \
          with handoff snapshot {snap_ulid}"
     );
-    match lifecycle::mark_released(store, volume_name, coord_id, snap_ulid).await {
-        Ok(_) => {
+    match lifecycle::mark_released(store, volume_name, identity.coordinator_id_str(), snap_ulid)
+        .await
+    {
+        Ok(MarkReleasedOutcome::Updated { vol_ulid }) => {
             info!(
                 "[release {volume_name}] released at handoff snapshot {snap_ulid} \
                  (flip {:.2?})",
                 flip_started.elapsed()
+            );
+            elide_coordinator::name_event_store::emit_best_effort(
+                store,
+                identity.as_ref(),
+                volume_name,
+                elide_core::name_event::EventKind::Released {
+                    handoff_snapshot: snap_ulid,
+                },
+                vol_ulid,
+            )
+            .await;
+            format!("ok {snap_ulid}")
+        }
+        Ok(_) => {
+            info!(
+                "[release {volume_name}] release flip was idempotent or absent \
+                 (no event emitted)"
             );
             format!("ok {snap_ulid}")
         }
@@ -2897,10 +2957,11 @@ async fn rebind_name_op(
     new_ulid_str: &str,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-    coord_id: &str,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     rescan: &Notify,
     prefetch_tracker: &PrefetchTracker,
 ) -> String {
+    let coord_id = identity.coordinator_id_str();
     let new_ulid = match ulid::Ulid::from_string(new_ulid_str) {
         Ok(u) => u,
         Err(e) => return format!("err invalid new_vol_ulid: {e}"),
@@ -2957,6 +3018,14 @@ async fn rebind_name_op(
         Ok(MarkClaimedOutcome::Claimed) => {
             rescan.notify_one();
             info!("[inbound] rebound name {volume_name} to new fork {new_ulid} (stopped)");
+            elide_coordinator::name_event_store::emit_best_effort(
+                store,
+                identity.as_ref(),
+                volume_name,
+                elide_core::name_event::EventKind::Claimed,
+                new_ulid,
+            )
+            .await;
             format!("ok {new_ulid}")
         }
         Ok(MarkClaimedOutcome::Absent) => {
@@ -3001,8 +3070,9 @@ async fn claim_volume_bucket_op(
     volume_name: &str,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
-    coord_id: &str,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> String {
+    let coord_id = identity.coordinator_id_str();
     use elide_core::name_record::NameState;
 
     // Claim always lands the volume in `Stopped`. A running local
@@ -3056,6 +3126,14 @@ async fn claim_volume_bucket_op(
                             "[inbound] reclaimed {volume_name} in place (vol_ulid {})",
                             record.vol_ulid
                         );
+                        elide_coordinator::name_event_store::emit_best_effort(
+                            store,
+                            identity.as_ref(),
+                            volume_name,
+                            elide_core::name_event::EventKind::Claimed,
+                            record.vol_ulid,
+                        )
+                        .await;
                         "ok reclaimed".to_string()
                     }
                     Ok(MarkReclaimedLocalOutcome::Absent) => {
@@ -3975,10 +4053,15 @@ mod tests {
         // Running volume: by_name symlink + by_id dir, NO volume.stopped.
         let vol_ulid = make_running_volume(data_dir.path());
 
+        let identity = std::sync::Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir.path())
+                .unwrap(),
+        );
+
         // names/<vol> = Live owned by us — would have been the path
         // through the rest of release_volume_op before this fix.
         let mut rec = NameRecord::live_minimal(vol_ulid);
-        rec.coordinator_id = Some("coord-self".into());
+        rec.coordinator_id = Some(identity.coordinator_id_str().to_owned());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
         let resp = release_volume_op(
@@ -3987,7 +4070,7 @@ mod tests {
             &snapshot_locks,
             &store,
             8 * 1024 * 1024,
-            "coord-self",
+            &identity,
             &rescan,
         )
         .await;

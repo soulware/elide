@@ -204,6 +204,28 @@ pub async fn emit_event(
     Ok(event)
 }
 
+/// Best-effort companion to [`emit_event`]. Used by lifecycle call
+/// sites that have just completed a successful CAS on
+/// `names/<name>` and need to append the corresponding journal
+/// entry — the entry must not block or fail the lifecycle
+/// operation it accompanies, so any error is logged and discarded.
+///
+/// The cost of a missed event is a single-event gap in the log,
+/// detectable later via `prev_event_ulid` skip — exactly the
+/// "best-effort" contract documented in `design-name-event-log.md`.
+pub async fn emit_best_effort(
+    store: &Arc<dyn ObjectStore>,
+    identity: &CoordinatorIdentity,
+    name: &str,
+    kind: EventKind,
+    vol_ulid: Ulid,
+) {
+    let kind_str = kind.as_str();
+    if let Err(e) = emit_event(store, identity, name, kind, vol_ulid).await {
+        warn!("[name_event_store] failed to emit {kind_str} event for {name}: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
