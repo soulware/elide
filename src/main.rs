@@ -398,16 +398,17 @@ enum VolumeCommand {
     /// ULID. Otherwise pulls only the delta since the last local
     /// ancestor, mints a fresh local fork descending from the
     /// released snapshot, and atomically rebinds `names/<name>`.
+    ///
+    /// Refuses if the bucket record is `Live` or `Stopped` and owned
+    /// by another coordinator. To override an unreachable owner,
+    /// run `volume release --force <name>` first (which declares the
+    /// previous owner dead and flips the record to `Released`), then
+    /// `volume claim <name>`. The two-step sequence is intentional:
+    /// `release --force` is the unconditional override, and `claim`
+    /// is always CAS-protected against concurrent claimants.
     Claim {
         /// Volume name
         name: String,
-        /// Override foreign Live/Stopped ownership: synthesises a
-        /// handoff snapshot from S3-visible segments under the dead
-        /// fork's prefix (signed by this coordinator's key), then
-        /// claims the name. Equivalent to running `volume release
-        /// --force` followed by `volume claim`.
-        #[arg(long)]
-        force: bool,
     },
 
     /// Release a volume's name back to the pool. Drains the WAL, publishes
@@ -825,9 +826,7 @@ fn main() {
                 if claim {
                     // run_claim's foreign-claim path streams the prefetch
                     // already; no second await needed here.
-                    if let Err(e) =
-                        run_claim(&args.data_dir, &name, false, &socket_path, &by_id_dir)
-                    {
+                    if let Err(e) = run_claim(&args.data_dir, &name, &socket_path, &by_id_dir) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
@@ -867,8 +866,8 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Claim { name, force } => {
-                if let Err(e) = run_claim(&args.data_dir, &name, force, &socket_path, &by_id_dir) {
+            VolumeCommand::Claim { name } => {
+                if let Err(e) = run_claim(&args.data_dir, &name, &socket_path, &by_id_dir) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -1657,12 +1656,11 @@ fn orphan_matches_intended_fork(
 fn run_claim(
     data_dir: &Path,
     name: &str,
-    force: bool,
     socket_path: &Path,
     by_id_dir: &Path,
 ) -> std::io::Result<()> {
     use coordinator_client::ClaimOutcome;
-    match coordinator_client::claim_volume_bucket(socket_path, name, force)? {
+    match coordinator_client::claim_volume_bucket(socket_path, name)? {
         ClaimOutcome::Reclaimed => Ok(()),
         ClaimOutcome::NeedsClaim {
             released_vol_ulid,
