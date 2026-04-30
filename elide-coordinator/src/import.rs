@@ -24,8 +24,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial_readonly};
-
-pub const LOCK_FILE: &str = "import.lock";
+use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE};
 
 /// Hard cap on entries in the new volume's `extent_index` provenance field.
 ///
@@ -196,7 +195,10 @@ fn validate_volume_name(name: &str) -> std::io::Result<()> {
     }
     Ok(())
 }
-const PID_FILE: &str = "import.pid";
+/// Pidfile for the import subprocess (distinct from the volume daemon's
+/// `volume.pid`). Local to this module since the supervisor never spawns
+/// or adopts an import subprocess via this file.
+const IMPORT_PID_FILE: &str = "import.pid";
 
 #[derive(Clone, Debug)]
 pub enum ImportState {
@@ -377,7 +379,7 @@ pub async fn spawn_import(
 
         // Write the import lock.
         let import_ulid = Ulid::new().to_string();
-        std::fs::write(vol_dir.join(LOCK_FILE), &import_ulid)?;
+        std::fs::write(vol_dir.join(IMPORT_LOCK_FILE), &import_ulid)?;
 
         // Create the by_name symlink immediately so `import status/attach` can
         // resolve the volume before the import completes. Removed on failure.
@@ -437,7 +439,7 @@ pub async fn spawn_import(
     };
 
     let pid = child.id().unwrap_or(0);
-    if let Err(e) = std::fs::write(vol_dir.join(PID_FILE), pid.to_string()) {
+    if let Err(e) = std::fs::write(vol_dir.join(IMPORT_PID_FILE), pid.to_string()) {
         // Best-effort: kill the child since we won't be tracking it.
         let _ = child.start_kill();
         let _ = std::fs::remove_file(&symlink_path);
@@ -457,7 +459,7 @@ pub async fn spawn_import(
     // waiting up to supervisor.scan_interval.
     {
         let watch_dir = vol_dir.clone();
-        let watch_lock = vol_dir.join(LOCK_FILE);
+        let watch_lock = vol_dir.join(IMPORT_LOCK_FILE);
         tokio::spawn(async move {
             loop {
                 if watch_dir.join("control.sock").exists() {
@@ -517,8 +519,8 @@ pub async fn spawn_import(
         }
 
         job.finish(final_state);
-        let _ = std::fs::remove_file(vol_dir.join(LOCK_FILE));
-        let _ = std::fs::remove_file(vol_dir.join(PID_FILE));
+        let _ = std::fs::remove_file(vol_dir.join(IMPORT_LOCK_FILE));
+        let _ = std::fs::remove_file(vol_dir.join(IMPORT_PID_FILE));
     });
 
     info!("[import {import_ulid}] started pid {pid} for {vol_name} from {oci_ref}");
@@ -543,7 +545,7 @@ pub fn cleanup_stale_locks(data_dir: &Path) {
 }
 
 fn cleanup_stale_lock_in(dir: &Path) {
-    let lock_path = dir.join(LOCK_FILE);
+    let lock_path = dir.join(IMPORT_LOCK_FILE);
     if !lock_path.exists() {
         return;
     }
@@ -554,7 +556,7 @@ fn cleanup_stale_lock_in(dir: &Path) {
         .to_owned();
 
     // Check if the recorded import process is still alive.
-    let pid = std::fs::read_to_string(dir.join(PID_FILE))
+    let pid = std::fs::read_to_string(dir.join(IMPORT_PID_FILE))
         .ok()
         .and_then(|t| t.trim().parse::<u32>().ok());
 
@@ -582,13 +584,13 @@ fn cleanup_stale_lock_in(dir: &Path) {
         dir.display()
     );
     let _ = std::fs::remove_file(&lock_path);
-    let _ = std::fs::remove_file(dir.join(PID_FILE));
+    let _ = std::fs::remove_file(dir.join(IMPORT_PID_FILE));
 }
 
 /// Send SIGTERM to the import process in `fork_dir`, if one is recorded.
 /// Returns true if a signal was sent.
 pub fn kill_import(fork_dir: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(fork_dir.join(PID_FILE)) else {
+    let Ok(text) = std::fs::read_to_string(fork_dir.join(IMPORT_PID_FILE)) else {
         return false;
     };
     let Ok(pid) = text.trim().parse::<u32>() else {
@@ -609,7 +611,7 @@ pub fn terminate_fork_processes(fork_dir: &Path) -> Vec<u32> {
     let mut pids = Vec::new();
     let label = fork_dir.display();
 
-    if let Ok(text) = std::fs::read_to_string(fork_dir.join("volume.pid"))
+    if let Ok(text) = std::fs::read_to_string(fork_dir.join(PID_FILE))
         && let Ok(pid) = text.trim().parse::<u32>()
         && is_alive(pid)
     {
@@ -618,7 +620,7 @@ pub fn terminate_fork_processes(fork_dir: &Path) -> Vec<u32> {
         pids.push(pid);
     }
 
-    if let Ok(text) = std::fs::read_to_string(fork_dir.join(PID_FILE))
+    if let Ok(text) = std::fs::read_to_string(fork_dir.join(IMPORT_PID_FILE))
         && let Ok(pid) = text.trim().parse::<u32>()
         && is_alive(pid)
     {
@@ -633,7 +635,7 @@ pub fn terminate_fork_processes(fork_dir: &Path) -> Vec<u32> {
 /// Send SIGTERM to the volume and import processes in `vol_dir`, then wait
 /// briefly for them to exit. Used by the `delete` operation.
 pub fn kill_all_for_volume(vol_dir: &Path) {
-    if let Ok(text) = std::fs::read_to_string(vol_dir.join("volume.pid"))
+    if let Ok(text) = std::fs::read_to_string(vol_dir.join(PID_FILE))
         && let Ok(pid) = text.trim().parse::<u32>()
         && is_alive(pid)
     {

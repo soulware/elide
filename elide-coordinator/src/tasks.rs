@@ -27,12 +27,8 @@ use crate::control;
 use crate::gc;
 use crate::prefetch;
 use crate::upload;
+use crate::volume_state::IMPORT_LOCK_FILE;
 use crate::{PrefetchTracker, SnapshotLockRegistry, snapshot_lock_for, unregister_prefetch};
-
-/// Name of the import lock file inside a volume directory.
-/// Present while an import job is actively writing to the volume; drain and GC
-/// are skipped during this window.
-const IMPORT_LOCK_FILE: &str = "import.lock";
 
 /// Request type for the per-fork evict channel.
 /// The sender receives the eviction result (count of bodies deleted).

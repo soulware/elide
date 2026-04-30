@@ -18,18 +18,19 @@ use elide_core::process::pid_is_alive;
 
 /// Per-volume daemon pidfile. Written by the volume process on
 /// startup; presence + liveness drives the `Running` classification.
-const PID_FILE: &str = "volume.pid";
+/// Canonical home for the filename — other modules consume it from
+/// here rather than redefining the literal.
+pub const PID_FILE: &str = "volume.pid";
 
 /// Manual-stop marker. Presence pins the volume to `StoppedManual`
 /// regardless of any other state — the coordinator's supervisor
 /// treats this as "do not relaunch".
-const STOPPED_FILE: &str = "volume.stopped";
+pub const STOPPED_FILE: &str = "volume.stopped";
 
 /// Per-volume import lock. Written by `elide-import`'s supervision
 /// protocol while a subprocess is running. The body is the import
-/// ULID. Mirrored here as a string literal because `import::LOCK_FILE`
-/// lives in the binary crate and cannot be referenced from the library.
-const IMPORT_LOCK_FILE: &str = "import.lock";
+/// ULID.
+pub const IMPORT_LOCK_FILE: &str = "import.lock";
 
 /// Read/write mode for a volume. Readonly is set on imported OCI
 /// volumes; everything else is read/write.
