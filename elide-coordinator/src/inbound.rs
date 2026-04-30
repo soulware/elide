@@ -242,7 +242,7 @@ async fn dispatch(line: &str, ctx: &IpcContext, peer_pid: Option<i32>) -> String
                 Err(msg) => return format!("err {msg}"),
             };
             if parsed.force {
-                force_release_volume_op(parsed.name, &ctx.store, &ctx.identity).await
+                force_release_volume_op(parsed.name, &ctx.data_dir, &ctx.store, &ctx.identity).await
             } else {
                 release_volume_op(
                     parsed.name,
@@ -2103,6 +2103,22 @@ async fn fork_create_op(
 
 // ── Volume stop / start ───────────────────────────────────────────────────────
 
+/// True if `<data_dir>/by_name/<name>` exists and the resolved fork
+/// has no `volume.stopped` marker — i.e. this host is actively
+/// serving (or supposed to be serving) `<name>`.
+///
+/// Used by recovery verbs (`release --force`, `claim`, `claim --force`)
+/// to refuse when the operator has typo'd a verb at their own running
+/// volume: those verbs are designed for unreachable peers and would
+/// otherwise leave on-disk state diverging from the bucket record.
+fn local_daemon_running(data_dir: &Path, volume_name: &str) -> bool {
+    let link = data_dir.join("by_name").join(volume_name);
+    match std::fs::canonicalize(&link) {
+        Ok(vol_dir) => !vol_dir.join("volume.stopped").exists(),
+        Err(_) => false,
+    }
+}
+
 async fn stop_volume_op(
     volume_name: &str,
     data_dir: &Path,
@@ -2341,11 +2357,23 @@ fn parse_release_args(args: &str) -> Result<ParsedReleaseArgs<'_>, String> {
 /// crash-recovery contract elsewhere.
 async fn force_release_volume_op(
     volume_name: &str,
+    data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> String {
     use elide_coordinator::lifecycle::{self, ForceReleaseOutcome};
     use elide_coordinator::recovery;
+
+    // Refuse when the "dead peer" is actually this host's running
+    // daemon. force-release is for unreachable peers; against a local
+    // running fork it would leave on-disk state diverging from the
+    // bucket record. The operator wants `volume stop` first.
+    if local_daemon_running(data_dir, volume_name) {
+        return format!(
+            "err volume '{volume_name}' is running on this host; \
+             stop it first with: elide volume stop {volume_name}"
+        );
+    }
 
     // Read the current record to learn which dead fork to recover from.
     let dead_vol_ulid =
@@ -2905,6 +2933,16 @@ async fn claim_volume_bucket_op(
 ) -> String {
     use elide_core::name_record::NameState;
 
+    // Claim always lands the volume in `Stopped`. A running local
+    // daemon contradicts that — refuse and point the operator at
+    // `volume stop` first.
+    if local_daemon_running(data_dir, volume_name) {
+        return format!(
+            "err volume '{volume_name}' is running on this host; \
+             stop it first with: elide volume stop {volume_name}"
+        );
+    }
+
     let record_opt = match elide_coordinator::name_store::read_name_record(store, volume_name).await
     {
         Ok(r) => r,
@@ -2926,7 +2964,7 @@ async fn claim_volume_bucket_op(
             .as_deref()
             .is_some_and(|id| id != coord_id)
     {
-        match force_release_volume_op(volume_name, store, identity).await {
+        match force_release_volume_op(volume_name, data_dir, store, identity).await {
             r if r.starts_with("ok") => {}
             err => return err,
         }
@@ -3663,7 +3701,8 @@ mod tests {
     async fn force_release_op_overwrites_live_to_released() {
         let (store, identity, dead_vol, _seg, _td) = force_release_fixture("vol").await;
 
-        let resp = force_release_volume_op("vol", &store, &identity).await;
+        let resp =
+            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity).await;
 
         assert!(resp.starts_with("ok "), "{resp}");
         let snap_str = resp.strip_prefix("ok ").unwrap();
@@ -3702,7 +3741,8 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = force_release_volume_op("vol", &store, &identity).await;
+        let resp =
+            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity).await;
         assert!(resp.starts_with("err "), "{resp}");
         assert!(
             resp.contains("force-release only overrides Live or Stopped"),
@@ -3716,7 +3756,9 @@ mod tests {
         let coord_dir = TempDir::new().unwrap();
         let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
 
-        let resp = force_release_volume_op("ghost", &store, &identity).await;
+        let resp =
+            force_release_volume_op("ghost", TempDir::new().unwrap().path(), &store, &identity)
+                .await;
         assert!(resp.starts_with("err "), "{resp}");
         assert!(resp.contains("no S3 record"), "{resp}");
     }
@@ -3732,7 +3774,8 @@ mod tests {
         let coord_dir = TempDir::new().unwrap();
         let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
 
-        let resp = force_release_volume_op("vol", &store, &identity).await;
+        let resp =
+            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity).await;
         assert!(resp.starts_with("err "), "{resp}");
         assert!(
             resp.contains("fetching volume.pub"),
@@ -3779,7 +3822,8 @@ mod tests {
         let coord_dir = TempDir::new().unwrap();
         let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
 
-        let resp = force_release_volume_op("vol", &store, &identity).await;
+        let resp =
+            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity).await;
         assert!(resp.starts_with("ok "), "{resp}");
 
         // Verify the synthesised manifest contains exactly one segment ULID
