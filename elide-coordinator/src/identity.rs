@@ -116,6 +116,18 @@ impl CoordinatorIdentity {
         &self.macaroon_root
     }
 
+    /// Sign `msg` with the coordinator's Ed25519 signing key.
+    /// Used for any artefact attributed to this coordinator's
+    /// identity — synthesised handoff snapshots (via the
+    /// `SegmentSigner` impl) and per-name event log entries (via
+    /// `name_event_store::emit_event`). Domain separation between
+    /// these uses is enforced by the *callers' canonical-form
+    /// pre-images*, not by separate keys.
+    pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        self.signing_key.sign(msg).to_bytes()
+    }
+
     /// Public (verifying) half of the keypair.
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
@@ -457,7 +469,6 @@ mod tests {
     #[test]
     fn sign_produces_signature_verifiable_against_published_pub() {
         use ed25519_dalek::{Signature, Verifier};
-        use elide_core::segment::SegmentSigner;
 
         let tmp = TempDir::new().unwrap();
         let id = CoordinatorIdentity::load_or_generate(tmp.path()).unwrap();

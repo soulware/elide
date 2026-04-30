@@ -154,7 +154,10 @@ pub async fn mark_stopped(
 pub enum MarkReleasedOutcome {
     /// `names/<name>` was updated to `Released`, recording
     /// `handoff_snapshot` so the next claimant can fork from it.
-    Updated,
+    /// Carries the now-released `vol_ulid` (the fork frozen by this
+    /// transition) so the caller can journal the event without an
+    /// extra read.
+    Updated { vol_ulid: Ulid },
     /// `names/<name>` did not exist in the bucket. The release verb
     /// requires a published record (something to hand off); callers
     /// should treat this as an error.
@@ -212,17 +215,26 @@ pub async fn mark_released(
     record.claimed_at = None;
     record.hostname = None;
 
+    let released_vol_ulid = record.vol_ulid;
     name_store::update_name_record(store, name, &record, version).await?;
-    Ok(MarkReleasedOutcome::Updated)
+    Ok(MarkReleasedOutcome::Updated {
+        vol_ulid: released_vol_ulid,
+    })
 }
 
 /// Outcome of `mark_released_force`.
 #[derive(Debug)]
 pub enum ForceReleaseOutcome {
-    /// `names/<name>` was unconditionally rewritten to the new state.
-    /// Carries the dead fork's `vol_ulid` so callers can surface it
-    /// (e.g. for operator output).
-    Overwritten { dead_vol_ulid: Ulid },
+    /// `names/<name>` was unconditionally rewritten to the new
+    /// state. Carries the dead fork's `vol_ulid` so callers can
+    /// surface it (e.g. for operator output) and the dead fork's
+    /// last known coordinator id (`None` if the prior record had
+    /// already been emptied of owner identity, e.g. an in-progress
+    /// release).
+    Overwritten {
+        dead_vol_ulid: Ulid,
+        displaced_coordinator_id: Option<String>,
+    },
     /// `names/<name>` did not exist in the bucket. Force-release of a
     /// non-existent name is meaningless — there is no dead fork to
     /// recover from.
@@ -283,9 +295,11 @@ pub async fn mark_released_force(
         handoff_snapshot: Some(handoff_snapshot),
     };
 
+    let displaced_coordinator_id = current.coordinator_id.clone();
     name_store::overwrite_name_record(store, name, &new).await?;
     Ok(ForceReleaseOutcome::Overwritten {
         dead_vol_ulid: current.vol_ulid,
+        displaced_coordinator_id,
     })
 }
 
@@ -814,7 +828,7 @@ mod tests {
         create_name_record(&s, "vol", &rec).await.unwrap();
 
         let outcome = mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
-        assert!(matches!(outcome, MarkReleasedOutcome::Updated));
+        assert!(matches!(outcome, MarkReleasedOutcome::Updated { .. }));
 
         let (got, _) = name_store::read_name_record(&s, "vol")
             .await
@@ -869,7 +883,7 @@ mod tests {
         mark_stopped(&s, "vol", &id_a()).await.unwrap();
 
         let outcome = mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
-        assert!(matches!(outcome, MarkReleasedOutcome::Updated));
+        assert!(matches!(outcome, MarkReleasedOutcome::Updated { .. }));
 
         let (got, _) = name_store::read_name_record(&s, "vol")
             .await
@@ -1461,8 +1475,12 @@ mod tests {
         // B force-releases without any ownership check.
         let outcome = mark_released_force(&s, "vol", snap()).await.unwrap();
         match outcome {
-            ForceReleaseOutcome::Overwritten { dead_vol_ulid } => {
+            ForceReleaseOutcome::Overwritten {
+                dead_vol_ulid,
+                displaced_coordinator_id,
+            } => {
                 assert_eq!(dead_vol_ulid, sample_ulid());
+                assert_eq!(displaced_coordinator_id.as_deref(), Some(id_a().as_str()));
             }
             other => panic!("expected Overwritten, got {other:?}"),
         }
