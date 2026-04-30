@@ -93,6 +93,38 @@ pub async fn fetch_volume_pub(
     parse_hex_pubkey(hex).with_context(|| format!("parsing volume.pub for {vol_ulid}"))
 }
 
+/// Like [`fetch_volume_pub`] but returns `Ok(None)` when the object is
+/// absent rather than an error.
+///
+/// Used by `volume release --force` to recover the corruption window
+/// where `names/<name>` was published before `volume.pub`. With no
+/// `volume.pub` in the bucket, no segments could ever have been
+/// signed-and-verified under that key, so the dead fork is provably
+/// empty: force-release publishes an empty synthesised handoff signed
+/// by the recovering coordinator's identity.
+pub async fn fetch_volume_pub_optional(
+    store: &Arc<dyn ObjectStore>,
+    vol_ulid: Ulid,
+) -> Result<Option<VerifyingKey>> {
+    let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+    match store.get(&key).await {
+        Ok(result) => {
+            let bytes = result
+                .bytes()
+                .await
+                .with_context(|| format!("reading volume.pub bytes for {vol_ulid}"))?;
+            let hex = std::str::from_utf8(&bytes)
+                .map_err(|e| anyhow::anyhow!("volume.pub for {vol_ulid} not valid utf-8: {e}"))?
+                .trim();
+            parse_hex_pubkey(hex)
+                .with_context(|| format!("parsing volume.pub for {vol_ulid}"))
+                .map(Some)
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("fetching volume.pub for {vol_ulid}"))),
+    }
+}
+
 fn parse_hex_pubkey(hex: &str) -> Result<VerifyingKey> {
     if hex.len() != 64 {
         anyhow::bail!(
@@ -683,6 +715,43 @@ mod tests {
 
         let got = fetch_volume_pub(&store, vol_ulid).await.unwrap();
         assert_eq!(got.to_bytes(), vk.to_bytes());
+    }
+
+    #[tokio::test]
+    async fn fetch_volume_pub_optional_returns_some_when_present() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let vol_ulid = Ulid::new();
+        let (_, vk) = make_signer();
+        upload_volume_pub(&store, vol_ulid, &vk).await;
+
+        let got = fetch_volume_pub_optional(&store, vol_ulid).await.unwrap();
+        let got = got.expect("present");
+        assert_eq!(got.to_bytes(), vk.to_bytes());
+    }
+
+    #[tokio::test]
+    async fn fetch_volume_pub_optional_returns_none_when_absent() {
+        // Mirrors the create-time crash window: names/<name> exists in
+        // S3 but `by_id/<vol>/volume.pub` was never uploaded.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let vol_ulid = Ulid::new();
+        let got = fetch_volume_pub_optional(&store, vol_ulid).await.unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_volume_pub_optional_propagates_malformed_hex() {
+        // A present-but-corrupt object is *not* an absent object — the
+        // caller wants to know about corruption, not silently treat it
+        // as the empty-fork recovery case.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let vol_ulid = Ulid::new();
+        let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+        store
+            .put(&key, PutPayload::from(b"not hex\n".as_slice()))
+            .await
+            .unwrap();
+        assert!(fetch_volume_pub_optional(&store, vol_ulid).await.is_err());
     }
 
     #[tokio::test]
