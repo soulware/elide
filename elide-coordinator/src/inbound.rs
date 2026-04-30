@@ -2464,7 +2464,7 @@ async fn force_release_volume_op(
     let dead_pub = match recovery::fetch_volume_pub_optional(store, dead_vol_ulid).await {
         Ok(k) => k,
         Err(e) => {
-            return format!("err fetching volume.pub for dead fork {dead_vol_ulid}: {e:#}");
+            return format!("err fetching volume.pub for released fork {dead_vol_ulid}: {e:#}");
         }
     };
     let segment_ulids: Vec<ulid::Ulid> = match dead_pub {
@@ -2474,7 +2474,7 @@ async fn force_release_volume_op(
                     Ok(r) => r,
                     Err(e) => {
                         return format!(
-                            "err listing/verifying segments for dead fork \
+                            "err listing/verifying segments for released fork \
                              {dead_vol_ulid}: {e:#}"
                         );
                     }
@@ -2483,7 +2483,7 @@ async fn force_release_volume_op(
                 recovered.segments.iter().map(|s| s.segment_ulid).collect();
             info!(
                 "[inbound] force-release {volume_name}: recovered {} segments \
-                 ({} dropped) from dead fork {dead_vol_ulid}",
+                 ({} dropped) from released fork {dead_vol_ulid}",
                 ulids.len(),
                 recovered.dropped,
             );
@@ -2491,7 +2491,7 @@ async fn force_release_volume_op(
         }
         None => {
             info!(
-                "[inbound] force-release {volume_name}: dead fork \
+                "[inbound] force-release {volume_name}: released fork \
                  {dead_vol_ulid} has no volume.pub in bucket — treating as \
                  empty (create-time crash before pub upload)"
             );
@@ -2517,7 +2517,7 @@ async fn force_release_volume_op(
     match outcome {
         Ok(ForceReleaseOutcome::Overwritten { dead_vol_ulid: d }) => {
             info!(
-                "[inbound] force-released volume {volume_name} (dead fork {d}) at \
+                "[inbound] force-released volume {volume_name} (released fork {d}) at \
                  synthesised handoff snapshot {}",
                 published.snap_ulid,
             );
