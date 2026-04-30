@@ -551,38 +551,20 @@ pub fn resolve_handoff_key(
     Err(io::Error::other(format!("unexpected response: {resp}")))
 }
 
-/// Options for `release_volume`.
-#[derive(Default, Clone, Debug)]
-pub struct ReleaseOpts<'a> {
-    /// `--force`: override foreign ownership of `names/<name>`.
-    /// Skips the local drain (the dead owner's WAL is unreachable),
-    /// synthesises a handoff snapshot from S3-visible segments, signs
-    /// it with the local coordinator's identity key, and
-    /// unconditionally flips `names/<name>` to `released` (or
-    /// `reserved` if `to` is set).
-    pub force: bool,
-    /// `--to <coord_id>`: targeted handoff. Final state is `reserved`
-    /// for the named coordinator instead of `released`. Composes with
-    /// `force`.
-    pub to: Option<&'a str>,
-}
-
 /// Release a volume's name back to the pool so any other coordinator can
-/// claim it via `volume start`. Drains WAL, publishes a handoff snapshot,
-/// halts the daemon, and flips `names/<name>` to `state=released` with
-/// the snapshot ULID recorded so the next claimant can fork from it.
+/// `volume claim` it. Drains WAL, publishes a handoff snapshot, halts
+/// the daemon, and flips `names/<name>` to `state=released` with the
+/// snapshot ULID recorded so the next claimant can fork from it.
 /// Returns the handoff snapshot ULID on success.
 ///
-/// With `opts.force`, skips ownership and drain (used when the
-/// previous owner is unreachable). With `opts.to`, the final state is
-/// `reserved` for the named coordinator. Both compose.
-pub fn release_volume(socket_path: &Path, name: &str, opts: ReleaseOpts<'_>) -> io::Result<String> {
+/// With `force`, skips ownership and drain — used when the previous
+/// owner is unreachable. The recovering coordinator synthesises a
+/// handoff snapshot from S3-visible segments and unconditionally
+/// rewrites the record.
+pub fn release_volume(socket_path: &Path, name: &str, force: bool) -> io::Result<String> {
     let mut cmd = format!("release {name}");
-    if opts.force {
+    if force {
         cmd.push_str(" --force");
-    }
-    if let Some(target) = opts.to {
-        cmd.push_str(&format!(" --to {target}"));
     }
     let resp = call(socket_path, &cmd)?;
     match resp.split_once(' ') {
@@ -592,50 +574,57 @@ pub fn release_volume(socket_path: &Path, name: &str, opts: ReleaseOpts<'_>) -> 
     }
 }
 
-/// Outcome of a `start_volume` call. The coordinator routes by the
-/// bucket-side `names/<name>` state; the response distinguishes the
-/// local-only path, the in-place reclaim of an own released name,
-/// and the cross-coordinator claim that needs CLI orchestration.
-pub enum StartOutcome {
-    /// Daemon was started locally (state was Stopped, ours; or Live, ours;
-    /// or no S3 record yet).
-    Started,
-    /// `Released` record's `vol_ulid` matched the local fork on disk —
-    /// the IPC flipped state back to `Live` keeping the same ULID. No
-    /// CLI orchestration was needed; the daemon is already started.
-    /// The CLI surfaces this distinction in its output.
+/// Start a volume locally. Pure local resume — flips an owned
+/// `Stopped` record to `Live`. Refuses if the volume has no local
+/// state, or if the bucket says `Released`. To take a `Released`
+/// name, call `claim_volume_bucket` first.
+pub fn start_volume(socket_path: &Path, name: &str) -> io::Result<()> {
+    let resp = call(socket_path, &format!("start {name}"))?;
+    if resp == "ok" {
+        return Ok(());
+    }
+    if let Some(msg) = resp.strip_prefix("err ") {
+        return Err(io::Error::other(msg.to_owned()));
+    }
+    Err(io::Error::other(format!("unexpected response: {resp}")))
+}
+
+/// Outcome of a `claim_volume_bucket` call.
+pub enum ClaimOutcome {
+    /// In-place reclaim: the local fork's ULID matched the released
+    /// record's. The bucket flipped from `Released` to `Stopped` with
+    /// the same `vol_ulid`. No CLI orchestration was needed.
     Reclaimed,
-    /// `Released` record's `vol_ulid` is foreign content — the CLI
-    /// needs to pull, mint a fresh fork, and call `claim_volume` with
-    /// the new ULID.
+    /// The released record's `vol_ulid` is foreign content. The CLI
+    /// must pull the source, mint a fresh local fork, and call
+    /// `rebind_name` with the new ULID.
     NeedsClaim {
         released_vol_ulid: String,
         handoff_snapshot: Option<String>,
     },
 }
 
-/// Start a volume.
+/// `volume claim <name> [--force]` IPC: bucket-side claim flow.
 ///
-/// Defaults to **local-only**: bucket-side state changes require
-/// `--remote`. Without it, the IPC refuses (1) when `<name>` has no
-/// local state, and (2) when the bucket-side `names/<name>` record is
-/// `Released` — both cases return an error pointing the operator at
-/// `--remote`. With `remote = true`, the IPC reclaims a `Released`
-/// record in place when the local fork's ULID matches (`Reclaimed`),
-/// or surfaces the cross-coordinator claim pin (`NeedsClaim`) when
-/// the released ULID is foreign content.
-pub fn start_volume(socket_path: &Path, name: &str, remote: bool) -> io::Result<StartOutcome> {
-    let cmd = if remote {
-        format!("start {name} --remote")
-    } else {
-        format!("start {name}")
-    };
-    let resp = call(socket_path, &cmd)?;
-    if resp == "ok" {
-        return Ok(StartOutcome::Started);
+/// On success, the volume is left in `Stopped` state — no daemon is
+/// launched. The CLI calls `start_volume` afterwards if a composed
+/// `start --claim` flow was requested.
+///
+/// With `force`, foreign `Live`/`Stopped` ownership is overridden by
+/// synthesising a handoff snapshot internally before claiming
+/// (equivalent to `release --force` then `claim`).
+pub fn claim_volume_bucket(
+    socket_path: &Path,
+    name: &str,
+    force: bool,
+) -> io::Result<ClaimOutcome> {
+    let mut cmd = format!("claim {name}");
+    if force {
+        cmd.push_str(" --force");
     }
+    let resp = call(socket_path, &cmd)?;
     if resp == "ok reclaimed" {
-        return Ok(StartOutcome::Reclaimed);
+        return Ok(ClaimOutcome::Reclaimed);
     }
     if let Some(rest) = resp.strip_prefix("released ") {
         let mut parts = rest.split_whitespace();
@@ -643,7 +632,7 @@ pub fn start_volume(socket_path: &Path, name: &str, remote: bool) -> io::Result<
             .next()
             .ok_or_else(|| io::Error::other(format!("malformed released response: {resp}")))?;
         let snap = parts.next();
-        return Ok(StartOutcome::NeedsClaim {
+        return Ok(ClaimOutcome::NeedsClaim {
             released_vol_ulid: vol.to_owned(),
             handoff_snapshot: snap.filter(|s| *s != "_").map(str::to_owned),
         });
@@ -654,11 +643,12 @@ pub fn start_volume(socket_path: &Path, name: &str, remote: bool) -> io::Result<
     Err(io::Error::other(format!("unexpected response: {resp}")))
 }
 
-/// Atomically rebind a `Released` name to a freshly-minted local fork.
-/// The CLI must have already materialised `by_id/<new_vol_ulid>/` before
-/// calling this. Returns the new ULID on success.
-pub fn claim_volume(socket_path: &Path, name: &str, new_vol_ulid: &str) -> io::Result<String> {
-    let resp = call(socket_path, &format!("claim {name} {new_vol_ulid}"))?;
+/// Atomically rebind a `Released` name to a freshly-minted local fork,
+/// leaving the bucket state in `Stopped`. The CLI must have already
+/// materialised `by_id/<new_vol_ulid>/` before calling this. Returns
+/// the new ULID on success.
+pub fn rebind_name(socket_path: &Path, name: &str, new_vol_ulid: &str) -> io::Result<String> {
+    let resp = call(socket_path, &format!("rebind-name {name} {new_vol_ulid}"))?;
     match resp.split_once(' ') {
         Some(("ok", ulid)) => Ok(ulid.trim().to_owned()),
         Some(("err", msg)) => Err(io::Error::other(msg.to_owned())),

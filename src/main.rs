@@ -369,53 +369,56 @@ enum VolumeCommand {
     Stop {
         /// Volume name
         name: String,
-        /// Release ownership instead of just halting locally. Drains the
-        /// WAL, publishes a handoff snapshot, and flips the bucket-side
-        /// state to `released` so any coordinator can claim the name via
-        /// `volume start`. Equivalent to `volume release <name>`.
+        /// Release ownership in the same operation. Drains the WAL,
+        /// publishes a handoff snapshot, and flips the bucket-side
+        /// state to `released` so any coordinator can claim the name
+        /// via `volume claim`. Equivalent to running `volume release`
+        /// after `volume stop`.
         #[arg(long)]
         release: bool,
-        /// With `--release`: hand off to a specific coordinator
-        /// (`names/<name>` flips to `reserved` rather than `released`).
-        /// Only the named coordinator may then claim. Equivalent to
-        /// `volume release --to <coord_id>`.
-        #[arg(long, value_name = "COORD_ID", requires = "release")]
-        to: Option<String>,
     },
 
-    /// Start a previously stopped volume.
+    /// Start a previously stopped volume locally.
     ///
-    /// Defaults to local-only: refuses any operation that needs to
-    /// change the bucket-side `names/<name>` ownership record.
-    /// Specifically, bare `volume start` refuses when (1) `<name>`
-    /// has no local state on this host, or (2) the bucket-side record
-    /// is `Released` (even if a local fork from a previous life is
-    /// still on disk). Both cases require `--remote`.
-    ///
-    /// With `--remote`, claiming a `Released` record splits two ways:
-    ///   - In-place reclaim if the local fork's ULID matches the
-    ///     released ULID (this host owned the name, released, and is
-    ///     re-claiming): cheap, no pull, same fork ULID kept.
-    ///   - Cross-coordinator claim otherwise: pulls only the delta
-    ///     since the last local ancestor, mints a fresh local fork
-    ///     descending from the released snapshot, and atomically
-    ///     rebinds `names/<name>`. Any prior local fork remains on
-    ///     disk and serves as ancestor cache where applicable.
+    /// Pure local resume: refuses if the volume has no local state on
+    /// this host, or if the bucket-side record is `Released`. Use
+    /// `volume claim` to take a `Released` name first, or pass
+    /// `--claim` here to compose claim + start.
     Start {
         /// Volume name
         name: String,
-        /// Required to (re)claim a `Released` or `Reserved` name —
-        /// the bucket-side record is read and rebound. Without this,
-        /// bare `volume start` is purely local (resume of a Stopped
-        /// fork we already own).
+        /// Compose with `volume claim`: claim the bucket-side record
+        /// first (in-place reclaim if the local fork matches the
+        /// released ULID, otherwise pull + mint a fresh fork), then
+        /// start the daemon.
         #[arg(long)]
-        remote: bool,
+        claim: bool,
+    },
+
+    /// Claim a `Released` volume name into local ownership without
+    /// starting the daemon. Result is a `Stopped` volume bound to
+    /// this coordinator; use `volume start` to bring up the daemon.
+    ///
+    /// In-place reclaim if the local fork's ULID matches the released
+    /// ULID. Otherwise pulls only the delta since the last local
+    /// ancestor, mints a fresh local fork descending from the
+    /// released snapshot, and atomically rebinds `names/<name>`.
+    Claim {
+        /// Volume name
+        name: String,
+        /// Override foreign Live/Stopped ownership: synthesises a
+        /// handoff snapshot from S3-visible segments under the dead
+        /// fork's prefix (signed by this coordinator's key), then
+        /// claims the name. Equivalent to running `volume release
+        /// --force` followed by `volume claim`.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Release a volume's name back to the pool. Drains the WAL, publishes
     /// a handoff snapshot, halts the daemon, and flips the bucket-side
     /// `names/<name>` record to `released` so any coordinator (this host
-    /// or another) may claim it via `volume start`. Use this to relocate
+    /// or another) may claim it via `volume claim`. Use this to relocate
     /// a named volume between hosts; use `volume stop` for a temporary
     /// halt that retains ownership.
     Release {
@@ -432,12 +435,6 @@ enum VolumeCommand {
         /// never promoted to S3.
         #[arg(long)]
         force: bool,
-        /// Targeted handoff: hand off to a specific coordinator.
-        /// `names/<name>` flips to `reserved` rather than `released`,
-        /// so only the named coordinator may then claim. Composes
-        /// with `--force`.
-        #[arg(long, value_name = "COORD_ID")]
-        to: Option<String>,
     },
 }
 
@@ -844,19 +841,12 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Stop { name, release, to } => {
+            VolumeCommand::Stop { name, release } => {
                 if release {
-                    let opts = coordinator_client::ReleaseOpts {
-                        force: false,
-                        to: to.as_deref(),
-                    };
-                    match coordinator_client::release_volume(&socket_path, &name, opts) {
-                        Ok(snap) => match to.as_deref() {
-                            Some(target) => {
-                                println!("{name}: released to {target} at handoff snapshot {snap}")
-                            }
-                            None => println!("{name}: released at handoff snapshot {snap}"),
-                        },
+                    match coordinator_client::release_volume(&socket_path, &name, false) {
+                        Ok(snap) => {
+                            println!("{name}: released at handoff snapshot {snap}");
+                        }
                         Err(e) => {
                             eprintln!("error: {e}");
                             std::process::exit(1);
@@ -871,68 +861,40 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Start { name, remote } => {
-                use coordinator_client::StartOutcome;
-                match coordinator_client::start_volume(&socket_path, &name, remote) {
-                    Ok(StartOutcome::Started) => {
-                        println!("{name}: started");
-                    }
-                    Ok(StartOutcome::Reclaimed) => {
-                        // In-place reclaim of a Released name owned by
-                        // this host: the local fork was already on
-                        // disk, the IPC just flipped the bucket-side
-                        // state back to Live. Distinct output so the
-                        // operator sees that an S3 state change
-                        // happened, not a plain Stopped → Live resume.
-                        println!("{name}: reclaimed and started");
-                    }
-                    Ok(StartOutcome::NeedsClaim {
-                        released_vol_ulid,
-                        handoff_snapshot,
-                    }) => {
-                        // Cross-coordinator claim: --remote was set
-                        // and the released vol_ulid is foreign content.
-                        // The IPC refuses NeedsClaim without --remote,
-                        // so reaching this arm means we may pull and
-                        // mint a new local fork.
-                        if let Err(e) = claim_released_name(
-                            &args.data_dir,
-                            &name,
-                            &released_vol_ulid,
-                            handoff_snapshot.as_deref(),
-                            &socket_path,
-                            &by_id_dir,
-                        ) {
-                            eprintln!("error: {e}");
-                            std::process::exit(1);
-                        }
-                        println!("{name}: claimed and started");
-                    }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
-                    }
+            VolumeCommand::Start { name, claim } => {
+                if claim
+                    && let Err(e) =
+                        run_claim(&args.data_dir, &name, false, &socket_path, &by_id_dir)
+                {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+                if let Err(e) = coordinator_client::start_volume(&socket_path, &name) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+                if claim {
+                    println!("{name}: claimed and started");
+                } else {
+                    println!("{name}: started");
                 }
             }
 
-            VolumeCommand::Release { name, force, to } => {
-                let opts = coordinator_client::ReleaseOpts {
-                    force,
-                    to: to.as_deref(),
-                };
-                match coordinator_client::release_volume(&socket_path, &name, opts) {
+            VolumeCommand::Claim { name, force } => {
+                if let Err(e) = run_claim(&args.data_dir, &name, force, &socket_path, &by_id_dir) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+                println!("{name}: claimed");
+            }
+
+            VolumeCommand::Release { name, force } => {
+                match coordinator_client::release_volume(&socket_path, &name, force) {
                     Ok(snap) => {
-                        let kind = match (force, to.as_deref()) {
-                            (false, None) => format!("released at handoff snapshot {snap}"),
-                            (false, Some(t)) => {
-                                format!("released to {t} at handoff snapshot {snap}")
-                            }
-                            (true, None) => {
-                                format!("force-released at synthesised handoff snapshot {snap}")
-                            }
-                            (true, Some(t)) => format!(
-                                "force-released to {t} at synthesised handoff snapshot {snap}"
-                            ),
+                        let kind = if force {
+                            format!("force-released at synthesised handoff snapshot {snap}")
+                        } else {
+                            format!("released at handoff snapshot {snap}")
                         };
                         println!("{name}: {kind}");
                     }
@@ -1654,18 +1616,41 @@ fn classify_symlink_for_claim(symlink: &Path) -> SymlinkState {
     }
 }
 
-/// CLI orchestration of `volume start` against a `Released` name.
+/// CLI orchestration of `volume claim`.
 ///
-/// Composes existing fork-creation plumbing with the coordinator's
-/// `claim` IPC:
-///   1. Build the source pin from `released_vol_ulid` + `handoff_snapshot`.
-///   2. Pull the source if not local (via the existing `remote_pull`).
-///   3. Mint a fresh local fork via `fork-create` IPC.
-///   4. Issue `claim <name> <new_vol_ulid>` to atomically rebind the
-///      bucket-side name to the new fork. The conditional PUT inside
-///      `claim` resolves races: if another coordinator wins, our local
-///      fork is left in place as a usable orphan and the user is told.
-fn claim_released_name(
+/// Calls the coordinator's `claim` IPC and dispatches:
+///   - `Reclaimed`: nothing else to do; the bucket flipped in place.
+///   - `NeedsClaim`: pull source if needed, mint a fresh local fork
+///     via `fork-create`, then `rebind-name` to atomically rebind the
+///     bucket record to the new fork (in `Stopped` state). The
+///     conditional PUT inside `rebind-name` resolves races; the local
+///     fork is left in place as a usable orphan if another
+///     coordinator wins.
+fn run_claim(
+    data_dir: &Path,
+    name: &str,
+    force: bool,
+    socket_path: &Path,
+    by_id_dir: &Path,
+) -> std::io::Result<()> {
+    use coordinator_client::ClaimOutcome;
+    match coordinator_client::claim_volume_bucket(socket_path, name, force)? {
+        ClaimOutcome::Reclaimed => Ok(()),
+        ClaimOutcome::NeedsClaim {
+            released_vol_ulid,
+            handoff_snapshot,
+        } => orchestrate_foreign_claim(
+            data_dir,
+            name,
+            &released_vol_ulid,
+            handoff_snapshot.as_deref(),
+            socket_path,
+            by_id_dir,
+        ),
+    }
+}
+
+fn orchestrate_foreign_claim(
     data_dir: &Path,
     name: &str,
     released_vol_ulid: &str,
@@ -1683,12 +1668,11 @@ fn claim_released_name(
     let from = format!("{released_vol_ulid}/{snap}");
 
     // Stale-symlink recovery: any pre-existing `by_name/<name>` entry
-    // is replaced — the operator opted in by passing `--remote` (the
-    // IPC refuses bare `start` against a `Released` record). The
-    // previous fork's ULID is logged so the operator knows which
-    // `by_id/<ulid>/` directory remains on disk: if it's an ancestor
-    // of the claimed snapshot it serves as transparent ancestor
-    // cache, otherwise it's a true orphan eligible for cleanup.
+    // is replaced. The previous fork's ULID is logged so the operator
+    // knows which `by_id/<ulid>/` directory remains on disk: if it's
+    // an ancestor of the claimed snapshot it serves as transparent
+    // ancestor cache, otherwise it's a true orphan eligible for
+    // cleanup.
     let symlink = data_dir.join("by_name").join(name);
     match classify_symlink_for_claim(&symlink) {
         SymlinkState::Absent => {}
@@ -1706,7 +1690,6 @@ fn claim_released_name(
         }
     }
 
-    // Pull source if not local.
     let source_dir = volume::resolve_ancestor_dir(by_id_dir, released_vol_ulid);
     if !source_dir.exists() {
         let config = load_fetch_config(socket_path, data_dir, released_vol_ulid)?;
@@ -1719,17 +1702,6 @@ fn claim_released_name(
         }
     }
 
-    // Resolve which Ed25519 key the handoff snapshot manifest is
-    // signed by: ordinary handoff snapshots use the source volume's
-    // own `volume.pub` (the regular block-reader path), but
-    // synthesised handoff snapshots minted by `volume release
-    // --force` are signed by the recovering coordinator's
-    // `coordinator.pub`. The coordinator already verifies the
-    // manifest signature and the recovering coordinator's pub
-    // binding before answering `recovery <hex>`, so we can pass the
-    // hex through to `fork-create` as `parent-key=` and the new
-    // fork's open-time ancestor walk will verify under the right
-    // key.
     let parent_key_hex = match coordinator_client::resolve_handoff_key(
         socket_path,
         released_vol_ulid,
@@ -1746,12 +1718,6 @@ fn claim_released_name(
         }
     };
 
-    // Mint a fresh local fork. fork-create writes by_id/<new_ulid>/
-    // and the by_name/<name> symlink, returns the new vol_ulid.
-    // The bucket record already exists in `Released` state; the
-    // `for_claim=true` flag tells the coordinator to skip
-    // `mark_initial` so we don't trip the AlreadyExists guard. The
-    // `claim` IPC below rebinds the record via `mark_claimed`.
     let new_vol_ulid = coordinator_client::fork_create(
         socket_path,
         name,
@@ -1762,11 +1728,7 @@ fn claim_released_name(
         true,
     )?;
 
-    // Atomically rebind the bucket-side name to our new fork. If the
-    // conditional PUT loses to another coordinator, surface the
-    // resulting error — the local fork is left in place for the
-    // operator to repurpose under a different name.
-    coordinator_client::claim_volume(socket_path, name, &new_vol_ulid)?;
+    coordinator_client::rebind_name(socket_path, name, &new_vol_ulid)?;
     Ok(())
 }
 

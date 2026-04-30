@@ -36,7 +36,7 @@ use ed25519_dalek::VerifyingKey;
 use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::identity::fetch_coordinator_pub;
 use elide_coordinator::lifecycle::{
-    self, ForceReleaseOutcome, MarkClaimedOutcome, MarkReleasedOutcome, MarkReservedOutcome,
+    self, ForceReleaseOutcome, MarkClaimedOutcome, MarkReleasedOutcome,
 };
 use elide_coordinator::name_store as ns;
 use elide_coordinator::portable;
@@ -62,7 +62,6 @@ const NUM_COORDS: usize = 2;
 enum Op {
     Create { name: u8, coord: u8 },
     Release { name: u8, coord: u8 },
-    ReleaseTo { name: u8, coord: u8, target: u8 },
     ForceRelease { name: u8, recovering: u8 },
     ClaimReleased { name: u8, coord: u8 },
 }
@@ -70,16 +69,10 @@ enum Op {
 fn arb_op() -> impl Strategy<Value = Op> {
     let name = 0u8..(NUM_NAMES as u8);
     let coord = 0u8..(NUM_COORDS as u8);
-    let target = 0u8..(NUM_COORDS as u8);
     let rec = 0u8..(NUM_COORDS as u8);
     prop_oneof![
         (name.clone(), coord.clone()).prop_map(|(name, coord)| Op::Create { name, coord }),
         (name.clone(), coord.clone()).prop_map(|(name, coord)| Op::Release { name, coord }),
-        (name.clone(), coord.clone(), target).prop_map(|(name, coord, target)| Op::ReleaseTo {
-            name,
-            coord,
-            target
-        }),
         (name.clone(), rec).prop_map(|(name, recovering)| Op::ForceRelease { name, recovering }),
         (name, coord).prop_map(|(name, coord)| Op::ClaimReleased { name, coord }),
     ]
@@ -189,32 +182,6 @@ impl World {
                     lifecycle::mark_released(&self.store, name_for(*name), &coord_id, snap).await;
             }
 
-            Op::ReleaseTo {
-                name,
-                coord,
-                target,
-            } => {
-                let coord_id = self.coords[*coord as usize].coordinator_id_str().to_owned();
-                let target_id = self.coords[*target as usize]
-                    .coordinator_id_str()
-                    .to_owned();
-                let vol_ulid = match ns::read_name_record(&self.store, name_for(*name)).await {
-                    Ok(Some((rec, _))) => rec.vol_ulid,
-                    _ => return,
-                };
-                let Some(snap) = self.publish_volume_snapshot(vol_ulid).await else {
-                    return;
-                };
-                let _: Result<MarkReservedOutcome, _> = lifecycle::mark_released_to(
-                    &self.store,
-                    name_for(*name),
-                    &coord_id,
-                    &target_id,
-                    snap,
-                )
-                .await;
-            }
-
             Op::ForceRelease { name, recovering } => {
                 // Read the current record to learn which dead fork to
                 // recover from. If the record is absent or already in
@@ -262,8 +229,14 @@ impl World {
             Op::ClaimReleased { name, coord } => {
                 let coord_id = self.coords[*coord as usize].coordinator_id_str().to_owned();
                 let new_vol = self.mint_fork().await;
-                let _: Result<MarkClaimedOutcome, _> =
-                    lifecycle::mark_claimed(&self.store, name_for(*name), &coord_id, new_vol).await;
+                let _: Result<MarkClaimedOutcome, _> = lifecycle::mark_claimed(
+                    &self.store,
+                    name_for(*name),
+                    &coord_id,
+                    new_vol,
+                    NameState::Live,
+                )
+                .await;
             }
         }
     }
@@ -376,21 +349,6 @@ impl World {
                     let snap = rec
                         .handoff_snapshot
                         .expect("Released record must carry a handoff_snapshot");
-                    self.verify_handoff_manifest(rec.vol_ulid, snap, name).await;
-                }
-                NameState::Reserved => {
-                    // Invariant 4.
-                    let target = rec
-                        .coordinator_id
-                        .as_deref()
-                        .expect("Reserved record must name a target coordinator");
-                    assert!(
-                        coord_ids.iter().any(|c| c == target),
-                        "Reserved record names unknown coordinator '{target}'"
-                    );
-                    let snap = rec
-                        .handoff_snapshot
-                        .expect("Reserved record must carry a handoff_snapshot");
                     self.verify_handoff_manifest(rec.vol_ulid, snap, name).await;
                 }
                 NameState::Readonly => {

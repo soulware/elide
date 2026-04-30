@@ -102,16 +102,20 @@ Eviction is only safe on volumes with reachable S3 backing. The current CLI impl
 
 ```
 elide volume status --remote <name>       # GET names/<name> (authoritative record)
-elide volume start --remote <name>        # claim a Released/Reserved name; pulls the chain
+elide volume claim <name>                 # take a Released name into local ownership (Stopped)
+elide volume start <name>                 # bring up the daemon
+elide volume start --claim <name>         # claim + start in one verb
 elide volume ls <name>                    # readable once prefetch completes
 ```
 
-`start --remote` reads `names/<name>` from the bucket. If the record is `Released` (or `Reserved` for this coordinator), the claim splits two ways:
+`volume claim` reads `names/<name>` from the bucket. If the record is `Released`, the claim splits two ways:
 
-- **In-place reclaim** when the released `vol_ulid` matches a local fork still on disk (this host owned the name, released it, now re-claims). The IPC flips state back to `Live` keeping the same ULID — no pull, no fork mint. Reported as `<name>: reclaimed and started`. This sub-case still requires `--remote` because the bucket-side ownership record is being changed.
-- **Cross-coordinator claim** otherwise. The CLI pulls the released ancestor's chain into `<data_dir>/by_id/<ulid>/` (only the delta since the last local ancestor — any prior local fork is reused as ancestor cache by the chain walk, since `remote_pull` stops walking up the chain at the first locally-present ancestor), mints a fresh local fork, and conditionally rebinds `names/<name>` to the new fork. Reported as `<name>: claimed and started`. Any prior local fork remains on disk; if it's part of the claimed chain it serves as ancestor cache, otherwise it is a true orphan eligible for cleanup.
+- **In-place reclaim** when the released `vol_ulid` matches a local fork still on disk (this host owned the name, released it, now re-claims). The IPC flips state to `Stopped` keeping the same ULID — no pull, no fork mint. Reported as `<name>: claimed`.
+- **Cross-coordinator claim** otherwise. The CLI pulls the released ancestor's chain into `<data_dir>/by_id/<ulid>/` (only the delta since the last local ancestor — any prior local fork is reused as ancestor cache by the chain walk), mints a fresh local fork, and conditionally rebinds `names/<name>` to the new fork (in `Stopped` state). Any prior local fork remains on disk; if it's part of the claimed chain it serves as ancestor cache, otherwise it is a true orphan eligible for cleanup.
 
-For `Live`/`Stopped` records held by another coordinator, see [`volume release --force`](#disaster-recovery).
+`claim` always leaves the volume `Stopped`; use `volume start` to bring up the daemon, or compose with `volume start --claim`.
+
+For `Live`/`Stopped` records held by another coordinator, run `volume claim --force <name>` (synthesises a handoff snapshot internally, equivalent to `volume release --force` then `volume claim`) — see [Disaster recovery](#disaster-recovery).
 
 ## Post-import workflows
 
@@ -122,7 +126,7 @@ An imported volume is readonly. Two ways to handle writes (not mutually exclusiv
 
 ## Disaster recovery
 
-- **Disk loss on a live volume.** Recoverable: everything in fully-uploaded segments. Lost: `pending/` and the in-memory WAL tail. Recover with `volume release --force <name>` from another host (synthesises a handoff snapshot from the dead fork's S3-visible segments) followed by `volume start --remote <name>`. The recovered fork is fresh and writable.
+- **Disk loss on a live volume.** Recoverable: everything in fully-uploaded segments. Lost: `pending/` and the in-memory WAL tail. Recover with `volume claim --force <name>` from another host — synthesises a handoff snapshot from the dead fork's S3-visible segments and claims the name in one verb. Then `volume start <name>` to bring up the daemon. The recovered fork is fresh and writable.
 - **Lost private key.** S3 data remains readable (signatures verified with `volume.pub` in S3), but new writes are impossible. If snapshots exist, branch from the latest via `volume create --from <src>`. Snapshot markers are intentionally unsigned empty files, so an emergency branch point can be created by uploading an empty file to `by_id/<vol>/snapshots/<ulid>` with a ULID ≥ the latest segment.
 - **Unresponsive or dead upstream, need current state past the latest snapshot.** Today: `volume create --from <src> --force-snapshot` uploads a forker-attested "now" marker and branches from it. Proposed replacement: `volume materialize <new-name> --from <vol_ulid>` copies the upstream's current state into a self-contained new volume, pending TTL resolution — see [design-replica-model.md](design-replica-model.md).
 - **Local `cache/` deletion.** Automatic recovery — `Volume::open` rebuilds from `index/*.idx` and reads demand-fetch bodies.
