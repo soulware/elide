@@ -678,15 +678,12 @@ fn main() {
                         }
                     }
                 } else {
-                    let resp = coordinator_client::status(&socket_path, &name)
-                        .unwrap_or_else(|e| format!("err {e}"));
-                    match resp.split_once(' ') {
-                        Some(("ok", rest)) => println!("{name}: {rest}"),
-                        Some(("err", msg)) => {
-                            eprintln!("{name}: {msg}");
+                    match coordinator_client::status(&socket_path, &name) {
+                        Ok(reply) => println!("{name}: {}", reply.lifecycle.wire_body()),
+                        Err(e) => {
+                            eprintln!("{name}: {e}");
                             std::process::exit(1);
                         }
-                        _ => println!("{name}: {resp}"),
                     }
                 }
             }
@@ -2106,10 +2103,17 @@ fn resolve_latest_remote_snapshot(
     })
 }
 
-/// Pretty-print a `RemoteStatus` for `elide volume status --remote`.
-fn print_remote_status(name: &str, rs: &coordinator_client::RemoteStatus) {
+/// Pretty-print a `StatusRemoteReply` for `elide volume status --remote`.
+fn print_remote_status(name: &str, rs: &coordinator_client::StatusRemoteReply) {
+    use elide_core::name_record::NameState;
+    let state_str = match rs.state {
+        NameState::Live => "live",
+        NameState::Stopped => "stopped",
+        NameState::Released => "released",
+        NameState::Readonly => "readonly",
+    };
     println!("{name}");
-    println!("  state           {}", rs.state);
+    println!("  state           {state_str}");
     println!("  vol_ulid        {}", rs.vol_ulid);
     if let Some(id) = &rs.coordinator_id {
         println!("  coordinator_id  {id}");
@@ -2126,7 +2130,7 @@ fn print_remote_status(name: &str, rs: &coordinator_client::RemoteStatus) {
     if let Some(snap) = &rs.handoff_snapshot {
         println!("  handoff_snap    {snap}");
     }
-    println!("  eligibility     {}", rs.eligibility);
+    println!("  eligibility     {}", rs.eligibility.wire_str());
 }
 
 /// Pull a volume (and its full ancestor chain) from the remote store as

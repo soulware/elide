@@ -35,8 +35,13 @@
 
 use std::io;
 
+use elide_core::name_record::NameState;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use ulid::Ulid;
+
+use crate::eligibility::Eligibility;
+use crate::volume_state::VolumeLifecycle;
 
 /// Outer envelope wrapping every reply from the coordinator.
 ///
@@ -208,6 +213,55 @@ where
     let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
     let value = serde_json::from_str(trimmed).map_err(io::Error::other)?;
     Ok(Some(value))
+}
+
+// ── Verb request envelope ─────────────────────────────────────────────
+//
+// Migrated verbs are listed here. Unmigrated verbs continue to use the
+// line-based dispatcher in `inbound::dispatch_legacy`. As verbs migrate
+// they move from there into this enum.
+//
+// Wire shape (NDJSON, one object per line):
+//   {"verb":"rescan"}
+//   {"verb":"status","volume":"foo"}
+//   {"verb":"status-remote","volume":"foo"}
+
+/// Typed coordinator IPC request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "verb", rename_all = "kebab-case")]
+pub enum Request {
+    /// Trigger an immediate fork-discovery pass. No payload.
+    Rescan,
+    /// Report a volume's local lifecycle (running / stopped / importing).
+    Status { volume: String },
+    /// Fetch the bucket-side `names/<volume>` record plus this
+    /// coordinator's eligibility to act on it.
+    StatusRemote { volume: String },
+}
+
+/// Reply for [`Request::Status`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusReply {
+    pub lifecycle: VolumeLifecycle,
+}
+
+/// Reply for [`Request::StatusRemote`]. Mirrors the fields of
+/// `NameRecord` plus the derived `eligibility` classification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusRemoteReply {
+    pub state: NameState,
+    pub vol_ulid: Ulid,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub coordinator_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub claimed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub handoff_snapshot: Option<Ulid>,
+    pub eligibility: Eligibility,
 }
 
 #[cfg(test)]
