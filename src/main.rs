@@ -1088,7 +1088,7 @@ enum ListFilter {
     All,
 }
 
-use elide_coordinator::volume_state::{VolumeLifecycle, VolumeMode};
+use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, VolumeLifecycle, VolumeMode};
 
 /// Cell value for the STATE column in `elide volume list`. Wraps the
 /// coordinator-derived `VolumeLifecycle` with two CLI-only sentinels:
@@ -1492,7 +1492,7 @@ fn create_fork(
         }
     };
 
-    if source_fork_dir.join("import.lock").exists() {
+    if source_fork_dir.join(IMPORT_LOCK_FILE).exists() {
         return Err(std::io::Error::other(format!(
             "volume '{from}' is still importing; wait for import to complete before forking"
         )));

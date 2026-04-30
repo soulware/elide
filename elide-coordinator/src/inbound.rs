@@ -32,6 +32,7 @@ use crate::credential::CredentialIssuer;
 use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
+use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
     EvictRegistry, PrefetchTracker, SnapshotLockRegistry, register_prefetch_or_get,
     subscribe_prefetch,
@@ -607,7 +608,7 @@ async fn start_import(
 
 /// Resolve a volume name to its import ULID via `import.lock`, if present.
 fn import_ulid_for_volume(name: &str, data_dir: &Path) -> Option<String> {
-    let lock_path = data_dir.join("by_name").join(name).join(import::LOCK_FILE);
+    let lock_path = data_dir.join("by_name").join(name).join(IMPORT_LOCK_FILE);
     std::fs::read_to_string(lock_path)
         .ok()
         .map(|s| s.trim().to_owned())
@@ -1143,7 +1144,7 @@ fn remove_volume(volume_name: &str, force: bool, data_dir: &Path) -> String {
         Err(e) => return format!("err resolving volume dir: {e}"),
     };
 
-    if !vol_dir.join("volume.stopped").exists() {
+    if !vol_dir.join(STOPPED_FILE).exists() {
         return "err volume is running; stop it first with: elide volume stop <name>".to_string();
     }
 
@@ -2146,7 +2147,7 @@ async fn fork_create_op(
 fn local_daemon_running(data_dir: &Path, volume_name: &str) -> bool {
     let link = data_dir.join("by_name").join(volume_name);
     match std::fs::canonicalize(&link) {
-        Ok(vol_dir) => !vol_dir.join("volume.stopped").exists(),
+        Ok(vol_dir) => !vol_dir.join(STOPPED_FILE).exists(),
         Err(_) => false,
     }
 }
@@ -2166,7 +2167,7 @@ async fn stop_volume_op(
         Err(e) => return format!("err resolving volume dir: {e}"),
     };
 
-    if vol_dir.join("volume.stopped").exists() {
+    if vol_dir.join(STOPPED_FILE).exists() {
         // Already stopped — idempotent success.
         return "ok".to_string();
     }
@@ -2220,7 +2221,7 @@ async fn stop_volume_op(
     }
 
     // Write the marker before sending shutdown so the supervisor won't restart.
-    if let Err(e) = std::fs::write(vol_dir.join("volume.stopped"), "") {
+    if let Err(e) = std::fs::write(vol_dir.join(STOPPED_FILE), "") {
         return format!("err writing volume.stopped: {e}");
     }
 
@@ -2234,7 +2235,7 @@ async fn stop_volume_op(
             // running volume. (Note: the S3 state has already flipped to
             // Stopped; that's a soft inconsistency the operator can resolve
             // by issuing `volume start` once the underlying issue is fixed.)
-            let _ = std::fs::remove_file(vol_dir.join("volume.stopped"));
+            let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
             format!("err shutdown failed: {resp}")
         }
         None => {
@@ -2296,7 +2297,7 @@ impl Drop for DrainingMarkerGuard {
             // pre-release state — without this the supervisor would
             // keep the (now transport-suppressed-then-restored)
             // process running indefinitely.
-            let stopped = self.vol_dir.join("volume.stopped");
+            let stopped = self.vol_dir.join(STOPPED_FILE);
             if let Err(e) = std::fs::write(&stopped, "")
                 && e.kind() != std::io::ErrorKind::AlreadyExists
             {
@@ -2574,7 +2575,7 @@ async fn release_volume_op(
     // to halt it inline, and any failure between halt and bucket-flip
     // would leave the volume in a "Released-but-running" mismatch the
     // operator can't easily recover from.
-    if !vol_dir.join("volume.stopped").exists() {
+    if !vol_dir.join(STOPPED_FILE).exists() {
         return format!(
             "err volume '{volume_name}' is running; \
              stop it first with: elide volume stop {volume_name}"
@@ -2658,7 +2659,7 @@ async fn release_volume_op(
     if let Err(e) = std::fs::write(vol_dir.join("volume.draining"), "") {
         return format!("err writing volume.draining: {e}");
     }
-    if let Err(e) = std::fs::remove_file(vol_dir.join("volume.stopped")) {
+    if let Err(e) = std::fs::remove_file(vol_dir.join(STOPPED_FILE)) {
         let _ = std::fs::remove_file(vol_dir.join("volume.draining"));
         return format!("err clearing volume.stopped for release: {e}");
     }
@@ -2721,14 +2722,14 @@ async fn release_volume_op(
     if let Some(g) = _draining_guard.as_mut() {
         g.defuse();
     }
-    if let Err(e) = std::fs::write(vol_dir.join("volume.stopped"), "") {
+    if let Err(e) = std::fs::write(vol_dir.join(STOPPED_FILE), "") {
         return format!("err writing volume.stopped: {e}");
     }
     info!("[release {volume_name}] halting daemon");
     match elide_coordinator::control::call_for_inbound(&vol_dir, "shutdown").await {
         Some(resp) if resp == "ok" => {}
         Some(resp) => {
-            let _ = std::fs::remove_file(vol_dir.join("volume.stopped"));
+            let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
             return format!("err shutdown failed: {resp}");
         }
         None => {
@@ -2928,7 +2929,7 @@ async fn rebind_name_op(
     // Ensure volume.stopped is present so the supervisor doesn't
     // launch the daemon when notified — claim leaves the volume
     // halted; start brings it up.
-    if let Err(e) = std::fs::write(new_dir.join("volume.stopped"), "") {
+    if let Err(e) = std::fs::write(new_dir.join(STOPPED_FILE), "") {
         return format!("err writing volume.stopped on new fork: {e}");
     }
 
@@ -3130,7 +3131,7 @@ async fn start_volume_op(
         Err(e) => return format!("err resolving volume dir: {e}"),
     };
 
-    if !vol_dir.join("volume.stopped").exists() {
+    if !vol_dir.join(STOPPED_FILE).exists() {
         return "err volume is not stopped".to_string();
     }
 
@@ -3171,7 +3172,7 @@ async fn start_volume_op(
         Err(e) => return format!("err nbd conflict check: {e}"),
     }
 
-    if let Err(e) = std::fs::remove_file(vol_dir.join("volume.stopped")) {
+    if let Err(e) = std::fs::remove_file(vol_dir.join(STOPPED_FILE)) {
         return format!("err clearing volume.stopped: {e}");
     }
     rescan.notify_one();
@@ -3189,7 +3190,7 @@ async fn start_volume_op(
 /// (the spawn-write race), or "pid mismatch".
 fn check_peer_pid(vol_dir: &Path, peer_pid: Option<i32>) -> Result<i32, String> {
     let peer_pid = peer_pid.ok_or_else(|| "err peer pid unavailable".to_string())?;
-    let pid_path = vol_dir.join("volume.pid");
+    let pid_path = vol_dir.join(PID_FILE);
     let recorded: i32 = match std::fs::read_to_string(&pid_path) {
         Ok(s) => s
             .trim()
@@ -3334,7 +3335,7 @@ mod tests {
     fn setup_volume(data_dir: &Path, ulid: &str, pid: i32) {
         let dir = data_dir.join("by_id").join(ulid);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("volume.pid"), pid.to_string()).unwrap();
+        std::fs::write(dir.join(PID_FILE), pid.to_string()).unwrap();
     }
 
     fn key() -> [u8; 32] {
@@ -4029,7 +4030,7 @@ mod tests {
         // Local marker now present.
         let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
         assert!(
-            vol_dir.join("volume.stopped").exists(),
+            vol_dir.join(STOPPED_FILE).exists(),
             "volume.stopped marker should be written"
         );
 
@@ -4059,7 +4060,7 @@ mod tests {
         assert_eq!(resp, "ok");
 
         let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
-        assert!(vol_dir.join("volume.stopped").exists());
+        assert!(vol_dir.join(STOPPED_FILE).exists());
 
         // Bucket record untouched — still owned by the other coordinator.
         let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();

@@ -29,12 +29,13 @@ use tracing::{error, info, warn};
 
 use tokio::process::Command;
 
+use elide_coordinator::volume_state::{PID_FILE, STOPPED_FILE};
+
 /// Env vars the coordinator exports into each volume subprocess so the
 /// volume's fetcher inherits store config without operator-level env or a
 /// per-volume `fetch.toml`. Built by [`crate::config::StoreSection::child_env`].
 pub type ChildEnv = Arc<Vec<(&'static str, String)>>;
 
-const PID_FILE: &str = "volume.pid";
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// A process that exits within this many seconds is considered a fast failure.
@@ -64,7 +65,7 @@ pub async fn supervise(
         }
 
         // Volume intentionally stopped — wait for the marker to disappear.
-        if fork_dir.join("volume.stopped").exists() {
+        if fork_dir.join(STOPPED_FILE).exists() {
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
         }
@@ -88,7 +89,7 @@ pub async fn supervise(
                          volume stopped (lower ULID wins)",
                         conflict.endpoint, conflict.name,
                     );
-                    let _ = std::fs::write(fork_dir.join("volume.stopped"), "");
+                    let _ = std::fs::write(fork_dir.join(STOPPED_FILE), "");
                     break;
                 }
                 // We have the lower ULID — the other supervisor will stop
@@ -119,7 +120,7 @@ pub async fn supervise(
                          volume stopped (lower ULID wins)",
                         conflict.dev_id, conflict.name,
                     );
-                    let _ = std::fs::write(fork_dir.join("volume.stopped"), "");
+                    let _ = std::fs::write(fork_dir.join(STOPPED_FILE), "");
                     break;
                 }
             }
@@ -139,7 +140,7 @@ pub async fn supervise(
                  Rerun the coordinator under sudo (or grant it CAP_SYS_ADMIN), \
                  or remove the [ublk] section from volume.toml. Marking volume.stopped."
             );
-            let _ = std::fs::write(fork_dir.join("volume.stopped"), "");
+            let _ = std::fs::write(fork_dir.join(STOPPED_FILE), "");
             continue;
         }
 
@@ -180,7 +181,7 @@ pub async fn supervise(
                         "[supervisor {label}] volume reported permanent misconfiguration; \
                          marking volume.stopped (see preceding line for cause)"
                     );
-                    let _ = std::fs::write(fork_dir.join("volume.stopped"), "");
+                    let _ = std::fs::write(fork_dir.join(STOPPED_FILE), "");
                     continue;
                 }
                 if started.elapsed().as_secs() < FAST_EXIT_THRESHOLD_SECS {

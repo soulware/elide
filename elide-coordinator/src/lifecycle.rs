@@ -21,6 +21,7 @@ use elide_core::name_record::{
 };
 
 use crate::name_store::{self, NameStoreError};
+use crate::volume_state::STOPPED_FILE;
 
 /// Errors from lifecycle transitions.
 #[derive(Debug)]
@@ -663,7 +664,7 @@ pub async fn reconcile_marker(
         return;
     }
 
-    let marker = vol_dir.join("volume.stopped");
+    let marker = vol_dir.join(STOPPED_FILE);
     let marker_present = marker.exists();
 
     match (record.state, marker_present) {
@@ -981,7 +982,7 @@ mod tests {
         std::fs::create_dir_all(&vol_dir).unwrap();
 
         reconcile_marker(&s, &vol_dir, "vol", &id_a()).await;
-        assert!(vol_dir.join("volume.stopped").exists());
+        assert!(vol_dir.join(STOPPED_FILE).exists());
     }
 
     #[tokio::test]
@@ -998,10 +999,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let vol_dir = tmp.path().join("vol");
         std::fs::create_dir_all(&vol_dir).unwrap();
-        std::fs::write(vol_dir.join("volume.stopped"), "").unwrap();
+        std::fs::write(vol_dir.join(STOPPED_FILE), "").unwrap();
 
         reconcile_marker(&s, &vol_dir, "vol", &id_a()).await;
-        assert!(!vol_dir.join("volume.stopped").exists());
+        assert!(!vol_dir.join(STOPPED_FILE).exists());
     }
 
     #[tokio::test]
@@ -1018,7 +1019,7 @@ mod tests {
 
         // B reconciles; A's record must not affect B's local state.
         reconcile_marker(&s, &vol_dir, "vol", &id_b()).await;
-        assert!(!vol_dir.join("volume.stopped").exists());
+        assert!(!vol_dir.join(STOPPED_FILE).exists());
     }
 
     fn other_ulid() -> Ulid {
@@ -1123,7 +1124,7 @@ mod tests {
         std::fs::create_dir_all(&vol_dir).unwrap();
 
         reconcile_marker(&s, &vol_dir, "vol", &id_a()).await;
-        assert!(!vol_dir.join("volume.stopped").exists());
+        assert!(!vol_dir.join(STOPPED_FILE).exists());
     }
 
     // ── mark_initial ────────────────────────────────────────────────────
