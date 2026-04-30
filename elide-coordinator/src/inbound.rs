@@ -32,6 +32,7 @@ use crate::credential::CredentialIssuer;
 use crate::import::{self, ImportRegistry, ImportState};
 use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::StoreSection;
+use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
     EvictRegistry, PrefetchTracker, SnapshotLockRegistry, register_prefetch_or_get,
@@ -1063,10 +1064,9 @@ fn volume_status(volume_name: &str, data_dir: &Path) -> String {
 /// claimed_at = "..."         # optional
 /// parent = "..."             # optional
 /// handoff_snapshot = "..."   # optional
-/// eligibility = "owned" | "foreign" | "reserved-for-self"
-///             | "reserved-for-other" | "released-claimable"
-///             | "readonly"
+/// eligibility = "owned" | "foreign" | "released-claimable" | "readonly"
 /// ```
+/// The eligibility values correspond to [`Eligibility`].
 async fn volume_status_remote(
     volume_name: &str,
     store: &Arc<dyn ObjectStore>,
@@ -1087,14 +1087,7 @@ async fn volume_status_remote(
         NameState::Readonly => "readonly",
     };
 
-    let eligibility = match record.state {
-        NameState::Live | NameState::Stopped => match record.coordinator_id.as_deref() {
-            Some(owner) if owner == coord_id => "owned",
-            _ => "foreign",
-        },
-        NameState::Released => "released-claimable",
-        NameState::Readonly => "readonly",
-    };
+    let eligibility = Eligibility::from_record(&record, coord_id);
 
     let mut body = String::with_capacity(256);
     body.push_str("ok\n");
