@@ -842,6 +842,10 @@ fn main() {
             }
 
             VolumeCommand::Stop { name, release } => {
+                if let Err(e) = coordinator_client::stop_volume(&socket_path, &name) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
                 if release {
                     match coordinator_client::release_volume(&socket_path, &name, false) {
                         Ok(snap) => {
@@ -853,10 +857,6 @@ fn main() {
                         }
                     }
                 } else {
-                    if let Err(e) = coordinator_client::stop_volume(&socket_path, &name) {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
-                    }
                     println!("{name}: stopped");
                 }
             }
