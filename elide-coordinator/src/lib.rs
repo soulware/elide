@@ -4,6 +4,7 @@ pub mod gc;
 pub mod identity;
 pub mod lifecycle;
 pub mod local_cond_store;
+pub mod name_event_store;
 pub mod name_store;
 pub mod portable;
 pub mod prefetch;
