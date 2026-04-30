@@ -359,6 +359,33 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
     }
 }
 
+/// Upload `<vol_dir>/volume.pub` to `by_id/<volume_id>/volume.pub` and write
+/// the local upload sentinel.
+///
+/// Used at create / fork time to establish the invariant
+/// "`names/<name>` only ever points at a `vol_ulid` whose `volume.pub` is
+/// already in the bucket". If the coordinator dies after this call but
+/// before the caller publishes `names/<name>`, the only artefact left in
+/// S3 is an orphan `volume.pub` keyed by an unreferenced ULID — harmless,
+/// and reclaimable by future GC.
+///
+/// The sentinel write means the daemon's later `upload_volume_metadata`
+/// pass observes a content-equal sentinel and skips the redundant PUT.
+pub async fn upload_volume_pub_initial(
+    vol_dir: &Path,
+    volume_id: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<()> {
+    let pub_key_path = vol_dir.join("volume.pub");
+    let bytes = std::fs::read(&pub_key_path)
+        .with_context(|| format!("reading {}", pub_key_path.display()))?;
+    upload_small_bytes(&bytes, volume_id, "volume.pub", MIME_TEXT, store).await?;
+    let sentinel = upload_sentinel(vol_dir, "volume.pub");
+    mark_uploaded(&sentinel, &bytes)
+        .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
+    Ok(())
+}
+
 async fn upload_small_bytes(
     data: &[u8],
     volume_id: &str,

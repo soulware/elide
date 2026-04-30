@@ -1350,10 +1350,48 @@ async fn create_volume_op(
     let vol_ulid_str = vol_ulid.to_string();
     let vol_dir = data_dir.join("by_id").join(&vol_ulid_str);
 
-    // Claim the name in S3 *before* creating any local state. This
-    // closes the cross-coordinator race where two hosts run
-    // `volume create <name>` concurrently — the loser sees
-    // `AlreadyExists` and refuses, leaving no partial local artefacts.
+    // Phase 1: create the local volume directory and signing key. We need
+    // `volume.pub` on disk before we can upload it, and we want the
+    // upload to land in S3 *before* `names/<name>` so the invariant
+    // "every named vol_ulid has volume.pub in the bucket" holds across
+    // crashes. A SIGINT before the upload leaves only local-disk state,
+    // which `cleanup_local` rolls back.
+    let cleanup_local = || {
+        let _ = std::fs::remove_file(by_name_dir.join(name));
+        let _ = std::fs::remove_dir_all(&vol_dir);
+    };
+    let signing_key = match (|| {
+        std::fs::create_dir_all(&vol_dir)?;
+        std::fs::create_dir_all(vol_dir.join("pending"))?;
+        std::fs::create_dir_all(vol_dir.join("index"))?;
+        std::fs::create_dir_all(vol_dir.join("cache"))?;
+        elide_core::signing::generate_keypair(
+            &vol_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+    })() {
+        Ok(k) => k,
+        Err(e) => {
+            cleanup_local();
+            return format!("err create failed: {e}");
+        }
+    };
+
+    // Phase 2: publish volume.pub to S3. A SIGINT here at worst leaves an
+    // orphan `by_id/<vol_ulid>/volume.pub` (no names/<name> references it,
+    // so it's harmless and GC-reclaimable).
+    if let Err(e) =
+        elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, &vol_ulid_str, store).await
+    {
+        cleanup_local();
+        return format!("err uploading volume.pub: {e:#}");
+    }
+
+    // Phase 3: claim the name in S3. After this point the names/<name>
+    // record exists in the bucket and references a vol_ulid whose
+    // volume.pub is already uploaded — recovery via `release --force`
+    // is always possible from here on.
     use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
     match mark_initial(store, name, coord_id, vol_ulid).await {
         Ok(MarkInitialOutcome::Claimed) => {}
@@ -1362,6 +1400,7 @@ async fn create_volume_op(
             existing_state,
             existing_owner,
         }) => {
+            cleanup_local();
             let owner = existing_owner.as_deref().unwrap_or("<unowned>");
             return format!(
                 "err name '{name}' already exists in bucket \
@@ -1370,31 +1409,26 @@ async fn create_volume_op(
             );
         }
         Err(LifecycleError::Store(e)) => {
+            cleanup_local();
             return format!("err claiming name in bucket: {e}");
         }
         Err(LifecycleError::OwnershipConflict { held_by }) => {
             // mark_initial doesn't currently surface this, but match
             // exhaustively so a future refactor doesn't silently drop it.
+            cleanup_local();
             return format!("err name held by another coordinator: {held_by}");
         }
         Err(LifecycleError::InvalidTransition { from, .. }) => {
+            cleanup_local();
             return format!("err names/<name> is in unexpected state {from:?}");
         }
     }
 
+    // Phase 4: finish local state (provenance, config, by_name symlink).
     let result: std::io::Result<()> = (|| {
-        std::fs::create_dir_all(&vol_dir)?;
-        std::fs::create_dir_all(vol_dir.join("pending"))?;
-        std::fs::create_dir_all(vol_dir.join("index"))?;
-        std::fs::create_dir_all(vol_dir.join("cache"))?;
-        let key = elide_core::signing::generate_keypair(
-            &vol_dir,
-            elide_core::signing::VOLUME_KEY_FILE,
-            elide_core::signing::VOLUME_PUB_FILE,
-        )?;
         elide_core::signing::write_provenance(
             &vol_dir,
-            &key,
+            &signing_key,
             elide_core::signing::VOLUME_PROVENANCE_FILE,
             &elide_core::signing::ProvenanceLineage::default(),
         )?;
@@ -1411,10 +1445,11 @@ async fn create_volume_op(
     })();
 
     if let Err(e) = result {
-        // Local setup failed. Best-effort: roll back local artefacts
-        // *and* the bucket-side claim so the name is free to retry.
-        let _ = std::fs::remove_file(by_name_dir.join(name));
-        let _ = std::fs::remove_dir_all(&vol_dir);
+        // Phase-4 failure: roll back local artefacts *and* the bucket-side
+        // claim so the name is free to retry. The orphan volume.pub stays
+        // in S3 — it's not pointed to by anything and will be reclaimed
+        // by future GC.
+        cleanup_local();
         let name_key = object_store::path::Path::from(format!("names/{name}"));
         if let Err(del_err) = store.delete(&name_key).await {
             warn!(
@@ -1969,53 +2004,17 @@ async fn fork_create_op(
     let new_vol_ulid = new_vol_ulid_value.to_string();
     let new_fork_dir = by_id_dir.join(&new_vol_ulid);
 
-    // For brand-new names, claim in S3 *before* materialising the
-    // fork: lose the race cleanly with no partial local state if
-    // another coordinator already holds the name, and roll back the
-    // bucket-side claim if local fork-out fails. For the
-    // claim-from-released path (`for-claim` flag), the bucket record
-    // already exists as `Released` and the CLI's subsequent `claim`
-    // IPC handles the rebind via `mark_claimed`; we only do the
-    // local materialisation here.
-    if !for_claim {
-        use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
-        match mark_initial(store, new_name, coord_id, new_vol_ulid_value).await {
-            Ok(MarkInitialOutcome::Claimed) => {}
-            Ok(MarkInitialOutcome::AlreadyExists {
-                existing_vol_ulid,
-                existing_state,
-                existing_owner,
-            }) => {
-                let owner = existing_owner.as_deref().unwrap_or("<unowned>");
-                return format!(
-                    "err name '{new_name}' already exists in bucket \
-                     (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
-                     owner={owner})"
-                );
-            }
-            Err(LifecycleError::Store(e)) => {
-                return format!("err claiming name in bucket: {e}");
-            }
-            Err(LifecycleError::OwnershipConflict { held_by }) => {
-                return format!("err name held by another coordinator: {held_by}");
-            }
-            Err(LifecycleError::InvalidTransition { from, .. }) => {
-                return format!("err names/<name> is in unexpected state {from:?}");
-            }
-        }
-    }
-
-    // Local-only rollback. After a successful `mark_initial` claim,
-    // every error-return path below also rolls back the bucket-side
-    // claim via `rollback_claim` so the name is free to retry. In the
-    // `for-claim` path no such record was created here, so
-    // `rollback_claim` is a no-op.
+    // Local rollback helpers. `rollback_claim` is a no-op until
+    // `mark_initial` succeeds (or in the `for-claim` path, where the
+    // bucket record was created by an earlier release and is owned by
+    // the CLI's subsequent `claim` IPC).
     let cleanup = |fork_dir: &Path, link: &Path| {
         let _ = std::fs::remove_file(link);
         let _ = std::fs::remove_dir_all(fork_dir);
     };
-    let rollback_claim = async || {
-        if for_claim {
+    let mut name_claimed_in_bucket = false;
+    let rollback_claim = async |claimed: bool| {
+        if !claimed {
             return;
         }
         let key = object_store::path::Path::from(format!("names/{new_name}"));
@@ -2027,6 +2026,9 @@ async fn fork_create_op(
         }
     };
 
+    // Phase 1: materialise the fork locally. This generates the new
+    // fork's keypair on disk so we can upload `volume.pub` before
+    // touching `names/<name>`.
     let fork_result: std::io::Result<()> = match (snap, parent_key) {
         (Some(snap), Some(vk)) => elide_core::volume::fork_volume_at_with_manifest_key(
             &new_fork_dir,
@@ -2039,8 +2041,62 @@ async fn fork_create_op(
     };
     if let Err(e) = fork_result {
         cleanup(&new_fork_dir, &symlink_path);
-        rollback_claim().await;
         return format!("err fork failed: {e}");
+    }
+
+    // Phase 2: publish volume.pub to S3 *before* claiming the name.
+    // A SIGINT here at worst leaves an orphan
+    // `by_id/<new_vol_ulid>/volume.pub` (no names/<name> references it,
+    // so it's harmless). Without this ordering, a crash between
+    // mark_initial and the daemon's first metadata-drain leaves
+    // `names/<name>` pointing at a vol_ulid whose volume.pub is
+    // missing — which makes both the normal claim path and
+    // `release --force` recovery impossible.
+    if let Err(e) =
+        elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, &new_vol_ulid, store)
+            .await
+    {
+        cleanup(&new_fork_dir, &symlink_path);
+        return format!("err uploading volume.pub: {e:#}");
+    }
+
+    // Phase 3: for brand-new names, claim in S3. For the
+    // claim-from-released path (`for-claim` flag), the bucket record
+    // already exists as `Released` and the CLI's subsequent `claim`
+    // IPC handles the rebind via `mark_claimed`; the volume.pub we
+    // just uploaded is what makes that rebind safe.
+    if !for_claim {
+        use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
+        match mark_initial(store, new_name, coord_id, new_vol_ulid_value).await {
+            Ok(MarkInitialOutcome::Claimed) => {
+                name_claimed_in_bucket = true;
+            }
+            Ok(MarkInitialOutcome::AlreadyExists {
+                existing_vol_ulid,
+                existing_state,
+                existing_owner,
+            }) => {
+                cleanup(&new_fork_dir, &symlink_path);
+                let owner = existing_owner.as_deref().unwrap_or("<unowned>");
+                return format!(
+                    "err name '{new_name}' already exists in bucket \
+                     (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
+                     owner={owner})"
+                );
+            }
+            Err(LifecycleError::Store(e)) => {
+                cleanup(&new_fork_dir, &symlink_path);
+                return format!("err claiming name in bucket: {e}");
+            }
+            Err(LifecycleError::OwnershipConflict { held_by }) => {
+                cleanup(&new_fork_dir, &symlink_path);
+                return format!("err name held by another coordinator: {held_by}");
+            }
+            Err(LifecycleError::InvalidTransition { from, .. }) => {
+                cleanup(&new_fork_dir, &symlink_path);
+                return format!("err names/<name> is in unexpected state {from:?}");
+            }
+        }
     }
 
     // Inherit size from source; require it to be set.
@@ -2048,7 +2104,7 @@ async fn fork_create_op(
         Ok(c) => c,
         Err(e) => {
             cleanup(&new_fork_dir, &symlink_path);
-            rollback_claim().await;
+            rollback_claim(name_claimed_in_bucket).await;
             return format!("err reading source volume config: {e}");
         }
     };
@@ -2056,7 +2112,7 @@ async fn fork_create_op(
         Some(s) => s,
         None => {
             cleanup(&new_fork_dir, &symlink_path);
-            rollback_claim().await;
+            rollback_claim(name_claimed_in_bucket).await;
             return "err source volume has no size (import may not have completed)".to_string();
         }
     };
@@ -2069,17 +2125,17 @@ async fn fork_create_op(
     .write(&new_fork_dir))
     {
         cleanup(&new_fork_dir, &symlink_path);
-        rollback_claim().await;
+        rollback_claim(name_claimed_in_bucket).await;
         return format!("err writing volume config: {e}");
     }
     if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
         cleanup(&new_fork_dir, &symlink_path);
-        rollback_claim().await;
+        rollback_claim(name_claimed_in_bucket).await;
         return format!("err creating by_name dir: {e}");
     }
     if let Err(e) = std::os::unix::fs::symlink(format!("../by_id/{new_vol_ulid}"), &symlink_path) {
         cleanup(&new_fork_dir, &symlink_path);
-        rollback_claim().await;
+        rollback_claim(name_claimed_in_bucket).await;
         return format!("err creating by_name symlink: {e}");
     }
 
@@ -2399,27 +2455,49 @@ async fn force_release_volume_op(
 
     // Recovery pipeline: fetch dead fork's pubkey, list+verify
     // segments, mint+sign+publish synthesised handoff snapshot.
-    let dead_pub = match recovery::fetch_volume_pub(store, dead_vol_ulid).await {
+    //
+    // If `volume.pub` is absent the dead fork crashed during the
+    // create-time window before the coordinator published it. No
+    // segment could have been signed-and-verified under a missing key,
+    // so the dead fork is provably empty: publish an empty synthesised
+    // handoff and flip to Released.
+    let dead_pub = match recovery::fetch_volume_pub_optional(store, dead_vol_ulid).await {
         Ok(k) => k,
         Err(e) => {
             return format!("err fetching volume.pub for dead fork {dead_vol_ulid}: {e:#}");
         }
     };
-    let recovered = match recovery::list_and_verify_segments(store, dead_vol_ulid, &dead_pub).await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return format!("err listing/verifying segments for dead fork {dead_vol_ulid}: {e:#}");
+    let segment_ulids: Vec<ulid::Ulid> = match dead_pub {
+        Some(dead_pub) => {
+            let recovered =
+                match recovery::list_and_verify_segments(store, dead_vol_ulid, &dead_pub).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return format!(
+                            "err listing/verifying segments for dead fork \
+                             {dead_vol_ulid}: {e:#}"
+                        );
+                    }
+                };
+            let ulids: Vec<ulid::Ulid> =
+                recovered.segments.iter().map(|s| s.segment_ulid).collect();
+            info!(
+                "[inbound] force-release {volume_name}: recovered {} segments \
+                 ({} dropped) from dead fork {dead_vol_ulid}",
+                ulids.len(),
+                recovered.dropped,
+            );
+            ulids
+        }
+        None => {
+            info!(
+                "[inbound] force-release {volume_name}: dead fork \
+                 {dead_vol_ulid} has no volume.pub in bucket — treating as \
+                 empty (create-time crash before pub upload)"
+            );
+            Vec::new()
         }
     };
-    let segment_ulids: Vec<ulid::Ulid> =
-        recovered.segments.iter().map(|s| s.segment_ulid).collect();
-    info!(
-        "[inbound] force-release {volume_name}: recovered {} segments \
-         ({} dropped) from dead fork {dead_vol_ulid}",
-        segment_ulids.len(),
-        recovered.dropped,
-    );
 
     let published = match recovery::mint_and_publish_synthesised_snapshot(
         store,
@@ -3043,12 +3121,7 @@ async fn claim_volume_bucket_op(
                     // Already ours — nothing to claim.
                     format!("err name '{volume_name}' is already held by this coordinator")
                 }
-                Some(owner) => format!(
-                    "err name '{volume_name}' is held by coordinator {owner}; \
-                     if that owner is unreachable, run \
-                     `elide volume release --force {volume_name}` first \
-                     to declare it dead, then re-run claim"
-                ),
+                Some(owner) => format!("err name '{volume_name}' is held by coordinator {owner}"),
                 None => {
                     format!("err name '{volume_name}' has no coordinator_id (malformed record)")
                 }
@@ -3760,7 +3833,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_release_op_errors_when_dead_pub_missing() {
+    async fn force_release_op_recovers_when_dead_pub_missing() {
+        // Reproduces the create-time crash window: `names/<name>` was
+        // published to S3 but the coordinator died before
+        // `volume.pub` made it to the bucket. With no `volume.pub`
+        // there is no key to verify any segment under, so the dead
+        // fork is provably empty — force-release publishes an empty
+        // synthesised handoff and flips to Released.
         let store: Arc<dyn ObjectStore> = mem_store();
         let dead_vol = ulid::Ulid::new();
         let mut rec = NameRecord::live_minimal(dead_vol);
@@ -3772,10 +3851,33 @@ mod tests {
 
         let resp =
             force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity).await;
-        assert!(resp.starts_with("err "), "{resp}");
-        assert!(
-            resp.contains("fetching volume.pub"),
-            "expected pubkey fetch error, got: {resp}"
+        assert!(resp.starts_with("ok "), "{resp}");
+        let snap_str = resp.strip_prefix("ok ").unwrap();
+        let snap_ulid = ulid::Ulid::from_string(snap_str).expect("snapshot ULID");
+
+        let (rec, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
+        assert_eq!(rec.state, NameState::Released);
+        assert_eq!(rec.vol_ulid, dead_vol);
+        assert_eq!(rec.handoff_snapshot, Some(snap_ulid));
+
+        // The synthesised manifest covers no segments.
+        let snap_prefix = StorePath::from(format!("by_id/{dead_vol}/snapshots/"));
+        use futures::TryStreamExt;
+        let listed: Vec<_> = store.list(Some(&snap_prefix)).try_collect().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let manifest = store
+            .get(&listed[0].location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let recovery = elide_core::signing::peek_snapshot_manifest_recovery(&manifest)
+            .unwrap()
+            .expect("synthesised handoff must carry recovery metadata");
+        assert_eq!(
+            recovery.recovering_coordinator_id,
+            identity.coordinator_id_str()
         );
     }
 
