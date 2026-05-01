@@ -85,7 +85,7 @@ signature = "<ed25519-sig-over-canonical-form>"
 
 - **`signature`** is over the canonicalised TOML (sorted keys, fixed
   whitespace), prefixed with the fixed domain tag
-  `"elide name-event v1\0"`, using the emitter's `coordinator.key`
+  `"elide volume-event v1\0"`, using the emitter's `coordinator.key`
   (the same identity introduced in
   `design-portable-live-volume.md`). Verification is by lookup at
   `coordinators/<coordinator_id>/coordinator.pub`. This makes the

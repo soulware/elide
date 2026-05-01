@@ -703,7 +703,7 @@ fn main() {
             }
 
             VolumeCommand::Events { name, json } => {
-                match coordinator_client::name_events(&socket_path, &name) {
+                match coordinator_client::volume_events(&socket_path, &name) {
                     Ok(reply) => {
                         if json {
                             for entry in &reply.events {
@@ -716,7 +716,7 @@ fn main() {
                                 }
                             }
                         } else {
-                            print_name_events(&reply);
+                            print_volume_events(&reply);
                         }
                     }
                     Err(e) => {
@@ -2147,9 +2147,9 @@ fn resolve_latest_remote_snapshot(
 }
 
 /// Pretty-print a `StatusRemoteReply` for `elide volume status --remote`.
-fn print_name_events(reply: &coordinator_client::NameEventsReply) {
+fn print_volume_events(reply: &coordinator_client::VolumeEventsReply) {
     use coordinator_client::SignatureStatus;
-    use elide_core::name_event::EventKind;
+    use elide_core::volume_event::EventKind;
 
     if reply.events.is_empty() {
         println!("(no events)");
