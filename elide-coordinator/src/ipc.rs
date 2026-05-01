@@ -230,13 +230,22 @@ pub enum Request {
     /// coordinator's published pubkey.
     VolumeEvents { volume: String },
 
+    // ── Read-only S3 lookups (CLI delegates to coordinator) ──────────
+    /// Resolve a volume name to its current `vol_ulid` via the
+    /// bucket-side `names/<name>` record. Lets the CLI walk the
+    /// `name → ULID` link without holding S3 credentials.
+    ResolveName { name: String },
+    /// Return the latest snapshot ULID for `vol_ulid` by listing
+    /// `by_id/<vol_ulid>/snapshots/` in the store. Empty result is
+    /// `snapshot_ulid: None`.
+    LatestSnapshot { vol_ulid: Ulid },
+
     // ── Creds + cleanup (final iteration) ────────────────────────────
     /// Vend the non-secret `[store]` config (bucket / endpoint /
-    /// region or local_path). Used by CLI read paths to build an S3
-    /// client that matches the coordinator's view of the world.
+    /// region or local_path). Used by spawned volume subprocesses
+    /// (over the macaroon handshake) to build an object_store that
+    /// matches the coordinator's view of the world.
     GetStoreConfig,
-    /// Vend long-lived S3 credentials from the coordinator's env.
-    GetStoreCreds,
     /// Mint a per-volume macaroon for a spawned volume process.
     /// PID-bound via SO_PEERCRED on the connecting socket — the
     /// coordinator refuses if the peer's PID doesn't match the
@@ -346,6 +355,20 @@ pub struct PullReadonlyReply {
     pub parent: Option<Ulid>,
 }
 
+/// Reply for [`Request::ResolveName`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolveNameReply {
+    pub vol_ulid: Ulid,
+}
+
+/// Reply for [`Request::LatestSnapshot`]. `snapshot_ulid` is `None`
+/// when the volume has no snapshots in the store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LatestSnapshotReply {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub snapshot_ulid: Option<Ulid>,
+}
+
 /// Reply for [`Request::ImportStart`]. The import runs detached; the
 /// CLI uses [`Request::ImportAttach`] to stream output.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -424,9 +447,10 @@ pub struct StoreConfigReply {
     pub region: Option<String>,
 }
 
-/// Reply for [`Request::GetStoreCreds`] and [`Request::Credentials`].
+/// Reply for [`Request::Credentials`]. Vended only over the
+/// macaroon-authenticated path used by spawned volume subprocesses.
 /// `expiry_unix` is set only on issued (short-lived) creds — the
-/// long-lived env-creds path leaves it `None`.
+/// long-lived passthrough issuer leaves it `None`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoreCredsReply {
     pub access_key_id: String,
