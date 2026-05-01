@@ -1,0 +1,674 @@
+//! Five-step verify pipeline for incoming peer-fetch requests.
+//!
+//! See `docs/design-peer-segment-fetch.md` § "Peer verification (v1)"
+//! for the full design. Each [`AuthError`] variant corresponds to one
+//! failed check and maps to a specific HTTP status code:
+//!
+//! | Step | Check                           | On failure |
+//! |------|---------------------------------|-----------|
+//! | 1    | Token decode + freshness        | 401        |
+//! | 2    | Ed25519 signature               | 401        |
+//! | 3    | Volume claimed by this coord    | 401        |
+//! | 4    | URL `vol_id` is in ancestry     | 403        |
+//! | 5    | Local file exists (route-level) | 404        |
+//!
+//! Step 5 is the route handler's responsibility — it's a stat that
+//! falls out as 404 if the file isn't present locally. The auth
+//! pipeline returns successfully once steps 1–4 pass; the handler
+//! then reads the file or returns 404.
+//!
+//! The design doc is the source of truth for caching policy.
+//! `coordinator.pub` and the ancestry walk are immutable per their
+//! respective keys, so this module memoises both forever. The
+//! `names/<name>` lookup is revalidated against S3 on every request
+//! in v1 — refreshing rather than ETag-conditional caching is a v1
+//! simplification; the auth fence still coincides with the S3 CAS.
+
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::sync::Arc;
+
+use ed25519_dalek::VerifyingKey;
+use elide_core::name_record::{NameRecord, NameState};
+use object_store::ObjectStore;
+use object_store::path::Path as StorePath;
+use tokio::sync::RwLock;
+use ulid::Ulid;
+
+use crate::ancestry::walk_ancestry;
+use crate::token::{
+    DEFAULT_FRESHNESS_WINDOW_SECS, PeerFetchToken, TokenDecodeError, TokenVerifyError,
+};
+
+/// Outcome of a failed authorisation check. Each variant maps to a
+/// specific HTTP status code via [`AuthError::status_code`].
+#[derive(Debug)]
+pub enum AuthError {
+    /// `Authorization` header missing or not a `Bearer <token>`.
+    MissingBearer,
+    /// Token wire form did not decode.
+    BadToken(TokenDecodeError),
+    /// Token clock skew exceeds the freshness window, or signature
+    /// failed to verify against the coordinator's published pubkey.
+    BadCredentials(TokenVerifyError),
+    /// Volume name in the token does not currently resolve to the
+    /// requesting coordinator (state isn't `Live` / `Stopped`, or
+    /// `coordinator_id` doesn't match).
+    NotCurrentClaimer,
+    /// URL's `vol_id` is not in the requesting volume's signed
+    /// fork-parent ancestry.
+    OutsideLineage,
+    /// Wrapper for any underlying S3 / parsing error encountered while
+    /// resolving the auth pipeline.
+    Backend(io::Error),
+}
+
+impl AuthError {
+    /// HTTP status code this error maps to in the response.
+    pub fn status_code(&self) -> u16 {
+        match self {
+            Self::MissingBearer => 401,
+            Self::BadToken(_) => 401,
+            Self::BadCredentials(_) => 401,
+            Self::NotCurrentClaimer => 401,
+            Self::OutsideLineage => 403,
+            Self::Backend(_) => 502,
+        }
+    }
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingBearer => f.write_str("missing or malformed Authorization header"),
+            Self::BadToken(e) => write!(f, "token decode failed: {e}"),
+            Self::BadCredentials(e) => write!(f, "credentials rejected: {e}"),
+            Self::NotCurrentClaimer => f.write_str("token holder is not the current claimer"),
+            Self::OutsideLineage => {
+                f.write_str("requested vol_id is outside claimed volume's lineage")
+            }
+            Self::Backend(e) => write!(f, "auth backend error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AuthError {}
+
+/// Successful auth result. Carries the resolved fields the route
+/// handler may want to log or use; held in request extensions if used
+/// as middleware.
+#[derive(Debug, Clone)]
+pub struct Authorized {
+    pub volume_name: String,
+    pub coordinator_id: String,
+    pub vol_id: Ulid,
+}
+
+/// Shared auth state: object store handle plus the immutable caches
+/// (`coordinator.pub`, ancestry).
+///
+/// Cheap to clone — internally `Arc`-wrapped.
+#[derive(Clone)]
+pub struct AuthState {
+    inner: Arc<AuthStateInner>,
+}
+
+struct AuthStateInner {
+    store: Arc<dyn ObjectStore>,
+    pub_keys: RwLock<HashMap<String, VerifyingKey>>,
+    ancestry_cache: RwLock<HashMap<Ulid, HashSet<Ulid>>>,
+    freshness_window_secs: u64,
+}
+
+impl AuthState {
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self::with_freshness_window(store, DEFAULT_FRESHNESS_WINDOW_SECS)
+    }
+
+    pub fn with_freshness_window(store: Arc<dyn ObjectStore>, freshness_window_secs: u64) -> Self {
+        Self {
+            inner: Arc::new(AuthStateInner {
+                store,
+                pub_keys: RwLock::new(HashMap::new()),
+                ancestry_cache: RwLock::new(HashMap::new()),
+                freshness_window_secs,
+            }),
+        }
+    }
+
+    /// Run the full five-step pipeline (steps 1–4 — step 5 is the
+    /// route handler's local stat). Returns the resolved
+    /// [`Authorized`] context on success.
+    pub async fn verify(
+        &self,
+        bearer_value: &str,
+        url_vol_id: Ulid,
+    ) -> Result<Authorized, AuthError> {
+        // Step 1: decode + freshness.
+        let token = PeerFetchToken::decode(bearer_value).map_err(AuthError::BadToken)?;
+        let now = PeerFetchToken::now_unix_seconds();
+        token
+            .check_freshness(now, self.inner.freshness_window_secs)
+            .map_err(AuthError::BadCredentials)?;
+
+        // Step 2: signature against published `coordinator.pub`.
+        let vk = self.coordinator_pub(&token.coordinator_id).await?;
+        token
+            .verify_signature(&vk)
+            .map_err(AuthError::BadCredentials)?;
+
+        // Step 3: ownership — the volume name's current claim record
+        // must point at this coordinator.
+        let name_record = self.fetch_name_record(&token.volume_name).await?;
+        match name_record.state {
+            NameState::Live | NameState::Stopped => {}
+            _ => return Err(AuthError::NotCurrentClaimer),
+        }
+        match name_record.coordinator_id.as_deref() {
+            Some(id) if id == token.coordinator_id => {}
+            _ => return Err(AuthError::NotCurrentClaimer),
+        }
+
+        // Step 4: lineage — URL's `vol_id` must be in the volume's
+        // signed fork-parent ancestry.
+        let ancestry = self.ancestry(name_record.vol_ulid).await?;
+        if !ancestry.contains(&url_vol_id) {
+            return Err(AuthError::OutsideLineage);
+        }
+
+        Ok(Authorized {
+            volume_name: token.volume_name,
+            coordinator_id: token.coordinator_id,
+            vol_id: url_vol_id,
+        })
+    }
+
+    async fn coordinator_pub(&self, coordinator_id: &str) -> Result<VerifyingKey, AuthError> {
+        if let Some(vk) = self.inner.pub_keys.read().await.get(coordinator_id) {
+            return Ok(*vk);
+        }
+
+        let key = StorePath::from(format!("coordinators/{coordinator_id}/coordinator.pub"));
+        let body = self
+            .inner
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| {
+                AuthError::Backend(io::Error::other(format!("fetch coordinator.pub: {e}")))
+            })?
+            .bytes()
+            .await
+            .map_err(|e| {
+                AuthError::Backend(io::Error::other(format!("read coordinator.pub: {e}")))
+            })?;
+        let text = std::str::from_utf8(&body).map_err(|e| {
+            AuthError::Backend(io::Error::other(format!("coordinator.pub not utf-8: {e}")))
+        })?;
+        let vk = parse_pub_hex(text.trim()).map_err(|e| {
+            AuthError::Backend(io::Error::other(format!("coordinator.pub parse: {e}")))
+        })?;
+
+        self.inner
+            .pub_keys
+            .write()
+            .await
+            .insert(coordinator_id.to_owned(), vk);
+        Ok(vk)
+    }
+
+    async fn fetch_name_record(&self, volume_name: &str) -> Result<NameRecord, AuthError> {
+        let key = StorePath::from(format!("names/{volume_name}"));
+        let body = self
+            .inner
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| match e {
+                object_store::Error::NotFound { .. } => AuthError::NotCurrentClaimer,
+                other => AuthError::Backend(io::Error::other(format!(
+                    "fetch names/{volume_name}: {other}"
+                ))),
+            })?
+            .bytes()
+            .await
+            .map_err(|e| {
+                AuthError::Backend(io::Error::other(format!(
+                    "read names/{volume_name} body: {e}"
+                )))
+            })?;
+        let text = std::str::from_utf8(&body).map_err(|e| {
+            AuthError::Backend(io::Error::other(format!(
+                "names/{volume_name} not utf-8: {e}"
+            )))
+        })?;
+        NameRecord::from_toml(text).map_err(|e| {
+            AuthError::Backend(io::Error::other(format!("parse names/{volume_name}: {e}")))
+        })
+    }
+
+    async fn ancestry(&self, vol_ulid: Ulid) -> Result<HashSet<Ulid>, AuthError> {
+        if let Some(set) = self.inner.ancestry_cache.read().await.get(&vol_ulid) {
+            return Ok(set.clone());
+        }
+        let set = walk_ancestry(self.inner.store.as_ref(), vol_ulid)
+            .await
+            .map_err(AuthError::Backend)?;
+        self.inner
+            .ancestry_cache
+            .write()
+            .await
+            .insert(vol_ulid, set.clone());
+        Ok(set)
+    }
+}
+
+/// Parse `Authorization: Bearer <token>` into the bare token bytes.
+/// Returns `Err(AuthError::MissingBearer)` if the header is absent or
+/// malformed.
+pub fn parse_bearer(header_value: Option<&str>) -> Result<&str, AuthError> {
+    let value = header_value.ok_or(AuthError::MissingBearer)?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .ok_or(AuthError::MissingBearer)?;
+    if token.is_empty() {
+        return Err(AuthError::MissingBearer);
+    }
+    Ok(token)
+}
+
+fn parse_pub_hex(s: &str) -> Result<VerifyingKey, String> {
+    if s.len() != 64 {
+        return Err(format!("expected 64 hex chars, got {}", s.len()));
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let hi = hex_nibble(s.as_bytes()[i * 2])?;
+        let lo = hex_nibble(s.as_bytes()[i * 2 + 1])?;
+        *byte = (hi << 4) | lo;
+    }
+    VerifyingKey::from_bytes(&bytes).map_err(|e| format!("invalid ed25519 pubkey: {e}"))
+}
+
+fn hex_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(format!("non-hex byte: 0x{b:02x}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use ed25519_dalek::{Signer, SigningKey};
+    use elide_core::name_record::{NameRecord, NameState};
+    use elide_core::signing::{ParentRef, ProvenanceLineage, write_provenance};
+    use object_store::memory::InMemory;
+    use rand_core::OsRng;
+    use tempfile::TempDir;
+
+    fn pub_hex(key: &SigningKey) -> String {
+        let bytes = key.verifying_key().to_bytes();
+        let mut s = String::with_capacity(64);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s.push('\n');
+        s
+    }
+
+    /// Construct a token signed with `key` by computing the signature
+    /// over the canonical signing payload directly. Mirrors what
+    /// `CoordinatorIdentity::sign` would do in production.
+    fn sign_token(
+        volume_name: &str,
+        coordinator_id: &str,
+        issued_at: u64,
+        key: &SigningKey,
+    ) -> PeerFetchToken {
+        let payload = PeerFetchToken::signing_payload(volume_name, coordinator_id, issued_at);
+        let sig = key.sign(&payload).to_bytes();
+        PeerFetchToken {
+            volume_name: volume_name.to_owned(),
+            coordinator_id: coordinator_id.to_owned(),
+            issued_at,
+            signature: sig,
+        }
+    }
+
+    /// Publish a volume's `volume.pub` + `volume.provenance` on the store.
+    async fn publish_volume(
+        store: &dyn ObjectStore,
+        vol_ulid: Ulid,
+        key: &SigningKey,
+        parent: Option<ParentRef>,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("volume.pub"), pub_hex(key)).unwrap();
+        let lineage = ProvenanceLineage {
+            parent,
+            extent_index: Vec::new(),
+        };
+        write_provenance(tmp.path(), key, "volume.provenance", &lineage).unwrap();
+        let pub_bytes = std::fs::read(tmp.path().join("volume.pub")).unwrap();
+        let prov_bytes = std::fs::read(tmp.path().join("volume.provenance")).unwrap();
+        store
+            .put(
+                &StorePath::from(format!("by_id/{vol_ulid}/volume.pub")),
+                Bytes::from(pub_bytes).into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &StorePath::from(format!("by_id/{vol_ulid}/volume.provenance")),
+                Bytes::from(prov_bytes).into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Publish a coordinator's `coordinator.pub`.
+    async fn publish_coordinator(store: &dyn ObjectStore, coord_id: &str, key: &SigningKey) {
+        store
+            .put(
+                &StorePath::from(format!("coordinators/{coord_id}/coordinator.pub")),
+                Bytes::from(pub_hex(key).into_bytes()).into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Publish a `names/<name>` record claimed by `coord_id`.
+    async fn publish_live_name(
+        store: &dyn ObjectStore,
+        name: &str,
+        vol_ulid: Ulid,
+        coord_id: &str,
+    ) {
+        let mut record = NameRecord::live_minimal(vol_ulid);
+        record.coordinator_id = Some(coord_id.to_owned());
+        record.state = NameState::Live;
+        let toml = record.to_toml().unwrap();
+        store
+            .put(
+                &StorePath::from(format!("names/{name}")),
+                Bytes::from(toml.into_bytes()).into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn make_state() -> (Arc<dyn ObjectStore>, AuthState) {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let auth = AuthState::new(store.clone());
+        (store, auth)
+    }
+
+    #[tokio::test]
+    async fn happy_path_root_volume() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+        let result = auth.verify(&bearer, vol_ulid).await.unwrap();
+        assert_eq!(result.coordinator_id, coord_id);
+        assert_eq!(result.volume_name, vol_name);
+        assert_eq!(result.vol_id, vol_ulid);
+    }
+
+    #[tokio::test]
+    async fn happy_path_ancestor_vol_id() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let root_key = SigningKey::generate(&mut OsRng);
+        let leaf_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "myvol";
+
+        let root_ulid = Ulid::new();
+        let leaf_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), root_ulid, &root_key, None).await;
+        publish_volume(
+            store.as_ref(),
+            leaf_ulid,
+            &leaf_key,
+            Some(ParentRef {
+                volume_ulid: root_ulid.to_string(),
+                snapshot_ulid: Ulid::new().to_string(),
+                pubkey: root_key.verifying_key().to_bytes(),
+                manifest_pubkey: None,
+            }),
+        )
+        .await;
+        publish_live_name(store.as_ref(), vol_name, leaf_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        // Asking for a segment of the root (in leaf's ancestry) should pass.
+        let result = auth.verify(&bearer, root_ulid).await.unwrap();
+        assert_eq!(result.vol_id, root_ulid);
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_bearer() {
+        let (_, auth) = make_state();
+        let err = auth
+            .verify("garbage-not-base64", Ulid::new())
+            .await
+            .expect_err("decode");
+        assert_eq!(err.status_code(), 401);
+        assert!(matches!(err, AuthError::BadToken(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_stale_token() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+
+        // Token issued in the distant past — well outside the 60s window.
+        let stale_at = PeerFetchToken::now_unix_seconds() - 3600;
+        let token = sign_token("myvol", coord_id, stale_at, &coord_key);
+        let bearer = token.encode();
+
+        let err = auth.verify(&bearer, Ulid::new()).await.expect_err("stale");
+        assert!(matches!(
+            err,
+            AuthError::BadCredentials(TokenVerifyError::Stale { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_signing_key() {
+        let (store, auth) = make_state();
+        let real_coord_key = SigningKey::generate(&mut OsRng);
+        let imposter_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+
+        // Published pubkey is real_coord_key, but the token is signed by imposter.
+        publish_coordinator(store.as_ref(), coord_id, &real_coord_key).await;
+        let token = sign_token(
+            "myvol",
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &imposter_key,
+        );
+        let bearer = token.encode();
+
+        let err = auth
+            .verify(&bearer, Ulid::new())
+            .await
+            .expect_err("bad sig");
+        assert!(matches!(
+            err,
+            AuthError::BadCredentials(TokenVerifyError::BadSignature(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_when_not_current_claimer() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let other_coord = "coord-b";
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let vol_ulid = Ulid::new();
+        let vol_name = "myvol";
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        // Names record claims coord-b owns the volume; token is from coord-a.
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, other_coord).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        let err = auth
+            .verify(&bearer, vol_ulid)
+            .await
+            .expect_err("wrong claimer");
+        assert!(matches!(err, AuthError::NotCurrentClaimer));
+        assert_eq!(err.status_code(), 401);
+    }
+
+    #[tokio::test]
+    async fn rejects_when_volume_released() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let vol_ulid = Ulid::new();
+        let vol_name = "myvol";
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+
+        // Released — even though coord_id matches the *most recent* owner,
+        // there's no current claim, so peer-fetch must not authorise.
+        let mut record = NameRecord::live_minimal(vol_ulid);
+        record.coordinator_id = Some(coord_id.to_owned());
+        record.state = NameState::Released;
+        store
+            .put(
+                &StorePath::from(format!("names/{vol_name}")),
+                Bytes::from(record.to_toml().unwrap().into_bytes()).into(),
+            )
+            .await
+            .unwrap();
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        let err = auth.verify(&bearer, vol_ulid).await.expect_err("released");
+        assert!(matches!(err, AuthError::NotCurrentClaimer));
+    }
+
+    #[tokio::test]
+    async fn rejects_outside_lineage() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+        let unrelated_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        let err = auth
+            .verify(&bearer, unrelated_ulid)
+            .await
+            .expect_err("not in lineage");
+        assert!(matches!(err, AuthError::OutsideLineage));
+        assert_eq!(err.status_code(), 403);
+    }
+
+    #[tokio::test]
+    async fn rejects_when_name_record_missing() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        // No names/<name> published.
+
+        let token = sign_token(
+            "missing-vol",
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        let err = auth
+            .verify(&bearer, Ulid::new())
+            .await
+            .expect_err("no name");
+        assert!(matches!(err, AuthError::NotCurrentClaimer));
+    }
+
+    #[tokio::test]
+    async fn parse_bearer_extracts_token() {
+        assert_eq!(parse_bearer(Some("Bearer abc123")).unwrap(), "abc123");
+    }
+
+    #[tokio::test]
+    async fn parse_bearer_rejects_missing() {
+        assert!(matches!(parse_bearer(None), Err(AuthError::MissingBearer)));
+        assert!(matches!(
+            parse_bearer(Some("Basic xyz")),
+            Err(AuthError::MissingBearer)
+        ));
+        assert!(matches!(
+            parse_bearer(Some("Bearer ")),
+            Err(AuthError::MissingBearer)
+        ));
+    }
+}
