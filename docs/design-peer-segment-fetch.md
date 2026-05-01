@@ -230,7 +230,31 @@ These are not v1 features (the simple version of v1 has no rate-limit at all), b
 
 - **Replay window.** `issued_at` ±60 s allows replay within that window. Strictly fine for read-only requests against signed bytes (worst case: replayed token retrieves bytes the original holder was already entitled to). Could tighten with a peer-issued challenge; probably overkill for v1.
 - **Coordinator key compromise.** Anyone with `coordinator.key` can claim and operate volumes for that coordinator anyway; peer fetch does not widen this blast radius. Rotation is the same event as today.
-- **Future: macaroons / credential service.** When the credential service direction (`docs/architecture.md` § S3 credential distribution via macaroons; `project_credential_service_scaling`) is built out, peer auth can switch to macaroons with third-party caveats verified against the issuer. Wire shape (Bearer token, lineage check) is unchanged; only the token format and verification step change.
+
+### Future: converge on the credential-service format
+
+The principal direction for any future evolution of the auth surface is **wire alignment with the eventual S3-cred service** (`docs/architecture.md` § S3 credential distribution via macaroons; `project_credential_service_scaling`). When that service exists, volumes will hold a single short-lived signed credential — likely a public-key macaroon or an equivalent caveat-based format — that conveys "you may read these S3 prefixes until time T." The natural move is to use exactly the same credential as the peer-fetch bearer: one library, one verification path, one mental model.
+
+Concretely this means the v1 bearer-token format is **not** the long-term shape. The current token is deliberately minimal so the migration cost is bounded by the things that won't change:
+
+- **Trust root** — verification against `coordinators/<id>/coordinator.pub` from S3 is the same in either format.
+- **Lineage check** — moves from "peer walks ancestry" to "credential carries the prefix list as caveats," but the semantics are identical.
+- **Freshness** — bounded validity moves from a custom `issued_at` field to a macaroon `time < T` caveat, but both express the same thing.
+- **Token lifetime** is short (60 s), so the migration is cheap in operational terms — no on-disk persistence to deal with, no long-lived sessions to wait out. Old clients stop minting old tokens; new clients use the new format; peers accept both during a brief window.
+
+The v1 bearer token therefore exists primarily to *defer* the format choice until the credential service is being designed, when the choice can be made jointly across both surfaces. Picking a format now would commit the credential service's design too, and there's no payoff in doing that before the service's other constraints (centralised vs federated issuance, third-party caveat structure, revocation strategy) are settled.
+
+Until then, the v1 `PeerFetchToken` semantics are intentionally a strict subset of what a public-key macaroon could express:
+
+| Bearer-token field | Macaroon equivalent |
+|---|---|
+| `coordinator_id`     | identifier (issuer) |
+| `volume_name`        | first-party caveat: `volume = <name>` |
+| `issued_at`          | first-party caveat: `time < <issued_at + window>` |
+| signature            | macaroon Ed25519 root signature |
+| (peer-side ancestry) | first-party caveat list: `prefix in [...]` (carried in credential, not derived on peer) |
+
+So the v1 verification logic is the macaroon verification logic minus caveats the v1 token doesn't yet carry. The migration is "stop deriving caveats locally, start trusting them from the credential."
 
 ## Discovery: which peer to ask
 
