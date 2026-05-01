@@ -36,9 +36,9 @@ use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
     self, ClaimReply, CreateReply, Envelope, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
     GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError,
-    NameEventsReply, PullReadonlyReply, RebindNameReply, RegisterReply, ReleaseReply, Request,
+    PullReadonlyReply, RebindNameReply, RegisterReply, ReleaseReply, Request,
     ResolveHandoffKeyReply, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
-    StoreCredsReply, UpdateReply,
+    StoreCredsReply, UpdateReply, VolumeEventsReply,
 };
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
@@ -376,9 +376,9 @@ async fn dispatch_json(
             let env: Envelope<ResolveHandoffKeyReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::NameEvents { volume } => {
+        Request::VolumeEvents { volume } => {
             let result = volume_events_typed(&volume, &ctx.store).await;
-            let env: Envelope<NameEventsReply> = result.into();
+            let env: Envelope<VolumeEventsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::GetStoreConfig => {
@@ -993,7 +993,7 @@ async fn volume_status_remote_typed(
     })
 }
 
-/// Typed implementation of the `name-events` verb. Lists every
+/// Typed implementation of the `volume-events` verb. Lists every
 /// event under `events/<volume>/`, parsed and signature-
 /// verified. A missing prefix returns an empty list — every name
 /// has a journal even if no events have been emitted yet, so
@@ -1001,11 +1001,11 @@ async fn volume_status_remote_typed(
 async fn volume_events_typed(
     volume_name: &str,
     store: &Arc<dyn ObjectStore>,
-) -> Result<NameEventsReply, IpcError> {
-    let entries = elide_coordinator::name_event_store::list_and_verify_events(store, volume_name)
+) -> Result<VolumeEventsReply, IpcError> {
+    let entries = elide_coordinator::volume_event_store::list_and_verify_events(store, volume_name)
         .await
         .map_err(|e| IpcError::store(format!("listing events for {volume_name}: {e}")))?;
-    Ok(NameEventsReply { events: entries })
+    Ok(VolumeEventsReply { events: entries })
 }
 
 // ── Volume remove ─────────────────────────────────────────────────────────────
@@ -1249,11 +1249,11 @@ async fn create_volume_op(
     use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
     match mark_initial(store, name, coord_id, identity.hostname(), vol_ulid).await {
         Ok(MarkInitialOutcome::Claimed) => {
-            elide_coordinator::name_event_store::emit_best_effort(
+            elide_coordinator::volume_event_store::emit_best_effort(
                 store,
                 identity.as_ref(),
                 name,
-                elide_core::name_event::EventKind::Created,
+                elide_core::volume_event::EventKind::Created,
                 vol_ulid,
             )
             .await;
@@ -1946,7 +1946,7 @@ async fn fork_create_op(
                 // record than just stating "this name appeared".
                 let kind = match (resolved_snap, src_cfg.name.clone()) {
                     (Some(source_snap_ulid), Some(source_name)) => {
-                        elide_core::name_event::EventKind::ForkedFrom {
+                        elide_core::volume_event::EventKind::ForkedFrom {
                             source_name,
                             source_vol_ulid,
                             source_snap_ulid,
@@ -1958,10 +1958,10 @@ async fn fork_create_op(
                              {source_ulid_str} missing name or snap; emitting \
                              Created in lieu of ForkedFrom"
                         );
-                        elide_core::name_event::EventKind::Created
+                        elide_core::volume_event::EventKind::Created
                     }
                 };
-                elide_coordinator::name_event_store::emit_best_effort(
+                elide_coordinator::volume_event_store::emit_best_effort(
                     store,
                     identity.as_ref(),
                     new_name,
@@ -2388,11 +2388,11 @@ async fn force_release_volume_op(
             );
 
             // Best-effort journal entry recording the override.
-            elide_coordinator::name_event_store::emit_best_effort(
+            elide_coordinator::volume_event_store::emit_best_effort(
                 store,
                 identity.as_ref(),
                 volume_name,
-                elide_core::name_event::EventKind::ForceReleased {
+                elide_core::volume_event::EventKind::ForceReleased {
                     handoff_snapshot: published.snap_ulid,
                     displaced_coordinator_id: displaced_coordinator_id
                         .unwrap_or_else(|| "<unknown>".to_string()),
@@ -2681,11 +2681,11 @@ async fn perform_release_flip(
                  (flip {:.2?})",
                 flip_started.elapsed()
             );
-            elide_coordinator::name_event_store::emit_best_effort(
+            elide_coordinator::volume_event_store::emit_best_effort(
                 store,
                 identity.as_ref(),
                 volume_name,
-                elide_core::name_event::EventKind::Released {
+                elide_core::volume_event::EventKind::Released {
                     handoff_snapshot: snap_ulid,
                 },
                 vol_ulid,
@@ -2903,11 +2903,11 @@ async fn rebind_name_op(
         Ok(MarkClaimedOutcome::Claimed) => {
             rescan.notify_one();
             info!("[inbound] rebound name {volume_name} to new fork {new_vol_ulid} (stopped)");
-            elide_coordinator::name_event_store::emit_best_effort(
+            elide_coordinator::volume_event_store::emit_best_effort(
                 store,
                 identity.as_ref(),
                 volume_name,
-                elide_core::name_event::EventKind::Claimed,
+                elide_core::volume_event::EventKind::Claimed,
                 new_vol_ulid,
             )
             .await;
@@ -3008,11 +3008,11 @@ async fn claim_volume_bucket_op(
                             "[inbound] reclaimed {volume_name} in place (vol_ulid {})",
                             record.vol_ulid
                         );
-                        elide_coordinator::name_event_store::emit_best_effort(
+                        elide_coordinator::volume_event_store::emit_best_effort(
                             store,
                             identity.as_ref(),
                             volume_name,
-                            elide_core::name_event::EventKind::Claimed,
+                            elide_core::volume_event::EventKind::Claimed,
                             record.vol_ulid,
                         )
                         .await;

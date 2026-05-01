@@ -18,9 +18,9 @@ use serde::Deserialize;
 pub use elide_coordinator::ipc::{
     ClaimReply, CreateReply, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
     GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind,
-    NameEventEntry, NameEventsReply, PullReadonlyReply, RebindNameReply, RegisterReply,
-    ReleaseReply, ResolveHandoffKeyReply, SignatureStatus, SnapshotReply, StatusRemoteReply,
-    StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
+    PullReadonlyReply, RebindNameReply, RegisterReply, ReleaseReply, ResolveHandoffKeyReply,
+    SignatureStatus, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
+    StoreCredsReply, UpdateReply, VolumeEventEntry, VolumeEventsReply,
 };
 
 /// Backwards-compatible aliases for the public client API. The
@@ -242,10 +242,10 @@ pub fn status_remote(socket_path: &Path, volume: &str) -> io::Result<StatusRemot
 /// Each entry includes a `signature_status` reporting whether the
 /// emitting coordinator's pubkey was reachable and the signature
 /// verified.
-pub fn name_events(socket_path: &Path, volume: &str) -> io::Result<NameEventsReply> {
+pub fn volume_events(socket_path: &Path, volume: &str) -> io::Result<VolumeEventsReply> {
     call_typed(
         socket_path,
-        &Request::NameEvents {
+        &Request::VolumeEvents {
             volume: volume.to_owned(),
         },
     )?
@@ -923,27 +923,27 @@ mod tests {
         assert!(err.to_string().contains("closed before terminal"), "{err}");
     }
 
-    /// name-events: empty list deserialises cleanly and the typed
+    /// volume-events: empty list deserialises cleanly and the typed
     /// reply preserves the empty `events` Vec.
     #[test]
-    fn name_events_parses_empty_reply() {
+    fn volume_events_parses_empty_reply() {
         let (_guard, sock) = temp_socket();
         let body = r#"{"outcome":"ok","data":{"events":[]}}"#;
         let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
-        let reply = name_events(&sock, "vol").expect("name-events should succeed");
+        let reply = volume_events(&sock, "vol").expect("volume-events should succeed");
         server.join().unwrap();
         assert!(reply.events.is_empty());
     }
 
-    /// name-events: a populated reply round-trips through the typed
+    /// volume-events: a populated reply round-trips through the typed
     /// envelope. Confirms `signature_status` decodes from its
     /// `{"status":"valid"}` wire shape.
     #[test]
-    fn name_events_parses_populated_reply() {
+    fn volume_events_parses_populated_reply() {
         let (_guard, sock) = temp_socket();
         let body = r#"{"outcome":"ok","data":{"events":[{"event":{"version":1,"event_ulid":"01J0000000000000000000000V","at":"2024-01-01T00:00:00.000Z","coordinator_id":"coord-a","vol_ulid":"01J0000000000000000000000W","kind":"created","signature":"00"},"signature_status":{"status":"valid"}}]}}"#;
         let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
-        let reply = name_events(&sock, "vol").expect("name-events should succeed");
+        let reply = volume_events(&sock, "vol").expect("volume-events should succeed");
         server.join().unwrap();
         assert_eq!(reply.events.len(), 1);
         assert_eq!(reply.events[0].signature_status, SignatureStatus::Valid);

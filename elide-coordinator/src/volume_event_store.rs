@@ -5,7 +5,7 @@
 //! separate top-level prefix so the pointer key and the event
 //! prefix never collide on the same parent — `aws s3 ls names/`
 //! lists names and nothing else; `aws s3 ls events/` lists logs.
-//! See `docs/design-name-event-log.md`.
+//! See `docs/design-volume-event-log.md`.
 //!
 //! Keys: `events/<name>/<event_ulid>.toml`. Each object is written
 //! exactly once via `If-None-Match: *` — duplicate ULIDs would be
@@ -21,16 +21,16 @@ use object_store::{ObjectStore, PutResult};
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use elide_core::name_event::{EventKind, NameEvent};
 use elide_core::signing::{self, VerifyingKey};
+use elide_core::volume_event::{EventKind, VolumeEvent};
 
 use crate::identity::{self, CoordinatorIdentity};
-use crate::ipc::{NameEventEntry, SignatureStatus};
+use crate::ipc::{SignatureStatus, VolumeEventEntry};
 use crate::portable::{ConditionalPutError, put_if_absent};
 
-/// Errors from `name_event_store` operations.
+/// Errors from `volume_event_store` operations.
 #[derive(Debug)]
-pub enum NameEventStoreError {
+pub enum VolumeEventStoreError {
     /// Failed to serialise the event as TOML.
     Serialise(toml::ser::Error),
     /// The underlying store reported an error.
@@ -45,10 +45,10 @@ pub enum NameEventStoreError {
     UnrepresentableTimestamp,
 }
 
-impl std::fmt::Display for NameEventStoreError {
+impl std::fmt::Display for VolumeEventStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Serialise(e) => write!(f, "serialising NameEvent: {e}"),
+            Self::Serialise(e) => write!(f, "serialising VolumeEvent: {e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::DuplicateEventUlid => write!(f, "duplicate event_ulid"),
             Self::UnrepresentableTimestamp => {
@@ -58,7 +58,7 @@ impl std::fmt::Display for NameEventStoreError {
     }
 }
 
-impl std::error::Error for NameEventStoreError {
+impl std::error::Error for VolumeEventStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Serialise(e) => Some(e),
@@ -68,13 +68,13 @@ impl std::error::Error for NameEventStoreError {
     }
 }
 
-impl From<object_store::Error> for NameEventStoreError {
+impl From<object_store::Error> for VolumeEventStoreError {
     fn from(e: object_store::Error) -> Self {
         Self::Store(e)
     }
 }
 
-impl From<ConditionalPutError> for NameEventStoreError {
+impl From<ConditionalPutError> for VolumeEventStoreError {
     fn from(e: ConditionalPutError) -> Self {
         match e {
             ConditionalPutError::PreconditionFailed => Self::DuplicateEventUlid,
@@ -92,9 +92,9 @@ fn event_key(name: &str, event_ulid: Ulid) -> StorePath {
 }
 
 /// Sign `event` in place using `identity`'s coordinator key. The
-/// payload is the bytes returned by [`NameEvent::signing_payload`];
+/// payload is the bytes returned by [`VolumeEvent::signing_payload`];
 /// the resulting hex-encoded signature lands in `event.signature`.
-fn sign_event(event: &mut NameEvent, identity: &CoordinatorIdentity) {
+fn sign_event(event: &mut VolumeEvent, identity: &CoordinatorIdentity) {
     let payload = event.signing_payload();
     let sig = identity.sign(&payload);
     event.signature = Some(signing::encode_hex(&sig));
@@ -109,19 +109,19 @@ fn sign_event(event: &mut NameEvent, identity: &CoordinatorIdentity) {
 pub async fn append_event(
     store: &Arc<dyn ObjectStore>,
     name: &str,
-    event: &NameEvent,
-) -> Result<PutResult, NameEventStoreError> {
+    event: &VolumeEvent,
+) -> Result<PutResult, VolumeEventStoreError> {
     debug_assert!(
         event.signature.is_some(),
         "append_event called with unsigned event — call sign+append via emit_event"
     );
 
-    let body = event.to_toml().map_err(NameEventStoreError::Serialise)?;
+    let body = event.to_toml().map_err(VolumeEventStoreError::Serialise)?;
     let key = event_key(name, event.event_ulid);
     let started = std::time::Instant::now();
     let r = put_if_absent(store.as_ref(), &key, Bytes::from(body.into_bytes())).await?;
     debug!(
-        "[name_event_store] PUT-IF-ABSENT {key} kind={} ({:.2?})",
+        "[volume_event_store] PUT-IF-ABSENT {key} kind={} ({:.2?})",
         event.kind.as_str(),
         started.elapsed()
     );
@@ -137,7 +137,7 @@ pub async fn append_event(
 pub async fn latest_event_ulid(
     store: &Arc<dyn ObjectStore>,
     name: &str,
-) -> Result<Option<Ulid>, NameEventStoreError> {
+) -> Result<Option<Ulid>, VolumeEventStoreError> {
     let prefix = event_prefix(name);
     let objects: Vec<_> = store.list(Some(&prefix)).try_collect().await?;
 
@@ -169,7 +169,7 @@ pub async fn latest_event_ulid(
 ///   2. Mint a fresh `event_ulid` via `Ulid::new()`. Callers that
 ///      need monotonicity guarantees across rapid back-to-back
 ///      events should wrap this with a `UlidMint`.
-///   3. Build the `NameEvent` with `at` derived from the ULID.
+///   3. Build the `VolumeEvent` with `at` derived from the ULID.
 ///   4. Sign with `identity.signing_key()` over the canonical
 ///      payload.
 ///   5. PUT under `If-None-Match: *`.
@@ -181,12 +181,12 @@ pub async fn emit_event(
     name: &str,
     kind: EventKind,
     vol_ulid: Ulid,
-) -> Result<NameEvent, NameEventStoreError> {
+) -> Result<VolumeEvent, VolumeEventStoreError> {
     let prev_event_ulid = match latest_event_ulid(store, name).await {
         Ok(p) => p,
         Err(e) => {
             warn!(
-                "[name_event_store] failed to list prior events for {name}: {e}; \
+                "[volume_event_store] failed to list prior events for {name}: {e}; \
                  emitting with prev_event_ulid=None"
             );
             None
@@ -194,7 +194,7 @@ pub async fn emit_event(
     };
 
     let event_ulid = Ulid::new();
-    let mut event = NameEvent::new(
+    let mut event = VolumeEvent::new(
         event_ulid,
         identity.coordinator_id_str().to_owned(),
         identity.hostname().map(str::to_owned),
@@ -202,7 +202,7 @@ pub async fn emit_event(
         prev_event_ulid,
         kind,
     )
-    .ok_or(NameEventStoreError::UnrepresentableTimestamp)?;
+    .ok_or(VolumeEventStoreError::UnrepresentableTimestamp)?;
 
     sign_event(&mut event, identity);
     append_event(store, name, &event).await?;
@@ -213,13 +213,13 @@ pub async fn emit_event(
 /// sorted ascending by `event_ulid`.
 ///
 /// Listed objects whose filename does not parse as `<ulid>.toml`,
-/// or whose body fails to parse as a [`NameEvent`], are dropped
+/// or whose body fails to parse as a [`VolumeEvent`], are dropped
 /// with a `warn!` — a corrupt file should be visible in the log
 /// but must not block the operator from inspecting the rest.
 pub async fn list_events(
     store: &Arc<dyn ObjectStore>,
     name: &str,
-) -> Result<Vec<NameEvent>, NameEventStoreError> {
+) -> Result<Vec<VolumeEvent>, VolumeEventStoreError> {
     let prefix = event_prefix(name);
     let objects: Vec<_> = store.list(Some(&prefix)).try_collect().await?;
 
@@ -238,12 +238,12 @@ pub async fn list_events(
             Ok(g) => match g.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
-                    warn!("[name_event_store] read {key}: {e}", key = obj.location);
+                    warn!("[volume_event_store] read {key}: {e}", key = obj.location);
                     continue;
                 }
             },
             Err(e) => {
-                warn!("[name_event_store] get {key}: {e}", key = obj.location);
+                warn!("[volume_event_store] get {key}: {e}", key = obj.location);
                 continue;
             }
         };
@@ -251,16 +251,16 @@ pub async fn list_events(
             Ok(s) => s,
             Err(e) => {
                 warn!(
-                    "[name_event_store] {key}: not UTF-8: {e}",
+                    "[volume_event_store] {key}: not UTF-8: {e}",
                     key = obj.location
                 );
                 continue;
             }
         };
-        match NameEvent::from_toml(text) {
+        match VolumeEvent::from_toml(text) {
             Ok(event) => events.push(event),
             Err(e) => {
-                warn!("[name_event_store] parse {key}: {e}", key = obj.location);
+                warn!("[volume_event_store] parse {key}: {e}", key = obj.location);
             }
         }
     }
@@ -272,7 +272,10 @@ pub async fn list_events(
 /// assumed to already match the event's `coordinator_id` (the
 /// caller resolves it via [`identity::fetch_coordinator_pub`],
 /// which enforces the binding).
-pub fn verify_event_signature(event: &NameEvent, verifying_key: &VerifyingKey) -> SignatureStatus {
+pub fn verify_event_signature(
+    event: &VolumeEvent,
+    verifying_key: &VerifyingKey,
+) -> SignatureStatus {
     use ed25519_dalek::Verifier;
 
     let Some(sig_hex) = event.signature.as_deref() else {
@@ -314,7 +317,7 @@ pub fn verify_event_signature(event: &NameEvent, verifying_key: &VerifyingKey) -
 pub async fn list_and_verify_events(
     store: &Arc<dyn ObjectStore>,
     name: &str,
-) -> Result<Vec<NameEventEntry>, NameEventStoreError> {
+) -> Result<Vec<VolumeEventEntry>, VolumeEventStoreError> {
     let events = list_events(store, name).await?;
 
     // Cache: Some(key) on success, None when fetch failed (with the
@@ -345,7 +348,7 @@ pub async fn list_and_verify_events(
                     .unwrap_or_else(|| "pubkey unavailable".to_string()),
             },
         };
-        entries.push(NameEventEntry {
+        entries.push(VolumeEventEntry {
             event,
             signature_status: status,
         });
@@ -361,7 +364,7 @@ pub async fn list_and_verify_events(
 ///
 /// The cost of a missed event is a single-event gap in the log,
 /// detectable later via `prev_event_ulid` skip — exactly the
-/// "best-effort" contract documented in `design-name-event-log.md`.
+/// "best-effort" contract documented in `design-volume-event-log.md`.
 pub async fn emit_best_effort(
     store: &Arc<dyn ObjectStore>,
     identity: &CoordinatorIdentity,
@@ -371,7 +374,7 @@ pub async fn emit_best_effort(
 ) {
     let kind_str = kind.as_str();
     if let Err(e) = emit_event(store, identity, name, kind, vol_ulid).await {
-        warn!("[name_event_store] failed to emit {kind_str} event for {name}: {e}");
+        warn!("[volume_event_store] failed to emit {kind_str} event for {name}: {e}");
     }
 }
 
@@ -450,7 +453,7 @@ mod tests {
         // Read the object back and parse it.
         let key = event_key("vol", ev.event_ulid);
         let bytes = s.get(&key).await.unwrap().bytes().await.unwrap();
-        let parsed = NameEvent::from_toml(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        let parsed = VolumeEvent::from_toml(std::str::from_utf8(&bytes).unwrap()).unwrap();
         assert_eq!(parsed, ev);
     }
 
@@ -496,7 +499,7 @@ mod tests {
             .expect("good emit");
 
         // Inject a non-ULID-named file (must be silently ignored) and
-        // a ULID-named file that fails to parse as a NameEvent (must
+        // a ULID-named file that fails to parse as a VolumeEvent (must
         // also be skipped, with a warn).
         s.put(
             &StorePath::from("events/vol/garbage.txt"),
