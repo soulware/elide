@@ -35,8 +35,8 @@
 
 use std::io;
 
-use elide_core::name_event::NameEvent;
 use elide_core::name_record::NameState;
+use elide_core::volume_event::VolumeEvent;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use ulid::Ulid;
@@ -228,7 +228,7 @@ pub enum Request {
     /// List the per-name event log at `events/<volume>/`,
     /// verifying each entry's signature against the emitting
     /// coordinator's published pubkey.
-    NameEvents { volume: String },
+    VolumeEvents { volume: String },
 
     // ── Creds + cleanup (final iteration) ────────────────────────────
     /// Vend the non-secret `[store]` config (bucket / endpoint /
@@ -457,7 +457,7 @@ pub enum ResolveHandoffKeyReply {
     Recovery { manifest_pubkey_hex: String },
 }
 
-/// Outcome of verifying a [`NameEvent::signature`] against the
+/// Outcome of verifying a [`VolumeEvent::signature`] against the
 /// emitting coordinator's published `coordinator.pub`.
 ///
 /// The CLI renders these as one-character markers in the operator
@@ -485,19 +485,19 @@ pub enum SignatureStatus {
     Missing,
 }
 
-/// One entry in [`NameEventsReply`] — the parsed event paired with
+/// One entry in [`VolumeEventsReply`] — the parsed event paired with
 /// its signature verification outcome.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NameEventEntry {
-    pub event: NameEvent,
+pub struct VolumeEventEntry {
+    pub event: VolumeEvent,
     pub signature_status: SignatureStatus,
 }
 
-/// Reply for [`Request::NameEvents`]. Entries are sorted by
+/// Reply for [`Request::VolumeEvents`]. Entries are sorted by
 /// `event_ulid` ascending — the canonical history order.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NameEventsReply {
-    pub events: Vec<NameEventEntry>,
+pub struct VolumeEventsReply {
+    pub events: Vec<VolumeEventEntry>,
 }
 
 #[cfg(test)]

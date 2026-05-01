@@ -6,7 +6,6 @@ pub mod identity;
 pub mod ipc;
 pub mod lifecycle;
 pub mod local_cond_store;
-pub mod name_event_store;
 pub mod name_store;
 pub mod portable;
 pub mod prefetch;
@@ -17,6 +16,7 @@ pub mod recovery;
 pub mod retention;
 pub mod tasks;
 pub mod upload;
+pub mod volume_event_store;
 pub mod volume_state;
 
 use std::collections::HashMap;

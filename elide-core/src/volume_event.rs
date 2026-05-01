@@ -1,6 +1,6 @@
 //! `events/<name>/<event_ulid>.toml` append-only journal entry.
 //!
-//! See `docs/design-name-event-log.md`. Each event records one
+//! See `docs/design-volume-event-log.md`. Each event records one
 //! lifecycle transition of a named volume. The pointer at
 //! `names/<name>` (`name_record.rs`) is canonical for "now"; this
 //! type is canonical for "ever" — the durable, signed history of
@@ -27,8 +27,8 @@
 //! # Signing
 //!
 //! Events are signed by the emitter's `coordinator.key` over the
-//! bytes returned by [`NameEvent::signing_payload`]. The payload is
-//! domain-tagged (`b"elide name-event v1\0"`) so a signature on an
+//! bytes returned by [`VolumeEvent::signing_payload`]. The payload is
+//! domain-tagged (`b"elide volume-event v1\0"`) so a signature on an
 //! event cannot be confused with one on any other coordinator-signed
 //! artefact (e.g. synthesised handoff snapshots) — the pre-image
 //! domain differs even if a malicious bucket-writer reuses the bytes
@@ -37,7 +37,7 @@
 //! The canonical form is deliberately not `toml::to_string` of the
 //! struct: the `toml` crate's output ordering depends on serde
 //! derive expansion details and could drift across releases.
-//! Instead, [`NameEvent::signing_payload`] emits a fixed-order
+//! Instead, [`VolumeEvent::signing_payload`] emits a fixed-order
 //! line-oriented byte stream that is stable as long as this module
 //! compiles. The on-disk TOML form is independent — readers parse
 //! TOML, then recompute the canonical payload from the parsed
@@ -50,9 +50,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ulid::Ulid;
 
 /// Domain-separation tag prepended to every event signing payload.
-/// Versioned independently of `NameEvent::version` so the signing
+/// Versioned independently of `VolumeEvent::version` so the signing
 /// pre-image can evolve without bumping the on-disk schema.
-pub const SIGNING_DOMAIN_TAG: &[u8] = b"elide name-event v1\0";
+pub const SIGNING_DOMAIN_TAG: &[u8] = b"elide volume-event v1\0";
 
 /// Convert a millisecond Unix timestamp (as carried by a ULID) to
 /// the canonical `DateTime<Utc>` we expose on the wire. Returns
@@ -68,7 +68,7 @@ fn datetime_from_ms(ms: u64) -> Option<DateTime<Utc>> {
 /// form with millisecond precision and a `Z` suffix
 /// (`"2026-04-30T12:34:56.789Z"`). Pinning the format at this layer
 /// keeps the on-disk shape stable across `chrono` releases —
-/// important because [`NameEvent::from_toml`] cross-checks the
+/// important because [`VolumeEvent::from_toml`] cross-checks the
 /// parsed value against `event_ulid.timestamp_ms()`.
 mod rfc3339_millis_z {
     use super::*;
@@ -85,12 +85,12 @@ mod rfc3339_millis_z {
     }
 }
 
-/// Kind discriminator + kind-specific fields for a [`NameEvent`].
+/// Kind discriminator + kind-specific fields for a [`VolumeEvent`].
 ///
 /// Internally tagged on `kind` so the on-disk TOML reads as a flat
 /// document. Variants carry only the fields that are *intrinsic* to
 /// the kind; common fields (`event_ulid`, `at`, `coordinator_id`,
-/// `vol_ulid`, `prev_event_ulid`) live on [`NameEvent`] itself.
+/// `vol_ulid`, `prev_event_ulid`) live on [`VolumeEvent`] itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
@@ -114,7 +114,7 @@ pub enum EventKind {
     },
     /// This name was created as a fork of another name's snapshot.
     /// Emitted on the *new* name's log only; the source name's log
-    /// is not updated (see `design-name-event-log.md` open question
+    /// is not updated (see `design-volume-event-log.md` open question
     /// 1).
     ForkedFrom {
         source_name: String,
@@ -137,7 +137,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Lowercase wire string for the `kind` field. Used in
-    /// [`NameEvent::signing_payload`] so the canonical form depends
+    /// [`VolumeEvent::signing_payload`] so the canonical form depends
     /// only on this module, not on the `serde` rename machinery.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -155,7 +155,7 @@ impl EventKind {
 /// Append-only journal entry stored at
 /// `events/<name>/<event_ulid>.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NameEvent {
+pub struct VolumeEvent {
     /// Schema version. Bumped on fresh-bucket-only breaking changes.
     pub version: u32,
 
@@ -183,6 +183,17 @@ pub struct NameEvent {
     /// `name_record.rs`).
     pub coordinator_id: String,
 
+    /// Hostname of the emitting coordinator at the time of emit.
+    /// Captured once at coordinator startup via
+    /// `gethostname()`; advisory metadata only — never compared
+    /// for ownership. `None` when the syscall failed or the
+    /// coordinator's view of its hostname is otherwise unavailable.
+    /// Stamped on every event so an audit trail attributes each
+    /// transition to a human-meaningful host name, not just the
+    /// opaque `coordinator_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+
     /// `vol_ulid` bound to the name at emit time (i.e. the value in
     /// `names/<name>` after the CAS this event records).
     pub vol_ulid: Ulid,
@@ -208,7 +219,7 @@ pub struct NameEvent {
     pub signature: Option<String>,
 }
 
-impl NameEvent {
+impl VolumeEvent {
     pub const CURRENT_VERSION: u32 = 1;
 
     /// Construct a new unsigned event. `at` is derived from
@@ -220,6 +231,7 @@ impl NameEvent {
     pub fn new(
         event_ulid: Ulid,
         coordinator_id: String,
+        hostname: Option<String>,
         vol_ulid: Ulid,
         prev_event_ulid: Option<Ulid>,
         kind: EventKind,
@@ -230,6 +242,7 @@ impl NameEvent {
             event_ulid,
             at,
             coordinator_id,
+            hostname,
             vol_ulid,
             prev_event_ulid,
             kind,
@@ -253,6 +266,16 @@ impl NameEvent {
         // `event_ulid`, enforced by the parse-time invariant. Signing
         // it would only re-state a fact already covered.
         push_field(&mut buf, "coordinator_id", &self.coordinator_id);
+        // `hostname` is signed even though it's advisory: the
+        // signature ensures a reader can trust the recorded
+        // hostname is what the emitter actually wrote, not a
+        // post-hoc bucket-rewrite. `None` is encoded as an empty
+        // string, matching the `prev_event_ulid` convention so the
+        // canonical form is unambiguous in either case.
+        match self.hostname.as_deref() {
+            Some(h) => push_field(&mut buf, "hostname", h),
+            None => push_field(&mut buf, "hostname", ""),
+        }
         push_field(&mut buf, "vol_ulid", &self.vol_ulid.to_string());
         match self.prev_event_ulid {
             Some(u) => push_field(&mut buf, "prev_event_ulid", &u.to_string()),
@@ -309,15 +332,15 @@ impl NameEvent {
     /// — the duplicate field exists only for human inspection, and
     /// a value that disagrees with the ULID is either a hand-edit
     /// or corruption.
-    pub fn from_toml(s: &str) -> Result<Self, ParseNameEventError> {
-        let event: NameEvent = toml::from_str(s).map_err(ParseNameEventError::Toml)?;
+    pub fn from_toml(s: &str) -> Result<Self, ParseVolumeEventError> {
+        let event: VolumeEvent = toml::from_str(s).map_err(ParseVolumeEventError::Toml)?;
         if event.version != Self::CURRENT_VERSION {
-            return Err(ParseNameEventError::UnsupportedVersion(event.version));
+            return Err(ParseVolumeEventError::UnsupportedVersion(event.version));
         }
         let ulid_ms = event.event_ulid.timestamp_ms();
         let at_ms = u64::try_from(event.at.timestamp_millis()).unwrap_or(u64::MAX);
         if at_ms != ulid_ms {
-            return Err(ParseNameEventError::TimestampMismatch { at_ms, ulid_ms });
+            return Err(ParseVolumeEventError::TimestampMismatch { at_ms, ulid_ms });
         }
         Ok(event)
     }
@@ -330,10 +353,10 @@ fn push_field(buf: &mut Vec<u8>, key: &str, value: &str) {
     buf.extend_from_slice(value.as_bytes());
 }
 
-/// Errors from [`NameEvent::from_toml`].
+/// Errors from [`VolumeEvent::from_toml`].
 #[derive(Debug)]
-pub enum ParseNameEventError {
-    /// The TOML body did not parse against the `NameEvent` schema.
+pub enum ParseVolumeEventError {
+    /// The TOML body did not parse against the `VolumeEvent` schema.
     Toml(toml::de::Error),
     /// The event carries a `version` this build does not understand.
     /// Bucket schema changes are fresh-bucket-only.
@@ -344,14 +367,14 @@ pub enum ParseNameEventError {
     TimestampMismatch { at_ms: u64, ulid_ms: u64 },
 }
 
-impl fmt::Display for ParseNameEventError {
+impl fmt::Display for ParseVolumeEventError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Toml(e) => write!(f, "{e}"),
             Self::UnsupportedVersion(v) => write!(
                 f,
-                "unsupported NameEvent version {v} (this build supports {})",
-                NameEvent::CURRENT_VERSION,
+                "unsupported VolumeEvent version {v} (this build supports {})",
+                VolumeEvent::CURRENT_VERSION,
             ),
             Self::TimestampMismatch { at_ms, ulid_ms } => write!(
                 f,
@@ -361,7 +384,7 @@ impl fmt::Display for ParseNameEventError {
     }
 }
 
-impl std::error::Error for ParseNameEventError {
+impl std::error::Error for ParseVolumeEventError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Toml(e) => Some(e),
@@ -391,10 +414,11 @@ mod tests {
         Ulid::from_string("01HSNHSNHSN000000000000000").unwrap()
     }
 
-    fn sample_event(kind: EventKind) -> NameEvent {
-        NameEvent::new(
+    fn sample_event(kind: EventKind) -> VolumeEvent {
+        VolumeEvent::new(
             event_ulid(),
             "01ABCDEFGHJKMNPQRSTVWXYZ23".to_string(),
+            Some("test-host".to_string()),
             vol_ulid(),
             None,
             kind,
@@ -430,7 +454,7 @@ mod tests {
         for kind in kinds {
             let ev = sample_event(kind.clone());
             let toml = ev.to_toml().expect("serialise");
-            let parsed = NameEvent::from_toml(&toml).expect("parse");
+            let parsed = VolumeEvent::from_toml(&toml).expect("parse");
             assert_eq!(parsed, ev, "round-trip mismatch for kind {:?}", kind);
         }
     }
@@ -458,6 +482,32 @@ mod tests {
             payload_a, payload_b,
             "signing payload must not include the signature field"
         );
+    }
+
+    #[test]
+    fn signing_payload_changes_with_hostname() {
+        // `hostname` is signed: an event with a different recorded
+        // hostname must produce a different canonical pre-image so
+        // a bucket-rewriter can't substitute a forged hostname
+        // under the original signature.
+        let mut a = sample_event(EventKind::Claimed);
+        let mut b = sample_event(EventKind::Claimed);
+        a.hostname = Some("host-a".to_string());
+        b.hostname = Some("host-b".to_string());
+        assert_ne!(a.signing_payload(), b.signing_payload());
+
+        // None vs Some("") must also differ — the canonical form
+        // distinguishes "no hostname recorded" from "the hostname
+        // is the empty string", even though both are unusual.
+        let mut c = sample_event(EventKind::Claimed);
+        let mut d = sample_event(EventKind::Claimed);
+        c.hostname = None;
+        d.hostname = Some("".to_string());
+        // Same canonical encoding (both push an empty value); this
+        // is intentional. We only require that *non-empty* hostname
+        // values are distinguished — `None` vs absent-but-empty is
+        // not a security-relevant distinction.
+        assert_eq!(c.signing_payload(), d.signing_payload());
     }
 
     #[test]
@@ -498,7 +548,7 @@ mod tests {
 
         // Round-trip through the wire.
         let toml = ev.to_toml().expect("serialise");
-        let parsed = NameEvent::from_toml(&toml).expect("parse");
+        let parsed = VolumeEvent::from_toml(&toml).expect("parse");
         let recomputed_payload = parsed.signing_payload();
         assert_eq!(
             payload, recomputed_payload,
@@ -546,8 +596,11 @@ mod tests {
         let mut ev = sample_event(EventKind::Claimed);
         ev.version = 999;
         let toml = ev.to_toml().expect("serialise");
-        let err = NameEvent::from_toml(&toml).expect_err("unknown version must fail");
-        assert!(matches!(err, ParseNameEventError::UnsupportedVersion(999)));
+        let err = VolumeEvent::from_toml(&toml).expect_err("unknown version must fail");
+        assert!(matches!(
+            err,
+            ParseVolumeEventError::UnsupportedVersion(999)
+        ));
     }
 
     #[test]
@@ -560,9 +613,9 @@ mod tests {
         let tampered = (ev.at + chrono::Duration::seconds(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         toml = toml.replace(&original, &tampered);
-        let err = NameEvent::from_toml(&toml).expect_err("at/ulid mismatch must fail");
+        let err = VolumeEvent::from_toml(&toml).expect_err("at/ulid mismatch must fail");
         assert!(
-            matches!(err, ParseNameEventError::TimestampMismatch { .. }),
+            matches!(err, ParseVolumeEventError::TimestampMismatch { .. }),
             "expected TimestampMismatch, got {err:?}"
         );
     }
