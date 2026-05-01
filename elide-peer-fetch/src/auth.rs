@@ -17,21 +17,51 @@
 //! pipeline returns successfully once steps 1–4 pass; the handler
 //! then reads the file or returns 404.
 //!
-//! The design doc is the source of truth for caching policy.
-//! `coordinator.pub` and the ancestry walk are immutable per their
-//! respective keys, so this module memoises both forever. The
-//! `names/<name>` lookup is revalidated against S3 on every request
-//! in v1 — refreshing rather than ETag-conditional caching is a v1
-//! simplification; the auth fence still coincides with the S3 CAS.
+//! ### Caching profile
+//!
+//! Three layers of cache, each tightly scoped:
+//!
+//! - **`coordinator.pub`** — immutable per `coordinator_id`. Cached
+//!   forever after first fetch.
+//!
+//! - **Ancestry walk** — immutable per `vol_ulid` (provenance is
+//!   write-once at fork time). Cached forever after first walk.
+//!
+//! - **`names/<volume_name>`** — ETag-conditional. The cache holds
+//!   `(NameRecord, ETag)`; every request fires a conditional GET with
+//!   `If-None-Match`. A 304 response confirms the cached value is
+//!   still fresh; a 200 returns the new value (and updates the cache).
+//!   This keeps the auth fence coincident with the S3 CAS — the
+//!   moment a new claim lands, the next request sees it via the 200
+//!   response.
+//!
+//! On top of that, [`AuthState`] memoises the *resolved* [`Authorized`]
+//! result keyed on the bearer token + URL `vol_id` for the lifetime
+//! of the token's freshness window. Within the cache window,
+//! repeated requests skip steps 3 and 4 entirely — no S3 lookups for
+//! `names/<name>` (not even the conditional one) and no ancestry
+//! cache touch. Cache lifetime is capped at the token's residual
+//! freshness so an entry can never authorise past the moment the
+//! token would itself become stale; a refreshed token (any
+//! coordinator re-mints in steady state every freshness-window
+//! interval) is a fresh cache miss and re-runs the full pipeline.
+//!
+//! This composition gives most of the benefit of per-connection
+//! memoisation (which the design doc anticipated as the natural future
+//! optimisation) without binding to the HTTP/2 connection abstraction:
+//! a typical prefetch session reuses one token throughout, which is
+//! exactly when the cache hits.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::VerifyingKey;
 use elide_core::name_record::{NameRecord, NameState};
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
+use object_store::{Error as ObjectStoreError, GetOptions};
 use tokio::sync::RwLock;
 use ulid::Ulid;
 
@@ -117,7 +147,30 @@ struct AuthStateInner {
     store: Arc<dyn ObjectStore>,
     pub_keys: RwLock<HashMap<String, VerifyingKey>>,
     ancestry_cache: RwLock<HashMap<Ulid, HashSet<Ulid>>>,
+    /// `(NameRecord, ETag)` per volume name. Revalidated via
+    /// `If-None-Match` on every request that reaches step 3.
+    name_records: RwLock<HashMap<String, (NameRecord, Option<String>)>>,
+    /// Resolved `Authorized` outcomes keyed on `(bearer_token, vol_id)`.
+    /// Entries expire at the token's residual freshness window so a
+    /// cached result never outlives the token's own freshness.
+    verified_tokens: RwLock<HashMap<VerifiedKey, VerifiedEntry>>,
     freshness_window_secs: u64,
+}
+
+/// Cache key for the resolved-Authorized cache. Bound to both the
+/// bearer (token bytes) and the URL `vol_id`, since the same token
+/// can validly authorise different `vol_id`s in the volume's
+/// ancestry, and each must be lineage-checked once.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VerifiedKey {
+    bearer: String,
+    vol_id: Ulid,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedEntry {
+    authorized: Authorized,
+    expires_at: Instant,
 }
 
 impl AuthState {
@@ -131,6 +184,8 @@ impl AuthState {
                 store,
                 pub_keys: RwLock::new(HashMap::new()),
                 ancestry_cache: RwLock::new(HashMap::new()),
+                name_records: RwLock::new(HashMap::new()),
+                verified_tokens: RwLock::new(HashMap::new()),
                 freshness_window_secs,
             }),
         }
@@ -139,26 +194,50 @@ impl AuthState {
     /// Run the full five-step pipeline (steps 1–4 — step 5 is the
     /// route handler's local stat). Returns the resolved
     /// [`Authorized`] context on success.
+    ///
+    /// On a fresh request, runs all four steps. On a repeat request
+    /// within the token's freshness window (same bearer, same
+    /// `vol_id`), the resolved [`Authorized`] is returned from
+    /// cache after only the cheap checks (decode, freshness,
+    /// signature) — the S3 round-trip for `names/<name>` and the
+    /// ancestry walk are skipped.
     pub async fn verify(
         &self,
         bearer_value: &str,
         url_vol_id: Ulid,
     ) -> Result<Authorized, AuthError> {
-        // Step 1: decode + freshness.
+        // Step 1: decode + freshness. Always runs — these are cheap
+        // and the freshness check is what bounds the cache lifetime.
         let token = PeerFetchToken::decode(bearer_value).map_err(AuthError::BadToken)?;
         let now = PeerFetchToken::now_unix_seconds();
         token
             .check_freshness(now, self.inner.freshness_window_secs)
             .map_err(AuthError::BadCredentials)?;
 
-        // Step 2: signature against published `coordinator.pub`.
+        // Step 2: signature. Always runs — the cache only memoises
+        // the *outcome* of the S3-side checks (steps 3 + 4); the
+        // signature still proves the request bytes were authored by
+        // the holder of `coordinator.key`.
         let vk = self.coordinator_pub(&token.coordinator_id).await?;
         token
             .verify_signature(&vk)
             .map_err(AuthError::BadCredentials)?;
 
+        // Cached resolution: `Authorized` keyed on this exact bearer +
+        // vol_id. Expiry is the token's residual freshness, so a
+        // cached entry can never authorise past the moment the token
+        // itself becomes stale.
+        let cache_key = VerifiedKey {
+            bearer: bearer_value.to_owned(),
+            vol_id: url_vol_id,
+        };
+        if let Some(entry) = self.lookup_cached(&cache_key).await {
+            return Ok(entry.authorized);
+        }
+
         // Step 3: ownership — the volume name's current claim record
-        // must point at this coordinator.
+        // must point at this coordinator. Revalidated via ETag on
+        // every cache miss.
         let name_record = self.fetch_name_record(&token.volume_name).await?;
         match name_record.state {
             NameState::Live | NameState::Stopped => {}
@@ -176,11 +255,56 @@ impl AuthState {
             return Err(AuthError::OutsideLineage);
         }
 
-        Ok(Authorized {
-            volume_name: token.volume_name,
-            coordinator_id: token.coordinator_id,
+        let authorized = Authorized {
+            volume_name: token.volume_name.clone(),
+            coordinator_id: token.coordinator_id.clone(),
             vol_id: url_vol_id,
-        })
+        };
+
+        self.cache_authorized(cache_key, authorized.clone(), &token, now)
+            .await;
+
+        Ok(authorized)
+    }
+
+    /// Look up a cached resolution; returns `None` if absent or
+    /// expired (in which case the caller falls through to a fresh
+    /// pipeline run).
+    async fn lookup_cached(&self, key: &VerifiedKey) -> Option<VerifiedEntry> {
+        let entry = self.inner.verified_tokens.read().await.get(key).cloned()?;
+        if Instant::now() < entry.expires_at {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    async fn cache_authorized(
+        &self,
+        key: VerifiedKey,
+        authorized: Authorized,
+        token: &PeerFetchToken,
+        now_unix: u64,
+    ) {
+        let drift = now_unix.abs_diff(token.issued_at);
+        let remaining = self.inner.freshness_window_secs.saturating_sub(drift);
+        if remaining == 0 {
+            // Token will be stale by next request anyway; don't bother
+            // caching (the entry would be invalidated immediately).
+            return;
+        }
+        let expires_at = Instant::now() + Duration::from_secs(remaining);
+        let entry = VerifiedEntry {
+            authorized,
+            expires_at,
+        };
+        let mut guard = self.inner.verified_tokens.write().await;
+        // Opportunistic eviction: drop expired entries while we hold
+        // the write lock, so the map can't grow unboundedly across
+        // a long-lived process.
+        let now = Instant::now();
+        guard.retain(|_, v| v.expires_at > now);
+        guard.insert(key, entry);
     }
 
     async fn coordinator_pub(&self, coordinator_id: &str) -> Result<VerifyingKey, AuthError> {
@@ -218,33 +342,61 @@ impl AuthState {
     }
 
     async fn fetch_name_record(&self, volume_name: &str) -> Result<NameRecord, AuthError> {
-        let key = StorePath::from(format!("names/{volume_name}"));
-        let body = self
+        // ETag-conditional revalidation: if we have a cached value
+        // for this volume, send `If-None-Match: <etag>`. A 304
+        // confirms the cached value; a 200 ships the new value.
+        let cached = self
             .inner
-            .store
-            .get(&key)
+            .name_records
+            .read()
             .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => AuthError::NotCurrentClaimer,
-                other => AuthError::Backend(io::Error::other(format!(
+            .get(volume_name)
+            .cloned();
+        let cached_etag = cached.as_ref().and_then(|(_, e)| e.clone());
+
+        let key = StorePath::from(format!("names/{volume_name}"));
+        let opts = GetOptions {
+            if_none_match: cached_etag,
+            ..Default::default()
+        };
+
+        let get_result = match self.inner.store.get_opts(&key, opts).await {
+            Ok(r) => r,
+            Err(ObjectStoreError::NotModified { .. }) => {
+                // Cached value still authoritative — return it.
+                let (record, _) = cached.expect("304 implies a cached value existed");
+                return Ok(record);
+            }
+            Err(ObjectStoreError::NotFound { .. }) => return Err(AuthError::NotCurrentClaimer),
+            Err(other) => {
+                return Err(AuthError::Backend(io::Error::other(format!(
                     "fetch names/{volume_name}: {other}"
-                ))),
-            })?
-            .bytes()
-            .await
-            .map_err(|e| {
-                AuthError::Backend(io::Error::other(format!(
-                    "read names/{volume_name} body: {e}"
-                )))
-            })?;
+                ))));
+            }
+        };
+
+        let new_etag = get_result.meta.e_tag.clone();
+        let body = get_result.bytes().await.map_err(|e| {
+            AuthError::Backend(io::Error::other(format!(
+                "read names/{volume_name} body: {e}"
+            )))
+        })?;
         let text = std::str::from_utf8(&body).map_err(|e| {
             AuthError::Backend(io::Error::other(format!(
                 "names/{volume_name} not utf-8: {e}"
             )))
         })?;
-        NameRecord::from_toml(text).map_err(|e| {
+        let record = NameRecord::from_toml(text).map_err(|e| {
             AuthError::Backend(io::Error::other(format!("parse names/{volume_name}: {e}")))
-        })
+        })?;
+
+        self.inner
+            .name_records
+            .write()
+            .await
+            .insert(volume_name.to_owned(), (record.clone(), new_etag));
+
+        Ok(record)
     }
 
     async fn ancestry(&self, vol_ulid: Ulid) -> Result<HashSet<Ulid>, AuthError> {
@@ -670,5 +822,183 @@ mod tests {
             parse_bearer(Some("Bearer ")),
             Err(AuthError::MissingBearer)
         ));
+    }
+
+    /// Per-token cache hit: the second verify with the same bearer
+    /// returns the cached `Authorized` even if the underlying
+    /// `names/<name>` has flipped to disauthorise. This proves the
+    /// resolved-Authorized cache is consulted; the trade-off is the
+    /// fence-gap is bounded by the token's freshness window (a refreshed
+    /// token would be a cache miss and pick up the change).
+    #[tokio::test]
+    async fn cache_returns_authorized_even_after_names_flips() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let other_coord = "coord-b";
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        // First verify: cache miss → full pipeline → success, cached.
+        auth.verify(&bearer, vol_ulid).await.unwrap();
+
+        // Flip the names record to disauthorise this coordinator.
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, other_coord).await;
+
+        // Second verify with same bearer + vol_id: cache hit, returns OK
+        // even though S3-side state would now reject. This is the
+        // expected behaviour — the cache lifetime is the token's
+        // freshness window, after which a fresh pipeline run picks up
+        // the change.
+        let result = auth.verify(&bearer, vol_ulid).await.unwrap();
+        assert_eq!(result.coordinator_id, coord_id);
+    }
+
+    /// Cache is keyed on `(bearer, vol_id)` — a different `vol_id`
+    /// for the same token bypasses the cache and re-runs the lineage
+    /// step, so each ancestor is independently authorised.
+    #[tokio::test]
+    async fn cache_keys_on_vol_id_independently() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let root_key = SigningKey::generate(&mut OsRng);
+        let leaf_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "myvol";
+
+        let root_ulid = Ulid::new();
+        let leaf_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), root_ulid, &root_key, None).await;
+        publish_volume(
+            store.as_ref(),
+            leaf_ulid,
+            &leaf_key,
+            Some(ParentRef {
+                volume_ulid: root_ulid.to_string(),
+                snapshot_ulid: Ulid::new().to_string(),
+                pubkey: root_key.verifying_key().to_bytes(),
+                manifest_pubkey: None,
+            }),
+        )
+        .await;
+        publish_live_name(store.as_ref(), vol_name, leaf_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        // Both ancestor + leaf authorise.
+        auth.verify(&bearer, leaf_ulid).await.unwrap();
+        auth.verify(&bearer, root_ulid).await.unwrap();
+
+        // Repeats hit cache.
+        auth.verify(&bearer, leaf_ulid).await.unwrap();
+        auth.verify(&bearer, root_ulid).await.unwrap();
+
+        // An unrelated vol_id is a cache miss → pipeline runs →
+        // ancestry rejection.
+        let unrelated = Ulid::new();
+        let err = auth
+            .verify(&bearer, unrelated)
+            .await
+            .expect_err("not in lineage");
+        assert!(matches!(err, AuthError::OutsideLineage));
+    }
+
+    /// ETag-conditional names lookup: a verify with no prior cache
+    /// (e.g. a different bearer that misses the resolved-Authorized
+    /// cache) still hits the names record cache via `If-None-Match`.
+    /// Updating the underlying names record changes the ETag, so the
+    /// next request observes the new value.
+    #[tokio::test]
+    async fn etag_conditional_picks_up_names_changes_on_cache_miss() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let other_coord = "coord-b";
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_coordinator(store.as_ref(), other_coord, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+
+        // First verify warms the names ETag cache.
+        let now = PeerFetchToken::now_unix_seconds();
+        let token1 = sign_token(vol_name, coord_id, now, &coord_key);
+        auth.verify(&token1.encode(), vol_ulid).await.unwrap();
+
+        // Flip names to other_coord. ETag changes → next conditional
+        // GET returns 200 with the new value.
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, other_coord).await;
+
+        // Mint a fresh token so the resolved-Authorized cache misses
+        // (different `issued_at` ⇒ different bearer bytes).
+        let token2 = sign_token(vol_name, coord_id, now + 1, &coord_key);
+        let err = auth
+            .verify(&token2.encode(), vol_ulid)
+            .await
+            .expect_err("names flipped");
+        assert!(matches!(err, AuthError::NotCurrentClaimer));
+    }
+
+    /// Tokens issued at exactly the freshness boundary skip caching
+    /// (the entry would expire immediately and never serve a hit).
+    #[tokio::test]
+    async fn boundary_token_does_not_pollute_cache() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+
+        // Token at exactly the boundary: drift == freshness_window.
+        // `check_freshness` accepts `<=`, so this is the last instant
+        // the token is fresh.
+        let now = PeerFetchToken::now_unix_seconds();
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            now - DEFAULT_FRESHNESS_WINDOW_SECS,
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        let result = auth.verify(&bearer, vol_ulid).await.unwrap();
+        assert_eq!(result.coordinator_id, coord_id);
+
+        // The verified-tokens map should not contain this entry —
+        // residual freshness was zero.
+        let cache_size = auth.inner.verified_tokens.read().await.len();
+        assert_eq!(
+            cache_size, 0,
+            "boundary token should not enter the resolved cache"
+        );
     }
 }
