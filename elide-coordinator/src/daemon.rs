@@ -97,21 +97,35 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // can find us during handoff discovery. Sibling write to
     // `coordinator.pub`. Absence of `peer_fetch.port` keeps the whole
     // mechanism off — no server, no advertisement, no peer tier.
-    if let Some(port) = config.peer_fetch.port {
-        let host = config.peer_fetch.advertised_host(identity.hostname());
-        let endpoint = elide_peer_fetch::PeerEndpoint::new(host, port);
-        if let Err(e) = endpoint
-            .publish(coord_wide.as_ref(), identity.coordinator_id_str())
-            .await
-        {
-            return Err(anyhow::anyhow!("publish peer-endpoint.toml: {e}"));
-        }
-        info!(
-            "[coordinator] peer-fetch endpoint advertised: {} (bind {})",
-            endpoint.url(),
-            config.peer_fetch.bind_addr(),
-        );
-    }
+    let peer_fetch_handle: Option<elide_coordinator::tasks::PeerFetchHandle> =
+        if let Some(port) = config.peer_fetch.port {
+            let host = config.peer_fetch.advertised_host(identity.hostname());
+            let endpoint = elide_peer_fetch::PeerEndpoint::new(host, port);
+            if let Err(e) = endpoint
+                .publish(coord_wide.as_ref(), identity.coordinator_id_str())
+                .await
+            {
+                return Err(anyhow::anyhow!("publish peer-endpoint.toml: {e}"));
+            }
+            info!(
+                "[coordinator] peer-fetch endpoint advertised: {} (bind {})",
+                endpoint.url(),
+                config.peer_fetch.bind_addr(),
+            );
+            // Build a single peer-fetch client to share across all
+            // per-volume tasks. The client pools HTTP/2 connections
+            // internally and signs tokens on demand via the
+            // `TokenSigner` impl on `CoordinatorIdentity`.
+            let signer: std::sync::Arc<dyn elide_peer_fetch::TokenSigner> = identity.clone();
+            match elide_peer_fetch::PeerFetchClient::new(signer) {
+                Ok(client) => Some(elide_coordinator::tasks::PeerFetchHandle { client }),
+                Err(e) => {
+                    return Err(anyhow::anyhow!("build peer-fetch client: {e}"));
+                }
+            }
+        } else {
+            None
+        };
     let coord_id_str: String = identity.coordinator_id_str().to_owned();
     let macaroon_root: [u8; 32] = *identity.macaroon_root();
     let issuer: Arc<dyn CredentialIssuer> = Arc::new(SharedKeyPassthrough::new_with_warning());
@@ -327,6 +341,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     snapshot_locks.clone(),
                     prefetch_tx,
                     prefetch_tracker.clone(),
+                    peer_fetch_handle.clone(),
                 ));
 
                 // Readonly volumes (imported bases) have no live process —

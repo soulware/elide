@@ -108,15 +108,24 @@ The "peer for this volume's prefetch" hint is held alongside the volume's other 
 
 ### 8. Prefetch integration
 
+Split into two passes — items 8a (`.idx` peer fall-through) and 8b (`.prefetch` warming-hint consumption) — because they're independent execution paths and 8b's body-Range-GET orchestration is large enough to deserve its own review surface.
+
+#### 8a. `.idx` peer fall-through
+
 In `elide-coordinator/src/prefetch.rs`:
 
-- Extend `prefetch_indexes` to take an optional peer-fetch context (`Option<(PeerFetchClient, PeerEndpoint, CoordinatorIdentity)>`).
-- For each missing `.idx`:
-  - Attempt peer `fetch_idx(vol_id, ulid)`. On `Some(bytes)`, verify signature, write to `index/<ulid>.idx`. On `None` or verification failure, fall through to the existing S3 path.
-  - In parallel, attempt peer `fetch_prefetch_hint(vol_id, ulid)`. On `Some(hint)`, hold in memory and enqueue background S3 Range-GETs for the bytes the hint indicates, populating `cache/<ulid>.body` on the new host. On `None`, no hint is recorded — that segment falls back to demand-only.
-- Existing call sites (`tasks.rs:177`, `inbound.rs:1712`) pass `None` initially; the claim-discovery hook (item 7) passes a populated context for the volume just claimed.
+- Extend `prefetch_indexes` to take an optional peer-fetch context (`Option<&PeerFetchContext>`).
+- For each missing `.idx`: attempt peer `fetch_idx(vol_id, ulid)`. On `Some(bytes)`, verify signature, write to `index/<ulid>.idx`. On `None` or verification failure, fall through to the existing S3 path.
+- Existing call sites pass `None` initially; the claim-discovery hook (item 7) passes a populated context for the volume just claimed.
+- `PrefetchResult` gains a `fetched_from_peer` counter so the per-prefetch-run signal split (peer hits vs. S3 hits) is visible in logs.
+
+#### 8b. `.prefetch` warming-hint consumption *(separate item)*
+
+- In parallel with the `.idx` fetch above: attempt peer `fetch_prefetch_hint(vol_id, ulid)`. On `Some(hint)`, hold in memory and enqueue background S3 Range-GETs for the bytes the hint indicates, populating `cache/<ulid>.body` on the new host. On `None`, no hint is recorded — that segment falls back to demand-only.
 
 The peer-fetched hint is never written to disk under the new host's `cache/<ulid>.present`. The new host's local `.present` is built from the bits its own S3 Range-GETs actually populate (whether triggered by the warming hint or by subsequent demand-fetch once the volume is mounted).
+
+This pass is the first place v1 actually warms body bytes from S3 *before* a guest read, so it's also the first place we measure whether the warming actually pays off (per the decision criteria below).
 
 ### 9. Tests
 

@@ -89,6 +89,16 @@ fn evict_one_body(fork_dir: &Path, ulid_str: &str) -> io::Result<usize> {
 ///
 /// Exits when the volume directory is removed. Intended to be spawned as a
 /// tokio task.
+/// Peer-fetch handle passed into [`run_volume_tasks`] when the
+/// coordinator has peer-fetch configured. `client` mints tokens via
+/// the coordinator's identity and pools HTTP/2 connections; the
+/// per-volume task uses it to construct a [`prefetch::PeerFetchContext`]
+/// after running the discovery hook.
+#[derive(Clone)]
+pub struct PeerFetchHandle {
+    pub client: elide_peer_fetch::PeerFetchClient,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_volume_tasks(
     fork_dir: PathBuf,
@@ -100,6 +110,7 @@ pub async fn run_volume_tasks(
     snapshot_locks: SnapshotLockRegistry,
     prefetch_done: Arc<watch::Sender<PrefetchState>>,
     prefetch_tracker: PrefetchTracker,
+    peer_fetch: Option<PeerFetchHandle>,
 ) {
     // Drop guard: when this task exits (clean break, await-point cancellation
     // on JoinSet abort, or panic) the tracker entry is removed. Combined with
@@ -174,7 +185,24 @@ pub async fn run_volume_tasks(
         // Publish prefetch progress to anyone waiting on `await-prefetch`.
         // The send target is the watch channel in `PrefetchTracker`; clones
         // already subscribed will see this transition from `None` → `Some`.
-        let prefetch_result = prefetch::prefetch_indexes(&fork_dir, &store).await;
+        // Peer-fetch context: populated only if the volume just claimed
+        // has a clean Released predecessor with a published peer-endpoint.
+        // Discovery is best-effort — every failure path here collapses
+        // to `None` and prefetch falls through to S3 cleanly.
+        let peer_ctx = match (peer_fetch.as_ref(), read_volume_name(&fork_dir)) {
+            (Some(handle), Some(volume_name)) => {
+                crate::peer_discovery::discover_peer_for_claim(&store, &volume_name)
+                    .await
+                    .map(|discovered| prefetch::PeerFetchContext {
+                        client: handle.client.clone(),
+                        endpoint: discovered.endpoint,
+                        volume_name,
+                    })
+            }
+            _ => None,
+        };
+        let prefetch_result =
+            prefetch::prefetch_indexes(&fork_dir, &store, peer_ctx.as_ref()).await;
         let did_fetch = match &prefetch_result {
             Ok(r) if r.fetched > 0 => {
                 info!(

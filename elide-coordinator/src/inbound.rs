@@ -1709,7 +1709,13 @@ async fn force_snapshot_now_op(
     }
 
     // Step 1: prefetch indexes from S3.
-    elide_coordinator::prefetch::prefetch_indexes(&ancestor_dir, store)
+    // No peer-fetch tier on the IPC pull-readonly path: this code runs
+    // for ad-hoc readonly hydration (e.g. CLI inspect of a peer's
+    // snapshot), not for the per-volume claim flow that owns the
+    // peer-fetch context. S3 is the canonical fallback for everything
+    // else; passing `None` here matches the v1 plan's "existing call
+    // sites pass None initially" guidance.
+    elide_coordinator::prefetch::prefetch_indexes(&ancestor_dir, store, None)
         .await
         .map_err(|e| IpcError::store(format!("prefetching ancestor indexes: {e:#}")))?;
 

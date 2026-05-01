@@ -73,6 +73,24 @@ impl elide_core::segment::SegmentSigner for CoordinatorIdentity {
     }
 }
 
+/// Implements [`elide_peer_fetch::TokenSigner`] so the
+/// coordinator's identity can mint peer-fetch bearer tokens directly
+/// — no IPC to a separate signing service, no per-volume keys.
+/// The signing payload is domain-tag-prefixed (see
+/// `elide_peer_fetch::token::DOMAIN_TAG`), so the same Ed25519 key
+/// signing peer-fetch tokens cannot collide with segment or
+/// volume-event signatures.
+impl elide_peer_fetch::TokenSigner for CoordinatorIdentity {
+    fn coordinator_id(&self) -> &str {
+        &self.coordinator_id_str
+    }
+
+    fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        self.signing_key.sign(msg).to_bytes()
+    }
+}
+
 impl std::fmt::Debug for CoordinatorIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoordinatorIdentity")
