@@ -2,7 +2,7 @@
 
 **Status:** Exploration. No implementation. This doc captures the design discussion to date and the decisions that have landed; several pieces are intentionally left open.
 
-**v1 scope: `.idx` only.** The first iteration fetches segment index files (`.idx`) from peers; body bytes are explicitly out of scope and continue to demand-fetch directly from S3. The `.idx` path is the simpler problem (small files, set known ahead of time, full-file semantics — no range/partial-coverage logic) and exercises the entire stack: discovery, auth, transport, signature verification, S3 fallback. Whether to extend to body fetch is a downstream decision informed by what v1 surfaces — peer hit rate, latency improvement vs direct S3, operational cost. The body-fetch design is sketched below for context but is **not** v1.
+**v1 scope: `.idx` + `.prefetch` only.** The first iteration fetches segment index files (`.idx`) and *prefetch hints* (`.prefetch`) from peers; body bytes are explicitly out of scope and continue to demand-fetch directly from S3. Both are small, full-file fetches (no range arithmetic), known up-front from ancestor walk, and exercise the entire stack: discovery, auth, transport, signature verification, S3 fallback. `.prefetch` is an opaque hint — "these are byte ranges worth warming" — used to drive background Range-GETs from S3 after claim. The peer happens to synthesise it from its local `.present` bitmap, but the wire resource is intentionally a different name from the on-disk file: clients consume it as advice, never confuse it with authoritative cache state, and the peer is free to evolve the encoding later. Whether to extend to peer body fetch is a downstream decision informed by what v1 surfaces. The body-fetch design is sketched below for context but is **not** v1.
 
 ## Problem
 
@@ -31,47 +31,75 @@ A volume's local post-upload layout is per-segment (see `docs/formats.md`):
 
 - `index/<ulid>.idx` — header + index + inline; always retained
 - `cache/<ulid>.body` — sparse body file; body-relative offsets
-- `cache/<ulid>.present` — per-entry presence bitmap
+- `cache/<ulid>.present` — per-entry presence bitmap (local cache state, authoritative for *this* host)
 
-The peer exposes these directly. A peer with `index/<ulid>.idx` locally can serve it; a peer with `cache/<ulid>.body` covered for a given range can serve that range.
+v1 wire resources:
+
+- `<ulid>.idx` — served verbatim from `index/<ulid>.idx`
+- `<ulid>.prefetch` — *prefetch hint*, derived from the peer's local `.present` (v1 returns its bytes as-is, but the format is the wire's, not the on-disk file's, and is free to evolve)
+- `.body` — deferred; not in v1
+
+The wire-level `.prefetch` name is deliberate: it tells the client "this is advice about what to warm," not "this is authoritative cache state." The new host's own `cache/<ulid>.present` is built from its own fetches, not copied from the peer.
 
 `pending/<ulid>` is **not** peer-eligible. Pending segments are not yet on S3, so a peer fetch that fell through to S3 fallback would fail. Only S3-promoted segments are served.
 
 The peer exposes per-segment data, not per-volume bundles. The same segment ULID is reachable via any volume that includes it in its ancestor chain, so per-segment is the natural unit; B's local state already encodes which of those segments it has, and B drives the fetch loop.
 
-## Wire shape: GETs that mirror S3 paths
+## Wire shape: per-segment GETs keyed by `(vol_id, ulid)`
 
-The peer's URL space is the same as S3's:
-
-```
-GET /by_id/<fork>/segments/<date>/<ulid>
-[Range: bytes=<a>-<b>]
-Authorization: Bearer <prefix-scoped token>
-```
-
-The caller asks the peer for the same path it would ask S3 for. On a hit, the peer returns 200/206 with bytes; on a miss, 404. The caller falls back to S3 for the same path. The peer is a literal pull-through cache, addressed identically to the upstream.
-
-Concurrency comes from HTTP/2 multiplexing — many parallel GETs on a single kept-alive connection. No batch endpoint; the multiplexing layer handles fan-out.
-
-The peer's local layout (`.idx` + sparse `.body` + `.present`) is not a single file like the S3 object. The endpoint synthesises the requested byte range from the local triplet: bytes in the index/inline section come from `.idx`, body-section bytes come from `.body` at the matching body-relative offset (subject to `.present`).
-
-### Index fetch (v1)
-
-The `.idx` files are small (~10–50 KB), and B's cold-start prefetch already enumerates the full set of ULIDs it needs by listing each ancestor's S3 prefix. The request set is fully known before fetching:
+The peer's URL space is intentionally narrower than S3's. S3 paths embed `by_id/<fork>/segments/<date>/<ulid>` because the date partition is an S3-side optimisation; the peer has its own local layout (`index/<ulid>.idx`, `cache/<ulid>.{body,present}`) and doesn't need the S3 prefix to find files. Stripping the noise gives:
 
 ```
-For each reachable segment ULID not already on disk:
-  GET <peer>/by_id/<fork>/segments/<date>/<ulid>
-  Range: bytes=0-<index_section_end>
-  - 200/206 → write to index/<ulid>.idx; verify signature
-  - 404      → fall back to S3 with the same path and Range
+GET /v1/<vol_id>/<ulid>.idx
+GET /v1/<vol_id>/<ulid>.prefetch
+Authorization: Bearer <token>
 ```
 
-The index section ends at `100 + index_length + inline_length`, which is a fixed offset readable from the segment header — same range used by the S3 path's index-only retrieval (`docs/formats.md`).
+`vol_id` is the fork that owns the segment (the segment's *home* volume, which may be an ancestor of the volume the requesting coordinator currently claims). `ulid` is the segment ULID. The `/v1/` prefix reserves room for protocol evolution.
 
-A "miss" on the peer is a `stat` of `<vol_dir>/<fork>/index/<ulid>.idx`: no I/O on miss; one read per hit.
+On a hit, the peer returns 200 with bytes; on a miss (file not present locally), 404; on auth failure, 401 or 403 (see auth pipeline below). The caller falls back to S3 for any non-200 response. The peer is a pull-through cache; semantics are unchanged from the previous "mirror S3 paths" sketch — only the URL shape is simpler.
 
-Signature verification still happens caller-side per `.idx`, exactly as on the S3 path. Bytes from a peer are not trusted past byte level — a tampering peer is caught at verification and the fetch retries from S3.
+**No batch endpoint.** Concurrency comes from HTTP/2 multiplexing — many parallel GETs on one kept-alive connection. The multiplexing layer handles fan-out, partial failures stay per-request (each GET succeeds or 404s independently), and a future body-fetch route slots in as `GET /v1/<vol_id>/<ulid>.body` with a `Range:` header — same shape.
+
+### `.prefetch` is a hint, not authoritative state
+
+The peer's local `.present` is per-host state: it reflects what *that host* has populated locally. Without something like it, the new coordinator only knows which LBAs are *mappable* (everything in the extent index after walking ancestor `.idx`s) — which for typical workloads is an order of magnitude larger than the working set actually touched (~2 GB image vs. ~130 MB boot working set per `findings.md`).
+
+The wire `.prefetch` resource exposes that information as advice. v1 returns the peer's `.present` bytes verbatim because they happen to encode exactly the right set, but the wire name is deliberately different to keep three distinct things from collapsing:
+
+| | What it is | Trusted? |
+|---|---|---|
+| Peer's local `cache/<ulid>.present` | Authoritative cache state for the peer | By the peer, for its own reads |
+| Wire `<ulid>.prefetch` response | Advice: "these byte ranges are worth warming" | No |
+| New host's local `cache/<ulid>.present` | Authoritative cache state for the new host, built from its own fetches | By the new host, for its own reads |
+
+It's not a perfect signal:
+
+- Whole-segment fetches mark more bits than the guest touched.
+- Body-cache eviction can clear bits even though the guest accessed them earlier.
+- Speculative prefetch can mark bits the guest never read.
+
+But it is workload-shaped, free (already exists in a usable form on the peer), and a strict superset of "guest accesses that survived in cache" — i.e. it captures the warm working set. v1 uses it solely to drive **background byte-range prefetch from S3** after `volume claim`: parse the hint, issue Range-GETs to S3 for the indicated bytes, populate the new host's `cache/<ulid>.body`. The new host's `cache/<ulid>.present` is then built from the bits it actually fetched — never from the wire response.
+
+If the peer has evicted body cache (so its `.present` is all-zeros or absent), the `.prefetch` response is empty or 404; the hint degrades to "demand-fetch only" — same as no peer at all. That's a graceful floor, not a failure.
+
+### Index + prefetch-hint fetch (v1)
+
+The `.idx` files are small (~10–50 KB) and `.prefetch` responses are smaller still (one bit per chunk on the wire). B's cold-start prefetch already enumerates the full set of ULIDs it needs by walking each ancestor's lineage. The request set is fully known before fetching:
+
+```
+For each reachable segment ULID not already on disk, in parallel on one HTTP/2 connection:
+  GET /v1/<vol_id>/<ulid>.idx
+    - 200 → write to index/<ulid>.idx; verify signature
+    - 404 → fall back to S3
+  GET /v1/<vol_id>/<ulid>.prefetch
+    - 200 → hold response in memory as warming hint; enqueue background Range-GETs to S3 for the indicated bytes
+    - 404 → no warming hint for this segment (peer has no body cache); demand-fetch only
+```
+
+Both are full-file fetches — `.idx` is the whole on-disk file; `.prefetch` is the whole hint payload (which v1 happens to derive from the peer's `.present` verbatim). A "miss" on the peer is a `stat` of the relevant local file; no I/O on miss, one read per hit.
+
+Signature verification still happens caller-side per `.idx`, exactly as on the S3 path. Bytes from a peer are not trusted past byte level — a tampering peer is caught at verification and the fetch retries from S3. `.prefetch` is never trusted as authoritative; it's a hint that drives subsequent S3 Range-GETs whose results *are* verified, and the new host's local `.present` reflects only those verified fetches.
 
 #### What v1 should surface
 
@@ -85,10 +113,10 @@ If those signals are weak, body fetch is unlikely to justify its complexity. If 
 
 ### Body fetch (deferred — not v1)
 
-Once `.idx` fetch is validated, the body-fetch extension uses the same peer-then-S3 tier with `Range:` covering the body-section bytes the read needs:
+Once `.idx` + `.prefetch` fetch is validated, the body-fetch extension uses the same peer-then-S3 tier with `Range:` covering the body-section bytes the read needs:
 
 ```
-GET <peer>/by_id/<fork>/segments/<date>/<ulid>
+GET /v1/<vol_id>/<ulid>.body
 Range: bytes=<a>-<b>
 ```
 
@@ -130,26 +158,49 @@ Carried in `Authorization: Bearer <base64(token)>`.
 
 ### Peer verification (v1)
 
-1. Decode the token; check `issued_at` is within a freshness window (e.g. ±60 s).
-2. Read `coordinators/<coordinator_id>/coordinator.pub` from S3. Verify the token signature against it. Mismatch → 401.
-3. ETag-conditional GET `names/<volume_name>` from S3. Confirm the current claim record's `coordinator_id` matches the token's `coordinator_id`. Mismatch → 401.
-4. Resolve the fork: `names/<volume_name>` → `vol_ulid`. Read `by_id/<vol_ulid>/volume.provenance` from S3. Walk the signed ancestor chain to produce the authorised prefix set: `by_id/<vol_ulid>/`, plus each ancestor's `by_id/<ancestor_ulid>/`.
-5. For each requested path, check prefix membership. Out of scope → 404 (no leak about presence).
+The peer's verify pipeline is five checks, each tied to a property the auth model must establish:
+
+| # | Check | Source | What it proves |
+|---|---|---|---|
+| 1 | Decode + freshness | token bytes, local clock | replay defence (±60 s window) |
+| 2 | Ed25519 signature valid against `coordinator.pub` | `coordinators/<token.coordinator_id>/coordinator.pub` from S3 | which coordinator is requesting |
+| 3 | `names/<token.volume_name>.coordinator_id == token.coordinator_id` | `names/<token.volume_name>` from S3 (ETag-conditional) | the requesting coordinator currently owns/claims this volume |
+| 4 | URL `vol_id` ∈ ancestry(`token.volume_name`) | walk `volume.provenance` chain from S3 starting at `names/<volume_name>.vol_ulid` | `vol_id` is in the requesting volume's signed lineage |
+| 5 | `index/<ulid>.idx` (or `cache/<ulid>.present`) exists locally under `vol_id` | local fs | `ulid` is a segment of `vol_id` (implicit — falls out as 404) |
+
+Failures map to status codes: 1–3 fail → 401 (bad credentials); 4 fails → 403 (out of authorised lineage); 5 fails → 404. Distinguishing 403 from 404 is fine here — there is no information leak (the requester has the lineage walk in hand and could derive the answer themselves).
 
 The coordinator-key model has two operational benefits over per-volume signing:
 
 - **No IPC for token minting.** The coordinator has its own key in memory; signing is in-process. Per-volume signing would require a coord → volume IPC round-trip per token (or per token-cache-miss).
 - **One token per coord can fan out across multiple volumes.** A single coordinator can re-use the same auth pattern to fetch indexes for any volume it claims, since the auth check is "is the requesting coord the current claimer?" — naturally true for every volume the coord owns.
 
-**v1 does not cache the auth lookups.** Each peer request triggers fresh S3 GETs for steps 2–4. The cost is bounded:
+#### Caching profile
 
-- Most peer-fetch sessions open one HTTP/2 connection and fire N requests on it; the auth lookups run concurrently with serving local files, so the marginal wall-clock cost across the batch is roughly one S3 round-trip total, not N.
-- Compared to the alternative — N missing `.idx` retrieved directly from S3 — even uncached peer auth is a clear win (N peer-RTTs plus ~1 amortised S3-RTT vs. N S3-RTTs).
-- ETag / `If-None-Match` on the `names/<name>` GET trims bandwidth on subsequent lookups within a session; the `names/<name>` object is small enough that this is bonus.
+Each check has its own staleness shape:
 
-The benefit of skipping the cache is that **the auth fence coincides exactly with the S3 CAS**: the moment a new claim lands, the peer's next request sees it. No TTL gap, no stale-claim window.
+- **`coordinator.pub`** (check 2) — immutable per `coordinator_id`. Cache forever; rotate is a separate operational event.
+- **`names/<volume_name>`** (check 3) — ETag-conditional GET. 304 in steady state; the auth fence coincides exactly with the S3 CAS that defines current ownership.
+- **`ancestry(volume_name)`** (check 4) — derived from `volume.provenance`, which is **immutable once the volume exists**. Forking creates new volumes; it does not alter the ancestry of existing ones. Cache forever per `volume_name`, never invalidate.
+- **Local file existence** (check 5) — `stat`, basically free.
 
-If auth lookups become a measurable bottleneck (e.g. very high request rates from many short-lived connections), the natural optimisation is **per-connection memoisation**: peer holds one auth result per `(connection, volume_name)` for that connection's lifetime. Connection close → fresh lookup. Simpler and tighter than a time-bounded TTL.
+So a steady-state request is: Ed25519 verify (microseconds) + one conditional `names/<name>` GET that 304s + cache hits for everything else + local stat. The expensive work happens once per `(coordinator, volume)` pair the peer has ever served, then never again.
+
+#### Why no time-bounded auth cache
+
+The benefit of *not* having a time-bounded cache for `names/<name>` (only ETag-conditional revalidation) is that **the auth fence coincides exactly with the S3 CAS**. The moment a new claim lands, the peer's next request sees it. Crucially, this means the auth fence and the `release --force` fence are the same event — see "Why this works" below.
+
+Per-connection memoisation (one auth result per `(connection, volume_name)` for the connection lifetime) is the natural optimisation if revalidation cost becomes a problem. Connection close → fresh lookup. v1 doesn't need it.
+
+#### Anti-abuse properties
+
+The auth model puts a verifiable `coordinator_id` on every request. That gives the peer a strong identity surface for behaviour-based defences without inventing new mechanism:
+
+- **Per-coordinator request budgets.** A coordinator that requests more `(vol_id, ulid)` pairs than its claimed volumes' lineages contain is misbehaving — even if every individual request is auth-valid. Rate-limiting and temporary blacklisting key off `coordinator_id` directly.
+- **Targeted blacklist.** A misbehaving or compromised coordinator can be denied at the peer without affecting any other coordinator on the LAN; the blacklist is a small set of `coordinator_id`s, locally configured.
+- **Thundering-herd containment.** Only the current claimer of `volume_name` can issue valid tokens for it, and only against `volume_name`'s ancestry — so a single rogue actor can't trigger N peers to fetch arbitrary segment data on its behalf.
+
+These are not v1 features (the simple version of v1 has no rate-limit at all), but the auth shape leaves them as cheap drop-ins later. They do not require any wire-format change.
 
 ### Why this works
 
@@ -164,8 +215,8 @@ If auth lookups become a measurable bottleneck (e.g. very high request rates fro
 ### Caveats
 
 - **Replay window.** `issued_at` ±60 s allows replay within that window. Strictly fine for read-only requests against signed bytes (worst case: replayed token retrieves bytes the original holder was already entitled to). Could tighten with a peer-issued challenge; probably overkill for v1.
-- **Token issuer is the volume process directly.** The volume holds `volume.key` and signs the token itself. The coordinator does not need to be in the request path. If a coordinator-mediated path is wanted later for audit, the scheme still works — same key, same verification.
-- **Future: macaroons / credential service.** When the credential service direction (`docs/architecture.md` § S3 credential distribution via macaroons; `project_credential_service_scaling`) is built out, peer auth can switch to macaroons with third-party caveats verified against the issuer. Wire shape (Bearer token, prefix membership check) is unchanged; only the token format and verification step change.
+- **Coordinator key compromise.** Anyone with `coordinator.key` can claim and operate volumes for that coordinator anyway; peer fetch does not widen this blast radius. Rotation is the same event as today.
+- **Future: macaroons / credential service.** When the credential service direction (`docs/architecture.md` § S3 credential distribution via macaroons; `project_credential_service_scaling`) is built out, peer auth can switch to macaroons with third-party caveats verified against the issuer. Wire shape (Bearer token, lineage check) is unchanged; only the token format and verification step change.
 
 ## Discovery: which peer to ask
 
@@ -213,14 +264,16 @@ Embedding the endpoint in the `released` event itself is an alternative but ties
 
 ## Out of scope for v1
 
-- **Release-time hint artifact.** An earlier draft proposed writing a per-segment populated-bitmap object to S3 at release time so B could drive proactive prefetch. Dropped — adds a new artifact and a write-path step for an optimisation we can revisit once the on-demand peer-then-S3 path is real.
-- **Cache retention policy on the source host.** A's `cache/<ulid>.{body,present}` may be evicted while B is still fetching. Fallback to S3 covers correctness; handoff transfer rate degrades if A evicts during the window. Smarter retention (release-grace window, refcount across volumes) is a future improvement.
-- **Cache-bitmap query endpoint.** Without a release hint, B doesn't know what A has populated until B asks. A bitmap-query endpoint would let B plan ahead; not needed for the basic peer-then-S3 tier to work.
+- **Peer body fetch.** Body bytes still go direct to S3 in v1. The `.prefetch` warming hint drives those S3 Range-GETs after claim, but the bytes themselves don't traverse the peer.
+- **Release-time hint artifact.** An earlier draft proposed writing a per-segment populated-bitmap object to S3 at release time so B could drive proactive prefetch. Dropped in favour of fetching `.prefetch` directly from the peer at claim time — same hint quality, no new S3 artifact, no write-path step.
+- **Cache retention policy on the source host.** A's `cache/<ulid>.{body,present}` may be evicted while B is still fetching. The peer's `.prefetch` response degrades gracefully (404 when the underlying state is gone; warming hint absent for that segment). Smarter retention (release-grace window, refcount across volumes) is a future improvement.
+- **Per-coordinator rate-limiting / blacklist.** The auth model exposes `coordinator_id` on every request, so behaviour-based defences are cheap drop-ins later. v1 ships with no rate-limit; the LAN-only deployment model and the lineage check together bound the abuse surface enough to defer.
 - **Multi-source peer fanout.** "Fetch from any of these N peers, take whoever responds first." Useful for image pull at scale; defer.
 - **Multi-tenant peer.** A single peer process serving multiple buckets under different cred scopes. Out of scope until per-host coordinators serve more than one bucket.
 
 ## Open questions
 
 1. **Hedging vs strict fall-through.** Should B try the peer first and fall back only on miss/timeout, or hedge-fire S3 after a short delay? Hedging has the best worst-case latency at the cost of duplicated request volume when the peer is slow. Probably not v1.
-2. **Maximal-prefix on partial body coverage.** The proposal returns the longest contiguous covered prefix of the requested range. Worth empirical confirmation that this beats the alternatives (404 the whole thing; serve the largest covered sub-range regardless of position) for typical cache shapes.
+2. **Maximal-prefix on partial body coverage.** When body fetch lands, the proposal returns the longest contiguous covered prefix of the requested range. Worth empirical confirmation that this beats the alternatives (404 the whole thing; serve the largest covered sub-range regardless of position) for typical cache shapes.
 3. **Discovery for image pull.** Out of scope until handoff lands, but worth a sketch eventually so the wire doesn't paint us into a corner.
+4. **`.prefetch` payload shape on the wire.** v1 returns the peer's on-disk `.present` bytes as-is. A future protocol bump could compress, summarise (RLE of populated extents), or restrict to only the LBAs the requesting volume actually maps in its extent index. The payload is small enough today that none of this is likely to matter, but the wire/file decoupling means we can change the encoding without renaming the resource.
