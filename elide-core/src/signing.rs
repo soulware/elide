@@ -297,20 +297,34 @@ pub fn read_lineage_with_key(
             dir.display()
         ))
     })?;
-    let (lineage, sig_bytes) = parse_provenance(&content, provenance_file)?;
+    verify_lineage_with_key(&content, verifying_key, provenance_file)
+}
+
+/// Verify and parse a provenance file from its in-memory bytes, using
+/// a caller-supplied verifying key.
+///
+/// Same trust shape as [`read_lineage_with_key`] — for ancestor walks
+/// where the trust anchor for each step is the `parent_pubkey` embedded
+/// in the child's signed provenance — but takes the file contents
+/// directly rather than reading from disk. Used by callers that fetch
+/// provenance from object stores (e.g. peer-fetch auth) and don't want
+/// to round-trip through the local filesystem.
+///
+/// `file_label` is used only in error messages.
+pub fn verify_lineage_with_key(
+    content: &str,
+    verifying_key: &VerifyingKey,
+    file_label: &str,
+) -> io::Result<ProvenanceLineage> {
+    let (lineage, sig_bytes) = parse_provenance(content, file_label)?;
     let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-        io::Error::other(format!(
-            "{provenance_file} sig wrong length (expected 64 bytes)"
-        ))
+        io::Error::other(format!("{file_label} sig wrong length (expected 64 bytes)"))
     })?;
     let signature = Signature::from_bytes(&sig_arr);
     let msg = provenance_signing_input(&lineage);
-    verifying_key.verify(&msg, &signature).map_err(|_| {
-        io::Error::other(format!(
-            "{provenance_file} in {} signature invalid",
-            dir.display()
-        ))
-    })?;
+    verifying_key
+        .verify(&msg, &signature)
+        .map_err(|_| io::Error::other(format!("{file_label} signature invalid")))?;
     Ok(lineage)
 }
 

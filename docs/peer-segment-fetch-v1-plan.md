@@ -77,11 +77,11 @@ Five-step pipeline per request, mapping to the four auth properties (identity, o
 
 1. **Decode + freshness.** Extract bearer token from `Authorization`; reject malformed; check `issued_at` within ±60 s of `now`.
 2. **Signature.** Fetch `coordinators/<token.coordinator_id>/coordinator.pub` from S3 (cache forever per `coordinator_id`). Verify Ed25519 signature. Mismatch → 401.
-3. **Ownership.** ETag-conditional GET `names/<token.volume_name>` from S3 (cache the value, revalidate via `If-None-Match` per request). Confirm `name_record.coordinator_id == token.coordinator_id`. Mismatch → 401.
+3. **Ownership.** ETag-conditional GET `names/<token.volume_name>` from S3 (cache `(NameRecord, ETag)`, revalidate via `If-None-Match` per request — 304 returns the cached value with no body transfer). Confirm `name_record.coordinator_id == token.coordinator_id` and `state ∈ { Live, Stopped }`. Mismatch → 401.
 4. **Lineage.** Walk `volume.provenance` from `name_record.vol_ulid` (signature-verified against `volume.pub`). Cache the resulting ancestry set forever per `volume_name` (provenance is immutable once a volume exists). Check the URL's `<vol_id>` is in the ancestry. Not in lineage → 403.
 5. **Segment membership.** Local stat of the file the route resolves to (`index/<ulid>.idx` for `.idx`, `cache/<ulid>.present` for `.prefetch`) under `by_id/<vol_id>/`. Missing → 404.
 
-Caching is pragmatic per check — `coordinator.pub` and ancestry are immutable so cache forever; `names/<name>` uses ETag-conditional revalidation so the auth fence coincides with the S3 CAS (closes the `release --force` window with no TTL gap). See the design doc for the full caching profile and the rationale for not using a time-bounded auth cache.
+In addition to the per-check caches, the resolved `Authorized` is memoised keyed on `(bearer_token, vol_id)` with a lifetime equal to the **token's residual freshness window**. Within that window, repeat requests skip steps 3 and 4 entirely (zero S3 round-trips). A refreshed token is a fresh cache miss and re-runs the full pipeline. See the design doc § "Caching profile" for the layered model and the auth-fence implications.
 
 ### 6. Peer-fetch client (caller side)
 

@@ -177,20 +177,34 @@ The coordinator-key model has two operational benefits over per-volume signing:
 
 #### Caching profile
 
-Each check has its own staleness shape:
+Each check has its own staleness shape, and v1 ships with all three caches active:
 
 - **`coordinator.pub`** (check 2) — immutable per `coordinator_id`. Cache forever; rotate is a separate operational event.
-- **`names/<volume_name>`** (check 3) — ETag-conditional GET. 304 in steady state; the auth fence coincides exactly with the S3 CAS that defines current ownership.
+- **`names/<volume_name>`** (check 3) — ETag-conditional GET. The peer holds `(NameRecord, ETag)` per volume name; every cache-miss request fires `If-None-Match: <etag>`. A 304 confirms the cached value (no body transferred); a 200 ships the new value and the cache updates. The auth fence coincides exactly with the S3 CAS that defines current ownership.
 - **`ancestry(volume_name)`** (check 4) — derived from `volume.provenance`, which is **immutable once the volume exists**. Forking creates new volumes; it does not alter the ancestry of existing ones. Cache forever per `volume_name`, never invalidate.
 - **Local file existence** (check 5) — `stat`, basically free.
 
-So a steady-state request is: Ed25519 verify (microseconds) + one conditional `names/<name>` GET that 304s + cache hits for everything else + local stat. The expensive work happens once per `(coordinator, volume)` pair the peer has ever served, then never again.
+On top of those per-check caches, the resolved [`Authorized`] outcome is also memoised, keyed on the bearer-token bytes plus URL `vol_id`, with a lifetime equal to the **token's residual freshness window**. Within that window, repeat requests with the same token + `vol_id` skip checks 3 and 4 entirely — no S3 round-trip even for the conditional `names/<name>` GET. A refreshed token (any coordinator re-mints in steady state every freshness-window interval) is a fresh cache miss and re-runs the full pipeline.
 
-#### Why no time-bounded auth cache
+So a steady-state prefetch session looks like:
 
-The benefit of *not* having a time-bounded cache for `names/<name>` (only ETag-conditional revalidation) is that **the auth fence coincides exactly with the S3 CAS**. The moment a new claim lands, the peer's next request sees it. Crucially, this means the auth fence and the `release --force` fence are the same event — see "Why this works" below.
+- **First request:** Ed25519 verify + 1 GET (`coordinator.pub`, ~once per coordinator ever) + 1 GET (`names/<name>`, full body) + N GETs (`volume.provenance` ancestry walk, once per volume ever) + local stat.
+- **Subsequent requests on same token, different `vol_id`:** Ed25519 verify + cache hits for everything except lineage check (which uses cached ancestry) + local stat.
+- **Subsequent requests on same token, same `vol_id`:** Ed25519 verify + resolved-Authorized cache hit + local stat. Zero S3 round-trips.
+- **Token refresh:** like first request, but `coordinator.pub` and ancestry stay cached, so it's just one ETag-conditional `names/<name>` (likely 304) + local stat.
 
-Per-connection memoisation (one auth result per `(connection, volume_name)` for the connection lifetime) is the natural optimisation if revalidation cost becomes a problem. Connection close → fresh lookup. v1 doesn't need it.
+#### Auth-fence properties under caching
+
+- **`coordinator.pub`** rotation: not modelled in v1 — keys never rotate; if compromised, the resolution is to mint a new coordinator. Cache-forever has no fence to violate.
+- **`ancestry`**: provenance is immutable, so cache-forever has no fence to violate.
+- **`names/<volume_name>`**: ETag revalidation makes the fence coincide with the S3 CAS — `release --force` flips the record, the next conditional GET returns 200 with the new value, the auth check fails on the next request that misses the resolved-Authorized cache.
+- **Resolved-Authorized cache**: the only layer that introduces a fence gap. A force-released coordinator's already-issued token can serve cached requests for up to the token's residual freshness — at most `DEFAULT_FRESHNESS_WINDOW_SECS` (60 s in v1). This is bounded, scoped to read-only operations against bytes the holder already had access to, and incurs no write-fence violation (writes are gated by S3 IAM, which `release --force` revokes independently). The trade is acceptable in exchange for skipping per-request S3 round-trips during normal prefetch sessions.
+
+#### Why no time-bounded cache for `names/<name>`
+
+The `names/<name>` cache uses ETag-conditional revalidation, **not** a wall-clock TTL. The reason is that ETag revalidation keeps the auth fence coincident with the S3 CAS at the cost of one small round-trip per cache miss; a TTL would introduce an additional fence gap on top of the resolved-Authorized cache without any further perf benefit.
+
+The resolved-Authorized cache *is* a time-bounded cache, but its bound is the token's freshness — not an arbitrary clock window — so it lines up naturally with the existing replay-window guarantee.
 
 #### Anti-abuse properties
 
@@ -216,7 +230,31 @@ These are not v1 features (the simple version of v1 has no rate-limit at all), b
 
 - **Replay window.** `issued_at` ±60 s allows replay within that window. Strictly fine for read-only requests against signed bytes (worst case: replayed token retrieves bytes the original holder was already entitled to). Could tighten with a peer-issued challenge; probably overkill for v1.
 - **Coordinator key compromise.** Anyone with `coordinator.key` can claim and operate volumes for that coordinator anyway; peer fetch does not widen this blast radius. Rotation is the same event as today.
-- **Future: macaroons / credential service.** When the credential service direction (`docs/architecture.md` § S3 credential distribution via macaroons; `project_credential_service_scaling`) is built out, peer auth can switch to macaroons with third-party caveats verified against the issuer. Wire shape (Bearer token, lineage check) is unchanged; only the token format and verification step change.
+
+### Future: converge on the credential-service format
+
+The principal direction for any future evolution of the auth surface is **wire alignment with the eventual S3-cred service** (`docs/architecture.md` § S3 credential distribution via macaroons; `project_credential_service_scaling`). When that service exists, volumes will hold a single short-lived signed credential — likely a public-key macaroon or an equivalent caveat-based format — that conveys "you may read these S3 prefixes until time T." The natural move is to use exactly the same credential as the peer-fetch bearer: one library, one verification path, one mental model.
+
+Concretely this means the v1 bearer-token format is **not** the long-term shape. The current token is deliberately minimal so the migration cost is bounded by the things that won't change:
+
+- **Trust root** — verification against `coordinators/<id>/coordinator.pub` from S3 is the same in either format.
+- **Lineage check** — moves from "peer walks ancestry" to "credential carries the prefix list as caveats," but the semantics are identical.
+- **Freshness** — bounded validity moves from a custom `issued_at` field to a macaroon `time < T` caveat, but both express the same thing.
+- **Token lifetime** is short (60 s), so the migration is cheap in operational terms — no on-disk persistence to deal with, no long-lived sessions to wait out. Old clients stop minting old tokens; new clients use the new format; peers accept both during a brief window.
+
+The v1 bearer token therefore exists primarily to *defer* the format choice until the credential service is being designed, when the choice can be made jointly across both surfaces. Picking a format now would commit the credential service's design too, and there's no payoff in doing that before the service's other constraints (centralised vs federated issuance, third-party caveat structure, revocation strategy) are settled.
+
+Until then, the v1 `PeerFetchToken` semantics are intentionally a strict subset of what a public-key macaroon could express:
+
+| Bearer-token field | Macaroon equivalent |
+|---|---|
+| `coordinator_id`     | identifier (issuer) |
+| `volume_name`        | first-party caveat: `volume = <name>` |
+| `issued_at`          | first-party caveat: `time < <issued_at + window>` |
+| signature            | macaroon Ed25519 root signature |
+| (peer-side ancestry) | first-party caveat list: `prefix in [...]` (carried in credential, not derived on peer) |
+
+So the v1 verification logic is the macaroon verification logic minus caveats the v1 token doesn't yet carry. The migration is "stop deriving caveats locally, start trusting them from the credential."
 
 ## Discovery: which peer to ask
 

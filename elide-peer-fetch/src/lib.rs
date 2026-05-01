@@ -1,7 +1,7 @@
 //! Opportunistic LAN peer-fetch tier in front of S3 for Elide segment data.
 //!
-//! v1 scope is `.idx` fetch only; body fetch is deferred. See
-//! `docs/design-peer-segment-fetch.md` and
+//! v1 scope is `.idx` + `.prefetch` fetch only; peer body fetch is
+//! deferred. See `docs/design-peer-segment-fetch.md` and
 //! `docs/peer-segment-fetch-v1-plan.md` for the design and plan.
 //!
 //! This crate contains:
@@ -17,10 +17,27 @@
 //!   HTTP server can be reached. Coordinators read this during
 //!   handoff discovery to dial the previous claimer.
 //!
-//! Subsequent items in the v1 plan (HTTP server, client, prefetch
-//! integration) will land alongside these.
+//! - [`ancestry`] — ObjectStore-backed walker that resolves a volume's
+//!   signed fork-parent chain into the set of fork ULIDs the peer is
+//!   allowed to serve segments from on its behalf.
+//!
+//! - [`auth`] — five-step verify pipeline that runs once per request:
+//!   token decode + freshness, signature, ownership (`names/<name>`
+//!   ETag-conditional), lineage (ancestry walk + URL prefix check),
+//!   and segment-membership (the local file existence falls out at the
+//!   route handler).
+//!
+//! - [`server`] — axum HTTP server with the two GET routes
+//!   (`/v1/<vol_id>/<ulid>.idx` and `/v1/<vol_id>/<ulid>.prefetch`)
+//!   wired through the auth middleware to the local `data_dir`.
+//!
+//! Items remaining in the v1 plan (client, prefetch integration) will
+//! land alongside these.
 
+pub mod ancestry;
+pub mod auth;
 pub mod endpoint;
+pub mod server;
 pub mod token;
 
 pub use endpoint::{EndpointParseError, PeerEndpoint};
