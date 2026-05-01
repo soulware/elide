@@ -2,6 +2,8 @@
 
 **Status:** Exploration. No implementation. This doc captures the design discussion to date and the decisions that have landed; several pieces are intentionally left open.
 
+**v1 scope: `.idx` only.** The first iteration fetches segment index files (`.idx`) from peers; body bytes are explicitly out of scope and continue to demand-fetch directly from S3. The `.idx` path is the simpler problem (small files, set known ahead of time, full-file semantics — no range/partial-coverage logic) and exercises the entire stack: discovery, auth, transport, signature verification, S3 fallback. Whether to extend to body fetch is a downstream decision informed by what v1 surfaces — peer hit rate, latency improvement vs direct S3, operational cost. The body-fetch design is sketched below for context but is **not** v1.
+
 ## Problem
 
 Multiple Elide coordinators run on a LAN. Today every fetch path miss goes directly to S3. Two scenarios make this avoidable:
@@ -53,7 +55,7 @@ Concurrency comes from HTTP/2 multiplexing — many parallel GETs on a single ke
 
 The peer's local layout (`.idx` + sparse `.body` + `.present`) is not a single file like the S3 object. The endpoint synthesises the requested byte range from the local triplet: bytes in the index/inline section come from `.idx`, body-section bytes come from `.body` at the matching body-relative offset (subject to `.present`).
 
-### Index fetch (first target)
+### Index fetch (v1)
 
 The `.idx` files are small (~10–50 KB), and B's cold-start prefetch already enumerates the full set of ULIDs it needs by listing each ancestor's S3 prefix. The request set is fully known before fetching:
 
@@ -69,9 +71,21 @@ The index section ends at `100 + index_length + inline_length`, which is a fixed
 
 A "miss" on the peer is a `stat` of `<vol_dir>/<fork>/index/<ulid>.idx`: no I/O on miss; one read per hit.
 
-### Body fetch (next)
+Signature verification still happens caller-side per `.idx`, exactly as on the S3 path. Bytes from a peer are not trusted past byte level — a tampering peer is caught at verification and the fetch retries from S3.
 
-Once `.idx` is present, demand-fetch on read goes through the same peer-then-S3 tier, with `Range:` covering the body-section bytes the read needs:
+#### What v1 should surface
+
+The point of shipping `.idx`-only first is to learn whether the peer tier is worth extending. Useful signals:
+
+- **Hit rate** at the peer, both for handoff (one specific peer) and image-pull (any peer with the bytes). Below some threshold the entire mechanism isn't paying for itself.
+- **Latency improvement** vs direct S3 for the cold-start prefetch phase, where `.idx` fetch dominates wall-clock time.
+- **Operational cost.** Did discovery work? Did auth survive real claim/release/force-release sequences? Did fallback to S3 collapse cleanly on every error path?
+
+If those signals are weak, body fetch is unlikely to justify its complexity. If they're strong, body fetch is the natural extension and is sketched below.
+
+### Body fetch (deferred — not v1)
+
+Once `.idx` fetch is validated, the body-fetch extension uses the same peer-then-S3 tier with `Range:` covering the body-section bytes the read needs:
 
 ```
 GET <peer>/by_id/<fork>/segments/<date>/<ulid>
@@ -87,7 +101,9 @@ Peer response semantics:
 
 No multi-range responses. A peer with gaps in the middle of the requested range serves only the prefix; S3 gets the rest, even if that means a small over-fetch. Multi-range handling is not worth the complexity for the expected win.
 
-Signature verification still happens caller-side per `.idx` and per body extent (against the signed `.idx`), exactly as on the S3 path. Bytes from a peer are not trusted past byte level — a tampering peer is caught at verification and the fetch retries from S3.
+Signature verification on body bytes is per-extent against the signed `.idx`, same as on the S3 path.
+
+The body-fetch path is genuinely more complex than `.idx` (range arithmetic, partial-coverage semantics, larger transfers, more failure modes during streaming). Validating `.idx` first ensures we only pay that complexity if v1 has demonstrated peer fetch is actually paying off.
 
 ## Auth: claim-derived bearer tokens, verified against S3
 
