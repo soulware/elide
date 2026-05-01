@@ -23,10 +23,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use elide_peer_fetch::{PeerEndpoint, PeerFetchClient};
 use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 use ulid::Ulid;
 
 use elide_core::signing::{self, VerifyingKey};
@@ -35,8 +36,34 @@ use elide_core::volume::{resolve_ancestor_dir, walk_extent_ancestors};
 use crate::pull::pull_volume_skeleton;
 use crate::upload::derive_names;
 
+/// Per-volume peer-fetch context populated by the claim-discovery
+/// hook ([`crate::peer_discovery::discover_peer_for_claim`]) and
+/// consumed once by the next prefetch run.
+///
+/// `volume_name` is the requesting volume's name (used in
+/// [`elide_peer_fetch::PeerFetchToken`]); `client` mints tokens on
+/// demand and pools HTTP/2 connections; `endpoint` is the previous
+/// claimer's advertised dial address.
+///
+/// Holding the context across multiple prefetch ticks is intentional:
+/// the discovered peer's relevance lifetime is short (the previous
+/// claimer is presumed to have been releasing its working set), and
+/// v1 only consults it on the *first* tick after claim. Subsequent
+/// ticks within the same volume task pass `None` so they fall through
+/// to S3 directly.
+#[derive(Clone)]
+pub struct PeerFetchContext {
+    pub client: PeerFetchClient,
+    pub endpoint: PeerEndpoint,
+    pub volume_name: String,
+}
+
 pub struct PrefetchResult {
     pub fetched: usize,
+    /// Of `fetched`, how many came from a peer (the rest came from S3).
+    /// Useful for the per-prefetch-run success-signal counters the v1
+    /// plan calls out.
+    pub fetched_from_peer: usize,
     pub skipped: usize,
     pub failed: usize,
 }
@@ -56,6 +83,7 @@ const HEADER_LEN: usize = SEGMENT_HEADER_LEN as usize;
 pub async fn prefetch_indexes(
     fork_dir: &Path,
     store: &Arc<dyn ObjectStore>,
+    peer: Option<&PeerFetchContext>,
 ) -> Result<PrefetchResult> {
     // `fork_dir` is `<data_dir>/by_id/<ulid>/`. All volumes — writable,
     // imported readonly bases, and pulled ancestors — live in `by_id/`.
@@ -67,6 +95,7 @@ pub async fn prefetch_indexes(
 
     let mut result = PrefetchResult {
         fetched: 0,
+        fetched_from_peer: 0,
         skipped: 0,
         failed: 0,
     };
@@ -84,6 +113,7 @@ pub async fn prefetch_indexes(
         &current_volume_id,
         None,
         &own_vk,
+        peer,
         &mut result,
     )
     .await?;
@@ -126,6 +156,7 @@ pub async fn prefetch_indexes(
             &parent.volume_ulid,
             Some(&parent.snapshot_ulid),
             &parent_vk,
+            peer,
             &mut result,
         )
         .await?;
@@ -179,6 +210,7 @@ pub async fn prefetch_indexes(
             &volume_id,
             ancestor.branch_ulid.as_deref(),
             &ancestor_vk,
+            peer,
             &mut result,
         )
         .await?;
@@ -193,6 +225,7 @@ async fn prefetch_fork(
     volume_id: &str,
     branch_ulid: Option<&str>,
     verifying_key: &VerifyingKey,
+    peer: Option<&PeerFetchContext>,
     result: &mut PrefetchResult,
 ) -> Result<()> {
     // Prefetch segment indexes from segments/ sub-prefix.
@@ -229,6 +262,27 @@ async fn prefetch_fork(
             continue;
         }
 
+        // Peer-fetch tier (best-effort): try the peer first if a context
+        // is available. On any failure path the loop falls through to the
+        // S3 fetch below; the peer is intentionally never blocking.
+        if let Some(peer_ctx) = peer
+            && let Some(ulid) = Ulid::from_string(ulid_str).ok()
+            && let Some(vol_ulid) = Ulid::from_string(volume_id).ok()
+        {
+            match peer_fetch_idx(peer_ctx, vol_ulid, ulid, fork_dir, ulid_str, verifying_key).await
+            {
+                Ok(()) => {
+                    info!("[prefetch] fetched index from peer: {ulid_str}");
+                    result.fetched += 1;
+                    result.fetched_from_peer += 1;
+                    continue;
+                }
+                Err(e) => {
+                    trace!("[prefetch] peer miss for {ulid_str}: {e:#}; falling through to S3");
+                }
+            }
+        }
+
         match fetch_idx(store, key, fork_dir, ulid_str, verifying_key).await {
             Ok(()) => {
                 info!("[prefetch] fetched index: {ulid_str}");
@@ -244,6 +298,41 @@ async fn prefetch_fork(
     // Prefetch snapshot markers and filemaps from snapshots/ sub-prefix.
     prefetch_snapshots(store, fork_dir, volume_id).await?;
 
+    Ok(())
+}
+
+/// Try to fetch a segment's `.idx` from the peer, verify its signature,
+/// and write it to `<fork_dir>/index/<ulid>.idx`.
+///
+/// Returns `Ok(())` on success. Any non-200 from the peer (404, auth
+/// failure, network error, timeout) bubbles up as `Err`, signalling
+/// "fall through to S3" — the caller never propagates this error
+/// further.
+async fn peer_fetch_idx(
+    peer: &PeerFetchContext,
+    vol_ulid: Ulid,
+    seg_ulid: Ulid,
+    fork_dir: &Path,
+    ulid_str: &str,
+    verifying_key: &VerifyingKey,
+) -> Result<()> {
+    let bytes = peer
+        .client
+        .fetch_idx(&peer.endpoint, &peer.volume_name, vol_ulid, seg_ulid)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("peer returned no bytes"))?;
+
+    // Verify before writing — a tampering peer is caught here and
+    // the caller falls through to S3 with no on-disk side effect.
+    elide_core::segment::verify_segment_bytes(&bytes, ulid_str, verifying_key)
+        .with_context(|| format!("verifying peer-served signature for {ulid_str}"))?;
+
+    let index_dir = fork_dir.join("index");
+    std::fs::create_dir_all(&index_dir).context("creating index dir")?;
+    let tmp_path = index_dir.join(format!("{ulid_str}.idx.tmp"));
+    let final_path = index_dir.join(format!("{ulid_str}.idx"));
+    std::fs::write(&tmp_path, &bytes).context("writing peer idx.tmp")?;
+    std::fs::rename(&tmp_path, &final_path).context("renaming peer idx.tmp")?;
     Ok(())
 }
 
@@ -442,7 +531,7 @@ mod tests {
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // Run prefetch_indexes on the child fork.
-        let result = prefetch_indexes(&child_dir, &store).await.unwrap();
+        let result = prefetch_indexes(&child_dir, &store, None).await.unwrap();
         assert_eq!(result.fetched, 1, "should fetch one .idx");
         assert_eq!(result.failed, 0);
 
@@ -456,7 +545,7 @@ mod tests {
         assert_eq!(entries[0].hash, hash);
 
         // Running again should skip (already present).
-        let result2 = prefetch_indexes(&child_dir, &store).await.unwrap();
+        let result2 = prefetch_indexes(&child_dir, &store, None).await.unwrap();
         assert_eq!(result2.fetched, 0);
         assert_eq!(result2.skipped, 1);
     }
@@ -530,7 +619,7 @@ mod tests {
         let key = StorePath::from(format!("by_id/{parent_ulid}/segments/19700101/{seg_ulid}"));
         store.put(&key, seg_bytes.into()).await.unwrap();
 
-        let result = prefetch_indexes(&child_dir, &store).await.unwrap();
+        let result = prefetch_indexes(&child_dir, &store, None).await.unwrap();
         assert_eq!(result.fetched, 1);
         assert_eq!(result.failed, 0);
 
@@ -590,7 +679,7 @@ mod tests {
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // prefetch_indexes should now fetch the root's own segment.
-        let result = prefetch_indexes(&root_dir, &store).await.unwrap();
+        let result = prefetch_indexes(&root_dir, &store, None).await.unwrap();
         assert_eq!(result.fetched, 1, "should fetch own .idx");
         assert_eq!(result.failed, 0);
 
@@ -643,7 +732,7 @@ mod tests {
             .unwrap();
 
         // Run prefetch — should download both snapshot marker and filemap.
-        let result = prefetch_indexes(&vol_dir, &store).await.unwrap();
+        let result = prefetch_indexes(&vol_dir, &store, None).await.unwrap();
         assert_eq!(result.failed, 0);
 
         let snap_dir = vol_dir.join("snapshots");
@@ -656,7 +745,65 @@ mod tests {
         assert_eq!(std::fs::read(&local_filemap).unwrap(), filemap_content);
 
         // Running again should skip (already present).
-        prefetch_indexes(&vol_dir, &store).await.unwrap();
+        prefetch_indexes(&vol_dir, &store, None).await.unwrap();
         // No error, no re-download.
+    }
+
+    /// `peer_fetch_idx` against an unreachable peer returns an error so
+    /// `prefetch_fork` falls through to S3. Covers the negative path
+    /// without requiring a live peer fixture (which the
+    /// `elide-peer-fetch::client` tests already exercise).
+    #[tokio::test]
+    async fn peer_fetch_idx_unreachable_returns_error() {
+        use elide_peer_fetch::PeerEndpoint;
+        use std::sync::Arc as StdArc;
+
+        #[derive(Debug)]
+        struct StubSigner;
+        impl elide_peer_fetch::TokenSigner for StubSigner {
+            fn coordinator_id(&self) -> &str {
+                "stub-coord"
+            }
+            fn sign(&self, _msg: &[u8]) -> [u8; 64] {
+                [0u8; 64]
+            }
+        }
+
+        let signer: StdArc<dyn elide_peer_fetch::TokenSigner> = StdArc::new(StubSigner);
+        let client = elide_peer_fetch::PeerFetchClient::builder(signer)
+            .request_timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+
+        let endpoint = PeerEndpoint::new("127.0.0.1".to_owned(), 1); // ECONNREFUSED
+
+        let peer_ctx = PeerFetchContext {
+            client,
+            endpoint,
+            volume_name: "any".to_owned(),
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let fork_dir = tmp.path().join("by_id").join("01ZZ00000000000000000000ZZ");
+        std::fs::create_dir_all(&fork_dir).unwrap();
+
+        let vol_ulid = Ulid::new();
+        let seg_ulid = Ulid::new();
+        let dummy_vk = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng).verifying_key();
+
+        let result = peer_fetch_idx(
+            &peer_ctx,
+            vol_ulid,
+            seg_ulid,
+            &fork_dir,
+            &seg_ulid.to_string(),
+            &dummy_vk,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "peer_fetch_idx should propagate error so the caller falls through to S3"
+        );
     }
 }

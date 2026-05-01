@@ -166,9 +166,13 @@ pub async fn latest_event_ulid(
 ///   1. Look up `prev_event_ulid` (best-effort — list failures fall
 ///      back to `None`, which produces a small audit gap rather
 ///      than blocking the emit).
-///   2. Mint a fresh `event_ulid` via `Ulid::new()`. Callers that
-///      need monotonicity guarantees across rapid back-to-back
-///      events should wrap this with a `UlidMint`.
+///   2. Mint a fresh `event_ulid`. When a `prev_event_ulid` was
+///      observed, seed a [`UlidMint`] with it so the new ULID is
+///      strictly greater — this guarantees monotonic ordering across
+///      rapid back-to-back emits within the same millisecond and
+///      across emits from different coordinators (each
+///      re-seeds from the latest S3 state). When no prior event
+///      exists, mint via `Ulid::new()` directly.
 ///   3. Build the `VolumeEvent` with `at` derived from the ULID.
 ///   4. Sign with `identity.signing_key()` over the canonical
 ///      payload.
@@ -193,7 +197,21 @@ pub async fn emit_event(
         }
     };
 
-    let event_ulid = Ulid::new();
+    // Seed a `UlidMint` from `prev_event_ulid` so the new event's
+    // ULID is strictly greater than the highest known event in the
+    // log. This is the architectural fix for the same-millisecond
+    // ordering race: two `Ulid::new()` calls within one ms produce
+    // ULIDs in random order, but `UlidMint::next()` advances the
+    // random portion when the clock hasn't moved past `last`. Cross-
+    // coordinator emits inherit the same property as long as each
+    // emitter re-seeds from S3 — which `latest_event_ulid` above does.
+    let event_ulid = match prev_event_ulid {
+        Some(prev) => {
+            let mut mint = elide_core::ulid_mint::UlidMint::new(prev);
+            mint.next()
+        }
+        None => Ulid::new(),
+    };
     let mut event = VolumeEvent::new(
         event_ulid,
         name.to_owned(),
@@ -441,6 +459,44 @@ mod tests {
             Some(first.event_ulid),
             "second event must reference the first"
         );
+    }
+
+    /// Regression for a same-millisecond ULID race that took down CI:
+    /// `Ulid::new()` is non-monotonic across two calls within one ms,
+    /// so back-to-back `emit_event` calls could produce events in
+    /// reverse ULID order — meaning `entries.last()` (which the
+    /// peer-discovery flow uses) returns the *first*-emitted event,
+    /// not the most recent.
+    ///
+    /// The fix lives in `emit_event`: seed a `UlidMint` with the
+    /// observed `prev_event_ulid` so the new ULID is strictly greater
+    /// than the highest event already in S3. This regression test
+    /// fires emits as fast as possible on a single thread — without
+    /// the mint, the failure shows up consistently inside the same
+    /// millisecond.
+    #[tokio::test]
+    async fn back_to_back_emits_are_strictly_monotonic() {
+        let s = store();
+        let (_tmp, id) = fresh_identity();
+
+        let mut last_ulid: Option<Ulid> = None;
+        // 32 emits with no awaits between minting calls — many of
+        // these will land within the same millisecond on a fast host
+        // (CI runners reliably).
+        for _ in 0..32 {
+            let ev = emit_event(&s, &id, "vol", EventKind::Created, vol_ulid())
+                .await
+                .expect("emit");
+            if let Some(prev) = last_ulid {
+                assert!(
+                    ev.event_ulid > prev,
+                    "event {} must be strictly greater than previous {}",
+                    ev.event_ulid,
+                    prev
+                );
+            }
+            last_ulid = Some(ev.event_ulid);
+        }
     }
 
     #[tokio::test]
