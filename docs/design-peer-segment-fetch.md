@@ -2,7 +2,7 @@
 
 **Status:** Exploration. No implementation. This doc captures the design discussion to date and the decisions that have landed; several pieces are intentionally left open.
 
-**v1 scope: `.idx` + `.present` only.** The first iteration fetches segment index files (`.idx`) and presence bitmaps (`.present`) from peers; body bytes are explicitly out of scope and continue to demand-fetch directly from S3. Both are small, full-file fetches (no range arithmetic), known up-front from ancestor walk, and exercise the entire stack: discovery, auth, transport, signature verification, S3 fallback. `.present` is fetched as an *advisory warming hint* — the peer's working-set shape — used to drive background byte-range prefetch from S3 after claim; it is never trusted as authoritative for local cache state. Whether to extend to peer body fetch is a downstream decision informed by what v1 surfaces. The body-fetch design is sketched below for context but is **not** v1.
+**v1 scope: `.idx` + `.prefetch` only.** The first iteration fetches segment index files (`.idx`) and *prefetch hints* (`.prefetch`) from peers; body bytes are explicitly out of scope and continue to demand-fetch directly from S3. Both are small, full-file fetches (no range arithmetic), known up-front from ancestor walk, and exercise the entire stack: discovery, auth, transport, signature verification, S3 fallback. `.prefetch` is an opaque hint — "these are byte ranges worth warming" — used to drive background Range-GETs from S3 after claim. The peer happens to synthesise it from its local `.present` bitmap, but the wire resource is intentionally a different name from the on-disk file: clients consume it as advice, never confuse it with authoritative cache state, and the peer is free to evolve the encoding later. Whether to extend to peer body fetch is a downstream decision informed by what v1 surfaces. The body-fetch design is sketched below for context but is **not** v1.
 
 ## Problem
 
@@ -31,9 +31,15 @@ A volume's local post-upload layout is per-segment (see `docs/formats.md`):
 
 - `index/<ulid>.idx` — header + index + inline; always retained
 - `cache/<ulid>.body` — sparse body file; body-relative offsets
-- `cache/<ulid>.present` — per-entry presence bitmap
+- `cache/<ulid>.present` — per-entry presence bitmap (local cache state, authoritative for *this* host)
 
-The peer exposes these directly. v1 serves `.idx` and `.present` only; `.body` (range-aware) is deferred.
+v1 wire resources:
+
+- `<ulid>.idx` — served verbatim from `index/<ulid>.idx`
+- `<ulid>.prefetch` — *prefetch hint*, derived from the peer's local `.present` (v1 returns its bytes as-is, but the format is the wire's, not the on-disk file's, and is free to evolve)
+- `.body` — deferred; not in v1
+
+The wire-level `.prefetch` name is deliberate: it tells the client "this is advice about what to warm," not "this is authoritative cache state." The new host's own `cache/<ulid>.present` is built from its own fetches, not copied from the peer.
 
 `pending/<ulid>` is **not** peer-eligible. Pending segments are not yet on S3, so a peer fetch that fell through to S3 fallback would fail. Only S3-promoted segments are served.
 
@@ -45,7 +51,7 @@ The peer's URL space is intentionally narrower than S3's. S3 paths embed `by_id/
 
 ```
 GET /v1/<vol_id>/<ulid>.idx
-GET /v1/<vol_id>/<ulid>.present
+GET /v1/<vol_id>/<ulid>.prefetch
 Authorization: Bearer <token>
 ```
 
@@ -55,37 +61,45 @@ On a hit, the peer returns 200 with bytes; on a miss (file not present locally),
 
 **No batch endpoint.** Concurrency comes from HTTP/2 multiplexing — many parallel GETs on one kept-alive connection. The multiplexing layer handles fan-out, partial failures stay per-request (each GET succeeds or 404s independently), and a future body-fetch route slots in as `GET /v1/<vol_id>/<ulid>.body` with a `Range:` header — same shape.
 
-### `.present` is a hint, not authoritative state
+### `.prefetch` is a hint, not authoritative state
 
-`.present` is per-host state: it reflects what *that host* has populated locally. Without it, the new coordinator only knows which LBAs are *mappable* (everything in the extent index after walking ancestor `.idx`s) — which for typical workloads is an order of magnitude larger than the working set actually touched (~2 GB image vs. ~130 MB boot working set per `findings.md`).
+The peer's local `.present` is per-host state: it reflects what *that host* has populated locally. Without something like it, the new coordinator only knows which LBAs are *mappable* (everything in the extent index after walking ancestor `.idx`s) — which for typical workloads is an order of magnitude larger than the working set actually touched (~2 GB image vs. ~130 MB boot working set per `findings.md`).
 
-The previous host's `.present` is the closest available signal to "what the workload actually used." It's not perfect:
+The wire `.prefetch` resource exposes that information as advice. v1 returns the peer's `.present` bytes verbatim because they happen to encode exactly the right set, but the wire name is deliberately different to keep three distinct things from collapsing:
+
+| | What it is | Trusted? |
+|---|---|---|
+| Peer's local `cache/<ulid>.present` | Authoritative cache state for the peer | By the peer, for its own reads |
+| Wire `<ulid>.prefetch` response | Advice: "these byte ranges are worth warming" | No |
+| New host's local `cache/<ulid>.present` | Authoritative cache state for the new host, built from its own fetches | By the new host, for its own reads |
+
+It's not a perfect signal:
 
 - Whole-segment fetches mark more bits than the guest touched.
 - Body-cache eviction can clear bits even though the guest accessed them earlier.
 - Speculative prefetch can mark bits the guest never read.
 
-But it is workload-shaped, free (already exists alongside `.idx` on the peer), and a strict superset of "guest accesses that survived in cache" — i.e. it captures the warm working set. v1 uses it solely to drive **background byte-range prefetch from S3** after `volume claim`: enumerate populated bits in the peer-fetched `.present`, issue Range GETs to S3 for those bytes, populate the new host's `cache/<ulid>.body`. The local `.present` is then built from the *new* host's actual fetches; the peer's `.present` is discarded.
+But it is workload-shaped, free (already exists in a usable form on the peer), and a strict superset of "guest accesses that survived in cache" — i.e. it captures the warm working set. v1 uses it solely to drive **background byte-range prefetch from S3** after `volume claim`: parse the hint, issue Range-GETs to S3 for the indicated bytes, populate the new host's `cache/<ulid>.body`. The new host's `cache/<ulid>.present` is then built from the bits it actually fetched — never from the wire response.
 
-If the peer has evicted body cache (so `.present` is all-zeros or absent), the hint degrades to "demand-fetch only" — same as no peer at all. That's a graceful floor, not a failure.
+If the peer has evicted body cache (so its `.present` is all-zeros or absent), the `.prefetch` response is empty or 404; the hint degrades to "demand-fetch only" — same as no peer at all. That's a graceful floor, not a failure.
 
-### Index + presence fetch (v1)
+### Index + prefetch-hint fetch (v1)
 
-The `.idx` files are small (~10–50 KB) and `.present` files are smaller still (one bit per chunk). B's cold-start prefetch already enumerates the full set of ULIDs it needs by walking each ancestor's lineage. The request set is fully known before fetching:
+The `.idx` files are small (~10–50 KB) and `.prefetch` responses are smaller still (one bit per chunk on the wire). B's cold-start prefetch already enumerates the full set of ULIDs it needs by walking each ancestor's lineage. The request set is fully known before fetching:
 
 ```
 For each reachable segment ULID not already on disk, in parallel on one HTTP/2 connection:
   GET /v1/<vol_id>/<ulid>.idx
     - 200 → write to index/<ulid>.idx; verify signature
     - 404 → fall back to S3
-  GET /v1/<vol_id>/<ulid>.present
-    - 200 → hold in memory as warming hint; enqueue background Range-GETs to S3 for populated bits
+  GET /v1/<vol_id>/<ulid>.prefetch
+    - 200 → hold response in memory as warming hint; enqueue background Range-GETs to S3 for the indicated bytes
     - 404 → no warming hint for this segment (peer has no body cache); demand-fetch only
 ```
 
-`.idx` is full-file (no Range needed; the segment's index section is the entire `.idx` file on disk). `.present` is also full-file. A "miss" on the peer is a `stat` of the local file; no I/O on miss, one read per hit.
+Both are full-file fetches — `.idx` is the whole on-disk file; `.prefetch` is the whole hint payload (which v1 happens to derive from the peer's `.present` verbatim). A "miss" on the peer is a `stat` of the relevant local file; no I/O on miss, one read per hit.
 
-Signature verification still happens caller-side per `.idx`, exactly as on the S3 path. Bytes from a peer are not trusted past byte level — a tampering peer is caught at verification and the fetch retries from S3. `.present` is never trusted as authoritative; it's a hint that drives subsequent S3 Range-GETs whose results *are* verified.
+Signature verification still happens caller-side per `.idx`, exactly as on the S3 path. Bytes from a peer are not trusted past byte level — a tampering peer is caught at verification and the fetch retries from S3. `.prefetch` is never trusted as authoritative; it's a hint that drives subsequent S3 Range-GETs whose results *are* verified, and the new host's local `.present` reflects only those verified fetches.
 
 #### What v1 should surface
 
@@ -99,7 +113,7 @@ If those signals are weak, body fetch is unlikely to justify its complexity. If 
 
 ### Body fetch (deferred — not v1)
 
-Once `.idx` + `.present` fetch is validated, the body-fetch extension uses the same peer-then-S3 tier with `Range:` covering the body-section bytes the read needs:
+Once `.idx` + `.prefetch` fetch is validated, the body-fetch extension uses the same peer-then-S3 tier with `Range:` covering the body-section bytes the read needs:
 
 ```
 GET /v1/<vol_id>/<ulid>.body
@@ -152,7 +166,7 @@ The peer's verify pipeline is five checks, each tied to a property the auth mode
 | 2 | Ed25519 signature valid against `coordinator.pub` | `coordinators/<token.coordinator_id>/coordinator.pub` from S3 | which coordinator is requesting |
 | 3 | `names/<token.volume_name>.coordinator_id == token.coordinator_id` | `names/<token.volume_name>` from S3 (ETag-conditional) | the requesting coordinator currently owns/claims this volume |
 | 4 | URL `vol_id` ∈ ancestry(`token.volume_name`) | walk `volume.provenance` chain from S3 starting at `names/<volume_name>.vol_ulid` | `vol_id` is in the requesting volume's signed lineage |
-| 5 | `index/<ulid>.idx` (or `.present`) exists locally under `vol_id` | local fs | `ulid` is a segment of `vol_id` (implicit — falls out as 404) |
+| 5 | `index/<ulid>.idx` (or `cache/<ulid>.present`) exists locally under `vol_id` | local fs | `ulid` is a segment of `vol_id` (implicit — falls out as 404) |
 
 Failures map to status codes: 1–3 fail → 401 (bad credentials); 4 fails → 403 (out of authorised lineage); 5 fails → 404. Distinguishing 403 from 404 is fine here — there is no information leak (the requester has the lineage walk in hand and could derive the answer themselves).
 
@@ -250,9 +264,9 @@ Embedding the endpoint in the `released` event itself is an alternative but ties
 
 ## Out of scope for v1
 
-- **Peer body fetch.** Body bytes still go direct to S3 in v1. The `.present` warming hint drives those S3 Range-GETs after claim, but the bytes themselves don't traverse the peer.
-- **Release-time hint artifact.** An earlier draft proposed writing a per-segment populated-bitmap object to S3 at release time so B could drive proactive prefetch. Dropped in favour of fetching `.present` directly from the peer at claim time — same hint quality, no new S3 artifact, no write-path step.
-- **Cache retention policy on the source host.** A's `cache/<ulid>.{body,present}` may be evicted while B is still fetching. Peer `.present` fetch degrades gracefully (404 on missing files; warming hint absent for that segment). Smarter retention (release-grace window, refcount across volumes) is a future improvement.
+- **Peer body fetch.** Body bytes still go direct to S3 in v1. The `.prefetch` warming hint drives those S3 Range-GETs after claim, but the bytes themselves don't traverse the peer.
+- **Release-time hint artifact.** An earlier draft proposed writing a per-segment populated-bitmap object to S3 at release time so B could drive proactive prefetch. Dropped in favour of fetching `.prefetch` directly from the peer at claim time — same hint quality, no new S3 artifact, no write-path step.
+- **Cache retention policy on the source host.** A's `cache/<ulid>.{body,present}` may be evicted while B is still fetching. The peer's `.prefetch` response degrades gracefully (404 when the underlying state is gone; warming hint absent for that segment). Smarter retention (release-grace window, refcount across volumes) is a future improvement.
 - **Per-coordinator rate-limiting / blacklist.** The auth model exposes `coordinator_id` on every request, so behaviour-based defences are cheap drop-ins later. v1 ships with no rate-limit; the LAN-only deployment model and the lineage check together bound the abuse surface enough to defer.
 - **Multi-source peer fanout.** "Fetch from any of these N peers, take whoever responds first." Useful for image pull at scale; defer.
 - **Multi-tenant peer.** A single peer process serving multiple buckets under different cred scopes. Out of scope until per-host coordinators serve more than one bucket.
@@ -262,4 +276,4 @@ Embedding the endpoint in the `released` event itself is an alternative but ties
 1. **Hedging vs strict fall-through.** Should B try the peer first and fall back only on miss/timeout, or hedge-fire S3 after a short delay? Hedging has the best worst-case latency at the cost of duplicated request volume when the peer is slow. Probably not v1.
 2. **Maximal-prefix on partial body coverage.** When body fetch lands, the proposal returns the longest contiguous covered prefix of the requested range. Worth empirical confirmation that this beats the alternatives (404 the whole thing; serve the largest covered sub-range regardless of position) for typical cache shapes.
 3. **Discovery for image pull.** Out of scope until handoff lands, but worth a sketch eventually so the wire doesn't paint us into a corner.
-4. **`.present` hint shape on the wire.** v1 returns the file as-is (the on-disk bitmap format). A future protocol bump could compress or summarise (e.g. run-length encoding of populated extents), but the file is small enough that this is unlikely to matter in practice.
+4. **`.prefetch` payload shape on the wire.** v1 returns the peer's on-disk `.present` bytes as-is. A future protocol bump could compress, summarise (RLE of populated extents), or restrict to only the LBAs the requesting volume actually maps in its extent index. The payload is small enough today that none of this is likely to matter, but the wire/file decoupling means we can change the encoding without renaming the resource.
