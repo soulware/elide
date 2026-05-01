@@ -1492,9 +1492,8 @@ fn create_fork(
             if dir.exists() {
                 dir
             } else {
-                let config = load_fetch_config(socket_path, data_dir, &ulid_str)?;
                 eprintln!("pulling {ulid_str} from remote store...");
-                remote_pull(&config, from, data_dir, socket_path)?;
+                remote_pull(from, data_dir, socket_path)?;
                 let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
                 if !dir.exists() {
                     return Err(std::io::Error::other(format!(
@@ -1510,16 +1509,11 @@ fn create_fork(
             if local.exists() {
                 local
             } else {
-                // Name not found locally — try the remote store.
-                let config = load_fetch_config_for_name(socket_path, data_dir, from)?;
+                // Name not found locally — ask the coordinator to resolve
+                // it and pull the chain.
                 eprintln!("pulling '{from}' from remote store...");
-                remote_pull(&config, from, data_dir, socket_path)?;
-                // remote_pull resolved the name to a ULID and pulled into
-                // by_id/<ulid>/. Find it by re-resolving the pull spec.
-                let store = elide::build_object_store(&config)
-                    .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
-                let rt = tokio::runtime::Runtime::new()?;
-                let ulid_str = resolve_pull_spec(&rt, &*store, from)?;
+                remote_pull(from, data_dir, socket_path)?;
+                let ulid_str = coordinator_client::resolve_name(socket_path, from)?.to_string();
                 let dir = volume::resolve_ancestor_dir(by_id_dir, &ulid_str);
                 if !dir.exists() {
                     return Err(std::io::Error::other(format!(
@@ -1576,10 +1570,12 @@ fn create_fork(
             } else if let Some(snap) = volume::latest_snapshot(&source_fork_dir)? {
                 Some(snap)
             } else {
-                let config = load_fetch_config(socket_path, data_dir, &source_ulid_str)?;
-                match resolve_latest_remote_snapshot(&config, &source_ulid_str) {
-                    Ok(snap) => Some(snap),
-                    Err(_) => {
+                let vol_ulid = ulid::Ulid::from_string(&source_ulid_str).map_err(|e| {
+                    std::io::Error::other(format!("invalid source ULID {source_ulid_str}: {e}"))
+                })?;
+                match coordinator_client::latest_snapshot(socket_path, vol_ulid)? {
+                    Some(snap) => Some(snap),
+                    None => {
                         return Err(std::io::Error::other(format!(
                             "source volume {source_ulid_str} has no snapshots; pass \
                              --force-snapshot to upload a new 'now' marker"
@@ -1793,9 +1789,8 @@ fn orchestrate_foreign_claim(
 
     let source_dir = volume::resolve_ancestor_dir(by_id_dir, released_vol_ulid);
     if !source_dir.exists() {
-        let config = load_fetch_config(socket_path, data_dir, released_vol_ulid)?;
         eprintln!("pulling {released_vol_ulid} from remote store...");
-        remote_pull(&config, &from, data_dir, socket_path)?;
+        remote_pull(&from, data_dir, socket_path)?;
         if !volume::resolve_ancestor_dir(by_id_dir, released_vol_ulid).exists() {
             return Err(std::io::Error::other(format!(
                 "source volume {released_vol_ulid} not found in remote store"
@@ -1904,86 +1899,6 @@ fn resolve_local_volume_ulid(data_dir: &Path, name: &str) -> Option<String> {
     Some(ulid::Ulid::from_string(last).ok()?.to_string())
 }
 
-/// Ask a running coordinator for its store config and (for S3) credentials.
-///
-/// Returns `Ok(Some(_))` when the coordinator is reachable and provided a
-/// usable config. Returns `Ok(None)` when no coordinator is running at
-/// `socket_path` — callers should fall back to `FetchConfig::load` in that
-/// case. Returns an error when the coordinator IS running but reported an
-/// error (e.g. `get-store-creds` failed because the coordinator's env has
-/// no AWS credentials) — that's an operator-visible misconfiguration and
-/// falling back would silently paper over it.
-///
-/// On success for an S3 store, exports `AWS_ACCESS_KEY_ID`,
-/// `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN` into this
-/// process's env so `rust-s3`'s default credential chain picks them up when
-/// building the fetcher.
-fn fetch_config_via_coordinator(
-    socket_path: &Path,
-) -> std::io::Result<Option<elide_fetch::FetchConfig>> {
-    if !socket_path.exists() {
-        return Ok(None);
-    }
-    let config = match coordinator_client::get_store_config(socket_path) {
-        Ok(c) => c,
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-    if let Some(path) = config.local_path {
-        return Ok(Some(elide_fetch::FetchConfig {
-            bucket: None,
-            endpoint: None,
-            region: None,
-            local_path: Some(path),
-            fetch_batch_bytes: None,
-        }));
-    }
-    let Some(bucket) = config.bucket else {
-        return Err(std::io::Error::other(
-            "coordinator returned empty store config",
-        ));
-    };
-    let creds = coordinator_client::get_store_creds(socket_path)?;
-    // SAFETY: CLI startup is single-threaded at this point — no background
-    // tasks have been spawned, so there are no concurrent env readers.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
-        if let Some(tok) = &creds.session_token {
-            std::env::set_var("AWS_SESSION_TOKEN", tok);
-        } else {
-            std::env::remove_var("AWS_SESSION_TOKEN");
-        }
-    }
-    Ok(Some(elide_fetch::FetchConfig {
-        bucket: Some(bucket),
-        endpoint: config.endpoint,
-        region: config.region,
-        local_path: None,
-        fetch_batch_bytes: None,
-    }))
-}
-
-/// Resolve the fetch config: try the running coordinator first, then fall
-/// back to `FetchConfig::load` (which reads `fetch.toml`, `ELIDE_S3_BUCKET`,
-/// or `./elide_store`). Returns `Ok(None)` if no source is available.
-fn resolve_fetch_config(
-    socket_path: &Path,
-    data_dir: &Path,
-) -> std::io::Result<Option<elide_fetch::FetchConfig>> {
-    if let Some(cfg) = fetch_config_via_coordinator(socket_path)? {
-        return Ok(Some(cfg));
-    }
-    elide_fetch::FetchConfig::load(data_dir)
-}
-
 /// Resolve the fetch config for a volume subprocess (`serve-volume`).
 ///
 /// The coordinator exports `ELIDE_COORDINATOR_SOCKET` into each spawned
@@ -2006,10 +1921,10 @@ fn resolve_volume_fetch_config(
     elide_fetch::FetchConfig::load(fork_dir)
 }
 
-/// Volume-side counterpart to `fetch_config_via_coordinator` that uses the
-/// PID-bound macaroon handshake instead of the unauthenticated
-/// `get-store-creds`. The CLI keeps using `get-store-creds` because it
-/// is not a spawned volume process and has no entry in `volume.pid`.
+/// Pull store config + macaroon-scoped S3 credentials from the
+/// coordinator over IPC. The CLI itself never holds raw S3 credentials
+/// — only spawned volume subprocesses can authenticate (PID-bound via
+/// SO_PEERCRED) and obtain creds for demand-fetch.
 fn fetch_config_via_coordinator_macaroon(
     socket_path: &Path,
     volume_ulid: &str,
@@ -2063,87 +1978,6 @@ fn fetch_config_via_coordinator_macaroon(
         local_path: None,
         fetch_batch_bytes: None,
     }))
-}
-
-/// Load the fetch config, or return a clear error mentioning the volume ULID.
-fn load_fetch_config(
-    socket_path: &Path,
-    data_dir: &Path,
-    ulid_str: &str,
-) -> std::io::Result<elide_fetch::FetchConfig> {
-    match resolve_fetch_config(socket_path, data_dir) {
-        Ok(Some(c)) => Ok(c),
-        Ok(None) => Err(std::io::Error::other(format!(
-            "source volume {ulid_str} not found locally and no store configured for remote pull"
-        ))),
-        Err(e) => Err(std::io::Error::other(format!(
-            "source volume {ulid_str} not found locally; failed to load store config: {e}"
-        ))),
-    }
-}
-
-/// Load the fetch config, or return a clear error mentioning a volume name.
-fn load_fetch_config_for_name(
-    socket_path: &Path,
-    data_dir: &Path,
-    name: &str,
-) -> std::io::Result<elide_fetch::FetchConfig> {
-    match resolve_fetch_config(socket_path, data_dir) {
-        Ok(Some(c)) => Ok(c),
-        Ok(None) => Err(std::io::Error::other(format!(
-            "volume '{name}' not found locally and no store configured for remote pull"
-        ))),
-        Err(e) => Err(std::io::Error::other(format!(
-            "volume '{name}' not found locally; failed to load store config: {e}"
-        ))),
-    }
-}
-
-/// Query the remote store for the latest snapshot of a volume.
-///
-/// Lists `by_id/<volume_id>/snapshots/` and returns the maximum snapshot ULID.
-/// Filemaps (filenames containing `.`) are filtered out.
-fn resolve_latest_remote_snapshot(
-    config: &elide_fetch::FetchConfig,
-    volume_id: &str,
-) -> std::io::Result<ulid::Ulid> {
-    use object_store::path::Path as StorePath;
-
-    let store = elide::build_object_store(config)
-        .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
-    let rt = tokio::runtime::Runtime::new()?;
-
-    let prefix = StorePath::from(format!("by_id/{volume_id}/snapshots/"));
-    let objects: Vec<object_store::ObjectMeta> =
-        rt.block_on(async {
-            use futures::TryStreamExt;
-            store.list(Some(&prefix)).try_collect().await.map_err(|e| {
-                std::io::Error::other(format!("listing snapshots for {volume_id}: {e}"))
-            })
-        })?;
-
-    let mut latest: Option<ulid::Ulid> = None;
-    for obj in &objects {
-        let Some(name) = obj.location.filename() else {
-            continue;
-        };
-        if name.contains('.') {
-            continue;
-        }
-        if let Ok(ulid) = ulid::Ulid::from_string(name) {
-            latest = Some(match latest {
-                Some(prev) if ulid > prev => ulid,
-                Some(prev) => prev,
-                None => ulid,
-            });
-        }
-    }
-
-    latest.ok_or_else(|| {
-        std::io::Error::other(format!(
-            "volume {volume_id} has no snapshots in the remote store"
-        ))
-    })
 }
 
 /// Pretty-print a `StatusRemoteReply` for `elide volume status --remote`.
@@ -2271,25 +2105,18 @@ fn print_remote_status(name: &str, rs: &coordinator_client::StatusRemoteReply) {
 /// for every parent ULID not already present in `by_id/`, its ancestor
 /// entry is pulled too. Encountering a mid-chain ancestor that is already
 /// local terminates the walk — the local copy is authoritative.
-fn remote_pull(
-    config: &elide_fetch::FetchConfig,
-    spec: &str,
-    data_dir: &Path,
-    socket_path: &Path,
-) -> std::io::Result<()> {
-    let store = elide::build_object_store(config)
-        .map_err(|e| std::io::Error::other(format!("store: {e}")))?;
-    let rt = tokio::runtime::Runtime::new()?;
-
-    // Step 1: parse `spec` and resolve to a root ULID to pull.
-    let root_ulid = resolve_pull_spec(&rt, &*store, spec)?;
+fn remote_pull(spec: &str, data_dir: &Path, socket_path: &Path) -> std::io::Result<()> {
+    // Step 1: resolve `spec` to the root ULID to pull. Names are resolved
+    // by the coordinator over `ResolveName` IPC; ULID forms are parsed
+    // locally. The CLI never talks to S3.
+    let root_ulid = resolve_pull_spec(socket_path, spec)?;
 
     // Step 2: walk the ancestor chain, pulling each ancestor that isn't
-    // already local. Start from the requested volume; after each pull, parse
-    // its downloaded provenance to find the next parent. The actual write
-    // is delegated to the coordinator's `pull-readonly` IPC so the
-    // root-owned by_id/ tree is written by the coordinator process, not
-    // the (possibly non-root) CLI.
+    // already local. The actual fetch + write is delegated to the
+    // coordinator's `pull-readonly` IPC: the coordinator does the S3 GET,
+    // verifies the provenance, writes the root-owned `by_id/<ulid>/`
+    // tree, and returns the parent ULID parsed from the verified
+    // provenance.
     let mut pulled: Vec<String> = Vec::new();
     let mut next: Option<String> = Some(root_ulid);
     while let Some(ulid_str) = next.take() {
@@ -2325,13 +2152,9 @@ fn remote_pull(
 /// forms the snapshot portion is validated but discarded — this function
 /// only decides *which volume* to pull; the snapshot ULID is a pinning
 /// concern for the caller (`volume create --from`), not for pull itself.
-fn resolve_pull_spec(
-    rt: &tokio::runtime::Runtime,
-    store: &dyn object_store::ObjectStore,
-    spec: &str,
-) -> std::io::Result<String> {
-    use object_store::path::Path as StorePath;
-
+/// Name resolution is delegated to the coordinator over `ResolveName`
+/// IPC so the CLI never builds an S3 client of its own.
+fn resolve_pull_spec(socket_path: &Path, spec: &str) -> std::io::Result<String> {
     if let Some((vol, snap)) = spec.split_once('/') {
         let vol = ulid::Ulid::from_string(vol)
             .map_err(|e| std::io::Error::other(format!("invalid volume ULID in spec: {e}")))?;
@@ -2343,25 +2166,9 @@ fn resolve_pull_spec(
         return Ok(vol.to_string());
     }
 
-    // Fallback: treat `spec` as a name and resolve via `names/<name>`.
     validate_volume_name(spec)?;
-    let name_key = StorePath::from(format!("names/{spec}"));
-    let raw = rt.block_on(async {
-        let data = store.get(&name_key).await.map_err(|e| match e {
-            object_store::Error::NotFound { .. } => {
-                std::io::Error::other(format!("volume '{spec}' not found in store"))
-            }
-            e => std::io::Error::other(format!("reading names/{spec}: {e}")),
-        })?;
-        data.bytes()
-            .await
-            .map_err(|e| std::io::Error::other(format!("reading names/{spec}: {e}")))
-    })?;
-    let body = std::str::from_utf8(&raw)
-        .map_err(|e| std::io::Error::other(format!("names/{spec}: {e}")))?;
-    let record = elide_core::name_record::NameRecord::from_toml(body)
-        .map_err(|e| std::io::Error::other(format!("parsing names/{spec}: {e}")))?;
-    Ok(record.vol_ulid.to_string())
+    let vol_ulid = coordinator_client::resolve_name(socket_path, spec)?;
+    Ok(vol_ulid.to_string())
 }
 
 /// Return `true` if a local copy of `<ulid>` exists.

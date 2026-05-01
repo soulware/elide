@@ -36,9 +36,9 @@ use elide_coordinator::eligibility::Eligibility;
 use elide_coordinator::ipc::{
     self, ClaimReply, CreateReply, Envelope, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
     GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcError,
-    PullReadonlyReply, RebindNameReply, RegisterReply, ReleaseReply, Request,
-    ResolveHandoffKeyReply, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
-    StoreCredsReply, UpdateReply, VolumeEventsReply,
+    LatestSnapshotReply, PullReadonlyReply, RebindNameReply, RegisterReply, ReleaseReply, Request,
+    ResolveHandoffKeyReply, ResolveNameReply, SnapshotReply, StatusRemoteReply, StatusReply,
+    StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventsReply,
 };
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE, STOPPED_FILE};
 use elide_coordinator::{
@@ -386,8 +386,14 @@ async fn dispatch_json(
             let env: Envelope<StoreConfigReply> = Envelope::ok(reply);
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::GetStoreCreds => {
-            let env: Envelope<StoreCredsReply> = render_store_creds().into();
+        Request::ResolveName { name } => {
+            let result = resolve_name_op(&name, &ctx.store).await;
+            let env: Envelope<ResolveNameReply> = result.into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::LatestSnapshot { vol_ulid } => {
+            let result = latest_snapshot_op(vol_ulid, &ctx.store).await;
+            let env: Envelope<LatestSnapshotReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Register { volume_ulid } => {
@@ -437,34 +443,57 @@ fn render_store_config(store: &StoreSection) -> StoreConfigReply {
     }
 }
 
-/// Read AWS env-creds. Errors if the coordinator's env has no
-/// credentials — callers should treat that as fatal rather than
-/// silently swap in their own env.
-fn render_store_creds() -> Result<StoreCredsReply, IpcError> {
-    let ak = match std::env::var("AWS_ACCESS_KEY_ID") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            return Err(IpcError::not_found(
-                "no credentials configured in coordinator env",
-            ));
+/// Resolve `names/<name>` in the bucket and return the bound `vol_ulid`.
+/// Errors NotFound when the name has no S3 record.
+async fn resolve_name_op(
+    name: &str,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<ResolveNameReply, IpcError> {
+    validate_volume_name(name).map_err(IpcError::bad_request)?;
+    match elide_coordinator::name_store::read_name_record(store, name).await {
+        Ok(Some((rec, _))) => Ok(ResolveNameReply {
+            vol_ulid: rec.vol_ulid,
+        }),
+        Ok(None) => Err(IpcError::not_found(format!(
+            "volume '{name}' not found in store"
+        ))),
+        Err(e) => Err(IpcError::store(format!("reading names/{name}: {e}"))),
+    }
+}
+
+/// LIST `by_id/<vol_ulid>/snapshots/` and return the highest snapshot
+/// ULID. Filemap and manifest siblings (filenames containing `.`) are
+/// filtered out so only the bare snapshot markers contribute.
+async fn latest_snapshot_op(
+    vol_ulid: ulid::Ulid,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<LatestSnapshotReply, IpcError> {
+    use futures::TryStreamExt;
+    use object_store::path::Path as StorePath;
+
+    let prefix = StorePath::from(format!("by_id/{vol_ulid}/snapshots/"));
+    let objects: Vec<object_store::ObjectMeta> = store
+        .list(Some(&prefix))
+        .try_collect()
+        .await
+        .map_err(|e| IpcError::store(format!("listing by_id/{vol_ulid}/snapshots/: {e}")))?;
+
+    let mut latest: Option<ulid::Ulid> = None;
+    for obj in objects {
+        let Some(filename) = obj.location.filename() else {
+            continue;
+        };
+        if filename.contains('.') {
+            continue;
         }
-    };
-    let sk = match std::env::var("AWS_SECRET_ACCESS_KEY") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            return Err(IpcError::internal(
-                "AWS_ACCESS_KEY_ID set but AWS_SECRET_ACCESS_KEY missing",
-            ));
+        if let Ok(u) = ulid::Ulid::from_string(filename)
+            && latest.is_none_or(|cur| u > cur)
+        {
+            latest = Some(u);
         }
-    };
-    let session_token = std::env::var("AWS_SESSION_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty());
-    Ok(StoreCredsReply {
-        access_key_id: ak,
-        secret_access_key: sk,
-        session_token,
-        expiry_unix: None,
+    }
+    Ok(LatestSnapshotReply {
+        snapshot_ulid: latest,
     })
 }
 

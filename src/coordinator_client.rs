@@ -18,16 +18,16 @@ use serde::Deserialize;
 pub use elide_coordinator::ipc::{
     ClaimReply, CreateReply, EvictReply, ForceSnapshotNowReply, ForkCreateReply,
     GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply, IpcErrorKind,
-    PullReadonlyReply, RebindNameReply, RegisterReply, ReleaseReply, ResolveHandoffKeyReply,
-    SignatureStatus, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
-    StoreCredsReply, UpdateReply, VolumeEventEntry, VolumeEventsReply,
+    LatestSnapshotReply, PullReadonlyReply, RebindNameReply, RegisterReply, ReleaseReply,
+    ResolveHandoffKeyReply, ResolveNameReply, SignatureStatus, SnapshotReply, StatusRemoteReply,
+    StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply, VolumeEventEntry,
+    VolumeEventsReply,
 };
 
-/// Backwards-compatible aliases for the public client API. The
-/// underlying types now live in `elide_coordinator::ipc` so server
-/// and client share the wire shape; the alias re-exports keep the
-/// `coordinator_client::StoreConfig` / `StoreCreds` names that
-/// callers throughout the workspace already use.
+/// Public-API aliases for the client side. The underlying types live
+/// in `elide_coordinator::ipc` so server and client share the wire
+/// shape; the aliases preserve the `coordinator_client::StoreConfig` /
+/// `StoreCreds` names used by the volume-subprocess macaroon flow.
 pub type StoreConfig = StoreConfigReply;
 pub type StoreCreds = StoreCredsReply;
 pub use elide_coordinator::volume_state::VolumeLifecycle;
@@ -72,16 +72,34 @@ pub fn is_reachable(socket_path: &Path) -> bool {
 }
 
 /// Ask the coordinator for its non-secret store config (bucket, endpoint,
-/// region, or local_path). This is the static counterpart to
-/// `get_store_creds`.
+/// region, or local_path). Used by spawned volume subprocesses (over the
+/// macaroon handshake) to build an object_store that matches the
+/// coordinator's view; the CLI itself never builds an object_store.
 pub fn get_store_config(socket_path: &Path) -> io::Result<StoreConfig> {
     call_typed(socket_path, &Request::GetStoreConfig)?.map_err(io::Error::other)
 }
 
-/// Ask the coordinator for S3 credentials (long-lived today, macaroon-scoped
-/// later). Errors if the coordinator's env has no credentials configured.
-pub fn get_store_creds(socket_path: &Path) -> io::Result<StoreCreds> {
-    call_typed(socket_path, &Request::GetStoreCreds)?.map_err(io::Error::other)
+/// Resolve a volume name to its current `vol_ulid` via the coordinator.
+/// The coordinator performs the bucket-side `names/<name>` lookup; the CLI
+/// holds no S3 credentials.
+pub fn resolve_name(socket_path: &Path, name: &str) -> io::Result<ulid::Ulid> {
+    let reply: ResolveNameReply = call_typed(
+        socket_path,
+        &Request::ResolveName {
+            name: name.to_owned(),
+        },
+    )?
+    .map_err(io::Error::other)?;
+    Ok(reply.vol_ulid)
+}
+
+/// Return the highest snapshot ULID under `by_id/<vol_ulid>/snapshots/`,
+/// or `None` if the volume has no snapshots in the store.
+pub fn latest_snapshot(socket_path: &Path, vol_ulid: ulid::Ulid) -> io::Result<Option<ulid::Ulid>> {
+    let reply: LatestSnapshotReply =
+        call_typed(socket_path, &Request::LatestSnapshot { vol_ulid })?
+            .map_err(io::Error::other)?;
+    Ok(reply.snapshot_ulid)
 }
 
 /// Default budget for [`await_prefetch`]. Longer than `OPEN_RETRY_BUDGET`
@@ -835,6 +853,55 @@ mod tests {
         assert_eq!(reply.state, NameState::Live);
         assert_eq!(reply.coordinator_id.as_deref(), Some("coord-self"));
         assert_eq!(reply.eligibility, Eligibility::Owned);
+    }
+
+    /// resolve-name: client sends `{"verb":"resolve-name","name":"vol"}`,
+    /// server returns the bound `vol_ulid`. Confirms the typed reply
+    /// round-trips and the helper unwraps the ULID directly.
+    #[test]
+    fn resolve_name_round_trips_typed_envelope() {
+        let (_guard, sock) = temp_socket();
+        let body = r#"{"outcome":"ok","data":{"vol_ulid":"01J0000000000000000000000V"}}"#;
+        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
+        let vol_ulid = resolve_name(&sock, "vol").expect("resolve-name should succeed");
+        server.join().unwrap();
+        assert_eq!(vol_ulid.to_string(), "01J0000000000000000000000V");
+    }
+
+    /// resolve-name: NotFound from the coordinator surfaces as a
+    /// transport-level `Err` whose message preserves the typed reason.
+    #[test]
+    fn resolve_name_propagates_not_found() {
+        let (_guard, sock) = temp_socket();
+        let body = r#"{"outcome":"err","error":{"kind":"not-found","message":"volume 'ghost' not found in store"}}"#;
+        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, body);
+        let err = resolve_name(&sock, "ghost").expect_err("ghost name should error");
+        server.join().unwrap();
+        assert!(err.to_string().contains("not found in store"), "{err}");
+    }
+
+    /// latest-snapshot: with a populated reply, the helper returns
+    /// `Some(ulid)`. The empty-store case (`snapshot_ulid: null`)
+    /// returns `None` so the caller can produce a clean error message.
+    #[test]
+    fn latest_snapshot_round_trips_some_and_none() {
+        let (_guard, sock) = temp_socket();
+        let some_body = r#"{"outcome":"ok","data":{"snapshot_ulid":"01J0000000000000000000000V"}}"#;
+        let server = spawn_one_shot_server(sock.clone(), Duration::ZERO, some_body);
+        let vol = ulid::Ulid::from_string("01J9999999999999999999999V").unwrap();
+        let reply = latest_snapshot(&sock, vol).expect("call should succeed");
+        server.join().unwrap();
+        assert_eq!(
+            reply.map(|u| u.to_string()).as_deref(),
+            Some("01J0000000000000000000000V"),
+        );
+
+        let (_guard2, sock2) = temp_socket();
+        let none_body = r#"{"outcome":"ok","data":{}}"#;
+        let server2 = spawn_one_shot_server(sock2.clone(), Duration::ZERO, none_body);
+        let reply = latest_snapshot(&sock2, vol).expect("call should succeed");
+        server2.join().unwrap();
+        assert!(reply.is_none());
     }
 
     /// Typed errors come back as `Err` with the kind preserved.
