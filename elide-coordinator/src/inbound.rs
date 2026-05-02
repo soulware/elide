@@ -1275,42 +1275,59 @@ async fn create_volume_op(
     let vol_ulid_str = vol_ulid.to_string();
     let vol_dir = data_dir.join("by_id").join(&vol_ulid_str);
 
-    // Phase 1: create the local volume directory and signing key. We need
-    // `volume.pub` on disk before we can upload it, and we want the
-    // upload to land in S3 *before* `names/<name>` so the invariant
-    // "every named vol_ulid has volume.pub in the bucket" holds across
-    // crashes. A SIGINT before the upload leaves only local-disk state,
-    // which `cleanup_local` rolls back.
+    // Phase 1: create the local volume directory, signing key, and
+    // signed empty-lineage `volume.provenance`. Both immutable trust
+    // artefacts must exist on disk before Phase 2 uploads them, and
+    // both must land in S3 *before* `names/<name>` so the invariant
+    // "every named vol_ulid has volume.pub *and* volume.provenance in
+    // the bucket" holds across crashes. A SIGINT before the upload
+    // leaves only local-disk state, which `cleanup_local` rolls back.
     let cleanup_local = || {
         let _ = std::fs::remove_file(by_name_dir.join(name));
         let _ = std::fs::remove_dir_all(&vol_dir);
     };
-    let signing_key = match (|| {
+    if let Err(e) = (|| {
         std::fs::create_dir_all(&vol_dir)?;
         std::fs::create_dir_all(vol_dir.join("pending"))?;
         std::fs::create_dir_all(vol_dir.join("index"))?;
         std::fs::create_dir_all(vol_dir.join("cache"))?;
-        elide_core::signing::generate_keypair(
+        let key = elide_core::signing::generate_keypair(
             &vol_dir,
             elide_core::signing::VOLUME_KEY_FILE,
             elide_core::signing::VOLUME_PUB_FILE,
-        )
+        )?;
+        elide_core::signing::write_provenance(
+            &vol_dir,
+            &key,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            &elide_core::signing::ProvenanceLineage::default(),
+        )?;
+        Ok::<_, std::io::Error>(())
     })() {
-        Ok(k) => k,
-        Err(e) => {
-            cleanup_local();
-            return Err(IpcError::internal(format!("create failed: {e}")));
-        }
-    };
+        cleanup_local();
+        return Err(IpcError::internal(format!("create failed: {e}")));
+    }
 
-    // Phase 2: publish volume.pub to S3. A SIGINT here at worst leaves an
-    // orphan `by_id/<vol_ulid>/volume.pub` (no names/<name> references it,
-    // so it's harmless and GC-reclaimable).
+    // Phase 2: publish volume.pub *and* volume.provenance to S3
+    // *before* claiming the name. Both files are immutable. A SIGINT
+    // here at worst leaves orphan
+    // `by_id/<vol_ulid>/{volume.pub, volume.provenance}` (no
+    // names/<name> references them, so they're harmless and
+    // GC-reclaimable).
     if let Err(e) =
         elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, &vol_ulid_str, store).await
     {
         cleanup_local();
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
+    }
+    if let Err(e) =
+        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, &vol_ulid_str, store)
+            .await
+    {
+        cleanup_local();
+        return Err(IpcError::store(format!(
+            "uploading volume.provenance: {e:#}"
+        )));
     }
 
     // Phase 3: claim the name in S3. After this point the names/<name>
@@ -1362,14 +1379,10 @@ async fn create_volume_op(
         }
     }
 
-    // Phase 4: finish local state (provenance, config, by_name symlink).
+    // Phase 4: finish local state (config + by_name symlink).
+    // Provenance was already written in Phase 1 so it could be
+    // uploaded in Phase 2 ahead of the names/<name> claim.
     let result: std::io::Result<()> = (|| {
-        elide_core::signing::write_provenance(
-            &vol_dir,
-            &signing_key,
-            elide_core::signing::VOLUME_PROVENANCE_FILE,
-            &elide_core::signing::ProvenanceLineage::default(),
-        )?;
         elide_core::config::VolumeConfig {
             name: Some(name.to_owned()),
             size: Some(size_bytes),
@@ -1943,20 +1956,36 @@ async fn fork_create_op(
         return Err(IpcError::internal(format!("fork failed: {e}")));
     }
 
-    // Phase 2: publish volume.pub to S3 *before* claiming the name.
-    // A SIGINT here at worst leaves an orphan
-    // `by_id/<new_vol_ulid>/volume.pub` (no names/<name> references it,
-    // so it's harmless). Without this ordering, a crash between
-    // mark_initial and the daemon's first metadata-drain leaves
-    // `names/<name>` pointing at a vol_ulid whose volume.pub is
-    // missing — which makes both the normal claim path and
-    // `release --force` recovery impossible.
+    // Phase 2: publish volume.pub *and* volume.provenance to S3
+    // *before* claiming the name. Both files are immutable from fork
+    // creation onward and self-signed by the new fork's keypair. A
+    // SIGINT here at worst leaves orphan
+    // `by_id/<new_vol_ulid>/{volume.pub, volume.provenance}` (no
+    // names/<name> references them, so they're harmless and
+    // reclaimable by future GC). Without this ordering, a crash
+    // between mark_initial and the daemon's first metadata-drain
+    // leaves `names/<name>` pointing at a vol_ulid whose immutable
+    // trust artefacts are missing — which breaks both the normal
+    // claim path and the peer-fetch auth pipeline (lineage walk
+    // 404s on volume.provenance).
     if let Err(e) =
         elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, &new_vol_ulid, store)
             .await
     {
         cleanup(&new_fork_dir, &symlink_path);
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
+    }
+    if let Err(e) = elide_coordinator::upload::upload_volume_provenance_initial(
+        &new_fork_dir,
+        &new_vol_ulid,
+        store,
+    )
+    .await
+    {
+        cleanup(&new_fork_dir, &symlink_path);
+        return Err(IpcError::store(format!(
+            "uploading volume.provenance: {e:#}"
+        )));
     }
 
     // Read source volume config: `src_cfg.name` feeds the
