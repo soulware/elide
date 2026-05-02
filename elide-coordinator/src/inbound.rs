@@ -3713,6 +3713,127 @@ async fn start_claim(volume: String, ctx: IpcContext) -> Result<ClaimStartReply,
     }
 }
 
+/// Walk back through empty intermediate forks and return the
+/// deepest non-empty ancestor as the source we should hand to
+/// `fork_create_op`.
+///
+/// Each iteration:
+///   1. Read the current effective fork's signed `volume.provenance`
+///      to find its `parent` ref.
+///   2. Fetch and verify its handoff manifest from S3.
+///   3. If `max(segment_ulids) < parent.snapshot_ulid`, the fork
+///      produced no writes of its own (every segment is inherited)
+///      — advance to its parent and loop.
+///   4. Otherwise, stop.
+///
+/// On loop advance, also pulls the parent's directory locally if
+/// not already present — chain-pull in step 1 of `run_claim_job`
+/// stops at the first existing dir, but the skip walk may need to
+/// reach further back.
+///
+/// Returns `(source_vol_ulid, snapshot_ulid, parent_key_hex)` ready
+/// to pass to `fork_create_op`. `parent_key_hex` is the
+/// manifest_pubkey override carried in the chosen ancestor
+/// reference (Some only for ancestors whose snapshot was a recovery
+/// snapshot).
+async fn skip_empty_intermediates(
+    job: &Arc<ClaimJob>,
+    volume: &str,
+    released_vol_ulid: ulid::Ulid,
+    handoff_snap: ulid::Ulid,
+    initial_parent_key_hex: Option<String>,
+    data_dir: &Path,
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
+) -> Result<(ulid::Ulid, ulid::Ulid, Option<String>), IpcError> {
+    use elide_core::signing::{
+        VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, encode_hex, load_verifying_key,
+        read_lineage_verifying_signature,
+    };
+    use elide_core::volume;
+
+    let by_id_dir = data_dir.join("by_id");
+
+    let mut effective_vol = released_vol_ulid;
+    let mut effective_snap = handoff_snap;
+    let mut effective_parent_key_hex = initial_parent_key_hex;
+
+    loop {
+        let dir = volume::resolve_ancestor_dir(&by_id_dir, &effective_vol.to_string());
+        let lineage =
+            read_lineage_verifying_signature(&dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE)
+                .map_err(|e| {
+                    IpcError::internal(format!("reading provenance for {effective_vol}: {e}"))
+                })?;
+        let Some(parent) = lineage.parent else {
+            // Root volume — nothing to skip to.
+            break;
+        };
+        let parent_vol_ulid = ulid::Ulid::from_string(&parent.volume_ulid).map_err(|e| {
+            IpcError::internal(format!(
+                "malformed parent volume_ulid in {effective_vol}: {e}"
+            ))
+        })?;
+        let parent_snap_ulid = ulid::Ulid::from_string(&parent.snapshot_ulid).map_err(|e| {
+            IpcError::internal(format!(
+                "malformed parent snapshot_ulid in {effective_vol}: {e}"
+            ))
+        })?;
+
+        // Verify and read this fork's handoff manifest. The fallback
+        // pubkey for a non-recovery manifest is the fork's own
+        // `volume.pub` on disk; recovery manifests are auto-resolved
+        // by the helper.
+        let fallback_pubkey = load_verifying_key(&dir, VOLUME_PUB_FILE).map_err(|e| {
+            IpcError::internal(format!("loading volume.pub for {effective_vol}: {e}"))
+        })?;
+
+        let store = stores.for_volume(&effective_vol);
+        let (manifest, _verifier) = elide_coordinator::recovery::fetch_verified_handoff_manifest(
+            &store,
+            effective_vol,
+            effective_snap,
+            &fallback_pubkey,
+        )
+        .await
+        .map_err(|e| {
+            IpcError::internal(format!(
+                "fetching handoff manifest {effective_vol}/{effective_snap}: {e}"
+            ))
+        })?;
+
+        let is_empty = manifest
+            .segment_ulids
+            .last()
+            .is_none_or(|m| *m < parent_snap_ulid);
+        if !is_empty {
+            break;
+        }
+
+        // Advance to parent. Pull it locally if not already there —
+        // step 1 of `run_claim_job` may not have reached this far
+        // back in the chain.
+        let parent_dir = volume::resolve_ancestor_dir(&by_id_dir, &parent.volume_ulid);
+        if !parent_dir.exists() {
+            job.append(ClaimAttachEvent::PullingAncestor {
+                vol_ulid: parent_vol_ulid,
+            });
+            let parent_store = stores.for_volume(&parent_vol_ulid);
+            let _ = pull_readonly_op(parent_vol_ulid, data_dir, &parent_store).await?;
+        }
+
+        info!(
+            "[claim {volume}] skipping empty intermediate {effective_vol}; \
+             using {parent_vol_ulid}/{parent_snap_ulid}"
+        );
+
+        effective_vol = parent_vol_ulid;
+        effective_snap = parent_snap_ulid;
+        effective_parent_key_hex = parent.manifest_pubkey.map(|k| encode_hex(&k));
+    }
+
+    Ok((effective_vol, effective_snap, effective_parent_key_hex))
+}
+
 /// Drive one claim-job to completion. Pulls the released volume's
 /// chain if needed, resolves the handoff key, mints the fresh fork
 /// (with `for_claim = true` so it skips `mark_initial` and lets
@@ -3763,6 +3884,30 @@ async fn run_claim_job(
     };
     job.append(ClaimAttachEvent::HandoffKeyResolved { key });
 
+    // Step 2b: skip empty intermediates. A fork that produced no
+    // writes between claim and release leaves a handoff snapshot
+    // whose segment list is identical to its parent's — every
+    // segment was inherited, none minted under this fork. Forking
+    // from such a no-op intermediate just bloats the chain by one
+    // link per cycle. Detect it and rewrite the source we hand to
+    // `fork_create_op` to point at the deepest non-empty ancestor.
+    //
+    // Predicate: max(segment_ulids in handoff manifest) <
+    // parent.snapshot_ulid. Sound by ULID monotonicity — any segment
+    // a child wrote was minted after its parent's snapshot was
+    // taken, so a child-written segment has a ULID strictly greater
+    // than the parent snapshot's ULID.
+    let (effective_vol, effective_snap, effective_parent_key_hex) = skip_empty_intermediates(
+        &job,
+        &volume,
+        released_vol_ulid,
+        handoff_snap,
+        parent_key_hex,
+        ctx.data_dir.as_path(),
+        &ctx.stores,
+    )
+    .await?;
+
     // Step 3: mint (or resume) the local fork. `for_claim = true`
     // tells `fork_create_op` to skip `mark_initial` (the released
     // record already exists) and to detect a resumable orphan at
@@ -3776,9 +3921,9 @@ async fn run_claim_job(
     // local to this host, so the hint is what makes this work.
     let reply = fork_create_op(
         &volume,
-        released_vol_ulid,
-        Some(handoff_snap),
-        parent_key_hex.as_deref(),
+        effective_vol,
+        Some(effective_snap),
+        effective_parent_key_hex.as_deref(),
         true,
         &[],
         Some(&volume),
@@ -4982,6 +5127,264 @@ mod tests {
             err.message.contains("not found locally") && err.message.contains(&bogus.to_string()),
             "{err}"
         );
+    }
+
+    // ── skip_empty_intermediates ──────────────────────────────────────────
+    //
+    // Setup: build a chain of forks on local disk (volume.pub +
+    // volume.provenance) and upload signed handoff manifests to a memstore.
+    // Then call `skip_empty_intermediates` and assert the effective
+    // (vol, snap, parent_key_hex) the claim path would feed into
+    // `fork_create_op`.
+
+    mod skip_empty_intermediates_tests {
+        use super::super::skip_empty_intermediates;
+        use crate::claim::ClaimJob;
+        use elide_coordinator::stores::PassthroughStores;
+        use elide_core::signing::{
+            ParentRef, ProvenanceLineage, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
+            build_snapshot_manifest_bytes, encode_hex, load_verifying_key, setup_readonly_identity,
+        };
+        use elide_core::ulid_mint::UlidMint;
+        use object_store::{ObjectStore, PutPayload, memory::InMemory};
+        use std::sync::Arc;
+        use tempfile::TempDir;
+        use ulid::Ulid;
+
+        struct Fork {
+            vol: Ulid,
+            snap: Ulid,
+            signer: Arc<dyn elide_core::segment::SegmentSigner>,
+            verifying_key: ed25519_dalek::VerifyingKey,
+        }
+
+        fn build_fork(
+            data_dir: &std::path::Path,
+            vol: Ulid,
+            snap: Ulid,
+            parent: Option<&Fork>,
+        ) -> Fork {
+            let dir = data_dir.join("by_id").join(vol.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let lineage = match parent {
+                None => ProvenanceLineage::default(),
+                Some(p) => ProvenanceLineage {
+                    parent: Some(ParentRef {
+                        volume_ulid: p.vol.to_string(),
+                        snapshot_ulid: p.snap.to_string(),
+                        pubkey: p.verifying_key.to_bytes(),
+                        manifest_pubkey: None,
+                    }),
+                    extent_index: vec![],
+                },
+            };
+
+            let signer =
+                setup_readonly_identity(&dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE, &lineage)
+                    .unwrap();
+            let verifying_key = load_verifying_key(&dir, VOLUME_PUB_FILE).unwrap();
+            Fork {
+                vol,
+                snap,
+                signer,
+                verifying_key,
+            }
+        }
+
+        async fn upload_handoff_manifest(
+            store: &Arc<dyn ObjectStore>,
+            fork: &Fork,
+            segment_ulids: &[Ulid],
+        ) {
+            let bytes = build_snapshot_manifest_bytes(fork.signer.as_ref(), segment_ulids, None);
+            let key = elide_coordinator::upload::snapshot_manifest_key(
+                &fork.vol.to_string(),
+                &fork.snap.to_string(),
+            )
+            .unwrap();
+            store.put(&key, PutPayload::from(bytes)).await.unwrap();
+        }
+
+        fn passthrough(
+            store: Arc<dyn ObjectStore>,
+        ) -> Arc<dyn elide_coordinator::stores::ScopedStores> {
+            Arc::new(PassthroughStores::new(store))
+        }
+
+        #[tokio::test]
+        async fn empty_fork_is_skipped() {
+            // R(writes) → F1(empty, released). Claim should fork from R, not F1.
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path();
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+            let mut mint = UlidMint::new(Ulid::nil());
+            let seg_a = mint.next();
+            let seg_b = mint.next();
+            let r_snap = mint.next(); // > seg_a, seg_b
+            let f1_snap = mint.next(); // > r_snap
+
+            let r = build_fork(data_dir, mint.next(), r_snap, None);
+            let f1 = build_fork(data_dir, mint.next(), f1_snap, Some(&r));
+
+            // R's handoff manifest = [seg_a, seg_b].
+            upload_handoff_manifest(&store, &r, &[seg_a, seg_b]).await;
+            // F1 wrote nothing → manifest inherits R's segments verbatim.
+            upload_handoff_manifest(&store, &f1, &[seg_a, seg_b]).await;
+
+            let job = ClaimJob::new();
+            let stores = passthrough(store);
+            let (vol, snap, key_hex) =
+                skip_empty_intermediates(&job, "vol", f1.vol, f1.snap, None, data_dir, &stores)
+                    .await
+                    .unwrap();
+            assert_eq!(vol, r.vol);
+            assert_eq!(snap, r.snap);
+            assert!(key_hex.is_none());
+        }
+
+        #[tokio::test]
+        async fn chained_empties_collapse_to_deepest_non_empty() {
+            // R(writes) → F1(empty) → F2(empty, released). Claim → R.
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path();
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+            let mut mint = UlidMint::new(Ulid::nil());
+            let seg_a = mint.next();
+            let r_snap = mint.next();
+            let f1_snap = mint.next();
+            let f2_snap = mint.next();
+
+            let r = build_fork(data_dir, mint.next(), r_snap, None);
+            let f1 = build_fork(data_dir, mint.next(), f1_snap, Some(&r));
+            let f2 = build_fork(data_dir, mint.next(), f2_snap, Some(&f1));
+
+            upload_handoff_manifest(&store, &r, &[seg_a]).await;
+            upload_handoff_manifest(&store, &f1, &[seg_a]).await;
+            upload_handoff_manifest(&store, &f2, &[seg_a]).await;
+
+            let job = ClaimJob::new();
+            let stores = passthrough(store);
+            let (vol, snap, _) =
+                skip_empty_intermediates(&job, "vol", f2.vol, f2.snap, None, data_dir, &stores)
+                    .await
+                    .unwrap();
+            assert_eq!(vol, r.vol);
+            assert_eq!(snap, r.snap);
+        }
+
+        #[tokio::test]
+        async fn non_empty_fork_is_not_skipped() {
+            // R(writes) → F1(writes, released). Claim should fork from F1.
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path();
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+            let mut mint = UlidMint::new(Ulid::nil());
+            let seg_a = mint.next();
+            let r_snap = mint.next();
+            let seg_b = mint.next(); // > r_snap → owned by F1
+            let f1_snap = mint.next();
+
+            let r = build_fork(data_dir, mint.next(), r_snap, None);
+            let f1 = build_fork(data_dir, mint.next(), f1_snap, Some(&r));
+
+            upload_handoff_manifest(&store, &r, &[seg_a]).await;
+            upload_handoff_manifest(&store, &f1, &[seg_a, seg_b]).await;
+
+            let job = ClaimJob::new();
+            let stores = passthrough(store);
+            let (vol, snap, _) =
+                skip_empty_intermediates(&job, "vol", f1.vol, f1.snap, None, data_dir, &stores)
+                    .await
+                    .unwrap();
+            assert_eq!(vol, f1.vol);
+            assert_eq!(snap, f1.snap);
+        }
+
+        #[tokio::test]
+        async fn root_fork_with_no_parent_is_not_skipped() {
+            // Released name points at a root volume (no parent). Even if its
+            // handoff manifest is empty, there's nothing to skip to.
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path();
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+            let mut mint = UlidMint::new(Ulid::nil());
+            let r_snap = mint.next();
+            let r = build_fork(data_dir, mint.next(), r_snap, None);
+            // Empty manifest — but no parent to redirect to.
+            upload_handoff_manifest(&store, &r, &[]).await;
+
+            let job = ClaimJob::new();
+            let stores = passthrough(store);
+            let (vol, snap, _) =
+                skip_empty_intermediates(&job, "vol", r.vol, r.snap, None, data_dir, &stores)
+                    .await
+                    .unwrap();
+            assert_eq!(vol, r.vol);
+            assert_eq!(snap, r.snap);
+        }
+
+        #[tokio::test]
+        async fn manifest_pubkey_override_flows_through_when_skipping() {
+            // F1's parent ref carries a manifest_pubkey override (recovery
+            // snapshot at the grandparent). When we skip F1 (empty), the
+            // override must be propagated as the new fork's parent_key_hex.
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path();
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+            let mut mint = UlidMint::new(Ulid::nil());
+            let seg_a = mint.next();
+            let r_snap = mint.next();
+            let f1_snap = mint.next();
+
+            let r = build_fork(data_dir, mint.next(), r_snap, None);
+            let f1_vol = mint.next();
+
+            // Construct F1 manually so we can inject a manifest_pubkey override.
+            let f1_dir = data_dir.join("by_id").join(f1_vol.to_string());
+            std::fs::create_dir_all(&f1_dir).unwrap();
+            let override_pubkey_bytes = [0xCDu8; 32];
+            let lineage = ProvenanceLineage {
+                parent: Some(ParentRef {
+                    volume_ulid: r.vol.to_string(),
+                    snapshot_ulid: r.snap.to_string(),
+                    pubkey: r.verifying_key.to_bytes(),
+                    manifest_pubkey: Some(override_pubkey_bytes),
+                }),
+                extent_index: vec![],
+            };
+            let f1_signer =
+                setup_readonly_identity(&f1_dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE, &lineage)
+                    .unwrap();
+            let f1_vk = load_verifying_key(&f1_dir, VOLUME_PUB_FILE).unwrap();
+            let f1 = Fork {
+                vol: f1_vol,
+                snap: f1_snap,
+                signer: f1_signer,
+                verifying_key: f1_vk,
+            };
+
+            upload_handoff_manifest(&store, &r, &[seg_a]).await;
+            upload_handoff_manifest(&store, &f1, &[seg_a]).await;
+
+            let job = ClaimJob::new();
+            let stores = passthrough(store);
+            let (vol, snap, key_hex) =
+                skip_empty_intermediates(&job, "vol", f1.vol, f1.snap, None, data_dir, &stores)
+                    .await
+                    .unwrap();
+            assert_eq!(vol, r.vol);
+            assert_eq!(snap, r.snap);
+            assert_eq!(
+                key_hex.as_deref(),
+                Some(encode_hex(&override_pubkey_bytes).as_str())
+            );
+        }
     }
 
     /// Tests for [`classify_resumable_orphan`] — exercises the
