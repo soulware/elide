@@ -1831,6 +1831,13 @@ async fn fork_create_op(
     parent_key_hex: Option<&str>,
     for_claim: bool,
     flags: &[String],
+    // Orchestrator-supplied source name. Used as a fallback when the
+    // source's on-disk `volume.toml` has no `name` field — typically
+    // because the source was pulled from S3 (`pull.rs` writes
+    // `name: None` for pulled ancestors). Without this hint, forks
+    // from a pulled source emit a `Created` journal event instead of
+    // the more useful `ForkedFrom { source_name, ... }`.
+    source_name_hint: Option<&str>,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
@@ -2066,7 +2073,8 @@ async fn fork_create_op(
             return Err(IpcError::internal(format!("writing volume config: {e}")));
         }
 
-        (resolved_snap, src_cfg.name)
+        let src_name = src_cfg.name.or_else(|| source_name_hint.map(str::to_owned));
+        (resolved_snap, src_name)
     } else {
         // Resume mode: orphan fork is fully materialised on disk,
         // volume.pub + volume.provenance are already on S3, and
@@ -2083,7 +2091,8 @@ async fn fork_create_op(
         });
         let src_name = elide_core::config::VolumeConfig::read(&source_dir)
             .ok()
-            .and_then(|c| c.name);
+            .and_then(|c| c.name)
+            .or_else(|| source_name_hint.map(str::to_owned));
         (resolved_snap, src_name)
     };
 
@@ -3536,7 +3545,7 @@ async fn run_fork_job(
         // Writable source: take an implicit snapshot. Need the
         // source's name to drive `snapshot_volume`; for `BareUlid` we
         // read it out of `volume.toml`.
-        let name = if let Some(n) = source_name {
+        let name = if let Some(n) = source_name.clone() {
             n
         } else {
             elide_core::config::VolumeConfig::read(&source_dir)
@@ -3572,6 +3581,13 @@ async fn run_fork_job(
         parent_key_hex.as_deref(),
         false,
         &flags,
+        // For a `Name` source the orchestrator already knows the
+        // user-facing name; pass it as a hint so a pulled source
+        // (whose `volume.toml` lacks `name`) still produces a
+        // `ForkedFrom` journal event instead of falling back to
+        // `Created`. ULID-only sources (`BareUlid` / `Pinned`) have
+        // no orchestrator-known name and rely on `src_cfg.name`.
+        source_name.as_deref(),
         &ctx.data_dir,
         &store,
         &ctx.identity,
@@ -3752,6 +3768,12 @@ async fn run_claim_job(
     // record already exists) and to detect a resumable orphan at
     // `by_name/<name>`.
     let store_wide = ctx.stores.coordinator_wide();
+    // Source's pre-release name == new fork name. Claim rebinds the
+    // same `names/<volume>` record; the released volume held that
+    // name before, so the journal's `ForkedFrom { source_name, ... }`
+    // is the volume name itself. The released source's
+    // `volume.toml` was written by the prior owner and is rarely
+    // local to this host, so the hint is what makes this work.
     let reply = fork_create_op(
         &volume,
         released_vol_ulid,
@@ -3759,6 +3781,7 @@ async fn run_claim_job(
         parent_key_hex.as_deref(),
         true,
         &[],
+        Some(&volume),
         &ctx.data_dir,
         &store_wide,
         &ctx.identity,
