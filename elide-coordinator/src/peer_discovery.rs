@@ -23,15 +23,21 @@
 //! gives nothing; the only sensible fallback in that case is direct
 //! S3, which is exactly what `None` selects.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use elide_core::volume_event::EventKind;
+use elide_core::signing::VerifyingKey;
+use elide_core::volume_event::{EventKind, VolumeEvent};
 use elide_peer_fetch::PeerEndpoint;
+use futures::TryStreamExt;
 use object_store::ObjectStore;
+use object_store::path::Path as StorePath;
 use tracing::debug;
+use ulid::Ulid;
 
+use crate::identity;
 use crate::ipc::SignatureStatus;
-use crate::volume_event_store::list_and_verify_events;
+use crate::volume_event_store::verify_event_signature;
 
 /// Result of discovery: who the previous claimer was, plus where to
 /// reach them. Returned by [`discover_peer_for_claim`].
@@ -42,6 +48,105 @@ pub struct DiscoveredPeer {
     /// Reachable endpoint advertised by that coordinator at
     /// `coordinators/<id>/peer-endpoint.toml`.
     pub endpoint: PeerEndpoint,
+}
+
+/// Outcome of the backward walk inside [`discover_peer_for_claim`].
+enum FindReleaserOutcome {
+    /// Found a valid `Released` event; carry the releaser's
+    /// coordinator id forward to endpoint resolution.
+    Found(String),
+    /// Walk terminated without a usable releaser — log empty,
+    /// non-handoff event encountered, signature failure, fetch error,
+    /// or pubkey unavailable. Caller returns `None`.
+    Stop,
+}
+
+/// Walk `locations` (newest-first) one event at a time, fetching and
+/// verifying each lazily, returning the coordinator id of the first
+/// `Released` event found. Skips `Claimed` events; bails on anything
+/// else.
+///
+/// `keys` is an in-out cache of `coordinator_id -> VerifyingKey`
+/// shared across iterations — a cross-host handoff log typically
+/// involves only two coordinators, so the cache amortises to one
+/// pubkey GET per coord.
+async fn find_releaser(
+    store: &Arc<dyn ObjectStore>,
+    volume_name: &str,
+    locations: &[(Ulid, StorePath)],
+    keys: &mut HashMap<String, VerifyingKey>,
+) -> FindReleaserOutcome {
+    for (_ulid, location) in locations {
+        let body = match store.get(location).await {
+            Ok(g) => match g.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    debug!("[peer-discovery {volume_name}] read {location}: {e}; skip peer");
+                    return FindReleaserOutcome::Stop;
+                }
+            },
+            Err(e) => {
+                debug!("[peer-discovery {volume_name}] get {location}: {e}; skip peer");
+                return FindReleaserOutcome::Stop;
+            }
+        };
+        let text = match std::str::from_utf8(&body) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("[peer-discovery {volume_name}] {location} not utf-8: {e}; skip peer");
+                return FindReleaserOutcome::Stop;
+            }
+        };
+        let event = match VolumeEvent::from_toml(text) {
+            Ok(e) => e,
+            Err(e) => {
+                debug!("[peer-discovery {volume_name}] parse {location}: {e}; skip peer");
+                return FindReleaserOutcome::Stop;
+            }
+        };
+
+        // Resolve the verifying key for this event's signer (cached).
+        let coord_id = event.coordinator_id.clone();
+        let vk = if let Some(vk) = keys.get(&coord_id) {
+            *vk
+        } else {
+            match identity::fetch_coordinator_pub(store.as_ref(), &coord_id).await {
+                Ok(vk) => {
+                    keys.insert(coord_id.clone(), vk);
+                    vk
+                }
+                Err(e) => {
+                    debug!(
+                        "[peer-discovery {volume_name}] coord pubkey unavailable for \
+                         {coord_id}: {e}; skip peer"
+                    );
+                    return FindReleaserOutcome::Stop;
+                }
+            }
+        };
+
+        match verify_event_signature(&event, &vk) {
+            SignatureStatus::Valid => {}
+            other => {
+                debug!("[peer-discovery {volume_name}] event signature {other:?}; skip peer");
+                return FindReleaserOutcome::Stop;
+            }
+        }
+
+        match &event.kind {
+            EventKind::Claimed => continue,
+            EventKind::Released { .. } => return FindReleaserOutcome::Found(coord_id),
+            other => {
+                debug!(
+                    "[peer-discovery {volume_name}] hit {} before Released; skip peer",
+                    other.as_str()
+                );
+                return FindReleaserOutcome::Stop;
+            }
+        }
+    }
+    debug!("[peer-discovery {volume_name}] no Released event in log; skip peer");
+    FindReleaserOutcome::Stop
 }
 
 /// Look up the previous claimer of `volume_name` via the volume event
@@ -60,53 +165,45 @@ pub async fn discover_peer_for_claim(
     store: &Arc<dyn ObjectStore>,
     volume_name: &str,
 ) -> Option<DiscoveredPeer> {
-    let entries = match list_and_verify_events(store, volume_name).await {
-        Ok(e) => e,
+    // List event-prefix locations once (one S3 LIST call). Filter +
+    // sort *descending* by ULID so we visit newest first.
+    let prefix = StorePath::from(format!("events/{volume_name}/"));
+    let listed: Vec<_> = match store.list(Some(&prefix)).try_collect::<Vec<_>>().await {
+        Ok(v) => v,
         Err(e) => {
-            debug!("[peer-discovery {volume_name}] event log read failed; skip peer: {e}");
+            debug!("[peer-discovery {volume_name}] event log list failed; skip peer: {e}");
             return None;
         }
     };
+    let mut locations: Vec<(Ulid, StorePath)> = listed
+        .into_iter()
+        .filter_map(|obj| {
+            let filename = obj.location.filename()?;
+            let stem = filename.strip_suffix(".toml")?;
+            let ulid = Ulid::from_string(stem).ok()?;
+            Some((ulid, obj.location))
+        })
+        .collect();
+    locations.sort_by_key(|(ulid, _)| std::cmp::Reverse(*ulid));
 
-    // Walk the log back-to-front. The expected handoff prefix on the
-    // tail is `… Released, Claimed`: the previous owner released, we
-    // (the new claimer) immediately emitted Claimed inside the same
-    // claim flow. Skip Claimed entries — they tell us nothing about
-    // who held the cache warm — and use the first Released we find.
-    // Stop on any other terminal kind (Created, ForkedFrom,
-    // ForceReleased, RenamedTo, RenamedFrom): those mean either no
-    // prior cleanly-released owner or that the previous owner is
-    // gone, so direct S3 is the only sensible source.
-    let mut coord_id: Option<String> = None;
-    for entry in entries.iter().rev() {
-        if entry.signature_status != SignatureStatus::Valid {
-            debug!(
-                "[peer-discovery {volume_name}] event signature is {:?}; skip peer",
-                entry.signature_status
-            );
-            return None;
-        }
-        match &entry.event.kind {
-            EventKind::Claimed => continue, // skip past Claimed events
-            EventKind::Released { .. } => {
-                coord_id = Some(entry.event.coordinator_id.clone());
-                break;
-            }
-            other => {
-                debug!(
-                    "[peer-discovery {volume_name}] hit {} before Released; skip peer",
-                    other.as_str()
-                );
-                return None;
-            }
-        }
-    }
-    let coord_id = match coord_id {
-        Some(id) => id,
-        None => {
-            debug!("[peer-discovery {volume_name}] no Released event in log; skip peer");
-            return None;
-        }
+    // Walk newest → oldest, fetching one event body at a time.
+    // Short-circuits on every event kind except `Claimed`:
+    //   - `Released`         → return the releaser's coordinator_id
+    //   - `Claimed`          → skip past (it tells us nothing about
+    //                          who held the cache warm); look further
+    //   - anything else      → no clean handoff, return None
+    //   - signature failure  → defensive bail, return None
+    //
+    // The typical case after a fresh claim is one or two GETs:
+    //   - log tail `[…, Released-by-A, Claimed-by-B]` → 2 GETs
+    //   - log tail `[…, Released-by-A]` (still unclaimed) → 1 GET
+    //   - log tail ending in `ForceReleased`/`Created`/etc. → 1 GET
+    // Pulling the full history was unnecessary — that's `list_events`
+    // territory, kept for the CLI's `volume events` IPC.
+    let mut keys: HashMap<String, VerifyingKey> = HashMap::new();
+    let coord_id = match find_releaser(store, volume_name, &locations, &mut keys).await {
+        FindReleaserOutcome::Found(coord_id) => coord_id,
+        FindReleaserOutcome::Stop => return None,
     };
 
     let endpoint = match PeerEndpoint::fetch(store.as_ref(), &coord_id).await {
@@ -201,6 +298,61 @@ mod tests {
             .expect("peer discovered");
         assert_eq!(discovered.coordinator_id, coord_id);
         assert_eq!(discovered.endpoint.url(), "http://10.0.0.42:8443");
+    }
+
+    /// Backward walk must short-circuit at the head: if the latest
+    /// event is `Released`, neither older valid events nor older
+    /// corrupt events should be fetched. Plants an unreadable event
+    /// at the oldest position (lowest-ULID name) — if the walk
+    /// reaches it, parsing fails and discovery returns `None`. The
+    /// happy path here can't see that corruption because it stops
+    /// at the head.
+    #[tokio::test]
+    async fn short_circuits_at_head_without_reading_older_events() {
+        use bytes::Bytes;
+        use object_store::path::Path as StorePath;
+
+        let store = store().await;
+        let (ident, _tmp) = make_coord(&store).await;
+        let coord_id = ident.coordinator_id_str().to_owned();
+
+        // Plant a deliberately-corrupt event at the lowest possible
+        // ULID — guaranteed to sort to the back of the list. The
+        // backward walk hits the newest entries first; if it
+        // short-circuits, this is never fetched.
+        let oldest_ulid = "01000000000000000000000000";
+        store
+            .put(
+                &StorePath::from(format!("events/vol/{oldest_ulid}.toml")),
+                Bytes::from_static(b"this is not valid toml at all").into(),
+            )
+            .await
+            .unwrap();
+
+        // Newest event: a clean Released. Should be the first thing
+        // visited by the backward walk.
+        let vol_ulid = Ulid::new();
+        emit_event(
+            &store,
+            &ident,
+            "vol",
+            EventKind::Released {
+                handoff_snapshot: Ulid::new(),
+            },
+            vol_ulid,
+        )
+        .await
+        .unwrap();
+
+        PeerEndpoint::new("10.0.0.42".to_owned(), 8443)
+            .publish(store.as_ref(), &coord_id)
+            .await
+            .unwrap();
+
+        let discovered = discover_peer_for_claim(&store, "vol")
+            .await
+            .expect("backward walk should short-circuit at the head's Released event");
+        assert_eq!(discovered.coordinator_id, coord_id);
     }
 
     #[tokio::test]
