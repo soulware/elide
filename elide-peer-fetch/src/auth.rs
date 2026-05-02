@@ -541,7 +541,7 @@ mod tests {
         vol_ulid: Ulid,
         coord_id: &str,
     ) {
-        let mut record = NameRecord::live_minimal(vol_ulid);
+        let mut record = NameRecord::live_minimal(vol_ulid, 4 * 1024 * 1024 * 1024);
         record.coordinator_id = Some(coord_id.to_owned());
         record.state = NameState::Live;
         let toml = record.to_toml().unwrap();
@@ -729,7 +729,7 @@ mod tests {
 
         // Released — even though coord_id matches the *most recent* owner,
         // there's no current claim, so peer-fetch must not authorise.
-        let mut record = NameRecord::live_minimal(vol_ulid);
+        let mut record = NameRecord::live_minimal(vol_ulid, 4 * 1024 * 1024 * 1024);
         record.coordinator_id = Some(coord_id.to_owned());
         record.state = NameState::Released;
         store

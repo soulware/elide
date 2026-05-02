@@ -65,6 +65,7 @@ mod tests {
         NameRecord {
             version: NameRecord::CURRENT_VERSION,
             vol_ulid: Ulid::nil(),
+            size: 4 * 1024 * 1024 * 1024,
             coordinator_id: owner.map(str::to_owned),
             state,
             parent: None,

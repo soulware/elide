@@ -23,7 +23,7 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial_readonly};
+use elide_coordinator::lifecycle::{MarkInitialOutcome, mark_initial_readonly};
 use elide_coordinator::volume_state::{IMPORT_LOCK_FILE, PID_FILE};
 
 /// Hard cap on entries in the new volume's `extent_index` provenance field.
@@ -310,71 +310,22 @@ pub async fn spawn_import(
     let vol_ulid = vol_ulid_value.to_string();
     let vol_dir = data_dir.join("by_id").join(&vol_ulid);
 
-    // Claim the name in S3 *before* creating any local state. Imports
-    // are readonly: the name binds to immutable content, no exclusive
-    // owner is recorded, and lifecycle verbs (`stop`/`release`/`start`)
-    // refuse the resulting record. Conditional-create still gives
-    // uniqueness: two coordinators racing to import the same name
-    // resolve cleanly (one wins, the other gets `AlreadyExists`).
-    match mark_initial_readonly(&store, vol_name, vol_ulid_value).await {
-        Ok(MarkInitialOutcome::Claimed) => {
-            elide_coordinator::volume_event_store::emit_best_effort(
-                &store,
-                identity.as_ref(),
-                vol_name,
-                elide_core::volume_event::EventKind::Created,
-                vol_ulid_value,
-            )
-            .await;
-        }
-        Ok(MarkInitialOutcome::AlreadyExists {
-            existing_vol_ulid,
-            existing_state,
-            existing_owner,
-        }) => {
-            let owner = existing_owner.as_deref().unwrap_or("<unowned>");
-            return Err(std::io::Error::other(format!(
-                "name '{vol_name}' already exists in bucket \
-                 (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
-                 owner={owner})"
-            )));
-        }
-        Err(LifecycleError::Store(e)) => {
-            return Err(std::io::Error::other(format!(
-                "claiming name in bucket: {e}"
-            )));
-        }
-        Err(LifecycleError::OwnershipConflict { held_by }) => {
-            return Err(std::io::Error::other(format!(
-                "name held by another coordinator: {held_by}"
-            )));
-        }
-        Err(LifecycleError::InvalidTransition { from, .. }) => {
-            return Err(std::io::Error::other(format!(
-                "names/<name> is in unexpected state {from:?}"
-            )));
-        }
-    }
+    // The bucket-side `names/<name>` claim is *deferred* until after
+    // import completes: `NameRecord` requires a real `size`, and the
+    // OCI image's logical size isn't known until `import_image` reads
+    // it from the extracted ext4. The post-wait task at the end of
+    // this function calls `mark_initial_readonly` with the final size.
+    //
+    // Cross-coordinator implication: two hosts racing to import the
+    // same name will both download/extract the OCI image; the second
+    // to call `mark_initial_readonly` sees `AlreadyExists` and rolls
+    // back local state. Wasted CPU/bandwidth, no corruption.
 
-    let rollback_claim = async |store: &Arc<dyn ObjectStore>, vol_name: &str| {
-        let key = object_store::path::Path::from(format!("names/{vol_name}"));
-        if let Err(e) = store.delete(&key).await {
-            warn!("[import] {vol_name}: rollback of names/<name> failed: {e}");
-        }
-    };
-
-    // From here on, any error must roll back the bucket-side claim
-    // before returning so the name is free to retry.
-    if let Err(e) = std::fs::create_dir_all(&by_name_dir) {
-        rollback_claim(&store, vol_name).await;
-        return Err(e);
-    }
-    if let Err(e) = std::fs::create_dir_all(&vol_dir) {
-        rollback_claim(&store, vol_name).await;
-        return Err(e);
-    }
-    // Wrap the rest of the local setup so any error rolls back both
-    // local artefacts and the bucket-side claim.
+    std::fs::create_dir_all(&by_name_dir)?;
+    std::fs::create_dir_all(&vol_dir)?;
+    // Wrap the rest of the local setup so any error rolls back local
+    // artefacts. No bucket-side claim exists yet — `mark_initial_readonly`
+    // runs only after the import process exits successfully.
     let setup: std::io::Result<String> = (|| {
         // Write volume.readonly immediately so a crashed import is never supervised
         // as a writable volume.
@@ -401,7 +352,6 @@ pub async fn spawn_import(
         Err(e) => {
             let _ = std::fs::remove_file(&symlink_path);
             let _ = std::fs::remove_dir_all(&vol_dir);
-            rollback_claim(&store, vol_name).await;
             return Err(e);
         }
     };
@@ -440,7 +390,6 @@ pub async fn spawn_import(
         Err(e) => {
             let _ = std::fs::remove_file(&symlink_path);
             let _ = std::fs::remove_dir_all(&vol_dir);
-            rollback_claim(&store, vol_name).await;
             return Err(std::io::Error::other(format!(
                 "failed to spawn {}: {e}",
                 elide_import_bin.display()
@@ -454,7 +403,6 @@ pub async fn spawn_import(
         let _ = child.start_kill();
         let _ = std::fs::remove_file(&symlink_path);
         let _ = std::fs::remove_dir_all(&vol_dir);
-        rollback_claim(&store, vol_name).await;
         return Err(e);
     }
 
@@ -487,6 +435,8 @@ pub async fn spawn_import(
     let import_ulid_clone = import_ulid.clone();
     let async_store = store.clone();
     let async_vol_name = vol_name.to_owned();
+    let async_identity = identity.clone();
+    let async_vol_dir = vol_dir.clone();
     tokio::spawn(async move {
         // Stream stderr into the job's output buffer.
         if let Some(stderr) = child.stderr.take() {
@@ -497,7 +447,7 @@ pub async fn spawn_import(
         }
 
         // Wait for the process to exit.
-        let (final_state, failed) = match child.wait().await {
+        let (mut final_state, mut failed) = match child.wait().await {
             Ok(s) if s.success() => {
                 info!("[import {import_ulid_clone}] done");
                 (ImportState::Done, false)
@@ -514,23 +464,78 @@ pub async fn spawn_import(
             }
         };
 
-        if failed {
-            // Remove the by_name symlink so the name is not reserved by a
-            // failed import (the vol_dir is left for post-mortem inspection),
-            // and release the bucket-side claim so the name can be retried.
-            let _ = std::fs::remove_file(&symlink_path);
-            let key = object_store::path::Path::from(format!("names/{async_vol_name}"));
-            if let Err(e) = async_store.delete(&key).await {
-                warn!(
-                    "[import {import_ulid_clone}] failed import cleanup: \
-                     could not release names/{async_vol_name}: {e}"
-                );
+        // Post-success: claim the bucket-side `names/<name>` now that
+        // the import has computed a real `size` and written it to
+        // `volume.toml`. This is the bucket-uniqueness gate for
+        // imports — two coordinators racing on the same name both
+        // arrive here, the second sees `AlreadyExists`, and its
+        // local artefacts are rolled back like any other failure.
+        if !failed {
+            let claim_outcome = (|| -> Result<(u64, MarkInitialOutcome), String> {
+                let cfg = elide_core::config::VolumeConfig::read(&async_vol_dir)
+                    .map_err(|e| format!("reading post-import volume.toml: {e}"))?;
+                let size = cfg
+                    .size
+                    .ok_or_else(|| "post-import volume.toml missing size".to_owned())?;
+                Ok((size, MarkInitialOutcome::Claimed))
+            })();
+            match claim_outcome {
+                Ok((size, _)) => {
+                    match mark_initial_readonly(&async_store, &async_vol_name, vol_ulid_value, size)
+                        .await
+                    {
+                        Ok(MarkInitialOutcome::Claimed) => {
+                            elide_coordinator::volume_event_store::emit_best_effort(
+                                &async_store,
+                                async_identity.as_ref(),
+                                &async_vol_name,
+                                elide_core::volume_event::EventKind::Created,
+                                vol_ulid_value,
+                            )
+                            .await;
+                        }
+                        Ok(MarkInitialOutcome::AlreadyExists {
+                            existing_vol_ulid,
+                            existing_state,
+                            existing_owner,
+                        }) => {
+                            let owner = existing_owner.as_deref().unwrap_or("<unowned>");
+                            let msg = format!(
+                                "name '{async_vol_name}' already exists in bucket \
+                                 (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
+                                 owner={owner})"
+                            );
+                            warn!("[import {import_ulid_clone}] {msg}");
+                            final_state = ImportState::Failed(msg);
+                            failed = true;
+                        }
+                        Err(e) => {
+                            let msg = format!("claiming name in bucket: {e}");
+                            warn!("[import {import_ulid_clone}] {msg}");
+                            final_state = ImportState::Failed(msg);
+                            failed = true;
+                        }
+                    }
+                }
+                Err(msg) => {
+                    warn!("[import {import_ulid_clone}] {msg}");
+                    final_state = ImportState::Failed(msg);
+                    failed = true;
+                }
             }
         }
 
+        if failed {
+            // Remove the by_name symlink so the name is not reserved by a
+            // failed import (the vol_dir is left for post-mortem inspection).
+            // No bucket claim to release: it was either never made (early
+            // failure) or never landed (claim itself failed).
+            let _ = std::fs::remove_file(&symlink_path);
+        }
+
         job.finish(final_state);
-        let _ = std::fs::remove_file(vol_dir.join(IMPORT_LOCK_FILE));
-        let _ = std::fs::remove_file(vol_dir.join(IMPORT_PID_FILE));
+        let _ = std::fs::remove_file(async_vol_dir.join(IMPORT_LOCK_FILE));
+        let _ = std::fs::remove_file(async_vol_dir.join(IMPORT_PID_FILE));
     });
 
     info!("[import {import_ulid}] started pid {pid} for {vol_name} from {oci_ref}");

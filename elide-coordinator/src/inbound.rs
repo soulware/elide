@@ -1271,7 +1271,16 @@ async fn create_volume_op(
     // volume.pub is already uploaded — recovery via `release --force`
     // is always possible from here on.
     use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
-    match mark_initial(store, name, coord_id, identity.hostname(), vol_ulid).await {
+    match mark_initial(
+        store,
+        name,
+        coord_id,
+        identity.hostname(),
+        vol_ulid,
+        size_bytes,
+    )
+    .await
+    {
         Ok(MarkInitialOutcome::Claimed) => {
             elide_coordinator::volume_event_store::emit_best_effort(
                 store,
@@ -1441,10 +1450,12 @@ fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
 
 /// Pull one readonly ancestor from the store.
 ///
-/// Mirrors the CLI's `pull_one_readonly`: downloads `manifest.toml`,
-/// `volume.pub`, and `volume.provenance`, writes the ancestor under
-/// `data_dir/by_id/<vol_ulid>/`, and returns the parent ULID parsed from
-/// the (signature-verified) provenance, or empty if this is a root volume.
+/// Downloads `volume.pub` and `volume.provenance` and writes the ancestor
+/// skeleton under `data_dir/by_id/<vol_ulid>/`. Returns the parent ULID
+/// parsed from the (signature-verified) provenance, or `None` if this is a
+/// root volume. Ancestors carry no `volume.toml` and no size: per
+/// `docs/design-volume-size-ownership.md`, size lives only on the live
+/// `names/<name>` record.
 async fn pull_readonly_op(
     vol_ulid: ulid::Ulid,
     data_dir: &Path,
@@ -1462,34 +1473,8 @@ async fn pull_readonly_op(
 
     let pull_started = std::time::Instant::now();
 
-    // Step 1: fetch manifest.toml.
+    // Step 1: fetch volume.pub.
     let step1_started = std::time::Instant::now();
-    let manifest_key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
-    let manifest_bytes = match store.get(&manifest_key).await {
-        Ok(d) => d
-            .bytes()
-            .await
-            .map_err(|e| IpcError::store(format!("reading manifest: {e}")))?,
-        Err(object_store::Error::NotFound { .. }) => {
-            return Err(IpcError::not_found(format!(
-                "manifest not found in store for volume {volume_id}"
-            )));
-        }
-        Err(e) => return Err(IpcError::store(format!("downloading manifest: {e}"))),
-    };
-    let manifest: toml::Table = std::str::from_utf8(&manifest_bytes)
-        .map_err(|e| IpcError::internal(format!("manifest is not valid utf-8: {e}")))
-        .and_then(|s| {
-            toml::from_str(s).map_err(|e| IpcError::internal(format!("parsing manifest.toml: {e}")))
-        })?;
-    let size = manifest
-        .get("size")
-        .and_then(|v| v.as_integer())
-        .ok_or_else(|| IpcError::internal("manifest.toml missing 'size'"))?;
-    let manifest_elapsed = step1_started.elapsed();
-
-    // Step 2: fetch volume.pub.
-    let step2_started = std::time::Instant::now();
     let pub_key_bytes = store
         .get(&StorePath::from(format!("by_id/{volume_id}/volume.pub")))
         .await
@@ -1497,10 +1482,10 @@ async fn pull_readonly_op(
         .bytes()
         .await
         .map_err(|e| IpcError::store(format!("reading volume.pub: {e}")))?;
-    let pub_elapsed = step2_started.elapsed();
+    let pub_elapsed = step1_started.elapsed();
 
-    // Step 3: fetch volume.provenance. NotFound is hard error.
-    let step3_started = std::time::Instant::now();
+    // Step 2: fetch volume.provenance. NotFound is hard error.
+    let step2_started = std::time::Instant::now();
     let provenance_bytes = match store
         .get(&StorePath::from(format!(
             "by_id/{volume_id}/volume.provenance"
@@ -1522,21 +1507,14 @@ async fn pull_readonly_op(
             )));
         }
     };
-    let provenance_elapsed = step3_started.elapsed();
+    let provenance_elapsed = step2_started.elapsed();
 
-    // Step 4: write the ancestor entry. No name carried over from manifest:
-    // a missing volume.name (and missing by_name/ symlink) is the on-disk
-    // marker that distinguishes a pulled ancestor from a user-managed volume.
-    let _ = manifest;
-    let step4_started = std::time::Instant::now();
+    // Step 3: write the ancestor entry. No `volume.toml` and no
+    // by_name symlink: both absences mark this entry as a pulled
+    // ancestor rather than a user-managed volume.
+    let step3_started = std::time::Instant::now();
     let result: std::io::Result<()> = (|| {
         std::fs::create_dir_all(&vol_dir)?;
-        elide_core::config::VolumeConfig {
-            name: None,
-            size: Some(size as u64),
-            ..Default::default()
-        }
-        .write(&vol_dir)?;
         std::fs::write(vol_dir.join("volume.readonly"), "")?;
         std::fs::write(vol_dir.join("volume.pub"), &pub_key_bytes)?;
         std::fs::write(
@@ -1550,10 +1528,10 @@ async fn pull_readonly_op(
         let _ = std::fs::remove_dir_all(&vol_dir);
         return Err(IpcError::internal(format!("writing pulled ancestor: {e}")));
     }
-    let write_elapsed = step4_started.elapsed();
+    let write_elapsed = step3_started.elapsed();
 
-    // Step 5: parse and verify provenance to find the parent.
-    let step5_started = std::time::Instant::now();
+    // Step 4: parse and verify provenance to find the parent.
+    let step4_started = std::time::Instant::now();
     let parent = match elide_core::signing::read_lineage_verifying_signature(
         &vol_dir,
         elide_core::signing::VOLUME_PUB_FILE,
@@ -1574,12 +1552,11 @@ async fn pull_readonly_op(
             )));
         }
     };
-    let verify_elapsed = step5_started.elapsed();
+    let verify_elapsed = step4_started.elapsed();
 
     info!(
-        "[inbound] pulled ancestor {volume_id} in {:.2?} (manifest {:.2?}, pub {:.2?}, provenance {:.2?}, write {:.2?}, verify {:.2?})",
+        "[inbound] pulled ancestor {volume_id} in {:.2?} (pub {:.2?}, provenance {:.2?}, write {:.2?}, verify {:.2?})",
         pull_started.elapsed(),
-        manifest_elapsed,
         pub_elapsed,
         provenance_elapsed,
         write_elapsed,
@@ -1988,7 +1965,7 @@ async fn fork_create_op(
     // mint. The remaining work — bucket-side `mark_claimed`,
     // `volume.stopped` marker, journal event — runs unconditionally
     // for the `for_claim` path further down.
-    let (resolved_snap, src_name) = if resume_existing.is_none() {
+    let (resolved_snap, src_name, size) = if resume_existing.is_none() {
         // Phase 1: materialise the fork locally. This generates the new
         // fork's keypair on disk so we can upload `volume.pub` before
         // touching `names/<name>`.
@@ -2044,11 +2021,10 @@ async fn fork_create_op(
             )));
         }
 
-        // Read source volume config: `src_cfg.name` feeds the
-        // `ForkedFrom` journal entry below, and `src_cfg.size` is
-        // inherited into the new fork's `volume.toml` further down.
-        // Done before the bucket claim so a malformed source fails
-        // cleanly without leaving a half-claimed name.
+        // Read source volume config for `src_cfg.name` (feeds the
+        // `ForkedFrom` journal entry). Done before the bucket claim
+        // so a malformed source fails cleanly without leaving a
+        // half-claimed name.
         let src_cfg = match elide_core::config::VolumeConfig::read(&source_dir) {
             Ok(c) => c,
             Err(e) => {
@@ -2058,13 +2034,37 @@ async fn fork_create_op(
                 )));
             }
         };
-        let size = match src_cfg.size {
-            Some(s) => s,
-            None => {
-                cleanup(&new_fork_dir, &symlink_path);
-                return Err(IpcError::conflict(
-                    "source volume has no size (import may not have completed)",
-                ));
+        // Inherited size for the new fork's local `volume.toml`. For a
+        // cross-coordinator claim (`for_claim`) the source is a
+        // pulled ancestor that carries no local `volume.toml` — size
+        // comes from the released NameRecord. For an in-host fork the
+        // source is the live volume, so its local `volume.toml.size`
+        // cache is authoritative.
+        let size = if for_claim {
+            match elide_coordinator::name_store::read_name_record(store, new_name).await {
+                Ok(Some((rec, _))) => rec.size,
+                Ok(None) => {
+                    cleanup(&new_fork_dir, &symlink_path);
+                    return Err(IpcError::not_found(format!(
+                        "claim target name '{new_name}' has no record in bucket"
+                    )));
+                }
+                Err(e) => {
+                    cleanup(&new_fork_dir, &symlink_path);
+                    return Err(IpcError::store(format!(
+                        "reading names/{new_name} for claim: {e}"
+                    )));
+                }
+            }
+        } else {
+            match src_cfg.size {
+                Some(s) => s,
+                None => {
+                    cleanup(&new_fork_dir, &symlink_path);
+                    return Err(IpcError::conflict(
+                        "source volume has no size (import may not have completed)",
+                    ));
+                }
             }
         };
 
@@ -2096,26 +2096,41 @@ async fn fork_create_op(
         }
 
         let src_name = src_cfg.name.or_else(|| source_name_hint.map(str::to_owned));
-        (resolved_snap, src_name)
+        (resolved_snap, src_name, size)
     } else {
         // Resume mode: orphan fork is fully materialised on disk,
         // volume.pub + volume.provenance are already on S3, and
         // volume.toml + by_name symlink already exist. We just need
         // the `resolved_snap` value so the journal event below can
-        // emit a meaningful record. We don't read `volume.toml`
-        // because the fresh-fork path read source's, not the new
-        // fork's; mirroring "use snap if pinned, else latest" is
-        // enough for the event.
+        // emit a meaningful record. The orphan's own volume.toml
+        // already carries `size` (written when the orphan was
+        // first minted), so re-read it here to seed `mark_initial`.
         let resolved_snap = snap.or_else(|| {
             elide_core::volume::latest_snapshot(&source_dir)
                 .ok()
                 .flatten()
         });
+        let new_fork_cfg = match elide_core::config::VolumeConfig::read(&new_fork_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                cleanup(&new_fork_dir, &symlink_path);
+                return Err(IpcError::internal(format!(
+                    "reading orphan fork config: {e}"
+                )));
+            }
+        };
+        let size = match new_fork_cfg.size {
+            Some(s) => s,
+            None => {
+                cleanup(&new_fork_dir, &symlink_path);
+                return Err(IpcError::internal("orphan fork has no size in volume.toml"));
+            }
+        };
         let src_name = elide_core::config::VolumeConfig::read(&source_dir)
             .ok()
             .and_then(|c| c.name)
             .or_else(|| source_name_hint.map(str::to_owned));
-        (resolved_snap, src_name)
+        (resolved_snap, src_name, size)
     };
 
     // Phase 3: for brand-new names, claim in S3. For the
@@ -2131,6 +2146,7 @@ async fn fork_create_op(
             coord_id,
             identity.hostname(),
             new_vol_ulid_value,
+            size,
         )
         .await
         {
@@ -4429,6 +4445,8 @@ mod tests {
         ulid::Ulid::from_string("01J0000000000000000000000V").unwrap()
     }
 
+    const SAMPLE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
     #[tokio::test]
     async fn status_remote_absent_name_returns_err() {
         let store = mem_store();
@@ -4442,7 +4460,7 @@ mod tests {
     #[tokio::test]
     async fn status_remote_owned_live_record() {
         let store = mem_store();
-        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid());
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         rec.coordinator_id = Some("coord-self".into());
         rec.hostname = Some("host-A".into());
         rec.claimed_at = Some("2026-04-28T00:00:00Z".into());
@@ -4464,7 +4482,7 @@ mod tests {
     #[tokio::test]
     async fn status_remote_foreign_live_record() {
         let store = mem_store();
-        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid());
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         rec.coordinator_id = Some("coord-other".into());
         elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
             .await
@@ -4480,7 +4498,7 @@ mod tests {
     #[tokio::test]
     async fn status_remote_released_is_claimable() {
         let store = mem_store();
-        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid());
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         rec.state = elide_core::name_record::NameState::Released;
         rec.handoff_snapshot = Some(sample_ulid());
         elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
@@ -4498,7 +4516,7 @@ mod tests {
     #[tokio::test]
     async fn status_remote_readonly() {
         let store = mem_store();
-        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid());
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         rec.state = elide_core::name_record::NameState::Readonly;
         elide_coordinator::name_store::create_name_record(&store, "img", &rec)
             .await
@@ -4591,7 +4609,7 @@ mod tests {
         upload_signed_segment(&store, dead_vol, seg_ulid, signer.as_ref(), b"data").await;
 
         // names/<name> = Live, owned by some "previous" coordinator id.
-        let mut rec = NameRecord::live_minimal(dead_vol);
+        let mut rec = NameRecord::live_minimal(dead_vol, SAMPLE_SIZE);
         rec.coordinator_id = Some("dead-owner".into());
         ns::create_name_record(&store, name, &rec).await.unwrap();
 
@@ -4681,7 +4699,7 @@ mod tests {
         // synthesised handoff and flips to Released.
         let store: Arc<dyn ObjectStore> = mem_store();
         let dead_vol = ulid::Ulid::new();
-        let mut rec = NameRecord::live_minimal(dead_vol);
+        let mut rec = NameRecord::live_minimal(dead_vol, SAMPLE_SIZE);
         rec.coordinator_id = Some("dead-owner".into());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
@@ -4752,7 +4770,7 @@ mod tests {
         let bad_key = StorePath::from(format!("by_id/{dead_vol}/segments/{bad_id}"));
         store.put(&bad_key, PutPayload::from(bytes)).await.unwrap();
 
-        let mut rec = NameRecord::live_minimal(dead_vol);
+        let mut rec = NameRecord::live_minimal(dead_vol, SAMPLE_SIZE);
         rec.coordinator_id = Some("dead-owner".into());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
@@ -4845,7 +4863,7 @@ mod tests {
 
         // names/<vol> = Live owned by us — would have been the path
         // through the rest of release_volume_op before this fix.
-        let mut rec = NameRecord::live_minimal(vol_ulid);
+        let mut rec = NameRecord::live_minimal(vol_ulid, SAMPLE_SIZE);
         rec.coordinator_id = Some(identity.coordinator_id_str().to_owned());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
@@ -4884,7 +4902,7 @@ mod tests {
 
         let vol_ulid = make_running_volume(data_dir.path());
 
-        let mut rec = NameRecord::live_minimal(vol_ulid);
+        let mut rec = NameRecord::live_minimal(vol_ulid, SAMPLE_SIZE);
         rec.state = NameState::Released;
         rec.coordinator_id = None;
         rec.handoff_snapshot = Some(ulid::Ulid::new());
@@ -4919,7 +4937,7 @@ mod tests {
 
         let vol_ulid = make_running_volume(data_dir.path());
 
-        let mut rec = NameRecord::live_minimal(vol_ulid);
+        let mut rec = NameRecord::live_minimal(vol_ulid, SAMPLE_SIZE);
         rec.coordinator_id = Some("coord-other".into());
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 

@@ -167,6 +167,7 @@ impl World {
                     &coord_id,
                     None,
                     vol_ulid,
+                    4 * 1024 * 1024 * 1024,
                 )
                 .await;
             }
