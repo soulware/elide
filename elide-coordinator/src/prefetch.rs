@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use elide_peer_fetch::{PeerEndpoint, PeerFetchClient};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use tracing::{info, trace, warn};
@@ -72,6 +72,13 @@ pub struct PrefetchResult {
 // so prefetch's manual header parsing stays in sync with the canonical format.
 use elide_core::segment::{HEADER_LEN as SEGMENT_HEADER_LEN, MAGIC as SEGMENT_MAGIC};
 const HEADER_LEN: usize = SEGMENT_HEADER_LEN as usize;
+
+/// Concurrency cap for parallel object fetches inside one prefetch
+/// pass — both `.idx` segment indexes and snapshot artifacts. Sized
+/// for HTTP/2 multiplexing on a single store connection: low enough
+/// not to trip rate limits on commodity object stores, high enough
+/// that one slow GET doesn't stall a chain walk.
+const PREFETCH_CONCURRENCY: usize = 8;
 
 /// Prefetch the index section (`.idx`) for all segments in `fork_dir` and its
 /// ancestors that are not present locally.
@@ -236,62 +243,92 @@ async fn prefetch_fork(
         .await
         .with_context(|| format!("listing by_id/{volume_id}/segments/"))?;
 
-    for obj in objects {
-        let key = &obj.location;
+    // Sync filter: drop bad-ULID / past-cutoff / already-local entries
+    // up front. Counts already-local as skipped (matches the previous
+    // sequential behaviour); other rejections are silent (malformed
+    // listings shouldn't pollute the operator log).
+    let vol_ulid = Ulid::from_string(volume_id).ok();
+    let to_fetch: Vec<(StorePath, String, Ulid)> = objects
+        .into_iter()
+        .filter_map(|obj| {
+            let ulid_str = obj.location.filename()?.to_owned();
+            let ulid = Ulid::from_string(&ulid_str).ok()?;
+            if branch_ulid.is_some_and(|cutoff| ulid_str.as_str() > cutoff) {
+                return None;
+            }
+            let local_idx = fork_dir.join("index").join(format!("{ulid_str}.idx"));
+            if local_idx.exists() {
+                result.skipped += 1;
+                return None;
+            }
+            Some((obj.location, ulid_str, ulid))
+        })
+        .collect();
 
-        // The last path component is the ULID.
-        let Some(ulid_str) = key.filename() else {
-            continue;
-        };
+    // Per-segment outcome from one parallel fetch. Aggregated into the
+    // shared `PrefetchResult` after the bounded parallel pass.
+    enum IdxOutcome {
+        FromPeer,
+        FromStore,
+        Failed,
+    }
 
-        // Validate as ULID.
-        if Ulid::from_string(ulid_str).is_err() {
-            continue;
-        }
-
-        // Apply branch-point cutoff: segments written after the snapshot that
-        // this fork branched from are not part of this fork's ancestry.
-        if branch_ulid.is_some_and(|cutoff| ulid_str > cutoff) {
-            continue;
-        }
-
-        // Skip if the index section is already present locally.
-        let local_idx = fork_dir.join("index").join(format!("{ulid_str}.idx"));
-        if local_idx.exists() {
-            result.skipped += 1;
-            continue;
-        }
-
-        // Peer-fetch tier (best-effort): try the peer first if a context
-        // is available. On any failure path the loop falls through to the
-        // S3 fetch below; the peer is intentionally never blocking.
-        if let Some(peer_ctx) = peer
-            && let Some(ulid) = Ulid::from_string(ulid_str).ok()
-            && let Some(vol_ulid) = Ulid::from_string(volume_id).ok()
-        {
-            match peer_fetch_idx(peer_ctx, vol_ulid, ulid, fork_dir, ulid_str, verifying_key).await
-            {
-                Ok(()) => {
-                    info!("[prefetch] fetched index from peer: {ulid_str}");
-                    result.fetched += 1;
-                    result.fetched_from_peer += 1;
-                    continue;
+    let outcomes: Vec<IdxOutcome> =
+        futures::stream::iter(to_fetch.into_iter().map(|(location, ulid_str, ulid)| {
+            let store = store.clone();
+            let fork_dir = fork_dir.to_path_buf();
+            let verifying_key = *verifying_key;
+            async move {
+                // Peer-fetch tier (best-effort): try the peer first if
+                // a context is available and we resolved both ULIDs.
+                // On any failure path fall through to S3.
+                if let (Some(peer_ctx), Some(vol_ulid)) = (peer, vol_ulid) {
+                    match peer_fetch_idx(
+                        peer_ctx,
+                        vol_ulid,
+                        ulid,
+                        &fork_dir,
+                        &ulid_str,
+                        &verifying_key,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            info!("[prefetch] fetched index from peer: {ulid_str}");
+                            return IdxOutcome::FromPeer;
+                        }
+                        Err(e) => {
+                            trace!(
+                                "[prefetch] peer miss for {ulid_str}: {e:#}; falling through to S3"
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    trace!("[prefetch] peer miss for {ulid_str}: {e:#}; falling through to S3");
+
+                match fetch_idx(&store, &location, &fork_dir, &ulid_str, &verifying_key).await {
+                    Ok(()) => {
+                        info!("[prefetch] fetched index: {ulid_str}");
+                        IdxOutcome::FromStore
+                    }
+                    Err(e) => {
+                        warn!("[prefetch] failed to fetch index {ulid_str}: {e:#}");
+                        IdxOutcome::Failed
+                    }
                 }
             }
-        }
+        }))
+        .buffer_unordered(PREFETCH_CONCURRENCY)
+        .collect()
+        .await;
 
-        match fetch_idx(store, key, fork_dir, ulid_str, verifying_key).await {
-            Ok(()) => {
-                info!("[prefetch] fetched index: {ulid_str}");
+    for outcome in outcomes {
+        match outcome {
+            IdxOutcome::FromPeer => {
                 result.fetched += 1;
+                result.fetched_from_peer += 1;
             }
-            Err(e) => {
-                warn!("[prefetch] failed to fetch index {ulid_str}: {e:#}");
-                result.failed += 1;
-            }
+            IdxOutcome::FromStore => result.fetched += 1,
+            IdxOutcome::Failed => result.failed += 1,
         }
     }
 
@@ -417,46 +454,61 @@ async fn prefetch_snapshots(
 
     let snap_dir = fork_dir.join("snapshots");
 
-    for obj in objects {
-        let Some(filename) = obj.location.filename() else {
-            continue;
-        };
-        let filename = filename.to_owned();
-
-        // When restricted to a branch-point snapshot, accept only the
-        // three known artifact shapes for that ULID.
-        if let Some(branch) = branch_ulid {
-            let matches = filename == branch
-                || filename == format!("{branch}.manifest")
-                || filename == format!("{branch}.filemap");
-            if !matches {
-                continue;
+    // Filter + skip-if-local synchronously, then fetch the remaining
+    // artifacts concurrently. Bounded with `buffer_unordered` so a
+    // very wide snapshot dir doesn't blast the store with hundreds
+    // of in-flight GETs.
+    let to_fetch: Vec<(object_store::path::Path, String)> = objects
+        .into_iter()
+        .filter_map(|obj| {
+            let filename = obj.location.filename()?.to_owned();
+            if let Some(branch) = branch_ulid {
+                let matches = filename == branch
+                    || filename == format!("{branch}.manifest")
+                    || filename == format!("{branch}.filemap");
+                if !matches {
+                    return None;
+                }
             }
-        }
+            if snap_dir.join(&filename).exists() {
+                return None;
+            }
+            Some((obj.location, filename))
+        })
+        .collect();
 
-        let local_path = snap_dir.join(&filename);
-        if local_path.exists() {
-            continue;
-        }
-
-        let data = store
-            .get(&obj.location)
-            .await
-            .with_context(|| format!("downloading {}", obj.location))?
-            .bytes()
-            .await
-            .with_context(|| format!("reading {}", obj.location))?;
-
-        std::fs::create_dir_all(&snap_dir).context("creating snapshots dir")?;
-
-        let tmp_path = snap_dir.join(format!("{filename}.tmp"));
-        std::fs::write(&tmp_path, &data)
-            .with_context(|| format!("writing {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, &local_path)
-            .with_context(|| format!("renaming to {}", local_path.display()))?;
-
-        info!("[prefetch] fetched snapshot artifact: {filename}");
+    if to_fetch.is_empty() {
+        return Ok(());
     }
+    std::fs::create_dir_all(&snap_dir).context("creating snapshots dir")?;
+
+    let snap_dir = snap_dir.clone();
+    futures::stream::iter(to_fetch.into_iter().map(|(location, filename)| {
+        let store = store.clone();
+        let snap_dir = snap_dir.clone();
+        async move {
+            let data = store
+                .get(&location)
+                .await
+                .with_context(|| format!("downloading {location}"))?
+                .bytes()
+                .await
+                .with_context(|| format!("reading {location}"))?;
+
+            let tmp_path = snap_dir.join(format!("{filename}.tmp"));
+            let local_path = snap_dir.join(&filename);
+            std::fs::write(&tmp_path, &data)
+                .with_context(|| format!("writing {}", tmp_path.display()))?;
+            std::fs::rename(&tmp_path, &local_path)
+                .with_context(|| format!("renaming to {}", local_path.display()))?;
+
+            info!("[prefetch] fetched snapshot artifact: {filename}");
+            anyhow::Ok(())
+        }
+    }))
+    .buffer_unordered(PREFETCH_CONCURRENCY)
+    .try_collect::<Vec<()>>()
+    .await?;
 
     Ok(())
 }
