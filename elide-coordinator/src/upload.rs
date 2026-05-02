@@ -192,12 +192,13 @@ pub fn snapshot_manifest_key(volume_id: &str, ulid_str: &str) -> Result<StorePat
 
 /// Volume manifest written to `by_id/<ulid>/manifest.toml` in the store.
 ///
-/// Contains everything a new host needs to reconstruct the local directory
-/// skeleton before prefetching segment indexes.
+/// Holds bookkeeping fields for operator inspection. The authoritative
+/// per-volume size lives on `names/<name>` (see
+/// `docs/design-volume-size-ownership.md`); this manifest carries none
+/// of it. Ancestors don't carry size on disk at all.
 #[derive(Serialize)]
 struct Manifest<'a> {
     name: &'a str,
-    size: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     readonly: bool,
     /// Present on forks only. Format: `<parent-ulid>/snapshots/<snapshot-ulid>`.
@@ -458,9 +459,6 @@ async fn upload_manifest(
         .trim()
         .to_owned();
     let name = name.as_str();
-    let size = cfg
-        .size
-        .ok_or_else(|| anyhow::anyhow!("volume.toml missing size"))?;
 
     let readonly = vol_dir.join("volume.readonly").exists();
 
@@ -483,7 +481,6 @@ async fn upload_manifest(
 
     let manifest = Manifest {
         name,
-        size,
         readonly,
         origin,
         source,
@@ -958,8 +955,11 @@ mod tests {
         let content = String::from_utf8(got.bytes().await.unwrap().to_vec()).unwrap();
         let table: toml::Table = toml::from_str(&content).unwrap();
         assert_eq!(table["name"].as_str(), Some("my-vol"));
-        assert_eq!(table["size"].as_integer(), Some(8192));
         assert_eq!(table["readonly"].as_bool(), Some(true));
+        assert!(
+            !table.contains_key("size"),
+            "size has moved to names/<name>; manifest.toml must not carry it"
+        );
 
         // names/<name> is owned by the lifecycle verbs, not drain. The
         // drain path must not touch it — assert no record was created.

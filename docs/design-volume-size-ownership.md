@@ -1,15 +1,15 @@
 # Volume size lives with the live owner
 
-**Status:** Proposed.
+**Status:** Implemented.
 
-`size` is the only mutable, load-bearing field carried by `manifest.toml` today, and it has no cryptographic anchor — it sits in an unsigned TOML file on S3, trusted via S3 IAM alone. The proposal is to relocate it to the `names/<name>` claim record (already authoritative for current ownership, already CAS-protected, already chained into the signed event log) and drop it from the per-volume on-disk skeleton entirely.
+`size` was previously the only mutable, load-bearing field carried by `manifest.toml`, and it had no cryptographic anchor — it sat in an unsigned TOML file on S3, trusted via S3 IAM alone. It now lives on the `names/<name>` claim record (already authoritative for current ownership, already CAS-protected, already chained into the signed event log). Ancestors carry no size on disk at all.
 
 ## The shape
 
-- Add `size: u64` to `NameRecord` (the TOML at `names/<name>`).
-- Drop `size` from `manifest.toml`. Ancestors carry no size on disk at all.
+- `size: u64` is a required field on `NameRecord` (the TOML at `names/<name>`); schema bumped to `version = 2`.
+- `manifest.toml` no longer carries `size`. Pulled-ancestor skeletons fetch `volume.pub + volume.provenance` only — no `manifest.toml` GET, no `volume.toml`.
 - The single owner of `names/<name>` — the coordinator currently holding the claim — is the sole writer of `size`. Updates are CAS-mutations on the same record that already serialises ownership, state, and handoff snapshot.
-- Local `volume.toml.size` becomes a *cache* of the authoritative `names/<name>.size`, populated at claim/bootstrap time, the same way `name` is already cached locally.
+- Local `volume.toml.size` is a *cache* of the authoritative `names/<name>.size`, hydrated at create / fork / claim / orphan-resume time, the same way `name` is already cached locally.
 
 ## Why this works
 
@@ -52,7 +52,9 @@ Once `size` moves out, the remaining fields are all derivable or non-load-bearin
 
 ## Migration
 
-Per project convention (no backwards-compat by default): existing `names/<name>` records get rewritten with `size` populated from their volume's current `manifest.toml` on first read by a coordinator running the new code. `manifest.toml` either lingers harmlessly (if kept for now) or gets removed in the follow-up cleanup. Existing ancestors keep their `manifest.toml` files on disk; nothing reads them under the new code.
+Per project convention (no backwards-compat by default): the schema bump from `version = 1` → `version = 2` is fresh-bucket-only. `NameRecord::from_toml` rejects unknown versions, so coordinators upgrading against a populated bucket will refuse to parse pre-existing records. Buckets must be re-created.
+
+For readonly imports, the bucket-side `mark_initial_readonly` claim is now deferred from `spawn_import` to post-`import_image` completion (the size isn't known until ext4 extraction). Two coordinators racing on the same name both download/extract; the second to claim sees `AlreadyExists` and rolls back local state. Wasted CPU/bandwidth, no corruption.
 
 ## Tradeoffs
 
@@ -60,4 +62,5 @@ Per project convention (no backwards-compat by default): existing `names/<name>`
 - **Pro:** peer-fetch can extend to the skeleton without further design — both remaining files are signed/anchored.
 - **Pro:** resize is a CAS, not a fork — no new vol_ulids per resize, no ancestor chain growth, no name rebind needed.
 - **Con:** ublk online resize requires Linux 6.16+. Older kernels need the older fall-back (stop + del + re-add) — but that's true of any resize implementation, with or without this proposal.
-- **Con:** an ancestor pulled by a host that *only* needs it as a fork source must skip it. There may be diagnostic tools that today walk ancestors and report sizes; those would need to either look up `names/<ancestor-name>` (only works if the ancestor is currently named) or accept that ancestor size isn't recoverable. Per the trace, no production code path does this.
+- **Con:** an ancestor pulled by a host that *only* needs it as a fork source carries no size locally. Diagnostic tools that walk ancestors and want sizes must either look up `names/<ancestor-name>` (only works if the ancestor is currently named) or accept that ancestor size isn't recoverable. No production code path does this.
+- **Con:** readonly-import bucket claim is deferred until after the OCI image is extracted, opening a small race window for concurrent same-name imports on different hosts. Both downloads complete; one wins the claim, the other rolls back. Operator error to begin with — and the alternative (claim up-front, sentinel size) was a worse fit for the trust model.

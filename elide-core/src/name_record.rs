@@ -14,22 +14,24 @@
 //! TOML, content-type `application/toml; charset=utf-8`. Optional fields
 //! are omitted on serialise via `skip_serializing_if = "Option::is_none"`.
 //!
-//! ## Phase 1 writer output (`NameRecord::live_minimal(vol_ulid)`)
+//! ## Minimal writer output (`NameRecord::live_minimal(vol_ulid, size)`)
 //!
 //! ```toml
-//! version = 1
+//! version = 2
 //! vol_ulid = "01J0000000000000000000000V"
+//! size = 4294967296
 //! state = "live"
 //! ```
 //!
-//! Three lines. `coordinator_id`, `parent`, `claimed_at`, `hostname`
+//! Four lines. `coordinator_id`, `parent`, `claimed_at`, `hostname`
 //! are all `None` and skipped.
 //!
-//! ## Phase 2 fully-populated record (after lifecycle verbs land)
+//! ## Fully-populated record
 //!
 //! ```toml
-//! version = 1
+//! version = 2
 //! vol_ulid = "01J0000000000000000000000V"
+//! size = 4294967296
 //! coordinator_id = "01ABCDEFGHJKMNPQRSTVWXYZ23"
 //! state = "released"
 //! parent = "01XYZ000000000000000000000/01SNP000000000000000000000"
@@ -40,11 +42,15 @@
 //!
 //! # Field semantics
 //!
-//! - `version` — schema version. Always `1` for this build. `from_toml`
+//! - `version` — schema version. Always `2` for this build. `from_toml`
 //!   rejects unknown values; schema changes are fresh-bucket-only.
 //! - `vol_ulid` — ULID of the fork currently bound to this name.
 //!   Crockford-Base32; round-trips through `ulid::Ulid` directly via
 //!   the `serde` feature on the `ulid` crate.
+//! - `size` — logical capacity of the volume in bytes. Authoritative;
+//!   the local `volume.toml.size` is a cache hydrated from this field.
+//!   The single owner of `names/<name>` is the sole writer (resize is a
+//!   CAS-mutation here, not a fork). See `docs/design-volume-size-ownership.md`.
 //! - `coordinator_id` — derived from the coordinator's Ed25519 public key
 //!   via `blake3::derive_key("elide coordinator-id v1", &pub_bytes)`,
 //!   formatted as a 26-char Crockford-Base32 ULID-shape (see
@@ -229,8 +235,7 @@ impl NameState {
 /// Record stored at `names/<name>` in the bucket.
 ///
 /// All cross-host ownership transfer goes through conditional PUTs on
-/// this record. Phase 1 of the portable-live-volume work establishes
-/// the schema; Phase 2 wires the lifecycle verbs that mutate it.
+/// this record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NameRecord {
     /// Schema version. Bumped on fresh-bucket-only breaking changes.
@@ -239,10 +244,15 @@ pub struct NameRecord {
     /// ULID of the fork currently bound to this name.
     pub vol_ulid: Ulid,
 
+    /// Logical capacity of the volume in bytes. Authoritative; the
+    /// local `volume.toml.size` is a cache hydrated from this field.
+    /// See `docs/design-volume-size-ownership.md`.
+    pub size: u64,
+
     /// Coordinator currently holding the name (when `state` is `Live`
     /// or `Stopped`), or the most recent owner (when `state` is
-    /// `Released`). `None` for records written by Phase 1 before the
-    /// coordinator-id plumbing lands in Phase 2.
+    /// `Released`). `None` on records that have never gone through a
+    /// lifecycle verb that records owner identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_id: Option<String>,
 
@@ -279,16 +289,16 @@ pub struct NameRecord {
 }
 
 impl NameRecord {
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 
     /// Create a record naming a single fork as live, with no
-    /// coordinator-specific metadata. Suitable for Phase 1 writers
-    /// (e.g. `upload_volume_metadata`) that don't yet have access to
-    /// `coordinator_id` or hostname.
-    pub fn live_minimal(vol_ulid: Ulid) -> Self {
+    /// coordinator-specific metadata. Useful for tests and any caller
+    /// that wants a plain `Live` skeleton to mutate.
+    pub fn live_minimal(vol_ulid: Ulid, size: u64) -> Self {
         Self {
             version: Self::CURRENT_VERSION,
             vol_ulid,
+            size,
             coordinator_id: None,
             state: NameState::Live,
             parent: None,
@@ -304,11 +314,22 @@ impl NameRecord {
     }
 
     /// Parse from TOML, rejecting unknown schema versions.
+    ///
+    /// Version is probed first via a minimal struct so an old-schema
+    /// record is reported as `UnsupportedVersion` rather than a generic
+    /// "missing field" TOML error. This makes the wrong-version case
+    /// unambiguous in operator-facing error messages.
     pub fn from_toml(s: &str) -> Result<Self, ParseNameRecordError> {
-        let record: NameRecord = toml::from_str(s).map_err(ParseNameRecordError::Toml)?;
-        if record.version != Self::CURRENT_VERSION {
-            return Err(ParseNameRecordError::UnsupportedVersion(record.version));
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            #[serde(default)]
+            version: u32,
         }
+        let probe: VersionProbe = toml::from_str(s).map_err(ParseNameRecordError::Toml)?;
+        if probe.version != Self::CURRENT_VERSION {
+            return Err(ParseNameRecordError::UnsupportedVersion(probe.version));
+        }
+        let record: NameRecord = toml::from_str(s).map_err(ParseNameRecordError::Toml)?;
         Ok(record)
     }
 }
@@ -353,13 +374,16 @@ mod tests {
         Ulid::from_string("01J0000000000000000000000V").unwrap()
     }
 
+    const SAMPLE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
     #[test]
     fn round_trip_minimal() {
-        let r = NameRecord::live_minimal(sample_ulid());
+        let r = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         let toml = r.to_toml().unwrap();
         let parsed = NameRecord::from_toml(&toml).unwrap();
         assert_eq!(parsed.version, NameRecord::CURRENT_VERSION);
         assert_eq!(parsed.vol_ulid, sample_ulid());
+        assert_eq!(parsed.size, SAMPLE_SIZE);
         assert_eq!(parsed.state, NameState::Live);
         assert!(parsed.coordinator_id.is_none());
         assert!(parsed.parent.is_none());
@@ -371,6 +395,7 @@ mod tests {
         let r = NameRecord {
             version: NameRecord::CURRENT_VERSION,
             vol_ulid: sample_ulid(),
+            size: SAMPLE_SIZE,
             coordinator_id: Some("01ABCDEFGHJKMNPQRSTVWXYZ23".to_string()),
             state: NameState::Released,
             parent: Some("01XYZ.../01ABC...".to_string()),
@@ -381,6 +406,7 @@ mod tests {
         let toml = r.to_toml().unwrap();
         let parsed = NameRecord::from_toml(&toml).unwrap();
         assert_eq!(parsed.coordinator_id, r.coordinator_id);
+        assert_eq!(parsed.size, SAMPLE_SIZE);
         assert_eq!(parsed.state, NameState::Released);
         assert_eq!(parsed.parent, r.parent);
         assert_eq!(parsed.claimed_at, r.claimed_at);
@@ -398,7 +424,7 @@ mod tests {
         ] {
             let r = NameRecord {
                 state,
-                ..NameRecord::live_minimal(sample_ulid())
+                ..NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE)
             };
             let toml = r.to_toml().unwrap();
             let parsed = NameRecord::from_toml(&toml).unwrap();
@@ -479,9 +505,15 @@ vol_ulid = "01J0000000000000000000000V"
 
     #[test]
     fn rejects_missing_required_fields() {
-        // `vol_ulid` is required.
-        let toml = "version = 1\n";
+        // `vol_ulid` and `size` are required.
+        let toml = "version = 2\n";
         assert!(NameRecord::from_toml(toml).is_err());
+
+        let toml = "version = 2\nvol_ulid = \"01J0000000000000000000000V\"\n";
+        assert!(
+            NameRecord::from_toml(toml).is_err(),
+            "missing size must fail to parse"
+        );
     }
 
     #[test]
@@ -490,7 +522,7 @@ vol_ulid = "01J0000000000000000000000V"
         // and stable across Rust enum identifier conventions.
         let r = NameRecord {
             state: NameState::Released,
-            ..NameRecord::live_minimal(sample_ulid())
+            ..NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE)
         };
         let toml = r.to_toml().unwrap();
         assert!(

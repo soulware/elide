@@ -289,6 +289,9 @@ pub async fn mark_released_force(
         // Same dead fork — the synthesised snapshot lives under this
         // prefix, and the next claimant forks from it.
         vol_ulid: current.vol_ulid,
+        // Capacity carries forward unchanged through release; the next
+        // claimant will fork at the same logical size.
+        size: current.size,
         // Released → no current owner.
         coordinator_id: None,
         state: NameState::Released,
@@ -467,6 +470,7 @@ pub async fn mark_initial(
     coord_id: &str,
     hostname: Option<&str>,
     vol_ulid: Ulid,
+    size: u64,
 ) -> Result<MarkInitialOutcome, LifecycleError> {
     // If a record already exists, surface its details so the caller can
     // produce a useful error. We do this read first so the common
@@ -483,6 +487,7 @@ pub async fn mark_initial(
     let record = elide_core::name_record::NameRecord {
         version: elide_core::name_record::NameRecord::CURRENT_VERSION,
         vol_ulid,
+        size,
         coordinator_id: Some(coord_id.to_owned()),
         state: NameState::Live,
         parent: None,
@@ -531,6 +536,7 @@ pub async fn mark_initial_readonly(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     vol_ulid: Ulid,
+    size: u64,
 ) -> Result<MarkInitialOutcome, LifecycleError> {
     if let Some((existing, _)) = name_store::read_name_record(store, name).await? {
         return Ok(MarkInitialOutcome::AlreadyExists {
@@ -543,6 +549,7 @@ pub async fn mark_initial_readonly(
     let record = elide_core::name_record::NameRecord {
         version: elide_core::name_record::NameRecord::CURRENT_VERSION,
         vol_ulid,
+        size,
         coordinator_id: None,
         state: NameState::Readonly,
         parent: None,
@@ -634,6 +641,10 @@ pub async fn mark_claimed(
     let new_record = elide_core::name_record::NameRecord {
         version: elide_core::name_record::NameRecord::CURRENT_VERSION,
         vol_ulid: new_vol_ulid,
+        // The new fork inherits the released ancestor's logical size —
+        // a claim is a continuation of the same volume identity, not a
+        // resize.
+        size: existing.size,
         coordinator_id: Some(coord_id.to_owned()),
         state: target_state,
         parent: parent_pin,
@@ -731,6 +742,8 @@ mod tests {
         Ulid::from_string("01J0000000000000000000000V").unwrap()
     }
 
+    const SAMPLE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
     fn key_a() -> [u8; 32] {
         [0xABu8; 32]
     }
@@ -757,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn mark_stopped_flips_live_to_stopped() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
 
         let outcome = mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
@@ -775,7 +788,7 @@ mod tests {
     #[tokio::test]
     async fn mark_stopped_is_idempotent_for_same_owner() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
 
         mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
@@ -786,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn mark_stopped_refuses_other_owners_record() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
 
         // First coordinator A claims via stop.
@@ -802,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn mark_stopped_refuses_released_record() {
         let s = store();
-        let mut rec = NameRecord::live_minimal(sample_ulid());
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         rec.state = NameState::Released;
         create_name_record(&s, "vol", &rec).await.unwrap();
 
@@ -832,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_flips_live_to_released_with_handoff() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
 
         let outcome = mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
@@ -857,7 +870,7 @@ mod tests {
         // Record has full ownership populated (mark_initial-style),
         // verify mark_released wipes all three identity fields.
         let s = store();
-        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 
@@ -886,7 +899,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_flips_stopped_to_released() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
@@ -904,7 +917,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_is_idempotent_for_same_owner() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
 
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
@@ -915,7 +928,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_refuses_other_owners_record() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
 
         // A claims via stop.
@@ -938,7 +951,7 @@ mod tests {
     #[tokio::test]
     async fn mark_live_resumes_stopped_record() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
@@ -955,7 +968,7 @@ mod tests {
     #[tokio::test]
     async fn mark_live_is_idempotent_when_already_live() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         // Phase 1 records start as Live with coordinator_id=None;
         // mark_stopped→mark_live cycles through both states with our id set.
@@ -969,7 +982,7 @@ mod tests {
     #[tokio::test]
     async fn mark_live_signals_released_for_claim_path() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
 
@@ -982,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn mark_live_refuses_other_owners_record() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
@@ -995,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_marker_writes_marker_when_s3_says_stopped() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
 
@@ -1010,7 +1023,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_marker_removes_marker_when_s3_says_live() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         // Cycle through stop → start so coordinator_id is set on the
         // record (Phase 1 records start as Live with no coordinator_id,
@@ -1030,7 +1043,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_marker_ignores_foreign_owned_records() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         // A claims via stop.
         mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
@@ -1060,7 +1073,7 @@ mod tests {
     #[tokio::test]
     async fn mark_claimed_refuses_non_released_record() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         // A owns + Live.
         mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
@@ -1080,7 +1093,7 @@ mod tests {
     #[tokio::test]
     async fn mark_claimed_rebinds_released_record() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
 
@@ -1111,7 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn mark_claimed_resolves_concurrent_races_to_one_winner() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         create_name_record(&s, "vol", &rec).await.unwrap();
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
 
@@ -1154,7 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn mark_initial_claims_fresh_name_with_full_ownership() {
         let s = store();
-        let outcome = mark_initial(&s, "fresh", &id_a(), None, sample_ulid())
+        let outcome = mark_initial(&s, "fresh", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
         assert!(matches!(outcome, MarkInitialOutcome::Claimed));
@@ -1164,6 +1177,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.vol_ulid, sample_ulid());
+        assert_eq!(got.size, SAMPLE_SIZE);
         assert_eq!(got.state, NameState::Live);
         assert!(
             got.coordinator_id.is_some(),
@@ -1176,11 +1190,11 @@ mod tests {
     async fn mark_initial_refuses_when_record_already_exists() {
         let s = store();
         // Pre-existing record under a different owner (key_b).
-        mark_initial(&s, "vol", &id_b(), None, sample_ulid())
+        mark_initial(&s, "vol", &id_b(), None, sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 
-        let outcome = mark_initial(&s, "vol", &id_a(), None, snap())
+        let outcome = mark_initial(&s, "vol", &id_a(), None, snap(), SAMPLE_SIZE)
             .await
             .unwrap();
         match outcome {
@@ -1212,8 +1226,12 @@ mod tests {
         let u1 = sample_ulid();
         let u2 = snap();
 
-        let r1 = mark_initial(&s, "alpha", &id_a(), None, u1).await.unwrap();
-        let r2 = mark_initial(&s, "beta", &id_b(), None, u2).await.unwrap();
+        let r1 = mark_initial(&s, "alpha", &id_a(), None, u1, SAMPLE_SIZE)
+            .await
+            .unwrap();
+        let r2 = mark_initial(&s, "beta", &id_b(), None, u2, SAMPLE_SIZE)
+            .await
+            .unwrap();
         assert!(matches!(r1, MarkInitialOutcome::Claimed));
         assert!(matches!(r2, MarkInitialOutcome::Claimed));
 
@@ -1237,7 +1255,7 @@ mod tests {
     async fn mark_reclaimed_local_flips_released_to_live_keeping_vol_ulid() {
         let s = store();
         // Set up: claim via mark_initial, release.
-        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
@@ -1274,7 +1292,7 @@ mod tests {
     #[tokio::test]
     async fn mark_reclaimed_local_reports_not_released_for_live_record() {
         let s = store();
-        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 
@@ -1299,7 +1317,7 @@ mod tests {
         // A different vol_ulid than the local fork → caller must use
         // the cross-coordinator claim path, not the in-place reclaim.
         let s = store();
-        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
@@ -1333,7 +1351,7 @@ mod tests {
     #[tokio::test]
     async fn mark_initial_readonly_claims_with_no_owner_identity() {
         let s = store();
-        let outcome = mark_initial_readonly(&s, "ubuntu24", sample_ulid())
+        let outcome = mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
         assert!(matches!(outcome, MarkInitialOutcome::Claimed));
@@ -1352,11 +1370,13 @@ mod tests {
     #[tokio::test]
     async fn mark_initial_readonly_refuses_when_name_already_exists() {
         let s = store();
-        mark_initial_readonly(&s, "ubuntu24", sample_ulid())
+        mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 
-        let outcome = mark_initial_readonly(&s, "ubuntu24", snap()).await.unwrap();
+        let outcome = mark_initial_readonly(&s, "ubuntu24", snap(), SAMPLE_SIZE)
+            .await
+            .unwrap();
         match outcome {
             MarkInitialOutcome::AlreadyExists {
                 existing_vol_ulid,
@@ -1375,11 +1395,13 @@ mod tests {
         // First a writable claim, then an attempt to import the same
         // name → must be refused.
         let s = store();
-        mark_initial(&s, "name", &id_a(), None, sample_ulid())
+        mark_initial(&s, "name", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 
-        let outcome = mark_initial_readonly(&s, "name", snap()).await.unwrap();
+        let outcome = mark_initial_readonly(&s, "name", snap(), SAMPLE_SIZE)
+            .await
+            .unwrap();
         assert!(matches!(
             outcome,
             MarkInitialOutcome::AlreadyExists {
@@ -1394,7 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn mark_stopped_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid())
+        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 
@@ -1413,7 +1435,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid())
+        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 
@@ -1432,7 +1454,7 @@ mod tests {
     #[tokio::test]
     async fn mark_live_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid())
+        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 
@@ -1454,7 +1476,7 @@ mod tests {
         // path — readonly records are not part of the claim-from-released
         // flow.
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid())
+        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 
@@ -1482,7 +1504,7 @@ mod tests {
     async fn mark_released_force_overrides_foreign_owned_live_record() {
         let s = store();
         // A owns Live.
-        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 
@@ -1515,7 +1537,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_force_overrides_foreign_owned_stopped_record() {
         let s = store();
-        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
         mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
@@ -1527,7 +1549,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_force_refuses_already_released_record() {
         let s = store();
-        mark_initial(&s, "vol", &id_a(), None, sample_ulid())
+        mark_initial(&s, "vol", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
         mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
@@ -1544,7 +1566,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_force_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid())
+        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE)
             .await
             .unwrap();
 

@@ -5,17 +5,18 @@
 // resolve a child's lineage:
 //
 //   by_id/<ulid>/
-//     volume.toml              — size only; no name (visual indicator that
-//                                this entry is a pulled ancestor, not a
-//                                user-managed volume)
-//     volume.readonly          — marker
+//     volume.readonly          — marker (ancestor, not user-managed)
 //     volume.pub               — Ed25519 verifying key
 //     volume.provenance        — signed lineage (parent + extent_index)
 //     index/                   — empty, populated by `prefetch_indexes`
 //
-// This is the async counterpart to the CLI's `pull_one_readonly` in
-// `src/main.rs`. The coordinator uses it to auto-heal ancestor chains when
-// a newly-discovered volume references a parent that isn't locally present
+// Ancestors carry no `volume.toml` and no size: per
+// `docs/design-volume-size-ownership.md` size lives only on
+// `names/<name>` for the live volume, and ancestors are read-only segment
+// containers reached through a child's LBA map.
+//
+// The coordinator uses this to auto-heal ancestor chains when a
+// newly-discovered volume references a parent that isn't locally present
 // (the "self-healing prefetch" path).
 
 use std::path::{Path, PathBuf};
@@ -31,14 +32,13 @@ use object_store::path::Path as StorePath;
 /// prefetch tick).
 ///
 /// Fetches:
-///   - `by_id/<volume_id>/manifest.toml`
 ///   - `by_id/<volume_id>/volume.pub`
 ///   - `by_id/<volume_id>/volume.provenance`
 ///
 /// Writes them into `<data_dir>/by_id/<volume_id>/` along with a
-/// `volume.readonly` marker, a `volume.toml` carrying only the size (no
-/// name), and an empty `index/` directory. The absent name and absent
-/// `by_name/` symlink mark this entry as a pulled ancestor rather than a
+/// `volume.readonly` marker and an empty `index/` directory. No
+/// `volume.toml` is written: ancestors carry no size, and the absent
+/// `by_name/` symlink marks the entry as a pulled ancestor rather than a
 /// user-managed volume.
 ///
 /// Signature verification of the downloaded `volume.provenance` is *not*
@@ -56,16 +56,14 @@ pub async fn pull_volume_skeleton(
         return Ok(vol_dir);
     }
 
-    // Three independent GETs — fire concurrently so per-ancestor pull
+    // Two independent GETs — fire concurrently so per-ancestor pull
     // latency is bounded by the slowest, not the sum.
-    let manifest_key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
     let pub_key = StorePath::from(format!("by_id/{volume_id}/volume.pub"));
     let provenance_key = StorePath::from(format!(
         "by_id/{volume_id}/{}",
         elide_core::signing::VOLUME_PROVENANCE_FILE
     ));
-    let (manifest_bytes, pub_bytes, provenance_bytes) = tokio::try_join!(
-        fetch_bytes(store, &manifest_key, "manifest.toml", volume_id),
+    let (pub_bytes, provenance_bytes) = tokio::try_join!(
         fetch_bytes(store, &pub_key, "volume.pub", volume_id),
         fetch_bytes(
             store,
@@ -74,24 +72,8 @@ pub async fn pull_volume_skeleton(
             volume_id,
         ),
     )?;
-    let manifest: toml::Table = toml::from_str(
-        std::str::from_utf8(&manifest_bytes)
-            .with_context(|| format!("manifest.toml for {volume_id} is not valid UTF-8"))?,
-    )
-    .with_context(|| format!("parsing manifest.toml for {volume_id}"))?;
-    let size = manifest
-        .get("size")
-        .and_then(|v| v.as_integer())
-        .ok_or_else(|| anyhow::anyhow!("manifest.toml for {volume_id} missing 'size'"))?;
 
     std::fs::create_dir_all(&vol_dir).with_context(|| format!("creating {}", vol_dir.display()))?;
-    elide_core::config::VolumeConfig {
-        name: None,
-        size: Some(size as u64),
-        ..Default::default()
-    }
-    .write(&vol_dir)
-    .with_context(|| format!("writing volume.toml for {volume_id}"))?;
     std::fs::write(vol_dir.join("volume.readonly"), "")
         .with_context(|| format!("writing volume.readonly for {volume_id}"))?;
     std::fs::write(vol_dir.join("volume.pub"), &pub_bytes)

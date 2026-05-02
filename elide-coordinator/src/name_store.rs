@@ -210,6 +210,8 @@ mod tests {
         Ulid::from_string("01J0000000000000000000000V").unwrap()
     }
 
+    const SAMPLE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
     #[tokio::test]
     async fn read_returns_none_for_absent() {
         let s = store();
@@ -220,7 +222,7 @@ mod tests {
     #[tokio::test]
     async fn create_then_read_round_trips() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
 
         create_name_record(&s, "vol", &rec).await.unwrap();
 
@@ -232,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn create_rejects_duplicate() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
 
         create_name_record(&s, "vol", &rec).await.unwrap();
         let err = create_name_record(&s, "vol", &rec)
@@ -244,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn update_with_correct_version_succeeds() {
         let s = store();
-        let mut rec = NameRecord::live_minimal(sample_ulid());
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
 
         create_name_record(&s, "vol", &rec).await.unwrap();
         let (_r, v) = read_name_record(&s, "vol").await.unwrap().unwrap();
@@ -259,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn update_with_stale_version_fails() {
         let s = store();
-        let mut rec = NameRecord::live_minimal(sample_ulid());
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
 
         create_name_record(&s, "vol", &rec).await.unwrap();
         let (_r, stale) = read_name_record(&s, "vol").await.unwrap().unwrap();
@@ -280,7 +282,7 @@ mod tests {
     #[tokio::test]
     async fn update_of_missing_key_fails() {
         let s = store();
-        let rec = NameRecord::live_minimal(sample_ulid());
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         let err = update_name_record(
             &s,
             "missing",

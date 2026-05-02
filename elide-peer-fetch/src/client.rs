@@ -399,7 +399,7 @@ mod tests {
             .unwrap();
 
         // Publish names/<vol_name>
-        let mut record = NameRecord::live_minimal(vol_ulid);
+        let mut record = NameRecord::live_minimal(vol_ulid, 4 * 1024 * 1024 * 1024);
         record.coordinator_id = Some(coord_id.clone());
         record.state = NameState::Live;
         store
