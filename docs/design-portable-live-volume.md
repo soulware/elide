@@ -709,6 +709,69 @@ but the read cost is bounded by the most recent handoff snapshot;
 `materialize` on demand collapses the chain when the operator (or
 automation) decides the chain has grown unwieldy.
 
+**Proposed: skip empty intermediates on claim.** A release/claim
+cycle that produces no writes — common when two coordinators
+ping-pong a volume for testing, or any time a volume is stopped on
+host A and started on host B without modifying it — currently adds
+a no-op fork to the chain. Each such fork has a fresh keypair, a
+signed `volume.provenance`, and a handoff snapshot whose manifest
+references exactly the same segments as its parent's snapshot. The
+chain grows but the visible state does not.
+
+The rule:
+
+- On `volume claim`, after reading the released name record but
+  before minting the new fork, decide whether the released fork is
+  empty.
+- **Empty predicate.** Read the released fork's
+  `volume.provenance` to obtain `parent.snapshot_ulid`. Read the
+  handoff snapshot's manifest. The released fork is empty iff
+  `max(handoff_manifest.segments) < parent.snapshot_ulid`. ULID
+  monotonicity guarantees: any segment a child wrote was minted
+  after its parent's snapshot was taken, so a child-written segment
+  has a ULID strictly greater than the parent snapshot's ULID. An
+  empty child's manifest contains only inherited segments, all with
+  ULIDs less than the parent snapshot's ULID.
+- **Action.** If empty, set the new fork's `parent` to the released
+  fork's own `parent` ref (taken straight out of its
+  `volume.provenance`). Otherwise, use the released fork as parent
+  (current behaviour).
+
+The released fork's `volume.pub` and `volume.provenance` remain on
+S3 — they are tiny (~355 bytes total) and unreachable orphans
+rather than chain links. They never contained segments, so there is
+nothing else to clean up. GC of these unreferenced fork prefixes
+can come later, but is not required for correctness or scale.
+
+The rule applied consistently keeps the chain shallow by induction:
+every fork's `parent` already points at a non-empty ancestor,
+because the previous claim applied the same rule. The "walk" is a
+single check per claim ("is the released fork empty?") — no
+traversal of empty chains.
+
+For a volume that already accumulated a long chain of empty
+intermediates before this rule was deployed, the next claim walks
+the chain once to find the deepest non-empty ancestor; subsequent
+claims see a chain of depth 2.
+
+**Race analysis.** Conditional PUT on `names/<name>` is the
+linearisation point for claims, exactly as today. Released forks
+are frozen — their `volume.provenance` and snapshot manifests are
+immutable. Two coordinators racing to claim a released name read
+the same S3 state, compute the same predicate, and produce
+equivalent provenance pointing at the same parent ref; only one
+wins the conditional PUT, and the loser's orphaned uploads are
+handled by the existing claim-failure path. The predicate is
+monotonically safe: a false negative (says "not empty" when actually
+was) degrades to current behaviour; a false positive cannot happen
+under ULID monotonicity for any non-GC fork. GC artefacts on a
+released fork register correctly as "not empty" because GC mints
+new segments with ULIDs greater than the parent snapshot's ULID.
+
+This composes with `materialize` rather than replacing it:
+`materialize` still exists for collapsing a chain that has grown
+because of *real writes*, where each link carries content.
+
 ## Open questions
 
 1. **Naming clarity.** "Live" today means "host-pinned and serving".

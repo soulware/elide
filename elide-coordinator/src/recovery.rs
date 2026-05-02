@@ -37,8 +37,8 @@ use ulid::Ulid;
 
 use elide_core::segment::{HEADER_LEN, MAGIC, SegmentSigner};
 use elide_core::signing::{
-    SnapshotManifestRecovery, build_snapshot_manifest_bytes, peek_snapshot_manifest_recovery,
-    read_snapshot_manifest_from_bytes,
+    SnapshotManifest, SnapshotManifestRecovery, build_snapshot_manifest_bytes,
+    peek_snapshot_manifest_recovery, read_snapshot_manifest_from_bytes,
 };
 
 use crate::portable::{self, ConditionalPutError};
@@ -466,6 +466,73 @@ pub async fn resolve_handoff_verifier(
         recovered_at: recovery.recovered_at,
         manifest_pubkey: Box::new(manifest_pubkey),
     })
+}
+
+/// Fetch a handoff snapshot manifest from S3, verify it under the
+/// right key, and return the parsed manifest alongside the
+/// [`HandoffVerifier`] that identified the key.
+///
+/// `fallback_pubkey` is the volume's own identity key, used when the
+/// manifest is a normal (non-recovery) handoff. For recovery
+/// manifests the recovering coordinator's pub is fetched and
+/// verified under the same path-binding rules as
+/// [`resolve_handoff_verifier`].
+///
+/// Used by the claim path to inspect the released fork's segment
+/// list and decide whether to skip an empty intermediate fork.
+pub async fn fetch_verified_handoff_manifest(
+    store: &Arc<dyn ObjectStore>,
+    vol_ulid: Ulid,
+    snap_ulid: Ulid,
+    fallback_pubkey: &VerifyingKey,
+) -> Result<(SnapshotManifest, HandoffVerifier), ResolveHandoffError> {
+    let key = snapshot_manifest_key(&vol_ulid.to_string(), &snap_ulid.to_string())
+        .map_err(|e| ResolveHandoffError::ManifestRead(e.context("computing manifest key")))?;
+    let bytes = store
+        .get(&key)
+        .await
+        .map_err(|e| {
+            ResolveHandoffError::ManifestRead(
+                anyhow::Error::new(e).context(format!("fetching snapshot manifest at {key}")),
+            )
+        })?
+        .bytes()
+        .await
+        .map_err(|e| {
+            ResolveHandoffError::ManifestRead(
+                anyhow::Error::new(e)
+                    .context(format!("reading snapshot manifest bytes from {key}")),
+            )
+        })?;
+
+    let recovery =
+        peek_snapshot_manifest_recovery(&bytes).map_err(ResolveHandoffError::ManifestParse)?;
+
+    match recovery {
+        None => {
+            let manifest = read_snapshot_manifest_from_bytes(&bytes, fallback_pubkey, &snap_ulid)
+                .map_err(ResolveHandoffError::SignatureInvalid)?;
+            Ok((manifest, HandoffVerifier::Normal))
+        }
+        Some(recovery) => {
+            let manifest_pubkey = crate::identity::fetch_coordinator_pub(
+                store.as_ref(),
+                &recovery.recovering_coordinator_id,
+            )
+            .await
+            .map_err(ResolveHandoffError::PubkeyResolution)?;
+            let manifest = read_snapshot_manifest_from_bytes(&bytes, &manifest_pubkey, &snap_ulid)
+                .map_err(ResolveHandoffError::SignatureInvalid)?;
+            Ok((
+                manifest,
+                HandoffVerifier::Synthesised {
+                    recovering_coordinator_id: recovery.recovering_coordinator_id,
+                    recovered_at: recovery.recovered_at,
+                    manifest_pubkey: Box::new(manifest_pubkey),
+                },
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
