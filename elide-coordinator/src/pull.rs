@@ -56,13 +56,24 @@ pub async fn pull_volume_skeleton(
         return Ok(vol_dir);
     }
 
-    let manifest_bytes = fetch_bytes(
-        store,
-        &StorePath::from(format!("by_id/{volume_id}/manifest.toml")),
-        "manifest.toml",
-        volume_id,
-    )
-    .await?;
+    // Three independent GETs — fire concurrently so per-ancestor pull
+    // latency is bounded by the slowest, not the sum.
+    let manifest_key = StorePath::from(format!("by_id/{volume_id}/manifest.toml"));
+    let pub_key = StorePath::from(format!("by_id/{volume_id}/volume.pub"));
+    let provenance_key = StorePath::from(format!(
+        "by_id/{volume_id}/{}",
+        elide_core::signing::VOLUME_PROVENANCE_FILE
+    ));
+    let (manifest_bytes, pub_bytes, provenance_bytes) = tokio::try_join!(
+        fetch_bytes(store, &manifest_key, "manifest.toml", volume_id),
+        fetch_bytes(store, &pub_key, "volume.pub", volume_id),
+        fetch_bytes(
+            store,
+            &provenance_key,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            volume_id,
+        ),
+    )?;
     let manifest: toml::Table = toml::from_str(
         std::str::from_utf8(&manifest_bytes)
             .with_context(|| format!("manifest.toml for {volume_id} is not valid UTF-8"))?,
@@ -72,24 +83,6 @@ pub async fn pull_volume_skeleton(
         .get("size")
         .and_then(|v| v.as_integer())
         .ok_or_else(|| anyhow::anyhow!("manifest.toml for {volume_id} missing 'size'"))?;
-
-    let pub_bytes = fetch_bytes(
-        store,
-        &StorePath::from(format!("by_id/{volume_id}/volume.pub")),
-        "volume.pub",
-        volume_id,
-    )
-    .await?;
-    let provenance_bytes = fetch_bytes(
-        store,
-        &StorePath::from(format!(
-            "by_id/{volume_id}/{}",
-            elide_core::signing::VOLUME_PROVENANCE_FILE
-        )),
-        elide_core::signing::VOLUME_PROVENANCE_FILE,
-        volume_id,
-    )
-    .await?;
 
     std::fs::create_dir_all(&vol_dir).with_context(|| format!("creating {}", vol_dir.display()))?;
     elide_core::config::VolumeConfig {
