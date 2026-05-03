@@ -324,6 +324,200 @@ impl std::fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
+/// Trait implemented by anything that can sign body-fetch tokens with
+/// a volume's Ed25519 key. Volume-side equivalent of [`TokenSigner`].
+///
+/// The signer's `volume.pub` is published at
+/// `by_id/<vol_ulid>/volume.pub` (the same per-fork key the rest of
+/// the trust model uses); the peer's auth pipeline resolves it from
+/// there.
+pub trait BodyTokenSigner: Debug + Send + Sync {
+    /// The volume ULID this signer represents — i.e. the ULID under
+    /// which the matching `volume.pub` is published.
+    fn vol_ulid(&self) -> Ulid;
+
+    /// Ed25519 sign the body-fetch token's canonical signing payload.
+    fn sign(&self, msg: &[u8]) -> [u8; 64];
+}
+
+/// HTTP client for the volume-signed `.body` route.
+///
+/// Cheap to clone — internal state is `Arc`-wrapped. Holds a
+/// connection pool, a body-token signer, and a single cached bearer
+/// (the token has no per-request scoping; one mint covers every body
+/// request on the same volume until refresh).
+#[derive(Clone)]
+pub struct BodyFetchClient {
+    inner: Arc<BodyInner>,
+}
+
+struct BodyInner {
+    http: reqwest::Client,
+    signer: Arc<dyn BodyTokenSigner>,
+    request_timeout: Duration,
+    token_refresh_after: Duration,
+    cached: RwLock<Option<CachedToken>>,
+}
+
+impl Debug for BodyFetchClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BodyFetchClient")
+            .field("signer", &self.inner.signer)
+            .field("request_timeout", &self.inner.request_timeout)
+            .field("token_refresh_after", &self.inner.token_refresh_after)
+            .finish()
+    }
+}
+
+impl BodyFetchClient {
+    /// Build a client with the default request timeout (5 s) and
+    /// default token refresh interval (half the freshness window).
+    pub fn new(signer: Arc<dyn BodyTokenSigner>) -> Result<Self, BuildError> {
+        Self::builder(signer).build()
+    }
+
+    pub fn builder(signer: Arc<dyn BodyTokenSigner>) -> BodyFetchClientBuilder {
+        BodyFetchClientBuilder {
+            signer,
+            request_timeout: Duration::from_secs(5),
+            token_refresh_after: Duration::from_secs(DEFAULT_FRESHNESS_WINDOW_SECS / 2),
+        }
+    }
+
+    /// Fetch a byte range from `seg_ulid` on the peer.
+    ///
+    /// `range_start` and `range_len` describe a half-open
+    /// body-section-relative interval `[range_start, range_start +
+    /// range_len)`.
+    ///
+    /// Returns:
+    /// - `Some(bytes)` on 200 (the peer covered the full requested
+    ///   range).
+    /// - `None` on 404 / 401 / 403 / 416 / network error / timeout —
+    ///   caller falls through to S3.
+    pub async fn fetch_body_range(
+        &self,
+        peer: &PeerEndpoint,
+        vol_id: Ulid,
+        seg_ulid: Ulid,
+        range_start: u64,
+        range_len: u64,
+    ) -> Option<Bytes> {
+        if range_len == 0 {
+            return Some(Bytes::new());
+        }
+        let url = format!("{}/v1/{}/{}.body", peer.url(), vol_id, seg_ulid);
+        let bearer = self.token_for().await;
+        let range_end_inclusive = range_start + range_len - 1;
+        let response = match self
+            .inner
+            .http
+            .get(&url)
+            .bearer_auth(&bearer)
+            .header(
+                http::header::RANGE,
+                format!("bytes={}-{}", range_start, range_end_inclusive),
+            )
+            .timeout(self.inner.request_timeout)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                trace!(
+                    target = "peer-fetch::client",
+                    url, error = %e, "body request failed"
+                );
+                return None;
+            }
+        };
+
+        let status = response.status();
+        if status != StatusCode::OK {
+            trace!(
+                target = "peer-fetch::client",
+                url,
+                status = status.as_u16(),
+                "body non-200"
+            );
+            return None;
+        }
+
+        match response.bytes().await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                trace!(
+                    target = "peer-fetch::client",
+                    url, error = %e, "read body bytes failed"
+                );
+                None
+            }
+        }
+    }
+
+    async fn token_for(&self) -> String {
+        if let Some(cached) = self.inner.cached.read().await.clone()
+            && Instant::now() < cached.refresh_at
+        {
+            return cached.bearer;
+        }
+        self.mint_token().await
+    }
+
+    async fn mint_token(&self) -> String {
+        let vol_ulid = self.inner.signer.vol_ulid();
+        let issued_at = crate::body_token::BodyFetchToken::now_unix_seconds();
+        let payload = crate::body_token::BodyFetchToken::signing_payload(vol_ulid, issued_at);
+        let signature = self.inner.signer.sign(&payload);
+        let token = crate::body_token::BodyFetchToken {
+            vol_ulid,
+            issued_at,
+            signature,
+        };
+        let bearer = token.encode();
+        let refresh_at = Instant::now() + self.inner.token_refresh_after;
+        *self.inner.cached.write().await = Some(CachedToken {
+            bearer: bearer.clone(),
+            refresh_at,
+        });
+        bearer
+    }
+}
+
+pub struct BodyFetchClientBuilder {
+    signer: Arc<dyn BodyTokenSigner>,
+    request_timeout: Duration,
+    token_refresh_after: Duration,
+}
+
+impl BodyFetchClientBuilder {
+    pub fn request_timeout(mut self, d: Duration) -> Self {
+        self.request_timeout = d;
+        self
+    }
+
+    pub fn token_refresh_after(mut self, d: Duration) -> Self {
+        self.token_refresh_after = d;
+        self
+    }
+
+    pub fn build(self) -> Result<BodyFetchClient, BuildError> {
+        let http = reqwest::Client::builder()
+            .pool_idle_timeout(Some(Duration::from_secs(60)))
+            .build()
+            .map_err(|e| BuildError(format!("build reqwest client: {e}")))?;
+        Ok(BodyFetchClient {
+            inner: Arc::new(BodyInner {
+                http,
+                signer: self.signer,
+                request_timeout: self.request_timeout,
+                token_refresh_after: self.token_refresh_after,
+                cached: RwLock::new(None),
+            }),
+        })
+    }
+}
+
 // The client tests bind a real TCP listener on 127.0.0.1 and exercise
 // the in-process axum router over the loopback. The Claude-Code
 // sandbox blocks `bind()`, so these tests fail with `EPERM` when run

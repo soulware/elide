@@ -160,6 +160,109 @@ This pass is the first place v1 actually warms body bytes from S3 *before* a gue
 - Per-coordinator rate-limiting / blacklist (auth model exposes `coordinator_id` so this is a cheap drop-in later).
 - Multi-tenant peer (peer serving multiple buckets under different scopes).
 
+## Proposed v1.1: generic peer body fetch (volume-owned)
+
+**Status:** Proposed. Not yet implemented; design lives in
+`design-peer-segment-fetch.md` § "Body fetch (deferred — not v1)" with
+a v1.1 block at the top of that section.
+
+v1.1 lifts the body-bytes exclusion. Every byte-range read on the
+running volume — first read after `volume start`, every subsequent
+demand-fetch — flows through the volume's `RangeFetcher`, peer-first
+then S3.
+
+**Single signer: `volume.key`.** Body bytes are volume-owned; the
+volume process holds `volume.key`; the peer-fetch token for body
+bytes is signed with that key. Peer-side verification resolves
+`by_id/<vol_id>/volume.pub`. There is no second token flavour and no
+coordinator-side body fetcher.
+
+**Coordinator-side prewarm step removed.** The pre-existing post-claim
+`elide_fetch::prewarm_volume_start` (`read(0, 2)` warming the first 8
+KiB into `cache/`) is deleted in v1.1. With peer body-fetch in front
+of S3, the first guest IO is a LAN round-trip; the latency that
+prewarm was hiding is no longer worth a second body-byte caller in a
+different process with a different signer. If measurements ever show
+it's worth re-introducing, the prewarm lands inside the volume daemon
+on start, signed with the same `volume.key` — no flavour change.
+
+Wire surface:
+
+```
+GET /v1/<vol_id>/<seg_ulid>.body
+Range: bytes=<a>-<b>
+Authorization: Bearer <volume-signed token>
+```
+
+- 200/206 → caller verifies per-extent against the signed `.idx`
+  (same trust model as the S3 path), then writes into
+  `cache/<seg_ulid>.body` at the right offset and updates
+  `cache/<seg_ulid>.present`.
+- 206 with maximal contiguous prefix → caller takes what it got,
+  asks S3 for the remainder.
+- 404 / 416 / 401 / 403 / network error → caller falls through to
+  the existing S3 range-fetch path. No retry against the peer.
+
+### Endpoint discovery extends to the volume process
+
+Today's `PeerFetchContext` is built at claim time in the coordinator
+and consumed once by the next prefetch tick. v1.1 makes the same
+context available to the volume process — handed across the
+volume-start IPC at the moment the daemon comes up — so the volume's
+`RangeFetcher` can issue peer requests against the right endpoint
+without re-discovering. If discovery yielded no peer
+(`force_released`, unknown predecessor, unreachable), the volume runs
+peer-less, exactly like a v1 read path runs S3-only.
+
+### Work items
+
+- **Server.** Add `.body` route to the peer-fetch axum router; parse
+  a single-range `Range:` header, honour fully-covered ranges with
+  200 / 206, return 206 with `Content-Range` carrying the maximal
+  contiguous covered prefix when the body file is sparse, 404 for
+  "no body file" or "no overlap," 416 for malformed ranges. Reuses
+  the existing five-step auth pipeline; verification key resolves to
+  `by_id/<vol_id>/volume.pub` for `.body` routes.
+- **Client.** `PeerFetchClient::fetch_body_range(peer, vol_id,
+  seg_ulid, range)` returning the bytes the peer covered (possibly
+  shorter than the requested range). Same token caching, same
+  fall-through semantics as `fetch_idx`.
+- **Token signer.** A `VolumeIdentity` `TokenSigner` impl alongside
+  the existing `CoordinatorIdentity` impl. Same trait, different key
+  source.
+- **`RangeFetcher` wire-up.** A peer-aware `RangeFetcher` decorator
+  that consults the peer first and falls through to the inner
+  S3-backed fetcher on miss. Constructed in the volume process on
+  start; the underlying S3 `RangeFetcher` is unchanged.
+- **Volume-side endpoint plumbing.** Extend the volume-start IPC to
+  carry an optional `PeerFetchContext`; the volume builds the
+  peer-aware `RangeFetcher` from it. Absent context = no peer tier.
+- **Remove coordinator-side prewarm.** Delete
+  `elide_fetch::prewarm_volume_start` and its call site in
+  `tasks.rs`; drop the prewarm log lines.
+- **Counters.** Per-volume counters
+  (`body_bytes_from_peer` / `body_bytes_from_store`) on the running
+  read path. Logged at info on volume stop.
+- **Tests.** Two-coordinator integration:
+  - Running read path: A holds the volume with `cache/<seg>.body`
+    populated; B claims, starts the daemon; a guest-issued read for
+    an extent A has cached lands from the peer.
+  - Partial-coverage: A has the segment's `.idx` but only the head
+    of its body cached; B's request for an interior range gets 206
+    with the head, S3 covers the rest. Verify the resulting
+    `cache/<seg>.body` matches what S3 would have produced standalone.
+  - Negatives: A's body fully evicted → peer 404 → S3 fallback; A
+    unreachable → fallback; volume-signed token after volume
+    rotation → 401, S3 fallback.
+
+### What v1.1 deliberately leaves for v1.2+
+
+- `.prefetch`-driven background body warming (v1.1 ships the
+  mechanism; v1.2 layers the warming-hint consumer onto it).
+- TLS for body bytes specifically (auth model already covers it; the
+  question is operational not protocol).
+- Multi-source peer fanout for body fetch.
+
 ## Decision criteria for extending to peer body fetch
 
 The point of shipping `.idx` + `.prefetch` first is to learn whether the mechanism is worth the additional complexity of peer body fetch (range arithmetic, partial-coverage semantics, larger transfers). Look for:
