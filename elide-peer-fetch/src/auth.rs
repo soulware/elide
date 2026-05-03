@@ -22,7 +22,7 @@
 //!
 //! ### Caching profile
 //!
-//! Three layers of cache, each tightly scoped:
+//! Four layers of cache, each tightly scoped:
 //!
 //! - **`coordinator.pub`** — immutable per `coordinator_id`. Cached
 //!   forever after first fetch.
@@ -30,30 +30,31 @@
 //! - **Ancestry walk** — immutable per `vol_ulid` (provenance is
 //!   write-once at fork time). Cached forever after first walk.
 //!
-//! - **`names/<volume_name>`** — ETag-conditional. The cache holds
-//!   `(NameRecord, ETag)`; every request fires a conditional GET with
-//!   `If-None-Match`. A 304 response confirms the cached value is
-//!   still fresh; a 200 returns the new value (and updates the cache).
-//!   This keeps the auth fence coincident with the S3 CAS — the
-//!   moment a new claim lands, the next request sees it via the 200
-//!   response.
+//! - **`names/<volume_name>`** — ETag-conditional. The underlying
+//!   cache holds `(NameRecord, ETag)` and a conditional GET with
+//!   `If-None-Match` revalidates against S3. Used as the fallback
+//!   when the per-bearer name-step cache (below) misses.
 //!
-//! On top of that, [`AuthState`] memoises the *resolved* [`Authorized`]
-//! result keyed on the bearer token + URL `vol_id` for the lifetime
-//! of the token's freshness window. Within the cache window,
-//! repeated requests skip steps 3 and 4 entirely — no S3 lookups for
-//! `names/<name>` (not even the conditional one) and no ancestry
-//! cache touch. Cache lifetime is capped at the token's residual
-//! freshness so an entry can never authorise past the moment the
-//! token would itself become stale; a refreshed token (any
-//! coordinator re-mints in steady state every freshness-window
-//! interval) is a fresh cache miss and re-runs the full pipeline.
+//! - **Per-bearer name-step cache** — keyed on the bearer bytes,
+//!   stores the verified `NameRecord` for the token's residual
+//!   freshness window. Skips the ETag round-trip entirely on hit.
+//!   Designed for chain walks: same token, many ancestor `vol_id`s,
+//!   step 3 answer is identical across them.
 //!
-//! This composition gives most of the benefit of per-connection
-//! memoisation (which the design doc anticipated as the natural future
-//! optimisation) without binding to the HTTP/2 connection abstraction:
-//! a typical prefetch session reuses one token throughout, which is
-//! exactly when the cache hits.
+//! On top of those, [`AuthState`] memoises the *resolved* [`Authorized`]
+//! result keyed on the bearer token + URL `vol_id` + `RouteAuthMode`
+//! for the lifetime of the token's freshness window. Within the cache
+//! window, repeated requests with the same `(bearer, vol_id, mode)`
+//! tuple skip the entire pipeline; chain-walk-shaped requests with
+//! different `vol_id`s but the same bearer fall through to the
+//! per-bearer name-step cache, then to the ancestry walk (cached after
+//! first), then to a freshly-stored verified-tokens entry.
+//!
+//! All cache lifetimes are capped at the token's residual freshness so
+//! an entry can never authorise past the moment the token itself
+//! becomes stale; a refreshed token (any coordinator re-mints in
+//! steady state every freshness-window interval) is a fresh cache miss
+//! and re-runs the full pipeline.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -158,6 +159,15 @@ struct AuthStateInner {
     /// `(NameRecord, ETag)` per volume name. Revalidated via
     /// `If-None-Match` on every request that reaches step 3.
     name_records: RwLock<HashMap<String, (NameRecord, Option<String>)>>,
+    /// Per-bearer name-record outcome. Skipping the ETag-conditional
+    /// GET on every request: chain walks reuse one token across
+    /// many `vol_id`s, and step 3 (`names/<volume>` ownership) is
+    /// `vol_id`-independent — the same token sees the same answer
+    /// for the same volume name regardless of which ancestor URL
+    /// the request targets. Lifetime tracks the token's residual
+    /// freshness window, so the staleness bound is identical to the
+    /// already-existing `verified_tokens` cache.
+    name_step_cache: RwLock<HashMap<String, NameStepEntry>>,
     /// Resolved `Authorized` outcomes keyed on `(bearer_token, vol_id)`.
     /// Entries expire at the token's residual freshness window so a
     /// cached result never outlives the token's own freshness.
@@ -252,6 +262,16 @@ struct VerifiedEntry {
     expires_at: Instant,
 }
 
+/// Cached step-3 result for a bearer. Stores the full `NameRecord`
+/// (state + coord_id + vol_ulid) rather than a precomputed boolean —
+/// step 4's lineage walk needs `vol_ulid`, and re-applying the
+/// state/coord_id check on a cache hit is essentially free.
+#[derive(Debug, Clone)]
+struct NameStepEntry {
+    name_record: NameRecord,
+    expires_at: Instant,
+}
+
 impl AuthState {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self::with_freshness_window(store, DEFAULT_FRESHNESS_WINDOW_SECS)
@@ -276,6 +296,7 @@ impl AuthState {
                 pub_keys: RwLock::new(HashMap::new()),
                 ancestry_cache: RwLock::new(HashMap::new()),
                 name_records: RwLock::new(HashMap::new()),
+                name_step_cache: RwLock::new(HashMap::new()),
                 verified_tokens: RwLock::new(HashMap::new()),
                 freshness_window_secs,
                 rate_limiter,
@@ -343,9 +364,21 @@ impl AuthState {
         }
 
         // Step 3: ownership — the volume name's current claim record
-        // must point at this coordinator. Revalidated via ETag on
-        // every cache miss.
-        let name_record = self.fetch_name_record(&token.volume_name).await?;
+        // must point at this coordinator. The per-bearer
+        // `name_step_cache` short-circuits the ETag-conditional GET
+        // when we've already resolved this token's name record within
+        // its freshness window — chain walks reuse one bearer across
+        // many ancestor `vol_id`s, so this is the hot path. The
+        // state/coord_id check is re-applied on every hit (cheap, and
+        // ensures we never bypass the actual gating logic).
+        let name_record = if let Some(cached) = self.lookup_name_step_cached(bearer_value).await {
+            cached
+        } else {
+            let nr = self.fetch_name_record(&token.volume_name).await?;
+            self.cache_name_step(bearer_value, nr.clone(), &token, now)
+                .await;
+            nr
+        };
         match name_record.state {
             NameState::Live | NameState::Stopped => {}
             _ => return Err(AuthError::NotCurrentClaimer),
@@ -385,6 +418,48 @@ impl AuthState {
         } else {
             None
         }
+    }
+
+    /// Look up a cached step-3 result for `bearer`. Returns the
+    /// remembered `NameRecord` if a non-expired entry exists; caller
+    /// re-applies the state/coord_id check on it.
+    async fn lookup_name_step_cached(&self, bearer: &str) -> Option<NameRecord> {
+        let entry = self
+            .inner
+            .name_step_cache
+            .read()
+            .await
+            .get(bearer)
+            .cloned()?;
+        if Instant::now() < entry.expires_at {
+            Some(entry.name_record)
+        } else {
+            None
+        }
+    }
+
+    async fn cache_name_step(
+        &self,
+        bearer: &str,
+        name_record: NameRecord,
+        token: &PeerFetchToken,
+        now_unix: u64,
+    ) {
+        let drift = now_unix.abs_diff(token.issued_at);
+        let remaining = self.inner.freshness_window_secs.saturating_sub(drift);
+        if remaining == 0 {
+            return;
+        }
+        let expires_at = Instant::now() + Duration::from_secs(remaining);
+        let entry = NameStepEntry {
+            name_record,
+            expires_at,
+        };
+        self.inner
+            .name_step_cache
+            .write()
+            .await
+            .insert(bearer.to_owned(), entry);
     }
 
     async fn cache_authorized(
@@ -1270,5 +1345,125 @@ mod tests {
             .await
             .expect_err("limiter rejected");
         assert!(matches!(err, AuthError::RateLimited("test-policy")));
+    }
+
+    /// Chain-walk shape: same bearer, different `vol_id`s. The
+    /// per-bearer `name_step_cache` short-circuits step 3 after the
+    /// first request, so a server-side mutation of `names/<volume>`
+    /// between calls is not observed for the cache window — same
+    /// staleness bound the existing `verified_tokens` cache already
+    /// has, just extended to the name-record sub-step that
+    /// `verified_tokens` couldn't cover (its key includes `vol_id`,
+    /// which differs per ancestor on the chain walk).
+    #[tokio::test]
+    async fn name_step_cache_short_circuits_chain_walk() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let other_coord = "coord-b";
+        let coord_id = "coord-a";
+        let root_key = SigningKey::generate(&mut OsRng);
+        let leaf_key = SigningKey::generate(&mut OsRng);
+        let vol_name = "myvol";
+
+        let root_ulid = Ulid::new();
+        let leaf_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_coordinator(store.as_ref(), other_coord, &coord_key).await;
+        publish_volume(store.as_ref(), root_ulid, &root_key, None).await;
+        publish_volume(
+            store.as_ref(),
+            leaf_ulid,
+            &leaf_key,
+            Some(ParentRef {
+                volume_ulid: root_ulid.to_string(),
+                snapshot_ulid: Ulid::new().to_string(),
+                pubkey: root_key.verifying_key().to_bytes(),
+                manifest_pubkey: None,
+            }),
+        )
+        .await;
+        publish_live_name(store.as_ref(), vol_name, leaf_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        // First verify: cache miss → fetches name_record → step 3
+        // passes → caches the NameRecord under the bearer.
+        auth.verify(&bearer, leaf_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
+
+        // Mutate the bucket-side name record to disauthorise this
+        // coordinator. With the per-request ETag revalidation that
+        // existed before this cache, the next verify would 401. With
+        // the sub-cache in place, the second verify reuses the
+        // remembered NameRecord and authorises.
+        publish_live_name(store.as_ref(), vol_name, leaf_ulid, other_coord).await;
+
+        // Different vol_id → `verified_tokens` cache misses → fall
+        // through to step 3. With the sub-cache hitting, this
+        // succeeds despite the server-side flip.
+        let result = auth
+            .verify(&bearer, root_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
+        assert_eq!(result.coordinator_id, coord_id);
+    }
+
+    /// The sub-cache is keyed on bearer; a different bearer
+    /// (different token bytes) does not share the entry, so the
+    /// flipped `names/<volume>` is observed.
+    #[tokio::test]
+    async fn name_step_cache_separate_per_bearer() {
+        let (store, auth) = make_state();
+        let coord_a_key = SigningKey::generate(&mut OsRng);
+        let coord_b_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), "coord-a", &coord_a_key).await;
+        publish_coordinator(store.as_ref(), "coord-b", &coord_b_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+
+        // Coord A holds the name initially; their token caches the
+        // record.
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, "coord-a").await;
+        let token_a = sign_token(
+            vol_name,
+            "coord-a",
+            PeerFetchToken::now_unix_seconds(),
+            &coord_a_key,
+        );
+        auth.verify(&token_a.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
+
+        // Bucket flips to coord B. Coord B's token has different
+        // bytes → separate sub-cache slot → fresh fetch → step 3
+        // sees the flip.
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, "coord-b").await;
+        let token_b = sign_token(
+            vol_name,
+            "coord-b",
+            PeerFetchToken::now_unix_seconds(),
+            &coord_b_key,
+        );
+        auth.verify(&token_b.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
+
+        // Coord A's bearer still passes because A's sub-cache entry
+        // hasn't been invalidated — same staleness window the
+        // `verified_tokens` cache already provides for repeats.
+        auth.verify(&token_a.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
     }
 }
