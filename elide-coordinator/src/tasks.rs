@@ -207,10 +207,11 @@ pub async fn run_volume_tasks(
             Ok(r) if r.fetched > 0 || r.snapshots_fetched > 0 => {
                 if r.fetched > 0 {
                     info!(
-                        "[prefetch {volume_id}{volume_name}] fetched {} index section(s) ({} from peer, {} from store)",
+                        "[prefetch {volume_id}{volume_name}] fetched {} index section(s) ({} from peer, {} from store, {} superseded by GC)",
                         r.fetched,
                         r.fetched_from_peer,
                         r.fetched - r.fetched_from_peer,
+                        r.superseded,
                     );
                 }
                 if r.snapshots_fetched > 0 {
