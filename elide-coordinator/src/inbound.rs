@@ -1654,16 +1654,27 @@ async fn force_snapshot_now_op(
         )));
     }
 
-    // Step 1: prefetch indexes from S3.
-    // No peer-fetch tier on the IPC pull-readonly path: this code runs
-    // for ad-hoc readonly hydration (e.g. CLI inspect of a peer's
-    // snapshot), not for the per-volume claim flow that owns the
-    // peer-fetch context. S3 is the canonical fallback for everything
-    // else; passing `None` here matches the v1 plan's "existing call
-    // sites pass None initially" guidance.
-    elide_coordinator::prefetch::prefetch_indexes(&ancestor_dir, store, None)
+    // Step 1: pull every .idx visible in S3 for this volume into
+    // local index/. We deliberately use the LIST-based path here
+    // rather than `prefetch_indexes` — the whole point of
+    // `force_snapshot_now` is to capture *pre-snapshot* bucket state
+    // (segments published since the last manifest, or where no
+    // manifest exists yet), so anchoring on a manifest would defeat
+    // the operation. The retention/ filter is preserved so we don't
+    // round-trip GC-superseded inputs.
+    //
+    // No peer-fetch tier on the IPC pull-readonly path: this code
+    // runs for ad-hoc readonly hydration (e.g. CLI inspect of a
+    // peer's snapshot), not for the per-volume claim flow that owns
+    // the peer-fetch context.
+    let vk = elide_core::signing::load_verifying_key(
+        &ancestor_dir,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
+    elide_coordinator::prefetch::pull_indexes_via_list(store, &ancestor_dir, &volume_id, &vk, None)
         .await
-        .map_err(|e| IpcError::store(format!("prefetching ancestor indexes: {e:#}")))?;
+        .map_err(|e| IpcError::store(format!("pulling indexes via list: {e:#}")))?;
 
     // Step 2: enumerate prefetched .idx files. Pin ULID = max(segments).
     let index_dir = ancestor_dir.join("index");
