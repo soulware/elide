@@ -4089,6 +4089,14 @@ async fn early_rebind_for_claim(
                 "[claim {volume}] early-rebind: bucket → {new_vol_ulid_str} \
                  (provenance pending)"
             );
+            elide_coordinator::volume_event_store::emit_best_effort(
+                &store_wide,
+                ctx.identity.as_ref(),
+                volume,
+                elide_core::volume_event::EventKind::Claimed,
+                new_vol_ulid,
+            )
+            .await;
             Ok((new_vol_ulid, new_fork_dir, signing_key))
         }
         Ok(MarkClaimedOutcome::Absent) => Err(IpcError::not_found(format!(
@@ -4215,28 +4223,6 @@ async fn finalize_claim_fork(
         .map_err(|e| IpcError::internal(format!("creating by_name symlink: {e}")))?;
     std::fs::write(new_fork_dir.join(STOPPED_FILE), "")
         .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
-
-    // Journal event: ForkedFrom when we have both source name and snap;
-    // Created otherwise (a less informative fallback).
-    let src_name = elide_core::config::VolumeConfig::read(&parent_dir)
-        .ok()
-        .and_then(|c| c.name);
-    let kind = match src_name {
-        Some(source_name) => elide_core::volume_event::EventKind::ForkedFrom {
-            source_name,
-            source_vol_ulid: effective_vol,
-            source_snap_ulid: effective_snap,
-        },
-        None => elide_core::volume_event::EventKind::Created,
-    };
-    elide_coordinator::volume_event_store::emit_best_effort(
-        &store_wide,
-        ctx.identity.as_ref(),
-        volume,
-        kind,
-        new_vol_ulid,
-    )
-    .await;
 
     register_prefetch_or_get(&ctx.prefetch_tracker, new_vol_ulid);
     ctx.rescan.notify_one();
