@@ -9,8 +9,6 @@
 //!   the bare snapshot marker (empty file under `snapshots/`).
 //! - [`PeerFetchClient::fetch_snapshot_manifest`] — full-file fetch of
 //!   `snapshots/<snap>.manifest` (signed handoff manifest).
-//! - [`PeerFetchClient::fetch_snapshot_filemap`] — full-file fetch of
-//!   `snapshots/<snap>.filemap` (per-file fragment table).
 //! - [`PeerFetchClient::fetch_volume_pub`] — full-file fetch of
 //!   `volume.pub` for an ancestor fork (skeleton pull).
 //! - [`PeerFetchClient::fetch_volume_provenance`] — full-file fetch of
@@ -19,10 +17,10 @@
 //! Failure model: the client treats every non-200 response (404 / 401 /
 //! 403 / network error / timeout) as `Ok(None)`. The caller — the
 //! prefetch loop — falls through to S3 on miss for the artifact
-//! flavours (`.idx`, `.manifest`, `.filemap`, marker) and simply drops
-//! the warming hint for `.prefetch` misses. There is intentionally
-//! no error type leakage from the peer; the peer is opportunistic, and
-//! every failure mode collapses to "ask S3 instead."
+//! flavours (`.idx`, `.manifest`, marker) and simply drops the warming
+//! hint for `.prefetch` misses. There is intentionally no error type
+//! leakage from the peer; the peer is opportunistic, and every failure
+//! mode collapses to "ask S3 instead."
 //!
 //! Connection pooling and per-token reuse:
 //! - One [`reqwest::Client`] under the hood, keep-alive enabled,
@@ -181,22 +179,6 @@ impl PeerFetchClient {
         snap_ulid: Ulid,
     ) -> Option<Bytes> {
         let url = format!("{}/v1/{}/{}.manifest", peer.url(), vol_id, snap_ulid);
-        self.get_bytes(volume_name, &url).await
-    }
-
-    /// Fetch `snapshots/<snap>.filemap` (per-file fragment table).
-    /// The filemap itself is unsigned; row-level blake3 hashes are
-    /// content-verified later when actually reading bytes, so a
-    /// tampered filemap can mislead dedup/lookup but cannot let
-    /// corrupted bytes through.
-    pub async fn fetch_snapshot_filemap(
-        &self,
-        peer: &PeerEndpoint,
-        volume_name: &str,
-        vol_id: Ulid,
-        snap_ulid: Ulid,
-    ) -> Option<Bytes> {
-        let url = format!("{}/v1/{}/{}.filemap", peer.url(), vol_id, snap_ulid);
         self.get_bytes(volume_name, &url).await
     }
 
