@@ -6,7 +6,6 @@
 //! - `GET /v1/<vol_id>/<ulid>.prefetch`    → serves `<data_dir>/by_id/<vol_id>/cache/<ulid>.present`
 //! - `GET /v1/<vol_id>/<ulid>.snapshot`    → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>` (empty marker)
 //! - `GET /v1/<vol_id>/<ulid>.manifest`    → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>.manifest`
-//! - `GET /v1/<vol_id>/<ulid>.filemap`     → serves `<data_dir>/by_id/<vol_id>/snapshots/<ulid>.filemap`
 //! - `GET /v1/<vol_id>/volume.pub`         → serves `<data_dir>/by_id/<vol_id>/volume.pub`
 //! - `GET /v1/<vol_id>/volume.provenance`  → serves `<data_dir>/by_id/<vol_id>/volume.provenance`
 //!
@@ -131,7 +130,6 @@ enum ResourceKind {
     Prefetch,
     SnapshotMarker,
     SnapshotManifest,
-    SnapshotFilemap,
     /// Per-fork `volume.pub` — fetched by ancestor-skeleton pull.
     VolumePub,
     /// Per-fork `volume.provenance` — fetched by ancestor-skeleton pull.
@@ -145,9 +143,7 @@ impl ResourceKind {
         match self {
             Self::Idx => Some("index"),
             Self::Prefetch => Some("cache"),
-            Self::SnapshotMarker | Self::SnapshotManifest | Self::SnapshotFilemap => {
-                Some("snapshots")
-            }
+            Self::SnapshotMarker | Self::SnapshotManifest => Some("snapshots"),
             Self::VolumePub | Self::VolumeProvenance => None,
         }
     }
@@ -163,7 +159,6 @@ impl ResourceKind {
             // it as `.snapshot` so the URL always carries one.
             (Self::SnapshotMarker, ResourceTarget::Ulid(u)) => u.to_string(),
             (Self::SnapshotManifest, ResourceTarget::Ulid(u)) => format!("{u}.manifest"),
-            (Self::SnapshotFilemap, ResourceTarget::Ulid(u)) => format!("{u}.filemap"),
             (Self::VolumePub, ResourceTarget::Skeleton) => "volume.pub".to_owned(),
             (Self::VolumeProvenance, ResourceTarget::Skeleton) => "volume.provenance".to_owned(),
             // Other combinations are rejected at parse time before
@@ -178,7 +173,6 @@ impl ResourceKind {
             Self::Prefetch => ".prefetch",
             Self::SnapshotMarker => ".snapshot",
             Self::SnapshotManifest => ".manifest",
-            Self::SnapshotFilemap => ".filemap",
             Self::VolumePub => "volume.pub",
             Self::VolumeProvenance => "volume.provenance",
         }
@@ -274,8 +268,6 @@ async fn handle_segment_inner(
                 (s, ResourceKind::Prefetch)
             } else if let Some(s) = filename.strip_suffix(".manifest") {
                 (s, ResourceKind::SnapshotManifest)
-            } else if let Some(s) = filename.strip_suffix(".filemap") {
-                (s, ResourceKind::SnapshotFilemap)
             } else if let Some(s) = filename.strip_suffix(".snapshot") {
                 (s, ResourceKind::SnapshotMarker)
             } else {
@@ -623,36 +615,6 @@ mod tests {
         );
         let req = Request::builder()
             .uri(format!("/v1/{}/{}.manifest", f.vol_ulid, snap_ulid))
-            .header(http::header::AUTHORIZATION, bearer_header(&token))
-            .body(Body::empty())
-            .unwrap();
-
-        let (status, returned) = run(&f.router, req).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(returned, body);
-    }
-
-    #[tokio::test]
-    async fn snapshot_filemap_happy_path() {
-        let f = fixture().await;
-        let snap_ulid = Ulid::new();
-        let body = b"# elide-filemap v2\n/etc/hosts\t0\tdeadbeef\t128\n";
-        write_local_file(
-            f.data_dir.path(),
-            f.vol_ulid,
-            "snapshots",
-            &format!("{snap_ulid}.filemap"),
-            body,
-        );
-
-        let token = sign_token(
-            &f.vol_name,
-            &f.coord_id,
-            PeerFetchToken::now_unix_seconds(),
-            &f.coord_key,
-        );
-        let req = Request::builder()
-            .uri(format!("/v1/{}/{}.filemap", f.vol_ulid, snap_ulid))
             .header(http::header::AUTHORIZATION, bearer_header(&token))
             .body(Body::empty())
             .unwrap();
