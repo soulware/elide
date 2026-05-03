@@ -1448,6 +1448,70 @@ fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Tracks ancestor skeletons pulled during one claim attempt and
+/// removes them from disk on drop unless [`Self::commit`] was called.
+///
+/// Why: `pull_readonly_op` verifies provenance against the
+/// just-downloaded `volume.pub` — a self-consistent check that does
+/// not catch a peer (or store) supplying matched-but-forged
+/// `volume.pub` + `volume.provenance` bytes. The forgery only fails
+/// later, when `resolve_handoff_key_op` checks the released volume's
+/// signed handoff manifest from S3 against that pubkey. Without this
+/// guard a failed claim leaves the bogus skeleton in
+/// `data_dir/by_id/<id>/`; the next retry sees the directory exists
+/// and reuses the lie. The guard ensures every ancestor pulled in a
+/// failing attempt is torn down before the error propagates.
+///
+/// The directory removal is cheap blocking I/O (`std::fs::remove_dir_all`),
+/// safe to run from `Drop`. Failures are logged but not propagated —
+/// at worst a leftover dir survives, the same outcome as today's
+/// behaviour, but only when the cleanup itself fails.
+struct PulledAncestorsGuard {
+    by_id_dir: PathBuf,
+    pulled: Vec<ulid::Ulid>,
+    committed: bool,
+}
+
+impl PulledAncestorsGuard {
+    fn new(by_id_dir: PathBuf) -> Self {
+        Self {
+            by_id_dir,
+            pulled: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn record(&mut self, vol_ulid: ulid::Ulid) {
+        self.pulled.push(vol_ulid);
+    }
+
+    /// Mark the pulled set as kept. Call after every downstream
+    /// verification step that could reject a peer-served forgery has
+    /// passed — typically right before `fork_create_op`.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PulledAncestorsGuard {
+    fn drop(&mut self) {
+        if self.committed || self.pulled.is_empty() {
+            return;
+        }
+        for vol_ulid in &self.pulled {
+            let dir = self.by_id_dir.join(vol_ulid.to_string());
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                warn!(
+                    "[claim cleanup] failed to remove pulled ancestor {}: {e}",
+                    dir.display()
+                );
+            } else {
+                info!("[claim cleanup] removed unverified ancestor {vol_ulid}");
+            }
+        }
+    }
+}
+
 /// Pull one readonly ancestor from the store.
 ///
 /// Downloads `volume.pub` and `volume.provenance` and writes the ancestor
@@ -1456,13 +1520,21 @@ fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
 /// root volume. Ancestors carry no `volume.toml` and no size: per
 /// `docs/design-volume-size-ownership.md`, size lives only on the live
 /// `names/<name>` record.
+///
+/// No peer-fetch tier here. The claim orchestrator and fork orchestrator
+/// both call this *before* `mark_claimed` rebinds `names/<name>` to us;
+/// the peer's auth check (`elide_peer_fetch::auth`) requires
+/// `coordinator_id` in the bucket's name record to match the requester's
+/// token, which it can't until the rebind. Adding peer-fetch here would
+/// guarantee a 401 round-trip per request before falling through to S3.
+/// The follow-up to enable peer-fetch on this path is to split the fork
+/// creation so `mark_claimed` happens before the chain walk; that work
+/// is tracked separately.
 async fn pull_readonly_op(
     vol_ulid: ulid::Ulid,
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<PullReadonlyReply, IpcError> {
-    use object_store::path::Path as StorePath;
-
     let volume_id = vol_ulid.to_string();
     let vol_dir = data_dir.join("by_id").join(&volume_id);
     if vol_dir.exists() {
@@ -1473,65 +1545,24 @@ async fn pull_readonly_op(
 
     let pull_started = std::time::Instant::now();
 
-    // Step 1: fetch volume.pub.
-    let step1_started = std::time::Instant::now();
-    let pub_key_bytes = store
-        .get(&StorePath::from(format!("by_id/{volume_id}/volume.pub")))
+    // Steps 1-3: fetch volume.pub + volume.provenance and write the
+    // ancestor skeleton via `pull_volume_skeleton`. The two GETs run
+    // in parallel so per-ancestor latency is bounded by the slowest
+    // leg rather than the sum.
+    elide_coordinator::pull::pull_volume_skeleton(store, data_dir, &volume_id, None)
         .await
-        .map_err(|e| IpcError::store(format!("downloading volume.pub: {e}")))?
-        .bytes()
-        .await
-        .map_err(|e| IpcError::store(format!("reading volume.pub: {e}")))?;
-    let pub_elapsed = step1_started.elapsed();
+        .map_err(|e| IpcError::store(format!("pulling skeleton for {volume_id}: {e}")))?;
+    let fetch_elapsed = pull_started.elapsed();
 
-    // Step 2: fetch volume.provenance. NotFound is hard error.
-    let step2_started = std::time::Instant::now();
-    let provenance_bytes = match store
-        .get(&StorePath::from(format!(
-            "by_id/{volume_id}/volume.provenance"
-        )))
-        .await
-    {
-        Ok(d) => d
-            .bytes()
-            .await
-            .map_err(|e| IpcError::store(format!("reading volume.provenance: {e}")))?,
-        Err(object_store::Error::NotFound { .. }) => {
-            return Err(IpcError::not_found(format!(
-                "volume.provenance not found in store for volume {volume_id}"
-            )));
-        }
-        Err(e) => {
-            return Err(IpcError::store(format!(
-                "downloading volume.provenance: {e}"
-            )));
-        }
-    };
-    let provenance_elapsed = step2_started.elapsed();
-
-    // Step 3: write the ancestor entry. No `volume.toml` and no
-    // by_name symlink: both absences mark this entry as a pulled
-    // ancestor rather than a user-managed volume.
-    let step3_started = std::time::Instant::now();
-    let result: std::io::Result<()> = (|| {
-        std::fs::create_dir_all(&vol_dir)?;
-        std::fs::write(vol_dir.join("volume.readonly"), "")?;
-        std::fs::write(vol_dir.join("volume.pub"), &pub_key_bytes)?;
-        std::fs::write(
-            vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE),
-            &provenance_bytes,
-        )?;
-        std::fs::create_dir_all(vol_dir.join("index"))?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        let _ = std::fs::remove_dir_all(&vol_dir);
-        return Err(IpcError::internal(format!("writing pulled ancestor: {e}")));
-    }
-    let write_elapsed = step3_started.elapsed();
-
-    // Step 4: parse and verify provenance to find the parent.
-    let step4_started = std::time::Instant::now();
+    // Step 4: parse and verify provenance to find the parent. Verification
+    // is self-consistent (provenance signature checked against the
+    // just-downloaded volume.pub) — peer-served forgery isn't caught here
+    // and is the caller's responsibility to detect downstream (typically
+    // by failing to verify a real S3-rooted artifact, e.g. the released
+    // volume's handoff manifest in `resolve_handoff_key_op`). The
+    // [`PulledAncestorsGuard`] in `run_claim_job` cleans up on that
+    // downstream failure.
+    let verify_started = std::time::Instant::now();
     let parent = match elide_core::signing::read_lineage_verifying_signature(
         &vol_dir,
         elide_core::signing::VOLUME_PUB_FILE,
@@ -1552,14 +1583,12 @@ async fn pull_readonly_op(
             )));
         }
     };
-    let verify_elapsed = step4_started.elapsed();
+    let verify_elapsed = verify_started.elapsed();
 
     info!(
-        "[inbound] pulled ancestor {volume_id} in {:.2?} (pub {:.2?}, provenance {:.2?}, write {:.2?}, verify {:.2?})",
+        "[inbound] pulled ancestor {volume_id} in {:.2?} (fetch {:.2?}, verify {:.2?})",
         pull_started.elapsed(),
-        pub_elapsed,
-        provenance_elapsed,
-        write_elapsed,
+        fetch_elapsed,
         verify_elapsed,
     );
     Ok(PullReadonlyReply { parent })
@@ -3884,6 +3913,7 @@ async fn start_claim(volume: String, ctx: IpcContext) -> Result<ClaimStartReply,
 /// manifest_pubkey override carried in the chosen ancestor
 /// reference (Some only for ancestors whose snapshot was a recovery
 /// snapshot).
+#[allow(clippy::too_many_arguments)]
 async fn skip_empty_intermediates(
     job: &Arc<ClaimJob>,
     volume: &str,
@@ -3892,6 +3922,7 @@ async fn skip_empty_intermediates(
     initial_parent_key_hex: Option<String>,
     data_dir: &Path,
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
+    guard: &mut PulledAncestorsGuard,
 ) -> Result<(ulid::Ulid, ulid::Ulid, Option<String>), IpcError> {
     use elide_core::signing::{
         VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, encode_hex, load_verifying_key,
@@ -3959,13 +3990,15 @@ async fn skip_empty_intermediates(
 
         // Advance to parent. Pull it locally if not already there —
         // step 1 of `run_claim_job` may not have reached this far
-        // back in the chain.
+        // back in the chain. Register the pull with the guard so a
+        // downstream verification failure cleans it up.
         let parent_dir = volume::resolve_ancestor_dir(&by_id_dir, &parent.volume_ulid);
         if !parent_dir.exists() {
             job.append(ClaimAttachEvent::PullingAncestor {
                 vol_ulid: parent_vol_ulid,
             });
             let parent_store = stores.for_volume(&parent_vol_ulid);
+            guard.record(parent_vol_ulid);
             let _ = pull_readonly_op(parent_vol_ulid, data_dir, &parent_store).await?;
         }
 
@@ -3998,8 +4031,16 @@ async fn run_claim_job(
 
     let by_id_dir = ctx.data_dir.join("by_id");
 
+    // Verification-failure cleanup guard. Records every ancestor
+    // skeleton we write during this attempt; on drop without commit,
+    // each is `remove_dir_all`'d so a retry refetches cleanly. Commit
+    // happens once all signature checks against S3-rooted artifacts
+    // have passed — see the `commit()` site below.
+    let mut pulled_guard = PulledAncestorsGuard::new(by_id_dir.clone());
+
     // Step 1: pull the released chain locally if absent. Walks
     // ancestor-by-ancestor exactly as the fork orchestrator does.
+    // No peer-fetch tier here — see `pull_readonly_op` for why.
     let chain_started = std::time::Instant::now();
     let mut chain_pulled = 0usize;
     let mut next: Option<ulid::Ulid> = Some(released_vol_ulid);
@@ -4010,6 +4051,7 @@ async fn run_claim_job(
         }
         job.append(ClaimAttachEvent::PullingAncestor { vol_ulid });
         let store = ctx.stores.for_volume(&vol_ulid);
+        pulled_guard.record(vol_ulid);
         let reply = pull_readonly_op(vol_ulid, &ctx.data_dir, &store).await?;
         chain_pulled += 1;
         next = reply.parent;
@@ -4028,7 +4070,13 @@ async fn run_claim_job(
 
     // Step 2: resolve the handoff key. Recovery snapshots are signed
     // by an attestation key the fork's provenance must record so its
-    // own signature verifies later.
+    // own signature verifies later. **This is the first step that
+    // verifies a peer-served pubkey against an S3-rooted artifact**:
+    // the released volume's signed handoff manifest comes from the
+    // bucket and is checked against the just-pulled `volume.pub`. A
+    // tampering peer is detected here; on `?` propagation
+    // `pulled_guard` tears down the bogus skeletons before the error
+    // returns to the caller.
     let handoff_started = std::time::Instant::now();
     let store = ctx.stores.for_volume(&released_vol_ulid);
     let key = resolve_handoff_key_op(released_vol_ulid, handoff_snap, &store).await?;
@@ -4065,8 +4113,13 @@ async fn run_claim_job(
         parent_key_hex,
         ctx.data_dir.as_path(),
         &ctx.stores,
+        &mut pulled_guard,
     )
     .await?;
+
+    // All signature checks against S3-rooted artifacts have passed.
+    // Commit so the pulled skeletons survive the rest of this job.
+    pulled_guard.commit();
 
     // Step 3: mint (or resume) the local fork. `for_claim = true`
     // tells `fork_create_op` to skip `mark_initial` (the released
@@ -5313,7 +5366,7 @@ mod tests {
     // `fork_create_op`.
 
     mod skip_empty_intermediates_tests {
-        use super::super::skip_empty_intermediates;
+        use super::super::{PulledAncestorsGuard, skip_empty_intermediates};
         use crate::claim::ClaimJob;
         use elide_coordinator::stores::PassthroughStores;
         use elide_core::signing::{
@@ -5411,10 +5464,18 @@ mod tests {
 
             let job = ClaimJob::new();
             let stores = passthrough(store);
-            let (vol, snap, key_hex) =
-                skip_empty_intermediates(&job, "vol", f1.vol, f1.snap, None, data_dir, &stores)
-                    .await
-                    .unwrap();
+            let (vol, snap, key_hex) = skip_empty_intermediates(
+                &job,
+                "vol",
+                f1.vol,
+                f1.snap,
+                None,
+                data_dir,
+                &stores,
+                &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
+            )
+            .await
+            .unwrap();
             assert_eq!(vol, r.vol);
             assert_eq!(snap, r.snap);
             assert!(key_hex.is_none());
@@ -5443,10 +5504,18 @@ mod tests {
 
             let job = ClaimJob::new();
             let stores = passthrough(store);
-            let (vol, snap, _) =
-                skip_empty_intermediates(&job, "vol", f2.vol, f2.snap, None, data_dir, &stores)
-                    .await
-                    .unwrap();
+            let (vol, snap, _) = skip_empty_intermediates(
+                &job,
+                "vol",
+                f2.vol,
+                f2.snap,
+                None,
+                data_dir,
+                &stores,
+                &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
+            )
+            .await
+            .unwrap();
             assert_eq!(vol, r.vol);
             assert_eq!(snap, r.snap);
         }
@@ -5472,10 +5541,18 @@ mod tests {
 
             let job = ClaimJob::new();
             let stores = passthrough(store);
-            let (vol, snap, _) =
-                skip_empty_intermediates(&job, "vol", f1.vol, f1.snap, None, data_dir, &stores)
-                    .await
-                    .unwrap();
+            let (vol, snap, _) = skip_empty_intermediates(
+                &job,
+                "vol",
+                f1.vol,
+                f1.snap,
+                None,
+                data_dir,
+                &stores,
+                &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
+            )
+            .await
+            .unwrap();
             assert_eq!(vol, f1.vol);
             assert_eq!(snap, f1.snap);
         }
@@ -5496,10 +5573,18 @@ mod tests {
 
             let job = ClaimJob::new();
             let stores = passthrough(store);
-            let (vol, snap, _) =
-                skip_empty_intermediates(&job, "vol", r.vol, r.snap, None, data_dir, &stores)
-                    .await
-                    .unwrap();
+            let (vol, snap, _) = skip_empty_intermediates(
+                &job,
+                "vol",
+                r.vol,
+                r.snap,
+                None,
+                data_dir,
+                &stores,
+                &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
+            )
+            .await
+            .unwrap();
             assert_eq!(vol, r.vol);
             assert_eq!(snap, r.snap);
         }
@@ -5551,10 +5636,18 @@ mod tests {
 
             let job = ClaimJob::new();
             let stores = passthrough(store);
-            let (vol, snap, key_hex) =
-                skip_empty_intermediates(&job, "vol", f1.vol, f1.snap, None, data_dir, &stores)
-                    .await
-                    .unwrap();
+            let (vol, snap, key_hex) = skip_empty_intermediates(
+                &job,
+                "vol",
+                f1.vol,
+                f1.snap,
+                None,
+                data_dir,
+                &stores,
+                &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
+            )
+            .await
+            .unwrap();
             assert_eq!(vol, r.vol);
             assert_eq!(snap, r.snap);
             assert_eq!(
