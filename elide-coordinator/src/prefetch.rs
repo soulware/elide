@@ -8,12 +8,21 @@
 // This is the "warm start" step for a fresh host mounting a forked volume.
 //
 // For each ancestor fork in the rebuild chain:
-//   1. List S3 objects under by_id/<volume_id>/
-//   2. For each ULID that passes the branch-point cutoff and is not already
-//      present in segments/ or cache/:
+//   1. Fetch the snapshot artifacts (marker + manifest) at the recorded
+//      branch point — peer-first, S3 fallback, no LIST.
+//   2. Verify the manifest under the parent pubkey committed in the
+//      requesting child's `volume.provenance`. The manifest enumerates
+//      every segment belonging to that fork at the snapshot — it's the
+//      authoritative, exhaustive set, and replaces what was previously
+//      a `LIST by_id/<vol>/segments/` plus a lex-cutoff filter.
+//   3. For each manifest segment ULID not already in `index/`:
 //        a. Range-GET [0..96] to parse the header (determines body_section_start)
 //        b. Range-GET [0..body_section_start] — header + index + inline
 //        c. Write atomically to <ancestor_fork_dir>/index/<ulid>.idx
+//
+// The current writable fork (slot 0) still uses LIST + skip-if-local, since
+// its `index/` may legitimately hold segments newer than the most recent
+// snapshot.
 //
 // After this runs, Volume::open will find the .idx files, rebuild_segments and
 // extentindex::rebuild will both scan index/*.idx, and the volume opens
@@ -288,78 +297,101 @@ async fn prefetch_fork(
     peer: Option<&PeerFetchContext>,
     result: &mut PrefetchResult,
 ) -> Result<()> {
-    // Phase 1: load retention/ markers BEFORE listing segments/. The
-    // ordering is load-bearing for correctness under concurrent GC.
-    //
-    // GC publishes in this order: PUT segments/<output>, then PUT
-    // retention/<output> marker listing inputs. Reaper deletes inputs
-    // first, then the marker. With strong-read S3, listing retention
-    // first guarantees: any marker we observe was written before our
-    // subsequent segments/ LIST, so the marker's GC output (PUT
-    // before the marker) is also visible to us. We can then safely
-    // skip an input segment iff its replacement output is observed in
-    // the segments listing.
-    //
-    // Reversing the order would be unsafe: a GC committing between
-    // segments LIST and retention LIST could mark an input as
-    // superseded by an output we never enumerated, leading us to skip
-    // the input *and* miss its replacement.
-    let supersessions = list_supersessions(store, volume_id).await;
+    // Snapshot artifacts (markers + manifests) come first: for ancestor
+    // forks the branch-point manifest is the authoritative segment list
+    // we'll feed into the .idx fetch loop, so it must be on disk before
+    // we decide what to fetch. For the current writable head the
+    // manifest isn't load-bearing here (writes can extend `index/`
+    // beyond any snapshot), but markers still need to be fetched for
+    // the read path.
+    prefetch_snapshots(store, fork_dir, volume_id, branch_ulid, peer, result).await?;
 
-    // Phase 2: list the segments/ sub-prefix.
-    let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
-    let objects: Vec<_> = store
-        .list(Some(&seg_prefix))
-        .try_collect()
-        .await
-        .with_context(|| format!("listing by_id/{volume_id}/segments/"))?;
-
-    // Set of segment ULIDs observed in *this* segments LIST. Used
-    // below to validate supersessions: a marker tells us "X is dead
-    // because Y replaces it"; we only skip X when Y is also in our
-    // listing. This belt-and-braces check catches the (impossible per
-    // GC ordering, but cheap to assert) case of a marker without its
-    // output and surfaces it as a wasted fetch instead of a silent
-    // gap.
-    let observed_outputs: HashSet<Ulid> = objects
-        .iter()
-        .filter_map(|obj| obj.location.filename())
-        .filter_map(|f| Ulid::from_string(f).ok())
-        .collect();
-
-    // Sync filter: drop bad-ULID / past-cutoff / already-local /
-    // GC-superseded entries up front. Counts already-local and
-    // superseded as skipped (matches the previous sequential
-    // behaviour); other rejections are silent (malformed listings
-    // shouldn't pollute the operator log).
     let vol_ulid = Ulid::from_string(volume_id).ok();
-    let to_fetch: Vec<(StorePath, String, Ulid)> = objects
-        .into_iter()
-        .filter_map(|obj| {
-            let ulid_str = obj.location.filename()?.to_owned();
-            let ulid = Ulid::from_string(&ulid_str).ok()?;
-            if branch_ulid.is_some_and(|cutoff| ulid_str.as_str() > cutoff) {
-                return None;
-            }
-            let local_idx = fork_dir.join("index").join(format!("{ulid_str}.idx"));
-            if local_idx.exists() {
-                result.skipped += 1;
-                return None;
-            }
-            if let Some(output) = supersessions.get(&ulid)
-                && observed_outputs.contains(output)
-            {
-                trace!(
-                    "[prefetch] skipping {ulid_str}: superseded by GC output {output} \
-                     (retention marker present, output observed in segments/)"
-                );
-                result.skipped += 1;
-                result.superseded += 1;
-                return None;
-            }
-            Some((obj.location, ulid_str, ulid))
-        })
-        .collect();
+    let to_fetch: Vec<(StorePath, String, Ulid)> = match branch_ulid {
+        Some(branch) => {
+            // Ancestor fork: the signed snapshot manifest at `branch`
+            // enumerates every segment belonging to this fork at the
+            // branch point. It's the exhaustive, trusted set — no LIST
+            // is needed and no retention/ filter is needed either:
+            // GC's snapshot-floor rule (`gc.rs` skips `seg_ulid <=
+            // floor`) means every manifest entry is below the parent's
+            // latest-snapshot floor, hence GC-untouchable and
+            // reaper-stable.
+            manifest_driven_fetch_set(fork_dir, volume_id, branch, verifying_key, result)?
+        }
+        None => {
+            // Writable head: this fork's `index/` may legitimately
+            // hold segments newer than the most recent snapshot, and
+            // those above-floor segments are exactly what GC operates
+            // on — so a retention-marker filter is required to avoid
+            // round-tripping superseded inputs (peer 404 → S3 fallback
+            // for an .idx the reader will never use).
+            //
+            // Phase 1: load retention/ markers BEFORE listing
+            // segments/. The ordering is load-bearing for correctness
+            // under concurrent GC. GC publishes in this order: PUT
+            // segments/<output>, then PUT retention/<output> marker
+            // listing inputs. Reaper deletes inputs first, then the
+            // marker. With strong-read S3, listing retention first
+            // guarantees: any marker we observe was written before our
+            // subsequent segments/ LIST, so the marker's GC output
+            // (PUT before the marker) is also visible to us. We can
+            // then safely skip an input segment iff its replacement
+            // output is observed in the segments listing.
+            //
+            // Reversing the order would be unsafe: a GC committing
+            // between segments LIST and retention LIST could mark an
+            // input as superseded by an output we never enumerated,
+            // leading us to skip the input *and* miss its replacement.
+            let supersessions = list_supersessions(store, volume_id).await;
+
+            // Phase 2: list the segments/ sub-prefix.
+            let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
+            let objects: Vec<_> = store
+                .list(Some(&seg_prefix))
+                .try_collect()
+                .await
+                .with_context(|| format!("listing by_id/{volume_id}/segments/"))?;
+
+            // Set of segment ULIDs observed in *this* segments LIST.
+            // Used below to validate supersessions: a marker tells us
+            // "X is dead because Y replaces it"; we only skip X when Y
+            // is also in our listing. This belt-and-braces check
+            // catches the (impossible per GC ordering, but cheap to
+            // assert) case of a marker without its output and surfaces
+            // it as a wasted fetch instead of a silent gap.
+            let observed_outputs: HashSet<Ulid> = objects
+                .iter()
+                .filter_map(|obj| obj.location.filename())
+                .filter_map(|f| Ulid::from_string(f).ok())
+                .collect();
+
+            objects
+                .into_iter()
+                .filter_map(|obj| {
+                    let ulid_str = obj.location.filename()?.to_owned();
+                    let ulid = Ulid::from_string(&ulid_str).ok()?;
+                    let local_idx = fork_dir.join("index").join(format!("{ulid_str}.idx"));
+                    if local_idx.exists() {
+                        result.skipped += 1;
+                        return None;
+                    }
+                    if let Some(output) = supersessions.get(&ulid)
+                        && observed_outputs.contains(output)
+                    {
+                        trace!(
+                            "[prefetch] skipping {ulid_str}: superseded by GC output {output} \
+                             (retention marker present, output observed in segments/)"
+                        );
+                        result.skipped += 1;
+                        result.superseded += 1;
+                        return None;
+                    }
+                    Some((obj.location, ulid_str, ulid))
+                })
+                .collect()
+        }
+    };
 
     // Per-segment outcome from one parallel fetch. Aggregated into the
     // shared `PrefetchResult` after the bounded parallel pass.
@@ -428,16 +460,6 @@ async fn prefetch_fork(
         }
     }
 
-    // Prefetch snapshot markers and manifests from snapshots/ sub-prefix.
-    // For ancestor walks (`branch_ulid = Some(...)`), restrict to just the
-    // branch-point snapshot's artifacts — older snapshots in the ancestor
-    // are not on the read path of this fork, and snapshots newer than the
-    // branch point belong to a parallel timeline. For the current
-    // writable fork (`branch_ulid = None`) we still fetch every snapshot
-    // present in the bucket so the read path can replay against any of
-    // them.
-    prefetch_snapshots(store, fork_dir, volume_id, branch_ulid, peer, result).await?;
-
     Ok(())
 }
 
@@ -500,6 +522,49 @@ async fn list_supersessions(store: &Arc<dyn ObjectStore>, volume_id: &str) -> Ha
         }
     }
     map
+}
+
+/// Build the `.idx` fetch set for an ancestor fork from its signed
+/// snapshot manifest at `branch_ulid`.
+///
+/// `prefetch_snapshots` is expected to have already landed
+/// `<fork_dir>/snapshots/<branch_ulid>.manifest` on disk; this helper
+/// reads + verifies it under `verifying_key` (the parent pubkey
+/// committed in the requesting child's `volume.provenance`, or the
+/// ancestor's own `volume.pub` for extent-index ancestors), then drops
+/// any segments already present in `index/`. Each remaining ULID is
+/// paired with its computed S3 key via [`crate::upload::segment_key`]
+/// — no bucket LIST is involved.
+fn manifest_driven_fetch_set(
+    fork_dir: &Path,
+    volume_id: &str,
+    branch_ulid: &str,
+    verifying_key: &VerifyingKey,
+    result: &mut PrefetchResult,
+) -> Result<Vec<(StorePath, String, Ulid)>> {
+    let snap_ulid = Ulid::from_string(branch_ulid)
+        .map_err(|e| anyhow::anyhow!("invalid branch ULID '{branch_ulid}': {e}"))?;
+    let manifest = elide_core::signing::read_snapshot_manifest(fork_dir, verifying_key, &snap_ulid)
+        .with_context(|| {
+            format!(
+                "reading snapshot manifest {branch_ulid} for {} (verifying under parent pubkey)",
+                fork_dir.display()
+            )
+        })?;
+
+    let mut out: Vec<(StorePath, String, Ulid)> = Vec::with_capacity(manifest.segment_ulids.len());
+    for ulid in manifest.segment_ulids {
+        let ulid_str = ulid.to_string();
+        let local_idx = fork_dir.join("index").join(format!("{ulid_str}.idx"));
+        if local_idx.exists() {
+            result.skipped += 1;
+            continue;
+        }
+        let key = crate::upload::segment_key(volume_id, &ulid_str)
+            .with_context(|| format!("computing segment key for {ulid_str}"))?;
+        out.push((key, ulid_str, ulid));
+    }
+    Ok(out)
 }
 
 /// Try to fetch a segment's `.idx` from the peer, verify its signature,
@@ -764,7 +829,7 @@ mod tests {
     use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
     use elide_core::signing::{
         ProvenanceLineage, VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
-        generate_keypair, load_signer, write_provenance,
+        build_snapshot_manifest_bytes, generate_keypair, load_signer, write_provenance,
     };
 
     /// Build a parent+child fork pair using the flat by_id/<ulid> layout.
@@ -839,13 +904,27 @@ mod tests {
         .unwrap();
 
         // Set up a local object store and upload the parent segment at the
-        // by_id/ key. Use a fixed date since seg_ulid has ts=0.
+        // canonical S3 key (date subdir derived from the segment ULID).
         let store_tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = StorePath::from(format!("by_id/{parent_ulid}/segments/19700101/{seg_ulid}"));
+        let key = crate::upload::segment_key(parent_ulid, seg_ulid).unwrap();
         store.put(&key, seg_bytes.into()).await.unwrap();
+
+        // Upload the parent's signed snapshot manifest at the branch
+        // point. Prefetch now reads this manifest as the authoritative
+        // .idx fetch set for the ancestor.
+        let manifest_bytes = build_snapshot_manifest_bytes(
+            parent_signer.as_ref(),
+            &[Ulid::from_string(seg_ulid).unwrap()],
+            None,
+        );
+        let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid).unwrap();
+        store
+            .put(&manifest_key, manifest_bytes.into())
+            .await
+            .unwrap();
 
         // Run prefetch_indexes on the child fork.
         let result = prefetch_indexes(&child_dir, &store, None).await.unwrap();
@@ -934,8 +1013,21 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = StorePath::from(format!("by_id/{parent_ulid}/segments/19700101/{seg_ulid}"));
+        let key = crate::upload::segment_key(parent_ulid, seg_ulid).unwrap();
         store.put(&key, seg_bytes.into()).await.unwrap();
+
+        // Parent's signed manifest at the branch point — required by
+        // the manifest-driven ancestor fetch path.
+        let manifest_bytes = build_snapshot_manifest_bytes(
+            parent_signer.as_ref(),
+            &[Ulid::from_string(seg_ulid).unwrap()],
+            None,
+        );
+        let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid).unwrap();
+        store
+            .put(&manifest_key, manifest_bytes.into())
+            .await
+            .unwrap();
 
         let result = prefetch_indexes(&child_dir, &store, None).await.unwrap();
         assert_eq!(result.fetched, 1);
@@ -1297,18 +1389,21 @@ mod tests {
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
         // Upload all three snapshots' artifacts into the parent's
-        // bucket prefix — including stale `.filemap` entries that a
-        // pre-#212 bucket would still carry.
+        // bucket prefix at canonical keys. The branch-point manifest
+        // is a real signed (empty-segment) manifest because the
+        // manifest-driven .idx path will read+verify it; the other two
+        // are junk to verify the branch filter doesn't pull them.
+        let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
+        let branch_manifest_bytes =
+            build_snapshot_manifest_bytes(parent_signer.as_ref(), &[], None);
         for snap in [earlier, branch, later] {
-            for suffix in ["", ".manifest", ".filemap"] {
-                let key = StorePath::from(format!(
-                    "by_id/{parent_ulid}/snapshots/19700101/{snap}{suffix}"
-                ));
-                store
-                    .put(&key, bytes::Bytes::from_static(b"x").into())
-                    .await
-                    .unwrap();
-            }
+            let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, snap).unwrap();
+            let manifest_payload = if snap == branch {
+                branch_manifest_bytes.clone().into()
+            } else {
+                bytes::Bytes::from_static(b"x").into()
+            };
+            store.put(&manifest_key, manifest_payload).await.unwrap();
         }
 
         prefetch_indexes(&child_dir, &store, None).await.unwrap();
@@ -1451,15 +1546,16 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        // Upload the manifest at its canonical key. The test fixture
-        // also uploads a stale bare-ULID marker + a stale `.filemap`
-        // (a pre-#215 / pre-#212 bucket); prefetch should ignore both.
+        // Upload a real signed (empty-segment) manifest at its
+        // canonical key — the manifest-driven .idx path will read +
+        // verify it. Per PR #215 the manifest is the sole snapshot
+        // record; the test also uploads a stale bare-ULID marker
+        // below to confirm prefetch ignores pre-#215 bucket residue.
+        let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
+        let manifest_bytes = build_snapshot_manifest_bytes(parent_signer.as_ref(), &[], None);
         let manifest_key = crate::upload::snapshot_manifest_key(parent_ulid, branch).unwrap();
         store
-            .put(
-                &manifest_key,
-                bytes::Bytes::from_static(b"manifest-bytes").into(),
-            )
+            .put(&manifest_key, manifest_bytes.into())
             .await
             .unwrap();
         let bare_marker =
