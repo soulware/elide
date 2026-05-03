@@ -124,6 +124,42 @@ If those signals are weak, body fetch is unlikely to justify its complexity. If 
 
 ### Body fetch (deferred — not v1)
 
+> **Proposed (v1.1):** generic peer body-fetch, owned end-to-end by the
+> volume process. Every byte-range read on the running volume — the
+> first one after `volume start` and every subsequent demand-fetch —
+> flows through the volume's `RangeFetcher`, which consults the peer
+> first and falls through to S3 on miss. Single mechanism, single
+> ownership boundary, single signer.
+>
+> **Single signer: `volume.key`.** Body bytes belong to the volume; the
+> volume process holds `volume.key` in memory; the peer-fetch token for
+> body bytes is signed with that key. Peer-side verification looks up
+> `by_id/<vol_id>/volume.pub` — the same per-fork key the rest of the
+> trust model already uses. There is no second token flavour, and no
+> coordinator-side body-byte fetcher: the coordinator continues to own
+> index-class artifacts (`.idx`, `.prefetch`, `.manifest`, skeletons)
+> with `coordinator.key`, and the boundary between the two signers
+> matches the boundary between the two artifact categories exactly.
+>
+> **No coordinator-side prewarm.** The pre-existing post-claim `read(0,
+> 2)` warm-up is removed in v1.1. With peer body-fetch in front of S3
+> the first guest IO is a LAN round-trip; the latency the prewarm step
+> was hiding is no longer worth a second signer flavour or a second
+> body-byte caller. If evidence ever shows it's worth re-introducing,
+> it lands inside the volume daemon (single signer, no flavour change).
+>
+> Endpoint discovery extends to the volume process: the coordinator
+> hands off the per-volume `PeerFetchContext` it built at claim time
+> across the volume-start IPC so the volume's `RangeFetcher` can use
+> it. If discovery yielded no peer (`force_released`, unknown
+> predecessor, unreachable), the volume runs peer-less, exactly like a
+> v1 read path runs S3-only.
+>
+> Partial-coverage 206 / 416 / "maximal contiguous prefix" semantics
+> are in scope: the running read path *will* ask for ranges the peer
+> has only partially cached (cache eviction + speculative prefetch make
+> full coverage the optimistic case, not the only case).
+
 Once `.idx` + `.prefetch` fetch is validated, the body-fetch extension uses the same peer-then-S3 tier with `Range:` covering the body-section bytes the read needs:
 
 ```
@@ -323,7 +359,7 @@ Embedding the endpoint in the `released` event itself is an alternative but ties
 
 ## Out of scope for v1
 
-- **Peer body fetch.** Body bytes still go direct to S3 in v1. The `.prefetch` warming hint drives those S3 Range-GETs after claim, but the bytes themselves don't traverse the peer.
+- **Peer body fetch.** Body bytes still go direct to S3 in v1. The `.prefetch` warming hint drives those S3 Range-GETs after claim, but the bytes themselves don't traverse the peer. *(Proposed v1.1 lifts this exclusion entirely: a generic `.body` Range route, owned by the volume process and wired at its `RangeFetcher` seam — see "Body fetch (deferred — not v1)" above. The pre-existing coordinator-side LBA 0/1 prewarm step is removed at the same time.)*
 - **Release-time hint artifact.** An earlier draft proposed writing a per-segment populated-bitmap object to S3 at release time so B could drive proactive prefetch. Dropped in favour of fetching `.prefetch` directly from the peer at claim time — same hint quality, no new S3 artifact, no write-path step.
 - **Cache retention policy on the source host.** A's `cache/<ulid>.{body,present}` may be evicted while B is still fetching. The peer's `.prefetch` response degrades gracefully (404 when the underlying state is gone; warming hint absent for that segment). Smarter retention (release-grace window, refcount across volumes) is a future improvement.
 - **Per-coordinator rate-limiting / blacklist.** The auth model exposes `coordinator_id` on every request, so behaviour-based defences are cheap drop-ins later. v1 ships with no rate-limit; the LAN-only deployment model and the lineage check together bound the abuse surface enough to defer.

@@ -70,6 +70,7 @@ use tokio::sync::RwLock;
 use ulid::Ulid;
 
 use crate::ancestry::walk_ancestry;
+use crate::body_token::BodyFetchToken;
 use crate::token::{
     DEFAULT_FRESHNESS_WINDOW_SECS, PeerFetchToken, TokenDecodeError, TokenVerifyError,
 };
@@ -155,6 +156,12 @@ pub struct AuthState {
 struct AuthStateInner {
     store: Arc<dyn ObjectStore>,
     pub_keys: RwLock<HashMap<String, VerifyingKey>>,
+    /// Per-fork `volume.pub` cache, used by the body-token verify path
+    /// (the coordinator-token path uses `pub_keys` instead). Keyed by
+    /// the volume ULID the key was published under. Cached forever:
+    /// `volume.pub` is immutable per fork — created once at fork time,
+    /// never rotated.
+    volume_pub_keys: RwLock<HashMap<Ulid, VerifyingKey>>,
     ancestry_cache: RwLock<HashMap<Ulid, HashSet<Ulid>>>,
     /// `(NameRecord, ETag)` per volume name. Revalidated via
     /// `If-None-Match` on every request that reaches step 3.
@@ -172,6 +179,9 @@ struct AuthStateInner {
     /// Entries expire at the token's residual freshness window so a
     /// cached result never outlives the token's own freshness.
     verified_tokens: RwLock<HashMap<VerifiedKey, VerifiedEntry>>,
+    /// Resolved body-token outcomes. Same caching shape as
+    /// `verified_tokens`, keyed on the body-token bearer + URL `vol_id`.
+    verified_body_tokens: RwLock<HashMap<VerifiedKey, BodyVerifiedEntry>>,
     freshness_window_secs: u64,
     rate_limiter: Arc<dyn RateLimiter>,
 }
@@ -275,6 +285,24 @@ struct NameStepEntry {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct BodyVerifiedEntry {
+    authorized: BodyAuthorized,
+    expires_at: Instant,
+}
+
+/// Successful body-token auth result. Carries the resolved fork
+/// identity and the URL `vol_id` the request was authorised against.
+#[derive(Debug, Clone)]
+pub struct BodyAuthorized {
+    /// Volume that signed the token (and is therefore proven, by key
+    /// possession, to be the fork it claims to be).
+    pub signer_vol_ulid: Ulid,
+    /// URL `vol_id` from the request — guaranteed to be in
+    /// `signer_vol_ulid`'s signed ancestry.
+    pub url_vol_id: Ulid,
+}
+
 impl AuthState {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self::with_freshness_window(store, DEFAULT_FRESHNESS_WINDOW_SECS)
@@ -297,10 +325,12 @@ impl AuthState {
             inner: Arc::new(AuthStateInner {
                 store,
                 pub_keys: RwLock::new(HashMap::new()),
+                volume_pub_keys: RwLock::new(HashMap::new()),
                 ancestry_cache: RwLock::new(HashMap::new()),
                 name_records: RwLock::new(HashMap::new()),
                 name_step_cache: RwLock::new(HashMap::new()),
                 verified_tokens: RwLock::new(HashMap::new()),
+                verified_body_tokens: RwLock::new(HashMap::new()),
                 freshness_window_secs,
                 rate_limiter,
             }),
@@ -409,6 +439,137 @@ impl AuthState {
             .await;
 
         Ok(authorized)
+    }
+
+    /// Verify a body-fetch (volume-signed) token.
+    ///
+    /// Pipeline:
+    /// 1. Decode + freshness.
+    /// 2. Signature verification against `by_id/<token.vol_ulid>/volume.pub`.
+    /// 3. Lineage: URL `vol_id` ∈ ancestry(`token.vol_ulid`).
+    ///
+    /// There is no `names/<name>` ownership step: the volume key
+    /// proves the signer *is* the fork. Read-only access to bytes the
+    /// fork's lineage covers is the natural privilege of that proof.
+    /// The route handler runs the local-stat / coverage check (step 4
+    /// equivalent) afterwards.
+    pub async fn verify_body_token(
+        &self,
+        bearer_value: &str,
+        url_vol_id: Ulid,
+    ) -> Result<BodyAuthorized, AuthError> {
+        let token = BodyFetchToken::decode(bearer_value).map_err(AuthError::BadToken)?;
+        let now = BodyFetchToken::now_unix_seconds();
+        token
+            .check_freshness(now, self.inner.freshness_window_secs)
+            .map_err(AuthError::BadCredentials)?;
+
+        // Signature verification first — same shape as the coordinator
+        // path: we don't trust the cached resolution past the moment
+        // the token authoring would itself fail.
+        let vk = self.volume_pub(token.vol_ulid).await?;
+        token
+            .verify_signature(&vk)
+            .map_err(AuthError::BadCredentials)?;
+
+        // Body-token requests always exercise the lineage check;
+        // there is no relax-skeleton variant for `.body`. Pin the
+        // cache mode to LineageGated so a future request that adds a
+        // skeleton-relax body flavour wouldn't accidentally share
+        // entries.
+        let cache_key = VerifiedKey {
+            bearer: bearer_value.to_owned(),
+            vol_id: url_vol_id,
+            mode: RouteAuthMode::LineageGated,
+        };
+        if let Some(entry) = self.lookup_cached_body(&cache_key).await {
+            return Ok(entry.authorized);
+        }
+
+        // Lineage check — URL's vol_id must be reachable from the
+        // signing volume's signed parent chain (or be the signing
+        // volume itself; `walk_ancestry` includes it).
+        let ancestry = self.ancestry(token.vol_ulid).await?;
+        if !ancestry.contains(&url_vol_id) {
+            return Err(AuthError::OutsideLineage);
+        }
+
+        let authorized = BodyAuthorized {
+            signer_vol_ulid: token.vol_ulid,
+            url_vol_id,
+        };
+        self.cache_body_authorized(cache_key, authorized.clone(), &token, now)
+            .await;
+        Ok(authorized)
+    }
+
+    /// Look up a cached body-token resolution; returns `None` if absent
+    /// or expired.
+    async fn lookup_cached_body(&self, key: &VerifiedKey) -> Option<BodyVerifiedEntry> {
+        let entry = self
+            .inner
+            .verified_body_tokens
+            .read()
+            .await
+            .get(key)
+            .cloned()?;
+        if Instant::now() < entry.expires_at {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    async fn cache_body_authorized(
+        &self,
+        key: VerifiedKey,
+        authorized: BodyAuthorized,
+        token: &BodyFetchToken,
+        now_unix: u64,
+    ) {
+        let drift = now_unix.abs_diff(token.issued_at);
+        let remaining = self.inner.freshness_window_secs.saturating_sub(drift);
+        if remaining == 0 {
+            return;
+        }
+        let expires_at = Instant::now() + Duration::from_secs(remaining);
+        let entry = BodyVerifiedEntry {
+            authorized,
+            expires_at,
+        };
+        let mut guard = self.inner.verified_body_tokens.write().await;
+        let now = Instant::now();
+        guard.retain(|_, v| v.expires_at > now);
+        guard.insert(key, entry);
+    }
+
+    async fn volume_pub(&self, vol_ulid: Ulid) -> Result<VerifyingKey, AuthError> {
+        if let Some(vk) = self.inner.volume_pub_keys.read().await.get(&vol_ulid) {
+            return Ok(*vk);
+        }
+
+        let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+        let body = self
+            .inner
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| AuthError::Backend(io::Error::other(format!("fetch volume.pub: {e}"))))?
+            .bytes()
+            .await
+            .map_err(|e| AuthError::Backend(io::Error::other(format!("read volume.pub: {e}"))))?;
+        let text = std::str::from_utf8(&body).map_err(|e| {
+            AuthError::Backend(io::Error::other(format!("volume.pub not utf-8: {e}")))
+        })?;
+        let vk = parse_pub_hex(text.trim())
+            .map_err(|e| AuthError::Backend(io::Error::other(format!("volume.pub parse: {e}"))))?;
+
+        self.inner
+            .volume_pub_keys
+            .write()
+            .await
+            .insert(vol_ulid, vk);
+        Ok(vk)
     }
 
     /// Look up a cached resolution; returns `None` if absent or

@@ -36,13 +36,18 @@
 
 pub mod ancestry;
 pub mod auth;
+pub mod body_token;
 pub mod client;
 pub mod endpoint;
 pub mod hint;
 pub mod server;
 pub mod token;
 
-pub use client::{BuildError, PeerFetchClient, PeerFetchClientBuilder, TokenSigner};
+pub use body_token::{BODY_DOMAIN_TAG, BodyFetchToken};
+pub use client::{
+    BodyFetchClient, BodyTokenSigner, BuildError, PeerFetchClient, PeerFetchClientBuilder,
+    TokenSigner,
+};
 pub use endpoint::{EndpointParseError, PeerEndpoint};
 pub use hint::PrefetchHint;
 pub use token::{

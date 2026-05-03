@@ -1243,6 +1243,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "blake3",
  "bytes",
  "ed25519-dalek",
  "elide-core",
