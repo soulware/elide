@@ -19,6 +19,7 @@
 // extentindex::rebuild will both scan index/*.idx, and the volume opens
 // correctly. Individual reads then demand-fetch the body bytes on first access.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,6 +35,7 @@ use elide_core::signing::{self, VerifyingKey};
 use elide_core::volume::{resolve_ancestor_dir, walk_extent_ancestors};
 
 use crate::pull::pull_volume_skeleton;
+use crate::retention::{parse_marker_body, parse_marker_key};
 use crate::upload::derive_names;
 
 /// Per-volume peer-fetch context populated by the claim-discovery
@@ -66,6 +68,11 @@ pub struct PrefetchResult {
     /// plan calls out.
     pub fetched_from_peer: usize,
     pub skipped: usize,
+    /// Of `skipped`, how many were dropped because a `retention/` marker
+    /// records them as inputs to a GC output that is also present in the
+    /// `segments/` listing — i.e. their replacement is observed and the
+    /// fetch would be redundant.
+    pub superseded: usize,
     pub failed: usize,
     /// Snapshot artifacts (markers, manifests, filemaps) downloaded
     /// during this run. Counted separately from `.idx` so the per-run
@@ -255,6 +262,7 @@ pub async fn prefetch_indexes(
         result.fetched += r.fetched;
         result.fetched_from_peer += r.fetched_from_peer;
         result.skipped += r.skipped;
+        result.superseded += r.superseded;
         result.failed += r.failed;
         result.snapshots_fetched += r.snapshots_fetched;
         result.snapshots_from_peer += r.snapshots_from_peer;
@@ -280,7 +288,25 @@ async fn prefetch_fork(
     peer: Option<&PeerFetchContext>,
     result: &mut PrefetchResult,
 ) -> Result<()> {
-    // Prefetch segment indexes from segments/ sub-prefix.
+    // Phase 1: load retention/ markers BEFORE listing segments/. The
+    // ordering is load-bearing for correctness under concurrent GC.
+    //
+    // GC publishes in this order: PUT segments/<output>, then PUT
+    // retention/<output> marker listing inputs. Reaper deletes inputs
+    // first, then the marker. With strong-read S3, listing retention
+    // first guarantees: any marker we observe was written before our
+    // subsequent segments/ LIST, so the marker's GC output (PUT
+    // before the marker) is also visible to us. We can then safely
+    // skip an input segment iff its replacement output is observed in
+    // the segments listing.
+    //
+    // Reversing the order would be unsafe: a GC committing between
+    // segments LIST and retention LIST could mark an input as
+    // superseded by an output we never enumerated, leading us to skip
+    // the input *and* miss its replacement.
+    let supersessions = list_supersessions(store, volume_id).await;
+
+    // Phase 2: list the segments/ sub-prefix.
     let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
     let objects: Vec<_> = store
         .list(Some(&seg_prefix))
@@ -288,10 +314,24 @@ async fn prefetch_fork(
         .await
         .with_context(|| format!("listing by_id/{volume_id}/segments/"))?;
 
-    // Sync filter: drop bad-ULID / past-cutoff / already-local entries
-    // up front. Counts already-local as skipped (matches the previous
-    // sequential behaviour); other rejections are silent (malformed
-    // listings shouldn't pollute the operator log).
+    // Set of segment ULIDs observed in *this* segments LIST. Used
+    // below to validate supersessions: a marker tells us "X is dead
+    // because Y replaces it"; we only skip X when Y is also in our
+    // listing. This belt-and-braces check catches the (impossible per
+    // GC ordering, but cheap to assert) case of a marker without its
+    // output and surfaces it as a wasted fetch instead of a silent
+    // gap.
+    let observed_outputs: HashSet<Ulid> = objects
+        .iter()
+        .filter_map(|obj| obj.location.filename())
+        .filter_map(|f| Ulid::from_string(f).ok())
+        .collect();
+
+    // Sync filter: drop bad-ULID / past-cutoff / already-local /
+    // GC-superseded entries up front. Counts already-local and
+    // superseded as skipped (matches the previous sequential
+    // behaviour); other rejections are silent (malformed listings
+    // shouldn't pollute the operator log).
     let vol_ulid = Ulid::from_string(volume_id).ok();
     let to_fetch: Vec<(StorePath, String, Ulid)> = objects
         .into_iter()
@@ -304,6 +344,17 @@ async fn prefetch_fork(
             let local_idx = fork_dir.join("index").join(format!("{ulid_str}.idx"));
             if local_idx.exists() {
                 result.skipped += 1;
+                return None;
+            }
+            if let Some(output) = supersessions.get(&ulid)
+                && observed_outputs.contains(output)
+            {
+                trace!(
+                    "[prefetch] skipping {ulid_str}: superseded by GC output {output} \
+                     (retention marker present, output observed in segments/)"
+                );
+                result.skipped += 1;
+                result.superseded += 1;
                 return None;
             }
             Some((obj.location, ulid_str, ulid))
@@ -388,6 +439,67 @@ async fn prefetch_fork(
     prefetch_snapshots(store, fork_dir, volume_id, branch_ulid, peer, result).await?;
 
     Ok(())
+}
+
+/// Build a map `input_ulid -> output_ulid` from all retention markers
+/// under `by_id/<volume_id>/retention/`. Each marker name is the GC
+/// output ULID; the body lists the input ULIDs that output replaces.
+///
+/// Best-effort: any LIST or GET error returns whatever has been
+/// collected so far (often empty), and prefetch falls back to the
+/// pre-retention behaviour of fetching every input. We never fail
+/// prefetch on a retention LIST error — the worst case is wasted
+/// peer/S3 round-trips, not data loss.
+///
+/// A marker that races deletion (404 on body GET) is dropped
+/// silently: the absence of supersession info just means we may
+/// re-fetch the input segment from S3, which by definition the
+/// reaper has either already removed (we then 404 on the segment
+/// fetch) or is about to. Either is correct.
+async fn list_supersessions(store: &Arc<dyn ObjectStore>, volume_id: &str) -> HashMap<Ulid, Ulid> {
+    let mut map = HashMap::new();
+    let prefix = StorePath::from(format!("by_id/{volume_id}/retention/"));
+    let listing: Vec<_> = match store.list(Some(&prefix)).try_collect().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("[prefetch] listing retention/ for {volume_id}: {e:#}");
+            return map;
+        }
+    };
+    for object in listing {
+        let key = object.location.as_ref();
+        let output_ulid = match parse_marker_key(key) {
+            Ok((_vol, out)) => out,
+            Err(_) => continue,
+        };
+        let payload = match store.get(&object.location).await {
+            Ok(p) => p,
+            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(e) => {
+                warn!("[prefetch] fetching marker {key}: {e:#}");
+                continue;
+            }
+        };
+        let bytes = match payload.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("[prefetch] reading marker body {key}: {e:#}");
+                continue;
+            }
+        };
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let inputs = match parse_marker_body(text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for input in inputs {
+            map.insert(input, output_ulid);
+        }
+    }
+    map
 }
 
 /// Try to fetch a segment's `.idx` from the peer, verify its signature,
@@ -972,6 +1084,172 @@ mod tests {
         let (_, entries, _) = elide_core::segment::read_segment_index(&idx_path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].hash, hash);
+    }
+
+    /// Retention awareness: an input segment listed in a `retention/`
+    /// marker must be skipped during prefetch when the marker's GC
+    /// output is also visible in the same `segments/` listing. This
+    /// avoids a wasted peer/S3 round-trip for an `.idx` whose owner
+    /// has already deleted it via GC promote.
+    #[tokio::test]
+    async fn prefetch_skips_segments_superseded_by_retention_marker() {
+        use crate::retention::{marker_key, render_marker};
+
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+        let root_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let root_ulid = Ulid::from_string(root_ulid_str).unwrap();
+        let root_dir = by_id.join(root_ulid_str);
+        std::fs::create_dir_all(&root_dir).unwrap();
+
+        let key = generate_keypair(&root_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        write_provenance(
+            &root_dir,
+            &key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
+
+        // Two segments — `old` is the GC input (will be marked
+        // superseded), `new` is the GC output (replacement).
+        let old_ulid_str = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let new_ulid_str = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let old_ulid = Ulid::from_string(old_ulid_str).unwrap();
+        let new_ulid = Ulid::from_string(new_ulid_str).unwrap();
+        let signer = load_signer(&root_dir, VOLUME_KEY_FILE).unwrap();
+
+        let write_seg = |ulid_str: &str, fill: u8| {
+            let data = vec![fill; 4096];
+            let hash = blake3::hash(&data);
+            let mut entries = vec![SegmentEntry::new_data(
+                hash,
+                0,
+                1,
+                SegmentFlags::empty(),
+                data,
+            )];
+            let staging = tmp.path().join(ulid_str);
+            write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
+            std::fs::read(&staging).unwrap()
+        };
+        let old_bytes = write_seg(old_ulid_str, 0x11);
+        let new_bytes = write_seg(new_ulid_str, 0x22);
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+        let old_key = StorePath::from(format!(
+            "by_id/{root_ulid_str}/segments/19700101/{old_ulid_str}"
+        ));
+        let new_key = StorePath::from(format!(
+            "by_id/{root_ulid_str}/segments/19700101/{new_ulid_str}"
+        ));
+        store.put(&old_key, old_bytes.into()).await.unwrap();
+        store.put(&new_key, new_bytes.into()).await.unwrap();
+
+        // Retention marker: `new` supersedes `old`.
+        let mk = marker_key(root_ulid, new_ulid);
+        let body = render_marker(&[old_ulid]);
+        store
+            .put(&mk, bytes::Bytes::from(body).into())
+            .await
+            .unwrap();
+
+        let result = prefetch_indexes(&root_dir, &store, None).await.unwrap();
+        assert_eq!(result.fetched, 1, "only the GC output should be fetched");
+        assert_eq!(result.superseded, 1, "old must be skipped via marker");
+        assert!(result.skipped >= 1);
+        assert_eq!(result.failed, 0);
+
+        // .idx for `new` written; .idx for `old` must NOT be present.
+        assert!(
+            root_dir
+                .join("index")
+                .join(format!("{new_ulid_str}.idx"))
+                .exists(),
+            "GC output .idx must be fetched"
+        );
+        assert!(
+            !root_dir
+                .join("index")
+                .join(format!("{old_ulid_str}.idx"))
+                .exists(),
+            "superseded input .idx must NOT be fetched"
+        );
+    }
+
+    /// Defensive case: a marker exists but its GC output is not
+    /// observed in the segments LIST. The prefetch must NOT skip
+    /// the input — we'd otherwise drop coverage of the input's
+    /// LBAs entirely. This races against an ordering inversion that
+    /// shouldn't happen given GC's PUT order, but it's cheap to
+    /// guard against and surfaces as a wasted (correct) fetch.
+    #[tokio::test]
+    async fn prefetch_does_not_skip_input_when_output_missing() {
+        use crate::retention::{marker_key, render_marker};
+
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+        let root_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let root_ulid = Ulid::from_string(root_ulid_str).unwrap();
+        let root_dir = by_id.join(root_ulid_str);
+        std::fs::create_dir_all(&root_dir).unwrap();
+
+        let key = generate_keypair(&root_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        write_provenance(
+            &root_dir,
+            &key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
+
+        let old_ulid_str = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let phantom_new_str = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        let old_ulid = Ulid::from_string(old_ulid_str).unwrap();
+        let phantom_new = Ulid::from_string(phantom_new_str).unwrap();
+        let signer = load_signer(&root_dir, VOLUME_KEY_FILE).unwrap();
+
+        let data = vec![0x33; 4096];
+        let mut entries = vec![SegmentEntry::new_data(
+            blake3::hash(&data),
+            0,
+            1,
+            SegmentFlags::empty(),
+            data,
+        )];
+        let staging = tmp.path().join(old_ulid_str);
+        write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
+        let bytes_old = std::fs::read(&staging).unwrap();
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+        let old_key = StorePath::from(format!(
+            "by_id/{root_ulid_str}/segments/19700101/{old_ulid_str}"
+        ));
+        store.put(&old_key, bytes_old.into()).await.unwrap();
+
+        // Marker references a phantom GC output that is NOT in segments/.
+        let mk = marker_key(root_ulid, phantom_new);
+        store
+            .put(&mk, bytes::Bytes::from(render_marker(&[old_ulid])).into())
+            .await
+            .unwrap();
+
+        let result = prefetch_indexes(&root_dir, &store, None).await.unwrap();
+        // Input must still be fetched because its replacement is invisible.
+        assert_eq!(result.fetched, 1);
+        assert_eq!(result.superseded, 0);
+        assert_eq!(result.failed, 0);
+        assert!(
+            root_dir
+                .join("index")
+                .join(format!("{old_ulid_str}.idx"))
+                .exists(),
+            "input must be fetched when replacement is not observed"
+        );
     }
 
     #[tokio::test]
