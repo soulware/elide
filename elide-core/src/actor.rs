@@ -1376,6 +1376,11 @@ pub struct VolumeReader {
     /// each transport thread holds its own reader. `RefCell` is sufficient;
     /// `Mutex` is not needed.
     file_cache: RefCell<FileCache>,
+    /// Per-reader cache of opened `cache/<ULID>.dmat` sidecars. Cleared
+    /// alongside `file_cache` whenever the snapshot's `flush_gen` changes,
+    /// so an eviction that drops `.dmat` from disk can't leave a stale FD
+    /// pointing at a removed inode.
+    dmat_cache: crate::volume::DmatCache,
     /// Generation of the last snapshot whose extent index offsets were used
     /// to populate `file_cache`. Compared against `ReadSnapshot::flush_gen`
     /// on every read; if they differ the cache is evicted before proceeding.
@@ -1401,6 +1406,7 @@ impl VolumeClient {
         VolumeReader {
             client: self.clone(),
             file_cache: RefCell::new(FileCache::default()),
+            dmat_cache: RefCell::new(std::collections::HashMap::new()),
             last_flush_gen: Cell::new(current_gen),
         }
     }
@@ -1681,16 +1687,20 @@ impl VolumeReader {
         let snap = self.client.snapshot.load();
         if snap.flush_gen != self.last_flush_gen.get() {
             self.file_cache.borrow_mut().clear();
+            self.dmat_cache.borrow_mut().clear();
             self.last_flush_gen.set(snap.flush_gen);
         }
         let config = &self.client.config;
         let extent_index = &snap.extent_index;
+        let cache_dir = config.base_dir.join("cache");
         read_extents(
             lba,
             lba_count,
             &snap.lbamap,
             extent_index,
             &self.file_cache,
+            &self.dmat_cache,
+            &cache_dir,
             |id, bss, idx| {
                 find_segment_in_dirs(
                     id,

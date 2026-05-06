@@ -6,6 +6,7 @@
 //! lifecycle helpers; both used to live here.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use crate::{
 
 use super::{
     AncestorLayer, BoxFetcher, FileCache, find_segment_in_dirs, open_delta_body_in_dirs,
-    read_extents,
+    read::DmatCache, read_extents,
 };
 
 /// Read-only view of a volume: rebuilds LBA map and extent index from
@@ -30,6 +31,7 @@ pub struct ReadonlyVolume {
     lbamap: lbamap::LbaMap,
     extent_index: extentindex::ExtentIndex,
     file_cache: RefCell<FileCache>,
+    dmat_cache: DmatCache,
     fetcher: Option<BoxFetcher>,
 }
 
@@ -47,6 +49,7 @@ impl ReadonlyVolume {
             lbamap,
             extent_index,
             file_cache: RefCell::new(FileCache::default()),
+            dmat_cache: RefCell::new(HashMap::new()),
             fetcher: None,
         })
     }
@@ -54,12 +57,15 @@ impl ReadonlyVolume {
     /// Read `lba_count` 4KB blocks starting at `start_lba`.
     /// Unwritten blocks are returned as zeros.
     pub fn read(&self, start_lba: u64, lba_count: u32) -> io::Result<Vec<u8>> {
+        let cache_dir = self.base_dir.join("cache");
         read_extents(
             start_lba,
             lba_count,
             &self.lbamap,
             &self.extent_index,
             &self.file_cache,
+            &self.dmat_cache,
+            &cache_dir,
             |id, bss, idx| self.find_segment_file(id, bss, idx),
             |id| {
                 open_delta_body_in_dirs(
