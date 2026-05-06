@@ -28,8 +28,84 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitflags::bitflags;
+
+/// Telemetry counters for the delta materialisation cache.
+///
+/// Counters are monotonic; reset only when the owning Volume / ReadonlyVolume /
+/// VolumeReader is dropped. Use `Ordering::Relaxed` — the counters are
+/// observation-only and do not gate any control flow.
+#[derive(Debug, Default)]
+pub struct DmatStats {
+    /// Every Delta entry read enters the dmat lookup path.
+    pub lookup_total: AtomicU64,
+    /// The dmat in-memory map served the read.
+    pub hit_total: AtomicU64,
+    /// The dmat in-memory map did not have the entry; falls through to
+    /// zstd-dict-decompress and writeback.
+    pub miss_total: AtomicU64,
+    /// A new record was appended to a `.dmat` file.
+    pub write_total: AtomicU64,
+    /// Bytes appended to `.dmat` files (post-compression).
+    pub write_bytes_total: AtomicU64,
+    /// Open-time scan truncated a partial or invalid tail.
+    pub open_truncate_total: AtomicU64,
+    /// Open-time scan rejected a record by structural failure (decompress
+    /// error, verifier rejection). Indicates corruption or schema drift.
+    pub open_invalid_total: AtomicU64,
+}
+
+impl DmatStats {
+    pub(crate) fn record_lookup(&self) {
+        self.lookup_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_hit(&self) {
+        self.hit_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_miss(&self) {
+        self.miss_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_write(&self, bytes: u64) {
+        self.write_total.fetch_add(1, Ordering::Relaxed);
+        self.write_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub(crate) fn record_open_scan(&self, scan: ScanStats) {
+        if scan.truncated {
+            self.open_truncate_total.fetch_add(1, Ordering::Relaxed);
+        }
+        if scan.invalid > 0 {
+            self.open_invalid_total
+                .fetch_add(scan.invalid as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot the counters as plain `u64`s. Cheap relaxed loads.
+    pub fn snapshot(&self) -> DmatStatsSnapshot {
+        DmatStatsSnapshot {
+            lookup_total: self.lookup_total.load(Ordering::Relaxed),
+            hit_total: self.hit_total.load(Ordering::Relaxed),
+            miss_total: self.miss_total.load(Ordering::Relaxed),
+            write_total: self.write_total.load(Ordering::Relaxed),
+            write_bytes_total: self.write_bytes_total.load(Ordering::Relaxed),
+            open_truncate_total: self.open_truncate_total.load(Ordering::Relaxed),
+            open_invalid_total: self.open_invalid_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Plain-`u64` snapshot of `DmatStats`. Useful for logging / IPC responses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DmatStatsSnapshot {
+    pub lookup_total: u64,
+    pub hit_total: u64,
+    pub miss_total: u64,
+    pub write_total: u64,
+    pub write_bytes_total: u64,
+    pub open_truncate_total: u64,
+    pub open_invalid_total: u64,
+}
 
 bitflags! {
     /// Flag byte in a `.dmat` record.

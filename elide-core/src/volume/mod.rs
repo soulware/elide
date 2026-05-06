@@ -188,6 +188,9 @@ pub struct Volume {
     /// lazily on first delta read for each segment; cleared on cache
     /// eviction. See `docs/design-delta-materialisation.md`.
     pub(in crate::volume) dmat_cache: read::DmatCache,
+    /// Telemetry counters for the dmat cache. Wrapped in `Arc` so the
+    /// stats can be cloned and shared with `VolumeReader`s and IPC.
+    pub(in crate::volume) dmat_stats: Arc<crate::dmat::DmatStats>,
     /// Signer for segment promotion. Every segment written by this volume
     /// (at WAL promotion and compaction) is signed with the fork's private key.
     /// See `segment::SegmentSigner`.
@@ -468,6 +471,7 @@ impl Volume {
             last_segment_ulid,
             file_cache: RefCell::new(FileCache::default()),
             dmat_cache: RefCell::new(std::collections::HashMap::new()),
+            dmat_stats: Arc::new(crate::dmat::DmatStats::default()),
             signer,
             verifying_key,
             fetcher: None,
@@ -676,6 +680,7 @@ impl Volume {
             &self.extent_index,
             &self.file_cache,
             &self.dmat_cache,
+            &self.dmat_stats,
             &cache_dir,
             |id, bss, idx| self.find_segment_file(id, bss, idx),
             |id| {
@@ -687,6 +692,11 @@ impl Volume {
                 )
             },
         )
+    }
+
+    /// Snapshot the dmat telemetry counters for this volume.
+    pub fn dmat_stats(&self) -> crate::dmat::DmatStatsSnapshot {
+        self.dmat_stats.snapshot()
     }
 
     /// Flush buffered WAL writes and fsync to disk. No-op when no WAL is open.

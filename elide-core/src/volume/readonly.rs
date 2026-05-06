@@ -10,10 +10,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ulid::Ulid;
 
 use crate::{
+    dmat::DmatStats,
     extentindex::{self, BodySource},
     lbamap,
 };
@@ -32,6 +34,7 @@ pub struct ReadonlyVolume {
     extent_index: extentindex::ExtentIndex,
     file_cache: RefCell<FileCache>,
     dmat_cache: DmatCache,
+    dmat_stats: Arc<DmatStats>,
     fetcher: Option<BoxFetcher>,
 }
 
@@ -50,6 +53,7 @@ impl ReadonlyVolume {
             extent_index,
             file_cache: RefCell::new(FileCache::default()),
             dmat_cache: RefCell::new(HashMap::new()),
+            dmat_stats: Arc::new(DmatStats::default()),
             fetcher: None,
         })
     }
@@ -65,6 +69,7 @@ impl ReadonlyVolume {
             &self.extent_index,
             &self.file_cache,
             &self.dmat_cache,
+            &self.dmat_stats,
             &cache_dir,
             |id, bss, idx| self.find_segment_file(id, bss, idx),
             |id| {
@@ -76,6 +81,11 @@ impl ReadonlyVolume {
                 )
             },
         )
+    }
+
+    /// Snapshot the dmat telemetry counters for this volume.
+    pub fn dmat_stats(&self) -> crate::dmat::DmatStatsSnapshot {
+        self.dmat_stats.snapshot()
     }
 
     fn find_segment_file(

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ulid::Ulid;
 
@@ -192,6 +193,7 @@ pub(crate) fn read_extents(
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<FileCache>,
     dmat_cache: &DmatCache,
+    dmat_stats: &Arc<dmat::DmatStats>,
     cache_dir: &Path,
     find_segment: impl Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
     open_delta_body: impl Fn(Ulid) -> io::Result<fs::File>,
@@ -236,6 +238,7 @@ pub(crate) fn read_extents(
                     extent_index,
                     file_cache,
                     dmat_cache,
+                    dmat_stats,
                     cache_dir,
                     &find_segment,
                     &open_delta_body,
@@ -397,6 +400,7 @@ fn try_read_delta_extent(
     extent_index: &extentindex::ExtentIndex,
     file_cache: &RefCell<FileCache>,
     dmat_cache: &DmatCache,
+    dmat_stats: &Arc<dmat::DmatStats>,
     cache_dir: &Path,
     find_segment: &dyn Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
     open_delta_body: &dyn Fn(Ulid) -> io::Result<fs::File>,
@@ -412,13 +416,21 @@ fn try_read_delta_extent(
     let delta_body_source = delta_loc.body_source;
     let options = delta_loc.options.clone();
 
+    dmat_stats.record_lookup();
+
     // dmat hit path: materialised bytes are already on disk for this
     // (segment, entry_idx). Read + lz4-decompress, copy out, return.
-    if let Some(materialised) =
-        dmat_lookup(dmat_cache, cache_dir, delta_segment_id, delta_entry_idx)?
-    {
+    if let Some(materialised) = dmat_lookup(
+        dmat_cache,
+        dmat_stats,
+        cache_dir,
+        delta_segment_id,
+        delta_entry_idx,
+    )? {
+        dmat_stats.record_hit();
         return copy_materialised_into(er, lba, &materialised, out).map(|()| true);
     }
+    dmat_stats.record_miss();
 
     // Pick the first option whose source hash resolves to a DATA/Inline
     // location. This is the earliest-source preference in its simplest
@@ -539,6 +551,7 @@ fn try_read_delta_extent(
     // and can be re-derived next time.
     if let Err(e) = dmat_writeback(
         dmat_cache,
+        dmat_stats,
         cache_dir,
         delta_segment_id,
         delta_entry_idx,
@@ -582,6 +595,7 @@ fn copy_materialised_into(
 /// on first access for a segment.
 fn dmat_lookup(
     dmat_cache: &DmatCache,
+    dmat_stats: &Arc<dmat::DmatStats>,
     cache_dir: &Path,
     segment_id: Ulid,
     entry_idx: u32,
@@ -595,7 +609,8 @@ fn dmat_lookup(
             if !path.exists() {
                 return Ok(None);
             }
-            let (d, _stats) = dmat::Dmat::open_or_create(&path, |_, _| true)?;
+            let (d, scan) = dmat::Dmat::open_or_create(&path, |_, _| true)?;
+            dmat_stats.record_open_scan(scan);
             v.insert(d)
         }
     };
@@ -612,6 +627,7 @@ fn dmat_lookup(
 /// flagged `FLAG_COMPRESSED` iff lz4 produced a meaningfully smaller payload.
 fn dmat_writeback(
     dmat_cache: &DmatCache,
+    dmat_stats: &Arc<dmat::DmatStats>,
     cache_dir: &Path,
     segment_id: Ulid,
     entry_idx: u32,
@@ -623,12 +639,14 @@ fn dmat_writeback(
         Entry::Occupied(o) => o.into_mut(),
         Entry::Vacant(v) => {
             let path = cache_dir.join(format!("{segment_id}.dmat"));
-            let (d, _stats) = dmat::Dmat::open_or_create(&path, |_, _| true)?;
+            let (d, scan) = dmat::Dmat::open_or_create(&path, |_, _| true)?;
+            dmat_stats.record_open_scan(scan);
             v.insert(d)
         }
     };
     let compressed = super::maybe_compress(materialised);
-    dmat_inst.append(entry_idx, materialised, compressed.as_deref())?;
+    let loc = dmat_inst.append(entry_idx, materialised, compressed.as_deref())?;
+    dmat_stats.record_write(loc.stored_length as u64);
     Ok(())
 }
 

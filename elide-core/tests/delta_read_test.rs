@@ -605,6 +605,13 @@ fn delta_read_populates_dmat_and_second_read_matches() {
             "first delta read must match child bytes"
         );
 
+        let stats_after_first = vol.dmat_stats();
+        assert_eq!(stats_after_first.lookup_total, 1);
+        assert_eq!(stats_after_first.miss_total, 1);
+        assert_eq!(stats_after_first.hit_total, 0);
+        assert_eq!(stats_after_first.write_total, 1);
+        assert!(stats_after_first.write_bytes_total > 0);
+
         assert!(
             dmat_path.exists(),
             "dmat must be created after a successful delta read"
@@ -625,6 +632,12 @@ fn delta_read_populates_dmat_and_second_read_matches() {
             after_first, after_second,
             "second read must hit the dmat (no new record appended)"
         );
+
+        let stats_after_second = vol.dmat_stats();
+        assert_eq!(stats_after_second.lookup_total, 2);
+        assert_eq!(stats_after_second.hit_total, 1);
+        assert_eq!(stats_after_second.miss_total, 1);
+        assert_eq!(stats_after_second.write_total, 1);
     }
 
     // Reopen and read again — the dmat must survive across volume open/close.

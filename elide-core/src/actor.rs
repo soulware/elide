@@ -1381,6 +1381,9 @@ pub struct VolumeReader {
     /// so an eviction that drops `.dmat` from disk can't leave a stale FD
     /// pointing at a removed inode.
     dmat_cache: crate::volume::DmatCache,
+    /// Telemetry counters for the dmat cache. Per-reader; aggregate by
+    /// summing snapshots across readers if needed.
+    dmat_stats: Arc<crate::dmat::DmatStats>,
     /// Generation of the last snapshot whose extent index offsets were used
     /// to populate `file_cache`. Compared against `ReadSnapshot::flush_gen`
     /// on every read; if they differ the cache is evicted before proceeding.
@@ -1407,6 +1410,7 @@ impl VolumeClient {
             client: self.clone(),
             file_cache: RefCell::new(FileCache::default()),
             dmat_cache: RefCell::new(std::collections::HashMap::new()),
+            dmat_stats: Arc::new(crate::dmat::DmatStats::default()),
             last_flush_gen: Cell::new(current_gen),
         }
     }
@@ -1700,6 +1704,7 @@ impl VolumeReader {
             extent_index,
             &self.file_cache,
             &self.dmat_cache,
+            &self.dmat_stats,
             &cache_dir,
             |id, bss, idx| {
                 find_segment_in_dirs(
@@ -1721,6 +1726,11 @@ impl VolumeReader {
                 )
             },
         )
+    }
+
+    /// Snapshot the dmat telemetry counters for this reader.
+    pub fn dmat_stats(&self) -> crate::dmat::DmatStatsSnapshot {
+        self.dmat_stats.snapshot()
     }
 }
 
