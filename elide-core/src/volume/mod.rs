@@ -52,6 +52,7 @@ mod open_state;
 mod read;
 mod readonly;
 mod reclaim;
+mod redact;
 mod repack;
 mod wal;
 
@@ -81,6 +82,7 @@ pub use reclaim::{
     ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult, ReclaimThresholds, ReclaimedEntry,
     scan_reclaim_candidates,
 };
+pub use redact::{RedactJob, RedactResult};
 pub use repack::{
     CompactionStats, DeltaRepackJob, DeltaRepackResult, DeltaRepackStats, DeltaRepackedSegment,
     RepackJob, RepackResult, RepackedDeadEntry, RepackedLiveEntry, RepackedSegment, SweepJob,
@@ -1130,7 +1132,7 @@ impl Volume {
     /// construction in `Volume::open`. Used by the GC apply path on both
     /// the stale-cancel and commit branches to keep the in-memory view
     /// from drifting relative to on-disk state.
-    fn rebuild_lbamap_from_disk(&mut self) -> io::Result<()> {
+    pub(in crate::volume) fn rebuild_lbamap_from_disk(&mut self) -> io::Result<()> {
         let mut chain: Vec<(PathBuf, Option<String>)> = self
             .ancestor_layers
             .iter()
@@ -1438,241 +1440,6 @@ impl Volume {
         Ok(())
     }
 
-    /// Drop hash-dead DATA entries from `pending/<ulid>`, so that deleted
-    /// data never leaves the local host via S3 upload. Called by the
-    /// coordinator just before the segment is read for upload.
-    ///
-    /// A DATA entry is **hash-dead** when:
-    /// - Its LBA no longer maps to this hash (LBA-dead), and
-    /// - No other live LBA in the volume references this hash.
-    ///
-    /// Such an entry has no readers (by construction) and its bytes are
-    /// safe to drop. LBA-dead-but-hash-alive entries are kept — their
-    /// bytes still back a DedupRef or Delta source somewhere. DedupRef,
-    /// Zero, Inline, Canonical*, and Delta entries are kept untouched.
-    ///
-    /// Returns the ULID under which the segment now lives in `pending/`.
-    /// When at least one hash-dead entry was dropped, the rewritten
-    /// segment is committed under a freshly minted ULID — distinct from
-    /// the input — and the input's `pending/<ulid>` is deleted; callers
-    /// must use the returned ULID for the subsequent upload + promote.
-    /// When nothing was hash-dead, returns the input ULID unchanged.
-    ///
-    /// Why a fresh ULID: a same-path rewrite (rename `tmp → pending/<ulid>`)
-    /// races concurrent `VolumeReader`s holding the pre-redact snapshot.
-    /// Such a reader's `extent_index` records the pre-redact
-    /// `body_section_start`; if it has no hot FD for the segment and
-    /// opens a fresh one after the rename, it lands on the new inode and
-    /// seeks into garbage. Re-issuing the ULID makes pre- and post-redact
-    /// refer to two distinct paths: a stale snapshot keeps resolving to
-    /// the old path (alive briefly via unlinked-but-open semantics for
-    /// readers that already had an FD; otherwise EIO surfaces a transient
-    /// I/O failure rather than silent corruption). Mirrors the same
-    /// pattern `flush_wal_to_pending` uses.
-    ///
-    /// Removing the entries (rather than only hole-punching their bodies)
-    /// is required for correctness: on crash+rebuild, `extent_index::rebuild`
-    /// walks segments in ULID ascending order and takes the first insert
-    /// per hash; a stale hash-dead entry surviving in a lower-ULID .idx
-    /// would shadow the same hash's live body in a later segment.
-    ///
-    /// Idempotent: calling again with the returned ULID is a no-op
-    /// because the first call already dropped every hash-dead entry,
-    /// and the returned ULID equals the input.
-    ///
-    /// Fast path: if no hash-dead DATA entries exist, returns the input
-    /// ULID without rewriting.
-    pub fn redact_segment(&mut self, ulid: Ulid) -> io::Result<Ulid> {
-        let old_ulid_str = ulid.to_string();
-        let pending_dir = self.base_dir.join("pending");
-        let old_seg_path = pending_dir.join(&old_ulid_str);
-
-        let (body_section_start, entries, inputs) =
-            segment::read_and_verify_segment_index(&old_seg_path, &self.verifying_key)?;
-
-        let live_hashes = self.lbamap.lba_referenced_hashes();
-        let is_hash_dead = |entry: &segment::SegmentEntry| -> bool {
-            if !entry.kind.is_data() || entry.stored_length == 0 {
-                return false;
-            }
-            let lba_live = self.lbamap.hash_at(entry.start_lba) == Some(entry.hash);
-            !lba_live && !live_hashes.contains(&entry.hash)
-        };
-
-        if !entries.iter().any(&is_hash_dead) {
-            return Ok(ulid);
-        }
-
-        // Partition: dropped hashes (for extent-index cleanup) vs
-        // surviving entries (rewritten into the new segment).
-        let (mut kept_entries, dropped_entries): (Vec<_>, Vec<_>) =
-            entries.into_iter().partition(|e| !is_hash_dead(e));
-        let dropped_count = dropped_entries.len();
-        let dropped_bytes: u64 = dropped_entries.iter().map(|e| e.stored_length as u64).sum();
-        let dropped_hashes: Vec<blake3::Hash> =
-            dropped_entries.into_iter().map(|e| e.hash).collect();
-
-        // Load live body bytes + inline section + delta body verbatim
-        // from the old segment file (still on disk, untouched until
-        // the rename below).
-        let inline_bytes = segment::read_inline_section(&old_seg_path)?;
-        segment::read_extent_bodies(
-            &old_seg_path,
-            body_section_start,
-            &mut kept_entries,
-            &inline_bytes,
-        )?;
-        let delta_body = segment::read_delta_body_section(&old_seg_path)?;
-
-        // Snapshot pre-rewrite (segment_id, body_offset) tokens for the
-        // body-bearing kept entries — used as CAS preconditions on the
-        // extent-index migration below. Capture *before*
-        // `write_segment_full` reassigns `stored_offset`.
-        let pre_rewrite_offsets: Vec<u64> = kept_entries.iter().map(|e| e.stored_offset).collect();
-
-        // Pre-mint two ULIDs in order: u_redact < u_flush.
-        //
-        // The rewritten segment must sit below any future WAL ULID to
-        // preserve the "max(pending) < running WAL" invariant
-        // (`docs/formats.md`). If we just called `mint.next()` once,
-        // the new ULID would advance past the currently-open WAL.
-        // Mirroring the GC checkpoint pattern (`mint_gc_checkpoint_ulids`),
-        // we mint both up-front and use `u_flush` to seal the live WAL
-        // into a fresh pending segment; afterwards the WAL is closed,
-        // and the next `ensure_wal_open` mints a ULID strictly above
-        // both u_redact and u_flush.
-        //
-        // `flush_wal_to_pending_as` is a no-op when the WAL is empty
-        // or absent — `u_flush` is then just a wasted mint advance,
-        // matching how `gc_checkpoint_for_test` handles the same case.
-        let u_redact = self.mint.next();
-        let u_flush = self.mint.next();
-        self.flush_wal_to_pending_as(u_flush)?;
-
-        let new_ulid_str = u_redact.to_string();
-        let new_seg_path = pending_dir.join(&new_ulid_str);
-
-        // Write new segment via tmp+rename under the new ULID.
-        // `write_segment_full` reassigns `stored_offset` for surviving
-        // entries based on the compacted body layout.
-        let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
-        let _ = fs::remove_file(&tmp_path);
-        let new_body_section_start = segment::write_segment_full(
-            &tmp_path,
-            &mut kept_entries,
-            &delta_body,
-            &inputs,
-            self.signer.as_ref(),
-        )?;
-        fs::rename(&tmp_path, &new_seg_path)?;
-        segment::fsync_dir(&new_seg_path)?;
-
-        // Migrate the extent index:
-        //   1. Drop entries for hash-dead entries that were removed.
-        //   2. Re-point each surviving Data/Inline entry from `ulid`
-        //      to `u_redact` with refreshed bss + body_offset + length;
-        //      CAS-by-(ulid, pre_rewrite_offset) so a concurrent writer
-        //      that re-pointed a hash at a newer segment wins.
-        //   3. Migrate surviving Delta locations the same way (segment
-        //      id flip + new bss + new body_length).
-        let new_body_length: u64 = kept_entries
-            .iter()
-            .filter(|e| e.kind.is_data())
-            .map(|e| e.stored_length as u64)
-            .sum();
-        let index = Arc::make_mut(&mut self.extent_index);
-        for hash in &dropped_hashes {
-            if index.lookup(hash).is_some_and(|loc| loc.segment_id == ulid) {
-                index.remove(hash);
-            }
-        }
-        for (entry, pre_offset) in kept_entries.iter().zip(pre_rewrite_offsets.iter().copied()) {
-            match entry.kind {
-                EntryKind::Data
-                | EntryKind::Inline
-                | EntryKind::CanonicalData
-                | EntryKind::CanonicalInline => {
-                    let inline_data = if entry.kind.is_inline() {
-                        entry.data.clone().map(Vec::into_boxed_slice)
-                    } else {
-                        None
-                    };
-                    index.replace_if_matches(
-                        entry.hash,
-                        ulid,
-                        pre_offset,
-                        extentindex::ExtentLocation {
-                            segment_id: u_redact,
-                            body_offset: entry.stored_offset,
-                            body_length: entry.stored_length,
-                            compressed: entry.compressed,
-                            body_source: BodySource::Local,
-                            body_section_start: new_body_section_start,
-                            inline_data,
-                        },
-                    );
-                }
-                EntryKind::Delta => {
-                    index.migrate_delta_full_location_if_matches(
-                        &entry.hash,
-                        ulid,
-                        u_redact,
-                        new_body_section_start,
-                        new_body_length,
-                    );
-                }
-                EntryKind::DedupRef | EntryKind::Zero => {
-                    // DedupRef / Zero entries carry no offsets pointing
-                    // into this segment — DedupRef resolves to another
-                    // segment via the extent index, Zero is recorded in
-                    // the LBA map only.
-                }
-            }
-        }
-
-        // Drop any cached fd for the old ULID. The actor's own
-        // FileCache; concurrent VolumeReaders observe the snapshot
-        // republish (driven by the actor handler) and clear theirs
-        // via `flush_gen` mismatch.
-        self.evict_cached_segment(ulid);
-
-        // Bump last_segment_ulid so first-snapshot pinning and any
-        // monotonicity invariant covers the new segment.
-        if self.last_segment_ulid < Some(u_redact) {
-            self.last_segment_ulid = Some(u_redact);
-        }
-        self.has_new_segments = true;
-
-        // Delete the old pending file. Any concurrent VolumeReader
-        // that loaded the pre-redact snapshot still references `ulid`
-        // via its extent-index entries; if it had a hot fd here, the
-        // unlink leaves the inode alive for that fd and reads return
-        // the original bytes. A reader without a hot fd that opens
-        // freshly post-unlink hits ENOENT, which surfaces as EIO — a
-        // transient I/O failure rather than silent corruption (the
-        // outcome the same-path rewrite would produce).
-        fs::remove_file(&old_seg_path)?;
-        segment::fsync_dir(&pending_dir)?;
-
-        // If a previous drain crashed mid-promote against the OLD
-        // ulid, sibling files (`index/<ulid>.idx`, `cache/<ulid>.body`,
-        // `.present`, `.delta`) may still be on disk. They reference
-        // the now-deleted body offsets and would be served as stale
-        // hits by the read path. Remove them; the next promote runs
-        // against `u_redact` and writes fresh siblings under that ULID.
-        crate::actor::invalidate_promote_siblings(
-            &self.base_dir.join("index"),
-            &self.base_dir.join("cache"),
-            ulid,
-        )?;
-
-        log::info!(
-            "redact {old_ulid_str} -> {new_ulid_str}: dropped {dropped_count} hash-dead DATA entries ({dropped_bytes} bytes)"
-        );
-
-        Ok(u_redact)
-    }
-
     /// Flush the current WAL to a segment in this node's `pending/`, update
     /// the extent index, and clear `pending_entries`. The WAL file is deleted.
     ///
@@ -1734,7 +1501,10 @@ impl Volume {
     ///
     /// Leaves `self.wal = None` on success — the next write lazily opens a
     /// fresh WAL. No-op when no WAL is currently open.
-    fn flush_wal_to_pending_as(&mut self, segment_ulid: Ulid) -> io::Result<()> {
+    pub(in crate::volume) fn flush_wal_to_pending_as(
+        &mut self,
+        segment_ulid: Ulid,
+    ) -> io::Result<()> {
         let Some(mut open) = self.wal.take() else {
             return Ok(());
         };

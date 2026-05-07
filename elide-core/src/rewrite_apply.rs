@@ -151,22 +151,39 @@ pub trait BodyResolver {
     fn open_delta_body(&self, segment_id: Ulid) -> io::Result<fs::File>;
 }
 
-/// Load per-input idx state. Returns `Err(MissingInput(...))` if any input's
-/// `.idx` is absent — in that case the caller cancels the plan (the input
-/// was deleted between plan emission and apply).
+/// Load per-input idx state for inputs that live in the GC handoff
+/// `index/<u>.idx` shape — coordinator-driven GC. Returns
+/// `Err(MissingInput(...))` if any input's `.idx` is absent (the input
+/// was deleted between plan emission and apply); the caller cancels.
 fn load_input_states(
     base_dir: &Path,
     inputs: &[Ulid],
 ) -> Result<HashMap<Ulid, InputState>, MaterialiseOutcome> {
     let index_dir = base_dir.join("index");
+    load_input_states_from(inputs, |u| index_dir.join(format!("{u}.idx")))
+}
+
+/// Generic input-state loader. The caller supplies a resolver that maps
+/// each input ULID to the file holding its segment index — `index/<u>.idx`
+/// for GC, `pending/<u>` for redact / sweep / repack / delta_repack.
+/// `read_segment_index` accepts both shapes (a full pending segment or
+/// just the .idx head) so a single loader handles every tier.
+fn load_input_states_from<F>(
+    inputs: &[Ulid],
+    resolve_path: F,
+) -> Result<HashMap<Ulid, InputState>, MaterialiseOutcome>
+where
+    F: Fn(&Ulid) -> std::path::PathBuf,
+{
     let mut out = HashMap::with_capacity(inputs.len());
     for input_ulid in inputs {
-        let idx_path = index_dir.join(format!("{input_ulid}.idx"));
+        let idx_path = resolve_path(input_ulid);
         let parsed = match segment::read_segment_index(&idx_path) {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(MaterialiseError::MissingInput(format!(
-                    "input {input_ulid} .idx missing"
+                    "input {input_ulid} segment file missing at {}",
+                    idx_path.display()
                 ))
                 .into());
             }
@@ -725,7 +742,9 @@ fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> Result<(), Materialise
 }
 
 impl<'a> MaterialiseCtx<'a> {
-    /// Construct a ctx by eagerly loading per-input idx state from disk.
+    /// Construct a ctx by eagerly loading per-input idx state from
+    /// `<base_dir>/index/<u>.idx`. Used by the GC handoff path —
+    /// inputs are committed segments confirmed in S3.
     pub fn new(
         base_dir: &'a Path,
         inputs: &[Ulid],
@@ -733,6 +752,26 @@ impl<'a> MaterialiseCtx<'a> {
         resolver: &'a dyn BodyResolver,
     ) -> Result<Self, MaterialiseOutcome> {
         let input_states = load_input_states(base_dir, inputs)?;
+        Ok(Self {
+            base_dir,
+            input_states,
+            extent_index,
+            resolver,
+        })
+    }
+
+    /// Construct a ctx for inputs in `<base_dir>/pending/<u>` (full
+    /// segment files, not just the `.idx` head). Used by redact /
+    /// sweep / repack / delta_repack — synchronous rewriters that
+    /// run on the actor against not-yet-uploaded segments.
+    pub fn new_for_pending(
+        base_dir: &'a Path,
+        inputs: &[Ulid],
+        extent_index: &'a ExtentIndex,
+        resolver: &'a dyn BodyResolver,
+    ) -> Result<Self, MaterialiseOutcome> {
+        let pending_dir = base_dir.join("pending");
+        let input_states = load_input_states_from(inputs, |u| pending_dir.join(u.to_string()))?;
         Ok(Self {
             base_dir,
             input_states,
