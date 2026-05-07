@@ -108,9 +108,9 @@ Each entry below has a named deterministic regression test; see the listed file 
 
 ### Runtime invariants gated behind `--features lbamap-invariant`
 
-Some bugs are easier to catch at the introducing call site than at the eventual symptom. For those, the volume layer keeps "is the in-memory state consistent with disk?" assertions that fire at the end of every state-mutating method and panic on divergence with a labelled message identifying the calling method.
+Some bugs are easier to catch at the introducing call site than at the eventual symptom. For those, the volume layer keeps "is the in-memory state consistent with disk?" assertions that fire at the end of structural state-mutating methods and panic on divergence with a labelled message identifying the calling method.
 
-These checks are **not free** — each call rebuilds an in-memory data structure from disk. To keep the everyday `cargo test -p elide-core` suite fast and to avoid slowing down elide-core's own proptest binaries (which don't exercise the coordinator-layer paths these invariants protect), the invariants are gated behind a separate `lbamap-invariant` feature.
+These checks are **not free** — each call rebuilds an in-memory data structure from disk. To keep the everyday `cargo test -p elide-core` suite fast and to avoid slowing down elide-core's own proptest binaries (which don't exercise the coordinator-layer paths these invariants protect), the invariants are gated behind a separate `lbamap-invariant` feature. The rebuild path additionally **skips ed25519 signature verification** (`lbamap::rebuild_segments_unverified`) since `Volume::open` already verifies signatures at startup and on-disk segments are immutable thereafter — the per-segment verify dominates the assertion cost.
 
 #### Wiring
 
@@ -141,11 +141,19 @@ Call at the **end** of every method that may mutate the asserted state, on every
 
 - **`Volume::assert_lbamap_consistent(caller)`** — rebuilds the lbamap from `discover_fork_segments` + WAL replay and compares to `self.lbamap` per LBA. Panics with the offending LBAs and the calling method name. Catches the class of bug where a state-mutating op moves disk state without updating the in-memory mirror (e.g. promoting a pending segment changes its tier in the walk order, which can flip the per-LBA winner). Called from structural ops only: `Volume::open`, `gc_checkpoint_for_test`, `apply_redact_result`, `apply_plan_apply_result`, and `apply_promote_segment_result`. **Not** called from `write` / `write_zeroes` — those are high-frequency incremental `lbamap.insert` updates whose drift would still be caught at the next structural op.
 
-#### When proptests trip the invariant on a hand-crafted segment
+#### When tests trip the invariant
 
-Some tests construct a segment file directly (e.g. `write_segment_with_delta_body` to lay down a hand-crafted Delta entry). These bypass the normal `Volume::write` → WAL → flush path that incrementally populates `self.lbamap`, so the next mutating op trips the invariant.
+Two recurring shapes, both test-setup artifacts that don't reflect production paths:
 
-Resolution: drop and reopen the `Volume` between the hand-craft and the next mutating call. `Volume::open`'s rebuild folds the new segment in. Production code paths never hit this — they always write through `Volume::write`.
+1. **Hand-crafted segment files.** Tests that lay down a segment directly (e.g. `write_segment_with_delta_body` for a Delta entry, or `populate_cache` for the 3-file demand-fetch format) bypass `Volume::write` → WAL → flush. `self.lbamap` never sees those entries; the next mutating op trips the invariant.
+
+   *Resolution:* drop and reopen the `Volume` between the hand-craft and the next mutating call. `Volume::open`'s rebuild folds the new segment in.
+
+2. **Promoting only the highest-ULID pending segment.** Tests that promote one pending segment while lower-ULID pending peers still claim overlapping LBAs flip the lbamap walk-order winner: pending always wins last, so once the high-ULID segment crosses into committed, a lower-ULID pending peer takes over for any overlapping LBA — but `self.lbamap` doesn't reflect the flip. Same drain-bug class as the one fixed for production drain in #265.
+
+   *Resolution:* promote all pending segments in ULID-ascending order via `segment::read_ulid_dir_sorted`. The just-promoted ULID then stays below every remaining pending ULID and no overlapping pending peer can take over.
+
+Production code paths don't hit either shape — `Volume::write` populates lbamap incrementally and the production drain (`coordinator/upload.rs`) sorts by ULID.
 
 ### Known gaps
 
