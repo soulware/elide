@@ -41,9 +41,11 @@ libublk = "0.4"
 [features]
 # Gate the slow property-based test suites behind an explicit feature so that
 # `cargo test -p elide-coordinator` runs only the fast unit/integration tests.
+# Enables elide-core's `proptest` feature too so the runtime invariants
+# (e.g. lbamap-vs-disk consistency check) fire under stress sequencing.
 #
 #   cargo test -p elide-coordinator --features proptest
-proptest = []
+proptest = ["elide-core/proptest"]
 
 [dev-dependencies]
 async-trait = "0.1"

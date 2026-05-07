@@ -46,21 +46,17 @@ fn simulate_upload(vol: &mut Volume, dir: &Path) {
     // Re-snapshot pending after every redact: redact may produce two new
     // pending entries (the rewritten segment + the flushed WAL contents)
     // under fresh ULIDs and remove the input.
+    //
+    // Always pick the lowest-ULID pending segment next — see
+    // `elide_core::segment::read_ulid_dir_sorted`.
     let mut promoted = std::collections::HashSet::new();
     loop {
-        let Ok(entries) = fs::read_dir(&pending_dir) else {
+        let Ok(ulids) = elide_core::segment::read_ulid_dir_sorted(&pending_dir) else {
             return;
         };
-        let next = entries.flatten().find_map(|e| {
-            let name = e.file_name();
-            let s = name.to_str()?;
-            if s.contains('.') {
-                return None;
-            }
-            let u = ulid::Ulid::from_string(s).ok()?;
-            if promoted.contains(&u) { None } else { Some(u) }
-        });
-        let Some(ulid) = next else { break };
+        let Some(ulid) = ulids.into_iter().find(|u| !promoted.contains(u)) else {
+            break;
+        };
         let redacted = vol.redact_segment(ulid).unwrap_or(ulid);
         if redacted != ulid {
             promoted.insert(ulid);
