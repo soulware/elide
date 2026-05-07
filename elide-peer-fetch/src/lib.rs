@@ -2,7 +2,7 @@
 //!
 //! v1 scope is `.idx` + `.prefetch` fetch only; peer body fetch is
 //! deferred. See `docs/notes/design-peer-segment-fetch.md` and
-//! `docs/notes/peer-segment-fetch-v1-plan.md` for the design and plan.
+//! `docs/notes/plan-peer-segment-fetch-v1.md` for the design and plan.
 //!
 //! This crate contains:
 //!

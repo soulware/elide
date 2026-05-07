@@ -10,7 +10,7 @@
 // disk.
 //
 // See `docs/notes/design-portable-live-volume.md` § "Coordinator identity"
-// and Phase 1.5 of `docs/notes/portable-live-volume-plan.md`.
+// and Phase 1.5 of `docs/notes/plan-portable-live-volume.md`.
 
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;

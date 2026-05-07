@@ -8,7 +8,7 @@
 - Step 4 — `promote_segment` offload (PR #59, landed out-of-sequence to prioritise per-upload actor stalls on a live dd workload).
 - Step 5 — shared `SegmentIndexCache` (PR #61), now covering all worker-thread segment reads and the actor-thread compact_pending scan.
 - Step 6 — `sweep_pending` (PR #62, 6a), `repack` (PR #64, 6b), `delta_repack_post_snapshot` (PR #65, 6c).
-- Step 7 — `sign_snapshot_manifest` offload + deletion of the dead `VolumeRequest::Snapshot` (PR #68); see [snapshot-offload-plan.md](snapshot-offload-plan.md).
+- Step 7 — `sign_snapshot_manifest` offload + deletion of the dead `VolumeRequest::Snapshot` (PR #68); see [plan-snapshot-offload.md](plan-snapshot-offload.md).
 
 The only remaining follow-ups are noted in-line: per-segment parallelism for delta_repack, and the out-of-scope coordinator-side blocking-GC issue at the bottom of this doc.
 
@@ -57,7 +57,7 @@ The CAS primitive is `ExtentIndex::replace_if_matches(hash, expected_segment_id,
 
 ## Flush vs promote — LANDED
 
-The flush/promote separation is fully implemented. See [promote-offload-plan.md](promote-offload-plan.md) for the complete design and implementation details.
+The flush/promote separation is fully implemented. See [plan-promote-offload.md](plan-promote-offload.md) for the complete design and implementation details.
 
 Summary: `VolumeRequest::Flush` is now a WAL fsync of the current WAL, plus (if any promote is in flight) a park on the promote generation counter. The actor returns to the select loop immediately in both cases — queued writes keep flowing while the FLUSH caller waits for the worker's old-WAL fsync. Promotion is triggered asynchronously by the threshold check and idle tick, dispatched to the worker thread as a `WorkerJob::Promote`; the old-WAL fsync runs as the first step of the worker job rather than on the actor. Results arrive on a dedicated bounded crossbeam channel (not a `VolumeRequest` variant). The actor's `select!` loop has three arms: `VolumeRequest`, worker results, and idle tick.
 
@@ -65,7 +65,7 @@ Summary: `VolumeRequest::Flush` is now a WAL fsync of the current WAL, plus (if 
 
 ### 1. WAL promote *(LANDED)*
 
-**Landed in PRs #51, #55, #56, #57.** See [promote-offload-plan.md](promote-offload-plan.md).
+**Landed in PRs #51, #55, #56, #57.** See [plan-promote-offload.md](plan-promote-offload.md).
 
 The worker is a single long-lived thread with bounded channels (capacity 4). Multiple promotes can be in flight. `gc_checkpoint` routes through the same worker with a parked reply. The apply phase uses CAS (`replace_if_matches`) to handle concurrent writes.
 
@@ -109,7 +109,7 @@ Per-segment parallelism (a small worker pool rather than a single worker) remain
 
 ### 4. `promote_segment` *(LANDED)*
 
-**Landed in PR #59.** See [promote-segment-offload-plan.md](promote-segment-offload-plan.md) for the full design and landing breakdown.
+**Landed in PR #59.** See [plan-promote-segment-offload.md](plan-promote-segment-offload.md) for the full design and landing breakdown.
 
 Prep phase on the actor picks the source (`pending/<ulid>` > `gc/<ulid>` > body-exists early-return) and builds a `PromoteSegmentJob`. Worker thread reads + verifies the index once, handles the GC tombstone shortcut, writes `index/<ulid>.idx` and `cache/<ulid>.{body,present}` (both idempotent on retry), and returns parsed entries + bss + inline bytes. Apply phase on the actor runs the extent-index CAS (Local → Cached) + `pending/<ulid>` delete for the drain path, or input-idx cleanup for the GC path. `WorkerResult::PromoteSegment` carries the ULID out-of-band so errors map to the right parked caller. Single-parse collapse folded in — the previous triple parse is now one `read_and_verify_segment_index` shared across tombstone check, idx extract, body copy, and apply-phase CAS.
 
@@ -121,7 +121,7 @@ Prep on the actor captures the signer `Arc` and base dir into a `SignSnapshotMan
 
 The dead `VolumeRequest::Snapshot` arm and `VolumeHandle::snapshot()` were deleted in the same landing — no live wire sender. `Volume::snapshot()` the method stays for in-process tests and never runs on the actor.
 
-See [snapshot-offload-plan.md](snapshot-offload-plan.md) for the design.
+See [plan-snapshot-offload.md](plan-snapshot-offload.md) for the design.
 
 ## Shared optimization: segment-index cache *(LANDED)*
 
@@ -148,15 +148,15 @@ Cache invalidation is file-length-based: tmp+rename rewrites change the entry co
 ## Sequencing
 
 1. **Make `extent_index` inserts conditional.** LANDED (PR #51). `replace_if_matches` on `ExtentIndex`.
-2. **Introduce a single worker thread and offload WAL promote.** LANDED (PRs #55, #56, #57). Dedicated bounded channels, three-arm `select!`, multi-promote queuing, GC checkpoint routing. See [promote-offload-plan.md](promote-offload-plan.md).
+2. **Introduce a single worker thread and offload WAL promote.** LANDED (PRs #55, #56, #57). Dedicated bounded channels, three-arm `select!`, multi-promote queuing, GC checkpoint routing. See [plan-promote-offload.md](plan-promote-offload.md).
 3. **Offload `apply_gc_handoffs`.** LANDED (PR #58). Generalized the worker to carry a `WorkerJob` enum and added the `GcHandoff` variant.
-4. **Offload `promote_segment` (and fix the re-parse).** LANDED (PR #59, out-of-sequence with the original plan). Added `WorkerJob::PromoteSegment` + parked-reply dispatch. See [promote-segment-offload-plan.md](promote-segment-offload-plan.md).
+4. **Offload `promote_segment` (and fix the re-parse).** LANDED (PR #59, out-of-sequence with the original plan). Added `WorkerJob::PromoteSegment` + parked-reply dispatch. See [plan-promote-segment-offload.md](plan-promote-segment-offload.md).
 5. **Land the segment-index cache.** LANDED. `SegmentIndexCache` covers the worker-thread `promote_segment` / sweep / repack / delta_repack paths and the actor-thread `compact_pending` loop. `delta_compute::rewrite_post_snapshot_with_prior` was plumbed through in step 6c.
 6. **Offload `sweep_pending`, `repack`, `delta_repack_post_snapshot`.** In that order — sweep is the simplest, delta_repack is the largest payoff. Per-segment parallelism (a small worker pool rather than a single worker) remains a future optimisation for delta_repack.
    - **6a (LANDED):** `sweep_pending`. Added `WorkerJob::Sweep` + parked-reply dispatch. Apply uses `replace_if_matches` for carried-live entries and the new `remove_if_matches` for dead entries, both keyed on the source `(segment_id, body_offset)`.
    - **6b (LANDED):** `repack`. Added `WorkerJob::Repack` + `parked_repack` slot. Per-segment rewrite with output ULID = input ULID; apply uses `replace_if_matches` / `remove_if_matches` keyed on the source `(seg_id, body_offset)` captured before `write_segment` reassigned offsets.
    - **6c (LANDED):** `delta_repack_post_snapshot`. Added `WorkerJob::DeltaRepack` + `parked_delta_repack` slot. Worker constructs the snapshot-pinned `BlockReader` off the actor; `rewrite_post_snapshot_with_prior` now takes the shared `SegmentIndexCache`. Apply pairs each rewritten entry with its pre-rewrite `(kind, stored_offset)` and CAS-updates the extent index via `replace_if_matches` / `remove_if_matches` / `insert_delta_if_absent` depending on the kind transition.
-7. **Offload `sign_snapshot_manifest` + delete dead `VolumeRequest::Snapshot`.** LANDED (PR #68). Added `WorkerJob::SignSnapshotManifest` + `parked_sign_snapshot_manifest` slot; retired the dead `VolumeRequest::Snapshot` wire command and `VolumeHandle::snapshot()`. See [snapshot-offload-plan.md](snapshot-offload-plan.md).
+7. **Offload `sign_snapshot_manifest` + delete dead `VolumeRequest::Snapshot`.** LANDED (PR #68). Added `WorkerJob::SignSnapshotManifest` + `parked_sign_snapshot_manifest` slot; retired the dead `VolumeRequest::Snapshot` wire command and `VolumeHandle::snapshot()`. See [plan-snapshot-offload.md](plan-snapshot-offload.md).
 
 After step 2 every subsequent step reuses the same infrastructure — bounded crossbeam channels, a worker thread (or pool), and result handling in the worker `select!` arm. No new primitives, no new locks, no read-path changes.
 

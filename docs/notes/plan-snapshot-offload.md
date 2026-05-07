@@ -1,6 +1,6 @@
 # Plan: offload `sign_snapshot_manifest` off the volume actor
 
-**Status:** Landed in PR #68 (`edea025`). Step 7 of [actor-offload-plan.md](actor-offload-plan.md). Reuses the worker-thread infrastructure established by [promote-offload-plan.md](promote-offload-plan.md) and extended through steps 2–6.
+**Status:** Landed in PR #68 (`edea025`). Step 7 of [plan-actor-offload.md](plan-actor-offload.md). Reuses the worker-thread infrastructure established by [plan-promote-offload.md](plan-promote-offload.md) and extended through steps 2–6.
 
 ## Goal
 
@@ -137,7 +137,7 @@ If the worker returns an error:
 2. **Add the worker variants and job/result types.** `WorkerJob::SignSnapshotManifest`, `WorkerResult::SignSnapshotManifest`, `SignSnapshotManifestJob`, `SignSnapshotManifestResult`.
 3. **Route `VolumeRequest::SignSnapshotManifest` through the worker.** Prep on the actor, dispatch to worker, park reply in `parked_sign_snapshot_manifest`, apply on result receipt.
 4. **Delete the dead `Snapshot` wire command.** Remove `VolumeRequest::Snapshot`, `VolumeHandle::snapshot()`, the `snapshot` arm in `src/control.rs`. No sender to notify.
-5. **Update `actor-offload-plan.md` step 7** to reflect the landed scope.
+5. **Update `plan-actor-offload.md` step 7** to reflect the landed scope.
 
 ## Open questions
 

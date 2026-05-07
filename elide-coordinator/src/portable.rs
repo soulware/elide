@@ -1,7 +1,7 @@
 //! Foundations for portable live volumes.
 //!
 //! See `docs/notes/design-portable-live-volume.md` and
-//! `docs/notes/portable-live-volume-plan.md`. This module hosts Phase 0 work:
+//! `docs/notes/plan-portable-live-volume.md`. This module hosts Phase 0 work:
 //!
 //! - `coordinator_id()` derivation from `coordinator.root_key`.
 //! - Conditional-PUT helpers (`put_if_absent`, `put_with_match`).

@@ -1,7 +1,7 @@
 # Portable live volume
 
 **Status:** Accepted. Implementation plan in
-[`portable-live-volume-plan.md`](portable-live-volume-plan.md).
+[`plan-portable-live-volume.md`](plan-portable-live-volume.md).
 
 The proposal gives a conceptually cleaner naming and lifecycle model
 than today's "live = host-pinned, fork to relocate" pattern, by

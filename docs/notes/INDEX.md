@@ -54,14 +54,14 @@ record of how the decision was reached; the synthesis doc is the current truth.
 
 | Doc | Summary |
 |---|---|
-| [actor-offload-plan.md](actor-offload-plan.md) | Offload heavy maintenance work off the volume actor to isolate write tail latency |
-| [promote-offload-plan.md](promote-offload-plan.md) | Offload WAL promotion onto the worker thread (first step of actor-offload-plan) |
-| [promote-segment-offload-plan.md](promote-segment-offload-plan.md) | Offload `promote_segment` IPC handler to the worker thread (step 6 of actor-offload-plan) |
-| [snapshot-offload-plan.md](snapshot-offload-plan.md) | Offload snapshot work off the volume actor |
-| [coordinator-driven-snapshot-plan.md](coordinator-driven-snapshot-plan.md) | Coordinator-driven snapshot flow |
-| [portable-live-volume-plan.md](portable-live-volume-plan.md) | Phased implementation of portable live volumes |
-| [fork-from-remote-plan.md](fork-from-remote-plan.md) | Auto-pull source + ancestor chain from S3 when forking from a name not local |
-| [peer-segment-fetch-v1-plan.md](peer-segment-fetch-v1-plan.md) | v1 implementation of peer-fetch — `.idx`-only, coordinator-driven, opt-in via coordinator config |
+| [plan-actor-offload.md](plan-actor-offload.md) | Offload heavy maintenance work off the volume actor to isolate write tail latency |
+| [plan-promote-offload.md](plan-promote-offload.md) | Offload WAL promotion onto the worker thread (first step of actor-offload-plan) |
+| [plan-promote-segment-offload.md](plan-promote-segment-offload.md) | Offload `promote_segment` IPC handler to the worker thread (step 6 of actor-offload-plan) |
+| [plan-snapshot-offload.md](plan-snapshot-offload.md) | Offload snapshot work off the volume actor |
+| [plan-coordinator-driven-snapshot.md](plan-coordinator-driven-snapshot.md) | Coordinator-driven snapshot flow |
+| [plan-portable-live-volume.md](plan-portable-live-volume.md) | Phased implementation of portable live volumes |
+| [plan-fork-from-remote.md](plan-fork-from-remote.md) | Auto-pull source + ancestor chain from S3 when forking from a name not local |
+| [plan-peer-segment-fetch-v1.md](plan-peer-segment-fetch-v1.md) | v1 implementation of peer-fetch — `.idx`-only, coordinator-driven, opt-in via coordinator config |
 
 ## Prior art and references
 

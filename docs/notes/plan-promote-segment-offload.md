@@ -1,6 +1,6 @@
 # Plan: offload `promote_segment` off the volume actor
 
-**Status:** Landed on branch `promote-segment-offload`. Step 6 of [actor-offload-plan.md](actor-offload-plan.md). Reuses the worker-thread infrastructure established by [promote-offload-plan.md](promote-offload-plan.md) and extended by PR #58.
+**Status:** Landed on branch `promote-segment-offload`. Step 6 of [plan-actor-offload.md](plan-actor-offload.md). Reuses the worker-thread infrastructure established by [plan-promote-offload.md](plan-promote-offload.md) and extended by PR #58.
 
 ## Goal
 

@@ -1,6 +1,6 @@
 # Plan: offload WAL promotion off the volume actor
 
-**Status:** Landed. All three landings merged. Depends on [actor-offload-plan.md](actor-offload-plan.md) — this was the first landing step for that broader plan.
+**Status:** Landed. All three landings merged. Depends on [plan-actor-offload.md](plan-actor-offload.md) — this was the first landing step for that broader plan.
 
 **Post-landing evolution.** PR #58 generalized the flusher thread into a shared worker thread that dispatches jobs via a `WorkerJob` enum (currently `Promote` and `GcHandoff`). No behavior change for promotes. Terminology throughout this doc uses "flusher" for historical continuity with the PRs it describes; the current code calls it `worker_thread` and the channels carry `WorkerJob` / `WorkerResult`.
 

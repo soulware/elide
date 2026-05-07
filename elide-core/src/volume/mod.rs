@@ -1760,7 +1760,7 @@ impl Volume {
 
     /// In-process checkpoint of the fork at the current point in the
     /// segment sequence. **Not** the production path — the coordinator-
-    /// driven snapshot flow (see `docs/notes/coordinator-driven-snapshot-plan.md`)
+    /// driven snapshot flow (see `docs/notes/plan-coordinator-driven-snapshot.md`)
     /// orchestrates flush → S3 drain → signed manifest → upload.
     ///
     /// This in-process variant exists for tests and offline tooling that
@@ -1908,7 +1908,7 @@ impl Volume {
     /// enumerates its own `index/` at the moment of the call: the result is a
     /// full list of every segment ULID that belongs to this volume as of the
     /// snapshot, *not* a delta over the previous snapshot. See
-    /// `docs/notes/coordinator-driven-snapshot-plan.md` for the rationale.
+    /// `docs/notes/plan-coordinator-driven-snapshot.md` for the rationale.
     ///
     /// The manifest is signed with the volume's private key so ancestor
     /// verification at open time can trust it via the embedded

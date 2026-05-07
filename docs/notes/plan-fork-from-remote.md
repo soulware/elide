@@ -97,7 +97,7 @@ Known gaps that did not make this branch and should be tackled next:
    gives offline-verifiable completeness and makes "ancestor fully
    prefetched" an exact predicate, not a brittle "index/ non-empty"
    heuristic. **Blocked on:** the snapshot flow moving into the
-   coordinator (see `docs/coordinator-driven-snapshot-plan.md`),
+   coordinator (see `docs/plan-coordinator-driven-snapshot.md`),
    because the `.manifest` write must happen *after* all pending
    segments are drained+promoted to `index/` — which is a cross-
    component sequencing concern.
