@@ -3,7 +3,7 @@
 //! a fresh ULID.
 //!
 //! Used by every site that rewrites a segment under a new ULID:
-//! coordinator-driven GC ([`crate::gc_plan`] / [`crate::gc_apply`]), redact,
+//! coordinator-driven GC ([`crate::rewrite_plan`] / [`crate::rewrite_apply`]), redact,
 //! sweep_pending, repack, and delta_repack. All four operations face the
 //! same problem: the rewrite's new ULID sorts after every input ULID, so
 //! on crash-recovery rebuild any entry the rewrite preserves competes with
@@ -14,7 +14,7 @@
 //! (truth for "what hash should LBA X currently resolve to") and the
 //! current `extent_index` (truth for "is this segment still the canonical
 //! body for this hash"). It returns one of [`EntryClassification`]'s
-//! variants, which the caller translates into a [`crate::gc_plan::PlanOutput`]
+//! variants, which the caller translates into a [`crate::rewrite_plan::PlanOutput`]
 //! (or its in-memory equivalent for synchronous rewriters).
 //!
 //! The classifier is pure: no I/O, no state mutation. Caller threads the
@@ -53,26 +53,26 @@ use crate::volume::ZERO_HASH;
 pub enum EntryClassification {
     /// Every block in the entry's LBA range still maps to its hash.
     /// The caller passes the entry through unchanged
-    /// ([`crate::gc_plan::PlanOutput::Keep`]).
+    /// ([`crate::rewrite_plan::PlanOutput::Keep`]).
     FullyLive,
 
     /// The entry's LBA range is fully overwritten, but its hash is still
     /// referenced elsewhere (DedupRef target / Delta source) AND this
     /// segment owns the body in `extent_index`. Demote to `CanonicalData`
-    /// or `CanonicalInline` ([`crate::gc_plan::PlanOutput::Canonical`]) —
+    /// or `CanonicalInline` ([`crate::rewrite_plan::PlanOutput::Canonical`]) —
     /// preserves the body for dedup resolution, drops the LBA claim.
     DemoteToCanonical,
 
     /// Multi-LBA `Zero` entry whose original span is partially or fully
     /// overwritten. Caller emits one Zero per surviving sub-run
-    /// ([`crate::gc_plan::PlanOutput::ZeroSplit`]). Empty `live_runs`
+    /// ([`crate::rewrite_plan::PlanOutput::ZeroSplit`]). Empty `live_runs`
     /// means fully overwritten — caller drops the entry.
     ZeroSubRuns(Vec<ExtentRead>),
 
     /// Some blocks of this multi-block entry are still live, some are
     /// overwritten. Caller emits one
-    /// [`crate::gc_plan::PlanOutput::Run`] per surviving sub-run,
-    /// optionally preceded by a [`crate::gc_plan::PlanOutput::Canonical`]
+    /// [`crate::rewrite_plan::PlanOutput::Run`] per surviving sub-run,
+    /// optionally preceded by a [`crate::rewrite_plan::PlanOutput::Canonical`]
     /// (when `emit_canonical` is true) to preserve the composite body
     /// for owned-body kinds whose hash is externally referenced.
     PartialDeath {

@@ -1805,7 +1805,7 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
 /// `outcome = Cancelled`; the actor's apply phase treats this as a no-op.
 /// Hard I/O failures propagate as `Err`.
 pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResult> {
-    use crate::gc_apply;
+    use crate::rewrite_apply;
 
     let GcPlanApplyJob {
         plan_path,
@@ -1829,19 +1829,20 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
         extent_index: &extent_index,
     };
     let inputs = plan.inputs();
-    let ctx = match gc_apply::MaterialiseCtx::new(&base_dir, &inputs, &extent_index, &resolver) {
+    let ctx = match rewrite_apply::MaterialiseCtx::new(&base_dir, &inputs, &extent_index, &resolver)
+    {
         Ok(c) => c,
-        Err(gc_apply::MaterialiseOutcome::Io(e)) => return Err(e),
-        Err(gc_apply::MaterialiseOutcome::Cancel(e)) => {
+        Err(rewrite_apply::MaterialiseOutcome::Io(e)) => return Err(e),
+        Err(rewrite_apply::MaterialiseOutcome::Cancel(e)) => {
             log::warn!("plan {new_ulid}: prepare cancelled ({e}); removing");
             let _ = fs::remove_file(&plan_path);
             return Ok(cancelled_result(new_ulid, plan_path, gc_dir, inputs));
         }
     };
-    let materialised = match gc_apply::materialise_plan(&plan, &ctx) {
+    let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
         Ok(m) => m,
-        Err(gc_apply::MaterialiseOutcome::Io(e)) => return Err(e),
-        Err(gc_apply::MaterialiseOutcome::Cancel(e)) => {
+        Err(rewrite_apply::MaterialiseOutcome::Io(e)) => return Err(e),
+        Err(rewrite_apply::MaterialiseOutcome::Cancel(e)) => {
             log::warn!("plan {new_ulid}: materialise cancelled ({e}); removing");
             let _ = fs::remove_file(&plan_path);
             return Ok(cancelled_result(new_ulid, plan_path, gc_dir, inputs));
@@ -1849,7 +1850,7 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
     };
     drop(ctx);
 
-    let gc_apply::Materialised {
+    let rewrite_apply::Materialised {
         mut entries,
         delta_body,
     } = materialised;
@@ -1931,7 +1932,7 @@ struct WorkerBodyResolver<'a> {
     extent_index: &'a crate::extentindex::ExtentIndex,
 }
 
-impl crate::gc_apply::BodyResolver for WorkerBodyResolver<'_> {
+impl crate::rewrite_apply::BodyResolver for WorkerBodyResolver<'_> {
     fn find_segment(
         &self,
         segment_id: Ulid,

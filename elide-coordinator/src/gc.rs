@@ -69,8 +69,8 @@ use object_store::path::Path as StorePath;
 use ulid::Ulid;
 
 use elide_core::extentindex::{self, ExtentIndex};
-use elide_core::gc_plan::{GcPlan, PlanOutput};
 use elide_core::lbamap::{self, LbaMap};
+use elide_core::rewrite_plan::{PlanOutput, RewritePlan};
 use elide_core::segment::{self, EntryKind, SegmentEntry};
 use elide_core::volume::latest_snapshot;
 
@@ -712,7 +712,7 @@ struct SegmentStats {
     /// Live entries — already classified by `collect_stats` (Zero sub-splits
     /// expanded, fully-LBA-dead-hash-live entries demoted via `into_canonical`).
     /// The coordinator uses these plus `partial_death_runs` to emit a
-    /// [`elide_core::gc_plan::GcPlan`]; the volume materialises bodies on apply.
+    /// [`elide_core::rewrite_plan::RewritePlan`]; the volume materialises bodies on apply.
     live_entries: Vec<SegmentEntry>,
     /// Per-entry position in the source segment's index section, parallel to
     /// `live_entries`. Referenced by plan outputs so the volume's materialise
@@ -1214,7 +1214,7 @@ fn compact_segments(
         }
     }
 
-    let plan = GcPlan { new_ulid, outputs };
+    let plan = RewritePlan { new_ulid, outputs };
     let plan_path = gc_dir.join(format!("{new_ulid_str}.plan"));
     plan.write_atomic(&plan_path)
         .context("writing GC plan file")?;
@@ -1697,7 +1697,7 @@ mod tests {
             .map(|e| e.path())
             .find(|p| p.extension().and_then(|s| s.to_str()) == Some("plan"))
             .expect("gc/ must contain a .plan file");
-        let plan = elide_core::gc_plan::GcPlan::read(&plan_path).unwrap();
+        let plan = elide_core::rewrite_plan::RewritePlan::read(&plan_path).unwrap();
 
         assert_eq!(
             plan.inputs(),

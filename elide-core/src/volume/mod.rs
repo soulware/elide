@@ -37,7 +37,7 @@ use ulid::Ulid;
 
 use crate::{
     extentindex::{self, BodySource},
-    gc_plan, lbamap,
+    lbamap, rewrite_plan,
     segment::{self, EntryKind},
     segment_cache,
     ulid_mint::UlidMint,
@@ -920,7 +920,7 @@ impl Volume {
         plan_path: PathBuf,
         new_ulid: Ulid,
     ) -> io::Result<Option<GcPlanApplyJob>> {
-        let plan = match gc_plan::GcPlan::read(&plan_path) {
+        let plan = match rewrite_plan::RewritePlan::read(&plan_path) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!(

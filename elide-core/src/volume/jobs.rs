@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use ulid::Ulid;
 
-use crate::{extentindex, gc_plan, segment, segment_cache};
+use crate::{extentindex, rewrite_plan, segment, segment_cache};
 
 use super::{
     AncestorLayer, BoxFetcher, DeltaRepackJob, DeltaRepackResult, ReclaimJob, ReclaimResult,
@@ -109,7 +109,7 @@ pub struct GcPlanApplyJob {
     pub verifying_key: ed25519_dalek::VerifyingKey,
     /// Pre-parsed plan. The actor validates parse + ULID match before
     /// dispatch so the worker never sees a malformed plan.
-    pub plan: gc_plan::GcPlan,
+    pub plan: rewrite_plan::RewritePlan,
 }
 
 /// Result returned by the worker after materialising a plan. The actor's

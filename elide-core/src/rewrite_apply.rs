@@ -1,15 +1,18 @@
-//! Volume-side materialisation of a coordinator-emitted [`GcPlan`].
+//! Materialise a [`RewritePlan`] into the entries + delta-body bytes that
+//! make up the new segment.
 //!
-//! See `docs/design-gc-plan-handoff.md`.
+//! Used by every rewriter that produces a fresh-ULID segment from one or
+//! more inputs — coordinator-driven GC, redact, sweep_pending, repack,
+//! delta_repack. The plan ([`crate::rewrite_plan::PlanOutput`]) is a
+//! declarative description; this module turns it into a concrete
+//! `(Vec<SegmentEntry>, Vec<u8>)` ready for [`crate::segment::write_segment_full`].
 //!
-//! The coordinator classifies inputs and writes a [`GcPlan`]; the volume
-//! reads it, resolves bodies through its own ancestor-aware / fetcher-aware
-//! primitives, builds the output segment's entries and delta body bytes, and
-//! hands them off to the caller to sign and commit.
+//! See `docs/design-gc-plan-handoff.md` for the original GC handoff
+//! design that this module's primitives were factored out of.
 //!
-//! This module contains only the pure materialisation step. The commit path
-//! — writing the signed segment, renaming tmp → bare, deriving extent-index
-//! updates — lives in `volume.rs` next to the existing handoff commit logic.
+//! Body resolution is abstracted via [`BodyResolver`] — the production
+//! impl walks the volume's self + ancestor dirs and the demand fetcher;
+//! tests can mock the trait against an in-memory tree.
 
 use std::collections::HashMap;
 use std::fs;
@@ -19,7 +22,7 @@ use std::path::Path;
 use ulid::Ulid;
 
 use crate::extentindex::{BodySource, ExtentIndex};
-use crate::gc_plan::{GcPlan, PlanOutput};
+use crate::rewrite_plan::{PlanOutput, RewritePlan};
 use crate::segment::{self, BoxFetcher, EntryKind, SegmentBodyLayout, SegmentEntry, SegmentFlags};
 
 /// Block size in bytes (4 KiB).
@@ -188,7 +191,7 @@ fn load_input_states(
 /// Materialise a plan into output entries + delta body. See the module
 /// docstring.
 pub fn materialise_plan(
-    plan: &GcPlan,
+    plan: &RewritePlan,
     ctx: &MaterialiseCtx<'_>,
 ) -> Result<Materialised, MaterialiseOutcome> {
     let mut out_entries: Vec<SegmentEntry> = Vec::new();
@@ -752,7 +755,7 @@ mod tests {
     //! `gc_delta_partial_death_compaction` deterministic test.
 
     use super::*;
-    use crate::gc_plan::{GcPlan, PlanOutput};
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
     use crate::segment::{self, DeltaOption, SegmentEntry, SegmentFlags};
 
     struct MockResolver {
@@ -843,7 +846,7 @@ mod tests {
 
         let index = ExtentIndex::default();
         let new_ulid = Ulid::new();
-        let plan = GcPlan {
+        let plan = RewritePlan {
             new_ulid,
             outputs: vec![PlanOutput::Keep {
                 input: input_ulid,
@@ -880,7 +883,7 @@ mod tests {
             delta_files: HashMap::new(),
         };
         let index = ExtentIndex::default();
-        let plan = GcPlan {
+        let plan = RewritePlan {
             new_ulid: Ulid::new(),
             outputs: vec![PlanOutput::ZeroSplit {
                 input: input_ulid,

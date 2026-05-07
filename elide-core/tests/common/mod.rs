@@ -255,7 +255,7 @@ fn compact_candidates_inner(
     extent_index: &extentindex::ExtentIndex,
     new_ulid: Ulid,
 ) -> Option<CompactResult> {
-    use elide_core::gc_plan::{GcPlan, PlanOutput};
+    use elide_core::rewrite_plan::{PlanOutput, RewritePlan};
 
     if candidates.is_empty() {
         return None;
@@ -366,12 +366,12 @@ fn compact_candidates_inner(
         outputs.iter().map(|o| o.input()).collect();
     for input_ulid in &inputs {
         if !referenced.contains(input_ulid) {
-            outputs.push(elide_core::gc_plan::PlanOutput::Drop { input: *input_ulid });
+            outputs.push(elide_core::rewrite_plan::PlanOutput::Drop { input: *input_ulid });
             referenced.insert(*input_ulid);
         }
     }
 
-    let plan = GcPlan { new_ulid, outputs };
+    let plan = RewritePlan { new_ulid, outputs };
     plan.write_atomic(&gc_dir.join(format!("{new_ulid}.plan")))
         .ok()?;
 

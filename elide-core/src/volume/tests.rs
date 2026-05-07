@@ -1645,7 +1645,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
                 // emit one `Keep` per entry that's still LBA-live or
                 // extent-canonical. Mirrors the coordinator's `collect_stats`
                 // → `PlanOutput::Keep` path for the fully-alive case.
-                use crate::gc_plan::{GcPlan, PlanOutput};
+                use crate::rewrite_plan::{PlanOutput, RewritePlan};
 
                 let mut outputs: Vec<PlanOutput> = Vec::new();
                 let mut kept_any = false;
@@ -1674,7 +1674,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
                 }
 
                 if kept_any {
-                    let plan = GcPlan {
+                    let plan = RewritePlan {
                         new_ulid: gc_ulid,
                         outputs,
                     };
@@ -2169,7 +2169,7 @@ fn gc_handoff_applies_and_renames() {
 /// Matches what the real coordinator emits for fully-alive inputs under
 /// the plan handoff protocol (see `docs/design-gc-plan-handoff.md`).
 fn simulate_coord_gc_staged(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -> String {
-    use crate::gc_plan::{GcPlan, PlanOutput};
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
     use crate::segment;
 
     let idx_path = fork_dir.join("index").join(format!("{old_ulid}.idx"));
@@ -2189,7 +2189,7 @@ fn simulate_coord_gc_staged(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -
             entry_idx,
         })
         .collect();
-    let plan = GcPlan { new_ulid, outputs };
+    let plan = RewritePlan { new_ulid, outputs };
     let plan_path = gc_dir.join(format!("{new_ulid_str}.plan"));
     plan.write_atomic(&plan_path).unwrap();
 
@@ -2327,7 +2327,7 @@ fn simulate_coord_gc_staged_two_inputs(
     seg_a_ulid: &str,
     seg_b_ulid: &str,
 ) -> String {
-    use crate::gc_plan::{GcPlan, PlanOutput};
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
     use crate::segment;
 
     let idx_b = fork_dir.join("index").join(format!("{seg_b_ulid}.idx"));
@@ -2353,7 +2353,7 @@ fn simulate_coord_gc_staged_two_inputs(
             entry_idx,
         }),
     );
-    let plan = GcPlan { new_ulid, outputs };
+    let plan = RewritePlan { new_ulid, outputs };
     plan.write_atomic(&gc_dir.join(format!("{new_ulid_str}.plan")))
         .unwrap();
 
