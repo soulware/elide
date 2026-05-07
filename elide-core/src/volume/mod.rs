@@ -1202,7 +1202,7 @@ impl Volume {
     /// `gc_proptest` runs already enable this feature; running with
     /// `--features proptest` is what catches drift bugs of the class fixed
     /// by sorting drain loops by ULID ascending.
-    #[cfg(feature = "proptest")]
+    #[cfg(feature = "lbamap-invariant")]
     pub(in crate::volume) fn assert_lbamap_consistent(&self, caller: &'static str) {
         let mut chain: Vec<(PathBuf, Option<String>)> = self
             .ancestor_layers
@@ -1291,8 +1291,8 @@ impl Volume {
         }
     }
 
-    /// No-op stub when `proptest` feature is disabled.
-    #[cfg(not(feature = "proptest"))]
+    /// No-op stub when `lbamap-invariant` feature is disabled.
+    #[cfg(not(feature = "lbamap-invariant"))]
     #[inline]
     pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
 

@@ -106,25 +106,27 @@ Each entry below has a named deterministic regression test; see the listed file 
 - Bug E: on restart, the extent index was rebuilt from on-disk `.idx` files which still pointed at old segments, leaving the system stale once `apply_done_handoffs` removed them. Fix in the manifest era: re-apply `.applied` handoffs on restart. Under the self-describing protocol the bare `gc/<new>` body is picked up by `collect_gc_applied_segment_files` during rebuild and feeds the extent index at low priority — so the bug is resolved structurally and no explicit re-apply is needed.
 - GC compactor converted DEDUP_REF entries to DATA entries with `stored_length=0`, producing a zero-length body record that caused EIO on rebuild. Fix: check `is_dedup_ref` and emit `new_dedup_ref` in the coordinator GC path. This bug was invisible to `elide-core`'s proptest because the test helper was a *separate reimplementation* of GC that happened to handle DEDUP_REFs correctly — which is why `gc_proptest.rs` exists in the coordinator crate, calling the real code.
 
-### Runtime invariants gated behind `--features proptest`
+### Runtime invariants gated behind `--features lbamap-invariant`
 
 Some bugs are easier to catch at the introducing call site than at the eventual symptom. For those, the volume layer keeps "is the in-memory state consistent with disk?" assertions that fire at the end of every state-mutating method and panic on divergence with a labelled message identifying the calling method.
 
-These checks are **not free** — they typically involve a full rebuild of an in-memory data structure from disk. To keep the everyday `cargo test -p elide-core` suite fast, they are gated behind the `proptest` feature flag and compile out to no-op stubs otherwise.
+These checks are **not free** — each call rebuilds an in-memory data structure from disk. To keep the everyday `cargo test -p elide-core` suite fast and to avoid slowing down elide-core's own proptest binaries (which don't exercise the coordinator-layer paths these invariants protect), the invariants are gated behind a separate `lbamap-invariant` feature.
 
 #### Wiring
 
-- Each crate that hosts proptest suites declares a `proptest` feature in `Cargo.toml`.
-- Downstream crates that re-run proptests (e.g. `elide-coordinator`) propagate via `proptest = ["elide-core/proptest"]`, so a single `cargo test --features proptest` enables every gated invariant in the dependency graph.
-- The invariant function is split into two definitions: a heavy implementation under `#[cfg(feature = "proptest")]`, and an `#[inline]` no-op stub under `#[cfg(not(feature = "proptest"))]`. Callers always invoke the same name; the compiler picks the right one. This avoids `#[cfg]` clutter at every call site.
+- `elide-core` declares two independent features: `proptest` (its own proptest suites) and `lbamap-invariant` (the runtime drift detection).
+- `elide-coordinator/proptest` propagates **both** to elide-core: `proptest = ["elide-core/proptest", "elide-core/lbamap-invariant"]`. Running `cargo test -p elide-coordinator --features proptest` enables the invariants because elide-coordinator's coordinator-layer stress (gc_proptest) is exactly where the drift bugs live.
+- Running `cargo test -p elide-core --features proptest` does **not** enable `lbamap-invariant` — elide-core's volume_proptest / fork_proptest / actor_proptest stay fast.
+- CI **must split the workspace command per crate** rather than running `cargo test --workspace --features proptest` — Cargo's resolver-2 unifies features across a workspace build, which would activate `lbamap-invariant` for elide-core's test binaries via the elide-coordinator dependency. The split is in `.github/workflows/ci.yml` under the `host-proptests` job.
+- The invariant function is split into two definitions: a heavy implementation under `#[cfg(feature = "lbamap-invariant")]`, and an `#[inline]` no-op stub under `#[cfg(not(feature = "lbamap-invariant"))]`. Callers always invoke the same name; the compiler picks the right one. This avoids `#[cfg]` clutter at every call site.
 
 ```rust
-#[cfg(feature = "proptest")]
+#[cfg(feature = "lbamap-invariant")]
 pub(in crate::volume) fn assert_lbamap_consistent(&self, caller: &'static str) {
     // ... rebuild from disk + WAL, compare to self.lbamap, panic on diverge.
 }
 
-#[cfg(not(feature = "proptest"))]
+#[cfg(not(feature = "lbamap-invariant"))]
 #[inline]
 pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
 ```
@@ -137,7 +139,7 @@ Call at the **end** of every method that may mutate the asserted state, on every
 
 #### Active invariants
 
-- **`Volume::assert_lbamap_consistent(caller)`** — rebuilds the lbamap from `discover_fork_segments` + WAL replay and compares to `self.lbamap` per LBA. Panics with the offending LBAs and the calling method name. Catches the class of bug where a state-mutating op moves disk state without updating the in-memory mirror (e.g. promoting a pending segment changes its tier in the walk order, which can flip the per-LBA winner). Currently called from `Volume::open`, `write`, `write_zeroes`, `gc_checkpoint_for_test`, `apply_redact_result`, `apply_plan_apply_result`, and `apply_promote_segment_result`.
+- **`Volume::assert_lbamap_consistent(caller)`** — rebuilds the lbamap from `discover_fork_segments` + WAL replay and compares to `self.lbamap` per LBA. Panics with the offending LBAs and the calling method name. Catches the class of bug where a state-mutating op moves disk state without updating the in-memory mirror (e.g. promoting a pending segment changes its tier in the walk order, which can flip the per-LBA winner). Called from structural ops only: `Volume::open`, `gc_checkpoint_for_test`, `apply_redact_result`, `apply_plan_apply_result`, and `apply_promote_segment_result`. **Not** called from `write` / `write_zeroes` — those are high-frequency incremental `lbamap.insert` updates whose drift would still be caught at the next structural op.
 
 #### When proptests trip the invariant on a hand-crafted segment
 
