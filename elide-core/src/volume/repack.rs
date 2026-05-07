@@ -325,7 +325,9 @@ impl Volume {
 
                 if let Some(out) = &seg.output {
                     for e in &out.out_entries {
-                        if e.kind == EntryKind::DedupRef {
+                        // DedupRef and Zero entries don't own a body — same
+                        // filter pattern as the redact / GC apply paths.
+                        if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
                             continue;
                         }
                         let current = index.lookup(&e.hash);
@@ -740,7 +742,9 @@ impl Volume {
 
         if let Some(new_ulid) = new_ulid {
             for e in &out_entries {
-                if e.kind == EntryKind::DedupRef {
+                // DedupRef and Zero entries don't own a body — same filter
+                // pattern as the redact / GC / sweep apply paths.
+                if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
                     continue;
                 }
                 let current = index.lookup(&e.hash);

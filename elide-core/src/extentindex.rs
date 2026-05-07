@@ -473,6 +473,12 @@ impl ExtentIndex {
     pub fn iter(&self) -> impl Iterator<Item = (&blake3::Hash, &ExtentLocation)> {
         self.inner.iter()
     }
+
+    /// Iterate `(hash, delta_location)` pairs for thin Delta entries.
+    /// Ordering is unspecified.
+    pub fn deltas_iter(&self) -> impl Iterator<Item = (&blake3::Hash, &DeltaLocation)> {
+        self.deltas.iter()
+    }
 }
 
 impl Default for ExtentIndex {
@@ -666,6 +672,102 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
     }
 
     Ok(index)
+}
+
+/// Rebuild just the hash → owning-segment-ULID mapping from disk,
+/// without signature verification, inline data, presence bitmaps, or
+/// any of the BodySource detail.
+///
+/// Used only by the `--features volume-invariants` runtime drift check
+/// (`Volume::assert_extent_index_consistent`). The full
+/// [`rebuild`] does much more work per segment and verifies signatures —
+/// neither is needed for an in-memory consistency check (signatures
+/// were already verified at `Volume::open` time, and we only care
+/// whether `self.extent_index[hash].segment_id` matches what the
+/// rebuild walk would assign).
+///
+/// Returns two maps mirroring the structure of [`ExtentIndex`]:
+/// - `inner_owners`: hash → owning segment ULID for body-owning entries
+///   (DATA, Inline, Canonical*).
+/// - `delta_owners`: hash → owning segment ULID for thin Delta entries
+///   that didn't already get a body owner from an earlier-walked segment
+///   (matches `insert_delta_if_absent`'s skip-if-DATA-exists rule).
+///
+/// Walk order matches [`rebuild`]: committed (gc ∪ index) sorted by
+/// ULID, then pending sorted by ULID, with `insert_if_absent` semantics
+/// (lowest-ULID-wins).
+///
+/// **Do not use for production rebuild paths** — they need the full
+/// machinery.
+#[cfg(feature = "volume-invariants")]
+pub fn rebuild_owners_unverified(
+    forks: &[(PathBuf, Option<String>)],
+) -> io::Result<(HashMap<blake3::Hash, Ulid>, HashMap<blake3::Hash, Ulid>)> {
+    let mut inner_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
+    let mut delta_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
+
+    for (fork_dir, branch_ulid) in forks {
+        let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
+        for sref in &segments {
+            let parsed = match segment::read_segment_index(&sref.path) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let (_bss, entries, _inputs) = parsed;
+            for entry in entries {
+                match entry.kind {
+                    EntryKind::Data
+                    | EntryKind::Inline
+                    | EntryKind::CanonicalData
+                    | EntryKind::CanonicalInline => {
+                        inner_owners.entry(entry.hash).or_insert(sref.ulid);
+                    }
+                    EntryKind::Delta => {
+                        // Mirror `insert_delta_if_absent`: skip if a DATA
+                        // entry already claims this hash.
+                        if !inner_owners.contains_key(&entry.hash) {
+                            delta_owners.entry(entry.hash).or_insert(sref.ulid);
+                        }
+                    }
+                    EntryKind::DedupRef | EntryKind::Zero => {
+                        // No body ownership.
+                    }
+                }
+            }
+        }
+
+        // Walk WAL files too. `replay_wal_records` inserts each WAL Data
+        // record into the live extent_index with the WAL's ULID as
+        // segment_id; without this, every Data record in the open WAL
+        // would show as "in_memory has inner; disk doesn't" (where
+        // "disk" was being interpreted as just segment files).
+        let wal_dir = fork_dir.join("wal");
+        if let Ok(entries) = std::fs::read_dir(&wal_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let Ok(wal_ulid) = Ulid::from_string(name) else {
+                    continue;
+                };
+                let Ok((records, _complete)) = crate::writelog::scan_readonly(&path) else {
+                    continue;
+                };
+                for record in records {
+                    if let crate::writelog::LogRecord::Data { hash, .. } = record {
+                        inner_owners.entry(hash).or_insert(wal_ulid);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((inner_owners, delta_owners))
 }
 
 // --- tests ---
