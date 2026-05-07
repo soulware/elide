@@ -1669,6 +1669,80 @@ fn reclaim_crash_recovery_seed_b0f166f0_regression() {
     assert_oracle(&mut vol, &oracle, "Crash");
 }
 
+/// Deterministic reproduction for proptest seed
+/// `3f9275b50fbcff2f3fa00c6b1b904cd9655ec341a5ebea5b2d350e38c43e07b4`,
+/// shrunk by `reclaim_crash_recovery` to the 6-op sequence below.
+///
+/// Three `WriteLargeMulti` writes overlap on a multi-block payload that
+/// shares the same composite `seed=88` content across two distinct
+/// start LBAs (24 and 25), so the third write lands as a `DedupRef`
+/// against the second write's body. After `reclaim_alias_merge` and
+/// `drain_with_redact`, an LBA in the overlap range reads back content
+/// that disagrees with the oracle.
+///
+/// **Currently failing — bug under investigation.** The deterministic
+/// repro lives here so the failure is fixed in tree, not via the
+/// stochastic proptest seed file.
+#[test]
+fn reclaim_crash_recovery_seed_3f9275b5_regression() {
+    use elide_core::volume::Volume;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    common::write_test_keypair(fork_dir);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
+
+    let write_large_multi = |vol: &mut Volume,
+                             oracle: &mut std::collections::HashMap<u64, [u8; 4096]>,
+                             lba: u8,
+                             seed: u8| {
+        let mut payload = Vec::with_capacity(8 * 4096);
+        for i in 0..8 {
+            payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i as u8)));
+        }
+        let start = 24 + lba as u64;
+        if vol.write(start, &payload).is_ok() {
+            for i in 0..8 {
+                let mut block = [0u8; 4096];
+                block.copy_from_slice(&payload[i * 4096..(i + 1) * 4096]);
+                oracle.insert(start + i as u64, block);
+            }
+        }
+    };
+
+    let assert_oracle =
+        |vol: &mut Volume, oracle: &std::collections::HashMap<u64, [u8; 4096]>, step: &str| {
+            for (&lba, expected) in oracle {
+                let actual = vol.read(lba, 1).unwrap();
+                assert_eq!(
+                    actual.as_slice(),
+                    expected.as_slice(),
+                    "lba {lba} wrong after {step}"
+                );
+            }
+        };
+
+    write_large_multi(&mut vol, &mut oracle, 2, 0);
+    assert_oracle(&mut vol, &oracle, "WriteLargeMulti(lba=2,seed=0)");
+
+    write_large_multi(&mut vol, &mut oracle, 0, 88);
+    assert_oracle(&mut vol, &oracle, "WriteLargeMulti(lba=0,seed=88)");
+
+    vol.flush_wal().unwrap();
+    assert_oracle(&mut vol, &oracle, "Flush");
+
+    write_large_multi(&mut vol, &mut oracle, 1, 88);
+    assert_oracle(&mut vol, &oracle, "WriteLargeMulti(lba=1,seed=88)");
+
+    let outcome = vol.reclaim_alias_merge(28, 6).unwrap();
+    assert!(!outcome.discarded, "single-threaded driver: never discards");
+    assert_oracle(&mut vol, &oracle, "ReclaimRange(start_lba=28,lba_count=6)");
+
+    common::drain_with_redact(&mut vol);
+    assert_oracle(&mut vol, &oracle, "DrainWithRedact");
+}
+
 /// Deterministic regression for the failure surfaced by
 /// `crash_recovery_oracle` after `SimOp::WriteMulti` was added in this
 /// branch. Shrunk to the 7-op sequence below.
