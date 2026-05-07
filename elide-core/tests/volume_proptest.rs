@@ -1677,12 +1677,37 @@ fn reclaim_crash_recovery_seed_b0f166f0_regression() {
 /// shares the same composite `seed=88` content across two distinct
 /// start LBAs (24 and 25), so the third write lands as a `DedupRef`
 /// against the second write's body. After `reclaim_alias_merge` and
-/// `drain_with_redact`, an LBA in the overlap range reads back content
-/// that disagrees with the oracle.
+/// `drain_with_redact`, LBAs 25..32 read back blocks shifted by one
+/// position relative to the oracle.
 ///
-/// **Currently failing — bug under investigation.** The deterministic
-/// repro lives here so the failure is fixed in tree, not via the
-/// stochastic proptest seed file.
+/// ## Root cause
+///
+/// `segment_classify::classify_entry` matches lbamap runs against the
+/// input entry **by hash only**. When two same-hash entries anchor
+/// the same body at *different* `start_lba`s (one direct DATA at
+/// `start=24`, one DedupRef at `start=25`), partially-overlapping
+/// LBAs are bytewise different — body block `i` of the first and
+/// body block `i` of the second are distinct bytes — even though
+/// the composite payload hash is identical.
+///
+/// The classifier currently counts every same-hash block as
+/// "matching", so an entry that has been partially superseded by a
+/// `DedupRef` at a different anchor classifies as `FullyLive` and is
+/// passed through verbatim. When redact (or sweep / repack / GC)
+/// rewrites under a fresh, *higher* ULID, the carried entry now
+/// sorts above the DedupRef on rebuild, and `lbamap::insert_inner`
+/// overwrites the DedupRef's anchor for the overlap range. Reads at
+/// those LBAs resolve through the wrong anchor.
+///
+/// Fix: classifier must additionally check that, for each `ExtentRead`
+/// in the lbamap, the anchor agrees with the input entry — i.e.
+/// `r.range_start - entry.start_lba == r.payload_block_offset`. Runs
+/// that match by hash but disagree on anchor are treated as
+/// non-matching for the purpose of `matching_blocks`, so the entry
+/// classifies as `PartialDeath` and is correctly split into surviving
+/// sub-runs only.
+///
+/// **Currently failing — fix in subsequent commit on this branch.**
 #[test]
 fn reclaim_crash_recovery_seed_3f9275b5_regression() {
     use elide_core::volume::Volume;
