@@ -224,6 +224,19 @@ impl Volume {
                     input_ulid,
                 )?;
 
+                // Rebuild self.lbamap from disk. Per-entry incremental
+                // `lbamap.insert` would be cheaper but is incorrect for
+                // the same reason as the GC apply path: redact's output
+                // `u_redact` is minted at prep time, so any live write
+                // landing during the redact window has a higher ULID and
+                // should win for overlapping LBAs. Walk-order rebuild
+                // respects ULID precedence; unconditional insert would
+                // clobber the live write's hash. See the comment in
+                // `apply_plan_apply_result` (applied branch) for details.
+                //
+                // Crash ordering: on a crash between unlink and rebuild,
+                // restart's `Volume::open` runs a full rebuild — same
+                // end state.
                 self.rebuild_lbamap_from_disk()?;
 
                 log::info!(

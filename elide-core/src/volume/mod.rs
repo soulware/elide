@@ -1046,16 +1046,18 @@ impl Volume {
             );
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
-            // Refresh `self.lbamap` from disk before returning. Without
-            // this, a legitimate cancel here pins the in-memory view to
-            // the pre-supersede state: if another GC output has already
-            // committed `disk[L] = H_new` while our snapshot still has
-            // `self.lbamap[L] = H_old`, the next pass re-reads `H_old`
-            // as live and fires the same cancel again — forever. Reads
-            // through `self.lbamap` would also keep returning `H_old`'s
-            // body even after disk moved on. Refreshing after the cancel
-            // lets the next pass see the current truth (one wasted pass,
-            // then convergence).
+            // Defence-in-depth: refresh `self.lbamap` from disk before
+            // returning, so any incremental drift can't pin the in-memory
+            // view to a stale state and infinite-cancel on the next pass.
+            //
+            // Post-#276 the originally-described scenario ("another GC
+            // output committed `disk[L] = H_new` while our snapshot still
+            // has `self.lbamap[L] = H_old`") is structurally less likely:
+            // GC passes are serial per volume, drain ordering is enforced,
+            // and `assert_lbamap_consistent` (under the `lbamap-invariant`
+            // feature) catches drift sources in stress runs. This rebuild
+            // remains as a production safety net since invariants don't
+            // run there.
             self.rebuild_lbamap_from_disk()?;
             self.assert_lbamap_consistent("apply_plan_apply_result_cancelled");
             self.assert_pending_above_committed("apply_plan_apply_result_cancelled");
@@ -1125,6 +1127,17 @@ impl Volume {
         // trips the stale-liveness check on the next GC pass (the input
         // entry's "still live" status is evaluated against a hash no longer
         // backed by any on-disk writer), cancelling apply and stalling GC.
+        //
+        // Per-entry incremental updates (`lbamap.insert` per output entry)
+        // are tempting as an optimisation but **incorrect**: GC's output
+        // ULID `u_gc` was minted at gc_checkpoint time, so post-checkpoint
+        // live writes have higher ULIDs. The walk-order rebuild respects
+        // ULID precedence and lets the live writer win for any overlap;
+        // unconditional `lbamap.insert` would override the live writer's
+        // hash with `u_gc`'s stale claim. The full rebuild is the only
+        // way to compute walk-order winners without lbamap tracking
+        // segment_id per entry. See `gc_output_loses_to_live_write_applied_after_gc`
+        // for the regression scenario.
         //
         // Crash ordering: on a crash between rename and rebuild, restart
         // re-runs `Volume::open`'s rebuild which produces the same result.
