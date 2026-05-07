@@ -900,24 +900,13 @@ proptest! {
                     let _ = common::half_promote_first_pending(fork_dir);
                 }
                 SimOp::DeltaRepack => {
-                    // Rewrites post-snapshot pending segments in place
-                    // under their original ULID via atomic rename. The
-                    // ULID set must be unchanged: no new ULIDs appear
-                    // and no existing ULID is dropped by this op.
+                    // Rewrites post-snapshot pending segments under
+                    // freshly-minted output ULIDs (PR #273+). Each
+                    // converted input is unlinked and replaced by an
+                    // output at a higher ULID. We don't assert on the
+                    // ULID set here — the per-LBA oracle invariant
+                    // below covers content correctness.
                     let _ = vol.delta_repack_post_snapshot();
-                    let after = all_segment_ulids(fork_dir);
-                    for u in after.difference(&ulids_before) {
-                        prop_assert!(
-                            false,
-                            "delta_repack produced unexpected new ULID {u}"
-                        );
-                    }
-                    for u in ulids_before.difference(&after) {
-                        prop_assert!(
-                            false,
-                            "delta_repack dropped existing ULID {u}"
-                        );
-                    }
                 }
                 SimOp::SignSnapshot => {
                     // Manifest + marker land under `snapshots/`, which
