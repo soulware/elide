@@ -63,18 +63,6 @@ record of how the decision was reached; the synthesis doc is the current truth.
 | [fork-from-remote-plan.md](fork-from-remote-plan.md) | Auto-pull source + ancestor chain from S3 when forking from a name not local |
 | [peer-segment-fetch-v1-plan.md](peer-segment-fetch-v1-plan.md) | v1 implementation of peer-fetch — `.idx`-only, coordinator-driven, opt-in via coordinator config |
 
-## Status snapshots
-
-Point-in-time waypoints. Latest first. Snapshots are *frozen* — never edit a
-status doc after its date; write a new one or update the synthesis docs.
-
-| Date | Doc |
-|---|---|
-| 2026-04-27 | [status-2026-04-27.md](status-2026-04-27.md) |
-| 2026-04-20 | [status-2026-04-20.md](status-2026-04-20.md) |
-| 2026-04-09 | [status-2026-04-09.md](status-2026-04-09.md) |
-| 2026-03-30 | [status-2026-03-30.md](status-2026-03-30.md) |
-
 ## Prior art and references
 
 | Doc | Summary |

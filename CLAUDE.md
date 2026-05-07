@@ -67,9 +67,11 @@ Two tiers, separated by audience:
 - `docs/testing.md` — property-based tests: ULID monotonicity invariant, crash-recovery oracle, simulation model
 - `docs/integrations.md` — Docker, Firecracker, Cloud Hypervisor, Kubernetes integration targets
 
+**Status snapshots at `docs/status/` — human-readable, indexed from README.** Dated waypoints (`status-YYYY-MM-DD.md`) summarising major changes, bug fixes, and remaining work since the previous status. Frozen on write: never edit a status doc after its date; write a new one or update synthesis docs.
+
 **Working record at `docs/notes/` — LLM-targeted, indexed in [`docs/notes/INDEX.md`](docs/notes/INDEX.md).**
 
-- Design discussions (`design-*.md`), implementation plans (`*-plan.md`), dated status snapshots (`status-YYYY-MM-DD.md`), prior-art notes (`reference-*.md`).
+- Design discussions (`design-*.md`), implementation plans (`*-plan.md`), prior-art notes (`reference-*.md`).
 - New designs and plans go here, not at `docs/` top level. README does **not** index this directory.
 - Consult `docs/notes/INDEX.md` before proposing changes in areas that have prior design discussion.
 
@@ -94,7 +96,7 @@ If a doc has grown past its budget, the next PR touching it should trim or split
 
 ### Rules for `docs/notes/`
 
-**One new doc per substantial PR is fine.** That's the point of the directory — keep the written record. New `design-*.md` and `*-plan.md` are encouraged for non-trivial work. Status docs (`status-YYYY-MM-DD.md`) are point-in-time snapshots: never edit one after its date; write a new one or update synthesis docs.
+**One new doc per substantial PR is fine.** That's the point of the directory — keep the written record. New `design-*.md` and `*-plan.md` are encouraged for non-trivial work.
 
 **Frontmatter convention** (see `docs/notes/INDEX.md` for the schema). Add to new notes; existing notes will be backfilled lazily.
 

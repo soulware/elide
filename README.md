@@ -20,10 +20,22 @@ Start with [docs/quickstart.md](docs/quickstart.md), then [docs/overview.md](doc
 | [docs/integrations.md](docs/integrations.md) | Integration targets: Docker, Firecracker, Cloud Hypervisor, Kubernetes |
 | [docs/vm-boot.md](docs/vm-boot.md) | Booting a VM from an Elide volume with QEMU direct kernel boot |
 
-`docs/notes/` holds design discussions, implementation plans, and dated status
-snapshots — a working record maintained for LLM context, not human-facing
-documentation. See [docs/notes/INDEX.md](docs/notes/INDEX.md) if you want to
-trace why a particular decision was made.
+## Status
+
+Dated waypoints — each summarises major changes, bug fixes, and remaining
+work relative to the previous status. Latest first.
+
+| Date | Document |
+|---|---|
+| 2026-04-27 | [docs/status/status-2026-04-27.md](docs/status/status-2026-04-27.md) |
+| 2026-04-20 | [docs/status/status-2026-04-20.md](docs/status/status-2026-04-20.md) |
+| 2026-04-09 | [docs/status/status-2026-04-09.md](docs/status/status-2026-04-09.md) |
+| 2026-03-30 | [docs/status/status-2026-03-30.md](docs/status/status-2026-03-30.md) |
+
+`docs/notes/` holds design discussions and implementation plans — a working
+record maintained for LLM context, not human-facing documentation. See
+[docs/notes/INDEX.md](docs/notes/INDEX.md) if you want to trace why a
+particular decision was made.
 
 ## Continuous integration
 
