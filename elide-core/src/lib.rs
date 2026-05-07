@@ -15,6 +15,7 @@ pub mod name_record;
 pub mod process;
 pub mod segment;
 pub mod segment_cache;
+pub mod segment_classify;
 pub mod signing;
 pub mod ulid_mint;
 pub mod volume;

@@ -31,7 +31,7 @@ use crate::signing;
 ///
 /// Returned by [`LbaMap::extents_in_range`]. Describes exactly which blocks
 /// the caller needs to copy from the stored payload.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExtentRead {
     /// Content hash — key into the extent index to find the segment file and offset.
     pub hash: blake3::Hash,
