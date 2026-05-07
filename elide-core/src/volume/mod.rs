@@ -86,7 +86,7 @@ pub use redact::{RedactJob, RedactResult};
 pub use repack::{
     CompactionStats, DeltaRepackJob, DeltaRepackResult, DeltaRepackStats, DeltaRepackedSegment,
     RepackJob, RepackResult, RepackedDeadEntry, RepackedLiveEntry, RepackedSegment, SweepJob,
-    SweepResult, SweptDeadEntry, SweptLiveEntry,
+    SweepResult, SweptInput,
 };
 use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 
