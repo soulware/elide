@@ -704,6 +704,11 @@ impl VolumeActor {
                 return;
             }
         };
+        // `prepare_delta_repack` flushes the WAL before pre-minting
+        // output ULIDs (mirrors `start_repack` / `start_redact`).
+        // Republish so readers don't resolve hashes through a deleted
+        // WAL.
+        self.publish_snapshot();
         if let Some(tx) = &self.worker_tx {
             if let Err(e) = tx.send(WorkerJob::DeltaRepack(job)) {
                 warn!("worker channel closed during delta_repack: {e}");
@@ -2820,6 +2825,7 @@ pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepac
         base_dir,
         pending_dir,
         snap_ulid,
+        output_ulids,
         signer,
         verifying_key,
         segment_cache,
@@ -2831,14 +2837,16 @@ pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepac
     // to seed a dictionary.
     let prior = BlockReader::open_snapshot(&base_dir, &snap_ulid, Box::new(|_| None))?;
 
-    let seg_paths = match segment::collect_segment_files(&pending_dir) {
+    let mut seg_paths = match segment::collect_segment_files(&pending_dir) {
         Ok(v) => v,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
+    seg_paths.sort();
 
     let mut stats = DeltaRepackStats::default();
     let mut segments: Vec<DeltaRepackedSegment> = Vec::new();
+    let mut next_output_idx: usize = 0;
 
     for seg_path in seg_paths {
         let seg_filename = seg_path
@@ -2856,8 +2864,23 @@ pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepac
 
         stats.segments_scanned += 1;
 
+        // Pre-mint a fresh output ULID for this rewrite. We only pop
+        // an ULID if we'll actually use it; rewriters that decline
+        // skip the consumption.
+        let new_ulid = match output_ulids.get(next_output_idx) {
+            Some(u) => *u,
+            None => {
+                warn!(
+                    "delta_repack: ran out of pre-minted output ULIDs at seg {seg_id} — skipping"
+                );
+                continue;
+            }
+        };
+        let output_path = pending_dir.join(new_ulid.to_string());
+
         let rewritten = match delta_compute::rewrite_post_snapshot_with_prior(
             &seg_path,
+            &output_path,
             &prior,
             signer.as_ref(),
             &verifying_key,
@@ -2873,7 +2896,14 @@ pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepac
             continue;
         };
 
-        segments.push(DeltaRepackedSegment { seg_id, rewrite });
+        // Successful rewrite — consume the pre-minted ULID slot.
+        next_output_idx += 1;
+        segments.push(DeltaRepackedSegment {
+            input_ulid: seg_id,
+            input_path: seg_path,
+            new_ulid,
+            rewrite,
+        });
     }
 
     Ok(DeltaRepackResult { stats, segments })

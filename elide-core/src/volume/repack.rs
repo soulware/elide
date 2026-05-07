@@ -166,6 +166,11 @@ pub struct DeltaRepackJob {
     pub base_dir: PathBuf,
     pub pending_dir: PathBuf,
     pub snap_ulid: Ulid,
+    /// Pre-minted output ULIDs (one per post-snapshot pending segment
+    /// at prep time, monotonically increasing, all below the next WAL
+    /// ULID). Worker assigns them in input-ULID order and only
+    /// consumes as many as it actually rewrites.
+    pub output_ulids: Vec<Ulid>,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub verifying_key: ed25519_dalek::VerifyingKey,
     pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
@@ -175,7 +180,9 @@ pub struct DeltaRepackJob {
 /// produced for every segment the worker actually rewrote
 /// (segments that had no convertible entries are skipped).
 pub struct DeltaRepackedSegment {
-    pub seg_id: Ulid,
+    pub input_ulid: Ulid,
+    pub input_path: PathBuf,
+    pub new_ulid: Ulid,
     pub rewrite: crate::delta_compute::RewrittenSegment,
 }
 
@@ -422,14 +429,33 @@ impl Volume {
     /// The snapshot-pinned `BlockReader` is constructed by the worker,
     /// not here — its provenance walk and extent-index rebuild can run
     /// off the actor.
-    pub fn prepare_delta_repack(&self) -> io::Result<Option<DeltaRepackJob>> {
+    pub fn prepare_delta_repack(&mut self) -> io::Result<Option<DeltaRepackJob>> {
         let Some(snap_ulid) = latest_snapshot(&self.base_dir)? else {
             return Ok(None);
         };
+        let pending_dir = self.base_dir.join("pending");
+
+        // Pre-mint one output ULID per post-snapshot pending segment +
+        // u_flush. Mirrors `prepare_repack`. Bound: every pending
+        // segment could in principle be a candidate; unused ULIDs are
+        // wasted advances of the mint counter (cheap).
+        let candidate_count = match segment::collect_segment_files(&pending_dir) {
+            Ok(v) => v.len(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
+        let mut output_ulids: Vec<Ulid> = Vec::with_capacity(candidate_count);
+        for _ in 0..candidate_count {
+            output_ulids.push(self.mint.next());
+        }
+        let u_flush = self.mint.next();
+        self.flush_wal_to_pending_as(u_flush)?;
+
         Ok(Some(DeltaRepackJob {
             base_dir: self.base_dir.clone(),
-            pending_dir: self.base_dir.join("pending"),
+            pending_dir,
             snap_ulid,
+            output_ulids,
             signer: Arc::clone(&self.signer),
             verifying_key: self.verifying_key,
             segment_cache: Arc::clone(&self.segment_cache),
@@ -439,21 +465,13 @@ impl Volume {
     /// Apply phase of `delta_repack_post_snapshot` — runs on the actor
     /// thread after the worker returns.
     ///
-    /// For each rewritten segment: evicts the fd cache, then walks
-    /// entries paired with their pre-rewrite `(kind, stored_offset)`.
-    /// CAS against the source location so a concurrent writer that
-    /// re-pointed a hash at a newer segment wins — we leave their
-    /// entry untouched, and the repacked body simply becomes
-    /// unreferenced until the next pass picks it up.
-    ///
-    /// - Data kept as Data, Inline kept as Inline:
-    ///   `replace_if_matches(hash, seg_id, pre_offset, new_loc)`.
-    /// - Data converted to Delta:
-    ///   `remove_if_matches(hash, seg_id, pre_offset)` followed by
-    ///   `insert_delta_if_absent(...)`.
-    /// - Pre-existing Delta: re-register via `insert_delta_if_absent`
-    ///   — no-op if the delta slot is still valid, which matches the
-    ///   pre-offload behaviour.
+    /// For each rewritten segment: CAS-updates entries against the
+    /// **input** ULID (`current loc.segment_id == input_ulid`) but
+    /// re-points them at the freshly-minted output ULID. Concurrent
+    /// writers that re-pointed a hash at a newer segment win — the
+    /// rewritten body simply becomes unreferenced until the next pass.
+    /// Then evicts the input's fd cache, unlinks the input pending
+    /// file, and rebuilds lbamap from disk.
     pub fn apply_delta_repack_result(
         &mut self,
         result: DeltaRepackResult,
@@ -462,21 +480,22 @@ impl Volume {
             mut stats,
             segments,
         } = result;
+        let pending_dir = self.base_dir.join("pending");
+        let any_changes = !segments.is_empty();
 
         for seg in segments {
-            let DeltaRepackedSegment { seg_id, rewrite } = seg;
+            let DeltaRepackedSegment {
+                input_ulid,
+                input_path,
+                new_ulid,
+                rewrite,
+            } = seg;
             let crate::delta_compute::RewrittenSegment {
                 entries,
                 new_body_section_start: new_bss,
                 delta_region_body_length,
                 stats: seg_stats,
             } = rewrite;
-
-            // Evict the file-cache fd — the segment file was swapped
-            // atomically by the worker's rename. A surviving cached fd
-            // on the old inode would serve reads with new offsets after
-            // the index update below lands.
-            self.evict_cached_segment(seg_id);
 
             let entries_len = entries.len();
             let ei = Arc::make_mut(&mut self.extent_index);
@@ -486,10 +505,10 @@ impl Volume {
                     (EntryKind::Data, EntryKind::Data) => {
                         ei.replace_if_matches(
                             post.hash,
-                            seg_id,
+                            input_ulid,
                             item.pre_stored_offset,
                             extentindex::ExtentLocation {
-                                segment_id: seg_id,
+                                segment_id: new_ulid,
                                 body_offset: post.stored_offset,
                                 body_length: post.stored_length,
                                 compressed: post.compressed,
@@ -502,10 +521,10 @@ impl Volume {
                     (EntryKind::Inline, EntryKind::Inline) => {
                         ei.replace_if_matches(
                             post.hash,
-                            seg_id,
+                            input_ulid,
                             item.pre_stored_offset,
                             extentindex::ExtentLocation {
-                                segment_id: seg_id,
+                                segment_id: new_ulid,
                                 body_offset: post.stored_offset,
                                 body_length: post.stored_length,
                                 compressed: post.compressed,
@@ -516,11 +535,11 @@ impl Volume {
                         );
                     }
                     (EntryKind::Data, EntryKind::Delta) => {
-                        ei.remove_if_matches(&post.hash, seg_id, item.pre_stored_offset);
+                        ei.remove_if_matches(&post.hash, input_ulid, item.pre_stored_offset);
                         ei.insert_delta_if_absent(
                             post.hash,
                             extentindex::DeltaLocation {
-                                segment_id: seg_id,
+                                segment_id: new_ulid,
                                 entry_idx: raw_idx as u32,
                                 body_source: extentindex::DeltaBodySource::Full {
                                     body_section_start: new_bss,
@@ -538,15 +557,10 @@ impl Volume {
                         );
                     }
                     (EntryKind::Delta, EntryKind::Delta) => {
-                        // Pre-existing delta: re-register so a reader
-                        // hitting this hash sees the updated
-                        // body_section_start. `_if_absent` is a no-op
-                        // when the slot still exists — matches the
-                        // pre-offload behaviour.
                         ei.insert_delta_if_absent(
                             post.hash,
                             extentindex::DeltaLocation {
-                                segment_id: seg_id,
+                                segment_id: new_ulid,
                                 entry_idx: raw_idx as u32,
                                 body_source: extentindex::DeltaBodySource::Full {
                                     body_section_start: new_bss,
@@ -564,17 +578,23 @@ impl Volume {
                         );
                     }
                     (EntryKind::DedupRef, _) | (EntryKind::Zero, _) => {}
-                    // Kind transitions other than Data→Data, Data→Delta,
-                    // Inline→Inline, Delta→Delta aren't produced by
-                    // `rewrite_post_snapshot_with_prior`; ignore rather
-                    // than assert so a future rewriter extension can't
-                    // crash the actor.
                     _ => {}
                 }
             }
 
+            self.evict_cached_segment(input_ulid);
+            match fs::remove_file(&input_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            if self.last_segment_ulid < Some(new_ulid) {
+                self.last_segment_ulid = Some(new_ulid);
+            }
+            self.has_new_segments = true;
+
             log::info!(
-                "delta_repack: seg {seg_id} converted {}/{} entries, {}→{} bytes",
+                "delta_repack: seg {input_ulid} -> {new_ulid} converted {}/{} entries, {}→{} bytes",
                 seg_stats.entries_converted,
                 entries_len,
                 seg_stats.original_body_bytes,
@@ -585,6 +605,11 @@ impl Volume {
             stats.entries_converted += seg_stats.entries_converted;
             stats.original_body_bytes += seg_stats.original_body_bytes;
             stats.delta_body_bytes += seg_stats.delta_body_bytes;
+        }
+
+        if any_changes {
+            segment::fsync_dir(&pending_dir)?;
+            self.rebuild_lbamap_from_disk()?;
         }
 
         Ok(stats)

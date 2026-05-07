@@ -509,14 +509,19 @@ pub struct RewrittenSegment {
 /// Tier 2 refinement relaxes that).
 ///
 /// Returns the rewritten entries (with their fresh `stored_offset`
-/// values from the in-place rewrite), the new `body_section_start`, and
-/// a stats struct. The caller is responsible for updating the in-memory
-/// extent index — this function only touches the segment file.
+/// values), the new `body_section_start`, and a stats struct. The
+/// caller is responsible for updating the in-memory extent index —
+/// this function only touches the segment file.
 ///
-/// Tmp + rename in place (same ULID), same crash-recovery story as
-/// `Volume::repack`.
+/// `output_path` is the destination the rewritten segment is renamed
+/// to. Pre-PR-272 callers passed `seg_path` itself (in-place rewrite,
+/// reusing the input ULID); the migrated call site passes
+/// `pending/<u_dr>` for a freshly-minted output ULID so concurrent
+/// VolumeReaders holding the pre-rewrite snapshot can't observe a
+/// same-path / different-body alias mid-flight.
 pub fn rewrite_post_snapshot_with_prior(
     seg_path: &Path,
+    output_path: &Path,
     prior: &BlockReader,
     signer: &dyn SegmentSigner,
     vk: &VerifyingKey,
@@ -641,18 +646,18 @@ pub fn rewrite_post_snapshot_with_prior(
     }
 
     let tmp_path = {
-        let mut name = seg_path
+        let mut name = output_path
             .file_name()
-            .ok_or_else(|| io::Error::other("segment path has no filename"))?
+            .ok_or_else(|| io::Error::other("output path has no filename"))?
             .to_owned();
         name.push(".delta.tmp");
-        seg_path.with_file_name(name)
+        output_path.with_file_name(name)
     };
     let _ = fs::remove_file(&tmp_path);
     let new_body_section_start =
         write_segment_with_delta_body(&tmp_path, &mut entries, &delta_body, signer)?;
-    fs::rename(&tmp_path, seg_path)?;
-    segment::fsync_dir(seg_path)?;
+    fs::rename(&tmp_path, output_path)?;
+    segment::fsync_dir(output_path)?;
 
     // Delta region starts at `new_body_section_start + delta_region_body_length`.
     // Compute it from post-rewrite stored_length on Data entries; that's the
