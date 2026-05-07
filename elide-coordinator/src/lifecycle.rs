@@ -4,10 +4,8 @@
 //! `names/<name>` and translates the underlying conditional-PUT
 //! mechanics into operator-level errors.
 //!
-//! See `docs/notes/design-portable-live-volume.md`. Phase 2 of the rollout
-//! lands `mark_stopped` here; subsequent phases add `mark_released`
-//! (release verb) and `claim_started_from_released` (the start verb's
-//! claim path).
+//! See `docs/notes/design-portable-live-volume.md` § "Verbs" for the
+//! state-transition semantics each function implements.
 
 use std::path::Path;
 use std::sync::Arc;

@@ -1,15 +1,9 @@
-//! Foundations for portable live volumes.
-//!
-//! See `docs/notes/design-portable-live-volume.md` and
-//! `docs/notes/plan-portable-live-volume.md`. This module hosts Phase 0 work:
+//! Foundations for portable live volumes — see
+//! `docs/notes/design-portable-live-volume.md`. Hosts:
 //!
 //! - `coordinator_id()` derivation from `coordinator.root_key`.
 //! - Conditional-PUT helpers (`put_if_absent`, `put_with_match`).
 //! - Bucket capability probe (`BucketCapabilities`).
-//!
-//! Later phases will plumb these into the `volume stop`/`volume start`
-//! flows and the `volume list` redesign. For now the module is
-//! standalone — no other code calls into it yet.
 
 use std::fmt;
 

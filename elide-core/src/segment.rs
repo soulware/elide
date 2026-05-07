@@ -363,7 +363,7 @@ bitflags! {
         /// hash is still referenced elsewhere via a DedupRef — preserves
         /// the canonical body without shadowing the live LBA mapping.
         /// Co-exists with `INLINE` (body in inline section) or without it
-        /// (body in body section). See `docs/formats.md`.
+        /// (body in body section).
         const CANONICAL_ONLY = 0x40;
     }
 }

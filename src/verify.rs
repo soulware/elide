@@ -1,7 +1,5 @@
 // Scan every segment in a volume directory and verify each extent's stored
-// body hashes to the declared hash in the segment index. Reports mismatches
-// (the signature of the corruption pattern described in
-// docs/notes/reference.md / project_gc_body_integrity_check.md).
+// body hashes to the declared hash in the segment index. Reports mismatches.
 //
 // Read-only: does not modify any files. Prints a one-line summary per
 // segment and a per-extent "MISMATCH" line for each poisoned body, then

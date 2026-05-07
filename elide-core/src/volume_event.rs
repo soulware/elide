@@ -1,9 +1,8 @@
 //! `events/<name>/<event_ulid>.toml` append-only journal entry.
 //!
-//! See `docs/notes/design-volume-event-log.md`. Each event records one
-//! lifecycle transition of a named volume. The pointer at
-//! `names/<name>` (`name_record.rs`) is canonical for "now"; this
-//! type is canonical for "ever" — the durable, signed history of
+//! Each event records one lifecycle transition of a named volume. The
+//! pointer at `names/<name>` (`name_record.rs`) is canonical for "now";
+//! this type is canonical for "ever" — the durable, signed history of
 //! every operation that touched the name.
 //!
 //! # Wire format
