@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -1298,11 +1298,17 @@ pub struct VolumeClient {
     tx: Sender<VolumeRequest>,
     snapshot: Arc<ArcSwap<ReadSnapshot>>,
     config: Arc<VolumeConfig>,
-    /// Held but unused — present so a follow-up PR can route the hot-path
-    /// write call directly through the lock rather than over the channel.
-    /// Cloned cheaply across `VolumeClient` clones.
+    /// `Weak` so the client side does not extend the `Volume`'s lifetime —
+    /// the actor is the sole strong owner. When the actor thread exits, the
+    /// `Volume` is dropped (releasing its `volume.lock` flock) even while
+    /// `VolumeClient` clones are still held by callers; tests rely on this
+    /// to reopen the volume after `handle.shutdown()`.
+    ///
+    /// A follow-up PR will use this to route hot-path writes directly through
+    /// the mutex rather than over the request channel; that path will
+    /// `upgrade()` for the duration of one write.
     #[allow(dead_code)]
-    volume: Arc<Mutex<Volume>>,
+    volume: Weak<Mutex<Volume>>,
 }
 
 /// Per-thread reader for a volume session.
@@ -2787,7 +2793,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         tx,
         snapshot,
         config,
-        volume,
+        volume: Arc::downgrade(&volume),
     };
 
     (actor, client)
