@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -168,7 +168,11 @@ pub(crate) enum VolumeRequest {
 /// `VolumeClient` is dropped (channel closes) or when a `Shutdown` message
 /// is received.
 pub struct VolumeActor {
-    volume: Volume,
+    /// Shared via `Arc<Mutex<...>>` rather than owned exclusively so a
+    /// future PR can let the ublk transport bypass the request channel
+    /// for hot-path writes by acquiring the same lock directly. Today
+    /// the actor is still the only writer; the lock is uncontended.
+    volume: Arc<Mutex<Volume>>,
     snapshot: Arc<ArcSwap<ReadSnapshot>>,
     rx: Receiver<VolumeRequest>,
     /// Local promotion counter.  Incremented on every WAL promotion and
@@ -316,7 +320,7 @@ impl VolumeActor {
     /// deletes old segment files.
     fn publish_snapshot(&mut self) {
         self.flush_gen += 1;
-        let (lbamap, extent_index) = self.volume.snapshot_maps();
+        let (lbamap, extent_index) = self.volume.lock().unwrap().snapshot_maps();
         self.snapshot.store(Arc::new(ReadSnapshot {
             lbamap,
             extent_index,
@@ -423,7 +427,7 @@ impl VolumeActor {
     /// a fresh WAL, then sends the job to the worker.  No-op if the WAL
     /// is empty.  Logs and returns on error.
     fn dispatch_promote(&mut self) {
-        let job = match self.volume.prepare_promote() {
+        let job = match self.volume.lock().unwrap().prepare_promote() {
             Ok(Some(job)) => job,
             Ok(None) => return,
             Err(e) => {
@@ -451,7 +455,7 @@ impl VolumeActor {
     /// `u_flush` arrives so that `pending/<u_flush>` is on disk before
     /// the coordinator runs `gc_fork`.
     fn start_gc_checkpoint(&mut self, reply: Sender<io::Result<Ulid>>) {
-        let prep = match self.volume.prepare_gc_checkpoint() {
+        let prep = match self.volume.lock().unwrap().prepare_gc_checkpoint() {
             Ok(prep) => prep,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -511,7 +515,7 @@ impl VolumeActor {
             return;
         }
 
-        let (to_process, already_applied) = match self.volume.scan_plan_handoffs() {
+        let (to_process, already_applied) = match self.volume.lock().unwrap().scan_plan_handoffs() {
             Ok(v) => v,
             Err(e) => {
                 if let Some(reply) = reply {
@@ -560,7 +564,12 @@ impl VolumeActor {
     /// inside `prepare_plan_apply`, so the batch continues with the next.
     fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) -> HandoffDispatch {
         while let Some((plan_path, new_ulid)) = parked.remaining.pop() {
-            let job = match self.volume.prepare_plan_apply(plan_path, new_ulid) {
+            let job = match self
+                .volume
+                .lock()
+                .unwrap()
+                .prepare_plan_apply(plan_path, new_ulid)
+            {
                 Ok(Some(job)) => job,
                 Ok(None) => continue,
                 Err(e) => {
@@ -600,7 +609,7 @@ impl VolumeActor {
     /// to the worker.  Reply is parked until
     /// [`crate::volume::RepackResult`] arrives and is applied.
     fn start_repack(&mut self, reply: Sender<io::Result<CompactionStats>>) {
-        let job = match self.volume.prepare_repack() {
+        let job = match self.volume.lock().unwrap().prepare_repack() {
             Ok(Some(j)) => j,
             Ok(None) => {
                 let _ = reply.send(Ok(CompactionStats::default()));
@@ -637,7 +646,7 @@ impl VolumeActor {
     /// returns `None` (no sealed snapshot) or when the dispatch fails
     /// because the worker channel has closed.
     fn start_delta_repack(&mut self, reply: Sender<io::Result<DeltaRepackStats>>) {
-        let job = match self.volume.prepare_delta_repack() {
+        let job = match self.volume.lock().unwrap().prepare_delta_repack() {
             Ok(Some(j)) => j,
             Ok(None) => {
                 let _ = reply.send(Ok(DeltaRepackStats::default()));
@@ -677,7 +686,12 @@ impl VolumeActor {
         lba_length: u32,
         reply: Sender<io::Result<ReclaimOutcome>>,
     ) {
-        let job = match self.volume.prepare_reclaim(start_lba, lba_length) {
+        let job = match self
+            .volume
+            .lock()
+            .unwrap()
+            .prepare_reclaim(start_lba, lba_length)
+        {
             Ok(j) => j,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -711,7 +725,11 @@ impl VolumeActor {
     /// [`crate::volume::SignSnapshotManifestResult`] arrives and the
     /// `has_new_segments` flag is flipped on the actor.
     fn start_sign_snapshot_manifest(&mut self, snap_ulid: Ulid, reply: Sender<io::Result<()>>) {
-        let job = self.volume.prepare_sign_snapshot_manifest(snap_ulid);
+        let job = self
+            .volume
+            .lock()
+            .unwrap()
+            .prepare_sign_snapshot_manifest(snap_ulid);
         if let Some(tx) = &self.worker_tx {
             if let Err(e) = tx.send(WorkerJob::SignSnapshotManifest(job)) {
                 warn!("worker channel closed during sign_snapshot_manifest: {e}");
@@ -748,7 +766,7 @@ impl VolumeActor {
             match self.worker_rx.recv() {
                 Ok(WorkerResult::Promote(Ok(result))) => {
                     self.promotes_in_flight -= 1;
-                    self.volume.apply_promote(&result);
+                    self.volume.lock().unwrap().apply_promote(&result);
                     self.publish_snapshot();
                     self.on_promote_success();
                 }
@@ -759,9 +777,8 @@ impl VolumeActor {
                 }
                 Ok(WorkerResult::GcPlan(Ok(result))) => {
                     self.handoff_in_flight = false;
-                    if let Ok(crate::volume::StagedApply::Applied) =
-                        self.volume.apply_plan_apply_result(result)
-                    {
+                    let applied = self.volume.lock().unwrap().apply_plan_apply_result(result);
+                    if let Ok(crate::volume::StagedApply::Applied) = applied {
                         self.publish_snapshot();
                     }
                 }
@@ -773,7 +790,8 @@ impl VolumeActor {
                     self.promote_segments_in_flight -= 1;
                     match result {
                         Ok(r) => {
-                            let apply_result = self.volume.apply_promote_segment_result(r);
+                            let apply_result =
+                                self.volume.lock().unwrap().apply_promote_segment_result(r);
                             if apply_result.is_ok() {
                                 self.publish_snapshot();
                             }
@@ -789,7 +807,7 @@ impl VolumeActor {
                     let reply = self.parked_repack.take();
                     let outcome = match result {
                         Ok(r) => {
-                            let apply_result = self.volume.apply_repack_result(r);
+                            let apply_result = self.volume.lock().unwrap().apply_repack_result(r);
                             if matches!(&apply_result, Ok(s) if s.segments_compacted > 0) {
                                 self.publish_snapshot();
                             }
@@ -808,7 +826,8 @@ impl VolumeActor {
                     let reply = self.parked_delta_repack.take();
                     let outcome = match result {
                         Ok(r) => {
-                            let apply_result = self.volume.apply_delta_repack_result(r);
+                            let apply_result =
+                                self.volume.lock().unwrap().apply_delta_repack_result(r);
                             if matches!(&apply_result, Ok(s) if s.entries_converted > 0) {
                                 self.publish_snapshot();
                             }
@@ -827,7 +846,10 @@ impl VolumeActor {
                     let reply = self.parked_sign_snapshot_manifest.take();
                     let outcome = match result {
                         Ok(r) => {
-                            self.volume.apply_sign_snapshot_manifest_result(r);
+                            self.volume
+                                .lock()
+                                .unwrap()
+                                .apply_sign_snapshot_manifest_result(r);
                             Ok(())
                         }
                         Err(e) => {
@@ -843,7 +865,7 @@ impl VolumeActor {
                     let reply = self.parked_reclaim.take();
                     let outcome = match result {
                         Ok(r) => {
-                            let apply_result = self.volume.apply_reclaim_result(r);
+                            let apply_result = self.volume.lock().unwrap().apply_reclaim_result(r);
                             if matches!(&apply_result, Ok(o) if !o.discarded && o.runs_rewritten > 0)
                             {
                                 self.publish_snapshot();
@@ -886,9 +908,9 @@ impl VolumeActor {
                     };
                     match req {
                         VolumeRequest::Write { lba, data, reply } => {
-                            let result = self.volume.write_owned(lba, data);
+                            let result = self.volume.lock().unwrap().write_owned(lba, data);
                             if result.is_ok() {
-                                let (lbamap, extent_index) = self.volume.snapshot_maps();
+                                let (lbamap, extent_index) = self.volume.lock().unwrap().snapshot_maps();
                                 self.snapshot.store(Arc::new(ReadSnapshot {
                                     lbamap,
                                     extent_index,
@@ -896,7 +918,7 @@ impl VolumeActor {
                                 }));
                             }
                             let _ = reply.send(result);
-                            if self.volume.needs_promote() {
+                            if self.volume.lock().unwrap().needs_promote() {
                                 self.dispatch_promote();
                             }
                         }
@@ -908,7 +930,8 @@ impl VolumeActor {
                             // onto the fresh WAL, matching how a real block
                             // device keeps accepting commands while a FLUSH
                             // is in flight at the controller.
-                            match self.volume.wal_fsync() {
+                            let fsync_result = self.volume.lock().unwrap().wal_fsync();
+                            match fsync_result {
                                 Ok(()) => self.park_or_resolve_flush(reply),
                                 Err(e) => {
                                     let _ = reply.send(Err(e));
@@ -918,7 +941,7 @@ impl VolumeActor {
                         VolumeRequest::PromoteWal { reply } => {
                             // Promote the WAL to a pending/ segment via the
                             // worker.  Reply once the segment is on disk.
-                            match self.volume.prepare_promote() {
+                            match self.volume.lock().unwrap().prepare_promote() {
                                 Ok(Some(job)) => {
                                     let ulid = job.segment_ulid;
                                     let old_wal_path = job.old_wal_path.clone();
@@ -951,9 +974,9 @@ impl VolumeActor {
                             lba_count,
                             reply,
                         } => {
-                            let result = self.volume.write_zeroes(start_lba, lba_count);
+                            let result = self.volume.lock().unwrap().write_zeroes(start_lba, lba_count);
                             if result.is_ok() {
-                                let (lbamap, extent_index) = self.volume.snapshot_maps();
+                                let (lbamap, extent_index) = self.volume.lock().unwrap().snapshot_maps();
                                 self.snapshot.store(Arc::new(ReadSnapshot {
                                     lbamap,
                                     extent_index,
@@ -961,7 +984,7 @@ impl VolumeActor {
                                 }));
                             }
                             let _ = reply.send(result);
-                            if self.volume.needs_promote() {
+                            if self.volume.lock().unwrap().needs_promote() {
                                 self.dispatch_promote();
                             }
                         }
@@ -998,7 +1021,7 @@ impl VolumeActor {
                         VolumeRequest::Promote { ulid, reply } => {
                             // Prep on the actor: cheap directory stat +
                             // job build. Dispatch to worker, park reply.
-                            match self.volume.prepare_promote_segment(ulid) {
+                            match self.volume.lock().unwrap().prepare_promote_segment(ulid) {
                                 Ok(PromoteSegmentPrep::AlreadyPromoted) => {
                                     let _ = reply.send(Ok(()));
                                 }
@@ -1029,7 +1052,7 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::FinalizeGcHandoff { ulid, reply } => {
-                            let _ = reply.send(self.volume.finalize_gc_handoff(ulid));
+                            let _ = reply.send(self.volume.lock().unwrap().finalize_gc_handoff(ulid));
                         }
                         VolumeRequest::SignSnapshotManifest { snap_ulid, reply } => {
                             if self.parked_sign_snapshot_manifest.is_some() {
@@ -1041,7 +1064,7 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::NoopStats { reply } => {
-                            let _ = reply.send(self.volume.noop_stats());
+                            let _ = reply.send(self.volume.lock().unwrap().noop_stats());
                         }
                         VolumeRequest::Reclaim {
                             start_lba,
@@ -1067,7 +1090,8 @@ impl VolumeActor {
                     match msg {
                         Ok(WorkerResult::GcPlan(Ok(result))) => {
                             self.handoff_in_flight = false;
-                            match self.volume.apply_plan_apply_result(result) {
+                            let applied = self.volume.lock().unwrap().apply_plan_apply_result(result);
+                            match applied {
                                 Ok(crate::volume::StagedApply::Applied) => {
                                     self.publish_snapshot();
                                     if let Some(ref mut parked) = self.parked_handoffs {
@@ -1113,7 +1137,7 @@ impl VolumeActor {
                         Ok(WorkerResult::Promote(Ok(result))) => {
                             self.promotes_in_flight -= 1;
                             let ulid = result.segment_ulid;
-                            self.volume.apply_promote(&result);
+                            self.volume.lock().unwrap().apply_promote(&result);
                             self.publish_snapshot();
                             // Resolve parked flushes only after apply + publish
                             // so the caller observes the old WAL deleted and the
@@ -1151,7 +1175,7 @@ impl VolumeActor {
                             match result {
                                 Ok(r) => {
                                     let apply_result =
-                                        self.volume.apply_promote_segment_result(r);
+                                        self.volume.lock().unwrap().apply_promote_segment_result(r);
                                     if apply_result.is_ok() {
                                         self.publish_snapshot();
                                     }
@@ -1169,7 +1193,7 @@ impl VolumeActor {
                             let reply = self.parked_repack.take();
                             let outcome = match result {
                                 Ok(r) => {
-                                    let apply_result = self.volume.apply_repack_result(r);
+                                    let apply_result = self.volume.lock().unwrap().apply_repack_result(r);
                                     if matches!(&apply_result, Ok(s) if s.segments_compacted > 0) {
                                         self.publish_snapshot();
                                     }
@@ -1188,7 +1212,7 @@ impl VolumeActor {
                             let reply = self.parked_delta_repack.take();
                             let outcome = match result {
                                 Ok(r) => {
-                                    let apply_result = self.volume.apply_delta_repack_result(r);
+                                    let apply_result = self.volume.lock().unwrap().apply_delta_repack_result(r);
                                     if matches!(&apply_result, Ok(s) if s.entries_converted > 0) {
                                         self.publish_snapshot();
                                     }
@@ -1207,7 +1231,7 @@ impl VolumeActor {
                             let reply = self.parked_sign_snapshot_manifest.take();
                             let outcome = match result {
                                 Ok(r) => {
-                                    self.volume.apply_sign_snapshot_manifest_result(r);
+                                    self.volume.lock().unwrap().apply_sign_snapshot_manifest_result(r);
                                     Ok(())
                                 }
                                 Err(e) => {
@@ -1223,7 +1247,7 @@ impl VolumeActor {
                             let reply = self.parked_reclaim.take();
                             let outcome = match result {
                                 Ok(r) => {
-                                    let apply_result = self.volume.apply_reclaim_result(r);
+                                    let apply_result = self.volume.lock().unwrap().apply_reclaim_result(r);
                                     if matches!(&apply_result, Ok(o) if !o.discarded && o.runs_rewritten > 0) {
                                         self.publish_snapshot();
                                     }
@@ -1274,6 +1298,11 @@ pub struct VolumeClient {
     tx: Sender<VolumeRequest>,
     snapshot: Arc<ArcSwap<ReadSnapshot>>,
     config: Arc<VolumeConfig>,
+    /// Held but unused — present so a follow-up PR can route the hot-path
+    /// write call directly through the lock rather than over the channel.
+    /// Cloned cheaply across `VolumeClient` clones.
+    #[allow(dead_code)]
+    volume: Arc<Mutex<Volume>>,
 }
 
 /// Per-thread reader for a volume session.
@@ -2715,6 +2744,8 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         fetcher: volume.fetcher().cloned(),
     });
 
+    let volume = Arc::new(Mutex::new(volume));
+
     // Channel depth of 64: enough to absorb bursts without blocking callers
     // while still providing backpressure if the actor falls behind.
     let (tx, rx) = bounded(64);
@@ -2728,7 +2759,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         .expect("failed to spawn worker thread");
 
     let actor = VolumeActor {
-        volume,
+        volume: Arc::clone(&volume),
         snapshot: Arc::clone(&snapshot),
         rx,
         flush_gen: 0,
@@ -2756,6 +2787,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         tx,
         snapshot,
         config,
+        volume,
     };
 
     (actor, client)
