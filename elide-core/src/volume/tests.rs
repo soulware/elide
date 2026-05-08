@@ -958,8 +958,27 @@ fn pending_ulids(base: &Path) -> Vec<ulid::Ulid> {
     ulids
 }
 
+/// Run `vol.repack()` and return the post-repack ULID for `input_ulid`
+/// (input ULID on no-op, smallest fresh ULID on rewrite — repack
+/// pre-mints `u_repack_i < u_flush`, so the rewrite output sorts below
+/// any WAL-flush peer). For single-input test scenarios.
+fn repack_for_input(vol: &mut Volume, base: &Path, input_ulid: ulid::Ulid) -> ulid::Ulid {
+    use std::collections::HashSet;
+    let pre: HashSet<_> = pending_ulids(base).into_iter().collect();
+    vol.repack().unwrap();
+    let post: HashSet<_> = pending_ulids(base).into_iter().collect();
+    if post.contains(&input_ulid) {
+        return input_ulid;
+    }
+    let mut fresh: Vec<_> = post.difference(&pre).copied().collect();
+    fresh.sort();
+    *fresh
+        .first()
+        .expect("expected at least one freshly-minted pending ULID after repack")
+}
+
 #[test]
-fn redact_segment_drops_hash_dead_data_entry() {
+fn repack_drops_hash_dead_data_entry() {
     // An entry whose LBA has been overwritten and whose hash is no longer
     // referenced anywhere must be dropped from `pending/<ulid>`'s index
     // entirely so deleted data never leaves the host. The surviving
@@ -987,7 +1006,7 @@ fn redact_segment_drops_hash_dead_data_entry() {
 
     let secret_hash = blake3::hash(&secret);
 
-    let new_ulid = vol.redact_segment(seg_ulid).unwrap();
+    let new_ulid = repack_for_input(&mut vol, &base, seg_ulid);
     assert_ne!(
         new_ulid, seg_ulid,
         "slow-path redact must return a freshly minted ULID"
@@ -1031,7 +1050,7 @@ fn redact_segment_drops_hash_dead_data_entry() {
 }
 
 #[test]
-fn promote_segment_after_redact_produces_correct_idx_and_present() {
+fn promote_segment_after_repack_produces_correct_idx_and_present() {
     // After redact + promote, the .idx contains DedupRef entries and the
     // .present bitset marks only Data entries as present.
     let base = keyed_temp_dir();
@@ -1057,7 +1076,7 @@ fn promote_segment_after_redact_produces_correct_idx_and_present() {
     vol.promote_segment(s1_ulid).unwrap();
 
     // Redact and promote S2 (simulating the coordinator drain path).
-    vol.redact_segment(s2_ulid).unwrap();
+    repack_for_input(&mut vol, &base, s2_ulid);
     vol.promote_segment(s2_ulid).unwrap();
 
     // The .idx should exist and contain DedupRef entries.
@@ -1090,7 +1109,7 @@ fn promote_segment_after_redact_produces_correct_idx_and_present() {
 }
 
 #[test]
-fn reads_work_after_redact_and_promote() {
+fn reads_work_after_repack_and_promote() {
     // After redact + promote, reads must still work correctly.
     // DedupRef reads go through the extent index to the canonical segment.
     let base = keyed_temp_dir();
@@ -1112,7 +1131,7 @@ fn reads_work_after_redact_and_promote() {
     // Promote S1 first to keep pending ULIDs above committed ULIDs (the
     // pending-above-committed invariant production drain relies on).
     vol.promote_segment(s1_ulid).unwrap();
-    vol.redact_segment(s2_ulid).unwrap();
+    repack_for_input(&mut vol, &base, s2_ulid);
     vol.promote_segment(s2_ulid).unwrap();
 
     assert_eq!(vol.read(0, 1).unwrap(), data, "LBA 0 after redact+promote");
@@ -1128,7 +1147,7 @@ fn reads_work_after_redact_and_promote() {
 }
 
 #[test]
-fn redact_segment_idempotent() {
+fn repack_idempotent() {
     // The first redact rewrites the segment under a freshly minted
     // ULID and removes the input. A second redact against the new
     // ULID is a no-op (no hash-dead entries remain) and returns the
@@ -1148,9 +1167,9 @@ fn redact_segment_idempotent() {
 
     // First redact: slow path, mints new ULID. Second redact on the
     // new ULID: fast path, returns the same ULID with no rewrite.
-    let new_ulid = vol.redact_segment(seg_ulid).unwrap();
+    let new_ulid = repack_for_input(&mut vol, &base, seg_ulid);
     assert_ne!(new_ulid, seg_ulid);
-    let new_ulid_again = vol.redact_segment(new_ulid).unwrap();
+    let new_ulid_again = repack_for_input(&mut vol, &base, new_ulid);
     assert_eq!(new_ulid_again, new_ulid);
 
     let pending_dir = base.join("pending");
@@ -1171,7 +1190,7 @@ fn redact_segment_idempotent() {
 }
 
 #[test]
-fn redact_segment_no_op_when_all_live() {
+fn repack_no_op_when_all_live() {
     // A segment with no hash-dead DATA entries is untouched by redact:
     // the file is unchanged, no sidecar is produced.
     let base = keyed_temp_dir();
@@ -1186,7 +1205,7 @@ fn redact_segment_no_op_when_all_live() {
     let seg_path = base.join("pending").join(ulid.to_string());
     let before = fs::read(&seg_path).unwrap();
 
-    vol.redact_segment(ulid).unwrap();
+    repack_for_input(&mut vol, &base, ulid);
 
     let after = fs::read(&seg_path).unwrap();
     assert_eq!(
@@ -1205,7 +1224,7 @@ fn redact_segment_no_op_when_all_live() {
 }
 
 #[test]
-fn redact_preserves_body_for_lba_dead_but_hash_alive_entry() {
+fn repack_preserves_body_for_lba_dead_but_hash_alive_entry() {
     // Regression test: if a Data entry's LBA is overwritten but the same
     // hash is alive at another LBA, redact must NOT punch the body.
     // GC's collect_stats keeps such entries via extent+hash liveness, so
@@ -1230,7 +1249,7 @@ fn redact_preserves_body_for_lba_dead_but_hash_alive_entry() {
     let other: Vec<u8> = (0..8192).map(|i| (i * 11 + 3) as u8).collect();
     vol.write(0, &other).unwrap();
 
-    vol.redact_segment(seg_ulid).unwrap();
+    repack_for_input(&mut vol, &base, seg_ulid);
 
     // Verify the DATA entry at LBA 0 still has real body bytes (not zeros)
     // in the in-place pending file.
@@ -1258,7 +1277,7 @@ fn redact_preserves_body_for_lba_dead_but_hash_alive_entry() {
 }
 
 #[test]
-fn redact_drops_entry_when_hash_fully_dead() {
+fn repack_drops_entry_when_hash_fully_dead() {
     // When both the LBA and the hash are dead (no LBA references the hash),
     // redact must drop the entry from the index. The dropped hash's body
     // bytes do not appear anywhere in the resulting pending file.
@@ -1281,7 +1300,7 @@ fn redact_drops_entry_when_hash_fully_dead() {
 
     let dead_hash = blake3::hash(&data);
 
-    let new_ulid = vol.redact_segment(seg_ulid).unwrap();
+    let new_ulid = repack_for_input(&mut vol, &base, seg_ulid);
     assert_ne!(new_ulid, seg_ulid);
 
     let new_seg_path = base.join("pending").join(new_ulid.to_string());
@@ -1304,7 +1323,7 @@ fn redact_drops_entry_when_hash_fully_dead() {
 }
 
 #[test]
-fn redact_keeps_extent_index_offsets_in_sync_for_surviving_entries() {
+fn repack_keeps_extent_index_offsets_in_sync_for_surviving_entries() {
     // Regression: redact rewrites pending/<ulid> with the hash-dead Data
     // entries removed, which shrinks the index section AND reassigns
     // body_offset for every surviving Data entry. Before the fix, the
@@ -1343,7 +1362,7 @@ fn redact_keeps_extent_index_offsets_in_sync_for_surviving_entries() {
     // Redact drops the dead entry and rewrites the segment under a
     // freshly minted ULID with a smaller index section + reassigned
     // body offsets for the survivor.
-    let new_ulid = vol.redact_segment(seg_ulid).unwrap();
+    let new_ulid = repack_for_input(&mut vol, &base, seg_ulid);
     assert_ne!(new_ulid, seg_ulid);
 
     // Read the surviving entry. With the in-memory extent index
@@ -1362,7 +1381,7 @@ fn redact_keeps_extent_index_offsets_in_sync_for_surviving_entries() {
 }
 
 #[test]
-fn redact_invalidates_extent_index_for_punched_hash() {
+fn repack_invalidates_extent_index_for_dropped_hash() {
     // Regression: after redact punches a hash-dead DATA body, a later write
     // whose content hashes to the same value must not use the dedup
     // shortcut — the canonical body bytes are gone. Before the fix, the
@@ -1390,7 +1409,7 @@ fn redact_invalidates_extent_index_for_punched_hash() {
 
     // Drain: redact (drops payload_A, rewrites under fresh ULID) then
     // promote to index/ + cache/. Mirrors the coordinator upload flow.
-    let redacted_ulid = vol.redact_segment(seg_ulid).unwrap();
+    let redacted_ulid = repack_for_input(&mut vol, &base, seg_ulid);
     vol.promote_segment(redacted_ulid).unwrap();
 
     // A fresh write with content matching payload_A. Without the fix, the
@@ -1461,17 +1480,17 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     let data_a = vec![17u8; 4096];
     vol.write(2, &data_a).unwrap();
     vol.flush_wal().unwrap();
+    vol.repack().unwrap();
     for ulid in pending_ulids(&base) {
-        let redacted = vol.redact_segment(ulid).unwrap();
-        vol.promote_segment(redacted).unwrap();
+        vol.promote_segment(ulid).unwrap();
     }
 
     let data_b = vec![34u8; 4096];
     vol.write(3, &data_b).unwrap();
     vol.flush_wal().unwrap();
+    vol.repack().unwrap();
     for ulid in pending_ulids(&base) {
-        let redacted = vol.redact_segment(ulid).unwrap();
-        vol.promote_segment(redacted).unwrap();
+        vol.promote_segment(ulid).unwrap();
     }
 
     vol.snapshot().unwrap();
@@ -1489,8 +1508,7 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     vol.write(6, &dedup_data_1).unwrap();
 
     // Repack: the post-snapshot segment (seed=0) is now fully dead.
-    // min_live_ratio=0.01 so the segment (0% live) is eligible.
-    vol.repack(0.01).unwrap();
+    vol.repack().unwrap();
 
     // The fully-dead seed=0 segment must have been deleted. Repack's
     // prep also flushes the WAL (the seed=1 writes) into a fresh
@@ -1506,9 +1524,9 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     // DrainWithRedact: redact + promote each remaining pending segment.
     // (The WAL was already flushed during prepare_repack.)
     vol.flush_wal().unwrap();
+    vol.repack().unwrap();
     for ulid in pending_ulids(&base) {
-        let redacted = vol.redact_segment(ulid).unwrap();
-        vol.promote_segment(redacted).unwrap();
+        vol.promote_segment(ulid).unwrap();
     }
 
     // Verify reads.
@@ -2812,7 +2830,7 @@ fn inline_repack_preserves_data() {
 
     // Repack: the segment with d0+d1 should be compacted; d1 survives.
     // Threshold 1.0 → compact any segment with dead extents.
-    let stats = vol.repack(1.0).unwrap();
+    let stats = vol.repack().unwrap();
     assert!(stats.segments_compacted > 0);
 
     // Reads still correct after repack.

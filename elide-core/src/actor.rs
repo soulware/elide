@@ -118,7 +118,6 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<usize>>,
     },
     Repack {
-        min_live_ratio: f64,
         reply: Sender<io::Result<CompactionStats>>,
     },
     DeltaRepackPostSnapshot {
@@ -131,10 +130,6 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<()>>,
     },
     GcCheckpoint {
-        reply: Sender<io::Result<Ulid>>,
-    },
-    RedactSegment {
-        ulid: Ulid,
         reply: Sender<io::Result<Ulid>>,
     },
     Promote {
@@ -261,11 +256,6 @@ pub struct VolumeActor {
     /// output segment. `None` when no reclaim is in progress;
     /// concurrent `Reclaim` requests are rejected with an error.
     parked_reclaim: Option<Sender<io::Result<ReclaimOutcome>>>,
-    /// Reply channel for an in-flight `RedactSegment` request, parked
-    /// while the worker thread reads, classifies, and materialises the
-    /// rewritten output. `None` when no redact is in progress;
-    /// concurrent `RedactSegment` requests are rejected with an error.
-    parked_redact: Option<Sender<io::Result<Ulid>>>,
 }
 
 /// State stashed while a `PromoteWal` promote is in flight.
@@ -634,7 +624,7 @@ impl VolumeActor {
             }
         };
         // `prepare_sweep` flushes the WAL before minting the sweep
-        // output ULID (mirroring `start_reclaim` / `start_redact`).
+        // output ULID (mirroring `start_reclaim`).
         // The flush mutates the extent index (WAL-relative offsets →
         // segment-relative) and may delete the old WAL file. Republish
         // so readers don't resolve hashes through the pre-flush
@@ -655,8 +645,8 @@ impl VolumeActor {
     /// Run the repack prep on the actor and dispatch the heavy middle
     /// to the worker.  Reply is parked until
     /// [`crate::volume::RepackResult`] arrives and is applied.
-    fn start_repack(&mut self, min_live_ratio: f64, reply: Sender<io::Result<CompactionStats>>) {
-        let job = match self.volume.prepare_repack(min_live_ratio) {
+    fn start_repack(&mut self, reply: Sender<io::Result<CompactionStats>>) {
+        let job = match self.volume.prepare_repack() {
             Ok(Some(j)) => j,
             Ok(None) => {
                 let _ = reply.send(Ok(CompactionStats::default()));
@@ -668,7 +658,7 @@ impl VolumeActor {
             }
         };
         // `prepare_repack` flushes the WAL before pre-minting output
-        // ULIDs (mirrors `start_sweep` / `start_redact`). The flush
+        // ULIDs (mirrors `start_sweep`). The flush
         // mutates the extent index and may delete the old WAL file —
         // republish so readers don't resolve hashes through the
         // pre-flush snapshot into a deleted WAL.
@@ -705,7 +695,7 @@ impl VolumeActor {
             }
         };
         // `prepare_delta_repack` flushes the WAL before pre-minting
-        // output ULIDs (mirrors `start_repack` / `start_redact`).
+        // output ULIDs (mirrors `start_repack`).
         // Republish so readers don't resolve hashes through a deleted
         // WAL.
         self.publish_snapshot();
@@ -761,37 +751,6 @@ impl VolumeActor {
         }
     }
 
-    /// Run the redact prep on the actor and dispatch the heavy middle
-    /// (read input + classify + materialise + tmp+rename) to the
-    /// worker. Reply is parked until
-    /// [`crate::volume::RedactResult`] arrives and is applied.
-    fn start_redact(&mut self, ulid: Ulid, reply: Sender<io::Result<Ulid>>) {
-        let job = match self.volume.prepare_redact(ulid) {
-            Ok(j) => j,
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
-        };
-        // `prepare_redact` flushes the WAL before minting `u_redact`
-        // (see the `u_redact < u_flush` invariant on
-        // `Volume::prepare_redact`). That mutates the extent index
-        // (WAL-relative offsets → segment-relative) and deletes the
-        // old WAL file. Republish so readers don't resolve hashes
-        // through the pre-flush snapshot into a deleted WAL.
-        self.publish_snapshot();
-        if let Some(tx) = &self.worker_tx {
-            if let Err(e) = tx.send(WorkerJob::Redact(job)) {
-                warn!("worker channel closed during redact: {e}");
-                let _ = reply.send(Err(io::Error::other("worker channel closed during redact")));
-                return;
-            }
-            self.parked_redact = Some(reply);
-        } else {
-            let _ = reply.send(Err(io::Error::other("worker not running")));
-        }
-    }
-
     /// Run the snapshot-manifest prep on the actor and dispatch the
     /// heavy middle (`index/` enumeration + signing + manifest/marker
     /// writes) to the worker.  Reply is parked until
@@ -832,7 +791,6 @@ impl VolumeActor {
             || self.parked_delta_repack.is_some()
             || self.parked_sign_snapshot_manifest.is_some()
             || self.parked_reclaim.is_some()
-            || self.parked_redact.is_some()
         {
             match self.worker_rx.recv() {
                 Ok(WorkerResult::Promote(Ok(result))) => {
@@ -967,25 +925,6 @@ impl VolumeActor {
                         let _ = reply.send(outcome);
                     }
                 }
-                Ok(WorkerResult::Redact(result)) => {
-                    let reply = self.parked_redact.take();
-                    let outcome = match result {
-                        Ok(r) => {
-                            let apply_result = self.volume.apply_redact_result(r);
-                            if apply_result.is_ok() {
-                                self.publish_snapshot();
-                            }
-                            apply_result
-                        }
-                        Err(e) => {
-                            warn!("worker redact failed during shutdown: {e}");
-                            Err(e)
-                        }
-                    };
-                    if let Some(reply) = reply {
-                        let _ = reply.send(outcome);
-                    }
-                }
                 Err(_) => {
                     // Channel closed — worker exited unexpectedly.
                     break;
@@ -1100,12 +1039,12 @@ impl VolumeActor {
                                 self.start_sweep(reply);
                             }
                         }
-                        VolumeRequest::Repack { min_live_ratio, reply } => {
+                        VolumeRequest::Repack { reply } => {
                             if self.parked_repack.is_some() {
                                 let _ = reply
                                     .send(Err(io::Error::other("concurrent repack not allowed")));
                             } else {
-                                self.start_repack(min_live_ratio, reply);
+                                self.start_repack(reply);
                             }
                         }
                         VolumeRequest::DeltaRepackPostSnapshot { reply } => {
@@ -1128,15 +1067,6 @@ impl VolumeActor {
                                 )));
                             } else {
                                 self.start_gc_checkpoint(reply);
-                            }
-                        }
-                        VolumeRequest::RedactSegment { ulid, reply } => {
-                            if self.parked_redact.is_some() {
-                                let _ = reply.send(Err(io::Error::other(
-                                    "concurrent redact_segment not allowed",
-                                )));
-                            } else {
-                                self.start_redact(ulid, reply);
                             }
                         }
                         VolumeRequest::Promote { ulid, reply } => {
@@ -1401,31 +1331,6 @@ impl VolumeActor {
                                 let _ = reply.send(outcome);
                             }
                         }
-                        Ok(WorkerResult::Redact(result)) => {
-                            let reply = self.parked_redact.take();
-                            let outcome = match result {
-                                Ok(r) => {
-                                    let apply_result = self.volume.apply_redact_result(r);
-                                    // Always publish — the rewrite path
-                                    // mutated extent_index + lbamap, and
-                                    // the no-op path returns the input
-                                    // ULID unchanged but readers should
-                                    // still observe the post-flush state
-                                    // from prep.
-                                    if apply_result.is_ok() {
-                                        self.publish_snapshot();
-                                    }
-                                    apply_result
-                                }
-                                Err(e) => {
-                                    warn!("worker redact failed: {e}");
-                                    Err(e)
-                                }
-                            };
-                            if let Some(reply) = reply {
-                                let _ = reply.send(outcome);
-                            }
-                        }
                         Err(_) => {
                             warn!("worker result channel closed unexpectedly");
                         }
@@ -1606,15 +1511,12 @@ impl VolumeClient {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Repack sparse pending segments below `min_live_ratio`.  Blocks until
-    /// the actor replies.
-    pub fn repack(&self, min_live_ratio: f64) -> io::Result<CompactionStats> {
+    /// Rewrite every pending segment with any hash-dead body bytes.
+    /// Blocks until the actor replies.
+    pub fn repack(&self) -> io::Result<CompactionStats> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
-            .send(VolumeRequest::Repack {
-                min_live_ratio,
-                reply: reply_tx,
-            })
+            .send(VolumeRequest::Repack { reply: reply_tx })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()
@@ -1654,27 +1556,6 @@ impl VolumeClient {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::GcCheckpoint { reply: reply_tx })
-            .map_err(|_| io::Error::other("volume actor channel closed"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
-    }
-
-    /// Redact a pending segment: drop hash-dead DATA entries so deleted
-    /// data never leaves the host via S3 upload.
-    ///
-    /// Called by the coordinator before reading the pending segment for
-    /// upload. Returns the ULID under which the segment now lives in
-    /// `pending/`: the input ULID when nothing was hash-dead (no-op),
-    /// or a freshly minted ULID when the segment was rewritten. Callers
-    /// must use the returned ULID for the subsequent upload + promote.
-    pub fn redact_segment(&self, ulid: Ulid) -> io::Result<Ulid> {
-        let (reply_tx, reply_rx) = bounded(1);
-        self.tx
-            .send(VolumeRequest::RedactSegment {
-                ulid,
-                reply: reply_tx,
-            })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()
@@ -1868,7 +1749,6 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
                 WorkerResult::SignSnapshotManifest(execute_sign_snapshot_manifest(job))
             }
             WorkerJob::Reclaim(job) => WorkerResult::Reclaim(execute_reclaim(job)),
-            WorkerJob::Redact(job) => WorkerResult::Redact(execute_redact(job)),
         };
         if result_tx.send(msg).is_err() {
             break;
@@ -2023,8 +1903,8 @@ fn cancelled_result(
 /// `BodyResolver` impl that holds borrowed references to the volume's
 /// segment-resolution dependencies. Used both by the worker-thread GC
 /// apply path (which doesn't have a live Volume to borrow) and by
-/// synchronous, on-actor rewriters (redact / sweep / repack /
-/// delta_repack) that hold a `&Volume` and can lend its fields.
+/// synchronous, on-actor rewriters (sweep / repack / delta_repack)
+/// that hold a `&Volume` and can lend its fields.
 pub(crate) struct WorkerBodyResolver<'a> {
     pub(crate) base_dir: &'a std::path::Path,
     pub(crate) ancestor_layers: &'a [AncestorLayer],
@@ -2569,10 +2449,10 @@ pub(crate) fn invalidate_promote_siblings(
 /// Execute a repack job: iterate every non-floor segment in `pending/`,
 /// classify entries via the shared
 /// [`crate::segment_classify::classify_entry`], and rewrite — under a
-/// freshly-minted ULID — any segment whose live ratio falls below
-/// `min_live_ratio`. Segments with no live entries are deleted
-/// outright. The fresh ULID closes the path-aliasing race the prior
-/// in-place rewrite carried, mirroring sweep / redact / GC.
+/// freshly-minted ULID — any segment with one or more hash-dead body
+/// entries. Segments with no live entries are deleted outright. The
+/// fresh ULID closes the path-aliasing race against concurrent readers,
+/// mirroring sweep / GC.
 pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     use crate::rewrite_apply::{self, MaterialiseCtx, MaterialiseOutcome, Materialised};
     use crate::rewrite_plan::{PlanOutput, RewritePlan};
@@ -2582,7 +2462,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         base_dir,
         pending_dir,
         floor,
-        min_live_ratio,
         output_ulids,
         lbamap_snapshot,
         extent_index_snapshot,
@@ -2643,7 +2522,10 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             .filter(|e| e.kind.has_body_bytes() && live_hashes.contains(&e.hash))
             .map(|e| e.stored_length as u64)
             .sum();
-        if live_bytes_estimate as f64 / total_bytes as f64 >= min_live_ratio {
+        // Skip when every body-bearing hash is live: rewriting would
+        // be a byte-identical no-op. Anything with a hash-dead body
+        // must be rewritten so deleted data does not leave the host.
+        if live_bytes_estimate == total_bytes {
             continue;
         }
 
@@ -3156,7 +3038,6 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         parked_delta_repack: None,
         parked_sign_snapshot_manifest: None,
         parked_reclaim: None,
-        parked_redact: None,
     };
 
     let client = VolumeClient {
@@ -3346,199 +3227,6 @@ fn read_reclaim_extent_body(
 ///
 /// Apply on the actor checks `Arc::ptr_eq` against the live lbamap; on
 /// mismatch the segment is deleted as an orphan.
-/// Worker-side execution of a [`crate::volume::RedactJob`].
-///
-/// Reads `pending/<input_ulid>`, classifies every entry against the
-/// snapshot maps in the job, fast-paths `NoOp` if all entries are
-/// fully-live, otherwise translates classifications to
-/// [`crate::rewrite_plan::PlanOutput`] records, runs `materialise_plan`,
-/// and atomically writes the output to `pending/<new_ulid>` via
-/// tmp+rename. Pure with respect to in-memory `Volume` state — only
-/// touches the filesystem and the snapshot Arcs in `job`.
-pub(crate) fn execute_redact(
-    job: crate::volume::RedactJob,
-) -> io::Result<crate::volume::RedactResult> {
-    use crate::rewrite_apply::{self, MaterialiseCtx, MaterialiseOutcome, Materialised};
-    use crate::rewrite_plan::{PlanOutput, RewritePlan};
-    use crate::segment_classify::{self, ClassifyCtx, EntryClassification};
-
-    let crate::volume::RedactJob {
-        input_ulid,
-        new_ulid,
-        base_dir,
-        pending_dir,
-        lbamap_snapshot,
-        extent_index_snapshot,
-        ancestor_layers,
-        fetcher,
-        signer,
-        verifying_key,
-    } = job;
-
-    let old_seg_path = pending_dir.join(input_ulid.to_string());
-    let (_input_bss, entries, _inputs) =
-        segment::read_and_verify_segment_index(&old_seg_path, &verifying_key)?;
-
-    let live_hashes = lbamap_snapshot.lba_referenced_hashes();
-    let classify_ctx = ClassifyCtx {
-        lba_map: &lbamap_snapshot,
-        extent_index: &extent_index_snapshot,
-        live_hashes: &live_hashes,
-        segment_id: input_ulid,
-    };
-    let classifications: Vec<EntryClassification> = entries
-        .iter()
-        .map(|e| segment_classify::classify_entry(e, &classify_ctx))
-        .collect();
-
-    // Redact's *trigger* is narrow: only rewrite when at least one entry
-    // is hash-dead (Drop / DropAndRemoveHash). That preserves the
-    // "don't ship deleted data to S3" framing — segments with no
-    // hash-dead entries are uploaded unchanged.
-    //
-    // When we *do* rewrite, the policy must be broad (full classifier
-    // semantics: DemoteToCanonical, PartialDeath, ZeroSubRuns), because
-    // the rewrite mints a fresh ULID that sorts above every input
-    // segment. Carrying stale LBA claims forward into the higher ULID
-    // would shadow newer writes on rebuild — the same correctness
-    // hazard GC already strips. Narrow trigger + broad rewrite keeps
-    // redact's name accurate without sacrificing rebuild safety.
-    let any_hash_dead = classifications.iter().any(|c| {
-        matches!(
-            c,
-            EntryClassification::Drop | EntryClassification::DropAndRemoveHash
-        )
-    });
-    if !any_hash_dead {
-        return Ok(crate::volume::RedactResult::NoOp { input_ulid });
-    }
-
-    // Translate each classification into PlanOutput record(s). Same
-    // mapping the coordinator GC uses — the classifier is shared
-    // infrastructure; once we've decided to rewrite, the policy lines
-    // up with GC.
-    let mut outputs: Vec<PlanOutput> = Vec::with_capacity(classifications.len());
-    for (entry_idx, (_entry, action)) in entries.iter().zip(classifications.iter()).enumerate() {
-        let entry_idx = entry_idx as u32;
-        match action {
-            EntryClassification::FullyLive => outputs.push(PlanOutput::Keep {
-                input: input_ulid,
-                entry_idx,
-            }),
-            EntryClassification::DemoteToCanonical => outputs.push(PlanOutput::Canonical {
-                input: input_ulid,
-                entry_idx,
-            }),
-            EntryClassification::ZeroSubRuns(runs) => {
-                for run in runs {
-                    outputs.push(PlanOutput::ZeroSplit {
-                        input: input_ulid,
-                        entry_idx,
-                        start_lba: run.range_start,
-                        lba_length: (run.range_end - run.range_start) as u32,
-                    });
-                }
-            }
-            EntryClassification::PartialDeath {
-                live_runs,
-                emit_canonical,
-            } => {
-                if *emit_canonical {
-                    outputs.push(PlanOutput::Canonical {
-                        input: input_ulid,
-                        entry_idx,
-                    });
-                }
-                for run in live_runs.iter() {
-                    outputs.push(PlanOutput::Run {
-                        input: input_ulid,
-                        entry_idx,
-                        payload_block_offset: run.payload_block_offset,
-                        start_lba: run.range_start,
-                        lba_length: (run.range_end - run.range_start) as u32,
-                    });
-                }
-            }
-            // DeferUnresolvableDelta: redact has no defer-the-segment
-            // escape hatch (every pending segment must drain). Keep the
-            // entry as-is; a later GC pass can convert/replan it once
-            // a source is resolvable.
-            EntryClassification::DeferUnresolvableDelta => outputs.push(PlanOutput::Keep {
-                input: input_ulid,
-                entry_idx,
-            }),
-            EntryClassification::DropAndRemoveHash | EntryClassification::Drop => {}
-        }
-    }
-
-    let plan = RewritePlan { new_ulid, outputs };
-
-    let resolver = WorkerBodyResolver {
-        base_dir: &base_dir,
-        ancestor_layers: &ancestor_layers,
-        fetcher: fetcher.as_ref(),
-        extent_index: &extent_index_snapshot,
-    };
-    let inputs = plan.inputs();
-    let ctx = match MaterialiseCtx::new_for_pending(
-        &base_dir,
-        &inputs,
-        &extent_index_snapshot,
-        &resolver,
-    ) {
-        Ok(c) => c,
-        Err(MaterialiseOutcome::Io(e)) => return Err(e),
-        Err(MaterialiseOutcome::Cancel(e)) => {
-            return Err(io::Error::other(format!(
-                "redact {input_ulid}: materialise prep cancelled: {e}"
-            )));
-        }
-    };
-    let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
-        Ok(m) => m,
-        Err(MaterialiseOutcome::Io(e)) => return Err(e),
-        Err(MaterialiseOutcome::Cancel(e)) => {
-            return Err(io::Error::other(format!(
-                "redact {input_ulid}: materialise cancelled: {e}"
-            )));
-        }
-    };
-    drop(ctx);
-
-    let Materialised {
-        entries: mut out_entries,
-        delta_body,
-    } = materialised;
-
-    let new_ulid_str = new_ulid.to_string();
-    let new_seg_path = pending_dir.join(&new_ulid_str);
-    let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
-    let _ = std::fs::remove_file(&tmp_path);
-    let new_body_section_start = segment::write_segment_full(
-        &tmp_path,
-        &mut out_entries,
-        &delta_body,
-        &[],
-        signer.as_ref(),
-    )?;
-    std::fs::rename(&tmp_path, &new_seg_path)?;
-    segment::fsync_dir(&new_seg_path)?;
-
-    let input_owned_hashes: Vec<blake3::Hash> = entries
-        .iter()
-        .filter(|e| e.kind.has_body_bytes())
-        .map(|e| e.hash)
-        .collect();
-
-    Ok(crate::volume::RedactResult::Rewritten {
-        input_ulid,
-        new_ulid,
-        new_body_section_start,
-        out_entries,
-        input_owned_hashes,
-    })
-}
-
 pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     let target_start = job.target_start_lba;
     let target_end = target_start + job.target_lba_length as u64;

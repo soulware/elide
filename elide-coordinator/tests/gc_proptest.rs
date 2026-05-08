@@ -30,31 +30,19 @@ use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
 
-/// Simulate coordinator drain: redact every pending in pass 1, then
-/// promote each in pass 2 in ULID-ascending order.
-///
-/// Mirrors the production drain in `coordinator/src/upload.rs`. The two
-/// passes preserve the structural invariant `max(committed) < min(pending)`
-/// throughout the drain — see that file's docs for the architectural
-/// motivation.
+/// Mirror the production drain: repack, then promote in ULID-ascending
+/// order. Preserves `max(committed) < min(pending)` throughout —
+/// see `coordinator/src/upload.rs::drain_pending`.
 fn simulate_upload(vol: &mut Volume, dir: &Path) {
     let pending_dir = dir.join("pending");
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    // Pass 1: redact every pending in place, in ULID-ascending order so
-    // fresh `u_redact_N` ULIDs preserve the temporal ordering of their
-    // inputs.
-    let snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
-    for ulid in snapshot {
-        let _ = vol.redact_segment(ulid);
-    }
+    let _ = vol.repack();
 
-    // Pass 2: promote in ULID-ascending order against the post-redact
-    // pending state.
-    let pending_after_redact =
+    let pending_after_repack =
         elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
-    for ulid in pending_after_redact {
+    for ulid in pending_after_repack {
         let _ = vol.promote_segment(ulid);
     }
 }

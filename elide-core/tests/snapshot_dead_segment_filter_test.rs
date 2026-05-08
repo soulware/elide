@@ -48,7 +48,7 @@ fn snapshot_manifest_omits_fully_dead_segment() {
     // Seg A: write a Zero entry at LBA 0, flush WAL → pending, drain → index/.
     vol.write_zeroes(0, 1).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
     assert!(common::pending_ulids(fork_dir).is_empty());
     let after_a: Vec<Ulid> = index_ulids(fork_dir);
     assert_eq!(after_a.len(), 1);
@@ -58,7 +58,7 @@ fn snapshot_manifest_omits_fully_dead_segment() {
     // so seg A's Zero entry is now LBA-dead.
     vol.write(0, &block(0xBB)).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
     let after_b: Vec<Ulid> = index_ulids(fork_dir);
     assert_eq!(after_b.len(), 2);
     let seg_b = *after_b.iter().find(|u| **u != seg_a).expect("seg B");
@@ -100,14 +100,14 @@ fn snapshot_manifest_omits_orphan_body_segment() {
 
     vol.write(0, &block(0xAA)).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
     let after_a = index_ulids(fork_dir);
     assert_eq!(after_a.len(), 1);
     let seg_a = after_a[0];
 
     vol.write(0, &block(0xBB)).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
     let after_b = index_ulids(fork_dir);
     assert_eq!(after_b.len(), 2);
     let seg_b = *after_b.iter().find(|u| **u != seg_a).expect("seg B");
@@ -134,7 +134,7 @@ fn snapshot_manifest_keeps_fully_alive_segment() {
     vol.write(0, &block(0x11)).unwrap();
     vol.write(8, &block(0x22)).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
     let segs = index_ulids(fork_dir);
     assert_eq!(segs.len(), 1);
 

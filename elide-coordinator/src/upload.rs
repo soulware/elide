@@ -208,55 +208,20 @@ pub async fn drain_pending(
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
     upload_volume_metadata(vol_dir, volume_id, store).await;
 
-    // Drain runs in two passes to preserve the structural invariant
-    // `max(committed_ulid) < min(pending_ulid)` throughout. The walk in
-    // `discover_fork_segments` is "committed sorted by ULID, then pending
-    // sorted by ULID, pending wins last on overlap"; that's only consistent
-    // with the temporal order of writes when every pending ULID sorts above
-    // every committed ULID. An interleaved redact+promote-per-iter loop
-    // breaks the invariant transiently: redact mints a fresh `u_redact`
-    // (above all current ULIDs); promoting it mid-loop puts a high-ULID
-    // entry into committed while older inputs are still in pending, so
-    // walk-order winners flip cross-tier.
-    //
-    // Pass 1 redacts every pending in ULID-ascending order. Sorting matters:
-    // mint advances on every call, so the order in which we redact decides
-    // which fresh `u_redact` ULID each input gets. Ascending pass 1 keeps
-    // redact-output ULIDs in temporal order with their input content —
-    // walk-order then matches temporal-order structurally, not just because
-    // broad-redact happens to strip overlapping claims.
-    //
-    // Pass 2 re-snapshots pending (post-redact) and uploads + promotes each
-    // in ULID-ascending order. Each promote moves the lowest-ULID pending
-    // to committed; remaining pending ULIDs all sort above it, so the
-    // structural invariant holds at every promote boundary.
-
-    // Pass 1: redact every pending in place.
-    {
-        let snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
-            .with_context(|| format!("listing pending dir: {}", pending_dir.display()))?;
-        for ulid in snapshot {
-            // Redact drops hash-dead DATA entries before upload so deleted
-            // data never leaves the host. When entries are dropped, the
-            // segment is rewritten under a freshly minted ULID and the
-            // input ULID's pending file is removed. We discard the returned
-            // ULID here — pass 2 re-snapshots pending to find every segment
-            // that needs uploading, including redact outputs and any
-            // WAL-flush peers redact created.
-            let _ = crate::control::redact_segment(vol_dir, ulid).await;
-        }
-    }
+    // Upload + promote in ULID-ascending order so each promote moves
+    // the lowest-ULID pending to committed, preserving
+    // `max(committed) < min(pending)` at every boundary. The drain
+    // caller has already run repack, so every remaining pending file
+    // is upload-ready.
 
     let mut uploaded = 0usize;
     let mut upload_failed = 0usize;
     let mut promote_failed = 0usize;
     let uploader = SegmentUploader { volume_id, store };
 
-    // Pass 2: upload + promote in ULID-ascending order against the
-    // post-redact pending state.
-    let pending_after_redact = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
+    let pending_snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
         .with_context(|| format!("listing pending dir: {}", pending_dir.display()))?;
-    for ulid in pending_after_redact {
+    for ulid in pending_snapshot {
         let upload_name = ulid.to_string();
         let segment_path = pending_dir.join(&upload_name);
 

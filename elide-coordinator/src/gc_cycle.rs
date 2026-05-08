@@ -161,7 +161,7 @@ impl GcCycleOrchestrator {
             );
         }
 
-        if let Some(s) = control::repack(&self.fork_dir, self.gc_config.density_threshold).await
+        if let Some(s) = control::repack(&self.fork_dir).await
             && s.segments_compacted > 0
         {
             info!(

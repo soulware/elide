@@ -82,7 +82,7 @@ fn reclaim_then_drain_redact_then_crash_preserves_bloat_fragment() {
     vol.flush_wal().unwrap();
 
     // DrainWithRedact
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
 
     // Crash: drop + reopen.
     drop(vol);

@@ -710,7 +710,7 @@ proptest! {
                         };
                     // Use a high threshold so any segment with dead bytes is a
                     // candidate, maximising the chance of actually repacking.
-                    let _ = vol.repack(0.9);
+                    let _ = vol.repack();
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
                         prop_assert!(
@@ -727,7 +727,7 @@ proptest! {
                     }
                 }
                 SimOp::DrainWithRedact => {
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
                     // A complete GC pass invalidates any previously-stashed
@@ -747,7 +747,7 @@ proptest! {
                     // put u_gc into committed alongside a lower-ULID pending
                     // peer — violating the structural pending-above-committed
                     // invariant.
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
                     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
                     // Core invariant: the volume mint must have advanced past the
                     // GC output ULID, so the next WAL flush produces a segment that
@@ -797,7 +797,7 @@ proptest! {
                     // Without this, a u_flush_old in pending below the
                     // about-to-be-minted u_gc would violate
                     // pending-above-committed once GcApply commits.
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some(u_gc);
                 }
@@ -859,7 +859,7 @@ proptest! {
                     // never hits this because the demand-fetch path uses
                     // S3-minted (lower) ULIDs, not freshly-minted ones; this is a
                     // test-helper artifact.
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
 
                     // gc_checkpoint flushes the WAL (may create a pending segment) then
                     // mints two fresh ULIDs; we use the first for the cache file.  All
@@ -1036,10 +1036,10 @@ proptest! {
                     let _ = vol.sweep_pending();
                 }
                 SimOp::Repack => {
-                    let _ = vol.repack(0.9);
+                    let _ = vol.repack();
                 }
                 SimOp::DrainWithRedact => {
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
                     // See ulid_monotonicity's CoordGcLocal — a full GC
@@ -1047,7 +1047,7 @@ proptest! {
                     pending_gc = None;
                     // Match production: drain → GC sequentially per tick
                     // (see ulid_monotonicity's CoordGcLocal for rationale).
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
                     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
@@ -1068,7 +1068,7 @@ proptest! {
                     // Without this, a u_flush_old in pending below the
                     // about-to-be-minted u_gc would violate
                     // pending-above-committed once GcApply commits.
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some(u_gc);
                 }
@@ -1147,7 +1147,7 @@ proptest! {
                     // pending segment with a lower ULID would violate
                     // pending-above-committed. See the matching comment in
                     // crash_recovery_oracle.
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
 
                     // effective_seed always has bit 7 set (128..=255) so it never
                     // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
@@ -1292,10 +1292,10 @@ proptest! {
                     let _ = vol.sweep_pending();
                 }
                 SimOp::Repack => {
-                    let _ = vol.repack(0.9);
+                    let _ = vol.repack();
                 }
                 SimOp::DrainWithRedact => {
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
                     // See ulid_monotonicity's CoordGcLocal — a full GC
@@ -1303,7 +1303,7 @@ proptest! {
                     pending_gc = None;
                     // Match production: drain → GC sequentially per tick
                     // (see ulid_monotonicity's CoordGcLocal for rationale).
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
                     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
@@ -1324,7 +1324,7 @@ proptest! {
                     // Without this, a u_flush_old in pending below the
                     // about-to-be-minted u_gc would violate
                     // pending-above-committed once GcApply commits.
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some(u_gc);
                 }
@@ -1386,7 +1386,7 @@ proptest! {
                     // pending segment with a lower ULID would violate
                     // pending-above-committed. See the matching comment in
                     // crash_recovery_oracle.
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
 
                     // effective_seed always has bit 7 set (128..=255) so it never
                     // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
@@ -1531,13 +1531,13 @@ proptest! {
                     let _ = vol.flush_wal();
                 }
                 ReclaimOp::DrainWithRedact => {
-                    common::drain_with_redact(&mut vol);
+                    common::drain_with_repack(&mut vol);
                 }
                 ReclaimOp::SweepPending => {
                     let _ = vol.sweep_pending();
                 }
                 ReclaimOp::Repack => {
-                    let _ = vol.repack(0.9);
+                    let _ = vol.repack();
                 }
                 ReclaimOp::ReclaimRange { start_lba, lba_count } => {
                     let outcome = vol
@@ -1636,7 +1636,7 @@ fn reclaim_crash_recovery_seed_a978281b_regression() {
     assert!(!outcome.discarded, "single-threaded driver: never discards");
     assert_oracle(&mut vol, &oracle, "ReclaimRange(start_lba=3,lba_count=6)");
 
-    let _ = vol.repack(0.9);
+    let _ = vol.repack();
     assert_oracle(&mut vol, &oracle, "Repack");
 
     drop(vol);
@@ -1738,7 +1738,7 @@ fn reclaim_crash_recovery_seed_b0f166f0_regression() {
 /// shares the same composite `seed=88` content across two distinct
 /// start LBAs (24 and 25), so the third write lands as a `DedupRef`
 /// against the second write's body. After `reclaim_alias_merge` and
-/// `drain_with_redact`, LBAs 25..32 read back blocks shifted by one
+/// `drain_with_repack`, LBAs 25..32 read back blocks shifted by one
 /// position relative to the oracle.
 ///
 /// ## Root cause
@@ -1825,7 +1825,7 @@ fn reclaim_crash_recovery_seed_3f9275b5_regression() {
     assert!(!outcome.discarded, "single-threaded driver: never discards");
     assert_oracle(&mut vol, &oracle, "ReclaimRange(start_lba=28,lba_count=6)");
 
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
     assert_oracle(&mut vol, &oracle, "DrainWithRedact");
 }
 
@@ -1895,7 +1895,7 @@ fn crash_recovery_writemulti_dedup_regression() {
     // Drain before gc_checkpoint to match production sequencing — without
     // it the un-drained pending segments would violate
     // pending-above-committed once GC apply commits u_gc.
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
 
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
     let _ = common::half_promote_first_pending(fork_dir);
@@ -1903,7 +1903,7 @@ fn crash_recovery_writemulti_dedup_regression() {
     // Mirrors `SimOp::PopulateFetched { lba: 0, seed: 0 }`: writes a
     // direct-fetch cache entry at LBA 16 with effective_seed 0x80.
     // PopulateFetched also drains first; do the same here.
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
     let effective_seed: u8 = 0x80;
     let cache_ulid = vol.gc_checkpoint_for_test().unwrap();
     common::populate_cache(fork_dir, cache_ulid, 16, effective_seed);

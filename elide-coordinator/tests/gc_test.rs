@@ -790,7 +790,7 @@ fn drain_failure_skips_gc_and_data_survives() {
 
     // Write more data — this ends up in pending/ after flushing.
     // Use unique data (not d0/d1) to avoid a dedup hit that would create
-    // a thin DedupRef — the mock socket does not run redact_segment.
+    // a thin DedupRef — the mock socket does not run repack.
     let d2 = [33u8; 4096];
     vol.write(1, &d2).unwrap();
     vol.flush_wal().unwrap();
@@ -1129,21 +1129,14 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
 
     let gc_config = make_gc_config();
 
-    // Helper: redact + promote all pending segments (no S3 upload —
-    // mirrors the proptest's simulate_upload which works locally only).
+    // Local drain helper (no S3 upload): repack, then promote in
+    // ULID-ascending order.
     let drain = |vol: &mut Volume| {
         let pending_dir = fork_dir.join("pending");
-        // Pass 1: redact every pending in ULID-ascending order.
-        let snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
-        for ulid in snapshot {
-            let _ = vol.redact_segment(ulid);
-        }
-        // Pass 2: promote in ULID-ascending order against the post-redact
-        // pending state. Preserves `max(committed) < min(pending)`
-        // throughout — see `coordinator/src/upload.rs::drain_pending`.
-        let pending_after_redact =
+        let _ = vol.repack();
+        let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
-        for ulid in pending_after_redact {
+        for ulid in pending_after_repack {
             let _ = vol.promote_segment(ulid);
         }
     };
@@ -1271,17 +1264,10 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
 
     let drain = |vol: &mut Volume| {
         let pending_dir = fork_dir.join("pending");
-        // Pass 1: redact every pending in ULID-ascending order.
-        let snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
-        for ulid in snapshot {
-            let _ = vol.redact_segment(ulid);
-        }
-        // Pass 2: promote in ULID-ascending order against the post-redact
-        // pending state. Preserves `max(committed) < min(pending)`
-        // throughout — see `coordinator/src/upload.rs::drain_pending`.
-        let pending_after_redact =
+        let _ = vol.repack();
+        let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
-        for ulid in pending_after_redact {
+        for ulid in pending_after_repack {
             let _ = vol.promote_segment(ulid);
         }
     };
@@ -1416,17 +1402,10 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
 
     let drain = |vol: &mut Volume| {
         let pending_dir = fork_dir.join("pending");
-        // Pass 1: redact every pending in ULID-ascending order.
-        let snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
-        for ulid in snapshot {
-            let _ = vol.redact_segment(ulid);
-        }
-        // Pass 2: promote in ULID-ascending order against the post-redact
-        // pending state. Preserves `max(committed) < min(pending)`
-        // throughout — see `coordinator/src/upload.rs::drain_pending`.
-        let pending_after_redact =
+        let _ = vol.repack();
+        let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
-        for ulid in pending_after_redact {
+        for ulid in pending_after_repack {
             let _ = vol.promote_segment(ulid);
         }
     };

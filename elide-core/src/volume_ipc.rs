@@ -25,17 +25,14 @@ pub enum VolumeRequest {
     PromoteWal,
     /// Compact small pending segments using default thresholds.
     SweepPending,
-    /// Compact sparse pending segments below the given live-extent ratio.
-    Repack { min_live_ratio: f64 },
+    /// Rewrite every pending segment with any hash-dead body bytes.
+    Repack,
     /// Rewrite post-snapshot pending segments as zstd-dictionary deltas.
     DeltaRepack,
     /// Flush the WAL and return a fresh GC output ULID.
     GcCheckpoint,
     /// Apply staged GC handoffs into the in-memory extent index.
     ApplyGcHandoffs,
-    /// Hole-punch hash-dead DATA entries in `pending/<segment_ulid>`
-    /// before S3 upload.
-    Redact { segment_ulid: Ulid },
     /// Sign and write `snapshots/<snap_ulid>.manifest` plus the marker.
     SnapshotManifest { snap_ulid: Ulid },
     /// Promote a confirmed-uploaded segment into `cache/`.
@@ -71,20 +68,6 @@ pub struct DeltaRepackReply {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct GcCheckpointReply {
     pub gc_ulid: Ulid,
-}
-
-/// Reply for [`VolumeRequest::Redact`].
-///
-/// `current_ulid` is the ULID under which the segment now lives in
-/// `pending/`. It equals the request's `segment_ulid` when redact was
-/// a no-op (no hash-dead DATA entries to drop) and is a freshly minted
-/// ULID otherwise — redact rewrites the segment under a new path to
-/// avoid path-aliasing a concurrent reader's pre-redact snapshot.
-/// Callers must use this ULID for the subsequent `Promote` (and any
-/// upload) call.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct RedactReply {
-    pub current_ulid: Ulid,
 }
 
 /// Reply for [`VolumeRequest::ApplyGcHandoffs`].

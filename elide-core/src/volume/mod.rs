@@ -52,7 +52,6 @@ mod open_state;
 mod read;
 mod readonly;
 mod reclaim;
-mod redact;
 mod repack;
 mod wal;
 
@@ -82,7 +81,6 @@ pub use reclaim::{
     ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult, ReclaimThresholds, ReclaimedEntry,
     scan_reclaim_candidates,
 };
-pub use redact::{RedactJob, RedactResult};
 pub use repack::{
     CompactionStats, DeltaRepackJob, DeltaRepackResult, DeltaRepackStats, DeltaRepackedSegment,
     RepackJob, RepackResult, RepackedOutput, RepackedSegment, SweepJob, SweepResult, SweptInput,
@@ -1083,8 +1081,7 @@ impl Volume {
         }
 
         for (i, e) in entries.iter().enumerate() {
-            // DedupRef and Zero entries don't own a body — see redact.rs
-            // for the same filter and reasoning.
+            // DedupRef and Zero entries don't own a body.
             if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
                 continue;
             }
@@ -1173,7 +1170,7 @@ impl Volume {
 
     /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic
     /// if it diverges from `self.lbamap`. Called at the end of every
-    /// **structural** op (segment-shape mutations: redact apply, promote,
+    /// **structural** op (segment-shape mutations: repack apply, promote,
     /// GC plan apply, checkpoint flush, volume open) so any drift trips at
     /// the introducing site, not three operations later as a stale-cancel
     /// or oracle mismatch.
@@ -1426,7 +1423,7 @@ impl Volume {
     /// dedup) but not for this check.
     ///
     /// **Also does NOT enforce "disk has more than memory" symmetry**.
-    /// After a redact / GC apply prunes a hash from in-memory because
+    /// After a repack / GC apply prunes a hash from in-memory because
     /// the local segment owned it, an ancestor segment may still own
     /// the hash on disk — leaving in-memory with no entry while disk
     /// does. Reading that hash would then miss the dedup opportunity

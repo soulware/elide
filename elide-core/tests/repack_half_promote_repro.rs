@@ -74,7 +74,7 @@ fn repack_after_half_promote_preserves_oracle_across_crash() {
 
     // Repack — rewrites pending/<u_flush> in place, compacting it. The
     // sibling .idx/.body written by HalfPromotePending above are now stale.
-    vol.repack(0.9).unwrap();
+    vol.repack().unwrap();
 
     // Crash + reopen + finish the half-promoted segment.
     drop(vol);
