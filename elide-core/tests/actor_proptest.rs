@@ -227,7 +227,7 @@ proptest! {
                 ActorOp::Repack => {
                     // Use 0.5 ratio: fires on any segment with >50% dead extents,
                     // which occurs naturally after write-overwrite-flush sequences.
-                    let _ = handle.repack(0.5);
+                    let _ = handle.repack();
                     // Same invariant: repack deletes old files; snapshot must be
                     // republished so handles evict their cached fds.
                     for (&lba, expected) in &oracle {

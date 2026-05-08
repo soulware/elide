@@ -1,6 +1,6 @@
 // Shared simulation helpers for proptest files.
 //
-// `drain_with_redact` and `simulate_coord_gc_local` mirror the real
+// `drain_with_repack` and `simulate_coord_gc_local` mirror the real
 // coordinator's drain-pending and GC logic without requiring an object store.
 // Both proptest suites (volume_proptest and actor_proptest) use these to drive
 // the same coordinator-side simulation.
@@ -42,59 +42,19 @@ pub fn write_test_keypair(dir: &Path) {
     .unwrap();
 }
 
-/// Drain via the full redact → promote path, matching the production
-/// coordinator upload protocol.
-///
-/// For each pending segment: calls `vol.redact_segment(ulid)` (drops
-/// hash-dead DATA entries; may rewrite the segment under a freshly
-/// minted ULID and a folded WAL into a separate pending segment) then
-/// `vol.promote_segment(returned_ulid)` which writes
-/// `index/<u>.idx` + `cache/<u>.{body,present}` from the pending file
-/// and updates the extent index.
-///
-/// Two-pass drain: redact every pending in place, then promote each in
-/// ULID-ascending order. Mirrors the production drain in
-/// `coordinator/src/upload.rs::drain_pending`. Preserves the structural
-/// invariant `max(committed) < min(pending)` throughout.
-pub fn drain_with_redact(vol: &mut elide_core::volume::Volume) {
-    // Pass 1: redact every pending in ULID-ascending order so fresh
-    // `u_redact_N` ULIDs preserve the temporal ordering of their inputs.
-    let snapshot = pending_ulids(vol.base_dir());
-    for ulid in snapshot {
-        vol.redact_segment(ulid).unwrap();
-    }
-    // Pass 2: promote in ULID-ascending order against the post-redact
-    // pending state.
-    let pending_after_redact = pending_ulids(vol.base_dir());
-    for ulid in pending_after_redact {
+/// Mirror the production drain (no S3 upload): repack, then promote
+/// every remaining pending segment in ULID-ascending order.
+pub fn drain_with_repack(vol: &mut elide_core::volume::Volume) {
+    vol.repack().unwrap();
+    for ulid in pending_ulids(vol.base_dir()) {
         vol.promote_segment(ulid).unwrap();
     }
 }
 
-/// Drain via the actor handle: redact + promote each pending segment.
-///
-/// Equivalent to `drain_with_redact` but works when the `Volume` is
-/// behind an actor — sends `RedactSegment` and `Promote` messages
-/// through the handle's channel, so the actor's in-memory snapshot is
-/// updated correctly. See `drain_with_redact` for the redact-may-mint
-/// rationale.
+/// `drain_with_repack` for a `VolumeClient` (actor-mediated).
 pub fn drain_via_handle(handle: &VolumeClient, base_dir: &Path) {
-    // Pass 1: redact every pending in ULID-ascending order. Sorting
-    // ascending matters: fresh `u_redact_N` ULIDs preserve the temporal
-    // ordering of their inputs so the subsequent rebuild walk's "pending
-    // wins last" semantic continues to match temporal-order even before
-    // promote runs.
-    let snapshot = pending_ulids(base_dir);
-    for ulid in snapshot {
-        handle.redact_segment(ulid).unwrap();
-    }
-    // Pass 2: promote in ULID-ascending order against the post-redact
-    // pending state. Each promote moves the lowest-ULID pending into
-    // committed; remaining pending ULIDs all sort above it, preserving
-    // `max(committed) < min(pending)` at every promote boundary —
-    // see `coordinator/src/upload.rs::drain_pending`.
-    let pending_after_redact = pending_ulids(base_dir);
-    for ulid in pending_after_redact {
+    handle.repack().unwrap();
+    for ulid in pending_ulids(base_dir) {
         handle.promote_segment(ulid).unwrap();
     }
 }

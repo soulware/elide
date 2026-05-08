@@ -32,11 +32,11 @@ fn plan_keep_two_data_entries_round_trips() {
     // fully-alive Data entry).
     vol.write(0, &[0xAA; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
 
     vol.write(1, &[0xBB; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
 
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
@@ -180,13 +180,13 @@ fn plan_partial_death_data_reconstructs_sub_runs() {
     }
     vol.write(0, &parent_bytes).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
 
     // Overwrite LBA 2.
     let overwrite = vec![0xEE; 4096];
     vol.write(2, &overwrite).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
 
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");

@@ -90,7 +90,7 @@ fn redact_hole_punched_hash_not_resurrected_by_rebuild() {
     // pending/<u_flush1> and removes its in-memory extent-index entry.
     // `promote` then writes index/<u_flush1>.idx + cache/<u_flush1>.body.
     // The .idx still carries h_full_102 entry metadata.
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
 
     // Step 5: write LBA 24..=31 with the same payload as step 1. The
     // hash is h_full_102 again. The extent-index entry was removed by

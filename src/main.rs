@@ -94,13 +94,9 @@ enum Command {
         out_dir: String,
     },
 
-    /// Repack sparse segments in a fork (diagnostic)
+    /// Rewrite pending segments that have any hash-dead body bytes (diagnostic)
     #[command(hide = true)]
-    Repack {
-        fork_dir: PathBuf,
-        #[arg(long, default_value_t = 0.7)]
-        min_live_ratio: f64,
-    },
+    Repack { fork_dir: PathBuf },
 
     /// Print header and index entries of a segment or .idx file (diagnostic)
     #[command(hide = true)]
@@ -1015,14 +1011,11 @@ fn main() {
             extract_boot(Path::new(&image), Path::new(&out_dir)).expect("extract-boot failed");
         }
 
-        Command::Repack {
-            fork_dir,
-            min_live_ratio,
-        } => {
+        Command::Repack { fork_dir } => {
             let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_owned();
             let mut vol =
                 volume::Volume::open(&fork_dir, &by_id_dir).expect("failed to open volume");
-            let stats = vol.repack(min_live_ratio).expect("repack failed");
+            let stats = vol.repack().expect("repack failed");
             println!(
                 "segments repacked: {}  bytes freed: {}  extents removed: {}",
                 stats.segments_compacted, stats.bytes_freed, stats.extents_removed,

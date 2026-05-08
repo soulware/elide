@@ -277,7 +277,7 @@ fn generate_from_snapshot_matches_import_filemap() {
     let import_text = fs::read_to_string(&filemap_path).unwrap();
 
     let mut vol = Volume::open(&vol_dir, vol_dir.parent().unwrap()).unwrap();
-    common::drain_with_redact(&mut vol);
+    common::drain_with_repack(&mut vol);
     drop(vol);
 
     fs::remove_file(&filemap_path).unwrap();

@@ -109,7 +109,6 @@ pub struct RepackJob {
     pub base_dir: PathBuf,
     pub pending_dir: PathBuf,
     pub floor: Option<Ulid>,
-    pub min_live_ratio: f64,
     pub output_ulids: Vec<Ulid>,
     pub lbamap_snapshot: Arc<lbamap::LbaMap>,
     pub extent_index_snapshot: Arc<extentindex::ExtentIndex>,
@@ -194,25 +193,17 @@ pub struct DeltaRepackResult {
 }
 
 impl Volume {
-    /// Compact sparse segments in `pending/`.
-    ///
-    /// For each segment where the ratio of live stored bytes to total stored
-    /// bytes is below `min_live_ratio`, the live extents are copied into a new
-    /// denser segment in `pending/` and the old segment is deleted. Segments
-    /// where all extents are dead are deleted directly without writing a new one.
-    ///
-    /// The WAL is not touched. The extent index is updated in place.
-    ///
-    /// `min_live_ratio` is in [0.0, 1.0]: 0.7 compacts any segment where more
-    /// than 30% of stored bytes are dead.
+    /// Rewrite every pending segment with at least one hash-dead body
+    /// entry under a freshly-minted ULID; delete all-dead segments
+    /// outright. Skips fully-live segments — sweep bin-packs those.
+    /// Guarantees deleted data does not leave the host.
     ///
     /// Synchronous wrapper around [`Self::prepare_repack`] +
-    /// [`crate::actor::execute_repack`] + [`Self::apply_repack_result`].
-    /// The actor offloads the middle phase to the worker thread; callers
-    /// that hold a `&mut Volume` directly (tests, tools) can keep using
-    /// this wrapper.
-    pub fn repack(&mut self, min_live_ratio: f64) -> io::Result<CompactionStats> {
-        let Some(job) = self.prepare_repack(min_live_ratio)? else {
+    /// [`crate::actor::execute_repack`] + [`Self::apply_repack_result`]
+    /// for tests and inline callers; the actor uses the trio directly
+    /// to offload the middle phase.
+    pub fn repack(&mut self) -> io::Result<CompactionStats> {
+        let Some(job) = self.prepare_repack()? else {
             return Ok(CompactionStats::default());
         };
         let result = crate::actor::execute_repack(job)?;
@@ -230,7 +221,7 @@ impl Volume {
     /// worker's classifier and body resolver.
     ///
     /// Returns `None` when `pending/` is missing or has no segments.
-    pub fn prepare_repack(&mut self, min_live_ratio: f64) -> io::Result<Option<RepackJob>> {
+    pub fn prepare_repack(&mut self) -> io::Result<Option<RepackJob>> {
         let pending_dir = self.base_dir.join("pending");
         let segs = match segment::collect_segment_files(&pending_dir) {
             Ok(v) => v,
@@ -242,12 +233,14 @@ impl Volume {
         }
         let floor = latest_snapshot(&self.base_dir)?;
 
-        // Pre-mint output ULIDs (one per current pending segment) +
-        // u_flush. Actor is single-threaded; no new pending segments
-        // can appear between prep and worker run, so this is an upper
-        // bound on what the worker consumes.
-        let mut output_ulids: Vec<Ulid> = Vec::with_capacity(segs.len());
-        for _ in 0..segs.len() {
+        // Pre-mint output ULIDs (one per current pending segment plus
+        // one for the WAL-flush peer that prepare creates next) and
+        // u_flush. The WAL-flush peer can itself be hash-dead-bearing
+        // — multiple writes to the same LBA inside one open WAL leave
+        // the earlier hashes dead in the flushed segment — so the
+        // worker may need to rewrite it too.
+        let mut output_ulids: Vec<Ulid> = Vec::with_capacity(segs.len() + 1);
+        for _ in 0..segs.len() + 1 {
             output_ulids.push(self.mint.next());
         }
         let u_flush = self.mint.next();
@@ -257,7 +250,6 @@ impl Volume {
             base_dir: self.base_dir.clone(),
             pending_dir,
             floor,
-            min_live_ratio,
             output_ulids,
             lbamap_snapshot: Arc::clone(&self.lbamap),
             extent_index_snapshot: Arc::clone(&self.extent_index),
@@ -873,7 +865,7 @@ mod tests {
         vol.write(1, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.repack(0.7).unwrap();
+        let stats = vol.repack().unwrap();
         assert_eq!(stats.segments_compacted, 0);
         assert_eq!(stats.bytes_freed, 0);
         assert_eq!(stats.extents_removed, 0);
@@ -902,7 +894,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // Two segments: first is 100% dead, second is live.
-        let stats = vol.repack(0.7).unwrap();
+        let stats = vol.repack().unwrap();
         assert_eq!(
             stats.segments_compacted, 1,
             "first segment should be compacted"
@@ -928,7 +920,7 @@ mod tests {
             vol.promote_for_test().unwrap();
             vol.write(0, &vec![0xBBu8; 4096]).unwrap(); // overwrite
             vol.promote_for_test().unwrap();
-            vol.repack(0.7).unwrap();
+            vol.repack().unwrap();
         }
 
         let vol = Volume::open(&base, &base).unwrap();
@@ -951,37 +943,14 @@ mod tests {
         vol.write(0, &vec![0x33u8; 4096]).unwrap(); // overwrites LBA 0
         vol.promote_for_test().unwrap();
 
-        // First segment is 50% dead — above default threshold of 30% dead (0.7 live).
-        let stats = vol.repack(0.7).unwrap();
+        // First segment has a hash-dead entry — repack rewrites it.
+        let stats = vol.repack().unwrap();
         assert_eq!(stats.segments_compacted, 1);
         assert!(stats.bytes_freed > 0);
 
         // Both LBAs read back correctly.
         assert_eq!(vol.read(0, 1).unwrap(), vec![0x33u8; 4096]);
         assert_eq!(vol.read(1, 1).unwrap(), vec![0x22u8; 4096]);
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn repack_respects_min_live_ratio() {
-        // With a strict ratio (1.0), any dead byte triggers compaction.
-        // With a lenient ratio (0.0), nothing is ever compacted.
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-
-        vol.write(0, &vec![0x11u8; 4096]).unwrap();
-        vol.promote_for_test().unwrap();
-        vol.write(0, &vec![0x22u8; 4096]).unwrap(); // LBA 0 now dead in seg 1
-        vol.promote_for_test().unwrap();
-
-        // Lenient threshold: first segment is 100% dead but ratio=0.0 → nothing compacted.
-        let stats = vol.repack(0.0).unwrap();
-        assert_eq!(stats.segments_compacted, 0);
-
-        // Strict threshold: compact anything with any dead bytes.
-        let stats = vol.repack(1.0).unwrap();
-        assert_eq!(stats.segments_compacted, 1);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -1002,7 +971,7 @@ mod tests {
         vol.snapshot().unwrap();
 
         // Even with a strict threshold the pre-snapshot segments must be skipped.
-        let stats = vol.repack(1.0).unwrap();
+        let stats = vol.repack().unwrap();
         assert_eq!(
             stats.segments_compacted, 0,
             "pre-snapshot segments must not be compacted"
@@ -1035,7 +1004,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // One pre-snapshot dead segment (frozen) + one post-snapshot dead segment (eligible).
-        let stats = vol.repack(1.0).unwrap();
+        let stats = vol.repack().unwrap();
         assert_eq!(
             stats.segments_compacted, 1,
             "exactly the post-snapshot dead segment should be compacted"
@@ -1066,7 +1035,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // Strict threshold: repack anything with dead bytes.
-        let stats = vol.repack(1.0).unwrap();
+        let stats = vol.repack().unwrap();
         assert_eq!(
             stats.segments_compacted, 0,
             "repack must not touch uploaded (cache/) segments"

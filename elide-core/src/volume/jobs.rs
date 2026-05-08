@@ -235,7 +235,6 @@ pub enum WorkerJob {
     DeltaRepack(DeltaRepackJob),
     SignSnapshotManifest(SignSnapshotManifestJob),
     Reclaim(ReclaimJob),
-    Redact(super::RedactJob),
 }
 
 /// Result returned by the worker thread to the actor.
@@ -256,5 +255,4 @@ pub enum WorkerResult {
     DeltaRepack(io::Result<DeltaRepackResult>),
     SignSnapshotManifest(io::Result<SignSnapshotManifestResult>),
     Reclaim(io::Result<ReclaimResult>),
-    Redact(io::Result<super::RedactResult>),
 }

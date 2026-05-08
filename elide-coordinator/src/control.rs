@@ -17,7 +17,7 @@ use elide_core::ipc::{Envelope, IpcError};
 use elide_core::volume::{CompactionStats, DeltaRepackStats};
 use elide_core::volume_ipc::{
     ApplyGcHandoffsReply, CompactionReply, ConnectedReply, DeltaRepackReply, GcCheckpointReply,
-    ReclaimReply, RedactReply, VolumeRequest,
+    ReclaimReply, VolumeRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -46,12 +46,11 @@ pub async fn sweep_pending(fork_dir: &Path) -> Option<CompactionStats> {
     Some(reply.stats)
 }
 
-/// Repack sparse pending segments below `min_live_ratio`.
+/// Rewrite every pending segment with any hash-dead body bytes.
 /// Returns compaction stats on success.
 /// Returns `None` and logs a warning if the socket is absent or the call fails.
-pub async fn repack(fork_dir: &Path, min_live_ratio: f64) -> Option<CompactionStats> {
-    let reply: CompactionReply =
-        call_typed(fork_dir, &VolumeRequest::Repack { min_live_ratio }).await?;
+pub async fn repack(fork_dir: &Path) -> Option<CompactionStats> {
+    let reply: CompactionReply = call_typed(fork_dir, &VolumeRequest::Repack).await?;
     Some(reply.stats)
 }
 
@@ -82,20 +81,6 @@ pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
     let reply: Option<ApplyGcHandoffsReply> =
         call_typed(fork_dir, &VolumeRequest::ApplyGcHandoffs).await;
     reply.map(|r| r.processed as usize).unwrap_or(0)
-}
-
-/// Redact a pending segment: drop hash-dead DATA entries before S3
-/// upload.
-///
-/// Returns the ULID under which the segment now lives in `pending/` —
-/// the input `segment_ulid` when redact was a no-op, or a freshly
-/// minted ULID when the segment was rewritten. Callers must use the
-/// returned ULID for the subsequent upload + promote. Returns `None`
-/// when the volume socket is unreachable or the call returned an
-/// error envelope.
-pub async fn redact_segment(fork_dir: &Path, segment_ulid: Ulid) -> Option<Ulid> {
-    let reply: RedactReply = call_typed(fork_dir, &VolumeRequest::Redact { segment_ulid }).await?;
-    Some(reply.current_ulid)
 }
 
 /// Sign and write a snapshot manifest plus the snapshot marker.
@@ -274,11 +259,10 @@ fn verb_label(request: &VolumeRequest) -> &'static str {
         VolumeRequest::Flush => "flush",
         VolumeRequest::PromoteWal => "promote-wal",
         VolumeRequest::SweepPending => "sweep-pending",
-        VolumeRequest::Repack { .. } => "repack",
+        VolumeRequest::Repack => "repack",
         VolumeRequest::DeltaRepack => "delta-repack",
         VolumeRequest::GcCheckpoint => "gc-checkpoint",
         VolumeRequest::ApplyGcHandoffs => "apply-gc-handoffs",
-        VolumeRequest::Redact { .. } => "redact",
         VolumeRequest::SnapshotManifest { .. } => "snapshot-manifest",
         VolumeRequest::Promote { .. } => "promote",
         VolumeRequest::FinalizeGcHandoff { .. } => "finalize-gc-handoff",
