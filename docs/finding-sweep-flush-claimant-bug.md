@@ -141,6 +141,16 @@ doesn't surface a failure there: the same WAL-flush-peer setup applies
 writes to the same LBA in one open WAL) would hit the same bug in
 repack alone.
 
+`apply_plan_apply_result` (GC apply) is also vulnerable for the same
+structural reason: `gc_checkpoint` mints `u_gc < u_flush`, the flush
+bumps lbamap claimants to `u_flush`, and a GC plan output with a fresh
+sliced hash gets blocked by the strict-newer guard. The latent bug
+surfaces only when a downstream structural pass classifies against the
+stale lbamap, which is why existing GC tests didn't catch it — the
+in-memory drift was even explicitly documented as "benign" in
+`assert_lbamap_consistent`. With the override threaded through, the
+divergence no longer occurs.
+
 ## Pre-existing nature
 
 Reproduced on `06c0881` (current main). Also reproduces at `015d38e`
