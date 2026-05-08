@@ -249,7 +249,7 @@ fn compact_candidates_inner(
             // are still live would be demoted whole to Canonical, losing
             // the surviving tail's LBA claim on rebuild.
             let end_lba = entry.start_lba + entry.lba_length as u64;
-            let runs = lba_map.extents_in_range(entry.start_lba, end_lba);
+            let runs: Vec<_> = lba_map.extents_in_range(entry.start_lba, end_lba).collect();
             let matching_blocks: u64 = runs
                 .iter()
                 .filter(|r| r.hash == entry.hash)

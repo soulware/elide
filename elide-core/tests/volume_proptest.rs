@@ -143,7 +143,6 @@ fn assert_manifest_filter_correct(
             let end = e.start_lba + e.lba_length as u64;
             let lba_live = lbamap
                 .extents_in_range(e.start_lba, end)
-                .iter()
                 .any(|r| r.hash == e.hash);
             if !lba_live {
                 continue;
@@ -161,14 +160,12 @@ fn assert_manifest_filter_correct(
                 let end = e.start_lba + e.lba_length as u64;
                 lbamap
                     .extents_in_range(e.start_lba, end)
-                    .iter()
                     .any(|r| r.hash == ZERO_HASH)
             }
             EntryKind::DedupRef | EntryKind::Delta => {
                 let end = e.start_lba + e.lba_length as u64;
                 lbamap
                     .extents_in_range(e.start_lba, end)
-                    .iter()
                     .any(|r| r.hash == e.hash)
             }
             EntryKind::Data

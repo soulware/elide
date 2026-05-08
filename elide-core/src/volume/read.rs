@@ -18,7 +18,7 @@ use ulid::Ulid;
 
 use crate::{
     delta_compute, dmat,
-    extentindex::{self, BodySource},
+    extentindex::{self, BodySource, SegmentPresence},
     lbamap,
     segment::{self},
 };
@@ -235,6 +235,10 @@ pub(crate) fn read_extents(
     let lba_count = (out.len() / 4096) as u32;
     let end_lba = lba + lba_count as u64;
     let mut cursor = lba;
+    // Per-loop cache for the most recently looked up segment's presence
+    // bitset. Multi-extent reads on the same segment (the steady state)
+    // skip the segment_presence HashMap probe after the first lookup.
+    let mut last_segment_presence: Option<(Ulid, Option<&Arc<SegmentPresence>>)> = None;
     for er in lbamap.extents_in_range(lba, end_lba) {
         // Fill any gap between the previous extent and this one with zeros —
         // unwritten LBAs read back as zero by block-device convention.
@@ -253,28 +257,7 @@ pub(crate) fn read_extents(
             continue;
         }
 
-        // Extract owned copies so the borrow of extent_index ends before
-        // we mutate file_cache.
-        let direct = extent_index.lookup(&er.hash).map(|loc| {
-            (
-                loc.segment_id,
-                loc.body_offset,
-                loc.body_length,
-                loc.compressed,
-                loc.body_section_start,
-                loc.body_source,
-                loc.inline_data.clone(),
-            )
-        });
-        let (
-            segment_id,
-            body_offset,
-            body_length,
-            compressed,
-            body_section_start,
-            body_source,
-            inline_data,
-        ) = match direct {
+        let loc = match extent_index.lookup(&er.hash) {
             Some(loc) => loc,
             None => {
                 // No direct DATA/Inline entry. Try a Delta entry.
@@ -296,23 +279,28 @@ pub(crate) fn read_extents(
             }
         };
 
-        // Inline extents: data is held in memory, no file I/O needed.
-        if let Some(ref idata) = inline_data {
-            let block_count = (er.range_end - er.range_start) as usize;
-            let out_start = (er.range_start - lba) as usize * 4096;
-            let out_slice = &mut out[out_start..out_start + block_count * 4096];
+        let block_count = (er.range_end - er.range_start) as usize;
+        let out_start = (er.range_start - lba) as usize * 4096;
+        let out_slice = &mut out[out_start..out_start + block_count * 4096];
+        let src_start = er.payload_block_offset as usize * 4096;
+        let src_end = src_start + block_count * 4096;
 
-            let raw = if compressed {
-                lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?
+        // Inline extents: bytes are held in the extent index, no file I/O.
+        if let Some(idata) = &loc.inline_data {
+            if loc.compressed {
+                let raw = lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?;
+                let src_slice = raw
+                    .get(src_start..src_end)
+                    .ok_or_else(|| io::Error::other("corrupt segment: inline payload too short"))?;
+                out_slice.copy_from_slice(src_slice);
             } else {
-                idata.to_vec()
-            };
-            let src_start = er.payload_block_offset as usize * 4096;
-            let src_end = src_start + block_count * 4096;
-            let src_slice = raw
-                .get(src_start..src_end)
-                .ok_or_else(|| io::Error::other("corrupt segment: inline payload too short"))?;
-            out_slice.copy_from_slice(src_slice);
+                // Slice straight out of the inline buffer — no allocation,
+                // no intermediate to_vec.
+                let src_slice = idata
+                    .get(src_start..src_end)
+                    .ok_or_else(|| io::Error::other("corrupt segment: inline payload too short"))?;
+                out_slice.copy_from_slice(src_slice);
+            }
             continue;
         }
 
@@ -337,42 +325,44 @@ pub(crate) fn read_extents(
         // replacement events (sweep/drain/GC apply) bump `flush_gen`
         // and clear the entire FileCache, so a hot FD here is
         // guaranteed to point at the same inode the bitset describes.
-        let presence_known_set = match body_source {
+        let presence_known_set = match loc.body_source {
             BodySource::Local => true,
-            BodySource::Cached(idx) => extent_index
-                .segment_presence(segment_id)
-                .is_some_and(|p| p.test(idx)),
+            BodySource::Cached(idx) => {
+                let presence = match last_segment_presence {
+                    Some((id, p)) if id == loc.segment_id => p,
+                    _ => {
+                        let p = extent_index.segment_presence(loc.segment_id);
+                        last_segment_presence = Some((loc.segment_id, p));
+                        p
+                    }
+                };
+                presence.is_some_and(|p| p.test(idx))
+            }
         };
         let mut cache = file_cache.borrow_mut();
-        if !presence_known_set || cache.get(segment_id).is_none() {
-            let path = find_segment(segment_id, body_section_start, body_source)?;
+        if !presence_known_set || cache.get(loc.segment_id).is_none() {
+            let path = find_segment(loc.segment_id, loc.body_section_start, loc.body_source)?;
             let layout = SegmentLayout::from_path(&path);
-            cache.insert(segment_id, layout, fs::File::open(&path)?);
+            cache.insert(loc.segment_id, layout, fs::File::open(&path)?);
         }
         let (layout, f) = cache
-            .get(segment_id)
+            .get(loc.segment_id)
             .expect("entry was just inserted or found");
 
         // body_offset is always body-relative (= stored_offset from the segment index).
         // For full segment files we must add body_section_start to get the file offset.
         let file_body_offset = match layout {
-            SegmentLayout::BodyOnly => body_offset,
-            SegmentLayout::Full => body_section_start + body_offset,
+            SegmentLayout::BodyOnly => loc.body_offset,
+            SegmentLayout::Full => loc.body_section_start + loc.body_offset,
         };
 
-        let block_count = (er.range_end - er.range_start) as usize;
-        let out_start = (er.range_start - lba) as usize * 4096;
-        let out_slice = &mut out[out_start..out_start + block_count * 4096];
-
-        if compressed {
-            let src_start = er.payload_block_offset as usize * 4096;
-            let src_end = src_start + block_count * 4096;
+        if loc.compressed {
             READ_SCRATCH.with(|s| -> io::Result<()> {
                 let mut s = s.borrow_mut();
                 let s = &mut *s;
 
                 // Read compressed bytes into the TLS scratch.
-                s.compressed.resize(body_length as usize, 0);
+                s.compressed.resize(loc.body_length as usize, 0);
                 f.read_exact_at(&mut s.compressed, file_body_offset)?;
 
                 // Parse the 4-byte LE size prefix that compress_prepend_size emits.
@@ -392,11 +382,15 @@ pub(crate) fn read_extents(
                 {
                     lz4_flex::decompress_into(payload, out_slice).map_err(|e| {
                         log::error!(
-                            "lz4 decompression failed: lba={lba} segment={segment_id} \
-                             layout={layout:?} bss={body_section_start} \
-                             body_offset={body_offset} body_length={body_length} \
-                             body_source={body_source:?} file_body_offset={file_body_offset} \
+                            "lz4 decompression failed: lba={lba} segment={} \
+                             layout={layout:?} bss={} body_offset={} body_length={} \
+                             body_source={:?} file_body_offset={file_body_offset} \
                              first_bytes={:?} err={e}",
+                            loc.segment_id,
+                            loc.body_section_start,
+                            loc.body_offset,
+                            loc.body_length,
+                            loc.body_source,
                             &s.compressed[..s.compressed.len().min(16)],
                         );
                         io::Error::other(e)
@@ -409,11 +403,15 @@ pub(crate) fn read_extents(
                 s.decompressed.resize(decompressed_size, 0);
                 lz4_flex::decompress_into(payload, &mut s.decompressed).map_err(|e| {
                     log::error!(
-                        "lz4 decompression failed: lba={lba} segment={segment_id} \
-                         layout={layout:?} bss={body_section_start} \
-                         body_offset={body_offset} body_length={body_length} \
-                         body_source={body_source:?} file_body_offset={file_body_offset} \
+                        "lz4 decompression failed: lba={lba} segment={} \
+                         layout={layout:?} bss={} body_offset={} body_length={} \
+                         body_source={:?} file_body_offset={file_body_offset} \
                          first_bytes={:?} err={e}",
+                        loc.segment_id,
+                        loc.body_section_start,
+                        loc.body_offset,
+                        loc.body_length,
+                        loc.body_source,
                         &s.compressed[..s.compressed.len().min(16)],
                     );
                     io::Error::other(e)
@@ -433,11 +431,11 @@ pub(crate) fn read_extents(
                      bss={} body_offset={} body_length={} payload_block_offset={} \
                      file_body_offset={} read_len={} file_size={} err={}",
                     lba,
-                    segment_id,
+                    loc.segment_id,
                     layout,
-                    body_section_start,
-                    body_offset,
-                    body_length,
+                    loc.body_section_start,
+                    loc.body_offset,
+                    loc.body_length,
                     er.payload_block_offset,
                     file_body_offset,
                     out_slice.len(),

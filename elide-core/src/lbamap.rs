@@ -423,43 +423,48 @@ impl LbaMap {
 
     /// Iterate over all extents that overlap `[start_lba, end_lba)`, in ascending LBA order.
     ///
-    /// Each entry describes the portion of the extent that falls within the requested range:
+    /// Each yielded item describes the portion of the extent that falls within the requested range:
     /// - `hash` — identifies the stored payload via the extent index
     /// - `range_start`, `range_end` — the sub-range of LBAs within `[start_lba, end_lba)`
     ///   that this extent covers; `range_end - range_start` blocks are needed
     /// - `payload_block_offset` — block offset within the stored payload for `range_start`
     ///
     /// Unwritten gaps between extents are omitted; the caller is responsible for
-    /// leaving those output bytes as zero.
-    pub fn extents_in_range(&self, start_lba: u64, end_lba: u64) -> Vec<ExtentRead> {
-        let mut result = Vec::new();
-
+    /// leaving those output bytes as zero. The returned iterator borrows `self`
+    /// — reads on the volume hot path consume it directly without ever
+    /// materialising a `Vec`.
+    pub fn extents_in_range(
+        &self,
+        start_lba: u64,
+        end_lba: u64,
+    ) -> impl Iterator<Item = ExtentRead> + '_ {
         // A predecessor entry (key < start_lba) may extend into the range.
-        if let Some((&key, &e)) = self.inner.range(..start_lba).next_back() {
-            let entry_end = key + e.lba_length as u64;
-            if entry_end > start_lba {
-                let range_end = entry_end.min(end_lba);
-                result.push(ExtentRead {
+        let predecessor = self
+            .inner
+            .range(..start_lba)
+            .next_back()
+            .and_then(move |(&key, &e)| {
+                let entry_end = key + e.lba_length as u64;
+                (entry_end > start_lba).then(|| ExtentRead {
                     hash: e.hash,
                     range_start: start_lba,
-                    range_end,
+                    range_end: entry_end.min(end_lba),
                     payload_block_offset: e.payload_block_offset + (start_lba - key) as u32,
-                });
-            }
-        }
+                })
+            });
 
         // All entries whose start_lba falls within [start_lba, end_lba).
-        for (&key, &e) in self.inner.range(start_lba..end_lba) {
+        let in_range = self.inner.range(start_lba..end_lba).map(move |(&key, &e)| {
             let range_end = (key + e.lba_length as u64).min(end_lba);
-            result.push(ExtentRead {
+            ExtentRead {
                 hash: e.hash,
                 range_start: key,
                 range_end,
                 payload_block_offset: e.payload_block_offset,
-            });
-        }
+            }
+        });
 
-        result
+        predecessor.into_iter().chain(in_range)
     }
 
     /// Look up the extent containing `lba`.
@@ -1260,17 +1265,21 @@ mod tests {
 
     // --- extents_in_range tests ---
 
+    fn extents_vec(map: &LbaMap, start: u64, end: u64) -> Vec<ExtentRead> {
+        map.extents_in_range(start, end).collect()
+    }
+
     #[test]
     fn extents_in_range_empty_map() {
         let map = LbaMap::new();
-        assert!(map.extents_in_range(0, 10).is_empty());
+        assert!(extents_vec(&map, 0, 10).is_empty());
     }
 
     #[test]
     fn extents_in_range_single_extent_fully_inside() {
         let mut map = LbaMap::new();
         map.insert(5, 3, h(1), u(1)); // [5, 8)
-        let result = map.extents_in_range(0, 10);
+        let result = extents_vec(&map, 0, 10);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].hash, h(1));
         assert_eq!(result[0].range_start, 5);
@@ -1283,7 +1292,7 @@ mod tests {
         let mut map = LbaMap::new();
         map.insert(0, 10, h(1), u(1)); // [0, 10)
         // Request [5, 15) — predecessor starts before range but extends in.
-        let result = map.extents_in_range(5, 15);
+        let result = extents_vec(&map, 5, 15);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].range_start, 5);
         assert_eq!(result[0].range_end, 10);
@@ -1296,7 +1305,7 @@ mod tests {
         map.insert(0, 4, h(1), u(1)); // [0, 4)
         map.insert(4, 4, h(2), u(2)); // [4, 8)
         map.insert(8, 4, h(3), u(3)); // [8, 12)
-        let result = map.extents_in_range(2, 10);
+        let result = extents_vec(&map, 2, 10);
         assert_eq!(result.len(), 3);
         // First: predecessor [0,4) clipped to [2,4)
         assert_eq!(result[0].range_start, 2);
@@ -1317,7 +1326,7 @@ mod tests {
         let mut map = LbaMap::new();
         map.insert(0, 2, h(1), u(1)); // [0, 2)
         map.insert(5, 2, h(2), u(2)); // [5, 7) — gap at [2, 5)
-        let result = map.extents_in_range(0, 7);
+        let result = extents_vec(&map, 0, 7);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].range_start, 0);
         assert_eq!(result[0].range_end, 2);
@@ -1330,7 +1339,7 @@ mod tests {
         let mut map = LbaMap::new();
         map.insert(0, 5, h(1), u(1)); // [0, 5) — ends exactly at range start
         map.insert(5, 5, h(2), u(2)); // [5, 10)
-        let result = map.extents_in_range(5, 10);
+        let result = extents_vec(&map, 5, 10);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].hash, h(2));
     }
@@ -1343,7 +1352,7 @@ mod tests {
         let mut map = LbaMap::new();
         map.insert(0, 10, h(1), u(1));
         map.insert(3, 1, h(2), u(2)); // splits [0,10) into [0,3), [3,4), [4,10) with offset=4
-        let result = map.extents_in_range(5, 8);
+        let result = extents_vec(&map, 5, 8);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].hash, h(1));
         assert_eq!(result[0].range_start, 5);
