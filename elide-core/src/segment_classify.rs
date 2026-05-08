@@ -143,7 +143,6 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
         let live_runs: Vec<ExtentRead> = ctx
             .lba_map
             .extents_in_range(entry.start_lba, end_lba)
-            .into_iter()
             .filter(|r| r.hash == ZERO_HASH)
             .collect();
         return EntryClassification::ZeroSubRuns(live_runs);
@@ -158,7 +157,10 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
     }
 
     let end_lba = entry.start_lba + entry.lba_length as u64;
-    let runs = ctx.lba_map.extents_in_range(entry.start_lba, end_lba);
+    let runs: Vec<ExtentRead> = ctx
+        .lba_map
+        .extents_in_range(entry.start_lba, end_lba)
+        .collect();
     // A run "matches" the input entry when its hash matches AND its
     // anchor agrees: the run's `payload_block_offset` for `range_start`
     // equals the entry's offset for that LBA. Same-hash runs with

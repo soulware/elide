@@ -2913,7 +2913,6 @@ pub(crate) fn live_index_segments(
             let end = entry.start_lba + entry.lba_length as u64;
             let lba_live = lbamap
                 .extents_in_range(entry.start_lba, end)
-                .iter()
                 .any(|r| r.hash == entry.hash);
             if !lba_live {
                 continue;
@@ -2964,14 +2963,12 @@ fn is_index_entry_live(
             let end = entry.start_lba + entry.lba_length as u64;
             lbamap
                 .extents_in_range(entry.start_lba, end)
-                .iter()
                 .any(|r| r.hash == crate::volume::ZERO_HASH)
         }
         EntryKind::DedupRef | EntryKind::Delta => {
             let end = entry.start_lba + entry.lba_length as u64;
             lbamap
                 .extents_in_range(entry.start_lba, end)
-                .iter()
                 .any(|r| r.hash == entry.hash)
         }
         EntryKind::Data

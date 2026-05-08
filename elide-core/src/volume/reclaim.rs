@@ -335,7 +335,8 @@ impl Volume {
         self.flush_wal()?;
 
         let end_lba = start_lba + lba_length as u64;
-        let entries = self.lbamap.extents_in_range(start_lba, end_lba);
+        let entries: Vec<lbamap::ExtentRead> =
+            self.lbamap.extents_in_range(start_lba, end_lba).collect();
 
         let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
         for layer in &self.ancestor_layers {
