@@ -1042,8 +1042,10 @@ mod imp {
                 }
             }
             UBLK_IO_OP_WRITE => {
-                let data = buf[..length as usize].to_vec();
-                match reader.write(start_lba, data) {
+                // Direct write path: ublk thread acquires the volume mutex and
+                // appends to the WAL on this thread.  The kernel I/O buffer is
+                // passed by reference — no per-write allocation.
+                match reader.write(start_lba, &buf[..length as usize]) {
                     Ok(()) => length as i32,
                     Err(e) => {
                         tracing::error!("[ublk write error offset={offset} len={length}: {e}]");

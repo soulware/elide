@@ -148,8 +148,8 @@ proptest! {
         for op in &ops {
             match op {
                 ActorOp::Write { lba, seed } => {
-                    let data = vec![*seed; 4096];
-                    if handle.write(*lba as u64, data).is_ok() {
+                    let data = [*seed; 4096];
+                    if handle.write(*lba as u64, &data).is_ok() {
                         let expected = [*seed; 4096];
                         // Read-your-writes: snapshot must reflect this write
                         // immediately, before any flush to pending/.
@@ -386,14 +386,14 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     let mut oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
 
     // Step 1: Write{lba:7, seed:0}
-    handle.write(7, vec![0u8; 4096]).unwrap();
+    handle.write(7, &[0u8; 4096]).unwrap();
     oracle.insert(7, [0u8; 4096]);
 
     // Step 2: Flush — WAL → pending/S1 with DATA(lba:7, hash0)
     handle.flush().unwrap();
 
     // Step 3: Write{lba:0, seed:0} — same hash0 → DEDUP_REF in WAL
-    handle.write(0, vec![0u8; 4096]).unwrap();
+    handle.write(0, &[0u8; 4096]).unwrap();
     oracle.insert(0, [0u8; 4096]);
 
     // Step 4: CoordGcLocal{2} — gc_checkpoint flushes DEDUP_REF to pending/u_flush1;
@@ -411,11 +411,11 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     common::drain_via_handle(&handle, fork_dir);
 
     // Step 6: Write{lba:1, seed:0} — same hash0 → DEDUP_REF in WAL
-    handle.write(1, vec![0u8; 4096]).unwrap();
+    handle.write(1, &[0u8; 4096]).unwrap();
     oracle.insert(1, [0u8; 4096]);
 
     // Step 7: Write{lba:7, seed:1} — new hash1 → DATA in WAL; oracle updated
-    handle.write(7, vec![1u8; 4096]).unwrap();
+    handle.write(7, &[1u8; 4096]).unwrap();
     oracle.insert(7, [1u8; 4096]);
 
     // Step 8: CoordGcLocal{2}
@@ -510,7 +510,7 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
     let mut oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
 
     // Step 1: Write{lba:0, seed:0} → WAL DATA(lba:0, hash0)
-    handle.write(0, vec![0u8; 4096]).unwrap();
+    handle.write(0, &[0u8; 4096]).unwrap();
     oracle.insert(0, [0u8; 4096]);
 
     // Step 2: CoordGcLocal{2} — gc_checkpoint flushes WAL → pending/u_flush_a;
@@ -525,11 +525,11 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
     }
 
     // Step 3: Write{lba:1, seed:1} → WAL DATA(lba:1, hash1)
-    handle.write(1, vec![1u8; 4096]).unwrap();
+    handle.write(1, &[1u8; 4096]).unwrap();
     oracle.insert(1, [1u8; 4096]);
 
     // Step 4: Write{lba:4, seed:2} → WAL DATA(lba:4, hash2)
-    handle.write(4, vec![2u8; 4096]).unwrap();
+    handle.write(4, &[2u8; 4096]).unwrap();
     oracle.insert(4, [2u8; 4096]);
 
     // Step 5: Reclaim{start_lba:0, lba_count:1} — reclaim_alias_merge over
@@ -540,7 +540,7 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
 
     // Step 6: Write{lba:4, seed:0} — hash0 already indexed → WAL
     //   DEDUP_REF(lba:4, hash0).
-    handle.write(4, vec![0u8; 4096]).unwrap();
+    handle.write(4, &[0u8; 4096]).unwrap();
     oracle.insert(4, [0u8; 4096]);
 
     // Step 7: SweepPending — merges the two small pending segments into

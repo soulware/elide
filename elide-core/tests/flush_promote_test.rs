@@ -53,7 +53,7 @@ fn flush_waits_for_in_flight_promote_to_complete() {
     // FLUSH_THRESHOLD, so the actor dispatches a promote to the worker
     // after one of these writes returns.
     for i in 0..33u64 {
-        handle.write(i * 256, incompressible_block(i)).unwrap();
+        handle.write(i * 256, &incompressible_block(i)).unwrap();
     }
 
     // FLUSH: must wait for the dispatched promote's old-WAL fsync
@@ -100,7 +100,7 @@ fn flush_without_pending_promote_is_fast_path() {
     let (handle, actor_thread) = open_actor(&fork_dir);
 
     // One small write — far below the 32 MiB threshold.
-    handle.write(0, vec![0xABu8; 4096]).unwrap();
+    handle.write(0, &[0xABu8; 4096]).unwrap();
     handle.flush().unwrap();
 
     // No promote was triggered, so pending/ should still be empty.
@@ -137,11 +137,11 @@ fn data_survives_crash_after_flush_with_deferred_fsync() {
 
         // Cross the threshold so a promote is in flight.
         for i in 0..33u64 {
-            handle.write(i * 256, incompressible_block(i)).unwrap();
+            handle.write(i * 256, &incompressible_block(i)).unwrap();
         }
         // Writes whose durability must survive reopen.
-        handle.write(10_000, probe_a.clone()).unwrap();
-        handle.write(10_001, probe_b.clone()).unwrap();
+        handle.write(10_000, &probe_a).unwrap();
+        handle.write(10_001, &probe_b).unwrap();
         handle.flush().unwrap();
 
         // Drop the handle to close the channel, then join the actor

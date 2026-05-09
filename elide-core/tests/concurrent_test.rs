@@ -48,7 +48,7 @@ fn coordinator_gc_does_not_create_read_failures() {
     // two candidates to compact.
     for lba in 0u64..4 {
         let data = vec![(lba as u8).wrapping_mul(11); 4096];
-        handle.write(lba, data.clone()).unwrap();
+        handle.write(lba, &data).unwrap();
         oracle.insert(lba, data);
     }
     handle.flush().unwrap();
@@ -56,7 +56,7 @@ fn coordinator_gc_does_not_create_read_failures() {
 
     for lba in 4u64..8 {
         let data = vec![(lba as u8).wrapping_mul(13); 4096];
-        handle.write(lba, data.clone()).unwrap();
+        handle.write(lba, &data).unwrap();
         oracle.insert(lba, data);
     }
     handle.flush().unwrap();
@@ -173,14 +173,14 @@ fn concurrent_apply_gc_handoffs_does_not_drop_replies() {
     // pending/) → drain_via_handle (pending/ → index/ + cache/).
     for lba in 0u64..4 {
         let data = vec![(lba as u8).wrapping_mul(11); 4096];
-        handle.write(lba, data).unwrap();
+        handle.write(lba, &data).unwrap();
     }
     handle.promote_wal().unwrap();
     common::drain_via_handle(&handle, &fork_dir);
 
     for lba in 4u64..8 {
         let data = vec![(lba as u8).wrapping_mul(13); 4096];
-        handle.write(lba, data).unwrap();
+        handle.write(lba, &data).unwrap();
     }
     handle.promote_wal().unwrap();
     common::drain_via_handle(&handle, &fork_dir);

@@ -25,12 +25,13 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use crossbeam_channel::{Receiver, Sender, bounded, tick};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, tick};
 use log::warn;
 
 use ulid::Ulid;
@@ -98,19 +99,15 @@ pub struct ReadSnapshot {
 // ---------------------------------------------------------------------------
 
 pub(crate) enum VolumeRequest {
-    Write {
-        lba: u64,
-        data: Vec<u8>,
-        reply: Sender<io::Result<()>>,
-    },
     Flush {
         reply: Sender<io::Result<()>>,
     },
-    Trim {
-        start_lba: u64,
-        lba_count: u32,
-        reply: Sender<io::Result<()>>,
-    },
+    /// Fire-and-forget signal from a direct writer that the WAL may have
+    /// crossed the promote threshold.  The actor checks `needs_promote()`
+    /// and dispatches a promote if so.  Idempotent; the actor's idle tick
+    /// would catch this eventually anyway, so a dropped signal (channel
+    /// full) is benign.
+    CheckPromote,
     ApplyGcHandoffs {
         reply: Sender<io::Result<usize>>,
     },
@@ -175,10 +172,13 @@ pub struct VolumeActor {
     volume: Arc<Mutex<Volume>>,
     snapshot: Arc<ArcSwap<ReadSnapshot>>,
     rx: Receiver<VolumeRequest>,
-    /// Local promotion counter.  Incremented on every WAL promotion and
-    /// embedded into the next `ReadSnapshot` store so that handles see a
-    /// consistent (generation, extent_index) pair from a single atomic load.
-    flush_gen: u64,
+    /// Promotion counter.  Bumped under the volume mutex on every snapshot
+    /// publish (actor-side state changes and direct writes from the ublk
+    /// transport) and embedded into the published `ReadSnapshot` so that
+    /// handles see a consistent (generation, extent_index) pair from a
+    /// single atomic load.  Shared with `VolumeClient` so direct writers
+    /// can publish without an actor round-trip.
+    flush_gen: Arc<AtomicU64>,
     /// Sender for dispatching jobs to the worker thread.
     /// `Option` so shutdown can `take()` it, dropping the sender to signal
     /// the worker to exit.
@@ -309,34 +309,40 @@ enum HandoffDispatch {
 /// tightened without any correctness implications.
 const IDLE_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Acquire the volume mutex.
+///
+/// Poisoning would mean library code panicked while holding the lock —
+/// forbidden by CLAUDE.md's "no panic in library paths" rule.  Once
+/// poisoned, the volume's in-memory state is mid-mutation and the
+/// caller's thread is already doomed; we surface that with a clear
+/// message rather than continuing on broken state.
+fn lock_volume(volume: &Arc<Mutex<Volume>>) -> MutexGuard<'_, Volume> {
+    volume.lock().expect("volume mutex poisoned")
+}
+
+/// Bump `flush_gen` and publish a fresh `ReadSnapshot`.
+///
+/// Must be called while holding the volume mutex (the `&Volume` argument
+/// is the live guard) so the (lbamap, extent_index, flush_gen) tuple
+/// observed by the next `snapshot.load()` is internally consistent.
+fn publish_snapshot(volume: &Volume, snapshot: &ArcSwap<ReadSnapshot>, flush_gen: &AtomicU64) {
+    let new_gen = flush_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let (lbamap, extent_index) = volume.snapshot_maps();
+    snapshot.store(Arc::new(ReadSnapshot {
+        lbamap,
+        extent_index,
+        flush_gen: new_gen,
+    }));
+}
+
 impl VolumeActor {
-    /// Republish the snapshot with updated maps and increment `flush_gen`.
-    ///
-    /// Called after any operation that changes the extent index or LBA map:
-    /// WAL promotions (explicit flush, threshold, idle tick) and compaction
-    /// operations (sweep_pending, repack).  Handles compare `flush_gen` against
-    /// their cached value and evict their file-handle cache on a mismatch,
-    /// ensuring they never serve stale segment offsets after a compaction
-    /// deletes old segment files.
-    /// Acquire the volume mutex.
-    ///
-    /// Poisoning would mean library code panicked while holding the lock —
-    /// forbidden by CLAUDE.md's "no panic in library paths" rule. Once
-    /// poisoned, the volume's in-memory state is mid-mutation and this
-    /// actor thread is already doomed; we surface that with a clear
-    /// message rather than continuing on broken state.
-    fn lock_volume(&self) -> std::sync::MutexGuard<'_, Volume> {
-        self.volume.lock().expect("volume mutex poisoned")
+    fn lock_volume(&self) -> MutexGuard<'_, Volume> {
+        lock_volume(&self.volume)
     }
 
     fn publish_snapshot(&mut self) {
-        self.flush_gen += 1;
-        let (lbamap, extent_index) = self.lock_volume().snapshot_maps();
-        self.snapshot.store(Arc::new(ReadSnapshot {
-            lbamap,
-            extent_index,
-            flush_gen: self.flush_gen,
-        }));
+        let guard = self.lock_volume();
+        publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
     }
 
     /// `Flush` arrives.  The current WAL has already been fsynced
@@ -899,17 +905,10 @@ impl VolumeActor {
                         }
                     };
                     match req {
-                        VolumeRequest::Write { lba, data, reply } => {
-                            let result = self.lock_volume().write_owned(lba, data);
-                            if result.is_ok() {
-                                let (lbamap, extent_index) = self.lock_volume().snapshot_maps();
-                                self.snapshot.store(Arc::new(ReadSnapshot {
-                                    lbamap,
-                                    extent_index,
-                                    flush_gen: self.flush_gen,
-                                }));
-                            }
-                            let _ = reply.send(result);
+                        VolumeRequest::CheckPromote => {
+                            // Direct writers signal here when needs_promote()
+                            // is true post-write.  Idempotent — prepare_promote
+                            // handles an empty WAL by returning Ok(None).
                             if self.lock_volume().needs_promote() {
                                 self.dispatch_promote();
                             }
@@ -960,25 +959,6 @@ impl VolumeActor {
                                 Err(e) => {
                                     let _ = reply.send(Err(e));
                                 }
-                            }
-                        }
-                        VolumeRequest::Trim {
-                            start_lba,
-                            lba_count,
-                            reply,
-                        } => {
-                            let result = self.lock_volume().write_zeroes(start_lba, lba_count);
-                            if result.is_ok() {
-                                let (lbamap, extent_index) = self.lock_volume().snapshot_maps();
-                                self.snapshot.store(Arc::new(ReadSnapshot {
-                                    lbamap,
-                                    extent_index,
-                                    flush_gen: self.flush_gen,
-                                }));
-                            }
-                            let _ = reply.send(result);
-                            if self.lock_volume().needs_promote() {
-                                self.dispatch_promote();
                             }
                         }
                         VolumeRequest::Repack { reply } => {
@@ -1298,11 +1278,18 @@ pub struct VolumeClient {
     /// `VolumeClient` clones are still held by callers; tests rely on this
     /// to reopen the volume after `handle.shutdown()`.
     ///
-    /// A follow-up PR will use this to route hot-path writes directly through
-    /// the mutex rather than over the request channel; that path will
-    /// `upgrade()` for the duration of one write.
-    #[allow(dead_code)]
+    /// Hot-path writes acquire this lock directly (`write`, `write_zeroes`)
+    /// rather than going through the request channel, avoiding a thread
+    /// hop and a kernel-buffer copy on every I/O.
     volume: Weak<Mutex<Volume>>,
+    /// Shared snapshot-generation counter.  Bumped under the volume mutex
+    /// on every `publish_snapshot` (actor-side and direct-write paths).
+    /// `Weak` would suffice since the actor is the sole strong owner of
+    /// the underlying `AtomicU64` lifetime, but `Arc` keeps the load path
+    /// to a single deref — bumps only happen under the volume mutex,
+    /// which already pins the actor's strong ref while the actor thread
+    /// is alive.
+    flush_gen: Arc<AtomicU64>,
 }
 
 /// Per-thread reader for a volume session.
@@ -1362,40 +1349,68 @@ impl VolumeClient {
 }
 
 impl VolumeClient {
-    /// Write `data` at `lba` via the actor.  Blocks until the actor replies.
-    pub fn write(&self, lba: u64, data: Vec<u8>) -> io::Result<()> {
-        let (reply_tx, reply_rx) = bounded(1);
-        self.tx
-            .send(VolumeRequest::Write {
-                lba,
-                data,
-                reply: reply_tx,
-            })
-            .map_err(|_| io::Error::other("volume actor channel closed"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    /// Acquire the live `Volume` mutex.  Returns an error if the actor has
+    /// already exited (and therefore dropped its strong `Arc`), since the
+    /// `Volume` — and the WAL it owns — is gone.
+    fn volume(&self) -> io::Result<Arc<Mutex<Volume>>> {
+        self.volume
+            .upgrade()
+            .ok_or_else(|| io::Error::other("volume actor exited"))
     }
 
-    /// Zero `lba_count` blocks starting at `lba`.  Blocks until the actor replies.
+    /// Signal the actor that the WAL may have crossed the promote
+    /// threshold.  Fire-and-forget: a dropped signal (channel full) is
+    /// caught by the actor's idle tick.
+    fn signal_check_promote(&self) {
+        match self.tx.try_send(VolumeRequest::CheckPromote) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                // Actor exited.  The next direct write will surface the
+                // error via `volume()`; nothing to do here.
+            }
+        }
+    }
+
+    /// Write `data` at `lba` directly into the volume's WAL.
     ///
+    /// Acquires the volume mutex on the calling thread — no actor hop,
+    /// no per-write allocation.  Republishes the read snapshot under the
+    /// lock so reads see the write atomically with `flush_gen`.  If the
+    /// write pushed the WAL across the promote threshold, signals the
+    /// actor after releasing the lock (fire-and-forget; idempotent).
+    pub fn write(&self, lba: u64, data: &[u8]) -> io::Result<()> {
+        let volume = self.volume()?;
+        let needs_promote = {
+            let mut guard = lock_volume(&volume);
+            guard.write(lba, data)?;
+            publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
+            guard.needs_promote()
+        };
+        if needs_promote {
+            self.signal_check_promote();
+        }
+        Ok(())
+    }
+
+    /// Zero `lba_count` blocks starting at `lba`.  Direct path — see
+    /// [`VolumeClient::write`] for the lock/snapshot/signal pattern.
     /// Writes a single zero-extent WAL record — no hashing, no data payload.
     /// See [`Volume::write_zeroes`] for details.
     pub fn write_zeroes(&self, start_lba: u64, lba_count: u32) -> io::Result<()> {
-        let (reply_tx, reply_rx) = bounded(1);
-        self.tx
-            .send(VolumeRequest::Trim {
-                start_lba,
-                lba_count,
-                reply: reply_tx,
-            })
-            .map_err(|_| io::Error::other("volume actor channel closed"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+        let volume = self.volume()?;
+        let needs_promote = {
+            let mut guard = lock_volume(&volume);
+            guard.write_zeroes(start_lba, lba_count)?;
+            publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
+            guard.needs_promote()
+        };
+        if needs_promote {
+            self.signal_check_promote();
+        }
+        Ok(())
     }
 
-    /// Trim (discard) `lba_count` blocks starting at `lba`.  Blocks until the actor replies.
+    /// Trim (discard) `lba_count` blocks starting at `lba`.
     pub fn trim(&self, start_lba: u64, lba_count: u32) -> io::Result<()> {
         self.write_zeroes(start_lba, lba_count)
     }
@@ -2745,6 +2760,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
     });
 
     let volume = Arc::new(Mutex::new(volume));
+    let flush_gen = Arc::new(AtomicU64::new(0));
 
     // Channel depth of 64: enough to absorb bursts without blocking callers
     // while still providing backpressure if the actor falls behind.
@@ -2762,7 +2778,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         volume: Arc::clone(&volume),
         snapshot: Arc::clone(&snapshot),
         rx,
-        flush_gen: 0,
+        flush_gen: Arc::clone(&flush_gen),
         worker_tx: Some(worker_job_tx),
         worker_rx: worker_result_rx,
         worker_handle: Some(worker_handle),
@@ -2788,6 +2804,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         snapshot,
         config,
         volume: Arc::downgrade(&volume),
+        flush_gen,
     };
 
     (actor, client)
