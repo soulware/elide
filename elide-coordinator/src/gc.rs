@@ -1742,7 +1742,7 @@ mod tests {
 
         // Body present, but only entry 0's bit is set in `present`.
         fs::write(cache.join(format!("{ulid}.body")), b"stub").unwrap();
-        fs::write(cache.join(format!("{ulid}.present")), &[0b0000_0001u8]).unwrap();
+        fs::write(cache.join(format!("{ulid}.present")), [0b0000_0001u8]).unwrap();
         assert!(!is_cache_resident(&cache, &stats));
     }
 
@@ -1756,7 +1756,7 @@ mod tests {
         let stats = make_stats(ulid, 3, 0, false); // three Data entries
 
         fs::write(cache.join(format!("{ulid}.body")), b"stub").unwrap();
-        fs::write(cache.join(format!("{ulid}.present")), &[0b0000_0111u8]).unwrap();
+        fs::write(cache.join(format!("{ulid}.present")), [0b0000_0111u8]).unwrap();
         assert!(is_cache_resident(&cache, &stats));
     }
 
