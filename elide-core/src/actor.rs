@@ -1120,12 +1120,9 @@ impl VolumeActor {
 
                             // Complete any parked operations waiting for this ULID.
                             // GC checkpoint.
-                            let is_gc = self
-                                .parked_gc
-                                .as_ref()
-                                .is_some_and(|p| ulid == p.u_flush);
-                            if is_gc {
-                                let parked = self.parked_gc.take().unwrap();
+                            if let Some(parked) =
+                                self.parked_gc.take_if(|p| ulid == p.u_flush)
+                            {
                                 let _ = parked.reply.send(Ok(parked.u_gc));
                             }
                             // PromoteWal callers.
