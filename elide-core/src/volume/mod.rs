@@ -862,23 +862,23 @@ impl Volume {
     /// up the actor machinery.  See [`GcCheckpointUlids`] for why both
     /// ULIDs are minted before any I/O.
     pub fn gc_checkpoint_for_test(&mut self) -> io::Result<Ulid> {
-        let GcCheckpointUlids { u_gc, u_flush } = self.mint_gc_checkpoint_ulids();
+        let GcCheckpointUlids { u_buckets, u_flush } = self.mint_gc_checkpoint_ulids(1);
         // Flush the current WAL to pending/ under u_flush. If the WAL is
         // empty (or absent), the file is deleted/skipped and u_flush is unused.
         self.flush_wal_to_pending_as(u_flush)?;
         self.assert_volume_invariants("gc_checkpoint_for_test");
-        Ok(u_gc)
+        Ok(u_buckets[0])
     }
 
-    /// Mint the two ULIDs for a GC checkpoint, in ordering-invariant order.
+    /// Mint the ULIDs for a GC checkpoint, in ordering-invariant order:
+    /// `max_buckets` bucket ULIDs followed by `u_flush`.
     ///
-    /// See [`GcCheckpointUlids`] for the ordering invariant and why both
+    /// See [`GcCheckpointUlids`] for the ordering invariant and why all
     /// are minted before any I/O.
-    fn mint_gc_checkpoint_ulids(&mut self) -> GcCheckpointUlids {
-        GcCheckpointUlids {
-            u_gc: self.mint.next(),
-            u_flush: self.mint.next(),
-        }
+    fn mint_gc_checkpoint_ulids(&mut self, max_buckets: usize) -> GcCheckpointUlids {
+        let u_buckets: Vec<Ulid> = (0..max_buckets).map(|_| self.mint.next()).collect();
+        let u_flush = self.mint.next();
+        GcCheckpointUlids { u_buckets, u_flush }
     }
 
     /// Apply staged GC handoff files written by the coordinator.
@@ -2700,8 +2700,8 @@ impl Volume {
     /// Idle check fire on every tick under active writes and silently
     /// disable GC. We still run GC on every tick; we only stop creating
     /// a new WAL file when there is nothing to promote.
-    pub fn prepare_gc_checkpoint(&mut self) -> io::Result<GcCheckpointPrep> {
-        let GcCheckpointUlids { u_gc, u_flush } = self.mint_gc_checkpoint_ulids();
+    pub fn prepare_gc_checkpoint(&mut self, max_buckets: usize) -> io::Result<GcCheckpointPrep> {
+        let GcCheckpointUlids { u_buckets, u_flush } = self.mint_gc_checkpoint_ulids(max_buckets);
 
         if self.pending_entries.is_empty() {
             // Empty or absent WAL — delete any lingering file, leave wal None.
@@ -2709,7 +2709,7 @@ impl Volume {
                 fs::remove_file(&open.path)?;
             }
             return Ok(GcCheckpointPrep {
-                u_gc,
+                u_buckets,
                 u_flush,
                 job: None,
             });
@@ -2742,7 +2742,7 @@ impl Volume {
         let pending_dir = self.base_dir.join("pending");
 
         Ok(GcCheckpointPrep {
-            u_gc,
+            u_buckets,
             u_flush,
             job: Some(PromoteJob {
                 segment_ulid: u_flush,

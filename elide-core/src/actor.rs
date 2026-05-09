@@ -128,7 +128,12 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<()>>,
     },
     GcCheckpoint {
-        reply: Sender<io::Result<Ulid>>,
+        /// Number of bucket ULIDs to pre-mint. The coordinator picks
+        /// `<= max_buckets` of them for emitted plans; the rest are
+        /// discarded. Mint is a free `u128` counter so over-reserving
+        /// has no cost.
+        max_buckets: usize,
+        reply: Sender<io::Result<Vec<Ulid>>>,
     },
     Promote {
         ulid: Ulid,
@@ -280,9 +285,9 @@ struct ParkedPromoteSegment {
 
 /// State stashed while a GC checkpoint's promote is in flight.
 struct ParkedGcCheckpoint {
-    u_gc: Ulid,
+    u_buckets: Vec<Ulid>,
     u_flush: Ulid,
-    reply: Sender<io::Result<Ulid>>,
+    reply: Sender<io::Result<Vec<Ulid>>>,
 }
 
 /// State for an in-progress batch of GC plan handoff applications.
@@ -475,8 +480,8 @@ impl VolumeActor {
     /// immediately.  The reply is parked until `PromoteComplete` for
     /// `u_flush` arrives so that `pending/<u_flush>` is on disk before
     /// the coordinator runs `gc_fork`.
-    fn start_gc_checkpoint(&mut self, reply: Sender<io::Result<Ulid>>) {
-        let prep = match self.lock_volume().prepare_gc_checkpoint() {
+    fn start_gc_checkpoint(&mut self, max_buckets: usize, reply: Sender<io::Result<Vec<Ulid>>>) {
+        let prep = match self.lock_volume().prepare_gc_checkpoint(max_buckets) {
             Ok(prep) => prep,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -484,12 +489,16 @@ impl VolumeActor {
             }
         };
 
-        let GcCheckpointPrep { u_gc, u_flush, job } = prep;
+        let GcCheckpointPrep {
+            u_buckets,
+            u_flush,
+            job,
+        } = prep;
 
         if let Some(job) = job {
             // Dispatch to worker, park the reply.
             self.parked_gc = Some(ParkedGcCheckpoint {
-                u_gc,
+                u_buckets,
                 u_flush,
                 reply,
             });
@@ -511,7 +520,7 @@ impl VolumeActor {
         } else {
             // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
             self.publish_snapshot();
-            let _ = reply.send(Ok(u_gc));
+            let _ = reply.send(Ok(u_buckets));
         }
     }
 
@@ -985,14 +994,14 @@ impl VolumeActor {
                         VolumeRequest::ApplyGcHandoffs { reply } => {
                             self.start_gc_handoffs(Some(reply));
                         }
-                        VolumeRequest::GcCheckpoint { reply } => {
+                        VolumeRequest::GcCheckpoint { max_buckets, reply } => {
                             if self.parked_gc.is_some() {
                                 // Concurrent GC checkpoint is an error.
                                 let _ = reply.send(Err(io::Error::other(
                                     "concurrent gc_checkpoint not allowed",
                                 )));
                             } else {
-                                self.start_gc_checkpoint(reply);
+                                self.start_gc_checkpoint(max_buckets, reply);
                             }
                         }
                         VolumeRequest::Promote { ulid, reply } => {
@@ -1127,7 +1136,7 @@ impl VolumeActor {
                             if let Some(parked) =
                                 self.parked_gc.take_if(|p| ulid == p.u_flush)
                             {
-                                let _ = parked.reply.send(Ok(parked.u_gc));
+                                let _ = parked.reply.send(Ok(parked.u_buckets));
                             }
                             // PromoteWal callers.
                             let mut i = 0;
@@ -1512,13 +1521,21 @@ impl VolumeClient {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Establish a GC checkpoint: flush the WAL and return a fresh ULID for
-    /// the GC output segment.  The ULID is strictly ordered below the fresh
-    /// WAL's ULID.  Blocks until the actor replies.
-    pub fn gc_checkpoint(&self) -> io::Result<Ulid> {
+    /// Establish a GC checkpoint: flush the WAL and return `max_buckets`
+    /// pre-minted output ULIDs for the GC output segments. Each bucket
+    /// ULID is strictly ordered below the fresh WAL's ULID. Blocks until
+    /// the actor replies.
+    ///
+    /// The coordinator picks at most `max_buckets` of the returned ULIDs
+    /// for the plans it emits this tick; unused ULIDs are simply
+    /// discarded (the volume's mint advances past them anyway).
+    pub fn gc_checkpoint(&self, max_buckets: usize) -> io::Result<Vec<Ulid>> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
-            .send(VolumeRequest::GcCheckpoint { reply: reply_tx })
+            .send(VolumeRequest::GcCheckpoint {
+                max_buckets,
+                reply: reply_tx,
+            })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()

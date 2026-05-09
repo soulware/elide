@@ -28,8 +28,12 @@ pub enum VolumeRequest {
     Repack,
     /// Rewrite post-snapshot pending segments as zstd-dictionary deltas.
     DeltaRepack,
-    /// Flush the WAL and return a fresh GC output ULID.
-    GcCheckpoint,
+    /// Flush the WAL and return `max_buckets` pre-minted GC output
+    /// ULIDs. The coordinator emits up to one plan per ULID this tick.
+    GcCheckpoint {
+        #[serde(default = "default_max_buckets")]
+        max_buckets: u32,
+    },
     /// Apply staged GC handoffs into the in-memory extent index.
     ApplyGcHandoffs,
     /// Sign and write `snapshots/<snap_ulid>.manifest` plus the marker.
@@ -63,10 +67,16 @@ pub struct DeltaRepackReply {
     pub stats: DeltaRepackStats,
 }
 
-/// Reply for [`VolumeRequest::GcCheckpoint`].
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// Reply for [`VolumeRequest::GcCheckpoint`]. Carries one ULID per
+/// pre-minted output bucket; length matches the request's `max_buckets`.
+/// The coordinator uses up to that many for emitted plans this tick.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcCheckpointReply {
-    pub gc_ulid: Ulid,
+    pub bucket_ulids: Vec<Ulid>,
+}
+
+fn default_max_buckets() -> u32 {
+    1
 }
 
 /// Reply for [`VolumeRequest::ApplyGcHandoffs`].

@@ -1,30 +1,39 @@
 // Coordinator-side S3 segment GC.
 //
-// Single per-tick selection that bin-packs eligible segments into one output
-// plan (≤ SWEEP_LIVE_CAP = 32 MiB live bytes rewritten per tick). Replaces
-// the former dead/repack/sweep three-pass split with one rule:
+// Per-tick first-fit-decreasing bin-pack across cache-resident eligible
+// segments, emitting up to `max_buckets_per_tick` output plans (each ≤
+// SWEEP_LIVE_CAP = 32 MiB live bytes / SWEEP_ENTRY_CAP = 8192 entries).
+// See `docs/design-gc-bucket-unification.md`.
 //
 //   Eligibility:
 //     * dead input — live_lba_bytes == 0, includable at zero rewrite cost
 //       (contributes to the output's `inputs` list, not its body).
 //     * small     — live_lba_bytes ≤ SWEEP_SMALL_THRESHOLD (16 MiB), any
 //       density. Consolidation candidate.
-//     * sparse    — density < density_threshold, any size. Reclamation
-//       candidate.
-//   Snapshot-floor segments are ineligible.
+//     * sparse    — density < density_threshold AND has dead bytes, any
+//       size. Reclamation candidate.
+//     Snapshot-floor and partial-LBA-death-Delta-deferred segments are
+//     ineligible.
+//
+//   Cache-residency filter:
+//     A candidate is eligible only when its body is fully resolvable
+//     without an S3 GET — `cache/<ulid>.body` exists AND every body-
+//     bearing live entry's bit is set in `cache/<ulid>.present`. Cold
+//     segments wait for organic warming (read, peer hint) before GC
+//     touches them. Lazy volumes still GC their own writes because
+//     locally-promoted segments are fully cache-resident at promote time.
 //
 //   Packing:
-//     1. All tombstone-like inputs fold in for free.
-//     2. Smalls sort ascending by live_lba_bytes and greedy-fill the 32 MiB
-//        live budget.
-//     3. One filler may top up the remaining headroom — chosen from the
-//        sparse-large set (live_lba_bytes > 16 MiB AND density < threshold).
-//        Among candidates that fit, prefer lowest density (maximum dead-
-//        byte reclamation); ties broken by largest live bytes (best fit).
+//     Tombstones fold for free into the first bucket (no body bytes).
+//     Other candidates sort descending by live_lba_bytes (FFD), placed
+//     into the first bucket with enough remaining live + entry budget;
+//     a new bucket is opened up to the cap. Each bucket emits one
+//     `gc/<u_bucket_i>.plan`. Per-bucket skip-check drops trivially-
+//     pointless buckets (single dense non-sparse non-tombstone input).
 //
-// Produces one output segment per tick under `u_gc`, or nothing if no
-// eligible input exists. Per-tick work is bounded by the 32 MiB live cap
-// plus O(1)-per-input tombstone bookkeeping on the apply side.
+// Per-tick work is bounded by `max_buckets × (32 MiB live + 8192 entries)`
+// of cache-resident input, plus O(1)-per-input tombstone bookkeeping on
+// the apply side.
 //
 // Handoff protocol (plan-based, crash-safe, filesystem-only coordination —
 // see docs/design-gc-plan-handoff.md for the full design):
@@ -68,7 +77,7 @@ use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use ulid::Ulid;
 
-use elide_core::extentindex::{self, ExtentIndex};
+use elide_core::extentindex::{self, ExtentIndex, SegmentPresence};
 use elide_core::lbamap::{self, LbaMap};
 use elide_core::rewrite_plan::{PlanOutput, RewritePlan};
 use elide_core::segment::{self, EntryKind, SegmentEntry};
@@ -125,21 +134,32 @@ pub enum NoneReason {
     NoCandidates,
 }
 
-/// Results from one GC pass.
+/// Results from one GC pass. Aggregates across all buckets emitted this
+/// tick — a multi-bucket pass sums input counts, bytes freed, and dead
+/// inputs over every plan.
 pub struct GcStats {
     pub strategy: GcStrategy,
-    /// Number of input segments compacted.
+    /// Number of input segments compacted across all buckets.
     pub candidates: usize,
-    /// Estimated bytes freed (dead bytes removed from old segments).
+    /// Estimated bytes freed across all buckets (dead bytes that won't
+    /// be carried into outputs).
     pub bytes_freed: u64,
     /// Total segments considered during this pass (above the snapshot floor).
     pub total_segments: usize,
-    /// Number of fully-dead segments cleaned up in the pre-pass.
+    /// Number of fully-dead segments cleaned up across all buckets.
     pub dead_cleaned: usize,
     /// Number of segments held back because they have at least one
     /// partially-LBA-dead body-bearing entry. See
     /// `docs/design-gc-overlap-correctness.md`.
     pub deferred: usize,
+    /// Number of plans emitted this tick (number of `gc/<ulid>.plan`
+    /// files written). Zero on `None` outcomes.
+    pub buckets_emitted: usize,
+    /// Number of eligible candidates filtered out this pass because
+    /// their body is not fully cache-resident. Useful for diagnosing
+    /// "GC is idle but lots of dead bytes on disk" — typically means
+    /// the volume hasn't read the relevant segments yet.
+    pub deferred_cold: usize,
 }
 
 impl GcStats {
@@ -151,33 +171,43 @@ impl GcStats {
             dead_cleaned: 0,
             deferred: 0,
             total_segments,
+            buckets_emitted: 0,
+            deferred_cold: 0,
         }
     }
 }
 
 /// Run one GC pass for a single fork.
 ///
-/// Selects up to one bucket of eligible segments (dead | small | sparse)
-/// via the rules documented at the top of this module, and emits a single
-/// plan under `u_gc`. Returns `GcStrategy::None(reason)` if nothing was
-/// eligible; the reason distinguishes genuine idle (`NoCandidates`) from
-/// transient bail-outs (`NoIndex`, `PendingHandoffs`).
+/// Selects up to `bucket_ulids.len()` independent buckets of eligible
+/// segments (dead | small | sparse, filtered to cache-resident candidates)
+/// via FFD bin-packing, and emits one plan per bucket under the
+/// corresponding `bucket_ulids[i]`. Returns `GcStrategy::None(reason)` if
+/// nothing was eligible; the reason distinguishes genuine idle
+/// (`NoCandidates`) from transient bail-outs (`NoIndex`,
+/// `PendingHandoffs`).
 ///
-/// `u_gc` must be pre-resolved via `gc_checkpoint` IPC before calling this
-/// function — it originates from the volume process so that ULID ordering
-/// is consistent with the volume's write clock.
+/// `bucket_ulids` must be pre-resolved via `gc_checkpoint` IPC before
+/// calling this function — they originate from the volume process so that
+/// ULID ordering is consistent with the volume's write clock. Unused
+/// ULIDs (when fewer buckets are emitted than were reserved) are simply
+/// discarded — the volume's mint has already advanced past them.
 ///
 /// `by_id_dir` is the data-dir root that houses `<volume_ulid>/` fork
-/// directories. Passed so that
-/// `walk_ancestors` can resolve the fork chain — the liveness rebuild must
-/// include ancestor layers, otherwise hashes live only via an ancestor LBA
-/// look dead to the coordinator and trip stale-liveness on apply.
+/// directories. Passed so that `walk_ancestors` can resolve the fork
+/// chain — the liveness rebuild must include ancestor layers, otherwise
+/// hashes live only via an ancestor LBA look dead to the coordinator and
+/// trip stale-liveness on apply.
 pub fn gc_fork(
     fork_dir: &Path,
     by_id_dir: &Path,
     config: &GcConfig,
-    u_gc: Ulid,
+    bucket_ulids: Vec<Ulid>,
 ) -> Result<GcStats> {
+    if bucket_ulids.is_empty() {
+        return Ok(GcStats::none(NoneReason::NoCandidates, 0));
+    }
+
     let index_dir = fork_dir.join("index");
     if !index_dir.exists() {
         return Ok(GcStats::none(NoneReason::NoIndex, 0));
@@ -195,7 +225,7 @@ pub fn gc_fork(
 
     // Clean up stale `<ulid>.staged.tmp` scratch from a prior crashed
     // compaction. Safe to remove unconditionally: the current pass mints
-    // a fresh ULID via `gc_checkpoint`, so no in-flight write targets
+    // fresh ULIDs via `gc_checkpoint`, so no in-flight write targets
     // any existing stale scratch.
     cleanup_staging_files(&gc_dir);
 
@@ -203,28 +233,94 @@ pub fn gc_fork(
     let total_segments = pass.total_segments;
     let deferred_count = pass.deferred_count;
 
-    match select_bucket(pass.eligible_stats, config, u_gc) {
-        SelectionOutcome::NoCandidates => Ok(GcStats {
+    // Cache-residency filter: drop candidates whose bodies aren't fully
+    // resolvable from local cache. Cold candidates wait for organic
+    // warming; GC never issues an S3 GET purely to enable a rewrite.
+    let cache_dir = fork_dir.join("cache");
+    let (resident_stats, cold_stats): (Vec<SegmentStats>, Vec<SegmentStats>) = pass
+        .eligible_stats
+        .into_iter()
+        .partition(|s| is_cache_resident(&cache_dir, s));
+    let deferred_cold = cold_stats.len();
+    if deferred_cold > 0 {
+        let cold_ulids: Vec<String> = cold_stats
+            .iter()
+            .map(|s| s.ulid_str[..8].to_string())
+            .collect();
+        tracing::info!(
+            "[gc] deferring {deferred_cold} cold-cache segment(s): [{}]",
+            cold_ulids.join(", ")
+        );
+    }
+
+    let buckets = select_buckets(resident_stats, config, bucket_ulids.len());
+    if buckets.is_empty() {
+        return Ok(GcStats {
             strategy: GcStrategy::None(NoneReason::NoCandidates),
             candidates: 0,
             bytes_freed: 0,
             dead_cleaned: 0,
             deferred: deferred_count,
             total_segments,
-        }),
-        SelectionOutcome::Compact(packed) => {
-            compact_segments(packed.bucket, &gc_dir, u_gc, &pass.live_hashes)
-                .context("gc compaction")?;
-            Ok(GcStats {
-                strategy: GcStrategy::Compact,
-                candidates: packed.candidates,
-                bytes_freed: packed.bytes_freed,
-                dead_cleaned: packed.dead_cleaned,
-                deferred: deferred_count,
-                total_segments,
-            })
-        }
+            buckets_emitted: 0,
+            deferred_cold,
+        });
     }
+
+    let mut total_candidates = 0usize;
+    let mut total_bytes_freed = 0u64;
+    let mut total_dead_cleaned = 0usize;
+    let mut buckets_emitted = 0usize;
+    for (packed, u_bucket) in buckets.into_iter().zip(bucket_ulids.into_iter()) {
+        compact_segments(packed.bucket, &gc_dir, u_bucket, &pass.live_hashes)
+            .context("gc compaction")?;
+        total_candidates += packed.candidates;
+        total_bytes_freed += packed.bytes_freed;
+        total_dead_cleaned += packed.dead_cleaned;
+        buckets_emitted += 1;
+    }
+
+    Ok(GcStats {
+        strategy: GcStrategy::Compact,
+        candidates: total_candidates,
+        bytes_freed: total_bytes_freed,
+        dead_cleaned: total_dead_cleaned,
+        deferred: deferred_count,
+        total_segments,
+        buckets_emitted,
+        deferred_cold,
+    })
+}
+
+/// True if the segment's body is fully resolvable from `cache/` without
+/// an S3 GET. A segment with no body-bearing live entries is trivially
+/// resident (only DedupRef / Inline / Zero entries, whose bytes either
+/// don't exist or live in the index section).
+fn is_cache_resident(cache_dir: &Path, stats: &SegmentStats) -> bool {
+    let body_bearing: Vec<u32> = stats
+        .live_entries
+        .iter()
+        .zip(stats.live_entry_indices.iter())
+        .filter_map(|(e, idx)| e.kind.is_data().then_some(*idx))
+        .collect();
+    if body_bearing.is_empty() {
+        // No `cache/<ulid>.body` slice is needed for materialisation —
+        // the volume's BlockReader resolves DedupRef via canonical
+        // segments (their own residency is checked when they're
+        // candidates) and Inline / Zero from the index section.
+        return true;
+    }
+    let body_path = cache_dir.join(format!("{}.body", stats.ulid_str));
+    if !body_path.exists() {
+        return false;
+    }
+    let present_path = cache_dir.join(format!("{}.present", stats.ulid_str));
+    let Ok(present_bytes) = fs::read(&present_path) else {
+        return false;
+    };
+    let max_idx = body_bearing.iter().copied().max().unwrap_or(0);
+    let presence = SegmentPresence::from_bytes(&present_bytes, max_idx + 1);
+    body_bearing.iter().all(|idx| presence.test(*idx))
 }
 
 /// Per-pass state loaded from disk — vk, ancestor-walked extent index, lbamap
@@ -314,149 +410,152 @@ struct PackedBucket {
     dead_cleaned: usize,
 }
 
-enum SelectionOutcome {
-    Compact(PackedBucket),
-    NoCandidates,
-}
+/// First-fit-decreasing bin-pack across all eligible cache-resident
+/// segments, capped at `max_buckets` outputs.
+///
+/// The classic FFD shape: candidates sort descending by `live_lba_bytes`,
+/// each placed in the first bucket with enough remaining live + entry
+/// budget; a new bucket is opened up to the cap. Tombstones fold into
+/// the first bucket for free (zero body, zero output entries).
+///
+/// Per-bucket skip-check drops trivially-pointless buckets (a single
+/// dense non-sparse non-tombstone input is a pointless rewrite). The
+/// caller treats an empty result as `GcStrategy::None(NoCandidates)`.
+fn select_buckets(
+    eligible: Vec<SegmentStats>,
+    config: &GcConfig,
+    max_buckets: usize,
+) -> Vec<PackedBucket> {
+    if max_buckets == 0 {
+        return Vec::new();
+    }
 
-/// Partition eligible stats into dead/small/large, filter sparse-large
-/// fillers, run the bin-pack, skip-check the result, then sort by ULID
-/// and emit the per-pass log line.
-fn select_bucket(eligible: Vec<SegmentStats>, config: &GcConfig, u_gc: Ulid) -> SelectionOutcome {
-    // Partition the stats into three disjoint buckets by shape:
-    //   * dead  — no live entries, no removed hashes (tombstone-only input).
-    //   * small — live_lba_bytes ≤ SWEEP_SMALL_THRESHOLD.
-    //   * large — everything else above the snapshot floor.
-    //
-    // Dead inputs are "free" packing candidates: they contribute to the
-    // output's inputs list and let promote_segment drop the stale .idx at
-    // apply time, without writing any body bytes for them.
-    //
-    // Smalls admit any entry kind (DATA, DEDUP_REF, Delta, Zero) — under
-    // the plan-handoff protocol the volume materialises the output, so
-    // consolidating e.g. several DEDUP_REF-only segments into one is a
-    // legitimate reclamation of S3 object count even without any physical
-    // body bytes to rewrite.
-    let mut dead_inputs: Vec<SegmentStats> = Vec::new();
-    let mut small_inputs: Vec<SegmentStats> = Vec::new();
-    let mut large_inputs: Vec<SegmentStats> = Vec::new();
+    let density_threshold = config.density_threshold;
+
+    // Partition into tombstones, residency-OK candidates whose rewrite is
+    // worth pursuing, and the rest (dropped here — a dense large input
+    // with no dead bytes never warrants a rewrite, regardless of bucket
+    // headroom). `has_data_content` excludes pure DedupRef/Zero/Inline
+    // segments where rewriting reclaims no physical body — they pack
+    // only as part of a tombstone-fold or a small-with-dead bucket.
+    let mut tombstones: Vec<SegmentStats> = Vec::new();
+    let mut candidates: Vec<SegmentStats> = Vec::new();
     for s in eligible {
         if s.live_entries.is_empty() && s.removed_hashes.is_empty() {
-            dead_inputs.push(s);
-        } else if s.live_lba_bytes <= SWEEP_SMALL_THRESHOLD {
-            small_inputs.push(s);
-        } else {
-            large_inputs.push(s);
+            tombstones.push(s);
+            continue;
         }
+        let is_small = s.live_lba_bytes <= SWEEP_SMALL_THRESHOLD;
+        let is_sparse =
+            s.density() < density_threshold && s.dead_lba_bytes() > 0 && s.has_data_content();
+        if is_small || is_sparse {
+            candidates.push(s);
+        }
+        // Else: dense-large with no dead bytes (or no body content) —
+        // rewriting it never pays for itself. Leave for retention.
     }
 
-    // Sparse-large candidates eligible to fill remaining headroom. Both
-    // density and dead-bytes-present gates mirror what the old per-pass
-    // repack enforced so a dense-large segment is never rewritten solely
-    // for consolidation — the only benefit would be one fewer S3 object,
-    // at the cost of rewriting ~16+ MiB of live bytes. `has_data_content`
-    // excludes DEDUP_REF-only / Zero-only segments where rewriting
-    // reclaims no physical body.
-    let density_threshold = config.density_threshold;
-    let sparse_large: Vec<SegmentStats> = large_inputs
-        .into_iter()
-        .filter(|s| {
-            s.density() < density_threshold && s.dead_lba_bytes() > 0 && s.has_data_content()
-        })
-        .collect();
+    // FFD: descending by live_lba_bytes. Ties broken by ULID for
+    // determinism.
+    candidates.sort_by(|a, b| {
+        b.live_lba_bytes
+            .cmp(&a.live_lba_bytes)
+            .then_with(|| a.ulid_str.cmp(&b.ulid_str))
+    });
 
-    // Smalls sorted ascending by live bytes for tightest bin-pack.
-    small_inputs.sort_by_key(|s| s.live_lba_bytes);
-
-    let mut bucket: Vec<SegmentStats> = Vec::new();
-    let mut budget = SWEEP_LIVE_CAP;
-    let mut entry_budget = SWEEP_ENTRY_CAP;
-
-    // Tier 0 — tombstone inputs. Free in both body bytes and output entries
-    // (they emit `Drop` records, not fresh entries). No budget effect.
-    bucket.append(&mut dead_inputs);
-
-    // Tier 1 — smalls, ascending. Greedy until the next would exceed either
-    // the live-bytes budget or the output-entry budget.
-    for s in small_inputs {
-        let s_entries = s.estimated_output_entries();
-        if s.live_lba_bytes <= budget && s_entries <= entry_budget {
-            budget -= s.live_lba_bytes;
-            entry_budget -= s_entries;
-            bucket.push(s);
-        }
+    struct OpenBucket {
+        items: Vec<SegmentStats>,
+        budget: u64,
+        entry_budget: usize,
     }
 
-    // Tier 2 — at most one sparse-large filler. Prefer lowest density
-    // (maximum dead-byte reclamation per rewritten byte); tie-break by
-    // largest live_lba_bytes (best fit for the remaining headroom).
-    // Filler must also fit the remaining entry budget.
-    if budget > 0
-        && entry_budget > 0
-        && let Some((pos, _)) = sparse_large
+    let mut buckets: Vec<OpenBucket> = Vec::new();
+    for c in candidates {
+        let entries_needed = c.estimated_output_entries();
+        let placement = buckets
             .iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                s.live_lba_bytes <= budget && s.estimated_output_entries() <= entry_budget
-            })
-            .min_by(|(_, a), (_, b)| {
-                a.density()
-                    .partial_cmp(&b.density())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.live_lba_bytes.cmp(&a.live_lba_bytes))
-            })
-    {
-        let mut sparse_large = sparse_large;
-        bucket.push(sparse_large.remove(pos));
+            .position(|b| c.live_lba_bytes <= b.budget && entries_needed <= b.entry_budget);
+        if let Some(idx) = placement {
+            let b = &mut buckets[idx];
+            b.budget -= c.live_lba_bytes;
+            b.entry_budget -= entries_needed;
+            b.items.push(c);
+        } else if buckets.len() < max_buckets {
+            // Single oversize input goes into a solo bucket. Even if it
+            // exceeds SWEEP_LIVE_CAP — better one bloated output than
+            // skipping reclamation entirely. Rare in practice (live
+            // bytes > 32 MiB on a snapshot-floor-eligible segment).
+            buckets.push(OpenBucket {
+                budget: SWEEP_LIVE_CAP.saturating_sub(c.live_lba_bytes),
+                entry_budget: SWEEP_ENTRY_CAP.saturating_sub(entries_needed),
+                items: vec![c],
+            });
+        }
+        // Else: no bucket has room and we're at the cap. Drop on the
+        // floor; next tick will re-evaluate.
     }
 
-    // Skip a pass that has no reclamation benefit. A bucket is worth
-    // emitting only if:
-    //   * it folds in at least one tombstone (a DELETE either way), or
-    //   * it folds in a sparse segment (rewrite reclaims dead bytes), or
-    //   * it consolidates ≥ 2 inputs (one fewer S3 object per pack).
-    // A single dense small input on its own is a pointless rewrite.
-    let has_dead = bucket
-        .iter()
-        .any(|s| s.live_entries.is_empty() && s.removed_hashes.is_empty());
-    let has_sparse = bucket.iter().any(|s| s.density() < density_threshold);
-    if !has_dead && !has_sparse && bucket.len() < 2 {
-        return SelectionOutcome::NoCandidates;
+    // Tombstones fold into the first bucket (any bucket; they cost
+    // nothing). If there are no candidate buckets but there are
+    // tombstones, open a tombstone-only bucket — the all-dead handoff is
+    // a real, useful output (zero-entry plan that lets inputs be
+    // deleted).
+    if !tombstones.is_empty() {
+        if buckets.is_empty() {
+            buckets.push(OpenBucket {
+                items: tombstones,
+                budget: SWEEP_LIVE_CAP,
+                entry_budget: SWEEP_ENTRY_CAP,
+            });
+        } else {
+            buckets[0].items.extend(tombstones);
+        }
     }
 
-    // Sort the bucket back into ULID order before handing it to
-    // `compact_segments` so its rebuild-order semantics hold (when two
-    // input segments cover the same LBA the latest source wins).
-    bucket.sort_by(|a, b| a.ulid_str.cmp(&b.ulid_str));
+    // Per-bucket skip-check + accounting + per-bucket log line.
+    let mut packed_out: Vec<PackedBucket> = Vec::new();
+    for OpenBucket { mut items, .. } in buckets {
+        let has_dead = items
+            .iter()
+            .any(|s| s.live_entries.is_empty() && s.removed_hashes.is_empty());
+        let has_sparse = items.iter().any(|s| s.density() < density_threshold);
+        if !has_dead && !has_sparse && items.len() < 2 {
+            // Single dense non-sparse non-tombstone input: pointless
+            // rewrite. Drop the bucket.
+            continue;
+        }
 
-    let candidates = bucket.len();
-    let bytes_freed: u64 = bucket.iter().map(|s| s.dead_lba_bytes()).sum();
-    let live_bytes: u64 = bucket.iter().map(|s| s.live_lba_bytes).sum();
-    let live_entries: usize = bucket.iter().map(|s| s.live_entries.len()).sum();
-    let removed_hashes: usize = bucket.iter().map(|s| s.removed_hashes.len()).sum();
-    let dead_cleaned = bucket
-        .iter()
-        .filter(|s| s.live_entries.is_empty() && s.removed_hashes.is_empty())
-        .count();
-    let input_ulids: Vec<&str> = bucket.iter().map(|s| s.ulid_str.as_str()).collect();
-    tracing::info!(
-        "[gc] compact: [{}] → {u_gc} inputs={} live_lba={} dead_lba={} \
-         live_entries={} removed_hashes={} dead_folded={}",
-        input_ulids.join(", "),
-        candidates,
-        live_bytes,
-        bytes_freed,
-        live_entries,
-        removed_hashes,
-        dead_cleaned,
-    );
+        // Sort the bucket back into ULID order before handing it to
+        // `compact_segments` so its rebuild-order semantics hold (when
+        // two input segments cover the same LBA the latest source wins).
+        items.sort_by(|a, b| a.ulid_str.cmp(&b.ulid_str));
 
-    SelectionOutcome::Compact(PackedBucket {
-        bucket,
-        candidates,
-        bytes_freed,
-        dead_cleaned,
-    })
+        let candidates = items.len();
+        let bytes_freed: u64 = items.iter().map(|s| s.dead_lba_bytes()).sum();
+        let live_bytes: u64 = items.iter().map(|s| s.live_lba_bytes).sum();
+        let live_entries: usize = items.iter().map(|s| s.live_entries.len()).sum();
+        let removed_hashes: usize = items.iter().map(|s| s.removed_hashes.len()).sum();
+        let dead_cleaned = items
+            .iter()
+            .filter(|s| s.live_entries.is_empty() && s.removed_hashes.is_empty())
+            .count();
+        let input_ulids: Vec<&str> = items.iter().map(|s| s.ulid_str.as_str()).collect();
+        tracing::info!(
+            "[gc] bucket: [{}] inputs={candidates} live_lba={live_bytes} \
+             dead_lba={bytes_freed} live_entries={live_entries} \
+             removed_hashes={removed_hashes} dead_folded={dead_cleaned}",
+            input_ulids.join(", "),
+        );
+
+        packed_out.push(PackedBucket {
+            bucket: items,
+            candidates,
+            bytes_freed,
+            dead_cleaned,
+        });
+    }
+
+    packed_out
 }
 
 /// Process volume-applied GC handoffs: walk bare `gc/<ulid>` files, upload
@@ -1436,6 +1535,231 @@ mod tests {
         assert!(!has_pending_results(&gc_dir).unwrap());
     }
 
+    /// Build a `SegmentStats` fixture from a stub specification.
+    ///
+    /// `live_data_entries` is the number of live `Data` entries the segment
+    /// claims to have (each accounted as `BLOCK_BYTES` of live LBA). The
+    /// total LBA bytes is taken as `live_lba_bytes + dead_lba_bytes`.
+    ///
+    /// `live_data_entries == 0` produces a tombstone-shaped input
+    /// (no live entries, no removed hashes).
+    fn make_stats(
+        ulid: Ulid,
+        live_data_entries: usize,
+        dead_lba_bytes: u64,
+        density_below_threshold: bool,
+    ) -> SegmentStats {
+        let live_lba_bytes = live_data_entries as u64 * BLOCK_BYTES;
+        let total_lba_bytes = live_lba_bytes + dead_lba_bytes;
+        // Allocate dummy bodies above INLINE_THRESHOLD (256) so kind = Data.
+        let live_entries: Vec<SegmentEntry> = (0..live_data_entries)
+            .map(|i| {
+                SegmentEntry::new_data(
+                    blake3::hash(&[i as u8]),
+                    i as u64,
+                    1,
+                    elide_core::segment::SegmentFlags::empty(),
+                    vec![0u8; 512],
+                )
+            })
+            .collect();
+        let live_entry_indices: Vec<u32> = (0..live_data_entries as u32).collect();
+        let partial_death_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>> =
+            vec![None; live_data_entries];
+        // density_below_threshold flips dead-fraction past the default 0.70
+        // density threshold by inflating dead bytes if the caller indicated
+        // we want a sparse classification but didn't pass enough dead.
+        let total_lba_bytes = if density_below_threshold && live_data_entries > 0 {
+            // density = live / total; want < 0.70, so total ≥ live / 0.69
+            let want_total = ((live_lba_bytes as f64) / 0.69).ceil() as u64;
+            total_lba_bytes.max(want_total)
+        } else {
+            total_lba_bytes
+        };
+        SegmentStats {
+            ulid_str: ulid.to_string(),
+            live_lba_bytes,
+            total_lba_bytes,
+            has_body_entries: live_data_entries > 0,
+            live_entries,
+            live_entry_indices,
+            removed_hashes: Vec::new(),
+            partial_death_runs,
+            has_partial_death: false,
+        }
+    }
+
+    fn make_config(density_threshold: f64) -> crate::config::GcConfig {
+        crate::config::GcConfig {
+            density_threshold,
+            ..crate::config::GcConfig::default()
+        }
+    }
+
+    #[test]
+    fn select_buckets_packs_smalls_into_one_bucket_when_they_fit() {
+        // Two smalls, plenty of headroom in a single bucket.
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        let a = make_stats(next(), 4, 0, false); // 16 KiB live, dense
+        let b = make_stats(next(), 4, 0, false);
+        let buckets = select_buckets(vec![a, b], &make_config(0.70), 4);
+        assert_eq!(buckets.len(), 1, "small pair fits in a single bucket");
+        assert_eq!(buckets[0].candidates, 2);
+    }
+
+    #[test]
+    fn select_buckets_emits_multiple_when_one_bucket_overflows() {
+        // Two segments each over half the live cap → can't share a bucket.
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        // 17 MiB live each (each individually fits SWEEP_LIVE_CAP=32 MiB
+        // but two together don't). Sparse so they're eligible.
+        let entries = (17 * 1024 * 1024 / BLOCK_BYTES) as usize;
+        let dead = 17 * 1024 * 1024;
+        let a = make_stats(next(), entries, dead, true);
+        let b = make_stats(next(), entries, dead, true);
+        let buckets = select_buckets(vec![a, b], &make_config(0.70), 4);
+        assert_eq!(buckets.len(), 2, "FFD opens a second bucket when needed");
+        assert_eq!(buckets[0].candidates, 1);
+        assert_eq!(buckets[1].candidates, 1);
+    }
+
+    #[test]
+    fn select_buckets_respects_max_buckets_cap() {
+        // Three sparse-large inputs that can't share, but cap = 1.
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        let entries = (17 * 1024 * 1024 / BLOCK_BYTES) as usize;
+        let dead = 17 * 1024 * 1024;
+        let inputs: Vec<SegmentStats> = (0..3)
+            .map(|_| make_stats(next(), entries, dead, true))
+            .collect();
+        let buckets = select_buckets(inputs, &make_config(0.70), 1);
+        assert_eq!(buckets.len(), 1, "cap holds even when more would fit");
+    }
+
+    #[test]
+    fn select_buckets_folds_tombstones_into_first_bucket() {
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        let small_a = make_stats(next(), 2, 0, false);
+        let small_b = make_stats(next(), 2, 0, false);
+        let tomb_a = make_stats(next(), 0, 4 * BLOCK_BYTES, false);
+        let tomb_b = make_stats(next(), 0, 8 * BLOCK_BYTES, false);
+        let buckets = select_buckets(
+            vec![small_a, small_b, tomb_a, tomb_b],
+            &make_config(0.70),
+            4,
+        );
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].candidates, 4, "two smalls + two tombstones");
+        assert_eq!(
+            buckets[0].dead_cleaned, 2,
+            "tombstones counted as dead-cleaned"
+        );
+    }
+
+    #[test]
+    fn select_buckets_emits_tombstone_only_bucket_with_no_other_candidates() {
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        let tomb = make_stats(next(), 0, 8 * BLOCK_BYTES, false);
+        let buckets = select_buckets(vec![tomb], &make_config(0.70), 4);
+        assert_eq!(buckets.len(), 1, "tombstone-only handoff is still emitted");
+        assert_eq!(buckets[0].dead_cleaned, 1);
+    }
+
+    #[test]
+    fn select_buckets_drops_lone_dense_input_as_pointless_rewrite() {
+        // Single dense small, no tombstone, not sparse → skip-check drops it.
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        let dense_small = make_stats(next(), 4, 0, false);
+        let buckets = select_buckets(vec![dense_small], &make_config(0.70), 4);
+        assert!(
+            buckets.is_empty(),
+            "lone dense small is a pointless rewrite"
+        );
+    }
+
+    #[test]
+    fn select_buckets_zero_cap_yields_no_buckets() {
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        let small = make_stats(next(), 4, 0, false);
+        assert!(select_buckets(vec![small], &make_config(0.70), 0).is_empty());
+    }
+
+    #[test]
+    fn is_cache_resident_returns_true_for_dedup_only_segment() {
+        // No body-bearing entries → no cache file needed.
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+
+        let ulid = Ulid::new();
+        let stats = SegmentStats {
+            ulid_str: ulid.to_string(),
+            live_lba_bytes: BLOCK_BYTES,
+            total_lba_bytes: BLOCK_BYTES,
+            has_body_entries: false,
+            live_entries: vec![SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 0, 1)],
+            live_entry_indices: vec![0],
+            removed_hashes: Vec::new(),
+            partial_death_runs: vec![None],
+            has_partial_death: false,
+        };
+        assert!(is_cache_resident(&cache, &stats));
+    }
+
+    #[test]
+    fn is_cache_resident_returns_false_when_body_missing() {
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+
+        let ulid = Ulid::new();
+        let stats = make_stats(ulid, 1, 0, false); // one Data entry
+        assert!(!is_cache_resident(&cache, &stats));
+    }
+
+    #[test]
+    fn is_cache_resident_returns_false_when_present_bit_unset() {
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+
+        let ulid = Ulid::new();
+        let stats = make_stats(ulid, 2, 0, false); // two Data entries
+
+        // Body present, but only entry 0's bit is set in `present`.
+        fs::write(cache.join(format!("{ulid}.body")), b"stub").unwrap();
+        fs::write(cache.join(format!("{ulid}.present")), &[0b0000_0001u8]).unwrap();
+        assert!(!is_cache_resident(&cache, &stats));
+    }
+
+    #[test]
+    fn is_cache_resident_returns_true_when_all_present_bits_set() {
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+
+        let ulid = Ulid::new();
+        let stats = make_stats(ulid, 3, 0, false); // three Data entries
+
+        fs::write(cache.join(format!("{ulid}.body")), b"stub").unwrap();
+        fs::write(cache.join(format!("{ulid}.present")), &[0b0000_0111u8]).unwrap();
+        assert!(is_cache_resident(&cache, &stats));
+    }
+
     /// Mirror the production drain: repack → S3 PUT → promote, in
     /// ULID-ascending order.
     async fn drain_with_repack(
@@ -1573,7 +1897,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
         assert!(
             stats.candidates >= 2,
             "GC should have compacted at least 2 segments (S1 + S2), got {}",
@@ -1673,7 +1997,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
+        gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
 
         // Find the emitted GC plan in gc/. Under the plan handoff protocol
         // the coordinator writes `gc/<ulid>.plan` instead of a signed
@@ -2446,7 +2770,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
         assert_eq!(
             stats.deferred, 0,
             "Delta partial-death must be expanded in-band, not deferred"
@@ -2545,7 +2869,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, u_gc).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
         assert!(
             stats.candidates >= 2,
             "GC should compact ≥2 segments, got {}",

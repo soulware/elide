@@ -107,7 +107,7 @@ fn coordinator_gc_does_not_create_read_failures() {
         // Brief pause so the reader has time to start.
         thread::sleep(Duration::from_millis(5));
 
-        let gc_ulid = gc_handle.gc_checkpoint().unwrap();
+        let gc_ulid = gc_handle.gc_checkpoint(1).unwrap()[0];
         if let Some((_, _, to_delete)) = common::simulate_coord_gc_local(&fork_dir_gc, gc_ulid, 2) {
             // Apply the handoff before deleting old files.  This updates the
             // volume's extent index to point at the new compacted segment,
@@ -188,7 +188,7 @@ fn concurrent_apply_gc_handoffs_does_not_drop_replies() {
     // Stage a GC handoff (gc/<new>.plan) without applying it yet — the
     // coordinator-side plan emitter runs, but no one has called
     // apply_gc_handoffs on the volume.
-    let gc_ulid = handle.gc_checkpoint().unwrap();
+    let gc_ulid = handle.gc_checkpoint(1).unwrap()[0];
     common::simulate_coord_gc_local(&fork_dir, gc_ulid, 2)
         .expect("GC simulation must produce a plan");
 

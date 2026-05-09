@@ -38,9 +38,10 @@
 //   scan_interval   = "30s"  # how often root directories are re-scanned for new forks
 //
 //   [gc]
-//   density_threshold = 0.70   # compact when live_bytes/file_bytes < threshold
-//   interval          = "10s"  # how often GC runs per fork
-//   retention_window  = "10m"  # how long GC inputs are retained in S3
+//   density_threshold    = 0.70   # compact when live_bytes/file_bytes < threshold
+//   interval             = "10s"  # how often GC runs per fork
+//   retention_window     = "10m"  # how long GC inputs are retained in S3
+//   max_buckets_per_tick = 4      # max independent output buckets per GC tick
 //
 // All duration fields use humantime ("5s", "30m", "24h").
 
@@ -405,6 +406,15 @@ pub struct GcConfig {
     /// strings like `"24h"`, `"30s"`, `"5m"`. Default: `10m`.
     #[serde(default = "default_retention_window", with = "humantime_serde")]
     pub retention_window: Duration,
+
+    /// Maximum number of output buckets emitted per GC tick. Each bucket
+    /// produces one `gc/<ulid>.plan` and ultimately one S3 object, so
+    /// raising this multiplies per-tick rewrite throughput and the
+    /// retention-window peak by the same factor. Selection is filtered
+    /// to fully cache-resident segments, so a tick never issues S3 GETs
+    /// purely to enable a rewrite. Default: `4`.
+    #[serde(default = "default_max_buckets_per_tick")]
+    pub max_buckets_per_tick: usize,
 }
 
 fn default_gc_density() -> f64 {
@@ -415,6 +425,9 @@ fn default_gc_interval() -> Duration {
 }
 fn default_retention_window() -> Duration {
     Duration::from_secs(10 * 60)
+}
+fn default_max_buckets_per_tick() -> usize {
+    4
 }
 
 impl GcConfig {
@@ -433,6 +446,7 @@ impl Default for GcConfig {
             density_threshold: default_gc_density(),
             interval: default_gc_interval(),
             retention_window: default_retention_window(),
+            max_buckets_per_tick: default_max_buckets_per_tick(),
         }
     }
 }
@@ -474,9 +488,10 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # scan_interval  = "30s"  # how often roots are re-scanned for new forks
 
 [gc]
-# density_threshold = 0.70    # compact when live_bytes / file_bytes < threshold
-# interval          = "10s"   # how often GC runs per fork
-# retention_window  = "10m"   # how long GC inputs stay in S3 before reaping
+# density_threshold    = 0.70    # compact when live_bytes / file_bytes < threshold
+# interval             = "10s"   # how often GC runs per fork
+# retention_window     = "10m"   # how long GC inputs stay in S3 before reaping
+# max_buckets_per_tick = 4       # max independent output buckets per GC tick
 
 [peer_fetch]
 # Setting `port` enables peer fetch: the coordinator binds an HTTP server on

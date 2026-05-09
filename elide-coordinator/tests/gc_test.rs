@@ -413,7 +413,7 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
 
     // Step 4: gc_fork — GC compaction; H0 appears dead from disk state.
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
 
     // Step 5: BUG B INJECTION — write D0 again to lba=5.
     // H0 is still in the extent index (apply_gc_handoffs hasn't run yet), so
@@ -467,7 +467,13 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
         &store,
     ));
 
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc2).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc2],
+    )
+    .unwrap();
     vol.apply_gc_handoffs().unwrap();
     rt.block_on(apply_done_handoffs(
         fork_dir,
@@ -579,7 +585,7 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
     // produced by flushing the current WAL will have a ULID below u_sweep.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
 
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
     vol.apply_gc_handoffs().unwrap();
     rt.block_on(apply_done_handoffs(
         fork_dir,
@@ -698,7 +704,7 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
     // the WAL segment wins → D2.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
 
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
     vol.apply_gc_handoffs().unwrap();
     rt.block_on(apply_done_handoffs(
         fork_dir,
@@ -855,7 +861,7 @@ fn drain_failure_skips_gc_and_data_survives() {
     // GC runs after successful drain: pending/ is now empty, all prior
     // segments are in segments/.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
     vol.apply_gc_handoffs().unwrap();
     rt.block_on(apply_done_handoffs(
         fork_dir,
@@ -957,7 +963,7 @@ fn gc_restart_safety_applied_handoff() {
     // Step 3: GC pass — gc_checkpoint mints ULIDs, gc_fork emits the coord
     // plan at gc/<new>.plan describing how to compact S1 and S2.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
 
     // Step 4: apply_gc_handoffs — materialises the plan: writes
     // gc/<new>.staged, signs it, renames to bare gc/<new>, and updates the
@@ -1081,7 +1087,7 @@ fn gc_collect_stats_skips_thin_dedup_ref_segment() {
     // Step 5: gc_checkpoint + gc_fork.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
 
-    let stats = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
+    let stats = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
 
     // All three segments (S1, S2, S3) should be included in stats.
     // With unified format, DedupRef segments are processed normally.
@@ -1149,7 +1155,7 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
     let gc_sweep = |vol: &mut Volume| {
         drain(vol);
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
-        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc);
+        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
         let _ = vol.apply_gc_handoffs();
         simulate_coord_cache_evict(fork_dir);
         let _ = rt.block_on(apply_done_handoffs(
@@ -1275,7 +1281,7 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
     let gc_sweep = |vol: &mut Volume| {
         drain(vol);
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
-        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc);
+        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
         let _ = vol.apply_gc_handoffs();
         simulate_coord_cache_evict(fork_dir);
         let _ = rt.block_on(apply_done_handoffs(
@@ -1413,7 +1419,7 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
     let gc_sweep = |vol: &mut Volume| {
         drain(vol);
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
-        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc);
+        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
         let _ = vol.apply_gc_handoffs();
         simulate_coord_cache_evict(fork_dir);
         let _ = rt.block_on(apply_done_handoffs(
@@ -1564,7 +1570,7 @@ fn gc_bug_h_canonical_body_shadows_live_lba() {
     // Volume method calls so the test is deterministic.
     let run_gc_round = |vol: &mut Volume| {
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
-        gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, u_gc).unwrap();
+        gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
         vol.apply_gc_handoffs().unwrap();
 
         // Collect bare gc/<ulid> files, promote each, then finalize.

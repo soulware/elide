@@ -153,17 +153,20 @@ fn dispatch(
                 );
             }
         },
-        VolumeRequest::GcCheckpoint => match handle.gc_checkpoint() {
-            Ok(gc_ulid) => {
-                let _ = write_envelope(writer, &Envelope::ok(GcCheckpointReply { gc_ulid }));
+        VolumeRequest::GcCheckpoint { max_buckets } => {
+            match handle.gc_checkpoint(max_buckets as usize) {
+                Ok(bucket_ulids) => {
+                    let _ =
+                        write_envelope(writer, &Envelope::ok(GcCheckpointReply { bucket_ulids }));
+                }
+                Err(e) => {
+                    let _ = write_envelope::<GcCheckpointReply>(
+                        writer,
+                        &Envelope::err(IpcError::internal(e.to_string())),
+                    );
+                }
             }
-            Err(e) => {
-                let _ = write_envelope::<GcCheckpointReply>(
-                    writer,
-                    &Envelope::err(IpcError::internal(e.to_string())),
-                );
-            }
-        },
+        }
         VolumeRequest::ApplyGcHandoffs => match handle.apply_gc_handoffs() {
             Ok(processed) => {
                 let _ = write_envelope(
