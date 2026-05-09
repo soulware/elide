@@ -53,22 +53,29 @@ pub struct PromoteResult {
     pub pre_promote_offsets: Vec<Option<u64>>,
 }
 
-/// The two ULIDs needed for a GC checkpoint, minted atomically in order.
+/// The ULIDs needed for a GC checkpoint, minted atomically in order.
 ///
-/// Ordering invariant: `u_gc < u_flush`.  Both come from the volume's own
-/// monotonic mint (never from an external clock), and `UlidMint` guarantees
-/// strict monotonicity even within the same millisecond.  Minting both up
-/// front — before any I/O — is what makes the ordering self-documenting and
-/// crash-safe: the WAL segment flushed at `u_flush` is guaranteed > `u_gc`,
-/// so rebuild applies the GC output before the flushed WAL segment.
+/// Ordering invariant: every `u_buckets[i] < u_flush`. All come from the
+/// volume's own monotonic mint (never from an external clock), and
+/// `UlidMint` guarantees strict monotonicity even within the same
+/// millisecond. Minting them all up front — before any I/O — is what makes
+/// the ordering self-documenting and crash-safe: the WAL segment flushed
+/// at `u_flush` is guaranteed > every bucket ULID, so rebuild applies all
+/// GC outputs before the flushed WAL segment.
+///
+/// `u_buckets` carries one ULID per potential output bucket the
+/// coordinator may emit this tick (capped by `max_buckets_per_tick`).
+/// Unused ULIDs are discarded by the coordinator — `UlidMint` is a
+/// `u128` counter, so over-reservation is free. The coordinator picks
+/// `bucket_ulids[i]` for the i-th packed bucket.
 ///
 /// No `u_wal` is pre-minted for the *next* WAL. Any future `mint.next()`
-/// that opens a WAL is monotonically > `u_flush > u_gc` by construction, so
-/// the "new WAL above GC output" invariant holds without reservation.
-/// Deferring WAL open to first-write is what avoids per-tick WAL churn on
-/// idle volumes.
+/// that opens a WAL is monotonically > `u_flush > all u_buckets` by
+/// construction, so the "new WAL above GC outputs" invariant holds
+/// without reservation. Deferring WAL open to first-write is what avoids
+/// per-tick WAL churn on idle volumes.
 pub(super) struct GcCheckpointUlids {
-    pub(super) u_gc: Ulid,
+    pub(super) u_buckets: Vec<Ulid>,
     pub(super) u_flush: Ulid,
 }
 
@@ -78,7 +85,9 @@ pub(super) struct GcCheckpointUlids {
 /// dispatches the job to the worker and stashes the reply.  When `job`
 /// is `None` the WAL was empty and the checkpoint completes immediately.
 pub struct GcCheckpointPrep {
-    pub u_gc: Ulid,
+    /// One pre-minted output ULID per potential bucket. Length equals
+    /// `max_buckets_per_tick` from the request.
+    pub u_buckets: Vec<Ulid>,
     /// Segment ULID used for the promoted WAL.  Used to identify the
     /// GC promote's `PromoteComplete` among other in-flight promotes.
     pub u_flush: Ulid,

@@ -247,7 +247,8 @@ impl GcCycleOrchestrator {
 
     async fn run_gc_pass(&mut self) {
         let volume_id = &self.volume_id;
-        let Some(u_gc) = control::gc_checkpoint(&self.fork_dir).await else {
+        let max_buckets = self.gc_config.max_buckets_per_tick.max(1);
+        let Some(bucket_ulids) = control::gc_checkpoint(&self.fork_dir, max_buckets).await else {
             return;
         };
 
@@ -261,7 +262,7 @@ impl GcCycleOrchestrator {
             let by_id_dir = self.by_id_dir.clone();
             let gc_config = self.gc_config.clone();
             tokio::task::spawn_blocking(move || {
-                gc::gc_fork(&fork_dir, &by_id_dir, &gc_config, u_gc)
+                gc::gc_fork(&fork_dir, &by_id_dir, &gc_config, bucket_ulids)
             })
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("gc task panicked: {e}")))
@@ -272,11 +273,19 @@ impl GcCycleOrchestrator {
                 candidates,
                 bytes_freed,
                 dead_cleaned,
+                buckets_emitted,
+                deferred_cold,
                 ..
             }) => {
                 self.gc_was_active = true;
+                let cold_note = if deferred_cold > 0 {
+                    format!(", {deferred_cold} cold-deferred")
+                } else {
+                    String::new()
+                };
                 info!(
-                    "[gc {volume_id}] compact: {candidates} input(s) ({dead_cleaned} dead), \
+                    "[gc {volume_id}] compact: {buckets_emitted} bucket(s), \
+                     {candidates} input(s) ({dead_cleaned} dead{cold_note}), \
                      ~{bytes_freed} bytes freed"
                 );
             }
