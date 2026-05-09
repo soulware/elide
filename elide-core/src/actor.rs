@@ -61,6 +61,10 @@ use crate::volume::{
 /// copying.
 pub struct VolumeConfig {
     pub base_dir: PathBuf,
+    /// Precomputed `base_dir.join("cache")`.  `read_into` runs on every
+    /// ublk read; allocating a fresh `PathBuf` per read showed up as
+    /// gratuitous churn since `base_dir` is fixed for the session.
+    pub cache_dir: PathBuf,
     pub ancestor_layers: Vec<AncestorLayer>,
     pub fetcher: Option<BoxFetcher>,
 }
@@ -1356,11 +1360,23 @@ impl VolumeClient {
     }
 
     /// Signal the actor that the WAL may have crossed the promote
-    /// threshold.  Fire-and-forget: a dropped signal (channel full) is
-    /// caught by the actor's idle tick.
+    /// threshold.
+    ///
+    /// Try non-blocking first; on `Full`, fall back to a blocking send.
+    /// We're past the volume mutex at this point, and the actor handlers
+    /// only block on the same mutex — so the actor will drain a slot as
+    /// soon as it finishes its current handler, with no deadlock risk.
+    /// Skipping a signal here would otherwise let WAL bytes pile up
+    /// behind a full mailbox until the 10 s idle tick wakes a promote.
     fn signal_check_promote(&self) {
         match self.tx.try_send(VolumeRequest::CheckPromote) {
-            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Ok(()) => {}
+            Err(TrySendError::Full(req)) => {
+                // Blocking send into the same channel; only fails if the
+                // actor has exited, which is the same case we already
+                // ignore below.
+                let _ = self.tx.send(req);
+            }
             Err(TrySendError::Disconnected(_)) => {
                 // Actor exited.  The next direct write will surface the
                 // error via `volume()`; nothing to do here.
@@ -1632,7 +1648,6 @@ impl VolumeReader {
         }
         let config = &self.client.config;
         let extent_index = &snap.extent_index;
-        let cache_dir = config.base_dir.join("cache");
         read_extents(
             lba,
             buf,
@@ -1641,7 +1656,7 @@ impl VolumeReader {
             &self.file_cache,
             &self.dmat_cache,
             &self.dmat_stats,
-            &cache_dir,
+            &config.cache_dir,
             |id, bss, idx| {
                 find_segment_in_dirs(
                     id,
@@ -2760,8 +2775,11 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
     });
     let snapshot = Arc::new(ArcSwap::new(initial));
 
+    let base_dir = volume.base_dir().to_owned();
+    let cache_dir = base_dir.join("cache");
     let config = Arc::new(VolumeConfig {
-        base_dir: volume.base_dir().to_owned(),
+        base_dir,
+        cache_dir,
         ancestor_layers: volume.ancestor_layers().to_vec(),
         fetcher: volume.fetcher().cloned(),
     });
