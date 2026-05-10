@@ -357,7 +357,15 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Remove { volume, force } => {
-            let result = remove_volume(&volume, force, &ctx.data_dir).await;
+            let store = ctx.stores.coordinator_wide();
+            let result = remove_volume(
+                &volume,
+                force,
+                &ctx.data_dir,
+                Some(&store),
+                Some(ctx.identity.coordinator_id_str()),
+            )
+            .await;
             // After local removal, tear down the per-volume IAM key +
             // policy. Best-effort: any IAM error is logged inside
             // `release` and does not block the IPC reply.
@@ -1029,6 +1037,8 @@ async fn remove_volume(
     volume_name: &str,
     force: bool,
     data_dir: &Path,
+    store: Option<&Arc<dyn ObjectStore>>,
+    coord_id: Option<&str>,
 ) -> Result<Option<ulid::Ulid>, IpcError> {
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
@@ -1039,9 +1049,11 @@ async fn remove_volume(
 
     let vol_dir = std::fs::canonicalize(&link)
         .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
-    // Volume directory is `by_id/<ulid>`; extract the ULID for the
-    // post-delete IAM cleanup hook. Returning it from this function
-    // keeps the dispatch site free of path-canonicalisation logic.
+    // Volume directory is `by_id/<ulid>`; extract the ULID once. Used
+    // both for the `data_dir/remote/<name>` breadcrumb (when the bucket
+    // says the name is still owned by us) and for the post-delete IAM
+    // cleanup hook. Returning it from this function keeps the dispatch
+    // site free of path-canonicalisation logic.
     let vol_ulid = vol_dir
         .file_name()
         .and_then(|s| s.to_str())
@@ -1069,6 +1081,19 @@ async fn remove_volume(
 
     import::kill_all_for_volume(&vol_dir);
 
+    // Write the breadcrumb before tearing down local state. Best-effort:
+    // a transient bucket-read error logs and skips rather than blocking
+    // the operator's removal.
+    if let (Some(store), Some(coord_id), Some(vol_ulid)) = (store, coord_id, vol_ulid)
+        && let Err(e) =
+            maybe_write_remote_breadcrumb(data_dir, volume_name, vol_ulid, store, coord_id).await
+    {
+        warn!(
+            "[inbound] remove {volume_name}: skipping remote breadcrumb ({e}); \
+             use `elide volume claim {volume_name}` to recover the name later"
+        );
+    }
+
     let _ = std::fs::remove_file(&link);
 
     std::fs::remove_dir_all(&vol_dir)
@@ -1080,6 +1105,48 @@ async fn remove_volume(
 
     info!("[inbound] removed volume {volume_name}");
     Ok(vol_ulid)
+}
+
+/// Read `names/<volume_name>` and, if the bucket record exists, is in a
+/// state that retains ownership (`Live` or `Stopped`), and names this
+/// coordinator as owner, write a `data_dir/remote/<volume_name>`
+/// breadcrumb. Surfaced by `volume list` so the user can see remotely-
+/// owned volumes that have no local fork.
+async fn maybe_write_remote_breadcrumb(
+    data_dir: &Path,
+    volume_name: &str,
+    vol_ulid: ulid::Ulid,
+    store: &Arc<dyn ObjectStore>,
+    coord_id: &str,
+) -> Result<(), String> {
+    use elide_core::name_record::NameState;
+
+    let record = match elide_coordinator::name_store::read_name_record(store, volume_name)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Some((rec, _)) => rec,
+        None => return Ok(()),
+    };
+
+    let owned_by_us = record
+        .coordinator_id
+        .as_deref()
+        .map(|owner| owner == coord_id)
+        .unwrap_or(false);
+    let retains_ownership = matches!(record.state, NameState::Live | NameState::Stopped);
+
+    if !(owned_by_us && retains_ownership) {
+        return Ok(());
+    }
+
+    elide_coordinator::remote_breadcrumb::write(data_dir, volume_name, vol_ulid)
+        .map_err(|e| format!("write remote breadcrumb: {e}"))?;
+    info!(
+        "[inbound] remove {volume_name}: wrote remote breadcrumb (vol {vol_ulid}, state={:?})",
+        record.state
+    );
+    Ok(())
 }
 
 /// Read the bound ublk `dev_id` from `vol_dir/volume.toml`, if any.
@@ -1956,6 +2023,10 @@ async fn force_release_volume_op(
             )
             .await;
 
+            if let Err(e) = elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name) {
+                warn!("[inbound] force-release {volume_name}: clearing breadcrumb: {e}");
+            }
+
             Ok(ReleaseReply {
                 handoff_snapshot: published.snap_ulid,
             })
@@ -2404,6 +2475,59 @@ fn latest_segment_ulid(index_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> 
 /// The result always leaves the volume `Stopped` (no daemon launched).
 /// The CLI calls `start` afterwards if `volume start --claim` was the
 /// composed flow.
+/// Resolve `volume start <name>` against the bucket when no local fork
+/// exists. Hydrates a remote-owned volume into local state on success;
+/// surfaces the appropriate error otherwise (foreign-owned → conflict,
+/// released → claim hint, unknown → not_found).
+async fn hydrate_or_route(
+    volume_name: &str,
+    store: &Arc<dyn ObjectStore>,
+    coord_id: &str,
+    core: &CoordinatorCore,
+) -> Result<(), IpcError> {
+    use elide_core::name_record::NameState;
+
+    let (record, _) = match elide_coordinator::name_store::read_name_record(store, volume_name)
+        .await
+        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?
+    {
+        Some(rec) => rec,
+        None => {
+            return Err(IpcError::not_found(format!(
+                "volume '{volume_name}' not found locally or in the bucket"
+            )));
+        }
+    };
+
+    let owned_by_us = record.coordinator_id.as_deref() == Some(coord_id);
+    match (record.state, owned_by_us) {
+        (NameState::Live | NameState::Stopped, true) => {
+            crate::start_remote::hydrate_remote_owned(
+                volume_name,
+                record.vol_ulid,
+                record.size,
+                store,
+                core,
+            )
+            .await
+        }
+        (NameState::Live | NameState::Stopped, false) => {
+            let held_by = record.coordinator_id.as_deref().unwrap_or("<unknown>");
+            Err(IpcError::conflict(format!(
+                "name '{volume_name}' is held by coordinator {held_by}; \
+                 run `volume release --force` to override"
+            )))
+        }
+        (NameState::Released, _) => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is Released; \
+             reclaim with: elide volume claim {volume_name}"
+        ))),
+        (NameState::Readonly, _) => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is readonly; cannot start"
+        ))),
+    }
+}
+
 async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<(), IpcError> {
     let data_dir: &Path = &core.data_dir;
     let store = core.stores.coordinator_wide();
@@ -2411,10 +2535,11 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
     let hostname = core.identity.hostname();
     let link = data_dir.join("by_name").join(volume_name);
     if !link.exists() {
-        return Err(IpcError::not_found(format!(
-            "volume '{volume_name}' not found locally; \
-             to claim it from the bucket, run: elide volume claim {volume_name}"
-        )));
+        // No local fork. If the bucket says we still own this name,
+        // hydrate the metadata from S3 and continue. Bodies remain
+        // demand-fetched. Foreign-owned, released, or unknown names
+        // route to the existing claim/not-found error shapes.
+        hydrate_or_route(volume_name, &store, coord_id, core).await?;
     }
     let vol_dir = std::fs::canonicalize(&link)
         .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
@@ -4116,7 +4241,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (vol_dir, link) =
             setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAA", None, true);
-        remove_volume("vol", false, tmp.path()).await.unwrap();
+        remove_volume("vol", false, tmp.path(), None, None)
+            .await
+            .unwrap();
         assert!(!vol_dir.exists(), "by_id dir should be removed");
         assert!(
             std::fs::symlink_metadata(&link).is_err(),
@@ -4139,7 +4266,9 @@ mod tests {
             Some(99),
             true,
         );
-        remove_volume("vol", false, tmp.path()).await.unwrap();
+        remove_volume("vol", false, tmp.path(), None, None)
+            .await
+            .unwrap();
         assert!(!vol_dir.exists());
         assert!(std::fs::symlink_metadata(&link).is_err());
     }
@@ -4154,7 +4283,7 @@ mod tests {
             Some(5),
             false, // no STOPPED_FILE
         );
-        let err = remove_volume("vol", false, tmp.path())
+        let err = remove_volume("vol", false, tmp.path(), None, None)
             .await
             .expect_err("running volume should be rejected");
         assert_eq!(err.kind, IpcErrorKind::Conflict);
@@ -4165,9 +4294,200 @@ mod tests {
     async fn remove_volume_unknown_returns_not_found() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
-        let err = remove_volume("ghost", false, tmp.path())
+        let err = remove_volume("ghost", false, tmp.path(), None, None)
             .await
             .expect_err("absent volume should be NotFound");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn remove_volume_writes_breadcrumb_when_owned() {
+        use elide_coordinator::name_store::create_name_record;
+        use elide_core::name_record::{NameRecord, NameState};
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid, None, true);
+
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut record =
+            NameRecord::live_minimal(ulid::Ulid::from_string(vol_ulid).unwrap(), SAMPLE_SIZE);
+        record.state = NameState::Stopped;
+        record.coordinator_id = Some("coord-A".to_owned());
+        create_name_record(&store, "vol", &record).await.unwrap();
+
+        remove_volume("vol", false, tmp.path(), Some(&store), Some("coord-A"))
+            .await
+            .unwrap();
+
+        let crumb = elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
+            .unwrap()
+            .expect("breadcrumb should exist");
+        assert_eq!(crumb.volume_id.to_string(), vol_ulid);
+    }
+
+    #[tokio::test]
+    async fn remove_volume_skips_breadcrumb_when_record_absent() {
+        let tmp = TempDir::new().unwrap();
+        let (_vol_dir, _link) =
+            setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAB", None, true);
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+
+        remove_volume("vol", false, tmp.path(), Some(&store), Some("coord-A"))
+            .await
+            .unwrap();
+
+        assert!(
+            elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
+                .unwrap()
+                .is_none(),
+            "no breadcrumb when bucket has no record"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_volume_skips_breadcrumb_when_owned_by_other() {
+        use elide_coordinator::name_store::create_name_record;
+        use elide_core::name_record::{NameRecord, NameState};
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAC";
+        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid, None, true);
+
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut record =
+            NameRecord::live_minimal(ulid::Ulid::from_string(vol_ulid).unwrap(), SAMPLE_SIZE);
+        record.state = NameState::Stopped;
+        record.coordinator_id = Some("coord-OTHER".to_owned());
+        create_name_record(&store, "vol", &record).await.unwrap();
+
+        remove_volume("vol", false, tmp.path(), Some(&store), Some("coord-A"))
+            .await
+            .unwrap();
+
+        assert!(
+            elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
+                .unwrap()
+                .is_none(),
+            "no breadcrumb when bucket says different owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_volume_skips_breadcrumb_when_released() {
+        use elide_coordinator::name_store::create_name_record;
+        use elide_core::name_record::{NameRecord, NameState};
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAD";
+        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid, None, true);
+
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut record =
+            NameRecord::live_minimal(ulid::Ulid::from_string(vol_ulid).unwrap(), SAMPLE_SIZE);
+        record.state = NameState::Released;
+        record.coordinator_id = Some("coord-A".to_owned());
+        create_name_record(&store, "vol", &record).await.unwrap();
+
+        remove_volume("vol", false, tmp.path(), Some(&store), Some("coord-A"))
+            .await
+            .unwrap();
+
+        assert!(
+            elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
+                .unwrap()
+                .is_none(),
+            "no breadcrumb when bucket state is Released"
+        );
+    }
+
+    // ── start hydrate_or_route ─────────────────────────────────────────
+
+    fn make_core(tmp: &TempDir, store: Arc<dyn ObjectStore>) -> CoordinatorCore {
+        let coord_dir = tmp.path().join("_coord");
+        std::fs::create_dir_all(&coord_dir).unwrap();
+        let identity = Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(&coord_dir).unwrap(),
+        );
+        CoordinatorCore {
+            data_dir: Arc::new(tmp.path().to_path_buf()),
+            stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(store)),
+            identity,
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_or_route_returns_not_found_when_no_record() {
+        use elide_coordinator::ipc::IpcErrorKind;
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let core = make_core(&tmp, Arc::clone(&store));
+        let err = hydrate_or_route("ghost", &store, "coord-A", &core)
+            .await
+            .expect_err("missing bucket record should be NotFound");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+        assert!(err.message.contains("not found"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn hydrate_or_route_conflicts_on_foreign_owner() {
+        use elide_coordinator::ipc::IpcErrorKind;
+        use elide_coordinator::name_store::create_name_record;
+        use elide_core::name_record::{NameRecord, NameState};
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let core = make_core(&tmp, Arc::clone(&store));
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        rec.state = NameState::Stopped;
+        rec.coordinator_id = Some("coord-OTHER".into());
+        create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let err = hydrate_or_route("vol", &store, "coord-A", &core)
+            .await
+            .expect_err("foreign-owned record should conflict");
+        assert_eq!(err.kind, IpcErrorKind::Conflict);
+        assert!(
+            err.message.contains("held by coordinator coord-OTHER"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("release --force"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn hydrate_or_route_routes_released_to_claim() {
+        use elide_coordinator::ipc::IpcErrorKind;
+        use elide_coordinator::name_store::create_name_record;
+        use elide_core::name_record::{NameRecord, NameState};
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let core = make_core(&tmp, Arc::clone(&store));
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        rec.state = NameState::Released;
+        rec.coordinator_id = Some("coord-A".into());
+        create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let err = hydrate_or_route("vol", &store, "coord-A", &core)
+            .await
+            .expect_err("released record should conflict");
+        assert_eq!(err.kind, IpcErrorKind::Conflict);
+        assert!(err.message.contains("Released"), "{}", err.message);
+        assert!(err.message.contains("volume claim vol"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn hydrate_or_route_refuses_readonly() {
+        use elide_coordinator::ipc::IpcErrorKind;
+        use elide_coordinator::name_store::create_name_record;
+        use elide_core::name_record::{NameRecord, NameState};
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> = mem_store();
+        let core = make_core(&tmp, Arc::clone(&store));
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        rec.state = NameState::Readonly;
+        create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let err = hydrate_or_route("vol", &store, "coord-A", &core)
+            .await
+            .expect_err("readonly record should refuse start");
+        assert_eq!(err.kind, IpcErrorKind::Conflict);
+        assert!(err.message.contains("readonly"), "{}", err.message);
     }
 }
