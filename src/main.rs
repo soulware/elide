@@ -418,12 +418,17 @@ enum VolumeCommand {
         release: bool,
     },
 
-    /// Start a previously stopped volume locally.
+    /// Start a previously stopped volume.
     ///
-    /// Pure local resume: refuses if the volume has no local state on
-    /// this host, or if the bucket-side record is `Released`. Use
-    /// `volume claim` to take a `Released` name first, or pass
-    /// `--claim` here to compose claim + start.
+    /// Resumes from local state when present. When the local fork is
+    /// missing but the bucket-side `names/<name>` record names this
+    /// coordinator as owner, transparently hydrates the metadata
+    /// (skeleton + indexes + signed basis manifest) from S3 and brings
+    /// the daemon up; segment bodies remain demand-fetched.
+    ///
+    /// Refuses if the bucket record is `Released` (use `volume claim`
+    /// or pass `--claim` here to compose claim + start) or owned by
+    /// another coordinator.
     Start {
         /// Volume name
         name: String,
