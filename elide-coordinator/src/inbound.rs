@@ -1072,15 +1072,14 @@ async fn remove_volume(
     // Write the breadcrumb before tearing down local state. Best-effort:
     // a transient bucket-read error logs and skips rather than blocking
     // the operator's removal.
-    if let (Some(store), Some(coord_id), Some(vol_ulid)) = (store, coord_id, vol_ulid) {
-        if let Err(e) =
+    if let (Some(store), Some(coord_id), Some(vol_ulid)) = (store, coord_id, vol_ulid)
+        && let Err(e) =
             maybe_write_remote_breadcrumb(data_dir, volume_name, vol_ulid, store, coord_id).await
-        {
-            warn!(
-                "[inbound] remove {volume_name}: skipping remote breadcrumb ({e}); \
-                 use `elide volume claim {volume_name}` to recover the name later"
-            );
-        }
+    {
+        warn!(
+            "[inbound] remove {volume_name}: skipping remote breadcrumb ({e}); \
+             use `elide volume claim {volume_name}` to recover the name later"
+        );
     }
 
     let _ = std::fs::remove_file(&link);
