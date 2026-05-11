@@ -1965,112 +1965,6 @@ async fn stop_volume_op(
     }
 }
 
-/// RAII guard that restores the original local state on drop.
-///
-/// Used by `release_volume_op` when it transparently restarts a
-/// stopped volume to perform the drain: the marker is cleaned up
-/// regardless of which exit path the function takes (success, error,
-/// panic), and on failure paths the `volume.stopped` marker is
-/// re-written so the volume returns to its pre-release state instead
-/// of being left running.
-pub(crate) struct DrainingMarkerGuard {
-    vol_dir: std::path::PathBuf,
-    /// Set to `true` once the release has reached a point where the
-    /// caller has explicitly written `volume.stopped` (i.e. the
-    /// release path's own halt step). Defuses the rollback so the
-    /// guard only removes the draining marker, leaving the volume
-    /// stopped as the release flow intends.
-    success: bool,
-}
-
-impl DrainingMarkerGuard {
-    pub(crate) fn new(vol_dir: std::path::PathBuf) -> Self {
-        Self {
-            vol_dir,
-            success: false,
-        }
-    }
-
-    /// Mark the release as having reached its own halt step — at this
-    /// point `volume.stopped` is back in place via the normal path
-    /// and we should *not* re-write it on drop.
-    pub(crate) fn defuse(&mut self) {
-        self.success = true;
-    }
-}
-
-impl Drop for DrainingMarkerGuard {
-    fn drop(&mut self) {
-        let draining = self.vol_dir.join("volume.draining");
-        if let Err(e) = std::fs::remove_file(&draining)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(
-                "[inbound] failed to remove draining marker {}: {e}",
-                draining.display()
-            );
-        }
-        if !self.success {
-            // Release failed before the explicit halt step. Re-write
-            // `volume.stopped` so the volume returns to its
-            // pre-release state — without this the supervisor would
-            // keep the (now transport-suppressed-then-restored)
-            // process running indefinitely.
-            let stopped = self.vol_dir.join(STOPPED_FILE);
-            if let Err(e) = std::fs::write(&stopped, "")
-                && e.kind() != std::io::ErrorKind::AlreadyExists
-            {
-                warn!(
-                    "[inbound] failed to restore volume.stopped after \
-                     aborted release at {}: {e}",
-                    stopped.display()
-                );
-            }
-            // The volume process is still running with the actor
-            // initialised; ask it to halt cleanly so the supervisor
-            // sees a clean exit and respects the marker we just
-            // wrote. Best-effort: a failed shutdown leaves the
-            // supervisor to notice the stopped marker on the next
-            // poll and not respawn after the eventual exit.
-            let vol_dir = self.vol_dir.clone();
-            tokio::spawn(async move {
-                let _ = elide_coordinator::control::shutdown(&vol_dir).await;
-            });
-        }
-    }
-}
-
-/// Poll until `control.sock` actually accepts a connection. Returns
-/// `true` as soon as a connect+accept succeeds, or `false` if
-/// `timeout` elapses first. Used by `release_volume_op` when
-/// transparently restarting a stopped volume so the snapshot path can
-/// talk to it.
-///
-/// File existence alone is not enough: the previous volume process
-/// can leave a stale socket file behind, and the new volume's
-/// `UnixListener::bind` does `remove_file` + `bind` — there is a
-/// window where the file exists but no listener is attached, so
-/// `connect()` returns `ECONNREFUSED`. We probe the connection itself
-/// and treat that as the readiness signal.
-pub(crate) async fn wait_for_control_sock(vol_dir: &Path, timeout: std::time::Duration) -> bool {
-    let socket = vol_dir.join("control.sock");
-    let deadline = std::time::Instant::now() + timeout;
-    let probe_step = std::time::Duration::from_millis(50);
-    while std::time::Instant::now() < deadline {
-        if socket.exists() {
-            match tokio::net::UnixStream::connect(&socket).await {
-                Ok(_) => return true,
-                Err(_) => {
-                    // Stale file (waiting for the new listener), or
-                    // listener is up but transient refusal — retry.
-                }
-            }
-        }
-        tokio::time::sleep(probe_step).await;
-    }
-    false
-}
-
 /// `volume release --force`.
 ///
 /// Override path for an unreachable previous owner: synthesise a
@@ -2317,30 +2211,37 @@ async fn finalize_force_release(
 }
 
 /// Relinquish ownership of `<volume_name>` so any other coordinator can
-/// `volume start` it. Composes the existing snapshot path:
+/// claim it.
 ///
-/// 1. Refuse if the volume is readonly (no exclusive owner to release)
-///    or a block-device client is connected (must disconnect cleanly first).
-/// 2. If the volume is `stopped`, transparently bring it back up
-///    (clear the marker, notify the supervisor, wait for
-///    `control.sock`) — the drain step needs a running daemon.
-/// 3. Verify S3 ownership before doing the expensive drain.
-/// 4. Drain WAL → publish handoff snapshot via `snapshot_volume`.
-/// 5. Send shutdown RPC to halt the daemon.
-/// 6. Write `volume.stopped` marker so the supervisor won't restart.
-/// 7. Conditional PUT to `names/<name>` setting state=Released and
-///    recording the handoff snapshot ULID.
+/// Pure bucket-flip: no daemon interaction, no drain. The drain
+/// responsibility belongs to `stop` — a clean stop publishes an
+/// auto-snapshot covering all durable state, and `release` reuses
+/// that snapshot as the handoff. If the previous stop was unclean
+/// (WAL/pending/gc has work post-dating the snapshot), release
+/// refuses with an operator hint pointing at `start` → `stop`
+/// (clean) → re-run.
 ///
-/// Two execution paths:
+/// Preconditions:
+///   - Local fork is `VolumeLifecycle::StoppedManual`, or absent
+///     (routes to [`release_breadcrumb_only`]).
+///   - Bucket role is `Role::Owner { .. }`.
 ///
-/// 1. **Fast path** (clean stopped volume, nothing to drain): reuse
-///    the previously-published snapshot as the handoff, skip the
-///    daemon restart entirely. Costs one S3 GET (ownership) + one
-///    conditional PUT (flip).
-///
-/// 2. **Slow path** (WAL non-empty / pending uploads / GC handoffs /
-///    new segments since last snapshot): bring the daemon up in
-///    drain mode, run the existing snapshot pipeline, halt, flip.
+/// Steps:
+///   1. Resolve local fork shape; route absent → breadcrumb-only.
+///   2. Refuse if local shape isn't `StoppedManual` (running →
+///      ''stop first''; readonly → ''nothing to release''; released
+///      → noop hint).
+///   3. Read bucket position; refuse via [`ensure_release_eligible`]
+///      if role isn't Owner.
+///   4. Fast-path inspection on the local fork: latest published
+///      snapshot must cover all durable state. Refuses otherwise.
+///   5. If cover is `Auto`, promote to a stable `<snap>.manifest`
+///      (server-side COPY+DELETE in S3, local rename) — claim
+///      paths resolve the handoff via the stable filename.
+///   6. Conditional PUT to `names/<name>` setting state=Released
+///      and recording the handoff snapshot ULID. Aftermath
+///      (display marker, journal event, breadcrumb cleanup) via
+///      [`perform_release_flip`].
 async fn release_volume_op(
     volume_name: &str,
     store: &Arc<dyn ObjectStore>,
@@ -2829,9 +2730,9 @@ async fn perform_release_flip(
 /// before the bucket flip — auto-snapshots are not stable enough to
 /// serve as a Released-name basis without that step.
 #[derive(Debug, PartialEq, Eq)]
-struct FastPathCover {
-    snap_ulid: ulid::Ulid,
-    kind: elide_core::signing::SnapshotKind,
+pub(crate) struct FastPathCover {
+    pub(crate) snap_ulid: ulid::Ulid,
+    pub(crate) kind: elide_core::signing::SnapshotKind,
 }
 
 /// Promote `<ulid>.auto.manifest` to `<ulid>.manifest` both locally
@@ -2849,7 +2750,7 @@ struct FastPathCover {
 /// local-rename leaves stale `<ulid>.auto.manifest` on disk — since
 /// the volume is about to be released and removed locally, this is
 /// irrelevant.
-async fn promote_auto_snapshot(
+pub(crate) async fn promote_auto_snapshot(
     vol_dir: &Path,
     volume_id: &str,
     snap_ulid: ulid::Ulid,
@@ -2899,7 +2800,7 @@ async fn promote_auto_snapshot(
     Ok(())
 }
 
-fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<FastPathCover>> {
+pub(crate) fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<FastPathCover>> {
     if !dir_is_empty_or_absent(&vol_dir.join("wal"))? {
         return Ok(None);
     }
