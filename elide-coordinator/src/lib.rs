@@ -1,4 +1,5 @@
 pub mod bins;
+pub mod bucket_position;
 pub mod config;
 pub mod control;
 pub mod eligibility;

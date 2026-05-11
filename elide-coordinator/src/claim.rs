@@ -244,6 +244,7 @@ async fn claim_volume_bucket_op(
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> Result<ClaimReply, IpcError> {
+    use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
     use elide_coordinator::volume_state::{VolumeLifecycle, clear_released_marker};
     use elide_core::name_record::NameState;
 
@@ -258,9 +259,9 @@ async fn claim_volume_bucket_op(
         )));
     }
 
-    // Resolve local fork once up front; used by both branches of the
-    // bucket-state dispatch below to discriminate in-place reclaim vs
-    // MustClaimFresh, and to reach the vol_dir for reconcile.
+    // Resolve local fork once up front; both bucket-state branches
+    // (Released → reclaim-vs-MustClaimFresh, OwnedByUs → reconcile)
+    // need the vol_dir / vol_ulid to discriminate.
     let (local_vol_dir, _shape) =
         VolumeLifecycle::resolve(&data_dir.join("by_name").join(volume_name))
             .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?;
@@ -270,195 +271,190 @@ async fn claim_volume_bucket_op(
         .and_then(|n| n.to_str())
         .and_then(|s| Ulid::from_string(s).ok());
 
-    let record_opt = elide_coordinator::name_store::read_name_record(store, volume_name)
+    let (position, _record) = fetch_position(store, volume_name, coord_id)
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
 
-    let (record, _version) = record_opt.ok_or_else(|| {
-        IpcError::not_found(format!(
+    match position {
+        OwnershipPosition::Absent => Err(IpcError::not_found(format!(
             "name '{volume_name}' has no S3 record; nothing to claim"
-        ))
-    })?;
-
-    match record.state {
-        NameState::Released => {
-            if local_vol_ulid == Some(record.vol_ulid) {
-                // In-place reclaim of a Released name we still hold
-                // locally. Three shapes for the matching `vol_ulid`:
-                //
-                //   (a) Original writable fork (has `volume.key`):
-                //       reconcile is a no-op on the local side; just
-                //       flip the bucket to Stopped.
-                //
-                //   (b) Fetched copy of our own lineage (no
-                //       `volume.key`, but a key shadow exists):
-                //       reconcile restores the key and strips the
-                //       fetched/readonly markers, then the bucket
-                //       flip proceeds.
-                //
-                //   (c) Fetched copy of a foreign lineage (no
-                //       `volume.key`, no shadow): reconcile refuses
-                //       with `NoKeyShadow` and we surface a hint to
-                //       fork via `volume create --from`.
-                let vol_dir = local_vol_dir
-                    .clone()
-                    .expect("local_vol_ulid matched record => fork dir resolved");
-                use elide_coordinator::volume_state::{
-                    ReconcileError, reconcile_owned_local_to_stopped,
-                };
-                if let Err(e) =
-                    reconcile_owned_local_to_stopped(&vol_dir, data_dir, record.vol_ulid)
-                {
-                    return Err(match e {
-                        ReconcileError::NoKeyShadow => IpcError::conflict(format!(
-                            "volume '{volume_name}' is a fetched (readonly) copy with no \
-                             local signing key. To use it as a writable fork run: \
-                             elide volume create --from {volume_name} <new-name>"
-                        )),
-                        ReconcileError::DaemonRunning => IpcError::conflict(format!(
-                            "volume '{volume_name}' is running on this host; \
-                             stop it first with: elide volume stop {volume_name}"
-                        )),
-                        ReconcileError::Io(e) => {
-                            IpcError::internal(format!("reconciling local fork: {e}"))
-                        }
-                    });
-                }
-                use elide_coordinator::lifecycle::{
-                    LifecycleError, MarkReclaimedLocalOutcome, mark_reclaimed_local,
-                };
-                match mark_reclaimed_local(
-                    store,
-                    volume_name,
-                    coord_id,
-                    identity.hostname(),
-                    record.vol_ulid,
-                    NameState::Stopped,
-                )
-                .await
-                {
-                    Ok(MarkReclaimedLocalOutcome::Reclaimed) => {
-                        info!(
-                            "[inbound] reclaimed {volume_name} in place (vol_ulid {})",
-                            record.vol_ulid
-                        );
-                        if let Err(e) =
-                            elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name)
-                        {
-                            warn!("[inbound] reclaim {volume_name}: clearing breadcrumb: {e}");
-                        }
-                        // Best-effort: drop the display-only marker now that
-                        // the bucket record is no longer Released.
-                        if let Err(e) = clear_released_marker(&vol_dir) {
-                            warn!(
-                                "[inbound] reclaim {volume_name}: clearing \
-                                 volume.released marker: {e}"
-                            );
-                        }
-                        elide_coordinator::volume_event_store::emit_best_effort(
-                            store,
-                            identity.as_ref(),
-                            volume_name,
-                            elide_core::volume_event::EventKind::Claimed,
-                            record.vol_ulid,
-                        )
-                        .await;
-                        Ok(ClaimReply::Reclaimed)
-                    }
-                    Ok(MarkReclaimedLocalOutcome::Absent) => Err(IpcError::precondition_failed(
-                        format!("names/{volume_name} vanished between read and reclaim"),
-                    )),
-                    Ok(MarkReclaimedLocalOutcome::NotReleased { observed_state, .. }) => {
-                        Err(IpcError::precondition_failed(format!(
-                            "names/{volume_name} changed underneath us; now in state \
-                             {observed_state:?}"
-                        )))
-                    }
-                    Ok(MarkReclaimedLocalOutcome::ForkMismatch {
-                        released_vol_ulid, ..
-                    }) => {
-                        // Race: someone rebound between our read and write.
-                        // Surface as MustClaimFresh routing — same shape as the
-                        // foreign-content path below.
-                        Ok(ClaimReply::MustClaimFresh {
-                            released_vol_ulid,
-                            handoff_snapshot: record.handoff_snapshot,
-                        })
-                    }
-                    Err(LifecycleError::Store(e)) => {
-                        Err(IpcError::store(format!("reclaim failed: {e}")))
-                    }
-                    Err(LifecycleError::OwnershipConflict { .. })
-                    | Err(LifecycleError::InvalidTransition { .. }) => Err(IpcError::conflict(
-                        format!("in-place reclaim of {volume_name} refused"),
-                    )),
-                }
-            } else {
+        ))),
+        OwnershipPosition::Released {
+            vol_ulid: released_vol_ulid,
+            handoff_snapshot,
+        } => {
+            if local_vol_ulid != Some(released_vol_ulid) {
                 // Foreign content — CLI must orchestrate the claim.
-                Ok(ClaimReply::MustClaimFresh {
-                    released_vol_ulid: record.vol_ulid,
-                    handoff_snapshot: record.handoff_snapshot,
-                })
+                return Ok(ClaimReply::MustClaimFresh {
+                    released_vol_ulid,
+                    handoff_snapshot,
+                });
             }
-        }
-        NameState::Live | NameState::Stopped => match record.coordinator_id.as_deref() {
-            Some(owner) if owner == coord_id => {
-                // Idempotent: we already own this name in the bucket.
-                // Reconcile the local fork to the canonical Stopped+
-                // writable shape so a subsequent `volume start` works
-                // immediately. Handles the case where the local fork
-                // was stamped by an earlier `volume fetch`: `volume.key`
-                // missing, `volume.readonly` + `volume.fetched` present.
-                //
-                // If no local fork exists at all (e.g. post-stop+remove,
-                // breadcrumb retained), `claim` doesn't hydrate — the
-                // operator should use `volume start`, which has the
-                // full hydrate-from-bucket pipeline.
-                use elide_coordinator::volume_state::{
-                    ReconcileError, ReconcileOutcome, reconcile_owned_local_to_stopped,
-                };
-                let vol_dir = match local_vol_dir.clone() {
-                    Some(d) => d,
-                    None => {
-                        return Err(IpcError::conflict(format!(
-                            "name '{volume_name}' is owned by this coordinator but has no \
-                             local fork; use `volume start {volume_name}` to hydrate"
-                        )));
-                    }
-                };
-                match reconcile_owned_local_to_stopped(&vol_dir, data_dir, record.vol_ulid) {
-                    Ok(ReconcileOutcome::AlreadyStopped) => {
-                        info!("[inbound] claim {volume_name}: already owned + stopped — no-op");
-                        Ok(ClaimReply::Reclaimed)
-                    }
-                    Ok(ReconcileOutcome::Reconciled) => {
-                        info!(
-                            "[inbound] claim {volume_name}: reconciled local fork to stopped+writable"
-                        );
-                        Ok(ClaimReply::Reclaimed)
-                    }
-                    Err(ReconcileError::NoKeyShadow) => Err(IpcError::conflict(format!(
+            // In-place reclaim of a Released name we still hold
+            // locally. Three shapes for the matching `vol_ulid`:
+            //
+            //   (a) Original writable fork (has `volume.key`):
+            //       reconcile is a no-op on the local side; just
+            //       flip the bucket to Stopped.
+            //
+            //   (b) Fetched copy of our own lineage (no
+            //       `volume.key`, but a key shadow exists):
+            //       reconcile restores the key and strips the
+            //       fetched/readonly markers, then the bucket
+            //       flip proceeds.
+            //
+            //   (c) Fetched copy of a foreign lineage (no
+            //       `volume.key`, no shadow): reconcile refuses
+            //       with `NoKeyShadow` and we surface a hint to
+            //       fork via `volume create --from`.
+            let vol_dir = local_vol_dir
+                .clone()
+                .expect("local_vol_ulid matched bucket => fork dir resolved");
+            use elide_coordinator::volume_state::{
+                ReconcileError, reconcile_owned_local_to_stopped,
+            };
+            if let Err(e) = reconcile_owned_local_to_stopped(&vol_dir, data_dir, released_vol_ulid)
+            {
+                return Err(match e {
+                    ReconcileError::NoKeyShadow => IpcError::conflict(format!(
                         "volume '{volume_name}' is a fetched (readonly) copy with no \
                          local signing key. To use it as a writable fork run: \
                          elide volume create --from {volume_name} <new-name>"
-                    ))),
-                    Err(ReconcileError::DaemonRunning) => Err(IpcError::conflict(format!(
+                    )),
+                    ReconcileError::DaemonRunning => IpcError::conflict(format!(
                         "volume '{volume_name}' is running on this host; \
                          stop it first with: elide volume stop {volume_name}"
-                    ))),
-                    Err(ReconcileError::Io(e)) => {
-                        Err(IpcError::internal(format!("reconciling local fork: {e}")))
+                    )),
+                    ReconcileError::Io(e) => {
+                        IpcError::internal(format!("reconciling local fork: {e}"))
                     }
+                });
+            }
+            use elide_coordinator::lifecycle::{
+                LifecycleError, MarkReclaimedLocalOutcome, mark_reclaimed_local,
+            };
+            match mark_reclaimed_local(
+                store,
+                volume_name,
+                coord_id,
+                identity.hostname(),
+                released_vol_ulid,
+                NameState::Stopped,
+            )
+            .await
+            {
+                Ok(MarkReclaimedLocalOutcome::Reclaimed) => {
+                    info!(
+                        "[inbound] reclaimed {volume_name} in place (vol_ulid {released_vol_ulid})"
+                    );
+                    if let Err(e) =
+                        elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name)
+                    {
+                        warn!("[inbound] reclaim {volume_name}: clearing breadcrumb: {e}");
+                    }
+                    // Best-effort: drop the display-only marker now that
+                    // the bucket record is no longer Released.
+                    if let Err(e) = clear_released_marker(&vol_dir) {
+                        warn!(
+                            "[inbound] reclaim {volume_name}: clearing \
+                             volume.released marker: {e}"
+                        );
+                    }
+                    elide_coordinator::volume_event_store::emit_best_effort(
+                        store,
+                        identity.as_ref(),
+                        volume_name,
+                        elide_core::volume_event::EventKind::Claimed,
+                        released_vol_ulid,
+                    )
+                    .await;
+                    Ok(ClaimReply::Reclaimed)
+                }
+                Ok(MarkReclaimedLocalOutcome::Absent) => Err(IpcError::precondition_failed(
+                    format!("names/{volume_name} vanished between read and reclaim"),
+                )),
+                Ok(MarkReclaimedLocalOutcome::NotReleased { observed_state, .. }) => {
+                    Err(IpcError::precondition_failed(format!(
+                        "names/{volume_name} changed underneath us; now in state \
+                         {observed_state:?}"
+                    )))
+                }
+                Ok(MarkReclaimedLocalOutcome::ForkMismatch {
+                    released_vol_ulid: raced_vol_ulid,
+                    ..
+                }) => {
+                    // Race: someone rebound between our read and write.
+                    // Surface as MustClaimFresh routing — same shape as the
+                    // foreign-content path above.
+                    Ok(ClaimReply::MustClaimFresh {
+                        released_vol_ulid: raced_vol_ulid,
+                        handoff_snapshot,
+                    })
+                }
+                Err(LifecycleError::Store(e)) => {
+                    Err(IpcError::store(format!("reclaim failed: {e}")))
+                }
+                Err(LifecycleError::OwnershipConflict { .. })
+                | Err(LifecycleError::InvalidTransition { .. }) => Err(IpcError::conflict(
+                    format!("in-place reclaim of {volume_name} refused"),
+                )),
+            }
+        }
+        OwnershipPosition::OwnedByUs { vol_ulid, .. } => {
+            // Idempotent: we already own this name in the bucket.
+            // Reconcile the local fork to the canonical Stopped+
+            // writable shape so a subsequent `volume start` works
+            // immediately. Handles the case where the local fork
+            // was stamped by an earlier `volume fetch`: `volume.key`
+            // missing, `volume.readonly` + `volume.fetched` present.
+            //
+            // If no local fork exists at all (e.g. post-stop+remove,
+            // breadcrumb retained), `claim` doesn't hydrate — the
+            // operator should use `volume start`, which has the
+            // full hydrate-from-bucket pipeline.
+            use elide_coordinator::volume_state::{
+                ReconcileError, ReconcileOutcome, reconcile_owned_local_to_stopped,
+            };
+            let vol_dir = match local_vol_dir.clone() {
+                Some(d) => d,
+                None => {
+                    return Err(IpcError::conflict(format!(
+                        "name '{volume_name}' is owned by this coordinator but has no \
+                         local fork; use `volume start {volume_name}` to hydrate"
+                    )));
+                }
+            };
+            match reconcile_owned_local_to_stopped(&vol_dir, data_dir, vol_ulid) {
+                Ok(ReconcileOutcome::AlreadyStopped) => {
+                    info!("[inbound] claim {volume_name}: already owned + stopped — no-op");
+                    Ok(ClaimReply::Reclaimed)
+                }
+                Ok(ReconcileOutcome::Reconciled) => {
+                    info!(
+                        "[inbound] claim {volume_name}: reconciled local fork to stopped+writable"
+                    );
+                    Ok(ClaimReply::Reclaimed)
+                }
+                Err(ReconcileError::NoKeyShadow) => Err(IpcError::conflict(format!(
+                    "volume '{volume_name}' is a fetched (readonly) copy with no \
+                     local signing key. To use it as a writable fork run: \
+                     elide volume create --from {volume_name} <new-name>"
+                ))),
+                Err(ReconcileError::DaemonRunning) => Err(IpcError::conflict(format!(
+                    "volume '{volume_name}' is running on this host; \
+                     stop it first with: elide volume stop {volume_name}"
+                ))),
+                Err(ReconcileError::Io(e)) => {
+                    Err(IpcError::internal(format!("reconciling local fork: {e}")))
                 }
             }
-            Some(owner) => Err(IpcError::conflict(format!(
-                "name '{volume_name}' is held by coordinator {owner}"
-            ))),
-            None => Err(IpcError::internal(format!(
-                "name '{volume_name}' has no coordinator_id (malformed record)"
-            ))),
-        },
-        NameState::Readonly => Err(IpcError::conflict(format!(
+        }
+        OwnershipPosition::OwnedByOther {
+            coord_id: owner, ..
+        } => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is held by coordinator {owner}"
+        ))),
+        OwnershipPosition::Readonly { .. } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is readonly (immutable handle); \
              pull it with `volume pull` to serve locally"
         ))),
