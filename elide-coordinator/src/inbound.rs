@@ -1229,6 +1229,28 @@ fn bound_ublk_id(vol_dir: &Path) -> Option<i32> {
 /// "Fully durable" means: no segments awaiting upload (`pending/` empty)
 /// and no unflushed WAL records (`wal/` empty). Both directories are
 /// populated by writes and emptied by the drain pipeline.
+/// Fetch `names/<name>` from the bucket, mapping the store error to
+/// the standard `IpcError::store` shape and treating `Ok(None)` via
+/// the caller-supplied closure (so each verb can phrase its
+/// `not_found` hint differently). Folds the three-arm `match` that
+/// every lifecycle-touching verb opened around the raw call.
+async fn read_name_record_required(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    not_found: impl FnOnce() -> IpcError,
+) -> Result<
+    (
+        elide_core::name_record::NameRecord,
+        object_store::UpdateVersion,
+    ),
+    IpcError,
+> {
+    let record = elide_coordinator::name_store::read_name_record(store, name)
+        .await
+        .map_err(|e| IpcError::store(format!("reading names/{name}: {e}")))?;
+    record.ok_or_else(not_found)
+}
+
 fn unflushed_state_reason(vol_dir: &Path) -> Option<String> {
     let dir_has_entries = |sub: &str| {
         std::fs::read_dir(vol_dir.join(sub))
@@ -2000,29 +2022,22 @@ async fn force_release_volume_op(
     }
 
     // Read the current record to learn which dead fork to recover from.
-    let dead_vol_ulid =
-        match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-            Ok(Some((rec, _))) => {
-                use elide_core::name_record::NameState;
-                match rec.state {
-                    NameState::Live | NameState::Stopped => rec.vol_ulid,
-                    other => {
-                        return Err(IpcError::conflict(format!(
-                            "names/{volume_name} is in state {other:?}; \
-                             force-release only overrides Live or Stopped records"
-                        )));
-                    }
-                }
-            }
-            Ok(None) => {
-                return Err(IpcError::not_found(format!(
-                    "name '{volume_name}' has no S3 record"
+    let dead_vol_ulid = {
+        use elide_core::name_record::NameState;
+        let (rec, _) = read_name_record_required(store, volume_name, || {
+            IpcError::not_found(format!("name '{volume_name}' has no S3 record"))
+        })
+        .await?;
+        match rec.state {
+            NameState::Live | NameState::Stopped => rec.vol_ulid,
+            other => {
+                return Err(IpcError::conflict(format!(
+                    "names/{volume_name} is in state {other:?}; \
+                     force-release only overrides Live or Stopped records"
                 )));
             }
-            Err(e) => {
-                return Err(IpcError::store(format!("reading names/{volume_name}: {e}")));
-            }
-        };
+        }
+    };
 
     // Recovery pipeline: fetch dead fork's pubkey, then either
     // promote an existing auto-snapshot (fast path) or synthesise a
@@ -2295,36 +2310,30 @@ async fn release_volume_op(
     // "already released" reply doesn't perturb the local volume.
     use elide_core::name_record::NameState;
     let read_started = std::time::Instant::now();
-    match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-        Ok(Some((rec, _))) => {
-            info!(
-                "[release {volume_name}] read names/<name>: state={:?} owner={:?} ({:.2?})",
-                rec.state,
-                rec.coordinator_id,
-                read_started.elapsed()
-            );
-            if let Some(existing) = rec.coordinator_id.as_deref()
-                && existing != coord_id
-            {
-                return Err(IpcError::conflict(format!(
-                    "name '{volume_name}' is owned by coordinator {existing}; \
-                     run `volume release --force` to override"
-                )));
-            }
-            if rec.state == NameState::Released {
-                return Err(IpcError::conflict(format!(
-                    "name '{volume_name}' is already released"
-                )));
-            }
-        }
-        Ok(None) => {
-            return Err(IpcError::not_found(format!(
-                "name '{volume_name}' has no S3 record; drain the volume first"
-            )));
-        }
-        Err(e) => {
-            return Err(IpcError::store(format!("reading names/{volume_name}: {e}")));
-        }
+    let (rec, _) = read_name_record_required(store, volume_name, || {
+        IpcError::not_found(format!(
+            "name '{volume_name}' has no S3 record; drain the volume first"
+        ))
+    })
+    .await?;
+    info!(
+        "[release {volume_name}] read names/<name>: state={:?} owner={:?} ({:.2?})",
+        rec.state,
+        rec.coordinator_id,
+        read_started.elapsed()
+    );
+    if let Some(existing) = rec.coordinator_id.as_deref()
+        && existing != coord_id
+    {
+        return Err(IpcError::conflict(format!(
+            "name '{volume_name}' is owned by coordinator {existing}; \
+             run `volume release --force` to override"
+        )));
+    }
+    if rec.state == NameState::Released {
+        return Err(IpcError::conflict(format!(
+            "name '{volume_name}' is already released"
+        )));
     }
 
     // Fast path: nothing has changed since the last published snapshot,
@@ -2546,16 +2555,14 @@ async fn release_breadcrumb_only(
         )));
     };
 
-    let record = elide_coordinator::name_store::read_name_record(store, volume_name)
-        .await
-        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
-    let (rec, _) = record.ok_or_else(|| {
+    let (rec, _) = read_name_record_required(store, volume_name, || {
         IpcError::not_found(format!(
             "name '{volume_name}' has no S3 record despite local breadcrumb; \
              stale breadcrumb — remove `{}/remote/{volume_name}` to dismiss",
             data_dir.display()
         ))
-    })?;
+    })
+    .await?;
 
     if let Some(existing) = rec.coordinator_id.as_deref()
         && existing != coord_id
@@ -3065,17 +3072,12 @@ async fn hydrate_or_route(
 ) -> Result<(), IpcError> {
     use elide_core::name_record::NameState;
 
-    let (record, _) = match elide_coordinator::name_store::read_name_record(store, volume_name)
-        .await
-        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?
-    {
-        Some(rec) => rec,
-        None => {
-            return Err(IpcError::not_found(format!(
-                "volume '{volume_name}' not found locally or in the bucket"
-            )));
-        }
-    };
+    let (record, _) = read_name_record_required(store, volume_name, || {
+        IpcError::not_found(format!(
+            "volume '{volume_name}' not found locally or in the bucket"
+        ))
+    })
+    .await?;
 
     let owned_by_us = record.coordinator_id.as_deref() == Some(coord_id);
     match (record.state, owned_by_us) {
