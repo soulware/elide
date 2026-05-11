@@ -2522,17 +2522,17 @@ struct FastPathCover {
 /// and in S3, plus rename the upload sentinel so the next drain
 /// doesn't try to re-upload anything. The signed bytes are byte-
 /// identical between kinds — filename is just addressing — so the
-/// S3 step is a COPY + DELETE (cheap, no re-sign).
+/// S3 step is a server-side COPY + DELETE: zero data transit through
+/// the coordinator, no re-sign.
 ///
-/// Ordering: S3 first (PUT new key, DELETE old key), then locally.
-/// A crash between the PUT and the DELETE leaves both `<ulid>.manifest`
-/// and `<ulid>.auto.manifest` in S3; the reader path (and
-/// `latest_snapshot_marker`) prefers `User` on a tie, so the
-/// transient state is benign. A crash between S3-OK and local-rename
-/// leaves stale `<ulid>.auto.manifest` on disk — `NotifyVolumeReady`
-/// would normally clean that up on the next start, but since the
-/// volume is about to be released and removed locally, the cleanup
-/// is irrelevant.
+/// Ordering: S3 first (COPY new key, DELETE old key), then locally.
+/// A crash between the COPY and the DELETE leaves both
+/// `<ulid>.manifest` and `<ulid>.auto.manifest` in S3; the reader
+/// path (and `latest_snapshot_marker`) prefers `User` on a tie, so
+/// the transient state is benign. A crash between S3-OK and
+/// local-rename leaves stale `<ulid>.auto.manifest` on disk — since
+/// the volume is about to be released and removed locally, this is
+/// irrelevant.
 async fn promote_auto_snapshot(
     vol_dir: &Path,
     volume_id: &str,
@@ -2542,21 +2542,12 @@ async fn promote_auto_snapshot(
     let auto_key = elide_coordinator::upload::auto_snapshot_manifest_key(volume_id, snap_ulid);
     let user_key = elide_coordinator::upload::snapshot_manifest_key(volume_id, snap_ulid);
 
-    // 1. Copy auto → user in S3 by GET+PUT (object_store::copy is
-    //    backend-specific and not always implemented; GET+PUT is
-    //    universal and the payload is small — a manifest, not body
-    //    data).
-    let bytes = store
-        .get(&auto_key)
-        .await
-        .map_err(|e| IpcError::store(format!("fetching {auto_key} for promotion: {e}")))?
-        .bytes()
-        .await
-        .map_err(|e| IpcError::store(format!("reading {auto_key} for promotion: {e}")))?;
-    store
-        .put(&user_key, bytes.into())
-        .await
-        .map_err(|e| IpcError::store(format!("writing {user_key} on promotion: {e}")))?;
+    // 1. Server-side copy auto → user. `object_store::copy` maps to
+    //    AWS S3's CopyObject API (and equivalents on other backends);
+    //    the bytes never cross the coordinator.
+    store.copy(&auto_key, &user_key).await.map_err(|e| {
+        IpcError::store(format!("copying {auto_key} → {user_key} on promotion: {e}"))
+    })?;
 
     // 2. Delete the auto key. Best-effort: a missing key is fine
     //    (something else already cleaned it up); other errors leave
