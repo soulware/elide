@@ -1121,15 +1121,36 @@ async fn remove_volume(
         .and_then(|s| s.to_str())
         .and_then(|s| ulid::Ulid::from_string(s).ok());
 
-    // Remove requires an explicitly-stopped fork. Preserves the
-    // prior gate: only proceed when `volume.stopped` is present.
-    // Every other shape (running, importing, readonly without
-    // stopped marker, released, fetched) refuses with the existing
-    // hint pointing the operator at `volume stop` first.
-    if !matches!(shape, VolumeLifecycle::StoppedManual) {
-        return Err(IpcError::conflict(
-            "volume is running; stop it first with: elide volume stop <name>",
-        ));
+    // Remove accepts any shape where no process is actively touching
+    // the fork:
+    //   - `StoppedManual`: daemon halted via `volume stop`.
+    //   - `Released { .. }`: ownership handed off; local fork is sticky
+    //     display-only state. Release requires Owner{Stopped} per the
+    //     #337 tightening, so the daemon is provably down.
+    //   - `Fetched { .. }` / `ReadonlyImported`: readonly local caches.
+    //     The supervisor refuses to spawn a daemon for these, so there
+    //     is nothing live to stop — removing them just drops the bytes.
+    //
+    // Refuses on `Running` (daemon alive), `Stopped` (no manual marker;
+    // supervisor may still respawn), and `Importing` (subprocess is
+    // actively writing). Error strings name the actual state so the
+    // operator isn't told "running" for a fetched or imported volume.
+    match &shape {
+        VolumeLifecycle::StoppedManual
+        | VolumeLifecycle::Released { .. }
+        | VolumeLifecycle::Fetched { .. }
+        | VolumeLifecycle::ReadonlyImported => {}
+        VolumeLifecycle::Running { .. } | VolumeLifecycle::Stopped => {
+            return Err(IpcError::conflict(
+                "volume is running; stop it first with: elide volume stop <name>",
+            ));
+        }
+        VolumeLifecycle::Importing { .. } => {
+            return Err(IpcError::conflict(
+                "volume import is in progress; wait for it to finish or cancel it before remove",
+            ));
+        }
+        VolumeLifecycle::Absent => unreachable!("vol_dir was Some above"),
     }
 
     if !force && let Some(reason) = unflushed_state_reason(&vol_dir) {
@@ -3732,6 +3753,61 @@ mod tests {
             .expect_err("running volume should be rejected");
         assert_eq!(err.kind, IpcErrorKind::Conflict);
         assert!(vol_dir.exists(), "dir must be preserved on conflict");
+    }
+
+    #[tokio::test]
+    async fn remove_volume_succeeds_when_released() {
+        // After `volume release`, the fork carries both
+        // `volume.stopped` (release requires Owner{Stopped}) and
+        // `volume.released`. `VolumeLifecycle::from_dir` returns
+        // `Released { .. }` because that marker takes precedence —
+        // but the daemon is provably halted, so remove must proceed.
+        let tmp = TempDir::new().unwrap();
+        let (vol_dir, link) =
+            setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAD", None, true);
+        write_released_marker(&vol_dir, ulid::Ulid::new()).unwrap();
+        remove_volume("vol", false, tmp.path(), None, None)
+            .await
+            .unwrap();
+        assert!(!vol_dir.exists(), "by_id dir should be removed");
+        assert!(std::fs::symlink_metadata(&link).is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_volume_succeeds_when_fetched_readonly_cache() {
+        // A `Fetched` fork is a foreign volume's bytes cached locally
+        // against a basis snapshot. No daemon, no owned bucket state —
+        // remove just drops the cached bytes.
+        use elide_coordinator::volume_state::FetchedRecord;
+        let tmp = TempDir::new().unwrap();
+        let (vol_dir, link) =
+            setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAE", None, false);
+        FetchedRecord {
+            basis_snapshot: ulid::Ulid::new().to_string(),
+            owner_coordinator_id: String::new(),
+            fetched_at: "2026-05-11T00:00:00Z".to_owned(),
+        }
+        .write(&vol_dir)
+        .unwrap();
+        remove_volume("vol", false, tmp.path(), None, None)
+            .await
+            .unwrap();
+        assert!(!vol_dir.exists());
+        assert!(std::fs::symlink_metadata(&link).is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_volume_succeeds_when_readonly_imported() {
+        // OCI base or readonly skeleton — no signing key, no daemon.
+        let tmp = TempDir::new().unwrap();
+        let (vol_dir, link) =
+            setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAF", None, false);
+        std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
+        remove_volume("vol", false, tmp.path(), None, None)
+            .await
+            .unwrap();
+        assert!(!vol_dir.exists());
+        assert!(std::fs::symlink_metadata(&link).is_err());
     }
 
     #[tokio::test]
