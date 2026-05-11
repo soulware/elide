@@ -957,8 +957,8 @@ async fn prefetch_snapshots(
     // of in-flight GETs.
     // Snapshots are recorded as `<ulid>.manifest`; everything else
     // under `snapshots/` (pre-#212 `.filemap` siblings, pre-#215
-    // bare-ULID markers, ephemeral `<ulid>.auto.manifest` checkpoints)
-    // is skipped — auto-snapshots are owned by the stop/start lifecycle
+    // bare-ULID markers, ephemeral `<ulid>-stop.manifest` checkpoints)
+    // is skipped — stop-snapshots are owned by the stop/start lifecycle
     // and should not flow into a prefetching peer.
     let to_fetch: Vec<(object_store::path::Path, String)> = objects
         .into_iter()

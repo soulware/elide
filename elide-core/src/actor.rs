@@ -1599,7 +1599,7 @@ impl VolumeClient {
     }
 
     /// Kind-explicit variant: choose between `<ulid>.manifest` (User —
-    /// the stable user/release snapshot) and `<ulid>.auto.manifest`
+    /// the stable user/release snapshot) and `<ulid>-stop.manifest`
     /// (Auto — the ephemeral checkpoint written by `volume stop`).
     pub fn sign_snapshot_manifest_kind(
         &self,
@@ -2674,7 +2674,7 @@ pub(crate) fn execute_sign_snapshot_manifest(
             &seg_ulids,
             None,
         )?,
-        crate::signing::SnapshotKind::Auto => crate::signing::write_auto_snapshot_manifest(
+        crate::signing::SnapshotKind::Stop => crate::signing::write_stop_snapshot_manifest(
             &base_dir,
             signer.as_ref(),
             &snap_ulid,

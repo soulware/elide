@@ -2351,7 +2351,7 @@ impl Volume {
 
     /// As [`Self::sign_snapshot_manifest`] but explicitly chooses
     /// between the stable user manifest (`<ulid>.manifest`) and the
-    /// ephemeral auto-snapshot variant (`<ulid>.auto.manifest`). The
+    /// ephemeral stop-snapshot variant (`<ulid>-stop.manifest`). The
     /// signed payload is identical for both.
     pub fn sign_snapshot_manifest_kind(
         &mut self,

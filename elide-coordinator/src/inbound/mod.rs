@@ -25,7 +25,7 @@ mod lifecycle;
 // Re-exports used by sibling modules (claim.rs, fork.rs) under the
 // previous flat `crate::inbound::*` shape.
 pub(crate) use lifecycle::{
-    local_daemon_running, promote_auto_snapshot, release_fast_path_handoff,
+    local_daemon_running, promote_stop_snapshot, release_fast_path_handoff,
 };
 
 // Shared test fixtures used by both `mod.rs::tests` and
@@ -769,8 +769,8 @@ pub(crate) async fn snapshot_volume(
 }
 
 /// As [`snapshot_volume`] but lets the caller choose between the stable
-/// user manifest (`<ulid>.manifest`) and the ephemeral auto-snapshot
-/// (`<ulid>.auto.manifest`). The auto variant is what `volume stop`
+/// user manifest (`<ulid>.manifest`) and the ephemeral stop-snapshot
+/// (`<ulid>-stop.manifest`). The auto variant is what `volume stop`
 /// publishes so that a future `start` (this host or another via
 /// `claim`) has a basis to hydrate from. See `docs/architecture.md`
 /// *Auto-snapshot lifecycle*.
@@ -832,21 +832,21 @@ pub(crate) async fn snapshot_volume_kind(
     // or a previous stop on the same index/ state already covered.
     // Republishing would write the same signed bytes at the same key,
     // wasting work and (for the user-manifest case) producing a
-    // redundant `.auto.manifest` sibling that NotifyVolumeReady would
+    // redundant `-stop.manifest` sibling that NotifyVolumeReady would
     // clean up on the next start anyway.
     //
     // User snapshots take this same path through `volume snapshot`,
     // but that verb is an explicit operator request — surprise no-op
     // there would be confusing — so the skip is gated on Auto only.
-    if kind == elide_core::signing::SnapshotKind::Auto
+    if kind == elide_core::signing::SnapshotKind::Stop
         && let Some(existing_kind) = covering_local_snapshot(&fork_dir, snap_ulid)
     {
         let label = match existing_kind {
             elide_core::signing::SnapshotKind::User => "user snapshot",
-            elide_core::signing::SnapshotKind::Auto => "auto-snapshot",
+            elide_core::signing::SnapshotKind::Stop => "stop-snapshot",
         };
         info!(
-            "[auto-snapshot {volume_id}] skipping: {label} {snap_ulid} \
+            "[stop-snapshot {volume_id}] skipping: {label} {snap_ulid} \
              already covers current state"
         );
         return Ok(SnapshotReply { snap_ulid });
@@ -856,8 +856,8 @@ pub(crate) async fn snapshot_volume_kind(
         elide_core::signing::SnapshotKind::User => {
             elide_coordinator::control::sign_snapshot_manifest(&fork_dir, snap_ulid).await
         }
-        elide_core::signing::SnapshotKind::Auto => {
-            elide_coordinator::control::sign_auto_snapshot_manifest(&fork_dir, snap_ulid).await
+        elide_core::signing::SnapshotKind::Stop => {
+            elide_coordinator::control::sign_stop_snapshot_manifest(&fork_dir, snap_ulid).await
         }
     };
     if !signed {
@@ -872,14 +872,14 @@ pub(crate) async fn snapshot_volume_kind(
 
     let label = match kind {
         elide_core::signing::SnapshotKind::User => "snapshot",
-        elide_core::signing::SnapshotKind::Auto => "auto-snapshot",
+        elide_core::signing::SnapshotKind::Stop => "stop-snapshot",
     };
     info!("[{label} {volume_id}] committed {snap_ulid}");
     Ok(SnapshotReply { snap_ulid })
 }
 
 /// Returns the kind of a local manifest at `<vol_dir>/snapshots/<ulid>.{,auto.}manifest`,
-/// or `None` if neither exists. Used by stop's auto-snapshot publish path
+/// or `None` if neither exists. Used by stop's stop-snapshot publish path
 /// to skip the redundant sign+upload when a covering manifest is already
 /// present.
 fn covering_local_snapshot(
@@ -894,12 +894,12 @@ fn covering_local_snapshot(
         return Some(elide_core::signing::SnapshotKind::User);
     }
     if snap_dir
-        .join(elide_core::signing::auto_snapshot_manifest_filename(
+        .join(elide_core::signing::stop_snapshot_manifest_filename(
             &snap_ulid,
         ))
         .exists()
     {
-        return Some(elide_core::signing::SnapshotKind::Auto);
+        return Some(elide_core::signing::SnapshotKind::Stop);
     }
     None
 }
@@ -2583,7 +2583,7 @@ mod tests {
     }
 
     /// `covering_local_snapshot` is the gate that suppresses the
-    /// redundant auto-snapshot publish at `stop` time when a manifest
+    /// redundant stop-snapshot publish at `stop` time when a manifest
     /// at the target ULID already exists locally.
     #[test]
     fn covering_local_snapshot_finds_user_manifest() {
@@ -2604,20 +2604,20 @@ mod tests {
     }
 
     #[test]
-    fn covering_local_snapshot_finds_auto_manifest() {
+    fn covering_local_snapshot_finds_stop_manifest() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
         let snap = ulid::Ulid::new();
         std::fs::write(
             tmp.path()
                 .join("snapshots")
-                .join(format!("{snap}.auto.manifest")),
+                .join(format!("{snap}-stop.manifest")),
             "x",
         )
         .unwrap();
         assert_eq!(
             covering_local_snapshot(tmp.path(), snap),
-            Some(elide_core::signing::SnapshotKind::Auto)
+            Some(elide_core::signing::SnapshotKind::Stop)
         );
     }
 
@@ -2644,7 +2644,7 @@ mod tests {
         std::fs::write(
             tmp.path()
                 .join("snapshots")
-                .join(format!("{snap}.auto.manifest")),
+                .join(format!("{snap}-stop.manifest")),
             "x",
         )
         .unwrap();

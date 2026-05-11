@@ -183,9 +183,9 @@ fn dispatch(
                 );
             }
         },
-        VolumeRequest::SnapshotManifest { snap_ulid, auto } => {
-            let kind = if auto {
-                elide_core::signing::SnapshotKind::Auto
+        VolumeRequest::SnapshotManifest { snap_ulid, stop } => {
+            let kind = if stop {
+                elide_core::signing::SnapshotKind::Stop
             } else {
                 elide_core::signing::SnapshotKind::User
             };

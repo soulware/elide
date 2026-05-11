@@ -443,13 +443,13 @@ impl ForkOrchestrator {
                     )));
                 }
             };
-            if cover.kind == elide_core::signing::SnapshotKind::Auto {
+            if cover.kind == elide_core::signing::SnapshotKind::Stop {
                 let volume_id =
                     elide_coordinator::upload::derive_names(&source_dir).map_err(|e| {
                         IpcError::internal(format!("[fork {name}] deriving source volume id: {e}"))
                     })?;
                 let store = self.ctx.core.stores.for_volume(&source_vol_ulid);
-                if let Err(e) = crate::inbound::promote_auto_snapshot(
+                if let Err(e) = crate::inbound::promote_stop_snapshot(
                     &source_dir,
                     &volume_id,
                     cover.snap_ulid,
@@ -458,7 +458,7 @@ impl ForkOrchestrator {
                 .await
                 {
                     return Err(IpcError::internal(format!(
-                        "promoting auto-snapshot {} for fork of '{name}': {e}",
+                        "promoting stop-snapshot {} for fork of '{name}': {e}",
                         cover.snap_ulid
                     )));
                 }
@@ -553,8 +553,11 @@ async fn resolve_name_op(
 }
 
 /// LIST `by_id/<vol_ulid>/snapshots/` and return the highest snapshot
-/// ULID. Filemap and manifest siblings (filenames containing `.`) are
-/// filtered out so only the bare snapshot markers contribute.
+/// ULID. Filemap and manifest siblings (filenames containing `.`) and
+/// stop-snapshot markers (`<ulid>-stop`, hyphen-tagged) are filtered
+/// out so only the bare user-snapshot markers contribute. Stop
+/// snapshots are ephemeral checkpoints owned by the stop/start
+/// lifecycle and must not be picked up as a fork basis.
 async fn latest_snapshot_op(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
@@ -574,7 +577,7 @@ async fn latest_snapshot_op(
         let Some(filename) = obj.location.filename() else {
             continue;
         };
-        if filename.contains('.') {
+        if filename.contains('.') || filename.contains('-') {
             continue;
         }
         if let Ok(u) = Ulid::from_string(filename)
