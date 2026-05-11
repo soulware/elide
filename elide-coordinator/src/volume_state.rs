@@ -296,6 +296,183 @@ pub fn clear_released_marker(vol_dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Verb-facing classification of a volume's on-disk state. Built
+/// once at IPC entry (via [`LocalShape::resolve`]) and matched by
+/// lifecycle verbs instead of each verb probing raw markers.
+///
+/// Distinct from [`VolumeLifecycle`] (the CLI-display flavour):
+/// `LocalShape` adds the "is this fork writable" axis (signing-key
+/// presence) and an explicit [`LocalShape::Absent`] for when no
+/// fork exists at all.
+///
+/// Marker precedence mirrors [`VolumeLifecycle::from_dir`]:
+/// `volume.released` → `volume.fetched` → `volume.readonly` →
+/// (writable runtime markers). Once we're in the writable arm:
+/// `volume.importing` → `volume.stopped` → live `volume.pid` →
+/// `Inactive` fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalShape {
+    /// No fork at this name. The caller's `by_name/<name>` symlink
+    /// is absent (or canonicalize returned `NotFound`). Distinct
+    /// from "running but daemon down" — there's no directory at
+    /// all.
+    Absent,
+    /// Fork has `volume.key`. Verbs that need to sign segments can
+    /// proceed. The runtime sub-state names which lifecycle marker
+    /// (if any) is in play.
+    Writable { runtime: WritableRuntime },
+    /// Fork has `volume.readonly` (or no `volume.key`) — verbs that
+    /// need a signing key must refuse. The source sub-state
+    /// distinguishes a foreign-fetched copy (which carries a basis
+    /// snapshot) from an imported OCI base.
+    Readonly { source: ReadonlySource },
+    /// `volume.released` marker is present — display-only state
+    /// reflecting a prior `volume release`. The bucket record is
+    /// authoritative; this is just the local sticky note. Body of
+    /// the marker file is the handoff snapshot ULID (parsed when
+    /// present).
+    Released { handoff: Option<ulid::Ulid> },
+}
+
+/// Sub-state of [`LocalShape::Writable`]. Mirrors the marker
+/// precedence in `VolumeLifecycle::from_dir` for the writable arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritableRuntime {
+    /// Default fallback: no lifecycle markers and the daemon is not
+    /// running. The supervisor would normally start it on the next
+    /// scan.
+    Inactive,
+    /// `volume.stopped` marker present — supervisor parks.
+    Stopped,
+    /// `volume.pid` names a live pid.
+    Running { pid: u32 },
+    /// `volume.importing` marker present — an import subprocess is
+    /// active.
+    Importing { import_ulid: String },
+}
+
+/// Sub-state of [`LocalShape::Readonly`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadonlySource {
+    /// Imported OCI base or a fork that's just been pulled as
+    /// readonly skeleton — `volume.readonly` is present without
+    /// `volume.fetched`.
+    Imported,
+    /// Foreign volume fetched into local cache — `volume.fetched`
+    /// carries the basis snapshot ULID.
+    Fetched { basis: ulid::Ulid },
+}
+
+impl LocalShape {
+    /// Classify a fork directly from its directory. The caller is
+    /// expected to have already canonicalized the `by_name`
+    /// symlink — use [`Self::resolve`] for the more common
+    /// "canonicalize and classify" combined entry point.
+    pub fn from_dir(vol_dir: &Path) -> std::io::Result<Self> {
+        // Released takes precedence — it's a terminal local state
+        // the operator should resolve via claim or release-force
+        // before anything else happens.
+        let released = vol_dir.join(RELEASED_FILE);
+        if released.exists() {
+            let handoff = std::fs::read_to_string(&released)
+                .ok()
+                .and_then(|s| ulid::Ulid::from_string(s.trim()).ok());
+            return Ok(Self::Released { handoff });
+        }
+
+        // Fetched marker → foreign readonly copy with a basis.
+        if let Some(rec) = FetchedRecord::read(vol_dir) {
+            let basis = ulid::Ulid::from_string(&rec.basis_snapshot).map_err(|e| {
+                std::io::Error::other(format!(
+                    "parse volume.fetched basis_snapshot: {e} (raw={:?})",
+                    rec.basis_snapshot
+                ))
+            })?;
+            return Ok(Self::Readonly {
+                source: ReadonlySource::Fetched { basis },
+            });
+        }
+
+        // No signing key (or explicit volume.readonly without
+        // volume.fetched) → readonly-imported. The two sub-cases
+        // produce the same shape because verbs that care about the
+        // distinction can re-inspect the dir if they need to —
+        // currently no verb does.
+        let has_key = vol_dir.join(elide_core::signing::VOLUME_KEY_FILE).exists();
+        if !has_key {
+            return Ok(Self::Readonly {
+                source: ReadonlySource::Imported,
+            });
+        }
+
+        // Writable arm: lifecycle markers in precedence order.
+        if vol_dir.join(IMPORTING_FILE).exists() {
+            let import_ulid = std::fs::read_to_string(vol_dir.join(IMPORTING_FILE))
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            return Ok(Self::Writable {
+                runtime: WritableRuntime::Importing { import_ulid },
+            });
+        }
+        if vol_dir.join(STOPPED_FILE).exists() {
+            return Ok(Self::Writable {
+                runtime: WritableRuntime::Stopped,
+            });
+        }
+        if let Ok(text) = std::fs::read_to_string(vol_dir.join(PID_FILE))
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && pid_is_alive(pid)
+        {
+            return Ok(Self::Writable {
+                runtime: WritableRuntime::Running { pid },
+            });
+        }
+        Ok(Self::Writable {
+            runtime: WritableRuntime::Inactive,
+        })
+    }
+
+    /// Canonicalise `by_name_link` and classify the resulting
+    /// directory. Returns the resolved `vol_dir` alongside the
+    /// shape — `vol_dir` is `Some` exactly when the shape is not
+    /// [`LocalShape::Absent`].
+    ///
+    /// Use this at the top of every lifecycle verb so the marker
+    /// probes happen once, in one place.
+    pub fn resolve(by_name_link: &Path) -> std::io::Result<(Option<std::path::PathBuf>, Self)> {
+        match std::fs::canonicalize(by_name_link) {
+            Ok(vol_dir) => {
+                let shape = Self::from_dir(&vol_dir)?;
+                Ok((Some(vol_dir), shape))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((None, Self::Absent)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// True when the variant is `Writable` and the runtime sub-state
+    /// indicates a live daemon. Verbs use this for the "is anyone
+    /// serving this volume right now" question.
+    pub fn is_daemon_running(&self) -> bool {
+        matches!(
+            self,
+            Self::Writable {
+                runtime: WritableRuntime::Running { .. }
+            }
+        )
+    }
+
+    /// True when verb-level writability is provable from the local
+    /// fork alone: `volume.key` is on disk. Does not consider key
+    /// shadows — callers that want to reconcile a readonly fork
+    /// into writable via the shadow path go through
+    /// [`reconcile_owned_local_to_stopped`] explicitly.
+    pub fn is_writable(&self) -> bool {
+        matches!(self, Self::Writable { .. })
+    }
+}
+
 /// Outcome categories for [`reconcile_owned_local_to_stopped`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReconcileOutcome {
@@ -817,5 +994,210 @@ mod tests {
         let err = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid)
             .expect_err("running daemon must refuse");
         assert!(matches!(err, ReconcileError::DaemonRunning));
+    }
+
+    // ── LocalShape::from_dir / resolve ───────────────────────────────
+
+    /// Build a fork-dir skeleton for `LocalShape` classification.
+    /// Adds `volume.key` by default (so the default classification is
+    /// `Writable { runtime: Inactive }`); the caller stamps markers
+    /// on top to exercise the precedence rules.
+    fn shape_scaffold(with_key: bool) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        if with_key {
+            std::fs::write(
+                tmp.path().join(elide_core::signing::VOLUME_KEY_FILE),
+                [0u8; 32],
+            )
+            .unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn local_shape_inactive_when_only_key_present() {
+        let d = shape_scaffold(true);
+        let s = LocalShape::from_dir(d.path()).unwrap();
+        assert!(matches!(
+            s,
+            LocalShape::Writable {
+                runtime: WritableRuntime::Inactive
+            }
+        ));
+    }
+
+    #[test]
+    fn local_shape_stopped_takes_precedence_over_inactive() {
+        let d = shape_scaffold(true);
+        std::fs::write(d.path().join(STOPPED_FILE), "").unwrap();
+        assert!(matches!(
+            LocalShape::from_dir(d.path()).unwrap(),
+            LocalShape::Writable {
+                runtime: WritableRuntime::Stopped
+            }
+        ));
+    }
+
+    #[test]
+    fn local_shape_running_when_pid_alive() {
+        let d = shape_scaffold(true);
+        std::fs::write(d.path().join(PID_FILE), std::process::id().to_string()).unwrap();
+        match LocalShape::from_dir(d.path()).unwrap() {
+            LocalShape::Writable {
+                runtime: WritableRuntime::Running { pid },
+            } => {
+                assert_eq!(pid, std::process::id());
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_shape_importing_takes_precedence_over_pid_and_stopped() {
+        let d = shape_scaffold(true);
+        let import_id = ulid::Ulid::new().to_string();
+        std::fs::write(d.path().join(IMPORTING_FILE), &import_id).unwrap();
+        std::fs::write(d.path().join(STOPPED_FILE), "").unwrap();
+        std::fs::write(d.path().join(PID_FILE), std::process::id().to_string()).unwrap();
+        match LocalShape::from_dir(d.path()).unwrap() {
+            LocalShape::Writable {
+                runtime: WritableRuntime::Importing { import_ulid },
+            } => {
+                assert_eq!(import_ulid, import_id);
+            }
+            other => panic!("expected Importing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_shape_readonly_imported_when_no_key() {
+        let d = shape_scaffold(false);
+        std::fs::write(d.path().join("volume.readonly"), "").unwrap();
+        assert!(matches!(
+            LocalShape::from_dir(d.path()).unwrap(),
+            LocalShape::Readonly {
+                source: ReadonlySource::Imported
+            }
+        ));
+    }
+
+    #[test]
+    fn local_shape_readonly_fetched_carries_basis() {
+        let d = shape_scaffold(false);
+        let basis = ulid::Ulid::new();
+        FetchedRecord {
+            basis_snapshot: basis.to_string(),
+            owner_coordinator_id: String::new(),
+            fetched_at: "2026-05-12T00:00:00Z".to_owned(),
+        }
+        .write(d.path())
+        .unwrap();
+        match LocalShape::from_dir(d.path()).unwrap() {
+            LocalShape::Readonly {
+                source: ReadonlySource::Fetched { basis: got },
+            } => {
+                assert_eq!(got, basis);
+            }
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_shape_released_takes_top_precedence() {
+        // volume.released wins even when volume.fetched and
+        // volume.stopped also exist on disk — terminal local state
+        // the operator should resolve first.
+        let d = shape_scaffold(true);
+        let handoff = ulid::Ulid::new();
+        let stale_basis = ulid::Ulid::new();
+        std::fs::write(d.path().join(RELEASED_FILE), handoff.to_string()).unwrap();
+        std::fs::write(d.path().join(STOPPED_FILE), "").unwrap();
+        FetchedRecord {
+            basis_snapshot: stale_basis.to_string(),
+            owner_coordinator_id: String::new(),
+            fetched_at: "x".to_owned(),
+        }
+        .write(d.path())
+        .unwrap();
+        match LocalShape::from_dir(d.path()).unwrap() {
+            LocalShape::Released { handoff: Some(u) } => {
+                assert_eq!(u, handoff);
+            }
+            other => panic!("expected Released, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_shape_released_with_unparseable_body_yields_none_handoff() {
+        let d = shape_scaffold(true);
+        std::fs::write(d.path().join(RELEASED_FILE), "not-a-ulid").unwrap();
+        match LocalShape::from_dir(d.path()).unwrap() {
+            LocalShape::Released { handoff: None } => {}
+            other => panic!("expected Released with None handoff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_shape_resolve_returns_absent_when_link_missing() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("by_name").join("ghost");
+        let (vol_dir, shape) = LocalShape::resolve(&missing).unwrap();
+        assert!(vol_dir.is_none());
+        assert_eq!(shape, LocalShape::Absent);
+    }
+
+    #[test]
+    fn local_shape_resolve_follows_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("by_id").join("vol");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(elide_core::signing::VOLUME_KEY_FILE), [0u8; 32]).unwrap();
+        let by_name = tmp.path().join("by_name").join("foo");
+        std::fs::create_dir_all(by_name.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &by_name).unwrap();
+        let (vol_dir, shape) = LocalShape::resolve(&by_name).unwrap();
+        assert_eq!(vol_dir.unwrap(), std::fs::canonicalize(&target).unwrap());
+        assert!(matches!(
+            shape,
+            LocalShape::Writable {
+                runtime: WritableRuntime::Inactive
+            }
+        ));
+    }
+
+    #[test]
+    fn local_shape_is_daemon_running() {
+        assert!(
+            LocalShape::Writable {
+                runtime: WritableRuntime::Running { pid: 1 }
+            }
+            .is_daemon_running()
+        );
+        assert!(
+            !LocalShape::Writable {
+                runtime: WritableRuntime::Stopped
+            }
+            .is_daemon_running()
+        );
+        assert!(!LocalShape::Absent.is_daemon_running());
+        assert!(!LocalShape::Released { handoff: None }.is_daemon_running());
+    }
+
+    #[test]
+    fn local_shape_is_writable() {
+        assert!(
+            LocalShape::Writable {
+                runtime: WritableRuntime::Inactive
+            }
+            .is_writable()
+        );
+        assert!(
+            !LocalShape::Readonly {
+                source: ReadonlySource::Imported
+            }
+            .is_writable()
+        );
+        assert!(!LocalShape::Absent.is_writable());
+        assert!(!LocalShape::Released { handoff: None }.is_writable());
     }
 }
