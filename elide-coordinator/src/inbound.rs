@@ -1180,32 +1180,21 @@ async fn maybe_write_remote_breadcrumb(
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
 ) -> Result<(), String> {
-    use elide_core::name_record::NameState;
+    use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
 
-    let record = match elide_coordinator::name_store::read_name_record(store, volume_name)
+    let (position, _) = fetch_position(store, volume_name, coord_id)
         .await
-        .map_err(|e| e.to_string())?
-    {
-        Some((rec, _)) => rec,
-        None => return Ok(()),
+        .map_err(|e| e.to_string())?;
+    let owned_state = match position {
+        OwnershipPosition::OwnedByUs { state, .. } => state,
+        _ => return Ok(()),
     };
-
-    let owned_by_us = record
-        .coordinator_id
-        .as_deref()
-        .map(|owner| owner == coord_id)
-        .unwrap_or(false);
-    let retains_ownership = matches!(record.state, NameState::Live | NameState::Stopped);
-
-    if !(owned_by_us && retains_ownership) {
-        return Ok(());
-    }
 
     elide_coordinator::remote_breadcrumb::write(data_dir, volume_name, vol_ulid)
         .map_err(|e| format!("write remote breadcrumb: {e}"))?;
     info!(
-        "[inbound] remove {volume_name}: wrote remote breadcrumb (vol {vol_ulid}, state={:?})",
-        record.state
+        "[inbound] remove {volume_name}: wrote remote breadcrumb (vol {vol_ulid}, owned_state={:?})",
+        owned_state
     );
     Ok(())
 }
@@ -1287,29 +1276,32 @@ async fn emit_release_aftermath(
 }
 
 /// Guard run early in every `volume release` variant (local fork
-/// and breadcrumb-only): refuse on a foreign-owned name (point at
-/// `release --force`) and on an already-Released record (idempotent
-/// feedback). The error strings are operator-facing and load-bearing
-/// for discoverability — keep them verbatim.
+/// and breadcrumb-only): pass through on `OwnedByUs`; refuse on
+/// foreign-owned (point at `release --force`), already-released,
+/// or readonly records; surface the caller-supplied `absent_msg`
+/// as the `not_found` reason. The error strings are
+/// operator-facing and load-bearing for discoverability — keep
+/// them verbatim.
 fn ensure_release_eligible(
-    rec: &elide_core::name_record::NameRecord,
+    position: &elide_coordinator::bucket_position::OwnershipPosition,
     volume_name: &str,
-    coord_id: &str,
+    absent_msg: String,
 ) -> Result<(), IpcError> {
-    if let Some(existing) = rec.coordinator_id.as_deref()
-        && existing != coord_id
-    {
-        return Err(IpcError::conflict(format!(
-            "name '{volume_name}' is owned by coordinator {existing}; \
+    use elide_coordinator::bucket_position::OwnershipPosition;
+    match position {
+        OwnershipPosition::OwnedByUs { .. } => Ok(()),
+        OwnershipPosition::OwnedByOther { coord_id, .. } => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is owned by coordinator {coord_id}; \
              run `volume release --force` to override"
-        )));
-    }
-    if rec.state == elide_core::name_record::NameState::Released {
-        return Err(IpcError::conflict(format!(
+        ))),
+        OwnershipPosition::Released { .. } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is already released"
-        )));
+        ))),
+        OwnershipPosition::Readonly { .. } => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is readonly; nothing to release"
+        ))),
+        OwnershipPosition::Absent => Err(IpcError::not_found(absent_msg)),
     }
-    Ok(())
 }
 
 /// User-wins-on-tie precedence for snapshot enumeration. Given a
@@ -1323,28 +1315,6 @@ fn snapshot_take_new(
     current: (ulid::Ulid, elide_core::signing::SnapshotKind),
 ) -> bool {
     new.0 > current.0 || (new.0 == current.0 && new.1 == elide_core::signing::SnapshotKind::User)
-}
-
-/// Fetch `names/<name>` from the bucket, mapping the store error to
-/// the standard `IpcError::store` shape and treating `Ok(None)` via
-/// the caller-supplied closure (so each verb can phrase its
-/// `not_found` hint differently). Folds the three-arm `match` that
-/// every lifecycle-touching verb opened around the raw call.
-async fn read_name_record_required(
-    store: &Arc<dyn ObjectStore>,
-    name: &str,
-    not_found: impl FnOnce() -> IpcError,
-) -> Result<
-    (
-        elide_core::name_record::NameRecord,
-        object_store::UpdateVersion,
-    ),
-    IpcError,
-> {
-    let record = elide_coordinator::name_store::read_name_record(store, name)
-        .await
-        .map_err(|e| IpcError::store(format!("reading names/{name}: {e}")))?;
-    record.ok_or_else(not_found)
 }
 
 fn unflushed_state_reason(vol_dir: &Path) -> Option<String> {
@@ -2128,16 +2098,21 @@ async fn force_release_volume_op(
 
     // Read the current record to learn which dead fork to recover from.
     let dead_vol_ulid = {
-        use elide_core::name_record::NameState;
-        let (rec, _) = read_name_record_required(store, volume_name, || {
-            IpcError::not_found(format!("name '{volume_name}' has no S3 record"))
-        })
-        .await?;
-        match rec.state {
-            NameState::Live | NameState::Stopped => rec.vol_ulid,
-            other => {
+        use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
+        let (position, _) = fetch_position(store, volume_name, identity.coordinator_id_str())
+            .await
+            .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
+        match position {
+            OwnershipPosition::OwnedByUs { vol_ulid, .. }
+            | OwnershipPosition::OwnedByOther { vol_ulid, .. } => vol_ulid,
+            OwnershipPosition::Absent => {
+                return Err(IpcError::not_found(format!(
+                    "name '{volume_name}' has no S3 record"
+                )));
+            }
+            OwnershipPosition::Released { .. } | OwnershipPosition::Readonly { .. } => {
                 return Err(IpcError::conflict(format!(
-                    "names/{volume_name} is in state {other:?}; \
+                    "names/{volume_name} is not in a Live or Stopped state; \
                      force-release only overrides Live or Stopped records"
                 )));
             }
@@ -2422,20 +2397,20 @@ async fn release_volume_op(
     // Verify ownership in S3 before doing any local state mutation.
     // Pulled ahead of the daemon restart so a "wrong owner" or
     // "already released" reply doesn't perturb the local volume.
+    use elide_coordinator::bucket_position::fetch_position;
     let read_started = std::time::Instant::now();
-    let (rec, _) = read_name_record_required(store, volume_name, || {
-        IpcError::not_found(format!(
-            "name '{volume_name}' has no S3 record; drain the volume first"
-        ))
-    })
-    .await?;
+    let (position, _) = fetch_position(store, volume_name, coord_id)
+        .await
+        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
     info!(
-        "[release {volume_name}] read names/<name>: state={:?} owner={:?} ({:.2?})",
-        rec.state,
-        rec.coordinator_id,
+        "[release {volume_name}] read names/<name>: position={position:?} ({:.2?})",
         read_started.elapsed()
     );
-    ensure_release_eligible(&rec, volume_name, coord_id)?;
+    ensure_release_eligible(
+        &position,
+        volume_name,
+        format!("name '{volume_name}' has no S3 record; drain the volume first"),
+    )?;
 
     // Fast path: nothing has changed since the last published snapshot,
     // so reuse it as the handoff. The next claimant forks from it
@@ -2663,16 +2638,22 @@ async fn release_breadcrumb_only(
         )));
     };
 
-    let (rec, _) = read_name_record_required(store, volume_name, || {
-        IpcError::not_found(format!(
+    use elide_coordinator::bucket_position::fetch_position;
+    let (position, fetched) = fetch_position(store, volume_name, coord_id)
+        .await
+        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
+    ensure_release_eligible(
+        &position,
+        volume_name,
+        format!(
             "name '{volume_name}' has no S3 record despite local breadcrumb; \
              stale breadcrumb — remove `{}/remote/{volume_name}` to dismiss",
             data_dir.display()
-        ))
-    })
-    .await?;
-
-    ensure_release_eligible(&rec, volume_name, coord_id)?;
+        ),
+    )?;
+    let rec = fetched
+        .expect("ensure_release_eligible(OwnedByUs) implies fetched is Some")
+        .0;
 
     // Find the latest published snapshot for this vol_ulid to use as
     // the handoff. The bucket should have an auto-snapshot from the
