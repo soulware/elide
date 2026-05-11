@@ -124,7 +124,33 @@ pub(crate) async fn start_fetch(
     // so we can fail fast (NotFound on either) without registering a
     // doomed-to-fail job. The actual body-warm work runs detached.
     let store = ctx.core.stores.coordinator_wide();
-    let (vol_ulid, size_bytes) = resolve_name(&volume_name, &store).await?;
+    let coord_id = ctx.core.identity.coordinator_id_str();
+    let (vol_ulid, size_bytes, owned_by_us) = resolve_name(&volume_name, &store, coord_id).await?;
+
+    // `fetch` is a *foreign* read: it pulls another coordinator's
+    // volume to local readonly state so we can browse it or fork
+    // from it. On a volume we already own there's nothing to fetch —
+    // the indexes are local, bodies arrive on demand at first read,
+    // and the post-fetch shape (`<S>.fetched` + `volume.readonly`)
+    // would actively contradict the writable owned state. Refuse
+    // with a hint pointing at the right verb.
+    if owned_by_us {
+        let by_name = ctx.core.data_dir.join("by_name").join(&volume_name);
+        let hint = if by_name.exists() {
+            format!(
+                "volume '{volume_name}' is already owned by this coordinator; \
+                 use `volume start {volume_name}` to bring it up, or \
+                 `volume create --from {volume_name} <new-name>` to fork from it"
+            )
+        } else {
+            format!(
+                "volume '{volume_name}' is owned by this coordinator but has no \
+                 local fork; use `volume start {volume_name}` to hydrate it from S3"
+            )
+        };
+        return Err(IpcError::conflict(hint));
+    }
+
     let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &store).await? {
         Some(u) => u,
         None => {
@@ -256,7 +282,9 @@ async fn run_orchestrator(
 
     // Stage 7. On clean exit, write the `volume.fetched` marker. Only
     // here, after every prior step succeeded, does the volume
-    // formally enter the `Fetched` lifecycle state.
+    // formally enter the `Fetched` lifecycle state. Reaching this
+    // point implies the bucket record is foreign-owned — owned-by-us
+    // fetches are refused in the synchronous front-half.
     write_fetched_marker(&fork_dir, basis_snapshot, &ctx)?;
     job.line(format!(
         "fetched: marker written ({} = {basis_snapshot})",
@@ -271,9 +299,13 @@ async fn run_orchestrator(
 async fn resolve_name(
     volume_name: &str,
     store: &Arc<dyn ObjectStore>,
-) -> Result<(Ulid, u64), IpcError> {
+    coord_id: &str,
+) -> Result<(Ulid, u64, bool), IpcError> {
     match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-        Ok(Some((rec, _))) => Ok((rec.vol_ulid, rec.size)),
+        Ok(Some((rec, _))) => {
+            let owned_by_us = rec.coordinator_id.as_deref() == Some(coord_id);
+            Ok((rec.vol_ulid, rec.size, owned_by_us))
+        }
         Ok(None) => Err(IpcError::not_found(format!(
             "volume '{volume_name}' not found in store"
         ))),
