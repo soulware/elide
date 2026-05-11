@@ -304,16 +304,14 @@ async fn resolve_name(
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
 ) -> Result<(Ulid, u64, bool), IpcError> {
-    match elide_coordinator::name_store::read_name_record(store, volume_name).await {
-        Ok(Some((rec, _))) => {
-            let owned_by_us = rec.coordinator_id.as_deref() == Some(coord_id);
-            Ok((rec.vol_ulid, rec.size, owned_by_us))
-        }
-        Ok(None) => Err(IpcError::not_found(format!(
-            "volume '{volume_name}' not found in store"
-        ))),
-        Err(e) => Err(IpcError::store(format!("reading names/{volume_name}: {e}"))),
-    }
+    use elide_coordinator::bucket_position::fetch_position;
+    let (position, record) = fetch_position(store, volume_name, coord_id)
+        .await
+        .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
+    let rec = record
+        .ok_or_else(|| IpcError::not_found(format!("volume '{volume_name}' not found in store")))?
+        .0;
+    Ok((rec.vol_ulid, rec.size, position.is_ours()))
 }
 
 /// LIST `by_id/<vol_ulid>/snapshots/` and return the highest snapshot
