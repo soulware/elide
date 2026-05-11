@@ -228,6 +228,18 @@ async fn fetch_and_verify_manifest(
             .map_err(|e| IpcError::internal(format!("writing {filename}.tmp: {e}")))?;
         std::fs::rename(&tmp, &local_path)
             .map_err(|e| IpcError::internal(format!("renaming {filename}.tmp: {e}")))?;
+        // These bytes came from S3 — pre-mark the upload sentinel so
+        // the daemon's first drain tick doesn't redundantly PUT them
+        // back. Best-effort: a failure here only costs a wasted PUT.
+        let sentinel_relative = match kind {
+            elide_core::signing::SnapshotKind::User => format!("snapshots/{snap_ulid}"),
+            elide_core::signing::SnapshotKind::Auto => format!("snapshots/{snap_ulid}.auto"),
+        };
+        if let Err(e) =
+            elide_coordinator::upload::mark_already_uploaded(fork_dir, &sentinel_relative, &[])
+        {
+            warn!("[hydrate {vol_ulid}] writing snapshot upload sentinel: {e}");
+        }
     }
 
     let verifying_key =

@@ -114,6 +114,22 @@ pub async fn pull_volume_skeleton(
     std::fs::create_dir_all(vol_dir.join("index"))
         .with_context(|| format!("creating index/ for {volume_id}"))?;
 
+    // These bytes came *from* S3 — record matching upload sentinels
+    // so the per-volume drain loop's first pass over
+    // `upload_volume_metadata` doesn't redundantly PUT them back.
+    // Failures here only mean the daemon will re-upload the (byte-
+    // identical) files on the next tick; no correctness impact.
+    if let Err(e) = crate::upload::mark_already_uploaded(&vol_dir, "volume.pub", &pub_bytes) {
+        tracing::warn!("[pull {volume_id}] writing volume.pub upload sentinel: {e}");
+    }
+    if let Err(e) = crate::upload::mark_already_uploaded(
+        &vol_dir,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+        &provenance_bytes,
+    ) {
+        tracing::warn!("[pull {volume_id}] writing volume.provenance upload sentinel: {e}");
+    }
+
     Ok(vol_dir)
 }
 
