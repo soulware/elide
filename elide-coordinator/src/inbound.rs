@@ -1985,7 +1985,7 @@ async fn force_release_volume_op(
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> Result<ReleaseReply, IpcError> {
-    use elide_coordinator::lifecycle::{self, ForceReleaseOutcome};
+    use elide_coordinator::lifecycle;
     use elide_coordinator::recovery;
 
     // Refuse when the "dead peer" is actually this host's running
@@ -2024,8 +2024,9 @@ async fn force_release_volume_op(
             }
         };
 
-    // Recovery pipeline: fetch dead fork's pubkey, list+verify
-    // segments, mint+sign+publish synthesised handoff snapshot.
+    // Recovery pipeline: fetch dead fork's pubkey, then either
+    // promote an existing auto-snapshot (fast path) or synthesise a
+    // fresh handoff manifest from S3-visible segments (slow path).
     //
     // If `volume.pub` is absent the dead fork crashed during the
     // create-time window before the coordinator published it. No
@@ -2039,6 +2040,50 @@ async fn force_release_volume_op(
                 "fetching volume.pub for released fork {dead_vol_ulid}: {e:#}"
             ))
         })?;
+
+    // Fast path: if the dead owner went through a clean `stop` before
+    // becoming unreachable, an `<S>.auto.manifest` is in S3 covering
+    // the durable state at that point. Promote it server-side
+    // instead of re-deriving the segment list. The promoted manifest
+    // retains the dead owner's signature; claimants verify it under
+    // the dead fork's `volume.pub`, same as any user snapshot.
+    if let Some(dead_pub_ref) = dead_pub.as_ref() {
+        match recovery::try_promote_auto_snapshot_for_force_release(
+            store,
+            dead_vol_ulid,
+            dead_pub_ref,
+        )
+        .await
+        {
+            Ok(Some(promoted)) => {
+                info!(
+                    "[inbound] force-release {volume_name}: fast path — promoted \
+                     dead owner's auto-snapshot {} (signed by dead volume.pub, \
+                     no recovery metadata)",
+                    promoted.snap_ulid
+                );
+                let outcome =
+                    lifecycle::mark_released_force(store, volume_name, promoted.snap_ulid).await;
+                return finalize_force_release(
+                    volume_name,
+                    data_dir,
+                    store,
+                    identity,
+                    promoted.snap_ulid,
+                    outcome,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    "[inbound] force-release {volume_name}: auto-snapshot \
+                     promotion failed ({e:#}); falling back to synthesis"
+                );
+            }
+        }
+    }
+
     let segment_ulids: Vec<ulid::Ulid> = match dead_pub {
         Some(dead_pub) => {
             let recovered = recovery::list_and_verify_segments(store, dead_vol_ulid, &dead_pub)
@@ -2080,6 +2125,35 @@ async fn force_release_volume_op(
 
     // Unconditional flip of names/<name>.
     let outcome = lifecycle::mark_released_force(store, volume_name, published.snap_ulid).await;
+    finalize_force_release(
+        volume_name,
+        data_dir,
+        store,
+        identity,
+        published.snap_ulid,
+        outcome,
+    )
+    .await
+}
+
+/// Handle the outcome of `mark_released_force` plus the best-effort
+/// after-effects (local display marker, journal entry, breadcrumb
+/// cleanup). Factored out so both the auto-promotion fast path and
+/// the segment-list synthesis slow path in `force_release_volume_op`
+/// converge on identical operator-visible behaviour once the bucket
+/// flip outcome is known.
+async fn finalize_force_release(
+    volume_name: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
+    handoff_snapshot: ulid::Ulid,
+    outcome: Result<
+        elide_coordinator::lifecycle::ForceReleaseOutcome,
+        elide_coordinator::lifecycle::LifecycleError,
+    >,
+) -> Result<ReleaseReply, IpcError> {
+    use elide_coordinator::lifecycle::ForceReleaseOutcome;
     match outcome {
         Ok(ForceReleaseOutcome::Overwritten {
             dead_vol_ulid: d,
@@ -2087,8 +2161,7 @@ async fn force_release_volume_op(
         }) => {
             info!(
                 "[inbound] force-released volume {volume_name} (released fork {d}) at \
-                 synthesised handoff snapshot {}",
-                published.snap_ulid,
+                 handoff snapshot {handoff_snapshot}",
             );
 
             // Best-effort local display marker. force-release is also
@@ -2096,7 +2169,7 @@ async fn force_release_volume_op(
             // any local fork — in that case the by_name symlink doesn't
             // resolve and we silently skip the marker write.
             if let Ok(vol_dir) = std::fs::canonicalize(data_dir.join("by_name").join(volume_name))
-                && let Err(e) = write_released_marker(&vol_dir, published.snap_ulid)
+                && let Err(e) = write_released_marker(&vol_dir, handoff_snapshot)
             {
                 warn!(
                     "[inbound] force-release {volume_name}: writing volume.released \
@@ -2110,7 +2183,7 @@ async fn force_release_volume_op(
                 identity.as_ref(),
                 volume_name,
                 elide_core::volume_event::EventKind::ForceReleased {
-                    handoff_snapshot: published.snap_ulid,
+                    handoff_snapshot,
                     displaced_coordinator_id: displaced_coordinator_id
                         .unwrap_or_else(|| "<unknown>".to_string()),
                 },
@@ -2122,9 +2195,7 @@ async fn force_release_volume_op(
                 warn!("[inbound] force-release {volume_name}: clearing breadcrumb: {e}");
             }
 
-            Ok(ReleaseReply {
-                handoff_snapshot: published.snap_ulid,
-            })
+            Ok(ReleaseReply { handoff_snapshot })
         }
         Ok(ForceReleaseOutcome::Absent) => {
             // Race: record disappeared between our read and our write.
@@ -2133,15 +2204,14 @@ async fn force_release_volume_op(
             )))
         }
         Ok(ForceReleaseOutcome::InvalidState { observed }) => {
-            // Race: state changed under us. The synthesised snapshot
-            // is still published (harmless); operator can retry.
+            // Race: state changed under us. The handoff snapshot is
+            // still published (harmless); operator can retry.
             Err(IpcError::precondition_failed(format!(
                 "names/{volume_name} changed underneath us; now in state {observed:?}"
             )))
         }
         Err(e) => Err(IpcError::store(format!(
-            "force-release flip failed (synthesised snapshot {} already published): {e}",
-            published.snap_ulid
+            "force-release flip failed (handoff snapshot {handoff_snapshot} already published): {e}"
         ))),
     }
 }

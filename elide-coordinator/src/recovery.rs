@@ -42,7 +42,7 @@ use elide_core::signing::{
 };
 
 use crate::portable::{self, ConditionalPutError};
-use crate::upload::snapshot_manifest_key;
+use crate::upload::{auto_snapshot_manifest_key, snapshot_manifest_key};
 
 /// One segment from the dead fork's S3 prefix that passed signature
 /// verification.
@@ -334,6 +334,108 @@ pub async fn mint_and_publish_synthesised_snapshot(
             anyhow::Error::new(e).context("publishing synthesised snapshot manifest"),
         )),
     }
+}
+
+/// Outcome of [`try_promote_auto_snapshot_for_force_release`].
+#[derive(Debug)]
+pub struct PromotedAutoSnapshot {
+    /// The promoted snapshot's ULID. Use this as the handoff for the
+    /// `Released` bucket flip; claimants will fetch it from
+    /// `by_id/<dead_vol>/snapshots/<YYYYMMDD>/<ulid>.manifest`.
+    pub snap_ulid: Ulid,
+}
+
+/// Search the dead fork's snapshots prefix in S3 for an existing
+/// `<ulid>.auto.manifest` and, if one is found and verifies under
+/// the dead fork's `volume.pub`, promote it server-side to
+/// `<ulid>.manifest`. The promoted manifest carries the dead owner's
+/// original signature — no recovery metadata is added, and no
+/// re-sign happens, because the dead owner already produced a
+/// verifiable checkpoint that we're simply re-addressing.
+///
+/// Returns `Ok(Some(_))` when a usable auto-snapshot was found and
+/// promoted; `Ok(None)` when no auto-snapshot exists (caller falls
+/// through to the segment-list synthesis path). Verification
+/// failures surface as `Ok(None)` with a warning rather than as
+/// errors, so a corrupt auto-shard never blocks recovery.
+///
+/// Why this is preferred to synthesis when available:
+///   - The dead owner's auto-snapshot represents an *intentional*
+///     checkpoint at stop time, signed by the volume's own key. No
+///     recovery metadata is needed — no recovering coordinator is
+///     making any claim about the segment list, they're just
+///     re-addressing what the dead owner already signed.
+///   - Server-side COPY is one round-trip with no data transit
+///     through the coordinator. Segment-list synthesis is
+///     O(segments) range-GETs to verify each segment header, plus a
+///     PUT.
+pub async fn try_promote_auto_snapshot_for_force_release(
+    store: &Arc<dyn ObjectStore>,
+    dead_vol_ulid: Ulid,
+    dead_pub: &VerifyingKey,
+) -> Result<Option<PromotedAutoSnapshot>> {
+    let prefix = StorePath::from(format!("by_id/{dead_vol_ulid}/snapshots/"));
+    let objects: Vec<object_store::ObjectMeta> = store
+        .list(Some(&prefix))
+        .try_collect()
+        .await
+        .with_context(|| format!("listing by_id/{dead_vol_ulid}/snapshots/"))?;
+
+    let mut latest_auto: Option<Ulid> = None;
+    for obj in &objects {
+        let Some(filename) = obj.location.filename() else {
+            continue;
+        };
+        let Some((u, kind)) = elide_core::signing::parse_snapshot_filename(filename) else {
+            continue;
+        };
+        if kind != elide_core::signing::SnapshotKind::Auto {
+            continue;
+        }
+        if latest_auto.is_none_or(|cur| u > cur) {
+            latest_auto = Some(u);
+        }
+    }
+    let Some(snap_ulid) = latest_auto else {
+        return Ok(None);
+    };
+
+    let auto_key = auto_snapshot_manifest_key(&dead_vol_ulid.to_string(), snap_ulid);
+    let user_key = snapshot_manifest_key(&dead_vol_ulid.to_string(), snap_ulid);
+
+    // Verify the auto-manifest under the dead fork's volume.pub
+    // before re-addressing it. If verification fails the manifest is
+    // corrupt or wasn't actually signed by the dead owner — fall
+    // through to synthesis rather than promoting a bad shard.
+    let bytes = store
+        .get(&auto_key)
+        .await
+        .with_context(|| format!("fetching auto-manifest {auto_key} for verification"))?
+        .bytes()
+        .await
+        .with_context(|| format!("reading auto-manifest {auto_key} bytes"))?;
+    if let Err(e) = read_snapshot_manifest_from_bytes(&bytes, dead_pub, &snap_ulid) {
+        warn!(
+            "[force-release {dead_vol_ulid}] auto-snapshot {snap_ulid} \
+             fails verification under dead volume.pub: {e}; falling back to synthesis"
+        );
+        return Ok(None);
+    }
+
+    // Server-side COPY auto → user (no data transit through the
+    // coordinator), then DELETE the auto key. A crash between the
+    // two leaves both objects in S3; the reader path prefers User on
+    // a tie, so the transient state is benign.
+    store
+        .copy(&auto_key, &user_key)
+        .await
+        .with_context(|| format!("copying {auto_key} → {user_key} on force-release promotion"))?;
+
+    if let Err(e) = store.delete(&auto_key).await {
+        warn!("[force-release {dead_vol_ulid}] deleting {auto_key} after promotion: {e}");
+    }
+
+    Ok(Some(PromotedAutoSnapshot { snap_ulid }))
 }
 
 /// Outcome of [`resolve_handoff_verifier`]: which Ed25519 key a
@@ -1127,5 +1229,130 @@ mod tests {
             .await
             .expect_err("missing manifest must refuse");
         assert!(matches!(err, ResolveHandoffError::ManifestRead(_)));
+    }
+
+    // ── force-release auto-snapshot promotion ─────────────────────────
+
+    /// PUT a signed manifest at the dead fork's auto-snapshot key,
+    /// returning the ULID for caller assertions. The signed bytes use
+    /// the same `build_snapshot_manifest_bytes` helper the rest of
+    /// the system uses, so the on-wire format matches what the
+    /// volume actor would have written.
+    async fn upload_auto_manifest(
+        store: &Arc<dyn ObjectStore>,
+        vol_ulid: Ulid,
+        snap_ulid: Ulid,
+        signer: &dyn SegmentSigner,
+        segment_ulids: &[Ulid],
+    ) {
+        let bytes = build_snapshot_manifest_bytes(signer, segment_ulids, None);
+        let key = auto_snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+        store.put(&key, PutPayload::from(bytes)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_promotion_no_snapshot_returns_none() {
+        // No auto-manifest in S3 → caller falls through to synthesis.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let vol_ulid = Ulid::new();
+        let (_, vk) = make_signer();
+        let got = try_promote_auto_snapshot_for_force_release(&store, vol_ulid, &vk)
+            .await
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_promotion_happy_path_copies_and_deletes() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let vol_ulid = Ulid::new();
+        let (signer, vk) = make_signer();
+        let snap_ulid = Ulid::new();
+        upload_auto_manifest(&store, vol_ulid, snap_ulid, signer.as_ref(), &[]).await;
+
+        let promoted = try_promote_auto_snapshot_for_force_release(&store, vol_ulid, &vk)
+            .await
+            .unwrap()
+            .expect("auto-snapshot present and verifying must be promoted");
+        assert_eq!(promoted.snap_ulid, snap_ulid);
+
+        // Auto key is gone, user key now exists.
+        let auto_key = auto_snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+        let user_key = snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+        assert!(
+            store.head(&auto_key).await.is_err(),
+            "auto.manifest must be deleted after promotion"
+        );
+        let meta = store.head(&user_key).await.expect("user.manifest exists");
+        assert!(meta.size > 0);
+    }
+
+    #[tokio::test]
+    async fn auto_promotion_picks_latest_among_multiple_autos() {
+        // Pathological multi-auto state (e.g. a crash interrupted a
+        // prior promotion). Latest ULID wins.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let vol_ulid = Ulid::new();
+        let (signer, vk) = make_signer();
+        let mut mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let older = mint.next();
+        let newer = mint.next();
+        upload_auto_manifest(&store, vol_ulid, older, signer.as_ref(), &[]).await;
+        upload_auto_manifest(&store, vol_ulid, newer, signer.as_ref(), &[]).await;
+
+        let promoted = try_promote_auto_snapshot_for_force_release(&store, vol_ulid, &vk)
+            .await
+            .unwrap()
+            .expect("must promote");
+        assert_eq!(promoted.snap_ulid, newer);
+    }
+
+    #[tokio::test]
+    async fn auto_promotion_returns_none_when_signature_verifies_under_wrong_key() {
+        // Auto-manifest was signed by `signer_a`, but force-release is
+        // invoked with the dead fork's `vk_b` (mismatch — e.g. the
+        // dead fork's volume.pub was rotated, or the auto-shard is
+        // bogus). Verification fails → return None, caller synthesises
+        // rather than promoting a manifest the dead owner didn't make.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let vol_ulid = Ulid::new();
+        let snap_ulid = Ulid::new();
+        let (signer_a, _vk_a) = make_signer();
+        let (_signer_b, vk_b) = make_signer();
+        upload_auto_manifest(&store, vol_ulid, snap_ulid, signer_a.as_ref(), &[]).await;
+
+        let got = try_promote_auto_snapshot_for_force_release(&store, vol_ulid, &vk_b)
+            .await
+            .unwrap();
+        assert!(
+            got.is_none(),
+            "verification failure must surface as None, not promotion"
+        );
+        // Auto-manifest is untouched (no destructive operation on
+        // verification failure).
+        let auto_key = auto_snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+        assert!(store.head(&auto_key).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn auto_promotion_ignores_user_manifests() {
+        // A user snapshot at the same ULID does NOT count as a
+        // promotable auto — `force-release` either uses an auto
+        // (faithful to dead owner's intent) or synthesises (covers
+        // all S3-visible segments). A user manifest the dead owner
+        // happened to publish doesn't trigger the fast path.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let vol_ulid = Ulid::new();
+        let (signer, vk) = make_signer();
+        let snap_ulid = Ulid::new();
+        // Upload as `<ulid>.manifest`, not `<ulid>.auto.manifest`.
+        let bytes = build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
+        let key = snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
+        store.put(&key, PutPayload::from(bytes)).await.unwrap();
+
+        let got = try_promote_auto_snapshot_for_force_release(&store, vol_ulid, &vk)
+            .await
+            .unwrap();
+        assert!(got.is_none());
     }
 }
