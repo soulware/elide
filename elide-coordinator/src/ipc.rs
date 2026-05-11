@@ -214,10 +214,17 @@ pub enum Request {
     /// symlink + `by_id/<vol_ulid>/` directory. Bucket records are
     /// untouched. With `force = false`, refuses if `pending/` or
     /// `wal/` is non-empty.
+    ///
+    /// Gated on a valid operator token (`docs/architecture.md` §
+    /// *Operator tokens*). The CLI resolves the token from
+    /// `--token` / `ELIDE_OPERATOR_TOKEN` / `~/.elide/operator-token`
+    /// and presents it here. Absent or invalid → forbidden.
     Remove {
         volume: String,
         #[serde(default)]
         force: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operator_token: Option<String>,
     },
     // ── Read-only history ────────────────────────────────────────────
     /// List the per-name event log at `events/<volume>/`,

@@ -396,7 +396,20 @@ async fn dispatch_json(
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::Remove { volume, force } => {
+        Request::Remove {
+            volume,
+            force,
+            operator_token,
+        } => {
+            // Operator-token gate. `Remove` is the only operator-gated
+            // mutation today; future destructive verbs slot in here
+            // alongside it.
+            if let Err(env) =
+                require_operator_token(operator_token.as_deref(), &volume, &ctx.identity, "remove")
+            {
+                let _ = ipc::write_message(writer, &env).await;
+                return;
+            }
             let store = ctx.stores.coordinator_wide();
             let result = remove_volume(
                 &volume,
@@ -519,6 +532,61 @@ async fn dispatch_json(
 /// match the coordinator's own default — the CLI builds an
 /// object_store from this and must agree with the coordinator on
 /// where the bytes live.
+/// Gate a coordinator mutation on a valid operator macaroon. On
+/// success, emits the audit-log event (op, nonce, volume) and returns
+/// `Ok`. On failure, returns an `Envelope::Err` ready for the caller
+/// to write back to the peer.
+///
+/// The caller passes the volume name the request targets; if the
+/// token carries a `Volume` caveat it must match. Errors are coarse
+/// by design — finer detail would help an attacker probe token state
+/// (see `OperatorReject`).
+fn require_operator_token(
+    encoded: Option<&str>,
+    op_volume: &str,
+    identity: &elide_coordinator::identity::CoordinatorIdentity,
+    op_name: &'static str,
+) -> Result<(), Envelope<()>> {
+    let Some(encoded) = encoded else {
+        return Err(Envelope::err(IpcError::forbidden(format!(
+            "{op_name} requires an operator token; pass --token to elide, set \
+             ELIDE_OPERATOR_TOKEN, or write one to ~/.elide/operator-token"
+        ))));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match macaroon::verify_operator(identity.macaroon_root(), encoded, now, Some(op_volume)) {
+        Ok(m) => {
+            let nonce_hex: String = m
+                .nonce()
+                .map(|n| n.iter().map(|b| format!("{b:02x}")).collect())
+                .unwrap_or_else(|| "?".to_owned());
+            tracing::info!(
+                target: "operator_token::authn",
+                op = op_name,
+                nonce = %nonce_hex,
+                volume = op_volume,
+                "operator-authenticated request",
+            );
+            Ok(())
+        }
+        Err(reject) => {
+            tracing::warn!(
+                target: "operator_token::authn",
+                op = op_name,
+                volume = op_volume,
+                reason = ?reject,
+                "rejected operator token",
+            );
+            Err(Envelope::err(IpcError::forbidden(format!(
+                "operator token rejected ({reject:?})"
+            ))))
+        }
+    }
+}
+
 fn render_store_config(store: &StoreSection) -> StoreConfigReply {
     if let Some(path) = &store.local_path {
         return StoreConfigReply {

@@ -13,9 +13,11 @@
 //     repeated:
 //       u8 tag
 //       Volume   (tag 0): u8 len, N UTF-8 bytes
-//       Scope    (tag 1): u8 (0 = credentials)
+//       Scope    (tag 1): u8 (0 = credentials, 1 = fetch-worker)
 //       Pid      (tag 2): i32 BE
 //       NotAfter (tag 3): u64 BE  (unix seconds)
+//       Role     (tag 4): u8 (0 = operator)
+//       Nonce    (tag 5): 16 bytes (random)
 //
 // The MAC is `blake3::keyed_hash(root_key, caveats_blob)`. blake3 in keyed
 // mode is HMAC-equivalent for our purposes (per the blake3 spec).
@@ -27,9 +29,13 @@ const TAG_VOLUME: u8 = 0;
 const TAG_SCOPE: u8 = 1;
 const TAG_PID: u8 = 2;
 const TAG_NOT_AFTER: u8 = 3;
+const TAG_ROLE: u8 = 4;
+const TAG_NONCE: u8 = 5;
 
 const SCOPE_CREDENTIALS: u8 = 0;
 const SCOPE_FETCH_WORKER: u8 = 1;
+
+const ROLE_OPERATOR: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -64,12 +70,38 @@ impl Scope {
     }
 }
 
+/// Distinguishes operator-issued tokens (human CLI users) from
+/// volume-process tokens. Volume tokens carry `Scope` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Operator macaroon: not PID-bound, gates coordinator mutations
+    /// (currently `Remove`). Requires a `NotAfter` caveat.
+    Operator,
+}
+
+impl Role {
+    fn to_byte(self) -> u8 {
+        match self {
+            Self::Operator => ROLE_OPERATOR,
+        }
+    }
+
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            ROLE_OPERATOR => Some(Self::Operator),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Caveat {
     Volume(String),
     Scope(Scope),
     Pid(i32),
     NotAfter(u64),
+    Role(Role),
+    Nonce([u8; 16]),
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +140,20 @@ impl Macaroon {
     pub fn not_after(&self) -> Option<u64> {
         self.caveats.iter().find_map(|c| match c {
             Caveat::NotAfter(t) => Some(*t),
+            _ => None,
+        })
+    }
+
+    pub fn role(&self) -> Option<Role> {
+        self.caveats.iter().find_map(|c| match c {
+            Caveat::Role(r) => Some(*r),
+            _ => None,
+        })
+    }
+
+    pub fn nonce(&self) -> Option<[u8; 16]> {
+        self.caveats.iter().find_map(|c| match c {
+            Caveat::Nonce(n) => Some(*n),
             _ => None,
         })
     }
@@ -159,6 +205,70 @@ pub fn verify(root_key: &[u8; 32], m: &Macaroon) -> bool {
     constant_time_eq(expected.as_bytes(), &m.mac)
 }
 
+/// Mint an operator macaroon. `expires_unix` is required (no
+/// indefinite operator tokens, per `docs/architecture.md` § *Operator
+/// tokens*). `volume` optionally restricts the token to operations on
+/// one volume name. A fresh 16-byte random nonce is included so the
+/// audit log can tie each authenticated operation back to a specific
+/// `token create` event.
+pub fn mint_operator(root_key: &[u8; 32], expires_unix: u64, volume: Option<&str>) -> Macaroon {
+    use rand_core::RngCore;
+    let mut nonce = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut nonce);
+    let mut caveats = vec![Caveat::Role(Role::Operator), Caveat::NotAfter(expires_unix)];
+    if let Some(v) = volume {
+        caveats.push(Caveat::Volume(v.to_owned()));
+    }
+    caveats.push(Caveat::Nonce(nonce));
+    mint(root_key, caveats)
+}
+
+/// Reasons an operator token may be rejected. Distinguishes "no token
+/// presented" from "token presented but invalid" so the dispatcher can
+/// log differently. Values are intentionally coarse — leaking finer
+/// detail would help an attacker probe token state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorReject {
+    Malformed,
+    BadMac,
+    WrongRole,
+    Expired,
+    VolumeMismatch,
+}
+
+/// Verify an encoded operator macaroon against the coordinator's root
+/// key and the current operation's runtime context.
+///
+/// Checks, in order: parseable; MAC matches; carries
+/// `Role::Operator`; `NotAfter` is present and in the future; if a
+/// `Volume` caveat is present, it matches the operation's target
+/// volume.
+pub fn verify_operator(
+    root_key: &[u8; 32],
+    encoded: &str,
+    now_unix: u64,
+    op_volume: Option<&str>,
+) -> Result<Macaroon, OperatorReject> {
+    let m = Macaroon::parse(encoded).map_err(|_| OperatorReject::Malformed)?;
+    if !verify(root_key, &m) {
+        return Err(OperatorReject::BadMac);
+    }
+    if m.role() != Some(Role::Operator) {
+        return Err(OperatorReject::WrongRole);
+    }
+    let expiry = m.not_after().ok_or(OperatorReject::Expired)?;
+    if expiry <= now_unix {
+        return Err(OperatorReject::Expired);
+    }
+    if let Some(scoped_to) = m.volume() {
+        match op_volume {
+            Some(req_volume) if req_volume == scoped_to => {}
+            _ => return Err(OperatorReject::VolumeMismatch),
+        }
+    }
+    Ok(m)
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -193,6 +303,14 @@ fn serialize_caveats(caveats: &[Caveat]) -> Vec<u8> {
             Caveat::NotAfter(t) => {
                 out.push(TAG_NOT_AFTER);
                 out.extend_from_slice(&t.to_be_bytes());
+            }
+            Caveat::Role(r) => {
+                out.push(TAG_ROLE);
+                out.push(r.to_byte());
+            }
+            Caveat::Nonce(n) => {
+                out.push(TAG_NONCE);
+                out.extend_from_slice(n);
             }
         }
     }
@@ -231,6 +349,19 @@ fn deserialize_caveats(blob: &[u8]) -> io::Result<Vec<Caveat>> {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(bytes);
                 Caveat::NotAfter(u64::from_be_bytes(a))
+            }
+            TAG_ROLE => {
+                let b = read_u8(&mut cur)?;
+                Caveat::Role(
+                    Role::from_byte(b)
+                        .ok_or_else(|| io::Error::other(format!("unknown role: {b}")))?,
+                )
+            }
+            TAG_NONCE => {
+                let bytes = read_n(&mut cur, 16)?;
+                let mut a = [0u8; 16];
+                a.copy_from_slice(bytes);
+                Caveat::Nonce(a)
             }
             _ => return Err(io::Error::other(format!("unknown caveat tag: {tag}"))),
         };
@@ -381,6 +512,79 @@ mod tests {
         let blob_hex = encode_hex(&[1u8, TAG_VOLUME]);
         let s = format!("v1.{mac}.{blob_hex}");
         assert!(Macaroon::parse(&s).is_err());
+    }
+
+    #[test]
+    fn operator_mint_verify_happy_path() {
+        let m = mint_operator(&key(), 2_000_000_000, None);
+        let s = m.encode();
+        let v = verify_operator(&key(), &s, 1_000_000_000, None).expect("valid");
+        assert_eq!(v.role(), Some(Role::Operator));
+        assert_eq!(v.not_after(), Some(2_000_000_000));
+        assert!(v.nonce().is_some());
+        assert!(v.volume().is_none());
+    }
+
+    #[test]
+    fn operator_token_rejects_expired() {
+        let m = mint_operator(&key(), 1_000, None);
+        let s = m.encode();
+        let err = verify_operator(&key(), &s, 2_000, None).unwrap_err();
+        assert_eq!(err, OperatorReject::Expired);
+    }
+
+    #[test]
+    fn operator_token_rejects_tampered_mac() {
+        let m = mint_operator(&key(), 2_000_000_000, None);
+        let mut other = key();
+        other[0] ^= 0xFF;
+        let s = m.encode();
+        let err = verify_operator(&other, &s, 1_000_000_000, None).unwrap_err();
+        assert_eq!(err, OperatorReject::BadMac);
+    }
+
+    #[test]
+    fn operator_token_rejects_wrong_role() {
+        // Mint a credentials-scoped macaroon and try verifying it as operator.
+        let m = mint(
+            &key(),
+            vec![
+                Caveat::Scope(Scope::Credentials),
+                Caveat::NotAfter(2_000_000_000),
+            ],
+        );
+        let s = m.encode();
+        let err = verify_operator(&key(), &s, 1_000_000_000, None).unwrap_err();
+        assert_eq!(err, OperatorReject::WrongRole);
+    }
+
+    #[test]
+    fn operator_volume_caveat_must_match_request() {
+        let m = mint_operator(&key(), 2_000_000_000, Some("vol-a"));
+        let s = m.encode();
+        // Request targets vol-b: rejected.
+        let err = verify_operator(&key(), &s, 1_000_000_000, Some("vol-b")).unwrap_err();
+        assert_eq!(err, OperatorReject::VolumeMismatch);
+        // Request omits volume: also rejected (token is scoped, request must name it).
+        let err = verify_operator(&key(), &s, 1_000_000_000, None).unwrap_err();
+        assert_eq!(err, OperatorReject::VolumeMismatch);
+        // Request matches: accepted.
+        assert!(verify_operator(&key(), &s, 1_000_000_000, Some("vol-a")).is_ok());
+    }
+
+    #[test]
+    fn operator_unscoped_token_works_for_any_volume() {
+        let m = mint_operator(&key(), 2_000_000_000, None);
+        let s = m.encode();
+        assert!(verify_operator(&key(), &s, 1_000_000_000, Some("vol-a")).is_ok());
+        assert!(verify_operator(&key(), &s, 1_000_000_000, None).is_ok());
+    }
+
+    #[test]
+    fn operator_token_nonces_are_unique() {
+        let a = mint_operator(&key(), 2_000_000_000, None).nonce().unwrap();
+        let b = mint_operator(&key(), 2_000_000_000, None).nonce().unwrap();
+        assert_ne!(a, b, "OsRng must not produce duplicate nonces");
     }
 
     #[test]

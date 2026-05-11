@@ -22,8 +22,61 @@ struct Args {
     #[arg(long, env = "ELIDE_DATA_DIR", global = true)]
     data_dir: Option<PathBuf>,
 
+    /// Operator macaroon for coordinator mutations that require one
+    /// (currently: `volume remove`). Resolved in order: this flag,
+    /// `ELIDE_OPERATOR_TOKEN` env var, `~/.elide/operator-token` file.
+    /// Mint with `elide-coordinator token create`.
+    #[arg(long, global = true)]
+    token: Option<String>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Resolve the operator token using the documented precedence order
+/// (`docs/architecture.md` § *Operator tokens*): `--token` flag, then
+/// `ELIDE_OPERATOR_TOKEN` env, then `<home>/.elide/operator-token` file.
+/// Returns `Ok(None)` when no source provides a token — callers gate
+/// on that themselves so the error message can be operation-specific.
+///
+/// Sources are passed in rather than read from globals so the precedence
+/// can be unit-tested without `std::env` races between tests.
+fn resolve_operator_token(
+    cli_flag: Option<&str>,
+    env_token: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> std::io::Result<Option<String>> {
+    if let Some(t) = cli_flag
+        && !t.is_empty()
+    {
+        return Ok(Some(t.to_owned()));
+    }
+    if let Some(t) = env_token
+        && !t.is_empty()
+    {
+        return Ok(Some(t.to_owned()));
+    }
+    let Some(home) = home else { return Ok(None) };
+    let path = home.join(".elide").join("operator-token");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_owned()))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// CLI-side shim: read env + home from process globals and delegate.
+fn resolve_operator_token_from_env(cli_flag: Option<&str>) -> std::io::Result<Option<String>> {
+    let env_token = std::env::var("ELIDE_OPERATOR_TOKEN").ok();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    resolve_operator_token(cli_flag, env_token.as_deref(), home.as_deref())
 }
 
 #[derive(Subcommand)]
@@ -874,7 +927,20 @@ fn main() {
             }
 
             VolumeCommand::Remove { name, force } => {
-                if let Err(e) = coord.remove_volume(&name, force) {
+                let token =
+                    resolve_operator_token_from_env(args.token.as_deref()).unwrap_or_else(|e| {
+                        eprintln!("error reading operator token: {e}");
+                        std::process::exit(1);
+                    });
+                if token.is_none() {
+                    eprintln!(
+                        "error: `volume remove` requires an operator token; pass --token, \
+                         set ELIDE_OPERATOR_TOKEN, or write one to ~/.elide/operator-token \
+                         (mint via `elide-coordinator token create`)"
+                    );
+                    std::process::exit(1);
+                }
+                if let Err(e) = coord.remove_volume(&name, force, token) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -2289,6 +2355,67 @@ fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn operator_token_flag_wins_over_env_and_file() {
+        let tmp = TempDir::new().unwrap();
+        let elide_dir = tmp.path().join(".elide");
+        std::fs::create_dir_all(&elide_dir).unwrap();
+        std::fs::write(elide_dir.join("operator-token"), "file-tok\n").unwrap();
+        let got =
+            resolve_operator_token(Some("flag-tok"), Some("env-tok"), Some(tmp.path())).unwrap();
+        assert_eq!(got.as_deref(), Some("flag-tok"));
+    }
+
+    #[test]
+    fn operator_token_env_wins_over_file() {
+        let tmp = TempDir::new().unwrap();
+        let elide_dir = tmp.path().join(".elide");
+        std::fs::create_dir_all(&elide_dir).unwrap();
+        std::fs::write(elide_dir.join("operator-token"), "file-tok\n").unwrap();
+        let got = resolve_operator_token(None, Some("env-tok"), Some(tmp.path())).unwrap();
+        assert_eq!(got.as_deref(), Some("env-tok"));
+    }
+
+    #[test]
+    fn operator_token_falls_back_to_file_trimmed() {
+        let tmp = TempDir::new().unwrap();
+        let elide_dir = tmp.path().join(".elide");
+        std::fs::create_dir_all(&elide_dir).unwrap();
+        std::fs::write(elide_dir.join("operator-token"), "  file-tok  \n").unwrap();
+        let got = resolve_operator_token(None, None, Some(tmp.path())).unwrap();
+        assert_eq!(got.as_deref(), Some("file-tok"));
+    }
+
+    #[test]
+    fn operator_token_empty_file_yields_none() {
+        let tmp = TempDir::new().unwrap();
+        let elide_dir = tmp.path().join(".elide");
+        std::fs::create_dir_all(&elide_dir).unwrap();
+        std::fs::write(elide_dir.join("operator-token"), "   \n").unwrap();
+        assert!(
+            resolve_operator_token(None, None, Some(tmp.path()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn operator_token_missing_file_yields_none() {
+        let tmp = TempDir::new().unwrap();
+        assert!(
+            resolve_operator_token(None, None, Some(tmp.path()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn operator_token_empty_flag_falls_through_to_env() {
+        let tmp = TempDir::new().unwrap();
+        let got = resolve_operator_token(Some(""), Some("env-tok"), Some(tmp.path())).unwrap();
+        assert_eq!(got.as_deref(), Some("env-tok"));
+    }
 
     /// Build a minimal `<data_dir>/by_id/<ulid>/` skeleton plus a
     /// `by_name/<name>` symlink. Returns the data dir and vol_dir for

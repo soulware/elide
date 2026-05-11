@@ -35,6 +35,7 @@ use std::process;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use elide_core::process::pid_is_alive;
+use humantime_serde::re::humantime;
 
 /// Coordinator-process pidfile. Lives at `<data_dir>/coordinator.pid` so
 /// `elide coord start` can refuse to start a second instance for the
@@ -75,6 +76,35 @@ enum Command {
         /// Overwrite the file if it already exists.
         #[arg(long)]
         force: bool,
+    },
+
+    /// Mint operator tokens. See `docs/architecture.md` § Operator tokens.
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Mint an operator macaroon. Prints the token to stdout; logs the
+    /// nonce, expiry, and optional volume scope to stderr so the
+    /// creation event is recoverable from coordinator logs.
+    Create {
+        #[arg(long, default_value = "coordinator.toml")]
+        config: PathBuf,
+        /// Override the data_dir from the config file (the root key
+        /// lives at `<data_dir>/coordinator.root_key`).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Token lifetime (humantime: `24h`, `7d`, `30m`). No
+        /// indefinite tokens — operator tokens require expiry.
+        #[arg(long, default_value = "24h", value_parser = parse_humantime_duration)]
+        expires: std::time::Duration,
+        /// Restrict the token to a single volume name. Omit for a
+        /// fleet-wide token.
+        #[arg(long)]
+        volume: Option<String>,
     },
 }
 
@@ -226,7 +256,61 @@ async fn run() -> Result<()> {
             elide_coordinator::log_init::init_stderr();
             init_config(&config, force)
         }
+        Command::Token { command } => {
+            elide_coordinator::log_init::init_stderr();
+            token_command(command)
+        }
     }
+}
+
+fn parse_humantime_duration(s: &str) -> Result<std::time::Duration, String> {
+    humantime::parse_duration(s).map_err(|e| e.to_string())
+}
+
+fn token_command(command: TokenCommand) -> Result<()> {
+    match command {
+        TokenCommand::Create {
+            config,
+            data_dir,
+            expires,
+            volume,
+        } => token_create(&config, data_dir, expires, volume.as_deref()),
+    }
+}
+
+fn token_create(
+    config_path: &std::path::Path,
+    data_dir_override: Option<PathBuf>,
+    expires: std::time::Duration,
+    volume: Option<&str>,
+) -> Result<()> {
+    let mut config = config::load(config_path)?;
+    if let Some(dir) = data_dir_override {
+        config.data_dir = dir;
+    }
+    let identity =
+        elide_coordinator::identity::CoordinatorIdentity::load_or_generate(&config.data_dir)
+            .map_err(|e| anyhow::anyhow!("loading coordinator identity: {e}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_secs();
+    let expires_unix = now.saturating_add(expires.as_secs());
+    let macaroon = macaroon::mint_operator(identity.macaroon_root(), expires_unix, volume);
+    let nonce = macaroon
+        .nonce()
+        .expect("mint_operator always includes a nonce");
+    let nonce_hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    tracing::info!(
+        target: "operator_token::create",
+        nonce = %nonce_hex,
+        expires_unix,
+        expires = %humantime::format_duration(expires),
+        volume = volume.unwrap_or("*"),
+        "minted operator token",
+    );
+    println!("{}", macaroon.encode());
+    Ok(())
 }
 
 fn init_config(path: &std::path::Path, force: bool) -> Result<()> {

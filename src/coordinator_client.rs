@@ -629,10 +629,16 @@ impl Client {
     /// local writes have been flushed and uploaded to S3 (`pending/`
     /// and `wal/` empty). Bucket-side records and segments are
     /// untouched.
-    pub fn remove_volume(&self, name: &str, force: bool) -> io::Result<()> {
+    pub fn remove_volume(
+        &self,
+        name: &str,
+        force: bool,
+        operator_token: Option<String>,
+    ) -> io::Result<()> {
         self.call_typed::<()>(&Request::Remove {
             volume: name.to_owned(),
             force,
+            operator_token,
         })?
         .map_err(io::Error::other)
     }
