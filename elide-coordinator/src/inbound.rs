@@ -1229,6 +1229,19 @@ fn bound_ublk_id(vol_dir: &Path) -> Option<i32> {
 /// "Fully durable" means: no segments awaiting upload (`pending/` empty)
 /// and no unflushed WAL records (`wal/` empty). Both directories are
 /// populated by writes and emptied by the drain pipeline.
+/// User-wins-on-tie precedence for snapshot enumeration. Given a
+/// candidate `(ulid, kind)` and the current best, returns `true`
+/// when the candidate should replace it: strictly newer ULID, or
+/// same ULID with `User` kind (which beats `Auto` to handle the
+/// transient state of an in-flight auto→user promotion that crashed
+/// between PUT and DELETE).
+fn snapshot_take_new(
+    new: (ulid::Ulid, elide_core::signing::SnapshotKind),
+    current: (ulid::Ulid, elide_core::signing::SnapshotKind),
+) -> bool {
+    new.0 > current.0 || (new.0 == current.0 && new.1 == elide_core::signing::SnapshotKind::User)
+}
+
 /// Fetch `names/<name>` from the bucket, mapping the store error to
 /// the standard `IpcError::store` shape and treating `Ok(None)` via
 /// the caller-supplied closure (so each verb can phrase its
@@ -2663,15 +2676,8 @@ async fn latest_release_handoff_snapshot(
         };
         latest = match latest {
             None => Some((u, kind)),
-            Some((cur_u, cur_k)) => {
-                let take_new =
-                    u > cur_u || (u == cur_u && kind == elide_core::signing::SnapshotKind::User);
-                if take_new {
-                    Some((u, kind))
-                } else {
-                    Some((cur_u, cur_k))
-                }
-            }
+            Some(cur) if snapshot_take_new((u, kind), cur) => Some((u, kind)),
+            cur => cur,
         };
     }
     Ok(latest)
@@ -3007,15 +3013,8 @@ fn latest_snapshot_marker(
         };
         latest = match latest {
             None => Some((u, k)),
-            Some((cur_u, cur_k)) => {
-                let take_new =
-                    u > cur_u || (u == cur_u && k == elide_core::signing::SnapshotKind::User);
-                if take_new {
-                    Some((u, k))
-                } else {
-                    Some((cur_u, cur_k))
-                }
-            }
+            Some(cur) if snapshot_take_new((u, k), cur) => Some((u, k)),
+            cur => cur,
         };
     }
     Ok(latest)
