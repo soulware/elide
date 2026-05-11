@@ -281,6 +281,56 @@ async fn claim_volume_bucket_op(
             };
 
             if local_vol_ulid == Some(record.vol_ulid) {
+                // Gate the in-place reclaim on local writability.
+                // Three local-fork shapes for matching vol_ulid:
+                //
+                //   (a) Original writable fork (has `volume.key`):
+                //       in-place reclaim is correct — flip the bucket
+                //       to Stopped and the operator runs `volume start`.
+                //
+                //   (b) Fetched copy of *our own* lineage (no
+                //       `volume.key`, but a key shadow exists at
+                //       `data_dir/keys/<vol_ulid>.key` because we
+                //       originally minted this volume on this host):
+                //       restore the key from the shadow, strip the
+                //       fetched/readonly markers, then proceed as (a).
+                //       This is the "I fetched my own released volume
+                //       and want to use it again" path.
+                //
+                //   (c) Fetched copy of a *foreign* lineage (no
+                //       `volume.key`, no key shadow): can't be made
+                //       writable in place — refuse with a hint to
+                //       fork via `volume create --from`. The fetched
+                //       lineage stays usable as a parent.
+                let vol_dir = std::fs::canonicalize(&link).map_err(|e| {
+                    IpcError::internal(format!("canonicalize {}: {e}", link.display()))
+                })?;
+                let has_local_key = vol_dir.join(elide_core::signing::VOLUME_KEY_FILE).exists();
+                let is_fetched = vol_dir
+                    .join(elide_coordinator::volume_state::FETCHED_FILE)
+                    .exists();
+                if !has_local_key {
+                    let shadow = elide_coordinator::key_shadow::read(data_dir, record.vol_ulid)
+                        .map_err(|e| IpcError::internal(format!("reading key shadow: {e}")))?;
+                    if let Some(key_bytes) = shadow {
+                        // (b) — restore writability.
+                        elide_core::segment::write_file_atomic(
+                            &vol_dir.join(elide_core::signing::VOLUME_KEY_FILE),
+                            &key_bytes,
+                        )
+                        .map_err(|e| {
+                            IpcError::internal(format!("restoring volume.key from shadow: {e}"))
+                        })?;
+                        info!("[inbound] reclaim {volume_name}: restored volume.key from shadow");
+                    } else {
+                        // (c) — foreign fetched content, can't reclaim in place.
+                        return Err(IpcError::conflict(format!(
+                            "volume '{volume_name}' is a fetched (readonly) copy with no \
+                             local signing key. To use it as a writable fork run: \
+                             elide volume create --from {volume_name} <new-name>"
+                        )));
+                    }
+                }
                 use elide_coordinator::lifecycle::{
                     LifecycleError, MarkReclaimedLocalOutcome, mark_reclaimed_local,
                 };
@@ -306,13 +356,32 @@ async fn claim_volume_bucket_op(
                         }
                         // Best-effort: drop the display-only marker now that
                         // the bucket record is no longer Released.
-                        if let Ok(vol_dir) = std::fs::canonicalize(&link)
-                            && let Err(e) = clear_released_marker(&vol_dir)
-                        {
+                        if let Err(e) = clear_released_marker(&vol_dir) {
                             warn!(
                                 "[inbound] reclaim {volume_name}: clearing \
                                  volume.released marker: {e}"
                             );
+                        }
+                        // Strip fetched/readonly markers if we just
+                        // resurrected the key from shadow (case (b)).
+                        // Idempotent on volumes that never had them.
+                        if is_fetched {
+                            if let Err(e) =
+                                elide_coordinator::volume_state::clear_fetched_marker(&vol_dir)
+                            {
+                                warn!(
+                                    "[inbound] reclaim {volume_name}: clearing \
+                                     volume.fetched marker: {e}"
+                                );
+                            }
+                            match std::fs::remove_file(vol_dir.join("volume.readonly")) {
+                                Ok(()) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => warn!(
+                                    "[inbound] reclaim {volume_name}: clearing \
+                                     volume.readonly marker: {e}"
+                                ),
+                            }
                         }
                         elide_coordinator::volume_event_store::emit_best_effort(
                             store,
