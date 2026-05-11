@@ -136,6 +136,14 @@ async fn run() -> Result<()> {
             std::fs::write(&pid_path, std::process::id().to_string())
                 .with_context(|| format!("writing pidfile: {}", pid_path.display()))?;
 
+            // Hoisted above the [iam] match so the coord-id is in scope
+            // for the per-coordinator caps-probe key below; daemon::run
+            // also calls load_or_generate, but it's idempotent.
+            let identity = elide_coordinator::identity::CoordinatorIdentity::load_or_generate(
+                &config.data_dir,
+            )
+            .map_err(|e| anyhow::anyhow!("loading coordinator identity: {e}"))?;
+
             let store = match &config.iam {
                 Some(iam_cfg) => {
                     let admin = iam_cfg.resolve_admin().context(
@@ -153,13 +161,6 @@ async fn run() -> Result<()> {
                              a local store has no IAM identity to manage"
                         )
                     })?;
-                    let identity =
-                        elide_coordinator::identity::CoordinatorIdentity::load_or_generate(
-                            &config.data_dir,
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("loading coordinator identity for writer key: {e}")
-                        })?;
                     let manager = iam::WriterKeyManager::new(
                         tigris_cfg,
                         bucket,
@@ -190,7 +191,15 @@ async fn run() -> Result<()> {
             // `claim_started_from_released`) all rely on `If-Match`
             // ETag updates against `names/<name>`. Failing here is far
             // clearer than warning on every `volume stop` later.
-            let probe_key = object_store::path::Path::from("__elide_caps_probe__");
+            // Probe key is per-coordinator so concurrent startups against
+            // the same bucket don't race on a shared key. Under `by_id/`
+            // because the [iam]-mode writer policy permits Put+Delete
+            // only on `by_id/*` and `names/*` — `events/*` and
+            // `coordinators/*` are append-only / immutable.
+            let probe_key = object_store::path::Path::from(format!(
+                "by_id/__elide_caps_probe_{}__",
+                identity.coordinator_id_str()
+            ));
             let caps = portable::probe_capabilities(store.as_ref(), &probe_key)
                 .await
                 .context("probing bucket capabilities")?;
