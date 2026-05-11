@@ -794,6 +794,32 @@ pub(crate) async fn snapshot_volume_kind(
     let snap_ulid = pick_snapshot_ulid(&fork_dir)
         .map_err(|e| IpcError::internal(format!("picking snap_ulid: {e}")))?;
 
+    // Auto-snapshot skip-if-covered: if a manifest (user OR auto) at
+    // this exact ULID already exists locally, the basis is already
+    // published — `volume snapshot` was run with no further writes,
+    // or a previous stop on the same index/ state already covered.
+    // Republishing would write the same signed bytes at the same key,
+    // wasting work and (for the user-manifest case) producing a
+    // redundant `.auto.manifest` sibling that NotifyVolumeReady would
+    // clean up on the next start anyway.
+    //
+    // User snapshots take this same path through `volume snapshot`,
+    // but that verb is an explicit operator request — surprise no-op
+    // there would be confusing — so the skip is gated on Auto only.
+    if kind == elide_core::signing::SnapshotKind::Auto
+        && let Some(existing_kind) = covering_local_snapshot(&fork_dir, snap_ulid)
+    {
+        let label = match existing_kind {
+            elide_core::signing::SnapshotKind::User => "user snapshot",
+            elide_core::signing::SnapshotKind::Auto => "auto-snapshot",
+        };
+        info!(
+            "[auto-snapshot {volume_id}] skipping: {label} {snap_ulid} \
+             already covers current state"
+        );
+        return Ok(SnapshotReply { snap_ulid });
+    }
+
     let signed = match kind {
         elide_core::signing::SnapshotKind::User => {
             elide_coordinator::control::sign_snapshot_manifest(&fork_dir, snap_ulid).await
@@ -818,6 +844,32 @@ pub(crate) async fn snapshot_volume_kind(
     };
     info!("[{label} {volume_id}] committed {snap_ulid}");
     Ok(SnapshotReply { snap_ulid })
+}
+
+/// Returns the kind of a local manifest at `<vol_dir>/snapshots/<ulid>.{,auto.}manifest`,
+/// or `None` if neither exists. Used by stop's auto-snapshot publish path
+/// to skip the redundant sign+upload when a covering manifest is already
+/// present.
+fn covering_local_snapshot(
+    vol_dir: &Path,
+    snap_ulid: ulid::Ulid,
+) -> Option<elide_core::signing::SnapshotKind> {
+    let snap_dir = vol_dir.join("snapshots");
+    if snap_dir
+        .join(elide_core::signing::snapshot_manifest_filename(&snap_ulid))
+        .exists()
+    {
+        return Some(elide_core::signing::SnapshotKind::User);
+    }
+    if snap_dir
+        .join(elide_core::signing::auto_snapshot_manifest_filename(
+            &snap_ulid,
+        ))
+        .exists()
+    {
+        return Some(elide_core::signing::SnapshotKind::Auto);
+    }
+    None
 }
 
 /// Pick a snapshot ULID as the max ULID in `fork_dir/index/`.
@@ -1933,7 +1985,7 @@ async fn force_release_volume_op(
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> Result<ReleaseReply, IpcError> {
-    use elide_coordinator::lifecycle::{self, ForceReleaseOutcome};
+    use elide_coordinator::lifecycle;
     use elide_coordinator::recovery;
 
     // Refuse when the "dead peer" is actually this host's running
@@ -1972,8 +2024,9 @@ async fn force_release_volume_op(
             }
         };
 
-    // Recovery pipeline: fetch dead fork's pubkey, list+verify
-    // segments, mint+sign+publish synthesised handoff snapshot.
+    // Recovery pipeline: fetch dead fork's pubkey, then either
+    // promote an existing auto-snapshot (fast path) or synthesise a
+    // fresh handoff manifest from S3-visible segments (slow path).
     //
     // If `volume.pub` is absent the dead fork crashed during the
     // create-time window before the coordinator published it. No
@@ -1987,6 +2040,50 @@ async fn force_release_volume_op(
                 "fetching volume.pub for released fork {dead_vol_ulid}: {e:#}"
             ))
         })?;
+
+    // Fast path: if the dead owner went through a clean `stop` before
+    // becoming unreachable, an `<S>.auto.manifest` is in S3 covering
+    // the durable state at that point. Promote it server-side
+    // instead of re-deriving the segment list. The promoted manifest
+    // retains the dead owner's signature; claimants verify it under
+    // the dead fork's `volume.pub`, same as any user snapshot.
+    if let Some(dead_pub_ref) = dead_pub.as_ref() {
+        match recovery::try_promote_auto_snapshot_for_force_release(
+            store,
+            dead_vol_ulid,
+            dead_pub_ref,
+        )
+        .await
+        {
+            Ok(Some(promoted)) => {
+                info!(
+                    "[inbound] force-release {volume_name}: fast path — promoted \
+                     dead owner's auto-snapshot {} (signed by dead volume.pub, \
+                     no recovery metadata)",
+                    promoted.snap_ulid
+                );
+                let outcome =
+                    lifecycle::mark_released_force(store, volume_name, promoted.snap_ulid).await;
+                return finalize_force_release(
+                    volume_name,
+                    data_dir,
+                    store,
+                    identity,
+                    promoted.snap_ulid,
+                    outcome,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    "[inbound] force-release {volume_name}: auto-snapshot \
+                     promotion failed ({e:#}); falling back to synthesis"
+                );
+            }
+        }
+    }
+
     let segment_ulids: Vec<ulid::Ulid> = match dead_pub {
         Some(dead_pub) => {
             let recovered = recovery::list_and_verify_segments(store, dead_vol_ulid, &dead_pub)
@@ -2028,6 +2125,35 @@ async fn force_release_volume_op(
 
     // Unconditional flip of names/<name>.
     let outcome = lifecycle::mark_released_force(store, volume_name, published.snap_ulid).await;
+    finalize_force_release(
+        volume_name,
+        data_dir,
+        store,
+        identity,
+        published.snap_ulid,
+        outcome,
+    )
+    .await
+}
+
+/// Handle the outcome of `mark_released_force` plus the best-effort
+/// after-effects (local display marker, journal entry, breadcrumb
+/// cleanup). Factored out so both the auto-promotion fast path and
+/// the segment-list synthesis slow path in `force_release_volume_op`
+/// converge on identical operator-visible behaviour once the bucket
+/// flip outcome is known.
+async fn finalize_force_release(
+    volume_name: &str,
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
+    handoff_snapshot: ulid::Ulid,
+    outcome: Result<
+        elide_coordinator::lifecycle::ForceReleaseOutcome,
+        elide_coordinator::lifecycle::LifecycleError,
+    >,
+) -> Result<ReleaseReply, IpcError> {
+    use elide_coordinator::lifecycle::ForceReleaseOutcome;
     match outcome {
         Ok(ForceReleaseOutcome::Overwritten {
             dead_vol_ulid: d,
@@ -2035,8 +2161,7 @@ async fn force_release_volume_op(
         }) => {
             info!(
                 "[inbound] force-released volume {volume_name} (released fork {d}) at \
-                 synthesised handoff snapshot {}",
-                published.snap_ulid,
+                 handoff snapshot {handoff_snapshot}",
             );
 
             // Best-effort local display marker. force-release is also
@@ -2044,7 +2169,7 @@ async fn force_release_volume_op(
             // any local fork — in that case the by_name symlink doesn't
             // resolve and we silently skip the marker write.
             if let Ok(vol_dir) = std::fs::canonicalize(data_dir.join("by_name").join(volume_name))
-                && let Err(e) = write_released_marker(&vol_dir, published.snap_ulid)
+                && let Err(e) = write_released_marker(&vol_dir, handoff_snapshot)
             {
                 warn!(
                     "[inbound] force-release {volume_name}: writing volume.released \
@@ -2058,7 +2183,7 @@ async fn force_release_volume_op(
                 identity.as_ref(),
                 volume_name,
                 elide_core::volume_event::EventKind::ForceReleased {
-                    handoff_snapshot: published.snap_ulid,
+                    handoff_snapshot,
                     displaced_coordinator_id: displaced_coordinator_id
                         .unwrap_or_else(|| "<unknown>".to_string()),
                 },
@@ -2070,9 +2195,7 @@ async fn force_release_volume_op(
                 warn!("[inbound] force-release {volume_name}: clearing breadcrumb: {e}");
             }
 
-            Ok(ReleaseReply {
-                handoff_snapshot: published.snap_ulid,
-            })
+            Ok(ReleaseReply { handoff_snapshot })
         }
         Ok(ForceReleaseOutcome::Absent) => {
             // Race: record disappeared between our read and our write.
@@ -2081,15 +2204,14 @@ async fn force_release_volume_op(
             )))
         }
         Ok(ForceReleaseOutcome::InvalidState { observed }) => {
-            // Race: state changed under us. The synthesised snapshot
-            // is still published (harmless); operator can retry.
+            // Race: state changed under us. The handoff snapshot is
+            // still published (harmless); operator can retry.
             Err(IpcError::precondition_failed(format!(
                 "names/{volume_name} changed underneath us; now in state {observed:?}"
             )))
         }
         Err(e) => Err(IpcError::store(format!(
-            "force-release flip failed (synthesised snapshot {} already published): {e}",
-            published.snap_ulid
+            "force-release flip failed (handoff snapshot {handoff_snapshot} already published): {e}"
         ))),
     }
 }
@@ -2197,20 +2319,64 @@ async fn release_volume_op(
 
     // Fast path: nothing has changed since the last published snapshot,
     // so reuse it as the handoff. The next claimant forks from it
-    // identically to a freshly-minted one.
+    // identically to a freshly-minted one. If the covering snapshot is
+    // an `Auto` (written by the preceding `stop`), promote it to a
+    // stable user manifest first — `Released` names must point at
+    // stable bases since claim/fork lineages will be built on top.
+    let volume_id_for_promote = elide_coordinator::upload::derive_names(&vol_dir).map_err(|e| {
+        IpcError::internal(format!("[release {volume_name}] deriving volume id: {e}"))
+    })?;
     match release_fast_path_handoff(&vol_dir) {
-        Ok(Some(snap_ulid)) => {
-            info!(
-                "[release {volume_name}] fast path: reusing snapshot {snap_ulid} \
-                 (clean stopped volume, no daemon restart needed)"
-            );
-            let result =
-                perform_release_flip(volume_name, &vol_dir, store, identity, snap_ulid).await;
-            info!(
-                "[release {volume_name}] complete in {:.2?}",
-                started.elapsed()
-            );
-            return result;
+        Ok(Some(cover)) => {
+            if cover.kind == elide_core::signing::SnapshotKind::Auto {
+                info!(
+                    "[release {volume_name}] fast path: promoting auto-snapshot \
+                     {} → stable manifest",
+                    cover.snap_ulid
+                );
+                if let Err(e) =
+                    promote_auto_snapshot(&vol_dir, &volume_id_for_promote, cover.snap_ulid, store)
+                        .await
+                {
+                    warn!(
+                        "[release {volume_name}] auto-snapshot promotion failed ({e}); \
+                         falling back to slow path"
+                    );
+                } else {
+                    info!(
+                        "[release {volume_name}] fast path: reusing snapshot {} \
+                         (clean stopped volume, no daemon restart needed)",
+                        cover.snap_ulid
+                    );
+                    let result = perform_release_flip(
+                        volume_name,
+                        &vol_dir,
+                        store,
+                        identity,
+                        cover.snap_ulid,
+                    )
+                    .await;
+                    info!(
+                        "[release {volume_name}] complete in {:.2?}",
+                        started.elapsed()
+                    );
+                    return result;
+                }
+            } else {
+                info!(
+                    "[release {volume_name}] fast path: reusing snapshot {} \
+                     (clean stopped volume, no daemon restart needed)",
+                    cover.snap_ulid
+                );
+                let result =
+                    perform_release_flip(volume_name, &vol_dir, store, identity, cover.snap_ulid)
+                        .await;
+                info!(
+                    "[release {volume_name}] complete in {:.2?}",
+                    started.elapsed()
+                );
+                return result;
+            }
         }
         Ok(None) => {
             info!(
@@ -2411,7 +2577,98 @@ async fn perform_release_flip(
 ///
 /// `Ok(None)` means slow path required; an `Err` is propagated to the
 /// caller as a fast-path inspection failure (also slow-path fallback).
-fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
+/// Result of a successful release fast-path inspection: the snapshot
+/// ULID to use as the handoff basis, plus the kind on disk. An `Auto`
+/// kind triggers the rename/copy promotion to `<ulid>.manifest`
+/// before the bucket flip — auto-snapshots are not stable enough to
+/// serve as a Released-name basis without that step.
+#[derive(Debug, PartialEq, Eq)]
+struct FastPathCover {
+    snap_ulid: ulid::Ulid,
+    kind: elide_core::signing::SnapshotKind,
+}
+
+/// Promote `<ulid>.auto.manifest` to `<ulid>.manifest` both locally
+/// and in S3, plus rename the upload sentinel so the next drain
+/// doesn't try to re-upload anything. The signed bytes are byte-
+/// identical between kinds — filename is just addressing — so the
+/// S3 step is a server-side COPY + DELETE: zero data transit through
+/// the coordinator, no re-sign.
+///
+/// Ordering: S3 first (COPY new key, DELETE old key), then locally.
+/// A crash between the COPY and the DELETE leaves both
+/// `<ulid>.manifest` and `<ulid>.auto.manifest` in S3; the reader
+/// path (and `latest_snapshot_marker`) prefers `User` on a tie, so
+/// the transient state is benign. A crash between S3-OK and
+/// local-rename leaves stale `<ulid>.auto.manifest` on disk — since
+/// the volume is about to be released and removed locally, this is
+/// irrelevant.
+async fn promote_auto_snapshot(
+    vol_dir: &Path,
+    volume_id: &str,
+    snap_ulid: ulid::Ulid,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<(), IpcError> {
+    let auto_key = elide_coordinator::upload::auto_snapshot_manifest_key(volume_id, snap_ulid);
+    let user_key = elide_coordinator::upload::snapshot_manifest_key(volume_id, snap_ulid);
+
+    // 1. Server-side copy auto → user. `object_store::copy` maps to
+    //    AWS S3's CopyObject API (and equivalents on other backends);
+    //    the bytes never cross the coordinator.
+    store.copy(&auto_key, &user_key).await.map_err(|e| {
+        IpcError::store(format!("copying {auto_key} → {user_key} on promotion: {e}"))
+    })?;
+
+    // 2. Delete the auto key. Best-effort: a missing key is fine
+    //    (something else already cleaned it up); other errors leave
+    //    a redundant `.auto.manifest` next to the user one, which is
+    //    operationally benign — both verify under the volume key.
+    if let Err(e) = store.delete(&auto_key).await {
+        warn!("[promote-auto {snap_ulid}] deleting {auto_key}: {e}");
+    }
+
+    // 3. Rename the local files. Best-effort: if the local copy was
+    //    already cleaned by NotifyVolumeReady at start, the source
+    //    won't exist and the rename returns NotFound — that's fine,
+    //    S3 is the source of truth and is already promoted.
+    let snap_dir = vol_dir.join("snapshots");
+    let from = snap_dir.join(elide_core::signing::auto_snapshot_manifest_filename(
+        &snap_ulid,
+    ));
+    let to = snap_dir.join(elide_core::signing::snapshot_manifest_filename(&snap_ulid));
+    match std::fs::rename(&from, &to) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(
+                "[promote-auto {snap_ulid}] renaming local manifest {} → {}: {e}",
+                from.display(),
+                to.display()
+            );
+        }
+    }
+
+    // 4. Rename the upload sentinel so the drain loop doesn't try
+    //    to re-upload anything for either kind.
+    let uploaded_dir = vol_dir.join("uploaded").join("snapshots");
+    let sentinel_from = uploaded_dir.join(format!("{snap_ulid}.auto"));
+    let sentinel_to = uploaded_dir.join(snap_ulid.to_string());
+    match std::fs::rename(&sentinel_from, &sentinel_to) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(
+                "[promote-auto {snap_ulid}] renaming sentinel {} → {}: {e}",
+                sentinel_from.display(),
+                sentinel_to.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<FastPathCover>> {
     if !dir_is_empty_or_absent(&vol_dir.join("wal"))? {
         return Ok(None);
     }
@@ -2422,17 +2679,23 @@ fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<ulid::Uli
         return Ok(None);
     }
 
-    let Some(snap_ulid) = latest_snapshot_marker(&vol_dir.join("snapshots"))? else {
+    let Some((snap_ulid, kind)) = latest_snapshot_marker(&vol_dir.join("snapshots"))? else {
         return Ok(None);
     };
 
-    // The snapshot pair (marker + .manifest) is uploaded atomically;
-    // the sentinel is written only after both succeed. Its presence
-    // is the canonical "this snapshot is on S3" check.
+    // The snapshot pair (marker + .manifest / .auto.manifest) is
+    // uploaded atomically; the sentinel is written only after both
+    // succeed. Its presence is the canonical "this snapshot is on
+    // S3" check. User and Auto have distinct sentinel labels under
+    // `uploaded/snapshots/` — see `upload_snapshot_metadata`.
+    let sentinel_name = match kind {
+        elide_core::signing::SnapshotKind::User => snap_ulid.to_string(),
+        elide_core::signing::SnapshotKind::Auto => format!("{snap_ulid}.auto"),
+    };
     let sentinel = vol_dir
         .join("uploaded")
         .join("snapshots")
-        .join(snap_ulid.to_string());
+        .join(&sentinel_name);
     if !sentinel.exists() {
         return Ok(None);
     }
@@ -2443,7 +2706,7 @@ fn release_fast_path_handoff(vol_dir: &Path) -> std::io::Result<Option<ulid::Uli
         return Ok(None);
     }
 
-    Ok(Some(snap_ulid))
+    Ok(Some(FastPathCover { snap_ulid, kind }))
 }
 
 fn dir_is_empty_or_absent(p: &Path) -> std::io::Result<bool> {
@@ -2454,27 +2717,40 @@ fn dir_is_empty_or_absent(p: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// Return the highest snapshot ULID found under `snap_dir`. Snapshots
-/// are recorded as `<ulid>.manifest` files; any other entry (including
-/// `<ulid>.filemap` siblings) is ignored.
-fn latest_snapshot_marker(snap_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> {
+/// Return the highest snapshot ULID found under `snap_dir`, paired
+/// with the kind (User from `<ulid>.manifest`, Auto from
+/// `<ulid>.auto.manifest`). Filemap and other siblings are skipped.
+/// On ties (same ULID present in both forms) the User kind wins —
+/// release's auto-promotion path is the only producer of that
+/// transient state, and the just-written stable manifest is the
+/// authoritative artefact.
+fn latest_snapshot_marker(
+    snap_dir: &Path,
+) -> std::io::Result<Option<(ulid::Ulid, elide_core::signing::SnapshotKind)>> {
     let entries = match std::fs::read_dir(snap_dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let mut latest: Option<ulid::Ulid> = None;
+    let mut latest: Option<(ulid::Ulid, elide_core::signing::SnapshotKind)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(s) = name.to_str() else { continue };
-        let Some(stem) = s.strip_suffix(".manifest") else {
+        let Some((u, k)) = elide_core::signing::parse_snapshot_filename(s) else {
             continue;
         };
-        if let Ok(u) = ulid::Ulid::from_string(stem)
-            && latest.is_none_or(|cur| u > cur)
-        {
-            latest = Some(u);
-        }
+        latest = match latest {
+            None => Some((u, k)),
+            Some((cur_u, cur_k)) => {
+                let take_new =
+                    u > cur_u || (u == cur_u && k == elide_core::signing::SnapshotKind::User);
+                if take_new {
+                    Some((u, k))
+                } else {
+                    Some((cur_u, cur_k))
+                }
+            }
+        };
     }
     Ok(latest)
 }
@@ -4058,12 +4334,46 @@ mod tests {
         tmp
     }
 
+    /// As `fast_path_clean_volume` but stamps an auto-snapshot
+    /// (`<ulid>.auto.manifest` + `uploaded/snapshots/<ulid>.auto`)
+    /// instead of a user one. Used to verify the fast path treats
+    /// auto-snapshots as a covering basis with promotion.
+    fn fast_path_clean_volume_auto(snap_ulid: ulid::Ulid) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        for sub in ["wal", "pending", "gc", "index", "snapshots"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap_ulid}.auto.manifest")),
+            "fake-signed",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("uploaded").join("snapshots")).unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("uploaded")
+                .join("snapshots")
+                .join(format!("{snap_ulid}.auto")),
+            "",
+        )
+        .unwrap();
+        tmp
+    }
+
     #[test]
     fn fast_path_eligible_when_clean_with_uploaded_snapshot() {
         let snap = ulid::Ulid::new();
         let tmp = fast_path_clean_volume(snap);
         let got = release_fast_path_handoff(tmp.path()).unwrap();
-        assert_eq!(got, Some(snap));
+        assert_eq!(
+            got,
+            Some(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::User
+            })
+        );
     }
 
     #[test]
@@ -4156,7 +4466,13 @@ mod tests {
             "",
         )
         .unwrap();
-        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), Some(snap));
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            Some(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::User
+            })
+        );
     }
 
     #[test]
@@ -4183,7 +4499,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             release_fast_path_handoff(tmp.path()).unwrap(),
-            Some(newer_snap)
+            Some(FastPathCover {
+                snap_ulid: newer_snap,
+                kind: elide_core::signing::SnapshotKind::User
+            })
         );
     }
 
@@ -4200,7 +4519,137 @@ mod tests {
         )
         .unwrap();
         std::fs::write(tmp.path().join("snapshots").join(snap.to_string()), "").unwrap();
-        assert_eq!(release_fast_path_handoff(tmp.path()).unwrap(), Some(snap));
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            Some(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::User
+            })
+        );
+    }
+
+    #[test]
+    fn fast_path_recognises_auto_snapshot_as_covering() {
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume_auto(snap);
+        assert_eq!(
+            release_fast_path_handoff(tmp.path()).unwrap(),
+            Some(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::Auto,
+            }),
+            "auto-snapshot with sentinel must be eligible (release promotes it later)"
+        );
+    }
+
+    #[test]
+    fn fast_path_prefers_user_when_same_ulid_has_both_kinds() {
+        // Transient state during an in-flight auto→user promotion:
+        // both files exist for the same ULID. The latest_snapshot
+        // tiebreaker is User, so release's fast path picks up the
+        // already-stable manifest and skips the (redundant)
+        // promotion step.
+        let snap = ulid::Ulid::new();
+        let tmp = fast_path_clean_volume(snap);
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap}.auto.manifest")),
+            "fake-signed",
+        )
+        .unwrap();
+        // Auto sentinel must also exist so the fast path doesn't
+        // reject on a missing sentinel.
+        std::fs::write(
+            tmp.path()
+                .join("uploaded")
+                .join("snapshots")
+                .join(format!("{snap}.auto")),
+            "",
+        )
+        .unwrap();
+        let got = release_fast_path_handoff(tmp.path()).unwrap();
+        assert_eq!(
+            got,
+            Some(FastPathCover {
+                snap_ulid: snap,
+                kind: elide_core::signing::SnapshotKind::User,
+            }),
+            "User wins the tiebreaker; auto sibling is the stale shard"
+        );
+    }
+
+    /// `covering_local_snapshot` is the gate that suppresses the
+    /// redundant auto-snapshot publish at `stop` time when a manifest
+    /// at the target ULID already exists locally.
+    #[test]
+    fn covering_local_snapshot_finds_user_manifest() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+        let snap = ulid::Ulid::new();
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap}.manifest")),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(
+            covering_local_snapshot(tmp.path(), snap),
+            Some(elide_core::signing::SnapshotKind::User)
+        );
+    }
+
+    #[test]
+    fn covering_local_snapshot_finds_auto_manifest() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+        let snap = ulid::Ulid::new();
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap}.auto.manifest")),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(
+            covering_local_snapshot(tmp.path(), snap),
+            Some(elide_core::signing::SnapshotKind::Auto)
+        );
+    }
+
+    #[test]
+    fn covering_local_snapshot_returns_none_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+        let snap = ulid::Ulid::new();
+        assert_eq!(covering_local_snapshot(tmp.path(), snap), None);
+    }
+
+    #[test]
+    fn covering_local_snapshot_prefers_user_over_auto() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("snapshots")).unwrap();
+        let snap = ulid::Ulid::new();
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap}.manifest")),
+            "x",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("snapshots")
+                .join(format!("{snap}.auto.manifest")),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(
+            covering_local_snapshot(tmp.path(), snap),
+            Some(elide_core::signing::SnapshotKind::User),
+            "User wins so an in-flight promotion is treated as already-done"
+        );
     }
 
     #[test]
