@@ -2197,30 +2197,37 @@ async fn finalize_force_release(
 }
 
 /// Relinquish ownership of `<volume_name>` so any other coordinator can
-/// `volume start` it. Composes the existing snapshot path:
+/// claim it.
 ///
-/// 1. Refuse if the volume is readonly (no exclusive owner to release)
-///    or a block-device client is connected (must disconnect cleanly first).
-/// 2. If the volume is `stopped`, transparently bring it back up
-///    (clear the marker, notify the supervisor, wait for
-///    `control.sock`) — the drain step needs a running daemon.
-/// 3. Verify S3 ownership before doing the expensive drain.
-/// 4. Drain WAL → publish handoff snapshot via `snapshot_volume`.
-/// 5. Send shutdown RPC to halt the daemon.
-/// 6. Write `volume.stopped` marker so the supervisor won't restart.
-/// 7. Conditional PUT to `names/<name>` setting state=Released and
-///    recording the handoff snapshot ULID.
+/// Pure bucket-flip: no daemon interaction, no drain. The drain
+/// responsibility belongs to `stop` — a clean stop publishes an
+/// auto-snapshot covering all durable state, and `release` reuses
+/// that snapshot as the handoff. If the previous stop was unclean
+/// (WAL/pending/gc has work post-dating the snapshot), release
+/// refuses with an operator hint pointing at `start` → `stop`
+/// (clean) → re-run.
 ///
-/// Two execution paths:
+/// Preconditions:
+///   - Local fork is `VolumeLifecycle::StoppedManual`, or absent
+///     (routes to [`release_breadcrumb_only`]).
+///   - Bucket role is `Role::Owner { .. }`.
 ///
-/// 1. **Fast path** (clean stopped volume, nothing to drain): reuse
-///    the previously-published snapshot as the handoff, skip the
-///    daemon restart entirely. Costs one S3 GET (ownership) + one
-///    conditional PUT (flip).
-///
-/// 2. **Slow path** (WAL non-empty / pending uploads / GC handoffs /
-///    new segments since last snapshot): bring the daemon up in
-///    drain mode, run the existing snapshot pipeline, halt, flip.
+/// Steps:
+///   1. Resolve local fork shape; route absent → breadcrumb-only.
+///   2. Refuse if local shape isn't `StoppedManual` (running →
+///      ''stop first''; readonly → ''nothing to release''; released
+///      → noop hint).
+///   3. Read bucket position; refuse via [`ensure_release_eligible`]
+///      if role isn't Owner.
+///   4. Fast-path inspection on the local fork: latest published
+///      snapshot must cover all durable state. Refuses otherwise.
+///   5. If cover is `Auto`, promote to a stable `<snap>.manifest`
+///      (server-side COPY+DELETE in S3, local rename) — claim
+///      paths resolve the handoff via the stable filename.
+///   6. Conditional PUT to `names/<name>` setting state=Released
+///      and recording the handoff snapshot ULID. Aftermath
+///      (display marker, journal event, breadcrumb cleanup) via
+///      [`perform_release_flip`].
 async fn release_volume_op(
     volume_name: &str,
     store: &Arc<dyn ObjectStore>,
