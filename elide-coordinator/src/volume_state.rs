@@ -300,10 +300,14 @@ pub fn clear_released_marker(vol_dir: &Path) -> std::io::Result<()> {
 /// once at IPC entry (via [`LocalShape::resolve`]) and matched by
 /// lifecycle verbs instead of each verb probing raw markers.
 ///
-/// Distinct from [`VolumeLifecycle`] (the CLI-display flavour):
-/// `LocalShape` adds the "is this fork writable" axis (signing-key
-/// presence) and an explicit [`LocalShape::Absent`] for when no
-/// fork exists at all.
+/// Distinct from [`VolumeLifecycle`] (the CLI-display flavour) only
+/// in that it adds an explicit [`LocalShape::Absent`] for when no
+/// fork exists at all. The on-disk classification is purely
+/// marker-driven — the same axes [`VolumeLifecycle`] uses — and is
+/// orthogonal to `volume.key` presence. Verbs that need a signing
+/// key for their operation check `volume.key` (or the local key
+/// shadow at `data_dir/keys/`) separately, because the writability
+/// story can legitimately pull from sources outside the fork dir.
 ///
 /// Marker precedence mirrors [`VolumeLifecycle::from_dir`]:
 /// `volume.released` → `volume.fetched` → `volume.readonly` →
@@ -393,13 +397,14 @@ impl LocalShape {
             });
         }
 
-        // No signing key (or explicit volume.readonly without
-        // volume.fetched) → readonly-imported. The two sub-cases
-        // produce the same shape because verbs that care about the
-        // distinction can re-inspect the dir if they need to —
-        // currently no verb does.
-        let has_key = vol_dir.join(elide_core::signing::VOLUME_KEY_FILE).exists();
-        if !has_key {
+        // Explicit `volume.readonly` marker → imported OCI base.
+        // Note: classification is marker-driven and orthogonal to
+        // `volume.key` presence — verbs that need a signing key for
+        // their operation check `volume.key` (or the local key
+        // shadow at `data_dir/keys/`) separately, since the
+        // writability story can pull from sources outside the fork
+        // dir.
+        if vol_dir.join("volume.readonly").exists() {
             return Ok(Self::Readonly {
                 source: ReadonlySource::Imported,
             });
@@ -463,12 +468,12 @@ impl LocalShape {
         )
     }
 
-    /// True when verb-level writability is provable from the local
-    /// fork alone: `volume.key` is on disk. Does not consider key
-    /// shadows — callers that want to reconcile a readonly fork
-    /// into writable via the shadow path go through
-    /// [`reconcile_owned_local_to_stopped`] explicitly.
-    pub fn is_writable(&self) -> bool {
+    /// True when the local fork has no readonly markers and is not
+    /// in a terminal state — i.e. the marker-level classification
+    /// is `Writable`. Does *not* assert that `volume.key` exists on
+    /// disk; verbs that need a signing key should check that
+    /// separately (or rely on the key-shadow reconcile path).
+    pub fn is_marker_writable(&self) -> bool {
         matches!(self, Self::Writable { .. })
     }
 }
@@ -1184,20 +1189,20 @@ mod tests {
     }
 
     #[test]
-    fn local_shape_is_writable() {
+    fn local_shape_is_marker_writable() {
         assert!(
             LocalShape::Writable {
                 runtime: WritableRuntime::Inactive
             }
-            .is_writable()
+            .is_marker_writable()
         );
         assert!(
             !LocalShape::Readonly {
                 source: ReadonlySource::Imported
             }
-            .is_writable()
+            .is_marker_writable()
         );
-        assert!(!LocalShape::Absent.is_writable());
-        assert!(!LocalShape::Released { handoff: None }.is_writable());
+        assert!(!LocalShape::Absent.is_marker_writable());
+        assert!(!LocalShape::Released { handoff: None }.is_marker_writable());
     }
 }

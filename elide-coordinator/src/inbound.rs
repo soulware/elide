@@ -1095,15 +1095,18 @@ async fn remove_volume(
     store: Option<&Arc<dyn ObjectStore>>,
     coord_id: Option<&str>,
 ) -> Result<Option<ulid::Ulid>, IpcError> {
+    use elide_coordinator::volume_state::{LocalShape, WritableRuntime};
     let link = data_dir.join("by_name").join(volume_name);
-    if !link.exists() {
-        return Err(IpcError::not_found(format!(
-            "volume not found: {volume_name}"
-        )));
-    }
-
-    let vol_dir = std::fs::canonicalize(&link)
-        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
+    let (vol_dir, shape) = match LocalShape::resolve(&link)
+        .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?
+    {
+        (Some(dir), shape) => (dir, shape),
+        (None, _) => {
+            return Err(IpcError::not_found(format!(
+                "volume not found: {volume_name}"
+            )));
+        }
+    };
     // Volume directory is `by_id/<ulid>`; extract the ULID once. Used
     // both for the `data_dir/remote/<name>` breadcrumb (when the bucket
     // says the name is still owned by us) and for the post-delete IAM
@@ -1114,7 +1117,19 @@ async fn remove_volume(
         .and_then(|s| s.to_str())
         .and_then(|s| ulid::Ulid::from_string(s).ok());
 
-    if !vol_dir.join(STOPPED_FILE).exists() {
+    // Remove requires the operator to have explicitly issued
+    // `volume stop` (i.e. `volume.stopped` is present). Preserves
+    // the pre-LocalShape behaviour: anything other than
+    // `Writable::Stopped` refuses with the same operator hint. The
+    // "readonly + no marker" and "writable inactive" cases both
+    // refuse here — historically those couldn't be removed via this
+    // verb either, and the operator-visible message is the same.
+    if !matches!(
+        &shape,
+        LocalShape::Writable {
+            runtime: WritableRuntime::Stopped
+        }
+    ) {
         return Err(IpcError::conflict(
             "volume is running; stop it first with: elide volume stop <name>",
         ));
@@ -1727,15 +1742,11 @@ pub(crate) async fn await_prefetch_op(
 /// `StoppedManual` fork is parked (no daemon, supervisor refuses to
 /// relaunch) so it is not "running" for these checks.
 pub(crate) fn local_daemon_running(data_dir: &Path, volume_name: &str) -> bool {
-    use elide_coordinator::volume_state::VolumeLifecycle;
+    use elide_coordinator::volume_state::LocalShape;
     let link = data_dir.join("by_name").join(volume_name);
-    match std::fs::canonicalize(&link) {
-        Ok(vol_dir) => matches!(
-            VolumeLifecycle::from_dir(&vol_dir),
-            VolumeLifecycle::Running { .. }
-        ),
-        Err(_) => false,
-    }
+    LocalShape::resolve(&link)
+        .map(|(_, shape)| shape.is_daemon_running())
+        .unwrap_or(false)
 }
 
 async fn stop_volume_op(
@@ -1747,22 +1758,42 @@ async fn stop_volume_op(
     coord_id: &str,
     hostname: Option<&str>,
 ) -> Result<(), IpcError> {
+    use elide_coordinator::volume_state::{LocalShape, WritableRuntime};
     let data_dir: &Path = &core.data_dir;
     let link = data_dir.join("by_name").join(volume_name);
-    if !link.exists() {
-        return Err(IpcError::not_found(format!(
-            "volume not found: {volume_name}"
-        )));
-    }
-    let vol_dir = std::fs::canonicalize(&link)
-        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
-
-    if vol_dir.join(STOPPED_FILE).exists() {
-        // Already stopped — idempotent success.
+    let (vol_dir, shape) = match LocalShape::resolve(&link)
+        .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?
+    {
+        (Some(dir), shape) => (dir, shape),
+        (None, _) => {
+            return Err(IpcError::not_found(format!(
+                "volume not found: {volume_name}"
+            )));
+        }
+    };
+    // Idempotent on a fork already parked at `volume.stopped`, and
+    // on terminal-state forks where stop has nothing to do.
+    if matches!(
+        &shape,
+        LocalShape::Writable {
+            runtime: WritableRuntime::Stopped
+        } | LocalShape::Released { .. }
+    ) {
         return Ok(());
     }
-
-    let readonly = vol_dir.join("volume.readonly").exists();
+    let readonly = matches!(&shape, LocalShape::Readonly { .. });
+    // Refuse the "currently importing" case explicitly — the import
+    // pipeline owns the volume's pending/wal/index state and a stop
+    // mid-import would race the writer.
+    if let LocalShape::Writable {
+        runtime: WritableRuntime::Importing { import_ulid },
+    } = &shape
+    {
+        return Err(IpcError::conflict(format!(
+            "volume '{volume_name}' is currently importing (job {import_ulid}); \
+             wait for it to finish before stopping"
+        )));
+    }
 
     // Refuse to stop while a block-device client is connected. The ublk
     // transport always reports `Disconnected` today, so this is a future
@@ -2246,6 +2277,7 @@ async fn release_volume_op(
     store: &Arc<dyn ObjectStore>,
     ctx: &IpcContext,
 ) -> Result<ReleaseReply, IpcError> {
+    use elide_coordinator::volume_state::{LocalShape, WritableRuntime};
     let identity = &ctx.identity;
     let data_dir: &Path = &ctx.data_dir;
     let snapshot_locks = &ctx.snapshot_locks;
@@ -2254,40 +2286,60 @@ async fn release_volume_op(
     info!("[release {volume_name}] start");
 
     let link = data_dir.join("by_name").join(volume_name);
-    if !link.exists() {
-        // No local fork — but a `remote/<name>` breadcrumb plus a
-        // bucket record that names us as owner is enough to release:
-        // the auto-snapshot from the preceding clean `stop` (which
-        // ran before `remove`) already covers the durable state, so
-        // there's no drain to do. Just flip the bucket to Released
-        // using that snapshot as the handoff, and clear the
-        // breadcrumb.
-        //
-        // This makes `stop → remove → release` work without forcing
-        // the operator to detour through `start → stop` first just
-        // to hand off a name they've already mentally given up.
-        return release_breadcrumb_only(volume_name, data_dir, store, identity, coord_id, started)
+    let (vol_dir, shape) = match LocalShape::resolve(&link)
+        .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?
+    {
+        (Some(dir), shape) => (dir, shape),
+        (None, _) => {
+            // No local fork — but a `remote/<name>` breadcrumb plus a
+            // bucket record that names us as owner is enough to release:
+            // the auto-snapshot from the preceding clean `stop` (which
+            // ran before `remove`) already covers the durable state, so
+            // there's no drain to do. Just flip the bucket to Released
+            // using that snapshot as the handoff, and clear the
+            // breadcrumb.
+            //
+            // This makes `stop → remove → release` work without forcing
+            // the operator to detour through `start → stop` first just
+            // to hand off a name they've already mentally given up.
+            return release_breadcrumb_only(
+                volume_name,
+                data_dir,
+                store,
+                identity,
+                coord_id,
+                started,
+            )
             .await;
-    }
-    let vol_dir = std::fs::canonicalize(&link)
-        .map_err(|e| IpcError::internal(format!("resolving volume dir: {e}")))?;
+        }
+    };
 
-    if vol_dir.join("volume.readonly").exists() {
-        return Err(IpcError::conflict("volume is readonly; nothing to release"));
-    }
-
-    // `release` is composed of two distinct phases: drain+publish (needs
-    // a running daemon) and bucket-flip (no daemon needed). To keep the
-    // operator-visible state coherent we require the daemon to already
-    // be `stopped` — otherwise a release on a running volume would have
-    // to halt it inline, and any failure between halt and bucket-flip
-    // would leave the volume in a "Released-but-running" mismatch the
-    // operator can't easily recover from.
-    if !vol_dir.join(STOPPED_FILE).exists() {
-        return Err(IpcError::conflict(format!(
-            "volume '{volume_name}' is running; \
-             stop it first with: elide volume stop {volume_name}"
-        )));
+    match &shape {
+        LocalShape::Readonly { .. } => {
+            return Err(IpcError::conflict("volume is readonly; nothing to release"));
+        }
+        LocalShape::Released { .. } => {
+            return Err(IpcError::conflict(format!(
+                "name '{volume_name}' is already released"
+            )));
+        }
+        LocalShape::Writable {
+            runtime: WritableRuntime::Stopped,
+        } => {}
+        // `release` is composed of two distinct phases: drain+publish
+        // (needs a running daemon) and bucket-flip (no daemon needed).
+        // To keep the operator-visible state coherent we require the
+        // daemon to already be `stopped` — otherwise a release on a
+        // running volume would have to halt it inline, and any
+        // failure between halt and bucket-flip would leave the volume
+        // in a "Released-but-running" mismatch the operator can't
+        // easily recover from.
+        _ => {
+            return Err(IpcError::conflict(format!(
+                "volume '{volume_name}' is running; \
+                 stop it first with: elide volume stop {volume_name}"
+            )));
+        }
     }
 
     // Verify ownership in S3 before doing any local state mutation.
