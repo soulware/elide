@@ -107,7 +107,7 @@ pub enum Request {
 
     // ── Iteration 2: lifecycle ───────────────────────────────────────
     /// Halt the local volume daemon. With default (`force = false`),
-    /// `stop` drains pending and publishes an auto-snapshot before
+    /// `stop` drains pending and publishes a stop-snapshot before
     /// SIGTERM so a future `start` (this host or another via `claim`)
     /// has a basis to hydrate from. `force = true` skips the
     /// drain/snapshot — for emergency local halt when the drain is
@@ -202,12 +202,12 @@ pub enum Request {
     AwaitPrefetch { vol_ulid: Ulid },
     /// Volume-to-coordinator signal sent by the volume binary right
     /// after `Volume::open` (or `ReadonlyVolume::open`) succeeds. The
-    /// coordinator uses this signal to clean up the auto-snapshot
+    /// coordinator uses this signal to clean up the stop-snapshot
     /// that gave hydrate a basis — once the local fork is provably
     /// openable, the S3 basis is no longer needed. Idempotent (a
     /// re-sent notification after coordinator restart is a no-op when
-    /// no auto-snapshot exists). Best-effort on the sender side: a
-    /// failed send leaves the auto-snapshot in place; the volume
+    /// no stop-snapshot exists). Best-effort on the sender side: a
+    /// failed send leaves the stop-snapshot in place; the volume
     /// continues to serve.
     NotifyVolumeReady { vol_ulid: Ulid },
     /// Remove the local instance of a volume: `by_name/<volume>`

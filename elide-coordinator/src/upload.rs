@@ -204,15 +204,15 @@ pub fn snapshot_manifest_key(volume_id: &str, ulid: Ulid) -> StorePath {
     ))
 }
 
-/// Build the object store key for an auto-snapshot manifest — the
-/// ephemeral `<ulid>.auto.manifest` variant written by `volume stop`.
+/// Build the object store key for a stop-snapshot manifest — the
+/// ephemeral `<ulid>-stop.manifest` variant written by `volume stop`.
 ///
-/// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>.auto.manifest`
-pub fn auto_snapshot_manifest_key(volume_id: &str, ulid: Ulid) -> StorePath {
+/// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>-stop.manifest`
+pub fn stop_snapshot_manifest_key(volume_id: &str, ulid: Ulid) -> StorePath {
     let dt: DateTime<Utc> = ulid.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
     StorePath::from(format!(
-        "by_id/{volume_id}/snapshots/{date}/{ulid}.auto.manifest"
+        "by_id/{volume_id}/snapshots/{date}/{ulid}-stop.manifest"
     ))
 }
 
@@ -472,7 +472,7 @@ pub async fn upload_snapshot_metadata(
 
         let sentinel_label = match kind {
             elide_core::signing::SnapshotKind::User => format!("snapshots/{snap_ulid}"),
-            elide_core::signing::SnapshotKind::Auto => format!("snapshots/{snap_ulid}.auto"),
+            elide_core::signing::SnapshotKind::Stop => format!("snapshots/{snap_ulid}-stop"),
         };
         let sentinel = upload_sentinel(vol_dir, &sentinel_label);
         if is_already_uploaded(&sentinel, &[]) {
@@ -482,8 +482,8 @@ pub async fn upload_snapshot_metadata(
         let manifest_path = snap_dir.join(name);
         let key = match kind {
             elide_core::signing::SnapshotKind::User => snapshot_manifest_key(volume_id, snap_ulid),
-            elide_core::signing::SnapshotKind::Auto => {
-                auto_snapshot_manifest_key(volume_id, snap_ulid)
+            elide_core::signing::SnapshotKind::Stop => {
+                stop_snapshot_manifest_key(volume_id, snap_ulid)
             }
         };
         let data = std::fs::read(&manifest_path)

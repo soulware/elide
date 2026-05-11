@@ -196,8 +196,8 @@ async fn fetch_and_verify_manifest(
         elide_core::signing::SnapshotKind::User => {
             elide_core::signing::snapshot_manifest_filename(&snap_ulid)
         }
-        elide_core::signing::SnapshotKind::Auto => {
-            elide_core::signing::auto_snapshot_manifest_filename(&snap_ulid)
+        elide_core::signing::SnapshotKind::Stop => {
+            elide_core::signing::stop_snapshot_manifest_filename(&snap_ulid)
         }
     };
     let local_path = snap_dir.join(&filename);
@@ -207,8 +207,8 @@ async fn fetch_and_verify_manifest(
             elide_core::signing::SnapshotKind::User => {
                 elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid)
             }
-            elide_core::signing::SnapshotKind::Auto => {
-                elide_coordinator::upload::auto_snapshot_manifest_key(
+            elide_core::signing::SnapshotKind::Stop => {
+                elide_coordinator::upload::stop_snapshot_manifest_key(
                     &vol_ulid.to_string(),
                     snap_ulid,
                 )
@@ -233,7 +233,7 @@ async fn fetch_and_verify_manifest(
         // back. Best-effort: a failure here only costs a wasted PUT.
         let sentinel_relative = match kind {
             elide_core::signing::SnapshotKind::User => format!("snapshots/{snap_ulid}"),
-            elide_core::signing::SnapshotKind::Auto => format!("snapshots/{snap_ulid}.auto"),
+            elide_core::signing::SnapshotKind::Stop => format!("snapshots/{snap_ulid}-stop"),
         };
         if let Err(e) =
             elide_coordinator::upload::mark_already_uploaded(fork_dir, &sentinel_relative, &[])

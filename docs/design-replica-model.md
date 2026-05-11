@@ -90,7 +90,7 @@ host, never snapshotted" degenerate case) → tail equals the whole volume.
 
 This gives upstreams a concrete policy: "tail ≤ X GB at any moment"
 translates to "any replica can catch up within a bounded download." It's
-also a defence against the dead-host case: an upstream that auto-snapshots
+also a defence against the dead-host case: an upstream that stop-snapshots
 at any cadence can never be in the "no snapshots" state.
 
 ## Live replicas

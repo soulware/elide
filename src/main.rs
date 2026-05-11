@@ -406,7 +406,7 @@ enum VolumeCommand {
     },
 
     /// Stop a running volume (flushes WAL, drains pending, publishes an
-    /// auto-snapshot, then halts the daemon and ublk device).
+    /// stop-snapshot, then halts the daemon and ublk device).
     Stop {
         /// Volume name
         name: String,
@@ -417,7 +417,7 @@ enum VolumeCommand {
         /// after `volume stop`.
         #[arg(long)]
         release: bool,
-        /// Skip the drain/auto-snapshot step. The local daemon is
+        /// Skip the drain/stop-snapshot step. The local daemon is
         /// halted but `pending/` and `wal/` may be left dirty, and no
         /// fresh basis manifest is published to S3. Use only when the
         /// drain is stuck or the host is being torn down quickly.
@@ -888,7 +888,7 @@ fn main() {
                 // `--force` with no reachable coordinator: fall back to
                 // direct CLI mode. Read volume.pid, SIGTERM if alive,
                 // write volume.stopped marker. No bucket flip (no
-                // credentials in the CLI), no auto-snapshot publish
+                // credentials in the CLI), no stop-snapshot publish
                 // (the daemon's the only signer). The bucket record is
                 // left as-is — typically `Live` — so cross-host
                 // recovery requires `volume release --force` from
@@ -900,7 +900,7 @@ fn main() {
                 // Without `--force`, an unreachable coordinator is an
                 // error — the operator should bring the coordinator
                 // back up first (cleaner stop with bucket flip and
-                // auto-snapshot).
+                // stop-snapshot).
                 if force && !coord.is_reachable() {
                     if release {
                         eprintln!(
@@ -1430,8 +1430,8 @@ fn coord_stop(
 /// coordinator socket is unreachable. Resolves `by_name/<name>` to the
 /// fork directory, SIGTERMs the running daemon if any, then writes
 /// `volume.stopped` so a future coordinator start respects the halt.
-/// No bucket flip and no auto-snapshot publish — the daemon is the
-/// only thing with the signing key for an auto-snapshot, and the
+/// No bucket flip and no stop-snapshot publish — the daemon is the
+/// only thing with the signing key for a stop-snapshot, and the
 /// CLI doesn't carry S3 credentials.
 ///
 /// On success the caller surfaces a warning explaining that

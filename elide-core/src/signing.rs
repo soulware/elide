@@ -76,40 +76,44 @@ pub const FORCE_SNAPSHOT_PUB_FILE: &str = "force-snapshot.pub";
 /// filename, e.g. `snapshots/01ABC....manifest`.
 pub const SNAPSHOT_MANIFEST_SUFFIX: &str = ".manifest";
 
-/// Suffix for auto-snapshot manifests — the ephemeral checkpoints written
+/// Suffix for stop-snapshot manifests — the ephemeral checkpoints written
 /// by `volume stop` to give a future `start` a basis to hydrate from.
 /// The signed payload is byte-identical to a user snapshot; only the
-/// filename differs. See `docs/architecture.md` *Auto-snapshot lifecycle*.
-pub const AUTO_SNAPSHOT_MANIFEST_SUFFIX: &str = ".auto.manifest";
+/// filename differs. See `docs/architecture.md` *Stop-snapshot lifecycle*.
+///
+/// The hyphen joins the ULID and `stop` into a single stem, so the file
+/// matches `*.manifest` globs cleanly and the kind tag does not look
+/// like a file extension.
+pub const STOP_SNAPSHOT_MANIFEST_SUFFIX: &str = "-stop.manifest";
 
 /// Discriminates `<ulid>.manifest` (user-pinned, stable) from
-/// `<ulid>.auto.manifest` (ephemeral checkpoint owned by the stop/start
+/// `<ulid>-stop.manifest` (ephemeral checkpoint owned by the stop/start
 /// lifecycle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotKind {
     User,
-    Auto,
+    Stop,
 }
 
 impl SnapshotKind {
     pub fn suffix(self) -> &'static str {
         match self {
             SnapshotKind::User => SNAPSHOT_MANIFEST_SUFFIX,
-            SnapshotKind::Auto => AUTO_SNAPSHOT_MANIFEST_SUFFIX,
+            SnapshotKind::Stop => STOP_SNAPSHOT_MANIFEST_SUFFIX,
         }
     }
 }
 
-/// Parse a snapshot filename like `<ulid>.manifest` or `<ulid>.auto.manifest`
+/// Parse a snapshot filename like `<ulid>.manifest` or `<ulid>-stop.manifest`
 /// into its `(ulid, kind)`. Returns `None` for anything that doesn't match
 /// either shape — including segments, indexes, and partial writes.
 ///
-/// Auto is checked first because `.auto.manifest` also ends in `.manifest`.
+/// Stop is checked first because `-stop.manifest` also ends in `.manifest`.
 pub fn parse_snapshot_filename(name: &str) -> Option<(ulid::Ulid, SnapshotKind)> {
-    if let Some(stem) = name.strip_suffix(AUTO_SNAPSHOT_MANIFEST_SUFFIX) {
+    if let Some(stem) = name.strip_suffix(STOP_SNAPSHOT_MANIFEST_SUFFIX) {
         return ulid::Ulid::from_string(stem)
             .ok()
-            .map(|u| (u, SnapshotKind::Auto));
+            .map(|u| (u, SnapshotKind::Stop));
     }
     if let Some(stem) = name.strip_suffix(SNAPSHOT_MANIFEST_SUFFIX) {
         return ulid::Ulid::from_string(stem)
@@ -735,11 +739,11 @@ pub fn snapshot_manifest_filename(snap_ulid: &ulid::Ulid) -> String {
     format!("{snap_ulid}{SNAPSHOT_MANIFEST_SUFFIX}")
 }
 
-/// Build the filename for `snap_ulid`'s auto-snapshot manifest
-/// (`<snap_ulid>.auto.manifest`) — the ephemeral checkpoint written by
+/// Build the filename for `snap_ulid`'s stop-snapshot manifest
+/// (`<snap_ulid>-stop.manifest`) — the ephemeral checkpoint written by
 /// `volume stop`.
-pub fn auto_snapshot_manifest_filename(snap_ulid: &ulid::Ulid) -> String {
-    format!("{snap_ulid}{AUTO_SNAPSHOT_MANIFEST_SUFFIX}")
+pub fn stop_snapshot_manifest_filename(snap_ulid: &ulid::Ulid) -> String {
+    format!("{snap_ulid}{STOP_SNAPSHOT_MANIFEST_SUFFIX}")
 }
 
 /// Domain-separation prefix for the recovery-manifest signing input.
@@ -807,15 +811,15 @@ pub fn write_snapshot_manifest(
     crate::segment::write_file_atomic(&path, &content)
 }
 
-/// Write a signed auto-snapshot manifest for `snap_ulid` at
-/// `vol_dir/snapshots/<snap_ulid>.auto.manifest`. The signed payload is
+/// Write a signed stop-snapshot manifest for `snap_ulid` at
+/// `vol_dir/snapshots/<snap_ulid>-stop.manifest`. The signed payload is
 /// byte-identical to [`write_snapshot_manifest`]; only the filename
-/// differs. Auto-snapshots are the ephemeral checkpoint variant — see
-/// `docs/architecture.md` *Auto-snapshot lifecycle*. Recovery metadata
-/// is intentionally not supported here: auto-snapshots are minted by
+/// differs. Stop-snapshots are the ephemeral checkpoint variant — see
+/// `docs/architecture.md` *Stop-snapshot lifecycle*. Recovery metadata
+/// is intentionally not supported here: stop-snapshots are minted by
 /// the owning volume's own signing key during a clean stop, never by a
 /// recovering coordinator.
-pub fn write_auto_snapshot_manifest(
+pub fn write_stop_snapshot_manifest(
     vol_dir: &Path,
     signer: &dyn SegmentSigner,
     snap_ulid: &ulid::Ulid,
@@ -824,7 +828,7 @@ pub fn write_auto_snapshot_manifest(
     let content = build_snapshot_manifest_bytes(signer, segment_ulids, None);
     let path = vol_dir
         .join("snapshots")
-        .join(auto_snapshot_manifest_filename(snap_ulid));
+        .join(stop_snapshot_manifest_filename(snap_ulid));
     crate::segment::write_file_atomic(&path, &content)
 }
 
@@ -878,20 +882,20 @@ pub fn read_snapshot_manifest(
     snap_ulid: &ulid::Ulid,
 ) -> io::Result<SnapshotManifest> {
     // The filename is just addressing; the signed payload is identical
-    // for `<ulid>.manifest` and `<ulid>.auto.manifest`. Probe the
+    // for `<ulid>.manifest` and `<ulid>-stop.manifest`. Probe the
     // stable filename first (the common case), then fall back to the
-    // auto variant — this is hit on the hydrate-from-bucket path,
-    // where the basis manifest written by `stop` is `.auto.manifest`.
+    // stop variant — this is hit on the hydrate-from-bucket path,
+    // where the basis manifest written by `stop` is `-stop.manifest`.
     let snap_dir = vol_dir.join("snapshots");
     let user_filename = snapshot_manifest_filename(snap_ulid);
     let content = match std::fs::read_to_string(snap_dir.join(&user_filename)) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let auto_filename = auto_snapshot_manifest_filename(snap_ulid);
-            std::fs::read_to_string(snap_dir.join(&auto_filename)).map_err(|e2| {
+            let stop_filename = stop_snapshot_manifest_filename(snap_ulid);
+            std::fs::read_to_string(snap_dir.join(&stop_filename)).map_err(|e2| {
                 io::Error::other(format!(
-                    "neither {user_filename} nor {auto_filename} in {} are readable \
-                     (user: {e}; auto: {e2})",
+                    "neither {user_filename} nor {stop_filename} in {} are readable \
+                     (user: {e}; stop: {e2})",
                     vol_dir.display()
                 ))
             })?
@@ -1214,19 +1218,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_snapshot_filename_auto() {
+    fn parse_snapshot_filename_stop() {
         let u = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        let name = auto_snapshot_manifest_filename(&u);
+        let name = stop_snapshot_manifest_filename(&u);
         let (parsed, kind) = parse_snapshot_filename(&name).expect("parses");
         assert_eq!(parsed, u);
-        assert_eq!(kind, SnapshotKind::Auto);
+        assert_eq!(kind, SnapshotKind::Stop);
     }
 
     #[test]
     fn parse_snapshot_filename_rejects_bare_marker() {
         // Historically `snapshots/<ulid>` (no extension) was the bare
         // snapshot marker. The parser should not treat it as a
-        // manifest — only `<ulid>.manifest` and `<ulid>.auto.manifest`
+        // manifest — only `<ulid>.manifest` and `<ulid>-stop.manifest`
         // are accepted.
         assert!(parse_snapshot_filename("01ARZ3NDEKTSV4RRFFQ69G5FAV").is_none());
     }
@@ -1237,11 +1241,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_and_user_filenames_differ() {
+    fn stop_and_user_filenames_differ() {
         let u = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert_ne!(
             snapshot_manifest_filename(&u),
-            auto_snapshot_manifest_filename(&u)
+            stop_snapshot_manifest_filename(&u)
         );
     }
 

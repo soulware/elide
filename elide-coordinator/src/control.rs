@@ -87,22 +87,22 @@ pub async fn sign_snapshot_manifest(fork_dir: &Path, snap_ulid: Ulid) -> bool {
         fork_dir,
         &VolumeRequest::SnapshotManifest {
             snap_ulid,
-            auto: false,
+            stop: false,
         },
     )
     .await
 }
 
-/// Sign and write an *auto-snapshot* manifest — the ephemeral
+/// Sign and write a *stop-snapshot* manifest — the ephemeral
 /// checkpoint variant used by `volume stop`. The signed payload is
 /// identical to a user snapshot; only the filename
-/// (`<ulid>.auto.manifest`) differs. Returns `true` on success.
-pub async fn sign_auto_snapshot_manifest(fork_dir: &Path, snap_ulid: Ulid) -> bool {
+/// (`<ulid>-stop.manifest`) differs. Returns `true` on success.
+pub async fn sign_stop_snapshot_manifest(fork_dir: &Path, snap_ulid: Ulid) -> bool {
     call_unit(
         fork_dir,
         &VolumeRequest::SnapshotManifest {
             snap_ulid,
-            auto: true,
+            stop: true,
         },
     )
     .await

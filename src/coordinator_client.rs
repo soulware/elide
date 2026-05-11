@@ -183,11 +183,11 @@ impl Client {
 
     /// Notify the coordinator that `Volume::open` succeeded for this
     /// fork. The coordinator uses this signal to clean up the
-    /// auto-snapshot from S3 — the local fork is provably sufficient
+    /// stop-snapshot from S3 — the local fork is provably sufficient
     /// to serve, so the bucket-side basis is no longer needed.
     ///
     /// Best-effort: callers should not block on this and should ignore
-    /// errors. A missed notification leaves the auto-snapshot in S3
+    /// errors. A missed notification leaves the stop-snapshot in S3
     /// until the next `volume stop` overwrites it — operationally
     /// harmless, just a small amount of S3 storage and a GC floor
     /// anchor at the old snapshot point.
@@ -244,7 +244,7 @@ impl Client {
         if let Err(e) = client.notify_volume_ready(vol_ulid) {
             tracing::warn!(
                 "[volume {vol_ulid}] notify-volume-ready to coordinator failed: {e}; \
-                 auto-snapshot cleanup deferred to next stop"
+                 stop-snapshot cleanup deferred to next stop"
             );
         }
     }
