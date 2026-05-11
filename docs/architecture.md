@@ -573,7 +573,7 @@ The `elide` CLI locates the operator token in this order:
 2. `ELIDE_OPERATOR_TOKEN` environment variable
 3. `~/.elide/operator-token` file
 
-It is presented with any coordinator mutation that requires one (currently: `delete`).
+It is presented with any coordinator mutation that requires one (currently: `remove` — the local-instance destruction verb that drops `by_name/<volume>` and `by_id/<vol_ulid>/`. Bucket records and segments are untouched; this is not an S3 delete). Other destructive verbs that may be gated later — `release --force` (overrides a foreign owner on `names/<name>`) and `coord stop --stop-volumes` (SIGTERMs every running volume) — are currently ungated and rely on socket access alone.
 
 **Attenuation:** an operator can narrow their token before sharing it — for example, scoping it to a single volume or shortening the expiry — without involving the coordinator. The coordinator verifies all caveats on receipt.
 
@@ -587,7 +587,7 @@ Volume processes on the same host share a uid and a filesystem. This has direct 
 
 **What macaroons do enforce — S3:** S3 credentials are scoped by IAM to a specific volume's prefix. This enforcement is external to Elide — AWS (or equivalent) rejects requests that exceed the credential's scope regardless of what the caller claims. The macaroon scheme ensures a volume process can only obtain credentials for its own volume. A compromised `myvm` process cannot request credentials for `othervm`, so it cannot read, write, or delete `othervm`'s S3 objects even with full local filesystem access.
 
-**What macaroons provide for coordinator operations — defense-in-depth:** requiring a volume-scoped macaroon for coordinator mutations (e.g. `delete`) raises the bar slightly over bare socket access, and provides an audit trail. It does not prevent a compromised process from achieving the same effect via direct filesystem manipulation. The value here is auditability and protocol clarity, not a hard security boundary.
+**What macaroons provide for coordinator operations — defense-in-depth:** requiring a volume-scoped macaroon for coordinator mutations (e.g. `remove`) raises the bar slightly over bare socket access, and provides an audit trail. It does not prevent a compromised process from achieving the same effect via direct filesystem manipulation. The value here is auditability and protocol clarity, not a hard security boundary.
 
 **Summary:**
 
@@ -660,7 +660,7 @@ The full per-volume IAM key model — three-tier admin/writer/RO key split, ance
 
 ### Token lifetime
 
-The macaroon lives for the lifetime of the volume process. "Token dies when process is stopped" is the revocation model: when the coordinator stops a volume (on `delete` or coordinator shutdown), the PID is no longer live. Any subsequent `credentials` request with the old macaroon fails the `SO_PEERCRED` check — the PID either doesn't exist or belongs to a different process.
+The macaroon lives for the lifetime of the volume process. "Token dies when process is stopped" is the revocation model: when the coordinator stops a volume (on `remove` or coordinator shutdown), the PID is no longer live. Any subsequent `credentials` request with the old macaroon fails the `SO_PEERCRED` check — the PID either doesn't exist or belongs to a different process.
 
 No revocation list is needed. This holds as long as the coordinator runs on the same host as the volumes. If the coordinator were ever moved off-host (not a current goal), the `SO_PEERCRED` check would be unavailable and explicit revocation would need to be designed.
 
