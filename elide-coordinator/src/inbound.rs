@@ -1069,6 +1069,12 @@ async fn remove_volume(
     // Write the breadcrumb before tearing down local state. Best-effort:
     // a transient bucket-read error logs and skips rather than blocking
     // the operator's removal.
+    //
+    // The signing key shadow at `data_dir/keys/<vol_ulid>.key` was
+    // written eagerly at volume creation time (and self-heals on every
+    // `volume start`), so `remove` does not need to touch it — the
+    // shadow already exists and survives `remove_dir_all` because it
+    // lives outside `vol_dir`.
     if let (Some(store), Some(coord_id), Some(vol_ulid)) = (store, coord_id, vol_ulid)
         && let Err(e) =
             maybe_write_remote_breadcrumb(data_dir, volume_name, vol_ulid, store, coord_id).await
@@ -1282,6 +1288,12 @@ async fn create_volume_op(
             elide_core::signing::VOLUME_KEY_FILE,
             elide_core::signing::VOLUME_PUB_FILE,
         )?;
+        // Shadow the signing key under `data_dir/keys/<vol_ulid>.key`
+        // immediately. The shadow is what lets a future
+        // `stop`→`remove`→`start` round-trip preserve writability
+        // (without it, hydrate-from-bucket can only ever produce a
+        // readonly view because the private key is never uploaded).
+        elide_coordinator::key_shadow::write(data_dir, vol_ulid, &key.to_bytes())?;
         elide_core::signing::write_provenance(
             &vol_dir,
             &key,
@@ -1291,6 +1303,8 @@ async fn create_volume_op(
         Ok::<_, std::io::Error>(())
     })() {
         cleanup_local();
+        // Best-effort shadow cleanup if create rolls back partway.
+        let _ = elide_coordinator::key_shadow::remove(data_dir, vol_ulid);
         return Err(IpcError::internal(format!("create failed: {e}")));
     }
 
@@ -2559,6 +2573,20 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
         return Err(IpcError::conflict("volume is not stopped"));
     }
 
+    // Self-heal the signing-key shadow at `data_dir/keys/<vol_ulid>.key`.
+    // For volumes created after key-shadow landed, the shadow already
+    // exists from create / fork / claim time; for pre-existing volumes
+    // this is the migration path. Cheap (32-byte file write) and
+    // best-effort — failures log but don't block start.
+    if let Some(vol_ulid) = vol_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| ulid::Ulid::from_string(s).ok())
+        && let Err(e) = self_heal_key_shadow(data_dir, &vol_dir, vol_ulid)
+    {
+        warn!("[inbound] start {volume_name}: self-heal key shadow: {e}");
+    }
+
     use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome, mark_live};
     match mark_live(&store, volume_name, coord_id, hostname).await {
         Ok(MarkLiveOutcome::Resumed) | Ok(MarkLiveOutcome::AlreadyLive) => {}
@@ -2617,6 +2645,23 @@ async fn start_volume_op(volume_name: &str, core: &CoordinatorCore) -> Result<()
 /// Delete any auto-snapshot manifests for this volume from both the
 /// local `snapshots/` directory and the bucket. Idempotent;
 /// missing-file errors are not surfaced.
+/// Read `vol_dir/volume.key` if present and write it to
+/// `data_dir/keys/<vol_ulid>.key`. No-op (Ok) on volumes that have no
+/// `volume.key` — readonly forks legitimately don't have one.
+fn self_heal_key_shadow(
+    data_dir: &Path,
+    vol_dir: &Path,
+    vol_ulid: ulid::Ulid,
+) -> std::io::Result<()> {
+    let key_path = vol_dir.join(elide_core::signing::VOLUME_KEY_FILE);
+    let bytes = match std::fs::read(&key_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    elide_coordinator::key_shadow::write(data_dir, vol_ulid, &bytes)
+}
+
 async fn cleanup_auto_snapshots(
     fork_dir: &Path,
     vol_ulid_str: &str,
