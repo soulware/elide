@@ -139,6 +139,26 @@ fn mark_uploaded(sentinel: &Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write an `uploaded/<relative>` sentinel containing `content`,
+/// asserting that S3 already holds these bytes at the matching key.
+/// Used by code paths that *downloaded* a skeleton file from S3
+/// (notably `pull_readonly_op` and `hydrate_remote_owned`) so the
+/// subsequent drain-loop pass over `upload_volume_metadata` sees a
+/// content-equal sentinel and skips a redundant PUT.
+///
+/// `relative` is the path under `<vol_dir>/uploaded/` — e.g.
+/// `"volume.pub"`, `"volume.provenance"`, or
+/// `format!("snapshots/{snap_ulid}")` for an empty snapshot
+/// sentinel.
+pub fn mark_already_uploaded(
+    vol_dir: &Path,
+    relative: &str,
+    content: &[u8],
+) -> std::io::Result<()> {
+    let sentinel = upload_sentinel(vol_dir, relative);
+    mark_uploaded(&sentinel, content)
+}
+
 pub struct DrainResult {
     /// Segments observed in `pending/` at the start of the tick.
     pub seen: usize,
