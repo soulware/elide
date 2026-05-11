@@ -13,6 +13,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use ed25519_dalek::VerifyingKey;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use tracing::{info, warn};
@@ -27,9 +28,12 @@ use elide_coordinator::volume_state::STOPPED_FILE;
 ///
 /// On return: `by_name/<volume_name>` is a symlink to the freshly-
 /// hydrated `by_id/<vol_ulid>/`, which has `volume.{pub,provenance}`,
-/// `snapshots/<basis>.manifest`, `index/*.idx`, `volume.toml`, `wal/`,
-/// `pending/`, and `volume.stopped`. The `data_dir/remote/<volume_name>`
-/// breadcrumb is cleared.
+/// `volume.toml`, `wal/`, `pending/`, and `volume.stopped`. The basis
+/// `<snap>.manifest` + `index/*.idx` land under the leaf when the leaf
+/// has published its own snapshot, or under the parent's fork dir when
+/// the leaf is a freshly-claimed fork that never wrote anything
+/// (`open_state` walks ancestry to find them). The
+/// `data_dir/remote/<volume_name>` breadcrumb is cleared.
 pub(crate) async fn hydrate_remote_owned(
     volume_name: &str,
     vol_ulid: Ulid,
@@ -43,30 +47,13 @@ pub(crate) async fn hydrate_remote_owned(
 
     pull_skeleton_chain(vol_ulid, &core.data_dir, &by_id_dir, store).await?;
 
-    let (basis_snapshot, basis_kind) = match latest_snapshot_in_store(vol_ulid, store).await? {
-        Some(pair) => pair,
-        None => {
-            return Err(IpcError::not_found(format!(
-                "volume '{volume_name}' has no published snapshot in the store; \
-                 cannot hydrate without a basis manifest"
-            )));
+    let basis_snapshot = match latest_snapshot_in_store(vol_ulid, store).await? {
+        Some((snap_ulid, kind)) => {
+            install_basis_under_leaf(vol_ulid, snap_ulid, kind, &fork_dir, store).await?;
+            snap_ulid
         }
+        None => install_basis_under_parent(volume_name, &fork_dir, &by_id_dir, store).await?,
     };
-
-    fetch_and_verify_manifest(vol_ulid, basis_snapshot, basis_kind, &fork_dir, store).await?;
-
-    let verifying_key =
-        elide_core::signing::load_verifying_key(&fork_dir, elide_core::signing::VOLUME_PUB_FILE)
-            .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
-    elide_coordinator::prefetch::pull_indexes_for_snapshot(
-        store,
-        &fork_dir,
-        &vol_ulid.to_string(),
-        basis_snapshot,
-        &verifying_key,
-    )
-    .await
-    .map_err(|e| IpcError::store(format!("pulling indexes for {basis_snapshot}: {e:#}")))?;
 
     elide_core::config::VolumeConfig {
         name: Some(volume_name.to_owned()),
@@ -184,11 +171,96 @@ async fn latest_snapshot_in_store(
     Ok(latest)
 }
 
+async fn install_basis_under_leaf(
+    vol_ulid: Ulid,
+    snap_ulid: Ulid,
+    kind: elide_core::signing::SnapshotKind,
+    fork_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<(), IpcError> {
+    let vk =
+        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+            .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
+    fetch_and_verify_manifest(vol_ulid, snap_ulid, kind, fork_dir, &vk, store).await?;
+    elide_coordinator::prefetch::pull_indexes_for_snapshot(
+        store,
+        fork_dir,
+        &vol_ulid.to_string(),
+        snap_ulid,
+        &vk,
+    )
+    .await
+    .map_err(|e| IpcError::store(format!("pulling indexes for {snap_ulid}: {e:#}")))?;
+    Ok(())
+}
+
+/// Hydrate a freshly-claimed fork that never published a snapshot of
+/// its own: the basis lives under the parent's prefix, pinned by the
+/// leaf's signed provenance. The parent skeleton has already been
+/// planted by `pull_skeleton_chain`. Fetch the parent's basis manifest
+/// plus indexes into the *parent's* fork dir — `open_state` walks
+/// ancestry to find them.
+async fn install_basis_under_parent(
+    volume_name: &str,
+    fork_dir: &Path,
+    by_id_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<Ulid, IpcError> {
+    let lineage = elide_core::signing::read_lineage_verifying_signature(
+        fork_dir,
+        elide_core::signing::VOLUME_PUB_FILE,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+    )
+    .map_err(|e| IpcError::internal(format!("verifying leaf provenance: {e}")))?;
+    let parent = lineage.parent.ok_or_else(|| {
+        IpcError::not_found(format!(
+            "volume '{volume_name}' has no published snapshot in the store; \
+             cannot hydrate without a basis manifest"
+        ))
+    })?;
+    let parent_vol = Ulid::from_string(&parent.volume_ulid)
+        .map_err(|e| IpcError::internal(format!("malformed parent volume ULID: {e}")))?;
+    let parent_snap = Ulid::from_string(&parent.snapshot_ulid)
+        .map_err(|e| IpcError::internal(format!("malformed parent snapshot ULID: {e}")))?;
+    let parent_dir = by_id_dir.join(&parent.volume_ulid);
+
+    // `manifest_pubkey` overrides the parent's own pubkey when the
+    // basis was synthesised by a recovering coordinator (force-release
+    // path). For normal handoffs they're the same.
+    let manifest_vk_bytes = parent.manifest_pubkey.unwrap_or(parent.pubkey);
+    let manifest_vk = VerifyingKey::from_bytes(&manifest_vk_bytes)
+        .map_err(|e| IpcError::internal(format!("invalid parent manifest pubkey: {e}")))?;
+
+    // Claim resolves the handoff via the promoted `<ulid>.manifest`
+    // key (release promotes stop → user before flipping), so the
+    // parent's basis is always a User-kind manifest here.
+    fetch_and_verify_manifest(
+        parent_vol,
+        parent_snap,
+        elide_core::signing::SnapshotKind::User,
+        &parent_dir,
+        &manifest_vk,
+        store,
+    )
+    .await?;
+    elide_coordinator::prefetch::pull_indexes_for_snapshot(
+        store,
+        &parent_dir,
+        &parent.volume_ulid,
+        parent_snap,
+        &manifest_vk,
+    )
+    .await
+    .map_err(|e| IpcError::store(format!("pulling parent indexes for {parent_snap}: {e:#}")))?;
+    Ok(parent_snap)
+}
+
 async fn fetch_and_verify_manifest(
     vol_ulid: Ulid,
     snap_ulid: Ulid,
     kind: elide_core::signing::SnapshotKind,
     fork_dir: &Path,
+    verifying_key: &VerifyingKey,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<(), IpcError> {
     let snap_dir = fork_dir.join("snapshots");
@@ -242,15 +314,12 @@ async fn fetch_and_verify_manifest(
         }
     }
 
-    let verifying_key =
-        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
-            .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
     // Verify against the bytes we just have on disk regardless of
     // filename — `read_snapshot_manifest` defaults to `<ulid>.manifest`,
     // so we read+verify from bytes for the auto variant.
     let bytes = std::fs::read(&local_path)
         .map_err(|e| IpcError::internal(format!("reading {filename}: {e}")))?;
-    elide_core::signing::read_snapshot_manifest_from_bytes(&bytes, &verifying_key, &snap_ulid)
+    elide_core::signing::read_snapshot_manifest_from_bytes(&bytes, verifying_key, &snap_ulid)
         .map_err(|e| IpcError::internal(format!("verifying basis manifest {snap_ulid}: {e}")))?;
     Ok(())
 }
