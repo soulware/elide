@@ -1229,6 +1229,63 @@ fn bound_ublk_id(vol_dir: &Path) -> Option<i32> {
 /// "Fully durable" means: no segments awaiting upload (`pending/` empty)
 /// and no unflushed WAL records (`wal/` empty). Both directories are
 /// populated by writes and emptied by the drain pipeline.
+/// Post-flip best-effort housekeeping shared by `volume release`,
+/// `volume release --force`, and the breadcrumb-only release path.
+/// Each successful bucket flip (`mark_released` / `mark_released_force`
+/// returning `Updated`) wants to do the same three things in the
+/// same order:
+///
+///   1. If we have a local fork: write `volume.released` so
+///      `volume list` reflects the new state without a bucket
+///      round-trip. Failure is logged but non-fatal — the bucket
+///      record is authoritative.
+///   2. Emit a journal entry recording the transition. The event
+///      kind varies: `Released` for the normal verb,
+///      `ForceReleased` for the override path. Best-effort.
+///   3. If a remote breadcrumb existed for this name, clear it.
+///      Some paths don't have a breadcrumb to clear (the standard
+///      local-fork release); a missing breadcrumb is a no-op.
+///
+/// Allow `too_many_arguments`: every parameter here is genuine
+/// plumbing — the alternative struct-of-options just shifts the
+/// same parameter list one indirection deeper without simplifying
+/// any caller.
+#[allow(clippy::too_many_arguments)]
+async fn emit_release_aftermath(
+    data_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
+    volume_name: &str,
+    vol_dir_for_marker: Option<&Path>,
+    handoff_snapshot: ulid::Ulid,
+    vol_ulid: ulid::Ulid,
+    event: elide_core::volume_event::EventKind,
+    clear_breadcrumb: bool,
+    log_prefix: &str,
+) {
+    if let Some(vol_dir) = vol_dir_for_marker
+        && let Err(e) = write_released_marker(vol_dir, handoff_snapshot)
+    {
+        warn!(
+            "[{log_prefix} {volume_name}] writing volume.released \
+             marker: {e} (display-only; bucket state authoritative)"
+        );
+    }
+    elide_coordinator::volume_event_store::emit_best_effort(
+        store,
+        identity.as_ref(),
+        volume_name,
+        event,
+        vol_ulid,
+    )
+    .await;
+    if clear_breadcrumb
+        && let Err(e) = elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name)
+    {
+        warn!("[{log_prefix} {volume_name}] clearing breadcrumb: {e}");
+    }
+}
+
 /// Guard run early in every `volume release` variant (local fork
 /// and breadcrumb-only): refuse on a foreign-owned name (point at
 /// `release --force`) and on an already-Released record (idempotent
@@ -2217,38 +2274,29 @@ async fn finalize_force_release(
                 "[inbound] force-released volume {volume_name} (released fork {d}) at \
                  handoff snapshot {handoff_snapshot}",
             );
-
-            // Best-effort local display marker. force-release is also
-            // used to displace a *foreign* coordinator's record without
-            // any local fork — in that case the by_name symlink doesn't
-            // resolve and we silently skip the marker write.
-            if let Ok(vol_dir) = std::fs::canonicalize(data_dir.join("by_name").join(volume_name))
-                && let Err(e) = write_released_marker(&vol_dir, handoff_snapshot)
-            {
-                warn!(
-                    "[inbound] force-release {volume_name}: writing volume.released \
-                     marker: {e} (display-only; bucket state authoritative)"
-                );
-            }
-
-            // Best-effort journal entry recording the override.
-            elide_coordinator::volume_event_store::emit_best_effort(
+            // force-release is also used to displace a *foreign*
+            // coordinator's record without any local fork — in that
+            // case the by_name symlink doesn't resolve and we
+            // silently skip the marker write.
+            let local_vol_dir =
+                std::fs::canonicalize(data_dir.join("by_name").join(volume_name)).ok();
+            emit_release_aftermath(
+                data_dir,
                 store,
-                identity.as_ref(),
+                identity,
                 volume_name,
+                local_vol_dir.as_deref(),
+                handoff_snapshot,
+                d,
                 elide_core::volume_event::EventKind::ForceReleased {
                     handoff_snapshot,
                     displaced_coordinator_id: displaced_coordinator_id
                         .unwrap_or_else(|| "<unknown>".to_string()),
                 },
-                d,
+                true,
+                "force-release",
             )
             .await;
-
-            if let Err(e) = elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name) {
-                warn!("[inbound] force-release {volume_name}: clearing breadcrumb: {e}");
-            }
-
             Ok(ReleaseReply { handoff_snapshot })
         }
         Ok(ForceReleaseOutcome::Absent) => {
@@ -2395,6 +2443,7 @@ async fn release_volume_op(
                     );
                     let result = perform_release_flip(
                         volume_name,
+                        data_dir,
                         &vol_dir,
                         store,
                         identity,
@@ -2413,9 +2462,15 @@ async fn release_volume_op(
                      (clean stopped volume, no daemon restart needed)",
                     cover.snap_ulid
                 );
-                let result =
-                    perform_release_flip(volume_name, &vol_dir, store, identity, cover.snap_ulid)
-                        .await;
+                let result = perform_release_flip(
+                    volume_name,
+                    data_dir,
+                    &vol_dir,
+                    store,
+                    identity,
+                    cover.snap_ulid,
+                )
+                .await;
                 info!(
                     "[release {volume_name}] complete in {:.2?}",
                     started.elapsed()
@@ -2527,7 +2582,8 @@ async fn release_volume_op(
         }
     }
 
-    let result = perform_release_flip(volume_name, &vol_dir, store, identity, snap_ulid).await;
+    let result =
+        perform_release_flip(volume_name, data_dir, &vol_dir, store, identity, snap_ulid).await;
     info!(
         "[release {volume_name}] complete in {:.2?}",
         started.elapsed()
@@ -2623,19 +2679,21 @@ async fn release_breadcrumb_only(
                  (breadcrumb-only, total {:.2?})",
                 started.elapsed()
             );
-            elide_coordinator::volume_event_store::emit_best_effort(
+            emit_release_aftermath(
+                data_dir,
                 store,
-                identity.as_ref(),
+                identity,
                 volume_name,
+                None,
+                snap_ulid,
+                vol_ulid,
                 elide_core::volume_event::EventKind::Released {
                     handoff_snapshot: snap_ulid,
                 },
-                vol_ulid,
+                true,
+                "release",
             )
             .await;
-            if let Err(e) = elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name) {
-                warn!("[release {volume_name}] clearing breadcrumb: {e}");
-            }
             Ok(ReleaseReply {
                 handoff_snapshot: snap_ulid,
             })
@@ -2772,6 +2830,7 @@ async fn promote_auto_in_store(
 
 async fn perform_release_flip(
     volume_name: &str,
+    data_dir: &Path,
     vol_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
@@ -2792,20 +2851,22 @@ async fn perform_release_flip(
                  (flip {:.2?})",
                 flip_started.elapsed()
             );
-            if let Err(e) = write_released_marker(vol_dir, snap_ulid) {
-                warn!(
-                    "[release {volume_name}] writing volume.released marker: {e} \
-                     (display-only; bucket state authoritative)"
-                );
-            }
-            elide_coordinator::volume_event_store::emit_best_effort(
+            // No breadcrumb to clear here: this path runs when a
+            // local fork existed, which means no breadcrumb was
+            // written (`remove` is the only producer).
+            emit_release_aftermath(
+                data_dir,
                 store,
-                identity.as_ref(),
+                identity,
                 volume_name,
+                Some(vol_dir),
+                snap_ulid,
+                vol_ulid,
                 elide_core::volume_event::EventKind::Released {
                     handoff_snapshot: snap_ulid,
                 },
-                vol_ulid,
+                false,
+                "release",
             )
             .await;
             Ok(ReleaseReply {
