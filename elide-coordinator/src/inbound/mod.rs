@@ -64,15 +64,15 @@ use crate::claim::{ClaimJobState, ClaimRegistry};
 use crate::credential::{CredentialIssuer, Credentialer, credential_issuer};
 use crate::fork::{ForkJobState, ForkRegistry};
 use crate::import::{self, ImportRegistry, ImportState};
-use crate::macaroon::{self, Caveat, Macaroon, Scope};
 use elide_coordinator::config::{StoreSection, store_config};
 use elide_coordinator::ipc::{
     self, ClaimAttachEvent, ClaimStartReply, CreateReply, Envelope, EvictReply, ForkAttachEvent,
     ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply,
-    IpcError, PullReadonlyReply, RegisterReply, ReleaseReply, Request, SnapshotReply,
-    StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
+    IpcError, MintOperatorTokenReply, PullReadonlyReply, RegisterReply, ReleaseReply, Request,
+    SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
     VolumeEventsReply,
 };
+use elide_coordinator::macaroon::{self, Caveat, Macaroon, OperatorOp, Scope};
 use elide_coordinator::volume_state::{
     FETCH_PID_FILE, IMPORTING_FILE, PID_FILE, write_released_marker,
 };
@@ -396,7 +396,20 @@ async fn dispatch_json(
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::Remove { volume, force } => {
+        Request::Remove {
+            volume,
+            force,
+            operator_token,
+        } => {
+            if let Err(env) = require_operator_token(
+                operator_token.as_deref(),
+                OperatorOp::Remove,
+                &volume,
+                &ctx.identity,
+            ) {
+                let _ = ipc::write_message(writer, &env).await;
+                return;
+            }
             let store = ctx.stores.coordinator_wide();
             let result = remove_volume(
                 &volume,
@@ -413,6 +426,27 @@ async fn dispatch_json(
                 credentialer.release_volume_ro(*vol_ulid).await;
             }
             let env: Envelope<()> = result.map(|_| ()).into();
+            let _ = ipc::write_message(writer, &env).await;
+        }
+        Request::MintOperatorToken { expires_unix } => {
+            let m = macaroon::mint_operator(ctx.identity.macaroon_root(), expires_unix);
+            let nonce_hex = m
+                .nonce()
+                .map(|n| macaroon::nonce_hex(&n))
+                .unwrap_or_default();
+            tracing::info!(
+                target: "operator_token::authn",
+                event = "mint",
+                nonce = %nonce_hex,
+                expires_unix,
+                "minted operator token",
+            );
+            let reply = MintOperatorTokenReply {
+                token: m.encode(),
+                nonce_hex,
+                expires_unix,
+            };
+            let env: Envelope<MintOperatorTokenReply> = Envelope::ok(reply);
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::VolumeEvents { volume } => {
@@ -508,6 +542,66 @@ async fn dispatch_json(
             let env: Envelope<()> = Envelope::ok(());
             let _ = ipc::write_message(writer, &env).await;
             crate::shutdown::trigger(keep_volumes);
+        }
+    }
+}
+
+// ── Operator-token gate ──────────────────────────────────────────────────────
+
+/// Verify an attenuated operator macaroon before dispatching a gated
+/// verb. On success, emits the `operator_token::authn` audit event
+/// and returns `Ok`. On failure, returns an `Envelope::Err` ready for
+/// the caller to write back to the peer.
+///
+/// The caller hands in the typed `OperatorOp` it is about to dispatch
+/// and the target volume name; the verifier requires the chain to
+/// carry matching `Op` and `Volume` caveats. Rejection reasons are
+/// coarse by design — see `OperatorReject`.
+fn require_operator_token(
+    encoded: Option<&str>,
+    op: OperatorOp,
+    op_volume: &str,
+    identity: &elide_coordinator::identity::CoordinatorIdentity,
+) -> Result<(), Envelope<()>> {
+    let Some(encoded) = encoded else {
+        return Err(Envelope::err(IpcError::forbidden(format!(
+            "{} requires an operator token; run `elide token create` and pass it via \
+             --token, ELIDE_OPERATOR_TOKEN, or ~/.elide/operator-token",
+            op.as_str()
+        ))));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match macaroon::verify_operator(identity.macaroon_root(), encoded, now, op, op_volume) {
+        Ok(m) => {
+            let nonce_hex = m
+                .nonce()
+                .map(|n| macaroon::nonce_hex(&n))
+                .unwrap_or_default();
+            tracing::info!(
+                target: "operator_token::authn",
+                event = "verify",
+                op = op.as_str(),
+                volume = op_volume,
+                nonce = %nonce_hex,
+                "authenticated operator request",
+            );
+            Ok(())
+        }
+        Err(reject) => {
+            tracing::warn!(
+                target: "operator_token::authn",
+                event = "reject",
+                op = op.as_str(),
+                volume = op_volume,
+                reason = ?reject,
+                "rejected operator token",
+            );
+            Err(Envelope::err(IpcError::forbidden(format!(
+                "operator token rejected ({reject:?})"
+            ))))
         }
     }
 }

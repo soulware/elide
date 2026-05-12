@@ -339,3 +339,34 @@ useful for development.
   switching the construction is free for them. Operator tokens are
   new. No on-disk macaroons exist. So the format change is a clean
   break with no migration.
+
+## Future directions
+
+These do not affect the design above; they describe extensions that
+slot in cleanly when the threat model or deployment shape warrants
+them.
+
+- **Third-party caveats for authentication.** The model above is
+  authorisation-only: possession of an operator token is treated as
+  operator identity. A future extension adds *third-party caveats* —
+  a caveat that says "valid only if the bearer also presents a
+  discharge macaroon from `<auth_service>` attesting predicate P."
+  This adds a real authentication step (SSO, webauthn, whatever the
+  auth service does) tied to each token use, with the discharge's
+  lifetime acting as the session length. The chained-MAC construction
+  already accommodates this — third-party caveats are just another
+  `Caveat` variant whose body is `(location_uri, caveat_id,
+  vid_key)`. None of the existing `Op` / `Volume` / `NotAfter`
+  surface needs to change.
+- **Root key in a separate signing process.** Today the coordinator
+  holds the root key in memory. Splitting it into a standalone
+  signing service reduces blast radius (coordinator compromise can
+  no longer forge across the fleet), gives mint operations an
+  independent audit boundary, and enables TPM/HSM backing. Verify is
+  hot — every operator-token IPC and every volume `credentials`
+  request — so the likely shape is per-coordinator derived keys
+  (signing service issues an HKDF-derived sub-key the coordinator
+  uses to verify locally) rather than RPC-on-verify. Mint is rare
+  enough to comfortably stay RPC. Worth doing when there is more
+  than one coordinator host, or when the coordinator's trust level
+  is bounded below the key's.
