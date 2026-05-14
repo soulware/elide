@@ -2310,7 +2310,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     // descending places the largest candidates in their own buckets
     // first; smaller candidates fill remaining headroom or start fresh
     // buckets.
-    candidates.sort_by(|a, b| b.live_bytes.cmp(&a.live_bytes));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.live_bytes));
 
     struct Bucket {
         candidate_idxs: Vec<usize>,
