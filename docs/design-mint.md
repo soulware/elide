@@ -351,10 +351,10 @@ Notes:
 - **Exactly one list-valued field exists** (`elide:Ancestors`). Every
   other caveat is scalar. The list-valued caveat type (open question #6)
   is the only macaroon-library extension this inventory requires.
-- **`elide:Coord` gates but does not template** in the v1 roles — the
-  `coord-*` policies use prefix wildcards (`names/*`, `events/*`,
-  `coordinators/*`), not `{{caveat.elide:Coord}}`. It becomes a template
-  variable only if the deferred one-time own-publish split lands.
+- **`elide:Coord` templates only in `coord-identity`**
+  (`coordinators/{{caveat.elide:Coord}}/*`, own-prefix write). Every
+  other `coord-*` role uses it as a gate only; their policies use
+  prefix wildcards (`names/*`, `coordinators/*`, `events/*`).
 - **`coord-base` is the read-only baseline every coordinator holds**, and
   the only credential the LAN/internet-exposed peer-fetch verifier holds.
   Coordinator-wide read of `names/*` / `coordinators/*` / `events/*`,
@@ -435,31 +435,46 @@ Coordinator-wide. Event-journal appends and reads.
   enforced here at the IAM layer — no role in the inventory holds delete on
   `events/`.
 
-### `coord-identity` (Split A)
+### `coord-identity` (Split A — own-prefix only)
 
-Coordinator-wide. One-time own identity publish plus ongoing peer-pub
-verification reads.
+Writes this coordinator's own identity records: `coordinator.pub` and
+`peer-endpoint.toml`. Scoped to **its own** `coordinators/<ulid>/`
+prefix via `elide:Coord` templating — it cannot touch any other
+coordinator's records. Peer identity/endpoint *reads* are not here;
+they are covered by the read-only `coord-base` baseline.
 
 - **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter`
 - **TTL:** 6h.
 - **Policy:** `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-  `arn:aws:s3:::{{tenant.bucket}}/coordinators/*`. Coordinator-identity
-  immutability is enforced here — no role holds delete on `coordinators/`.
-
-(The one-time own-publish write could be split into an ultra-short-TTL
-write-once role distinct from the ongoing peer-read; deferred — noted, not
-specified.)
+  `arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat.elide:Coord}}/*`.
+  Coordinator-identity immutability is enforced here — no role holds
+  delete on `coordinators/`. A leaked `coord-identity` key can rewrite
+  only its own coordinator's identity, not impersonate another.
 
 ### `coord-list` (Split A)
 
-Coordinator-wide bucket enumeration. `s3:ListBucket` has no `s3:prefix`
-condition on Tigris, so it is all-or-nothing and **cannot** be folded into
-per-volume `coord-data`.
+Coordinator-wide bucket enumeration: `volume list --remote` (LIST
+`names/`), snapshot enumeration when the branch point is unknown (LIST
+`by_id/<vol>/snapshots/`), event-log find-latest / peer-discovery (LIST
+`events/<name>/`).
+
+`s3:ListBucket` is irreducibly bucket-global on Tigris. AWS scopes it
+to a prefix only via the `s3:prefix` condition key; Tigris supports
+**no string condition keys** — only `IpAddress`/`NotIpAddress` and the
+`Date*` family ([Tigris IAM policy support][tigris-iam-policies]). So
+`coord-list` cannot be prefix-scoped or folded into per-volume
+`coord-data`; it is the one structurally un-scopable role. Mitigation
+is temporal only: short TTL, assumed on demand while enumerating.
 
 - **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter`
 - **TTL:** 6h.
 - **Policy:** `s3:ListBucket` on `arn:aws:s3:::{{tenant.bucket}}` (bucket
   resource, no object statement).
+
+It only exposes object *keys* (ULIDs, names, coord ids), never object
+contents. Eliminating LIST dependence — `events/<name>/HEAD` pointers,
+deterministic manifest keys, a maintained `names` index — would shrink
+or remove `coord-list`; tracked as open question #12.
 
 ### `volume-ro`
 
@@ -664,6 +679,14 @@ prematurely.
     stated in the role inventory but not fully specified — the exact set of
     roles a GC pass assumes, and whether the reaper's delete wants its own
     narrower role, is open.
+12. **Eliminate `coord-list`.** It is the one structurally un-scopable
+    role (Tigris `ListBucket` is bucket-global; no string conditions to
+    prefix-scope it). Replacing the LIST paths with `events/<name>/HEAD`
+    pointers, deterministic manifest keys, and a maintained `names`
+    index — ideas already floated in `design-volume-event-log.md` and
+    `design-peer-segment-fetch.md` for performance — would shrink it to
+    just `volume list --remote`, or remove it entirely. Not blocking;
+    the temporal mitigation (short TTL, on-demand) holds until then.
 
 ## Future directions
 
@@ -712,3 +735,4 @@ around:
 
 [assume-role-web-identity]: https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html
 [session-tags]: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_session-tags.html
+[tigris-iam-policies]: https://www.tigrisdata.com/docs/iam/policies/
