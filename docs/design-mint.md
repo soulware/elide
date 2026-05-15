@@ -593,12 +593,17 @@ prematurely.
    explicit rotation endpoint. Probably defer to v2.
 4. **`names/*` wildcard in the peer-fetch policy.** Trailing wildcard, so
    supported by Tigris in principle. Open whether the role config should
-   bind to the specific name (caveat-driven) for tighter scoping, or whether
-   `names/*` is acceptable given peer-fetch reads are auth-only.
-5. **Mid-path wildcard verification.** Even after the peer-fetch collapse,
-   any future role that wants `by_id/*/<something>` shape needs Tigris to
-   support mid-path `*`. Empirical test still needed and worth running once,
-   to settle the design space.
+   bind to the specific name for tighter scoping — which would mean adding
+   an `elide:Name` scalar caveat (the only addition to the *Caveat field
+   inventory* this question implies) — or whether `names/*` is acceptable
+   given peer-fetch reads are auth-only.
+5. **Mid-path wildcard verification.** Not on the v1 critical path: after
+   the peer-fetch collapse, `coord-data` uses a single-volume *trailing*
+   wildcard (`by_id/{{caveat.elide:Volume}}/*`) and `volume-ro` uses exact
+   ancestor ARNs — neither needs mid-path `*`. It remains a constraint on
+   any *future* role wanting `by_id/*/<something>` shape. Empirical test
+   still worth running once to settle the design space, but no longer
+   blocks the current inventory.
 6. **Caveat library schema.** List-valued caveats with intersection
    semantics are required; `design-auth-model.md` documents only scalar
    caveats today. Needs extending — minor work, but the encoding needs to
@@ -610,15 +615,31 @@ prematurely.
 8. **Caller-side credential refresh.** Should mint return a refresh token,
    or should callers just re-call `AssumeRole` on expiry? STS does the
    latter; same answer probably right here. Worth being explicit.
-9. **Rate-limiting / quota per macaroon root.** A misbehaving caller could
-   exhaust Tigris IAM throughput. Mint-side per-root rate limiting may be
-   needed. Defer to v2 unless real workload demands surface it earlier.
+9. **Tigris IAM rate-limit headroom — gates Split B.** This is no longer a
+   "defer unless workload demands" item: per-volume `coord-data` (Split B)
+   makes `AssumeRole` volume scale with active volumes — roughly one mint
+   round-trip per active volume per TTL window per coordinator, each one a
+   Tigris `CreatePolicy`+`CreateAccessKey`+`AttachUserPolicy` sequence.
+   Tigris publishes no IAM rate limit. The 24h `coord-data` TTL is the
+   primary knob (longer → fewer mints, larger leaked-key window); mint-side
+   per-root rate limiting / burst smoothing may also be needed. Measuring
+   Tigris IAM headroom at realistic volume counts is the gate before Split B
+   is committed to implementation.
 10. **What lives in the mint vs in the closed-source web console.** The
     mint is the credential plane. The web console handles user identity
     (SSO), org/tenant management, key custody UX, audit visualisation, and
     multi-coordinator dashboarding. The exact API boundary between them
     (does the console talk to mint over the same `/v1/assume-role`, or via
     a privileged management interface?) is TBD.
+11. **GC / reaper cross-volume composition under per-volume `coord-data`.**
+    `coord-data` is scoped to a single volume's `by_id/<vol>/*`. GC reads
+    input/ancestor prefixes that belong to *other* volumes and the reaper
+    deletes a fully-consumed volume's prefix. The sketched answer (GC input
+    reads via a separately-assumed `volume-ro`; the output write and the
+    reaper's own-prefix delete via `coord-data` on the target volume) is
+    stated in the role inventory but not fully specified — the exact set of
+    roles a GC pass assumes, and whether the reaper's delete wants its own
+    narrower role, is open.
 
 ## Future directions
 
