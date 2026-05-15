@@ -165,6 +165,29 @@ The same mint code supports three deployment shapes:
 (2) and (3) differ only in whose Tigris account the admin credential is
 issued against — the mint software is identical.
 
+## Coordinator bootstrap & macaroon lifecycle
+
+A coordinator holds a long-lived **primary macaroon** issued by mint,
+acquired once at provisioning and persisted in the coordinator's
+`data_dir` (mode 0600, alongside the identity key), loaded on every
+start and reused across restarts. Per request it appends narrowing
+caveats (`elide:Volume`, a tighter `NotAfter`) before calling
+`assume-role`; the stored macaroon is never sent unattenuated.
+
+Issuance is triggered either out of band (an operator runs `mint issue`
+and places the result in `data_dir`) or by coordinator self-enrolment
+against a mint issuance endpoint gated by an identity authority through
+a third-party caveat — see *Open questions* #13.
+
+Three refresh cadences, distinct:
+
+- **Tigris keypair** — re-call `assume-role` with the held macaroon
+  (*Open questions* #8).
+- **Primary macaroon** — re-issued before its `NotAfter`; re-touches the
+  issuance authority (#13).
+- **Discharge macaroon** — when a third-party caveat is present, fetched
+  from the identity authority on its own shorter cadence.
+
 ## Protocol
 
 ### Endpoint
@@ -765,8 +788,10 @@ prematurely.
     so what authorizes *issuance itself* must be pinned down: admin-only
     local operation, an admin-scoped endpoint, and/or issuance that
     itself binds a third-party caveat to the identity authority so a
-    bare issuance call can't hand out a coordinator token. Decide before
-    any issuance code exists.
+    bare issuance call can't hand out a coordinator token. Also open:
+    whether issuance binds the macaroon to the coordinator's existing
+    Ed25519 identity (a proof-of-possession caveat) so the stored file
+    is not a bare bearer token. Decide before any issuance code exists.
 14. **Macaroon-root provisioning.** The root is mint-held and never
     distributed, but how it comes to exist is unspecified: mint
     generates it on first start and persists it (like the coordinator's
