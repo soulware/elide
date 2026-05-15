@@ -310,7 +310,7 @@ The peer's verify pipeline is five checks, each tied to a property the auth mode
 | 1 | Decode + freshness | token bytes, local clock | replay defence (±60 s window) |
 | 2 | Ed25519 signature valid against `coordinator.pub` | `coordinators/<token.coordinator_id>/coordinator.pub` from S3 | which coordinator is requesting |
 | 3 | `names/<token.volume_name>.coordinator_id == token.coordinator_id` | `names/<token.volume_name>` from S3 (ETag-conditional) | the requesting coordinator currently owns/claims this volume |
-| 4 | URL `vol_id` ∈ ancestry(`token.volume_name`) — anchor under revision, see *Proposed: anchor step 4 at the URL's `vol_id`* | walk the signed `volume.provenance` chain from the peer's **local** `by_id/<vol_id>/volume.{provenance,pub}` (the peer holds these for every fork it serves, pulled with the volume); fail closed if absent | `vol_id` is in the requesting volume's signed lineage |
+| 4 | URL `vol_id` has a self-consistent signed chain the peer serves | walk the signed `volume.provenance` chain from the peer's **local** `by_id/<vol_id>/volume.{provenance,pub}`, anchored at `vol_id` itself (the peer holds these for every fork it serves, pulled with the volume); fail closed if absent | the peer serves `vol_id` and its chain verifies |
 | 5 | `index/<ulid>.idx` (or `cache/<ulid>.present`) exists locally under `vol_id` | local fs | `ulid` is a segment of `vol_id` (implicit — falls out as 404) |
 
 Failures map to status codes: 1–3 fail → 401 (bad credentials); 4 fails → 403 (out of authorised lineage); 5 fails → 404. Distinguishing 403 from 404 is fine here — there is no information leak (the requester has the lineage walk in hand and could derive the answer themselves).
@@ -321,60 +321,38 @@ Step 4 (lineage walk) only runs for **payload routes**: `.idx`, `.prefetch`. The
 
 The reason is that step 4 is *intent scoping* — "this requester actually has business with the URL's `vol_id`" — not confidentiality. Within the bucket trust boundary every authenticated coordinator already has S3 read access to every key, so the lineage gate isn't keeping anything secret; it's filtering against accidental over-fetch. The skeleton-class artifacts are signed bytes the caller verifies before trusting (Ed25519 verifying key, signed lineage record, signed snapshot manifest), so peer tampering is detected even without the gate.
 
-Relaxing those routes is what makes claim-time chain walks work end-to-end. The new fork's `volume.provenance` isn't published until `finalize_claim_fork` — and that finalisation needs the verified parent, which needs `skip_empty_intermediates` to read each ancestor's signed manifest, which under `LineageGated` would itself need the new fork's provenance. Without `SkeletonsOnly` the loop would never start; the chain walk would 401 every request and silently fall through to S3 on the very path peer-fetch was added to accelerate. (This reasoning is the S3-era one: `SkeletonsOnly` bootstraps the *skeleton* routes, but post-#356/#357 the payload routes hit the same fall-through for a different reason — see *Proposed: anchor step 4 at the URL's `vol_id`*.)
+Relaxing those routes is what makes claim-time chain walks work end-to-end. The new fork's `volume.provenance` isn't published until `finalize_claim_fork` — and that finalisation needs the verified parent, which needs `skip_empty_intermediates` to read each ancestor's signed manifest, which under `LineageGated` would itself need the new fork's provenance. Without `SkeletonsOnly` the loop would never start; the chain walk would 401 every request and silently fall through to S3 on the very path peer-fetch was added to accelerate.
 
 DoS pressure on the now-broader skeleton surface is the responsibility of the [`RateLimiter`] hook, which is consulted before the cache regardless of mode.
 
-#### Proposed: anchor step 4 at the URL's `vol_id`
+#### Step 4 anchor
 
-> **Status:** proposed, not yet settled. Resolves a handoff regression
-> introduced when lineage verification became local-only (#356/#357);
-> supersedes the step-4 anchor described in the table above once
-> accepted.
+Step 4 anchors the ancestry walk at the URL's `vol_id`, not at the
+volume the token's name resolves to. The walk roots at `vol_id` and
+verifies the signed `volume.provenance` chain the peer holds locally
+for it; a fork the peer does not serve has no local chain →
+`OutsideLineage` (403, fail closed; the requester falls back to S3).
 
-**The defect.** Step 4 as implemented resolves `token.volume_name` to a
-vol_id via the S3 `names/<name>` record (`name_record.vol_ulid`) and
-walks the ancestry from there against the peer's **local**
-`volume.provenance`. During handoff these two are incompatible: the
-claiming coordinator rebinds `names/<name>` to its **new fork** before
-the payload fetch (early-rebind), so `name_record.vol_ulid` is the
-claimant's child fork — whose provenance is published only to S3 and is
-*structurally never* on the serving (releasing) peer's local disk. The
-local walk hits `NotFound` → `OutsideLineage` (403) → the requester
-falls back to S3 on every first claim — the exact failure the
-*SkeletonsOnly* paragraph above warns about, relocated from the
-skeleton routes to the payload routes. (Concretely: A released X at
-`ulid_a`; B claims X at new fork `ulid_b`, parent `ulid_a`. Everything
-B fetches from A is `ulid_a` or older — A never hears of `ulid_b`. But
-step 4 walks from `ulid_b`, which A cannot have.)
+Anchoring at the name record would be wrong: the claiming coordinator
+rebinds `names/<name>` to its new fork before fetching payload, so the
+name resolves to the claimant's child fork — whose provenance is on S3
+only and is structurally never on the serving (releasing) peer's local
+disk. The serving peer only ever holds, and only ever needs to attest
+to, the chain of the fork whose bytes are being requested.
 
-**The fix.** Anchor the walk at the URL's `vol_id` directly: step 4
-becomes "the serving peer holds a self-consistent signed
-`volume.provenance` chain rooted at `url_vol_id`". A fork the peer
-doesn't serve has no local chain → `OutsideLineage` (403, fail-closed;
-requester falls back to S3) — unchanged from today's behaviour for
-unserved forks. In the handoff case A holds `ulid_a`'s signed chain →
-authorised. No `names/<name>` → vol_id resolution, no `by_name`
-readlink, no new local state.
+This means step 4 does not bind `token.volume_name` to `url_vol_id` —
+intentionally. Per *Route auth modes* above the gate is intent scoping,
+not confidentiality: every authenticated coordinator already has direct
+S3 read to every key, so reaching another volume's bytes through a peer
+grants nothing a plain S3 `GET` wouldn't. Step 4 still fails closed for
+any `vol_id` the peer doesn't serve (a misdirected `vol_id` 403s),
+keeps provenance signatures verified on the walked chain, and keeps
+rate-limit attribution on `coordinator_id`. The legitimate-claimer gate
+is steps 2–3.
 
-This deliberately drops the binding between `token.volume_name` and
-`url_vol_id`. That binding is not a security control: per *Route auth
-modes* above, step 4 is intent scoping, not confidentiality — within
-the bucket trust boundary every authenticated coordinator already has
-direct S3 read to every key, so a coordinator using a valid claim on
-one volume to fetch another's bytes via a peer gains nothing it
-couldn't already `GET` from S3. What step 4 still does after this
-change: fail closed for any `vol_id` the peer doesn't actually serve
-(intent scoping against accidental over-fetch is preserved — a
-misdirected `vol_id` still 403s), keep provenance signatures verified
-on the walked chain, and keep rate-limit attribution on
-`coordinator_id` (step 2, unaffected). Steps 2–3 still establish that
-the requester is the legitimate current claimer of *some* volume; that
-is the gating fact, and it is unchanged.
-
-**Body-token path unchanged.** `verify_body_token` keeps its
-`token.vol_ulid` anchor: the volume key proves the signer *is* the
-fork, a different trust root not subject to the rebind problem.
+The body-token path (`verify_body_token`) anchors at `token.vol_ulid`
+instead: the volume key proves the signer *is* the fork, a distinct
+trust root not subject to the rebind.
 
 The coordinator-key model has two operational benefits over per-volume signing:
 
@@ -387,7 +365,7 @@ Each check has its own staleness shape, and v1 ships with all three caches activ
 
 - **`coordinator.pub`** (check 2) — immutable per `coordinator_id`. Cache forever; rotate is a separate operational event.
 - **`names/<volume_name>`** (check 3) — ETag-conditional GET. The peer holds `(NameRecord, ETag)` per volume name; every cache-miss request fires `If-None-Match: <etag>`. A 304 confirms the cached value (no body transferred); a 200 ships the new value and the cache updates. The auth fence coincides exactly with the S3 CAS that defines current ownership.
-- **`ancestry(volume_name)`** (check 4) — walked from the peer's **local** signed `volume.provenance` chain, which is **immutable once the volume exists**. Forking creates new volumes; it does not alter the ancestry of existing ones. Cache forever per `volume_name`, never invalidate. (A fork the peer doesn't serve has no local chain — the walk fails closed; nothing to cache.) The anchor that roots this walk is under revision — see *Proposed: anchor step 4 at the URL's `vol_id`*, which re-keys this cache per `vol_id` instead of per `volume_name`; cache-forever still holds (a fork's provenance is immutable).
+- **`ancestry(vol_id)`** (check 4) — walked from the peer's **local** signed `volume.provenance` chain rooted at the URL's `vol_id`, which is **immutable once the fork exists**. Forking creates new volumes; it does not alter the ancestry of existing ones. Cache forever per `vol_id`, never invalidate. (A fork the peer doesn't serve has no local chain — the walk fails closed; nothing to cache.)
 - **Local file existence** (check 5) — `stat`, basically free.
 
 On top of those per-check caches, the resolved [`Authorized`] outcome is also memoised, keyed on the bearer-token bytes plus URL `vol_id`, with a lifetime equal to the **token's residual freshness window**. Within that window, repeat requests with the same token + `vol_id` skip checks 3 and 4 entirely — no S3 round-trip even for the conditional `names/<name>` GET. A refreshed token (any coordinator re-mints in steady state every freshness-window interval) is a fresh cache miss and re-runs the full pipeline.
@@ -418,7 +396,7 @@ The auth model puts a verifiable `coordinator_id` on every request. That gives t
 
 - **Per-coordinator request budgets.** A coordinator that requests more `(vol_id, ulid)` pairs than its claimed volumes' lineages contain is misbehaving — even if every individual request is auth-valid. Rate-limiting and temporary blacklisting key off `coordinator_id` directly.
 - **Targeted blacklist.** A misbehaving or compromised coordinator can be denied at the peer without affecting any other coordinator on the LAN; the blacklist is a small set of `coordinator_id`s, locally configured.
-- **Thundering-herd containment.** Only the current claimer of `volume_name` can issue valid tokens for it, and only against `volume_name`'s ancestry — so a single rogue actor can't trigger N peers to fetch arbitrary segment data on its behalf.
+- **Thundering-herd containment.** Only the current claimer of a volume can issue valid tokens for it (steps 2–3), and a peer serves only forks it holds locally (step 4 fails closed otherwise) — so a single rogue actor can't trigger N peers to fetch arbitrary segment data on its behalf.
 
 These are not v1 features (the simple version of v1 has no rate-limit at all), but the auth shape leaves them as cheap drop-ins later. They do not require any wire-format change.
 
