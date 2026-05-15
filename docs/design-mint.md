@@ -335,8 +335,8 @@ definition below):
 | `coord-events` | ● | ● | ● | | |
 | `coord-identity` | ● | ● | ● | | |
 | `coord-list` | ● | ● | ● | | |
+| `coord-base` | ● | ● | ● | | |
 | `volume-ro` | ● | ● | | ● | ● |
-| `peer-fetch` | ● | ● | ● | | |
 
 Non-caveat template inputs (the other two substitution classes, listed
 here so the issuer's surface is unambiguous):
@@ -355,12 +355,10 @@ Notes:
   `coord-*` policies use prefix wildcards (`names/*`, `events/*`,
   `coordinators/*`), not `{{caveat.elide:Coord}}`. It becomes a template
   variable only if the deferred one-time own-publish split lands.
-- **`peer-fetch` is coordinator-wide and read-only.** It is *not* a
-  per-request, per-volume, or mint-issued-bearer role (see the role
-  definition for the history). The exposed peer-fetch verifier does not
-  know in advance which name a peer will ask about, so `names/*` is the
-  correct scope, not a caveat-bound exact ARN. `elide:PeerCoord` and the
-  per-request peer-fetch caveats were removed when Model 2 was rejected.
+- **`coord-base` is the read-only baseline every coordinator holds**, and
+  the only credential the LAN/internet-exposed peer-fetch verifier holds.
+  Coordinator-wide read of `names/*` / `coordinators/*` / `events/*`,
+  gated by `elide:Coord` like the other `coord-*` roles.
 
 ## Elide as customer: role inventory
 
@@ -375,6 +373,9 @@ The monolithic `coord-writer` is split two ways:
   assumed with an `elide:Volume` caveat and cached coordinator-side per
   vol_ulid. This reopens `design-iam-key-model.md` § *Per-volume scoping for
   writes (rejected)* — see *Why Split B is viable now* below.
+
+Orthogonally, `coord-base` is the read-only control-plane baseline every
+coordinator holds (it is not a fragment of the writer policy).
 
 ### TTL principle
 
@@ -497,52 +498,51 @@ active volume per TTL window per coordinator, gated by Tigris IAM rate
 limits (*Open questions* #9). The 24h TTL is the primary knob: longer →
 fewer mints, larger leaked-key window.
 
-### `peer-fetch` (Split A — coordinator-wide, read-only)
+### `coord-base` (Split A — coordinator-wide, read-only baseline)
 
-Coordinator-wide, read-only. Held by the serving coordinator's
-LAN/internet-exposed peer-fetch HTTP service for the S3 reads its
-request-verification pipeline performs.
-
-The bearer a requesting coordinator B presents to a serving coordinator
-A is the public-key `PeerFetchToken` (`design-peer-segment-fetch.md` §
-*Token shape*): Ed25519-signed with B's `coordinator.key`, verified by A
-against B's `coordinator.pub`. Mint is not in the peer verify path and
-issues no peer bearer; its only peer-fetch role is this credential.
+The baseline read-only credential every coordinator holds. Covers the
+control-plane public state a coordinator reads as a matter of course:
+name resolution and claim verification, peer-coordinator identity and
+endpoint resolution, event-log and peer-discovery reads.
 
 - **Required caveats:** `elide:Coord`, `Audience=mint`, `NotAfter` — the
   same coordinator-wide gate as the other `coord-*` roles.
-- **TTL:** short (1h), like the other coordinator-held roles; tighter is
-  warranted here as the exposed surface.
-- **Policy:** `s3:GetObject` only, on the two artifacts the gap-free
-  verify pipeline reads — the current-claimer check (`names/<name>`,
-  ETag-conditional per request, so the auth fence stays coincident with
-  the S3 CAS `release --force` triggers) and the requester-pubkey check
-  (`coordinators/<B>/coordinator.pub`):
+- **TTL:** short (1h), like the other coordinator-held roles.
+- **Policy:** `s3:GetObject` only, on `names/*`, `coordinators/*`, and
+  `events/*`:
 
 ```
 {
   "Version": "2012-10-17",
   "Statement": [{
-    "Sid": "AuthVerifyReadsOnly",
+    "Sid": "ControlPlaneReadOnly",
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
       "arn:aws:s3:::{{tenant.bucket}}/names/*",
-      "arn:aws:s3:::{{tenant.bucket}}/coordinators/*/coordinator.pub"
+      "arn:aws:s3:::{{tenant.bucket}}/coordinators/*",
+      "arn:aws:s3:::{{tenant.bucket}}/events/*"
     ]
   }]
 }
 ```
 
-Read-only, no `by_id/` access — a compromised peer-fetch surface can
-neither mutate state nor drain segments (`design-iam-key-model.md` §
-*IAM-layer invariants*). It is strictly less than `coord-names` (which
-holds write on `names/*`); the split exists because the holder is the
-exposed surface.
+**Invariant: `coord-base` is read-only and `by_id/`-free.** This is what
+makes it safe to be the *only* credential held by the LAN/internet-
+exposed peer-fetch HTTP verifier: a compromise of the exposed surface
+can neither mutate state nor read segment bodies
+(`design-iam-key-model.md` § *IAM-layer invariants*). The write-capable
+`coord-names` / `coord-identity` / `coord-events` roles stay separate
+and are held only by the non-exposed mutation paths. `coord-base` must
+never accrete a write action or any `by_id/` read; doing so silently
+breaks exposed-surface containment.
 
-No `by_id/` read is needed because lineage is verified by the serving
-peer against its **own local** signed `volume.provenance` chain (it
-holds the chain for every fork it serves), not via S3 — see
+The peer-fetch verifier needs no dedicated role and no `by_id/` access:
+it uses `coord-base` for the gap-free fence (per-request ETag-
+conditional `names/<name>` read, coincident with the `release --force`
+S3 CAS) and the requester-pubkey check (`coordinators/<B>/
+coordinator.pub`), and verifies lineage against the serving peer's
+**own local** signed `volume.provenance` chain — see
 `design-peer-segment-fetch.md` § *Peer verification* check 4.
 
 The `ephemeral-fetch` key class from the prior model collapses into
@@ -615,17 +615,16 @@ prematurely.
 3. **Trust root rotation.** Static trust roots fit v1, but rotation needs a
    story. Options: hot-reload on SIGHUP, dual-key acceptance during overlap,
    explicit rotation endpoint. Probably defer to v2.
-4. **Peer-fetch scope — settled.** `peer-fetch` is coordinator-wide,
-   read-only, `s3:GetObject` on `names/*` + `coordinators/*/
-   coordinator.pub` only. Lineage is verified by the serving peer
-   against its own *local* signed `volume.provenance`, not via S3, so it
-   is not a mint concern. The force-release fence is gap-free via the
-   per-request ETag-conditional `names/<name>` read (fence coincident
-   with the S3 CAS) — this is why the role still exists at all.
+4. **Peer-fetch scope — settled.** There is no dedicated peer-fetch
+   role; the verifier uses `coord-base` (read-only `names/*` /
+   `coordinators/*` / `events/*`). Lineage is verified by the serving
+   peer against its own *local* signed `volume.provenance`, not via S3.
+   The force-release fence is gap-free via the per-request ETag-
+   conditional `names/<name>` read (fence coincident with the S3 CAS).
 5. **Mid-path wildcard verification.** Not on the v1 critical path:
    `coord-data` uses a single-volume *trailing* wildcard
    (`by_id/{{caveat.elide:Volume}}/*`), `volume-ro` uses exact ancestor
-   ARNs, and `peer-fetch` touches no `by_id/` at all — none need mid-path
+   ARNs, and `coord-base` touches no `by_id/` at all — none need mid-path
    `*`. It is only a constraint on a future role wanting
    `by_id/*/<something>` shape. Empirical test still worth running once,
    but does not block the current inventory.

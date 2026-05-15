@@ -394,9 +394,9 @@ verified by the serving coordinator against `coordinators/<id>/
 coordinator.pub`. The serving coordinator does not — and by design
 cannot — hold the macaroon chained-MAC root key (`design-mint.md` §
 *Trust model*), so a mint-issued symmetric macaroon cannot serve as the
-peer bearer. Mint stays out of the peer verify path; its only peer-fetch
-role is issuing the serving coordinator its read-only verifier
-credential (`design-mint.md` § *`peer-fetch`*).
+peer bearer. Mint stays out of the peer verify path; the serving
+coordinator's verification reads use its baseline read-only credential
+(`design-mint.md` § *`coord-base`*).
 
 Lineage is verified by the serving peer against its **own local**
 signed `volume.provenance` chain (it holds the chain for every fork it
@@ -429,7 +429,7 @@ The claim sequence:
 
 Peer-fetch then inspects the same event B already has:
 
-- If `kind == "released"` and the signature verifies against `coordinators/<event.coordinator_id>/coordinator.pub`: the prior owner is identified. Resolve their endpoint via `coordinators/<event.coordinator_id>/peer-endpoint.toml` (proposed; see below) and use as peer.
+- If `kind == "released"` and the signature verifies against `coordinators/<event.coordinator_id>/coordinator.pub`: the prior owner is identified. Resolve their endpoint via `coordinators/<event.coordinator_id>/peer-endpoint.toml` (see below) and use as peer.
 - **Anything else** (`force_released`, missing event, signature failure, missing endpoint, unreachable peer, …): skip peer; fetch direct from S3.
 
 The "anything-other-than-clean-released → S3" rule keeps the logic boring: one happy path, and every failure mode at every layer collapses to the same fallback.
@@ -438,13 +438,14 @@ For `force_released` specifically, the event's emitter is the *recovering* coord
 
 `prev_event_ulid` on each event chains backward through history; useful for verifying that no concurrent event was missed but not for *finding* the head of the log. Whatever mechanism the event-log design adopts for find-latest (LIST + sort by default, with `events/<name>/HEAD` pointer or inverted-ULID keys as future optimisations) is shared between claim and peer-fetch.
 
-### Coordinator endpoint registry (proposed)
+### Coordinator endpoint registry
 
-The handoff discovery step assumes a way to resolve `coordinator_id` → reachable endpoint. The natural slot is sibling to the already-proposed `coordinators/<coordinator_id>/coordinator.pub`:
+`coordinator_id` → reachable endpoint resolves via a sibling of
+`coordinators/<coordinator_id>/coordinator.pub`:
 
 ```
-coordinators/<coordinator_id>/coordinator.pub        — already proposed
-coordinators/<coordinator_id>/peer-endpoint.toml     — new
+coordinators/<coordinator_id>/coordinator.pub
+coordinators/<coordinator_id>/peer-endpoint.toml
 ```
 
 `peer-endpoint.toml` records `host`, `port`, and any TLS hints. A coordinator updates its own endpoint at startup; absence or unreachability flows naturally into the "fall back to S3" branch above.
