@@ -350,9 +350,17 @@ keeps provenance signatures verified on the walked chain, and keeps
 rate-limit attribution on `coordinator_id`. The legitimate-claimer gate
 is steps 2–3.
 
-The body-token path (`verify_body_token`) anchors at `token.vol_ulid`
-instead: the volume key proves the signer *is* the fork, a distinct
-trust root not subject to the rebind.
+The body-token path (`verify_body_token`) anchors step 4 at
+`url_vol_id` for the same reason. Its identity proof is distinct: the
+Ed25519 signature is verified against `by_id/<token.vol_ulid>/volume.pub`,
+proving the signer holds the requesting fork's volume key — a trust
+root not subject to the rebind. But `token.vol_ulid` is itself the
+claimant's freshly-rebound fork, whose provenance is published to S3
+only and is structurally never on the serving peer's local disk.
+Anchoring the lineage walk there would 403 every first claim, exactly
+as anchoring the coordinator path at the name record did. The walk
+therefore roots at `url_vol_id` (the served ancestor whose bytes are
+requested); the volume-key signature remains the identity gate.
 
 The coordinator-key model has two operational benefits over per-volume signing:
 
