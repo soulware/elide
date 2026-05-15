@@ -453,8 +453,15 @@ impl AuthState {
         }
 
         // Step 4: lineage — `LineageGated` only. Skeletons skip this.
+        // Anchored at the URL's `vol_id`, not the name record's: the
+        // claimant rebinds `names/<name>` to its new fork before the
+        // payload fetch, and that fork's provenance is never on the
+        // serving peer's local disk. The gate is "this peer holds a
+        // self-consistent signed chain rooted at `url_vol_id`" — the
+        // walk fails closed (`OutsideLineage`) for any fork it doesn't
+        // serve. See docs/design-peer-segment-fetch.md.
         if matches!(mode, RouteAuthMode::LineageGated) {
-            let ancestry = self.ancestry(name_record.vol_ulid).await?;
+            let ancestry = self.ancestry(url_vol_id).await?;
             if !ancestry.contains(&url_vol_id) {
                 return Err(AuthError::OutsideLineage);
             }
@@ -1182,6 +1189,50 @@ mod tests {
             .expect_err("not in lineage");
         assert!(matches!(err, AuthError::OutsideLineage));
         assert_eq!(err.status_code(), 403);
+    }
+
+    /// Handoff regression: the claimant rebinds `names/<name>` to its
+    /// new fork before the payload fetch, so `name_record.vol_ulid` is
+    /// a child fork whose provenance is never on the serving peer's
+    /// local store. Step 4 must anchor at the URL's `vol_id` (the
+    /// parent fork the peer actually serves), not the name record —
+    /// otherwise every first claim 403s and falls back to S3. See
+    /// docs/design-peer-segment-fetch.md.
+    #[tokio::test]
+    async fn lineage_anchored_at_url_vol_id_not_name_record() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let parent_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "myvol";
+        // The parent fork the releasing peer serves locally.
+        let parent_ulid = Ulid::new();
+        // The claimant's rebound fork — provenance never published
+        // anywhere the serving peer can see (S3-only in production).
+        let rebound_child_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), parent_ulid, &parent_key, None).await;
+        // Name record points at the child; the child has no provenance.
+        publish_live_name(store.as_ref(), vol_name, rebound_child_ulid, coord_id).await;
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let bearer = token.encode();
+
+        // Anchored at the name record (child) this would 403 — the
+        // child's provenance is unwalkable. Anchored at `url_vol_id`
+        // (the served parent) it authorises.
+        let result = auth
+            .verify(&bearer, parent_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect("parent fork is locally served and self-consistent");
+        assert_eq!(result.vol_id, parent_ulid);
+        assert_eq!(result.coordinator_id, coord_id);
     }
 
     #[tokio::test]
