@@ -134,7 +134,10 @@ enum Command {
         command: CoordCommand,
     },
 
-    /// Manage operator tokens (mint via the coordinator).
+    /// Mint operator tokens. Tokens are minted by the coordinator and
+    /// stored per-coordinator in `~/.elide/tokens.toml` (keyed by
+    /// data_dir), so gated verbs like `volume remove` pick them up
+    /// without `--token`.
     Token {
         #[command(subcommand)]
         command: TokenCommand,
