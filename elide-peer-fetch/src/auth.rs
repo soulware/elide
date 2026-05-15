@@ -484,7 +484,8 @@ impl AuthState {
     /// Pipeline:
     /// 1. Decode + freshness.
     /// 2. Signature verification against `by_id/<token.vol_ulid>/volume.pub`.
-    /// 3. Lineage: URL `vol_id` ∈ ancestry(`token.vol_ulid`).
+    /// 3. Lineage: the peer holds a self-consistent signed chain rooted
+    ///    at `url_vol_id`.
     ///
     /// There is no `names/<name>` ownership step: the volume key
     /// proves the signer *is* the fork. Read-only access to bytes the
@@ -524,10 +525,17 @@ impl AuthState {
             return Ok(entry.authorized);
         }
 
-        // Lineage check — URL's vol_id must be reachable from the
-        // signing volume's signed parent chain (or be the signing
-        // volume itself; `walk_ancestry` includes it).
-        let ancestry = self.ancestry(token.vol_ulid).await?;
+        // Lineage check — anchored at the URL's `vol_id`, not at
+        // `token.vol_ulid`. The signature step above already proves
+        // the requester holds `token.vol_ulid`'s volume key, but that
+        // ulid is the claimant's freshly-rebound fork, whose
+        // provenance is S3-only and structurally never on the serving
+        // peer's local disk. The gate here is the same as the
+        // coordinator path's step 4: "this peer holds a self-consistent
+        // signed chain rooted at `url_vol_id`" — fail closed
+        // (`OutsideLineage`) for any fork it doesn't serve. See
+        // docs/design-peer-segment-fetch.md.
+        let ancestry = self.ancestry(url_vol_id).await?;
         if !ancestry.contains(&url_vol_id) {
             return Err(AuthError::OutsideLineage);
         }
@@ -1719,5 +1727,89 @@ mod tests {
         auth.verify(&token_a.encode(), vol_ulid, RouteAuthMode::LineageGated)
             .await
             .unwrap();
+    }
+
+    /// Sign a `BodyFetchToken` with `key` over its canonical payload —
+    /// mirrors what `VolumeBodySigner` does in production.
+    fn sign_body_token(vol_ulid: Ulid, issued_at: u64, key: &SigningKey) -> BodyFetchToken {
+        let payload = BodyFetchToken::signing_payload(vol_ulid, issued_at);
+        let sig = key.sign(&payload).to_bytes();
+        BodyFetchToken {
+            vol_ulid,
+            issued_at,
+            signature: sig,
+        }
+    }
+
+    /// Publish only `by_id/<vol>/volume.pub` (no provenance). Models the
+    /// claimant's freshly-rebound fork during handoff: its `volume.pub`
+    /// is on S3 (the claim uploads it, so the signature verifies) but
+    /// its `volume.provenance` is never on the serving peer's local
+    /// disk.
+    async fn publish_volume_pub_only(store: &dyn ObjectStore, vol_ulid: Ulid, key: &SigningKey) {
+        store
+            .put(
+                &StorePath::from(format!("by_id/{vol_ulid}/volume.pub")),
+                Bytes::from(pub_hex(key).into_bytes()).into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Handoff regression for the body-token path: `token.vol_ulid` is
+    /// the claimant's rebound fork, whose provenance is S3-only and
+    /// never on the serving peer's local disk. Step 4 must anchor at
+    /// `url_vol_id` (the served ancestor whose bytes are requested),
+    /// not `token.vol_ulid` — otherwise every first claim 403s and the
+    /// body falls back to S3. Sibling of
+    /// `lineage_anchored_at_url_vol_id_not_name_record` for the
+    /// coordinator path. See docs/design-peer-segment-fetch.md.
+    #[tokio::test]
+    async fn body_lineage_anchored_at_url_vol_id_not_token_vol_ulid() {
+        let (store, auth) = make_state();
+        let parent_key = SigningKey::generate(&mut OsRng);
+        let child_key = SigningKey::generate(&mut OsRng);
+        // The served ancestor the peer holds a local chain for.
+        let parent_ulid = Ulid::new();
+        // The claimant's rebound fork — volume.pub on S3, provenance
+        // never on the serving peer's local disk.
+        let child_ulid = Ulid::new();
+
+        publish_volume(store.as_ref(), parent_ulid, &parent_key, None).await;
+        publish_volume_pub_only(store.as_ref(), child_ulid, &child_key).await;
+
+        let token = sign_body_token(child_ulid, BodyFetchToken::now_unix_seconds(), &child_key);
+
+        // Anchored at `token.vol_ulid` (child) this 403s — the child's
+        // provenance is unwalkable. Anchored at `url_vol_id` (the
+        // served parent) it authorises.
+        let authorized = auth
+            .verify_body_token(&token.encode(), parent_ulid)
+            .await
+            .expect("served-ancestor body fetch authorises under volume-key proof");
+        assert_eq!(authorized.signer_vol_ulid, child_ulid);
+        assert_eq!(authorized.url_vol_id, parent_ulid);
+    }
+
+    /// Fail-closed property is preserved: a valid volume-key signature
+    /// does not grant body access to a `url_vol_id` the peer does not
+    /// serve. The signature verifies (pub is on S3) but the lineage
+    /// walk NotFounds → `OutsideLineage` (403 → S3 fallback).
+    #[tokio::test]
+    async fn body_unserved_url_vol_id_fails_closed() {
+        let (store, auth) = make_state();
+        let signer_key = SigningKey::generate(&mut OsRng);
+        let signer_ulid = Ulid::new();
+        // No provenance published anywhere for this ulid.
+        let unserved_ulid = Ulid::new();
+
+        publish_volume_pub_only(store.as_ref(), signer_ulid, &signer_key).await;
+        let token = sign_body_token(signer_ulid, BodyFetchToken::now_unix_seconds(), &signer_key);
+
+        let err = auth
+            .verify_body_token(&token.encode(), unserved_ulid)
+            .await
+            .expect_err("peer must not serve a vol_id it holds no local chain for");
+        assert_eq!(err.status_code(), 403);
     }
 }
