@@ -890,7 +890,8 @@ prematurely.
     anchor — signing `BLAKE3(presented-macaroon-tail ‖ unix-seconds)`
     with a ±skew window vs. a mint-issued nonce. Tail-binding to pin the
     proof to the exact request is fixed; the freshness mechanism is the
-    live choice.
+    live choice — it is DPoP's resolved `iat`-skew vs. server-`nonce`
+    tradeoff; prior art: RFC 7800 (`cnf` PoP key) and RFC 9449 (DPoP).
 
 ## Future directions
 
