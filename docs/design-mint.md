@@ -402,6 +402,20 @@ their full namespaced name through the `caveat` helper:
 `{{caveat "elide:Volume"}}`. The string-argument form is what makes the
 `:` separator usable in a template at all.
 
+### Partitioning vs. narrowing caveats
+
+Caveats split into two kinds by where their value originates:
+
+- **Partitioning** — `elide:Coord`. Separates mutually-distrusting
+  principals. Stamped at issuance and bound to the authenticated identity
+  (see *Coordinator bootstrap*, #13); a caller never supplies it.
+- **Narrowing** — `elide:Volume`, `elide:Ancestors`, `NotAfter`.
+  Coordinator-appended, restricting an existing grant to one volume /
+  lineage / expiry for attribution and per-credential blast-radius
+  reduction. Volume ownership across coordinators is established by the
+  name-claim and body-token lineage; `elide:Volume` scopes a
+  coordinator's own credential within authority it already holds.
+
 ### List-valued caveats with intersection semantics
 
 A list-valued caveat (e.g. `elide:Ancestors=[A,B,C]`) attenuates by
@@ -425,7 +439,7 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `NotAfter` | uint64 (unix s) | scalar, intersecting | issuer | Gate — caps granted TTL (`min(req, role.max, NotAfter−now)`). |
 | `Role` | string | scalar or list | issuer | Gate only — restricts assumable roles. Optional. |
 | `elide:Coord` | string (coord-ulid) | scalar | stamped at issuance, bound to coordinator identity (#13) — never coordinator-appended | Gate on all `coord-*`; defines the primary macaroon. Templated only in the deferred one-time-publish split. |
-| `elide:Volume` | string (vol-ulid) | scalar | coordinator | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
+| `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 | `elide:Ancestors` | list of vol-ulids | **list**, intersecting | coordinator | Gate **and** template — `{{#each}}` over ancestor ARNs. |
 
 Per-role gate matrix (template substitutions are listed in each role's
@@ -599,9 +613,9 @@ Narrowest scope in the system and the most refresh-sensitive holder.
 rejected per-volume writer keys on two grounds. The mint redesign changes
 one of them:
 
-- *Confused-deputy enforcement is "modest"* — unchanged. Volume-identity
-  correctness still lives in `volume_event_store` / claim records / the
-  directory structure; per-volume IAM is still a redundant belt.
+- *Confused-deputy enforcement is "modest"* — unchanged. `elide:Volume`
+  is a narrowing caveat (see *Partitioning vs. narrowing caveats*);
+  per-volume IAM remains a redundant belt over the name-claim lineage.
 - *Operational cost* (N persisted policies, `ListPolicies` reconciliation,
   orphan reaping, refresh churn) — **dissolved**. Mint keys are short-lived,
   vended on demand, never persisted, expired by `DateLessThan`. No
