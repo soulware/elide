@@ -193,12 +193,22 @@ and places the result in `data_dir`) or by coordinator self-enrolment
 against a mint issuance endpoint gated by an identity authority through
 a third-party caveat — see *Open questions* #13.
 
-Three refresh cadences, distinct:
+Refresh cadences, distinct, in increasing trust cost:
 
 - **Tigris keypair** — re-call `assume-role` with the held macaroon
   (*Open questions* #8).
-- **Primary macaroon** — re-issued before its `NotAfter`; re-touches the
-  issuance authority (#13).
+- **`volume-ro` attenuation** — coordinator-local, near-free: the
+  coordinator re-attenuates off its primary and re-hands to the volume.
+  No mint or issuance round trip. Per fetch episode for non-lazy
+  volumes; on a longer timer for lazy ones. Bounded by the primary's
+  `NotAfter` — a lazy `volume-ro` cannot outlive the primary it chains
+  from, so primary rotation must re-hand fresh attenuations to live
+  lazy volumes (the only case where this coupling bites).
+- **Primary macaroon** — re-issued before its `NotAfter`. Authenticated
+  by proof-of-possession of the coordinator's identity key, so refresh
+  is in-band/automatic; only the *first* acquisition is out-of-band
+  (operator `mint issue` or identity-authority-gated self-enrolment —
+  *Open questions* #13).
 - **Discharge macaroon** — when a third-party caveat is present, fetched
   from the identity authority on its own shorter cadence.
 
@@ -595,16 +605,27 @@ or remove `coord-list`; tracked as open question #12.
 
 ### `volume-ro`
 
-Per-volume, held by the volume process (vended via the macaroon handshake).
-Narrowest scope in the system and the most refresh-sensitive holder.
+Per-volume read of one volume's lineage, vended to the volume process via
+the macaroon handshake. Used only when the volume reads S3 itself:
+hydration, or the S3 fallback when peer-fetch is unavailable. Peer-fetch
+proper does not use it — that path is the Ed25519 `PeerFetchToken`
+against a peer's local bytes (`design-peer-segment-fetch.md`).
 
 - **Required caveats:** `elide:Volume`, `elide:Ancestors`, `Audience=mint`,
   `NotAfter`
-- **TTL:** 30 days. Long deliberately: read-only, single volume + fixed
-  ancestor list, held by long-running data-plane processes whose refresh
-  path stalls guest I/O on failure. The 30d revocation window is the
-  accepted cost of that refresh robustness, bounded by the minimal blast
-  radius (read one volume's lineage).
+- **TTL — split by volume mode:**
+  - *Non-lazy (default):* short-lived, vended on demand. A hydrated
+    volume serves from local cache and touches S3 only in bounded fetch
+    episodes; a refresh stall there does not stall guest I/O, so the
+    coordinator re-attenuates a fresh `volume-ro` off its primary per
+    episode (local, free). Minutes-to-hours, not days — no long-lived
+    attenuation outstanding for a primary rotation to cap.
+  - *Lazy:* longer-lived. Cache-miss demand-fetch is synchronous to
+    guest I/O, so this holder is refresh-sensitive and trades a wider
+    revocation window for refresh robustness, bounded by the minimal
+    blast radius (read one volume's lineage). Hours-to-days, tuned to
+    the demand-fetch profile and capped by the primary's `NotAfter`
+    (see *Coordinator bootstrap*).
 - **Policy:** the per-volume RO shape, exact ARNs for self + each ancestor.
 
 ### Why Split B is viable now
