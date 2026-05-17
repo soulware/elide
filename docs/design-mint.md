@@ -246,12 +246,16 @@ seen on a different `sub` is anomalous (a new key is a new principal)
 and surfaced. Unapproved records age out on a bound ≥ the intermediate
 `exp`, keeping the table transient rather than a registry.
 
-**(2) Operator approval.** Out of band the operator runs
-`mint enroll list` and `mint enroll approve <sub>`, having checked the
-displayed `cnf` pubkey fingerprint against the client through a trusted
-side channel (the client prints its own). This confirmation is the trust anchor binding `sub` to the
-rightful key in the minimal deployment; the third-party caveat is an
-additive upgrade, not a replacement.
+**(2) Operator approval.** `mint enroll approve <sub>` prints the
+pending record's `cnf` fingerprint and requires an interactive y/N
+confirmation (default no); the operator confirms only after matching it,
+through a trusted side channel, against what the client reports
+(`mint client fingerprint`). That interactive confirmation **is** the
+trust anchor binding `sub` to the rightful key in the minimal
+deployment — it gates approval rather than trailing it; the third-party
+caveat is an additive upgrade, not a replacement. `--yes` skips the
+prompt for automation (the operator then asserts the out-of-band check
+happened).
 
 **(3) `POST /v1/enroll-exchange`.** Before the intermediate expires the
 coordinator presents it with a `coordinator.key` PoP, discharging any

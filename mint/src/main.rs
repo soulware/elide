@@ -128,13 +128,20 @@ enum EnrollCmd {
     },
     /// Approve a pending record by its `sub`.
     ///
-    /// Verify the displayed `cnf` fingerprint matches the client out of
-    /// band *before* approving — that confirmation is the trust anchor.
+    /// Prints the record's `cnf` fingerprint and asks for an
+    /// interactive y/N confirmation: confirming **is** the trust anchor
+    /// (it must match what the client reports via
+    /// `mint client fingerprint`). `--yes` skips the prompt for
+    /// automation.
     Approve {
         #[arg(long, default_value = "mint.toml")]
         config: PathBuf,
         /// The opaque principal id (Elide: the coordinator ULID).
         sub: String,
+        /// Skip the interactive confirmation (automation only — you are
+        /// asserting the fingerprint was verified out of band).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -149,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Bootstrap { config, rotate } => bootstrap(&config, rotate),
         Command::Enroll { cmd } => match cmd {
             EnrollCmd::List { config } => enroll_list(&config),
-            EnrollCmd::Approve { config, sub } => enroll_approve(&config, &sub),
+            EnrollCmd::Approve { config, sub, yes } => enroll_approve(&config, &sub, yes),
         },
         Command::Client { client_dir, cmd } => client_cmd(client_dir, cmd).await,
     }
@@ -321,16 +328,42 @@ fn enroll_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn enroll_approve(config: &Path, sub: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn enroll_approve(config: &Path, sub: &str, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
     let config = load(config)?;
     let store = open_store(&config)?;
-    if store.approve(sub)? {
-        eprintln!(
-            "approved {sub} — verify its fingerprint matches the client out \
-             of band before it exchanges"
+    let pending = store
+        .get_pending(sub)?
+        .ok_or_else(|| format!("no pending enrollment for sub {sub}"))?;
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let fp = mint::state::fingerprint(&pending.pubkey);
+
+    eprintln!("pending enrollment:");
+    eprintln!("  sub:         {sub}");
+    eprintln!("  fingerprint: {fp}");
+    eprintln!("  peer:        {}", pending.peer_ip);
+    eprintln!("  age:         {}s", now.saturating_sub(pending.first_seen));
+
+    if !yes {
+        eprint!(
+            "Approve? This authorises the binding — the fingerprint must \
+             match what the client reports (`mint client fingerprint`). [y/N] "
         );
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
+            eprintln!("not approved");
+            std::process::exit(1);
+        }
+    }
+
+    if store.approve(sub)? {
+        eprintln!("approved {sub}");
         Ok(())
     } else {
+        // Raced away between get_pending and approve (e.g. GC / rotate).
         Err(format!("no pending enrollment for sub {sub}").into())
     }
 }
