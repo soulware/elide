@@ -1,51 +1,68 @@
-//! mint entry point.
+//! mint entry point (`docs/design-mint.md` § *Reference client &
+//! demo*).
 //!
 //! ```text
-//! mint serve <config.toml> [bind-addr]            # default bind 127.0.0.1:8085
-//! mint enroll-token <config.toml> --coord <ulid> --coord-pub ed25519:<b64> [--ttl <secs>]
+//! mint serve <config.toml> [bind-addr]      # default 127.0.0.1:8085
+//! mint bootstrap <config.toml>              # print the current bootstrap macaroon
+//! mint bootstrap rotate <config.toml>       # new nonce, then print it
+//! mint enroll list <config.toml>            # pending records
+//! mint enroll approve <config.toml> <sub>   # approve a pending record
 //! ```
 //!
-//! `serve` runs the verification/vending HTTP surface. The prototype
-//! always wires the faked keypair minter — swapping in a real
-//! `TigrisMinter` is the single change to go live (see `iam.rs`).
+//! `serve` runs the verification/vending HTTP surface. Until the live
+//! Tigris SigV4 minter lands this binary wires [`FakeMinter`] and warns
+//! loudly on every start: the enroll/exchange flow is real, but
+//! `assume-role` returns a **deterministic fake keypair**. This is an
+//! explicit, temporary interim — not a silent optional path — removed
+//! when the real minter is wired (`docs/design-mint.md` § *Reference
+//! client & demo*: "no stub backend").
 //!
-//! `enroll-token` is the operator side of issuance (`docs/design-mint.md`
-//! § *Coordinator bootstrap*): it holds the mint root (from the config
-//! TOML) and emits a base64 enrollment token for one named coordinator —
-//! the admin-local "vouch for coordinator X" act that stands in for an
-//! identity-authority discharge while third-party caveats are deferred
-//! (design *Open questions* #15). The token is handed out-of-band to
-//! whoever brings the coordinator up; the coordinator exchanges it for a
-//! non-expiring primary at `POST /v1/enroll`.
+//! `bootstrap` / `enroll` are the operator side. The networked
+//! `mint client` (the coordinator's half) is the staged tail.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 
-use chrono::Utc;
 use mint::audit::AuditLog;
 use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
-use mint::issuance::mint_enrollment_token;
-
-/// Default enrollment-token lifetime: a provisioning window, not a
-/// session. One-time and key-bound, so an unused leak is inert; this
-/// only bounds how long a minted-but-unredeemed token stays usable.
-const DEFAULT_ENROLL_TTL_SECONDS: u64 = 3600;
+use mint::issuance::mint_bootstrap;
+use mint::state::Store;
 
 const USAGE: &str = "usage:\n  \
     mint serve <config.toml> [bind-addr]\n  \
-    mint enroll-token <config.toml> --coord <ulid> --coord-pub ed25519:<b64> [--ttl <secs>]";
+    mint bootstrap <config.toml>\n  \
+    mint bootstrap rotate <config.toml>\n  \
+    mint enroll list <config.toml>\n  \
+    mint enroll approve <config.toml> <sub>";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let cmd = args.next().ok_or(USAGE)?;
+    let rest: Vec<String> = args.collect();
     match cmd.as_str() {
-        "serve" => serve(args.collect()).await,
-        "enroll-token" => enroll_token(args.collect()),
+        "serve" => serve(rest).await,
+        "bootstrap" => bootstrap(rest),
+        "enroll" => enroll(rest),
         _ => Err(USAGE.into()),
     }
+}
+
+/// Open the persisted state store from the config's `state_dir`,
+/// erroring if it is unset (required for every subcommand here).
+fn open_store(cfg: &Config) -> Result<Store, Box<dyn std::error::Error>> {
+    let dir = cfg
+        .state_dir
+        .as_ref()
+        .ok_or("config is missing state_dir (required for serve/bootstrap/enroll)")?;
+    Ok(Store::open(dir)?)
+}
+
+fn load(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    Ok(Config::load(Path::new(path))?)
 }
 
 async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -62,25 +79,25 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "127.0.0.1:8085".into())
         .parse()?;
 
-    let config = Arc::new(Config::load(std::path::Path::new(&config_path))?);
+    let config = Arc::new(load(&config_path)?);
+    let store = Arc::new(open_store(&config)?);
+    tracing::warn!(
+        "INTERIM: assume-role uses the FAKE keypair minter — it returns a \
+         deterministic non-production keypair. The enroll/exchange flow is \
+         real. Remove when the live Tigris SigV4 minter is wired."
+    );
     tracing::info!(
         audience = %config.audience,
         roles = config.roles.len(),
         admin_credential = config.admin.is_some(),
-        "loaded config (prototype: keypair minting is FAKED)"
+        "loaded config"
     );
-    if config.admin.is_none() {
-        tracing::warn!(
-            "no Tigris admin credential in env (AWS_ACCESS_KEY_ID / \
-             AWS_SECRET_ACCESS_KEY); fine for the faked minter, but a \
-             real Tigris minter would refuse to start"
-        );
-    }
 
     let state = AppState {
         config,
         minter: Arc::new(FakeMinter::new()),
         audit: Arc::new(AuditLog::new(Box::new(std::io::stdout()))),
+        store,
     };
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -89,47 +106,81 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn enroll_token(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+/// `mint bootstrap [rotate] <config.toml>` — emit the bootstrap
+/// macaroon (root + op=enroll + aud + the current nonce). `rotate`
+/// draws a new nonce first (cancelling in-flight enrollments), then
+/// emits the macaroon carrying it. The macaroon goes to stdout for
+/// piping; diagnostics to stderr.
+fn bootstrap(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut a = args.into_iter();
-    let config_path = a.next().ok_or(USAGE)?;
-    let mut coord: Option<String> = None;
-    let mut coord_pub: Option<String> = None;
-    let mut ttl = DEFAULT_ENROLL_TTL_SECONDS;
-    while let Some(flag) = a.next() {
-        match flag.as_str() {
-            "--coord" => coord = Some(a.next().ok_or("--coord needs a value")?),
-            "--coord-pub" => coord_pub = Some(a.next().ok_or("--coord-pub needs a value")?),
-            "--ttl" => {
-                ttl = a
-                    .next()
-                    .ok_or("--ttl needs a value")?
-                    .parse()
-                    .map_err(|_| "--ttl must be a positive integer (seconds)")?
-            }
-            other => return Err(format!("unknown flag {other}\n{USAGE}").into()),
-        }
-    }
-    let coord = coord.ok_or("--coord <ulid> is required")?;
-    let coord_pub = coord_pub.ok_or("--coord-pub ed25519:<b64> is required")?;
-
-    let config = Config::load(std::path::Path::new(&config_path))?;
-    let not_after = (Utc::now().timestamp().max(0) as u64)
-        .checked_add(ttl)
-        .ok_or("--ttl overflows")?;
-
-    let token = mint_enrollment_token(
-        &config.trust_root,
-        &config.audience,
-        &coord,
-        &coord_pub,
-        not_after,
-    )?;
-    // The token is the only thing this command emits — straight to
-    // stdout so it can be piped/captured; diagnostics go to stderr.
+    let first = a.next().ok_or(USAGE)?;
+    let (rotate, config_path) = if first == "rotate" {
+        (true, a.next().ok_or(USAGE)?)
+    } else {
+        (false, first)
+    };
+    let config = load(&config_path)?;
+    let store = open_store(&config)?;
+    let nonce = if rotate {
+        let n = store.rotate_bootstrap()?;
+        eprintln!("rotated bootstrap nonce; in-flight enrollments cancelled");
+        n
+    } else {
+        store.current_bootstrap()?
+    };
+    let mac = mint_bootstrap(&config.trust_root, &config.audience, &nonce);
     eprintln!(
-        "enrollment token for coord={coord} audience={} expires in {ttl}s",
+        "bootstrap macaroon for audience={} (non-expiring, reusable)",
         config.audience
     );
-    println!("{}", token.encode());
+    println!("{}", mac.encode());
     Ok(())
+}
+
+fn enroll(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut a = args.into_iter();
+    let sub = a.next().ok_or(USAGE)?;
+    match sub.as_str() {
+        "list" => {
+            let config = load(&a.next().ok_or(USAGE)?)?;
+            let store = open_store(&config)?;
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            let rows = store.list(now)?;
+            if rows.is_empty() {
+                eprintln!("no pending enrollments");
+                return Ok(());
+            }
+            println!(
+                "{:<28} {:<18} {:<16} {:>7} {:<9} FLAGS",
+                "SUB", "FINGERPRINT", "PEER", "AGE(s)", "APPROVED"
+            );
+            for r in rows {
+                println!(
+                    "{:<28} {:<18} {:<16} {:>7} {:<9} {}",
+                    r.sub,
+                    r.fingerprint,
+                    r.peer_ip,
+                    r.age_seconds,
+                    if r.approved { "yes" } else { "no" },
+                    if r.anomalous_pub { "ANOMALOUS-PUB" } else { "" }
+                );
+            }
+            Ok(())
+        }
+        "approve" => {
+            let config = load(&a.next().ok_or(USAGE)?)?;
+            let target = a.next().ok_or("enroll approve needs a <sub>")?;
+            let store = open_store(&config)?;
+            if store.approve(&target)? {
+                eprintln!(
+                    "approved {target} — verify its fingerprint matches the client \
+                     out of band before it exchanges"
+                );
+                Ok(())
+            } else {
+                Err(format!("no pending enrollment for sub {target}").into())
+            }
+        }
+        other => Err(format!("unknown enroll subcommand {other}\n{USAGE}").into()),
+    }
 }

@@ -1,4 +1,4 @@
-//! Holder-of-key proof for the `elide:CoordKey` caveat
+//! Holder-of-key proof for the `cnf` caveat
 //! (`docs/design-mint.md` § *Coordinator bootstrap*, § *Authentication*;
 //! open question #16).
 //!
@@ -10,7 +10,7 @@
 //! BLAKE3( macaroon-tail(32) ‖ BLAKE3(raw-request-body) )
 //! ```
 //!
-//! verified against the `ed25519:<pub>` sealed in `elide:CoordKey`. The
+//! verified against the `ed25519:<pub>` sealed in `cnf`. The
 //! tail binds the proof to this exact attenuated macaroon; the body
 //! hash binds it to this exact request (the body the policy renders
 //! from). Freshness is the `ts` field *inside* the body — already
@@ -21,21 +21,23 @@
 //! detached signature stays a header (`X-Mint-Coord-Pop`): it cannot
 //! live in the body it signs.
 //!
-//! Resolution of `elide:CoordKey` goes through the tri-state
+//! Resolution of `cnf` goes through the tri-state
 //! [`Resolved`]: `Absent` ⇒ the macaroon is a plain bearer (no PoP
 //! required — generic non-Elide callers); `Value` ⇒ PoP **required**;
 //! `Unsatisfiable` ⇒ **reject**. The last is the downgrade defence: a
 //! holder can append caveats with only the trailing MAC, so an
-//! appended contradictory `elide:CoordKey` must fail closed here, never
+//! appended contradictory `cnf` must fail closed here, never
 //! resolve to "absent" and silently drop the PoP requirement.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
-use crate::caveat::{Caveat, EffectiveCaveats, Resolved};
+use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name};
 
-pub const COORD_KEY_CAVEAT: &str = "elide:CoordKey";
+/// The holder-of-key caveat (RFC 7800 `cnf`, scalar-encoded). Re-export
+/// of [`crate::caveat::name::CNF`] so PoP call sites read in one place.
+pub const CNF_CAVEAT: &str = name::CNF;
 const ED25519_PREFIX: &str = "ed25519:";
 
 /// Replay window on the proof timestamp (#16). Generous for a
@@ -45,9 +47,9 @@ pub const SKEW_SECONDS: u64 = 60;
 /// Outcome of a successful PoP evaluation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PopOutcome {
-    /// No `elide:CoordKey` — the macaroon is a plain bearer.
+    /// No `cnf` — the macaroon is a plain bearer.
     NotKeyBound,
-    /// `elide:CoordKey` present and the request proved possession.
+    /// `cnf` present and the request proved possession.
     Verified,
 }
 
@@ -57,9 +59,9 @@ pub enum PopOutcome {
 /// for the audit log / tests only.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PopReject {
-    #[error("contradictory elide:CoordKey")]
+    #[error("contradictory cnf")]
     Unsatisfiable,
-    #[error("malformed elide:CoordKey")]
+    #[error("malformed cnf")]
     BadKey,
     #[error("proof header absent")]
     MissingProof,
@@ -109,7 +111,7 @@ fn body_ts(body: &[u8]) -> Result<u64, PopReject> {
         .ok_or(PopReject::BadProof)
 }
 
-fn parse_coord_key(value: &str) -> Result<[u8; 32], PopReject> {
+fn parse_cnf(value: &str) -> Result<[u8; 32], PopReject> {
     let b64 = value
         .strip_prefix(ED25519_PREFIX)
         .ok_or(PopReject::BadKey)?;
@@ -141,10 +143,10 @@ pub fn check(
     proof: Option<Proof>,
     now_unix: u64,
 ) -> Result<PopOutcome, PopReject> {
-    let key = match EffectiveCaveats::new(caveats).resolve(COORD_KEY_CAVEAT) {
+    let key = match EffectiveCaveats::new(caveats).resolve(CNF_CAVEAT) {
         Resolved::Absent => return Ok(PopOutcome::NotKeyBound),
         Resolved::Unsatisfiable => return Err(PopReject::Unsatisfiable),
-        Resolved::Value(k) => parse_coord_key(&k)?,
+        Resolved::Value(k) => parse_cnf(&k)?,
     };
     let proof = proof.ok_or(PopReject::MissingProof)?;
     let vk = VerifyingKey::from_bytes(&key).map_err(|_| PopReject::BadKey)?;
@@ -161,22 +163,22 @@ pub fn check(
     Ok(PopOutcome::Verified)
 }
 
-/// The `elide:CoordKey` caveat value for an Ed25519 seed:
+/// The `cnf` caveat value for an Ed25519 seed:
 /// `ed25519:<base64 pubkey>`. This is the reference for what the
 /// issuance path seals into the primary; a coordinator's identity key
 /// seed produces the value mint must verify against.
-pub fn coord_key_value(seed: &[u8; 32]) -> String {
+pub fn cnf_value(seed: &[u8; 32]) -> String {
     let vk = SigningKey::from_bytes(seed).verifying_key();
     format!("{ED25519_PREFIX}{}", BASE64.encode(vk.to_bytes()))
 }
 
-/// Validate an `elide:CoordKey` caveat value (`ed25519:<base64 pubkey>`)
+/// Validate an `cnf` caveat value (`ed25519:<base64 pubkey>`)
 /// is well-formed *and* a usable Ed25519 verifying key. The issuance
 /// path uses this to reject a malformed operator-supplied `--coord-pub`
 /// at enrollment-token mint time rather than letting it fail opaquely
 /// at the coordinator's first `assume-role`.
-pub fn validate_coord_key(value: &str) -> Result<(), PopReject> {
-    let raw = parse_coord_key(value)?;
+pub fn validate_cnf(value: &str) -> Result<(), PopReject> {
+    let raw = parse_cnf(value)?;
     VerifyingKey::from_bytes(&raw)
         .map(|_| ())
         .map_err(|_| PopReject::BadKey)
@@ -198,7 +200,7 @@ mod tests {
 
     fn signer() -> ([u8; 32], String) {
         let seed = [7u8; 32];
-        (seed, coord_key_value(&seed))
+        (seed, cnf_value(&seed))
     }
 
     /// A request body carrying the freshness `ts` field plus optional
@@ -225,7 +227,7 @@ mod tests {
     #[test]
     fn valid_proof_verifies() {
         let (sk, key) = signer();
-        let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
+        let cv = vec![Caveat::scalar(CNF_CAVEAT, key)];
         let b = body(1000, ",\"role\":\"x\"");
         let p = proof_for(&sk, &TAIL, &b);
         assert_eq!(
@@ -237,7 +239,7 @@ mod tests {
     #[test]
     fn key_bound_without_proof_is_rejected() {
         let (_, key) = signer();
-        let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
+        let cv = vec![Caveat::scalar(CNF_CAVEAT, key)];
         assert_eq!(
             check(&cv, &TAIL, &body(1000, ""), None, 1000),
             Err(PopReject::MissingProof)
@@ -247,7 +249,7 @@ mod tests {
     #[test]
     fn tampered_body_fails() {
         let (sk, key) = signer();
-        let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
+        let cv = vec![Caveat::scalar(CNF_CAVEAT, key)];
         let p = proof_for(&sk, &TAIL, &body(1000, ",\"ancestors\":[\"A\"]"));
         // Same proof, different body → digest mismatch (verified before
         // ts is even read).
@@ -266,7 +268,7 @@ mod tests {
     #[test]
     fn proof_bound_to_the_macaroon_tail() {
         let (sk, key) = signer();
-        let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
+        let cv = vec![Caveat::scalar(CNF_CAVEAT, key)];
         let b = body(1000, "");
         let p = proof_for(&sk, &TAIL, &b);
         // A proof minted for TAIL must not verify against another tail.
@@ -279,7 +281,7 @@ mod tests {
     #[test]
     fn stale_timestamp_rejected() {
         let (sk, key) = signer();
-        let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
+        let cv = vec![Caveat::scalar(CNF_CAVEAT, key)];
         let b = body(1000, "");
         let p = proof_for(&sk, &TAIL, &b);
         // Signature is valid; the in-body ts is outside the skew window.
@@ -294,7 +296,7 @@ mod tests {
         // A correctly-signed body that omits `ts`: signature verifies,
         // but freshness can't be established → reject (not minted).
         let (sk, key) = signer();
-        let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
+        let cv = vec![Caveat::scalar(CNF_CAVEAT, key)];
         let b = br#"{"role":"x"}"#;
         let p = proof_for(&sk, &TAIL, b);
         assert_eq!(
@@ -306,7 +308,7 @@ mod tests {
     #[test]
     fn wrong_key_fails() {
         let (_, key) = signer();
-        let cv = vec![Caveat::scalar(COORD_KEY_CAVEAT, key)];
+        let cv = vec![Caveat::scalar(CNF_CAVEAT, key)];
         let b = body(1000, "");
         let p = proof_for(&[3u8; 32], &TAIL, &b);
         assert_eq!(
@@ -318,13 +320,13 @@ mod tests {
     #[test]
     fn contradictory_coordkey_fails_closed_not_bearer() {
         // The downgrade defence: an appended second, different
-        // elide:CoordKey must reject — never resolve to Absent and
+        // cnf must reject — never resolve to Absent and
         // drop the PoP requirement (which would make a captured
         // primary a usable bearer).
         let (_, key) = signer();
         let cv = vec![
-            Caveat::scalar(COORD_KEY_CAVEAT, key),
-            Caveat::scalar(COORD_KEY_CAVEAT, "ed25519:AAAA"),
+            Caveat::scalar(CNF_CAVEAT, key),
+            Caveat::scalar(CNF_CAVEAT, "ed25519:AAAA"),
         ];
         assert_eq!(
             check(&cv, &TAIL, &body(1000, ""), None, 1000),

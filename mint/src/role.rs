@@ -6,12 +6,12 @@
 //! long. This module does **not** verify the MAC — that already
 //! happened — it only evaluates caveat *values*.
 
-use crate::caveat::{EffectiveCaveats, Resolved};
+use crate::caveat::{EffectiveCaveats, Resolved, name};
 use crate::config::{Config, Role};
 
-const AUDIENCE_CAVEAT: &str = "Audience";
-const NOT_AFTER_CAVEAT: &str = "NotAfter";
-const ROLE_CAVEAT: &str = "Role";
+const AUDIENCE_CAVEAT: &str = name::AUD;
+const NOT_AFTER_CAVEAT: &str = name::EXP;
+const ROLE_CAVEAT: &str = name::ROLE;
 
 /// Why an assume-role request was refused. Mapped to coarse HTTP
 /// statuses by the caller; never surfaced verbatim to the client.
@@ -122,7 +122,7 @@ trust_root_hex = "00000000000000000000000000000000000000000000000000000000000000
 bucket = "b"
 [[role]]
 name = "volume-ro"
-required_caveats = ["elide:Volume", "Audience", "NotAfter"]
+required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 1000
 default_ttl_seconds = 800
@@ -134,9 +134,9 @@ policy = "{}"
 
     fn good_caveats(not_after: u64) -> Vec<Caveat> {
         vec![
-            Caveat::scalar("Audience", "mint"),
+            Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar("elide:Volume", "01ARZ"),
-            Caveat::scalar("NotAfter", not_after.to_string()),
+            Caveat::scalar(name::EXP, not_after.to_string()),
         ]
     }
 
@@ -155,7 +155,7 @@ policy = "{}"
     #[test]
     fn wrong_audience_denied() {
         let mut cv = good_caveats(1_000_000);
-        cv[0] = Caveat::scalar("Audience", "other");
+        cv[0] = Caveat::scalar(name::AUD, "other");
         assert_eq!(
             authorize(&cfg(), &cv, "volume-ro", 800, 1000),
             Err(Denied::WrongAudience)
@@ -165,8 +165,8 @@ policy = "{}"
     #[test]
     fn missing_required_caveat_denied() {
         let cv = vec![
-            Caveat::scalar("Audience", "mint"),
-            Caveat::scalar("NotAfter", "1000000"),
+            Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::EXP, "1000000"),
         ];
         assert_eq!(
             authorize(&cfg(), &cv, "volume-ro", 800, 1000),
@@ -193,7 +193,7 @@ policy = "{}"
     #[test]
     fn role_caveat_restricts() {
         let mut cv = good_caveats(1_000_000);
-        cv.push(Caveat::scalar("Role", "coord-names"));
+        cv.push(Caveat::scalar(name::ROLE, "coord-names"));
         assert_eq!(
             authorize(&cfg(), &cv, "volume-ro", 800, 1000),
             Err(Denied::RoleNotPermitted)

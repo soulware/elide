@@ -1,62 +1,45 @@
-//! Primary-macaroon issuance (`docs/design-mint.md` § *Coordinator
-//! bootstrap & macaroon lifecycle*).
+//! Macaroon issuance (`docs/design-mint.md` § *Coordinator bootstrap &
+//! macaroon lifecycle*, § *Enrollment*).
 //!
-//! Issuance is two acts by two different principals at two different
-//! moments, sharing only the `elide:CoordKey` through-line:
+//! Every macaroon mint here is a fresh chain **from the root** (only
+//! the root holder can mint; a coordinator can only attenuate). Three
+//! mint points, each stamped with its own positively-required `op`:
 //!
-//! 1. **Enrollment-token mint** — an operator, on the mint host, with
-//!    the mint root ([`mint_enrollment_token`]). It is the "vouch for
-//!    coordinator X" act: in the minimal self-hosted deployment there is
-//!    no identity authority to discharge a third-party caveat against
-//!    (design *Open questions* #15, deferred), so this admin-local
-//!    operation *is* the trust anchor. The token is **expiring**
-//!    (`NotAfter`) and **key-bound** (`elide:CoordKey` = the
-//!    coordinator's public identity key).
+//! 1. [`mint_bootstrap`] — `op=enroll`, the reusable non-expiring
+//!    participation gate. No principal identity; carries the current
+//!    `bootstrap` nonce.
+//! 2. [`mint_intermediate`] — `op=enroll-exchange`, short-lived,
+//!    minted at `POST /v1/enroll` once the presented (coordinator-
+//!    attenuated) bootstrap has verified and a pending record exists.
+//!    Carries the self-asserted `sub`/`cnf` forward.
+//! 3. [`mint_primary`] — `op=assume-role`, non-expiring, minted at
+//!    `POST /v1/enroll-exchange` after operator approval. Same
+//!    `sub`/`cnf`; no `exp`.
 //!
-//! 2. **Enrollment exchange** — the coordinator, over HTTP, proving
-//!    possession of `coordinator.key` ([`remint_primary`], driven by
-//!    `POST /v1/enroll`). Mint re-mints **from its root** a primary
-//!    carrying the *same* `Audience` + `elide:Coord` + `elide:CoordKey`,
-//!    **stripped of `NotAfter`** — Fly.io's service-token pattern, only
-//!    the root holder can re-mint. The exchange does not bind a key; it
-//!    removes the expiry scaffolding around a binding already there, so
-//!    a stolen enrollment token is inert (the thief lacks
-//!    `coordinator.key`; PoP fails) and the primary does not expire (a
-//!    file-only leak is already inert, a key compromise renews
-//!    regardless).
-//!
-//! MAC verification, the holder-of-key PoP, and the `NotAfter` clock
-//! check are the HTTP layer's job (they need the root, the request
-//! body/proof, and the verifier's clock respectively). The functions
-//! here are pure given an already-authenticated token.
+//! MAC verification, the `op`/`aud`/`bootstrap` gates, the holder-of-key
+//! PoP and the pending/approval lookup are the HTTP layer's job (they
+//! need the root, config and the state store). The functions here are
+//! pure given an already-authenticated macaroon.
 
-use crate::caveat::{Caveat, EffectiveCaveats, Resolved};
+use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op};
 use crate::macaroon::{self, Macaroon};
-use crate::pop::{self, COORD_KEY_CAVEAT};
+use crate::pop;
 
-pub const AUDIENCE_CAVEAT: &str = "Audience";
-pub const COORD_CAVEAT: &str = "elide:Coord";
-pub const NOT_AFTER_CAVEAT: &str = "NotAfter";
-
-/// Why issuance refused. The HTTP layer collapses every variant to the
-/// same opaque `401` (the enrollment exchange shares `assume-role`'s
-/// "don't help an attacker distinguish causes" model); the variant is
-/// for the audit log and tests.
+/// Why extracting the bound identity from a verified macaroon failed.
+/// The HTTP layer collapses every variant to the same opaque `401`
+/// (don't help an attacker distinguish causes); the variant is for the
+/// audit log and tests.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EnrollError {
-    /// `elide:CoordKey` value is not a well-formed Ed25519 pubkey.
-    #[error("malformed elide:CoordKey")]
-    BadCoordKey,
-    /// The token's `Audience` is missing or != this mint's audience.
-    #[error("audience mismatch")]
-    AudienceMismatch,
-    /// The token carries no `elide:Coord` (it is not coordinator-scoped).
-    #[error("missing elide:Coord")]
-    MissingCoord,
-    /// The token carries no `elide:CoordKey` (it is a bearer token — an
-    /// enrollment token must be key-bound or a captured copy enrols).
-    #[error("missing elide:CoordKey")]
-    MissingCoordKey,
+    /// `cnf` is not a well-formed `ed25519:<b64 pub>`.
+    #[error("malformed cnf")]
+    BadCnf,
+    /// No `sub` (the macaroon is not principal-scoped).
+    #[error("missing sub")]
+    MissingSub,
+    /// No `cnf` (not key-bound — a bearer cannot enrol).
+    #[error("missing cnf")]
+    MissingCnf,
     /// A binding caveat resolved `Unsatisfiable` (≥2 disagreeing
     /// occurrences — the append-a-contradictory-copy downgrade; fail
     /// closed, never read as absent).
@@ -64,74 +47,79 @@ pub enum EnrollError {
     Unsatisfiable,
 }
 
-/// Mint an enrollment token: the mint root attenuated with
-/// `Audience` + `elide:Coord` + `elide:CoordKey` + `NotAfter`. Operator
-/// act (2) — `coord_key_value` is the coordinator's *public* identity
-/// (`ed25519:<b64>`), validated here so a typo is rejected now rather
-/// than at the coordinator's first `assume-role`.
-pub fn mint_enrollment_token(
-    root: &[u8; 32],
-    audience: &str,
-    coord_ulid: &str,
-    coord_key_value: &str,
-    not_after_unix: u64,
-) -> Result<Macaroon, EnrollError> {
-    pop::validate_coord_key(coord_key_value).map_err(|_| EnrollError::BadCoordKey)?;
-    Ok(macaroon::mint(
+/// The reusable bootstrap macaroon: root attenuated with `op=enroll`,
+/// `aud`, and the current `bootstrap` nonce. Non-expiring, carries no
+/// principal identity — a pure participation gate, distributed
+/// out-of-band and reusable for every enrolling client.
+pub fn mint_bootstrap(root: &[u8; 32], audience: &str, bootstrap_nonce: &str) -> Macaroon {
+    macaroon::mint(
         root,
         vec![
-            Caveat::scalar(AUDIENCE_CAVEAT, audience),
-            Caveat::scalar(COORD_CAVEAT, coord_ulid),
-            Caveat::scalar(COORD_KEY_CAVEAT, coord_key_value),
-            Caveat::scalar(NOT_AFTER_CAVEAT, not_after_unix.to_string()),
+            Caveat::scalar(name::OP, op::ENROLL),
+            Caveat::scalar(name::AUD, audience),
+            Caveat::scalar(name::BOOTSTRAP, bootstrap_nonce),
         ],
-    ))
+    )
 }
 
-/// Re-mint the primary from an authenticated enrollment `token`.
-///
-/// The caller (HTTP `/v1/enroll`) has already verified the token's MAC
-/// against `root`, run the holder-of-key PoP, and confirmed `NotAfter`
-/// is present and not past. This extracts the bound identity and
-/// re-mints a fresh primary carrying exactly the `Audience`,
-/// `elide:Coord` and `elide:CoordKey` triple, with `NotAfter` dropped so
-/// the primary does not expire. The fresh nonce makes it an independent
-/// chain, not an attenuation of the token (only the root holder can do
-/// this).
-pub fn remint_primary(
+/// The short-lived intermediate handed back from `POST /v1/enroll`:
+/// `op=enroll-exchange`, `aud`, the self-asserted `sub`/`cnf`, and an
+/// `exp`. (The third-party caveat for a configured identity authority
+/// is deferred — design *Open questions* #15.)
+pub fn mint_intermediate(
     root: &[u8; 32],
-    expected_audience: &str,
-    token: &Macaroon,
-) -> Result<Macaroon, EnrollError> {
-    let eff = EffectiveCaveats::new(token.caveats());
-
-    match eff.resolve(AUDIENCE_CAVEAT) {
-        Resolved::Value(a) if a == expected_audience => {}
-        Resolved::Unsatisfiable => return Err(EnrollError::Unsatisfiable),
-        _ => return Err(EnrollError::AudienceMismatch),
-    }
-
-    let coord = match eff.resolve(COORD_CAVEAT) {
-        Resolved::Value(v) => v,
-        Resolved::Unsatisfiable => return Err(EnrollError::Unsatisfiable),
-        Resolved::Absent => return Err(EnrollError::MissingCoord),
-    };
-
-    let coord_key = match eff.resolve(COORD_KEY_CAVEAT) {
-        Resolved::Value(v) => v,
-        Resolved::Unsatisfiable => return Err(EnrollError::Unsatisfiable),
-        Resolved::Absent => return Err(EnrollError::MissingCoordKey),
-    };
-    pop::validate_coord_key(&coord_key).map_err(|_| EnrollError::BadCoordKey)?;
-
-    Ok(macaroon::mint(
+    audience: &str,
+    sub: &str,
+    cnf: &str,
+    exp_unix: u64,
+) -> Macaroon {
+    macaroon::mint(
         root,
         vec![
-            Caveat::scalar(AUDIENCE_CAVEAT, expected_audience),
-            Caveat::scalar(COORD_CAVEAT, coord),
-            Caveat::scalar(COORD_KEY_CAVEAT, coord_key),
+            Caveat::scalar(name::OP, op::ENROLL_EXCHANGE),
+            Caveat::scalar(name::AUD, audience),
+            Caveat::scalar(name::SUB, sub),
+            Caveat::scalar(name::CNF, cnf),
+            Caveat::scalar(name::EXP, exp_unix.to_string()),
         ],
-    ))
+    )
+}
+
+/// The non-expiring primary, re-minted from root at a successful
+/// exchange: `op=assume-role`, `aud`, the same `sub`/`cnf`, **no**
+/// `exp`. A fresh chain, not an attenuation of the intermediate (only
+/// the root holder can do this).
+pub fn mint_primary(root: &[u8; 32], audience: &str, sub: &str, cnf: &str) -> Macaroon {
+    macaroon::mint(
+        root,
+        vec![
+            Caveat::scalar(name::OP, op::ASSUME_ROLE),
+            Caveat::scalar(name::AUD, audience),
+            Caveat::scalar(name::SUB, sub),
+            Caveat::scalar(name::CNF, cnf),
+        ],
+    )
+}
+
+/// Extract the bound `(sub, cnf)` from an already-MAC-verified
+/// macaroon, tri-state-safe: a contradictory copy of either fails
+/// closed (never silently read as the first value), and `cnf` is
+/// validated as a usable Ed25519 key here so a malformed one is
+/// refused at enrollment rather than opaquely at first `assume-role`.
+pub fn bound_identity(token: &Macaroon) -> Result<(String, String), EnrollError> {
+    let eff = EffectiveCaveats::new(token.caveats());
+    let sub = match eff.resolve(name::SUB) {
+        Resolved::Value(v) => v,
+        Resolved::Unsatisfiable => return Err(EnrollError::Unsatisfiable),
+        Resolved::Absent => return Err(EnrollError::MissingSub),
+    };
+    let cnf = match eff.resolve(name::CNF) {
+        Resolved::Value(v) => v,
+        Resolved::Unsatisfiable => return Err(EnrollError::Unsatisfiable),
+        Resolved::Absent => return Err(EnrollError::MissingCnf),
+    };
+    pop::validate_cnf(&cnf).map_err(|_| EnrollError::BadCnf)?;
+    Ok((sub, cnf))
 }
 
 #[cfg(test)]
@@ -139,115 +127,95 @@ mod tests {
     use super::*;
 
     const ROOT: [u8; 32] = [7u8; 32];
-    const COORD: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
-    fn coord_key() -> String {
-        pop::coord_key_value(&[3u8; 32])
+    fn cnf() -> String {
+        pop::cnf_value(&[3u8; 32])
     }
 
     #[test]
-    fn enrollment_token_carries_the_four_caveats() {
-        let t =
-            mint_enrollment_token(&ROOT, "mint", COORD, &coord_key(), 1_700_000_000).expect("mint");
-        assert!(t.verify(&ROOT));
-        let eff = EffectiveCaveats::new(t.caveats());
-        assert_eq!(eff.resolve(AUDIENCE_CAVEAT), Resolved::Value("mint".into()));
-        assert_eq!(eff.resolve(COORD_CAVEAT), Resolved::Value(COORD.into()));
-        assert_eq!(eff.resolve(COORD_KEY_CAVEAT), Resolved::Value(coord_key()));
-        assert_eq!(eff.not_after(NOT_AFTER_CAVEAT), Some(1_700_000_000));
-    }
-
-    #[test]
-    fn malformed_coord_pub_rejected_at_token_mint() {
+    fn bootstrap_is_enroll_op_no_identity() {
+        let b = mint_bootstrap(&ROOT, "mint", "nonceXYZ");
+        assert!(b.verify(&ROOT));
+        let eff = EffectiveCaveats::new(b.caveats());
+        assert_eq!(eff.resolve(name::OP), Resolved::Value(op::ENROLL.into()));
+        assert_eq!(eff.resolve(name::AUD), Resolved::Value("mint".into()));
         assert_eq!(
-            mint_enrollment_token(&ROOT, "mint", COORD, "ed25519:not-base64!!", 1),
-            Err(EnrollError::BadCoordKey)
+            eff.resolve(name::BOOTSTRAP),
+            Resolved::Value("nonceXYZ".into())
         );
+        assert_eq!(eff.resolve(name::SUB), Resolved::Absent);
+        assert_eq!(eff.resolve(name::CNF), Resolved::Absent);
+    }
+
+    #[test]
+    fn intermediate_then_primary_carry_identity_with_distinct_ops() {
+        let inter = mint_intermediate(&ROOT, "mint", SUB, &cnf(), 1_700_000_000);
+        assert!(inter.verify(&ROOT));
+        let ie = EffectiveCaveats::new(inter.caveats());
         assert_eq!(
-            mint_enrollment_token(&ROOT, "mint", COORD, "rsa:whatever", 1),
-            Err(EnrollError::BadCoordKey)
+            ie.resolve(name::OP),
+            Resolved::Value(op::ENROLL_EXCHANGE.into())
         );
-    }
+        assert_eq!(ie.not_after(name::EXP), Some(1_700_000_000));
 
-    #[test]
-    fn primary_strips_not_after_and_preserves_binding() {
-        let token =
-            mint_enrollment_token(&ROOT, "mint", COORD, &coord_key(), 1_700_000_000).unwrap();
-        let primary = remint_primary(&ROOT, "mint", &token).expect("remint");
-
-        assert!(primary.verify(&ROOT));
-        let eff = EffectiveCaveats::new(primary.caveats());
-        // Same binding through-line ...
-        assert_eq!(eff.resolve(COORD_CAVEAT), Resolved::Value(COORD.into()));
-        assert_eq!(eff.resolve(COORD_KEY_CAVEAT), Resolved::Value(coord_key()));
-        // ... NotAfter scaffolding removed: the primary does not expire.
-        assert_eq!(eff.not_after(NOT_AFTER_CAVEAT), None);
-        assert_eq!(primary.caveats().len(), 3);
-    }
-
-    #[test]
-    fn primary_is_a_fresh_chain_not_an_attenuation() {
-        // Re-mint from root → independent nonce, not token ‖ extra.
-        let token =
-            mint_enrollment_token(&ROOT, "mint", COORD, &coord_key(), 1_700_000_000).unwrap();
-        let primary = remint_primary(&ROOT, "mint", &token).unwrap();
-        assert_ne!(primary.nonce(), token.nonce());
-        assert_ne!(primary.tail(), token.tail());
-    }
-
-    #[test]
-    fn audience_mismatch_refused() {
-        let token = mint_enrollment_token(&ROOT, "other", COORD, &coord_key(), 1).unwrap();
+        let prim = mint_primary(&ROOT, "mint", SUB, &cnf());
+        assert!(prim.verify(&ROOT));
+        let pe = EffectiveCaveats::new(prim.caveats());
         assert_eq!(
-            remint_primary(&ROOT, "mint", &token),
-            Err(EnrollError::AudienceMismatch)
+            pe.resolve(name::OP),
+            Resolved::Value(op::ASSUME_ROLE.into())
         );
+        assert_eq!(pe.resolve(name::SUB), Resolved::Value(SUB.into()));
+        assert_eq!(pe.resolve(name::CNF), Resolved::Value(cnf()));
+        // The primary does not expire.
+        assert_eq!(pe.not_after(name::EXP), None);
+        // Fresh chain, not an attenuation of the intermediate.
+        assert_ne!(prim.nonce(), inter.nonce());
     }
 
     #[test]
-    fn bearer_enrollment_token_refused() {
-        // No elide:CoordKey → a captured copy would enrol. Must reject;
-        // an enrollment token has to be key-bound.
-        let token = macaroon::mint(
+    fn bound_identity_extracts_sub_and_cnf() {
+        let m = macaroon::mint(
             &ROOT,
             vec![
-                Caveat::scalar(AUDIENCE_CAVEAT, "mint"),
-                Caveat::scalar(COORD_CAVEAT, COORD),
-                Caveat::scalar(NOT_AFTER_CAVEAT, "1"),
+                Caveat::scalar(name::SUB, SUB),
+                Caveat::scalar(name::CNF, cnf()),
             ],
         );
-        assert_eq!(
-            remint_primary(&ROOT, "mint", &token),
-            Err(EnrollError::MissingCoordKey)
+        assert_eq!(bound_identity(&m), Ok((SUB.to_string(), cnf())));
+    }
+
+    #[test]
+    fn missing_or_bad_identity_refused() {
+        let no_cnf = macaroon::mint(&ROOT, vec![Caveat::scalar(name::SUB, SUB)]);
+        assert_eq!(bound_identity(&no_cnf), Err(EnrollError::MissingCnf));
+
+        let no_sub = macaroon::mint(&ROOT, vec![Caveat::scalar(name::CNF, cnf())]);
+        assert_eq!(bound_identity(&no_sub), Err(EnrollError::MissingSub));
+
+        let bad_cnf = macaroon::mint(
+            &ROOT,
+            vec![
+                Caveat::scalar(name::SUB, SUB),
+                Caveat::scalar(name::CNF, "ed25519:not-base64!!"),
+            ],
         );
+        assert_eq!(bound_identity(&bad_cnf), Err(EnrollError::BadCnf));
     }
 
     #[test]
     fn contradictory_binding_fails_closed() {
-        // Appended second, disagreeing elide:Coord (only the trailing
-        // MAC is needed to append). Must be Unsatisfiable, never read
-        // as the first value.
-        let token = mint_enrollment_token(&ROOT, "mint", COORD, &coord_key(), 1)
-            .unwrap()
-            .attenuate(Caveat::scalar(COORD_CAVEAT, "01EVIL"));
-        assert_eq!(
-            remint_primary(&ROOT, "mint", &token),
-            Err(EnrollError::Unsatisfiable)
-        );
-    }
-
-    #[test]
-    fn missing_coord_refused() {
-        let token = macaroon::mint(
+        // Appended second, disagreeing sub (only the trailing MAC is
+        // needed to append). Must be Unsatisfiable, never the first value.
+        let m = macaroon::mint(
             &ROOT,
             vec![
-                Caveat::scalar(AUDIENCE_CAVEAT, "mint"),
-                Caveat::scalar(COORD_KEY_CAVEAT, coord_key()),
+                Caveat::scalar(name::SUB, SUB),
+                Caveat::scalar(name::CNF, cnf()),
             ],
-        );
-        assert_eq!(
-            remint_primary(&ROOT, "mint", &token),
-            Err(EnrollError::MissingCoord)
-        );
+        )
+        .attenuate(Caveat::scalar(name::SUB, "01EVIL"));
+        assert_eq!(bound_identity(&m), Err(EnrollError::Unsatisfiable));
     }
 }

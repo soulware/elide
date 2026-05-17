@@ -13,6 +13,40 @@
 
 use std::collections::BTreeSet;
 
+/// Canonical caveat names (`docs/design-mint.md` § *Standard caveats*).
+/// **Borrowed** names reuse a registered claim verbatim (RFC 7519 /
+/// RFC 7800) — the abbreviation *is* the standard. **Coined** names are
+/// mint-specific, readable lowercase, deliberately *not* in the
+/// registered-claim style.
+pub mod name {
+    // Borrowed (RFC 7519 / RFC 7800).
+    /// RFC 7519 audience — the service this macaroon is for.
+    pub const AUD: &str = "aud";
+    /// RFC 7519 expiry, unix seconds; multiple narrow to the minimum.
+    pub const EXP: &str = "exp";
+    /// RFC 7519 subject — the opaque principal the credential is bound
+    /// to (Elide: a coordinator ULID).
+    pub const SUB: &str = "sub";
+    /// RFC 7800 confirmation — the holder-of-key, scalar-encoded
+    /// `ed25519:<pub>` (not the JWT `cnf` JSON object).
+    pub const CNF: &str = "cnf";
+    // Coined (mint-specific; no registered equivalent).
+    /// Endpoint partition: `enroll` / `enroll-exchange` / `assume-role`.
+    pub const OP: &str = "op";
+    /// Restricts the assumable role. Optional.
+    pub const ROLE: &str = "role";
+    /// Carried only by the bootstrap macaroon; the current nonce.
+    pub const BOOTSTRAP: &str = "bootstrap";
+}
+
+/// `op` caveat values. Mint stamps one at every point it mints; each
+/// endpoint **positively requires** its own (never tests absence).
+pub mod op {
+    pub const ENROLL: &str = "enroll";
+    pub const ENROLL_EXCHANGE: &str = "enroll-exchange";
+    pub const ASSUME_ROLE: &str = "assume-role";
+}
+
 /// A single named scalar caveat in a macaroon's chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caveat {

@@ -22,6 +22,7 @@ pub mod issuance;
 pub mod macaroon;
 pub mod pop;
 pub mod role;
+pub mod state;
 pub mod template;
 
 pub use caveat::{Caveat, Resolved};

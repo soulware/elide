@@ -10,6 +10,11 @@
 audience = "mint"
 trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
 
+# Persisted-state directory (current bootstrap nonce + transient
+# pending-enrollment table), same custody as trust_root_hex. Required by
+# `serve` / `bootstrap` / `enroll`.
+state_dir = "/var/lib/mint"
+
 [tenant]
 bucket = "elide-demo"
 
@@ -22,7 +27,7 @@ bucket = "elide-demo"
 
 [[role]]
 name = "volume-ro"
-required_caveats = ["elide:Volume", "Audience", "NotAfter"]
+required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 2592000      # 30 days
 default_ttl_seconds = 2592000
@@ -48,7 +53,7 @@ policy = """
 
 [[role]]
 name = "coord-data"
-required_caveats = ["elide:Coord", "elide:Volume", "Audience", "NotAfter"]
+required_caveats = ["sub", "elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
@@ -69,7 +74,7 @@ policy = """
 
 [[role]]
 name = "coord-base"
-required_caveats = ["elide:Coord", "Audience", "NotAfter"]
+required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600

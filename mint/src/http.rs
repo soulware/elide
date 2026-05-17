@@ -1,18 +1,21 @@
 //! HTTP surface (`docs/design-mint.md` § *Protocol*).
 //!
 //! ```text
-//! POST /v1/assume-role   Authorization: Macaroon <b64>   (per request)
-//! POST /v1/enroll        Authorization: Macaroon <b64>   (once at provisioning)
+//! POST /v1/assume-role      op=assume-role   (per request)
+//! POST /v1/enroll           op=enroll        (creates a pending record)
+//! POST /v1/enroll-exchange  op=enroll-exchange (403 until approved)
 //! GET  /healthz
 //! ```
 //!
-//! Error model is deliberately coarse (§ *Authentication*, § *Response*):
-//!
-//! - any macaroon problem (missing header, bad base64, bad MAC) → `401`
-//!   with no detail, so an attacker can't distinguish failure causes;
-//! - role/caveat denial → `400`;
-//! - backend (Tigris) failure → `503`;
-//! - every response carries `X-Request-Id`.
+//! Authentication is identical across all three operations: MAC against
+//! the root, the positively-required `op` for the endpoint, `aud`, and
+//! the holder-of-key PoP over `tail ‖ BLAKE3(body)` (the body is the
+//! freshness `ts` for the enrollment endpoints, the full exercise body
+//! for `assume-role`). Every failure is an opaque `401` with no detail
+//! so an attacker can't distinguish causes; role/caveat denial is
+//! `400`; backend failure `503`. The **sole** non-`401` authorization
+//! outcome is `/v1/enroll-exchange` returning `403` for a
+//! not-yet-approved pending record — an awaited state, not a failure.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,20 +31,30 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::audit::{AuditEntry, AuditLog, sanitise_caveats};
-use crate::caveat::EffectiveCaveats;
+use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op};
 use crate::config::Config;
 use crate::iam::KeypairMinter;
-use crate::issuance::{self, NOT_AFTER_CAVEAT};
+use crate::issuance;
 use crate::macaroon::Macaroon;
 use crate::pop::{self, PopOutcome};
 use crate::role::{self, Denied};
+use crate::state::{Recorded, StateError, Store};
 use crate::template::render_policy;
+
+/// Intermediate lifetime: long enough for an operator to approve out of
+/// band, short by design. If it lapses the client just re-enrols
+/// (idempotent for the same `(sub, pub)` → fresh intermediate).
+const INTERMEDIATE_TTL_SECONDS: u64 = 600;
+/// Unapproved pending records age out past this (≥ the intermediate
+/// `exp`, so a still-usable intermediate always has its record).
+const PENDING_MAX_AGE_SECONDS: u64 = 3600;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub minter: Arc<dyn KeypairMinter>,
     pub audit: Arc<AuditLog>,
+    pub store: Arc<Store>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -49,6 +62,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/assume-role", post(assume_role))
         .route("/v1/enroll", post(enroll))
+        .route("/v1/enroll-exchange", post(enroll_exchange))
         .with_state(state)
 }
 
@@ -66,6 +80,14 @@ fn respond(request_id: &str, status: StatusCode, body: serde_json::Value) -> Res
     resp
 }
 
+fn unauthorized(request_id: &str) -> Response {
+    respond(
+        request_id,
+        StatusCode::UNAUTHORIZED,
+        json!({"error": "unauthorized"}),
+    )
+}
+
 /// Pull the bearer macaroon out of `Authorization: Macaroon <b64>`.
 fn extract_macaroon(headers: &HeaderMap) -> Option<Macaroon> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
@@ -73,16 +95,43 @@ fn extract_macaroon(headers: &HeaderMap) -> Option<Macaroon> {
     Macaroon::decode(b64).ok()
 }
 
-async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let caller = headers
+fn peer_ip(headers: &HeaderMap) -> String {
+    headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
-        .to_string();
+        .to_string()
+}
 
+/// A scalar caveat must be present and equal to `expected` — the
+/// positive-value gate (`op`/`aud`). Absent, contradictory, or any
+/// other value all fail closed; no path tests for absence.
+fn scalar_is(caveats: &[Caveat], n: &str, expected: &str) -> bool {
+    matches!(
+        EffectiveCaveats::new(caveats).resolve(n),
+        Resolved::Value(v) if v == expected
+    )
+}
+
+/// The detached PoP from `X-Mint-Coord-Pop`, if syntactically present.
+/// A malformed header is a hard `Err` (caller maps to 401); absence is
+/// `Ok(None)` (caller decides whether key-binding is required).
+fn pop_proof(headers: &HeaderMap) -> Result<Option<pop::Proof>, ()> {
+    match headers
+        .get("x-mint-coord-pop")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(sig) => pop::Proof::from_b64(sig).map(Some).map_err(|_| ()),
+        None => Ok(None),
+    }
+}
+
+async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let caller = peer_ip(&headers);
     let audit = |entry: AuditEntry| state.audit.record(&entry);
     let now = Utc::now();
+    let now_unix = now.timestamp().max(0) as u64;
     let base_entry = |outcome: &str| AuditEntry {
         timestamp: now.to_rfc3339(),
         request_id: request_id.clone(),
@@ -98,23 +147,20 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     // --- Authentication: any failure is an opaque 401. ---
     let Some(mac) = extract_macaroon(&headers) else {
         audit(base_entry("denied:unauthenticated"));
-        return respond(
-            &request_id,
-            StatusCode::UNAUTHORIZED,
-            json!({"error": "unauthorized"}),
-        );
+        return unauthorized(&request_id);
     };
     if !mac.verify(&state.config.trust_root) {
         audit(base_entry("denied:bad_mac"));
-        return respond(
-            &request_id,
-            StatusCode::UNAUTHORIZED,
-            json!({"error": "unauthorized"}),
-        );
+        return unauthorized(&request_id);
+    }
+    let caveats = mac.caveats().to_vec();
+    // Positive op gate: this endpoint serves op=assume-role only.
+    if !scalar_is(&caveats, name::OP, op::ASSUME_ROLE) {
+        audit(base_entry("denied:wrong_op"));
+        return unauthorized(&request_id);
     }
 
     let nonce_hex = mac.nonce_hex();
-    let caveats = mac.caveats().to_vec();
     let entry = |outcome: &str, role: &str, ttl: Option<u64>, key: Option<String>| AuditEntry {
         timestamp: now.to_rfc3339(),
         request_id: request_id.clone(),
@@ -127,50 +173,22 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         tigris_access_key_id: key,
     };
 
-    // --- Holder-of-key PoP (elide:CoordKey) ---
-    // Enforced before anything reads the body: the proof signs over the
-    // exact raw body bytes, so a verified PoP is what makes the
-    // request.* template inputs trustworthy. Any failure is the same
-    // opaque 401 as a bad MAC (don't distinguish causes); a
-    // contradictory elide:CoordKey fails closed here, never downgrades
-    // to bearer.
-    let pop_proof = match headers
-        .get("x-mint-coord-pop")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(sig) => match pop::Proof::from_b64(sig) {
-            Ok(p) => Some(p),
-            Err(_) => {
-                audit(entry("denied:pop", "", None, None));
-                return respond(
-                    &request_id,
-                    StatusCode::UNAUTHORIZED,
-                    json!({"error": "unauthorized"}),
-                );
-            }
-        },
-        None => None,
+    // --- Holder-of-key PoP (cnf). Enforced before anything reads the
+    // body: the proof signs the exact raw bytes, so a verified PoP is
+    // what makes the request.* template inputs trustworthy. ---
+    let proof = match pop_proof(&headers) {
+        Ok(p) => p,
+        Err(()) => {
+            audit(entry("denied:pop", "", None, None));
+            return unauthorized(&request_id);
+        }
     };
-    if let Err(_e) = pop::check(
-        &caveats,
-        mac.tail(),
-        &body,
-        pop_proof,
-        now.timestamp().max(0) as u64,
-    ) {
+    if pop::check(&caveats, mac.tail(), &body, proof, now_unix).is_err() {
         audit(entry("denied:pop", "", None, None));
-        return respond(
-            &request_id,
-            StatusCode::UNAUTHORIZED,
-            json!({"error": "unauthorized"}),
-        );
+        return unauthorized(&request_id);
     }
 
-    // --- Request body ---
-    // Parse twice from the same bytes: the typed view (role/ttl) and
-    // the generic `request.*` template namespace. Both are derived from
-    // the exact bytes the PoP signature covers (§ pop): the policy can
-    // only ever reflect the body the coordinator signed.
+    // --- Request body (the exact bytes the PoP covers). ---
     let Ok(req) = serde_json::from_slice::<AssumeRoleBody>(&body) else {
         audit(entry("denied:bad_request", "", None, None));
         return respond(
@@ -182,8 +200,6 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     let request_json: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
 
-    // Default TTL is the role's default; resolve before authorize so the
-    // clamp in `role::authorize` sees a concrete number.
     let requested_ttl = match req.ttl_seconds {
         Some(t) => t,
         None => match state.config.roles.get(&req.role) {
@@ -199,13 +215,8 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         },
     };
 
-    let granted = match role::authorize(
-        &state.config,
-        &caveats,
-        &req.role,
-        requested_ttl,
-        now.timestamp().max(0) as u64,
-    ) {
+    let granted = match role::authorize(&state.config, &caveats, &req.role, requested_ttl, now_unix)
+    {
         Ok(g) => g,
         Err(d) => {
             audit(entry(
@@ -222,7 +233,6 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         }
     };
 
-    // --- Render policy + mint keypair ---
     let expiry = now + chrono::Duration::seconds(granted.ttl_seconds as i64);
     let expiry_iso = expiry.to_rfc3339();
     let policy = match render_policy(
@@ -287,112 +297,254 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     }
 }
 
-/// `POST /v1/enroll` — the enrollment exchange (`docs/design-mint.md`
-/// § *Coordinator bootstrap*). The coordinator presents an
-/// operator-issued enrollment token (expiring, key-bound) and proves
-/// possession of `coordinator.key`; mint re-mints from its root a
-/// non-expiring **primary** carrying the same `elide:Coord` +
-/// `elide:CoordKey`, `NotAfter` stripped.
-///
-/// Same opaque model as `assume-role`: every authentication failure is
-/// a detail-free `401`. Distinct from `assume-role` in two ways — the
-/// presented token **must** be key-bound (a bearer enrollment token
-/// would let any captor enrol), and it **must** carry an unexpired
-/// `NotAfter` (an enrollment token that never expires defeats the point
-/// of the one-time exchange).
+/// `POST /v1/enroll` (`docs/design-mint.md` § *Enrollment* (1)). The
+/// client presents the coordinator-attenuated bootstrap macaroon
+/// (`op=enroll`, current `bootstrap`, self-asserted `sub`/`cnf`) and a
+/// PoP. Mint records a **pending** record keyed by `sub` and returns a
+/// short-lived intermediate. Always `200` for an accepted
+/// (new or idempotent) `(sub, pub)`; conflicts and auth failures are
+/// the opaque `401`.
 async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let caller = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-    let audit = |entry: AuditEntry| state.audit.record(&entry);
-    let now = Utc::now();
-    let now_unix = now.timestamp().max(0) as u64;
-
-    let unauthorized = |request_id: &str| {
-        respond(
-            request_id,
-            StatusCode::UNAUTHORIZED,
-            json!({"error": "unauthorized"}),
-        )
-    };
-
-    let base_entry =
-        |outcome: &str, nonce: Option<String>, caveats: &[crate::caveat::Caveat]| AuditEntry {
-            timestamp: now.to_rfc3339(),
+    let caller = peer_ip(&headers);
+    let now_unix = Utc::now().timestamp().max(0) as u64;
+    let audit = |outcome: &str, caveats: &[Caveat]| {
+        state.audit.record(&AuditEntry {
+            timestamp: Utc::now().to_rfc3339(),
             request_id: request_id.clone(),
             caller_address: caller.clone(),
-            macaroon_nonce: nonce,
+            macaroon_nonce: None,
             macaroon_caveats: sanitise_caveats(caveats),
             role: String::new(),
             granted_ttl_seconds: None,
             outcome: format!("enroll:{outcome}"),
             tigris_access_key_id: None,
-        };
+        });
+    };
 
-    // --- Authentication: any failure is an opaque 401. ---
-    let Some(token) = extract_macaroon(&headers) else {
-        audit(base_entry("denied:unauthenticated", None, &[]));
+    // Opportunistic GC keeps the pending table transient.
+    if let Err(e) = state.store.gc(now_unix, PENDING_MAX_AGE_SECONDS) {
+        tracing::warn!(error = %e, "pending gc failed");
+    }
+
+    let Some(mac) = extract_macaroon(&headers) else {
+        audit("denied:unauthenticated", &[]);
         return unauthorized(&request_id);
     };
-    if !token.verify(&state.config.trust_root) {
-        audit(base_entry("denied:bad_mac", None, &[]));
+    if !mac.verify(&state.config.trust_root) {
+        audit("denied:bad_mac", &[]);
         return unauthorized(&request_id);
     }
-    let caveats = token.caveats().to_vec();
-    let nonce_hex = token.nonce_hex();
+    let caveats = mac.caveats().to_vec();
 
-    // --- Holder-of-key PoP. Unlike assume-role, NotKeyBound is a
-    // refusal here: an enrollment token must be key-bound or a captured
-    // copy enrols a coordinator the captor doesn't own. ---
-    let pop_proof = match headers
-        .get("x-mint-coord-pop")
-        .and_then(|v| v.to_str().ok())
+    if !scalar_is(&caveats, name::OP, op::ENROLL)
+        || !scalar_is(&caveats, name::AUD, &state.config.audience)
     {
-        Some(sig) => match pop::Proof::from_b64(sig) {
-            Ok(p) => Some(p),
-            Err(_) => {
-                audit(base_entry("denied:pop", Some(nonce_hex), &caveats));
-                return unauthorized(&request_id);
-            }
-        },
-        None => None,
+        audit("denied:wrong_op", &caveats);
+        return unauthorized(&request_id);
+    }
+    let current = match state.store.current_bootstrap() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "read bootstrap nonce");
+            return respond(
+                &request_id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "service unavailable"}),
+            );
+        }
     };
-    match pop::check(&caveats, token.tail(), &body, pop_proof, now_unix) {
+    if !scalar_is(&caveats, name::BOOTSTRAP, &current) {
+        audit("denied:stale_bootstrap", &caveats);
+        return unauthorized(&request_id);
+    }
+
+    // PoP is mandatory here (the bootstrap is bearer until the client
+    // attenuates cnf; NotKeyBound means it didn't, so a captured copy
+    // could enrol). Body is the freshness ts only.
+    let proof = match pop_proof(&headers) {
+        Ok(p) => p,
+        Err(()) => {
+            audit("denied:pop", &caveats);
+            return unauthorized(&request_id);
+        }
+    };
+    match pop::check(&caveats, mac.tail(), &body, proof, now_unix) {
         Ok(PopOutcome::Verified) => {}
         Ok(PopOutcome::NotKeyBound) | Err(_) => {
-            audit(base_entry("denied:pop", Some(nonce_hex), &caveats));
+            audit("denied:pop", &caveats);
             return unauthorized(&request_id);
         }
     }
 
-    // --- Enrollment-token expiry. The token must carry an unexpired
-    // NotAfter; the primary it mints will have none. ---
-    match EffectiveCaveats::new(&caveats).not_after(NOT_AFTER_CAVEAT) {
+    let (sub, cnf) = match issuance::bound_identity(&mac) {
+        Ok(v) => v,
+        Err(_) => {
+            audit("denied:identity", &caveats);
+            return unauthorized(&request_id);
+        }
+    };
+
+    match state
+        .store
+        .record_pending(&sub, &cnf, &current, &caller, now_unix)
+    {
+        Ok(Recorded::Created) | Ok(Recorded::Idempotent) => {}
+        Err(StateError::Io(e)) => {
+            tracing::error!(error = %e, "record pending");
+            return respond(
+                &request_id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "service unavailable"}),
+            );
+        }
+        // Conflict / BadSub / Corrupt: opaque 401 (don't distinguish).
+        Err(_) => {
+            audit("denied:conflict", &caveats);
+            return unauthorized(&request_id);
+        }
+    }
+
+    let intermediate = issuance::mint_intermediate(
+        &state.config.trust_root,
+        &state.config.audience,
+        &sub,
+        &cnf,
+        now_unix.saturating_add(INTERMEDIATE_TTL_SECONDS),
+    );
+    audit("pending", &caveats);
+    respond(
+        &request_id,
+        StatusCode::OK,
+        json!({ "intermediate": intermediate.encode() }),
+    )
+}
+
+/// `POST /v1/enroll-exchange` (`docs/design-mint.md` § *Enrollment*
+/// (3)). The client presents the intermediate (`op=enroll-exchange`,
+/// unexpired `exp`) and a PoP. If the pending record is approved, mint
+/// re-mints the non-expiring primary from root and **consumes** the
+/// record. `403` (not `401`) while approval is still pending — the one
+/// awaited, non-failure outcome.
+async fn enroll_exchange(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let caller = peer_ip(&headers);
+    let now_unix = Utc::now().timestamp().max(0) as u64;
+    let audit = |outcome: &str, caveats: &[Caveat]| {
+        state.audit.record(&AuditEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            request_id: request_id.clone(),
+            caller_address: caller.clone(),
+            macaroon_nonce: None,
+            macaroon_caveats: sanitise_caveats(caveats),
+            role: String::new(),
+            granted_ttl_seconds: None,
+            outcome: format!("exchange:{outcome}"),
+            tigris_access_key_id: None,
+        });
+    };
+
+    let Some(mac) = extract_macaroon(&headers) else {
+        audit("denied:unauthenticated", &[]);
+        return unauthorized(&request_id);
+    };
+    if !mac.verify(&state.config.trust_root) {
+        audit("denied:bad_mac", &[]);
+        return unauthorized(&request_id);
+    }
+    let caveats = mac.caveats().to_vec();
+
+    if !scalar_is(&caveats, name::OP, op::ENROLL_EXCHANGE)
+        || !scalar_is(&caveats, name::AUD, &state.config.audience)
+    {
+        audit("denied:wrong_op", &caveats);
+        return unauthorized(&request_id);
+    }
+    match EffectiveCaveats::new(&caveats).not_after(name::EXP) {
         Some(exp) if exp > now_unix => {}
         _ => {
-            audit(base_entry("denied:expired", Some(nonce_hex), &caveats));
+            audit("denied:expired", &caveats);
             return unauthorized(&request_id);
         }
     }
 
-    // --- Re-mint the primary from the root. ---
-    match issuance::remint_primary(&state.config.trust_root, &state.config.audience, &token) {
-        Ok(primary) => {
-            audit(base_entry("granted", Some(nonce_hex), &caveats));
-            respond(
-                &request_id,
-                StatusCode::OK,
-                json!({ "primary": primary.encode() }),
-            )
+    let proof = match pop_proof(&headers) {
+        Ok(p) => p,
+        Err(()) => {
+            audit("denied:pop", &caveats);
+            return unauthorized(&request_id);
         }
-        Err(_) => {
-            audit(base_entry("denied:issuance", Some(nonce_hex), &caveats));
-            unauthorized(&request_id)
+    };
+    match pop::check(&caveats, mac.tail(), &body, proof, now_unix) {
+        Ok(PopOutcome::Verified) => {}
+        Ok(PopOutcome::NotKeyBound) | Err(_) => {
+            audit("denied:pop", &caveats);
+            return unauthorized(&request_id);
         }
     }
+
+    let (sub, cnf) = match issuance::bound_identity(&mac) {
+        Ok(v) => v,
+        Err(_) => {
+            audit("denied:identity", &caveats);
+            return unauthorized(&request_id);
+        }
+    };
+
+    // The pending record must exist and its bound key must match the
+    // presented cnf — the approval was for *this* (sub, pub) pair.
+    match state.store.get_pending(&sub) {
+        Ok(Some(p)) if p.pubkey == cnf => {}
+        Ok(_) => {
+            audit("denied:no_pending", &caveats);
+            return unauthorized(&request_id);
+        }
+        Err(StateError::Io(e)) => {
+            tracing::error!(error = %e, "read pending");
+            return respond(
+                &request_id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "service unavailable"}),
+            );
+        }
+        Err(_) => {
+            audit("denied:no_pending", &caveats);
+            return unauthorized(&request_id);
+        }
+    }
+
+    if !state.store.is_approved(&sub) {
+        // The one non-401 authorization outcome: awaited, not a failure.
+        audit("awaiting_approval", &caveats);
+        return respond(
+            &request_id,
+            StatusCode::FORBIDDEN,
+            json!({"error": "awaiting operator approval"}),
+        );
+    }
+
+    let primary =
+        issuance::mint_primary(&state.config.trust_root, &state.config.audience, &sub, &cnf);
+    if let Err(e) = state.store.consume(&sub) {
+        // Don't hand out a primary while the record lingers — the
+        // client retries; consume+re-mint is idempotent in identity.
+        tracing::error!(error = %e, "consume pending");
+        return respond(
+            &request_id,
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "service unavailable"}),
+        );
+    }
+    audit("granted", &caveats);
+    respond(
+        &request_id,
+        StatusCode::OK,
+        json!({ "primary": primary.encode() }),
+    )
 }
 
 fn denied_tag(d: &Denied) -> &'static str {
