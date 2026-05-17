@@ -40,6 +40,8 @@ pub enum ClientError {
     KeyExists(String),
     #[error("malformed {0}")]
     BadFile(&'static str),
+    #[error("{path} not found — {hint}")]
+    Missing { path: String, hint: &'static str },
     #[error("server returned {status}: {body}")]
     Server { status: u16, body: String },
     #[error("server response missing the {0} field")]
@@ -68,6 +70,20 @@ fn write_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
+/// Read a client-state file, turning a missing one into an actionable
+/// error (which path, and the prerequisite command) rather than an
+/// opaque `Io(NotFound)`. Other io errors stay distinct.
+fn read_text(path: &Path, hint: &'static str) -> Result<String, ClientError> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(ClientError::Missing {
+            path: path.display().to_string(),
+            hint,
+        }),
+        Err(e) => Err(ClientError::Io(e)),
+    }
+}
+
 /// Generate a fresh Ed25519 identity into `dir`. Refuses to clobber an
 /// existing `client.key` unless `force` (a key *is* an identity —
 /// overwriting it silently is a footgun, same stance as elide).
@@ -91,7 +107,10 @@ pub fn keygen(dir: &Path, force: bool) -> Result<(String, String), ClientError> 
 }
 
 fn load_seed(dir: &Path) -> Result<[u8; 32], ClientError> {
-    let raw = fs::read_to_string(dir.join(KEY_FILE))?;
+    let raw = read_text(
+        &dir.join(KEY_FILE),
+        "run `mint client keygen` (or --client-dir to point at an existing identity)",
+    )?;
     decode_hex_32(&raw)
 }
 
@@ -188,8 +207,14 @@ pub async fn enroll(
 /// exit code / retry.
 pub async fn exchange(dir: &Path, base_url: &str) -> Result<bool, ClientError> {
     let seed = load_seed(dir)?;
-    let inter = Macaroon::decode(fs::read_to_string(dir.join(INTERMEDIATE_FILE))?.trim())
-        .map_err(|_| ClientError::BadFile(INTERMEDIATE_FILE))?;
+    let inter = Macaroon::decode(
+        read_text(
+            &dir.join(INTERMEDIATE_FILE),
+            "run `mint client enroll …` first",
+        )?
+        .trim(),
+    )
+    .map_err(|_| ClientError::BadFile(INTERMEDIATE_FILE))?;
     let body = format!(r#"{{"ts":{}}}"#, now_unix());
     let (status, text) = post(
         &format!("{base_url}/v1/enroll-exchange"),
@@ -220,8 +245,14 @@ pub async fn assume_role(
     ttl_seconds: u64,
 ) -> Result<String, ClientError> {
     let seed = load_seed(dir)?;
-    let mut mac = Macaroon::decode(fs::read_to_string(dir.join(PRIMARY_FILE))?.trim())
-        .map_err(|_| ClientError::BadFile(PRIMARY_FILE))?;
+    let mut mac = Macaroon::decode(
+        read_text(
+            &dir.join(PRIMARY_FILE),
+            "run `mint client exchange` after the operator approves",
+        )?
+        .trim(),
+    )
+    .map_err(|_| ClientError::BadFile(PRIMARY_FILE))?;
     // The primary does not expire; the role gate requires `exp`. Bound
     // it to the requested lifetime.
     let exp = now_unix().saturating_add(ttl_seconds);
