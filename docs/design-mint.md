@@ -61,7 +61,7 @@ signed session token, because Tigris has no session-token endpoint).
 ```
 
 The caller (e.g. an Elide coordinator) holds a macaroon **issued by the
-mint itself** — minted once at provisioning/login, then attenuated by
+mint itself** — minted once at enrollment, then attenuated by
 the caller per request. The macaroon is a pure *capability* (which
 roles this key-bound principal may assume, until when); the per-request
 *exercise* parameters (role, TTL, and any role-specific scoping data
@@ -93,8 +93,8 @@ caller ↔ Tigris S3:  the freshly-minted scoped keypair
 
 **mint is both issuer and verifier of the primary macaroon.** The
 symmetric macaroon root key lives and dies inside the mint and is never
-distributed: mint mints a caller's macaroon once (at coordinator
-registration — `elide coord register`), and verifies the attenuated
+distributed: mint mints a caller's primary once (at the enrollment
+exchange — § *Coordinator bootstrap*), and verifies the attenuated
 macaroon presented on every `assume-role`. Issuer and verifier being the same process is what
 removes any root-distribution problem — there is no separate authority
 to share the root with, and no "configure mint to trust the
@@ -131,7 +131,10 @@ Each mint instance is configured with:
    How it is provisioned (mint-generated and persisted, vs. supplied
    like the admin credential) is an open question; it is a secret, so
    it is not a plaintext TOML field. (v1 is single-root; multi-root for
-   federating issuers is out of scope.)
+   federating issuers is out of scope.) The current **`BootstrapNonce`**
+   is persisted alongside the root under the same custody — it must
+   survive restart so the distributed bootstrap macaroon stays valid;
+   only `mint bootstrap rotate` changes it.
 2. **Zero or more third-party discharge keys** — one symmetric key per
    identity/discharge authority mint trusts to satisfy a third-party
    caveat. Absent in the minimal self-hosted deployment (no third-party
@@ -176,75 +179,101 @@ issued against — the mint software is identical.
 
 ## Coordinator bootstrap & macaroon lifecycle
 
-The **primary macaroon** is precisely the mint root attenuated with
-`elide:Coord=<coord-ulid>` and nothing else: the point in the chain
-where authority has been narrowed to exactly one coordinator identity.
-It *is* that coordinator's identity within the credential plane —
-"primary" means the per-coordinator anchor, not an unconstrained
-mint-root macaroon. Every credential the coordinator vends is a further
-attenuation of it.
+The **primary macaroon** is the mint root attenuated to exactly one
+coordinator identity: `Operation=assume-role`, `Audience=mint`,
+`elide:Coord=<coord-ulid>`, `elide:CoordKey=ed25519:<coordinator.pub>`,
+no `NotAfter`. It *is* that coordinator's identity within the credential
+plane; every credential the coordinator vends is a further attenuation
+of it. A coordinator holds it long-lived — persisted in `data_dir`
+(mode 0600, alongside the identity key), loaded on every start, reused
+across restarts. Per request and per managed volume it appends narrowing
+caveats (`elide:Volume`, a tighter `NotAfter`) before calling
+`assume-role`; the stored macaroon is never sent unattenuated. **The
+primary does not expire**: once PoP-bound a file-only leak is inert (the
+thief lacks `coordinator.key`) and a key compromise renews regardless,
+so there is no re-issuance cadence. The identity key is not rotated: a
+new key is a new coordinator — new `coord-ulid`, new enrollment.
 
-The `elide:Coord` caveat is stamped by the issuance path and bound to
-the authenticated coordinator identity (*Open questions* #13); a
-coordinator never appends its own — a self-chosen `elide:Coord` would
-let it mint credentials for another coordinator's prefix (see the
-`coord-identity` own-prefix template).
+`elide:Coord` and `elide:CoordKey` are partitioning caveats. A
+coordinator self-asserts them only inside the enrollment exchange; a
+primary carrying them exists only because mint re-minted it from root
+after the operator vouched for the pairing (below). A coordinator can
+never append them to an existing macaroon to widen authority — a
+contradictory copy is unsatisfiable and fails closed.
 
-A coordinator holds this macaroon long-lived: acquired once at
-provisioning and persisted in the coordinator's `data_dir` (mode 0600,
-alongside the identity key), loaded on every start and reused across
-restarts. Per request — and per managed volume — it appends further
-narrowing caveats (`elide:Volume`, a tighter `NotAfter`) before calling
-`assume-role`; the stored macaroon is never sent unattenuated.
-
-The primary is **bound to the coordinator's Ed25519 identity** by a
-first-party proof-of-possession caveat. At issuance mint seals
-`elide:CoordKey=ed25519:<coordinator.pub>` into the primary alongside
-`elide:Coord`, under the same chain MAC. `assume-role` honours the
-macaroon only when the request carries a fresh Ed25519 signature, by
+The primary is **bound to the coordinator's Ed25519 identity** by the
+`elide:CoordKey` first-party holder-of-key caveat. `assume-role` honours
+the macaroon only when the request carries a fresh Ed25519 signature, by
 `coordinator.key`, over `BLAKE3(presented-macaroon-tail ‖
 BLAKE3(request-body))` — the tail binds the proof to this exact
-capability macaroon (role/`NotAfter`/`elide:Volume`), the body hash
-binds it to this exact request (the role, TTL, and role-specific
-scoping data such as the ancestor set). Freshness is a `ts` field
-**inside the body** (unix seconds) — already covered by
-`BLAKE3(request-body)`, so it needs no separate signed term and no
-header; within a ±skew window it bounds replay — verified against the
-sealed key. Folding the body hash
-into the one PoP payload is what authenticates request-supplied
-scoping data: it is not a separate signature and not a separate caveat
-(an isolated body signature, untied to the tail and freshness, would
-be replayable and splice-able onto another macaroon). The
-`elide:CoordKey` caveat is the single "this request is signed by the
-bound key" predicate; widening its signed payload to include the body
-extends that one predicate to cover the body. The persisted file alone is therefore inert:
-the secret stays the one identity key the coordinator already protects
+capability macaroon (role/`NotAfter`/`elide:Volume`), the body hash to
+this exact request (role, TTL, scoping data such as the ancestor set).
+Freshness is a `ts` field **inside the body** (unix seconds, ±skew
+window) — already covered by `BLAKE3(request-body)`, so no separate
+signed term and no header. The persisted file alone is therefore inert:
+the only secret is the identity key the coordinator already protects
 (name-claims, provenance, peer-fetch), and mint keeps no per-coordinator
-registry — the pairing rides the token. Enrollment is a one-time
-exchange. `elide coord register` obtains an enrollment token for one
-specific coordinator (parameterised by that coordinator's
-`coordinator.pub`), carrying `elide:Coord` + `elide:CoordKey` + a
-third-party caveat (discharged via a login redirect to the identity
-authority, or operator-mediated) + a `NotAfter`. The coordinator presents it and proves possession of
-`coordinator.key`. mint verifies the discharge, the PoP against the
-token's `elide:CoordKey`, and the `elide:Coord` binding, then **re-mints
-from its root** a primary carrying the *same* `elide:Coord` +
-`elide:CoordKey`, stripped of the third-party caveat and `NotAfter`
-(Fly.io's service-token pattern — only the root holder can re-mint).
-`elide:CoordKey` is the through-line in both tokens; the exchange does
-not bind a key, it removes the identity/expiry scaffolding around a
-binding that was already there. A stolen enrollment token is therefore
-inert the same way the primary is — it can only re-enrol the one
-coordinator whose private key the thief does not hold (idempotent), not
-stand up a rogue coordinator. **The
-primary does not expire**: once PoP-bound, a primary `NotAfter` is
-security-neutral — a file-only leak is already inert and a
-`coordinator.key` compromise renews regardless — so there is no
-re-issuance cadence. The one thing expiry would force, periodic
-identity-authority re-attestation, is a deployment concern (#15). The
-identity key is not rotated: a new key is a new coordinator — new
-`coord-ulid`, new enrollment, new primary. Enrollment-exchange surface
-(#13) and the PoP wire detail (#16) are open.
+registry once the primary is issued — the pairing rides the token.
+
+### Enrollment
+
+Enrollment binds a coordinator's self-asserted
+`elide:Coord`/`elide:CoordKey` to an operator-verified key, once, and
+exchanges it for the non-expiring primary.
+
+**Bootstrap macaroon.** At first start mint draws a random
+`BootstrapNonce`, persists it (single current value, same custody as the
+root), and emits the bootstrap macaroon — the root attenuated with
+`Operation=enroll`, `Audience=mint`, `BootstrapNonce=<current>`. It is
+non-expiring, carries no coordinator identity, and is a pure
+participation gate. It is distributed out-of-band and is reusable for
+every coordinator that enrols against this mint.
+
+**(1) `POST /v1/enroll`.** The coordinator attenuates the bootstrap
+macaroon with `elide:Coord=<own ulid>` and
+`elide:CoordKey=ed25519:<own pub>` and presents it with a
+`coordinator.key` PoP over the body (the `assume-role` PoP machinery).
+Mint verifies the chain against its root, `Operation=enroll`,
+`BootstrapNonce`=current, and the PoP against the appended
+`elide:CoordKey`; records a **pending enrollment** keyed by
+`elide:Coord` — `(coord-ulid, pub, BootstrapNonce, first-seen ts, peer
+ip)`; and returns an **intermediate macaroon** minted fresh from root:
+short `NotAfter`, `Operation=enroll-exchange`, the same
+`elide:Coord`/`elide:CoordKey`, plus a third-party caveat when an
+identity authority is configured. The pending table is keyed by
+coord-ulid: a retried request with an identical `(ulid, pub)` is
+idempotent (fresh intermediate, same record); a second request for the
+same ulid with a different pub is a conflict that surfaces to the
+operator and never auto-resolves; a pub seen on a different ulid is
+anomalous (a new key is a new coordinator) and surfaced. Unapproved
+records age out on a bound ≥ the intermediate `NotAfter`, keeping the
+table transient rather than a registry.
+
+**(2) Operator approval.** Out of band the operator runs
+`mint enroll list` and `mint enroll approve <coord-ulid>`, having
+checked the displayed `coordinator.pub` fingerprint against the
+coordinator through a trusted side channel (the coordinator prints its
+own). This confirmation is the trust anchor binding `elide:Coord` to the
+rightful key in the minimal deployment; the third-party caveat is an
+additive upgrade, not a replacement.
+
+**(3) `POST /v1/enroll-exchange`.** Before the intermediate expires the
+coordinator presents it with a `coordinator.key` PoP, discharging any
+third-party caveat. Mint verifies the chain, `Operation=enroll-exchange`,
+the PoP, and the discharge; requires the pending record **approved**;
+**re-mints from root** the primary (`Operation=assume-role`, the same
+`elide:Coord`/`elide:CoordKey`, `Audience=mint`, no `NotAfter`, no
+third-party caveat); and **consumes** the pending+approval record. A
+later re-enrollment of the same coordinator is a fresh pending request
+needing fresh approval — mint holds no standing per-coordinator state
+once the primary is issued.
+
+**Rotation.** `mint bootstrap rotate` draws a new random
+`BootstrapNonce`, persists it, emits a fresh bootstrap macaroon, and
+drops every pending record whose `BootstrapNonce` is not the new value.
+Outstanding primaries are unaffected — they carry no `BootstrapNonce`
+and were re-minted from root. Restart preserves the nonce; only explicit
+rotation cancels in-flight enrollments.
 
 Refresh cadences, distinct, in increasing trust cost:
 
@@ -264,7 +293,7 @@ above); it is minted once at enrollment.
 
 ## Protocol
 
-### Endpoint
+### `assume-role`
 
 ```
 POST /v1/assume-role
@@ -294,20 +323,49 @@ Content-Type: application/json
 }
 ```
 
+### Enrollment endpoints
+
+```
+POST /v1/enroll              # bootstrap (+elide:Coord/elide:CoordKey) + PoP
+                             # → 200 intermediate macaroon (base64)
+
+POST /v1/enroll-exchange     # intermediate + PoP + discharge bundle
+                             # → 200 primary macaroon (base64)
+```
+
+Both carry the macaroon in `Authorization: Macaroon <base64>` and the
+PoP in `X-Mint-Coord-Pop` exactly as `assume-role` (the body is the PoP
+freshness `ts` and nothing else). `/v1/enroll` always returns `200` with
+an intermediate even for a brand-new `(ulid, pub)` — the pending record
+is created and approval is out-of-band; the coordinator polls
+`/v1/enroll-exchange`, which returns `403` until the operator has
+approved and `200` with the primary once it has. Failures are the same
+opaque `401` as `assume-role`.
+
 ### Authentication
 
-The `Authorization` header carries the primary macaroon, base64-encoded;
-any discharge macaroons for third-party caveats accompany it (bundle
-wire format per *Open questions* #15). The mint verifies the primary's
-chain MAC against its own macaroon root, and each discharge against the
-relevant third-party key (see `design-auth-model.md` for the
-construction).
+Authentication is identical across all three `Operation`s — `enroll`,
+`enroll-exchange`, `assume-role`. The `Authorization` header carries the
+presented macaroon, base64-encoded — the coordinator-attenuated
+bootstrap at `/v1/enroll`, the intermediate at `/v1/enroll-exchange`,
+the attenuated primary at `/v1/assume-role`; any discharge macaroons for
+third-party caveats accompany it (bundle wire format per *Open
+questions* #15; discharges apply to the intermediate and primary, never
+the bootstrap). The mint verifies the presented macaroon's chain MAC
+against its own macaroon root, and each discharge against the relevant
+third-party key (see `design-auth-model.md` for the construction).
 
 The request also carries the proof-of-possession the macaroon's
 `elide:CoordKey` caveat requires: `X-Mint-Coord-Pop` is the base64
 Ed25519 signature, by `coordinator.key`, over `BLAKE3(macaroon-tail ‖
-BLAKE3(request-body))`. The freshness timestamp is **not** a header —
-it is a `ts` field (unix seconds) *inside the body*, already covered by
+BLAKE3(request-body))`. Every Elide-path token is key-bound — the
+coordinator appends `elide:CoordKey` when it attenuates the bootstrap,
+and mint carries it through the intermediate and primary — so PoP is
+required on all three operations. The body it covers differs by
+operation: at `/v1/enroll` and `/v1/enroll-exchange` it is just the
+freshness `ts`; at `/v1/assume-role` it is the full exercise body (§
+*Request body*). The freshness timestamp is **not** a header — it is a
+`ts` field (unix seconds) *inside the body*, already covered by
 `BLAKE3(request-body)`, so it needs no separate signed term. Only the
 detached signature is a header (it cannot live in the body it signs).
 The mint recomputes the digest over the **exact raw body bytes it
@@ -316,19 +374,27 @@ itself a footgun) and the presented macaroon's tail, verifies the
 signature against the sealed `elide:CoordKey`, and **then** reads `ts`
 from the now-authenticated body and rejects it if outside the skew
 window. Only after the signature verifies does any `request.*` body
-field — `ts` included — become a trusted input. A macaroon that carries no `elide:CoordKey` is a plain
-bearer and no PoP is required (the Elide enrollment path always seals
-one; bearer support is for non-Elide callers).
+field — `ts` included — become a trusted input. A macaroon that carries
+no `elide:CoordKey` is a plain bearer and no PoP is required: this
+applies only to a non-Elide caller at `/v1/assume-role`; the Elide
+enrollment path always seals one, so `enroll`/`enroll-exchange` are
+never bearer.
 
-If verification fails — bad MAC, unknown root, malformed encoding, missing
-or bad PoP when `elide:CoordKey` is present — the mint returns `401
-Unauthorized` with no further detail (don't help an attacker distinguish
-"wrong key" from "tampered caveats" from "bad PoP").
+If verification fails — bad MAC, unknown root, malformed encoding,
+wrong/absent `Operation` for the endpoint, stale `BootstrapNonce`,
+missing or bad PoP when `elide:CoordKey` is present — the mint returns
+`401 Unauthorized` with no further detail (don't help an attacker
+distinguish "wrong key" from "tampered caveats" from "bad PoP"). The
+sole non-`401` authorization outcome is `/v1/enroll-exchange` returning
+`403` for a not-yet-approved pending record — an awaited state, not an
+auth failure.
 
 ### Request body
 
-The request body specifies the **exercise of authority** — what the caller
-is asking for right now within the bounds the macaroon attests to. The
+This section is the `/v1/assume-role` body; the `enroll`/`enroll-exchange`
+bodies carry only `ts`. The request body specifies the **exercise of
+authority** — what the caller is asking for right now within the bounds
+the macaroon attests to. The
 whole body is covered by the PoP signature (§ *Authentication*), so every
 field is vouched for by `coordinator.key` and bound to this exact
 macaroon and moment. Mint is **body-field-agnostic** in the same way it
@@ -493,6 +559,17 @@ That said, several caveats are **conventional** across uses:
   assume. If absent, any role the mint config exposes is reachable.
   (Scalar only — there are no list-valued caveats; a caller wanting a
   narrower role just attenuates with a tighter `Role`.)
+- **`Operation`** (string, scalar). Partitions a token to one mint
+  operation: `enroll`, `enroll-exchange`, or `assume-role`. Mint stamps
+  it at every point it mints (bootstrap, intermediate, primary) and each
+  endpoint **positively requires** its own value — no endpoint tests for
+  absence. Immutable by construction: a coordinator can only append, and
+  a contradictory copy is unsatisfiable.
+- **`BootstrapNonce`** (string, scalar). Carried only by the bootstrap
+  macaroon. Mint stores one current random value (persisted, same
+  custody as the root) and rejects any bootstrap whose `BootstrapNonce`
+  ≠ current. `mint bootstrap rotate` draws a new value; equality only,
+  no ordering.
 
 ### Namespacing
 
@@ -523,11 +600,15 @@ on occurrence order.
 
 Caveats split into two kinds by where their value originates:
 
-- **Partitioning** — `elide:Coord`, `elide:CoordKey`. Identify and bind
-  the principal. Stamped at issuance and bound to the authenticated
-  identity (see *Coordinator bootstrap*, #13); a caller never supplies
-  or alters them (an appended contradictory copy is unsatisfiable and
-  fails closed, never silently dropped).
+- **Partitioning** — `Operation`, `BootstrapNonce`, `elide:Coord`,
+  `elide:CoordKey`. Identify what the token is for and bind the
+  principal. `Operation`/`BootstrapNonce` are mint-stamped at each mint
+  point; `elide:Coord`/`elide:CoordKey` are coordinator-self-asserted
+  inside enrollment and survive into a primary only via the
+  re-mint-from-root that follows operator approval (see *Coordinator
+  bootstrap*). A caller never alters any of them — an appended
+  contradictory copy is unsatisfiable and fails closed, never silently
+  dropped.
 - **Narrowing** — `elide:Volume`, `NotAfter`. Coordinator-appended,
   restricting an existing grant to one volume / expiry for attribution
   and per-credential blast-radius reduction. Volume ownership across
@@ -551,10 +632,12 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | Caveat | Type | Scalar/List | Issuer | Purpose |
 |---|---|---|---|---|
 | `Audience` | string | scalar | macaroon issuer | Gate only — must equal `mint`. Cross-service replay defense. |
+| `Operation` | string | scalar | mint, at each mint point | Gate only — endpoint partition (`enroll` / `enroll-exchange` / `assume-role`); each endpoint positively requires its value. |
+| `BootstrapNonce` | string | scalar | mint, on first start / rotate | Gate only — bootstrap macaroon must carry the current value. |
 | `NotAfter` | uint64 (unix s) | scalar | issuer | Gate — caps granted TTL (`min(req, role.max, NotAfter−now)`); multiple narrow to the minimum. |
 | `Role` | string | scalar | issuer | Gate only — restricts the assumable role. Optional. |
-| `elide:Coord` | string (coord-ulid) | scalar | stamped at issuance, bound to coordinator identity (#13) — never coordinator-appended | Gate on all `coord-*`; defines the primary macaroon. Templated only in the deferred one-time-publish split. |
-| `elide:CoordKey` | string (`ed25519:<pub>`) | scalar | sealed at issuance alongside `elide:Coord` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ BLAKE3(body)` (freshness `ts` rides in the body), verified against this key. Makes the primary key-bound (not a bearer) and authenticates the request body. |
+| `elide:Coord` | string (coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a primary only via re-mint-from-root after operator approval | Gate on all `coord-*`; defines the primary macaroon. Templated only in the deferred one-time-publish split. |
+| `elide:CoordKey` | string (`ed25519:<pub>`) | scalar | coordinator-self-asserted alongside `elide:Coord` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ BLAKE3(body)` (freshness `ts` rides in the body), verified against this key. Makes the primary key-bound (not a bearer) and authenticates the request body. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 
 The ancestor set is **not** in this table — it is not a caveat. It is
@@ -955,42 +1038,37 @@ prematurely.
     `design-peer-segment-fetch.md` for performance — would shrink it to
     just `volume list --remote`, or remove it entirely. Not blocking;
     the temporal mitigation (short TTL, on-demand) holds until then.
-13. **Enrollment surface.** The exchange itself is decided (see
-    *Coordinator bootstrap*): the enrollment token is `elide:Coord`- and
-    `elide:CoordKey`-bound, mint verifies discharge + PoP + binding and
-    re-mints a stripped, non-expiring primary. Open: the transport — a
-    privileged endpoint vs. an out-of-band `mint issue --coord <id>`
-    operator command — and, in the minimal deployment with no identity
-    authority, what stands in for the discharge (admin-only local
-    operation). Also open: the pubkey-first ordering this implies —
-    `elide coord register` is parameterised by `coordinator.pub`, so the
-    coordinator's identity must exist before the enrollment token is
-    minted (generate identity → `elide coord register`, login redirect
-    discharges the third-party caveat → coord-bound enrollment token →
-    exchange). Decide before any issuance code exists.
+13. **Enrollment surface — settled.** See *Coordinator bootstrap* §
+    *Enrollment*: reusable non-expiring bootstrap macaroon → coordinator
+    self-asserts `elide:Coord`/`elide:CoordKey` and `POST /v1/enroll`
+    creates a pending record → operator approves a displayed pubkey
+    fingerprint → `POST /v1/enroll-exchange` re-mints the primary from
+    root and consumes the record. `BootstrapNonce` is the rotation knob;
+    `Operation` partitions the three endpoints.
 14. **Macaroon-root provisioning.** The root is mint-held and never
     distributed, but how it comes to exist is unspecified: mint
     generates it on first start and persists it (like the coordinator's
     identity key), or it is supplied via the environment like the admin
     credential. Generation-and-persist avoids an operator step but means
     losing mint state invalidates every outstanding macaroon; supplied
-    means another secret to manage but survives a mint rebuild. Tied to
-    rotation (#3).
+    means another secret to manage but survives a mint rebuild. The
+    persisted `BootstrapNonce` shares this custody and the same
+    open question. Tied to rotation (#3).
 15. **Third-party-caveat construction.** Delegation to an identity
     authority is a third-party caveat (mint shares a symmetric key per
     discharge authority; the caveat carries a verification key encrypted
     to that authority; the holder presents discharge macaroons).
     `design-auth-model.md` documents only scalar first-party caveats
     today; the third-party construction and its discharge-bundle wire
-    format on `assume-role` need specifying.
-    Whether a primary macaroon with *no* third-party caveat (operator-
-    issued, trust = possession) is the supported minimal self-hosted
-    deployment — with third-party discharge the opt-in central-service
-    upgrade — is part of this question. Because the primary does not
+    format on the intermediate at `/v1/enroll-exchange` need specifying.
+    The anchor split is settled: the minimal self-hosted deployment is
+    anchored by operator approval of a displayed fingerprint (§
+    *Enrollment*); the third-party caveat mint stamps on the
+    intermediate is the additive central-service upgrade, not a
+    replacement. Open within this question: because the primary does not
     expire, periodic re-attestation of a coordinator (e.g. a managed
-    customer who left) is not enforced by primary expiry; whether the
-    central service enforces it at the discharge layer for ongoing
-    operations or by refusing re-enrollment is part of this question.
+    customer who left) is enforced at the discharge layer or by refusing
+    re-enrollment — which, is unsettled.
 16. **PoP caveat wire detail.** `elide:CoordKey` is decided (first-party
     holder-of-key; primary is key-bound, not a bearer; the signed
     payload is `BLAKE3(presented-macaroon-tail ‖ BLAKE3(request-body))`
