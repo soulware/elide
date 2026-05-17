@@ -15,6 +15,7 @@
 
 pub mod audit;
 pub mod caveat;
+pub mod client;
 pub mod config;
 pub mod http;
 pub mod iam;
@@ -24,6 +25,7 @@ pub mod pop;
 pub mod role;
 pub mod state;
 pub mod template;
+pub mod tigris;
 
 pub use caveat::{Caveat, Resolved};
 pub use config::Config;

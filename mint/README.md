@@ -67,25 +67,33 @@ enrollments; outstanding primaries are unaffected.
 
 ## Run it
 
+clap CLI (`--config` defaults to `mint.toml`). Server + operator:
+
 ```sh
-mint bootstrap            mint/examples/demo.toml   # print the bootstrap macaroon
-mint enroll list          mint/examples/demo.toml
-mint enroll approve       mint/examples/demo.toml <sub>
-mint serve                mint/examples/demo.toml 127.0.0.1:8085
+mint serve   --config demo.toml [--tigris]      # --tigris = real Tigris IAM; else fake minter
+mint bootstrap --config demo.toml               # print the bootstrap macaroon
+mint enroll list    --config demo.toml
+mint enroll approve --config demo.toml <sub>    # shows the fingerprint, interactive y/N; --yes for automation
 ```
 
-**Interim:** until the live Tigris SigV4 minter lands, `serve` wires
-`FakeMinter` and warns loudly on every start — the enroll/exchange flow
-is real, but `assume-role` returns a deterministic placeholder keypair.
-This is an explicit, temporary deviation from the design's "no stub
-backend", removed when the real minter is wired.
+Client (the coordinator's half; identity under `./mint_client`):
 
-## Staged tail
+```sh
+mint client keygen
+mint client fingerprint                                  # operator compares this during `enroll approve`
+mint client enroll      --id <sub> <macaroon|file|->     # bootstrap is the final positional arg
+mint client exchange                                     # exit 2 until approved, then saves the primary
+mint client assume-role --request '{"prefix":"demo/x"}' [--caveat N=V] <role>
+                                                         # request body is opaque pass-through
+```
 
-The networked `mint client enroll|exchange|assume-role` and the live
-Tigris IAM SigV4 minter (the one production-coupled module, isolated
-behind `KeypairMinter`) are the next stage. Also out of scope here: TLS,
-multi-root / root rotation, multi-tenancy, `ListRoles`/`GetRole`,
+Without `--tigris`, `serve` wires the deterministic fake minter (warns
+loudly) so the whole flow runs hermetically; `--tigris` calls real
+Tigris IAM and requires `AWS_*` admin creds.
+
+## Out of scope
+
+TLS, multi-root / root rotation, multi-tenancy, `ListRoles`/`GetRole`,
 third-party-caveat discharge for a central identity authority
 (`docs/design-mint.md` § *Open questions* #14/#15). `trust_root_hex`
 straight from TOML remains the OQ#14 shortcut.

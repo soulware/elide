@@ -246,12 +246,16 @@ seen on a different `sub` is anomalous (a new key is a new principal)
 and surfaced. Unapproved records age out on a bound ≥ the intermediate
 `exp`, keeping the table transient rather than a registry.
 
-**(2) Operator approval.** Out of band the operator runs
-`mint enroll list` and `mint enroll approve <sub>`, having checked the
-displayed `cnf` pubkey fingerprint against the client through a trusted
-side channel (the client prints its own). This confirmation is the trust anchor binding `sub` to the
-rightful key in the minimal deployment; the third-party caveat is an
-additive upgrade, not a replacement.
+**(2) Operator approval.** `mint enroll approve <sub>` prints the
+pending record's `cnf` fingerprint and requires an interactive y/N
+confirmation (default no); the operator confirms only after matching it,
+through a trusted side channel, against what the client reports
+(`mint client fingerprint`). That interactive confirmation **is** the
+trust anchor binding `sub` to the rightful key in the minimal
+deployment — it gates approval rather than trailing it; the third-party
+caveat is an additive upgrade, not a replacement. `--yes` skips the
+prompt for automation (the operator then asserts the out-of-band check
+happened).
 
 **(3) `POST /v1/enroll-exchange`.** Before the intermediate expires the
 coordinator presents it with a `coordinator.key` PoP, discharging any
@@ -965,22 +969,28 @@ Reference client (the ed25519 keypair is created out-of-band; the
 client only reads it; `--id` is the opaque `sub`):
 
 ```
-mint client enroll        --bootstrap <f> --key <ed25519> --id <sub>   # → intermediate
-mint client exchange      --intermediate <f> --key <ed25519>           # 403 until approved → primary
-mint client assume-role   --primary <f> --key <ed25519> \
-                          --role <read|write> --prefix <p>             # → Tigris keypair
+mint client keygen                                       # → client.key/.pub
+mint client enroll       --id <sub> <macaroon|file|->    # → intermediate
+mint client exchange                                     # 403 until approved → primary
+mint client assume-role  --request '{"prefix":"x"}' <role>   # → Tigris keypair
 ```
 
 A worked `examples/` script chains them: `serve` (background) →
 `client enroll` → operator `enroll approve` → `client exchange` →
 `client assume-role`, printing the returned Tigris keypair.
 
-**Backend: real Tigris.** `assume-role` calls Tigris IAM with the admin
-credential from the `AWS_*` environment — there is no stub backend. The
-demo therefore runs on a host carrying Tigris admin creds (the Elide
-test VM). Consequence for CI: the `bootstrap` / `enroll` /
-`enroll-exchange` legs are hermetic (no Tigris) and run anywhere; the
-`assume-role` leg's end-to-end is VM-only.
+**Backend.** `serve --tigris` selects the real Tigris IAM minter — a
+self-contained AWS IAM Query-API client (`CreateAccessKey` →
+`CreatePolicy` → `AttachUserPolicy`, SigV4-signed against
+`https://iam.storage.dev`, overridable via `MINT_IAM_ENDPOINT`), ported
+into `mint/` rather than shared with `elide-tigris-iam` so the crate
+keeps zero `elide-*` deps. It hard-errors at startup without a Tigris
+admin credential in the `AWS_*` environment, so a misconfiguration
+fails fast rather than at the first request. Without `--tigris`,
+`serve` wires the deterministic fake minter (no account needed).
+Consequence for CI: the `bootstrap` / `enroll` / `enroll-exchange` legs
+and the fake-minter `assume-role` are hermetic and run anywhere; the
+real-Tigris `assume-role` end-to-end is VM-only.
 
 **Demo role config** is a minimal `read` / `write` pair over a single
 `{{request.prefix}}` (shipped as `examples/demo.toml`) — distinct from
