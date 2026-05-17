@@ -1,13 +1,5 @@
 //! mint entry point (`docs/design-mint.md` § *Reference client &
-//! demo*).
-//!
-//! ```text
-//! mint serve <config.toml> [bind-addr]      # default 127.0.0.1:8085
-//! mint bootstrap <config.toml>              # print the current bootstrap macaroon
-//! mint bootstrap rotate <config.toml>       # new nonce, then print it
-//! mint enroll list <config.toml>            # pending records
-//! mint enroll approve <config.toml> <sub>   # approve a pending record
-//! ```
+//! demo*). clap-derived CLI, matching the elide coordinator's shape.
 //!
 //! `serve` runs the verification/vending HTTP surface. Until the live
 //! Tigris SigV4 minter lands this binary wires [`FakeMinter`] and warns
@@ -21,9 +13,10 @@
 //! `mint client` (the coordinator's half) is the staged tail.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use clap::{Parser, Subcommand};
 use mint::audit::AuditLog;
 use mint::config::Config;
 use mint::http::{AppState, router};
@@ -31,55 +24,89 @@ use mint::iam::FakeMinter;
 use mint::issuance::mint_bootstrap;
 use mint::state::Store;
 
-const USAGE: &str = "usage:\n  \
-    mint serve <config.toml> [bind-addr]\n  \
-    mint bootstrap <config.toml>\n  \
-    mint bootstrap rotate <config.toml>\n  \
-    mint enroll list <config.toml>\n  \
-    mint enroll approve <config.toml> <sub>";
+#[derive(Parser)]
+#[command(about = "mint: macaroon-authenticated scoped-credential vending for Tigris")]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the verification/vending HTTP service.
+    Serve {
+        #[arg(long, default_value = "mint.toml")]
+        config: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8085")]
+        bind: SocketAddr,
+    },
+    /// Print the bootstrap macaroon (reusable, non-expiring).
+    ///
+    /// The macaroon goes to stdout for piping; diagnostics to stderr.
+    Bootstrap {
+        #[arg(long, default_value = "mint.toml")]
+        config: PathBuf,
+        /// Draw a new bootstrap nonce first, cancelling in-flight
+        /// enrollments (outstanding primaries are unaffected).
+        #[arg(long)]
+        rotate: bool,
+    },
+    /// Operator: inspect and approve pending enrollments.
+    Enroll {
+        #[command(subcommand)]
+        cmd: EnrollCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum EnrollCmd {
+    /// List pending enrollment records.
+    List {
+        #[arg(long, default_value = "mint.toml")]
+        config: PathBuf,
+    },
+    /// Approve a pending record by its `sub`.
+    ///
+    /// Verify the displayed `cnf` fingerprint matches the client out of
+    /// band *before* approving — that confirmation is the trust anchor.
+    Approve {
+        #[arg(long, default_value = "mint.toml")]
+        config: PathBuf,
+        /// The opaque principal id (Elide: the coordinator ULID).
+        sub: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let cmd = args.next().ok_or(USAGE)?;
-    let rest: Vec<String> = args.collect();
-    match cmd.as_str() {
-        "serve" => serve(rest).await,
-        "bootstrap" => bootstrap(rest),
-        "enroll" => enroll(rest),
-        _ => Err(USAGE.into()),
+    match Args::parse().command {
+        Command::Serve { config, bind } => serve(&config, bind).await,
+        Command::Bootstrap { config, rotate } => bootstrap(&config, rotate),
+        Command::Enroll { cmd } => match cmd {
+            EnrollCmd::List { config } => enroll_list(&config),
+            EnrollCmd::Approve { config, sub } => enroll_approve(&config, &sub),
+        },
     }
 }
 
-/// Open the persisted state store from the config's `state_dir`,
-/// erroring if it is unset (required for every subcommand here).
+fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
+    Ok(Config::load(path)?)
+}
+
+/// Open the persisted state store from the config's `state_dir`
+/// (defaults to `./mint_data` when the config omits it).
 fn open_store(cfg: &Config) -> Result<Store, Box<dyn std::error::Error>> {
-    let dir = cfg
-        .state_dir
-        .as_ref()
-        .ok_or("config is missing state_dir (required for serve/bootstrap/enroll)")?;
-    Ok(Store::open(dir)?)
+    Ok(Store::open(&cfg.state_dir)?)
 }
 
-fn load(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    Ok(Config::load(Path::new(path))?)
-}
-
-async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(config: &Path, bind: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let mut a = args.into_iter();
-    let config_path = a.next().ok_or(USAGE)?;
-    let bind: SocketAddr = a
-        .next()
-        .unwrap_or_else(|| "127.0.0.1:8085".into())
-        .parse()?;
-
-    let config = Arc::new(load(&config_path)?);
+    let config = Arc::new(load(config)?);
     let store = Arc::new(open_store(&config)?);
     tracing::warn!(
         "INTERIM: assume-role uses the FAKE keypair minter — it returns a \
@@ -90,6 +117,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         audience = %config.audience,
         roles = config.roles.len(),
         admin_credential = config.admin.is_some(),
+        state_dir = %config.state_dir.display(),
         "loaded config"
     );
 
@@ -106,20 +134,8 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `mint bootstrap [rotate] <config.toml>` — emit the bootstrap
-/// macaroon (root + op=enroll + aud + the current nonce). `rotate`
-/// draws a new nonce first (cancelling in-flight enrollments), then
-/// emits the macaroon carrying it. The macaroon goes to stdout for
-/// piping; diagnostics to stderr.
-fn bootstrap(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut a = args.into_iter();
-    let first = a.next().ok_or(USAGE)?;
-    let (rotate, config_path) = if first == "rotate" {
-        (true, a.next().ok_or(USAGE)?)
-    } else {
-        (false, first)
-    };
-    let config = load(&config_path)?;
+fn bootstrap(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load(config)?;
     let store = open_store(&config)?;
     let nonce = if rotate {
         let n = store.rotate_bootstrap()?;
@@ -137,50 +153,43 @@ fn bootstrap(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn enroll(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut a = args.into_iter();
-    let sub = a.next().ok_or(USAGE)?;
-    match sub.as_str() {
-        "list" => {
-            let config = load(&a.next().ok_or(USAGE)?)?;
-            let store = open_store(&config)?;
-            let now = chrono::Utc::now().timestamp().max(0) as u64;
-            let rows = store.list(now)?;
-            if rows.is_empty() {
-                eprintln!("no pending enrollments");
-                return Ok(());
-            }
-            println!(
-                "{:<28} {:<18} {:<16} {:>7} {:<9} FLAGS",
-                "SUB", "FINGERPRINT", "PEER", "AGE(s)", "APPROVED"
-            );
-            for r in rows {
-                println!(
-                    "{:<28} {:<18} {:<16} {:>7} {:<9} {}",
-                    r.sub,
-                    r.fingerprint,
-                    r.peer_ip,
-                    r.age_seconds,
-                    if r.approved { "yes" } else { "no" },
-                    if r.anomalous_pub { "ANOMALOUS-PUB" } else { "" }
-                );
-            }
-            Ok(())
-        }
-        "approve" => {
-            let config = load(&a.next().ok_or(USAGE)?)?;
-            let target = a.next().ok_or("enroll approve needs a <sub>")?;
-            let store = open_store(&config)?;
-            if store.approve(&target)? {
-                eprintln!(
-                    "approved {target} — verify its fingerprint matches the client \
-                     out of band before it exchanges"
-                );
-                Ok(())
-            } else {
-                Err(format!("no pending enrollment for sub {target}").into())
-            }
-        }
-        other => Err(format!("unknown enroll subcommand {other}\n{USAGE}").into()),
+fn enroll_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load(config)?;
+    let store = open_store(&config)?;
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let rows = store.list(now)?;
+    if rows.is_empty() {
+        eprintln!("no pending enrollments");
+        return Ok(());
+    }
+    println!(
+        "{:<28} {:<18} {:<16} {:>7} {:<9} FLAGS",
+        "SUB", "FINGERPRINT", "PEER", "AGE(s)", "APPROVED"
+    );
+    for r in rows {
+        println!(
+            "{:<28} {:<18} {:<16} {:>7} {:<9} {}",
+            r.sub,
+            r.fingerprint,
+            r.peer_ip,
+            r.age_seconds,
+            if r.approved { "yes" } else { "no" },
+            if r.anomalous_pub { "ANOMALOUS-PUB" } else { "" }
+        );
+    }
+    Ok(())
+}
+
+fn enroll_approve(config: &Path, sub: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load(config)?;
+    let store = open_store(&config)?;
+    if store.approve(sub)? {
+        eprintln!(
+            "approved {sub} — verify its fingerprint matches the client out \
+             of band before it exchanges"
+        );
+        Ok(())
+    } else {
+        Err(format!("no pending enrollment for sub {sub}").into())
     }
 }

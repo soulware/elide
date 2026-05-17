@@ -11,9 +11,9 @@ audience = "mint"
 trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
 
 # Persisted-state directory (current bootstrap nonce + transient
-# pending-enrollment table), same custody as trust_root_hex. Required by
-# `serve` / `bootstrap` / `enroll`.
-state_dir = "/var/lib/mint"
+# pending-enrollment table), same custody as trust_root_hex. Defaults
+# to ./mint_data (analogous to ./elide_data); uncomment to override:
+# state_dir = "mint_data"
 
 [tenant]
 bucket = "elide-demo"

@@ -13,7 +13,9 @@
 
 audience = "mint"
 trust_root_hex = "0000000000000000000000000000000000000000000000000000000000000000"
-state_dir = "/tmp/mint-demo-state"
+# state_dir defaults to ./mint_data (relative to the working directory,
+# analogous to ./elide_data). Uncomment to override:
+# state_dir = "mint_data"
 
 [tenant]
 bucket = "mint-demo"
