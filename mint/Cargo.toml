@@ -9,6 +9,7 @@ description = "Macaroon-authenticated scoped-credential vending for Tigris (prot
 async-trait        = "0.1"
 axum               = "0.7"
 base64             = "0.22"
+clap               = { version = "4", features = ["derive"] }
 blake3             = "1"
 chrono             = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 ed25519-dalek      = "2"
@@ -25,5 +26,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid               = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 tower = { version = "0.5", features = ["util"] }

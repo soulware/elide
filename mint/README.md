@@ -3,87 +3,89 @@
 Macaroon-authenticated scoped-credential vending for Tigris. Tracks
 [`docs/design-mint.md`](../docs/design-mint.md).
 
-This is an **initial implementation to feel out the shape** — a runnable
+This is an implementation tracking the settled design — a runnable
 vertical slice, not v1. It lives in the elide workspace during the
 design phase and is deliberately free of `elide-*` dependencies; it is
 destined to become a standalone OSS project.
 
-## What works
+## Caveat vocabulary
 
-The full request path runs end to end:
+Borrowed verbatim from the RFCs (`docs/design-mint.md` § *Standard
+caveats*): `aud` (RFC 7519), `exp` (RFC 7519), `sub` (RFC 7519 — the
+opaque principal; Elide puts a coordinator ULID here), `cnf` (RFC 7800
+holder-of-key, scalar-encoded `ed25519:<pub>`). Coined, mint-specific:
+`op` (endpoint partition — positively required at every endpoint, never
+absence-tested), `role`, `bootstrap` (the rotation nonce). Elide's only
+namespaced caveat is `elide:Volume`.
+
+## Flow
+
+**Enrollment** (`docs/design-mint.md` § *Enrollment*):
 
 ```
-Authorization: Macaroon <b64>  ->  verify MAC against trust root
-  ->  elide:CoordKey PoP: Ed25519 over BLAKE3(tail ‖ BLAKE3(body))
-  ->  parse {role, ttl_seconds, ...}  ->  audience / Role /
-  required-caveat gate  ->  TTL clamp (min(req, role.max, NotAfter-now))
-  ->  render IAM policy from caveats + PoP-verified request.*
-  ->  mint keypair
-  ->  {access_key_id, secret_access_key, expiration}  +  audit line
+mint bootstrap             -> reusable non-expiring bootstrap macaroon
+                              (op=enroll, aud, current bootstrap nonce)
+client attenuates sub+cnf, PoP
+  POST /v1/enroll          -> pending record (keyed by sub) + short
+                              intermediate (op=enroll-exchange)
+operator: mint enroll list / approve <sub>   (verify cnf fingerprint
+                              out of band — the client prints its own)
+  POST /v1/enroll-exchange -> 403 until approved, then re-mint the
+                              non-expiring primary from root
+                              (op=assume-role); pending record consumed
 ```
+
+**Vending**: the client attenuates the held primary (`exp`,
+`elide:Volume`, …) and `POST /v1/assume-role` + PoP → role gate →
+policy render → Tigris keypair.
+
+`mint bootstrap rotate` draws a new nonce and cancels in-flight
+enrollments; outstanding primaries are unaffected.
+
+## Modules
 
 - `caveat` / `macaroon` — named **scalar** caveats, chained-BLAKE3 MAC,
-  base64 wire. Same construction as the elide coordinator's v2
-  macaroon. There is no list-valued caveat type: `EffectiveCaveats`
-  resolves a name tri-state — `Absent` / `Value` / `Unsatisfiable` —
-  and ≥2 disagreeing occurrences are `Unsatisfiable` (fail closed,
-  never silently `Absent`; this is the append-a-contradictory-copy
-  downgrade defence). Not wire-compatible with the elide v2 typed
-  format (by design).
-- `pop` — the `elide:CoordKey` holder-of-key gate. A request bearing a
-  key-bound macaroon must carry `X-Mint-Coord-Pop` (Ed25519 sig); the
-  signature covers `tail ‖ BLAKE3(raw-body)`, binding it to the exact
-  macaroon and the exact body. Freshness is a `ts` field *in the body*
-  (unix seconds), already covered by the body hash — no `…-Ts` header;
-  verified, then ±skew-checked (design OQ#16). No `elide:CoordKey` ⇒
-  plain bearer (no PoP); contradictory ⇒ rejected. `client_signature`
-  / `coord_key_value` are the reference client surface (what a
-  coordinator does per request).
-- `config` — TOML: audience, single trust root, tenant, roles with TTL
-  bounds and policy templates. Validated on load. The Tigris admin
-  credential is **not** in the TOML — it is read from `AWS_ACCESS_KEY_ID`
-  / `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`), the same
-  convention as the elide coordinator.
-- `role` — required-caveat gate (present *and* satisfiable),
-  `Audience`/`Role` checks, TTL clamp.
-- `template` — handlebars rendering of the IAM policy from four
-  provenance-distinct classes: `caveat.*` (MAC-bound), `request.*`
-  (PoP-verified body, e.g. `request.ancestors`), `tenant.*` (config),
-  `system.*` (mint-computed). Strict mode — a referenced-but-absent or
-  unsatisfiable input fails the render closed.
-- `iam` — `KeypairMinter` trait. Prototype ships `FakeMinter`
-  (deterministic, records calls). A real Tigris minter wrapping
-  `elide-tigris-iam` slots in unchanged.
-- `audit` — one JSON line per call; secrets never logged (key id only).
-- `http` — axum `POST /v1/assume-role` + `GET /healthz`, coarse
-  401/400/503 error model, `X-Request-Id`.
+  base64 wire. `EffectiveCaveats` resolves a name tri-state — `Absent`
+  / `Value` / `Unsatisfiable` — ≥2 disagreeing occurrences are
+  `Unsatisfiable` (fail closed, the append-a-contradictory-copy
+  defence). `caveat::name` / `caveat::op` are the canonical constants.
+- `pop` — the `cnf` holder-of-key gate. Ed25519 over
+  `tail ‖ BLAKE3(raw-body)`; freshness `ts` rides in the body. Required
+  on all three operations in the Elide path.
+- `issuance` — `mint_bootstrap` / `mint_intermediate` / `mint_primary`
+  (each a fresh chain from root) + `bound_identity`.
+- `state` — persisted bootstrap nonce + transient pending table, a
+  directory of files (`bootstrap`, `pending/<sub>.json`,
+  `approved/<sub>`) so the lifecycle is `ls`-inspectable. Idempotent
+  same-`(sub,pub)`, conflict on a different key, GC of stale unapproved,
+  consume-on-exchange.
+- `config` — TOML: audience, trust root, `state_dir`, tenant, roles.
+  Admin credential from `AWS_*`, never the TOML.
+- `role` / `template` / `audit` / `http` — role gate, handlebars policy
+  render, JSON audit line, axum endpoints.
+- `iam` — `KeypairMinter` trait; `FakeMinter` for tests.
 
 ## Run it
 
 ```sh
-cargo run -p mint -- mint/examples/mint.toml 127.0.0.1:8085
+mint bootstrap            mint/examples/demo.toml   # print the bootstrap macaroon
+mint enroll list          mint/examples/demo.toml
+mint enroll approve       mint/examples/demo.toml <sub>
+mint serve                mint/examples/demo.toml 127.0.0.1:8085
 ```
 
-Keypair minting is **faked** — no real Tigris call is made; the audit
-log goes to stdout.
+**Interim:** until the live Tigris SigV4 minter lands, `serve` wires
+`FakeMinter` and warns loudly on every start — the enroll/exchange flow
+is real, but `assume-role` returns a deterministic placeholder keypair.
+This is an explicit, temporary deviation from the design's "no stub
+backend", removed when the real minter is wired.
 
-## Not yet (deliberately out of scope for this slice)
+## Staged tail
 
-Real Tigris IAM client, TLS, multi-root / trust-root rotation,
-multi-tenancy, `ListRoles`/`GetRole`, rate-limit smoothing, refresh
-tokens. See `docs/design-mint.md` § *Open questions*.
-
-**Issuance / enrollment:** mint is the *issuer and verifier* of the
-primary macaroon (root never distributed). The verifier side and the
-`elide:CoordKey` PoP are built; the *issuance* side is not — there is
-no `elide coord register` / enrollment exchange and no third-party
-caveat discharge (`docs/design-mint.md` open questions #13–#15). The
-prototype reads `trust_root_hex` straight from the TOML purely so the
-slice runs; that TOML root is a shortcut, not the intended provisioning
-(open question #14).
-
-**PoP wire:** the ±skew freshness anchor and the signed payload
-(`tail ‖ BLAKE3(body)`, `ts` in-body) are settled in the design
-(OQ#16); the encoding (`X-Mint-Coord-Pop` base64 Ed25519, body `ts`
-unix seconds, 60s skew) is an implementation choice in `src/pop.rs`,
-not a fixed protocol.
+The networked `mint client enroll|exchange|assume-role` and the live
+Tigris IAM SigV4 minter (the one production-coupled module, isolated
+behind `KeypairMinter`) are the next stage. Also out of scope here: TLS,
+multi-root / root rotation, multi-tenancy, `ListRoles`/`GetRole`,
+third-party-caveat discharge for a central identity authority
+(`docs/design-mint.md` § *Open questions* #14/#15). `trust_root_hex`
+straight from TOML remains the OQ#14 shortcut.

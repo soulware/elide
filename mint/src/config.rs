@@ -35,6 +35,14 @@ pub struct RawConfig {
     /// Single v1 trust root: 32-byte symmetric macaroon-signing key,
     /// hex-encoded.
     pub trust_root_hex: String,
+    /// Directory for mint's persisted state — the current bootstrap
+    /// nonce and the transient pending-enrollment table — under the
+    /// same custody as `trust_root_hex` (`docs/design-mint.md`
+    /// § *Enrollment*, § *Mint configuration*). Defaults to
+    /// `./mint_data` (relative to the working directory, analogous to
+    /// `./elide_data`) when omitted.
+    #[serde(default)]
+    pub state_dir: Option<String>,
     pub tenant: Tenant,
     #[serde(rename = "role", default)]
     pub roles: Vec<RawRole>,
@@ -112,6 +120,10 @@ pub struct RawRole {
 pub struct Config {
     pub audience: String,
     pub trust_root: [u8; 32],
+    /// Persisted-state directory (bootstrap nonce + pending table),
+    /// same custody as `trust_root`. Defaults to `./mint_data` when the
+    /// config omits `state_dir`.
+    pub state_dir: std::path::PathBuf,
     pub tenant: Tenant,
     /// Resolved from the AWS environment at load time. `None` when the
     /// env is unset (fine for the prototype's faked minter; a real
@@ -167,6 +179,10 @@ impl Config {
         Ok(Config {
             audience: raw.audience,
             trust_root,
+            state_dir: raw
+                .state_dir
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("mint_data")),
             tenant: raw.tenant,
             admin: AdminCredential::from_env(),
             roles,
