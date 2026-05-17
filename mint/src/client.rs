@@ -42,6 +42,10 @@ pub enum ClientError {
     BadFile(&'static str),
     #[error("{path} not found — {hint}")]
     Missing { path: String, hint: &'static str },
+    #[error("--request must be a JSON object ({0})")]
+    BadRequest(&'static str),
+    #[error("--caveat must be NAME=VALUE (got {0:?})")]
+    BadCaveat(String),
     #[error(
         "exchange refused (401) — the intermediate most likely expired \
          (it is short-lived). Re-run `mint client enroll …` for a fresh \
@@ -244,17 +248,67 @@ pub async fn exchange(dir: &Path, base_url: &str) -> Result<bool, ClientError> {
     }
 }
 
-/// `mint client assume-role`: attenuate the held primary (a bounding
-/// `exp`, optional `elide:Volume`), exercise it. Returns the raw
-/// keypair JSON to print.
+/// Parse `NAME=VALUE` narrowing-caveat args. mint is
+/// caveat-vocabulary-agnostic, so the client is too: no name is
+/// special-cased (`elide:Volume`, `exp`, anything).
+fn parse_caveats(args: &[String]) -> Result<Vec<(String, String)>, ClientError> {
+    args.iter()
+        .map(|a| match a.split_once('=') {
+            Some((n, v)) if !n.is_empty() => Ok((n.to_string(), v.to_string())),
+            _ => Err(ClientError::BadCaveat(a.clone())),
+        })
+        .collect()
+}
+
+/// Resolve `--request` (inline JSON, `@file`, or `-` for stdin) and
+/// merge it under the client-owned `ts`/`role`/`ttl_seconds` (those are
+/// the conventional fields the client sets and signs; a value supplied
+/// for them in `--request` is overwritten, not trusted). Pure +
+/// ts-injected for testability. mint is body-field-agnostic — every
+/// other `request.*` field is opaque pass-through.
+fn build_request_body(
+    request_src: Option<&str>,
+    role: &str,
+    ttl_seconds: u64,
+    ts: u64,
+) -> Result<String, ClientError> {
+    let mut obj = match request_src {
+        None => serde_json::Map::new(),
+        Some(src) => {
+            let raw = if src == "-" {
+                let mut s = String::new();
+                io::stdin().read_to_string(&mut s)?;
+                s
+            } else if let Some(path) = src.strip_prefix('@') {
+                fs::read_to_string(path)?
+            } else {
+                src.to_string()
+            };
+            match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(serde_json::Value::Object(m)) => m,
+                Ok(_) => return Err(ClientError::BadRequest("not an object")),
+                Err(_) => return Err(ClientError::BadRequest("invalid JSON")),
+            }
+        }
+    };
+    obj.insert("ts".into(), ts.into());
+    obj.insert("role".into(), role.into());
+    obj.insert("ttl_seconds".into(), ttl_seconds.into());
+    Ok(serde_json::Value::Object(obj).to_string())
+}
+
+/// `mint client assume-role`: attenuate the held primary (the bounding
+/// `exp` from `ttl`, plus any caller-supplied narrowing caveats),
+/// exercise it. Returns the raw keypair JSON to print.
 pub async fn assume_role(
     dir: &Path,
     base_url: &str,
     role: &str,
-    prefix: Option<&str>,
-    volume: Option<&str>,
+    request_src: Option<&str>,
+    caveats: &[String],
     ttl_seconds: u64,
 ) -> Result<String, ClientError> {
+    let caveats = parse_caveats(caveats)?;
     let seed = load_seed(dir)?;
     let mut mac = Macaroon::decode(
         read_text(
@@ -265,20 +319,13 @@ pub async fn assume_role(
     )
     .map_err(|_| ClientError::BadFile(PRIMARY_FILE))?;
     // The primary does not expire; the role gate requires `exp`. Bound
-    // it to the requested lifetime.
+    // it to the requested lifetime, then apply caller narrowing caveats.
     let exp = now_unix().saturating_add(ttl_seconds);
     mac = mac.attenuate(Caveat::scalar(name::EXP, exp.to_string()));
-    if let Some(v) = volume {
-        mac = mac.attenuate(Caveat::scalar("elide:Volume", v));
+    for (n, v) in &caveats {
+        mac = mac.attenuate(Caveat::scalar(n.as_str(), v.as_str()));
     }
-    let mut obj = serde_json::Map::new();
-    obj.insert("ts".into(), now_unix().into());
-    obj.insert("role".into(), role.into());
-    obj.insert("ttl_seconds".into(), ttl_seconds.into());
-    if let Some(p) = prefix {
-        obj.insert("prefix".into(), p.into());
-    }
-    let body = serde_json::Value::Object(obj).to_string();
+    let body = build_request_body(request_src, role, ttl_seconds, now_unix())?;
     let (status, text) = post(&format!("{base_url}/v1/assume-role"), &mac, &seed, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
@@ -351,5 +398,57 @@ mod tests {
             read_macaroon_arg("/no/such/path-and-not-a-macaroon"),
             Err(ClientError::BadFile(_))
         ));
+    }
+
+    #[test]
+    fn request_body_is_opaque_passthrough_with_client_owned_fields() {
+        // No --request: just the client-owned conventional fields.
+        let b = build_request_body(None, "read", 900, 1000).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["ts"], 1000);
+        assert_eq!(v["role"], "read");
+        assert_eq!(v["ttl_seconds"], 900);
+
+        // Arbitrary fields (incl. an array) pass through verbatim;
+        // client-owned keys win over anything the caller put there.
+        let b = build_request_body(
+            Some(r#"{"prefix":"demo/x","ancestors":["a","b"],"role":"EVIL","ts":1}"#),
+            "read",
+            900,
+            1000,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["prefix"], "demo/x");
+        assert_eq!(v["ancestors"], serde_json::json!(["a", "b"]));
+        assert_eq!(v["role"], "read", "client-owned, not caller's EVIL");
+        assert_eq!(v["ts"], 1000, "client-owned, not caller's 1");
+
+        // Non-object / invalid JSON fails closed.
+        assert!(matches!(
+            build_request_body(Some("[1,2]"), "r", 1, 1),
+            Err(ClientError::BadRequest(_))
+        ));
+        assert!(matches!(
+            build_request_body(Some("{not json"), "r", 1, 1),
+            Err(ClientError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn caveat_parsing_is_vocabulary_agnostic() {
+        let ok = parse_caveats(&[
+            "elide:Volume=01VOL".into(),
+            "Region=eu=west".into(), // only the first '=' splits
+        ])
+        .unwrap();
+        assert_eq!(ok[0], ("elide:Volume".into(), "01VOL".into()));
+        assert_eq!(ok[1], ("Region".into(), "eu=west".into()));
+        for bad in ["novalue", "=novalue"] {
+            assert!(matches!(
+                parse_caveats(&[bad.to_string()]),
+                Err(ClientError::BadCaveat(_))
+            ));
+        }
     }
 }

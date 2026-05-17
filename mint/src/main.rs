@@ -108,10 +108,15 @@ enum ClientCmd {
     AssumeRole {
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
-        #[arg(long)]
-        prefix: Option<String>,
-        #[arg(long)]
-        volume: Option<String>,
+        /// PoP-signed request body as a JSON object: inline, `@file`,
+        /// or `-` for stdin. Opaque pass-through into `request.*` —
+        /// `ts`/`role`/`ttl_seconds` are client-owned and ignored here.
+        #[arg(long, value_name = "JSON|@FILE|-")]
+        request: Option<String>,
+        /// Narrowing caveat to attenuate the primary with (repeatable).
+        /// Vocabulary-agnostic — e.g. `--caveat elide:Volume=01VOL`.
+        #[arg(long = "caveat", value_name = "NAME=VALUE")]
+        caveat: Vec<String>,
         #[arg(long, default_value_t = 900)]
         ttl: u64,
         /// Role name from the mint config.
@@ -201,20 +206,13 @@ async fn client_cmd(
         }
         ClientCmd::AssumeRole {
             url,
-            role,
-            prefix,
-            volume,
+            request,
+            caveat,
             ttl,
+            role,
         } => {
-            let kp = mint::client::assume_role(
-                &dir,
-                &url,
-                &role,
-                prefix.as_deref(),
-                volume.as_deref(),
-                ttl,
-            )
-            .await?;
+            let kp = mint::client::assume_role(&dir, &url, &role, request.as_deref(), &caveat, ttl)
+                .await?;
             println!("{kp}");
             Ok(())
         }

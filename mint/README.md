@@ -83,7 +83,8 @@ mint client keygen
 mint client fingerprint                                  # operator compares this during `enroll approve`
 mint client enroll      --id <sub> <macaroon|file|->     # bootstrap is the final positional arg
 mint client exchange                                     # exit 2 until approved, then saves the primary
-mint client assume-role --prefix <p> <role>              # role is the final positional arg
+mint client assume-role --request '{"prefix":"demo/x"}' [--caveat N=V] <role>
+                                                         # request body is opaque pass-through
 ```
 
 Without `--tigris`, `serve` wires the deterministic fake minter (warns

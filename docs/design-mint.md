@@ -972,7 +972,7 @@ client only reads it; `--id` is the opaque `sub`):
 mint client keygen                                       # → client.key/.pub
 mint client enroll       --id <sub> <macaroon|file|->    # → intermediate
 mint client exchange                                     # 403 until approved → primary
-mint client assume-role  --prefix <p> <role>             # → Tigris keypair
+mint client assume-role  --request '{"prefix":"x"}' <role>   # → Tigris keypair
 ```
 
 A worked `examples/` script chains them: `serve` (background) →
