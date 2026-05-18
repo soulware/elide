@@ -16,9 +16,10 @@ roles_dir = "examples/demo_roles"
 # examples/demo_roles/read.json); set policy_file only to override.
 
 # Listener transport (docs/design-mint.md § "Transport"). `bind` and
-# `socket` are mutually exclusive; set exactly one.
+# `socket` are mutually exclusive; with neither set the default is
+# TCP 127.0.0.1:8085.
 #
-#   # TCP — the default and only production transport.
+#   # TCP listener.
 #   bind = "127.0.0.1:8085"           # client: --url http://127.0.0.1:8085
 #
 #   # UDS — the bundled single-host dev shape (coordinator + mint
