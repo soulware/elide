@@ -460,7 +460,7 @@ Error model is deliberately coarse; see *Open questions*.
 
 Roles are declared in the TOML config file (loaded at mint startup).
 Each role's *metadata* stays in `mint.toml`; its *policy template* lives
-in its own file under `roles_dir`, named by `policy_file`:
+in its own file under `roles_dir`, named `<name>.json` by default:
 
 ```toml
 [[role]]
@@ -469,7 +469,7 @@ required_caveats = ["elide:Volume"]
 min_ttl_seconds = 60
 max_ttl_seconds = 604800     # 7 days
 default_ttl_seconds = 86400  # 1 day
-policy_file = "volume-ro.json"
+# template: <roles_dir>/volume-ro.json (the default; no policy_file needed)
 ```
 
 ```jsonc
@@ -493,20 +493,27 @@ policy_file = "volume-ro.json"
 }
 ```
 
-`policy_file` is resolved against `roles_dir`. It must be a single
-normal path component — parsed, not substring-checked: `Path::new` of it
-must yield exactly one `Component::Normal`. That rejects path separators,
+The template filename defaults to `<name>.json`; an optional
+`policy_file` on a role overrides it (for a non-`.json` name, or to
+point two roles at one shared template). Whether derived or explicit,
+the filename is resolved against `roles_dir` and must be a single normal
+path component — parsed, not substring-checked: `Path::new` of it must
+yield exactly one `Component::Normal`. That rejects path separators,
 absolute paths, `.`, `..`, parent traversal, and the empty string in one
-predicate, so a role name cannot reach outside the roles directory. The
-guarantee is name-level: a symlink *inside* `roles_dir` is still
-followed, but `roles_dir` shares `mint.toml`'s custody, so its contents
-are the operator's own, not an external-input boundary. The role
-inventory — names, required caveats, TTL bounds —
+predicate, so neither a role name nor a `policy_file` can reach outside
+the roles directory. Because the default derives from `name`, an unsafe
+role name (one containing a separator or `..`) is rejected by the same
+check — distinctly diagnosed (`BadDerivedPolicyName`) from a bad
+explicit `policy_file` (`BadPolicyFileName`), pointing the operator at
+the actual fix. The guarantee is name-level: a symlink *inside*
+`roles_dir` is still followed, but `roles_dir` shares `mint.toml`'s
+custody, so its contents are the operator's own, not an external-input
+boundary. The role inventory — names, required caveats, TTL bounds —
 stays visible at a glance in one `mint.toml`; only the multi-line
 handlebars-over-JSON template, which is awkward to lint and diff inside a
-TOML triple-quoted string, moves to a per-role file. A role with no
-`policy_file` is a config error: the policy is mandatory and has no
-inline form.
+TOML triple-quoted string, moves to a per-role file. The policy is
+mandatory: a role whose template file is absent is a config error
+(`ReadPolicyFile`); there is no inline form.
 
 ### Templating
 

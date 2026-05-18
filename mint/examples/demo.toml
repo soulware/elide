@@ -19,6 +19,8 @@ trust_root_hex = "00000000000000000000000000000000000000000000000000000000000000
 # path is used verbatim. roles_dir is set so the demo runs from mint/:
 roles_dir = "examples/demo_roles"
 # data_dir = "mint_data"
+# Each role's template defaults to <roles_dir>/<name>.json (read ->
+# examples/demo_roles/read.json); set policy_file only to override.
 
 [tenant]
 bucket = "mint-demo"
@@ -29,7 +31,6 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
-policy_file = "read.json"
 
 [[role]]
 name = "write"
@@ -37,4 +38,3 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300
-policy_file = "write.json"

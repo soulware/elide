@@ -31,6 +31,11 @@ pub enum ConfigError {
          (no path separators, no '.' or '..', not absolute)"
     )]
     BadPolicyFileName { role: String, value: String },
+    #[error(
+        "role {role}: derived policy filename {value:?} is not a single \
+         filename — set an explicit policy_file or rename the role"
+    )]
+    BadDerivedPolicyName { role: String, value: String },
     #[error("role {role}: read policy_file {path}: {source}")]
     ReadPolicyFile {
         role: String,
@@ -132,9 +137,12 @@ pub struct RawRole {
     pub max_ttl_seconds: u64,
     pub default_ttl_seconds: u64,
     /// Filename of the IAM-policy handlebars template (see
-    /// [`crate::template`]), resolved against `roles_dir`. Must be a
-    /// single normal path component — validated by [`read_policy`].
-    pub policy_file: String,
+    /// [`crate::template`]), resolved against `roles_dir`. Optional;
+    /// defaults to `<name>.json`. Whether explicit or derived it must
+    /// be a single normal path component — validated by [`read_policy`]
+    /// (so a role `name` with a path separator is rejected too).
+    #[serde(default)]
+    pub policy_file: Option<String>,
 }
 
 /// Validated configuration, ready to serve.
@@ -196,7 +204,10 @@ impl Config {
                     field: "ttl_seconds".into(),
                 });
             }
-            let policy = read_policy(&roles_dir, &r.name, &r.policy_file)?;
+            let policy = match r.policy_file {
+                Some(ref f) => read_policy(&roles_dir, &r.name, f, true)?,
+                None => read_policy(&roles_dir, &r.name, &format!("{}.json", r.name), false)?,
+            };
             let role = Role {
                 name: r.name.clone(),
                 required_caveats: r.required_caveats,
@@ -233,13 +244,24 @@ impl Config {
 /// `roles_dir`. The guarantee is name-level — a symlink *inside*
 /// `roles_dir` is still followed, but `roles_dir` shares the config's
 /// custody, so its contents are the operator's own.
-fn read_policy(roles_dir: &Path, role: &str, policy_file: &str) -> Result<String, ConfigError> {
+///
+/// `explicit` selects the diagnostic: a bad *explicit* `policy_file` is
+/// [`ConfigError::BadPolicyFileName`]; a bad *derived* `<name>.json`
+/// (i.e. an unsafe role name) is [`ConfigError::BadDerivedPolicyName`].
+fn read_policy(
+    roles_dir: &Path,
+    role: &str,
+    policy_file: &str,
+    explicit: bool,
+) -> Result<String, ConfigError> {
     let mut comps = Path::new(policy_file).components();
     let only = comps.next();
     if comps.next().is_some() || !matches!(only, Some(Component::Normal(_))) {
-        return Err(ConfigError::BadPolicyFileName {
-            role: role.to_owned(),
-            value: policy_file.to_owned(),
+        let (role, value) = (role.to_owned(), policy_file.to_owned());
+        return Err(if explicit {
+            ConfigError::BadPolicyFileName { role, value }
+        } else {
+            ConfigError::BadDerivedPolicyName { role, value }
         });
     }
     let path = roles_dir.join(policy_file);
@@ -365,6 +387,29 @@ policy_file = "volume-ro.json"
         assert!(matches!(
             Config::from_toml_str(&toml),
             Err(ConfigError::ReadPolicyFile { .. })
+        ));
+    }
+
+    #[test]
+    fn policy_file_defaults_to_name_json() {
+        // Drop the explicit policy_file: it must derive `<name>.json`.
+        let toml = SAMPLE.replace("policy_file = \"volume-ro.json\"\n", "");
+        let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
+        assert_eq!(c.roles["volume-ro"].policy, "{}");
+    }
+
+    #[test]
+    fn unsafe_role_name_rejected_when_derived() {
+        // No explicit policy_file, so the unsafe name flows into the
+        // derived filename and must be caught — distinctly from an
+        // explicit bad policy_file.
+        let toml = SAMPLE
+            .replace("policy_file = \"volume-ro.json\"\n", "")
+            .replace("[tenant]", "roles_dir = \"mint_roles\"\n[tenant]")
+            .replace("name = \"volume-ro\"", "name = \"../escape\"");
+        assert!(matches!(
+            Config::from_toml_str(&toml),
+            Err(ConfigError::BadDerivedPolicyName { .. })
         ));
     }
 }

@@ -19,6 +19,10 @@ trust_root_hex = "00000000000000000000000000000000000000000000000000000000000000
 # Set here so the example runs from the mint/ crate directory:
 roles_dir = "examples/mint_roles"
 # data_dir = "mint_data"
+#
+# Each role's policy template is <roles_dir>/<name>.json by default
+# (so volume-ro -> examples/mint_roles/volume-ro.json); set an explicit
+# policy_file on a role only to override that name.
 
 [tenant]
 bucket = "elide-demo"
@@ -36,7 +40,6 @@ required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 2592000      # 30 days
 default_ttl_seconds = 2592000
-policy_file = "volume-ro.json"
 
 [[role]]
 name = "coord-data"
@@ -44,7 +47,6 @@ required_caveats = ["sub", "elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
-policy_file = "coord-data.json"
 
 [[role]]
 name = "coord-base"
@@ -52,4 +54,3 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
-policy_file = "coord-base.json"

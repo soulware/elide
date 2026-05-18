@@ -61,7 +61,8 @@ enrollments; outstanding primaries are unaffected.
   consume-on-exchange.
 - `config` — TOML: audience, trust root, `data_dir`, `roles_dir`,
   tenant, role metadata. Each role's policy template is a separate file
-  under `roles_dir` (`policy_file`, a single normal path component).
+  under `roles_dir`, `<name>.json` by default (`policy_file` overrides);
+  derived or explicit, it must be a single normal path component.
   Admin credential from `AWS_*`, never the TOML.
 - `role` / `template` / `audit` / `http` — role gate, handlebars policy
   render, JSON audit line, axum endpoints.
