@@ -68,6 +68,18 @@ enrollments; outstanding primaries are unaffected.
   render, JSON audit line, axum endpoints.
 - `iam` — `KeypairMinter` trait; `FakeMinter` for tests.
 
+## Build
+
+mint is its own Cargo workspace, independent of the elide workspace it
+is nested in (Standalone-OSS-to-be). Build, test, and lint it from this
+directory — `cargo …` run from the elide root deliberately does not see
+it:
+
+```sh
+cd mint
+cargo build && cargo test
+```
+
 ## Run it
 
 clap CLI (`--config` defaults to `mint.toml`). Server + operator:

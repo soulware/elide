@@ -1,3 +1,10 @@
+# mint is its own workspace, independent of the elide workspace above
+# it. It is Standalone-OSS-to-be; this nested workspace makes a future
+# git extraction a pure directory move with no Cargo changes. Build,
+# test, and lint it from this directory (`cd mint && cargo …`).
+[workspace]
+resolver = "2"
+
 [package]
 name = "mint"
 version = "0.1.0"

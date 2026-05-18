@@ -18,6 +18,8 @@
 
 # Rust build output
 /target/
+# mint is its own nested workspace with its own target dir
+/mint/target/
 
 # Local reference copies (lsvd impl + paper)
 /refs/
