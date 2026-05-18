@@ -14,6 +14,13 @@ roles_dir = "examples/elide_roles"
 # (so volume-ro -> examples/elide_roles/volume-ro.json); set an explicit
 # policy_file on a role only to override that name.
 
+# Listener transport (docs/design-mint.md § "Transport"). `bind` and
+# `socket` are mutually exclusive. The bundled single-host dev shape
+# (coordinator + mint co-resident) uses the UDS listener:
+socket = "mint_data/mint.sock"        # client: --url unix:mint_data/mint.sock
+# For a TCP listener instead, replace the line above with:
+#   bind = "127.0.0.1:8085"           # client: --url http://127.0.0.1:8085
+
 [tenant]
 bucket = "elide-demo"
 
