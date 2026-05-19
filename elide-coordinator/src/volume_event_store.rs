@@ -50,6 +50,11 @@ use crate::portable::{
 /// any `prev_event_ulid` walk.
 const HEAD_WINDOW: usize = 16;
 
+/// Default `limit` for [`recent_events`] / `volume events` when the
+/// caller doesn't specify one: the full HEAD window, answered in a
+/// single GET with no `prev_event_ulid` walk.
+pub const DEFAULT_EVENTS_LIMIT: usize = HEAD_WINDOW;
+
 fn head_key(name: &str) -> StorePath {
     StorePath::from(format!("events/{name}/HEAD"))
 }
@@ -390,6 +395,72 @@ pub async fn emit_event(
     Ok(event)
 }
 
+/// Up to `limit` most-recent events for `name`, newest-first
+/// (`[0]` is the latest). No LIST.
+///
+/// Served from the `events/<name>/HEAD` window in a single GET when
+/// the window already holds `limit` events, or when the whole log
+/// fits in the window. When `limit` exceeds a *full* window, the
+/// oldest in-window event's `prev_event_ulid` back-link is walked one
+/// immutable record at a time until `limit` is reached, the chain
+/// roots out, or a link 404s — a crash phantom (HEAD names a record
+/// whose standalone body was never written): stop and return what we
+/// have. A corrupt/unreadable record on the chain truncates the walk
+/// for the same reason (its back-link is gone) — logged, not fatal.
+///
+/// An absent HEAD is an empty log → empty vec.
+pub async fn recent_events(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    limit: usize,
+) -> Result<Vec<VolumeEvent>, VolumeEventStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let Some((head, _ver)) = read_head(store, name).await? else {
+        return Ok(Vec::new());
+    };
+    let mut events = head.events;
+    if events.len() >= limit {
+        events.truncate(limit);
+        return Ok(events);
+    }
+    // A non-full window holds the entire log (`pushed` only drops
+    // events once it exceeds HEAD_WINDOW); nothing older to walk.
+    if events.len() < HEAD_WINDOW {
+        return Ok(events);
+    }
+    // Window full and more was asked for: walk the back-link chain
+    // from the oldest in-window event.
+    let mut prev = events.last().and_then(|e| e.prev_event_ulid);
+    while events.len() < limit {
+        let Some(p) = prev else { break };
+        let key = event_key(name, p);
+        let got = match store.get(&key).await {
+            Ok(g) => g,
+            Err(object_store::Error::NotFound { .. }) => {
+                debug!("[volume_event_store] {key} missing (phantom back-link); stop walk");
+                break;
+            }
+            Err(e) => return Err(VolumeEventStoreError::Store(e)),
+        };
+        let bytes = got.bytes().await.map_err(VolumeEventStoreError::Store)?;
+        let event = match std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|t| VolumeEvent::from_toml(t).ok())
+        {
+            Some(ev) => ev,
+            None => {
+                debug!("[volume_event_store] {key} unreadable/corrupt; stop walk");
+                break;
+            }
+        };
+        prev = event.prev_event_ulid;
+        events.push(event);
+    }
+    Ok(events)
+}
+
 /// List every event under `events/<name>/`, parsed and
 /// sorted ascending by `event_ulid`.
 ///
@@ -500,8 +571,8 @@ pub fn verify_event_signature(
     }
 }
 
-/// Read every event under `events/<name>/` and pair each
-/// with a [`SignatureStatus`].
+/// Read the `limit` most-recent events for `name` (ascending
+/// `event_ulid` order) and pair each with a [`SignatureStatus`].
 ///
 /// Coordinator pubkeys are fetched once per unique `coordinator_id`
 /// observed in the log and cached for the duration of the call.
@@ -511,8 +582,12 @@ pub fn verify_event_signature(
 pub async fn list_and_verify_events(
     store: &Arc<dyn ObjectStore>,
     name: &str,
+    limit: usize,
 ) -> Result<Vec<VolumeEventEntry>, VolumeEventStoreError> {
-    let events = list_events(store, name).await?;
+    // `recent_events` is newest-first; the history view is
+    // chronological, so reverse to ascending `event_ulid`.
+    let mut events = recent_events(store, name, limit).await?;
+    events.reverse();
 
     // Cache: Some(key) on success, None when fetch failed (with the
     // failure reason carried in `key_failures`).
@@ -763,7 +838,9 @@ mod tests {
             .await
             .expect("emit");
 
-        let entries = list_and_verify_events(&s, "vol").await.expect("verify");
+        let entries = list_and_verify_events(&s, "vol", DEFAULT_EVENTS_LIMIT)
+            .await
+            .expect("verify");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].signature_status, SignatureStatus::Valid);
     }
@@ -778,7 +855,9 @@ mod tests {
             .await
             .expect("emit");
 
-        let entries = list_and_verify_events(&s, "vol").await.expect("verify");
+        let entries = list_and_verify_events(&s, "vol", DEFAULT_EVENTS_LIMIT)
+            .await
+            .expect("verify");
         assert_eq!(entries.len(), 1);
         assert!(matches!(
             entries[0].signature_status,
@@ -796,19 +875,24 @@ mod tests {
             .await
             .expect("emit");
 
-        // Hand-tamper the on-disk event: keep the signature but flip
-        // the kind. The event still parses; the signature should not
-        // verify against the new payload.
-        let key = event_key("vol", original.event_ulid);
+        // Hand-tamper the inline HEAD entry: keep the signature but
+        // flip the kind. HEAD is the read source (no LIST), so the
+        // per-event signature check must still catch the mutation
+        // even though the standalone archival record is untouched.
         let mut tampered = original.clone();
         tampered.kind = EventKind::Claimed;
-        let body = tampered.to_toml().expect("serialise");
+        let head = EventHead {
+            events: vec![tampered],
+        };
+        let body = toml::to_string(&head).expect("serialise head");
         // PUT overwrites — InMemory has no conditional semantics for this.
-        s.put(&key, Bytes::from(body.into_bytes()).into())
+        s.put(&head_key("vol"), Bytes::from(body.into_bytes()).into())
             .await
-            .expect("overwrite");
+            .expect("overwrite head");
 
-        let entries = list_and_verify_events(&s, "vol").await.expect("verify");
+        let entries = list_and_verify_events(&s, "vol", DEFAULT_EVENTS_LIMIT)
+            .await
+            .expect("verify");
         assert_eq!(entries.len(), 1);
         assert!(matches!(
             entries[0].signature_status,
@@ -832,7 +916,9 @@ mod tests {
             .await
             .expect("second");
 
-        let entries = list_and_verify_events(&s, "vol").await.expect("verify");
+        let entries = list_and_verify_events(&s, "vol", DEFAULT_EVENTS_LIMIT)
+            .await
+            .expect("verify");
         assert_eq!(entries.len(), 2);
         for e in &entries {
             assert_eq!(e.signature_status, SignatureStatus::Valid);
