@@ -1418,14 +1418,16 @@ prematurely.
     segments,retention}/` (prefetch, recovery, fork-verify, the
     reaper, snapshot resolution), so this is structural, not a corner.
 
-    **Proposed:** every LIST is replaced by a deterministic GET. The
-    per-name event log is the spine (append-only, self-linking,
-    `events/<name>/HEAD` pointer); snapshot enumeration is a
-    *projection* of it (`SnapshotPublished`/`SnapshotDeleted` events;
-    handoff/fork snapshots are already in `Released`/`ForkedFrom`),
-    with a `by_id/<vol>/snapshots/LATEST` per-kind pointer as an O(1)
-    cache of that fold. Only the high-cardinality per-write sets keep a
-    separate **maintained index**:
+    **Proposed:** every LIST is replaced by a deterministic GET,
+    respecting the name/`vol_ulid` identity split. The per-name event
+    log is the spine (append-only, self-linking, `events/<name>/HEAD`
+    pointer) and already carries the cross-epoch handoff/fork snapshot
+    references (`Released`/`ForceReleased`/`ForkedFrom`) — no new event
+    kinds. The per-vol "latest snapshot" is a
+    `by_id/<vol>/snapshots/LATEST` pointer written under `coord-data`
+    (no cross-role write); no consumer needs a per-vol snapshot *set*.
+    Only the high-cardinality per-write sets keep a separate
+    **maintained index**:
 
     - a per-volume segment index replaces the `segments/` LIST
       (the WAL drain and GC append to it as they create objects); a
