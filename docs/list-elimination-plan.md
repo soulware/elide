@@ -82,15 +82,45 @@ per-vol `LATEST`. So no `SnapshotPublished`/`SnapshotDeleted` events,
 no snapshot projection, no snapshot index — snapshots are a per-vol
 pointer plus references the per-name log already carries.
 
-### The event-log spine (existing events only)
+### The event-log spine (existing events, existing back-links)
 
-- **`events/<name>/HEAD`** — pointer to the newest event; readers walk
-  the back-linked chain from it (across `RenamedFrom.inherits_log_from`
-  for renamed names). Replaces the `events/<name>/` LISTs
-  (`peer_discovery.rs:171`, `volume_event_store.rs:155/253`). **No new
-  event kinds** — the existing lifecycle events are sufficient; key
-  shape coordinated with `design-volume-event-log.md`, not reinvented.
-  Runs under `coord-writer`.
+- **`events/<name>/HEAD`** — pointer to the newest event; readers
+  follow the **already-present** `VolumeEvent.prev_event_ulid`
+  back-link from it (across `RenamedFrom.inherits_log_from` for the
+  full-history case). **No event-format change and no new event
+  kinds:** `prev_event_ulid` is already written on every `emit_event`;
+  only the *discovery* of the latest ULID is LIST-based today
+  (`latest_event_ulid`), and the two walkers choose to LIST+sort
+  instead of following the link that already exists. P1 is therefore:
+  add the `HEAD` object; `emit_event` reads/advances `HEAD` instead of
+  LIST-max; the walkers follow `prev_event_ulid` from `HEAD`. Replaces
+  `peer_discovery.rs:171`, `volume_event_store.rs:155/253`. Key shape
+  coordinated with `design-volume-event-log.md`. Runs under
+  `coord-writer`.
+
+#### Access patterns (all bounded except an explicit `--all`)
+
+1. **Append** — `GET HEAD`, write the record (with `prev =` HEAD),
+   advance `HEAD`. O(1), no walk. The common write path
+   (`Created`/`Claimed`/`Released`/`Renamed`); replaces
+   `latest_event_ulid`'s LIST.
+2. **Claim / peer-discovery** — walk `HEAD → prev → …`, short-circuit
+   at the first decisive lifecycle event. Documented typical cost in
+   the code: **1–2 GETs** (`…,Released,Claimed` → 2; `…,Released` →
+   1). Also subsumes the redundant `latest_release_handoff_snapshot`
+   LIST. A bounded suffix, never to genesis.
+3. **Operator `volume events`** — changed to **bounded "recent N"**:
+   walk back N from `HEAD` (default N; `--all` for the full
+   to-genesis walk, including the `inherits_log_from` rename
+   crossing). Removes the only unbounded *default* walker;
+   `list_events`' whole-prefix LIST goes away. `--all` stays
+   LIST-free (same prev-walk, O(history) GETs — acceptable because
+   explicit and off the hot path).
+
+So at runtime the chain is never walked to genesis: writes are
+HEAD-only, claim is a 1–2-hop suffix, the default history view is a
+recent-N suffix. The O(history) traversal exists only behind an
+explicit `--all`.
 
 ### Maintained index (`segments`, `retention` only)
 
@@ -190,11 +220,15 @@ the purpose and is itself an optional-correctness path).
 
 Ordered so each phase builds on the prior.
 
-- **P1 — event-log spine: `events/<name>/HEAD` + chain walk.** Migrate
-  `peer_discovery` and `volume_event_store` off the `events/` LIST;
-  align the pointer/key shape with `design-volume-event-log.md`. **No
-  new event kinds.** This also gives the claim path its handoff via
-  the existing `Released`/`ForkedFrom` events.
+- **P1 — event-log spine: `events/<name>/HEAD` + prev-walk.** Add the
+  `HEAD` object; `emit_event` reads/advances `HEAD` instead of
+  LIST-max; rewrite `peer_discovery` and `volume_event_store`'s
+  walkers to follow the **already-present** `prev_event_ulid` from
+  `HEAD`. **No event-format change, no new event kinds.** Change
+  `volume events` to bounded recent-N (`--all` = explicit
+  to-genesis prev-walk). Align pointer/key shape with
+  `design-volume-event-log.md`. Also gives the claim path its handoff
+  via the existing `Released`/`ForkedFrom` events.
 - **P2 — per-vol `snapshots/LATEST` pointer.** Write it (per kind) at
   publish under `coord-data`; migrate the latest-snapshot consumers
   (`fetch.rs:325`, `fork.rs:561`, `prefetch.rs:949`,
