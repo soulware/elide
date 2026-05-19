@@ -33,29 +33,71 @@ scan; the substitutes below do not need the date partition.
 
 Two classes:
 
-### Class 1 — latest-pointer (single well-known key)
+The substitutes form three layers, not two. The spine is the
+**per-name event log** — already append-only, already self-linking,
+already getting a `HEAD` pointer. Snapshot enumeration is a
+*projection of that spine*, not a parallel structure (the rejected
+alternative — chaining snapshot manifests — fails because snapshots
+are deleted mid-sequence, e.g. `-stop` snapshots; the event log
+represents deletion as another appended event, not a structural
+mutation, which is exactly why the projection survives deletion where
+a manifest chain would not). Only the genuinely high-cardinality
+per-write sets (`segments`, `retention`) need a separate maintained
+index.
 
-A monotonic pointer object written by conditional-PUT at publish; the
-reader GETs it instead of listing.
+### Layer A — the event-log spine
 
-- **`by_id/<vol>/snapshots/LATEST`** — content: latest snapshot ULID
-  and its full dated manifest key. Written at snapshot publish
-  (`upload.rs` snapshot path). Migrates the four "latest snapshot"
-  consumers (`fetch.rs:325`, `fork.rs:561`, `prefetch.rs:949`,
-  `start_remote.rs:147`) from LIST→max to GET-pointer.
-- **`events/<name>/HEAD`** — the pointer already proposed in
-  `design-volume-event-log.md`. Migrates `peer_discovery.rs:171` and
-  `volume_event_store.rs:155/253`. This path runs under `coord-writer`
-  today; coordinate the key shape with that doc rather than inventing a
-  second one.
+- **`events/<name>/HEAD`** — pointer to the newest event; readers walk
+  the back-linked chain from it (across `RenamedFrom.inherits_log_from`
+  for renamed names). Replaces the `events/<name>/` LISTs
+  (`peer_discovery.rs:171`, `volume_event_store.rs:155/253`). Key
+  shape coordinated with `design-volume-event-log.md`, not reinvented.
+  Runs under `coord-writer`.
+- **Snapshot lifecycle becomes events.** Add `SnapshotPublished {
+  snap_ulid, kind }` and `SnapshotDeleted { snap_ulid }` to
+  `EventKind`. The *handoff/fork* snapshots are **already** in the log
+  — `Released`/`ForceReleased` carry `handoff_snapshot`, `ForkedFrom`
+  carries `source_snap_ulid`; the projection folds those too, so a
+  release/claim handoff needs no new event. The set of a volume's
+  snapshots, and the latest of each `kind`, is the fold of
+  `SnapshotPublished` − `SnapshotDeleted` (+ the handoff/fork
+  references) over the chain. Replaces the snapshot-set LISTs
+  (`lifecycle.rs:777`, `lifecycle.rs:1502`, and
+  `latest_release_handoff_snapshot` behind `lifecycle.rs:560/707` —
+  the latter is *pure redundancy today*: it LISTs to recompute a ULID
+  the `Released` event already records).
 
-### Class 2 — maintained index (the live set)
+  Consequence: routine snapshot publish (`upload.rs:876`, per-volume,
+  `coord-data`) must also append to the per-name event log
+  (`coord-writer`). This crosses the data/control role boundary, but
+  snapshot publish is an infrequent coordinator-mediated control
+  action (not per-write), and the coordinator holds both roles — it
+  composes both handles at that one touch-point, the mixed-prefix
+  pattern `design-mint.md` § *Coordinator store architecture* already
+  prescribes.
 
-`snapshots/` *enumeration* (cleanup/GC, `lifecycle.rs:777/1502`),
-`segments/`, and `retention/` are intrinsically dynamic — accreted by
-the WAL drain and GC, pruned by the reaper — so a pointer cannot
-represent them. Each becomes a per-volume index object the *writer of
-the underlying objects also maintains*:
+### Layer B — latest-pointer caches (O(1) hot path)
+
+The spine fold is O(events since the datum). For the hot reads that
+only want "the latest" — claim/hydrate/fork resolution — a derived
+pointer avoids the walk:
+
+- **`by_id/<vol>/snapshots/LATEST`** — latest snapshot **per kind**
+  (`snapshot_take_new` semantics: stable vs `-stop`), written
+  conditional-PUT at publish. Migrates `fetch.rs:325`, `fork.rs:561`,
+  `prefetch.rs:949`, `start_remote.rs:147`, `lifecycle.rs:777`.
+
+This pointer is a **cache of the Layer-A fold, never an independent
+truth**: it is reconstructable by replaying the event log, and that
+equivalence is the reconcile invariant (below). A lost/stale pointer
+is a performance regression, not a correctness one.
+
+### Layer C — maintained index (`segments`, `retention` only)
+
+The genuinely high-cardinality per-write sets — accreted by the WAL
+drain and GC, pruned by the reaper — are too large to fold from the
+event chain on every read, so they keep a dedicated per-volume index
+object:
 
 - **segment index** — appended by the drain (`upload.rs`) as each
   segment is uploaded and by GC as it writes outputs; the reaper
@@ -63,12 +105,45 @@ the underlying objects also maintains*:
   `fork.rs:670`, `recovery.rs:165`.
 - **retention index** — appended by GC with each supersession marker.
   Replaces `prefetch.rs:643`, `reaper.rs:80`.
-- **snapshot index** — the set side of snapshots (distinct from
-  `LATEST`), for snapshot GC/cleanup. Replaces `lifecycle.rs:777/1502`.
 
-These may collapse into one per-volume append-only "manifest delta
-log" rather than three objects — an implementation choice deferred to
-P3, but constrained by the next section.
+These two may collapse into one per-volume append-only "manifest
+delta log" — an implementation choice deferred to its phase, but
+constrained by the next section. Snapshots are deliberately **not**
+here: they are Layer A.
+
+### Worked example — a release/claim cycle
+
+Coordinator **A** owns `myvol`; **B** later claims it. Every step is a
+GET or a known-key PUT/DELETE — no LIST.
+
+1. **Steady state (A).** A seals snapshot `S2`: writes
+   `by_id/<vol>/snapshots/<date>/S2.manifest`, appends
+   `SnapshotPublished{S2,Stable}` to `events/myvol/`, advances
+   `events/myvol/HEAD`, bumps `snapshots/LATEST` → `(S2,Stable)`.
+2. **Release (A).** A seals the handoff/stop snapshot `Sh`, writes its
+   manifest, CASes `names/myvol` Live→Released, appends
+   `Released{handoff_snapshot: Sh}` and advances `HEAD` (this event
+   already exists today). Optionally bumps `LATEST` → `(Sh,Stop)`.
+3. **Claim (B).** B CASes `names/myvol` Released→Claimed. To learn
+   what to fork from it reads `snapshots/LATEST` (O(1)) and/or walks
+   `events/myvol/` from `HEAD` back to the newest `Released` →
+   `handoff = Sh` directly (today this is the redundant
+   `latest_release_handoff_snapshot` LIST). B appends `Claimed`,
+   advances `HEAD`.
+4. **Hydrate (B).** From `Sh.manifest` (a GET) B gets the segment
+   ULID set — the manifest already enumerates segments, so no LIST;
+   any segment not local is range-GET by deterministic key.
+5. **Stop-snapshot cleanup (B).** Today `lifecycle.rs:1502` LISTs the
+   snapshot prefix to find and delete leftover `-stop` objects. Under
+   this design B already knows `Sh` from step 3's event walk: it
+   `DELETE`s `Sh` by known key and appends `SnapshotDeleted{Sh}`, so
+   the projection stays exact. No LIST.
+
+The invariant the example illustrates: **the event log is the
+per-name authoritative spine; a snapshot's existence and removal are
+appended events; "the snapshot set" and "the handoff" are folds over
+the chain from `HEAD`; `snapshots/LATEST` is an O(1) cache of one
+fold, never independent truth.**
 
 ### Reconcile/repair without LIST
 
@@ -76,8 +151,15 @@ LIST is today's implicit source of truth ("what is actually in the
 bucket"). Removing it removes that self-heal, so the plan must replace
 it, not merely delete it:
 
-- The index is **authoritative** for the runtime; readers trust it.
-- Divergence is bounded and one-directional by construction if the
+- **Layer A/B reconcile by event replay, not LIST.** The snapshot
+  projection and the `LATEST` cache are derived from the event chain;
+  their authoritative rebuild is *replaying `events/<name>/`*, which
+  is itself LIST-free (the chain walks from `HEAD`; `HEAD` durability
+  is `design-volume-event-log.md`'s concern, not redesigned here). A
+  stale/lost `LATEST` is recomputed by replay — a perf event, not a
+  correctness one.
+- **Layer C index is authoritative for the runtime**; readers trust
+  it. Divergence is bounded and one-directional by construction if the
   index entry is written *after* the object PUT and *before* the
   operation reports success: a crash can leave an object with no index
   entry (a reclaimable space leak — never a correctness loss, since an
@@ -85,11 +167,12 @@ it, not merely delete it:
   with no object on a path that matters (readers already tolerate a
   `404` on segment fetch — `list_supersessions` explicitly does).
 - The **rebuild defines correctness** (cf. the project invariant for
-  derived state with rebuild + incremental paths): the index's
-  authoritative regeneration is a one-time elevated LIST, and the
-  incremental drain/GC/reaper updates must structurally match what
-  that rebuild would produce. This is asserted in the proptest model
-  (below), not just by convention.
+  derived state with rebuild + incremental paths): for Layer A/B the
+  rebuild is the event replay above; for the Layer C index it is a
+  one-time elevated LIST. Either way the incremental
+  drain/GC/reaper/publish updates must structurally match what the
+  rebuild would produce — asserted in the proptest model (below), not
+  by convention.
 - Orphan reclamation (un-indexed objects) is an **explicit operator
   maintenance pass** that may use a privileged LIST under a separate
   elevated credential — deliberately *not* the coordinator runtime or
@@ -103,17 +186,27 @@ Each phase is independently shippable and leaves the tree green; no
 phase introduces a dual LIST+index runtime fallback (that would defeat
 the purpose and is itself an optional-correctness path).
 
-- **P1 — snapshots `LATEST` pointer.** Write at publish; migrate the
-  four latest-snapshot consumers. Smallest, self-contained, removes
-  the most frequent per-volume LIST (prefetch warm-start).
-- **P2 — `events/<name>/HEAD` pointer.** Migrate `peer_discovery` and
-  `volume_event_store`; align with `design-volume-event-log.md`.
+Ordered so each phase builds on the prior: the event-log spine first,
+since snapshots project onto it.
+
+- **P1 — event-log spine: `events/<name>/HEAD` + chain walk.** Migrate
+  `peer_discovery` and `volume_event_store` off the `events/` LIST;
+  align the pointer/key shape with `design-volume-event-log.md`. This
+  is the substrate the next phase folds over.
+- **P2 — snapshots as an event projection.** Add `SnapshotPublished` /
+  `SnapshotDeleted` to `EventKind`; emit on publish/delete (compose
+  the `coord-writer` event-log handle at the `coord-data` publish
+  touch-point). Add the `snapshots/LATEST` per-kind pointer as the
+  O(1) cache. Migrate the latest-snapshot consumers (`fetch.rs:325`,
+  `fork.rs:561`, `prefetch.rs:949`, `start_remote.rs:147`,
+  `lifecycle.rs:777`) to the pointer, and the set/handoff/cleanup
+  consumers (`lifecycle.rs:560/707/1502`) to the chain fold. Removes
+  every snapshot LIST.
 - **P3 — segment index.** Drain + GC maintenance, crash-ordering as
   above; migrate `prefetch`/`recovery`/`fork-verify`; define + test
   the reconcile invariant.
-- **P4 — retention + snapshot-set indexes** (or fold into P3's log);
-  migrate `prefetch` supersession, `reaper`, and snapshot
-  cleanup/GC (`lifecycle.rs:777/1502`).
+- **P4 — retention index** (or fold into P3's delta log); migrate
+  `prefetch` supersession and `reaper`.
 - **P5 — drop the grant.** Delete `s3:ListBucket` from
   `mint/examples/elide_roles/coord-writer.json`, the §*`coord-writer`*
   policy, and the role-inventory table in `design-mint.md`; add a CI

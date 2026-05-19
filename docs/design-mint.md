@@ -1418,16 +1418,16 @@ prematurely.
     segments,retention}/` (prefetch, recovery, fork-verify, the
     reaper, snapshot resolution), so this is structural, not a corner.
 
-    **Proposed:** every LIST is replaced by a deterministic GET, in
-    two classes:
+    **Proposed:** every LIST is replaced by a deterministic GET. The
+    per-name event log is the spine (append-only, self-linking,
+    `events/<name>/HEAD` pointer); snapshot enumeration is a
+    *projection* of it (`SnapshotPublished`/`SnapshotDeleted` events;
+    handoff/fork snapshots are already in `Released`/`ForkedFrom`),
+    with a `by_id/<vol>/snapshots/LATEST` per-kind pointer as an O(1)
+    cache of that fold. Only the high-cardinality per-write sets keep a
+    separate **maintained index**:
 
-    - **Latest-pointer (single well-known key, conditional-PUT on
-      publish):** `by_id/<vol>/snapshots/LATEST` replaces the
-      snapshot-discovery LIST; `events/<name>/HEAD` replaces the
-      event-prefix LIST (the pointer idea already in
-      `design-volume-event-log.md`). Readers GET the pointer.
-    - **Maintained index (writer-/GC-updated object, the live set):**
-      a per-volume segment index replaces the `segments/` LIST
+    - a per-volume segment index replaces the `segments/` LIST
       (the WAL drain and GC append to it as they create objects); a
       per-volume retention index replaces the `retention/` LIST (GC
       appends supersession markers). The index, not LIST, is the
