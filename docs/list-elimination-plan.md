@@ -84,43 +84,65 @@ pointer plus references the per-name log already carries.
 
 ### The event-log spine (existing events, existing back-links)
 
-- **`events/<name>/HEAD`** — pointer to the newest event; readers
-  follow the **already-present** `VolumeEvent.prev_event_ulid`
-  back-link from it (across `RenamedFrom.inherits_log_from` for the
-  full-history case). **No event-format change and no new event
-  kinds:** `prev_event_ulid` is already written on every `emit_event`;
-  only the *discovery* of the latest ULID is LIST-based today
-  (`latest_event_ulid`), and the two walkers choose to LIST+sort
-  instead of following the link that already exists. P1 is therefore:
-  add the `HEAD` object; `emit_event` reads/advances `HEAD` instead of
-  LIST-max; the walkers follow `prev_event_ulid` from `HEAD`. Replaces
-  `peer_discovery.rs:171`, `volume_event_store.rs:155/253`. Key shape
-  coordinated with `design-volume-event-log.md`. Runs under
-  `coord-writer`.
+- **`events/<name>/HEAD` — a bounded window, not a scalar pointer.**
+  `HEAD` carries the **last *N* events as full signed records**,
+  rebuilt on every append as `new_HEAD = (new_event :: old_HEAD)[..N]`
+  — one conditional-PUT, the same write that advances ordering today,
+  just carrying *N* compact entries instead of one ULID. Events are
+  tiny (ULID + enum + coord id + sig); N≈16 is a few KB.
 
-#### Access patterns (all bounded except an explicit `--all`)
+  **`prev_event_ulid` is already on every record** (`volume_event.rs`,
+  written by `emit_event`), so the authoritative chain already exists;
+  what is LIST-based today is only latest-ULID *discovery*
+  (`latest_event_ulid`) and the two walkers choosing LIST+sort over
+  the link that is already there. **No event-format change, no new
+  event kinds.**
 
-1. **Append** — `GET HEAD`, write the record (with `prev =` HEAD),
-   advance `HEAD`. O(1), no walk. The common write path
+  **HEAD is a cache, never a trust root.** Each entry is the
+  already-individually-signed event record, so a tampered or dropped
+  entry fails the existing per-event signature check or simply falls
+  back to the prev-walk; correctness rests on the per-event
+  signatures + the authoritative `prev_event_ulid` chain, exactly as
+  today. HEAD's "rebuild" *is* the prev-walk (the project invariant
+  for derived state: the rebuild defines correctness).
+
+  **Crash ordering:** event record PUT *before* the HEAD rewrite (same
+  discipline as the segment index). A crash between leaves HEAD
+  stale-by-one; the next reader sees the newest record's `prev` ≠
+  HEAD's top and repairs by one hop, or prev-walks. Staleness is
+  bounded and self-healing.
+
+  Replaces `peer_discovery.rs:171`, `volume_event_store.rs:155/253`.
+  Key shape coordinated with `design-volume-event-log.md`. Runs under
+  `coord-writer`. *N* is a tuning param (default ≈16), not pinned by
+  the design.
+
+#### Access patterns (0 hops common; bounded fallback; `--all` opt-in)
+
+1. **Append** — `GET HEAD`, write the record (`prev =` HEAD's top),
+   rewrite `HEAD`. O(1), no walk. The common write path
    (`Created`/`Claimed`/`Released`/`Renamed`); replaces
    `latest_event_ulid`'s LIST.
-2. **Claim / peer-discovery** — walk `HEAD → prev → …`, short-circuit
-   at the first decisive lifecycle event. Documented typical cost in
-   the code: **1–2 GETs** (`…,Released,Claimed` → 2; `…,Released` →
-   1). Also subsumes the redundant `latest_release_handoff_snapshot`
-   LIST. A bounded suffix, never to genesis.
-3. **Operator `volume events`** — changed to **bounded "recent N"**:
-   walk back N from `HEAD` (default N; `--all` for the full
-   to-genesis walk, including the `inherits_log_from` rename
-   crossing). Removes the only unbounded *default* walker;
-   `list_events`' whole-prefix LIST goes away. `--all` stays
-   LIST-free (same prev-walk, O(history) GETs — acceptable because
-   explicit and off the hot path).
+2. **Claim / peer-discovery** — the decisive event
+   (`Released`/`ForceReleased`/`ForkedFrom`) and its payload are
+   almost always within the last *N*, so they are **in the HEAD GET
+   itself — zero extra hops**. Only a pathological tail (>*N* events
+   since the last `Released`) falls back to the bounded
+   `prev_event_ulid` walk. Subsumes the redundant
+   `latest_release_handoff_snapshot` LIST. (Peer-discovery still does
+   one *keyed* GET for the releaser's `coordinators/<id>/peer-endpoint`
+   — not a walk, unavoidable.)
+3. **Operator `volume events`** — bounded **recent-N**: served
+   entirely from the HEAD window when the CLI default ≤ *N* (**zero
+   walk**); larger windows or `--all` fall back to the prev-walk
+   (`--all` = full to-genesis incl. the `inherits_log_from` rename
+   crossing, still LIST-free). Removes the unbounded default walker;
+   `list_events`' whole-prefix LIST goes away.
 
-So at runtime the chain is never walked to genesis: writes are
-HEAD-only, claim is a 1–2-hop suffix, the default history view is a
-recent-N suffix. The O(history) traversal exists only behind an
-explicit `--all`.
+So at runtime the chain is essentially never walked: appends are a
+single GET+PUT, the common claim/peer-discovery and the default
+history view are answered from the one HEAD GET, and a `prev` walk
+happens only on a long unclaimed tail or an explicit `--all`.
 
 ### Maintained index (`segments`, `retention` only)
 
@@ -156,10 +178,10 @@ GET or a known-key PUT/DELETE — no LIST.
    `events/myvol/`, advances `HEAD`. This event **already exists
    today**; nothing new on the name axis.
 3. **Claim (B).** B CASes `names/myvol` Released→Claimed. It learns
-   the fork point by walking `events/myvol/` from `HEAD` back to the
-   newest `Released` → `handoff = Sh` (replacing the redundant
-   `latest_release_handoff_snapshot` LIST). B appends `Claimed`,
-   advances `HEAD`.
+   the fork point from the **single `HEAD` GET** — `Released{handoff:
+   Sh}` is in the window (no `prev` walk in the common case;
+   replacing the redundant `latest_release_handoff_snapshot` LIST). B
+   appends `Claimed` and rewrites `HEAD`.
 4. **Hydrate (B).** From `Sh.manifest` (a GET, key known from step 3)
    B gets the segment ULID set — the manifest already enumerates
    segments, so no LIST; any segment not local is range-GET by
@@ -220,15 +242,18 @@ the purpose and is itself an optional-correctness path).
 
 Ordered so each phase builds on the prior.
 
-- **P1 — event-log spine: `events/<name>/HEAD` + prev-walk.** Add the
-  `HEAD` object; `emit_event` reads/advances `HEAD` instead of
-  LIST-max; rewrite `peer_discovery` and `volume_event_store`'s
-  walkers to follow the **already-present** `prev_event_ulid` from
-  `HEAD`. **No event-format change, no new event kinds.** Change
-  `volume events` to bounded recent-N (`--all` = explicit
-  to-genesis prev-walk). Align pointer/key shape with
+- **P1 — event-log spine: windowed `events/<name>/HEAD`.** Add the
+  `HEAD` object carrying the last *N* signed records (rebuilt on
+  append; record PUT before HEAD rewrite). `emit_event` reads/advances
+  `HEAD` instead of LIST-max; `peer_discovery` and
+  `volume_event_store` read the window, falling back to the
+  **already-present** `prev_event_ulid` walk only on a long tail.
+  **No event-format change, no new event kinds.** Change `volume
+  events` to bounded recent-N (served from the window; `--all` =
+  explicit to-genesis prev-walk). Align key/shape with
   `design-volume-event-log.md`. Also gives the claim path its handoff
-  via the existing `Released`/`ForkedFrom` events.
+  from the HEAD window via the existing `Released`/`ForkedFrom`
+  events.
 - **P2 — per-vol `snapshots/LATEST` pointer.** Write it (per kind) at
   publish under `coord-data`; migrate the latest-snapshot consumers
   (`fetch.rs:325`, `fork.rs:561`, `prefetch.rs:949`,

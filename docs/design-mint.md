@@ -1420,8 +1420,9 @@ prematurely.
 
     **Proposed:** every LIST is replaced by a deterministic GET,
     respecting the name/`vol_ulid` identity split. The per-name event
-    log is the spine (append-only, self-linking, `events/<name>/HEAD`
-    pointer) and already carries the cross-epoch handoff/fork snapshot
+    log is the spine (append-only, self-linking, a bounded
+    `events/<name>/HEAD` window of the last N signed records) and
+    already carries the cross-epoch handoff/fork snapshot
     references (`Released`/`ForceReleased`/`ForkedFrom`) — no new event
     kinds. The per-vol "latest snapshot" is a
     `by_id/<vol>/snapshots/LATEST` pointer written under `coord-data`
