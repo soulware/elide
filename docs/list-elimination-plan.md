@@ -53,34 +53,57 @@ axis crossing legible. Snapshots split along it exactly, and
 respecting the split (rather than forcing a cross-axis write) is what
 keeps the design simple:
 
-- **Per-vol "latest snapshot in *this* `vol_ulid`"** — a
-  `by_id/<vol>/snapshots/LATEST` pointer (per kind:
-  `snapshot_take_new`, stable vs `-stop`), written conditional-PUT at
-  publish by the per-vol path, **under `coord-data` only — no
-  cross-role write, no new event**. Migrates `fetch.rs:325`,
-  `fork.rs:561`, `prefetch.rs:949`, `start_remote.rs:147`,
-  `lifecycle.rs:777`. Reconstructable from local volume state / the
-  next publish (a lost pointer self-heals; not a correctness datum).
-- **Per-name "the handoff/fork point to consume"** — *already* on the
-  event log: `Released`/`ForceReleased` carry `handoff_snapshot`,
-  `ForkedFrom` carries `source_snap_ulid`. The claimant reads it off
-  the chain it is already walking. Covers `lifecycle.rs:560/707` and
-  the claim path. `latest_release_handoff_snapshot`'s LIST
-  (`lifecycle.rs:560/707`) is *pure redundancy today* — it LISTs to
-  recompute a ULID the `Released` event already records — and on the
-  release side the coordinator just sealed the snapshot, so it knows
-  the ULID directly without LIST or event read.
-- **Leftover `-stop` cleanup** (`lifecycle.rs:1502`) — the `-stop`
-  being swept *is* the handoff snapshot; its ULID is in the per-name
-  `Released` event. Delete by known key; no per-vol enumeration.
+The latest-snapshot need splits into a *benign* per-vol case and a
+*correctness-sensitive* per-name case, and each goes to the substitute
+that cannot skew for it:
+
+- **Per-vol "latest stable basis" — a single `by_id/<vol>/snapshots/LATEST`
+  pointer (`User` snapshots only).** Body is the bare snapshot ULID.
+  Written GET-max-PUT (no CAS — single-writer per vol) in
+  `upload_snapshot_manifests` immediately after the manifest PUT,
+  **under `coord-data` only — no cross-role write, no event**. Migrates
+  `fetch.rs:325`, `fork.rs:561`, `prefetch.rs:947`,
+  `start_remote.rs:147`, `lifecycle.rs:777`. Here a stale/lost pointer
+  is genuinely benign and self-heals on the next publish: these
+  consumers fetch a basis and then catch up via segments, so an old
+  basis only costs extra GETs, never data. A pointer is the right tool
+  *because* the failure mode is harmless.
+- **Per-name "the handoff/fork/stop point" — on the event-log spine,
+  not a pointer.** The cross-epoch references are name-axis facts and
+  must commit atomically with the ordered, CAS'd `events/<name>/HEAD`
+  (P1), so there is no separate mutable object to skew:
+  - `Released`/`ForceReleased` carry `handoff_snapshot`, `ForkedFrom`
+    carries `source_snap_ulid` (already today). Covers the claim path
+    and `lifecycle.rs:560/707` — `latest_release_handoff_snapshot`'s
+    LIST is *pure redundancy* (recomputes a ULID the `Released` event
+    already records; the releaser also knows it directly).
+  - **New `EventKind::Stopped { checkpoint_snapshot }`**, emitted at
+    `volume stop`. `Stopped` is a durable resting state (a host can
+    die while a volume is parked, having cleanly stopped but never
+    released — `Released` never fires, so its `handoff_snapshot`
+    cannot carry the basis). This is the missing `Live→Stopped`
+    lifecycle transition the event log should record anyway; it is
+    *not* per-snapshot spam (one event per `volume stop`, lifecycle
+    cadence — steady-state `User` snapshots emit nothing). Recovery
+    (`recovery.rs:379/384`) reads the latest of
+    `{Released, ForceReleased, Stopped}` checkpoint off the HEAD
+    window; absent → segment-list synthesis exactly as today. This is
+    why there is **no `LATEST-stop` pointer**: the recovery basis is
+    the one place a pointer's manifest-then-crash-before-bump window
+    *would* lose committed data (no "next seal" after a crash), so it
+    goes on the spine where the event append *is* the commit point.
+  - **Leftover `-stop` cleanup** (`lifecycle.rs:1502`) — the `-stop`
+    being swept is the `Stopped`/`Released` checkpoint; delete by
+    known key from the event, no per-vol enumeration.
 
 A full sweep confirms **no consumer needs a per-vol snapshot *set***:
 there is no stable-snapshot retention/GC enumerator, and `prefetch`
 resolves ancestor snapshots from the *branch ULID in signed
 provenance* (name-axis lineage), only the writable head wanting the
 per-vol `LATEST`. So no `SnapshotPublished`/`SnapshotDeleted` events,
-no snapshot projection, no snapshot index — snapshots are a per-vol
-pointer plus references the per-name log already carries.
+no snapshot projection, no snapshot index — snapshots are a single
+benign per-vol pointer plus the handoff/fork/stop references the
+per-name event spine carries.
 
 ### The event-log spine (existing events, existing back-links)
 
@@ -248,9 +271,10 @@ Coordinator **A** owns `myvol`; **B** later claims it. Every step is a
 GET or a known-key PUT/DELETE — no LIST.
 
 1. **Steady state (A).** A seals snapshot `S2`: writes
-   `by_id/<vol>/snapshots/<date>/S2.manifest` and bumps
-   `by_id/<vol>/snapshots/LATEST → (S2,Stable)`. Both writes are
-   per-vol, **`coord-data` only** — no event, no `coord-writer`.
+   `by_id/<vol>/snapshots/<date>/S2.manifest` then bumps
+   `by_id/<vol>/snapshots/LATEST → S2` (bare ULID, `User` only). Both
+   writes are per-vol, **`coord-data` only** — no event, no
+   `coord-writer`.
 2. **Release (A).** A seals the handoff/stop snapshot `Sh` (it knows
    `Sh`'s ULID directly — it just minted it), CASes `names/myvol`
    Live→Released, then appends to `events/myvol/`: CAS `HEAD` with
@@ -268,8 +292,15 @@ GET or a known-key PUT/DELETE — no LIST.
 5. **Stop-snapshot cleanup (B).** Today `lifecycle.rs:1502` LISTs the
    snapshot prefix to find leftover `-stop` objects. `Sh` is already
    known from step 3's event walk: B `DELETE`s `Sh` by known key. No
-   LIST, no new event (the name log already recorded `Sh` via
-   `Released`; its consumption needs no separate marker).
+   LIST, no new marker.
+
+**Unclean variant.** If A had instead `stop`ped `myvol` and the host
+died while it was parked (never reaching step 2's `Released`), step 2
+is absent — but A's `volume stop` emitted `Stopped{checkpoint: Sh}` on
+the same HEAD spine. B's force-release reads `Sh` from the HEAD window
+exactly as step 3 reads `Released`; the recovery basis never depended
+on the per-vol pointer, so the manifest-then-crash-before-bump window
+cannot lose it.
 
 The invariant the example illustrates: **the name axis (event log)
 carries ownership and the cross-epoch handoff/fork snapshot
@@ -287,10 +318,15 @@ it, not merely delete it:
   per-name handoff/fork references live in events that already exist
   and are durable on the chain (`HEAD` durability is
   `design-volume-event-log.md`'s concern, not redesigned here). The
-  per-vol `snapshots/LATEST` pointer is not a correctness datum: it is
-  reconstructable from local volume state and is overwritten by the
+  per-vol `snapshots/LATEST` pointer is not a correctness datum: it
+  serves only the clean data-axis consumers (`User` basis), is
+  reconstructable from local volume state, and is overwritten by the
   next publish, so a lost/stale pointer self-heals — a perf event, not
-  a correctness one.
+  a correctness one. This holds *because* the one
+  correctness-sensitive case — the unclean-recovery basis — was kept
+  off the pointer and put on the event spine (`Stopped` / `Released` /
+  `ForceReleased`), where there is no manifest-then-crash-before-bump
+  window to lose.
 - **The segment/retention index is authoritative for the runtime**;
   readers trust it. Divergence is bounded and one-directional by
   construction if the
