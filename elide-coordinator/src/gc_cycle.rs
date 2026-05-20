@@ -406,24 +406,39 @@ impl GcCycleOrchestrator {
             return false;
         }
 
-        let volume_id = &self.volume_id;
-        for input in &to_reap {
-            let key = upload::segment_key(volume_id, *input);
-            match self.store.delete(&key).await {
-                Ok(_) => {}
-                Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => {
-                    // A failed DELETE is logged and retried next reap
-                    // tick: the entry stays in `Superseded` because we
-                    // only `apply_reap` the inputs we actually
-                    // processed (this loop continues, so the input
-                    // remains in `to_reap` regardless — see below).
-                    // The HEAD-after-object rule means a stale entry
-                    // is harmless: readers tolerate the 404.
-                    warn!("[reap {volume_id}] delete {key}: {e}; will retry");
+        // Fan the DELETEs out concurrently so the per-vol tick isn't
+        // blocked on N sequential round-trips when retention expires
+        // for a large batch at once. Concurrency cap matches the
+        // peer-fetch / drain idiom — high enough to overlap latency,
+        // low enough not to burst the bucket.
+        use futures::stream::{self, StreamExt};
+        const REAP_CONCURRENCY: usize = 16;
+        let volume_id = self.volume_id.as_str();
+        let store = self.store.clone();
+        stream::iter(to_reap.iter().copied())
+            .for_each_concurrent(REAP_CONCURRENCY, |input| {
+                let store = store.clone();
+                let key = upload::segment_key(volume_id, input);
+                async move {
+                    match store.delete(&key).await {
+                        Ok(_) => {}
+                        Err(object_store::Error::NotFound { .. }) => {}
+                        Err(e) => {
+                            // A failed DELETE is logged and retried
+                            // on the next reap tick. The HEAD-after-
+                            // object rule means a stale `Superseded`
+                            // entry is harmless: readers tolerate the
+                            // 404. `apply_reap` is still called
+                            // unconditionally below because the
+                            // tombstone is only over-recorded by one
+                            // tick if it turns out the delete didn't
+                            // land (benign).
+                            warn!("[reap {volume_id}] delete {key}: {e}; will retry");
+                        }
+                    }
                 }
-            }
-        }
+            })
+            .await;
         head.apply_reap(&to_reap);
         info!(
             "[reap {volume_id}] reaped {} input segment(s) past retention",
