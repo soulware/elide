@@ -313,11 +313,21 @@ async fn dispatch_json(
         Request::Release { volume, force } => {
             // Mixed: per-volume snapshot publish + names/<volume> flip.
             // Coordinator-wide today; future Tigris work splits this.
-            let store = ctx.stores.writer();
             let result = if force {
-                lifecycle::force_release_volume_op(&volume, &ctx.data_dir, &store, &ctx.identity)
-                    .await
+                // force-release straddles two role scopes: coord-writer
+                // for names/<name> + events/<name>/, and per-vol
+                // coord-data for by_id/<dead_vol>/. Pass the
+                // `ScopedStores` so the op can pick the right
+                // credential for each step.
+                lifecycle::force_release_volume_op(
+                    &volume,
+                    &ctx.data_dir,
+                    &ctx.stores,
+                    &ctx.identity,
+                )
+                .await
             } else {
+                let store = ctx.stores.writer();
                 lifecycle::release_volume_op(&volume, &store, ctx).await
             };
             let env: Envelope<ReleaseReply> = result.into();
