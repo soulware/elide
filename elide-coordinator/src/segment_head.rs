@@ -111,7 +111,26 @@ pub fn head_key(vol: Ulid) -> StorePath {
 /// `SegmentHead` produces a valid body. Sorting is structural (the
 /// fields are `BTreeSet`/`BTreeMap`), so the output is deterministic.
 pub fn render(head: &SegmentHead) -> String {
-    let mut out = String::new();
+    // Pre-allocate the body buffer. At thousands of post-snapshot
+    // entries `render` is on the per-active-tick hot path, so the
+    // ~12 reallocations a default `String::new()` would do for a
+    // 100KB+ body are worth eliminating. ULIDs are exactly 26 chars
+    // Crockford-Base32; RFC3339 with the millisecond precision
+    // `chrono` emits is ≤ 30 chars (e.g. `2026-05-20T12:34:56.789+00:00`).
+    //
+    //   anchor line             ≤ 32   ("anchor: <ulid>\n")
+    //   section header          ≤ 16   ("superseded:\n")
+    //   added/tombstoned entry    29   ("  <ulid>\n")
+    //   superseded entry        ≤ 90   ("  <in> <out> <ts>\n")
+    //
+    // Slight over-estimate is preferable to under (under triggers
+    // exactly the realloc we are trying to avoid).
+    let cap = 32
+        + 3 * 16
+        + head.added.len() * 29
+        + head.tombstoned.len() * 29
+        + head.superseded.len() * 90;
+    let mut out = String::with_capacity(cap);
     out.push_str("anchor: ");
     match head.anchor {
         Some(u) => out.push_str(&u.to_string()),
@@ -272,15 +291,30 @@ where
 /// too, not just over `added` — a pre-snapshot input GC superseded
 /// *after* the snapshot is in the manifest and must still be skipped.
 pub fn live_set(manifest_segments: &BTreeSet<Ulid>, head: &SegmentHead) -> BTreeSet<Ulid> {
-    let mut live = manifest_segments.clone();
-    live.extend(head.added.iter().copied());
-    for input in head.superseded.keys() {
-        live.remove(input);
-    }
-    for u in &head.tombstoned {
-        live.remove(u);
-    }
-    live
+    // Single filtered pass over `manifest ∪ added`, no intermediate
+    // clone of the manifest. Callers run this with manifests in the
+    // 10K–100K range (the full pre-snapshot live set on a busy
+    // volume), so cloning the manifest just to delete a handful of
+    // entries from the copy was the dominant allocation cost.
+    //
+    // `Superseded` and `Tombstoned` are bounded by the post-snapshot
+    // window (retention_window worth of GC + reaper lag) and stay
+    // small relative to the manifest, so materialising a `HashSet`
+    // for O(1) membership tests is a clear win over re-running the
+    // `BTreeSet::contains` log-n probe per filtered ULID.
+    use std::collections::HashSet;
+    let exclude: HashSet<Ulid> = head
+        .superseded
+        .keys()
+        .copied()
+        .chain(head.tombstoned.iter().copied())
+        .collect();
+    manifest_segments
+        .iter()
+        .chain(head.added.iter())
+        .copied()
+        .filter(|u| !exclude.contains(u))
+        .collect()
 }
 
 /// Resolve the live segment set for `vol` from S3: read the latest
@@ -306,23 +340,38 @@ pub async fn resolve_live_segments(
     manifest_verifying_key: &VerifyingKey,
 ) -> Result<BTreeSet<Ulid>, ResolveError> {
     let vol_id = vol.to_string();
-    let manifest_segments = read_manifest_segments(store, &vol_id, manifest_verifying_key).await?;
+    // LATEST first — its result decides whether to fetch a manifest
+    // at all. The manifest body GET and the HEAD GET are independent
+    // once we know the snap ulid, so issue them concurrently and pay
+    // one round-trip instead of two.
+    let snap_ulid = match upload::read_latest_snapshot(store, &vol_id).await {
+        Ok(opt) => opt,
+        Err(e) => return Err(ResolveError::Latest(e.to_string())),
+    };
+    let manifest_segments = match snap_ulid {
+        Some(snap) => {
+            let manifest_fut =
+                fetch_and_parse_manifest(store, &vol_id, snap, manifest_verifying_key);
+            let head_fut = read_head(store, vol);
+            let (manifest_res, head_res) = futures::join!(manifest_fut, head_fut);
+            let head = head_res.map_err(|e| ResolveError::Head(e.to_string()))?;
+            let manifest = manifest_res?;
+            return Ok(live_set(&manifest, &head));
+        }
+        None => BTreeSet::new(),
+    };
     let head = read_head(store, vol)
         .await
         .map_err(|e| ResolveError::Head(e.to_string()))?;
     Ok(live_set(&manifest_segments, &head))
 }
 
-async fn read_manifest_segments(
+async fn fetch_and_parse_manifest(
     store: &Arc<dyn ObjectStore>,
     vol_id: &str,
+    snap_ulid: Ulid,
     manifest_verifying_key: &VerifyingKey,
 ) -> Result<BTreeSet<Ulid>, ResolveError> {
-    let snap_ulid = match upload::read_latest_snapshot(store, vol_id).await {
-        Ok(Some(u)) => u,
-        Ok(None) => return Ok(BTreeSet::new()),
-        Err(e) => return Err(ResolveError::Latest(e.to_string())),
-    };
     let key = upload::snapshot_manifest_key(vol_id, snap_ulid);
     let bytes = match store.get(&key).await {
         Ok(g) => g
