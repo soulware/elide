@@ -196,7 +196,7 @@ pub(crate) async fn stop_volume_op(
 pub(crate) async fn force_release_volume_op(
     volume_name: &str,
     data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> Result<ReleaseReply, IpcError> {
     use elide_coordinator::lifecycle;
@@ -213,10 +213,23 @@ pub(crate) async fn force_release_volume_op(
         )));
     }
 
+    // Two credentials are involved. Operations on `names/<name>` and
+    // `events/<name>/` (the name-flip CAS, the journal entry, the
+    // initial record read) ride the coordinator-wide `coord-writer`
+    // credential. Operations on `by_id/<dead_vol>/` (volume.pub,
+    // LATEST, manifest, HEAD, segments, the synthesised manifest
+    // write) ride a per-volume `coord-data` credential minted
+    // specifically for `dead_vol_ulid` — `coord-writer` has no
+    // access to `by_id/` at all (see `mint/examples/elide_roles/`).
+    // Both creds are mintable by this coordinator for any vol_ulid;
+    // there is no ownership check at mint time, by design for the
+    // recovery path.
+    let writer = stores.writer();
+
     // Read the current record to learn which dead fork to recover from.
     let dead_vol_ulid = {
         use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
-        let (position, _) = fetch_position(store, volume_name, identity.coordinator_id_str())
+        let (position, _) = fetch_position(&writer, volume_name, identity.coordinator_id_str())
             .await
             .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
         match position {
@@ -236,6 +249,10 @@ pub(crate) async fn force_release_volume_op(
         }
     };
 
+    // Mint the per-volume credential now that we know `dead_vol_ulid`.
+    // All by_id/<dead_vol>/* ops below ride this store.
+    let dead_store = stores.data_for_volume(&dead_vol_ulid);
+
     // Recovery pipeline: fetch dead fork's pubkey, then either
     // promote an existing stop-snapshot (fast path) or synthesise a
     // fresh handoff manifest from S3-visible segments (slow path).
@@ -245,7 +262,7 @@ pub(crate) async fn force_release_volume_op(
     // segment could have been signed-and-verified under a missing key,
     // so the dead fork is provably empty: publish an empty synthesised
     // handoff and flip to Released.
-    let dead_pub = recovery::fetch_volume_pub_optional(store, dead_vol_ulid)
+    let dead_pub = recovery::fetch_volume_pub_optional(&dead_store, dead_vol_ulid)
         .await
         .map_err(|e| {
             IpcError::store(format!(
@@ -261,7 +278,7 @@ pub(crate) async fn force_release_volume_op(
     // the dead fork's `volume.pub`, same as any user snapshot.
     if let Some(dead_pub_ref) = dead_pub.as_ref() {
         match recovery::try_promote_stop_snapshot_for_force_release(
-            store,
+            &dead_store,
             dead_vol_ulid,
             dead_pub_ref,
         )
@@ -275,11 +292,11 @@ pub(crate) async fn force_release_volume_op(
                     promoted.snap_ulid
                 );
                 let outcome =
-                    lifecycle::mark_released_force(store, volume_name, promoted.snap_ulid).await;
+                    lifecycle::mark_released_force(&writer, volume_name, promoted.snap_ulid).await;
                 return finalize_force_release(
                     volume_name,
                     data_dir,
-                    store,
+                    &writer,
                     identity,
                     promoted.snap_ulid,
                     outcome,
@@ -298,13 +315,14 @@ pub(crate) async fn force_release_volume_op(
 
     let segment_ulids: Vec<ulid::Ulid> = match dead_pub {
         Some(dead_pub) => {
-            let recovered = recovery::list_and_verify_segments(store, dead_vol_ulid, &dead_pub)
-                .await
-                .map_err(|e| {
-                    IpcError::store(format!(
-                        "listing/verifying segments for released fork {dead_vol_ulid}: {e:#}"
-                    ))
-                })?;
+            let recovered =
+                recovery::list_and_verify_segments(&dead_store, dead_vol_ulid, &dead_pub)
+                    .await
+                    .map_err(|e| {
+                        IpcError::store(format!(
+                            "listing/verifying segments for released fork {dead_vol_ulid}: {e:#}"
+                        ))
+                    })?;
             let ulids: Vec<ulid::Ulid> =
                 recovered.segments.iter().map(|s| s.segment_ulid).collect();
             info!(
@@ -326,7 +344,7 @@ pub(crate) async fn force_release_volume_op(
     };
 
     let published = recovery::mint_and_publish_synthesised_snapshot(
-        store,
+        &dead_store,
         dead_vol_ulid,
         &segment_ulids,
         identity.as_ref(),
@@ -336,11 +354,11 @@ pub(crate) async fn force_release_volume_op(
     .map_err(|e| IpcError::store(format!("publishing synthesised snapshot: {e}")))?;
 
     // Unconditional flip of names/<name>.
-    let outcome = lifecycle::mark_released_force(store, volume_name, published.snap_ulid).await;
+    let outcome = lifecycle::mark_released_force(&writer, volume_name, published.snap_ulid).await;
     finalize_force_release(
         volume_name,
         data_dir,
-        store,
+        &writer,
         identity,
         published.snap_ulid,
         outcome,
@@ -1559,6 +1577,7 @@ mod tests {
 
     use elide_coordinator::identity::CoordinatorIdentity;
     use elide_coordinator::name_store as ns;
+    use elide_coordinator::stores::{PassthroughStores, ScopedStores};
     use elide_core::name_record::{NameRecord, NameState};
     use elide_core::segment::{SegmentEntry, SegmentFlags, SegmentSigner, write_segment};
     use elide_core::signing::generate_ephemeral_signer;
@@ -1567,6 +1586,15 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Wrap a single in-memory `ObjectStore` in `PassthroughStores`
+    /// so test callers can pass it as `&Arc<dyn ScopedStores>` to
+    /// `force_release_volume_op`. Both sides see the same bucket
+    /// bytes, matching the local-store / no-`[mint]` deployment
+    /// where every role resolves to the same underlying store.
+    fn scoped(store: &Arc<dyn ObjectStore>) -> Arc<dyn ScopedStores> {
+        Arc::new(PassthroughStores::new(Arc::clone(store)))
     }
 
     /// Upload a `volume.pub` for the dead fork at the canonical path.
@@ -1670,10 +1698,14 @@ mod tests {
     async fn force_release_op_overwrites_live_to_released() {
         let (store, identity, dead_vol, _seg, _td) = force_release_fixture("vol").await;
 
-        let reply =
-            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
-                .await
-                .expect("force-release should succeed");
+        let reply = force_release_volume_op(
+            "vol",
+            TempDir::new().unwrap().path(),
+            &scoped(&store),
+            &identity,
+        )
+        .await
+        .expect("force-release should succeed");
         let snap_ulid = reply.handoff_snapshot;
 
         // names/<vol> is now Released, references the dead fork.
@@ -1709,9 +1741,14 @@ mod tests {
             .await
             .unwrap();
 
-        let err = force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
-            .await
-            .expect_err("already-released record must refuse");
+        let err = force_release_volume_op(
+            "vol",
+            TempDir::new().unwrap().path(),
+            &scoped(&store),
+            &identity,
+        )
+        .await
+        .expect_err("already-released record must refuse");
         assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::Conflict);
         assert!(
             err.message
@@ -1727,10 +1764,14 @@ mod tests {
         let coord_dir = TempDir::new().unwrap();
         let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
 
-        let err =
-            force_release_volume_op("ghost", TempDir::new().unwrap().path(), &store, &identity)
-                .await
-                .expect_err("ghost name must error");
+        let err = force_release_volume_op(
+            "ghost",
+            TempDir::new().unwrap().path(),
+            &scoped(&store),
+            &identity,
+        )
+        .await
+        .expect_err("ghost name must error");
         assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::NotFound);
         assert!(err.message.contains("no S3 record"), "{}", err.message);
     }
@@ -1752,10 +1793,14 @@ mod tests {
         let coord_dir = TempDir::new().unwrap();
         let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
 
-        let reply =
-            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
-                .await
-                .expect("force-release on missing-pub fork should succeed");
+        let reply = force_release_volume_op(
+            "vol",
+            TempDir::new().unwrap().path(),
+            &scoped(&store),
+            &identity,
+        )
+        .await
+        .expect("force-release on missing-pub fork should succeed");
         let snap_ulid = reply.handoff_snapshot;
 
         let (rec, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
@@ -1829,10 +1874,14 @@ mod tests {
         let coord_dir = TempDir::new().unwrap();
         let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
 
-        let reply =
-            force_release_volume_op("vol", TempDir::new().unwrap().path(), &store, &identity)
-                .await
-                .expect("force-release with one tampered segment must still succeed");
+        let reply = force_release_volume_op(
+            "vol",
+            TempDir::new().unwrap().path(),
+            &scoped(&store),
+            &identity,
+        )
+        .await
+        .expect("force-release with one tampered segment must still succeed");
         let snap_str = reply.handoff_snapshot.to_string();
 
         // Verify the synthesised manifest contains exactly one segment ULID
