@@ -32,8 +32,8 @@ pub trait ScopedStores {
 the surface reduction). `writer` and `data_for_volume` keep the full
 `object_store::ObjectStore` surface. The consequences:
 
-- **221 `Arc<dyn ObjectStore>` occurrences across 23 files in
-  `elide-coordinator/src/`** (top offenders: `recovery.rs` 35,
+- **215 `Arc<dyn ObjectStore>` occurrences across 23 files in
+  `elide-coordinator/src/`** (top offenders: `recovery.rs` 28,
   `inbound/lifecycle.rs` 26, `prefetch.rs` 17, `upload.rs` 15,
   `segment_head.rs` 14, `stores.rs` 13, `inbound/mod.rs` 13).
   Every helper takes `&Arc<dyn ObjectStore>` as a parameter, so any
@@ -179,15 +179,16 @@ computed inside the handle from the `Ulid` timestamp.
 | Delete | `delete` | `delete(SnapshotId)` |
 | Read LATEST pointer | `GET snapshots/LATEST` | `read_latest() -> Option<LatestPointer>` |
 | CAS LATEST pointer | conditional `PUT` | `advance_latest(prev, new) -> Result<LatestPointer, LatestConflict>` |
-| List under prefix | LIST `snapshots/` *(offline reconcile only)* | **not exposed** |
+| List under prefix | *(none in runtime)* | **not exposed** |
 
-LIST has no domain shape because LIST has no domain meaning — every
-runtime LIST that survives is the same offline-rebuild operator path
-described in `list-elimination-plan.md` § *Reconcile*. That path
-takes a separate elevated-credential handle, not this one. (Today
-`inbound/lifecycle.rs` still LISTs snapshots to delete the set — that
-call is in scope for replacement via the per-vol HEAD object before
-the typed surface lands, or moves under the reconcile handle.)
+LIST has no domain shape because LIST has no domain meaning at
+runtime. The `s3:ListBucket` grant left `coord-writer`'s policy in
+P5 of `list-elimination-plan.md` (PR #406); every per-volume and
+per-name prefix LIST was replaced by a deterministic GET against a
+maintained pointer or HEAD object. The only remaining LIST use case
+is the offline-rebuild operator path described in
+`list-elimination-plan.md` § *Reconcile*, which takes a separate
+elevated-credential handle, not this one.
 
 ### `VolumeData::retention()` (`coord-data`, `by_id/<vol>/retention/`)
 
@@ -368,12 +369,6 @@ that *some* `PreconditionFailed` happens.
 
 ## Open questions
 
-- **Where does `inbound/lifecycle.rs:777,1502` LIST land?** Today
-  these LIST `by_id/<vol>/snapshots/` for cleanup. They have to
-  either move under the per-vol HEAD object (extending its scope to
-  also enumerate snapshot ULIDs — a doc-level decision in
-  `design-segment-index.md`), or under the offline-reconcile handle.
-  Probably the former; this design assumes that.
 - **`peer_verifier_store()` escape hatch lifetime.** Currently a
   cross-crate workaround. Removing it requires either letting
   `elide-peer-fetch` depend on `DomainStores`, or vending the
