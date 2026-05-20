@@ -128,7 +128,7 @@ pub fn peer_fetch_handle() -> Option<&'static PeerFetchHandle> {
 pub async fn run_volume_tasks(
     fork_dir: PathBuf,
     store: Arc<dyn ObjectStore>,
-    journal: Arc<dyn crate::event_journal::EventJournal>,
+    journal: Arc<dyn crate::event_journal::EventJournalReader>,
     drain_interval: Duration,
     gc_config: GcConfig,
     mut evict_rx: mpsc::Receiver<(Option<String>, EvictReply)>,

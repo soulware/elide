@@ -32,7 +32,7 @@ use elide_peer_fetch::PeerEndpoint;
 use object_store::ObjectStore;
 use tracing::debug;
 
-use crate::event_journal::{self, EventJournal, verify_event_signature};
+use crate::event_journal::{self, EventJournalReader, verify_event_signature};
 use crate::identity;
 use crate::ipc::SignatureStatus;
 
@@ -140,7 +140,7 @@ async fn find_releaser(
 /// out of scope for v1).
 pub async fn discover_peer_for_claim(
     store: &Arc<dyn ObjectStore>,
-    journal: &dyn EventJournal,
+    journal: &dyn EventJournalReader,
     volume_name: &str,
 ) -> Option<DiscoveredPeer> {
     // Read the `events/<name>/HEAD` window in a single GET — no LIST.
@@ -207,11 +207,11 @@ pub async fn discover_peer_for_claim(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_journal::BucketEventJournal;
+    use crate::event_journal::{BucketEventJournal, EventJournal};
     use crate::identity::CoordinatorIdentity;
 
     fn journal_for(store: &Arc<dyn ObjectStore>) -> BucketEventJournal {
-        BucketEventJournal::new(Arc::clone(store))
+        BucketEventJournal::new(Arc::clone(store), Arc::clone(store))
     }
     use elide_core::volume_event::EventKind;
     use object_store::memory::InMemory;

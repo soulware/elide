@@ -697,7 +697,7 @@ impl ClaimOrchestrator {
         // and coordinators/<other>/peer-endpoint.toml — all RO and all cross-
         // coordinator, so the correct credential is coord-base.
         let store_base = self.ctx.core.stores.peer_verifier_store();
-        let journal = self.ctx.core.stores.event_journal();
+        let journal = self.ctx.core.stores.event_journal_ro();
         if let Some(discovered) = elide_coordinator::peer_discovery::discover_peer_for_claim(
             &store_base,
             journal.as_ref(),

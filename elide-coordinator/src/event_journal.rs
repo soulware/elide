@@ -191,13 +191,21 @@ impl From<ConditionalPutError> for EventError {
     }
 }
 
-/// Per-name append-only event log. The trait deliberately omits any
-/// `delete` operation: the `events/` append-only invariant becomes a
-/// type-level property.
+/// Read-only view over the per-name event log. Split out from
+/// [`EventJournal`] so a pure-read call site (`volume events` IPC,
+/// peer-discovery, the per-volume task's claim-handoff lookup) can
+/// take `&dyn EventJournalReader` and **cannot** call `emit` at
+/// compile time. The split mirrors [`crate::stores::ReadStore`] vs
+/// `ObjectStore`: credential scope becomes type scope.
 ///
-/// Acquired via [`crate::stores::ScopedStores::event_journal`].
+/// Backed by the `coord-base` role — reads on `events/*` and on
+/// `coordinators/<other>/*` (the latter is what `list_and_verify`
+/// needs for cross-coordinator pubkey resolution; `coord-writer`'s
+/// policy does not grant it).
+///
+/// Acquired via [`crate::stores::ScopedStores::event_journal_ro`].
 #[async_trait]
-pub trait EventJournal: Send + Sync {
+pub trait EventJournalReader: Send + Sync {
     /// GET `events/<name>/HEAD`. `Ok(None)` means the object is absent
     /// — a genuinely empty log (first event for this name). A
     /// transient store error is propagated, **not** mapped to `None`.
@@ -206,9 +214,39 @@ pub trait EventJournal: Send + Sync {
         name: &str,
     ) -> Result<Option<(EventHead, EventHeadToken)>, EventError>;
 
+    /// Up to `limit` most-recent events for `name`, newest-first.
+    /// Served from the HEAD window in a single GET when possible;
+    /// otherwise walks the `prev_event_ulid` back-link chain.
+    async fn recent(&self, name: &str, limit: usize) -> Result<Vec<VolumeEvent>, EventError>;
+
+    /// Read the `limit` most-recent events ordered chronologically
+    /// (ascending `event_ulid`) and pair each with a
+    /// [`SignatureStatus`].
+    async fn list_and_verify(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<VolumeEventEntry>, EventError>;
+}
+
+/// Per-name append-only event log. The trait deliberately omits any
+/// `delete` operation: the `events/` append-only invariant becomes a
+/// type-level property.
+///
+/// Extends [`EventJournalReader`] with the mutating [`Self::emit`].
+/// Backed by both `coord-writer` (for the emit CAS, which runs wholly
+/// on one credential per `docs/design-mint.md`) and `coord-base` (for
+/// the inherited read methods, which need cross-coord pubkey reads
+/// for verify).
+///
+/// Acquired via [`crate::stores::ScopedStores::event_journal`].
+#[async_trait]
+pub trait EventJournal: EventJournalReader {
     /// Mint a fresh event, sign it with `identity`, and append it.
     /// Holds the in-process per-name emit lock for the duration of
-    /// the read-modify-write.
+    /// the read-modify-write. The whole CAS (HEAD GET → HEAD PUT →
+    /// record PUT) runs on the `coord-writer` credential — never
+    /// split mid-mutation.
     async fn emit(
         &self,
         identity: &CoordinatorIdentity,
@@ -233,32 +271,31 @@ pub trait EventJournal: Send + Sync {
             warn!("[event-journal] failed to emit {kind_str} event for {name}: {e}");
         }
     }
-
-    /// Up to `limit` most-recent events for `name`, newest-first.
-    /// Served from the HEAD window in a single GET when possible;
-    /// otherwise walks the `prev_event_ulid` back-link chain.
-    async fn recent(&self, name: &str, limit: usize) -> Result<Vec<VolumeEvent>, EventError>;
-
-    /// Read the `limit` most-recent events ordered chronologically
-    /// (ascending `event_ulid`) and pair each with a
-    /// [`SignatureStatus`].
-    async fn list_and_verify(
-        &self,
-        name: &str,
-        limit: usize,
-    ) -> Result<Vec<VolumeEventEntry>, EventError>;
 }
 
-/// `EventJournal` backed by an `Arc<dyn ObjectStore>` writer handle
-/// (the `coord-writer` role). One per [`crate::stores::ScopedStores`]
-/// instance.
+/// Read-only `EventJournalReader` over a `coord-base`-scoped store.
+/// Constructed by [`crate::stores::ScopedStores::event_journal_ro`].
+pub struct ReadOnlyEventJournal {
+    reader: Arc<dyn ObjectStore>,
+}
+
+impl ReadOnlyEventJournal {
+    pub fn new(reader: Arc<dyn ObjectStore>) -> Self {
+        Self { reader }
+    }
+}
+
+/// Full `EventJournal` impl. Holds two credential-scoped store
+/// handles: `writer` (`coord-writer`) for the emit CAS, and `reader`
+/// (`coord-base`) for read methods + signature-verify pubkey reads.
 pub struct BucketEventJournal {
-    store: Arc<dyn ObjectStore>,
+    writer: Arc<dyn ObjectStore>,
+    reader: Arc<dyn ObjectStore>,
 }
 
 impl BucketEventJournal {
-    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+    pub fn new(writer: Arc<dyn ObjectStore>, reader: Arc<dyn ObjectStore>) -> Self {
+        Self { writer, reader }
     }
 }
 
@@ -325,33 +362,167 @@ async fn append_record(
     Ok(())
 }
 
+async fn read_head_via(
+    store: &dyn ObjectStore,
+    name: &str,
+) -> Result<Option<(EventHead, EventHeadToken)>, EventError> {
+    let key = head_key(name);
+    let got = match store.get(&key).await {
+        Ok(g) => g,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(EventError::Store(e)),
+    };
+    let version = UpdateVersion {
+        e_tag: got.meta.e_tag.clone(),
+        version: got.meta.version.clone(),
+    };
+    let bytes = got.bytes().await.map_err(EventError::Store)?;
+    let text = std::str::from_utf8(&bytes).map_err(|e| {
+        EventError::Store(object_store::Error::Generic {
+            store: "events",
+            source: format!("HEAD not utf-8: {e}").into(),
+        })
+    })?;
+    let head: EventHead = toml::from_str(text).map_err(EventError::ParseHead)?;
+    Ok(Some((head, EventHeadToken { version })))
+}
+
+async fn recent_via(
+    store: &dyn ObjectStore,
+    name: &str,
+    limit: usize,
+) -> Result<Vec<VolumeEvent>, EventError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let Some((head, _tok)) = read_head_via(store, name).await? else {
+        return Ok(Vec::new());
+    };
+    let mut events = head.events;
+    if events.len() >= limit {
+        events.truncate(limit);
+        return Ok(events);
+    }
+    if events.len() < HEAD_WINDOW {
+        return Ok(events);
+    }
+    let mut prev = events.last().and_then(|e| e.prev_event_ulid);
+    while events.len() < limit {
+        let Some(p) = prev else { break };
+        let key = event_key(name, p);
+        let got = match store.get(&key).await {
+            Ok(g) => g,
+            Err(object_store::Error::NotFound { .. }) => {
+                debug!("[event-journal] {key} missing (phantom back-link); stop walk");
+                break;
+            }
+            Err(e) => return Err(EventError::Store(e)),
+        };
+        let bytes = got.bytes().await.map_err(EventError::Store)?;
+        let event = match std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|t| VolumeEvent::from_toml(t).ok())
+        {
+            Some(ev) => ev,
+            None => {
+                debug!("[event-journal] {key} unreadable/corrupt; stop walk");
+                break;
+            }
+        };
+        prev = event.prev_event_ulid;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+async fn list_and_verify_via(
+    store: &dyn ObjectStore,
+    name: &str,
+    limit: usize,
+) -> Result<Vec<VolumeEventEntry>, EventError> {
+    let mut events = recent_via(store, name, limit).await?;
+    events.reverse();
+
+    let mut keys: HashMap<String, Option<VerifyingKey>> = HashMap::new();
+    let mut key_failures: HashMap<String, String> = HashMap::new();
+
+    let mut entries = Vec::with_capacity(events.len());
+    for event in events {
+        let coord_id = event.coordinator_id.clone();
+        if !keys.contains_key(&coord_id) {
+            match identity::fetch_coordinator_pub(store, &coord_id).await {
+                Ok(vk) => {
+                    keys.insert(coord_id.clone(), Some(vk));
+                }
+                Err(e) => {
+                    key_failures.insert(coord_id.clone(), format!("{e}"));
+                    keys.insert(coord_id.clone(), None);
+                }
+            }
+        }
+        let status = match keys.get(&coord_id).and_then(|opt| opt.as_ref()) {
+            Some(vk) => verify_event_signature(&event, vk),
+            None => SignatureStatus::KeyUnavailable {
+                reason: key_failures
+                    .get(&coord_id)
+                    .cloned()
+                    .unwrap_or_else(|| "pubkey unavailable".to_string()),
+            },
+        };
+        entries.push(VolumeEventEntry {
+            event,
+            signature_status: status,
+        });
+    }
+    Ok(entries)
+}
+
 #[async_trait]
-impl EventJournal for BucketEventJournal {
+impl EventJournalReader for ReadOnlyEventJournal {
     async fn read_head(
         &self,
         name: &str,
     ) -> Result<Option<(EventHead, EventHeadToken)>, EventError> {
-        let key = head_key(name);
-        let got = match self.store.get(&key).await {
-            Ok(g) => g,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(EventError::Store(e)),
-        };
-        let version = UpdateVersion {
-            e_tag: got.meta.e_tag.clone(),
-            version: got.meta.version.clone(),
-        };
-        let bytes = got.bytes().await.map_err(EventError::Store)?;
-        let text = std::str::from_utf8(&bytes).map_err(|e| {
-            EventError::Store(object_store::Error::Generic {
-                store: "events",
-                source: format!("HEAD not utf-8: {e}").into(),
-            })
-        })?;
-        let head: EventHead = toml::from_str(text).map_err(EventError::ParseHead)?;
-        Ok(Some((head, EventHeadToken { version })))
+        read_head_via(self.reader.as_ref(), name).await
     }
 
+    async fn recent(&self, name: &str, limit: usize) -> Result<Vec<VolumeEvent>, EventError> {
+        recent_via(self.reader.as_ref(), name, limit).await
+    }
+
+    async fn list_and_verify(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<VolumeEventEntry>, EventError> {
+        list_and_verify_via(self.reader.as_ref(), name, limit).await
+    }
+}
+
+#[async_trait]
+impl EventJournalReader for BucketEventJournal {
+    async fn read_head(
+        &self,
+        name: &str,
+    ) -> Result<Option<(EventHead, EventHeadToken)>, EventError> {
+        read_head_via(self.reader.as_ref(), name).await
+    }
+
+    async fn recent(&self, name: &str, limit: usize) -> Result<Vec<VolumeEvent>, EventError> {
+        recent_via(self.reader.as_ref(), name, limit).await
+    }
+
+    async fn list_and_verify(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<VolumeEventEntry>, EventError> {
+        list_and_verify_via(self.reader.as_ref(), name, limit).await
+    }
+}
+
+#[async_trait]
+impl EventJournal for BucketEventJournal {
     async fn emit(
         &self,
         identity: &CoordinatorIdentity,
@@ -362,7 +533,10 @@ impl EventJournal for BucketEventJournal {
         let lock = name_emit_lock(name);
         let _guard = lock.lock().await;
 
-        let head = self.read_head(name).await?;
+        // CAS runs wholly on coord-writer: the design-mint rule is that
+        // a mutation path uses one credential end-to-end, including the
+        // reads that are part of the mutation.
+        let head = read_head_via(self.writer.as_ref(), name).await?;
         let (prev_head, expected) = match head {
             Some((h, tok)) => (Some(h), Some(tok.version)),
             None => (None, None),
@@ -390,95 +564,9 @@ impl EventJournal for BucketEventJournal {
 
         let new_head = prev_head.unwrap_or_default().pushed(event.clone());
         let is_force = matches!(event.kind, EventKind::ForceReleased { .. });
-        write_head(self.store.as_ref(), name, &new_head, expected, is_force).await?;
-        append_record(self.store.as_ref(), name, &event).await?;
+        write_head(self.writer.as_ref(), name, &new_head, expected, is_force).await?;
+        append_record(self.writer.as_ref(), name, &event).await?;
         Ok(event)
-    }
-
-    async fn recent(&self, name: &str, limit: usize) -> Result<Vec<VolumeEvent>, EventError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let Some((head, _tok)) = self.read_head(name).await? else {
-            return Ok(Vec::new());
-        };
-        let mut events = head.events;
-        if events.len() >= limit {
-            events.truncate(limit);
-            return Ok(events);
-        }
-        if events.len() < HEAD_WINDOW {
-            return Ok(events);
-        }
-        let mut prev = events.last().and_then(|e| e.prev_event_ulid);
-        while events.len() < limit {
-            let Some(p) = prev else { break };
-            let key = event_key(name, p);
-            let got = match self.store.get(&key).await {
-                Ok(g) => g,
-                Err(object_store::Error::NotFound { .. }) => {
-                    debug!("[event-journal] {key} missing (phantom back-link); stop walk");
-                    break;
-                }
-                Err(e) => return Err(EventError::Store(e)),
-            };
-            let bytes = got.bytes().await.map_err(EventError::Store)?;
-            let event = match std::str::from_utf8(&bytes)
-                .ok()
-                .and_then(|t| VolumeEvent::from_toml(t).ok())
-            {
-                Some(ev) => ev,
-                None => {
-                    debug!("[event-journal] {key} unreadable/corrupt; stop walk");
-                    break;
-                }
-            };
-            prev = event.prev_event_ulid;
-            events.push(event);
-        }
-        Ok(events)
-    }
-
-    async fn list_and_verify(
-        &self,
-        name: &str,
-        limit: usize,
-    ) -> Result<Vec<VolumeEventEntry>, EventError> {
-        let mut events = self.recent(name, limit).await?;
-        events.reverse();
-
-        let mut keys: HashMap<String, Option<VerifyingKey>> = HashMap::new();
-        let mut key_failures: HashMap<String, String> = HashMap::new();
-
-        let mut entries = Vec::with_capacity(events.len());
-        for event in events {
-            let coord_id = event.coordinator_id.clone();
-            if !keys.contains_key(&coord_id) {
-                match identity::fetch_coordinator_pub(self.store.as_ref(), &coord_id).await {
-                    Ok(vk) => {
-                        keys.insert(coord_id.clone(), Some(vk));
-                    }
-                    Err(e) => {
-                        key_failures.insert(coord_id.clone(), format!("{e}"));
-                        keys.insert(coord_id.clone(), None);
-                    }
-                }
-            }
-            let status = match keys.get(&coord_id).and_then(|opt| opt.as_ref()) {
-                Some(vk) => verify_event_signature(&event, vk),
-                None => SignatureStatus::KeyUnavailable {
-                    reason: key_failures
-                        .get(&coord_id)
-                        .cloned()
-                        .unwrap_or_else(|| "pubkey unavailable".to_string()),
-                },
-            };
-            entries.push(VolumeEventEntry {
-                event,
-                signature_status: status,
-            });
-        }
-        Ok(entries)
     }
 }
 
@@ -526,8 +614,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn journal() -> (Arc<dyn ObjectStore>, BucketEventJournal) {
+        // Tests use a single in-memory store for both writer and
+        // reader — the credential fan-out is a deployment concern, not
+        // a behavioural one.
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let j = BucketEventJournal::new(Arc::clone(&store));
+        let j = BucketEventJournal::new(Arc::clone(&store), Arc::clone(&store));
         (store, j)
     }
 
