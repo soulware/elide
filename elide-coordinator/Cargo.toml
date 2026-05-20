@@ -73,7 +73,3 @@ tempfile    = "3"
 [[test]]
 name = "gc_proptest"
 required-features = ["proptest"]
-
-[[test]]
-name = "retention_marker_proptest"
-required-features = ["proptest"]
