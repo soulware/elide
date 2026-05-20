@@ -72,9 +72,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use object_store::ObjectStore;
-use object_store::path::Path as StorePath;
 use ulid::Ulid;
 
 use elide_core::extentindex::{self, ExtentIndex, SegmentPresence};
@@ -84,7 +82,6 @@ use elide_core::segment::{self, EntryKind, SegmentEntry};
 use elide_core::volume::latest_snapshot;
 
 use crate::config::GcConfig;
-use crate::retention::{marker_key, render_marker};
 
 /// Maximum total live bytes included in one small-segment sweep pass.
 /// Matches the volume's FLUSH_THRESHOLD to keep output segment size bounded.
@@ -570,16 +567,12 @@ fn select_buckets(
 /// treated as success; `finalize_gc_handoff` is a no-op if the bare file is
 /// already gone).
 ///
-/// Each successful handoff writes a retention marker at
-/// `retention/<gc_output_ulid>` listing the consumed input ULIDs. The
-/// coordinator's reaper deletes those inputs from S3 after the
-/// configured retention window — see `crate::reaper` and
-/// `docs/design-replica-model.md`.
-///
 /// Returns one [`HandoffOutcome`] per handoff completed end-to-end this
 /// tick — the orchestrator feeds these into the per-volume HEAD's
 /// `Added` (the output ULID) and `Superseded` (input → output edges)
-/// per `docs/design-segment-index.md`. Handoffs that deferred (volume
+/// per `docs/design-segment-index.md`. The folded reap step in the
+/// same tick loop later DELETEs the consumed inputs once
+/// `since + retention_window` elapses. Handoffs that deferred (volume
 /// not running) are absent from the returned vec and retried next tick.
 pub async fn apply_done_handoffs(
     fork_dir: &Path,
@@ -596,18 +589,14 @@ pub async fn apply_done_handoffs(
         return Ok(Vec::new());
     }
 
-    // Load vk + parse volume_ulid once. Both are needed by every iteration;
-    // the original loop reloaded vk per file, but we've already gated on a
-    // non-empty bare set, so volume.pub must exist.
+    // Load vk once; the original loop reloaded it per file, but we've
+    // already gated on a non-empty bare set, so volume.pub must exist.
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .context("loading volume verifying key")?;
-    let volume_ulid = Ulid::from_string(volume_id)
-        .map_err(|e| anyhow::anyhow!("invalid volume_id '{volume_id}': {e}"))?;
     let cursor = HandoffCursor {
         fork_dir,
         cache_dir: fork_dir.join("cache"),
-        volume_ulid,
         vk,
         uploader: crate::upload::SegmentUploader { volume_id, store },
     };
@@ -670,14 +659,13 @@ fn collect_bare_handoffs(gc_dir: &Path) -> Result<Vec<fs::DirEntry>> {
 struct HandoffCursor<'a> {
     fork_dir: &'a Path,
     cache_dir: std::path::PathBuf,
-    volume_ulid: Ulid,
     vk: elide_core::signing::VerifyingKey,
     uploader: crate::upload::SegmentUploader<'a>,
 }
 
 impl HandoffCursor<'_> {
-    /// Run upload → promote → marker → input-cache cleanup → finalize for
-    /// one bare `gc/<name>` file. Returns `Some(outcome)` if the handoff
+    /// Run upload → promote → input-cache cleanup → finalize for one
+    /// bare `gc/<name>` file. Returns `Some(outcome)` if the handoff
     /// completed end-to-end; `None` if a step deferred (volume not
     /// running) — the next tick retries idempotently.
     async fn process_one(&self, name: &str, gc_body: &Path) -> Result<Option<HandoffOutcome>> {
@@ -715,22 +703,6 @@ impl HandoffCursor<'_> {
             warn!("[gc] promote {new_ulid_str}: volume not running; will retry next tick");
             return Ok(None);
         }
-
-        // Write a retention marker at `retention/<gc_output_ulid>` listing
-        // the consumed input ULIDs. The reaper deletes those inputs from
-        // S3 (and the marker) once `ulid_timestamp(<gc_output_ulid>) +
-        // retention_retention` has passed — giving replicas a guaranteed
-        // grace period. See `docs/design-replica-model.md`.
-        //
-        // Idempotency: the marker key is the GC output ULID, so re-running
-        // this loop after a crash re-PUTs the same key with the same body.
-        let body = render_marker(&inputs);
-        let key: StorePath = marker_key(self.volume_ulid, new_ulid);
-        self.uploader
-            .store
-            .put(&key, Bytes::from(body).into())
-            .await
-            .with_context(|| format!("writing retention marker {new_ulid_str}"))?;
 
         // Drop each consumed input's local cache. Safe here: promote_segment
         // already published cache/<new>.body and index/<new>.idx, and deleted

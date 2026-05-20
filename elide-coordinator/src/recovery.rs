@@ -140,52 +140,54 @@ fn parse_hex_pubkey(hex: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("invalid Ed25519 pubkey: {e}"))
 }
 
-/// List every segment under `by_id/<vol_ulid>/segments/`, verify each
-/// one's signature against `verifying_key`, and return the set of
-/// verified segments sorted by ULID.
+/// Resolve the live segment set for `vol_ulid` from S3 — `manifest ∪
+/// HEAD` per `docs/design-segment-index.md` — verify each one's
+/// signature against `verifying_key`, and return the verified set
+/// sorted by ULID.
+///
+/// Enumeration is LIST-free: at most three GETs (snapshots/LATEST,
+/// the manifest if present, HEAD) plus the per-segment verification
+/// range-fetches. The synthesised handoff this output feeds carries
+/// our (the recovering coordinator's) signature over whatever we
+/// were able to verify — segments missing from S3 or failing the
+/// signature check are dropped, never minted into the manifest.
 ///
 /// Verification is the same as the regular fetch path
 /// (`prefetch::fetch_idx`): two range-GETs per segment (header, then
 /// `[0, body_section_start)`) and a call to
 /// [`elide_core::segment::verify_segment_bytes`]. The body bytes are
-/// not fetched.
-///
-/// Objects whose key doesn't parse as a ULID (e.g. stray `.tmp` files
-/// from interrupted uploads, the `segments/` directory marker on some
-/// backends) are silently skipped — they aren't segment uploads. A
-/// segment-shaped object whose verification fails is dropped with a
-/// `warn!` and counted in `RecoveredSegments::dropped`.
+/// not fetched. A segment whose key resolves but signature check
+/// fails is dropped with a `warn!` and counted in
+/// `RecoveredSegments::dropped`. A 404 on the header range-fetch
+/// (e.g. HEAD names a Superseded edge whose Tombstoned entry has not
+/// yet caught up after a crash) is treated the same — drop it and
+/// continue.
 pub async fn list_and_verify_segments(
     store: &Arc<dyn ObjectStore>,
     vol_ulid: Ulid,
     verifying_key: &VerifyingKey,
 ) -> Result<RecoveredSegments> {
-    let prefix = StorePath::from(format!("by_id/{vol_ulid}/segments/"));
-    let objects: Vec<_> = store
-        .list(Some(&prefix))
-        .try_collect()
+    let vol_id = vol_ulid.to_string();
+    let live = crate::segment_head::resolve_live_segments(store, vol_ulid, verifying_key)
         .await
-        .with_context(|| format!("listing by_id/{vol_ulid}/segments/"))?;
+        .with_context(|| format!("resolving live segments for {vol_ulid}"))?;
 
     let mut out = RecoveredSegments::default();
 
-    for obj in objects {
-        let Some(filename) = obj.location.filename() else {
-            continue;
-        };
-        let Ok(segment_ulid) = Ulid::from_string(filename) else {
-            // Not a segment upload — could be a stray .tmp, a directory
-            // placeholder, or some other artefact. Don't count as a
-            // recovery failure.
-            continue;
-        };
+    for segment_ulid in live {
+        let key = crate::upload::segment_key(&vol_id, segment_ulid);
+        let filename = segment_ulid.to_string();
 
-        match verify_one_segment(store, &obj.location, filename, verifying_key).await {
+        match verify_one_segment(store, &key, &filename, verifying_key).await {
             Ok(()) => {
                 out.segments.push(VerifiedSegment {
                     segment_ulid,
-                    etag: obj.e_tag.clone(),
-                    size: obj.size as u64,
+                    // HEAD-based enumeration doesn't carry etag/size —
+                    // those come from a LIST. Both fields are
+                    // diagnostic-only (the synthesised manifest is
+                    // keyed by ULID).
+                    etag: None,
+                    size: 0,
                 });
             }
             Err(e) => {
@@ -745,9 +747,23 @@ mod tests {
     }
 
     fn segment_key(vol_ulid: Ulid, seg_ulid: Ulid) -> StorePath {
-        // Mirror upload::segment_key without the date sharding (the
-        // recovery code lists the whole segments/ prefix anyway).
-        StorePath::from(format!("by_id/{vol_ulid}/segments/{seg_ulid}"))
+        // Match production: HEAD-driven recovery resolves the segment
+        // key from the ULID via `upload::segment_key`, which date-shards
+        // by the ULID's embedded timestamp.
+        crate::upload::segment_key(&vol_ulid.to_string(), seg_ulid)
+    }
+
+    /// Seed HEAD with the given segment ULIDs in `Added`. HEAD-driven
+    /// recovery enumerates from HEAD ∪ manifest; for tests that don't
+    /// also seed a manifest, the entries here are the entire live set.
+    async fn seed_head_added(store: &Arc<dyn ObjectStore>, vol_ulid: Ulid, segs: &[Ulid]) {
+        let mut head = crate::segment_head::SegmentHead::empty(None);
+        for s in segs {
+            head.added.insert(*s);
+        }
+        crate::segment_head::put_head(store, vol_ulid, &head)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -771,6 +787,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        seed_head_added(&store, vol_ulid, &[s1, s2, s3]).await;
 
         let got = list_and_verify_segments(&store, vol_ulid, &vk)
             .await
@@ -778,9 +795,6 @@ mod tests {
         assert_eq!(got.dropped, 0);
         let ulids: Vec<_> = got.segments.iter().map(|v| v.segment_ulid).collect();
         assert_eq!(ulids, vec![s1, s2, s3]);
-        for v in &got.segments {
-            assert!(v.size > 0, "segment size populated");
-        }
     }
 
     #[tokio::test]
@@ -819,6 +833,7 @@ mod tests {
             .put(&segment_key(vol_ulid, bad_id), PutPayload::from(bad))
             .await
             .unwrap();
+        seed_head_added(&store, vol_ulid, &[good_id, bad_id]).await;
 
         let got = list_and_verify_segments(&store, vol_ulid, &vk)
             .await
@@ -843,43 +858,13 @@ mod tests {
             .put(&segment_key(vol_ulid, bogus_id), PutPayload::from(bogus))
             .await
             .unwrap();
+        seed_head_added(&store, vol_ulid, &[bogus_id]).await;
 
         let got = list_and_verify_segments(&store, vol_ulid, &vk)
             .await
             .unwrap();
         assert_eq!(got.dropped, 1);
         assert!(got.segments.is_empty());
-    }
-
-    #[tokio::test]
-    async fn non_ulid_keys_are_silently_skipped() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let vol_ulid = Ulid::new();
-        let (signer, vk) = make_signer();
-        upload_volume_pub(&store, vol_ulid, &vk).await;
-
-        // A real segment.
-        let seg_id = Ulid::new();
-        let good = build_segment_bytes(signer.as_ref(), vec![seg_entry(0, 1, b"x")]);
-        store
-            .put(&segment_key(vol_ulid, seg_id), PutPayload::from(good))
-            .await
-            .unwrap();
-
-        // A leftover .tmp upload (not a ULID key).
-        let tmp_key = StorePath::from(format!("by_id/{vol_ulid}/segments/{}.tmp", Ulid::new()));
-        store
-            .put(&tmp_key, PutPayload::from(b"partial-upload".as_slice()))
-            .await
-            .unwrap();
-
-        let got = list_and_verify_segments(&store, vol_ulid, &vk)
-            .await
-            .unwrap();
-        // The .tmp object was silently skipped, not counted as dropped.
-        assert_eq!(got.dropped, 0);
-        assert_eq!(got.segments.len(), 1);
-        assert_eq!(got.segments[0].segment_ulid, seg_id);
     }
 
     #[tokio::test]
@@ -909,6 +894,7 @@ mod tests {
             )
             .await
             .unwrap();
+        seed_head_added(&store, vol_ulid, &[good_id, foreign_id]).await;
 
         let got = list_and_verify_segments(&store, vol_ulid, &advertised_vk)
             .await
