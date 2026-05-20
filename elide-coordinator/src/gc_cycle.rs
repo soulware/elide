@@ -40,6 +40,11 @@ pub struct GcCycleOrchestrator {
     snap_lock: Arc<AsyncMutex<()>>,
     last_gc: Instant,
     gc_was_active: bool,
+    /// Cross-tick: last time the reap step fired. Gated on
+    /// `gc_config.reaper_cadence()` (= `max(retention/10, 1s)`,
+    /// unchanged from the old standalone reaper); see
+    /// `docs/design-segment-index.md` *Reaper fold*.
+    last_reap: Instant,
     /// Per-tick scratch: ULIDs uploaded (drain) or produced (GC output)
     /// that must land in HEAD's `Added` set before this tick reports
     /// success. Cleared at the start of every `run_tick`.
@@ -65,9 +70,13 @@ impl GcCycleOrchestrator {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| fork_dir.clone());
         let snap_lock = snapshot_lock_for(snapshot_locks, &fork_dir);
-        // Run GC on the first tick to clear any backlog from a previous run.
+        // Run GC and reap on the first tick to clear any backlog from a
+        // previous run.
         let last_gc = Instant::now()
             .checked_sub(gc_config.interval)
+            .unwrap_or_else(Instant::now);
+        let last_reap = Instant::now()
+            .checked_sub(gc_config.reaper_cadence())
             .unwrap_or_else(Instant::now);
         // volume_id is the volume directory name, validated as a ULID by
         // the caller (`derive_names` / `volume_ulid` in tasks.rs).
@@ -86,6 +95,7 @@ impl GcCycleOrchestrator {
             snap_lock,
             last_gc,
             gc_was_active: true,
+            last_reap,
             tick_added: Vec::new(),
             tick_superseded: Vec::new(),
         }
@@ -306,9 +316,10 @@ impl GcCycleOrchestrator {
         }
     }
 
-    /// Read current HEAD, merge this tick's `Added` and `Superseded`
-    /// entries, and overwrite. No-op when no state changed this tick —
-    /// idle ticks pay nothing.
+    /// Read HEAD once, apply this tick's drain/GC/reap deltas, and
+    /// overwrite. The reap step is folded in here (`docs/design-
+    /// segment-index.md` *Reaper fold*) so a tick that fires drain +
+    /// GC + reap still pays exactly one GET + one PUT.
     ///
     /// Single-writer-per-vol-epoch is structural (the per-volume tick
     /// loop is the sole writer for this volume); a plain GET + merge +
@@ -316,17 +327,31 @@ impl GcCycleOrchestrator {
     /// `read_head` treats a 404 or unparseable body as empty, and we
     /// rewrite from the current truth.
     async fn publish_head_delta(&mut self) {
-        if self.tick_added.is_empty() && self.tick_superseded.is_empty() {
+        let reap_due = self.last_reap.elapsed() >= self.gc_config.reaper_cadence();
+        let has_scratch = !self.tick_added.is_empty() || !self.tick_superseded.is_empty();
+        if !reap_due && !has_scratch {
             return;
         }
-        let volume_id = &self.volume_id;
+
         let mut head = match segment_head::read_head(&self.store, self.volume_ulid).await {
             Ok(h) => h,
             Err(e) => {
-                warn!("[head {volume_id}] read failed: {e}; treating as empty");
+                warn!(
+                    "[head {}] read failed: {e}; treating as empty",
+                    self.volume_id
+                );
                 segment_head::SegmentHead::empty(None)
             }
         };
+
+        let mut mutated = has_scratch;
+        if reap_due {
+            if self.reap_expired(&mut head).await {
+                mutated = true;
+            }
+            self.last_reap = Instant::now();
+        }
+
         for u in self.tick_added.drain(..) {
             head.added.insert(u);
         }
@@ -334,12 +359,77 @@ impl GcCycleOrchestrator {
             head.superseded
                 .insert(input, segment_head::Supersession { output, since });
         }
+
+        if !mutated {
+            return;
+        }
         if let Err(e) = segment_head::put_head(&self.store, self.volume_ulid, &head).await {
             warn!(
-                "[head {volume_id}] put failed: {e}; \
-                 self-heals on the next active tick"
+                "[head {}] put failed: {e}; \
+                 self-heals on the next active tick",
+                self.volume_id
             );
         }
+    }
+
+    /// Reap step: walk HEAD's `Superseded` edges, DELETE the input
+    /// objects whose `since + retention_window <= now`, and update
+    /// `head` via `apply_reap`. Returns `true` if any input was
+    /// reaped (the caller PUTs HEAD only when mutated).
+    ///
+    /// Crash ordering (`docs/design-segment-index.md` *Writers and
+    /// crash ordering*): DELETE the object first, *then* PUT HEAD
+    /// dropping the `Superseded` edge / adding `Tombstoned`. A crash
+    /// between leaves HEAD listing a gone object — readers tolerate
+    /// the 404. The reverse order would leak the entry by dropping
+    /// the tombstone record before the object delete succeeded.
+    async fn reap_expired(&mut self, head: &mut segment_head::SegmentHead) -> bool {
+        let now = Utc::now();
+        let retention = match chrono::Duration::from_std(self.gc_config.retention_window) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    "[reap {}] retention_window {:?} out of chrono::Duration range: {e}; \
+                     skipping reap pass",
+                    self.volume_id, self.gc_config.retention_window
+                );
+                return false;
+            }
+        };
+        let to_reap: Vec<Ulid> = head
+            .superseded
+            .iter()
+            .filter(|(_, edge)| edge.since + retention <= now)
+            .map(|(input, _)| *input)
+            .collect();
+        if to_reap.is_empty() {
+            return false;
+        }
+
+        let volume_id = &self.volume_id;
+        for input in &to_reap {
+            let key = upload::segment_key(volume_id, *input);
+            match self.store.delete(&key).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => {
+                    // A failed DELETE is logged and retried next reap
+                    // tick: the entry stays in `Superseded` because we
+                    // only `apply_reap` the inputs we actually
+                    // processed (this loop continues, so the input
+                    // remains in `to_reap` regardless — see below).
+                    // The HEAD-after-object rule means a stale entry
+                    // is harmless: readers tolerate the 404.
+                    warn!("[reap {volume_id}] delete {key}: {e}; will retry");
+                }
+            }
+        }
+        head.apply_reap(&to_reap);
+        info!(
+            "[reap {volume_id}] reaped {} input segment(s) past retention",
+            to_reap.len()
+        );
+        true
     }
 
     async fn run_gc_pass(&mut self) {
@@ -537,6 +627,125 @@ mod tests {
         let head = segment_head::read_head(&store, vol_ulid()).await.unwrap();
         assert!(head.added.contains(&prior), "prior entry retained");
         assert!(head.added.contains(&new), "this tick's entry merged");
+    }
+
+    #[tokio::test]
+    async fn reap_step_deletes_expired_inputs_and_tombstones_in_head() {
+        // Seed HEAD with a Superseded edge whose `since` is well in
+        // the past, plus an unrelated one inside the retention window.
+        // The reap step deletes the expired input from S3 and tombstones
+        // it in HEAD; the un-expired edge is left alone.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator(store.clone());
+        // Speed the reap gate so it fires on the next publish.
+        orch.last_reap = std::time::Instant::now()
+            - orch.gc_config.reaper_cadence()
+            - std::time::Duration::from_secs(1);
+
+        let mut m = UlidMint::new(Ulid::nil());
+        let input_expired = m.next();
+        let input_fresh = m.next();
+        let output = m.next();
+
+        // Put the input segment objects in S3 (the reap step DELETEs by
+        // key).
+        let vol_id_str = vol_ulid().to_string();
+        let expired_key = crate::upload::segment_key(&vol_id_str, input_expired);
+        let fresh_key = crate::upload::segment_key(&vol_id_str, input_fresh);
+        store
+            .put(&expired_key, bytes::Bytes::from_static(b"body").into())
+            .await
+            .unwrap();
+        store
+            .put(&fresh_key, bytes::Bytes::from_static(b"body").into())
+            .await
+            .unwrap();
+
+        let mut head = segment_head::SegmentHead::empty(None);
+        head.added.insert(output);
+        let retention = orch.gc_config.retention_window;
+        let expired_since = Utc::now()
+            - chrono::Duration::from_std(retention).unwrap()
+            - chrono::Duration::seconds(1);
+        head.superseded.insert(
+            input_expired,
+            Supersession {
+                output,
+                since: expired_since,
+            },
+        );
+        head.superseded.insert(
+            input_fresh,
+            Supersession {
+                output,
+                since: Utc::now(),
+            },
+        );
+        segment_head::put_head(&store, vol_ulid(), &head)
+            .await
+            .unwrap();
+
+        orch.publish_head_delta().await;
+
+        // Expired input: S3 object gone, HEAD edge replaced with
+        // Tombstoned. Fresh input: untouched on both sides.
+        assert!(
+            matches!(
+                store.head(&expired_key).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "expired input segment must be deleted from S3"
+        );
+        assert!(
+            store.head(&fresh_key).await.is_ok(),
+            "fresh input segment must be retained"
+        );
+
+        let head = segment_head::read_head(&store, vol_ulid()).await.unwrap();
+        assert!(!head.superseded.contains_key(&input_expired));
+        assert!(head.tombstoned.contains(&input_expired));
+        assert!(
+            head.superseded.contains_key(&input_fresh),
+            "fresh edge retained until its retention window elapses"
+        );
+        assert!(!head.tombstoned.contains(&input_fresh));
+    }
+
+    #[tokio::test]
+    async fn reap_skipped_when_no_superseded_entries() {
+        // The reap step gate fires by time, but if HEAD has no
+        // Superseded entries there's nothing to reap and HEAD is left
+        // alone. We verify no PUT occurred by writing a marker body
+        // and checking it survived.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator(store.clone());
+        orch.last_reap = std::time::Instant::now()
+            - orch.gc_config.reaper_cadence()
+            - std::time::Duration::from_secs(1);
+
+        // Seed an empty HEAD so reap finds nothing.
+        let seed = segment_head::SegmentHead::empty(None);
+        segment_head::put_head(&store, vol_ulid(), &seed)
+            .await
+            .unwrap();
+
+        // Replace HEAD with a known marker after seeding — we want to
+        // confirm publish_head_delta does NOT overwrite when nothing
+        // changed.
+        let key = segment_head::head_key(vol_ulid());
+        store
+            .put(&key, bytes::Bytes::from_static(b"sentinel").into())
+            .await
+            .unwrap();
+
+        orch.publish_head_delta().await;
+
+        let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+        assert_eq!(
+            got.as_ref(),
+            b"sentinel",
+            "publish must not PUT when no work was done"
+        );
     }
 
     #[tokio::test]

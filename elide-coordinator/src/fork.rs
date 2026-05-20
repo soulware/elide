@@ -584,9 +584,7 @@ async fn force_snapshot_now_op(
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<ForceSnapshotNowReply, IpcError> {
-    use futures::TryStreamExt;
     use object_store::PutPayload;
-    use object_store::path::Path as StorePath;
 
     let volume_id = vol_ulid.to_string();
     let ancestor_dir = data_dir.join("by_id").join(&volume_id);
@@ -642,23 +640,19 @@ async fn force_snapshot_now_op(
     let snap = max_seg.unwrap_or_else(Ulid::new);
     let snap_str = snap.to_string();
 
-    // Step 3: verify pinned segments still present in S3 before
-    // committing to a manifest. We list rather than HEAD-each because a
-    // single LIST is cheaper than N HEADs once there's more than a
-    // handful of pins.
-    let seg_prefix = StorePath::from(format!("by_id/{volume_id}/segments/"));
-    let pinned: std::collections::HashSet<Ulid> = segments.iter().copied().collect();
-    let objects = store
-        .list(Some(&seg_prefix))
-        .try_collect::<Vec<_>>()
+    // Step 3: verify pinned segments are still live before committing
+    // to a manifest. Re-read HEAD (one GET, plus LATEST + manifest
+    // GETs inside the resolver) and check pinned ⊆ live(manifest,
+    // HEAD). A pin missing here means a concurrent owner GC raced us
+    // and either superseded it or the reaper tombstoned it between
+    // Step 1's hydration and this verification.
+    let vol_ulid =
+        Ulid::from_string(&volume_id).map_err(|e| IpcError::internal(format!("vol ulid: {e}")))?;
+    let live = elide_coordinator::segment_head::resolve_live_segments(store, vol_ulid, &vk)
         .await
-        .map_err(|e| IpcError::store(format!("listing segments for verification: {e}")))?;
-    let present: std::collections::HashSet<Ulid> = objects
-        .iter()
-        .filter_map(|o| o.location.filename())
-        .filter_map(|name| Ulid::from_string(name).ok())
-        .collect();
-    let mut missing: Vec<Ulid> = pinned.difference(&present).copied().collect();
+        .map_err(|e| IpcError::store(format!("resolving live segments for verification: {e}")))?;
+    let pinned: std::collections::BTreeSet<Ulid> = segments.iter().copied().collect();
+    let mut missing: Vec<Ulid> = pinned.difference(&live).copied().collect();
     if !missing.is_empty() {
         missing.sort();
         let preview: Vec<String> = missing.iter().take(5).map(|u| u.to_string()).collect();

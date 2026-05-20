@@ -33,12 +33,14 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use elide_core::signing::{self, VerifyingKey};
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::portable::MIME_TEXT;
+use crate::upload;
 
 /// The post-snapshot delta carried by `by_id/<vol>/HEAD`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -281,6 +283,65 @@ pub fn live_set(manifest_segments: &BTreeSet<Ulid>, head: &SegmentHead) -> BTree
     live
 }
 
+/// Resolve the live segment set for `vol` from S3: read the latest
+/// manifest via `snapshots/LATEST` (P2 pointer), read HEAD, and apply
+/// the read-path formula (`docs/design-segment-index.md`).
+///
+/// At most three GETs: one for `snapshots/LATEST`, one for the
+/// manifest blob (skipped on a fresh volume with no `User` snapshot
+/// yet), one for HEAD. Bounded regardless of segment cardinality —
+/// this is the LIST-free replacement the design specifies.
+///
+/// Trust model: the manifest signature is verified (it is the trusted
+/// basis for the boundary); HEAD is unsigned enumeration; per-segment
+/// signatures are verified by callers at fetch time.
+///
+/// A missing manifest is treated as an empty set, not a failure: a
+/// fresh volume that has never sealed a snapshot has only HEAD's
+/// `Added` segments, and the formula reduces to those minus any
+/// `Superseded` / `Tombstoned` HEAD already accumulated.
+pub async fn resolve_live_segments(
+    store: &Arc<dyn ObjectStore>,
+    vol: Ulid,
+    manifest_verifying_key: &VerifyingKey,
+) -> Result<BTreeSet<Ulid>, ResolveError> {
+    let vol_id = vol.to_string();
+    let manifest_segments = read_manifest_segments(store, &vol_id, manifest_verifying_key).await?;
+    let head = read_head(store, vol)
+        .await
+        .map_err(|e| ResolveError::Head(e.to_string()))?;
+    Ok(live_set(&manifest_segments, &head))
+}
+
+async fn read_manifest_segments(
+    store: &Arc<dyn ObjectStore>,
+    vol_id: &str,
+    manifest_verifying_key: &VerifyingKey,
+) -> Result<BTreeSet<Ulid>, ResolveError> {
+    let snap_ulid = match upload::read_latest_snapshot(store, vol_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return Ok(BTreeSet::new()),
+        Err(e) => return Err(ResolveError::Latest(e.to_string())),
+    };
+    let key = upload::snapshot_manifest_key(vol_id, snap_ulid);
+    let bytes = match store.get(&key).await {
+        Ok(g) => g
+            .bytes()
+            .await
+            .map_err(|e| ResolveError::Manifest(format!("{key}: {e}")))?,
+        // A LATEST pointer to a missing manifest is benign — the
+        // pointer is a perf hint, not a correctness datum
+        // (`upload.rs` *snapshot_latest_key*). Self-heals on next
+        // publish; treat as no manifest.
+        Err(object_store::Error::NotFound { .. }) => return Ok(BTreeSet::new()),
+        Err(e) => return Err(ResolveError::Manifest(format!("{key}: {e}"))),
+    };
+    let manifest =
+        signing::read_snapshot_manifest_from_bytes(&bytes, manifest_verifying_key, &snap_ulid)
+            .map_err(|e| ResolveError::Manifest(format!("{key} parse/verify: {e}")))?;
+    Ok(manifest.segment_ulids.into_iter().collect())
+}
+
 /// GET `by_id/<vol>/HEAD`. `Ok(SegmentHead::empty(None))` when absent —
 /// HEAD self-heals on the next active tick, so a 404 starts the writer
 /// from an empty state rather than failing.
@@ -395,6 +456,25 @@ impl fmt::Display for PutHeadError {
 }
 
 impl std::error::Error for PutHeadError {}
+
+#[derive(Debug)]
+pub enum ResolveError {
+    Latest(String),
+    Manifest(String),
+    Head(String),
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResolveError::Latest(s) => write!(f, "reading snapshots/LATEST: {s}"),
+            ResolveError::Manifest(s) => write!(f, "reading manifest: {s}"),
+            ResolveError::Head(s) => write!(f, "reading HEAD: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
 
 #[cfg(test)]
 mod tests {
@@ -691,5 +771,133 @@ mod tests {
             .unwrap();
         let h = read_head(&store, vol()).await.unwrap();
         assert_eq!(h, SegmentHead::empty(None));
+    }
+
+    // --- resolve_live_segments: manifest ∪ HEAD ---
+
+    async fn seed_manifest(
+        store: &Arc<dyn ObjectStore>,
+        vol_id: &str,
+        snap_ulid: Ulid,
+        segments: &[Ulid],
+        signer: &dyn elide_core::segment::SegmentSigner,
+    ) {
+        let bytes = elide_core::signing::build_snapshot_manifest_bytes(signer, segments, None);
+        let key = crate::upload::snapshot_manifest_key(vol_id, snap_ulid);
+        store.put(&key, Bytes::from(bytes).into()).await.unwrap();
+        // Seed the LATEST pointer the same way `bump_latest_snapshot` would.
+        let latest_key = crate::upload::snapshot_latest_key(vol_id);
+        store
+            .put(
+                &latest_key,
+                Bytes::from(snap_ulid.to_string().into_bytes()).into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolve_fresh_volume_returns_empty() {
+        // No LATEST, no HEAD ⇒ no live segments.
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let live = resolve_live_segments(&store, vol(), &vk).await.unwrap();
+        assert!(live.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_manifest_only_returns_manifest_segments() {
+        // A sealed snapshot exists; HEAD is absent (cleared at seal).
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let s1 = m.next();
+        let s2 = m.next();
+        let snap = m.next();
+        seed_manifest(&store, &vol().to_string(), snap, &[s1, s2], &*signer).await;
+
+        let live = resolve_live_segments(&store, vol(), &vk).await.unwrap();
+        assert_eq!(live, [s1, s2].into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn resolve_head_only_returns_added_segments() {
+        // Fresh volume with no manifest but drains have happened —
+        // HEAD's `Added` set is the entire live set.
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let a1 = m.next();
+        let a2 = m.next();
+        let mut head = SegmentHead::empty(None);
+        head.added.insert(a1);
+        head.added.insert(a2);
+        put_head(&store, vol(), &head).await.unwrap();
+
+        let live = resolve_live_segments(&store, vol(), &vk).await.unwrap();
+        assert_eq!(live, [a1, a2].into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn resolve_manifest_plus_head_applies_full_formula() {
+        // Pre-snapshot segments in manifest; post-snapshot drain in
+        // Added; one pre-snapshot superseded after seal; one
+        // post-snapshot tombstoned by reaper.
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let pre1 = m.next();
+        let pre2 = m.next(); // will be Superseded
+        let snap = m.next();
+        let post1 = m.next();
+        let post2 = m.next(); // will be Tombstoned
+        let out = m.next(); // GC output for pre2
+
+        seed_manifest(&store, &vol().to_string(), snap, &[pre1, pre2], &*signer).await;
+
+        let mut head = SegmentHead::empty(Some(snap));
+        head.added.insert(post1);
+        head.added.insert(post2);
+        head.added.insert(out);
+        head.superseded.insert(
+            pre2,
+            Supersession {
+                output: out,
+                since: Utc::now(),
+            },
+        );
+        head.tombstoned.insert(post2);
+        put_head(&store, vol(), &head).await.unwrap();
+
+        let live = resolve_live_segments(&store, vol(), &vk).await.unwrap();
+        // pre1 survives; pre2 superseded; post1 added; post2 tombstoned; out added.
+        assert_eq!(live, [pre1, post1, out].into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn resolve_treats_dangling_latest_as_empty_manifest() {
+        // A LATEST pointer to a missing manifest is benign (perf hint,
+        // self-heals on next publish). The resolver must not fail and
+        // must fall back to HEAD-only.
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let snap = m.next();
+        let a = m.next();
+        // Seed LATEST but no manifest blob.
+        let latest_key = crate::upload::snapshot_latest_key(&vol().to_string());
+        store
+            .put(
+                &latest_key,
+                Bytes::from(snap.to_string().into_bytes()).into(),
+            )
+            .await
+            .unwrap();
+        let mut head = SegmentHead::empty(None);
+        head.added.insert(a);
+        put_head(&store, vol(), &head).await.unwrap();
+
+        let live = resolve_live_segments(&store, vol(), &vk).await.unwrap();
+        assert_eq!(live, [a].into_iter().collect());
     }
 }

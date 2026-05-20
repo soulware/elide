@@ -324,19 +324,12 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         });
     }
 
-    // Coordinator-wide retention reaper. One ticker fans out
-    // per-owned-volume reap operations (non-blocking spawn inside
-    // `tick_once`). Cadence is derived from the configured retention;
-    // see GcConfig::reaper_cadence. Retention is read on each tick from
-    // the captured config.
-    //
-    // Sweeps `names/` for owned volumes — coordinator-wide scope.
-    tasks.spawn(elide_coordinator::reaper::run(
-        stores.writer(),
-        config.data_dir.clone(),
-        gc_config.reaper_cadence(),
-        gc_config.retention_window,
-    ));
+    // Retention reaping is folded into the per-volume tick loop
+    // (`gc_cycle::GcCycleOrchestrator::reap_expired`); see
+    // `docs/design-segment-index.md` *Reaper fold*. No coordinator-
+    // wide reaper task — the per-volume loop is the sole writer of
+    // its volume's HEAD and the sole DELETEr of its superseded
+    // inputs.
 
     let mut scan_tick = tokio::time::interval(scan_interval);
     scan_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
