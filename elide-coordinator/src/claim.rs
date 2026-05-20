@@ -682,9 +682,12 @@ impl ClaimOrchestrator {
         let Some(handle) = elide_coordinator::tasks::peer_fetch_handle() else {
             return;
         };
-        let store_wide = self.ctx.core.stores.writer();
+        // Discovery reads events/<name>/HEAD, coordinators/<other>/coordinator.pub,
+        // and coordinators/<other>/peer-endpoint.toml — all RO and all cross-
+        // coordinator, so the correct credential is coord-base.
+        let store_base = self.ctx.core.stores.peer_verifier_store();
         if let Some(discovered) =
-            elide_coordinator::peer_discovery::discover_peer_for_claim(&store_wide, &self.volume)
+            elide_coordinator::peer_discovery::discover_peer_for_claim(&store_base, &self.volume)
                 .await
         {
             self.peer_ctx = Some(PeerFetchContext {

@@ -124,6 +124,14 @@ async fn find_releaser(
 /// missing/invalid signature, non-`Released` latest event, no
 /// published endpoint, store error) collapses to `None`.
 ///
+/// `store` must be a `coord-base`-scoped handle (e.g.
+/// `ScopedStores::peer_verifier_store`). Every read this function
+/// makes is cross-coordinator: `events/<name>/HEAD`,
+/// `coordinators/<other>/coordinator.pub`, and
+/// `coordinators/<other>/peer-endpoint.toml`. `coord-base` is the
+/// only role whose IAM policy grants reads on `coordinators/*` for
+/// all ids.
+///
 /// The caller — typically the per-volume task at startup — uses the
 /// returned peer as a one-shot warming hint for the next prefetch
 /// tick. Subsequent prefetch ticks within the same volume task run
