@@ -648,6 +648,45 @@ In-flight fetches started under the old credentials are not cancelled on refresh
 
 The caveat set is small and typed (`volume`, `scope`, `pid`, optionally `not-after`). It is implemented in `elide-coordinator/src/macaroon.rs` using `blake3::keyed_hash` for each step of the chained MAC; the existing `macaroon` crate on crates.io was considered but its untyped string-caveat surface is a worse fit than a typed enum here. Wire format is a single hex line over the existing IPC line protocol: `v2.<16-byte nonce, hex>.<32-byte mac, hex>.<caveat blob, hex>`. Verification runs through `macaroon::verify` (MAC) followed by `macaroon::check_caveats` (AND-of-predicates evaluation against a `VerifyCtx`).
 
+## Cross-volume isolation invariants
+
+The block layer's defining hazard is "a request bound to volume A returns bytes belonging to volume B." This is the conceptual sibling of CVE-2026-31431 (*Copy Fail*) at our layer: a single mistake in the routing chain — auth, index resolution, or byte assembly — can leak data across tenants even when every individual component appears correct. The invariants below state precisely what must hold, where each statement is enforced in code, and the audit obligation a new caller takes on.
+
+### The three statements
+
+**(1) Authorisation.** A request authorised to act on volume `V` is represented by a `macaroon::Verified<Ulid>` value whose inner ULID equals `V`'s canonical id. The only production code paths that construct one are `macaroon::check_caveats` (volume-daemon tokens) and `macaroon::verify_operator` (operator tokens), both in `elide-coordinator/src/macaroon.rs`. `Verified::for_test` exists but is gated on `cfg(test)` *and* the `test-helpers` Cargo feature, so non-test code cannot reach it.
+
+**(2) Index / map resolution.** For a request bearing `Verified<Ulid>(V)`, the extent-index lookup `(V, lba) → (segment_id, offset, length)` resolves only to segments authored by `V`'s lineage — `V` itself or a transitive ancestor reachable through `walk_ancestors` in `elide-core/src/volume/ancestry.rs`. The per-`Volume` `Arc<ExtentIndex>` + `Arc<LbaMap>` are atomically loaded as a `ReadSnapshot` (`elide-core/src/actor.rs`); a `VolumeReader` constructed by `VolumeClient::reader` cannot hold an index belonging to a different volume.
+
+**(3) Byte assembly.** Bytes returned to the ublk completion path are the bytes named by the (segment_id, offset, length) tuple from the just-completed index lookup. `find_segment_in_dirs` (`elide-core/src/volume/read.rs`) restricts segment lookup to `{self.base_dir} ∪ {ancestor_layers[].dir}`; the per-volume IAM credentials returned by `MintCredentialIssuer` (`elide-coordinator/src/mint_client.rs`) further bound any demand-fetch to the volume's own + ancestor S3 prefixes.
+
+### Chokepoint functions
+
+| Layer | Function | Role |
+|---|---|---|
+| Auth | `macaroon::check_caveats` | Volume-daemon token verifier; only production constructor of `Verified<Ulid>` for daemon paths |
+| Auth | `macaroon::verify_operator` | Operator token verifier; only production constructor for operator paths |
+| Auth-consume | `inbound::authenticate_volume_macaroon` | Hands `Verified<Ulid>` to the daemon-path callers |
+| Auth-consume | `inbound::require_operator_token` | Hands `Verified<Ulid>` to operator-verb dispatchers |
+| Auth-consume (leaf) | `credential::CredentialIssuer::issue` | Trait method takes `Verified<Ulid>` — every backend (`SharedKeyPassthrough`, `MintCredentialIssuer`) declares this contract |
+| Auth-consume (leaf) | `inbound::remove_volume` | Takes `Verified<Ulid>`; the only volume-removal entry |
+| Auth-consume (leaf) | `inbound::resolve_volume_name` | Takes `&Verified<Ulid>`; reverse-resolves the local name claim for the bound volume |
+| Index | `Volume::base_dir`, `Volume::fork_dirs` | Per-volume ownership of the index/cache directories; volume identity is the path's basename |
+| Index | `volume::ancestry::walk_ancestors` | Determines the *lineage set* — the only segments a volume's reads may resolve to |
+| Byte | `volume::read::find_segment_in_dirs` | Scans `self ∪ ancestor_layers` only; demand-fetch credentials are per-lineage scoped |
+
+### Audit obligation
+
+Adding code that touches volume identity inherits the following review obligations:
+
+- **New IPC verb that acts on a specific volume**: must consume a `Verified<Ulid>` produced by one of the verifiers. The wire field carrying the volume target should be `Ulid`, not `String`; resolution from a name happens on the client (see `VolumeCommand::Remove` in `src/main.rs`) so the coordinator never re-resolves a name during an authorised action (closes a CLI→coord rotation TOCTOU on the name binding). Adding an unauthenticated equivalent of an authenticated verb is a design change that requires explicit review.
+- **New `CredentialIssuer` implementation**: cannot accept a bare volume identifier — the trait signature requires `Verified<Ulid>`. The compiler refuses any implementation that would.
+- **New byte-returning code path**: must derive its `base_dir` and `ancestor_layers` from a single `Volume` (or its `VolumeClient`/`VolumeReader`) so the lineage set is bounded by construction. Anything that takes a *free* `Path` to read segment bytes is a regression on (3); route it through `VolumeReader::read_into` instead.
+
+### Why the receipt rather than a check
+
+The `Verified<Ulid>` shape (typed receipt with module-private constructors) is preferred over a runtime cross-check ("the dispatcher verified the request matches the URL volume") because the dispatcher pattern was the exact shape of the `verify_body_token` lineage bug fixed in 2026-05-15: two `Ulid` values of the same Rust type were available at the call site, and the wrong one was used as the lineage anchor. Encoding the constraint at the type level — only one `Verified<Ulid>` is reachable per request, and downstream functions accept only that — makes the bug uncompilable rather than catchable by review.
+
 ## Import process lifecycle
 
 OCI import is a potentially long-running operation. The coordinator supervises it as a short-lived child process, analogous to a volume process, with an explicit lifecycle marker on disk.
