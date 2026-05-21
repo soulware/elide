@@ -1161,6 +1161,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "elide-coordinator",
  "elide-core",
  "elide-fetch",
  "elide-peer-fetch",

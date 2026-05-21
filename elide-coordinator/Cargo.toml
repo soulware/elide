@@ -64,11 +64,22 @@ libublk = "0.4"
 #   cargo test -p elide-coordinator --features proptest
 proptest = ["elide-core/proptest", "elide-core/volume-invariants"]
 
+# Exposes test-only constructors (e.g. `macaroon::Verified::for_test`)
+# to downstream test targets — including this crate's *bin* tests,
+# which compile the lib as a regular dependency and therefore can't
+# see lib-side `#[cfg(test)]` items. The feature is auto-enabled in
+# the lib build through `dev-dependencies` so the lib's own unit tests
+# also pick it up.
+test-helpers = []
+
 [dev-dependencies]
 async-trait = "0.1"
 blake3      = "1"
 proptest    = "1"
 tempfile    = "3"
+# Auto-enable test-helpers on the lib whenever the bin/test binaries
+# are compiled in `cargo test`. See the `test-helpers` feature.
+elide-coordinator = { path = ".", features = ["test-helpers"] }
 
 [[test]]
 name = "gc_proptest"

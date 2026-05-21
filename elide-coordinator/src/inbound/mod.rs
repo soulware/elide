@@ -435,7 +435,7 @@ async fn dispatch_json(
             };
             let store = ctx.stores.writer();
             let result = remove_volume(
-                verified.copy_inner(),
+                verified,
                 force,
                 &ctx.data_dir,
                 Some(&store),
@@ -1276,13 +1276,14 @@ async fn volume_events_typed(
 /// `force = true` skips the second check, accepting that any local-only
 /// pending segments or unflushed WAL records will be discarded.
 async fn remove_volume(
-    volume_ulid: ulid::Ulid,
+    verified: macaroon::Verified<ulid::Ulid>,
     force: bool,
     data_dir: &Path,
     store: Option<&Arc<dyn ObjectStore>>,
     coord_id: Option<&str>,
 ) -> Result<Option<ulid::Ulid>, IpcError> {
     use elide_coordinator::volume_state::VolumeLifecycle;
+    let volume_ulid = verified.copy_inner();
     let volume_ulid_str = volume_ulid.to_string();
     let vol_dir_path = data_dir.join("by_id").join(&volume_ulid_str);
     let (vol_dir, shape) = VolumeLifecycle::resolve(&vol_dir_path)
@@ -2241,11 +2242,14 @@ async fn authenticate_volume_macaroon(
 /// `names/<name>`; a coordinator with no local `by_name` entry for the
 /// volume is not its current local claimer and cannot mint a passing
 /// claimer token.
-fn resolve_volume_name(data_dir: &Path, volume_ulid: ulid::Ulid) -> Result<String, IpcError> {
+fn resolve_volume_name(
+    data_dir: &Path,
+    verified: &macaroon::Verified<ulid::Ulid>,
+) -> Result<String, IpcError> {
     let by_name = data_dir.join("by_name");
     let entries = std::fs::read_dir(&by_name)
         .map_err(|e| IpcError::internal(format!("read by_name: {e}")))?;
-    let target_ulid_str = volume_ulid.to_string();
+    let target_ulid_str = verified.copy_inner().to_string();
     for entry in entries.flatten() {
         let link = entry.path();
         if !link.is_symlink() {
@@ -2274,10 +2278,9 @@ async fn issue_credentials(
 ) -> Result<StoreCredsReply, IpcError> {
     let (m, verified) =
         authenticate_volume_macaroon(macaroon_str, data_dir, peer_pid, macaroon_root).await?;
-    let volume_ulid = verified.copy_inner();
-    let volume_ulid_str = volume_ulid.to_string();
+    let volume_ulid_str = verified.copy_inner().to_string();
     let creds = issuer
-        .issue(&volume_ulid_str)
+        .issue(verified)
         .await
         .map_err(|e| IpcError::internal(format!("issue: {e}")))?;
     info!(
@@ -2313,7 +2316,7 @@ async fn mint_peer_claimer_token(
         authenticate_volume_macaroon(macaroon_str, data_dir, peer_pid, identity.macaroon_root())
             .await?;
     let volume_ulid = verified.copy_inner();
-    let name = resolve_volume_name(data_dir, volume_ulid)?;
+    let name = resolve_volume_name(data_dir, &verified)?;
     let coordinator_id = identity.coordinator_id_str().to_owned();
     let issued_at = elide_peer_fetch::PeerFetchToken::now_unix_seconds();
     let payload =
@@ -2515,7 +2518,10 @@ mod tests {
     struct FixedIssuer;
     #[async_trait::async_trait]
     impl CredentialIssuer for FixedIssuer {
-        async fn issue(&self, _vol: &str) -> std::io::Result<IssuedCredentials> {
+        async fn issue(
+            &self,
+            _vol: macaroon::Verified<ulid::Ulid>,
+        ) -> std::io::Result<IssuedCredentials> {
             Ok(IssuedCredentials {
                 access_key_id: "AK".into(),
                 secret_access_key: "SK".into(),
@@ -2537,6 +2543,10 @@ mod tests {
 
     fn ulid_from(s: &str) -> ulid::Ulid {
         ulid::Ulid::from_string(s).unwrap()
+    }
+
+    fn verified_from(s: &str) -> macaroon::Verified<ulid::Ulid> {
+        macaroon::Verified::for_test(ulid_from(s))
     }
 
     #[test]
@@ -3141,7 +3151,7 @@ mod tests {
         std::os::unix::fs::symlink(&vol_dir, by_name.join("myvol")).unwrap();
 
         assert_eq!(
-            resolve_volume_name(tmp.path(), ulid).unwrap(),
+            resolve_volume_name(tmp.path(), &macaroon::Verified::for_test(ulid)).unwrap(),
             "myvol".to_owned()
         );
     }
@@ -3152,8 +3162,8 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
         // by_name has no symlink pointing at this ulid → not the
         // current local claimer → forbidden (403-class).
-        let err =
-            resolve_volume_name(tmp.path(), ulid::Ulid::new()).expect_err("no claim → reject");
+        let err = resolve_volume_name(tmp.path(), &macaroon::Verified::for_test(ulid::Ulid::new()))
+            .expect_err("no claim → reject");
         assert_eq!(err.kind, IpcErrorKind::Forbidden);
     }
 
@@ -3206,7 +3216,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
-        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists(), "by_id dir should be removed");
@@ -3227,7 +3237,7 @@ mod tests {
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAB";
         let (vol_dir, link) =
             setup_removable_volume(tmp.path(), "vol", vol_ulid_str, Some(99), true);
-        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3245,7 +3255,7 @@ mod tests {
             Some(5),
             false, // no STOPPED_FILE
         );
-        let err = remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        let err = remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .expect_err("running volume should be rejected");
         assert_eq!(err.kind, IpcErrorKind::Conflict);
@@ -3263,7 +3273,7 @@ mod tests {
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAD";
         let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
         write_released_marker(&vol_dir, ulid::Ulid::new()).unwrap();
-        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists(), "by_id dir should be removed");
@@ -3286,7 +3296,7 @@ mod tests {
         }
         .write(&vol_dir)
         .unwrap();
-        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3300,7 +3310,7 @@ mod tests {
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAF";
         let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, false);
         std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
-        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3312,9 +3322,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
         // ULID with no `by_id/<ulid>` directory → not_found.
-        let err = remove_volume(ulid::Ulid::new(), false, tmp.path(), None, None)
-            .await
-            .expect_err("absent volume should be NotFound");
+        let err = remove_volume(
+            macaroon::Verified::for_test(ulid::Ulid::new()),
+            false,
+            tmp.path(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("absent volume should be NotFound");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
     }
 
@@ -3333,7 +3349,7 @@ mod tests {
         create_name_record(&store, "vol", &record).await.unwrap();
 
         remove_volume(
-            ulid_from(vol_ulid_str),
+            verified_from(vol_ulid_str),
             false,
             tmp.path(),
             Some(&store),
@@ -3356,7 +3372,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
 
         remove_volume(
-            ulid_from(vol_ulid_str),
+            verified_from(vol_ulid_str),
             false,
             tmp.path(),
             Some(&store),
@@ -3388,7 +3404,7 @@ mod tests {
         create_name_record(&store, "vol", &record).await.unwrap();
 
         remove_volume(
-            ulid_from(vol_ulid_str),
+            verified_from(vol_ulid_str),
             false,
             tmp.path(),
             Some(&store),
@@ -3420,7 +3436,7 @@ mod tests {
         create_name_record(&store, "vol", &record).await.unwrap();
 
         remove_volume(
-            ulid_from(vol_ulid_str),
+            verified_from(vol_ulid_str),
             false,
             tmp.path(),
             Some(&store),
