@@ -498,9 +498,11 @@ impl MintCredentialIssuer {
 
 #[async_trait]
 impl CredentialIssuer for MintCredentialIssuer {
-    async fn issue(&self, volume_id: &str) -> io::Result<IssuedCredentials> {
-        let vol_ulid = Ulid::from_string(volume_id)
-            .map_err(|e| io::Error::other(format!("invalid vol_ulid: {e}")))?;
+    async fn issue(
+        &self,
+        volume_id: elide_coordinator::macaroon::Verified<Ulid>,
+    ) -> io::Result<IssuedCredentials> {
+        let vol_ulid = volume_id.copy_inner();
         let by_id_dir = self.data_dir.join("by_id");
         let fork_dir = by_id_dir.join(vol_ulid.to_string());
         let ancestors = elide_core::volume::lineage_ulids(&fork_dir, &by_id_dir)

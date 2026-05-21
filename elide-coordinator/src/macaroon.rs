@@ -372,6 +372,21 @@ impl<T: Copy> Verified<T> {
     }
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
+impl<T> Verified<T> {
+    /// Test-only escape: construct a `Verified` without going through a
+    /// verifier. Gated on `cfg(test)` (for this crate's own unit tests)
+    /// and the `test-helpers` feature (auto-enabled in dev builds so
+    /// the bin's tests can construct one even though the lib they link
+    /// against is a non-test build). Production code physically cannot
+    /// reach this constructor — every non-test code path that consumes
+    /// a `Verified<Ulid>` must obtain it from [`check_caveats`] or
+    /// [`verify_operator`].
+    pub fn for_test(inner: T) -> Self {
+        Self(inner)
+    }
+}
+
 /// Mint an operator macaroon. The root token is coordinator-wide: no
 /// `Volume` or `Op` caveats. The CLI narrows per use by appending
 /// `Op(<verb>)`, `Volume(<target>)`, and a short `NotAfter` before

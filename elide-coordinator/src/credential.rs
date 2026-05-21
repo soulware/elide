@@ -19,6 +19,8 @@ use async_trait::async_trait;
 use tracing::warn;
 use ulid::Ulid;
 
+use elide_coordinator::macaroon::Verified;
+
 /// Credentials issued to a volume in response to an authenticated
 /// `credentials` request.
 #[derive(Clone)]
@@ -38,12 +40,18 @@ pub struct IssuedCredentials {
 /// macaroon handshake (volume binding, PID check, MAC verify) runs
 /// upstream and is identical for every backend.
 ///
+/// The argument is [`Verified<Ulid>`] rather than a bare `Ulid`: the
+/// only way to construct one in production is by going through
+/// [`crate::macaroon::check_caveats`] or
+/// [`crate::macaroon::verify_operator`], so the trait *declares* that
+/// it can only be called for an authorised volume.
+///
 /// `issue` is async because the mint-backed impl calls out to the
 /// external mint service to vend per-volume keys. The shared-key
 /// passthrough impl returns immediately from cache.
 #[async_trait]
 pub trait CredentialIssuer: Send + Sync {
-    async fn issue(&self, volume_id: &str) -> io::Result<IssuedCredentials>;
+    async fn issue(&self, volume_id: Verified<Ulid>) -> io::Result<IssuedCredentials>;
 }
 
 /// Lower-layer abstraction over whatever component actually vends
@@ -100,7 +108,7 @@ impl SharedKeyPassthrough {
 
 #[async_trait]
 impl CredentialIssuer for SharedKeyPassthrough {
-    async fn issue(&self, _volume_id: &str) -> io::Result<IssuedCredentials> {
+    async fn issue(&self, _volume_id: Verified<Ulid>) -> io::Result<IssuedCredentials> {
         if let Some(c) = self.cached.get() {
             return Ok(c.clone());
         }
