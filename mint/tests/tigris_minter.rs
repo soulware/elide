@@ -99,7 +99,11 @@ async fn mints_keypair_via_three_signed_calls_in_order() {
     let minter = TigrisMinter::with_endpoint(&admin(), endpoint).unwrap();
 
     let kp = minter
-        .mint_keypair(r#"{"Version":"2012-10-17"}"#, Duration::from_secs(3600))
+        .mint_keypair(
+            "mint_test_global_20260521T000000Z_deadbeef",
+            r#"{"Version":"2012-10-17"}"#,
+            Duration::from_secs(3600),
+        )
         .await
         .expect("mint succeeds");
 
@@ -130,7 +134,11 @@ async fn iam_error_maps_to_backend_unavailable() {
     let minter = TigrisMinter::with_endpoint(&admin(), endpoint).unwrap();
 
     let err = minter
-        .mint_keypair("{}", Duration::from_secs(60))
+        .mint_keypair(
+            "mint_test_global_20260521T000000Z_deadbeef",
+            "{}",
+            Duration::from_secs(60),
+        )
         .await
         .expect_err("CreatePolicy 400 must fail the mint");
     let MintError::Backend(msg) = err;

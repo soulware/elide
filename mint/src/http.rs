@@ -33,7 +33,7 @@ use serde_json::json;
 use crate::audit::{AuditEntry, AuditLog, sanitise_caveats};
 use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op};
 use crate::config::Config;
-use crate::iam::KeypairMinter;
+use crate::iam::{self, KeypairMinter};
 use crate::issuance;
 use crate::macaroon::Macaroon;
 use crate::pop::{self, PopOutcome};
@@ -269,9 +269,19 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         }
     };
 
+    let scope = match EffectiveCaveats::new(&caveats).resolve("elide:Volume") {
+        Resolved::Value(v) => Some(v),
+        Resolved::Absent | Resolved::Unsatisfiable => None,
+    };
+    let policy_name = iam::policy_name(&granted.role.name, scope.as_deref(), expiry);
+
     match state
         .minter
-        .mint_keypair(&policy, Duration::from_secs(granted.ttl_seconds))
+        .mint_keypair(
+            &policy_name,
+            &policy,
+            Duration::from_secs(granted.ttl_seconds),
+        )
         .await
     {
         Ok(kp) => {
