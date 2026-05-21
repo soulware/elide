@@ -74,14 +74,28 @@ impl GcCycleOrchestrator {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| fork_dir.clone());
         let snap_lock = snapshot_lock_for(snapshot_locks, &fork_dir);
-        // Run GC and reap on the first tick to clear any backlog from a
-        // previous run.
-        let last_gc = Instant::now()
-            .checked_sub(gc_config.interval)
-            .unwrap_or_else(Instant::now);
-        let last_reap = Instant::now()
-            .checked_sub(gc_config.reaper_cadence())
-            .unwrap_or_else(Instant::now);
+        // Force GC and reap on the first tick only if local-fs markers
+        // suggest a previous run left work behind — pending segments
+        // mid-drain or bare GC handoffs that the coordinator started
+        // but didn't finalise. A provably quiescent fork (clean
+        // shutdown) defers both to their natural cadence, so the
+        // forced first-tick reap doesn't wake the volume's `coord-data`
+        // credential for nothing on every live volume at startup.
+        let backdate = fork_has_local_backlog(&fork_dir);
+        let last_gc = if backdate {
+            Instant::now()
+                .checked_sub(gc_config.interval)
+                .unwrap_or_else(Instant::now)
+        } else {
+            Instant::now()
+        };
+        let last_reap = if backdate {
+            Instant::now()
+                .checked_sub(gc_config.reaper_cadence())
+                .unwrap_or_else(Instant::now)
+        } else {
+            Instant::now()
+        };
         // volume_id is the volume directory name, validated as a ULID by
         // the caller (`derive_names` / `volume_ulid` in tasks.rs).
         // Re-parsing here keeps the typed value local; an unparseable
@@ -525,6 +539,46 @@ impl GcCycleOrchestrator {
     }
 }
 
+/// Local-fs preflight: does this fork show signs of work the previous
+/// coordinator left mid-stream? Two markers:
+///
+///   - `pending/` contains any file: drain didn't finish promoting
+///     segments to S3.
+///   - `gc/` contains any bare ULID-named file (no extension, no
+///     `.plan` sibling): a GC handoff the volume committed locally
+///     but the coordinator didn't upload + promote yet
+///     ([`gc::apply_done_handoffs`]).
+///
+/// Errors reading either dir are treated as "no backlog" — a missing
+/// pending/ or gc/ dir is the normal quiescent shape. The check is
+/// best-effort: a false negative just defers the forced reap by one
+/// cadence interval (it still runs on the natural schedule); there is
+/// no correctness consequence.
+fn fork_has_local_backlog(fork_dir: &Path) -> bool {
+    if let Ok(mut entries) = std::fs::read_dir(fork_dir.join("pending"))
+        && entries.next().is_some()
+    {
+        return true;
+    }
+    let gc_dir = fork_dir.join("gc");
+    if let Ok(entries) = std::fs::read_dir(&gc_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.contains('.') {
+                continue;
+            }
+            if Ulid::from_string(name).is_err() {
+                continue;
+            }
+            if !gc_dir.join(format!("{name}.plan")).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     //! HEAD-merge integration for the per-volume tick loop.
@@ -802,5 +856,61 @@ mod tests {
         assert!(head.added.contains(&drained));
         assert!(head.added.contains(&output));
         assert!(head.superseded.contains_key(&input));
+    }
+
+    #[test]
+    fn fork_quiescent_when_no_pending_or_gc_dir() {
+        // Quiescent shape: neither pending/ nor gc/ exist (or both
+        // empty). `fork_has_local_backlog` returns false; the
+        // orchestrator won't force a first-tick reap.
+        let tmp = TempDir::new().unwrap();
+        assert!(!super::fork_has_local_backlog(tmp.path()));
+        std::fs::create_dir_all(tmp.path().join("pending")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("gc")).unwrap();
+        assert!(!super::fork_has_local_backlog(tmp.path()));
+    }
+
+    #[test]
+    fn fork_has_backlog_when_pending_has_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("pending")).unwrap();
+        std::fs::write(tmp.path().join("pending").join("01J7"), b"").unwrap();
+        assert!(super::fork_has_local_backlog(tmp.path()));
+    }
+
+    #[test]
+    fn fork_has_backlog_for_bare_gc_handoff() {
+        // Bare = ULID-parseable filename, no `.plan` sibling, no
+        // extension. Matches `gc::collect_bare_handoffs`.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("gc")).unwrap();
+        let ulid = ulid::Ulid::new().to_string();
+        std::fs::write(tmp.path().join("gc").join(&ulid), b"").unwrap();
+        assert!(super::fork_has_local_backlog(tmp.path()));
+    }
+
+    #[test]
+    fn fork_quiescent_when_gc_only_holds_staged_or_planned() {
+        // A `.staged` / `.plan` file in gc/ is a mid-apply marker the
+        // volume will resolve, not a coordinator-owed handoff. Same
+        // logic as `gc::collect_bare_handoffs`'s filter — these must
+        // not trip the backlog signal.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("gc")).unwrap();
+        let ulid = ulid::Ulid::new().to_string();
+        std::fs::write(tmp.path().join("gc").join(format!("{ulid}.staged")), b"").unwrap();
+        std::fs::write(tmp.path().join("gc").join(format!("{ulid}.plan")), b"").unwrap();
+        std::fs::write(tmp.path().join("gc").join(&ulid), b"").unwrap();
+        assert!(!super::fork_has_local_backlog(tmp.path()));
+    }
+
+    #[test]
+    fn fork_quiescent_when_gc_holds_non_ulid_names() {
+        // Garbage filenames in gc/ (shouldn't happen but defensive)
+        // must not be treated as backlog.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("gc")).unwrap();
+        std::fs::write(tmp.path().join("gc").join("not-a-ulid"), b"").unwrap();
+        assert!(!super::fork_has_local_backlog(tmp.path()));
     }
 }
