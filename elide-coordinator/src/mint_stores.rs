@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -30,6 +30,7 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use tokio::sync::Mutex;
+use tracing::info;
 use ulid::Ulid;
 
 use elide_coordinator::config::{MintConfig, StoreSection};
@@ -153,6 +154,10 @@ impl RoleStore {
             return Ok(Arc::clone(&c.store));
         }
 
+        // Time the assume-role round-trip and S3-client construction
+        // together — both are on the critical path of a credential
+        // miss and we want to know how much one cache miss costs.
+        let mint_started = Instant::now();
         let issued = self
             .assume()
             .await
@@ -160,6 +165,7 @@ impl RoleStore {
                 store: "mint",
                 source: Box::new(e),
             })?;
+        let assume_elapsed = mint_started.elapsed();
         let store = self
             .store_cfg
             .build_with_creds(&issued.access_key_id, &issued.secret_access_key)
@@ -167,6 +173,17 @@ impl RoleStore {
                 store: "mint",
                 source: e.into(),
             })?;
+        let total_elapsed = mint_started.elapsed();
+        info!(
+            "[mint] assume role={} vol={} assume={:.2?} total={:.2?} ttl={}s",
+            self.role,
+            self.vol_ulid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            assume_elapsed,
+            total_elapsed,
+            self.ttl_secs,
+        );
 
         let now = now_unix();
         let expiry = issued.expiry_unix.unwrap_or(now + self.ttl_secs);
