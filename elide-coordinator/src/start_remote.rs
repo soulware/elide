@@ -272,22 +272,17 @@ async fn fetch_and_verify_manifest(
     if !local_path.exists() {
         let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
         let snapshots = vd.snapshots();
-        let bytes = match kind {
+        match kind {
             elide_core::signing::SnapshotKind::User => {
-                snapshots.get_manifest_bytes(snap_ulid).await
+                snapshots.get_manifest_to_file(snap_ulid, &local_path).await
             }
             elide_core::signing::SnapshotKind::Stop => {
-                snapshots.get_stop_manifest_bytes(snap_ulid).await
+                snapshots
+                    .get_stop_manifest_to_file(snap_ulid, &local_path)
+                    .await
             }
         }
         .map_err(|e| IpcError::store(format!("fetching {filename}: {e}")))?;
-        std::fs::create_dir_all(&snap_dir)
-            .map_err(|e| IpcError::internal(format!("creating snapshots/: {e}")))?;
-        let tmp = snap_dir.join(format!("{filename}.tmp"));
-        std::fs::write(&tmp, &bytes)
-            .map_err(|e| IpcError::internal(format!("writing {filename}.tmp: {e}")))?;
-        std::fs::rename(&tmp, &local_path)
-            .map_err(|e| IpcError::internal(format!("renaming {filename}.tmp: {e}")))?;
         // These bytes came from S3 — pre-mark the upload sentinel so
         // the daemon's first drain tick doesn't redundantly PUT them
         // back. Best-effort: a failure here only costs a wasted PUT.

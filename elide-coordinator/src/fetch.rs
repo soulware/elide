@@ -374,19 +374,10 @@ async fn fetch_and_verify_manifest(
     if !local_path.exists() {
         job.line(format!("fetching basis manifest {snap_ulid}"));
         let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
-        let bytes = vd
-            .snapshots()
-            .get_manifest_bytes(snap_ulid)
+        vd.snapshots()
+            .get_manifest_to_file(snap_ulid, &local_path)
             .await
-            .map_err(|e| IpcError::store(format!("fetching {filename} from store: {e}")))?;
-
-        std::fs::create_dir_all(&snap_dir)
-            .map_err(|e| IpcError::internal(format!("creating snapshots/: {e}")))?;
-        let tmp = snap_dir.join(format!("{filename}.tmp"));
-        std::fs::write(&tmp, &bytes)
-            .map_err(|e| IpcError::internal(format!("writing {filename}.tmp: {e}")))?;
-        std::fs::rename(&tmp, &local_path)
-            .map_err(|e| IpcError::internal(format!("renaming {filename}.tmp: {e}")))?;
+            .map_err(|e| IpcError::store(format!("fetching {filename}: {e}")))?;
     }
 
     // Verify under the volume's own `volume.pub`. (Synthesised

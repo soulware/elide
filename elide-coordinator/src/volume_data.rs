@@ -237,6 +237,31 @@ async fn upload_file_to_snapshots(
         .map_err(SnapshotsError::Put)
 }
 
+/// Atomic write: create parent dirs, write through `<dest>.tmp`,
+/// rename into place. Used by the `_to_file` snapshot view methods
+/// so a crash mid-download never leaves a partial manifest at the
+/// final path.
+fn write_file_atomic(dest: &std::path::Path, bytes: &[u8]) -> Result<(), SnapshotsError> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| SnapshotsError::WriteFile {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    let mut tmp = dest.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes).map_err(|e| SnapshotsError::WriteFile {
+        path: tmp.clone(),
+        source: e,
+    })?;
+    std::fs::rename(&tmp, dest).map_err(|e| SnapshotsError::WriteFile {
+        path: dest.to_path_buf(),
+        source: e,
+    })?;
+    Ok(())
+}
+
 /// Non-async, zero-cost view bundling the snapshot-manifest ops and
 /// the `snapshots/LATEST` pointer.
 pub struct SnapshotsView<'a> {
@@ -348,6 +373,32 @@ impl SnapshotsView<'_> {
         let key = manifest_key(self.vol_ulid, snap_ulid);
         let got = self.store.get(&key).await.map_err(SnapshotsError::Get)?;
         got.bytes().await.map_err(SnapshotsError::Get)
+    }
+
+    /// GET the manifest body and write it atomically to `dest` on
+    /// the local filesystem. Creates `dest.parent()` if missing,
+    /// writes through `<dest>.tmp`, then renames into place — so a
+    /// crash mid-write never leaves a partial manifest at the final
+    /// path. Mirrors [`Self::put_manifest_from_file`] but in the
+    /// download direction.
+    pub async fn get_manifest_to_file(
+        &self,
+        snap_ulid: Ulid,
+        dest: &std::path::Path,
+    ) -> Result<(), SnapshotsError> {
+        let bytes = self.get_manifest_bytes(snap_ulid).await?;
+        write_file_atomic(dest, &bytes)
+    }
+
+    /// Sibling to [`Self::get_manifest_to_file`] for the
+    /// `-stop.manifest` variant.
+    pub async fn get_stop_manifest_to_file(
+        &self,
+        snap_ulid: Ulid,
+        dest: &std::path::Path,
+    ) -> Result<(), SnapshotsError> {
+        let bytes = self.get_stop_manifest_bytes(snap_ulid).await?;
+        write_file_atomic(dest, &bytes)
     }
 
     /// GET, parse, and verify the snapshot manifest under
@@ -568,6 +619,12 @@ pub enum SnapshotsError {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    /// Failed to write or rename the on-disk destination file for a
+    /// download (`_to_file` view methods).
+    WriteFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     /// `bump_latest_if_newer` lost a CAS race against an unrelated
     /// (older) value — surface the attempted + current pointer so
     /// the operator can investigate.
@@ -585,6 +642,7 @@ impl std::fmt::Display for SnapshotsError {
             Self::NotUtf8(e) => write!(f, "LATEST body not utf-8: {e}"),
             Self::Verify(e) => write!(f, "parsing/verifying manifest: {e}"),
             Self::ReadFile { path, source } => write!(f, "reading {}: {source}", path.display()),
+            Self::WriteFile { path, source } => write!(f, "writing {}: {source}", path.display()),
             Self::LatestRaceLost { attempted, current } => match current {
                 Some(c) => write!(
                     f,
@@ -606,6 +664,7 @@ impl std::error::Error for SnapshotsError {
             Self::NotUtf8(e) => Some(e),
             Self::Verify(e) => Some(e),
             Self::ReadFile { source, .. } => Some(source),
+            Self::WriteFile { source, .. } => Some(source),
             Self::LatestRaceLost { .. } => None,
         }
     }
@@ -948,6 +1007,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PublishManifestError::AlreadyExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn snapshots_get_manifest_to_file_writes_bytes_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_s, vd) = vd();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let snap = m.next();
+        let body = manifest_bytes(&*signer, &[m.next()]);
+        vd.snapshots()
+            .put_manifest(snap, body.clone())
+            .await
+            .unwrap();
+
+        // dest is inside a subdirectory that does not exist — view
+        // creates parents.
+        let dest = tmp
+            .path()
+            .join("nested")
+            .join("snapshots")
+            .join("m.manifest");
+        vd.snapshots()
+            .get_manifest_to_file(snap, &dest)
+            .await
+            .unwrap();
+
+        let on_disk = std::fs::read(&dest).unwrap();
+        assert_eq!(on_disk.as_slice(), body.as_ref());
+
+        // No leftover .tmp at the final path.
+        let leftover = {
+            let mut p = dest.as_os_str().to_os_string();
+            p.push(".tmp");
+            std::path::PathBuf::from(p)
+        };
+        assert!(!leftover.exists(), "atomic rename must consume the .tmp");
+    }
+
+    #[tokio::test]
+    async fn snapshots_get_manifest_to_file_reports_absent_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_s, vd) = vd();
+        let snap = mint().next();
+        let dest = tmp.path().join("m.manifest");
+        let err = vd
+            .snapshots()
+            .get_manifest_to_file(snap, &dest)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SnapshotsError::Get(object_store::Error::NotFound { .. })
+        ));
+        assert!(!dest.exists(), "no file written when fetch fails");
     }
 
     #[tokio::test]
