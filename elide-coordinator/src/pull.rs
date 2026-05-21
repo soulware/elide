@@ -75,8 +75,15 @@ pub async fn pull_volume_skeleton(
         .with_context(|| format!("parsing volume_id {volume_id} as ULID"))?;
 
     // Two independent GETs — fire concurrently so per-ancestor pull
-    // latency is bounded by the slowest, not the sum. Each side tries
-    // the peer first and falls through to S3 on any non-200 response.
+    // latency is bounded by the slowest, not the sum. `volume.pub` is
+    // mandatory (the fork is unverifiable without it).
+    // `volume.provenance` is optional: a fork that crashed between
+    // `claim::early_rebind` (which uploads `volume.pub`) and
+    // `finalize` (which uploads provenance) leaves S3 with pub but no
+    // provenance. `release --force` is documented to recover from that
+    // shape, so the pull must tolerate it too — write the skeleton
+    // without provenance and let downstream walkers terminate at it
+    // (see `prefetch::prefetch_indexes` + `claim::skip_empty_intermediates_impl`).
     let pub_key = StorePath::from(format!("by_id/{volume_id}/volume.pub"));
     let provenance_key = StorePath::from(format!(
         "by_id/{volume_id}/{}",
@@ -91,14 +98,7 @@ pub async fn pull_volume_skeleton(
             vol_ulid,
             peer,
         ),
-        fetch_skeleton_file(
-            store,
-            &provenance_key,
-            SkeletonFile::VolumeProvenance,
-            volume_id,
-            vol_ulid,
-            peer,
-        ),
+        fetch_skeleton_file_optional(store, &provenance_key, volume_id, vol_ulid, peer),
     )?;
 
     std::fs::create_dir_all(&vol_dir).with_context(|| format!("creating {}", vol_dir.display()))?;
@@ -106,11 +106,18 @@ pub async fn pull_volume_skeleton(
         .with_context(|| format!("writing volume.readonly for {volume_id}"))?;
     std::fs::write(vol_dir.join("volume.pub"), &pub_bytes)
         .with_context(|| format!("writing volume.pub for {volume_id}"))?;
-    std::fs::write(
-        vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE),
-        &provenance_bytes,
-    )
-    .with_context(|| format!("writing volume.provenance for {volume_id}"))?;
+    if let Some(ref provenance_bytes) = provenance_bytes {
+        std::fs::write(
+            vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE),
+            provenance_bytes,
+        )
+        .with_context(|| format!("writing volume.provenance for {volume_id}"))?;
+    } else {
+        info!(
+            "[pull {volume_id}] no volume.provenance in store; \
+             writing partial skeleton (crashed-mid-create fork)"
+        );
+    }
     std::fs::create_dir_all(vol_dir.join("index"))
         .with_context(|| format!("creating index/ for {volume_id}"))?;
 
@@ -122,15 +129,53 @@ pub async fn pull_volume_skeleton(
     if let Err(e) = crate::upload::mark_already_uploaded(&vol_dir, "volume.pub", &pub_bytes) {
         tracing::warn!("[pull {volume_id}] writing volume.pub upload sentinel: {e}");
     }
-    if let Err(e) = crate::upload::mark_already_uploaded(
-        &vol_dir,
-        elide_core::signing::VOLUME_PROVENANCE_FILE,
-        &provenance_bytes,
-    ) {
+    if let Some(ref provenance_bytes) = provenance_bytes
+        && let Err(e) = crate::upload::mark_already_uploaded(
+            &vol_dir,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            provenance_bytes,
+        )
+    {
         tracing::warn!("[pull {volume_id}] writing volume.provenance upload sentinel: {e}");
     }
 
     Ok(vol_dir)
+}
+
+/// Like `fetch_skeleton_file` but treats S3 `NotFound` as `Ok(None)`
+/// rather than an error. Used for `volume.provenance`, which a
+/// partial-fork (`early_rebind` without `finalize`) legitimately
+/// lacks in the bucket. The peer-fetch leg already surfaces "miss" as
+/// `None`; this lets the S3 leg do the same on a hard absence rather
+/// than failing the whole pull.
+async fn fetch_skeleton_file_optional(
+    store: &Arc<dyn ObjectStore>,
+    key: &StorePath,
+    volume_id: &str,
+    vol_ulid: Ulid,
+    peer: Option<&PeerFetchContext>,
+) -> Result<Option<Bytes>> {
+    if let Some(peer_ctx) = peer
+        && let Some(bytes) =
+            peer_fetch_skeleton(peer_ctx, SkeletonFile::VolumeProvenance, vol_ulid).await
+    {
+        info!(
+            "[pull] fetched {} from peer for {}",
+            SkeletonFile::VolumeProvenance.label(),
+            volume_id
+        );
+        return Ok(Some(bytes));
+    }
+    match store.get(key).await {
+        Ok(resp) => resp
+            .bytes()
+            .await
+            .map(Some)
+            .with_context(|| format!("reading volume.provenance for {volume_id}")),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(anyhow::Error::from(e))
+            .with_context(|| format!("downloading volume.provenance for {volume_id}")),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -328,6 +373,77 @@ mod tests {
         assert_eq!(
             std::fs::read(vol_dir.join("volume.provenance")).unwrap(),
             prov_bytes
+        );
+    }
+
+    /// Regression: pulling a partial fork (S3 has `volume.pub` but
+    /// no `volume.provenance`) must succeed and write the skeleton
+    /// without provenance, rather than erroring on the absent file.
+    /// This is the cross-host shape of the `release --force` → `claim`
+    /// recovery path: a prior `early_rebind` uploaded `volume.pub`
+    /// to S3 but never reached `finalize` (which uploads provenance);
+    /// `release --force` published a synthesised handoff over it; a
+    /// claimant on a different host now pulls the skeleton.
+    #[tokio::test]
+    async fn skeleton_pull_tolerates_missing_provenance_in_store() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let vol_ulid = Ulid::new();
+        let vol_id = vol_ulid.to_string();
+
+        let pub_bytes = b"pub-bytes\n";
+        // Note: only volume.pub is uploaded — no volume.provenance.
+        store
+            .put(
+                &StorePath::from(format!("by_id/{vol_id}/volume.pub")),
+                bytes::Bytes::from_static(pub_bytes).into(),
+            )
+            .await
+            .unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = pull_volume_skeleton(&store, tmp.path(), &vol_id, None)
+            .await
+            .expect("missing provenance in store must not abort the pull");
+
+        assert!(vol_dir.join("volume.readonly").exists());
+        assert_eq!(
+            std::fs::read(vol_dir.join("volume.pub")).unwrap(),
+            pub_bytes
+        );
+        assert!(
+            !vol_dir.join("volume.provenance").exists(),
+            "provenance must be absent when the store lacks it — \
+             writing a placeholder would break downstream signature checks"
+        );
+        assert!(vol_dir.join("index").is_dir());
+    }
+
+    /// Sibling: a real S3 error other than NotFound on the provenance
+    /// leg must still propagate (we tolerate absence, not transport
+    /// failure). InMemory store doesn't model arbitrary errors, so this
+    /// covers the `volume.pub` mandatory-fetch leg instead — same code
+    /// path, opposite sense: pub NotFound must still error.
+    #[tokio::test]
+    async fn skeleton_pull_errors_when_volume_pub_is_absent() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let vol_ulid = Ulid::new();
+        let vol_id = vol_ulid.to_string();
+        // Upload provenance but NOT volume.pub: the fork is unverifiable.
+        store
+            .put(
+                &StorePath::from(format!("by_id/{vol_id}/volume.provenance")),
+                bytes::Bytes::from_static(b"prov").into(),
+            )
+            .await
+            .unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let err = pull_volume_skeleton(&store, tmp.path(), &vol_id, None)
+            .await
+            .expect_err("missing volume.pub must abort the pull");
+        assert!(
+            err.to_string().contains("volume.pub"),
+            "error should name the missing file: {err}"
         );
     }
 }
