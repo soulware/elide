@@ -175,10 +175,7 @@ impl MetadataView<'_> {
     }
 
     /// Upload `volume.pub` from a local file. Reads the file
-    /// verbatim and PUTs the body to
-    /// `by_id/<vol>/volume.pub`. Returns the uploaded bytes so the
-    /// caller can record the matching upload sentinel without
-    /// re-reading.
+    /// verbatim and PUTs the body to `by_id/<vol>/volume.pub`.
     ///
     /// The on-disk format is the canonical form (authored by
     /// `signing::generate_keypair`): `lowercase-hex(pub) + "\n"`.
@@ -187,23 +184,13 @@ impl MetadataView<'_> {
     pub async fn write_pubkey_from_file(
         &self,
         path: &std::path::Path,
-    ) -> Result<Bytes, MetadataError> {
-        let bytes = std::fs::read(path).map_err(|e| MetadataError::ReadFile {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        let body = Bytes::from(bytes);
-        let key = pubkey_key(self.vol_ulid);
-        crate::upload::put_with_content_type(self.store, &key, body.clone(), MIME_TEXT)
-            .await
-            .map_err(MetadataError::Put)?;
-        Ok(body)
+    ) -> Result<(), MetadataError> {
+        upload_file_to_store(self.store, &pubkey_key(self.vol_ulid), path).await
     }
 
     /// Upload `volume.provenance` from a local file. Reads the file
     /// verbatim and PUTs the body to
-    /// `by_id/<vol>/volume.provenance`. Returns the uploaded bytes so
-    /// the caller can record the matching upload sentinel.
+    /// `by_id/<vol>/volume.provenance`.
     ///
     /// The on-disk format is the canonical signed form authored by
     /// [`signing::write_provenance`]; the view ships exactly those
@@ -212,18 +199,42 @@ impl MetadataView<'_> {
     pub async fn write_provenance_from_file(
         &self,
         path: &std::path::Path,
-    ) -> Result<Bytes, MetadataError> {
-        let bytes = std::fs::read(path).map_err(|e| MetadataError::ReadFile {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        let body = Bytes::from(bytes);
-        let key = provenance_key(self.vol_ulid);
-        crate::upload::put_with_content_type(self.store, &key, body.clone(), MIME_TEXT)
-            .await
-            .map_err(MetadataError::Put)?;
-        Ok(body)
+    ) -> Result<(), MetadataError> {
+        upload_file_to_store(self.store, &provenance_key(self.vol_ulid), path).await
     }
+}
+
+/// Read `path` and PUT its bytes to `key` under the metadata
+/// surface — used for `volume.pub` and `volume.provenance` uploads.
+async fn upload_file_to_store(
+    store: &Arc<dyn ObjectStore>,
+    key: &StorePath,
+    path: &std::path::Path,
+) -> Result<(), MetadataError> {
+    let bytes = std::fs::read(path).map_err(|e| MetadataError::ReadFile {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    crate::upload::put_with_content_type(store, key, Bytes::from(bytes), MIME_TEXT)
+        .await
+        .map_err(MetadataError::Put)
+}
+
+/// Sibling to [`upload_file_to_store`] for the snapshots surface —
+/// same shape, distinct error type so the snapshot view's
+/// `Result` stays typed.
+async fn upload_file_to_snapshots(
+    store: &Arc<dyn ObjectStore>,
+    key: &StorePath,
+    path: &std::path::Path,
+) -> Result<(), SnapshotsError> {
+    let bytes = std::fs::read(path).map_err(|e| SnapshotsError::ReadFile {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    crate::upload::put_with_content_type(store, key, Bytes::from(bytes), MIME_TEXT)
+        .await
+        .map_err(SnapshotsError::Put)
 }
 
 /// Non-async, zero-cost view bundling the snapshot-manifest ops and
@@ -248,25 +259,15 @@ impl SnapshotsView<'_> {
     }
 
     /// Upload a signed snapshot manifest from a local file. Reads the
-    /// file verbatim and PUTs the body. Returns the uploaded bytes so
-    /// the caller can record an upload sentinel without re-reading
-    /// the file. Used by the regular drain seal path where the
-    /// manifest is authored by the volume process and lives on disk.
+    /// file verbatim and PUTs the body. Used by the regular drain
+    /// seal path where the manifest is authored by the volume
+    /// process and lives on disk.
     pub async fn put_manifest_from_file(
         &self,
         snap_ulid: Ulid,
         path: &std::path::Path,
-    ) -> Result<Bytes, SnapshotsError> {
-        let bytes = std::fs::read(path).map_err(|e| SnapshotsError::ReadFile {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        let body = Bytes::from(bytes);
-        let key = manifest_key(self.vol_ulid, snap_ulid);
-        crate::upload::put_with_content_type(self.store, &key, body.clone(), MIME_TEXT)
-            .await
-            .map_err(SnapshotsError::Put)?;
-        Ok(body)
+    ) -> Result<(), SnapshotsError> {
+        upload_file_to_snapshots(self.store, &manifest_key(self.vol_ulid, snap_ulid), path).await
     }
 
     /// PUT the `-stop.manifest` ephemeral variant written by
@@ -288,17 +289,13 @@ impl SnapshotsView<'_> {
         &self,
         snap_ulid: Ulid,
         path: &std::path::Path,
-    ) -> Result<Bytes, SnapshotsError> {
-        let bytes = std::fs::read(path).map_err(|e| SnapshotsError::ReadFile {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        let body = Bytes::from(bytes);
-        let key = stop_manifest_key(self.vol_ulid, snap_ulid);
-        crate::upload::put_with_content_type(self.store, &key, body.clone(), MIME_TEXT)
-            .await
-            .map_err(SnapshotsError::Put)?;
-        Ok(body)
+    ) -> Result<(), SnapshotsError> {
+        upload_file_to_snapshots(
+            self.store,
+            &stop_manifest_key(self.vol_ulid, snap_ulid),
+            path,
+        )
+        .await
     }
 
     /// Conditional PUT with `If-None-Match: *`. The synthesised
@@ -847,31 +844,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_pubkey_returns_uploaded_bytes_for_sentinel() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (_s, vd) = vd();
-        let body = b"01234567890123456789012345678901234567890123456789012345678901AB\n";
-        let path = seed_file(tmp.path(), "volume.pub", body);
-        let got = vd.metadata().write_pubkey_from_file(&path).await.unwrap();
-        assert_eq!(
-            got.as_ref(),
-            body,
-            "returned bytes feed the upload sentinel"
-        );
-    }
-
-    #[tokio::test]
     async fn metadata_provenance_from_file_round_trip_via_store() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, vd) = vd();
         let body = b"provenance body";
         let path = seed_file(tmp.path(), "volume.provenance", body);
-        let got = vd
-            .metadata()
+        vd.metadata()
             .write_provenance_from_file(&path)
             .await
             .unwrap();
-        assert_eq!(got.as_ref(), body);
+        // S3 holds exactly what was on disk — the view ships the
+        // file verbatim, so a byte-equal comparison succeeds.
         let from_store = store.get(&provenance_key(vd.vol_ulid())).await.unwrap();
         assert_eq!(from_store.bytes().await.unwrap().as_ref(), body);
     }
