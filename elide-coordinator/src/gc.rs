@@ -594,11 +594,14 @@ pub async fn apply_done_handoffs(
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .context("loading volume verifying key")?;
+    let vol_ulid = Ulid::from_string(volume_id)
+        .map_err(|e| anyhow::anyhow!("apply_done_handoffs: volume_id {volume_id}: {e}"))?;
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     let cursor = HandoffCursor {
         fork_dir,
         cache_dir: fork_dir.join("cache"),
         vk,
-        uploader: crate::upload::SegmentUploader { volume_id, store },
+        vd: &vd,
     };
 
     let mut outcomes: Vec<HandoffOutcome> = Vec::new();
@@ -660,7 +663,7 @@ struct HandoffCursor<'a> {
     fork_dir: &'a Path,
     cache_dir: std::path::PathBuf,
     vk: elide_core::signing::VerifyingKey,
-    uploader: crate::upload::SegmentUploader<'a>,
+    vd: &'a crate::volume_data::VolumeData,
 }
 
 impl HandoffCursor<'_> {
@@ -691,8 +694,9 @@ impl HandoffCursor<'_> {
         // Upload + promote are idempotent: if a previous pass already
         // uploaded and promoted, the store PUT is a re-PUT of the same
         // bytes and `promote_segment` short-circuits on cache body presence.
-        self.uploader
-            .upload(gc_body, new_ulid)
+        self.vd
+            .segments()
+            .put_from_file(new_ulid, gc_body)
             .await
             .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
 

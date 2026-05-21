@@ -419,15 +419,16 @@ impl GcCycleOrchestrator {
         use futures::stream::{self, StreamExt};
         const REAP_CONCURRENCY: usize = 16;
         let volume_id = self.volume_id.as_str();
-        let store = self.store.clone();
+        let vd = self.volume_data.clone();
         stream::iter(to_reap.iter().copied())
             .for_each_concurrent(REAP_CONCURRENCY, |input| {
-                let store = store.clone();
-                let key = upload::segment_key(volume_id, input);
+                let segments = vd.segments();
                 async move {
-                    match store.delete(&key).await {
+                    match segments.delete(input).await {
                         Ok(_) => {}
-                        Err(object_store::Error::NotFound { .. }) => {}
+                        Err(crate::volume_data::SegmentsError::Delete(
+                            object_store::Error::NotFound { .. },
+                        )) => {}
                         Err(e) => {
                             // A failed DELETE is logged and retried
                             // on the next reap tick. The HEAD-after-
@@ -438,7 +439,10 @@ impl GcCycleOrchestrator {
                             // tombstone is only over-recorded by one
                             // tick if it turns out the delete didn't
                             // land (benign).
-                            warn!("[reap {volume_id}] delete {key}: {e}; will retry");
+                            warn!(
+                                "[reap {volume_id}] delete {}: {e}; will retry",
+                                segments.segment_key(input)
+                            );
                         }
                     }
                 }

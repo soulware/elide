@@ -94,19 +94,18 @@ pub async fn list_and_verify_segments(
     vol_ulid: Ulid,
     verifying_key: &VerifyingKey,
 ) -> Result<RecoveredSegments> {
-    let vol_id = vol_ulid.to_string();
     let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     let live = crate::segment_head::resolve_live_segments(&vd, verifying_key)
         .await
         .with_context(|| format!("resolving live segments for {vol_ulid}"))?;
 
     let mut out = RecoveredSegments::default();
+    let segments = vd.segments();
 
     for segment_ulid in live {
-        let key = crate::upload::segment_key(&vol_id, segment_ulid);
         let filename = segment_ulid.to_string();
 
-        match verify_one_segment(store, &key, &filename, verifying_key).await {
+        match verify_one_segment(&segments, segment_ulid, &filename, verifying_key).await {
             Ok(()) => {
                 out.segments.push(VerifiedSegment {
                     segment_ulid,
@@ -135,14 +134,14 @@ pub async fn list_and_verify_segments(
 /// signature. Body bytes are not fetched. Mirrors the verification
 /// step of `prefetch::fetch_idx`.
 async fn verify_one_segment(
-    store: &Arc<dyn ObjectStore>,
-    key: &StorePath,
+    segments: &crate::volume_data::SegmentsView<'_>,
+    seg_ulid: Ulid,
     segment_id: &str,
     verifying_key: &VerifyingKey,
 ) -> Result<()> {
     // Header first, to learn how big the index section is.
-    let header = store
-        .get_range(key, 0..HEADER_LEN as usize)
+    let header = segments
+        .get_range(seg_ulid, 0..HEADER_LEN as usize)
         .await
         .with_context(|| format!("fetching header for {segment_id}"))?;
 
@@ -160,8 +159,8 @@ async fn verify_one_segment(
     // but is bundled in the same prefix — fetching it here matches the
     // existing prefetch path and keeps the range count stable across
     // verification flavours.
-    let idx_bytes = store
-        .get_range(key, 0..body_section_start)
+    let idx_bytes = segments
+        .get_range(seg_ulid, 0..body_section_start)
         .await
         .with_context(|| format!("fetching index section for {segment_id}"))?;
 
