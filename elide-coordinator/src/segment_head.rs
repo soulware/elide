@@ -31,16 +31,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use elide_core::signing::{self, VerifyingKey};
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
-use tracing::warn;
 use ulid::Ulid;
 
-use crate::portable::MIME_TEXT;
 use crate::upload;
+use crate::volume_data::VolumeData;
 
 /// The post-snapshot delta carried by `by_id/<vol>/HEAD`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -334,12 +332,18 @@ pub fn live_set(manifest_segments: &BTreeSet<Ulid>, head: &SegmentHead) -> BTree
 /// fresh volume that has never sealed a snapshot has only HEAD's
 /// `Added` segments, and the formula reduces to those minus any
 /// `Superseded` / `Tombstoned` HEAD already accumulated.
+///
+/// Bridges two object classes — HEAD (via the typed `head()` view)
+/// and `snapshots/LATEST` + manifest (via the raw `data_store()`
+/// escape hatch). When the snapshots view lands in a later step of
+/// `docs/design-domain-store.md`, the escape hatch goes away.
 pub async fn resolve_live_segments(
-    store: &Arc<dyn ObjectStore>,
-    vol: Ulid,
+    vd: &dyn VolumeData,
     manifest_verifying_key: &VerifyingKey,
 ) -> Result<BTreeSet<Ulid>, ResolveError> {
+    let vol = vd.vol_ulid();
     let vol_id = vol.to_string();
+    let store = vd.data_store();
     // LATEST first — its result decides whether to fetch a manifest
     // at all. The manifest body GET and the HEAD GET are independent
     // once we know the snap ulid, so issue them concurrently and pay
@@ -348,11 +352,12 @@ pub async fn resolve_live_segments(
         Ok(opt) => opt,
         Err(e) => return Err(ResolveError::Latest(e.to_string())),
     };
+    let head_view = vd.head();
     let manifest_segments = match snap_ulid {
         Some(snap) => {
             let manifest_fut =
                 fetch_and_parse_manifest(store, &vol_id, snap, manifest_verifying_key);
-            let head_fut = read_head(store, vol);
+            let head_fut = head_view.read();
             let (manifest_res, head_res) = futures::join!(manifest_fut, head_fut);
             let head = head_res.map_err(|e| ResolveError::Head(e.to_string()))?;
             let manifest = manifest_res?;
@@ -360,7 +365,8 @@ pub async fn resolve_live_segments(
         }
         None => BTreeSet::new(),
     };
-    let head = read_head(store, vol)
+    let head = head_view
+        .read()
         .await
         .map_err(|e| ResolveError::Head(e.to_string()))?;
     Ok(live_set(&manifest_segments, &head))
@@ -389,56 +395,6 @@ async fn fetch_and_parse_manifest(
         signing::read_snapshot_manifest_from_bytes(&bytes, manifest_verifying_key, &snap_ulid)
             .map_err(|e| ResolveError::Manifest(format!("{key} parse/verify: {e}")))?;
     Ok(manifest.segment_ulids.into_iter().collect())
-}
-
-/// GET `by_id/<vol>/HEAD`. `Ok(SegmentHead::empty(None))` when absent —
-/// HEAD self-heals on the next active tick, so a 404 starts the writer
-/// from an empty state rather than failing.
-///
-/// An unparseable body is also treated as empty (logged), matching the
-/// design's "derived, unsigned state" stance: HEAD is an
-/// availability/enumeration hint, not an authenticity root, and
-/// corruption self-heals on the next writer pass.
-pub async fn read_head(
-    store: &Arc<dyn ObjectStore>,
-    vol: Ulid,
-) -> Result<SegmentHead, ReadHeadError> {
-    let key = head_key(vol);
-    let bytes = match store.get(&key).await {
-        Ok(g) => g
-            .bytes()
-            .await
-            .map_err(|e| ReadHeadError::Get(format!("{key}: {e}")))?,
-        Err(object_store::Error::NotFound { .. }) => return Ok(SegmentHead::empty(None)),
-        Err(e) => return Err(ReadHeadError::Get(format!("{key}: {e}"))),
-    };
-    let text = std::str::from_utf8(&bytes).map_err(|e| ReadHeadError::NotUtf8(e.to_string()))?;
-    match parse(text) {
-        Ok(h) => Ok(h),
-        Err(e) => {
-            warn!(
-                "[segment_head] {key} unparseable ({e}); treating as empty (self-heals on next tick)"
-            );
-            Ok(SegmentHead::empty(None))
-        }
-    }
-}
-
-/// PUT `by_id/<vol>/HEAD` with the rendered body. Whole-object overwrite,
-/// no CAS — the per-volume tick loop is the sole writer (drain → GC →
-/// reap sequential within one tick), so single-writer-per-vol-epoch is a
-/// structural fact, not a runtime check.
-pub async fn put_head(
-    store: &Arc<dyn ObjectStore>,
-    vol: Ulid,
-    head: &SegmentHead,
-) -> Result<(), PutHeadError> {
-    let key = head_key(vol);
-    let body = render(head);
-    crate::upload::put_with_content_type(store, &key, Bytes::from(body.into_bytes()), MIME_TEXT)
-        .await
-        .map_err(|e| PutHeadError::Put(format!("{key}: {e}")))?;
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,38 +429,6 @@ impl fmt::Display for ParseHeadError {
 }
 
 impl std::error::Error for ParseHeadError {}
-
-#[derive(Debug)]
-pub enum ReadHeadError {
-    Get(String),
-    NotUtf8(String),
-}
-
-impl fmt::Display for ReadHeadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ReadHeadError::Get(s) => write!(f, "getting HEAD: {s}"),
-            ReadHeadError::NotUtf8(s) => write!(f, "HEAD body not utf-8: {s}"),
-        }
-    }
-}
-
-impl std::error::Error for ReadHeadError {}
-
-#[derive(Debug)]
-pub enum PutHeadError {
-    Put(String),
-}
-
-impl fmt::Display for PutHeadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PutHeadError::Put(s) => write!(f, "putting HEAD: {s}"),
-        }
-    }
-}
-
-impl std::error::Error for PutHeadError {}
 
 #[derive(Debug)]
 pub enum ResolveError {
@@ -750,79 +674,13 @@ mod tests {
         assert_eq!(parsed.anchor, Some(a));
     }
 
-    #[tokio::test]
-    async fn read_returns_empty_when_absent() {
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let h = read_head(&store, vol()).await.unwrap();
-        assert_eq!(h, SegmentHead::empty(None));
-    }
-
-    #[tokio::test]
-    async fn put_then_read_round_trips() {
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let mut m = mint();
-        let anchor = m.next();
-        let a = m.next();
-        let input = m.next();
-        let output = m.next();
-        let tomb = m.next();
-
-        let mut h = SegmentHead::empty(Some(anchor));
-        h.added.insert(a);
-        h.added.insert(output);
-        h.superseded.insert(
-            input,
-            Supersession {
-                output,
-                since: DateTime::parse_from_rfc3339("2026-05-20T12:34:56Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-            },
-        );
-        h.tombstoned.insert(tomb);
-
-        put_head(&store, vol(), &h).await.unwrap();
-        let got = read_head(&store, vol()).await.unwrap();
-        assert_eq!(got, h);
-    }
-
-    #[tokio::test]
-    async fn put_overwrites_previous_body() {
-        // Whole-object overwrite: a second put with fewer entries must
-        // replace, not merge — single-writer-per-vol-epoch is the
-        // invariant that makes this safe.
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let mut m = mint();
-        let a1 = m.next();
-        let a2 = m.next();
-
-        let mut h1 = SegmentHead::empty(None);
-        h1.added.insert(a1);
-        h1.added.insert(a2);
-        put_head(&store, vol(), &h1).await.unwrap();
-
-        let h2 = SegmentHead::empty(None);
-        put_head(&store, vol(), &h2).await.unwrap();
-
-        let got = read_head(&store, vol()).await.unwrap();
-        assert!(got.added.is_empty(), "second put must overwrite, not merge");
-    }
-
-    #[tokio::test]
-    async fn unparseable_body_treated_as_empty() {
-        // Corruption self-heals on the next writer pass — HEAD is
-        // derived state, not authority.
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let key = head_key(vol());
-        store
-            .put(&key, Bytes::from_static(b"not a valid head body").into())
-            .await
-            .unwrap();
-        let h = read_head(&store, vol()).await.unwrap();
-        assert_eq!(h, SegmentHead::empty(None));
-    }
-
     // --- resolve_live_segments: manifest ∪ HEAD ---
+    //
+    // (HEAD read/put/delete round-trips live in `volume_data.rs` tests
+    // now that those operations belong to `VolumeData::head()`.)
+
+    use crate::volume_data::{BucketVolumeData, VolumeData};
+    use bytes::Bytes;
 
     async fn seed_manifest(
         store: &Arc<dyn ObjectStore>,
@@ -845,12 +703,17 @@ mod tests {
             .unwrap();
     }
 
+    fn vd_for(store: Arc<dyn ObjectStore>) -> Arc<dyn VolumeData> {
+        Arc::new(BucketVolumeData::new(store, vol()))
+    }
+
     #[tokio::test]
     async fn resolve_fresh_volume_returns_empty() {
         // No LATEST, no HEAD ⇒ no live segments.
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let live = resolve_live_segments(&store, vol(), &vk).await.unwrap();
+        let vd = vd_for(store);
+        let live = resolve_live_segments(&*vd, &vk).await.unwrap();
         assert!(live.is_empty());
     }
 
@@ -865,7 +728,8 @@ mod tests {
         let snap = m.next();
         seed_manifest(&store, &vol().to_string(), snap, &[s1, s2], &*signer).await;
 
-        let live = resolve_live_segments(&store, vol(), &vk).await.unwrap();
+        let vd = vd_for(store);
+        let live = resolve_live_segments(&*vd, &vk).await.unwrap();
         assert_eq!(live, [s1, s2].into_iter().collect());
     }
 
@@ -881,9 +745,10 @@ mod tests {
         let mut head = SegmentHead::empty(None);
         head.added.insert(a1);
         head.added.insert(a2);
-        put_head(&store, vol(), &head).await.unwrap();
+        let vd = vd_for(Arc::clone(&store));
+        vd.head().put(&head).await.unwrap();
 
-        let live = resolve_live_segments(&store, vol(), &vk).await.unwrap();
+        let live = resolve_live_segments(&*vd, &vk).await.unwrap();
         assert_eq!(live, [a1, a2].into_iter().collect());
     }
 
@@ -916,9 +781,10 @@ mod tests {
             },
         );
         head.tombstoned.insert(post2);
-        put_head(&store, vol(), &head).await.unwrap();
+        let vd = vd_for(Arc::clone(&store));
+        vd.head().put(&head).await.unwrap();
 
-        let live = resolve_live_segments(&store, vol(), &vk).await.unwrap();
+        let live = resolve_live_segments(&*vd, &vk).await.unwrap();
         // pre1 survives; pre2 superseded; post1 added; post2 tombstoned; out added.
         assert_eq!(live, [pre1, post1, out].into_iter().collect());
     }
@@ -944,9 +810,10 @@ mod tests {
             .unwrap();
         let mut head = SegmentHead::empty(None);
         head.added.insert(a);
-        put_head(&store, vol(), &head).await.unwrap();
+        let vd = vd_for(Arc::clone(&store));
+        vd.head().put(&head).await.unwrap();
 
-        let live = resolve_live_segments(&store, vol(), &vk).await.unwrap();
+        let live = resolve_live_segments(&*vd, &vk).await.unwrap();
         assert_eq!(live, [a].into_iter().collect());
     }
 }

@@ -648,7 +648,8 @@ async fn force_snapshot_now_op(
     // Step 1's hydration and this verification.
     let vol_ulid =
         Ulid::from_string(&volume_id).map_err(|e| IpcError::internal(format!("vol ulid: {e}")))?;
-    let live = elide_coordinator::segment_head::resolve_live_segments(store, vol_ulid, &vk)
+    let vd = elide_coordinator::volume_data::BucketVolumeData::new(Arc::clone(store), vol_ulid);
+    let live = elide_coordinator::segment_head::resolve_live_segments(&vd, &vk)
         .await
         .map_err(|e| IpcError::store(format!("resolving live segments for verification: {e}")))?;
     let pinned: std::collections::BTreeSet<Ulid> = segments.iter().copied().collect();
@@ -855,19 +856,16 @@ async fn fork_create_op(
     // artefacts are missing — which breaks both the normal claim path
     // and the peer-fetch auth pipeline (lineage walk 404s on
     // volume.provenance).
+    let new_vd = ctx.core.stores.volume_data(&new_vol_ulid_value);
     if let Err(e) =
-        elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, &new_vol_ulid, store)
-            .await
+        elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, new_vd.as_ref()).await
     {
         cleanup(&new_fork_dir, &symlink_path);
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
     }
-    if let Err(e) = elide_coordinator::upload::upload_volume_provenance_initial(
-        &new_fork_dir,
-        &new_vol_ulid,
-        store,
-    )
-    .await
+    if let Err(e) =
+        elide_coordinator::upload::upload_volume_provenance_initial(&new_fork_dir, new_vd.as_ref())
+            .await
     {
         cleanup(&new_fork_dir, &symlink_path);
         return Err(IpcError::store(format!(

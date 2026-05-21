@@ -136,13 +136,17 @@ exist so callers state which sub-object they are touching.
 
 ```rust
 trait VolumeData {
-    fn segments(&self)  -> Segments<'_>;
-    fn snapshots(&self) -> Snapshots<'_>;
-    fn retention(&self) -> Retention<'_>;
-    fn head(&self)      -> SegmentHead<'_>;
-    fn metadata(&self)  -> VolumeMetadata<'_>;   // volume.pub, volume.provenance
+    fn segments(&self)  -> SegmentsView<'_>;
+    fn snapshots(&self) -> SnapshotsView<'_>;
+    fn retention(&self) -> RetentionView<'_>;
+    fn head(&self)      -> HeadView<'_>;
+    fn metadata(&self)  -> MetadataView<'_>;   // volume.pub, volume.provenance
 }
 ```
+
+(The sub-view types are named `…View<'_>` to avoid collision with the
+data-bearing types they describe — `SegmentHead`, `SnapshotMeta`, etc.
+— which live in their own modules.)
 
 The borrow is from the `VolumeData` itself; sub-accessors are
 zero-cost views (they hold a `&self` reference to the parent handle
@@ -360,12 +364,22 @@ value. The migration is per-object:
 1. `EventJournal` first — smallest surface (~3 functions), strictest
    invariant payoff (`no delete` as a type), and a known-good test
    harness (`volume_event_store.rs`). Validates the verb-shape
-   choices on a low-blast-radius slice.
+   choices on a low-blast-radius slice. *Landed in PR #411.*
 2. `NameClaims` — next smallest, exercises the `ClaimToken` /
-   conditional-write shape that's reused everywhere.
+   conditional-write shape that's reused everywhere. *Landed in
+   PR #412.*
 3. `VolumeData::head()` and `VolumeData::metadata()` — fixed keys,
    tiny surface; clears the `recovery.rs` and `segment_head.rs`
-   cluster.
+   cluster. *Landed in this PR.* `VolumeData` is the per-volume
+   handle vended by `ScopedStores::volume_data(&vol_ulid)`. The
+   parent trait carries flat async methods for the migrated
+   operations; sub-views (`HeadView<'_>`, `MetadataView<'_>`) are
+   inherent methods on `dyn VolumeData` so callers name the
+   sub-object they touch (`vd.head().read()`, `vd.metadata()
+   .read_pubkey()`). The escape hatch `VolumeData::data_store()`
+   exposes the raw `Arc<dyn ObjectStore>` for object classes the
+   handle does not yet vend (segments, snapshots, retention); it
+   goes away in step 4.
 4. `VolumeData::segments()` and `::snapshots()` — the bulk of the
    `upload.rs`, `prefetch.rs`, `gc_cycle.rs`, `inbound/lifecycle.rs`
    churn.

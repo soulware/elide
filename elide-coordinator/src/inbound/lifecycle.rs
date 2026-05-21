@@ -255,6 +255,7 @@ pub(crate) async fn force_release_volume_op(
     // Mint the per-volume credential now that we know `dead_vol_ulid`.
     // All by_id/<dead_vol>/* ops below ride this store.
     let dead_store = stores.data_for_volume(&dead_vol_ulid);
+    let dead_vd = stores.volume_data(&dead_vol_ulid);
 
     // Recovery pipeline: fetch dead fork's pubkey, then synthesise a
     // fresh handoff manifest from the dead fork's HEAD-enumerated
@@ -265,11 +266,13 @@ pub(crate) async fn force_release_volume_op(
     // segment could have been signed-and-verified under a missing key,
     // so the dead fork is provably empty: publish an empty synthesised
     // handoff and flip to Released.
-    let dead_pub = recovery::fetch_volume_pub_optional(&dead_store, dead_vol_ulid)
+    let dead_pub = dead_vd
+        .metadata()
+        .read_pubkey_optional()
         .await
         .map_err(|e| {
             IpcError::store(format!(
-                "fetching volume.pub for released fork {dead_vol_ulid}: {e:#}"
+                "fetching volume.pub for released fork {dead_vol_ulid}: {e}"
             ))
         })?;
 
@@ -1642,15 +1645,13 @@ mod tests {
         vol_ulid: ulid::Ulid,
         segs: &[ulid::Ulid],
     ) {
-        let mut head = elide_coordinator::segment_head::read_head(store, vol_ulid)
-            .await
-            .unwrap();
+        use elide_coordinator::volume_data::{BucketVolumeData, VolumeData};
+        let vd: Arc<dyn VolumeData> = Arc::new(BucketVolumeData::new(Arc::clone(store), vol_ulid));
+        let mut head = vd.head().read().await.unwrap();
         for s in segs {
             head.added.insert(*s);
         }
-        elide_coordinator::segment_head::put_head(store, vol_ulid, &head)
-            .await
-            .unwrap();
+        vd.head().put(&head).await.unwrap();
     }
 
     /// Fixture: a name in `Live` state pointing at a dead fork that has

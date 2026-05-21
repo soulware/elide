@@ -419,7 +419,8 @@ pub async fn pull_indexes_via_list(
 
     let vol_ulid = Ulid::from_string(volume_id)
         .map_err(|e| anyhow::anyhow!("invalid volume_id {volume_id}: {e}"))?;
-    let live = crate::segment_head::resolve_live_segments(store, vol_ulid, verifying_key)
+    let vd = crate::volume_data::BucketVolumeData::new(Arc::clone(store), vol_ulid);
+    let live = crate::segment_head::resolve_live_segments(&vd, verifying_key)
         .await
         .with_context(|| format!("resolving live segments for {volume_id}"))?;
 
@@ -1487,9 +1488,12 @@ mod tests {
                 since: chrono::Utc::now(),
             },
         );
-        crate::segment_head::put_head(&store, root_ulid, &head)
-            .await
-            .unwrap();
+        {
+            use crate::volume_data::{BucketVolumeData, VolumeData};
+            let vd: Arc<dyn VolumeData> =
+                Arc::new(BucketVolumeData::new(Arc::clone(&store), root_ulid));
+            vd.head().put(&head).await.unwrap();
+        }
 
         let result = pull_indexes_via_list(&store, &root_dir, root_ulid_str, &vk, None)
             .await

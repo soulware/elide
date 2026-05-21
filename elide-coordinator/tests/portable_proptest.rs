@@ -207,7 +207,12 @@ impl World {
                 // list_and_verify_segments returns an empty slice;
                 // the synthesised manifest covers nothing, which the
                 // recovery API explicitly allows.
-                let dead_pub = match recovery::fetch_volume_pub(&self.store, dead_vol).await {
+                let dead_vd: std::sync::Arc<dyn elide_coordinator::volume_data::VolumeData> =
+                    std::sync::Arc::new(elide_coordinator::volume_data::BucketVolumeData::new(
+                        std::sync::Arc::clone(&self.store),
+                        dead_vol,
+                    ));
+                let dead_pub = match dead_vd.metadata().read_pubkey().await {
                     Ok(k) => k,
                     Err(_) => return,
                 };

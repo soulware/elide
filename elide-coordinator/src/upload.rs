@@ -432,8 +432,8 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
     }
 }
 
-/// Upload `<vol_dir>/volume.pub` to `by_id/<volume_id>/volume.pub` and write
-/// the local upload sentinel.
+/// Upload `<vol_dir>/volume.pub` via the volume's typed metadata
+/// handle and write the local upload sentinel.
 ///
 /// Used at create / fork time to establish the invariant
 /// "`names/<name>` only ever points at a `vol_ulid` whose `volume.pub` is
@@ -446,22 +446,23 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
 /// pass observes a content-equal sentinel and skips the redundant PUT.
 pub async fn upload_volume_pub_initial(
     vol_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
+    vd: &dyn crate::volume_data::VolumeData,
 ) -> Result<()> {
     let pub_key_path = vol_dir.join("volume.pub");
     let bytes = std::fs::read(&pub_key_path)
         .with_context(|| format!("reading {}", pub_key_path.display()))?;
-    upload_small_bytes(&bytes, volume_id, "volume.pub", MIME_TEXT, store).await?;
+    vd.metadata()
+        .write_pubkey_bytes(&bytes)
+        .await
+        .with_context(|| format!("uploading volume.pub for {}", vd.vol_ulid()))?;
     let sentinel = upload_sentinel(vol_dir, "volume.pub");
     mark_uploaded(&sentinel, &bytes)
         .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
     Ok(())
 }
 
-/// Upload `<vol_dir>/volume.provenance` to
-/// `by_id/<volume_id>/volume.provenance` and write the local upload
-/// sentinel.
+/// Upload `<vol_dir>/volume.provenance` via the volume's typed
+/// metadata handle and write the local upload sentinel.
 ///
 /// Sibling to [`upload_volume_pub_initial`]: extends the same
 /// "`names/<name>` only ever points at a `vol_ulid` whose immutable
@@ -480,20 +481,15 @@ pub async fn upload_volume_pub_initial(
 /// has no `names/<name>` referrer and is reclaimed by future GC.
 pub async fn upload_volume_provenance_initial(
     vol_dir: &Path,
-    volume_id: &str,
-    store: &Arc<dyn ObjectStore>,
+    vd: &dyn crate::volume_data::VolumeData,
 ) -> Result<()> {
     let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
     let bytes = std::fs::read(&provenance_path)
         .with_context(|| format!("reading {}", provenance_path.display()))?;
-    upload_small_bytes(
-        &bytes,
-        volume_id,
-        elide_core::signing::VOLUME_PROVENANCE_FILE,
-        MIME_TEXT,
-        store,
-    )
-    .await?;
+    vd.metadata()
+        .write_provenance_bytes(&bytes)
+        .await
+        .with_context(|| format!("uploading volume.provenance for {}", vd.vol_ulid()))?;
     let sentinel = upload_sentinel(vol_dir, elide_core::signing::VOLUME_PROVENANCE_FILE);
     mark_uploaded(&sentinel, &bytes)
         .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
@@ -597,7 +593,10 @@ pub async fn upload_snapshot_metadata(
                         }
                     };
                     let empty = crate::segment_head::SegmentHead::empty(Some(snap_ulid));
-                    if let Err(e) = crate::segment_head::put_head(store, vol_ulid, &empty).await {
+                    let vd: Arc<dyn crate::volume_data::VolumeData> = Arc::new(
+                        crate::volume_data::BucketVolumeData::new(Arc::clone(store), vol_ulid),
+                    );
+                    if let Err(e) = vd.head().put(&empty).await {
                         warn!(
                             "[upload] truncating HEAD for {snap_ulid}: {e}; \
                              self-heals on next active tick"
