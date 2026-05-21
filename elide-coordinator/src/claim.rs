@@ -728,7 +728,10 @@ impl ClaimOrchestrator {
             }
             self.job
                 .append(ClaimAttachEvent::PullingAncestor { vol_ulid });
-            let store = self.ctx.core.stores.data_for_volume(&vol_ulid);
+            // Ancestor reads are GETs only — read-scoped `volume-ro`
+            // is enough (and avoids reaching for write-capable
+            // `coord-data` we never use on this path).
+            let store = self.ctx.core.stores.volume_ro(&vol_ulid, &[]);
             self.pulled_guard.record(vol_ulid);
             let reply = pull_readonly_op(
                 vol_ulid,
@@ -769,11 +772,10 @@ impl ClaimOrchestrator {
     /// up; see [`Self::early_rebind`] for the recovery story.)
     async fn resolve_handoff_key(&mut self) -> Result<(), IpcError> {
         let handoff_started = std::time::Instant::now();
-        let store = self
-            .ctx
-            .core
-            .stores
-            .data_for_volume(&self.released_vol_ulid);
+        // Reads the handoff manifest under
+        // `by_id/<released>/snapshots/` — GET only, so `volume-ro` is
+        // the right scope.
+        let store = self.ctx.core.stores.volume_ro(&self.released_vol_ulid, &[]);
         let base_ro = self.ctx.core.stores.peer_verifier_store();
         let key = resolve_handoff_key_via_recovery(
             self.released_vol_ulid,
@@ -1087,7 +1089,8 @@ pub(crate) async fn skip_empty_intermediates_impl(
             IpcError::internal(format!("loading volume.pub for {effective_vol}: {e}"))
         })?;
 
-        let store = stores.data_for_volume(&effective_vol);
+        // Pure-read manifest fetch — `volume-ro` is the right scope.
+        let store = stores.volume_ro(&effective_vol, &[]);
         let base_ro = stores.peer_verifier_store();
         let (manifest, _verifier) = elide_coordinator::recovery::fetch_verified_handoff_manifest(
             &store,
@@ -1120,7 +1123,10 @@ pub(crate) async fn skip_empty_intermediates_impl(
             job.append(ClaimAttachEvent::PullingAncestor {
                 vol_ulid: parent_vol_ulid,
             });
-            let parent_store = stores.data_for_volume(&parent_vol_ulid);
+            // Ancestor pull is GET-only — `volume-ro` suffices, and is
+            // the least-privileged credential that grants read on
+            // `by_id/<ancestor>/*`.
+            let parent_store = stores.volume_ro(&parent_vol_ulid, &[]);
             guard.record(parent_vol_ulid);
             let _ = pull_readonly_op(parent_vol_ulid, data_dir, &parent_store, peer).await?;
         }

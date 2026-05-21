@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use object_store::ObjectStore;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
@@ -127,7 +126,7 @@ pub fn peer_fetch_handle() -> Option<&'static PeerFetchHandle> {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_volume_tasks(
     fork_dir: PathBuf,
-    store: Arc<dyn ObjectStore>,
+    stores: Arc<dyn crate::stores::ScopedStores>,
     journal: Arc<dyn crate::event_journal::EventJournalReader>,
     drain_interval: Duration,
     gc_config: GcConfig,
@@ -182,6 +181,15 @@ pub async fn run_volume_tasks(
         .map(|n| format!(" ({n})"))
         .unwrap_or_default();
 
+    // Per-vol coord-data store for drain/GC writes under
+    // `by_id/<vol>/`. Peer-discovery reads `events/<name>/` and runs
+    // on coord-base. Prefetch crosses ancestor prefixes so it mints
+    // `volume-ro` itself inside `prefetch_indexes`.
+    let data_store = match parsed_ulid {
+        Some(u) => stores.data_for_volume(&u),
+        None => stores.writer(),
+    };
+
     // Prefetch segment indexes on startup if the fork has no local index files.
     // This covers the common case of a volume pulled from the store with only
     // the directory skeleton — without .idx files Volume::open cannot rebuild
@@ -203,9 +211,10 @@ pub async fn run_volume_tasks(
         // has a clean Released predecessor with a published peer-endpoint.
         // Discovery is best-effort — every failure path here collapses
         // to `None` and prefetch falls through to S3 cleanly.
+        let peer_discovery_store = stores.writer();
         let peer_ctx = match (peer_fetch_handle(), read_volume_name(&fork_dir)) {
             (Some(handle), Some(volume_name)) => crate::peer_discovery::discover_peer_for_claim(
-                &store,
+                &peer_discovery_store,
                 journal.as_ref(),
                 &volume_name,
             )
@@ -218,7 +227,7 @@ pub async fn run_volume_tasks(
             _ => None,
         };
         let prefetch_result =
-            prefetch::prefetch_indexes(&fork_dir, &store, peer_ctx.as_ref()).await;
+            prefetch::prefetch_indexes(&fork_dir, &stores, peer_ctx.as_ref()).await;
         match &prefetch_result {
             Ok(r) if r.fetched > 0 || r.snapshots_fetched > 0 || r.hints_fetched > 0 => {
                 if r.fetched > 0 {
@@ -268,7 +277,7 @@ pub async fn run_volume_tasks(
     let mut orch = GcCycleOrchestrator::new(
         fork_dir.clone(),
         volume_id,
-        store,
+        data_store,
         gc_config,
         &snapshot_locks,
     );

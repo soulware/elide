@@ -58,11 +58,13 @@ pub(crate) const COORD_ENROLL_ROLES: &[&str] = &[
 const CAVEAT_EXP: &str = "exp";
 const CAVEAT_VOLUME: &str = "elide:Volume";
 
-/// Lifetime requested for a `volume-ro` credential. Matches the
-/// documented `volume-ro` role default/max (`docs/design-mint.md`
-/// § "Elide as customer": 30 days) and the prior in-process iam
-/// default, so the `exp` we attenuate to never exceeds the role bound.
-const VOLUME_RO_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// Lifetime requested for a `volume-ro` credential. Set to 1h: the
+/// non-lazy fetch episode completes in seconds, and the lazy-volume
+/// cache refreshes proactively at half-life (`docs/design-mint.md`
+/// § "Keypair freshness — split by volume mode"). Read keys on the
+/// narrowest scope still benefit from the tightest revocation window
+/// that doesn't put the refresh path on the hot path.
+pub(crate) const VOLUME_RO_TTL_SECS: u64 = 60 * 60;
 
 pub(crate) fn now_unix() -> io::Result<u64> {
     SystemTime::now()

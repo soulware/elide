@@ -118,7 +118,7 @@ const PREFETCH_CONCURRENCY: usize = 8;
 /// of any segment not already in `index/`.
 pub async fn prefetch_indexes(
     fork_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
+    stores: &Arc<dyn crate::stores::ScopedStores>,
     peer: Option<&PeerFetchContext>,
 ) -> Result<PrefetchResult> {
     // `fork_dir` is `<data_dir>/by_id/<ulid>/`. All volumes — writable,
@@ -128,6 +128,13 @@ pub async fn prefetch_indexes(
         .and_then(|p| p.parent())
         .unwrap_or(fork_dir);
     let by_id_dir = data_dir.join("by_id");
+    let own_ulid = Ulid::from_string(
+        fork_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("fork_dir has no name: {}", fork_dir.display()))?,
+    )
+    .map_err(|e| anyhow::anyhow!("fork_dir name is not a ULID: {e}"))?;
 
     // Two-pass shape:
     //   Pass 1 (this scope): walk lineage chain + extent ancestors to
@@ -172,8 +179,15 @@ pub async fn prefetch_indexes(
     let own_lineage =
         signing::read_lineage_with_key(fork_dir, &own_vk, signing::VOLUME_PROVENANCE_FILE)
             .with_context(|| format!("reading provenance for {}", fork_dir.display()))?;
+    let mut ancestor_ulids: Vec<Ulid> = Vec::new();
     let mut cursor = own_lineage.parent;
     while let Some(parent) = cursor {
+        let parent_ulid = Ulid::from_string(&parent.volume_ulid).map_err(|e| {
+            anyhow::anyhow!(
+                "ancestor volume_ulid '{}' is not a ULID: {e}",
+                parent.volume_ulid
+            )
+        })?;
         let parent_dir = resolve_ancestor_dir(by_id_dir.as_path(), &parent.volume_ulid);
         let parent_dir = if parent_dir.exists() {
             parent_dir
@@ -182,10 +196,12 @@ pub async fn prefetch_indexes(
                 "[prefetch] pulling ancestor skeleton: {}",
                 parent.volume_ulid
             );
-            pull_volume_skeleton(store, data_dir, &parent.volume_ulid, peer)
+            let parent_store = stores.volume_ro(&parent_ulid, &[]);
+            pull_volume_skeleton(&parent_store, data_dir, &parent.volume_ulid, peer)
                 .await
                 .with_context(|| format!("pulling ancestor {}", parent.volume_ulid))?
         };
+        ancestor_ulids.push(parent_ulid);
         let parent_vk = VerifyingKey::from_bytes(&parent.pubkey).map_err(|e| {
             anyhow::anyhow!(
                 "invalid parent pubkey in provenance for {}: {e}",
@@ -251,7 +267,10 @@ pub async fn prefetch_indexes(
                     )
                 })?;
             info!("[prefetch] pulling extent-source skeleton: {ulid_str}");
-            pull_volume_skeleton(store, data_dir, ulid_str, peer)
+            let ulid = Ulid::from_string(ulid_str)
+                .map_err(|e| anyhow::anyhow!("extent ancestor '{ulid_str}' not a ULID: {e}"))?;
+            let ancestor_store = stores.volume_ro(&ulid, &[]);
+            pull_volume_skeleton(&ancestor_store, data_dir, ulid_str, peer)
                 .await
                 .with_context(|| format!("pulling extent-source {ulid_str}"))?
         };
@@ -264,6 +283,12 @@ pub async fn prefetch_indexes(
         // the requesting child's provenance, so no
         // `manifest_pubkey` override applies). Manifest verify and
         // segment verify both use the ancestor's own volume.pub.
+        let ancestor_ulid = Ulid::from_string(&volume_id).map_err(|e| {
+            anyhow::anyhow!("extent ancestor volume_id '{volume_id}' not a ULID: {e}")
+        })?;
+        if !ancestor_ulids.contains(&ancestor_ulid) {
+            ancestor_ulids.push(ancestor_ulid);
+        }
         tasks.push(PrefetchTask {
             dir: ancestor_dir,
             volume_id,
@@ -274,7 +299,11 @@ pub async fn prefetch_indexes(
     }
 
     // Pass 2: dispatch all `prefetch_fork` calls concurrently. Each
-    // task gets its own `PrefetchResult`; merge after.
+    // task gets its own `PrefetchResult`; merge after. All tasks share
+    // one `volume-ro` store scoped to the head fork plus every
+    // discovered ancestor — the role's policy expands one read ARN per
+    // entry (`docs/design-mint.md` § `volume-ro`).
+    let store = stores.volume_ro(&own_ulid, &ancestor_ulids);
     let peer_owned: Option<PeerFetchContext> = peer.cloned();
     let outcomes: Vec<PrefetchResult> = futures::stream::iter(tasks.into_iter().map(|task| {
         let store = store.clone();
@@ -906,6 +935,13 @@ mod tests {
         build_snapshot_manifest_bytes, generate_keypair, load_signer, write_provenance,
     };
 
+    /// Wrap a single `ObjectStore` as a `ScopedStores` so the test
+    /// `prefetch_indexes` calls match the production signature; the
+    /// passthrough returns the same store for every role.
+    fn passthrough(store: &Arc<dyn ObjectStore>) -> Arc<dyn crate::stores::ScopedStores> {
+        Arc::new(crate::stores::PassthroughStores::new(Arc::clone(store)))
+    }
+
     /// Build a parent+child fork pair using the flat by_id/<ulid> layout.
     /// Upload the parent segment to the store at the correct by_id/ prefix.
     /// Verify prefetch_indexes downloads the .idx file for the parent.
@@ -1004,7 +1040,9 @@ mod tests {
         .unwrap();
 
         // Run prefetch_indexes on the child fork.
-        let result = prefetch_indexes(&child_dir, &store, None).await.unwrap();
+        let result = prefetch_indexes(&child_dir, &passthrough(&store), None)
+            .await
+            .unwrap();
         assert_eq!(result.fetched, 1, "should fetch one .idx");
         assert_eq!(result.failed, 0);
 
@@ -1018,7 +1056,9 @@ mod tests {
         assert_eq!(entries[0].hash, hash);
 
         // Running again should skip (already present).
-        let result2 = prefetch_indexes(&child_dir, &store, None).await.unwrap();
+        let result2 = prefetch_indexes(&child_dir, &passthrough(&store), None)
+            .await
+            .unwrap();
         assert_eq!(result2.fetched, 0);
         assert_eq!(result2.skipped, 1);
     }
@@ -1109,7 +1149,9 @@ mod tests {
         .await
         .unwrap();
 
-        let result = prefetch_indexes(&child_dir, &store, None).await.unwrap();
+        let result = prefetch_indexes(&child_dir, &passthrough(&store), None)
+            .await
+            .unwrap();
         assert_eq!(result.fetched, 1);
         assert_eq!(result.failed, 0);
 
@@ -1243,7 +1285,9 @@ mod tests {
         // Run prefetch on the child. Should succeed: manifest verifies
         // under the override key, the .idx itself verifies under the
         // parent's volume.pub.
-        let result = prefetch_indexes(&child_dir, &store, None).await.unwrap();
+        let result = prefetch_indexes(&child_dir, &passthrough(&store), None)
+            .await
+            .unwrap();
         assert_eq!(
             result.fetched, 1,
             "synthesised handoff manifest must verify under override key"
@@ -1325,7 +1369,9 @@ mod tests {
         .await
         .unwrap();
 
-        let result = prefetch_indexes(&root_dir, &store, None).await.unwrap();
+        let result = prefetch_indexes(&root_dir, &passthrough(&store), None)
+            .await
+            .unwrap();
         assert_eq!(result.fetched, 1, "should fetch own .idx");
         assert_eq!(result.failed, 0);
 
@@ -1380,7 +1426,9 @@ mod tests {
         let key = crate::upload::segment_key(root_ulid, seg_ulid.parse().unwrap());
         store.put(&key, seg_bytes.into()).await.unwrap();
 
-        let result = prefetch_indexes(&root_dir, &store, None).await.unwrap();
+        let result = prefetch_indexes(&root_dir, &passthrough(&store), None)
+            .await
+            .unwrap();
         assert_eq!(result.fetched, 0, "no snapshot → no fetch");
         assert!(
             !root_dir
@@ -1551,7 +1599,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = prefetch_indexes(&vol_dir, &store, None).await.unwrap();
+        let result = prefetch_indexes(&vol_dir, &passthrough(&store), None)
+            .await
+            .unwrap();
         assert_eq!(result.failed, 0);
 
         let snap_dir = vol_dir.join("snapshots");
@@ -1560,7 +1610,9 @@ mod tests {
         assert!(!snap_dir.join(format!("{snap_ulid}.filemap")).exists());
 
         // Idempotent: re-running doesn't re-download.
-        prefetch_indexes(&vol_dir, &store, None).await.unwrap();
+        prefetch_indexes(&vol_dir, &passthrough(&store), None)
+            .await
+            .unwrap();
     }
 
     /// Ancestor-walk path: when an ancestor has multiple snapshots in
@@ -1644,7 +1696,9 @@ mod tests {
                 .unwrap();
         }
 
-        prefetch_indexes(&child_dir, &store, None).await.unwrap();
+        prefetch_indexes(&child_dir, &passthrough(&store), None)
+            .await
+            .unwrap();
 
         let parent_snap_dir = parent_dir.join("snapshots");
         assert!(
@@ -1818,7 +1872,7 @@ mod tests {
             volume_name: "myvol".to_owned(),
         };
 
-        let result = prefetch_indexes(&child_dir, &store, Some(&peer))
+        let result = prefetch_indexes(&child_dir, &passthrough(&store), Some(&peer))
             .await
             .unwrap();
 
