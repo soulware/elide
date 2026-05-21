@@ -3,21 +3,25 @@
 //! Third slice of the domain-typed store layer
 //! (`docs/design-domain-store.md`). [`VolumeData`] is the per-volume
 //! handle; it carves the volume's `coord-data` prefix into
-//! object-class sub-accessors that callers name explicitly. This
-//! slice populates two of the four sub-accessors the design
-//! enumerates:
+//! object-class sub-accessors that callers name explicitly. The
+//! currently-populated sub-accessors are:
 //!
 //! * [`HeadView`] — the per-volume HEAD object
 //!   (`by_id/<vol>/HEAD`, the post-snapshot delta from
 //!   `docs/design-segment-index.md`). Single-writer, no CAS.
 //! * [`MetadataView`] — the immutable trust artefacts
 //!   `by_id/<vol>/volume.pub` and `by_id/<vol>/volume.provenance`.
+//! * [`SnapshotsView`] — signed snapshot manifests under
+//!   `by_id/<vol>/snapshots/…` and the `snapshots/LATEST` pointer.
+//!   Includes a typed CAS (`advance_latest` / `LatestPointerToken`)
+//!   for the LATEST pointer; an `If-None-Match: *` verb
+//!   (`try_publish_manifest`) for the synthesised-handoff publish
+//!   path; and a typed `get_manifest(snap, vk) -> SnapshotManifest`
+//!   that parses and verifies in one step (with `get_manifest_bytes`
+//!   for the recovery flow that peeks the unauthenticated recovery
+//!   header before picking a verifying key).
 //!
-//! The remaining sub-accessors (segments, snapshots, retention) land
-//! in later slices. Until they do, [`VolumeData::data_store`] is an
-//! escape hatch returning the raw `Arc<dyn ObjectStore>` so callers
-//! spanning multiple object classes (`resolve_live_segments`,
-//! `prefetch`, the snapshot publish path) keep working unchanged.
+//! The remaining sub-accessor (segments) lands in a later slice.
 //!
 //! `VolumeData` is a concrete struct, not a trait. There is one
 //! impl, no reader/writer split (every op rides one `coord-data`
@@ -28,13 +32,15 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
+use object_store::{ObjectMeta, ObjectStore, UpdateVersion};
 use ulid::Ulid;
 
-use elide_core::signing::VerifyingKey;
+use elide_core::signing::{self, SnapshotManifest, VerifyingKey};
 
-use crate::portable::MIME_TEXT;
+use crate::portable::{
+    ConditionalPutError, MIME_TEXT, put_if_absent_with_type, put_with_match_with_type,
+};
 use crate::segment_head::{self, ParseHeadError, SegmentHead};
 
 /// Per-volume domain handle, scoped to `by_id/<vol>/…` on the
@@ -56,15 +62,6 @@ impl VolumeData {
         self.vol_ulid
     }
 
-    /// Escape hatch for object classes not yet covered by a
-    /// sub-accessor (segments, snapshots, retention). Returns the raw
-    /// `coord-data`-credentialled store. Removed as the remaining
-    /// sub-accessors land (`docs/design-domain-store.md` § *Cascade
-    /// containment*).
-    pub fn data_store(&self) -> &Arc<dyn ObjectStore> {
-        &self.store
-    }
-
     /// HEAD operations (`by_id/<vol>/HEAD`).
     pub fn head(&self) -> HeadView<'_> {
         HeadView {
@@ -76,6 +73,14 @@ impl VolumeData {
     /// Immutable metadata (`volume.pub`, `volume.provenance`).
     pub fn metadata(&self) -> MetadataView<'_> {
         MetadataView {
+            store: &self.store,
+            vol_ulid: self.vol_ulid,
+        }
+    }
+
+    /// Signed snapshot manifests and the `snapshots/LATEST` pointer.
+    pub fn snapshots(&self) -> SnapshotsView<'_> {
+        SnapshotsView {
             store: &self.store,
             vol_ulid: self.vol_ulid,
         }
@@ -169,32 +174,473 @@ impl MetadataView<'_> {
         }
     }
 
-    /// PUT `by_id/<vol>/volume.pub` with the given hex-encoded body.
-    /// Bytes are passed through verbatim — the on-disk format is
-    /// `lowercase-hex(pub_bytes) + "\n"` and this method preserves it.
-    pub async fn write_pubkey_bytes(&self, bytes: &[u8]) -> Result<(), MetadataError> {
+    /// Upload `volume.pub` from a local file. Reads the file
+    /// verbatim and PUTs the body to
+    /// `by_id/<vol>/volume.pub`. Returns the uploaded bytes so the
+    /// caller can record the matching upload sentinel without
+    /// re-reading.
+    ///
+    /// The on-disk format is the canonical form (authored by
+    /// `signing::generate_keypair`): `lowercase-hex(pub) + "\n"`.
+    /// The view ships exactly those bytes — no parse, no
+    /// re-serialise.
+    pub async fn write_pubkey_from_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Bytes, MetadataError> {
+        let bytes = std::fs::read(path).map_err(|e| MetadataError::ReadFile {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let body = Bytes::from(bytes);
         let key = pubkey_key(self.vol_ulid);
-        crate::upload::put_with_content_type(
-            self.store,
-            &key,
-            Bytes::copy_from_slice(bytes),
-            MIME_TEXT,
-        )
-        .await
-        .map_err(MetadataError::Put)
+        crate::upload::put_with_content_type(self.store, &key, body.clone(), MIME_TEXT)
+            .await
+            .map_err(MetadataError::Put)?;
+        Ok(body)
     }
 
-    /// PUT `by_id/<vol>/volume.provenance` with the given body.
-    pub async fn write_provenance_bytes(&self, bytes: &[u8]) -> Result<(), MetadataError> {
+    /// Upload `volume.provenance` from a local file. Reads the file
+    /// verbatim and PUTs the body to
+    /// `by_id/<vol>/volume.provenance`. Returns the uploaded bytes so
+    /// the caller can record the matching upload sentinel.
+    ///
+    /// The on-disk format is the canonical signed form authored by
+    /// [`signing::write_provenance`]; the view ships exactly those
+    /// bytes — the structured `ProvenanceLineage` is parsed by
+    /// downstream readers, never re-serialised here.
+    pub async fn write_provenance_from_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Bytes, MetadataError> {
+        let bytes = std::fs::read(path).map_err(|e| MetadataError::ReadFile {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let body = Bytes::from(bytes);
         let key = provenance_key(self.vol_ulid);
-        crate::upload::put_with_content_type(
-            self.store,
-            &key,
-            Bytes::copy_from_slice(bytes),
-            MIME_TEXT,
-        )
-        .await
-        .map_err(MetadataError::Put)
+        crate::upload::put_with_content_type(self.store, &key, body.clone(), MIME_TEXT)
+            .await
+            .map_err(MetadataError::Put)?;
+        Ok(body)
+    }
+}
+
+/// Non-async, zero-cost view bundling the snapshot-manifest ops and
+/// the `snapshots/LATEST` pointer.
+pub struct SnapshotsView<'a> {
+    store: &'a Arc<dyn ObjectStore>,
+    vol_ulid: Ulid,
+}
+
+impl SnapshotsView<'_> {
+    /// PUT a signed snapshot manifest at
+    /// `by_id/<vol>/snapshots/<date>/<snap_ulid>.manifest`. Used by
+    /// callers that already hold the canonical bytes in memory
+    /// (synthesised handoffs, the force-release empty manifest). The
+    /// (date, ulid) partitioning makes the key globally unique by
+    /// construction, so no CAS.
+    pub async fn put_manifest(&self, snap_ulid: Ulid, bytes: Bytes) -> Result<(), SnapshotsError> {
+        let key = manifest_key(self.vol_ulid, snap_ulid);
+        crate::upload::put_with_content_type(self.store, &key, bytes, MIME_TEXT)
+            .await
+            .map_err(SnapshotsError::Put)
+    }
+
+    /// Upload a signed snapshot manifest from a local file. Reads the
+    /// file verbatim and PUTs the body. Returns the uploaded bytes so
+    /// the caller can record an upload sentinel without re-reading
+    /// the file. Used by the regular drain seal path where the
+    /// manifest is authored by the volume process and lives on disk.
+    pub async fn put_manifest_from_file(
+        &self,
+        snap_ulid: Ulid,
+        path: &std::path::Path,
+    ) -> Result<Bytes, SnapshotsError> {
+        let bytes = std::fs::read(path).map_err(|e| SnapshotsError::ReadFile {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let body = Bytes::from(bytes);
+        let key = manifest_key(self.vol_ulid, snap_ulid);
+        crate::upload::put_with_content_type(self.store, &key, body.clone(), MIME_TEXT)
+            .await
+            .map_err(SnapshotsError::Put)?;
+        Ok(body)
+    }
+
+    /// PUT the `-stop.manifest` ephemeral variant written by
+    /// `volume stop`. Same path-shape as [`Self::put_manifest`].
+    pub async fn put_stop_manifest(
+        &self,
+        snap_ulid: Ulid,
+        bytes: Bytes,
+    ) -> Result<(), SnapshotsError> {
+        let key = stop_manifest_key(self.vol_ulid, snap_ulid);
+        crate::upload::put_with_content_type(self.store, &key, bytes, MIME_TEXT)
+            .await
+            .map_err(SnapshotsError::Put)
+    }
+
+    /// Sibling to [`Self::put_manifest_from_file`] for the
+    /// `-stop.manifest` variant.
+    pub async fn put_stop_manifest_from_file(
+        &self,
+        snap_ulid: Ulid,
+        path: &std::path::Path,
+    ) -> Result<Bytes, SnapshotsError> {
+        let bytes = std::fs::read(path).map_err(|e| SnapshotsError::ReadFile {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let body = Bytes::from(bytes);
+        let key = stop_manifest_key(self.vol_ulid, snap_ulid);
+        crate::upload::put_with_content_type(self.store, &key, body.clone(), MIME_TEXT)
+            .await
+            .map_err(SnapshotsError::Put)?;
+        Ok(body)
+    }
+
+    /// Conditional PUT with `If-None-Match: *`. The synthesised
+    /// handoff manifest published by `volume release --force` uses
+    /// this verb so concurrent recovering coordinators racing on the
+    /// same freshly-minted `snap_ulid` resolve cleanly — one wins,
+    /// the others get [`PublishManifestError::AlreadyExists`].
+    pub async fn try_publish_manifest(
+        &self,
+        snap_ulid: Ulid,
+        bytes: Bytes,
+    ) -> Result<(), PublishManifestError> {
+        let key = manifest_key(self.vol_ulid, snap_ulid);
+        match put_if_absent_with_type(self.store.as_ref(), &key, bytes, MIME_TEXT).await {
+            Ok(_) => Ok(()),
+            Err(ConditionalPutError::PreconditionFailed) => {
+                Err(PublishManifestError::AlreadyExists { key })
+            }
+            Err(ConditionalPutError::Other(e)) => Err(PublishManifestError::Other(e)),
+        }
+    }
+
+    /// Build the canonical manifest key — used by callers that need
+    /// to surface it (logging, error paths). Internal writes go
+    /// through the typed verbs above.
+    pub fn manifest_key(&self, snap_ulid: Ulid) -> StorePath {
+        manifest_key(self.vol_ulid, snap_ulid)
+    }
+
+    /// Build the `-stop.manifest` variant key.
+    pub fn stop_manifest_key(&self, snap_ulid: Ulid) -> StorePath {
+        stop_manifest_key(self.vol_ulid, snap_ulid)
+    }
+
+    /// GET raw stop-manifest bytes (the `-stop.manifest` variant
+    /// written by `volume stop`).
+    pub async fn get_stop_manifest_bytes(&self, snap_ulid: Ulid) -> Result<Bytes, SnapshotsError> {
+        let key = stop_manifest_key(self.vol_ulid, snap_ulid);
+        let got = self.store.get(&key).await.map_err(SnapshotsError::Get)?;
+        got.bytes().await.map_err(SnapshotsError::Get)
+    }
+
+    /// GET raw manifest bytes. Used by the recovery flow that peeks
+    /// the unauthenticated `recovery:` header
+    /// ([`signing::peek_snapshot_manifest_recovery`]) before picking
+    /// which verifying key to use. Pure-read sites that already know
+    /// which key to verify under should call [`Self::get_manifest`]
+    /// instead so verification happens at the boundary.
+    pub async fn get_manifest_bytes(&self, snap_ulid: Ulid) -> Result<Bytes, SnapshotsError> {
+        let key = manifest_key(self.vol_ulid, snap_ulid);
+        let got = self.store.get(&key).await.map_err(SnapshotsError::Get)?;
+        got.bytes().await.map_err(SnapshotsError::Get)
+    }
+
+    /// GET, parse, and verify the snapshot manifest under
+    /// `verifying_key`. One round-trip. Callers supply the key that
+    /// matches the trust path: the volume's own `volume.pub` for
+    /// ordinary handoff snapshots, or a recovering coordinator's
+    /// `coordinator.pub` for synthesised handoffs — see
+    /// `crate::recovery::HandoffVerifier`.
+    pub async fn get_manifest(
+        &self,
+        snap_ulid: Ulid,
+        verifying_key: &VerifyingKey,
+    ) -> Result<SnapshotManifest, SnapshotsError> {
+        let bytes = self.get_manifest_bytes(snap_ulid).await?;
+        signing::read_snapshot_manifest_from_bytes(&bytes, verifying_key, &snap_ulid)
+            .map_err(SnapshotsError::Verify)
+    }
+
+    /// HEAD on the manifest key. `Ok(None)` for absent. Used by
+    /// existence-check fast paths (peer fetch fallback decisions,
+    /// reconciliation).
+    pub async fn head_manifest(
+        &self,
+        snap_ulid: Ulid,
+    ) -> Result<Option<ObjectMeta>, SnapshotsError> {
+        let key = manifest_key(self.vol_ulid, snap_ulid);
+        match self.store.head(&key).await {
+            Ok(m) => Ok(Some(m)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(SnapshotsError::Get(e)),
+        }
+    }
+
+    /// DELETE the manifest. Cleanup / reaper path.
+    pub async fn delete_manifest(&self, snap_ulid: Ulid) -> Result<(), SnapshotsError> {
+        let key = manifest_key(self.vol_ulid, snap_ulid);
+        self.store.delete(&key).await.map_err(SnapshotsError::Put)
+    }
+
+    /// Promote a `-stop.manifest` to its `User` counterpart. Server-side
+    /// COPY from `<snap>-stop.manifest` → `<snap>.manifest`, then
+    /// best-effort DELETE of the `-stop.manifest` original. A leftover
+    /// `-stop.manifest` after a failed DELETE is benign — the reader
+    /// path prefers `User` on a tie.
+    pub async fn promote_stop_to_user(&self, snap_ulid: Ulid) -> Result<(), SnapshotsError> {
+        let stop = stop_manifest_key(self.vol_ulid, snap_ulid);
+        let user = manifest_key(self.vol_ulid, snap_ulid);
+        self.store
+            .copy(&stop, &user)
+            .await
+            .map_err(SnapshotsError::Put)?;
+        if let Err(e) = self.store.delete(&stop).await {
+            tracing::warn!("[volume_data] promote-stop {snap_ulid}: deleting {stop}: {e}");
+        }
+        Ok(())
+    }
+
+    /// DELETE the `-stop.manifest` variant (e.g. after a failed-resume
+    /// reclamation that won't promote).
+    pub async fn delete_stop_manifest(&self, snap_ulid: Ulid) -> Result<(), SnapshotsError> {
+        let key = stop_manifest_key(self.vol_ulid, snap_ulid);
+        self.store.delete(&key).await.map_err(SnapshotsError::Put)
+    }
+
+    /// GET `by_id/<vol>/snapshots/LATEST`. Returns the current snap
+    /// ULID plus an unforgeable [`LatestPointerToken`] carrying the
+    /// `If-Match` ETag for a subsequent [`Self::advance_latest`].
+    /// `Ok(None)` when absent (fresh volume / pointer not yet
+    /// written).
+    ///
+    /// An unparseable body is treated as absent and logged — the
+    /// pointer is a perf hint, not a correctness datum (the
+    /// correctness-sensitive recovery basis lives on the event
+    /// spine).
+    pub async fn read_latest(&self) -> Result<Option<(Ulid, LatestPointerToken)>, SnapshotsError> {
+        let key = latest_key(self.vol_ulid);
+        let got = match self.store.get(&key).await {
+            Ok(g) => g,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(SnapshotsError::Get(e)),
+        };
+        let version = UpdateVersion {
+            e_tag: got.meta.e_tag.clone(),
+            version: got.meta.version.clone(),
+        };
+        let bytes = got.bytes().await.map_err(SnapshotsError::Get)?;
+        let text = std::str::from_utf8(&bytes).map_err(SnapshotsError::NotUtf8)?;
+        match Ulid::from_string(text.trim()) {
+            Ok(u) => Ok(Some((u, LatestPointerToken { version }))),
+            Err(_) => {
+                tracing::warn!(
+                    "[volume_data] {key} unparseable; treating as absent (self-heals on next publish)"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// CAS the LATEST pointer to `new_snap`. `prev` is the token
+    /// returned by a previous [`Self::read_latest`]; pass `None` to
+    /// request `If-None-Match: *` (the first publish). On
+    /// [`LatestConflict::Stale`] the caller receives the
+    /// then-current pointer ULID so they can decide whether to retry
+    /// or bail (a race we lost where the winner advanced past us is
+    /// benign for this perf-hint pointer).
+    pub async fn advance_latest(
+        &self,
+        prev: Option<LatestPointerToken>,
+        new_snap: Ulid,
+    ) -> Result<LatestPointerToken, LatestConflict> {
+        let key = latest_key(self.vol_ulid);
+        let body = Bytes::from(new_snap.to_string().into_bytes());
+        let outcome = match prev {
+            Some(tok) => {
+                put_with_match_with_type(self.store.as_ref(), &key, body, tok.version, MIME_TEXT)
+                    .await
+            }
+            None => put_if_absent_with_type(self.store.as_ref(), &key, body, MIME_TEXT).await,
+        };
+        match outcome {
+            Ok(result) => Ok(LatestPointerToken {
+                version: UpdateVersion::from(result),
+            }),
+            Err(ConditionalPutError::PreconditionFailed) => {
+                // Surface the current value so the caller can decide.
+                let current = match self.read_latest().await {
+                    Ok(Some((u, _))) => Some(u),
+                    _ => None,
+                };
+                Err(LatestConflict::Stale { current })
+            }
+            Err(ConditionalPutError::Other(e)) => Err(LatestConflict::Store(e)),
+        }
+    }
+
+    /// Convenience: ensure LATEST is at least `new_snap`. Reads the
+    /// current pointer; if it is already `>= new_snap`, no-ops.
+    /// Otherwise CASes once. A `Stale { current >= new_snap }` race
+    /// is treated as benign (someone else got there first with a
+    /// newer or equal value). Other `Stale` outcomes propagate so
+    /// the caller can decide on retry policy.
+    pub async fn bump_latest_if_newer(&self, new_snap: Ulid) -> Result<(), SnapshotsError> {
+        let cur = self.read_latest().await?;
+        if let Some((c, _)) = &cur
+            && *c >= new_snap
+        {
+            return Ok(());
+        }
+        let tok = cur.map(|(_, t)| t);
+        match self.advance_latest(tok, new_snap).await {
+            Ok(_) => Ok(()),
+            Err(LatestConflict::Stale { current: Some(c) }) if c >= new_snap => Ok(()),
+            Err(LatestConflict::Stale { current }) => Err(SnapshotsError::LatestRaceLost {
+                attempted: new_snap,
+                current,
+            }),
+            Err(LatestConflict::Store(e)) => Err(SnapshotsError::Put(e)),
+        }
+    }
+}
+
+/// Unforgeable read-receipt for `by_id/<vol>/snapshots/LATEST`.
+/// Carries the `If-Match` precondition for a subsequent
+/// [`SnapshotsView::advance_latest`]. Constructible only inside this
+/// module; holding one proves the caller has read LATEST's current
+/// state.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct LatestPointerToken {
+    version: UpdateVersion,
+}
+
+/// Conflict outcomes for [`SnapshotsView::advance_latest`].
+#[derive(Debug)]
+pub enum LatestConflict {
+    /// The pointer changed under us. `current` is the value present
+    /// after the failed CAS (best-effort: `None` if a follow-up
+    /// `read_latest` could not surface it).
+    Stale { current: Option<Ulid> },
+    /// Underlying store error unrelated to the CAS condition.
+    Store(object_store::Error),
+}
+
+impl std::fmt::Display for LatestConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stale {
+                current: Some(c), ..
+            } => write!(f, "LATEST advanced under us to {c}"),
+            Self::Stale { current: None, .. } => {
+                write!(f, "LATEST changed under us (current value unavailable)")
+            }
+            Self::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for LatestConflict {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Errors from [`SnapshotsView`] operations.
+#[derive(Debug)]
+pub enum SnapshotsError {
+    Get(object_store::Error),
+    Put(object_store::Error),
+    NotUtf8(std::str::Utf8Error),
+    /// Manifest body did not parse or its signature did not verify
+    /// under the supplied key.
+    Verify(std::io::Error),
+    /// Failed to read the on-disk source file for an upload.
+    ReadFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    /// `bump_latest_if_newer` lost a CAS race against an unrelated
+    /// (older) value — surface the attempted + current pointer so
+    /// the operator can investigate.
+    LatestRaceLost {
+        attempted: Ulid,
+        current: Option<Ulid>,
+    },
+}
+
+impl std::fmt::Display for SnapshotsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Get(e) => write!(f, "getting snapshot object: {e}"),
+            Self::Put(e) => write!(f, "writing snapshot object: {e}"),
+            Self::NotUtf8(e) => write!(f, "LATEST body not utf-8: {e}"),
+            Self::Verify(e) => write!(f, "parsing/verifying manifest: {e}"),
+            Self::ReadFile { path, source } => write!(f, "reading {}: {source}", path.display()),
+            Self::LatestRaceLost { attempted, current } => match current {
+                Some(c) => write!(
+                    f,
+                    "advancing LATEST to {attempted} lost to concurrent writer (now {c})"
+                ),
+                None => write!(
+                    f,
+                    "advancing LATEST to {attempted} lost to concurrent writer (now unknown)"
+                ),
+            },
+        }
+    }
+}
+
+impl std::error::Error for SnapshotsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Get(e) | Self::Put(e) => Some(e),
+            Self::NotUtf8(e) => Some(e),
+            Self::Verify(e) => Some(e),
+            Self::ReadFile { source, .. } => Some(source),
+            Self::LatestRaceLost { .. } => None,
+        }
+    }
+}
+
+/// Errors from [`SnapshotsView::try_publish_manifest`].
+#[derive(Debug)]
+pub enum PublishManifestError {
+    /// A manifest already exists at this key — the conditional create
+    /// refused. Carries the key for diagnostics. Vanishingly
+    /// improbable unless two recovering coordinators both minted the
+    /// same `snap_ulid` (a millisecond-level ULID collision).
+    AlreadyExists { key: StorePath },
+    /// Underlying store error unrelated to the CAS condition.
+    Other(object_store::Error),
+}
+
+impl std::fmt::Display for PublishManifestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyExists { key } => write!(f, "manifest already exists at {key}"),
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PublishManifestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Other(e) => Some(e),
+            _ => None,
+        }
     }
 }
 
@@ -239,6 +685,11 @@ pub enum MetadataError {
     PubkeyNotUtf8(std::str::Utf8Error),
     /// `volume.pub` body did not parse as 64 hex chars + Ed25519 pub.
     InvalidPubkey(String),
+    /// Failed to read the on-disk source file for an upload.
+    ReadFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for MetadataError {
@@ -248,6 +699,9 @@ impl std::fmt::Display for MetadataError {
             Self::Put(e) => write!(f, "putting metadata: {e}"),
             Self::PubkeyNotUtf8(e) => write!(f, "volume.pub not utf-8: {e}"),
             Self::InvalidPubkey(s) => write!(f, "invalid volume.pub: {s}"),
+            Self::ReadFile { path, source } => {
+                write!(f, "reading {}: {source}", path.display())
+            }
         }
     }
 }
@@ -257,6 +711,7 @@ impl std::error::Error for MetadataError {
         match self {
             Self::Get(e) | Self::Put(e) => Some(e),
             Self::PubkeyNotUtf8(e) => Some(e),
+            Self::ReadFile { source, .. } => Some(source),
             Self::InvalidPubkey(_) => None,
         }
     }
@@ -271,6 +726,22 @@ fn provenance_key(vol: Ulid) -> StorePath {
         "by_id/{vol}/{name}",
         name = elide_core::signing::VOLUME_PROVENANCE_FILE,
     ))
+}
+
+fn manifest_key(vol: Ulid, snap: Ulid) -> StorePath {
+    let dt: chrono::DateTime<chrono::Utc> = snap.datetime().into();
+    let date = dt.format("%Y%m%d").to_string();
+    StorePath::from(format!("by_id/{vol}/snapshots/{date}/{snap}.manifest"))
+}
+
+fn stop_manifest_key(vol: Ulid, snap: Ulid) -> StorePath {
+    let dt: chrono::DateTime<chrono::Utc> = snap.datetime().into();
+    let date = dt.format("%Y%m%d").to_string();
+    StorePath::from(format!("by_id/{vol}/snapshots/{date}/{snap}-stop.manifest"))
+}
+
+fn latest_key(vol: Ulid) -> StorePath {
+    StorePath::from(format!("by_id/{vol}/snapshots/LATEST"))
 }
 
 fn parse_hex_pubkey(hex: &str) -> Result<VerifyingKey, MetadataError> {
@@ -335,15 +806,23 @@ mod tests {
         assert_eq!(vd.head().read().await.unwrap(), SegmentHead::empty(None));
     }
 
+    /// Seed a file with `bytes` inside `dir` named `name`, returning
+    /// the full path. The view's metadata writes consume on-disk
+    /// files; tests stage them in a tempdir.
+    fn seed_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
     #[tokio::test]
     async fn metadata_pubkey_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
         let (_s, vd) = vd();
         let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
         let hex = elide_core::signing::encode_hex(&vk.to_bytes()) + "\n";
-        vd.metadata()
-            .write_pubkey_bytes(hex.as_bytes())
-            .await
-            .unwrap();
+        let path = seed_file(tmp.path(), "volume.pub", hex.as_bytes());
+        vd.metadata().write_pubkey_from_file(&path).await.unwrap();
         let got = vd.metadata().read_pubkey().await.unwrap();
         assert_eq!(got.to_bytes(), vk.to_bytes());
     }
@@ -357,23 +836,258 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_pubkey_optional_present_is_some() {
+        let tmp = tempfile::tempdir().unwrap();
         let (_s, vd) = vd();
         let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
         let hex = elide_core::signing::encode_hex(&vk.to_bytes()) + "\n";
-        vd.metadata()
-            .write_pubkey_bytes(hex.as_bytes())
-            .await
-            .unwrap();
+        let path = seed_file(tmp.path(), "volume.pub", hex.as_bytes());
+        vd.metadata().write_pubkey_from_file(&path).await.unwrap();
         let got = vd.metadata().read_pubkey_optional().await.unwrap();
         assert_eq!(got.expect("present").to_bytes(), vk.to_bytes());
     }
 
     #[tokio::test]
-    async fn metadata_provenance_bytes_round_trip_via_store() {
+    async fn metadata_pubkey_returns_uploaded_bytes_for_sentinel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_s, vd) = vd();
+        let body = b"01234567890123456789012345678901234567890123456789012345678901AB\n";
+        let path = seed_file(tmp.path(), "volume.pub", body);
+        let got = vd.metadata().write_pubkey_from_file(&path).await.unwrap();
+        assert_eq!(
+            got.as_ref(),
+            body,
+            "returned bytes feed the upload sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_provenance_from_file_round_trip_via_store() {
+        let tmp = tempfile::tempdir().unwrap();
         let (store, vd) = vd();
         let body = b"provenance body";
-        vd.metadata().write_provenance_bytes(body).await.unwrap();
-        let got = store.get(&provenance_key(vd.vol_ulid())).await.unwrap();
-        assert_eq!(got.bytes().await.unwrap().as_ref(), body);
+        let path = seed_file(tmp.path(), "volume.provenance", body);
+        let got = vd
+            .metadata()
+            .write_provenance_from_file(&path)
+            .await
+            .unwrap();
+        assert_eq!(got.as_ref(), body);
+        let from_store = store.get(&provenance_key(vd.vol_ulid())).await.unwrap();
+        assert_eq!(from_store.bytes().await.unwrap().as_ref(), body);
+    }
+
+    #[tokio::test]
+    async fn metadata_write_pubkey_reports_missing_file() {
+        let (_s, vd) = vd();
+        let bogus = std::path::Path::new("/does/not/exist/volume.pub");
+        let err = vd
+            .metadata()
+            .write_pubkey_from_file(bogus)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetadataError::ReadFile { .. }));
+    }
+
+    // ── SnapshotsView ───────────────────────────────────────────────
+
+    fn manifest_bytes(signer: &dyn elide_core::segment::SegmentSigner, segments: &[Ulid]) -> Bytes {
+        Bytes::from(elide_core::signing::build_snapshot_manifest_bytes(
+            signer, segments, None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn snapshots_put_manifest_round_trips_through_get_manifest() {
+        let (_s, vd) = vd();
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let s1 = m.next();
+        let s2 = m.next();
+        let snap = m.next();
+        let body = manifest_bytes(&*signer, &[s1, s2]);
+        vd.snapshots()
+            .put_manifest(snap, body.clone())
+            .await
+            .unwrap();
+        let parsed = vd.snapshots().get_manifest(snap, &vk).await.unwrap();
+        assert_eq!(parsed.segment_ulids, vec![s1, s2]);
+    }
+
+    #[tokio::test]
+    async fn snapshots_get_manifest_rejects_wrong_key() {
+        let (_s, vd) = vd();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let (_signer2, wrong_vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let s1 = m.next();
+        let snap = m.next();
+        vd.snapshots()
+            .put_manifest(snap, manifest_bytes(&*signer, &[s1]))
+            .await
+            .unwrap();
+        assert!(
+            vd.snapshots().get_manifest(snap, &wrong_vk).await.is_err(),
+            "verification must fail under the wrong key"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshots_get_manifest_bytes_is_unverified() {
+        // Used by the recovery flow that peeks the unauthenticated
+        // recovery header before picking a verifying key.
+        let (_s, vd) = vd();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let snap = m.next();
+        let body = manifest_bytes(&*signer, &[]);
+        vd.snapshots()
+            .put_manifest(snap, body.clone())
+            .await
+            .unwrap();
+        let got = vd.snapshots().get_manifest_bytes(snap).await.unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[tokio::test]
+    async fn snapshots_try_publish_manifest_rejects_second_publish() {
+        let (_s, vd) = vd();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let snap = m.next();
+        let body = manifest_bytes(&*signer, &[]);
+        vd.snapshots()
+            .try_publish_manifest(snap, body.clone())
+            .await
+            .unwrap();
+        let err = vd
+            .snapshots()
+            .try_publish_manifest(snap, body)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PublishManifestError::AlreadyExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn snapshots_head_manifest_reports_absence() {
+        let (_s, vd) = vd();
+        let snap = mint().next();
+        assert!(vd.snapshots().head_manifest(snap).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshots_head_manifest_reports_presence() {
+        let (_s, vd) = vd();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let snap = m.next();
+        vd.snapshots()
+            .put_manifest(snap, manifest_bytes(&*signer, &[]))
+            .await
+            .unwrap();
+        assert!(vd.snapshots().head_manifest(snap).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn snapshots_delete_manifest_removes_object() {
+        let (_s, vd) = vd();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let mut m = mint();
+        let snap = m.next();
+        vd.snapshots()
+            .put_manifest(snap, manifest_bytes(&*signer, &[]))
+            .await
+            .unwrap();
+        vd.snapshots().delete_manifest(snap).await.unwrap();
+        assert!(vd.snapshots().head_manifest(snap).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshots_read_latest_absent_is_none() {
+        let (_s, vd) = vd();
+        assert!(vd.snapshots().read_latest().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshots_advance_latest_then_read_round_trips() {
+        let (_s, vd) = vd();
+        let snap = mint().next();
+        let tok = vd.snapshots().advance_latest(None, snap).await.unwrap();
+        let (got, _tok2) = vd.snapshots().read_latest().await.unwrap().unwrap();
+        assert_eq!(got, snap);
+        // Holding the post-advance token, we can advance again to a
+        // newer ULID with a single CAS.
+        let mut m = UlidMint::new(snap);
+        let _ = m.next(); // skip equal-or-prior
+        let newer = m.next();
+        vd.snapshots()
+            .advance_latest(Some(tok), newer)
+            .await
+            .unwrap();
+        let (got2, _) = vd.snapshots().read_latest().await.unwrap().unwrap();
+        assert_eq!(got2, newer);
+    }
+
+    #[tokio::test]
+    async fn snapshots_advance_latest_with_stale_token_returns_stale() {
+        let (_s, vd) = vd();
+        let mut m = mint();
+        let a = m.next();
+        let b = m.next();
+        let tok_a = vd.snapshots().advance_latest(None, a).await.unwrap();
+        // Bypass our token: another writer advances to `b`.
+        vd.snapshots()
+            .advance_latest(Some(tok_a.clone()), b)
+            .await
+            .unwrap();
+        // Now `tok_a` is stale. Advancing under it fails.
+        let err = vd
+            .snapshots()
+            .advance_latest(Some(tok_a), a)
+            .await
+            .unwrap_err();
+        match err {
+            LatestConflict::Stale { current } => assert_eq!(current, Some(b)),
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshots_advance_latest_initial_with_some_token_rejects_when_absent() {
+        // Passing a (fabricated) token to advance against an absent
+        // LATEST should fail — only `None` is valid for the first
+        // publish. We exercise this via the symmetric scenario:
+        // a None advance succeeds when LATEST is absent, a None
+        // advance fails when LATEST exists.
+        let (_s, vd) = vd();
+        let mut m = mint();
+        let a = m.next();
+        let b = m.next();
+        vd.snapshots().advance_latest(None, a).await.unwrap();
+        let err = vd.snapshots().advance_latest(None, b).await.unwrap_err();
+        assert!(matches!(err, LatestConflict::Stale { current: Some(_) }));
+    }
+
+    #[tokio::test]
+    async fn snapshots_bump_latest_if_newer_idempotent_when_equal() {
+        let (_s, vd) = vd();
+        let snap = mint().next();
+        vd.snapshots().bump_latest_if_newer(snap).await.unwrap();
+        // Second call is a no-op (cur >= new), no CAS issued.
+        vd.snapshots().bump_latest_if_newer(snap).await.unwrap();
+        let (got, _) = vd.snapshots().read_latest().await.unwrap().unwrap();
+        assert_eq!(got, snap);
+    }
+
+    #[tokio::test]
+    async fn snapshots_bump_latest_if_newer_skips_when_already_newer() {
+        let (_s, vd) = vd();
+        let mut m = mint();
+        let older = m.next();
+        let newer = m.next();
+        vd.snapshots().bump_latest_if_newer(newer).await.unwrap();
+        // Attempting to bump to `older` is a no-op because cur (newer) >= older.
+        vd.snapshots().bump_latest_if_newer(older).await.unwrap();
+        let (got, _) = vd.snapshots().read_latest().await.unwrap().unwrap();
+        assert_eq!(got, newer, "older bump must not regress LATEST");
     }
 }

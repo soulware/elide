@@ -41,9 +41,6 @@ use elide_core::signing::{
     peek_snapshot_manifest_recovery, read_snapshot_manifest_from_bytes,
 };
 
-use crate::portable::{self, ConditionalPutError};
-use crate::upload::snapshot_manifest_key;
-
 /// One segment from the dead fork's S3 prefix that passed signature
 /// verification.
 #[derive(Debug, Clone)]
@@ -255,24 +252,23 @@ pub async fn mint_and_publish_synthesised_snapshot(
 
     // Reuse the existing key shape so this manifest sits next to any
     // historical snapshots under the dead fork's prefix.
-    let dead_vol_str = dead_vol_ulid.to_string();
-    let key = snapshot_manifest_key(&dead_vol_str, snap_ulid);
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), dead_vol_ulid);
+    let snapshots = vd.snapshots();
+    let key = snapshots.manifest_key(snap_ulid);
 
-    match portable::put_if_absent_with_type(
-        store.as_ref(),
-        &key,
-        Bytes::from(bytes),
-        portable::MIME_TEXT,
-    )
-    .await
+    match snapshots
+        .try_publish_manifest(snap_ulid, Bytes::from(bytes))
+        .await
     {
-        Ok(_) => Ok(PublishedSynthesisedSnapshot { snap_ulid, key }),
-        Err(ConditionalPutError::PreconditionFailed) => {
+        Ok(()) => Ok(PublishedSynthesisedSnapshot { snap_ulid, key }),
+        Err(crate::volume_data::PublishManifestError::AlreadyExists { key }) => {
             Err(PublishSnapshotError::AlreadyExists { key })
         }
-        Err(ConditionalPutError::Other(e)) => Err(PublishSnapshotError::Other(
-            anyhow::Error::new(e).context("publishing synthesised snapshot manifest"),
-        )),
+        Err(crate::volume_data::PublishManifestError::Other(e)) => {
+            Err(PublishSnapshotError::Other(
+                anyhow::Error::new(e).context("publishing synthesised snapshot manifest"),
+            ))
+        }
     }
 }
 
@@ -372,22 +368,15 @@ pub async fn resolve_handoff_verifier(
     vol_ulid: Ulid,
     snap_ulid: Ulid,
 ) -> Result<HandoffVerifier, ResolveHandoffError> {
-    let key = snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
-    let bytes = data_store
-        .get(&key)
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(data_store), vol_ulid);
+    let bytes = vd
+        .snapshots()
+        .get_manifest_bytes(snap_ulid)
         .await
         .map_err(|e| {
-            ResolveHandoffError::ManifestRead(
-                anyhow::Error::new(e).context(format!("fetching snapshot manifest at {key}")),
-            )
-        })?
-        .bytes()
-        .await
-        .map_err(|e| {
-            ResolveHandoffError::ManifestRead(
-                anyhow::Error::new(e)
-                    .context(format!("reading snapshot manifest bytes from {key}")),
-            )
+            ResolveHandoffError::ManifestRead(anyhow::Error::msg(format!(
+                "fetching snapshot manifest for {vol_ulid}/{snap_ulid}: {e}"
+            )))
         })?;
 
     let recovery =
@@ -504,22 +493,14 @@ async fn fetch_manifest_from_store(
     vol_ulid: Ulid,
     snap_ulid: Ulid,
 ) -> Result<Bytes, ResolveHandoffError> {
-    let key = snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
-    store
-        .get(&key)
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    vd.snapshots()
+        .get_manifest_bytes(snap_ulid)
         .await
         .map_err(|e| {
-            ResolveHandoffError::ManifestRead(
-                anyhow::Error::new(e).context(format!("fetching snapshot manifest at {key}")),
-            )
-        })?
-        .bytes()
-        .await
-        .map_err(|e| {
-            ResolveHandoffError::ManifestRead(
-                anyhow::Error::new(e)
-                    .context(format!("reading snapshot manifest bytes from {key}")),
-            )
+            ResolveHandoffError::ManifestRead(anyhow::Error::msg(format!(
+                "fetching snapshot manifest for {vol_ulid}/{snap_ulid}: {e}"
+            )))
         })
 }
 
@@ -890,10 +871,13 @@ mod tests {
         // via an unsafe cheat: use the public helper directly.
         let payload = Bytes::from_static(b"already here");
         // Already present — ensure put_if_absent fails.
-        let err = portable::put_if_absent(store.as_ref(), &collision_key, payload)
+        let err = crate::portable::put_if_absent(store.as_ref(), &collision_key, payload)
             .await
             .expect_err("expected precondition-failed");
-        assert!(matches!(err, ConditionalPutError::PreconditionFailed));
+        assert!(matches!(
+            err,
+            crate::portable::ConditionalPutError::PreconditionFailed
+        ));
     }
 
     // ── resolve_handoff_verifier ───────────────────────────────────────
@@ -924,8 +908,11 @@ mod tests {
             &[Ulid::new()],
             None,
         );
-        let key = snapshot_manifest_key(&dead_vol.to_string(), snap_ulid);
-        store.put(&key, PutPayload::from(bytes)).await.unwrap();
+        let vd = crate::volume_data::VolumeData::new(Arc::clone(&store), dead_vol);
+        vd.snapshots()
+            .put_manifest(snap_ulid, Bytes::from(bytes))
+            .await
+            .unwrap();
 
         let outcome = resolve_handoff_verifier(&store, &store, dead_vol, snap_ulid)
             .await

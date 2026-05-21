@@ -846,11 +846,15 @@ async fn synthesise_empty_owner_handoff(
     let snap_ulid = ulid::Ulid::new();
     let manifest_bytes =
         elide_core::signing::build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
-    let key = elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
-    store
-        .put(&key, manifest_bytes.clone().into())
+    elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid)
+        .snapshots()
+        .put_manifest(snap_ulid, bytes::Bytes::from(manifest_bytes.clone()))
         .await
-        .map_err(|e| IpcError::store(format!("publishing empty handoff manifest {key}: {e}")))?;
+        .map_err(|e| {
+            IpcError::store(format!(
+                "publishing empty handoff manifest {snap_ulid}: {e}"
+            ))
+        })?;
     info!(
         "[release {volume_name}] synthesised empty handoff \
          {snap_ulid} (signed by local key shadow)"
@@ -909,15 +913,13 @@ async fn promote_stop_in_store(
     snap_ulid: ulid::Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<(), IpcError> {
-    let stop_key = elide_coordinator::upload::stop_snapshot_manifest_key(vol_ulid, snap_ulid);
-    let user_key = elide_coordinator::upload::snapshot_manifest_key(vol_ulid, snap_ulid);
-    store.copy(&stop_key, &user_key).await.map_err(|e| {
-        IpcError::store(format!("copying {stop_key} → {user_key} on promotion: {e}"))
-    })?;
-    if let Err(e) = store.delete(&stop_key).await {
-        warn!("[promote-stop {snap_ulid}] deleting {stop_key}: {e}");
-    }
-    Ok(())
+    let vol = ulid::Ulid::from_string(vol_ulid)
+        .map_err(|e| IpcError::internal(format!("vol_ulid {vol_ulid} not a ULID: {e}")))?;
+    elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol)
+        .snapshots()
+        .promote_stop_to_user(snap_ulid)
+        .await
+        .map_err(|e| IpcError::store(format!("promoting stop→user for {snap_ulid}: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1499,16 +1501,23 @@ async fn cleanup_stop_snapshots(
         }
     }
 
+    let vol_ulid = ulid::Ulid::from_string(vol_ulid_str)
+        .map_err(|e| IpcError::internal(format!("vol_ulid {vol_ulid_str} not a ULID: {e}")))?;
+    let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     for snap_ulid in stop_ulids {
         // Drop the upload sentinel together with the manifest —
         // leaving it convinces the next drain an unchanged-ULID
         // stop-snapshot is already in S3, silently skipping re-upload.
         let _ = std::fs::remove_file(sentinel_dir.join(format!("{snap_ulid}-stop")));
-        let key = elide_coordinator::upload::stop_snapshot_manifest_key(vol_ulid_str, snap_ulid);
-        if let Err(e) = store.delete(&key).await
-            && !matches!(e, object_store::Error::NotFound { .. })
+        if let Err(e) = vd.snapshots().delete_stop_manifest(snap_ulid).await
+            && !matches!(
+                e,
+                elide_coordinator::volume_data::SnapshotsError::Put(
+                    object_store::Error::NotFound { .. }
+                )
+            )
         {
-            warn!("[inbound] failed to delete stop-snapshot {key}: {e}");
+            warn!("[inbound] failed to delete stop-snapshot {snap_ulid}: {e}");
         }
     }
     Ok(())
@@ -1706,11 +1715,11 @@ mod tests {
         assert_eq!(rec.handoff_snapshot, Some(snap_ulid));
 
         // Synthesised manifest landed at the predicted snapshot key.
-        let manifest_key =
-            elide_coordinator::upload::snapshot_manifest_key(&dead_vol.to_string(), snap_ulid);
-        store
-            .head(&manifest_key)
+        elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead_vol)
+            .snapshots()
+            .head_manifest(snap_ulid)
             .await
+            .expect("head_manifest succeeds")
             .expect("synthesised manifest present at predicted key");
     }
 
@@ -1794,15 +1803,12 @@ mod tests {
         assert_eq!(rec.handoff_snapshot, Some(snap_ulid));
 
         // The synthesised manifest covers no segments.
-        let manifest_key =
-            elide_coordinator::upload::snapshot_manifest_key(&dead_vol.to_string(), snap_ulid);
-        let manifest = store
-            .get(&manifest_key)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
+        let manifest =
+            elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead_vol)
+                .snapshots()
+                .get_manifest_bytes(snap_ulid)
+                .await
+                .unwrap();
         let recovery = elide_core::signing::peek_snapshot_manifest_recovery(&manifest)
             .unwrap()
             .expect("synthesised handoff must carry recovery metadata");
@@ -1869,15 +1875,12 @@ mod tests {
 
         // Verify the synthesised manifest contains exactly one segment ULID
         // — the good one. Read the manifest body and look for both ids.
-        let manifest_key =
-            elide_coordinator::upload::snapshot_manifest_key(&dead_vol.to_string(), snap_ulid);
-        let manifest_body = store
-            .get(&manifest_key)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
+        let manifest_body =
+            elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead_vol)
+                .snapshots()
+                .get_manifest_bytes(snap_ulid)
+                .await
+                .unwrap();
         let body_str = std::str::from_utf8(&manifest_body).unwrap();
         assert!(
             body_str.contains(&good_id.to_string()),
@@ -2093,9 +2096,9 @@ mod tests {
         rec.handoff_snapshot = Some(snap);
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
-        let key = elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap);
-        store
-            .put(&key, PutPayload::from(b"fake-signed".to_vec()))
+        elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), vol_ulid)
+            .snapshots()
+            .put_manifest(snap, bytes::Bytes::from_static(b"fake-signed"))
             .await
             .unwrap();
 
@@ -2180,8 +2183,15 @@ mod tests {
         let snap = reply.handoff_snapshot;
 
         // Synthesised manifest is in S3 (authoritative)…
-        let s3_key = elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap);
-        assert!(store.get(&s3_key).await.is_ok(), "manifest must be in S3");
+        assert!(
+            elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), vol_ulid)
+                .snapshots()
+                .head_manifest(snap)
+                .await
+                .expect("head_manifest succeeds")
+                .is_some(),
+            "manifest must be in S3"
+        );
 
         // …and mirrored locally with its upload sentinel.
         let local_manifest = vol_dir
