@@ -43,7 +43,6 @@ use anyhow::{Context, Result};
 use elide_peer_fetch::{PeerEndpoint, PeerFetchClient};
 use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
-use object_store::path::Path as StorePath;
 use tracing::{info, trace, warn};
 use ulid::Ulid;
 
@@ -369,24 +368,15 @@ async fn prefetch_fork(
             .map(|u| u.to_string()),
     };
 
-    let to_fetch: Vec<(StorePath, String, Ulid)> = match anchor.as_deref() {
-        Some(snap) => {
-            manifest_driven_fetch_set(fork_dir, volume_id, snap, manifest_verifying_key, result)?
-        }
+    let to_fetch: Vec<(String, Ulid)> = match anchor.as_deref() {
+        Some(snap) => manifest_driven_fetch_set(fork_dir, snap, manifest_verifying_key, result)?,
         None => Vec::new(),
     };
 
-    let vol_ulid = Ulid::from_string(volume_id).ok();
-    fetch_idx_set(
-        store,
-        fork_dir,
-        verifying_key,
-        peer,
-        vol_ulid,
-        to_fetch,
-        result,
-    )
-    .await;
+    let vol_ulid = Ulid::from_string(volume_id)
+        .map_err(|e| anyhow::anyhow!("invalid volume_id {volume_id}: {e}"))?;
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    fetch_idx_set(&vd, fork_dir, verifying_key, peer, to_fetch, result).await;
     Ok(())
 }
 
@@ -424,7 +414,7 @@ pub async fn pull_indexes_via_list(
         .await
         .with_context(|| format!("resolving live segments for {volume_id}"))?;
 
-    let to_fetch: Vec<(StorePath, String, Ulid)> = live
+    let to_fetch: Vec<(String, Ulid)> = live
         .into_iter()
         .filter_map(|ulid| {
             let ulid_str = ulid.to_string();
@@ -433,21 +423,11 @@ pub async fn pull_indexes_via_list(
                 result.skipped += 1;
                 return None;
             }
-            let key = crate::upload::segment_key(volume_id, ulid);
-            Some((key, ulid_str, ulid))
+            Some((ulid_str, ulid))
         })
         .collect();
 
-    fetch_idx_set(
-        store,
-        fork_dir,
-        verifying_key,
-        peer,
-        Some(vol_ulid),
-        to_fetch,
-        &mut result,
-    )
-    .await;
+    fetch_idx_set(&vd, fork_dir, verifying_key, peer, to_fetch, &mut result).await;
     Ok(result)
 }
 
@@ -470,12 +450,11 @@ pub async fn pull_indexes_via_list(
 /// follow-up hint GET would also 404. Skipping the round-trip in that
 /// case keeps the fan-out tight without losing any signal.
 async fn fetch_idx_set(
-    store: &Arc<dyn ObjectStore>,
+    vd: &crate::volume_data::VolumeData,
     fork_dir: &Path,
     verifying_key: &VerifyingKey,
     peer: Option<&PeerFetchContext>,
-    vol_ulid: Option<Ulid>,
-    to_fetch: Vec<(StorePath, String, Ulid)>,
+    to_fetch: Vec<(String, Ulid)>,
     result: &mut PrefetchResult,
 ) {
     enum IdxOutcome {
@@ -489,14 +468,15 @@ async fn fetch_idx_set(
         hint_persisted: bool,
     }
 
+    let vol_ulid = vd.vol_ulid();
     let outcomes: Vec<SegOutcome> =
-        futures::stream::iter(to_fetch.into_iter().map(|(location, ulid_str, ulid)| {
-            let store = store.clone();
+        futures::stream::iter(to_fetch.into_iter().map(|(ulid_str, ulid)| {
+            let vd = vd.clone();
             let fork_dir = fork_dir.to_path_buf();
             let verifying_key = *verifying_key;
             async move {
                 let mut hint_persisted = false;
-                if let (Some(peer_ctx), Some(vol_ulid)) = (peer, vol_ulid) {
+                if let Some(peer_ctx) = peer {
                     match peer_fetch_idx(
                         peer_ctx,
                         vol_ulid,
@@ -540,18 +520,18 @@ async fn fetch_idx_set(
                     }
                 }
 
-                let idx = match fetch_idx(&store, &location, &fork_dir, &ulid_str, &verifying_key)
-                    .await
-                {
-                    Ok(()) => {
-                        info!("[prefetch] fetched index: {ulid_str}");
-                        IdxOutcome::FromStore
-                    }
-                    Err(e) => {
-                        warn!("[prefetch] failed to fetch index {ulid_str}: {e:#}");
-                        IdxOutcome::Failed
-                    }
-                };
+                let segments = vd.segments();
+                let idx =
+                    match fetch_idx(&segments, ulid, &fork_dir, &ulid_str, &verifying_key).await {
+                        Ok(()) => {
+                            info!("[prefetch] fetched index: {ulid_str}");
+                            IdxOutcome::FromStore
+                        }
+                        Err(e) => {
+                            warn!("[prefetch] failed to fetch index {ulid_str}: {e:#}");
+                            IdxOutcome::Failed
+                        }
+                    };
                 SegOutcome {
                     idx,
                     hint_persisted,
@@ -614,35 +594,22 @@ pub async fn pull_indexes_for_snapshot(
     verifying_key: &VerifyingKey,
 ) -> Result<usize> {
     let mut result = PrefetchResult::default();
-    let to_fetch = manifest_driven_fetch_set(
-        fork_dir,
-        volume_id,
-        &snap_ulid.to_string(),
-        verifying_key,
-        &mut result,
-    )?;
+    let to_fetch =
+        manifest_driven_fetch_set(fork_dir, &snap_ulid.to_string(), verifying_key, &mut result)?;
     let n = to_fetch.len();
-    let vol_ulid = Ulid::from_string(volume_id).ok();
-    fetch_idx_set(
-        store,
-        fork_dir,
-        verifying_key,
-        None,
-        vol_ulid,
-        to_fetch,
-        &mut result,
-    )
-    .await;
+    let vol_ulid = Ulid::from_string(volume_id)
+        .map_err(|e| anyhow::anyhow!("invalid volume_id {volume_id}: {e}"))?;
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    fetch_idx_set(&vd, fork_dir, verifying_key, None, to_fetch, &mut result).await;
     Ok(n)
 }
 
 fn manifest_driven_fetch_set(
     fork_dir: &Path,
-    volume_id: &str,
     branch_ulid: &str,
     manifest_verifying_key: &VerifyingKey,
     result: &mut PrefetchResult,
-) -> Result<Vec<(StorePath, String, Ulid)>> {
+) -> Result<Vec<(String, Ulid)>> {
     let snap_ulid = Ulid::from_string(branch_ulid)
         .map_err(|e| anyhow::anyhow!("invalid branch ULID '{branch_ulid}': {e}"))?;
     let manifest =
@@ -654,7 +621,7 @@ fn manifest_driven_fetch_set(
             )
         })?;
 
-    let mut out: Vec<(StorePath, String, Ulid)> = Vec::with_capacity(manifest.segment_ulids.len());
+    let mut out: Vec<(String, Ulid)> = Vec::with_capacity(manifest.segment_ulids.len());
     for ulid in manifest.segment_ulids {
         let ulid_str = ulid.to_string();
         let local_idx = fork_dir.join("index").join(format!("{ulid_str}.idx"));
@@ -662,8 +629,7 @@ fn manifest_driven_fetch_set(
             result.skipped += 1;
             continue;
         }
-        let key = crate::upload::segment_key(volume_id, ulid);
-        out.push((key, ulid_str, ulid));
+        out.push((ulid_str, ulid));
     }
     Ok(out)
 }
@@ -746,15 +712,15 @@ async fn peer_fetch_idx(
 /// Download the index portion of one segment, verify its signature, and write
 /// it as `<fork_dir>/index/<ulid>.idx`.
 async fn fetch_idx(
-    store: &Arc<dyn ObjectStore>,
-    key: &StorePath,
+    segments: &crate::volume_data::SegmentsView<'_>,
+    seg_ulid: Ulid,
     fork_dir: &Path,
     ulid_str: &str,
     verifying_key: &VerifyingKey,
 ) -> Result<()> {
     // Fetch the header first to determine how large the index section is.
-    let header = store
-        .get_range(key, 0..HEADER_LEN)
+    let header = segments
+        .get_range(seg_ulid, 0..HEADER_LEN)
         .await
         .with_context(|| format!("fetching header for {ulid_str}"))?;
 
@@ -770,8 +736,8 @@ async fn fetch_idx(
     let body_section_start = HEADER_LEN + index_length as usize + inline_length as usize;
 
     // Fetch [0, body_section_start) — header + index + inline.
-    let idx_bytes = store
-        .get_range(key, 0..body_section_start)
+    let idx_bytes = segments
+        .get_range(seg_ulid, 0..body_section_start)
         .await
         .with_context(|| format!("fetching index section for {ulid_str}"))?;
 

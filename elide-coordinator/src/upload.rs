@@ -37,9 +37,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use object_store::path::Path as StorePath;
-use object_store::{
-    Attribute, AttributeValue, Attributes, ObjectStore, PutOptions, WriteMultipart,
-};
+use object_store::{Attribute, AttributeValue, Attributes, ObjectStore, PutOptions};
 use ulid::Ulid;
 
 use crate::portable::MIME_TEXT;
@@ -52,7 +50,7 @@ pub const DEFAULT_PART_SIZE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Process-global multipart part size, set once at daemon startup from
 /// `StoreSection::multipart_part_size_bytes()`. Threading this through
-/// `daemon → tasks → gc_cycle → drain_pending → SegmentUploader` (plus
+/// `daemon → tasks → gc_cycle → drain_pending → SegmentsView` (plus
 /// the IPC context chain) is pure ceremony for a value that is constant
 /// across the process lifetime and only changes when the operator edits
 /// `elide.toml` and restarts.
@@ -68,7 +66,7 @@ pub fn set_part_size_bytes(bytes: usize) {
 /// Resolve the part size to use for the next multipart upload. Falls
 /// back to [`DEFAULT_PART_SIZE_BYTES`] if `set_part_size_bytes` has not
 /// been called — the path tests take.
-fn part_size_bytes() -> usize {
+pub(crate) fn part_size_bytes() -> usize {
     PART_SIZE_BYTES
         .get()
         .copied()
@@ -248,7 +246,10 @@ pub async fn drain_pending(
     let mut upload_failed = 0usize;
     let mut promote_failed = 0usize;
     let mut uploaded_ulids: Vec<Ulid> = Vec::new();
-    let uploader = SegmentUploader { volume_id, store };
+    let vol_ulid = Ulid::from_string(volume_id)
+        .map_err(|e| anyhow::anyhow!("drain: volume_id {volume_id} is not a ULID: {e}"))?;
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    let segments = vd.segments();
 
     let pending_snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
         .with_context(|| format!("listing pending dir: {}", pending_dir.display()))?;
@@ -257,8 +258,14 @@ pub async fn drain_pending(
         let upload_name = ulid.to_string();
         let segment_path = pending_dir.join(&upload_name);
 
-        match uploader.upload(&segment_path, ulid).await {
+        let started = Instant::now();
+        match segments.put_from_file(ulid, &segment_path).await {
             Ok(()) => {
+                info!(
+                    "[upload] {} in {:.2?}",
+                    segments.segment_key(ulid),
+                    started.elapsed()
+                );
                 // Segment confirmed in S3; promote IPC tells the controlling
                 // process (volume or import in serve phase) to write index/ +
                 // cache/ and delete pending/<ulid>.
@@ -537,61 +544,6 @@ pub async fn upload_snapshot_metadata(
     }
 
     Ok(())
-}
-
-/// Bundles the loop-invariants every segment upload threads through —
-/// destination volume and object store handle — so callers (drain path,
-/// GC handoff cursor) construct one above the loop rather than passing
-/// the same arguments per file. Multipart chunk size is read from the
-/// process-global [`PART_SIZE_BYTES`].
-pub(crate) struct SegmentUploader<'a> {
-    pub(crate) volume_id: &'a str,
-    pub(crate) store: &'a Arc<dyn ObjectStore>,
-}
-
-impl SegmentUploader<'_> {
-    /// Used by both the drain path (pending/<ulid>) and GC compaction (gc
-    /// body). The upload goes via multipart: each part is a separate request
-    /// with its own timeout and retry, so a stalled part no longer forces a
-    /// restart of the whole segment upload. Small segments complete in a
-    /// single part at roughly the same cost as a simple PUT.
-    ///
-    /// Concurrency is capped at `MAX_CONCURRENT_PARTS` via `wait_for_capacity`
-    /// so parallel parts don't saturate the upload link and trip reqwest's
-    /// 30s per-request timeout. Two parts in flight is enough to hide one
-    /// request's handshake latency without fanning out.
-    pub(crate) async fn upload(&self, path: &Path, ulid: Ulid) -> Result<()> {
-        const MAX_CONCURRENT_PARTS: usize = 2;
-
-        let key = segment_key(self.volume_id, ulid);
-        let data = std::fs::read(path).with_context(|| format!("reading segment {ulid}"))?;
-        let len = data.len();
-        let mut bytes = Bytes::from(data);
-        let part_size = part_size_bytes();
-
-        let started = Instant::now();
-        let upload = self
-            .store
-            .put_multipart(&key)
-            .await
-            .with_context(|| format!("initiating multipart upload for {key}"))?;
-        let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size);
-        while !bytes.is_empty() {
-            let take = bytes.len().min(part_size);
-            let part = bytes.split_to(take);
-            writer
-                .wait_for_capacity(MAX_CONCURRENT_PARTS)
-                .await
-                .with_context(|| format!("multipart part upload for {key}"))?;
-            writer.put(part);
-        }
-        writer
-            .finish()
-            .await
-            .with_context(|| format!("uploading segment {ulid} to {key}"))?;
-        info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
-        Ok(())
-    }
 }
 
 #[cfg(test)]

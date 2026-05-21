@@ -20,8 +20,10 @@
 //!   that parses and verifies in one step (with `get_manifest_bytes`
 //!   for the recovery flow that peeks the unauthenticated recovery
 //!   header before picking a verifying key).
-//!
-//! The remaining sub-accessor (segments) lands in a later slice.
+//! * [`SegmentsView`] — segment bodies under
+//!   `by_id/<vol>/segments/<YYYYMMDD>/<ulid>`. Multipart PUT for
+//!   bodies (via `put_from_file`), range-GET for header+index
+//!   verification (`get_range`), and DELETE for the retention reaper.
 //!
 //! `VolumeData` is a concrete struct, not a trait. There is one
 //! impl, no reader/writer split (every op rides one `coord-data`
@@ -29,11 +31,12 @@
 //! `InMemory` `ObjectStore` underneath). If a second impl becomes
 //! useful later, splitting back into a trait is mechanical.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::path::Path as StorePath;
-use object_store::{ObjectMeta, ObjectStore, UpdateVersion};
+use object_store::{ObjectMeta, ObjectStore, UpdateVersion, WriteMultipart};
 use ulid::Ulid;
 
 use elide_core::signing::{self, SnapshotManifest, VerifyingKey};
@@ -81,6 +84,14 @@ impl VolumeData {
     /// Signed snapshot manifests and the `snapshots/LATEST` pointer.
     pub fn snapshots(&self) -> SnapshotsView<'_> {
         SnapshotsView {
+            store: &self.store,
+            vol_ulid: self.vol_ulid,
+        }
+    }
+
+    /// Segment bodies under `by_id/<vol>/segments/<date>/<ulid>`.
+    pub fn segments(&self) -> SegmentsView<'_> {
+        SegmentsView {
             store: &self.store,
             vol_ulid: self.vol_ulid,
         }
@@ -560,6 +571,127 @@ impl SnapshotsView<'_> {
     }
 }
 
+/// Non-async, zero-cost view bundling the segment-body operations
+/// under `by_id/<vol>/segments/<YYYYMMDD>/<ulid>`.
+pub struct SegmentsView<'a> {
+    store: &'a Arc<dyn ObjectStore>,
+    vol_ulid: Ulid,
+}
+
+impl SegmentsView<'_> {
+    /// Build the canonical segment key. The date partition is
+    /// derived from the segment ULID's timestamp, so keys are stable
+    /// and reconstructible from the ULID alone.
+    pub fn segment_key(&self, seg_ulid: Ulid) -> StorePath {
+        segment_key(self.vol_ulid, seg_ulid)
+    }
+
+    /// Multipart PUT of a segment body read from `path`.
+    ///
+    /// Used by the drain path (`pending/<ulid>`) and the GC handoff
+    /// cursor (`gc/<ulid>` after `compact`). Multipart is chosen
+    /// unconditionally: each part is a separate request with its own
+    /// timeout and retry budget, so a stalled part doesn't restart
+    /// the whole upload. Small segments still complete in a single
+    /// part at roughly the cost of a plain PUT.
+    ///
+    /// Part size is the process-global value installed at daemon
+    /// boot via [`crate::upload::set_part_size_bytes`]. Two parts
+    /// in flight is enough to hide one request's handshake latency
+    /// without bursting the upload link.
+    pub async fn put_from_file(
+        &self,
+        seg_ulid: Ulid,
+        path: &std::path::Path,
+    ) -> Result<(), SegmentsError> {
+        const MAX_CONCURRENT_PARTS: usize = 2;
+
+        let key = self.segment_key(seg_ulid);
+        let data = std::fs::read(path).map_err(|e| SegmentsError::ReadFile {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let mut bytes = Bytes::from(data);
+        let part_size = crate::upload::part_size_bytes();
+
+        let upload = self
+            .store
+            .put_multipart(&key)
+            .await
+            .map_err(SegmentsError::Put)?;
+        let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size);
+        while !bytes.is_empty() {
+            let take = bytes.len().min(part_size);
+            let part = bytes.split_to(take);
+            writer
+                .wait_for_capacity(MAX_CONCURRENT_PARTS)
+                .await
+                .map_err(SegmentsError::Put)?;
+            writer.put(part);
+        }
+        writer.finish().await.map_err(SegmentsError::Put)?;
+        Ok(())
+    }
+
+    /// Range-GET the given byte interval. Used by the
+    /// header+index-section verify path (recovery + prefetch) which
+    /// fetches the fixed header first, then the index extent it
+    /// reports. Returns the bytes in memory — callers verify under
+    /// the volume's pubkey before persisting.
+    pub async fn get_range(
+        &self,
+        seg_ulid: Ulid,
+        range: Range<usize>,
+    ) -> Result<Bytes, SegmentsError> {
+        let key = self.segment_key(seg_ulid);
+        self.store
+            .get_range(&key, range)
+            .await
+            .map_err(SegmentsError::Get)
+    }
+
+    /// DELETE the segment object. Used by the per-volume retention
+    /// reaper after the `Superseded` edge has aged past retention
+    /// (`docs/design-segment-index.md`).
+    pub async fn delete(&self, seg_ulid: Ulid) -> Result<(), SegmentsError> {
+        let key = self.segment_key(seg_ulid);
+        self.store.delete(&key).await.map_err(SegmentsError::Delete)
+    }
+}
+
+/// Errors from [`SegmentsView`] operations.
+#[derive(Debug)]
+pub enum SegmentsError {
+    Get(object_store::Error),
+    Put(object_store::Error),
+    Delete(object_store::Error),
+    /// Failed to read the on-disk source file for an upload.
+    ReadFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for SegmentsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Get(e) => write!(f, "getting segment object: {e}"),
+            Self::Put(e) => write!(f, "putting segment object: {e}"),
+            Self::Delete(e) => write!(f, "deleting segment object: {e}"),
+            Self::ReadFile { path, source } => write!(f, "reading {}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for SegmentsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Get(e) | Self::Put(e) | Self::Delete(e) => Some(e),
+            Self::ReadFile { source, .. } => Some(source),
+        }
+    }
+}
+
 /// Unforgeable read-receipt for `by_id/<vol>/snapshots/LATEST`.
 /// Carries the `If-Match` precondition for a subsequent
 /// [`SnapshotsView::advance_latest`]. Constructible only inside this
@@ -788,6 +920,12 @@ fn manifest_key(vol: Ulid, snap: Ulid) -> StorePath {
     let dt: chrono::DateTime<chrono::Utc> = snap.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
     StorePath::from(format!("by_id/{vol}/snapshots/{date}/{snap}.manifest"))
+}
+
+fn segment_key(vol: Ulid, seg: Ulid) -> StorePath {
+    let dt: chrono::DateTime<chrono::Utc> = seg.datetime().into();
+    let date = dt.format("%Y%m%d").to_string();
+    StorePath::from(format!("by_id/{vol}/segments/{date}/{seg}"))
 }
 
 fn stop_manifest_key(vol: Ulid, snap: Ulid) -> StorePath {
@@ -1186,5 +1324,78 @@ mod tests {
         vd.snapshots().bump_latest_if_newer(older).await.unwrap();
         let (got, _) = vd.snapshots().read_latest().await.unwrap().unwrap();
         assert_eq!(got, newer, "older bump must not regress LATEST");
+    }
+
+    // ── SegmentsView ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn segments_segment_key_is_date_partitioned_by_ulid_timestamp() {
+        let (_s, vd) = vd();
+        // Pin a ULID's timestamp so the expected partition is exact.
+        let seg = Ulid::from_parts(1_743_120_000_000, 42);
+        let key = vd.segments().segment_key(seg);
+        let dt: chrono::DateTime<chrono::Utc> = seg.datetime().into();
+        let date = dt.format("%Y%m%d").to_string();
+        assert_eq!(
+            key.as_ref(),
+            format!("by_id/{}/segments/{date}/{seg}", vd.vol_ulid()),
+        );
+    }
+
+    #[tokio::test]
+    async fn segments_put_from_file_round_trips_via_get_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_s, vd) = vd();
+        let seg = mint().next();
+        // Body larger than the fallback part size would force real
+        // multipart; the in-memory store handles either path
+        // transparently, but we cover the small-payload case here
+        // (one part) since that is the common drain case.
+        let body = b"segment body bytes";
+        let path = tmp.path().join(seg.to_string());
+        std::fs::write(&path, body).unwrap();
+
+        vd.segments().put_from_file(seg, &path).await.unwrap();
+
+        let got = vd.segments().get_range(seg, 0..body.len()).await.unwrap();
+        assert_eq!(got.as_ref(), body);
+    }
+
+    #[tokio::test]
+    async fn segments_put_from_file_reports_missing_source() {
+        let (_s, vd) = vd();
+        let seg = mint().next();
+        let bogus = std::path::Path::new("/does/not/exist/segment");
+        let err = vd.segments().put_from_file(seg, bogus).await.unwrap_err();
+        assert!(matches!(err, SegmentsError::ReadFile { .. }));
+    }
+
+    #[tokio::test]
+    async fn segments_get_range_absent_returns_get_error() {
+        let (_s, vd) = vd();
+        let seg = mint().next();
+        let err = vd.segments().get_range(seg, 0..8).await.unwrap_err();
+        assert!(matches!(
+            err,
+            SegmentsError::Get(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn segments_delete_removes_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_s, vd) = vd();
+        let seg = mint().next();
+        let body = b"x";
+        let path = tmp.path().join(seg.to_string());
+        std::fs::write(&path, body).unwrap();
+        vd.segments().put_from_file(seg, &path).await.unwrap();
+
+        vd.segments().delete(seg).await.unwrap();
+        let err = vd.segments().get_range(seg, 0..1).await.unwrap_err();
+        assert!(matches!(
+            err,
+            SegmentsError::Get(object_store::Error::NotFound { .. })
+        ));
     }
 }
