@@ -1062,6 +1062,32 @@ pub(crate) async fn skip_empty_intermediates_impl(
 
     loop {
         let dir = volume::resolve_ancestor_dir(&by_id_dir, &effective_vol.to_string());
+        // A fork can legitimately lack `volume.provenance`: `early_rebind`
+        // writes `volume.{key,pub}` and `mark_claimed`s the bucket, but
+        // `volume.provenance` is only written in `finalize`. A coordinator
+        // crash between the two leaves a partial fork the bucket points
+        // at; `release --force` then publishes a synthesised empty
+        // handoff over it (per `early_rebind`'s docstring), and a fresh
+        // `claim` is documented to "proceed". Treat missing provenance
+        // the same as a root volume — no chain to skip past — so that
+        // recovery path actually completes. Other read errors (corrupt
+        // file, signature mismatch) still propagate.
+        let provenance_path = dir.join(VOLUME_PROVENANCE_FILE);
+        match std::fs::metadata(&provenance_path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(
+                    "[claim {volume}] {effective_vol} has no volume.provenance; \
+                     treating as crashed-mid-create fork (no chain to skip)"
+                );
+                break;
+            }
+            Err(e) => {
+                return Err(IpcError::internal(format!(
+                    "stat provenance for {effective_vol}: {e}"
+                )));
+            }
+        }
         let lineage =
             read_lineage_verifying_signature(&dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE)
                 .map_err(|e| {
@@ -1336,6 +1362,68 @@ mod tests {
         .unwrap();
         assert_eq!(vol, f1.vol);
         assert_eq!(snap, f1.snap);
+    }
+
+    #[tokio::test]
+    async fn partial_fork_without_provenance_is_treated_as_root() {
+        // Regression for the `release --force` → `claim` recovery path
+        // documented on `early_rebind`. A prior `claim` that died
+        // between `early_rebind` (writes volume.{key,pub}, `mark_claimed`s
+        // the bucket) and `finalize` (writes volume.provenance) leaves a
+        // local fork dir with no provenance. `release --force` publishes
+        // an empty synthesised handoff over it; the next `claim` must
+        // treat the partial fork as a root-equivalent and proceed,
+        // forking from the synthesised empty handoff rather than erroring
+        // out on `volume.provenance not readable`.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut mint = UlidMint::new(Ulid::nil());
+        let partial_vol = mint.next();
+        let synth_snap = mint.next();
+
+        // Partial skeleton: volume.{key,pub} only — NO volume.provenance.
+        // Matches what `early_rebind` writes before crashing.
+        let dir = data_dir.join("by_id").join(partial_vol.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let signing_key = elide_core::signing::generate_keypair(
+            &dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        // Publish an empty synthesised handoff manifest at `synth_snap`
+        // signed by `partial_vol`'s own key (simulating release --force on
+        // a "crashed-during-create empty fork" — segments list is `[]`).
+        let (signer, _vk) =
+            elide_core::signing::signer_from_bytes(&signing_key.to_bytes()).unwrap();
+        let manifest_bytes =
+            elide_core::signing::build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
+        elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), partial_vol)
+            .snapshots()
+            .put_manifest(synth_snap, bytes::Bytes::from(manifest_bytes))
+            .await
+            .unwrap();
+
+        let job = ClaimJob::new();
+        let stores = passthrough(store);
+        let (vol, snap, _) = skip_empty_intermediates_impl(
+            &job,
+            "vol",
+            partial_vol,
+            synth_snap,
+            None,
+            data_dir,
+            &stores,
+            None,
+            &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
+        )
+        .await
+        .expect("missing provenance must not error — must break loop");
+        // Effective ancestor = the partial fork itself; nothing to skip past.
+        assert_eq!(vol, partial_vol);
+        assert_eq!(snap, synth_snap);
     }
 
     #[tokio::test]
