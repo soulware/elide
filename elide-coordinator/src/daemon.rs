@@ -458,21 +458,15 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     Arc::new(tokio::sync::watch::channel(None).0)
                 });
 
-                // Per-volume drain / GC / prefetch loop runs against
-                // that volume's `coord-data` handle. A directory whose
-                // name is not a ULID is not a real volume; it falls
-                // back to the coordinator-wide writer handle.
-                let vol_store = match vol_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|s| ulid::Ulid::from_string(s).ok())
-                {
-                    Some(u) => stores.data_for_volume(&u),
-                    None => stores.writer(),
-                };
+                // Per-volume drain / GC / prefetch loop. The task
+                // mints its own per-purpose handles off `stores`:
+                // `coord-data` for drain/GC writes, `coord-writer` for
+                // peer discovery's `events/<name>/` reads, and
+                // `volume-ro` (own + ancestors) for the prefetch
+                // chain walk.
                 tasks.spawn(elide_coordinator::tasks::run_volume_tasks(
                     vol_dir.clone(),
-                    vol_store,
+                    Arc::clone(&stores),
                     stores.event_journal_ro(),
                     drain_interval,
                     gc_config.clone(),

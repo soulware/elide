@@ -36,7 +36,10 @@ use elide_coordinator::config::{MintConfig, StoreSection};
 use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::stores::{ReadOnlyAdapter, ReadStore, ScopedStores};
 
-use crate::mint_client::{MintEndpoint, ROLE_COORD_BASE, ROLE_COORD_DATA, ROLE_COORD_WRITER};
+use crate::mint_client::{
+    MintEndpoint, ROLE_COORD_BASE, ROLE_COORD_DATA, ROLE_COORD_WRITER, ROLE_VOLUME_RO,
+    VOLUME_RO_TTL_SECS,
+};
 
 const CAVEAT_VOLUME: &str = "elide:Volume";
 
@@ -67,9 +70,13 @@ pub struct RoleStore {
     store_cfg: StoreSection,
     role: &'static str,
     ttl_secs: u64,
-    /// `coord-data` is per-volume; the `elide:Volume` narrowing caveat
-    /// + audit value. `None` for the coordinator-wide roles.
+    /// `coord-data` and `volume-ro` are per-volume; the `elide:Volume`
+    /// narrowing caveat + audit value. `None` for the coordinator-wide
+    /// roles.
     vol_ulid: Option<Ulid>,
+    /// `volume-ro`-only: the PoP-signed ancestor list the role template
+    /// expands into per-ancestor read ARNs. Empty for every other role.
+    ancestors: Vec<Ulid>,
     cached: Mutex<Option<Cached>>,
 }
 
@@ -97,12 +104,24 @@ impl RoleStore {
         ttl_secs: u64,
         vol_ulid: Option<Ulid>,
     ) -> Self {
+        Self::with_ancestors(endpoint, store_cfg, role, ttl_secs, vol_ulid, Vec::new())
+    }
+
+    fn with_ancestors(
+        endpoint: MintEndpoint,
+        store_cfg: StoreSection,
+        role: &'static str,
+        ttl_secs: u64,
+        vol_ulid: Option<Ulid>,
+        ancestors: Vec<Ulid>,
+    ) -> Self {
         Self {
             endpoint,
             store_cfg,
             role,
             ttl_secs,
             vol_ulid,
+            ancestors,
             cached: Mutex::new(None),
         }
     }
@@ -151,8 +170,16 @@ impl RoleStore {
             Some(v) => vec![(CAVEAT_VOLUME, v.as_str())],
             None => Vec::new(),
         };
+        // `volume-ro` is the one role whose policy template references
+        // `request.ancestors`; surface the chain as PoP-signed body.
+        let extra_owned: Vec<(&str, serde_json::Value)> = if self.ancestors.is_empty() {
+            Vec::new()
+        } else {
+            let ancestor_strs: Vec<String> = self.ancestors.iter().map(Ulid::to_string).collect();
+            vec![("ancestors", serde_json::json!(ancestor_strs))]
+        };
         self.endpoint
-            .assume_role(self.role, self.ttl_secs, &narrowing, &[])
+            .assume_role(self.role, self.ttl_secs, &narrowing, &extra_owned)
             .await
     }
 }
@@ -310,6 +337,21 @@ impl ScopedStores for MintScopedStores {
             map.insert(*vol_ulid, Arc::clone(&rs));
         }
         rs as Arc<dyn ObjectStore>
+    }
+
+    fn volume_ro(&self, vol_ulid: &Ulid, ancestors: &[Ulid]) -> Arc<dyn ObjectStore> {
+        // Not cached: the ancestor list varies per call (chain walks
+        // discover different lineages; ancestor-pull sites mint with
+        // `&[]`). Each `volume_ro` minted store assumes its keypair
+        // lazily on first op and reuses it for the role's 1h window.
+        Arc::new(RoleStore::with_ancestors(
+            self.endpoint.clone(),
+            self.store_cfg.clone(),
+            ROLE_VOLUME_RO,
+            VOLUME_RO_TTL_SECS,
+            Some(*vol_ulid),
+            ancestors.to_vec(),
+        )) as Arc<dyn ObjectStore>
     }
 }
 

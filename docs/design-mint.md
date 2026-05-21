@@ -938,18 +938,28 @@ Per-volume read of one volume's lineage. **Assumed by the coordinator**,
 not the volume: the coordinator attenuates its credential (`elide:Volume`,
 `exp`), puts the honest ancestor lineage in the request body as
 `request.ancestors`, calls `assume-role` with its `coordinator.key` PoP
-(which signs the body), and vends the resulting **Tigris keypair** to
-the volume process over the local handshake. The volume holds only that
-keypair — it never holds a macaroon and never calls mint, so the
-coordinator is the only principal that authenticates to mint. Used only
-when the volume reads S3 itself: hydration, or the S3 fallback when
-peer-fetch is unavailable. Peer-fetch proper does not use it — that path
-is the Ed25519 `PeerFetchToken` against a peer's local bytes
-(`design-peer-segment-fetch.md`).
+(which signs the body), and uses the resulting **Tigris keypair** for
+two read paths:
+
+1. **Volume process reads** — coordinator vends the keypair to the volume
+   over the local handshake; the volume holds only that keypair, never
+   holds a macaroon, never calls mint. Reaches S3 on hydration or the
+   S3 fallback when peer-fetch is unavailable. Peer-fetch proper does
+   not use it — that path is the Ed25519 `PeerFetchToken` against a
+   peer's local bytes (`design-peer-segment-fetch.md`).
+2. **Coordinator-side ancestor reads** — `prefetch_indexes` (warm-start
+   `.idx` chain walk) and claim-time `pull_readonly_op` (ancestor
+   skeleton + manifest reads). The coordinator's own per-volume
+   `coord-data` is single-prefix, so cross-ancestor reads ride
+   `volume-ro` with the appropriate `request.ancestors` body.
 
 - **Required caveats:** `elide:Volume`, `aud=mint`, `exp`
 - **Required body:** `request.ancestors` (PoP-signed; the role template
   references it, so an absent value fails the render closed)
+- **TTL:** 1h. Both consumers tolerate it cleanly: non-lazy volume
+  episodes complete in seconds; lazy volumes refresh proactively at
+  half-life; coord-side prefetch completes in seconds. The tightest
+  revocation window that keeps refresh off the hot path.
 - **Keypair freshness — split by volume mode:**
   - *Non-lazy (default):* the coordinator assumes on demand. A hydrated
     volume serves from local cache and touches S3 only in bounded fetch
@@ -1210,8 +1220,9 @@ before its `DateLessThan` (the *TTL principle*: TTL is the maximum
 revocation latency, so refresh well inside it — e.g. at half-life),
 rebuilding the `object_store` on rotation; a brief refresh stall is
 absorbed by the WAL for writes and is off the hot path for reads
-(`coord-base`/`coord-writer` 1h, `coord-data` 24h; `volume-ro`
-freshness is § *Elide as customer*'s split-by-volume-mode rule).
+(`coord-base`/`coord-writer` 1h, `coord-data` 24h, `volume-ro` 1h;
+freshness for `volume-ro` is § *Elide as customer*'s split-by-volume-mode
+rule).
 First use assumes lazily. `PassthroughStores` stays the impl for the
 local-store / no-`[mint]` case; the mint-backed `ScopedStores` impl is
 selected when `[mint]` is configured.

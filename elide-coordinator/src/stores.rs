@@ -108,8 +108,17 @@ pub trait ScopedStores: Send + Sync {
     fn writer(&self) -> Arc<dyn ObjectStore>;
 
     /// `coord-data`: read+write under `by_id/<vol_ulid>/`. Uploads,
-    /// GC, snapshot publish, readonly ancestor pulls.
+    /// GC, snapshot publish.
     fn data_for_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore>;
+
+    /// `volume-ro`: read-only under `by_id/<vol_ulid>/*` plus one
+    /// `by_id/<ancestor>/*` per entry in `ancestors`
+    /// (`docs/design-mint.md` § `volume-ro`). The coordinator's own
+    /// `coord-data` is single-prefix, so cross-ancestor reads
+    /// (`prefetch_indexes`, `pull_readonly_op`) ride this role. The
+    /// returned store is `GetObject`-only — wrong-prefix writes fail
+    /// at IAM, not at the call site.
+    fn volume_ro(&self, vol_ulid: &Ulid, ancestors: &[Ulid]) -> Arc<dyn ObjectStore>;
 
     /// The `coord-base` store as a plain [`ObjectStore`], for the one
     /// cross-crate consumer that needs it: the peer-fetch verifier
@@ -202,6 +211,10 @@ impl ScopedStores for PassthroughStores {
     }
 
     fn data_for_volume(&self, _vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.inner)
+    }
+
+    fn volume_ro(&self, _vol_ulid: &Ulid, _ancestors: &[Ulid]) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.inner)
     }
 
