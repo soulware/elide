@@ -772,28 +772,30 @@ async fn release_breadcrumb_only(
 /// snapshot LIST, no event walk (`docs/list-elimination-plan.md`
 /// § *Identity axes*).
 ///
-/// Two structured sources, both authoritative and CAS-protected on
-/// the record:
-///   - `handoff_snapshot` — set by the prior owner's `mark_released`
-///     and *retained* across in-place reclaim (same `vol_ulid`), so
-///     it is the basis for a fork reclaimed and released again
-///     without ever being started.
-///   - `parent` (`<vol_ulid>/<snap>`) — set by cross-coordinator
-///     `mark_claimed`, which relocates the released ancestor's
-///     handoff here when it mints a new `vol_ulid`.
+/// Only `record.handoff_snapshot` is honoured. Per the field's
+/// invariant (`NameRecord::handoff_snapshot`,
+/// `docs/design-portable-live-volume.md`), the snap it names lives
+/// under **`record.vol_ulid`** — set either by the original owner's
+/// `mark_released` or retained across in-place reclaim (same
+/// `vol_ulid`), so the bare ULID composes correctly with the
+/// caller's `vd.snapshots()` (which is keyed on `record.vol_ulid`).
+///
+/// `record.parent` (`<prev_vol_ulid>/<prev_snap_ulid>`) is **not** a
+/// fallback. Its snap lives under `prev_vol_ulid` in S3, so writing it
+/// into the new record's `handoff_snapshot` via `mark_released` would
+/// break the invariant — the next claimant would compose
+/// `by_id/<record.vol_ulid>/snapshots/.../<prev_snap>.manifest` and
+/// 404 (the manifest is under `prev_vol_ulid`). When only `parent` is
+/// set — i.e. this fork is a cross-coord claim that was never started
+/// — callers fall through to `synthesise_empty_owner_handoff`, which
+/// publishes a fresh empty manifest under `record.vol_ulid` signed by
+/// the new fork's own key shadow.
 ///
 /// The handoff a `Released` record names is already a promoted `User`
 /// manifest (release promotes a `Stop` cover before flipping), so no
-/// per-kind promote is needed here. `None` only when neither source
-/// exists (a root volume created/claimed and released without ever
-/// writing) — the caller synthesises an empty owner-signed handoff.
+/// per-kind promote is needed here.
 fn reuse_handoff_snapshot(record: &elide_core::name_record::NameRecord) -> Option<ulid::Ulid> {
-    if let Some(snap) = record.handoff_snapshot {
-        return Some(snap);
-    }
-    let parent = record.parent.as_deref()?;
-    let snap = parent.rsplit_once('/').map_or(parent, |(_, s)| s);
-    ulid::Ulid::from_string(snap).ok()
+    record.handoff_snapshot
 }
 
 /// Server-side promote a stop-snapshot to a stable user manifest in
@@ -2727,5 +2729,59 @@ mod tests {
             .expect_err("readonly record should refuse start");
         assert_eq!(err.kind, IpcErrorKind::Conflict);
         assert!(err.message.contains("readonly"), "{}", err.message);
+    }
+
+    // ── reuse_handoff_snapshot ────────────────────────────────────────────
+
+    #[test]
+    fn reuse_handoff_snapshot_returns_handoff_when_set() {
+        // The handoff_snapshot field is invariant-under-record.vol_ulid
+        // (set by the original owner's mark_released, or retained
+        // through in-place reclaim). Bare ULID composes correctly.
+        let vol = ulid::Ulid::new();
+        let snap = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(vol, 1);
+        rec.handoff_snapshot = Some(snap);
+        assert_eq!(reuse_handoff_snapshot(&rec), Some(snap));
+    }
+
+    #[test]
+    fn reuse_handoff_snapshot_returns_none_when_only_parent_is_set() {
+        // Regression: a cross-coord-claimed fork has `parent` populated
+        // but `handoff_snapshot = None`. Returning the parent's bare
+        // snap ULID would compose to `by_id/<new_vol>/snapshots/.../<snap>`
+        // which 404s — the snap lives under prev_vol_ulid. Caller must
+        // synthesise a fresh handoff under record.vol_ulid instead.
+        let prev_vol = ulid::Ulid::new();
+        let prev_snap = ulid::Ulid::new();
+        let new_vol = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(new_vol, 1);
+        rec.parent = Some(format!("{prev_vol}/{prev_snap}"));
+        rec.handoff_snapshot = None;
+        assert_eq!(reuse_handoff_snapshot(&rec), None);
+    }
+
+    #[test]
+    fn reuse_handoff_snapshot_returns_handoff_even_when_parent_also_set() {
+        // After release of an in-place-reclaimed fork that originated
+        // from a cross-coord claim: both fields are populated, but
+        // handoff_snapshot is the authoritative one (under
+        // record.vol_ulid). The parent is ancestry only.
+        let vol = ulid::Ulid::new();
+        let snap = ulid::Ulid::new();
+        let prev_vol = ulid::Ulid::new();
+        let prev_snap = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(vol, 1);
+        rec.handoff_snapshot = Some(snap);
+        rec.parent = Some(format!("{prev_vol}/{prev_snap}"));
+        assert_eq!(reuse_handoff_snapshot(&rec), Some(snap));
+    }
+
+    #[test]
+    fn reuse_handoff_snapshot_returns_none_on_root() {
+        // Root volume created/claimed and released without ever writing:
+        // neither field set. Caller synthesises.
+        let rec = NameRecord::live_minimal(ulid::Ulid::new(), 1);
+        assert_eq!(reuse_handoff_snapshot(&rec), None);
     }
 }
