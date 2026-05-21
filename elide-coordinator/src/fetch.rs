@@ -326,8 +326,11 @@ async fn latest_snapshot_in_store(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<Option<Ulid>, IpcError> {
-    elide_coordinator::upload::read_latest_snapshot(store, &vol_ulid.to_string())
+    let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    vd.snapshots()
+        .read_latest()
         .await
+        .map(|opt| opt.map(|(u, _)| u))
         .map_err(|e| {
             IpcError::store(format!(
                 "reading latest-snapshot pointer for {vol_ulid}: {e}"
@@ -370,23 +373,11 @@ async fn fetch_and_verify_manifest(
 
     if !local_path.exists() {
         job.line(format!("fetching basis manifest {snap_ulid}"));
-        let key =
-            elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
-        let bytes = store
-            .get(&key)
+        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+        vd.snapshots()
+            .get_manifest_to_file(snap_ulid, &local_path)
             .await
-            .map_err(|e| IpcError::store(format!("fetching {filename} from store: {e}")))?
-            .bytes()
-            .await
-            .map_err(|e| IpcError::store(format!("reading {filename}: {e}")))?;
-
-        std::fs::create_dir_all(&snap_dir)
-            .map_err(|e| IpcError::internal(format!("creating snapshots/: {e}")))?;
-        let tmp = snap_dir.join(format!("{filename}.tmp"));
-        std::fs::write(&tmp, &bytes)
-            .map_err(|e| IpcError::internal(format!("writing {filename}.tmp: {e}")))?;
-        std::fs::rename(&tmp, &local_path)
-            .map_err(|e| IpcError::internal(format!("renaming {filename}.tmp: {e}")))?;
+            .map_err(|e| IpcError::store(format!("fetching {filename}: {e}")))?;
     }
 
     // Verify under the volume's own `volume.pub`. (Synthesised

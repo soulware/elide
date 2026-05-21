@@ -152,16 +152,18 @@ async fn latest_snapshot_in_store(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<Option<(Ulid, elide_core::signing::SnapshotKind)>, IpcError> {
-    Ok(
-        elide_coordinator::upload::read_latest_snapshot(store, &vol_ulid.to_string())
-            .await
-            .map_err(|e| {
-                IpcError::store(format!(
-                    "reading latest-snapshot pointer for {vol_ulid}: {e}"
-                ))
-            })?
-            .map(|u| (u, elide_core::signing::SnapshotKind::User)),
-    )
+    let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    Ok(vd
+        .snapshots()
+        .read_latest()
+        .await
+        .map(|opt| opt.map(|(u, _)| u))
+        .map_err(|e| {
+            IpcError::store(format!(
+                "reading latest-snapshot pointer for {vol_ulid}: {e}"
+            ))
+        })?
+        .map(|u| (u, elide_core::signing::SnapshotKind::User)))
 }
 
 async fn install_basis_under_leaf(
@@ -268,31 +270,19 @@ async fn fetch_and_verify_manifest(
     let local_path = snap_dir.join(&filename);
 
     if !local_path.exists() {
-        let key = match kind {
+        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+        let snapshots = vd.snapshots();
+        match kind {
             elide_core::signing::SnapshotKind::User => {
-                elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid)
+                snapshots.get_manifest_to_file(snap_ulid, &local_path).await
             }
             elide_core::signing::SnapshotKind::Stop => {
-                elide_coordinator::upload::stop_snapshot_manifest_key(
-                    &vol_ulid.to_string(),
-                    snap_ulid,
-                )
+                snapshots
+                    .get_stop_manifest_to_file(snap_ulid, &local_path)
+                    .await
             }
-        };
-        let bytes = store
-            .get(&key)
-            .await
-            .map_err(|e| IpcError::store(format!("fetching {filename}: {e}")))?
-            .bytes()
-            .await
-            .map_err(|e| IpcError::store(format!("reading {filename}: {e}")))?;
-        std::fs::create_dir_all(&snap_dir)
-            .map_err(|e| IpcError::internal(format!("creating snapshots/: {e}")))?;
-        let tmp = snap_dir.join(format!("{filename}.tmp"));
-        std::fs::write(&tmp, &bytes)
-            .map_err(|e| IpcError::internal(format!("writing {filename}.tmp: {e}")))?;
-        std::fs::rename(&tmp, &local_path)
-            .map_err(|e| IpcError::internal(format!("renaming {filename}.tmp: {e}")))?;
+        }
+        .map_err(|e| IpcError::store(format!("fetching {filename}: {e}")))?;
         // These bytes came from S3 — pre-mark the upload sentinel so
         // the daemon's first drain tick doesn't redundantly PUT them
         // back. Best-effort: a failure here only costs a wasted PUT.

@@ -223,22 +223,12 @@ async fn run_seal(world: &mut World, head: &mut SegmentHead) -> bool {
     let snap = world.mint.next();
     let live: Vec<Ulid> = world.expected_live.iter().copied().collect();
     let bytes = signing::build_snapshot_manifest_bytes(world.signer.as_ref(), &live, None);
-    let vol_id = world.vol_id();
-    let manifest_key = upload::snapshot_manifest_key(&vol_id, snap);
-    world
-        .store
-        .put(&manifest_key, Bytes::from(bytes).into())
+    let vd = world_vd(world);
+    vd.snapshots()
+        .put_manifest(snap, Bytes::from(bytes))
         .await
         .unwrap();
-    let latest_key = upload::snapshot_latest_key(&vol_id);
-    world
-        .store
-        .put(
-            &latest_key,
-            Bytes::from(snap.to_string().into_bytes()).into(),
-        )
-        .await
-        .unwrap();
+    vd.snapshots().bump_latest_if_newer(snap).await.unwrap();
     // Truncate HEAD to empty anchored at the new snap.
     *head = SegmentHead::empty(Some(snap));
     true
@@ -248,7 +238,7 @@ async fn run_seal(world: &mut World, head: &mut SegmentHead) -> bool {
 /// leaves S3 + HEAD untouched (e.g. `Reap` with no Superseded
 /// edges, `Gc` with empty live set).
 async fn apply_op(world: &mut World, op: &SimOp) {
-    let mut head = world_vd(&world).head().read().await.unwrap();
+    let mut head = world_vd(world).head().read().await.unwrap();
     let mutated = match op {
         SimOp::Drain { count } => run_drain(world, &mut head, *count).await,
         SimOp::Gc { input_count } => run_gc(world, &mut head, *input_count).await,
@@ -267,10 +257,12 @@ async fn apply_op(world: &mut World, op: &SimOp) {
 /// `live_set(manifest, rebuilt)` and compares against the actual
 /// HEAD's live set.
 async fn rebuild_head(world: &World) -> SegmentHead {
-    let vol_id = world.vol_id();
-    let anchor = upload::read_latest_snapshot(&world.store, &vol_id)
+    let anchor = world_vd(world)
+        .snapshots()
+        .read_latest()
         .await
-        .unwrap();
+        .unwrap()
+        .map(|(u, _)| u);
 
     let prefix = StorePath::from(format!("by_id/{}/segments/", world.vol_ulid));
     let objects: Vec<_> = world.store.list(Some(&prefix)).try_collect().await.unwrap();
@@ -353,28 +345,22 @@ async fn rebuild_head(world: &World) -> SegmentHead {
 }
 
 async fn read_manifest_segments(world: &World) -> BTreeSet<Ulid> {
-    let vol_id = world.vol_id();
-    let snap = match upload::read_latest_snapshot(&world.store, &vol_id).await {
-        Ok(Some(u)) => u,
-        Ok(None) => return BTreeSet::new(),
-        Err(_) => return BTreeSet::new(),
+    let vd = world_vd(world);
+    let snapshots = vd.snapshots();
+    let snap = match snapshots.read_latest().await {
+        Ok(Some((u, _))) => u,
+        _ => return BTreeSet::new(),
     };
-    let key = upload::snapshot_manifest_key(&vol_id, snap);
-    let bytes = match world.store.get(&key).await {
-        Ok(g) => g.bytes().await.unwrap(),
-        Err(_) => return BTreeSet::new(),
-    };
-    signing::read_snapshot_manifest_from_bytes(&bytes, &world.vk, &snap)
-        .unwrap()
-        .segment_ulids
-        .into_iter()
-        .collect()
+    match snapshots.get_manifest(snap, &world.vk).await {
+        Ok(m) => m.segment_ulids.into_iter().collect(),
+        Err(_) => BTreeSet::new(),
+    }
 }
 
 // ── Invariant ───────────────────────────────────────────────────────────
 
 async fn assert_equivalence(world: &World) -> Result<(), TestCaseError> {
-    let actual = world_vd(&world).head().read().await.unwrap();
+    let actual = world_vd(world).head().read().await.unwrap();
     let manifest = read_manifest_segments(world).await;
     let rebuilt = rebuild_head(world).await;
 
@@ -501,7 +487,7 @@ proptest! {
 /// its effect on live should be considered un-acknowledged).
 async fn apply_op_crashing(world: &mut World, op: &SimOp) {
     let expected_pre = world.expected_live.clone();
-    let mut head = world_vd(&world).head().read().await.unwrap();
+    let mut head = world_vd(world).head().read().await.unwrap();
     match op {
         SimOp::Drain { count } => {
             run_drain(world, &mut head, *count).await;
