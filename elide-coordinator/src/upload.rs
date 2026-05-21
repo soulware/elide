@@ -138,6 +138,20 @@ fn mark_uploaded(sentinel: &Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Like [`mark_uploaded`] but records the sentinel by copying the
+/// source file directly — no intermediate userspace buffer. Used when
+/// the upload helper just shipped a local file: the sentinel records
+/// a byte-equal copy of what S3 now holds, and the next
+/// [`is_already_uploaded`] check is a verbatim disk-vs-disk
+/// comparison.
+fn mark_uploaded_from_file(sentinel: &Path, source: &Path) -> std::io::Result<()> {
+    if let Some(parent) = sentinel.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(source, sentinel)?;
+    Ok(())
+}
+
 /// Write an `uploaded/<relative>` sentinel containing `content`,
 /// asserting that S3 already holds these bytes at the matching key.
 /// Used by code paths that *downloaded* a skeleton file from S3
@@ -358,13 +372,12 @@ pub async fn upload_volume_pub_initial(
     vd: &crate::volume_data::VolumeData,
 ) -> Result<()> {
     let pub_key_path = vol_dir.join("volume.pub");
-    let bytes = vd
-        .metadata()
+    vd.metadata()
         .write_pubkey_from_file(&pub_key_path)
         .await
         .with_context(|| format!("uploading volume.pub for {}", vd.vol_ulid()))?;
     let sentinel = upload_sentinel(vol_dir, "volume.pub");
-    mark_uploaded(&sentinel, &bytes)
+    mark_uploaded_from_file(&sentinel, &pub_key_path)
         .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
     Ok(())
 }
@@ -392,13 +405,12 @@ pub async fn upload_volume_provenance_initial(
     vd: &crate::volume_data::VolumeData,
 ) -> Result<()> {
     let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
-    let bytes = vd
-        .metadata()
+    vd.metadata()
         .write_provenance_from_file(&provenance_path)
         .await
         .with_context(|| format!("uploading volume.provenance for {}", vd.vol_ulid()))?;
     let sentinel = upload_sentinel(vol_dir, elide_core::signing::VOLUME_PROVENANCE_FILE);
-    mark_uploaded(&sentinel, &bytes)
+    mark_uploaded_from_file(&sentinel, &provenance_path)
         .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
     Ok(())
 }
@@ -490,9 +502,8 @@ pub async fn upload_snapshot_metadata(
             }
         };
         match put_result {
-            Ok(body) => {
-                let len = body.len();
-                info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
+            Ok(()) => {
+                info!("[upload] {key} in {:.2?}", started.elapsed());
                 if let Err(e) = mark_uploaded(&sentinel, &[]) {
                     warn!("failed to mark snapshot {snap_ulid} sentinel: {e}");
                 }
