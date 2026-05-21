@@ -952,6 +952,24 @@ fn main() {
             }
 
             VolumeCommand::Remove { name, force, token } => {
+                // Resolve `name` → ULID once, locally, against the
+                // `by_name/<name>` symlink. The token gets attenuated
+                // for *this* ULID and the wire request carries the same
+                // ULID, so the coordinator never re-reads `by_name`
+                // during the remove (eliminates a CLI→coord rotation
+                // TOCTOU on the name binding).
+                let volume_ulid = match resolve_local_volume_ulid(&data_dir, &name)
+                    .and_then(|s| ulid::Ulid::from_string(&s).ok())
+                {
+                    Some(u) => u,
+                    None => {
+                        eprintln!(
+                            "error: no local volume named {name:?}; the by_name/{name} \
+                             link is missing or broken"
+                        );
+                        std::process::exit(1);
+                    }
+                };
                 let stored = match elide::operator_token::resolve(token.as_deref(), &data_dir) {
                     Ok(Some(t)) => t,
                     Ok(None) => {
@@ -971,7 +989,7 @@ fn main() {
                 let wire = match elide::operator_token::attenuate_for(
                     &stored,
                     elide_coordinator::macaroon::OperatorOp::Remove,
-                    &name,
+                    volume_ulid,
                 ) {
                     Ok(t) => t,
                     Err(e) => {
@@ -979,7 +997,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-                if let Err(e) = coord.remove_volume(&name, force, wire) {
+                if let Err(e) = coord.remove_volume(volume_ulid, force, wire) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }

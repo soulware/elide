@@ -246,7 +246,7 @@ pub fn missing_token_hint(op: OperatorOp) -> String {
 /// call extends the chain from the previous tail MAC. The resulting
 /// token verifies against the same root key as the stored one because
 /// the chain replays correctly.
-pub fn attenuate_for(stored: &str, op: OperatorOp, volume: &str) -> io::Result<String> {
+pub fn attenuate_for(stored: &str, op: OperatorOp, volume_ulid: ulid::Ulid) -> io::Result<String> {
     let m = Macaroon::parse(stored)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -254,7 +254,7 @@ pub fn attenuate_for(stored: &str, op: OperatorOp, volume: &str) -> io::Result<S
         .unwrap_or(0);
     let wire = m
         .attenuate(Caveat::Op(op))
-        .attenuate(Caveat::Volume(volume.to_owned()))
+        .attenuate(Caveat::Volume(volume_ulid.to_string()))
         .attenuate(Caveat::NotAfter(now + USE_EXPIRY_SECS));
     Ok(wire.encode())
 }
@@ -280,28 +280,37 @@ mod tests {
             .as_secs()
     }
 
+    fn ulid_a() -> ulid::Ulid {
+        ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap()
+    }
+
+    fn ulid_b() -> ulid::Ulid {
+        ulid::Ulid::from_string("01JQBBBBBBBBBBBBBBBBBBBBBB").unwrap()
+    }
+
     #[test]
     fn attenuate_round_trips_and_verifies() {
         let root = mint_operator(&key(), now() + 86_400);
-        let wire = attenuate_for(&root.encode(), OperatorOp::Remove, "myvm").unwrap();
+        let wire = attenuate_for(&root.encode(), OperatorOp::Remove, ulid_a()).unwrap();
         let ctx = VerifyOperatorCtx {
             now_unix: now(),
             op: OperatorOp::Remove,
-            op_volume: "myvm",
+            op_volume: ulid_a(),
         };
-        let m = verify_operator(&key(), &wire, &ctx).unwrap();
+        let (m, verified) = verify_operator(&key(), &wire, &ctx).unwrap();
         assert_eq!(m.op(), Some(OperatorOp::Remove));
-        assert_eq!(m.volume(), Some("myvm"));
+        assert_eq!(m.volume(), Some(ulid_a()));
+        assert_eq!(verified.copy_inner(), ulid_a());
     }
 
     #[test]
     fn attenuate_scopes_to_named_volume_only() {
         let root = mint_operator(&key(), now() + 86_400);
-        let wire = attenuate_for(&root.encode(), OperatorOp::Remove, "myvm").unwrap();
+        let wire = attenuate_for(&root.encode(), OperatorOp::Remove, ulid_a()).unwrap();
         let ctx = VerifyOperatorCtx {
             now_unix: now(),
             op: OperatorOp::Remove,
-            op_volume: "othervm",
+            op_volume: ulid_b(),
         };
         assert!(verify_operator(&key(), &wire, &ctx).is_err());
     }
