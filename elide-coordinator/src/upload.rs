@@ -446,7 +446,7 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
 /// pass observes a content-equal sentinel and skips the redundant PUT.
 pub async fn upload_volume_pub_initial(
     vol_dir: &Path,
-    vd: &dyn crate::volume_data::VolumeData,
+    vd: &crate::volume_data::VolumeData,
 ) -> Result<()> {
     let pub_key_path = vol_dir.join("volume.pub");
     let bytes = std::fs::read(&pub_key_path)
@@ -481,7 +481,7 @@ pub async fn upload_volume_pub_initial(
 /// has no `names/<name>` referrer and is reclaimed by future GC.
 pub async fn upload_volume_provenance_initial(
     vol_dir: &Path,
-    vd: &dyn crate::volume_data::VolumeData,
+    vd: &crate::volume_data::VolumeData,
 ) -> Result<()> {
     let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
     let bytes = std::fs::read(&provenance_path)
@@ -593,9 +593,7 @@ pub async fn upload_snapshot_metadata(
                         }
                     };
                     let empty = crate::segment_head::SegmentHead::empty(Some(snap_ulid));
-                    let vd: Arc<dyn crate::volume_data::VolumeData> = Arc::new(
-                        crate::volume_data::BucketVolumeData::new(Arc::clone(store), vol_ulid),
-                    );
+                    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
                     if let Err(e) = vd.head().put(&empty).await {
                         warn!(
                             "[upload] truncating HEAD for {snap_ulid}: {e}; \

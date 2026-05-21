@@ -613,7 +613,7 @@ impl ClaimOrchestrator {
         // claimants doing release --force on a stuck fork have the file they
         // expect.
         let new_vd = self.ctx.core.stores.volume_data(&new_vol_ulid);
-        elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, new_vd.as_ref())
+        elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, &new_vd)
             .await
             .map_err(|e| IpcError::store(format!("uploading volume.pub: {e:#}")))?;
 
@@ -884,12 +884,9 @@ impl ClaimOrchestrator {
         .map_err(|e| IpcError::internal(format!("writing provenance: {e}")))?;
 
         let prov_vd = self.ctx.core.stores.volume_data(&new_fork.vol_ulid);
-        elide_coordinator::upload::upload_volume_provenance_initial(
-            &new_fork.dir,
-            prov_vd.as_ref(),
-        )
-        .await
-        .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
+        elide_coordinator::upload::upload_volume_provenance_initial(&new_fork.dir, &prov_vd)
+            .await
+            .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
 
         // wal/ and pending/ now — daemon discovery becomes interested only
         // after these exist, by which point the provenance is on S3 and the

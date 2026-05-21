@@ -98,7 +98,7 @@ pub async fn list_and_verify_segments(
     verifying_key: &VerifyingKey,
 ) -> Result<RecoveredSegments> {
     let vol_id = vol_ulid.to_string();
-    let vd = crate::volume_data::BucketVolumeData::new(Arc::clone(store), vol_ulid);
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     let live = crate::segment_head::resolve_live_segments(&vd, verifying_key)
         .await
         .with_context(|| format!("resolving live segments for {vol_ulid}"))?;
@@ -598,13 +598,15 @@ mod tests {
     /// recovery enumerates from HEAD ∪ manifest; for tests that don't
     /// also seed a manifest, the entries here are the entire live set.
     async fn seed_head_added(store: &Arc<dyn ObjectStore>, vol_ulid: Ulid, segs: &[Ulid]) {
-        use crate::volume_data::{BucketVolumeData, VolumeData};
         let mut head = crate::segment_head::SegmentHead::empty(None);
         for s in segs {
             head.added.insert(*s);
         }
-        let vd: Arc<dyn VolumeData> = Arc::new(BucketVolumeData::new(Arc::clone(store), vol_ulid));
-        vd.head().put(&head).await.unwrap();
+        crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid)
+            .head()
+            .put(&head)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

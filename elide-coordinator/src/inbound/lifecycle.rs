@@ -1645,8 +1645,7 @@ mod tests {
         vol_ulid: ulid::Ulid,
         segs: &[ulid::Ulid],
     ) {
-        use elide_coordinator::volume_data::{BucketVolumeData, VolumeData};
-        let vd: Arc<dyn VolumeData> = Arc::new(BucketVolumeData::new(Arc::clone(store), vol_ulid));
+        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
         let mut head = vd.head().read().await.unwrap();
         for s in segs {
             head.added.insert(*s);

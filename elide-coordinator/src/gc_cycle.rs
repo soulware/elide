@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 use crate::config::GcConfig;
 use crate::segment_head;
-use crate::volume_data::{BucketVolumeData, VolumeData};
+use crate::volume_data::VolumeData;
 use crate::volume_state::IMPORTING_FILE;
 use crate::{SnapshotLockRegistry, control, gc, snapshot_lock_for, upload};
 
@@ -39,7 +39,7 @@ pub struct GcCycleOrchestrator {
     /// Typed handle for the per-volume `by_id/<vol>/…` objects. Used
     /// for HEAD ops; raw `store` is still used for object classes the
     /// domain layer doesn't yet vend (segments, snapshot manifests).
-    volume_data: Arc<dyn VolumeData>,
+    volume_data: VolumeData,
     gc_config: GcConfig,
     snap_lock: Arc<AsyncMutex<()>>,
     last_gc: Instant,
@@ -89,8 +89,7 @@ impl GcCycleOrchestrator {
         // `expect` and explain it.
         let volume_ulid = Ulid::from_string(&volume_id)
             .expect("volume_id is a parsed ULID upstream (tasks.rs / derive_names)");
-        let volume_data: Arc<dyn VolumeData> =
-            Arc::new(BucketVolumeData::new(Arc::clone(&store), volume_ulid));
+        let volume_data = VolumeData::new(Arc::clone(&store), volume_ulid);
         Self {
             fork_dir,
             by_id_dir,
@@ -339,11 +338,7 @@ impl GcCycleOrchestrator {
             return;
         }
 
-        // Hold the Arc locally so HeadView's borrow doesn't compete
-        // with `&mut self` in `reap_expired` below.
-        let vd = Arc::clone(&self.volume_data);
-        let head_view = vd.head();
-        let mut head = match head_view.read().await {
+        let mut head = match self.volume_data.head().read().await {
             Ok(h) => h,
             Err(e) => {
                 warn!(
@@ -373,7 +368,7 @@ impl GcCycleOrchestrator {
         if !mutated {
             return;
         }
-        if let Err(e) = head_view.put(&head).await {
+        if let Err(e) = self.volume_data.head().put(&head).await {
             warn!(
                 "[head {}] put failed: {e}; \
                  self-heals on the next active tick",
@@ -545,8 +540,8 @@ mod tests {
         Ulid::from_string("01J0000000000000000000000V").unwrap()
     }
 
-    fn vd_for(store: Arc<dyn ObjectStore>) -> Arc<dyn VolumeData> {
-        Arc::new(BucketVolumeData::new(store, vol_ulid()))
+    fn vd_for(store: Arc<dyn ObjectStore>) -> VolumeData {
+        VolumeData::new(store, vol_ulid())
     }
 
     async fn read_head_via(store: &Arc<dyn ObjectStore>) -> segment_head::SegmentHead {

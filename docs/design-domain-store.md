@@ -371,15 +371,17 @@ value. The migration is per-object:
 3. `VolumeData::head()` and `VolumeData::metadata()` — fixed keys,
    tiny surface; clears the `recovery.rs` and `segment_head.rs`
    cluster. *Landed in this PR.* `VolumeData` is the per-volume
-   handle vended by `ScopedStores::volume_data(&vol_ulid)`. The
-   parent trait carries flat async methods for the migrated
-   operations; sub-views (`HeadView<'_>`, `MetadataView<'_>`) are
-   inherent methods on `dyn VolumeData` so callers name the
-   sub-object they touch (`vd.head().read()`, `vd.metadata()
-   .read_pubkey()`). The escape hatch `VolumeData::data_store()`
-   exposes the raw `Arc<dyn ObjectStore>` for object classes the
-   handle does not yet vend (segments, snapshots, retention); it
-   goes away in step 4.
+   handle vended by `ScopedStores::volume_data(&vol_ulid)` —
+   intentionally a **concrete struct, not a trait**: there is one
+   impl, no reader/writer split (every op rides one `coord-data`
+   credential), and tests substitute an `InMemory` `ObjectStore`
+   underneath rather than a second impl. Sub-views (`HeadView<'_>`,
+   `MetadataView<'_>`) are returned by inherent methods so callers
+   name the sub-object they touch (`vd.head().read()`,
+   `vd.metadata().read_pubkey()`). The escape hatch
+   `VolumeData::data_store()` exposes the raw `Arc<dyn ObjectStore>`
+   for object classes the handle does not yet vend (segments,
+   snapshots, retention); it goes away in step 4.
 4. `VolumeData::segments()` and `::snapshots()` — the bulk of the
    `upload.rs`, `prefetch.rs`, `gc_cycle.rs`, `inbound/lifecycle.rs`
    churn.

@@ -338,7 +338,7 @@ pub fn live_set(manifest_segments: &BTreeSet<Ulid>, head: &SegmentHead) -> BTree
 /// escape hatch). When the snapshots view lands in a later step of
 /// `docs/design-domain-store.md`, the escape hatch goes away.
 pub async fn resolve_live_segments(
-    vd: &dyn VolumeData,
+    vd: &VolumeData,
     manifest_verifying_key: &VerifyingKey,
 ) -> Result<BTreeSet<Ulid>, ResolveError> {
     let vol = vd.vol_ulid();
@@ -679,7 +679,7 @@ mod tests {
     // (HEAD read/put/delete round-trips live in `volume_data.rs` tests
     // now that those operations belong to `VolumeData::head()`.)
 
-    use crate::volume_data::{BucketVolumeData, VolumeData};
+    use crate::volume_data::VolumeData;
     use bytes::Bytes;
 
     async fn seed_manifest(
@@ -703,8 +703,8 @@ mod tests {
             .unwrap();
     }
 
-    fn vd_for(store: Arc<dyn ObjectStore>) -> Arc<dyn VolumeData> {
-        Arc::new(BucketVolumeData::new(store, vol()))
+    fn vd_for(store: Arc<dyn ObjectStore>) -> VolumeData {
+        VolumeData::new(store, vol())
     }
 
     #[tokio::test]
@@ -713,7 +713,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
         let vd = vd_for(store);
-        let live = resolve_live_segments(&*vd, &vk).await.unwrap();
+        let live = resolve_live_segments(&vd, &vk).await.unwrap();
         assert!(live.is_empty());
     }
 
@@ -729,7 +729,7 @@ mod tests {
         seed_manifest(&store, &vol().to_string(), snap, &[s1, s2], &*signer).await;
 
         let vd = vd_for(store);
-        let live = resolve_live_segments(&*vd, &vk).await.unwrap();
+        let live = resolve_live_segments(&vd, &vk).await.unwrap();
         assert_eq!(live, [s1, s2].into_iter().collect());
     }
 
@@ -748,7 +748,7 @@ mod tests {
         let vd = vd_for(Arc::clone(&store));
         vd.head().put(&head).await.unwrap();
 
-        let live = resolve_live_segments(&*vd, &vk).await.unwrap();
+        let live = resolve_live_segments(&vd, &vk).await.unwrap();
         assert_eq!(live, [a1, a2].into_iter().collect());
     }
 
@@ -784,7 +784,7 @@ mod tests {
         let vd = vd_for(Arc::clone(&store));
         vd.head().put(&head).await.unwrap();
 
-        let live = resolve_live_segments(&*vd, &vk).await.unwrap();
+        let live = resolve_live_segments(&vd, &vk).await.unwrap();
         // pre1 survives; pre2 superseded; post1 added; post2 tombstoned; out added.
         assert_eq!(live, [pre1, post1, out].into_iter().collect());
     }
@@ -813,7 +813,7 @@ mod tests {
         let vd = vd_for(Arc::clone(&store));
         vd.head().put(&head).await.unwrap();
 
-        let live = resolve_live_segments(&*vd, &vk).await.unwrap();
+        let live = resolve_live_segments(&vd, &vk).await.unwrap();
         assert_eq!(live, [a].into_iter().collect());
     }
 }

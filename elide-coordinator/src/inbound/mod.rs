@@ -1671,15 +1671,13 @@ async fn create_volume_op(
     // names/<name> references them, so they're harmless and
     // GC-reclaimable).
     let create_vd = core.stores.volume_data(&vol_ulid);
-    if let Err(e) =
-        elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, create_vd.as_ref()).await
+    if let Err(e) = elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, &create_vd).await
     {
         cleanup_local();
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
     }
     if let Err(e) =
-        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, create_vd.as_ref())
-            .await
+        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, &create_vd).await
     {
         cleanup_local();
         return Err(IpcError::store(format!(
