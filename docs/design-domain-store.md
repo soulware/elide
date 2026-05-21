@@ -370,7 +370,7 @@ value. The migration is per-object:
    PR #412.*
 3. `VolumeData::head()` and `VolumeData::metadata()` — fixed keys,
    tiny surface; clears the `recovery.rs` and `segment_head.rs`
-   cluster. *Landed in this PR.* `VolumeData` is the per-volume
+   cluster. *Landed in PR #414.* `VolumeData` is the per-volume
    handle vended by `ScopedStores::volume_data(&vol_ulid)` —
    intentionally a **concrete struct, not a trait**: there is one
    impl, no reader/writer split (every op rides one `coord-data`
@@ -378,16 +378,44 @@ value. The migration is per-object:
    underneath rather than a second impl. Sub-views (`HeadView<'_>`,
    `MetadataView<'_>`) are returned by inherent methods so callers
    name the sub-object they touch (`vd.head().read()`,
-   `vd.metadata().read_pubkey()`). The escape hatch
-   `VolumeData::data_store()` exposes the raw `Arc<dyn ObjectStore>`
-   for object classes the handle does not yet vend (segments,
-   snapshots, retention); it goes away in step 4.
-4. `VolumeData::segments()` and `::snapshots()` — the bulk of the
-   `upload.rs`, `prefetch.rs`, `gc_cycle.rs`, `inbound/lifecycle.rs`
-   churn.
-5. `VolumeData::retention()` — small; can land with `segments()` or
+   `vd.metadata().read_pubkey()`).
+4. `VolumeData::snapshots()` — manifest publish / fetch and the
+   `snapshots/LATEST` pointer. *Landed in this PR (stacked on
+   #414).* Verb shape:
+   - `put_manifest(snap, Bytes)` for in-memory builds (synthesised
+     handoffs, force-release empty manifest).
+   - `put_manifest_from_file(snap, &Path)` for disk-to-S3 uploads
+     (regular drain seal path, force-snapshot-now). Reads the file
+     verbatim, ships the bytes, returns them so the caller can
+     record an upload sentinel without re-reading. The same
+     file-input shape is used by [`MetadataView`] for
+     `volume.pub` / `volume.provenance` uploads: when the on-disk
+     file *is* the canonical signed form, the view's role is
+     "ship this file" — not "parse and re-serialise."
+   - `try_publish_manifest(snap, Bytes)` — `If-None-Match: *` for
+     the synthesised-handoff conditional create.
+   - `get_manifest(snap, &VerifyingKey) -> SnapshotManifest` —
+     fetch + parse + verify in one step; the typed boundary.
+   - `get_manifest_bytes(snap) -> Bytes` — raw fetch for the
+     recovery flow that peeks the unauthenticated `recovery:`
+     header to decide which key to verify under.
+   - `head_manifest(snap)`, `delete_manifest(snap)`,
+     `promote_stop_to_user(snap)`.
+   - `read_latest()` returns `Option<(Ulid, LatestPointerToken)>`;
+     `advance_latest(prev, new)` is the typed CAS with
+     `LatestConflict::Stale { current }` surfaced when a peer
+     advanced under us. `bump_latest_if_newer(snap)` wraps the
+     read+CAS for the common drain-seal call site.
+
+   The `data_store()` escape hatch introduced in step 3 is removed
+   in this step — `resolve_live_segments` now routes both HEAD and
+   LATEST/manifest through typed views.
+
+6. `VolumeData::segments()` — the bulk of the `upload.rs`,
+   `prefetch.rs`, `gc_cycle.rs`, `inbound/lifecycle.rs` churn.
+7. `VolumeData::retention()` — small; can land with `segments()` or
    later.
-6. `OwnIdentity` and `ControlPlaneReader` — finish, then delete
+8. `OwnIdentity` and `ControlPlaneReader` — finish, then delete
    `ScopedStores` and the `Arc<dyn ObjectStore>` accessors.
 
 Each step leaves the tree green and reduces the

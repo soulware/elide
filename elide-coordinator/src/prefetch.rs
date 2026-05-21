@@ -843,10 +843,14 @@ async fn prefetch_snapshots(
     // are not a writable head's basis (ancestors resolve via signed
     // provenance) and stop-snapshots never flow into prefetch, per
     // `docs/list-elimination-plan.md` § *Identity axes*.
+    let vol_ulid_parsed =
+        Ulid::from_string(volume_id).with_context(|| format!("parsing volume_id {volume_id}"))?;
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid_parsed);
+    let snapshots = vd.snapshots();
     let basis = match branch_ulid {
         Some(b) => Ulid::from_string(b).with_context(|| format!("parsing branch ulid {b}"))?,
-        None => match crate::upload::read_latest_snapshot(store, volume_id).await? {
-            Some(u) => u,
+        None => match snapshots.read_latest().await? {
+            Some((u, _)) => u,
             None => return Ok(()),
         },
     };
@@ -857,14 +861,10 @@ async fn prefetch_snapshots(
     }
     std::fs::create_dir_all(&snap_dir).context("creating snapshots dir")?;
 
-    let key = crate::upload::snapshot_manifest_key(volume_id, basis);
-    let data = store
-        .get(&key)
+    let data = snapshots
+        .get_manifest_bytes(basis)
         .await
-        .with_context(|| format!("downloading {key}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("reading {key}"))?;
+        .with_context(|| format!("downloading manifest {basis}"))?;
     write_snapshot_artifact_atomic(&snap_dir, &filename, &data)?;
     info!("[prefetch] fetched snapshot artifact: {filename}");
     result.snapshots_fetched += 1;
@@ -892,7 +892,6 @@ async fn prefetch_branch_snapshot_artifacts(
     peer: &PeerFetchContext,
     result: &mut PrefetchResult,
 ) -> Result<()> {
-    let volume_id = vol_ulid.to_string();
     let snap_ulid_str = snap_ulid.to_string();
     let manifest_name = format!("{snap_ulid_str}.manifest");
 
@@ -914,14 +913,12 @@ async fn prefetch_branch_snapshot_artifacts(
     }
 
     trace!("[prefetch] peer miss for snapshot artifact {manifest_name}; falling through to S3");
-    let key = crate::upload::snapshot_manifest_key(&volume_id, snap_ulid);
-    let data = store
-        .get(&key)
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    let data = vd
+        .snapshots()
+        .get_manifest_bytes(snap_ulid)
         .await
-        .with_context(|| format!("downloading {key}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("reading {key}"))?;
+        .with_context(|| format!("downloading snapshot manifest {snap_ulid}"))?;
     write_snapshot_artifact_atomic(snap_dir, &manifest_name, &data)?;
     info!("[prefetch] fetched snapshot artifact: {manifest_name}");
     result.snapshots_fetched += 1;
@@ -1031,12 +1028,14 @@ mod tests {
             &[Ulid::from_string(seg_ulid).unwrap()],
             None,
         );
-        let manifest_key =
-            crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid.parse().unwrap());
-        store
-            .put(&manifest_key, manifest_bytes.into())
-            .await
-            .unwrap();
+        crate::volume_data::VolumeData::new(
+            Arc::clone(&store),
+            Ulid::from_string(parent_ulid).unwrap(),
+        )
+        .snapshots()
+        .put_manifest(snap_ulid.parse().unwrap(), manifest_bytes.into())
+        .await
+        .unwrap();
 
         // Run prefetch_indexes on the child fork.
         let result = prefetch_indexes(&child_dir, &store, None).await.unwrap();
@@ -1135,12 +1134,14 @@ mod tests {
             &[Ulid::from_string(seg_ulid).unwrap()],
             None,
         );
-        let manifest_key =
-            crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid.parse().unwrap());
-        store
-            .put(&manifest_key, manifest_bytes.into())
-            .await
-            .unwrap();
+        crate::volume_data::VolumeData::new(
+            Arc::clone(&store),
+            Ulid::from_string(parent_ulid).unwrap(),
+        )
+        .snapshots()
+        .put_manifest(snap_ulid.parse().unwrap(), manifest_bytes.into())
+        .await
+        .unwrap();
 
         let result = prefetch_indexes(&child_dir, &store, None).await.unwrap();
         assert_eq!(result.fetched, 1);
@@ -1264,12 +1265,14 @@ mod tests {
             &[Ulid::from_string(seg_ulid).unwrap()],
             None,
         );
-        let manifest_key =
-            crate::upload::snapshot_manifest_key(parent_ulid, snap_ulid.parse().unwrap());
-        store
-            .put(&manifest_key, manifest_bytes.into())
-            .await
-            .unwrap();
+        crate::volume_data::VolumeData::new(
+            Arc::clone(&store),
+            Ulid::from_string(parent_ulid).unwrap(),
+        )
+        .snapshots()
+        .put_manifest(snap_ulid.parse().unwrap(), manifest_bytes.into())
+        .await
+        .unwrap();
 
         // Run prefetch on the child. Should succeed: manifest verifies
         // under the override key, the .idx itself verifies under the
@@ -1336,22 +1339,25 @@ mod tests {
             &[Ulid::from_string(seg_ulid).unwrap()],
             None,
         );
-        let manifest_key =
-            crate::upload::snapshot_manifest_key(root_ulid, snap_ulid.parse().unwrap());
-        store
-            .put(&manifest_key, manifest_bytes.into())
-            .await
-            .unwrap();
+        crate::volume_data::VolumeData::new(
+            Arc::clone(&store),
+            Ulid::from_string(root_ulid).unwrap(),
+        )
+        .snapshots()
+        .put_manifest(snap_ulid.parse().unwrap(), manifest_bytes.into())
+        .await
+        .unwrap();
         // The writable-head listed path resolves its basis from the
-        // `snapshots/LATEST` pointer (no LIST). Seed it as the upload
-        // path would after the manifest PUT.
-        store
-            .put(
-                &crate::upload::snapshot_latest_key(root_ulid),
-                bytes::Bytes::from(snap_ulid.as_bytes().to_vec()).into(),
-            )
-            .await
-            .unwrap();
+        // `snapshots/LATEST` pointer (no LIST). Seed it via the typed
+        // CAS, matching what the upload path does after the manifest PUT.
+        crate::volume_data::VolumeData::new(
+            Arc::clone(&store),
+            Ulid::from_string(root_ulid).unwrap(),
+        )
+        .snapshots()
+        .advance_latest(None, snap_ulid.parse().unwrap())
+        .await
+        .unwrap();
 
         let result = prefetch_indexes(&root_dir, &store, None).await.unwrap();
         assert_eq!(result.fetched, 1, "should fetch own .idx");
@@ -1547,20 +1553,20 @@ mod tests {
         let snap_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let signer = load_signer(&vol_dir, VOLUME_KEY_FILE).unwrap();
         let manifest_bytes = build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
-        store
-            .put(
-                &crate::upload::snapshot_manifest_key(vol_ulid, snap_ulid.parse().unwrap()),
-                manifest_bytes.into(),
-            )
+        let vd_seed = crate::volume_data::VolumeData::new(
+            Arc::clone(&store),
+            Ulid::from_string(vol_ulid).unwrap(),
+        );
+        vd_seed
+            .snapshots()
+            .put_manifest(snap_ulid.parse().unwrap(), manifest_bytes.into())
             .await
             .unwrap();
         // Writable-head listed path resolves its basis from the
-        // `snapshots/LATEST` pointer; seed it as the upload path would.
-        store
-            .put(
-                &crate::upload::snapshot_latest_key(vol_ulid),
-                bytes::Bytes::from(snap_ulid.as_bytes().to_vec()).into(),
-            )
+        // `snapshots/LATEST` pointer; seed it via the typed CAS.
+        vd_seed
+            .snapshots()
+            .advance_latest(None, snap_ulid.parse().unwrap())
             .await
             .unwrap();
         let bare_key = StorePath::from(format!("by_id/{vol_ulid}/snapshots/19700101/{snap_ulid}"));
@@ -1655,15 +1661,21 @@ mod tests {
         let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
         let branch_manifest_bytes =
             build_snapshot_manifest_bytes(parent_signer.as_ref(), &[], None);
+        let parent_vd = crate::volume_data::VolumeData::new(
+            Arc::clone(&store),
+            Ulid::from_string(parent_ulid).unwrap(),
+        );
         for snap in [earlier, branch, later] {
-            let manifest_key =
-                crate::upload::snapshot_manifest_key(parent_ulid, snap.parse().unwrap());
-            let manifest_payload = if snap == branch {
+            let manifest_payload: bytes::Bytes = if snap == branch {
                 branch_manifest_bytes.clone().into()
             } else {
-                bytes::Bytes::from_static(b"x").into()
+                bytes::Bytes::from_static(b"x")
             };
-            store.put(&manifest_key, manifest_payload).await.unwrap();
+            parent_vd
+                .snapshots()
+                .put_manifest(snap.parse().unwrap(), manifest_payload)
+                .await
+                .unwrap();
         }
 
         prefetch_indexes(&child_dir, &store, None).await.unwrap();
@@ -1813,12 +1825,14 @@ mod tests {
         // below to confirm prefetch ignores pre-#215 bucket residue.
         let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
         let manifest_bytes = build_snapshot_manifest_bytes(parent_signer.as_ref(), &[], None);
-        let manifest_key =
-            crate::upload::snapshot_manifest_key(parent_ulid, branch.parse().unwrap());
-        store
-            .put(&manifest_key, manifest_bytes.into())
-            .await
-            .unwrap();
+        crate::volume_data::VolumeData::new(
+            Arc::clone(&store),
+            Ulid::from_string(parent_ulid).unwrap(),
+        )
+        .snapshots()
+        .put_manifest(branch.parse().unwrap(), manifest_bytes.into())
+        .await
+        .unwrap();
         let bare_marker =
             StorePath::from(format!("by_id/{parent_ulid}/snapshots/19700101/{branch}"));
         store

@@ -39,9 +39,8 @@ use elide_coordinator::lifecycle::{
     self, ForceReleaseOutcome, MarkClaimedOutcome, MarkReleasedOutcome,
 };
 use elide_coordinator::name_store as ns;
-use elide_coordinator::portable;
 use elide_coordinator::recovery;
-use elide_coordinator::upload::snapshot_manifest_key;
+use elide_coordinator::volume_data::VolumeData;
 use elide_core::name_record::NameState;
 use elide_core::segment::SegmentSigner;
 use elide_core::signing::{
@@ -147,10 +146,12 @@ impl World {
         let signer = self.vol_signers.get(&vol_ulid)?;
         let snap_ulid = Ulid::new();
         let bytes = build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
-        let key = snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
-        // Use put_if_absent so we don't accidentally overwrite an
-        // existing manifest minted by a parallel op.
-        portable::put_if_absent(self.store.as_ref(), &key, Bytes::from(bytes))
+        // Use try_publish_manifest (If-None-Match: *) so we don't
+        // accidentally overwrite an existing manifest minted by a
+        // parallel op.
+        VolumeData::new(self.store.clone(), vol_ulid)
+            .snapshots()
+            .try_publish_manifest(snap_ulid, Bytes::from(bytes))
             .await
             .ok()?;
         Some(snap_ulid)
@@ -261,15 +262,11 @@ impl World {
     /// `coordinator.pub`, which the coordinator-pub fetcher itself
     /// path-binds to its derived id.
     async fn verify_handoff_manifest(&self, vol_ulid: Ulid, snap: Ulid, name: &str) {
-        let snap_key = snapshot_manifest_key(&vol_ulid.to_string(), snap);
-        let body = self
-            .store
-            .get(&snap_key)
+        let body = VolumeData::new(self.store.clone(), vol_ulid)
+            .snapshots()
+            .get_manifest_bytes(snap)
             .await
-            .unwrap_or_else(|e| panic!("name '{name}' snapshot {snap} missing: {e}"))
-            .bytes()
-            .await
-            .unwrap_or_else(|e| panic!("name '{name}' snapshot {snap} body unreadable: {e}"));
+            .unwrap_or_else(|e| panic!("name '{name}' snapshot {snap} unreadable: {e}"));
 
         let recovery = peek_snapshot_manifest_recovery(&body)
             .unwrap_or_else(|e| panic!("name '{name}' snapshot {snap} unparseable: {e}"));

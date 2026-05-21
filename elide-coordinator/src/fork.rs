@@ -562,14 +562,17 @@ async fn latest_snapshot_op(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<LatestSnapshotReply, IpcError> {
-    let snapshot_ulid =
-        elide_coordinator::upload::read_latest_snapshot(store, &vol_ulid.to_string())
-            .await
-            .map_err(|e| {
-                IpcError::store(format!(
-                    "reading latest-snapshot pointer for {vol_ulid}: {e}"
-                ))
-            })?;
+    let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    let snapshot_ulid = vd
+        .snapshots()
+        .read_latest()
+        .await
+        .map(|opt| opt.map(|(u, _)| u))
+        .map_err(|e| {
+            IpcError::store(format!(
+                "reading latest-snapshot pointer for {vol_ulid}: {e}"
+            ))
+        })?;
     Ok(LatestSnapshotReply { snapshot_ulid })
 }
 
@@ -584,8 +587,6 @@ async fn force_snapshot_now_op(
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<ForceSnapshotNowReply, IpcError> {
-    use object_store::PutPayload;
-
     let volume_id = vol_ulid.to_string();
     let ancestor_dir = data_dir.join("by_id").join(&volume_id);
     if !ancestor_dir.exists() {
@@ -695,11 +696,9 @@ async fn force_snapshot_now_op(
     let manifest_path = ancestor_dir
         .join("snapshots")
         .join(format!("{snap_str}.manifest"));
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .map_err(|e| IpcError::internal(format!("reading just-written manifest: {e}")))?;
-    let manifest_key = elide_coordinator::upload::snapshot_manifest_key(&volume_id, snap);
-    store
-        .put(&manifest_key, PutPayload::from(manifest_bytes))
+    let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    vd.snapshots()
+        .put_manifest_from_file(snap, &manifest_path)
         .await
         .map_err(|e| IpcError::store(format!("uploading snapshot manifest: {e}")))?;
 

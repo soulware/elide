@@ -1149,7 +1149,7 @@ mod tests {
         build_snapshot_manifest_bytes, encode_hex, load_verifying_key, setup_readonly_identity,
     };
     use elide_core::ulid_mint::UlidMint;
-    use object_store::{ObjectStore, PutPayload, memory::InMemory};
+    use object_store::{ObjectStore, memory::InMemory};
     use tempfile::TempDir;
 
     struct Fork {
@@ -1200,9 +1200,11 @@ mod tests {
         segment_ulids: &[Ulid],
     ) {
         let bytes = build_snapshot_manifest_bytes(fork.signer.as_ref(), segment_ulids, None);
-        let key =
-            elide_coordinator::upload::snapshot_manifest_key(&fork.vol.to_string(), fork.snap);
-        store.put(&key, PutPayload::from(bytes)).await.unwrap();
+        elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), fork.vol)
+            .snapshots()
+            .put_manifest(fork.snap, bytes::Bytes::from(bytes))
+            .await
+            .unwrap();
     }
 
     fn passthrough(

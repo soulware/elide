@@ -138,6 +138,20 @@ fn mark_uploaded(sentinel: &Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Like [`mark_uploaded`] but records the sentinel by copying the
+/// source file directly — no intermediate userspace buffer. Used when
+/// the upload helper just shipped a local file: the sentinel records
+/// a byte-equal copy of what S3 now holds, and the next
+/// [`is_already_uploaded`] check is a verbatim disk-vs-disk
+/// comparison.
+fn mark_uploaded_from_file(sentinel: &Path, source: &Path) -> std::io::Result<()> {
+    if let Some(parent) = sentinel.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(source, sentinel)?;
+    Ok(())
+}
+
 /// Write an `uploaded/<relative>` sentinel containing `content`,
 /// asserting that S3 already holds these bytes at the matching key.
 /// Used by code paths that *downloaded* a skeleton file from S3
@@ -198,97 +212,6 @@ pub fn segment_key(volume_id: &str, ulid: Ulid) -> StorePath {
     let dt: DateTime<Utc> = ulid.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
     StorePath::from(format!("by_id/{volume_id}/segments/{date}/{ulid}"))
-}
-
-/// Build the object store key for a signed snapshot manifest.
-///
-/// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>.manifest`
-pub fn snapshot_manifest_key(volume_id: &str, ulid: Ulid) -> StorePath {
-    let dt: DateTime<Utc> = ulid.datetime().into();
-    let date = dt.format("%Y%m%d").to_string();
-    StorePath::from(format!(
-        "by_id/{volume_id}/snapshots/{date}/{ulid}.manifest"
-    ))
-}
-
-/// Build the object store key for a stop-snapshot manifest — the
-/// ephemeral `<ulid>-stop.manifest` variant written by `volume stop`.
-///
-/// Format: `by_id/<volume_ulid>/snapshots/YYYYMMDD/<snapshot_ulid>-stop.manifest`
-pub fn stop_snapshot_manifest_key(volume_id: &str, ulid: Ulid) -> StorePath {
-    let dt: DateTime<Utc> = ulid.datetime().into();
-    let date = dt.format("%Y%m%d").to_string();
-    StorePath::from(format!(
-        "by_id/{volume_id}/snapshots/{date}/{ulid}-stop.manifest"
-    ))
-}
-
-/// Object-store key for the per-vol latest stable-snapshot pointer:
-/// `by_id/<vol>/snapshots/LATEST`. A single fixed key per volume —
-/// the pointer the clean data-axis consumers GET instead of LISTing
-/// the snapshot prefix (`docs/list-elimination-plan.md` § *Identity
-/// axes*). Tracks the newest `User` (stable) snapshot only; body is
-/// the bare ULID. There is deliberately **no `-stop` pointer**: the
-/// unclean-recovery basis lives on the event spine
-/// (`Stopped`/`Released`/`ForceReleased`), where there is no
-/// manifest-then-crash-before-bump window to lose.
-pub fn snapshot_latest_key(volume_id: &str) -> StorePath {
-    StorePath::from(format!("by_id/{volume_id}/snapshots/LATEST"))
-}
-
-/// GET the per-vol latest stable-snapshot pointer. `Ok(None)` when
-/// absent (no stable snapshot yet, or the pointer not yet written —
-/// it self-heals on the next publish). An unparseable body is treated
-/// as absent (logged), not fatal: it is a perf hint, not a
-/// correctness datum (the correctness-sensitive recovery basis is on
-/// the event spine, not here).
-pub async fn read_latest_snapshot(
-    store: &Arc<dyn ObjectStore>,
-    volume_id: &str,
-) -> Result<Option<Ulid>> {
-    let key = snapshot_latest_key(volume_id);
-    let bytes = match store.get(&key).await {
-        Ok(g) => g.bytes().await.context("reading latest-snapshot pointer")?,
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(e) => return Err(anyhow::anyhow!("getting {key}: {e}")),
-    };
-    let text = std::str::from_utf8(&bytes)
-        .context("latest-snapshot pointer not utf-8")?
-        .trim();
-    match Ulid::from_string(text) {
-        Ok(u) => Ok(Some(u)),
-        Err(e) => {
-            warn!("[upload] {key} unparseable ({e}); ignoring (self-heals on next publish)");
-            Ok(None)
-        }
-    }
-}
-
-/// Bump the per-vol latest stable-snapshot pointer to `snap_ulid`
-/// when it is newer (ULID order) than what is there. Single-writer
-/// per vol (the owning coordinator's coord-data seal path), so a
-/// plain GET-max-PUT — no CAS. A lost race only drops a perf hint the
-/// next publish restores.
-async fn bump_latest_snapshot(
-    store: &Arc<dyn ObjectStore>,
-    volume_id: &str,
-    snap_ulid: Ulid,
-) -> Result<()> {
-    if let Some(cur) = read_latest_snapshot(store, volume_id).await?
-        && cur >= snap_ulid
-    {
-        return Ok(());
-    }
-    let key = snapshot_latest_key(volume_id);
-    put_with_content_type(
-        store,
-        &key,
-        Bytes::from(snap_ulid.to_string().into_bytes()),
-        MIME_TEXT,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("writing {key}: {e}"))?;
-    Ok(())
 }
 
 /// Upload all committed segments from `pending/` to the object store, then
@@ -449,14 +372,12 @@ pub async fn upload_volume_pub_initial(
     vd: &crate::volume_data::VolumeData,
 ) -> Result<()> {
     let pub_key_path = vol_dir.join("volume.pub");
-    let bytes = std::fs::read(&pub_key_path)
-        .with_context(|| format!("reading {}", pub_key_path.display()))?;
     vd.metadata()
-        .write_pubkey_bytes(&bytes)
+        .write_pubkey_from_file(&pub_key_path)
         .await
         .with_context(|| format!("uploading volume.pub for {}", vd.vol_ulid()))?;
     let sentinel = upload_sentinel(vol_dir, "volume.pub");
-    mark_uploaded(&sentinel, &bytes)
+    mark_uploaded_from_file(&sentinel, &pub_key_path)
         .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
     Ok(())
 }
@@ -484,14 +405,12 @@ pub async fn upload_volume_provenance_initial(
     vd: &crate::volume_data::VolumeData,
 ) -> Result<()> {
     let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
-    let bytes = std::fs::read(&provenance_path)
-        .with_context(|| format!("reading {}", provenance_path.display()))?;
     vd.metadata()
-        .write_provenance_bytes(&bytes)
+        .write_provenance_from_file(&provenance_path)
         .await
         .with_context(|| format!("uploading volume.provenance for {}", vd.vol_ulid()))?;
     let sentinel = upload_sentinel(vol_dir, elide_core::signing::VOLUME_PROVENANCE_FILE);
-    mark_uploaded(&sentinel, &bytes)
+    mark_uploaded_from_file(&sentinel, &provenance_path)
         .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
     Ok(())
 }
@@ -551,19 +470,40 @@ pub async fn upload_snapshot_metadata(
         }
 
         let manifest_path = snap_dir.join(name);
-        let key = match kind {
-            elide_core::signing::SnapshotKind::User => snapshot_manifest_key(volume_id, snap_ulid),
-            elide_core::signing::SnapshotKind::Stop => {
-                stop_snapshot_manifest_key(volume_id, snap_ulid)
+        let started = Instant::now();
+
+        // Construct the per-volume handle lazily on the first
+        // manifest in `snap_dir`. `volume_id` is the volume's
+        // directory name and is the ULID the manifest belongs to;
+        // an unparseable `volume_id` is a programmer error upstream
+        // (the daemon validates it) — treat the manifest as
+        // un-uploadable and continue.
+        let vol_ulid = match ulid::Ulid::from_string(volume_id) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("[upload] snapshot publish: volume_id {volume_id} not a ULID: {e}");
+                continue;
             }
         };
-        let data = std::fs::read(&manifest_path)
-            .with_context(|| format!("reading snapshot manifest: {}", manifest_path.display()))?;
-        let len = data.len();
-        let started = Instant::now();
-        match put_with_content_type(store, &key, Bytes::from(data), MIME_TEXT).await {
+        let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+        let snapshots = vd.snapshots();
+
+        let key = snapshots.manifest_key(snap_ulid);
+        let put_result = match kind {
+            elide_core::signing::SnapshotKind::User => {
+                snapshots
+                    .put_manifest_from_file(snap_ulid, &manifest_path)
+                    .await
+            }
+            elide_core::signing::SnapshotKind::Stop => {
+                snapshots
+                    .put_stop_manifest_from_file(snap_ulid, &manifest_path)
+                    .await
+            }
+        };
+        match put_result {
             Ok(()) => {
-                info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
+                info!("[upload] {key} in {:.2?}", started.elapsed());
                 if let Err(e) = mark_uploaded(&sentinel, &[]) {
                     warn!("failed to mark snapshot {snap_ulid} sentinel: {e}");
                 }
@@ -573,7 +513,7 @@ pub async fn upload_snapshot_metadata(
                 // the `Stopped` event on the spine. A failure here must
                 // not fail the upload (self-heals on the next publish).
                 if kind == elide_core::signing::SnapshotKind::User {
-                    if let Err(e) = bump_latest_snapshot(store, volume_id, snap_ulid).await {
+                    if let Err(e) = snapshots.bump_latest_if_newer(snap_ulid).await {
                         warn!("[upload] bumping snapshots/LATEST for {snap_ulid}: {e}");
                     }
                     // Truncate the post-snapshot HEAD: the new manifest
@@ -583,17 +523,7 @@ pub async fn upload_snapshot_metadata(
                     // a plain unconditional PUT — same pattern as
                     // `snapshots/LATEST`. See `docs/design-segment-index.md`
                     // *Truncation*.
-                    let vol_ulid = match ulid::Ulid::from_string(volume_id) {
-                        Ok(u) => u,
-                        Err(e) => {
-                            warn!(
-                                "[upload] truncating HEAD: volume_id {volume_id} not a ULID: {e}"
-                            );
-                            continue;
-                        }
-                    };
                     let empty = crate::segment_head::SegmentHead::empty(Some(snap_ulid));
-                    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
                     if let Err(e) = vd.head().put(&empty).await {
                         warn!(
                             "[upload] truncating HEAD for {snap_ulid}: {e}; \
@@ -999,10 +929,12 @@ mod tests {
         drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
 
         // Manifest is in store.
-        let manifest_key = snapshot_manifest_key(VOL_ULID, snap_ulid);
-        let meta = store
-            .head(&manifest_key)
+        let vol = ulid::Ulid::from_string(VOL_ULID).unwrap();
+        let meta = crate::volume_data::VolumeData::new(Arc::clone(&store), vol)
+            .snapshots()
+            .head_manifest(snap_ulid)
             .await
+            .expect("head_manifest succeeds")
             .expect("snapshot manifest not in store");
         assert!(meta.size > 0);
 
