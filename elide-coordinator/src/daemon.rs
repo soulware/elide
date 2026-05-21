@@ -46,8 +46,8 @@ use crate::supervisor;
 use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::volume_state::{IMPORTING_FILE, PID_FILE};
 use elide_coordinator::{
-    EvictRegistry, PrefetchTracker, SnapshotLockRegistry, new_prefetch_tracker,
-    new_snapshot_lock_registry, register_prefetch_or_get, replace_prefetch,
+    EvictRegistry, PrefetchTracker, ReadinessTracker, SnapshotLockRegistry, new_prefetch_tracker,
+    new_readiness_tracker, new_snapshot_lock_registry, register_prefetch_or_get, replace_prefetch,
 };
 
 pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Result<()> {
@@ -255,6 +255,11 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // is spawned, so the volume binary's first IPC always finds an entry).
     let prefetch_tracker: PrefetchTracker = new_prefetch_tracker();
 
+    // Per-fork daemon-readiness tracker. `start_volume_op` arms an entry
+    // before triggering rescan; the volume binary's `NotifyVolumeReady`
+    // IPC flips it to true; the IPC waits with a timeout. See #432.
+    let readiness_tracker: ReadinessTracker = new_readiness_tracker();
+
     // Tracks each known volume's directory inode and the abort handle
     // for its supervisor task (when supervised). Prune drops the entry
     // when *either* signal goes stale:
@@ -304,6 +309,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             evict_registry: evict_registry.clone(),
             snapshot_locks: snapshot_locks.clone(),
             prefetch_tracker: prefetch_tracker.clone(),
+            readiness_tracker: readiness_tracker.clone(),
             stores: stores.clone(),
             identity: identity.clone(),
             credentialer: credentialer.clone(),

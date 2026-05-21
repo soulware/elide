@@ -387,8 +387,8 @@ pub enum ReconcileError {
     /// writing `volume.key` or `volume.stopped`). Local state may be
     /// partially reconciled; idempotent retry is the recovery path.
     Io(std::io::Error),
-    /// The volume daemon appears to be currently running (`control.sock`
-    /// is present). Reconciliation refuses rather than racing the
+    /// The volume daemon is currently running for this fork (live pid
+    /// in `volume.pid`). Reconciliation refuses rather than racing the
     /// daemon — operator should `volume stop` first.
     DaemonRunning,
 }
@@ -428,7 +428,7 @@ impl From<std::io::Error> for ReconcileError {
 ///   - `volume.readonly` absent.
 ///   - `volume.fetched` absent.
 ///   - `volume.stopped` present.
-///   - `control.sock` absent (i.e. daemon not running).
+///   - No live daemon (no `volume.pid` with an alive pid).
 ///
 /// Used by:
 ///   - `volume claim` against a `Live`/`Stopped` record owned by us
@@ -445,7 +445,11 @@ pub fn reconcile_owned_local_to_stopped(
     data_dir: &Path,
     vol_ulid: ulid::Ulid,
 ) -> Result<ReconcileOutcome, ReconcileError> {
-    if fork_dir.join("control.sock").exists() {
+    // `control.sock` alone is not a reliable liveness signal — it
+    // survives a `process::exit` shutdown or a crash. Trust the
+    // PID-anchored classifier instead so a stale socket file from a
+    // dead daemon doesn't block reconcile.
+    if VolumeLifecycle::from_dir(fork_dir).is_running() {
         return Err(ReconcileError::DaemonRunning);
     }
 
@@ -994,12 +998,32 @@ mod tests {
             [0u8; 32],
         )
         .unwrap();
-        // Simulate a running daemon by planting control.sock as a file
-        // (real socket creation would require nix unix-socket support;
-        // the helper only checks existence).
-        std::fs::write(vol_dir.join("control.sock"), "").unwrap();
+        // A live pid in volume.pid is the canonical "daemon is running"
+        // signal — see `VolumeLifecycle::from_dir`.
+        std::fs::write(vol_dir.join(PID_FILE), std::process::id().to_string()).unwrap();
         let err = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid)
             .expect_err("running daemon must refuse");
         assert!(matches!(err, ReconcileError::DaemonRunning));
+    }
+
+    #[test]
+    fn reconcile_ignores_stale_control_sock() {
+        // Regression for the second site in #432: a stale control.sock
+        // left behind by a `process::exit` shutdown (or a crash) must
+        // not be misread as "daemon running". Without a live pid the
+        // fork is parked and reconcile must proceed.
+        let (_tmp, data_dir, vol_dir, vol_ulid) = reconcile_scaffolding(false);
+        std::fs::write(
+            vol_dir.join(elide_core::signing::VOLUME_KEY_FILE),
+            [0u8; 32],
+        )
+        .unwrap();
+        std::fs::write(vol_dir.join("control.sock"), "").unwrap();
+        // Also plant volume.released — this is the exact shape hit by
+        // `stop` → `release` → `claim` on the live VM.
+        std::fs::write(vol_dir.join(RELEASED_FILE), ulid::Ulid::new().to_string()).unwrap();
+        let out = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid)
+            .expect("stale socket alone must not block reconcile");
+        assert_eq!(out, ReconcileOutcome::Reconciled);
     }
 }
