@@ -308,6 +308,16 @@ impl MintScopedStores {
             data: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Block until the mint endpoint accepts a `coord-base`
+    /// `assume-role`. Used at startup so the coordinator survives mint
+    /// coming up after it (systemd ordering, fresh box, etc.) instead
+    /// of failing on the first S3 op.
+    pub async fn wait_for_ready(&self) -> std::io::Result<()> {
+        self.endpoint
+            .wait_for_ready(ROLE_COORD_BASE, COORD_CONTROL_TTL_SECS)
+            .await
+    }
 }
 
 impl ScopedStores for MintScopedStores {
