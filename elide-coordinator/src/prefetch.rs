@@ -232,6 +232,33 @@ pub async fn prefetch_indexes(
         });
         trusted_dirs.push(parent_dir.clone());
         // Continue walking under the pubkey the child committed to.
+        // A partial fork — `volume.pub` present but no
+        // `volume.provenance` — is a documented intermediate state
+        // (`claim::early_rebind` writes `volume.{key,pub}` and
+        // `mark_claimed`s the bucket; `volume.provenance` is only
+        // written in `finalize`). Such a fork has no segments of its
+        // own and no recorded ancestry beyond what its own children
+        // committed to, so terminate the walk here rather than erroring
+        // — the prefetch task pushed above covers everything reachable
+        // through this branch. Other I/O errors still propagate.
+        let provenance_path = parent_dir.join(signing::VOLUME_PROVENANCE_FILE);
+        match std::fs::metadata(&provenance_path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(
+                    "[prefetch] ancestor {} has no volume.provenance; \
+                     ending chain walk here (crashed-mid-create fork)",
+                    parent.volume_ulid
+                );
+                break;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "stat provenance for ancestor {}: {e}",
+                    parent.volume_ulid
+                ));
+            }
+        }
         let parent_lineage = signing::read_lineage_with_key(
             &parent_dir,
             &parent_vk,
@@ -1887,5 +1914,76 @@ mod tests {
         // 1 fetched (manifest) from S3; peer was unreachable.
         assert_eq!(result.snapshots_fetched, 1);
         assert_eq!(result.snapshots_from_peer, 0);
+    }
+
+    /// Regression: a child fork that points at a partial-fork parent
+    /// (volume.pub only, no volume.provenance — left by an early_rebind
+    /// that never reached finalize) must not abort prefetch. The walk
+    /// terminates at the partial fork; prefetch completes successfully
+    /// after consuming the parent's empty synthesised handoff manifest.
+    #[tokio::test]
+    async fn prefetch_indexes_terminates_walk_at_partial_fork_parent() {
+        let tmp = TempDir::new().unwrap();
+        let by_id = tmp.path().join("by_id");
+
+        let parent_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let child_ulid = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        let parent_dir = by_id.join(parent_ulid);
+        let child_dir = by_id.join(child_ulid);
+
+        std::fs::create_dir_all(parent_dir.join("snapshots")).unwrap();
+        std::fs::create_dir_all(child_dir.join("pending")).unwrap();
+
+        // Parent: volume.{key,pub} only — NO volume.provenance.
+        // Matches what `claim::early_rebind` writes before a finalize
+        // crash.
+        let parent_key = generate_keypair(&parent_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        let child_key = generate_keypair(&child_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+
+        // Child signs provenance pointing at parent. Pubkey carried in
+        // ParentRef is parent's volume.pub — the partial fork has it,
+        // so the child's commitment verifies independent of whether
+        // parent later writes its own provenance.
+        let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        write_provenance(
+            &child_dir,
+            &child_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage {
+                parent: Some(elide_core::signing::ParentRef {
+                    volume_ulid: parent_ulid.to_owned(),
+                    snapshot_ulid: snap_ulid.to_owned(),
+                    pubkey: parent_key.verifying_key().to_bytes(),
+                    manifest_pubkey: None,
+                }),
+                extent_index: Vec::new(),
+                oci_source: None,
+            },
+        )
+        .unwrap();
+
+        // Parent's empty synthesised handoff manifest (what
+        // `release --force` would have written over the partial fork).
+        let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
+        let manifest_bytes = build_snapshot_manifest_bytes(parent_signer.as_ref(), &[], None);
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+        crate::volume_data::VolumeData::new(
+            Arc::clone(&store),
+            Ulid::from_string(parent_ulid).unwrap(),
+        )
+        .snapshots()
+        .put_manifest(snap_ulid.parse().unwrap(), manifest_bytes.into())
+        .await
+        .unwrap();
+
+        let result = prefetch_indexes(&child_dir, &passthrough(&store), None)
+            .await
+            .expect("missing parent provenance must not abort prefetch");
+        // Empty handoff → no .idx fetches; the walk simply stops at the
+        // partial fork rather than recursing past it.
+        assert_eq!(result.fetched, 0);
+        assert_eq!(result.failed, 0);
     }
 }
