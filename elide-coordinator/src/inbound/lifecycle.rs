@@ -431,7 +431,6 @@ async fn finalize_force_release(
 ///    drain mode, run the existing snapshot pipeline, halt, flip.
 pub(crate) async fn release_volume_op(
     volume_name: &str,
-    store: &Arc<dyn ObjectStore>,
     ctx: &IpcContext,
 ) -> Result<ReleaseReply, IpcError> {
     let identity = &ctx.identity;
@@ -439,6 +438,16 @@ pub(crate) async fn release_volume_op(
     let coord_id = identity.coordinator_id_str();
     let started = std::time::Instant::now();
     info!("[release {volume_name}] start");
+
+    // `release` straddles two role scopes: `coord-writer` for the
+    // `names/<name>` flip + the `events/<name>/` emission, and per-vol
+    // `coord-data` for the `by_id/<vol>/snapshots/` promote / publish.
+    // `coord-writer` has no access to `by_id/` (see
+    // `mint/examples/elide_roles/`), so the typed [`VolumeData`] is
+    // constructed once `vol_ulid` is known and threaded into each
+    // by_id/ op.
+    let writer = ctx.stores.writer();
+    let stores = &ctx.stores;
 
     use elide_coordinator::volume_state::VolumeLifecycle;
     let link = data_dir.join("by_name").join(volume_name);
@@ -463,7 +472,7 @@ pub(crate) async fn release_volume_op(
             return release_breadcrumb_only(
                 volume_name,
                 data_dir,
-                store,
+                stores,
                 journal.as_ref(),
                 claims.as_ref(),
                 identity,
@@ -504,7 +513,7 @@ pub(crate) async fn release_volume_op(
     // "already released" reply doesn't perturb the local volume.
     use elide_coordinator::bucket_position::fetch_position;
     let read_started = std::time::Instant::now();
-    let (position, fetched) = fetch_position(store, volume_name, coord_id)
+    let (position, fetched) = fetch_position(&writer, volume_name, coord_id)
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
     info!(
@@ -529,9 +538,6 @@ pub(crate) async fn release_volume_op(
     // The operator's recovery is `start` → `stop` (clean drain) →
     // `release` — `release` itself is a pure bucket-flip, no daemon
     // interaction.
-    let volume_id_for_promote = elide_coordinator::upload::derive_names(&vol_dir).map_err(|e| {
-        IpcError::internal(format!("[release {volume_name}] deriving volume id: {e}"))
-    })?;
     let cover = match release_fast_path_handoff(&vol_dir) {
         Ok(FastPathDisposition::Cover(cover)) => cover,
         Ok(FastPathDisposition::NeverRan) => {
@@ -556,14 +562,9 @@ pub(crate) async fn release_volume_op(
             let snap_ulid = match reuse_handoff_snapshot(rec) {
                 Some(s) => s,
                 None => {
-                    synthesise_empty_owner_handoff(
-                        volume_name,
-                        data_dir,
-                        vol_ulid,
-                        store,
-                        Some(&vol_dir),
-                    )
-                    .await?
+                    let vd = stores.volume_data(&vol_ulid);
+                    synthesise_empty_owner_handoff(volume_name, data_dir, &vd, Some(&vol_dir))
+                        .await?
                 }
             };
             info!(
@@ -608,9 +609,13 @@ pub(crate) async fn release_volume_op(
             "[release {volume_name}] promoting stop-snapshot {} → stable manifest",
             cover.snap_ulid
         );
-        if let Err(e) =
-            promote_stop_snapshot(&vol_dir, &volume_id_for_promote, cover.snap_ulid, store).await
-        {
+        let vol_ulid = position.vol_ulid().ok_or_else(|| {
+            IpcError::internal(format!(
+                "[release {volume_name}] eligible OwnedByUs position has no vol_ulid"
+            ))
+        })?;
+        let vd = stores.volume_data(&vol_ulid);
+        if let Err(e) = promote_stop_snapshot(&vol_dir, &vd, cover.snap_ulid).await {
             return Err(IpcError::internal(format!(
                 "promoting stop-snapshot {} for release: {e}",
                 cover.snap_ulid
@@ -667,7 +672,7 @@ pub(crate) async fn release_volume_op(
 async fn release_breadcrumb_only(
     volume_name: &str,
     data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
     journal: &dyn elide_coordinator::event_journal::EventJournal,
     claims: &dyn elide_coordinator::name_claims::NameClaims,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
@@ -688,8 +693,9 @@ async fn release_breadcrumb_only(
         )));
     };
 
+    let writer = stores.writer();
     use elide_coordinator::bucket_position::fetch_position;
-    let (position, fetched) = fetch_position(store, volume_name, coord_id)
+    let (position, fetched) = fetch_position(&writer, volume_name, coord_id)
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
     ensure_release_eligible(
@@ -718,7 +724,8 @@ async fn release_breadcrumb_only(
         // to materialise into, so synthesise an empty owner-signed
         // handoff.
         None => {
-            synthesise_empty_owner_handoff(volume_name, data_dir, rec.vol_ulid, store, None).await?
+            let vd = stores.volume_data(&rec.vol_ulid);
+            synthesise_empty_owner_handoff(volume_name, data_dir, &vd, None).await?
         }
     };
     info!(
@@ -828,11 +835,10 @@ fn reuse_handoff_snapshot(record: &elide_core::name_record::NameRecord) -> Optio
 async fn synthesise_empty_owner_handoff(
     volume_name: &str,
     data_dir: &Path,
-    vol_ulid: ulid::Ulid,
-    store: &Arc<dyn ObjectStore>,
+    vd: &elide_coordinator::volume_data::VolumeData,
     local_fork_dir: Option<&Path>,
 ) -> Result<ulid::Ulid, IpcError> {
-    let shadow = elide_coordinator::key_shadow::read(data_dir, vol_ulid)
+    let shadow = elide_coordinator::key_shadow::read(data_dir, vd.vol_ulid())
         .map_err(|e| IpcError::internal(format!("reading key shadow: {e}")))?;
     let key_bytes = shadow.ok_or_else(|| {
         IpcError::not_found(format!(
@@ -846,8 +852,7 @@ async fn synthesise_empty_owner_handoff(
     let snap_ulid = ulid::Ulid::new();
     let manifest_bytes =
         elide_core::signing::build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
-    elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid)
-        .snapshots()
+    vd.snapshots()
         .put_manifest(snap_ulid, bytes::Bytes::from(manifest_bytes.clone()))
         .await
         .map_err(|e| {
@@ -908,15 +913,14 @@ fn materialise_handoff_locally(
 /// tie). Shared between the breadcrumb-only release path (S3 only)
 /// and the local fast-path release (which wraps with local file +
 /// sentinel renames).
+///
+/// Writes under `by_id/<vol>/snapshots/` — must ride the per-vol
+/// `coord-data` credential, hence the typed [`VolumeData`] argument.
 async fn promote_stop_in_store(
-    vol_ulid: &str,
+    vd: &elide_coordinator::volume_data::VolumeData,
     snap_ulid: ulid::Ulid,
-    store: &Arc<dyn ObjectStore>,
 ) -> Result<(), IpcError> {
-    let vol = ulid::Ulid::from_string(vol_ulid)
-        .map_err(|e| IpcError::internal(format!("vol_ulid {vol_ulid} not a ULID: {e}")))?;
-    elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol)
-        .snapshots()
+    vd.snapshots()
         .promote_stop_to_user(snap_ulid)
         .await
         .map_err(|e| IpcError::store(format!("promoting stop→user for {snap_ulid}: {e}")))
@@ -1060,12 +1064,11 @@ pub(crate) enum FastPathDisposition {
 /// irrelevant.
 pub(crate) async fn promote_stop_snapshot(
     vol_dir: &Path,
-    volume_id: &str,
+    vd: &elide_coordinator::volume_data::VolumeData,
     snap_ulid: ulid::Ulid,
-    store: &Arc<dyn ObjectStore>,
 ) -> Result<(), IpcError> {
     // 1+2. Server-side COPY + DELETE in S3 via the shared helper.
-    promote_stop_in_store(volume_id, snap_ulid, store).await?;
+    promote_stop_in_store(vd, snap_ulid).await?;
 
     // 3. Rename the local files. Best-effort: if the local copy was
     //    already cleaned by NotifyVolumeReady at start, the source
@@ -1451,7 +1454,7 @@ fn self_heal_key_shadow(
 pub(crate) async fn notify_volume_ready_op(
     vol_ulid: ulid::Ulid,
     data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> Result<(), IpcError> {
     let vol_ulid_str = vol_ulid.to_string();
     let fork_dir = data_dir.join("by_id").join(&vol_ulid_str);
@@ -1460,7 +1463,8 @@ pub(crate) async fn notify_volume_ready_op(
             "fork dir for {vol_ulid_str} not present locally"
         )));
     }
-    if let Err(e) = cleanup_stop_snapshots(&fork_dir, &vol_ulid_str, store).await {
+    let vd = stores.volume_data(&vol_ulid);
+    if let Err(e) = cleanup_stop_snapshots(&fork_dir, &vd).await {
         warn!(
             "[inbound] notify-ready {vol_ulid_str}: cleanup_stop_snapshots failed: {e:#}; \
              stop-snapshot will be overwritten by the next stop"
@@ -1469,10 +1473,15 @@ pub(crate) async fn notify_volume_ready_op(
     Ok(())
 }
 
+/// Delete `<vol>/snapshots/<S>-stop.manifest` objects for any
+/// stop-snapshots sealed locally at the last `volume stop`. Runs on
+/// `NotifyVolumeReady` once the volume confirms it has rehydrated.
+///
+/// Deletes under `by_id/<vol>/snapshots/` — must ride the per-vol
+/// `coord-data` credential, hence the typed [`VolumeData`] argument.
 async fn cleanup_stop_snapshots(
     fork_dir: &Path,
-    vol_ulid_str: &str,
-    store: &Arc<dyn ObjectStore>,
+    vd: &elide_coordinator::volume_data::VolumeData,
 ) -> Result<(), IpcError> {
     // The `-stop` checkpoints to drop are exactly the ones this fork
     // sealed locally at its last stop. Enumerate the local snapshots
@@ -1501,9 +1510,6 @@ async fn cleanup_stop_snapshots(
         }
     }
 
-    let vol_ulid = ulid::Ulid::from_string(vol_ulid_str)
-        .map_err(|e| IpcError::internal(format!("vol_ulid {vol_ulid_str} not a ULID: {e}")))?;
-    let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     for snap_ulid in stop_ulids {
         // Drop the upload sentinel together with the manifest —
         // leaving it convinces the next drain an unchanged-ULID
@@ -1558,9 +1564,8 @@ mod tests {
         let sentinel_path = sentinel_dir.join(format!("{snap_ulid}-stop"));
         std::fs::write(&sentinel_path, b"").unwrap();
 
-        cleanup_stop_snapshots(&fork_dir, &vol_ulid.to_string(), &store)
-            .await
-            .unwrap();
+        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), vol_ulid);
+        cleanup_stop_snapshots(&fork_dir, &vd).await.unwrap();
 
         assert!(!manifest_path.exists(), "stop.manifest should be removed");
         assert!(
@@ -2045,7 +2050,7 @@ mod tests {
             credentialer: None,
         };
 
-        let err = release_volume_op("vol", &store, &ctx)
+        let err = release_volume_op("vol", &ctx)
             .await
             .expect_err("running volume must refuse release");
 
@@ -2118,7 +2123,7 @@ mod tests {
             credentialer: None,
         };
 
-        let reply = release_volume_op("vol", &store, &ctx)
+        let reply = release_volume_op("vol", &ctx)
             .await
             .expect("clean never-started fork must release by reusing the S3 handoff");
 
@@ -2177,7 +2182,7 @@ mod tests {
             credentialer: None,
         };
 
-        let reply = release_volume_op("vol", &store, &ctx)
+        let reply = release_volume_op("vol", &ctx)
             .await
             .expect("never-ran fork with no S3 snapshot must synthesise a handoff");
         let snap = reply.handoff_snapshot;
