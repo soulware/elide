@@ -17,6 +17,7 @@ use ulid::Ulid;
 
 use crate::config::GcConfig;
 use crate::segment_head;
+use crate::volume_data::VolumeData;
 use crate::volume_state::IMPORTING_FILE;
 use crate::{SnapshotLockRegistry, control, gc, snapshot_lock_for, upload};
 
@@ -34,8 +35,11 @@ pub struct GcCycleOrchestrator {
     fork_dir: PathBuf,
     by_id_dir: PathBuf,
     volume_id: String,
-    volume_ulid: Ulid,
     store: Arc<dyn ObjectStore>,
+    /// Typed handle for the per-volume `by_id/<vol>/…` objects. Used
+    /// for HEAD ops; raw `store` is still used for object classes the
+    /// domain layer doesn't yet vend (segments, snapshot manifests).
+    volume_data: VolumeData,
     gc_config: GcConfig,
     snap_lock: Arc<AsyncMutex<()>>,
     last_gc: Instant,
@@ -85,12 +89,13 @@ impl GcCycleOrchestrator {
         // `expect` and explain it.
         let volume_ulid = Ulid::from_string(&volume_id)
             .expect("volume_id is a parsed ULID upstream (tasks.rs / derive_names)");
+        let volume_data = VolumeData::new(Arc::clone(&store), volume_ulid);
         Self {
             fork_dir,
             by_id_dir,
             volume_id,
-            volume_ulid,
             store,
+            volume_data,
             gc_config,
             snap_lock,
             last_gc,
@@ -333,7 +338,7 @@ impl GcCycleOrchestrator {
             return;
         }
 
-        let mut head = match segment_head::read_head(&self.store, self.volume_ulid).await {
+        let mut head = match self.volume_data.head().read().await {
             Ok(h) => h,
             Err(e) => {
                 warn!(
@@ -363,7 +368,7 @@ impl GcCycleOrchestrator {
         if !mutated {
             return;
         }
-        if let Err(e) = segment_head::put_head(&self.store, self.volume_ulid, &head).await {
+        if let Err(e) = self.volume_data.head().put(&head).await {
             warn!(
                 "[head {}] put failed: {e}; \
                  self-heals on the next active tick",
@@ -535,6 +540,18 @@ mod tests {
         Ulid::from_string("01J0000000000000000000000V").unwrap()
     }
 
+    fn vd_for(store: Arc<dyn ObjectStore>) -> VolumeData {
+        VolumeData::new(store, vol_ulid())
+    }
+
+    async fn read_head_via(store: &Arc<dyn ObjectStore>) -> segment_head::SegmentHead {
+        vd_for(Arc::clone(store)).head().read().await.unwrap()
+    }
+
+    async fn put_head_via(store: &Arc<dyn ObjectStore>, head: &segment_head::SegmentHead) {
+        vd_for(Arc::clone(store)).head().put(head).await.unwrap();
+    }
+
     fn orchestrator(store: Arc<dyn ObjectStore>) -> (GcCycleOrchestrator, TempDir) {
         let tmp = TempDir::new().unwrap();
         // Build `<tmp>/by_id/<vol>/` so by_id_dir resolves to a real
@@ -581,7 +598,7 @@ mod tests {
 
         orch.publish_head_delta().await;
 
-        let head = segment_head::read_head(&store, vol_ulid()).await.unwrap();
+        let head = read_head_via(&store).await;
         assert!(head.added.contains(&a1));
         assert!(head.added.contains(&a2));
         assert!(head.superseded.is_empty());
@@ -605,7 +622,7 @@ mod tests {
 
         orch.publish_head_delta().await;
 
-        let head = segment_head::read_head(&store, vol_ulid()).await.unwrap();
+        let head = read_head_via(&store).await;
         assert!(head.added.contains(&output));
         assert_eq!(
             head.superseded.get(&input_a),
@@ -631,15 +648,13 @@ mod tests {
 
         let mut seed = segment_head::SegmentHead::empty(None);
         seed.added.insert(prior);
-        segment_head::put_head(&store, vol_ulid(), &seed)
-            .await
-            .unwrap();
+        put_head_via(&store, &seed).await;
 
         let (mut orch, _tmp) = orchestrator(store.clone());
         orch.tick_added.push(new);
         orch.publish_head_delta().await;
 
-        let head = segment_head::read_head(&store, vol_ulid()).await.unwrap();
+        let head = read_head_via(&store).await;
         assert!(head.added.contains(&prior), "prior entry retained");
         assert!(head.added.contains(&new), "this tick's entry merged");
     }
@@ -696,9 +711,7 @@ mod tests {
                 since: Utc::now(),
             },
         );
-        segment_head::put_head(&store, vol_ulid(), &head)
-            .await
-            .unwrap();
+        put_head_via(&store, &head).await;
 
         orch.publish_head_delta().await;
 
@@ -716,7 +729,7 @@ mod tests {
             "fresh input segment must be retained"
         );
 
-        let head = segment_head::read_head(&store, vol_ulid()).await.unwrap();
+        let head = read_head_via(&store).await;
         assert!(!head.superseded.contains_key(&input_expired));
         assert!(head.tombstoned.contains(&input_expired));
         assert!(
@@ -740,9 +753,7 @@ mod tests {
 
         // Seed an empty HEAD so reap finds nothing.
         let seed = segment_head::SegmentHead::empty(None);
-        segment_head::put_head(&store, vol_ulid(), &seed)
-            .await
-            .unwrap();
+        put_head_via(&store, &seed).await;
 
         // Replace HEAD with a known marker after seeding — we want to
         // confirm publish_head_delta does NOT overwrite when nothing
@@ -783,7 +794,7 @@ mod tests {
 
         orch.publish_head_delta().await;
 
-        let head = segment_head::read_head(&store, vol_ulid()).await.unwrap();
+        let head = read_head_via(&store).await;
         assert!(head.added.contains(&drained));
         assert!(head.added.contains(&output));
         assert!(head.superseded.contains_key(&input));

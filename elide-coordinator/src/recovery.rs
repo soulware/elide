@@ -7,7 +7,7 @@
 //! is unreachable. The recovering coordinator:
 //!
 //!   1. Fetches the dead fork's `volume.pub` from S3
-//!      ([`fetch_volume_pub`]).
+//!      ([`crate::volume_data::MetadataView::read_pubkey`]).
 //!   2. Resolves the dead fork's live segment set via
 //!      `manifest ∪ HEAD` (`docs/design-segment-index.md`),
 //!      range-fetches each segment's `header + index` section, and
@@ -70,76 +70,6 @@ pub struct RecoveredSegments {
     pub dropped: usize,
 }
 
-/// Fetch and parse `by_id/<vol_ulid>/volume.pub` from the bucket.
-///
-/// The file is the same `lowercase-hex(pub_bytes) + "\n"` shape used
-/// for the on-disk `volume.pub`.
-pub async fn fetch_volume_pub(
-    store: &Arc<dyn ObjectStore>,
-    vol_ulid: Ulid,
-) -> Result<VerifyingKey> {
-    let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
-    let result = store
-        .get(&key)
-        .await
-        .with_context(|| format!("fetching volume.pub for {vol_ulid}"))?;
-    let bytes = result
-        .bytes()
-        .await
-        .with_context(|| format!("reading volume.pub bytes for {vol_ulid}"))?;
-    let hex = std::str::from_utf8(&bytes)
-        .map_err(|e| anyhow::anyhow!("volume.pub for {vol_ulid} not valid utf-8: {e}"))?
-        .trim();
-    parse_hex_pubkey(hex).with_context(|| format!("parsing volume.pub for {vol_ulid}"))
-}
-
-/// Like [`fetch_volume_pub`] but returns `Ok(None)` when the object is
-/// absent rather than an error.
-///
-/// Used by `volume release --force` to recover the corruption window
-/// where `names/<name>` was published before `volume.pub`. With no
-/// `volume.pub` in the bucket, no segments could ever have been
-/// signed-and-verified under that key, so the dead fork is provably
-/// empty: force-release publishes an empty synthesised handoff signed
-/// by the recovering coordinator's identity.
-pub async fn fetch_volume_pub_optional(
-    store: &Arc<dyn ObjectStore>,
-    vol_ulid: Ulid,
-) -> Result<Option<VerifyingKey>> {
-    let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
-    match store.get(&key).await {
-        Ok(result) => {
-            let bytes = result
-                .bytes()
-                .await
-                .with_context(|| format!("reading volume.pub bytes for {vol_ulid}"))?;
-            let hex = std::str::from_utf8(&bytes)
-                .map_err(|e| anyhow::anyhow!("volume.pub for {vol_ulid} not valid utf-8: {e}"))?
-                .trim();
-            parse_hex_pubkey(hex)
-                .with_context(|| format!("parsing volume.pub for {vol_ulid}"))
-                .map(Some)
-        }
-        Err(object_store::Error::NotFound { .. }) => Ok(None),
-        Err(e) => Err(anyhow::Error::new(e).context(format!("fetching volume.pub for {vol_ulid}"))),
-    }
-}
-
-fn parse_hex_pubkey(hex: &str) -> Result<VerifyingKey> {
-    if hex.len() != 64 {
-        anyhow::bail!(
-            "expected 64 hex chars for Ed25519 pubkey, got {}",
-            hex.len()
-        );
-    }
-    let mut bytes = [0u8; 32];
-    for i in 0..32 {
-        bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| anyhow::anyhow!("invalid hex at position {}", i * 2))?;
-    }
-    VerifyingKey::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("invalid Ed25519 pubkey: {e}"))
-}
-
 /// Resolve the live segment set for `vol_ulid` from S3 — `manifest ∪
 /// HEAD` per `docs/design-segment-index.md` — verify each one's
 /// signature against `verifying_key`, and return the verified set
@@ -168,7 +98,8 @@ pub async fn list_and_verify_segments(
     verifying_key: &VerifyingKey,
 ) -> Result<RecoveredSegments> {
     let vol_id = vol_ulid.to_string();
-    let live = crate::segment_head::resolve_live_segments(store, vol_ulid, verifying_key)
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    let live = crate::segment_head::resolve_live_segments(&vd, verifying_key)
         .await
         .with_context(|| format!("resolving live segments for {vol_ulid}"))?;
 
@@ -671,7 +602,9 @@ mod tests {
         for s in segs {
             head.added.insert(*s);
         }
-        crate::segment_head::put_head(store, vol_ulid, &head)
+        crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid)
+            .head()
+            .put(&head)
             .await
             .unwrap();
     }
@@ -814,65 +747,8 @@ mod tests {
         assert_eq!(kept, vec![good_id]);
     }
 
-    #[tokio::test]
-    async fn fetch_volume_pub_round_trips_via_bucket() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let vol_ulid = Ulid::new();
-        let (_, vk) = make_signer();
-        upload_volume_pub(&store, vol_ulid, &vk).await;
-
-        let got = fetch_volume_pub(&store, vol_ulid).await.unwrap();
-        assert_eq!(got.to_bytes(), vk.to_bytes());
-    }
-
-    #[tokio::test]
-    async fn fetch_volume_pub_optional_returns_some_when_present() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let vol_ulid = Ulid::new();
-        let (_, vk) = make_signer();
-        upload_volume_pub(&store, vol_ulid, &vk).await;
-
-        let got = fetch_volume_pub_optional(&store, vol_ulid).await.unwrap();
-        let got = got.expect("present");
-        assert_eq!(got.to_bytes(), vk.to_bytes());
-    }
-
-    #[tokio::test]
-    async fn fetch_volume_pub_optional_returns_none_when_absent() {
-        // Mirrors the create-time crash window: names/<name> exists in
-        // S3 but `by_id/<vol>/volume.pub` was never uploaded.
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let vol_ulid = Ulid::new();
-        let got = fetch_volume_pub_optional(&store, vol_ulid).await.unwrap();
-        assert!(got.is_none());
-    }
-
-    #[tokio::test]
-    async fn fetch_volume_pub_optional_propagates_malformed_hex() {
-        // A present-but-corrupt object is *not* an absent object — the
-        // caller wants to know about corruption, not silently treat it
-        // as the empty-fork recovery case.
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let vol_ulid = Ulid::new();
-        let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
-        store
-            .put(&key, PutPayload::from(b"not hex\n".as_slice()))
-            .await
-            .unwrap();
-        assert!(fetch_volume_pub_optional(&store, vol_ulid).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn fetch_volume_pub_rejects_malformed_hex() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let vol_ulid = Ulid::new();
-        let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
-        store
-            .put(&key, PutPayload::from(b"not hex\n".as_slice()))
-            .await
-            .unwrap();
-        assert!(fetch_volume_pub(&store, vol_ulid).await.is_err());
-    }
+    // (`volume.pub` read round-trips moved to `volume_data.rs` tests
+    // alongside the `MetadataView::read_pubkey` implementation.)
 
     // ── mint_and_publish_synthesised_snapshot ─────────────────────────
 

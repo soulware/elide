@@ -39,6 +39,16 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use elide_coordinator::segment_head::{self, SegmentHead, Supersession};
 use elide_coordinator::upload;
+use elide_coordinator::volume_data::VolumeData;
+
+/// Thin helper so test ops stay readable after the
+/// `segment_head::{read,put}_head` free functions moved behind the
+/// typed `VolumeData::head()` view. Each call constructs a fresh
+/// `VolumeData` over the test's shared `Arc<dyn ObjectStore>`; the
+/// inner Arc clone is cheap.
+fn world_vd(world: &World) -> VolumeData {
+    VolumeData::new(std::sync::Arc::clone(&world.store), world.vol_ulid)
+}
 use elide_core::segment::{self, SegmentEntry, SegmentFlags, SegmentSigner};
 use elide_core::signing::{self, VerifyingKey};
 use elide_core::ulid_mint::UlidMint;
@@ -238,9 +248,7 @@ async fn run_seal(world: &mut World, head: &mut SegmentHead) -> bool {
 /// leaves S3 + HEAD untouched (e.g. `Reap` with no Superseded
 /// edges, `Gc` with empty live set).
 async fn apply_op(world: &mut World, op: &SimOp) {
-    let mut head = segment_head::read_head(&world.store, world.vol_ulid)
-        .await
-        .unwrap();
+    let mut head = world_vd(&world).head().read().await.unwrap();
     let mutated = match op {
         SimOp::Drain { count } => run_drain(world, &mut head, *count).await,
         SimOp::Gc { input_count } => run_gc(world, &mut head, *input_count).await,
@@ -248,9 +256,7 @@ async fn apply_op(world: &mut World, op: &SimOp) {
         SimOp::Seal => run_seal(world, &mut head).await,
     };
     if mutated {
-        segment_head::put_head(&world.store, world.vol_ulid, &head)
-            .await
-            .unwrap();
+        world_vd(world).head().put(&head).await.unwrap();
     }
 }
 
@@ -368,9 +374,7 @@ async fn read_manifest_segments(world: &World) -> BTreeSet<Ulid> {
 // ── Invariant ───────────────────────────────────────────────────────────
 
 async fn assert_equivalence(world: &World) -> Result<(), TestCaseError> {
-    let actual = segment_head::read_head(&world.store, world.vol_ulid)
-        .await
-        .unwrap();
+    let actual = world_vd(&world).head().read().await.unwrap();
     let manifest = read_manifest_segments(world).await;
     let rebuilt = rebuild_head(world).await;
 
@@ -497,9 +501,7 @@ proptest! {
 /// its effect on live should be considered un-acknowledged).
 async fn apply_op_crashing(world: &mut World, op: &SimOp) {
     let expected_pre = world.expected_live.clone();
-    let mut head = segment_head::read_head(&world.store, world.vol_ulid)
-        .await
-        .unwrap();
+    let mut head = world_vd(&world).head().read().await.unwrap();
     match op {
         SimOp::Drain { count } => {
             run_drain(world, &mut head, *count).await;
@@ -528,9 +530,7 @@ async fn crash_after_drain_leaves_orphan_in_rebuilt_only() {
     apply_op(&mut world, &SimOp::Drain { count: 2 }).await;
     apply_op_crashing(&mut world, &SimOp::Drain { count: 3 }).await;
 
-    let actual = segment_head::read_head(&world.store, world.vol_ulid)
-        .await
-        .unwrap();
+    let actual = world_vd(&world).head().read().await.unwrap();
     let manifest = read_manifest_segments(&world).await;
     let rebuilt = rebuild_head(&world).await;
     let live_actual = segment_head::live_set(&manifest, &actual);
@@ -557,9 +557,7 @@ async fn crash_after_reap_leaves_input_404_in_actual() {
     apply_op(&mut world, &SimOp::Gc { input_count: 2 }).await;
     apply_op_crashing(&mut world, &SimOp::Reap).await;
 
-    let actual = segment_head::read_head(&world.store, world.vol_ulid)
-        .await
-        .unwrap();
+    let actual = world_vd(&world).head().read().await.unwrap();
     let manifest = read_manifest_segments(&world).await;
     let rebuilt = rebuild_head(&world).await;
     // Both views exclude the inputs: actual via Superseded,
@@ -595,9 +593,7 @@ async fn crash_after_gc_diverges_benignly() {
     apply_op(&mut world, &SimOp::Drain { count: 3 }).await;
     apply_op_crashing(&mut world, &SimOp::Gc { input_count: 2 }).await;
 
-    let actual = segment_head::read_head(&world.store, world.vol_ulid)
-        .await
-        .unwrap();
+    let actual = world_vd(&world).head().read().await.unwrap();
     let manifest = read_manifest_segments(&world).await;
     let rebuilt = rebuild_head(&world).await;
     let live_actual = segment_head::live_set(&manifest, &actual);
@@ -631,9 +627,7 @@ async fn crash_after_seal_leaves_pre_seal_state_in_actual() {
     let pre_seal_live = world.expected_live.clone();
     apply_op_crashing(&mut world, &SimOp::Seal).await;
 
-    let actual = segment_head::read_head(&world.store, world.vol_ulid)
-        .await
-        .unwrap();
+    let actual = world_vd(&world).head().read().await.unwrap();
     let manifest = read_manifest_segments(&world).await;
     let live_actual = segment_head::live_set(&manifest, &actual);
     // The just-written manifest contains the live set; HEAD's stale

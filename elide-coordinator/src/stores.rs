@@ -41,6 +41,7 @@ use crate::event_journal::{
     BucketEventJournal, EventJournal, EventJournalReader, ReadOnlyEventJournal,
 };
 use crate::name_claims::{BucketNameClaims, NameClaims, NameClaimsReader, ReadOnlyNameClaims};
+use crate::volume_data::VolumeData;
 
 /// Read-only S3 surface — `coord-base`. Exposes `get` and `head`. A
 /// holder can read individual objects; the containment boundary the
@@ -163,6 +164,17 @@ pub trait ScopedStores: Send + Sync {
     /// readers.
     fn name_claims_ro(&self) -> Arc<dyn NameClaimsReader> {
         Arc::new(ReadOnlyNameClaims::new(self.peer_verifier_store()))
+    }
+
+    /// Per-volume domain handle for `by_id/<vol>/…` objects. Vends
+    /// non-`async` sub-accessors (`head()`, `metadata()`) that group
+    /// the operations a caller may name. Backed by the same
+    /// `coord-data` credential as [`Self::data_for_volume`]; the two
+    /// co-exist while the remaining object-class views
+    /// (segments / snapshots / retention) migrate in later steps of
+    /// `docs/design-domain-store.md`.
+    fn volume_data(&self, vol_ulid: &Ulid) -> VolumeData {
+        VolumeData::new(self.data_for_volume(vol_ulid), *vol_ulid)
     }
 }
 

@@ -1588,6 +1588,10 @@ async fn create_volume_op(
     core: &CoordinatorCore,
 ) -> Result<CreateReply, IpcError> {
     let identity = &core.identity;
+    // `coord-writer` for the names/<name> rollback on Phase-4 failure
+    // (see end of function); the by_id/<vol>/{volume.pub,.provenance}
+    // uploads go through the per-volume `coord-data` handle vended by
+    // `core.stores.volume_data(&vol_ulid)`.
     let store = core.stores.writer();
     let data_dir: &Path = &core.data_dir;
     let coord_id = identity.coordinator_id_str();
@@ -1666,15 +1670,14 @@ async fn create_volume_op(
     // `by_id/<vol_ulid>/{volume.pub, volume.provenance}` (no
     // names/<name> references them, so they're harmless and
     // GC-reclaimable).
-    if let Err(e) =
-        elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, &vol_ulid_str, &store).await
+    let create_vd = core.stores.volume_data(&vol_ulid);
+    if let Err(e) = elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, &create_vd).await
     {
         cleanup_local();
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
     }
     if let Err(e) =
-        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, &vol_ulid_str, &store)
-            .await
+        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, &create_vd).await
     {
         cleanup_local();
         return Err(IpcError::store(format!(

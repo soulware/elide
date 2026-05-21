@@ -612,14 +612,10 @@ impl ClaimOrchestrator {
         // `by_id/<id>/volume.pub` to verify our parent provenance) and future
         // claimants doing release --force on a stuck fork have the file they
         // expect.
-        let store = self.ctx.core.stores.data_for_volume(&new_vol_ulid);
-        elide_coordinator::upload::upload_volume_pub_initial(
-            &new_fork_dir,
-            &new_vol_ulid_str,
-            &store,
-        )
-        .await
-        .map_err(|e| IpcError::store(format!("uploading volume.pub: {e:#}")))?;
+        let new_vd = self.ctx.core.stores.volume_data(&new_vol_ulid);
+        elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, &new_vd)
+            .await
+            .map_err(|e| IpcError::store(format!("uploading volume.pub: {e:#}")))?;
 
         // Bucket rebind. Peer-fetch auth accepts our coord_id from this point
         // onward.
@@ -887,14 +883,10 @@ impl ClaimOrchestrator {
         )
         .map_err(|e| IpcError::internal(format!("writing provenance: {e}")))?;
 
-        let store = self.ctx.core.stores.data_for_volume(&new_fork.vol_ulid);
-        elide_coordinator::upload::upload_volume_provenance_initial(
-            &new_fork.dir,
-            &new_vol_ulid_str,
-            &store,
-        )
-        .await
-        .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
+        let prov_vd = self.ctx.core.stores.volume_data(&new_fork.vol_ulid);
+        elide_coordinator::upload::upload_volume_provenance_initial(&new_fork.dir, &prov_vd)
+            .await
+            .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
 
         // wal/ and pending/ now — daemon discovery becomes interested only
         // after these exist, by which point the provenance is on S3 and the

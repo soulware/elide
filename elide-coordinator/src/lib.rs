@@ -29,6 +29,7 @@ pub mod segment_head;
 pub mod stores;
 pub mod tasks;
 pub mod upload;
+pub mod volume_data;
 pub mod volume_state;
 
 use std::collections::HashMap;
