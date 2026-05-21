@@ -50,13 +50,20 @@ const LOG_RELAY_SOCKET: &str = "log.sock";
 /// avoid spinning syscalls on every log event.
 const RELAY_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
+/// Default `EnvFilter` directives applied when `RUST_LOG` is unset.
+/// Base level is INFO; noisy third-party INFO lines on a hot path get
+/// clamped to WARN so the coordinator log stays readable. Override
+/// with `RUST_LOG` for ad-hoc debugging.
+const DEFAULT_FILTER: &str = "info,\
+    object_store::aws::builder=warn";
+
 /// Initialise tracing with stderr-only output. Use for short-lived
 /// CLI commands that don't have (or care about) a `data_dir`.
 pub fn init_stderr() {
     tracing_log::LogTracer::init().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER)),
         )
         .try_init()
         .ok();
@@ -71,7 +78,8 @@ pub fn init_for_coord(data_dir: &Path) -> io::Result<()> {
     let file_writer = SharedFile::new(file);
 
     tracing_log::LogTracer::init().ok();
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
     if tee_stderr {
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
@@ -98,7 +106,8 @@ pub fn init_for_volume(data_dir: &Path) -> io::Result<()> {
     let relay_writer = RelayClient::new(data_dir.join(LOG_RELAY_SOCKET));
 
     tracing_log::LogTracer::init().ok();
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(file_writer.and(relay_writer))
