@@ -325,8 +325,12 @@ async fn dispatch_json(
                 )
                 .await
             } else {
-                let store = ctx.stores.writer();
-                lifecycle::release_volume_op(&volume, &store, ctx).await
+                // `release_volume_op` straddles two role scopes
+                // (coord-writer for names/<name> + per-vol coord-data
+                // for by_id/<vol>/snapshots/). It picks the right
+                // credential for each step internally; just hand it
+                // the IpcContext.
+                lifecycle::release_volume_op(&volume, ctx).await
             };
             let env: Envelope<ReleaseReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
@@ -404,8 +408,11 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::NotifyVolumeReady { vol_ulid } => {
-            let store = ctx.stores.writer();
-            let result = lifecycle::notify_volume_ready_op(vol_ulid, &ctx.data_dir, &store).await;
+            // Deletes under `by_id/<vol>/snapshots/` — needs coord-data
+            // per-vol, not coord-writer. The op picks the cred via
+            // `ScopedStores::volume_data(&vol_ulid)` internally.
+            let result =
+                lifecycle::notify_volume_ready_op(vol_ulid, &ctx.data_dir, &ctx.stores).await;
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }

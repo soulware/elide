@@ -444,18 +444,9 @@ impl ForkOrchestrator {
                 }
             };
             if cover.kind == elide_core::signing::SnapshotKind::Stop {
-                let volume_id =
-                    elide_coordinator::upload::derive_names(&source_dir).map_err(|e| {
-                        IpcError::internal(format!("[fork {name}] deriving source volume id: {e}"))
-                    })?;
-                let store = self.ctx.core.stores.data_for_volume(&source_vol_ulid);
-                if let Err(e) = crate::inbound::promote_stop_snapshot(
-                    &source_dir,
-                    &volume_id,
-                    cover.snap_ulid,
-                    &store,
-                )
-                .await
+                let vd = self.ctx.core.stores.volume_data(&source_vol_ulid);
+                if let Err(e) =
+                    crate::inbound::promote_stop_snapshot(&source_dir, &vd, cover.snap_ulid).await
                 {
                     return Err(IpcError::internal(format!(
                         "promoting stop-snapshot {} for fork of '{name}': {e}",
