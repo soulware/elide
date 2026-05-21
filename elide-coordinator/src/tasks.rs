@@ -276,7 +276,7 @@ pub async fn run_volume_tasks(
 
     let mut orch = GcCycleOrchestrator::new(
         fork_dir.clone(),
-        volume_id,
+        volume_id.clone(),
         data_store,
         gc_config,
         &snapshot_locks,
@@ -284,6 +284,21 @@ pub async fn run_volume_tasks(
 
     let mut tick = tokio::time::interval(drain_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Readonly forks (pulled ancestors + imported bases) never accept
+    // writes, so drain/GC ticks are wasted work — and worse, the first
+    // tick would assume `coord-data` for the volume, burning a mint
+    // round-trip + IAM key on a credential that's never used. Re-check
+    // the marker each tick so a readonly→writable transition
+    // (`hydrate_remote_owned` strips the marker on a successful
+    // `volume start`) starts producing ticks on the next interval
+    // without needing to respawn this task.
+    if fork_dir.join("volume.readonly").exists() {
+        info!(
+            "[coordinator] {volume_id}{volume_name} is readonly; \
+             drain/GC ticks suspended until writable"
+        );
+    }
 
     loop {
         tokio::select! {
@@ -296,6 +311,9 @@ pub async fn run_volume_tasks(
                 let _ = reply_tx.send(result);
             }
             _ = tick.tick() => {
+                if fork_dir.join("volume.readonly").exists() {
+                    continue;
+                }
                 if matches!(orch.run_tick().await, TickOutcome::Stop) {
                     break;
                 }
