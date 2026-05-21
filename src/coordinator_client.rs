@@ -671,9 +671,14 @@ impl Client {
     /// The coordinator rejects the call with `kind = "forbidden"` if
     /// the token is absent, malformed, or fails any caveat check —
     /// see `docs/design-auth-model.md`.
-    pub fn remove_volume(&self, name: &str, force: bool, operator_token: String) -> io::Result<()> {
+    pub fn remove_volume(
+        &self,
+        volume_ulid: ulid::Ulid,
+        force: bool,
+        operator_token: String,
+    ) -> io::Result<()> {
         self.call_typed::<()>(&Request::Remove {
-            volume: name.to_owned(),
+            volume_ulid,
             force,
             operator_token: Some(operator_token),
         })?
@@ -1323,7 +1328,7 @@ mod tests {
         let parsed = Macaroon::parse(&out).expect("parse");
 
         let ctx = macaroon::VerifyCtx {
-            volume: "01JQAAAAAAAAAAAAAAAAAAAAAA",
+            volume: ulid::Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
             peer_pid: 12345,
             now_unix: now_at_mint + CREDS_REQ_TTL_SECS + 1,
             accepted_scopes: &[Scope::Credentials, Scope::FetchWorker],

@@ -217,11 +217,15 @@ pub enum Request {
     ///
     /// Gated on an attenuated operator token (see
     /// [`Request::MintOperatorToken`] and `docs/design-auth-model.md`).
-    /// The CLI appends `Op(Remove)`, `Volume(volume)`, and a short
-    /// `NotAfter` to its stored token before sending it here. Absent
-    /// or invalid → `Envelope::Err { kind: "forbidden" }`.
+    /// The CLI resolves the user-typed name to a ULID via
+    /// [`Request::ResolveName`] before sending; the resolved ULID is
+    /// carried both on the wire and inside the operator token's
+    /// `Volume` caveat, so the coordinator never re-reads
+    /// `names/<name>` for an authorisation decision. This eliminates a
+    /// rotation-between-CLI-and-coord TOCTOU on the name binding.
+    /// Absent or invalid token → `Envelope::Err { kind: "forbidden" }`.
     Remove {
-        volume: String,
+        volume_ulid: Ulid,
         #[serde(default)]
         force: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]

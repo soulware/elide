@@ -39,6 +39,7 @@ use std::io;
 
 use rand_core::{OsRng, RngCore};
 use subtle::ConstantTimeEq;
+use ulid::Ulid;
 
 const MAGIC: &str = "v2";
 const DOMAIN: &[u8] = b"elide-macaroon-v2";
@@ -176,9 +177,13 @@ impl Macaroon {
         encode_hex(&self.nonce)
     }
 
-    pub fn volume(&self) -> Option<&str> {
+    /// The `Volume` caveat parsed as a [`Ulid`]. `None` when the caveat
+    /// is absent or its string contents do not parse as a canonical ULID
+    /// — the wire field is a `String` for length-prefixed framing, but
+    /// the only valid contents are ULID-shaped per the auth model.
+    pub fn volume(&self) -> Option<Ulid> {
         self.caveats.iter().find_map(|c| match c {
-            Caveat::Volume(v) => Some(v.as_str()),
+            Caveat::Volume(v) => Ulid::from_string(v).ok(),
             _ => None,
         })
     }
@@ -334,10 +339,37 @@ impl Macaroon {
 /// caveat of the matching kind (AND semantics, so attenuation can only
 /// restrict authority).
 pub struct VerifyCtx<'a> {
-    pub volume: &'a str,
+    pub volume: Ulid,
     pub peer_pid: i32,
     pub now_unix: u64,
     pub accepted_scopes: &'a [Scope],
+}
+
+/// A volume identity that has just emerged from a verifier. The inner
+/// field is module-private: the only way to obtain a `Verified<Ulid>`
+/// is through [`check_caveats`] (volume-daemon tokens) or
+/// [`verify_operator`] (operator tokens). Downstream code that resolves
+/// volume-scoped state (registry lookup, segment fetch, IAM teardown)
+/// consumes the receipt instead of a bare `Ulid`, so the only way to
+/// reach those code paths is via a successful verification of *this*
+/// volume — eliminating the "auth said A, but used B" bug shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Verified<T>(T);
+
+impl<T> Verified<T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+
+    pub fn get(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Copy> Verified<T> {
+    pub fn copy_inner(&self) -> T {
+        self.0
+    }
 }
 
 /// Mint an operator macaroon. The root token is coordinator-wide: no
@@ -359,10 +391,10 @@ pub fn mint_operator(root_key: &[u8; 32], expires_unix: u64) -> Macaroon {
 /// Runtime context for operator-token caveat evaluation. Operator
 /// tokens carry no `Pid` or `Scope`, so they need a parallel context
 /// to [`VerifyCtx`].
-pub struct VerifyOperatorCtx<'a> {
+pub struct VerifyOperatorCtx {
     pub now_unix: u64,
     pub op: OperatorOp,
-    pub op_volume: &'a str,
+    pub op_volume: Ulid,
 }
 
 /// Reasons an operator token may be rejected. Coarse on the wire (the
@@ -389,10 +421,8 @@ pub enum OperatorReject {
 /// `Volume` equal to `ctx.op_volume`. The root token alone is
 /// insufficient — `MissingVolume` / `MissingOp` reject any chain that
 /// did not get narrowed at the CLI.
-pub fn check_operator_caveats(
-    m: &Macaroon,
-    ctx: &VerifyOperatorCtx<'_>,
-) -> Result<(), OperatorReject> {
+pub fn check_operator_caveats(m: &Macaroon, ctx: &VerifyOperatorCtx) -> Result<(), OperatorReject> {
+    let expected_volume_str = ctx.op_volume.to_string();
     let mut saw_role = false;
     let mut saw_volume = false;
     let mut saw_op = false;
@@ -412,7 +442,7 @@ pub fn check_operator_caveats(
             }
             Caveat::Volume(v) => {
                 saw_volume = true;
-                if v != ctx.op_volume {
+                if v != &expected_volume_str {
                     return Err(OperatorReject::VolumeMismatch);
                 }
             }
@@ -435,25 +465,28 @@ pub fn check_operator_caveats(
 
 /// Top-level operator-token check. Parses the wire form, verifies the
 /// MAC chain against `root_key`, then evaluates every caveat against
-/// `ctx`. Returns the parsed macaroon on success (the caller uses its
-/// `nonce_hex` for the audit log).
+/// `ctx`. Returns the parsed macaroon and a [`Verified<Ulid>`] receipt
+/// carrying the authorised volume (equal to `ctx.op_volume` by
+/// construction — the check has just passed).
 pub fn verify_operator(
     root_key: &[u8; 32],
     encoded: &str,
-    ctx: &VerifyOperatorCtx<'_>,
-) -> Result<Macaroon, OperatorReject> {
+    ctx: &VerifyOperatorCtx,
+) -> Result<(Macaroon, Verified<Ulid>), OperatorReject> {
     let m = Macaroon::parse(encoded).map_err(|_| OperatorReject::Malformed)?;
     if !verify(root_key, &m) {
         return Err(OperatorReject::BadMac);
     }
     check_operator_caveats(&m, ctx)?;
-    Ok(m)
+    Ok((m, Verified(ctx.op_volume)))
 }
 
-/// Evaluate every caveat against `ctx`. Returns the first failure as a
-/// short reason string, or `Ok(())` if all predicates hold. Does NOT
-/// verify the MAC — call [`verify`] first.
-pub fn check_caveats(m: &Macaroon, ctx: &VerifyCtx<'_>) -> Result<(), &'static str> {
+/// Evaluate every caveat against `ctx`. On success returns a
+/// [`Verified<Ulid>`] receipt for the bound volume (equal to
+/// `ctx.volume` by construction). On failure returns a short reason
+/// string. Does NOT verify the MAC — call [`verify`] first.
+pub fn check_caveats(m: &Macaroon, ctx: &VerifyCtx<'_>) -> Result<Verified<Ulid>, &'static str> {
+    let expected_volume_str = ctx.volume.to_string();
     let mut saw_volume = false;
     let mut saw_scope = false;
     let mut saw_pid = false;
@@ -461,7 +494,7 @@ pub fn check_caveats(m: &Macaroon, ctx: &VerifyCtx<'_>) -> Result<(), &'static s
         match c {
             Caveat::Volume(v) => {
                 saw_volume = true;
-                if v != ctx.volume {
+                if v != &expected_volume_str {
                     return Err("volume caveat does not match request");
                 }
             }
@@ -498,7 +531,7 @@ pub fn check_caveats(m: &Macaroon, ctx: &VerifyCtx<'_>) -> Result<(), &'static s
     if !saw_pid {
         return Err("missing pid caveat");
     }
-    Ok(())
+    Ok(Verified(ctx.volume))
 }
 
 fn serialize_caveats(caveats: &[Caveat]) -> Vec<u8> {
@@ -658,9 +691,25 @@ mod tests {
         k
     }
 
+    const ULID_A_STR: &str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+    const ULID_B_STR: &str = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+    const ULID_C_STR: &str = "01JQCCCCCCCCCCCCCCCCCCCCCC";
+
+    fn ulid_a() -> Ulid {
+        Ulid::from_string(ULID_A_STR).unwrap()
+    }
+
+    fn ulid_b() -> Ulid {
+        Ulid::from_string(ULID_B_STR).unwrap()
+    }
+
+    fn ulid_c() -> Ulid {
+        Ulid::from_string(ULID_C_STR).unwrap()
+    }
+
     fn sample_caveats() -> Vec<Caveat> {
         vec![
-            Caveat::Volume("01JQAAAAAAAAAAAAAAAAAAAAAA".to_owned()),
+            Caveat::Volume(ULID_A_STR.to_owned()),
             Caveat::Scope(Scope::Credentials),
             Caveat::Pid(12345),
         ]
@@ -698,7 +747,7 @@ mod tests {
     #[test]
     fn accessors_extract_caveat_values() {
         let m = mint(&key(), sample_caveats());
-        assert_eq!(m.volume(), Some("01JQAAAAAAAAAAAAAAAAAAAAAA"));
+        assert_eq!(m.volume(), Some(ulid_a()));
         assert_eq!(m.scope(), Some(Scope::Credentials));
         assert_eq!(m.pid(), Some(12345));
         assert_eq!(m.not_after(), None);
@@ -765,7 +814,7 @@ mod tests {
     #[test]
     fn not_after_caveat_roundtrips() {
         let caveats = vec![
-            Caveat::Volume("vol".to_owned()),
+            Caveat::Volume(ULID_B_STR.to_owned()),
             Caveat::Scope(Scope::Credentials),
             Caveat::Pid(1),
             Caveat::NotAfter(1_700_000_000),
@@ -777,7 +826,7 @@ mod tests {
         assert!(verify(&key(), &parsed));
     }
 
-    fn ctx<'a>(volume: &'a str, pid: i32, now: u64) -> VerifyCtx<'a> {
+    fn ctx<'a>(volume: Ulid, pid: i32, now: u64) -> VerifyCtx<'a> {
         VerifyCtx {
             volume,
             peer_pid: pid,
@@ -789,7 +838,8 @@ mod tests {
     #[test]
     fn check_caveats_accepts_well_formed_token() {
         let m = mint(&key(), sample_caveats());
-        check_caveats(&m, &ctx("01JQAAAAAAAAAAAAAAAAAAAAAA", 12345, 1_000)).unwrap();
+        let verified = check_caveats(&m, &ctx(ulid_a(), 12345, 1_000)).unwrap();
+        assert_eq!(verified.copy_inner(), ulid_a());
     }
 
     #[test]
@@ -799,26 +849,29 @@ mod tests {
             &key(),
             vec![Caveat::Scope(Scope::Credentials), Caveat::Pid(1)],
         );
-        assert!(check_caveats(&m, &ctx("v", 1, 0)).is_err());
+        assert!(check_caveats(&m, &ctx(ulid_b(), 1, 0)).is_err());
         // Missing scope.
-        let m = mint(&key(), vec![Caveat::Volume("v".into()), Caveat::Pid(1)]);
-        assert!(check_caveats(&m, &ctx("v", 1, 0)).is_err());
+        let m = mint(
+            &key(),
+            vec![Caveat::Volume(ULID_B_STR.into()), Caveat::Pid(1)],
+        );
+        assert!(check_caveats(&m, &ctx(ulid_b(), 1, 0)).is_err());
         // Missing pid.
         let m = mint(
             &key(),
             vec![
-                Caveat::Volume("v".into()),
+                Caveat::Volume(ULID_B_STR.into()),
                 Caveat::Scope(Scope::Credentials),
             ],
         );
-        assert!(check_caveats(&m, &ctx("v", 1, 0)).is_err());
+        assert!(check_caveats(&m, &ctx(ulid_b(), 1, 0)).is_err());
     }
 
     #[test]
     fn check_caveats_rejects_mismatched_pid_and_volume() {
         let m = mint(&key(), sample_caveats());
-        assert!(check_caveats(&m, &ctx("01JQAAAAAAAAAAAAAAAAAAAAAA", 99999, 1_000)).is_err());
-        assert!(check_caveats(&m, &ctx("different-vol", 12345, 1_000)).is_err());
+        assert!(check_caveats(&m, &ctx(ulid_a(), 99999, 1_000)).is_err());
+        assert!(check_caveats(&m, &ctx(ulid_b(), 12345, 1_000)).is_err());
     }
 
     #[test]
@@ -826,8 +879,8 @@ mod tests {
         let mut caveats = sample_caveats();
         caveats.push(Caveat::NotAfter(500));
         let m = mint(&key(), caveats);
-        assert!(check_caveats(&m, &ctx("01JQAAAAAAAAAAAAAAAAAAAAAA", 12345, 1_000)).is_err());
-        check_caveats(&m, &ctx("01JQAAAAAAAAAAAAAAAAAAAAAA", 12345, 100)).unwrap();
+        assert!(check_caveats(&m, &ctx(ulid_a(), 12345, 1_000)).is_err());
+        check_caveats(&m, &ctx(ulid_a(), 12345, 100)).unwrap();
     }
 
     #[test]
@@ -840,14 +893,8 @@ mod tests {
         // correctly because the volume only knew the trailing MAC.
         assert!(verify(&key(), &attenuated));
         // And the attenuation is enforced.
-        check_caveats(&attenuated, &ctx("01JQAAAAAAAAAAAAAAAAAAAAAA", 12345, 500)).unwrap();
-        assert!(
-            check_caveats(
-                &attenuated,
-                &ctx("01JQAAAAAAAAAAAAAAAAAAAAAA", 12345, 2_001)
-            )
-            .is_err()
-        );
+        check_caveats(&attenuated, &ctx(ulid_a(), 12345, 500)).unwrap();
+        assert!(check_caveats(&attenuated, &ctx(ulid_a(), 12345, 2_001)).is_err());
     }
 
     #[test]
@@ -861,7 +908,7 @@ mod tests {
         let m = mint(&key(), caveats);
         let widened = m.attenuate(Caveat::NotAfter(10_000));
         assert!(verify(&key(), &widened));
-        assert!(check_caveats(&widened, &ctx("01JQAAAAAAAAAAAAAAAAAAAAAA", 12345, 1_500)).is_err());
+        assert!(check_caveats(&widened, &ctx(ulid_a(), 12345, 1_500)).is_err());
     }
 
     #[test]
@@ -869,15 +916,15 @@ mod tests {
         // Adding a contradicting Volume or Pid leaves the token unusable
         // by either side — the AND-check fails for any runtime context.
         let m = mint(&key(), sample_caveats());
-        let pivoted = m.clone().attenuate(Caveat::Volume("other-vol".into()));
+        let pivoted = m.clone().attenuate(Caveat::Volume(ULID_B_STR.into()));
         assert!(verify(&key(), &pivoted));
-        assert!(check_caveats(&pivoted, &ctx("01JQAAAAAAAAAAAAAAAAAAAAAA", 12345, 0)).is_err());
-        assert!(check_caveats(&pivoted, &ctx("other-vol", 12345, 0)).is_err());
+        assert!(check_caveats(&pivoted, &ctx(ulid_a(), 12345, 0)).is_err());
+        assert!(check_caveats(&pivoted, &ctx(ulid_b(), 12345, 0)).is_err());
 
         let repidded = m.attenuate(Caveat::Pid(99));
         assert!(verify(&key(), &repidded));
-        assert!(check_caveats(&repidded, &ctx("01JQAAAAAAAAAAAAAAAAAAAAAA", 12345, 0)).is_err());
-        assert!(check_caveats(&repidded, &ctx("01JQAAAAAAAAAAAAAAAAAAAAAA", 99, 0)).is_err());
+        assert!(check_caveats(&repidded, &ctx(ulid_a(), 12345, 0)).is_err());
+        assert!(check_caveats(&repidded, &ctx(ulid_a(), 99, 0)).is_err());
     }
 
     #[test]
@@ -888,7 +935,7 @@ mod tests {
         let a = mint(
             &key(),
             vec![
-                Caveat::Volume("v".into()),
+                Caveat::Volume(ULID_B_STR.into()),
                 Caveat::Scope(Scope::Credentials),
                 Caveat::Pid(1),
             ],
@@ -898,7 +945,7 @@ mod tests {
             vec![
                 Caveat::Pid(1),
                 Caveat::Scope(Scope::Credentials),
-                Caveat::Volume("v".into()),
+                Caveat::Volume(ULID_B_STR.into()),
             ],
         );
         assert_ne!(a.mac, b.mac);
@@ -910,7 +957,7 @@ mod tests {
     const ROOT_EXPIRES: u64 = T_NOW + 30 * 86_400;
     const USE_EXPIRES: u64 = T_NOW + 60;
 
-    fn op_ctx<'a>(op: OperatorOp, op_volume: &'a str, now: u64) -> VerifyOperatorCtx<'a> {
+    fn op_ctx(op: OperatorOp, op_volume: Ulid, now: u64) -> VerifyOperatorCtx {
         VerifyOperatorCtx {
             now_unix: now,
             op,
@@ -921,12 +968,12 @@ mod tests {
     fn attenuated_operator_token(
         expiry_root: u64,
         op: OperatorOp,
-        vol: &str,
+        vol: Ulid,
         expiry_use: u64,
     ) -> String {
         mint_operator(&key(), expiry_root)
             .attenuate(Caveat::Op(op))
-            .attenuate(Caveat::Volume(vol.to_owned()))
+            .attenuate(Caveat::Volume(vol.to_string()))
             .attenuate(Caveat::NotAfter(expiry_use))
             .encode()
     }
@@ -956,17 +1003,19 @@ mod tests {
 
     #[test]
     fn verify_operator_happy_path_after_cli_attenuation() {
-        let t = attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, "myvm", USE_EXPIRES);
-        let m = verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, "myvm", T_NOW)).unwrap();
+        let t = attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, ulid_a(), USE_EXPIRES);
+        let (m, verified) =
+            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap();
         assert_eq!(m.op(), Some(OperatorOp::Remove));
-        assert_eq!(m.volume(), Some("myvm"));
+        assert_eq!(m.volume(), Some(ulid_a()));
+        assert_eq!(verified.copy_inner(), ulid_a());
     }
 
     #[test]
     fn verify_operator_rejects_wire_token_use_expired() {
-        let t = attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, "myvm", T_NOW - 1);
+        let t = attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, ulid_a(), T_NOW - 1);
         assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, "myvm", T_NOW)).unwrap_err(),
+            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap_err(),
             OperatorReject::Expired,
         );
     }
@@ -974,9 +1023,9 @@ mod tests {
     #[test]
     fn verify_operator_rejects_when_root_expired_even_if_use_window_open() {
         // Root expiry is in the past; attenuation cannot widen authority.
-        let t = attenuated_operator_token(T_NOW - 1, OperatorOp::Remove, "myvm", USE_EXPIRES);
+        let t = attenuated_operator_token(T_NOW - 1, OperatorOp::Remove, ulid_a(), USE_EXPIRES);
         assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, "myvm", T_NOW)).unwrap_err(),
+            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap_err(),
             OperatorReject::Expired,
         );
     }
@@ -984,7 +1033,7 @@ mod tests {
     #[test]
     fn verify_operator_rejects_bad_mac() {
         let mut t =
-            attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, "myvm", USE_EXPIRES);
+            attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, ulid_a(), USE_EXPIRES);
         // Flip a byte inside the MAC region: format is
         // `v2.<nonce>.<mac>.<blob>`. The MAC section starts after the
         // second dot.
@@ -994,7 +1043,7 @@ mod tests {
         let bytes = unsafe { t.as_bytes_mut() };
         bytes[pos] = if bytes[pos] == b'a' { b'b' } else { b'a' };
         assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, "myvm", T_NOW)).unwrap_err(),
+            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap_err(),
             OperatorReject::BadMac,
         );
     }
@@ -1011,7 +1060,7 @@ mod tests {
             verify_operator(
                 &key(),
                 &mismatching.encode(),
-                &op_ctx(OperatorOp::Remove, "myvm", T_NOW),
+                &op_ctx(OperatorOp::Remove, ulid_b(), T_NOW),
             )
             .unwrap_err(),
             OperatorReject::VolumeMismatch,
@@ -1020,7 +1069,7 @@ mod tests {
         let matching = mint(
             &key(),
             vec![
-                Caveat::Volume("myvm".to_owned()),
+                Caveat::Volume(ULID_B_STR.to_owned()),
                 Caveat::Scope(Scope::Credentials),
                 Caveat::Pid(12345),
             ],
@@ -1029,7 +1078,7 @@ mod tests {
             verify_operator(
                 &key(),
                 &matching.encode(),
-                &op_ctx(OperatorOp::Remove, "myvm", T_NOW),
+                &op_ctx(OperatorOp::Remove, ulid_b(), T_NOW),
             )
             .unwrap_err(),
             OperatorReject::WrongRole,
@@ -1045,20 +1094,20 @@ mod tests {
         // failure shape we can exercise is "no Op caveat at all":
         // returns MissingOp.
         let t = mint_operator(&key(), ROOT_EXPIRES)
-            .attenuate(Caveat::Volume("myvm".to_owned()))
+            .attenuate(Caveat::Volume(ULID_A_STR.to_owned()))
             .attenuate(Caveat::NotAfter(USE_EXPIRES))
             .encode();
         assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, "myvm", T_NOW)).unwrap_err(),
+            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap_err(),
             OperatorReject::MissingOp,
         );
     }
 
     #[test]
     fn verify_operator_rejects_volume_mismatch() {
-        let t = attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, "myvm", USE_EXPIRES);
+        let t = attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, ulid_a(), USE_EXPIRES);
         assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, "othervm", T_NOW)).unwrap_err(),
+            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_c(), T_NOW)).unwrap_err(),
             OperatorReject::VolumeMismatch,
         );
     }
@@ -1072,7 +1121,7 @@ mod tests {
             .attenuate(Caveat::NotAfter(USE_EXPIRES))
             .encode();
         assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, "myvm", T_NOW)).unwrap_err(),
+            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap_err(),
             OperatorReject::MissingVolume,
         );
     }
@@ -1084,11 +1133,11 @@ mod tests {
         // because evaluation is AND-of-predicates.
         let m = mint_operator(&key(), T_NOW - 1)
             .attenuate(Caveat::Op(OperatorOp::Remove))
-            .attenuate(Caveat::Volume("myvm".to_owned()))
+            .attenuate(Caveat::Volume(ULID_A_STR.to_owned()))
             .attenuate(Caveat::NotAfter(T_NOW + 86_400));
         assert!(verify(&key(), &m));
         assert_eq!(
-            check_operator_caveats(&m, &op_ctx(OperatorOp::Remove, "myvm", T_NOW)),
+            check_operator_caveats(&m, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)),
             Err(OperatorReject::Expired),
         );
     }

@@ -413,22 +413,25 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Remove {
-            volume,
+            volume_ulid,
             force,
             operator_token,
         } => {
-            if let Err(env) = require_operator_token(
+            let verified = match require_operator_token(
                 operator_token.as_deref(),
                 OperatorOp::Remove,
-                &volume,
+                volume_ulid,
                 ctx.identity.macaroon_root(),
             ) {
-                let _ = ipc::write_message(writer, &env).await;
-                return;
-            }
+                Ok(v) => v,
+                Err(env) => {
+                    let _ = ipc::write_message(writer, &env).await;
+                    return;
+                }
+            };
             let store = ctx.stores.writer();
             let result = remove_volume(
-                &volume,
+                verified.copy_inner(),
                 force,
                 &ctx.data_dir,
                 Some(&store),
@@ -581,15 +584,16 @@ async fn dispatch_json(
 fn require_operator_token(
     encoded: Option<&str>,
     op: OperatorOp,
-    op_volume: &str,
+    op_volume: ulid::Ulid,
     root_key: &[u8; 32],
-) -> Result<(), Envelope<()>> {
+) -> Result<macaroon::Verified<ulid::Ulid>, Envelope<()>> {
+    let op_volume_str = op_volume.to_string();
     let Some(encoded) = encoded else {
         tracing::warn!(
             target: "operator_token::authn",
             event = "reject",
             op = op.as_str(),
-            volume = op_volume,
+            volume = %op_volume_str,
             reason = "missing",
             "rejected operator request: no token presented",
         );
@@ -610,23 +614,23 @@ fn require_operator_token(
         op_volume,
     };
     match macaroon::verify_operator(root_key, encoded, &ctx) {
-        Ok(m) => {
+        Ok((m, verified)) => {
             tracing::info!(
                 target: "operator_token::authn",
                 event = "verify",
                 op = op.as_str(),
-                volume = op_volume,
+                volume = %op_volume_str,
                 macaroon_nonce = %m.nonce_hex(),
                 "authenticated operator request",
             );
-            Ok(())
+            Ok(verified)
         }
         Err(reject) => {
             tracing::warn!(
                 target: "operator_token::authn",
                 event = "reject",
                 op = op.as_str(),
-                volume = op_volume,
+                volume = %op_volume_str,
                 reason = ?reject,
                 "rejected operator token",
             );
@@ -1269,27 +1273,29 @@ async fn volume_events_typed(
 /// `force = true` skips the second check, accepting that any local-only
 /// pending segments or unflushed WAL records will be discarded.
 async fn remove_volume(
-    volume_name: &str,
+    volume_ulid: ulid::Ulid,
     force: bool,
     data_dir: &Path,
     store: Option<&Arc<dyn ObjectStore>>,
     coord_id: Option<&str>,
 ) -> Result<Option<ulid::Ulid>, IpcError> {
     use elide_coordinator::volume_state::VolumeLifecycle;
-    let link = data_dir.join("by_name").join(volume_name);
-    let (vol_dir, shape) = VolumeLifecycle::resolve(&link)
-        .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?;
-    let vol_dir =
-        vol_dir.ok_or_else(|| IpcError::not_found(format!("volume not found: {volume_name}")))?;
-    // Volume directory is `by_id/<ulid>`; extract the ULID once. Used
-    // both for the `data_dir/remote/<name>` breadcrumb (when the bucket
-    // says the name is still owned by us) and for the post-delete IAM
-    // cleanup hook. Returning it from this function keeps the dispatch
-    // site free of path-canonicalisation logic.
-    let vol_ulid = vol_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .and_then(|s| ulid::Ulid::from_string(s).ok());
+    let volume_ulid_str = volume_ulid.to_string();
+    let vol_dir_path = data_dir.join("by_id").join(&volume_ulid_str);
+    let (vol_dir, shape) = VolumeLifecycle::resolve(&vol_dir_path)
+        .map_err(|e| IpcError::internal(format!("resolving by_id/{volume_ulid_str}: {e}")))?;
+    let vol_dir = vol_dir
+        .ok_or_else(|| IpcError::not_found(format!("volume not found: {volume_ulid_str}")))?;
+    // ULID is the input; carry it through to the caller for the
+    // post-delete IAM cleanup hook.
+    let vol_ulid = Some(volume_ulid);
+
+    // Best-effort reverse-resolve of the local name claim, used for
+    // the `data_dir/remote/<name>` breadcrumb, the by_name symlink
+    // cleanup, and human-readable log lines. `None` is fine — a
+    // `Fetched` or `ReadonlyImported` volume might never have had a
+    // by_name entry.
+    let local_name = find_local_name_for_ulid(data_dir, volume_ulid);
 
     // Remove accepts any shape where no process is actively touching
     // the fork:
@@ -1341,24 +1347,27 @@ async fn remove_volume(
 
     // Write the breadcrumb before tearing down local state. Best-effort:
     // a transient bucket-read error logs and skips rather than blocking
-    // the operator's removal.
+    // the operator's removal. A volume without a current local name
+    // claim has nothing to breadcrumb under — skip silently.
     //
     // The signing key shadow at `data_dir/keys/<vol_ulid>.key` was
     // written eagerly at volume creation time (and self-heals on every
     // `volume start`), so `remove` does not need to touch it — the
     // shadow already exists and survives `remove_dir_all` because it
     // lives outside `vol_dir`.
-    if let (Some(store), Some(coord_id), Some(vol_ulid)) = (store, coord_id, vol_ulid)
+    if let (Some(store), Some(coord_id), Some(name)) = (store, coord_id, local_name.as_deref())
         && let Err(e) =
-            maybe_write_remote_breadcrumb(data_dir, volume_name, vol_ulid, store, coord_id).await
+            maybe_write_remote_breadcrumb(data_dir, name, volume_ulid, store, coord_id).await
     {
         warn!(
-            "[inbound] remove {volume_name}: skipping remote breadcrumb ({e}); \
-             use `elide volume claim {volume_name}` to recover the name later"
+            "[inbound] remove {name} ({volume_ulid_str}): skipping remote breadcrumb ({e}); \
+             use `elide volume claim {name}` to recover the name later"
         );
     }
 
-    let _ = std::fs::remove_file(&link);
+    if let Some(name) = local_name.as_deref() {
+        let _ = std::fs::remove_file(data_dir.join("by_name").join(name));
+    }
 
     std::fs::remove_dir_all(&vol_dir)
         .map_err(|e| IpcError::internal(format!("remove failed: {e}")))?;
@@ -1367,8 +1376,36 @@ async fn remove_volume(
         crate::ublk_sweep::teardown_bound_device(&vol_dir, id).await;
     }
 
-    info!("[inbound] removed volume {volume_name}");
+    match local_name.as_deref() {
+        Some(name) => info!("[inbound] removed volume {name} ({volume_ulid_str})"),
+        None => info!("[inbound] removed volume {volume_ulid_str}"),
+    }
     Ok(vol_ulid)
+}
+
+/// Best-effort reverse-resolve from `volume_ulid` to the current local
+/// name claim (the by_name symlink that points at this ULID's vol_dir).
+/// Returns `None` when no by_name entry exists or the directory is
+/// missing — the caller treats absence as informational, not an error.
+fn find_local_name_for_ulid(data_dir: &Path, volume_ulid: ulid::Ulid) -> Option<String> {
+    let target_ulid_str = volume_ulid.to_string();
+    let by_name = data_dir.join("by_name");
+    let entries = std::fs::read_dir(&by_name).ok()?;
+    for entry in entries.flatten() {
+        let link = entry.path();
+        if !link.is_symlink() {
+            continue;
+        }
+        let Ok(target) = std::fs::canonicalize(&link) else {
+            continue;
+        };
+        if target.file_name().and_then(|n| n.to_str()) == Some(target_ulid_str.as_str())
+            && let Some(name) = entry.file_name().to_str()
+        {
+            return Some(name.to_owned());
+        }
+    }
+    None
 }
 
 /// Read `names/<volume_name>` and, if the bucket record exists, is in a
@@ -2154,7 +2191,7 @@ async fn authenticate_volume_macaroon(
     data_dir: &Path,
     peer_pid: Option<i32>,
     macaroon_root: &[u8; 32],
-) -> Result<(Macaroon, String), IpcError> {
+) -> Result<(Macaroon, macaroon::Verified<ulid::Ulid>), IpcError> {
     let m = Macaroon::parse(macaroon_str)
         .map_err(|e| IpcError::bad_request(format!("parse macaroon: {e}")))?;
     if !macaroon::verify(macaroon_root, &m) {
@@ -2165,8 +2202,7 @@ async fn authenticate_volume_macaroon(
     let peer_pid = peer_pid.ok_or_else(|| IpcError::forbidden("peer pid unavailable"))?;
     let volume_ulid = m
         .volume()
-        .ok_or_else(|| IpcError::forbidden("macaroon missing volume caveat"))?
-        .to_owned();
+        .ok_or_else(|| IpcError::forbidden("macaroon missing volume caveat"))?;
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2174,10 +2210,10 @@ async fn authenticate_volume_macaroon(
     // Credentials and FetchWorker macaroons grant the same downstream
     // creds; the split exists so a leaked fetch macaroon can't be
     // replayed at a future verb gated on `Scope::Credentials`.
-    macaroon::check_caveats(
+    let verified = macaroon::check_caveats(
         &m,
         &VerifyCtx {
-            volume: &volume_ulid,
+            volume: volume_ulid,
             peer_pid,
             now_unix,
             accepted_scopes: &[Scope::Credentials, Scope::FetchWorker],
@@ -2186,12 +2222,12 @@ async fn authenticate_volume_macaroon(
     .map_err(IpcError::forbidden)?;
     // Re-validate that volume.pid still matches — covers the case where the
     // original process has exited and the PID was reused.
-    let vol_dir = data_dir.join("by_id").join(&volume_ulid);
+    let vol_dir = data_dir.join("by_id").join(volume_ulid.to_string());
     check_peer_pid(&vol_dir, Some(peer_pid)).map_err(IpcError::forbidden)?;
     if !pid_is_alive(peer_pid as u32) {
         return Err(IpcError::forbidden("peer pid not alive"));
     }
-    Ok((m, volume_ulid))
+    Ok((m, verified))
 }
 
 /// Resolve a claimed volume's current name from its ULID via the
@@ -2200,10 +2236,11 @@ async fn authenticate_volume_macaroon(
 /// `names/<name>`; a coordinator with no local `by_name` entry for the
 /// volume is not its current local claimer and cannot mint a passing
 /// claimer token.
-fn resolve_volume_name(data_dir: &Path, volume_ulid: &str) -> Result<String, IpcError> {
+fn resolve_volume_name(data_dir: &Path, volume_ulid: ulid::Ulid) -> Result<String, IpcError> {
     let by_name = data_dir.join("by_name");
     let entries = std::fs::read_dir(&by_name)
         .map_err(|e| IpcError::internal(format!("read by_name: {e}")))?;
+    let target_ulid_str = volume_ulid.to_string();
     for entry in entries.flatten() {
         let link = entry.path();
         if !link.is_symlink() {
@@ -2212,7 +2249,7 @@ fn resolve_volume_name(data_dir: &Path, volume_ulid: &str) -> Result<String, Ipc
         let Ok(target) = std::fs::canonicalize(&link) else {
             continue;
         };
-        if target.file_name().and_then(|n| n.to_str()) == Some(volume_ulid)
+        if target.file_name().and_then(|n| n.to_str()) == Some(target_ulid_str.as_str())
             && let Some(name) = entry.file_name().to_str()
         {
             return Ok(name.to_owned());
@@ -2230,15 +2267,17 @@ async fn issue_credentials(
     macaroon_root: &[u8; 32],
     issuer: &dyn CredentialIssuer,
 ) -> Result<StoreCredsReply, IpcError> {
-    let (m, volume_ulid) =
+    let (m, verified) =
         authenticate_volume_macaroon(macaroon_str, data_dir, peer_pid, macaroon_root).await?;
+    let volume_ulid = verified.copy_inner();
+    let volume_ulid_str = volume_ulid.to_string();
     let creds = issuer
-        .issue(&volume_ulid)
+        .issue(&volume_ulid_str)
         .await
         .map_err(|e| IpcError::internal(format!("issue: {e}")))?;
     info!(
         target: "creds::issuance",
-        volume_ulid = %volume_ulid,
+        volume_ulid = %volume_ulid_str,
         peer_pid,
         macaroon_nonce = %m.nonce_hex(),
         macaroon_not_after = ?m.narrowest_not_after(),
@@ -2265,10 +2304,11 @@ async fn mint_peer_claimer_token(
     peer_pid: Option<i32>,
     identity: &elide_coordinator::identity::CoordinatorIdentity,
 ) -> Result<PeerClaimerTokenReply, IpcError> {
-    let (m, volume_ulid) =
+    let (m, verified) =
         authenticate_volume_macaroon(macaroon_str, data_dir, peer_pid, identity.macaroon_root())
             .await?;
-    let name = resolve_volume_name(data_dir, &volume_ulid)?;
+    let volume_ulid = verified.copy_inner();
+    let name = resolve_volume_name(data_dir, volume_ulid)?;
     let coordinator_id = identity.coordinator_id_str().to_owned();
     let issued_at = elide_peer_fetch::PeerFetchToken::now_unix_seconds();
     let payload =
@@ -3088,15 +3128,15 @@ mod tests {
     #[test]
     fn resolve_volume_name_maps_ulid_via_by_name_symlink() {
         let tmp = TempDir::new().unwrap();
-        let ulid = ulid::Ulid::new().to_string();
-        let vol_dir = tmp.path().join("by_id").join(&ulid);
+        let ulid = ulid::Ulid::new();
+        let vol_dir = tmp.path().join("by_id").join(ulid.to_string());
         std::fs::create_dir_all(&vol_dir).unwrap();
         let by_name = tmp.path().join("by_name");
         std::fs::create_dir_all(&by_name).unwrap();
         std::os::unix::fs::symlink(&vol_dir, by_name.join("myvol")).unwrap();
 
         assert_eq!(
-            resolve_volume_name(tmp.path(), &ulid).unwrap(),
+            resolve_volume_name(tmp.path(), ulid).unwrap(),
             "myvol".to_owned()
         );
     }
@@ -3107,8 +3147,8 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
         // by_name has no symlink pointing at this ulid → not the
         // current local claimer → forbidden (403-class).
-        let err = resolve_volume_name(tmp.path(), &ulid::Ulid::new().to_string())
-            .expect_err("no claim → reject");
+        let err =
+            resolve_volume_name(tmp.path(), ulid::Ulid::new()).expect_err("no claim → reject");
         assert_eq!(err.kind, IpcErrorKind::Forbidden);
     }
 
@@ -3159,9 +3199,9 @@ mod tests {
     #[tokio::test]
     async fn remove_volume_without_ublk_succeeds() {
         let tmp = TempDir::new().unwrap();
-        let (vol_dir, link) =
-            setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAA", None, true);
-        remove_volume("vol", false, tmp.path(), None, None)
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
+        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists(), "by_id dir should be removed");
@@ -3179,14 +3219,10 @@ mod tests {
         // remove_dir_all runs (otherwise read would fail and we'd still
         // be in this branch — but the dir wouldn't be gone).
         let tmp = TempDir::new().unwrap();
-        let (vol_dir, link) = setup_removable_volume(
-            tmp.path(),
-            "vol",
-            "01JQAAAAAAAAAAAAAAAAAAAAAB",
-            Some(99),
-            true,
-        );
-        remove_volume("vol", false, tmp.path(), None, None)
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAB";
+        let (vol_dir, link) =
+            setup_removable_volume(tmp.path(), "vol", vol_ulid_str, Some(99), true);
+        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3196,14 +3232,15 @@ mod tests {
     #[tokio::test]
     async fn remove_volume_rejects_running() {
         let tmp = TempDir::new().unwrap();
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAC";
         let (vol_dir, _link) = setup_removable_volume(
             tmp.path(),
             "vol",
-            "01JQAAAAAAAAAAAAAAAAAAAAAC",
+            vol_ulid_str,
             Some(5),
             false, // no STOPPED_FILE
         );
-        let err = remove_volume("vol", false, tmp.path(), None, None)
+        let err = remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .expect_err("running volume should be rejected");
         assert_eq!(err.kind, IpcErrorKind::Conflict);
@@ -3218,10 +3255,10 @@ mod tests {
         // `Released { .. }` because that marker takes precedence —
         // but the daemon is provably halted, so remove must proceed.
         let tmp = TempDir::new().unwrap();
-        let (vol_dir, link) =
-            setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAD", None, true);
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAD";
+        let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
         write_released_marker(&vol_dir, ulid::Ulid::new()).unwrap();
-        remove_volume("vol", false, tmp.path(), None, None)
+        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists(), "by_id dir should be removed");
@@ -3235,8 +3272,8 @@ mod tests {
         // remove just drops the cached bytes.
         use elide_coordinator::volume_state::FetchedRecord;
         let tmp = TempDir::new().unwrap();
-        let (vol_dir, link) =
-            setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAE", None, false);
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAE";
+        let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, false);
         FetchedRecord {
             basis_snapshot: ulid::Ulid::new().to_string(),
             owner_coordinator_id: String::new(),
@@ -3244,7 +3281,7 @@ mod tests {
         }
         .write(&vol_dir)
         .unwrap();
-        remove_volume("vol", false, tmp.path(), None, None)
+        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3255,10 +3292,10 @@ mod tests {
     async fn remove_volume_succeeds_when_readonly_imported() {
         // OCI base or readonly skeleton — no signing key, no daemon.
         let tmp = TempDir::new().unwrap();
-        let (vol_dir, link) =
-            setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAF", None, false);
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAF";
+        let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, false);
         std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
-        remove_volume("vol", false, tmp.path(), None, None)
+        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3269,7 +3306,8 @@ mod tests {
     async fn remove_volume_unknown_returns_not_found() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
-        let err = remove_volume("ghost", false, tmp.path(), None, None)
+        // ULID with no `by_id/<ulid>` directory → not_found.
+        let err = remove_volume(ulid::Ulid::new(), false, tmp.path(), None, None)
             .await
             .expect_err("absent volume should be NotFound");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -3280,36 +3318,47 @@ mod tests {
         use elide_coordinator::name_store::create_name_record;
         use elide_core::name_record::{NameRecord, NameState};
         let tmp = TempDir::new().unwrap();
-        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
-        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid, None, true);
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
 
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let mut record =
-            NameRecord::live_minimal(ulid::Ulid::from_string(vol_ulid).unwrap(), SAMPLE_SIZE);
+        let mut record = NameRecord::live_minimal(ulid_from(vol_ulid_str), SAMPLE_SIZE);
         record.state = NameState::Stopped;
         record.coordinator_id = Some("coord-A".to_owned());
         create_name_record(&store, "vol", &record).await.unwrap();
 
-        remove_volume("vol", false, tmp.path(), Some(&store), Some("coord-A"))
-            .await
-            .unwrap();
+        remove_volume(
+            ulid_from(vol_ulid_str),
+            false,
+            tmp.path(),
+            Some(&store),
+            Some("coord-A"),
+        )
+        .await
+        .unwrap();
 
         let crumb = elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
             .unwrap()
             .expect("breadcrumb should exist");
-        assert_eq!(crumb.volume_id.to_string(), vol_ulid);
+        assert_eq!(crumb.volume_id.to_string(), vol_ulid_str);
     }
 
     #[tokio::test]
     async fn remove_volume_skips_breadcrumb_when_record_absent() {
         let tmp = TempDir::new().unwrap();
-        let (_vol_dir, _link) =
-            setup_removable_volume(tmp.path(), "vol", "01JQAAAAAAAAAAAAAAAAAAAAAB", None, true);
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAB";
+        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
 
-        remove_volume("vol", false, tmp.path(), Some(&store), Some("coord-A"))
-            .await
-            .unwrap();
+        remove_volume(
+            ulid_from(vol_ulid_str),
+            false,
+            tmp.path(),
+            Some(&store),
+            Some("coord-A"),
+        )
+        .await
+        .unwrap();
 
         assert!(
             elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
@@ -3324,19 +3373,24 @@ mod tests {
         use elide_coordinator::name_store::create_name_record;
         use elide_core::name_record::{NameRecord, NameState};
         let tmp = TempDir::new().unwrap();
-        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAC";
-        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid, None, true);
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAC";
+        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
 
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let mut record =
-            NameRecord::live_minimal(ulid::Ulid::from_string(vol_ulid).unwrap(), SAMPLE_SIZE);
+        let mut record = NameRecord::live_minimal(ulid_from(vol_ulid_str), SAMPLE_SIZE);
         record.state = NameState::Stopped;
         record.coordinator_id = Some("coord-OTHER".to_owned());
         create_name_record(&store, "vol", &record).await.unwrap();
 
-        remove_volume("vol", false, tmp.path(), Some(&store), Some("coord-A"))
-            .await
-            .unwrap();
+        remove_volume(
+            ulid_from(vol_ulid_str),
+            false,
+            tmp.path(),
+            Some(&store),
+            Some("coord-A"),
+        )
+        .await
+        .unwrap();
 
         assert!(
             elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
@@ -3351,19 +3405,24 @@ mod tests {
         use elide_coordinator::name_store::create_name_record;
         use elide_core::name_record::{NameRecord, NameState};
         let tmp = TempDir::new().unwrap();
-        let vol_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAD";
-        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid, None, true);
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAD";
+        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
 
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let mut record =
-            NameRecord::live_minimal(ulid::Ulid::from_string(vol_ulid).unwrap(), SAMPLE_SIZE);
+        let mut record = NameRecord::live_minimal(ulid_from(vol_ulid_str), SAMPLE_SIZE);
         record.state = NameState::Released;
         record.coordinator_id = Some("coord-A".to_owned());
         create_name_record(&store, "vol", &record).await.unwrap();
 
-        remove_volume("vol", false, tmp.path(), Some(&store), Some("coord-A"))
-            .await
-            .unwrap();
+        remove_volume(
+            ulid_from(vol_ulid_str),
+            false,
+            tmp.path(),
+            Some(&store),
+            Some("coord-A"),
+        )
+        .await
+        .unwrap();
 
         assert!(
             elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
