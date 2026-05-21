@@ -111,14 +111,24 @@ pub trait ScopedStores: Send + Sync {
     /// GC, snapshot publish.
     fn data_for_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore>;
 
-    /// `volume-ro`: read-only under `by_id/<vol_ulid>/*` plus one
+    /// `volume-ro` scoped to one volume's prefix only. Read-only
+    /// under `by_id/<vol_ulid>/*`. Used by single-volume read sites:
+    /// pulling an ancestor's skeleton, fetching a parent's handoff
+    /// manifest, walking an extent-source ancestor. The returned
+    /// store is `GetObject`-only — wrong-prefix writes fail at IAM,
+    /// not at the call site.
+    fn read_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore>;
+
+    /// `volume-ro` scoped to a head fork plus its full ancestor chain.
+    /// Read-only under `by_id/<vol_ulid>/*` plus one
     /// `by_id/<ancestor>/*` per entry in `ancestors`
-    /// (`docs/design-mint.md` § `volume-ro`). The coordinator's own
-    /// `coord-data` is single-prefix, so cross-ancestor reads
-    /// (`prefetch_indexes`, `pull_readonly_op`) ride this role. The
-    /// returned store is `GetObject`-only — wrong-prefix writes fail
-    /// at IAM, not at the call site.
-    fn volume_ro(&self, vol_ulid: &Ulid, ancestors: &[Ulid]) -> Arc<dyn ObjectStore>;
+    /// (`docs/design-mint.md` § `volume-ro`). Used by the
+    /// head-prefetch fan-out (`prefetch::prefetch_indexes` pass 2),
+    /// which dispatches per-fork reads against a single shared
+    /// credential. `ancestors` is the chain derived from the head's
+    /// own provenance; for a given vol_ulid it is deterministic.
+    fn read_head_with_ancestors(&self, vol_ulid: &Ulid, ancestors: &[Ulid])
+    -> Arc<dyn ObjectStore>;
 
     /// The `coord-base` store as a plain [`ObjectStore`], for the one
     /// cross-crate consumer that needs it: the peer-fetch verifier
@@ -214,7 +224,15 @@ impl ScopedStores for PassthroughStores {
         Arc::clone(&self.inner)
     }
 
-    fn volume_ro(&self, _vol_ulid: &Ulid, _ancestors: &[Ulid]) -> Arc<dyn ObjectStore> {
+    fn read_volume(&self, _vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.inner)
+    }
+
+    fn read_head_with_ancestors(
+        &self,
+        _vol_ulid: &Ulid,
+        _ancestors: &[Ulid],
+    ) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.inner)
     }
 

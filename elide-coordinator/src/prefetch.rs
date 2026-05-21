@@ -196,7 +196,7 @@ pub async fn prefetch_indexes(
                 "[prefetch] pulling ancestor skeleton: {}",
                 parent.volume_ulid
             );
-            let parent_store = stores.volume_ro(&parent_ulid, &[]);
+            let parent_store = stores.read_volume(&parent_ulid);
             pull_volume_skeleton(&parent_store, data_dir, &parent.volume_ulid, peer)
                 .await
                 .with_context(|| format!("pulling ancestor {}", parent.volume_ulid))?
@@ -269,7 +269,7 @@ pub async fn prefetch_indexes(
             info!("[prefetch] pulling extent-source skeleton: {ulid_str}");
             let ulid = Ulid::from_string(ulid_str)
                 .map_err(|e| anyhow::anyhow!("extent ancestor '{ulid_str}' not a ULID: {e}"))?;
-            let ancestor_store = stores.volume_ro(&ulid, &[]);
+            let ancestor_store = stores.read_volume(&ulid);
             pull_volume_skeleton(&ancestor_store, data_dir, ulid_str, peer)
                 .await
                 .with_context(|| format!("pulling extent-source {ulid_str}"))?
@@ -303,7 +303,7 @@ pub async fn prefetch_indexes(
     // one `volume-ro` store scoped to the head fork plus every
     // discovered ancestor — the role's policy expands one read ARN per
     // entry (`docs/design-mint.md` § `volume-ro`).
-    let store = stores.volume_ro(&own_ulid, &ancestor_ulids);
+    let store = stores.read_head_with_ancestors(&own_ulid, &ancestor_ulids);
     let peer_owned: Option<PeerFetchContext> = peer.cloned();
     let outcomes: Vec<PrefetchResult> = futures::stream::iter(tasks.into_iter().map(|task| {
         let store = store.clone();

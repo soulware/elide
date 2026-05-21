@@ -43,11 +43,6 @@ use crate::mint_client::{
 
 const CAVEAT_VOLUME: &str = "elide:Volume";
 
-/// `volume-ro` cache key: `(vol_ulid, normalised ancestor set)`.
-/// Ancestors are sorted + deduped at insert time so two calls with
-/// equivalent sets share a single facade.
-type VolumeRoKey = (Ulid, Vec<Ulid>);
-
 /// Documented coord-* TTLs (`docs/design-mint.md` § *Elide as
 /// customer*): coordinator-wide control plane 1h, per-volume data 24h.
 const COORD_CONTROL_TTL_SECS: u64 = 60 * 60;
@@ -281,13 +276,18 @@ pub struct MintScopedStores {
     endpoint: MintEndpoint,
     store_cfg: StoreSection,
     data: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
-    /// `volume-ro` facades keyed by `(vol_ulid, sorted ancestors)`. The
-    /// ancestor list is normalised so two calls with equivalent sets
-    /// (different order or with duplicates) share one facade. Most
-    /// callers pass `&[]`, so in practice this collapses to one entry
-    /// per `vol_ulid` for the read-only chain-walk paths and one extra
-    /// entry per distinct ancestor set for the prefetch fan-out.
-    volume_ro: Mutex<HashMap<VolumeRoKey, Arc<RoleStore>>>,
+    /// `volume-ro` facades for single-volume reads, keyed by `vol_ulid`.
+    /// Populated by `read_volume`; each entry's mint policy grants
+    /// `by_id/<vol_ulid>/*` only.
+    read_volume: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
+    /// `volume-ro` facades for head-prefetch reads, keyed by the head
+    /// `vol_ulid`. The ancestor chain is deterministic from the head's
+    /// provenance, so the first call's chain wins; subsequent calls for
+    /// the same head reuse the facade. Kept separate from `read_volume`
+    /// so a previously-cached narrow facade can't satisfy a later wide
+    /// request (and vice versa, the wide facade is more permissive than
+    /// any future narrow request needs).
+    read_head: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
 }
 
 impl MintScopedStores {
@@ -318,7 +318,8 @@ impl MintScopedStores {
             endpoint,
             store_cfg,
             data: Mutex::new(HashMap::new()),
-            volume_ro: Mutex::new(HashMap::new()),
+            read_volume: Mutex::new(HashMap::new()),
+            read_head: Mutex::new(HashMap::new()),
         }
     }
 
@@ -371,20 +372,41 @@ impl ScopedStores for MintScopedStores {
         rs as Arc<dyn ObjectStore>
     }
 
-    fn volume_ro(&self, vol_ulid: &Ulid, ancestors: &[Ulid]) -> Arc<dyn ObjectStore> {
-        // Cached by `(vol_ulid, sorted ancestors)` so successive reads
-        // of the same parent inside one claim/start collapse onto one
-        // mint round-trip — the role's 1h TTL covers a whole orchestrator
-        // pass. The ancestor list is normalised (sorted + deduped) so
-        // callers that pass equivalent sets in different orders share
-        // an entry. `try_lock` keeps the method sync; momentary
-        // contention falls back to constructing a fresh facade.
-        let mut key_ancestors = ancestors.to_vec();
-        key_ancestors.sort();
-        key_ancestors.dedup();
-        let key = (*vol_ulid, key_ancestors);
-        if let Ok(map) = self.volume_ro.try_lock()
-            && let Some(rs) = map.get(&key)
+    fn read_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+        // Cached by vol_ulid so successive reads of the same parent
+        // inside one claim/start collapse onto one mint round-trip —
+        // the role's 1h TTL covers a whole orchestrator pass.
+        // `try_lock` keeps the method sync; momentary contention falls
+        // back to constructing a fresh facade (its first op assumes
+        // lazily either way — no correctness impact).
+        if let Ok(map) = self.read_volume.try_lock()
+            && let Some(rs) = map.get(vol_ulid)
+        {
+            return Arc::clone(rs) as Arc<dyn ObjectStore>;
+        }
+        let rs = Arc::new(RoleStore::new(
+            self.endpoint.clone(),
+            self.store_cfg.clone(),
+            ROLE_VOLUME_RO,
+            VOLUME_RO_TTL_SECS,
+            Some(*vol_ulid),
+        ));
+        if let Ok(mut map) = self.read_volume.try_lock() {
+            map.insert(*vol_ulid, Arc::clone(&rs));
+        }
+        rs as Arc<dyn ObjectStore>
+    }
+
+    fn read_head_with_ancestors(
+        &self,
+        vol_ulid: &Ulid,
+        ancestors: &[Ulid],
+    ) -> Arc<dyn ObjectStore> {
+        // Cached by vol_ulid. The ancestor chain is deterministic from
+        // the head's own provenance, so a second call for the same head
+        // hits the cache regardless of the literal ancestor argument.
+        if let Ok(map) = self.read_head.try_lock()
+            && let Some(rs) = map.get(vol_ulid)
         {
             return Arc::clone(rs) as Arc<dyn ObjectStore>;
         }
@@ -394,10 +416,10 @@ impl ScopedStores for MintScopedStores {
             ROLE_VOLUME_RO,
             VOLUME_RO_TTL_SECS,
             Some(*vol_ulid),
-            key.1.clone(),
+            ancestors.to_vec(),
         ));
-        if let Ok(mut map) = self.volume_ro.try_lock() {
-            map.insert(key, Arc::clone(&rs));
+        if let Ok(mut map) = self.read_head.try_lock() {
+            map.insert(*vol_ulid, Arc::clone(&rs));
         }
         rs as Arc<dyn ObjectStore>
     }
@@ -472,62 +494,56 @@ mod tests {
     }
 
     #[test]
-    fn volume_ro_cache_reuses_facade_for_same_vol_and_ancestors() {
+    fn read_volume_cache_reuses_facade_for_same_vol_ulid() {
         let stores = test_scoped_stores();
         let v = Ulid::new();
-        let s1 = stores.volume_ro(&v, &[]);
-        let s2 = stores.volume_ro(&v, &[]);
+        let s1 = stores.read_volume(&v);
+        let s2 = stores.read_volume(&v);
         assert!(
             Arc::ptr_eq(&s1, &s2),
-            "second volume_ro call with identical (vol_ulid, ancestors) must hit the cache"
+            "second read_volume call for the same vol_ulid must hit the cache"
         );
     }
 
     #[test]
-    fn volume_ro_cache_normalises_ancestor_set() {
+    fn read_volume_cache_separates_distinct_vol_ulids() {
         let stores = test_scoped_stores();
-        let v = Ulid::new();
-        let a = Ulid::new();
-        let b = Ulid::new();
-        // Same set, different order: must collide on the same cache entry.
-        let s1 = stores.volume_ro(&v, &[a, b]);
-        let s2 = stores.volume_ro(&v, &[b, a]);
-        assert!(
-            Arc::ptr_eq(&s1, &s2),
-            "ancestor order must not affect cache key"
-        );
-        // And dedup: [a, a] equivalent to [a].
-        let s3 = stores.volume_ro(&v, &[a]);
-        let s4 = stores.volume_ro(&v, &[a, a]);
-        assert!(
-            Arc::ptr_eq(&s3, &s4),
-            "duplicate ancestors must not split the cache entry"
-        );
-    }
-
-    #[test]
-    fn volume_ro_cache_separates_distinct_ancestor_sets() {
-        let stores = test_scoped_stores();
-        let v = Ulid::new();
-        let a = Ulid::new();
-        // Different ancestor sets must produce different facades —
-        // the mint-side policy expands a different set of read ARNs.
-        let empty = stores.volume_ro(&v, &[]);
-        let with_a = stores.volume_ro(&v, &[a]);
-        assert!(
-            !Arc::ptr_eq(&empty, &with_a),
-            "different ancestor sets must not share a facade"
-        );
-    }
-
-    #[test]
-    fn volume_ro_cache_separates_distinct_vol_ulids() {
-        let stores = test_scoped_stores();
-        let s_parent = stores.volume_ro(&Ulid::new(), &[]);
-        let s_other = stores.volume_ro(&Ulid::new(), &[]);
+        let s_parent = stores.read_volume(&Ulid::new());
+        let s_other = stores.read_volume(&Ulid::new());
         assert!(
             !Arc::ptr_eq(&s_parent, &s_other),
             "different vol_ulids must not share a facade"
+        );
+    }
+
+    #[test]
+    fn read_head_cache_reuses_facade_for_same_head() {
+        let stores = test_scoped_stores();
+        let v = Ulid::new();
+        let a = Ulid::new();
+        let s1 = stores.read_head_with_ancestors(&v, &[a]);
+        let s2 = stores.read_head_with_ancestors(&v, &[a]);
+        assert!(
+            Arc::ptr_eq(&s1, &s2),
+            "second head-prefetch call for the same head must hit the cache"
+        );
+    }
+
+    #[test]
+    fn read_volume_and_read_head_use_independent_caches() {
+        // The same vol_ulid called via the two methods must produce
+        // distinct facades — the narrow one (read_volume) and the wide
+        // one (read_head_with_ancestors) carry different mint policies,
+        // and the wide-then-narrow / narrow-then-wide ordering must
+        // not contaminate either cache.
+        let stores = test_scoped_stores();
+        let v = Ulid::new();
+        let a = Ulid::new();
+        let narrow = stores.read_volume(&v);
+        let wide = stores.read_head_with_ancestors(&v, &[a]);
+        assert!(
+            !Arc::ptr_eq(&narrow, &wide),
+            "single-volume and head-with-ancestors facades must be independent"
         );
     }
 }
