@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rand_core::{OsRng, RngCore};
 
 #[derive(Debug, Clone)]
 pub struct MintedKeypair {
@@ -37,15 +38,40 @@ pub enum MintError {
 #[async_trait]
 pub trait KeypairMinter: Send + Sync {
     /// Mint a keypair scoped by `policy_json`, expiring after `ttl`.
+    /// `policy_name` is the IAM policy name to register the document
+    /// under — operator-visible metadata, no security significance.
+    /// Build it via [`policy_name`].
     async fn mint_keypair(
         &self,
+        policy_name: &str,
         policy_json: &str,
         ttl: Duration,
     ) -> Result<MintedKeypair, MintError>;
 }
 
+/// Build a mint-issued IAM policy name.
+///
+/// Format: `mint_<role>_<scope>_<expiry>_<nonce>`
+/// - `role`: role slug (e.g. `coord-data`, `volume-ro`).
+/// - `scope`: volume ULID for volume-scoped roles, `global` otherwise.
+/// - `expiry`: basic ISO 8601 UTC (`YYYYMMDDTHHMMSSZ`) of the policy's
+///   `DateLessThan` — sorts lexically = chronologically in the Tigris
+///   console.
+/// - `nonce`: 32 bits of OS randomness as 8 lowercase hex chars; ensures
+///   uniqueness within a single (role, scope, second) bucket.
+///
+/// All characters are in IAM's policy-name charset (`[\w+=,.@-]{1,128}`).
+/// `_` separates fields; `-` only appears inside the role slug.
+pub fn policy_name(role: &str, scope: Option<&str>, expiry: DateTime<Utc>) -> String {
+    let scope = scope.unwrap_or("global");
+    let expiry_compact = expiry.format("%Y%m%dT%H%M%SZ");
+    let nonce: u32 = OsRng.next_u32();
+    format!("mint_{role}_{scope}_{expiry_compact}_{nonce:08x}")
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordedMint {
+    pub policy_name: String,
     pub policy_json: String,
     pub ttl: Duration,
     pub issued_key_id: String,
@@ -79,6 +105,7 @@ impl Default for FakeMinter {
 impl KeypairMinter for FakeMinter {
     async fn mint_keypair(
         &self,
+        policy_name: &str,
         policy_json: &str,
         ttl: Duration,
     ) -> Result<MintedKeypair, MintError> {
@@ -89,6 +116,7 @@ impl KeypairMinter for FakeMinter {
         let n = calls.len();
         let key_id = format!("tid_fake_{n:08}");
         calls.push(RecordedMint {
+            policy_name: policy_name.to_string(),
             policy_json: policy_json.to_string(),
             ttl,
             issued_key_id: key_id.clone(),
@@ -111,10 +139,40 @@ mod tests {
     #[tokio::test]
     async fn fake_minter_records_and_is_deterministic() {
         let m = FakeMinter::new();
-        let k0 = m.mint_keypair("{}", Duration::from_secs(60)).await.unwrap();
-        let k1 = m.mint_keypair("{}", Duration::from_secs(60)).await.unwrap();
+        let k0 = m
+            .mint_keypair(
+                "mint_test_global_20260521T000000Z_00000000",
+                "{}",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let k1 = m
+            .mint_keypair(
+                "mint_test_global_20260521T000000Z_00000001",
+                "{}",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
         assert_eq!(k0.access_key_id, "tid_fake_00000000");
         assert_eq!(k1.access_key_id, "tid_fake_00000001");
         assert_eq!(m.calls().len(), 2);
+    }
+
+    #[test]
+    fn policy_name_shape() {
+        let expiry = "2026-05-21T14:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        let scoped = policy_name("coord-data", Some("01JD8K3FQ9R0YHGWZV5XPMNTAB"), expiry);
+        assert!(
+            scoped.starts_with("mint_coord-data_01JD8K3FQ9R0YHGWZV5XPMNTAB_20260521T143000Z_"),
+            "got {scoped}"
+        );
+        // 4 (mint) + 1 + 10 (coord-data) + 1 + 26 + 1 + 16 + 1 + 8 = 68
+        assert_eq!(scoped.len(), 68);
+        assert!(scoped.len() <= 128);
+
+        let global = policy_name("coord-base", None, expiry);
+        assert!(global.starts_with("mint_coord-base_global_20260521T143000Z_"));
     }
 }

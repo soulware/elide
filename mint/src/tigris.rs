@@ -224,18 +224,15 @@ impl KeypairMinter for TigrisMinter {
     /// dates the returned keypair for the caller and the audit log.
     async fn mint_keypair(
         &self,
+        policy_name: &str,
         policy_json: &str,
         ttl: Duration,
     ) -> Result<MintedKeypair, MintError> {
         let backend = |e: TigrisError| MintError::Backend(e.to_string());
 
         let (access_key_id, secret_access_key) = self.create_access_key().await.map_err(backend)?;
-        // Policy name must be unique per issuance and within IAM's
-        // [\w+=,.@-]{1,128} charset; `mint-` + 32 hex satisfies both and
-        // marks the policy as mint-issued for operator visibility.
-        let policy_name = format!("mint-{}", uuid::Uuid::new_v4().simple());
         let policy_arn = self
-            .create_policy(&policy_name, policy_json)
+            .create_policy(policy_name, policy_json)
             .await
             .map_err(backend)?;
         self.attach_user_policy(&access_key_id, &policy_arn)
