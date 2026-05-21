@@ -193,13 +193,23 @@ async fn run() -> Result<()> {
                      and conditional-PUT are validated lazily on first \
                      assume-role per role"
                 );
+                let scoped = mint_stores::MintScopedStores::new(
+                    mint_cfg,
+                    config.store.clone(),
+                    config.data_dir.clone(),
+                    identity.clone(),
+                );
+                // Block here until mint accepts a `coord-base` assume-role,
+                // so the coordinator survives mint coming up after it
+                // (systemd ordering, fresh box) instead of failing on the
+                // first S3 op (publish coordinator.pub) with a connect
+                // error.
+                if let Err(e) = scoped.wait_for_ready().await {
+                    let _ = std::fs::remove_file(&pid_path);
+                    return Err(anyhow::anyhow!("waiting for mint to become ready: {e}"));
+                }
                 let stores: std::sync::Arc<dyn elide_coordinator::stores::ScopedStores> =
-                    std::sync::Arc::new(mint_stores::MintScopedStores::new(
-                        mint_cfg,
-                        config.store.clone(),
-                        config.data_dir.clone(),
-                        identity.clone(),
-                    ));
+                    std::sync::Arc::new(scoped);
                 let result = daemon::run(config, stores).await;
                 let _ = std::fs::remove_file(&pid_path);
                 return result;

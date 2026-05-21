@@ -264,7 +264,21 @@ async fn post_tcp(
         .body(body)
         .send()
         .await
-        .map_err(|e| io::Error::other(format!("mint request failed: {e}")))?;
+        .map_err(|e| {
+            // Tag connect/timeout failures with a specific `ErrorKind` so
+            // `wait_for_ready` can distinguish "mint not up yet" from a
+            // real protocol-level error.
+            if e.is_connect() {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("mint request failed: {e}"),
+                )
+            } else if e.is_timeout() {
+                io::Error::new(io::ErrorKind::TimedOut, format!("mint request failed: {e}"))
+            } else {
+                io::Error::other(format!("mint request failed: {e}"))
+            }
+        })?;
     let status = resp.status().as_u16();
     let text = resp
         .text()
@@ -301,8 +315,22 @@ async fn post_uds(
         .map_err(|e| io::Error::other(format!("building mint uds request: {e}")))?;
     let resp = tokio::time::timeout(request_timeout, client.request(req))
         .await
-        .map_err(|_| io::Error::other("mint uds request timed out"))?
-        .map_err(|e| io::Error::other(format!("mint uds request failed: {e}")))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mint uds request timed out"))?
+        .map_err(|e| {
+            // Tag connect-class failures so `wait_for_ready` can
+            // distinguish "mint not up yet" from a real protocol error.
+            // hyperlocal's connector raises an `io::Error::NotFound`
+            // when the socket is missing entirely — surface that as
+            // `ConnectionRefused` too.
+            if e.is_connect() {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("mint uds request failed: {e}"),
+                )
+            } else {
+                io::Error::other(format!("mint uds request failed: {e}"))
+            }
+        })?;
     let status = resp.status().as_u16();
     let bytes = resp
         .into_body()
@@ -433,6 +461,46 @@ impl MintEndpoint {
             session_token: None,
             expiry_unix: Some(expiry_unix),
         })
+    }
+
+    /// Block until the mint endpoint accepts an `assume-role` for
+    /// `role`. Retries indefinitely on connect/timeout failures with
+    /// exponential backoff (100ms → 5s cap); any other error
+    /// (HTTP status, missing credential file, decode failure, etc.)
+    /// is fatal. The vended credentials are discarded — this is a
+    /// readiness probe; the real first use during normal operation
+    /// will re-assume and cache.
+    pub async fn wait_for_ready(&self, role: &str, ttl_secs: u64) -> io::Result<()> {
+        let mut delay = Duration::from_millis(100);
+        let cap = Duration::from_secs(5);
+        let mut attempt: u64 = 0;
+        loop {
+            attempt += 1;
+            match self.assume_role(role, ttl_secs, &[], &[]).await {
+                Ok(_) => {
+                    if attempt > 1 {
+                        tracing::info!("[coordinator] mint reachable after {attempt} attempts");
+                    }
+                    return Ok(());
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if attempt == 1 || attempt.is_multiple_of(10) {
+                        warn!(
+                            "[coordinator] mint not reachable yet ({e}); \
+                             retrying (attempt {attempt})"
+                        );
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(cap);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
