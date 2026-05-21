@@ -326,8 +326,11 @@ async fn latest_snapshot_in_store(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<Option<Ulid>, IpcError> {
-    elide_coordinator::upload::read_latest_snapshot(store, &vol_ulid.to_string())
+    let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+    vd.snapshots()
+        .read_latest()
         .await
+        .map(|opt| opt.map(|(u, _)| u))
         .map_err(|e| {
             IpcError::store(format!(
                 "reading latest-snapshot pointer for {vol_ulid}: {e}"
@@ -370,15 +373,12 @@ async fn fetch_and_verify_manifest(
 
     if !local_path.exists() {
         job.line(format!("fetching basis manifest {snap_ulid}"));
-        let key =
-            elide_coordinator::upload::snapshot_manifest_key(&vol_ulid.to_string(), snap_ulid);
-        let bytes = store
-            .get(&key)
+        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+        let bytes = vd
+            .snapshots()
+            .get_manifest_bytes(snap_ulid)
             .await
-            .map_err(|e| IpcError::store(format!("fetching {filename} from store: {e}")))?
-            .bytes()
-            .await
-            .map_err(|e| IpcError::store(format!("reading {filename}: {e}")))?;
+            .map_err(|e| IpcError::store(format!("fetching {filename} from store: {e}")))?;
 
         std::fs::create_dir_all(&snap_dir)
             .map_err(|e| IpcError::internal(format!("creating snapshots/: {e}")))?;

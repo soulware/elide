@@ -29,15 +29,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use elide_core::signing::{self, VerifyingKey};
-use object_store::ObjectStore;
+use elide_core::signing::VerifyingKey;
 use object_store::path::Path as StorePath;
 use ulid::Ulid;
 
-use crate::upload;
 use crate::volume_data::VolumeData;
 
 /// The post-snapshot delta carried by `by_id/<vol>/HEAD`.
@@ -333,30 +330,26 @@ pub fn live_set(manifest_segments: &BTreeSet<Ulid>, head: &SegmentHead) -> BTree
 /// `Added` segments, and the formula reduces to those minus any
 /// `Superseded` / `Tombstoned` HEAD already accumulated.
 ///
-/// Bridges two object classes — HEAD (via the typed `head()` view)
-/// and `snapshots/LATEST` + manifest (via the raw `data_store()`
-/// escape hatch). When the snapshots view lands in a later step of
-/// `docs/design-domain-store.md`, the escape hatch goes away.
+/// Routed entirely through [`VolumeData`]'s typed views — `head()`
+/// for HEAD, `snapshots()` for `snapshots/LATEST` and the manifest.
+/// No `data_store()` escape hatch.
 pub async fn resolve_live_segments(
     vd: &VolumeData,
     manifest_verifying_key: &VerifyingKey,
 ) -> Result<BTreeSet<Ulid>, ResolveError> {
-    let vol = vd.vol_ulid();
-    let vol_id = vol.to_string();
-    let store = vd.data_store();
+    let snapshots = vd.snapshots();
+    let head_view = vd.head();
     // LATEST first — its result decides whether to fetch a manifest
     // at all. The manifest body GET and the HEAD GET are independent
     // once we know the snap ulid, so issue them concurrently and pay
     // one round-trip instead of two.
-    let snap_ulid = match upload::read_latest_snapshot(store, &vol_id).await {
-        Ok(opt) => opt,
+    let snap_ulid = match snapshots.read_latest().await {
+        Ok(opt) => opt.map(|(u, _)| u),
         Err(e) => return Err(ResolveError::Latest(e.to_string())),
     };
-    let head_view = vd.head();
     let manifest_segments = match snap_ulid {
         Some(snap) => {
-            let manifest_fut =
-                fetch_and_parse_manifest(store, &vol_id, snap, manifest_verifying_key);
+            let manifest_fut = fetch_and_parse_manifest(&snapshots, snap, manifest_verifying_key);
             let head_fut = head_view.read();
             let (manifest_res, head_res) = futures::join!(manifest_fut, head_fut);
             let head = head_res.map_err(|e| ResolveError::Head(e.to_string()))?;
@@ -373,28 +366,23 @@ pub async fn resolve_live_segments(
 }
 
 async fn fetch_and_parse_manifest(
-    store: &Arc<dyn ObjectStore>,
-    vol_id: &str,
+    snapshots: &crate::volume_data::SnapshotsView<'_>,
     snap_ulid: Ulid,
     manifest_verifying_key: &VerifyingKey,
 ) -> Result<BTreeSet<Ulid>, ResolveError> {
-    let key = upload::snapshot_manifest_key(vol_id, snap_ulid);
-    let bytes = match store.get(&key).await {
-        Ok(g) => g
-            .bytes()
-            .await
-            .map_err(|e| ResolveError::Manifest(format!("{key}: {e}")))?,
-        // A LATEST pointer to a missing manifest is benign — the
-        // pointer is a perf hint, not a correctness datum
-        // (`upload.rs` *snapshot_latest_key*). Self-heals on next
-        // publish; treat as no manifest.
-        Err(object_store::Error::NotFound { .. }) => return Ok(BTreeSet::new()),
-        Err(e) => return Err(ResolveError::Manifest(format!("{key}: {e}"))),
-    };
-    let manifest =
-        signing::read_snapshot_manifest_from_bytes(&bytes, manifest_verifying_key, &snap_ulid)
-            .map_err(|e| ResolveError::Manifest(format!("{key} parse/verify: {e}")))?;
-    Ok(manifest.segment_ulids.into_iter().collect())
+    // A LATEST pointer to a missing manifest is benign — the pointer
+    // is a perf hint, not a correctness datum. Self-heals on next
+    // publish; treat as no manifest.
+    match snapshots
+        .get_manifest(snap_ulid, manifest_verifying_key)
+        .await
+    {
+        Ok(manifest) => Ok(manifest.segment_ulids.into_iter().collect()),
+        Err(crate::volume_data::SnapshotsError::Get(object_store::Error::NotFound { .. })) => {
+            Ok(BTreeSet::new())
+        }
+        Err(e) => Err(ResolveError::Manifest(e.to_string())),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,24 +669,23 @@ mod tests {
 
     use crate::volume_data::VolumeData;
     use bytes::Bytes;
+    use object_store::ObjectStore;
+    use std::sync::Arc;
 
     async fn seed_manifest(
-        store: &Arc<dyn ObjectStore>,
-        vol_id: &str,
+        vd: &VolumeData,
         snap_ulid: Ulid,
         segments: &[Ulid],
         signer: &dyn elide_core::segment::SegmentSigner,
     ) {
         let bytes = elide_core::signing::build_snapshot_manifest_bytes(signer, segments, None);
-        let key = crate::upload::snapshot_manifest_key(vol_id, snap_ulid);
-        store.put(&key, Bytes::from(bytes).into()).await.unwrap();
-        // Seed the LATEST pointer the same way `bump_latest_snapshot` would.
-        let latest_key = crate::upload::snapshot_latest_key(vol_id);
-        store
-            .put(
-                &latest_key,
-                Bytes::from(snap_ulid.to_string().into_bytes()).into(),
-            )
+        vd.snapshots()
+            .put_manifest(snap_ulid, Bytes::from(bytes))
+            .await
+            .unwrap();
+        // Seed the LATEST pointer via the typed CAS.
+        vd.snapshots()
+            .advance_latest(None, snap_ulid)
             .await
             .unwrap();
     }
@@ -726,9 +713,9 @@ mod tests {
         let s1 = m.next();
         let s2 = m.next();
         let snap = m.next();
-        seed_manifest(&store, &vol().to_string(), snap, &[s1, s2], &*signer).await;
-
         let vd = vd_for(store);
+        seed_manifest(&vd, snap, &[s1, s2], &*signer).await;
+
         let live = resolve_live_segments(&vd, &vk).await.unwrap();
         assert_eq!(live, [s1, s2].into_iter().collect());
     }
@@ -767,7 +754,8 @@ mod tests {
         let post2 = m.next(); // will be Tombstoned
         let out = m.next(); // GC output for pre2
 
-        seed_manifest(&store, &vol().to_string(), snap, &[pre1, pre2], &*signer).await;
+        let vd = vd_for(Arc::clone(&store));
+        seed_manifest(&vd, snap, &[pre1, pre2], &*signer).await;
 
         let mut head = SegmentHead::empty(Some(snap));
         head.added.insert(post1);
@@ -781,7 +769,6 @@ mod tests {
             },
         );
         head.tombstoned.insert(post2);
-        let vd = vd_for(Arc::clone(&store));
         vd.head().put(&head).await.unwrap();
 
         let live = resolve_live_segments(&vd, &vk).await.unwrap();
@@ -799,18 +786,12 @@ mod tests {
         let mut m = mint();
         let snap = m.next();
         let a = m.next();
-        // Seed LATEST but no manifest blob.
-        let latest_key = crate::upload::snapshot_latest_key(&vol().to_string());
-        store
-            .put(
-                &latest_key,
-                Bytes::from(snap.to_string().into_bytes()).into(),
-            )
-            .await
-            .unwrap();
+        let vd = vd_for(Arc::clone(&store));
+        // Seed LATEST via the typed CAS, but skip the manifest body —
+        // the resolver must tolerate the dangling pointer.
+        vd.snapshots().advance_latest(None, snap).await.unwrap();
         let mut head = SegmentHead::empty(None);
         head.added.insert(a);
-        let vd = vd_for(Arc::clone(&store));
         vd.head().put(&head).await.unwrap();
 
         let live = resolve_live_segments(&vd, &vk).await.unwrap();
