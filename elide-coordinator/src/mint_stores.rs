@@ -43,6 +43,11 @@ use crate::mint_client::{
 
 const CAVEAT_VOLUME: &str = "elide:Volume";
 
+/// `volume-ro` cache key: `(vol_ulid, normalised ancestor set)`.
+/// Ancestors are sorted + deduped at insert time so two calls with
+/// equivalent sets share a single facade.
+type VolumeRoKey = (Ulid, Vec<Ulid>);
+
 /// Documented coord-* TTLs (`docs/design-mint.md` § *Elide as
 /// customer*): coordinator-wide control plane 1h, per-volume data 24h.
 const COORD_CONTROL_TTL_SECS: u64 = 60 * 60;
@@ -276,6 +281,13 @@ pub struct MintScopedStores {
     endpoint: MintEndpoint,
     store_cfg: StoreSection,
     data: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
+    /// `volume-ro` facades keyed by `(vol_ulid, sorted ancestors)`. The
+    /// ancestor list is normalised so two calls with equivalent sets
+    /// (different order or with duplicates) share one facade. Most
+    /// callers pass `&[]`, so in practice this collapses to one entry
+    /// per `vol_ulid` for the read-only chain-walk paths and one extra
+    /// entry per distinct ancestor set for the prefetch fan-out.
+    volume_ro: Mutex<HashMap<VolumeRoKey, Arc<RoleStore>>>,
 }
 
 impl MintScopedStores {
@@ -306,6 +318,7 @@ impl MintScopedStores {
             endpoint,
             store_cfg,
             data: Mutex::new(HashMap::new()),
+            volume_ro: Mutex::new(HashMap::new()),
         }
     }
 
@@ -359,18 +372,34 @@ impl ScopedStores for MintScopedStores {
     }
 
     fn volume_ro(&self, vol_ulid: &Ulid, ancestors: &[Ulid]) -> Arc<dyn ObjectStore> {
-        // Not cached: the ancestor list varies per call (chain walks
-        // discover different lineages; ancestor-pull sites mint with
-        // `&[]`). Each `volume_ro` minted store assumes its keypair
-        // lazily on first op and reuses it for the role's 1h window.
-        Arc::new(RoleStore::with_ancestors(
+        // Cached by `(vol_ulid, sorted ancestors)` so successive reads
+        // of the same parent inside one claim/start collapse onto one
+        // mint round-trip — the role's 1h TTL covers a whole orchestrator
+        // pass. The ancestor list is normalised (sorted + deduped) so
+        // callers that pass equivalent sets in different orders share
+        // an entry. `try_lock` keeps the method sync; momentary
+        // contention falls back to constructing a fresh facade.
+        let mut key_ancestors = ancestors.to_vec();
+        key_ancestors.sort();
+        key_ancestors.dedup();
+        let key = (*vol_ulid, key_ancestors);
+        if let Ok(map) = self.volume_ro.try_lock()
+            && let Some(rs) = map.get(&key)
+        {
+            return Arc::clone(rs) as Arc<dyn ObjectStore>;
+        }
+        let rs = Arc::new(RoleStore::with_ancestors(
             self.endpoint.clone(),
             self.store_cfg.clone(),
             ROLE_VOLUME_RO,
             VOLUME_RO_TTL_SECS,
             Some(*vol_ulid),
-            ancestors.to_vec(),
-        )) as Arc<dyn ObjectStore>
+            key.1.clone(),
+        ));
+        if let Ok(mut map) = self.volume_ro.try_lock() {
+            map.insert(key, Arc::clone(&rs));
+        }
+        rs as Arc<dyn ObjectStore>
     }
 }
 
@@ -418,5 +447,87 @@ mod tests {
         for role in [ROLE_COORD_BASE, ROLE_COORD_WRITER, ROLE_COORD_DATA] {
             assert!(extra_body_for(role, &[Ulid::new()]).is_empty());
         }
+    }
+
+    fn test_scoped_stores() -> MintScopedStores {
+        use elide_coordinator::config::StoreSection;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let identity = Arc::new(
+            CoordinatorIdentity::load_or_generate(tmp.path()).expect("identity load_or_generate"),
+        );
+        // A unix:<path> URL satisfies validation; no `assume_role` is
+        // ever invoked in these tests — the facades are inspected for
+        // cache identity only.
+        let cfg = MintConfig {
+            url: "unix:/tmp/elide-mint-test.sock".to_owned(),
+            connect_timeout: std::time::Duration::from_secs(5),
+            request_timeout: std::time::Duration::from_secs(30),
+        };
+        MintScopedStores::new(
+            &cfg,
+            StoreSection::default(),
+            tmp.path().to_path_buf(),
+            identity,
+        )
+    }
+
+    #[test]
+    fn volume_ro_cache_reuses_facade_for_same_vol_and_ancestors() {
+        let stores = test_scoped_stores();
+        let v = Ulid::new();
+        let s1 = stores.volume_ro(&v, &[]);
+        let s2 = stores.volume_ro(&v, &[]);
+        assert!(
+            Arc::ptr_eq(&s1, &s2),
+            "second volume_ro call with identical (vol_ulid, ancestors) must hit the cache"
+        );
+    }
+
+    #[test]
+    fn volume_ro_cache_normalises_ancestor_set() {
+        let stores = test_scoped_stores();
+        let v = Ulid::new();
+        let a = Ulid::new();
+        let b = Ulid::new();
+        // Same set, different order: must collide on the same cache entry.
+        let s1 = stores.volume_ro(&v, &[a, b]);
+        let s2 = stores.volume_ro(&v, &[b, a]);
+        assert!(
+            Arc::ptr_eq(&s1, &s2),
+            "ancestor order must not affect cache key"
+        );
+        // And dedup: [a, a] equivalent to [a].
+        let s3 = stores.volume_ro(&v, &[a]);
+        let s4 = stores.volume_ro(&v, &[a, a]);
+        assert!(
+            Arc::ptr_eq(&s3, &s4),
+            "duplicate ancestors must not split the cache entry"
+        );
+    }
+
+    #[test]
+    fn volume_ro_cache_separates_distinct_ancestor_sets() {
+        let stores = test_scoped_stores();
+        let v = Ulid::new();
+        let a = Ulid::new();
+        // Different ancestor sets must produce different facades —
+        // the mint-side policy expands a different set of read ARNs.
+        let empty = stores.volume_ro(&v, &[]);
+        let with_a = stores.volume_ro(&v, &[a]);
+        assert!(
+            !Arc::ptr_eq(&empty, &with_a),
+            "different ancestor sets must not share a facade"
+        );
+    }
+
+    #[test]
+    fn volume_ro_cache_separates_distinct_vol_ulids() {
+        let stores = test_scoped_stores();
+        let s_parent = stores.volume_ro(&Ulid::new(), &[]);
+        let s_other = stores.volume_ro(&Ulid::new(), &[]);
+        assert!(
+            !Arc::ptr_eq(&s_parent, &s_other),
+            "different vol_ulids must not share a facade"
+        );
     }
 }
