@@ -170,6 +170,74 @@ pub fn unregister_prefetch(tracker: &PrefetchTracker, vol_ulid: &Ulid) {
     }
 }
 
+/// Per-fork daemon-readiness flag.
+///
+/// `false` until the volume binary sends `NotifyVolumeReady` (i.e.
+/// `Volume::open` succeeded and the control socket is bound), then
+/// `true`. `start_volume_op` registers an entry before triggering
+/// rescan and awaits the flip with a bounded timeout, so the IPC reply
+/// doesn't lie about the daemon being ready to serve.
+pub type ReadinessTracker = Arc<Mutex<HashMap<Ulid, Arc<watch::Sender<bool>>>>>;
+
+/// Construct an empty [`ReadinessTracker`].
+pub fn new_readiness_tracker() -> ReadinessTracker {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Insert (or fetch) the readiness sender for `vol_ulid`, resetting the
+/// channel to `false`. Used by `start_volume_op` immediately before
+/// kicking the supervisor — the reset is what makes a second start of a
+/// previously-ready volume wait again rather than seeing the prior
+/// `true`.
+pub fn arm_readiness(tracker: &ReadinessTracker, vol_ulid: Ulid) -> Arc<watch::Sender<bool>> {
+    let mut guard = tracker.lock().expect("readiness tracker poisoned");
+    let sender = guard
+        .entry(vol_ulid)
+        .or_insert_with(|| {
+            let (tx, _rx) = watch::channel(false);
+            Arc::new(tx)
+        })
+        .clone();
+    sender.send_replace(false);
+    sender
+}
+
+/// Flip the readiness flag for `vol_ulid` to `true`. Idempotent;
+/// creates the entry if absent so a notify that arrives before
+/// `arm_readiness` (degenerate but possible if the order ever inverts)
+/// still leaves a `true` for the subsequent subscriber.
+pub fn signal_ready(tracker: &ReadinessTracker, vol_ulid: Ulid) {
+    let mut guard = tracker.lock().expect("readiness tracker poisoned");
+    guard
+        .entry(vol_ulid)
+        .or_insert_with(|| {
+            let (tx, _rx) = watch::channel(true);
+            Arc::new(tx)
+        })
+        .send_replace(true);
+}
+
+/// Subscribe to the per-fork readiness flag. Returns `None` if no
+/// entry exists.
+pub fn subscribe_readiness(
+    tracker: &ReadinessTracker,
+    vol_ulid: &Ulid,
+) -> Option<watch::Receiver<bool>> {
+    tracker
+        .lock()
+        .expect("readiness tracker poisoned")
+        .get(vol_ulid)
+        .map(|tx| tx.subscribe())
+}
+
+/// Remove the entry for `vol_ulid`. Called on volume teardown so the
+/// channel doesn't outlive the fork.
+pub fn unregister_readiness(tracker: &ReadinessTracker, vol_ulid: &Ulid) {
+    if let Ok(mut guard) = tracker.lock() {
+        guard.remove(vol_ulid);
+    }
+}
+
 #[cfg(test)]
 mod prefetch_tracker_tests {
     use super::*;
@@ -238,5 +306,61 @@ mod prefetch_tracker_tests {
         assert!(result.is_err(), "subscriber must see Err after exit");
         // After unregister, late subscribers find no entry.
         assert!(subscribe_prefetch(&tracker, &v).is_none());
+    }
+}
+
+#[cfg(test)]
+mod readiness_tracker_tests {
+    use super::*;
+
+    fn vol() -> Ulid {
+        Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAB").unwrap()
+    }
+
+    /// `arm_readiness` is idempotent on the channel identity (same
+    /// `Arc<Sender>` per ULID), but resets the value to `false` —
+    /// so a second start of a previously-ready volume waits again
+    /// rather than seeing the prior `true`.
+    #[tokio::test]
+    async fn arm_resets_value_but_keeps_channel() {
+        let tracker = new_readiness_tracker();
+        let v = vol();
+        let tx1 = arm_readiness(&tracker, v);
+        tx1.send_replace(true);
+        let mut rx = subscribe_readiness(&tracker, &v).expect("entry must be registered");
+        assert!(*rx.borrow_and_update());
+
+        let tx2 = arm_readiness(&tracker, v);
+        assert!(Arc::ptr_eq(&tx1, &tx2), "arm must reuse the existing Arc");
+        // The reset to false is visible to existing subscribers.
+        rx.changed().await.expect("re-arm must publish a change");
+        assert!(!*rx.borrow_and_update());
+    }
+
+    /// `signal_ready` flips the flag for subscribers waiting on
+    /// `changed().await`. Mirrors the start→notify path.
+    #[tokio::test]
+    async fn signal_ready_unblocks_subscriber() {
+        let tracker = new_readiness_tracker();
+        let v = vol();
+        arm_readiness(&tracker, v);
+        let mut rx = subscribe_readiness(&tracker, &v).expect("entry must be registered");
+        assert!(!*rx.borrow_and_update());
+
+        signal_ready(&tracker, v);
+        rx.changed().await.expect("signal_ready must publish");
+        assert!(*rx.borrow_and_update());
+    }
+
+    /// `signal_ready` arriving before `arm_readiness` (degenerate but
+    /// possible if the order ever inverts) still leaves a `true` flag
+    /// for the subsequent subscriber — no signal is lost.
+    #[tokio::test]
+    async fn signal_before_arm_is_durable() {
+        let tracker = new_readiness_tracker();
+        let v = vol();
+        signal_ready(&tracker, v);
+        let mut rx = subscribe_readiness(&tracker, &v).expect("entry must exist after signal");
+        assert!(*rx.borrow_and_update());
     }
 }

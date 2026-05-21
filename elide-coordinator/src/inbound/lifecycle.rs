@@ -1286,9 +1286,19 @@ pub(crate) async fn hydrate_or_route(
     }
 }
 
+/// Upper bound on how long `start_volume_op` waits for the volume
+/// daemon's `NotifyVolumeReady` after triggering the supervisor rescan.
+/// Sized for the supervisor's POLL_INTERVAL (2s) plus daemon spawn,
+/// `Volume::open`, WAL replay, and extent-index reconstruction; the
+/// trade-off is "operator wait" vs "false-negative timeout on a slow
+/// open". A timeout returns an error rather than silently letting the
+/// CLI claim success — the supervisor still keeps the daemon running.
+const START_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(crate) async fn start_volume_op(
     volume_name: &str,
     core: &CoordinatorCore,
+    readiness_tracker: &elide_coordinator::ReadinessTracker,
 ) -> Result<(), IpcError> {
     use elide_coordinator::volume_state::VolumeLifecycle;
     let data_dir: &Path = &core.data_dir;
@@ -1409,16 +1419,56 @@ pub(crate) async fn start_volume_op(
         }
     }
 
+    // Arm the readiness flag *before* triggering rescan so the daemon's
+    // `NotifyVolumeReady` can't beat us to the channel and leave a stale
+    // `true` from a previous start cycle. `arm_readiness` resets to
+    // `false` even if an entry already exists.
+    let vol_ulid = vol_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| ulid::Ulid::from_string(s).ok());
+    let mut ready_rx = vol_ulid.map(|u| {
+        elide_coordinator::arm_readiness(readiness_tracker, u);
+        elide_coordinator::subscribe_readiness(readiness_tracker, &u)
+            .expect("arm_readiness just inserted")
+    });
+
     std::fs::remove_file(vol_dir.join(STOPPED_FILE))
         .map_err(|e| IpcError::internal(format!("clearing volume.stopped: {e}")))?;
     crate::rescan::trigger();
 
-    // Note: stop-snapshot cleanup is no longer done here. The volume
-    // binary signals readiness via `NotifyVolumeReady` once
-    // `Volume::open` succeeds, and that handler cleans up the
-    // stop-snapshot. This avoids a window where `start` returned OK
-    // but the daemon failed to open, leaving the user with the
-    // bucket-side basis already deleted and no way to recover.
+    // Wait for the daemon to report readiness so the IPC reply doesn't
+    // race a subsequent `stop` / `snapshot` against a half-bound socket.
+    // If we couldn't derive a vol_ulid (foreign-shaped fork dir, should
+    // not happen for an owned start) skip the wait — better to return
+    // OK than block forever.
+    if let Some(rx) = ready_rx.as_mut() {
+        let wait = async {
+            // `borrow_and_update` consumes the current value; loop until
+            // it reports `true` or the channel closes.
+            loop {
+                if *rx.borrow_and_update() {
+                    return Ok(());
+                }
+                if rx.changed().await.is_err() {
+                    return Err(IpcError::internal(format!(
+                        "readiness channel for '{volume_name}' closed before ready"
+                    )));
+                }
+            }
+        };
+        match tokio::time::timeout(START_READY_TIMEOUT, wait).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(IpcError::internal(format!(
+                    "volume '{volume_name}' did not signal readiness within \
+                     {}s; the daemon may still be opening — check coordinator logs",
+                    START_READY_TIMEOUT.as_secs()
+                )));
+            }
+        }
+    }
 
     info!("[inbound] started volume {volume_name}");
     Ok(())
@@ -1457,6 +1507,7 @@ pub(crate) async fn notify_volume_ready_op(
     vol_ulid: ulid::Ulid,
     data_dir: &Path,
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
+    readiness_tracker: &elide_coordinator::ReadinessTracker,
 ) -> Result<(), IpcError> {
     let vol_ulid_str = vol_ulid.to_string();
     let fork_dir = data_dir.join("by_id").join(&vol_ulid_str);
@@ -1465,6 +1516,10 @@ pub(crate) async fn notify_volume_ready_op(
             "fork dir for {vol_ulid_str} not present locally"
         )));
     }
+    // Flip the readiness flag before doing post-ready housekeeping so
+    // any pending `start_volume_op` unblocks on the daemon's actual
+    // readiness, not on the cleanup completing.
+    elide_coordinator::signal_ready(readiness_tracker, vol_ulid);
     let vd = stores.volume_data(&vol_ulid);
     if let Err(e) = cleanup_stop_snapshots(&fork_dir, &vd).await {
         warn!(
@@ -2045,6 +2100,7 @@ mod tests {
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             snapshot_locks: SnapshotLockRegistry::default(),
             prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            readiness_tracker: elide_coordinator::new_readiness_tracker(),
             stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
                 store.clone(),
             )),
@@ -2118,6 +2174,7 @@ mod tests {
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             snapshot_locks: SnapshotLockRegistry::default(),
             prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            readiness_tracker: elide_coordinator::new_readiness_tracker(),
             stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
                 store.clone(),
             )),
@@ -2177,6 +2234,7 @@ mod tests {
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             snapshot_locks: SnapshotLockRegistry::default(),
             prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            readiness_tracker: elide_coordinator::new_readiness_tracker(),
             stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
                 store.clone(),
             )),

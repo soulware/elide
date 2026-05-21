@@ -78,7 +78,9 @@ use elide_coordinator::macaroon::{
 use elide_coordinator::volume_state::{
     FETCH_PID_FILE, IMPORTING_FILE, PID_FILE, write_released_marker,
 };
-use elide_coordinator::{EvictRegistry, PrefetchTracker, SnapshotLockRegistry, subscribe_prefetch};
+use elide_coordinator::{
+    EvictRegistry, PrefetchTracker, ReadinessTracker, SnapshotLockRegistry, subscribe_prefetch,
+};
 use elide_core::process::pid_is_alive;
 
 /// Shared coordinator state threaded through every inbound op.
@@ -101,6 +103,7 @@ pub struct IpcContext {
     pub evict_registry: EvictRegistry,
     pub snapshot_locks: SnapshotLockRegistry,
     pub prefetch_tracker: PrefetchTracker,
+    pub readiness_tracker: ReadinessTracker,
     pub stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
     /// The coordinator's identity bundle. Used as a `SegmentSigner`
     /// when minting synthesised handoff snapshots during
@@ -337,7 +340,8 @@ async fn dispatch_json(
         }
         Request::Start { volume } => {
             // Conditional PUT on names/<volume>: coordinator-wide.
-            let result = lifecycle::start_volume_op(&volume, &ctx.core()).await;
+            let result =
+                lifecycle::start_volume_op(&volume, &ctx.core(), &ctx.readiness_tracker).await;
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -411,8 +415,13 @@ async fn dispatch_json(
             // Deletes under `by_id/<vol>/snapshots/` — needs coord-data
             // per-vol, not coord-writer. The op picks the cred via
             // `ScopedStores::volume_data(&vol_ulid)` internally.
-            let result =
-                lifecycle::notify_volume_ready_op(vol_ulid, &ctx.data_dir, &ctx.stores).await;
+            let result = lifecycle::notify_volume_ready_op(
+                vol_ulid,
+                &ctx.data_dir,
+                &ctx.stores,
+                &ctx.readiness_tracker,
+            )
+            .await;
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -931,7 +940,10 @@ pub(crate) async fn snapshot_volume_kind(
     let link = core.data_dir.join("by_name").join(vol_name);
     let fork_dir = std::fs::canonicalize(&link)
         .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
-    if !fork_dir.join("control.sock").exists() {
+    // PID liveness, not raw control.sock existence — a `process::exit`
+    // shutdown or crash leaves the socket file behind, and that would
+    // false-positive this gate (see #432).
+    if !elide_coordinator::volume_state::VolumeLifecycle::from_dir(&fork_dir).is_running() {
         return Err(IpcError::conflict(format!(
             "volume '{vol_name}' is not running — start it first"
         )));

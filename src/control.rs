@@ -62,7 +62,7 @@ fn run(
 ) {
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_connection(stream, &handle, &client_connected),
+            Ok(stream) => handle_connection(stream, &socket_path, &handle, &client_connected),
             Err(_) => break,
         }
     }
@@ -71,6 +71,7 @@ fn run(
 
 fn handle_connection(
     stream: std::os::unix::net::UnixStream,
+    socket_path: &Path,
     handle: &VolumeClient,
     client_connected: &AtomicBool,
 ) {
@@ -116,6 +117,11 @@ fn handle_connection(
                 return;
             }
         }
+        // process::exit bypasses Drop, so the listener's natural cleanup
+        // at the end of `run` never runs. Unlink the socket here so the
+        // next start doesn't inherit a stale file that other liveness
+        // checks would misread as "daemon present".
+        let _ = std::fs::remove_file(socket_path);
         std::process::exit(0);
     }
 
