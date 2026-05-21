@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -30,6 +30,7 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use tokio::sync::Mutex;
+use tracing::info;
 use ulid::Ulid;
 
 use elide_coordinator::config::{MintConfig, StoreSection};
@@ -153,6 +154,10 @@ impl RoleStore {
             return Ok(Arc::clone(&c.store));
         }
 
+        // Time the assume-role round-trip and S3-client construction
+        // together — both are on the critical path of a credential
+        // miss and we want to know how much one cache miss costs.
+        let mint_started = Instant::now();
         let issued = self
             .assume()
             .await
@@ -160,6 +165,7 @@ impl RoleStore {
                 store: "mint",
                 source: Box::new(e),
             })?;
+        let assume_elapsed = mint_started.elapsed();
         let store = self
             .store_cfg
             .build_with_creds(&issued.access_key_id, &issued.secret_access_key)
@@ -167,6 +173,17 @@ impl RoleStore {
                 store: "mint",
                 source: e.into(),
             })?;
+        let total_elapsed = mint_started.elapsed();
+        info!(
+            "[mint] assume role={} vol={} assume={:.2?} total={:.2?} ttl={}s",
+            self.role,
+            self.vol_ulid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            assume_elapsed,
+            total_elapsed,
+            self.ttl_secs,
+        );
 
         let now = now_unix();
         let expiry = issued.expiry_unix.unwrap_or(now + self.ttl_secs);
@@ -276,6 +293,18 @@ pub struct MintScopedStores {
     endpoint: MintEndpoint,
     store_cfg: StoreSection,
     data: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
+    /// `volume-ro` facades for single-volume reads, keyed by `vol_ulid`.
+    /// Populated by `read_volume`; each entry's mint policy grants
+    /// `by_id/<vol_ulid>/*` only.
+    read_volume: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
+    /// `volume-ro` facades for head-prefetch reads, keyed by the head
+    /// `vol_ulid`. The ancestor chain is deterministic from the head's
+    /// provenance, so the first call's chain wins; subsequent calls for
+    /// the same head reuse the facade. Kept separate from `read_volume`
+    /// so a previously-cached narrow facade can't satisfy a later wide
+    /// request (and vice versa, the wide facade is more permissive than
+    /// any future narrow request needs).
+    read_head: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
 }
 
 impl MintScopedStores {
@@ -306,6 +335,8 @@ impl MintScopedStores {
             endpoint,
             store_cfg,
             data: Mutex::new(HashMap::new()),
+            read_volume: Mutex::new(HashMap::new()),
+            read_head: Mutex::new(HashMap::new()),
         }
     }
 
@@ -358,19 +389,56 @@ impl ScopedStores for MintScopedStores {
         rs as Arc<dyn ObjectStore>
     }
 
-    fn volume_ro(&self, vol_ulid: &Ulid, ancestors: &[Ulid]) -> Arc<dyn ObjectStore> {
-        // Not cached: the ancestor list varies per call (chain walks
-        // discover different lineages; ancestor-pull sites mint with
-        // `&[]`). Each `volume_ro` minted store assumes its keypair
-        // lazily on first op and reuses it for the role's 1h window.
-        Arc::new(RoleStore::with_ancestors(
+    fn read_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+        // Cached by vol_ulid so successive reads of the same parent
+        // inside one claim/start collapse onto one mint round-trip —
+        // the role's 1h TTL covers a whole orchestrator pass.
+        // `try_lock` keeps the method sync; momentary contention falls
+        // back to constructing a fresh facade (its first op assumes
+        // lazily either way — no correctness impact).
+        if let Ok(map) = self.read_volume.try_lock()
+            && let Some(rs) = map.get(vol_ulid)
+        {
+            return Arc::clone(rs) as Arc<dyn ObjectStore>;
+        }
+        let rs = Arc::new(RoleStore::new(
+            self.endpoint.clone(),
+            self.store_cfg.clone(),
+            ROLE_VOLUME_RO,
+            VOLUME_RO_TTL_SECS,
+            Some(*vol_ulid),
+        ));
+        if let Ok(mut map) = self.read_volume.try_lock() {
+            map.insert(*vol_ulid, Arc::clone(&rs));
+        }
+        rs as Arc<dyn ObjectStore>
+    }
+
+    fn read_head_with_ancestors(
+        &self,
+        vol_ulid: &Ulid,
+        ancestors: &[Ulid],
+    ) -> Arc<dyn ObjectStore> {
+        // Cached by vol_ulid. The ancestor chain is deterministic from
+        // the head's own provenance, so a second call for the same head
+        // hits the cache regardless of the literal ancestor argument.
+        if let Ok(map) = self.read_head.try_lock()
+            && let Some(rs) = map.get(vol_ulid)
+        {
+            return Arc::clone(rs) as Arc<dyn ObjectStore>;
+        }
+        let rs = Arc::new(RoleStore::with_ancestors(
             self.endpoint.clone(),
             self.store_cfg.clone(),
             ROLE_VOLUME_RO,
             VOLUME_RO_TTL_SECS,
             Some(*vol_ulid),
             ancestors.to_vec(),
-        )) as Arc<dyn ObjectStore>
+        ));
+        if let Ok(mut map) = self.read_head.try_lock() {
+            map.insert(*vol_ulid, Arc::clone(&rs));
+        }
+        rs as Arc<dyn ObjectStore>
     }
 }
 
@@ -418,5 +486,81 @@ mod tests {
         for role in [ROLE_COORD_BASE, ROLE_COORD_WRITER, ROLE_COORD_DATA] {
             assert!(extra_body_for(role, &[Ulid::new()]).is_empty());
         }
+    }
+
+    fn test_scoped_stores() -> MintScopedStores {
+        use elide_coordinator::config::StoreSection;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let identity = Arc::new(
+            CoordinatorIdentity::load_or_generate(tmp.path()).expect("identity load_or_generate"),
+        );
+        // A unix:<path> URL satisfies validation; no `assume_role` is
+        // ever invoked in these tests — the facades are inspected for
+        // cache identity only.
+        let cfg = MintConfig {
+            url: "unix:/tmp/elide-mint-test.sock".to_owned(),
+            connect_timeout: std::time::Duration::from_secs(5),
+            request_timeout: std::time::Duration::from_secs(30),
+        };
+        MintScopedStores::new(
+            &cfg,
+            StoreSection::default(),
+            tmp.path().to_path_buf(),
+            identity,
+        )
+    }
+
+    #[test]
+    fn read_volume_cache_reuses_facade_for_same_vol_ulid() {
+        let stores = test_scoped_stores();
+        let v = Ulid::new();
+        let s1 = stores.read_volume(&v);
+        let s2 = stores.read_volume(&v);
+        assert!(
+            Arc::ptr_eq(&s1, &s2),
+            "second read_volume call for the same vol_ulid must hit the cache"
+        );
+    }
+
+    #[test]
+    fn read_volume_cache_separates_distinct_vol_ulids() {
+        let stores = test_scoped_stores();
+        let s_parent = stores.read_volume(&Ulid::new());
+        let s_other = stores.read_volume(&Ulid::new());
+        assert!(
+            !Arc::ptr_eq(&s_parent, &s_other),
+            "different vol_ulids must not share a facade"
+        );
+    }
+
+    #[test]
+    fn read_head_cache_reuses_facade_for_same_head() {
+        let stores = test_scoped_stores();
+        let v = Ulid::new();
+        let a = Ulid::new();
+        let s1 = stores.read_head_with_ancestors(&v, &[a]);
+        let s2 = stores.read_head_with_ancestors(&v, &[a]);
+        assert!(
+            Arc::ptr_eq(&s1, &s2),
+            "second head-prefetch call for the same head must hit the cache"
+        );
+    }
+
+    #[test]
+    fn read_volume_and_read_head_use_independent_caches() {
+        // The same vol_ulid called via the two methods must produce
+        // distinct facades — the narrow one (read_volume) and the wide
+        // one (read_head_with_ancestors) carry different mint policies,
+        // and the wide-then-narrow / narrow-then-wide ordering must
+        // not contaminate either cache.
+        let stores = test_scoped_stores();
+        let v = Ulid::new();
+        let a = Ulid::new();
+        let narrow = stores.read_volume(&v);
+        let wide = stores.read_head_with_ancestors(&v, &[a]);
+        assert!(
+            !Arc::ptr_eq(&narrow, &wide),
+            "single-volume and head-with-ancestors facades must be independent"
+        );
     }
 }
