@@ -317,7 +317,7 @@ async fn dispatch_json(
             let result = if force {
                 // force-release straddles two role scopes: coord-writer
                 // for names/<name> + events/<name>/, and per-vol
-                // coord-data for by_id/<dead_vol>/. Pass the
+                // volume-rw for by_id/<dead_vol>/. Pass the
                 // `ScopedStores` so the op can pick the right
                 // credential for each step.
                 lifecycle::force_release_volume_op(
@@ -329,7 +329,7 @@ async fn dispatch_json(
                 .await
             } else {
                 // `release_volume_op` straddles two role scopes
-                // (coord-writer for names/<name> + per-vol coord-data
+                // (coord-writer for names/<name> + per-vol volume-rw
                 // for by_id/<vol>/snapshots/). It picks the right
                 // credential for each step internally; just hand it
                 // the IpcContext.
@@ -414,7 +414,7 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::NotifyVolumeReady { vol_ulid } => {
-            // Deletes under `by_id/<vol>/snapshots/` — needs coord-data
+            // Deletes under `by_id/<vol>/snapshots/` — needs volume-rw
             // per-vol, not coord-writer. The op picks the cred via
             // `ScopedStores::volume_data(&vol_ulid)` internally.
             let result = lifecycle::notify_volume_ready_op(
@@ -959,12 +959,12 @@ pub(crate) async fn snapshot_volume_kind(
         .map_err(|e| IpcError::internal(format!("deriving volume id: {e}")))?;
     // Every store op below writes under `by_id/<vol>/` (segment drain,
     // GC handoff apply, snapshot manifest publish). That prefix is
-    // owned by `coord-data`; `coord-writer` is `names/*` + `events/*`
+    // owned by `volume-rw`; `coord-writer` is `names/*` + `events/*`
     // + `coordinators/<sub>/*` only and would 403 on the snapshot PUT.
     // Mirrors the same fix in `release_volume_op` (commit 4e6950f).
     let vol_ulid = ulid::Ulid::from_string(&volume_id)
         .map_err(|e| IpcError::internal(format!("vol dir name not a valid ULID: {e}")))?;
-    let store = core.stores.data_for_volume(&vol_ulid);
+    let store = core.stores.volume_rw(&vol_ulid);
 
     let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir);
     let _guard = lock.lock_owned().await;
@@ -1687,7 +1687,7 @@ async fn create_volume_op(
     let identity = &core.identity;
     // `coord-writer` for the names/<name> rollback on Phase-4 failure
     // (see end of function); the by_id/<vol>/{volume.pub,.provenance}
-    // uploads go through the per-volume `coord-data` handle vended by
+    // uploads go through the per-volume `volume-rw` handle vended by
     // `core.stores.volume_data(&vol_ulid)`.
     let store = core.stores.writer();
     let data_dir: &Path = &core.data_dir;
@@ -3173,10 +3173,10 @@ mod tests {
     // routing can't quietly regress.
 
     #[tokio::test]
-    async fn snapshot_volume_kind_routes_through_data_for_volume() {
+    async fn snapshot_volume_kind_routes_through_volume_rw() {
         // Regression for the user-visible 2026-05-21 bug: stop's
         // snapshot publish (and the GC handoff apply + drain) write
-        // under `by_id/<vol>/`, which needs per-vol `coord-data`. Using
+        // under `by_id/<vol>/`, which needs per-vol `volume-rw`. Using
         // `writer()` (coord-writer) produced silent 403s on Tigris.
         //
         // We can't run the full snapshot through this unit test (it
@@ -3227,8 +3227,8 @@ mod tests {
         let calls = recording.calls();
         assert_eq!(
             calls,
-            vec![RoleCall::DataForVolume(vol_ulid)],
-            "stop's snapshot publish must mint coord-data for the vol_ulid; \
+            vec![RoleCall::VolumeRw(vol_ulid)],
+            "stop's snapshot publish must mint volume-rw for the vol_ulid; \
              got {calls:?}"
         );
     }

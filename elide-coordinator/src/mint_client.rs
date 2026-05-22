@@ -39,19 +39,19 @@ const NONCE_LEN: usize = 16;
 /// Canonical mint role inventory — the single source of truth shared by
 /// the enrollment fan-out (`crate::enroll`), the `[mint]` startup gate,
 /// and the scoped stores (`crate::mint_stores`), so the three can never
-/// drift. `coord-data` is per-volume only at `assume-role` time (the
+/// drift. `volume-rw` is per-volume only at `assume-role` time (the
 /// `elide:Volume` narrowing caveat); enrollment still mints exactly one
-/// `credentials/coord-data`.
+/// `credentials/volume-rw`.
 pub(crate) const ROLE_COORD_BASE: &str = "coord-base";
 pub(crate) const ROLE_COORD_WRITER: &str = "coord-writer";
-pub(crate) const ROLE_COORD_DATA: &str = "coord-data";
+pub(crate) const ROLE_VOLUME_RW: &str = "volume-rw";
 pub(crate) const ROLE_VOLUME_RO: &str = "volume-ro";
 
 /// Every role the coordinator enrols for, in fan-out order.
 pub(crate) const COORD_ENROLL_ROLES: &[&str] = &[
     ROLE_COORD_BASE,
     ROLE_COORD_WRITER,
-    ROLE_COORD_DATA,
+    ROLE_VOLUME_RW,
     ROLE_VOLUME_RO,
 ];
 

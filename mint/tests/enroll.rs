@@ -40,15 +40,15 @@ max_ttl_seconds = 2592000
 default_ttl_seconds = 2592000
 policy_file = "volume-ro.json"
 [[role]]
-name = "coord-data"
+name = "volume-rw"
 required_caveats = ["aud"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
-policy_file = "coord-data.json"
+policy_file = "volume-rw.json"
 "#;
 
-const COORD_DATA_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[]}"#;
+const VOLUME_RW_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[]}"#;
 
 const POLICY: &str = r#"
 {
@@ -67,7 +67,7 @@ fn config() -> Config {
         TOML_TEMPLATE,
         &[
             ("volume-ro.json", POLICY),
-            ("coord-data.json", COORD_DATA_POLICY),
+            ("volume-rw.json", VOLUME_RW_POLICY),
         ],
     )
 }
@@ -228,7 +228,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
                 "/v1/enroll-exchange",
                 &ticket,
                 &COORD_SEED,
-                r#","role":"coord-data""#,
+                r#","role":"volume-rw""#,
             ))
             .await
             .unwrap(),
@@ -238,7 +238,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     let cd = field(&body, "credential");
     assert_eq!(
         EffectiveCaveats::new(cd.caveats()).resolve(name::ROLE),
-        Resolved::Value("coord-data".into())
+        Resolved::Value("volume-rw".into())
     );
 
     // floor gate: a role not in the mint config is the same opaque 401.

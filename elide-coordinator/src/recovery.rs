@@ -350,12 +350,12 @@ impl std::error::Error for ResolveHandoffError {}
 ///      uses the source volume's own `volume.pub` (the regular
 ///      block-reader path).
 ///
-/// `data_store` is scoped to `by_id/<vol_ulid>/` (`coord-data`) and
+/// `data_store` is scoped to `by_id/<vol_ulid>/` (`volume-rw`) and
 /// reads the manifest. `base_ro_store` is the coordinator-wide
 /// `coord-base` read scope and is used only to fetch the recovering
 /// coordinator's `coordinators/<id>/coordinator.pub` — a key outside
 /// any single volume's `by_id/` prefix and therefore not reachable
-/// under `coord-data`. The split mirrors `volume release --force`'s
+/// under `volume-rw`. The split mirrors `volume release --force`'s
 /// per-credential routing (see PR #405).
 ///
 /// Failures at any step refuse cleanly with a typed

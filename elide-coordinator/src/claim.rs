@@ -765,7 +765,7 @@ impl ClaimOrchestrator {
                 .append(ClaimAttachEvent::PullingAncestor { vol_ulid });
             // Ancestor reads are GETs only — read-scoped `volume-ro`
             // is enough (and avoids reaching for write-capable
-            // `coord-data` we never use on this path).
+            // `volume-rw` we never use on this path).
             let store = self.ctx.core.stores.read_volume(&vol_ulid);
             self.pulled_guard.record(vol_ulid);
             let reply = pull_readonly_op(

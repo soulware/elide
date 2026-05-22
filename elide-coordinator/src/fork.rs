@@ -314,7 +314,8 @@ impl ForkOrchestrator {
             }
             self.job
                 .append(ForkAttachEvent::PullingAncestor { vol_ulid });
-            let store = self.ctx.core.stores.data_for_volume(&vol_ulid);
+            // Skeleton pull is pure-read — `volume-ro`, not `volume-rw`.
+            let store = self.ctx.core.stores.read_volume(&vol_ulid);
             let reply = pull_readonly_op(vol_ulid, &self.ctx.core.data_dir, &store, None).await?;
             next = reply.parent;
         }
@@ -342,7 +343,8 @@ impl ForkOrchestrator {
     ///     "now" snapshot via [`force_snapshot_now_op`] and record the
     ///     attestation pubkey as `parent_key_hex`.
     ///   - Readonly source: use the latest local snapshot, falling back
-    ///     to [`latest_snapshot_op`] (LIST in S3).
+    ///     to [`latest_snapshot_op`] (the per-vol `snapshots/LATEST`
+    ///     pointer in S3).
     ///   - Writable source: take an implicit snapshot. If the source
     ///     daemon is stopped, transparently bring it up in
     ///     transport-suppressed mode for the drain, then halt and
@@ -368,9 +370,9 @@ impl ForkOrchestrator {
             let snap_ulid = if self.force_snapshot {
                 // `force_snapshot_now_op` reads `by_id/<source>/segments/`
                 // and PUTs the new manifest under `by_id/<source>/snapshots/`,
-                // so it rides per-vol `coord-data` for the source — not
+                // so it rides per-vol `volume-rw` for the source — not
                 // `coord-writer`, which has no `by_id/` access.
-                let store = self.ctx.core.stores.data_for_volume(&source_vol_ulid);
+                let store = self.ctx.core.stores.volume_rw(&source_vol_ulid);
                 let reply =
                     force_snapshot_now_op(source_vol_ulid, &self.ctx.core.data_dir, &store).await?;
                 self.parent_key_hex = Some(reply.attestation_pubkey_hex.clone());
@@ -384,7 +386,8 @@ impl ForkOrchestrator {
             {
                 snap
             } else {
-                let store = self.ctx.core.stores.data_for_volume(&source_vol_ulid);
+                // Pure-read latest-snapshot pointer lookup — `volume-ro`.
+                let store = self.ctx.core.stores.read_volume(&source_vol_ulid);
                 match latest_snapshot_op(source_vol_ulid, &store)
                     .await?
                     .snapshot_ulid
@@ -590,13 +593,12 @@ async fn force_snapshot_now_op(
         )));
     }
 
-    // Step 1: pull every .idx visible in S3 for this volume into local
-    // index/. We deliberately use the LIST-based path here rather than
-    // `prefetch_indexes` — the whole point of `force_snapshot_now` is to
-    // capture *pre-snapshot* bucket state (segments published since the
-    // last manifest, or where no manifest exists yet), so anchoring on a
-    // manifest would defeat the operation. The retention/ filter is
-    // preserved so we don't round-trip GC-superseded inputs.
+    // Step 1: pull every live .idx for this volume into local index/.
+    // `pull_indexes_for_head` resolves the live set from HEAD (not a
+    // snapshot manifest) — the whole point of `force_snapshot_now` is
+    // to capture *pre-snapshot* bucket state (segments published since
+    // the last manifest, or where no manifest exists yet), so anchoring
+    // on a manifest would defeat the operation.
     //
     // No peer-fetch tier on the IPC pull-readonly path: this code runs
     // for ad-hoc readonly hydration (e.g. CLI inspect of a peer's
@@ -607,9 +609,9 @@ async fn force_snapshot_now_op(
         elide_core::signing::VOLUME_PUB_FILE,
     )
     .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
-    elide_coordinator::prefetch::pull_indexes_via_list(store, &ancestor_dir, &volume_id, &vk, None)
+    elide_coordinator::prefetch::pull_indexes_for_head(store, &ancestor_dir, &volume_id, &vk, None)
         .await
-        .map_err(|e| IpcError::store(format!("pulling indexes via list: {e:#}")))?;
+        .map_err(|e| IpcError::store(format!("pulling indexes for head: {e:#}")))?;
 
     // Step 2: enumerate prefetched .idx files. Pin ULID = max(segments).
     let index_dir = ancestor_dir.join("index");

@@ -28,19 +28,19 @@ audience = "mint"
 [tenant]
 bucket = "demo-bucket"
 [[role]]
-name = "coord-data"
+name = "volume-rw"
 required_caveats = ["aud"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
-policy_file = "coord-data.json"
+policy_file = "volume-rw.json"
 "#;
 
 fn config() -> Config {
     common::parse_config(
         TOML,
         &[(
-            "coord-data.json",
+            "volume-rw.json",
             r#"{"Version":"2012-10-17","Statement":[]}"#,
         )],
     )
@@ -93,7 +93,7 @@ async fn full_flow_over_unix_socket() {
     .expect("enroll over uds");
 
     // exchange before approval: not a failure, just not yet approved.
-    let role = "coord-data";
+    let role = "volume-rw";
     let cred = mint::client::credential_path(role);
     assert!(
         !mint::client::exchange(

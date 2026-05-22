@@ -32,7 +32,7 @@ max_ttl_seconds = 2592000      # 30 days
 default_ttl_seconds = 2592000
 
 [[role]]
-name = "coord-data"
+name = "volume-rw"
 required_caveats = ["sub", "elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 86400        # 24h

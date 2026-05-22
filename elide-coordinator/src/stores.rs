@@ -19,7 +19,7 @@
 //!   write: `names/`, `events/` (get + append), own
 //!   `coordinators/<sub>/`, and `ListBucket`.
 //!
-//! * [`ScopedStores::data_for_volume`] — `coord-data`. Per-volume
+//! * [`ScopedStores::volume_rw`] — `volume-rw`. Per-volume
 //!   read+write under `by_id/<vol_ulid>/`.
 //!
 //! `volume-ro` is vended to the volume process
@@ -107,9 +107,12 @@ pub trait ScopedStores: Send + Sync {
     /// paths use this end-to-end (the reads in a CAS included).
     fn writer(&self) -> Arc<dyn ObjectStore>;
 
-    /// `coord-data`: read+write under `by_id/<vol_ulid>/`. Uploads,
-    /// GC, snapshot publish.
-    fn data_for_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore>;
+    /// `volume-rw`: read+write under `by_id/<vol_ulid>/`. The write
+    /// credential for one volume's data — segment drain, GC, snapshot
+    /// publish — and the credential for mixed read+write paths (a
+    /// recovery flow that reads HEAD then publishes a synthesised
+    /// manifest). Pure-read sites use [`Self::read_volume`] instead.
+    fn volume_rw(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore>;
 
     /// `volume-ro` scoped to one volume's prefix only. Read-only
     /// under `by_id/<vol_ulid>/*`. Used by single-volume read sites:
@@ -188,12 +191,12 @@ pub trait ScopedStores: Send + Sync {
     /// Per-volume domain handle for `by_id/<vol>/…` objects. Vends
     /// non-`async` sub-accessors (`head()`, `metadata()`) that group
     /// the operations a caller may name. Backed by the same
-    /// `coord-data` credential as [`Self::data_for_volume`]; the two
+    /// `volume-rw` credential as [`Self::volume_rw`]; the two
     /// co-exist while the remaining object-class views
     /// (segments / snapshots / retention) migrate in later steps of
     /// `docs/design-domain-store.md`.
     fn volume_data(&self, vol_ulid: &Ulid) -> VolumeData {
-        VolumeData::new(self.data_for_volume(vol_ulid), *vol_ulid)
+        VolumeData::new(self.volume_rw(vol_ulid), *vol_ulid)
     }
 }
 
@@ -220,7 +223,7 @@ impl ScopedStores for PassthroughStores {
         Arc::clone(&self.inner)
     }
 
-    fn data_for_volume(&self, _vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+    fn volume_rw(&self, _vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.inner)
     }
 
@@ -249,7 +252,7 @@ impl ScopedStores for PassthroughStores {
 pub enum RoleCall {
     BaseRo,
     Writer,
-    DataForVolume(Ulid),
+    VolumeRw(Ulid),
     ReadVolume(Ulid),
     ReadHeadWithAncestors(Ulid, Vec<Ulid>),
     PeerVerifier,
@@ -309,9 +312,9 @@ impl ScopedStores for RecordingStores {
         self.record(RoleCall::Writer);
         self.inner.writer()
     }
-    fn data_for_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
-        self.record(RoleCall::DataForVolume(*vol_ulid));
-        self.inner.data_for_volume(vol_ulid)
+    fn volume_rw(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+        self.record(RoleCall::VolumeRw(*vol_ulid));
+        self.inner.volume_rw(vol_ulid)
     }
     fn read_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
         self.record(RoleCall::ReadVolume(*vol_ulid));
@@ -345,7 +348,7 @@ mod tests {
         let stores = PassthroughStores::new(Arc::clone(&inner));
 
         let w = stores.writer();
-        let d = stores.data_for_volume(&Ulid::new());
+        let d = stores.volume_rw(&Ulid::new());
         assert!(Arc::ptr_eq(&w, &inner));
         assert!(Arc::ptr_eq(&d, &inner));
 

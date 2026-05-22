@@ -2,7 +2,7 @@
 //! store architecture*).
 //!
 //! Each coordinator role (`coord-base`, `coord-writer`, and one
-//! `coord-data` per volume) is a [`RoleStore`] facade over a Tigris
+//! `volume-rw` per volume) is a [`RoleStore`] facade over a Tigris
 //! keypair that mint vends via `assume-role`. The facade implements
 //! [`ObjectStore`] and acquires its keypair lazily on first use,
 //! caching the built `AmazonS3` client and re-assuming once the cached
@@ -38,7 +38,7 @@ use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::stores::{ReadOnlyAdapter, ReadStore, ScopedStores};
 
 use crate::mint_client::{
-    MintEndpoint, ROLE_COORD_BASE, ROLE_COORD_DATA, ROLE_COORD_WRITER, ROLE_VOLUME_RO,
+    MintEndpoint, ROLE_COORD_BASE, ROLE_COORD_WRITER, ROLE_VOLUME_RO, ROLE_VOLUME_RW,
     VOLUME_RO_TTL_SECS,
 };
 
@@ -47,7 +47,7 @@ const CAVEAT_VOLUME: &str = "elide:Volume";
 /// Documented coord-* TTLs (`docs/design-mint.md` § *Elide as
 /// customer*): coordinator-wide control plane 1h, per-volume data 24h.
 const COORD_CONTROL_TTL_SECS: u64 = 60 * 60;
-const COORD_DATA_TTL_SECS: u64 = 24 * 60 * 60;
+const VOLUME_RW_TTL_SECS: u64 = 24 * 60 * 60;
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -71,7 +71,7 @@ pub struct RoleStore {
     store_cfg: StoreSection,
     role: &'static str,
     ttl_secs: u64,
-    /// `coord-data` and `volume-ro` are per-volume; the `elide:Volume`
+    /// `volume-rw` and `volume-ro` are per-volume; the `elide:Volume`
     /// narrowing caveat + audit value. `None` for the coordinator-wide
     /// roles.
     vol_ulid: Option<Ulid>,
@@ -366,7 +366,7 @@ impl ScopedStores for MintScopedStores {
         Arc::clone(&self.base) as Arc<dyn ObjectStore>
     }
 
-    fn data_for_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+    fn volume_rw(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
         // Reuse a volume's facade so its keypair cache is shared
         // across ops. `try_lock` keeps this sync method non-blocking;
         // a momentary contention just builds a fresh facade (its first
@@ -379,8 +379,8 @@ impl ScopedStores for MintScopedStores {
         let rs = Arc::new(RoleStore::new(
             self.endpoint.clone(),
             self.store_cfg.clone(),
-            ROLE_COORD_DATA,
-            COORD_DATA_TTL_SECS,
+            ROLE_VOLUME_RW,
+            VOLUME_RW_TTL_SECS,
             Some(*vol_ulid),
         ));
         if let Ok(mut map) = self.data.try_lock() {
@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn role_ttls_match_doc() {
         assert_eq!(COORD_CONTROL_TTL_SECS, 3600);
-        assert_eq!(COORD_DATA_TTL_SECS, 86400);
+        assert_eq!(VOLUME_RW_TTL_SECS, 86400);
     }
 
     #[test]
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn non_volume_ro_roles_emit_no_extra_body() {
-        for role in [ROLE_COORD_BASE, ROLE_COORD_WRITER, ROLE_COORD_DATA] {
+        for role in [ROLE_COORD_BASE, ROLE_COORD_WRITER, ROLE_VOLUME_RW] {
             assert!(extra_body_for(role, &[Ulid::new()]).is_empty());
         }
     }

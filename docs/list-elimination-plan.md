@@ -16,10 +16,10 @@ Related: `design-volume-event-log.md` (event HEAD pointer),
 
 | Prefix LISTed | Call sites | What it derives | Role today |
 |---|---|---|---|
-| `by_id/<vol>/snapshots/` | `fetch.rs:325`, `fork.rs:561`, `prefetch.rs:949`, `start_remote.rs:147` | max snapshot ULID + its dated `.manifest` key | `coord-data` |
-| `by_id/<vol>/snapshots/` | `inbound/lifecycle.rs:777`, `inbound/lifecycle.rs:1502` | the *set* of snapshots, for cleanup/delete | `coord-data`/`writer` |
-| `by_id/<vol>/segments/` | `prefetch.rs:442`, `fork.rs:670`, `recovery.rs:165` | the live segment-ULID set for the volume | `coord-data` |
-| `by_id/<vol>/retention/` | `prefetch.rs:643` (`list_supersessions`), `reaper.rs:80` | GC supersession markers (input→output) | `coord-data` |
+| `by_id/<vol>/snapshots/` | `fetch.rs:325`, `fork.rs:561`, `prefetch.rs:949`, `start_remote.rs:147` | max snapshot ULID + its dated `.manifest` key | `volume-rw` |
+| `by_id/<vol>/snapshots/` | `inbound/lifecycle.rs:777`, `inbound/lifecycle.rs:1502` | the *set* of snapshots, for cleanup/delete | `volume-rw`/`writer` |
+| `by_id/<vol>/segments/` | `prefetch.rs:442`, `fork.rs:670`, `recovery.rs:165` | the live segment-ULID set for the volume | `volume-rw` |
+| `by_id/<vol>/retention/` | `prefetch.rs:643` (`list_supersessions`), `reaper.rs:80` | GC supersession markers (input→output) | `volume-rw` |
 | `events/<name>/` | `peer_discovery.rs:171`, `volume_event_store.rs:155/253` | the event-record set / head for a name | `coord-writer` |
 
 `config.rs:289` (`probe`, bare `by_id/`) is the *non*-mint passthrough
@@ -44,7 +44,7 @@ bijective for a live name but **not stable over time**:
   the new `vol_ulid` until it reads the name. This is the event log,
   `events/<name>/`, under `coord-writer`.
 - **`by_id/<vol_ulid>/`** — the data (segments/snapshots/retention),
-  per-*vol_ulid*, under `coord-data`. A name walks through a sequence
+  per-*vol_ulid*, under `volume-rw`. A name walks through a sequence
   of `vol_ulid`s over its life (fork lineage); a `vol_ulid`'s data
   outlives the instant (ancestors are read by descendants).
 
@@ -61,7 +61,7 @@ that cannot skew for it:
   pointer (`User` snapshots only).** Body is the bare snapshot ULID.
   Written GET-max-PUT (no CAS — single-writer per vol) in
   `upload_snapshot_manifests` immediately after the manifest PUT,
-  **under `coord-data` only — no cross-role write, no event**. Migrates
+  **under `volume-rw` only — no cross-role write, no event**. Migrates
   `fetch.rs:325`, `fork.rs:561`, `prefetch.rs:947`,
   `start_remote.rs:147`, `lifecycle.rs:777`. Here a stale/lost pointer
   is genuinely benign and self-heals on the next publish: these
@@ -293,7 +293,7 @@ GET or a known-key PUT/DELETE — no LIST.
 1. **Steady state (A).** A seals snapshot `S2`: writes
    `by_id/<vol>/snapshots/<date>/S2.manifest` then bumps
    `by_id/<vol>/snapshots/LATEST → S2` (bare ULID, `User` only). Both
-   writes are per-vol, **`coord-data` only** — no event, no
+   writes are per-vol, **`volume-rw` only** — no event, no
    `coord-writer`.
 2. **Release (A).** A seals the handoff/stop snapshot `Sh` (it knows
    `Sh`'s ULID directly — it just minted it), CASes `names/myvol`
@@ -395,7 +395,7 @@ Ordered so each phase builds on the prior.
   handoff from the HEAD window via the existing `Released`/`ForkedFrom`
   events.
 - **P2 — per-vol `snapshots/LATEST` pointer.** Write it (per kind) at
-  publish under `coord-data`; migrate the latest-snapshot consumers
+  publish under `volume-rw`; migrate the latest-snapshot consumers
   (`fetch.rs:325`, `fork.rs:561`, `prefetch.rs:949`,
   `start_remote.rs:147`, `lifecycle.rs:777`). Repoint the handoff /
   cleanup consumers (`lifecycle.rs:560/707/1502`) at the P1 chain
@@ -437,7 +437,7 @@ a snapshot). No on-disk format negotiation, no runtime dual path.
   index ≡ object-set invariant after every op, including crash
   injection between object PUT and index append (proptest-guardian
   scope).
-- End-to-end on the Tigris VM with `coord-data` carrying no
+- End-to-end on the Tigris VM with `volume-rw` carrying no
   `ListBucket` and `coord-writer`'s `ListBucket` removed.
 
 ## Out of scope / revisit later
