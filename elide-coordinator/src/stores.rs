@@ -133,13 +133,15 @@ pub trait ScopedStores: Send + Sync {
     fn read_head_with_ancestors(&self, vol_ulid: &Ulid, ancestors: &[Ulid])
     -> Arc<dyn ObjectStore>;
 
-    /// The `coord-base` store as a plain [`ObjectStore`], for the one
-    /// cross-crate consumer that needs it: the peer-fetch verifier
-    /// (`elide_peer_fetch::auth::AuthState`), which reads only and
-    /// lives in a lower crate that cannot depend on [`ReadStore`].
-    /// In-coordinator code uses [`Self::base_ro`]; the read-only
-    /// guarantee for this handle rests on `coord-base`'s IAM policy.
-    fn peer_verifier_store(&self) -> Arc<dyn ObjectStore>;
+    /// The `coord-base` store as a plain [`ObjectStore`]. Reads the
+    /// coordinator-wide control-plane prefixes plus `meta/*` (every
+    /// volume's `volume.provenance` / `volume.pub`); the read-only
+    /// guarantee rests on `coord-base`'s IAM policy. Used for the
+    /// ancestor-skeleton pulls (`meta/` is bucket-wide, so chain
+    /// discovery needs no per-volume credential) and by the peer-fetch
+    /// verifier (`elide_peer_fetch::auth::AuthState`), which lives in a
+    /// lower crate that cannot depend on [`ReadStore`].
+    fn base_object_store(&self) -> Arc<dyn ObjectStore>;
 
     /// Full read+write handle for the per-name event log
     /// (`events/<name>/…`). Backed by both `coord-writer` (for
@@ -153,7 +155,7 @@ pub trait ScopedStores: Send + Sync {
     fn event_journal(&self) -> Arc<dyn EventJournal> {
         Arc::new(BucketEventJournal::new(
             self.writer(),
-            self.peer_verifier_store(),
+            self.base_object_store(),
         ))
     }
 
@@ -163,7 +165,7 @@ pub trait ScopedStores: Send + Sync {
     /// at the type level either. Mirrors the
     /// [`ReadStore`] vs `ObjectStore` split.
     fn event_journal_ro(&self) -> Arc<dyn EventJournalReader> {
-        Arc::new(ReadOnlyEventJournal::new(self.peer_verifier_store()))
+        Arc::new(ReadOnlyEventJournal::new(self.base_object_store()))
     }
 
     /// Full read+write handle for the `names/<name>` claim records.
@@ -175,7 +177,7 @@ pub trait ScopedStores: Send + Sync {
     fn name_claims(&self) -> Arc<dyn NameClaims> {
         Arc::new(BucketNameClaims::new(
             self.writer(),
-            self.peer_verifier_store(),
+            self.base_object_store(),
         ))
     }
 
@@ -185,7 +187,7 @@ pub trait ScopedStores: Send + Sync {
     /// `bucket_position::fetch_position`, and the few pure-display
     /// readers.
     fn name_claims_ro(&self) -> Arc<dyn NameClaimsReader> {
-        Arc::new(ReadOnlyNameClaims::new(self.peer_verifier_store()))
+        Arc::new(ReadOnlyNameClaims::new(self.base_object_store()))
     }
 
     /// Per-volume domain handle for `by_id/<vol>/…` objects. Vends
@@ -239,7 +241,7 @@ impl ScopedStores for PassthroughStores {
         Arc::clone(&self.inner)
     }
 
-    fn peer_verifier_store(&self) -> Arc<dyn ObjectStore> {
+    fn base_object_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.inner)
     }
 }
@@ -255,7 +257,7 @@ pub enum RoleCall {
     VolumeRw(Ulid),
     ReadVolume(Ulid),
     ReadHeadWithAncestors(Ulid, Vec<Ulid>),
-    PeerVerifier,
+    BaseObjectStore,
 }
 
 /// `ScopedStores` decorator that records every method call and
@@ -331,9 +333,9 @@ impl ScopedStores for RecordingStores {
         ));
         self.inner.read_head_with_ancestors(vol_ulid, ancestors)
     }
-    fn peer_verifier_store(&self) -> Arc<dyn ObjectStore> {
-        self.record(RoleCall::PeerVerifier);
-        self.inner.peer_verifier_store()
+    fn base_object_store(&self) -> Arc<dyn ObjectStore> {
+        self.record(RoleCall::BaseObjectStore);
+        self.inner.base_object_store()
     }
 }
 

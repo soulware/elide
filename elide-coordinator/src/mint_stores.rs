@@ -362,7 +362,7 @@ impl ScopedStores for MintScopedStores {
         Arc::clone(&self.writer) as Arc<dyn ObjectStore>
     }
 
-    fn peer_verifier_store(&self) -> Arc<dyn ObjectStore> {
+    fn base_object_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.base) as Arc<dyn ObjectStore>
     }
 

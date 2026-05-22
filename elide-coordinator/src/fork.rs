@@ -314,8 +314,9 @@ impl ForkOrchestrator {
             }
             self.job
                 .append(ForkAttachEvent::PullingAncestor { vol_ulid });
-            // Skeleton pull is pure-read — `volume-ro`, not `volume-rw`.
-            let store = self.ctx.core.stores.read_volume(&vol_ulid);
+            // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
+            // bucket-wide objects on the warm `coord-base` credential.
+            let store = self.ctx.core.stores.base_object_store();
             let reply = pull_readonly_op(vol_ulid, &self.ctx.core.data_dir, &store, None).await?;
             next = reply.parent;
         }

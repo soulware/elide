@@ -556,7 +556,7 @@ mod tests {
         vol_ulid: Ulid,
         vk: &VerifyingKey,
     ) -> impl std::future::Future<Output = ()> + use<> {
-        let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+        let key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
         let payload = format!("{}\n", encode_hex(&vk.to_bytes()));
         let store = store.clone();
         async move {

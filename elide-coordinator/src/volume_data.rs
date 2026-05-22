@@ -10,7 +10,7 @@
 //!   (`by_id/<vol>/HEAD`, the post-snapshot delta from
 //!   `docs/design-segment-index.md`). Single-writer, no CAS.
 //! * [`MetadataView`] — the immutable trust artefacts
-//!   `by_id/<vol>/volume.pub` and `by_id/<vol>/volume.provenance`.
+//!   `meta/<vol>.pub` and `meta/<vol>.provenance`.
 //! * [`SnapshotsView`] — signed snapshot manifests under
 //!   `by_id/<vol>/snapshots/…` and the `snapshots/LATEST` pointer.
 //!   Includes a typed CAS (`advance_latest` / `LatestPointerToken`)
@@ -158,7 +158,7 @@ pub struct MetadataView<'a> {
 }
 
 impl MetadataView<'_> {
-    /// GET `by_id/<vol>/volume.pub` and parse the hex-encoded body
+    /// GET `meta/<vol>.pub` and parse the hex-encoded body
     /// into an Ed25519 [`VerifyingKey`].
     pub async fn read_pubkey(&self) -> Result<VerifyingKey, MetadataError> {
         let key = pubkey_key(self.vol_ulid);
@@ -171,7 +171,7 @@ impl MetadataView<'_> {
     /// Like [`Self::read_pubkey`] but returns `Ok(None)` when the
     /// object is absent. Used by `volume release --force` to recover
     /// the create-time window where `names/<name>` was published
-    /// before `volume.pub`.
+    /// before `meta/<vol>.pub`.
     pub async fn read_pubkey_optional(&self) -> Result<Option<VerifyingKey>, MetadataError> {
         let key = pubkey_key(self.vol_ulid);
         match self.store.get(&key).await {
@@ -186,7 +186,7 @@ impl MetadataView<'_> {
     }
 
     /// Upload `volume.pub` from a local file. Reads the file
-    /// verbatim and PUTs the body to `by_id/<vol>/volume.pub`.
+    /// verbatim and PUTs the body to `meta/<vol>.pub`.
     ///
     /// The on-disk format is the canonical form (authored by
     /// `signing::generate_keypair`): `lowercase-hex(pub) + "\n"`.
@@ -200,8 +200,7 @@ impl MetadataView<'_> {
     }
 
     /// Upload `volume.provenance` from a local file. Reads the file
-    /// verbatim and PUTs the body to
-    /// `by_id/<vol>/volume.provenance`.
+    /// verbatim and PUTs the body to `meta/<vol>.provenance`.
     ///
     /// The on-disk format is the canonical signed form authored by
     /// [`signing::write_provenance`]; the view ships exactly those
@@ -906,14 +905,11 @@ impl std::error::Error for MetadataError {
 }
 
 fn pubkey_key(vol: Ulid) -> StorePath {
-    StorePath::from(format!("by_id/{vol}/volume.pub"))
+    StorePath::from(elide_core::store_keys::meta_pub_key(vol))
 }
 
 fn provenance_key(vol: Ulid) -> StorePath {
-    StorePath::from(format!(
-        "by_id/{vol}/{name}",
-        name = elide_core::signing::VOLUME_PROVENANCE_FILE,
-    ))
+    StorePath::from(elide_core::store_keys::meta_provenance_key(vol))
 }
 
 fn manifest_key(vol: Ulid, snap: Ulid) -> StorePath {

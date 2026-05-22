@@ -2227,7 +2227,7 @@ async fn resolve_peer_endpoint_for_volume(
     let volume_name = elide_coordinator::tasks::read_volume_name(&vol_dir)?;
     // Cross-coordinator RO reads: events/<name>/HEAD + coordinators/<other>/* —
     // coord-base scope. The read-only journal carries that.
-    let store = stores.peer_verifier_store();
+    let store = stores.base_object_store();
     let journal = stores.event_journal_ro();
     elide_coordinator::peer_discovery::discover_peer_for_claim(
         &store,

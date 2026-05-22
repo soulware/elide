@@ -808,8 +808,8 @@ Notes:
   `coordinators/*`.
 - **`coord-base` is the read-only baseline every coordinator holds**, and
   the only credential the LAN/internet-exposed peer-fetch verifier holds.
-  Coordinator-wide read of `names/*` / `coordinators/*` / `events/*`,
-  gated by `sub` like the other `coord-*` roles.
+  Coordinator-wide read of `names/*` / `coordinators/*` / `events/*` /
+  `meta/*`, gated by `sub` like the other `coord-*` roles.
 
 ## Elide as customer: role inventory
 
@@ -817,9 +817,9 @@ Elide's coordinator authenticates to mint and assumes **four roles**:
 
 | Role | Scope | Held by |
 |---|---|---|
-| `coord-base` | read-only `names/* coordinators/* events/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
+| `coord-base` | read-only `names/* coordinators/* events/* meta/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
 | `coord-writer` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`) | the non-exposed mutation paths |
-| `volume-rw` | per-volume `by_id/<vol>/*` read+write (**Split B** — per-volume) | the coordinator, cached per vol_ulid |
+| `volume-rw` | per-volume `by_id/<vol>/*` read+write, plus that volume's `meta/<vol>.{provenance,pub}` (**Split B** — per-volume) | the coordinator, cached per vol_ulid |
 | `volume-ro` | per-volume lineage read, vended to the volume process | the coordinator (assumes), the volume (holds the keypair) |
 
 **Why not the per-purpose split (Split A).** `design-iam-key-model.md`'s
@@ -886,8 +886,10 @@ prefix.
   the window; WAL absorbs a brief refresh stall), and 24h bounds the
   write/delete revocation window on a single volume.
 - **Policy:** `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
-  `arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*`, single
-  volume only.
+  `arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*`,
+  plus the volume's two exact `meta/{{caveat "elide:Volume"}}.provenance`
+  and `meta/{{caveat "elide:Volume"}}.pub` objects (the drain uploads
+  them; force-release reads `volume.pub`). Single volume only.
 
 GC and the reaper cross volume boundaries (read ancestor/input prefixes,
 delete a consumed prefix). GC *input reads* compose by assuming `volume-ro`
@@ -947,11 +949,15 @@ two read paths:
    S3 fallback when peer-fetch is unavailable. Peer-fetch proper does
    not use it — that path is the Ed25519 `PeerFetchToken` against a
    peer's local bytes (`design-peer-segment-fetch.md`).
-2. **Coordinator-side ancestor reads** — `prefetch_indexes` (warm-start
-   `.idx` chain walk) and claim-time `pull_readonly_op` (ancestor
-   skeleton + manifest reads). The coordinator's own per-volume
-   `volume-rw` is single-prefix, so cross-ancestor reads ride
-   `volume-ro` with the appropriate `request.ancestors` body.
+2. **Coordinator-side ancestor `.idx` reads** — `prefetch_indexes`'s
+   warm-start chain walk reads each ancestor's `by_id/<a>/*` index
+   bulk; the coordinator's own per-volume `volume-rw` is single-prefix,
+   so these cross-ancestor reads ride `volume-ro` with the appropriate
+   `request.ancestors` body. The provenance/pub skeleton reads that
+   *discover* the chain (`pull_readonly_op`, and the skeleton pulls
+   inside `prefetch_indexes`) are **not** `volume-ro` — they hit only
+   `meta/*` and ride the warm `coord-base` credential, so chain
+   discovery costs no per-ancestor mint.
 
 - **Required caveats:** `elide:Volume`, `aud=mint`, `exp`
 - **Required body:** `request.ancestors` (PoP-signed; the role template
@@ -1008,8 +1014,8 @@ endpoint resolution, event-log and peer-discovery reads.
 - **Required caveats:** `sub`, `aud=mint`, `exp` — the
   same coordinator-wide gate as the other `coord-*` roles.
 - **TTL:** short (1h), like the other coordinator-held roles.
-- **Policy:** `s3:GetObject` only, on `names/*`, `coordinators/*`, and
-  `events/*`:
+- **Policy:** `s3:GetObject` only, on `names/*`, `coordinators/*`,
+  `events/*`, and `meta/*`:
 
 ```
 {
@@ -1021,17 +1027,28 @@ endpoint resolution, event-log and peer-discovery reads.
     "Resource": [
       "arn:aws:s3:::{{tenant.bucket}}/names/*",
       "arn:aws:s3:::{{tenant.bucket}}/coordinators/*",
-      "arn:aws:s3:::{{tenant.bucket}}/events/*"
+      "arn:aws:s3:::{{tenant.bucket}}/events/*",
+      "arn:aws:s3:::{{tenant.bucket}}/meta/*"
     ]
   }]
 }
 ```
 
+`meta/*` is every volume's `volume.provenance` / `volume.pub`
+(`formats.md` § *Volume provenance*). Granting it bucket-wide lets a
+coordinator walk any ancestor chain's provenance under this one warm
+credential — the per-ancestor `volume-ro` mint for chain discovery is
+gone. The flat `meta/` prefix exists so `meta/*` is a trailing
+wildcard (Tigris does not match `*` mid-resource).
+
 **Invariant: `coord-base` is read-only and `by_id/`-free.** This is what
 makes it safe to be the *only* credential held by the LAN/internet-
 exposed peer-fetch HTTP verifier: a compromise of the exposed surface
 can neither mutate state nor read segment bodies
-(`design-iam-key-model.md` § *IAM-layer invariants*). The write-capable
+(`design-iam-key-model.md` § *IAM-layer invariants*). `meta/*` does not
+weaken this — it carries only the signed, already-public
+`volume.provenance` / `volume.pub`, never segment bodies, which stay in
+`by_id/`. The write-capable
 `coord-writer` and `volume-rw` roles stay separate and are held only
 by the non-exposed mutation paths. `coord-base` must never accrete a
 write action or any `by_id/` read; doing so silently breaks

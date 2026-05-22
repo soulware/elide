@@ -44,10 +44,9 @@ pub(crate) async fn hydrate_remote_owned(
     let fork_dir = by_id_dir.join(vol_ulid.to_string());
 
     // Hydrate is pure-read against S3 — every write lands on local
-    // disk. Both the skeleton chain and the leaf basis ride `volume-ro`.
-    // The chain is a per-ancestor walk: each iteration touches one
-    // `by_id/<u>/` prefix, so it mints a per-ULID `read_volume` view
-    // inside the loop rather than threading a single broad credential.
+    // disk. The skeleton chain reads only `meta/*` and rides the warm
+    // `coord-base` credential (no per-ancestor mint); the leaf basis
+    // reads `by_id/<leaf>/*` and rides `volume-ro`.
     pull_skeleton_chain(vol_ulid, &core.data_dir, &by_id_dir, &core.stores).await?;
 
     let leaf_store = core.stores.read_volume(&vol_ulid);
@@ -144,7 +143,9 @@ async fn pull_skeleton_chain(
         if by_id_dir.join(u.to_string()).exists() {
             break;
         }
-        let store = stores.read_volume(&u);
+        // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
+        // bucket-wide objects on the warm `coord-base` credential.
+        let store = stores.base_object_store();
         let reply = pull_readonly_op(u, data_dir, &store, None).await?;
         next = reply.parent;
     }
@@ -363,7 +364,7 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let vk = signing_key.verifying_key();
 
-        let pub_key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+        let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
         let pub_hex: String = vk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
         let pub_body = format!("{pub_hex}\n");
         store
@@ -375,7 +376,7 @@ mod tests {
         let lineage = ProvenanceLineage::default();
         write_provenance(tmp.path(), &signing_key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
         let body = std::fs::read(tmp.path().join(VOLUME_PROVENANCE_FILE)).unwrap();
-        let prov_key = StorePath::from(format!("by_id/{vol_ulid}/{VOLUME_PROVENANCE_FILE}"));
+        let prov_key = StorePath::from(elide_core::store_keys::meta_provenance_key(vol_ulid));
         store.put(&prov_key, PutPayload::from(body)).await.unwrap();
     }
 

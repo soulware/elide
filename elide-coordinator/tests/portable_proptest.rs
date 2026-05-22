@@ -122,7 +122,7 @@ impl World {
     async fn mint_fork(&mut self) -> Ulid {
         let vol_ulid = Ulid::new();
         let (signer, vk) = generate_ephemeral_signer();
-        let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+        let key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
         let body = format!(
             "{}\n",
             vk.to_bytes()
@@ -274,7 +274,7 @@ impl World {
         let vk: VerifyingKey = match recovery {
             None => {
                 // Ordinary manifest: signed by the volume itself.
-                let pub_key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+                let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
                 let pub_body = self
                     .store
                     .get(&pub_key)
@@ -329,7 +329,7 @@ impl World {
 
             // Invariant 5: every recorded vol_ulid must have a
             // volume.pub uploaded.
-            let pub_key = StorePath::from(format!("by_id/{}/volume.pub", rec.vol_ulid));
+            let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(rec.vol_ulid));
             assert!(
                 self.store.head(&pub_key).await.is_ok(),
                 "name '{name}' references vol_ulid {} but its volume.pub is missing",

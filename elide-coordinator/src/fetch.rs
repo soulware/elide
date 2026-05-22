@@ -364,10 +364,10 @@ async fn pull_ancestor_chain(
             break;
         }
         job.line(format!("pulling ancestor {vol_ulid}"));
-        // Each iteration touches a distinct `by_id/<vol_ulid>/` prefix —
-        // mint a per-ULID `volume-ro` view rather than reusing one
-        // leaf-scoped credential (which would 403 on every ancestor).
-        let store = stores.read_volume(&vol_ulid);
+        // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
+        // bucket-wide objects on the warm `coord-base` credential, so
+        // the whole chain walk needs no per-ancestor mint.
+        let store = stores.base_object_store();
         let reply = pull_readonly_op(vol_ulid, data_dir, &store, None).await?;
         next = reply.parent;
     }
@@ -598,13 +598,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_ancestor_chain_mints_volume_ro_per_ulid() {
-        // The orchestrator's ancestor walk touches a distinct
-        // `by_id/<u>/` prefix per iteration. It must mint a per-ULID
-        // `volume-ro` view — reusing one leaf-scoped credential (the
-        // pre-fix shape) 403s on every ancestor. The pull itself fails
-        // here (empty store), but the credential pick for the leaf is
-        // recorded before that.
+    async fn pull_ancestor_chain_rides_coord_base_not_per_ulid_volume_ro() {
+        // The ancestor walk pulls only `meta/<ulid>.{provenance,pub}`
+        // skeletons — bucket-wide objects covered by the warm
+        // `coord-base` credential. It must ride `base_object_store`,
+        // never mint a per-ULID `volume-ro` (or `volume-rw`) view. The
+        // pull itself fails here (empty store), but the credential pick
+        // is recorded before that.
         let data_dir = TempDir::new().unwrap();
         let by_id_dir = data_dir.path().join("by_id");
 
@@ -619,8 +619,8 @@ mod tests {
 
         assert_eq!(
             recording.calls(),
-            vec![RoleCall::ReadVolume(leaf)],
-            "ancestor pull must mint volume-ro per ULID, never volume-rw"
+            vec![RoleCall::BaseObjectStore],
+            "ancestor skeleton pull must ride coord-base, never a per-ULID volume-ro mint"
         );
     }
 }
