@@ -241,6 +241,99 @@ impl ScopedStores for PassthroughStores {
     }
 }
 
+/// Which `ScopedStores` method a caller selected, captured by
+/// [`RecordingStores`] in the order the calls happened. Tests assert
+/// against this sequence to pin down credential-routing decisions
+/// per IPC verb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleCall {
+    BaseRo,
+    Writer,
+    DataForVolume(Ulid),
+    ReadVolume(Ulid),
+    ReadHeadWithAncestors(Ulid, Vec<Ulid>),
+    PeerVerifier,
+}
+
+/// `ScopedStores` decorator that records every method call and
+/// delegates behaviour to an inner impl (typically
+/// [`PassthroughStores`] over an `InMemory` store). Lets tests assert
+/// "verb X selected role Y for vol Z" without spinning up the mint.
+///
+/// Cheap: `Arc<Mutex<Vec<RoleCall>>>` for the log, no synchronous I/O
+/// beyond the delegate.
+pub struct RecordingStores {
+    inner: Arc<dyn ScopedStores>,
+    calls: std::sync::Mutex<Vec<RoleCall>>,
+}
+
+impl RecordingStores {
+    pub fn wrap(inner: Arc<dyn ScopedStores>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            calls: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Snapshot the recorded call sequence.
+    pub fn calls(&self) -> Vec<RoleCall> {
+        self.calls
+            .lock()
+            .expect("recording stores poisoned")
+            .clone()
+    }
+
+    /// Drop the recorded calls. Useful when a test wants to ignore
+    /// setup-phase calls and only inspect the verb under test.
+    pub fn clear(&self) {
+        self.calls
+            .lock()
+            .expect("recording stores poisoned")
+            .clear();
+    }
+
+    fn record(&self, call: RoleCall) {
+        self.calls
+            .lock()
+            .expect("recording stores poisoned")
+            .push(call);
+    }
+}
+
+impl ScopedStores for RecordingStores {
+    fn base_ro(&self) -> Arc<dyn ReadStore> {
+        self.record(RoleCall::BaseRo);
+        self.inner.base_ro()
+    }
+    fn writer(&self) -> Arc<dyn ObjectStore> {
+        self.record(RoleCall::Writer);
+        self.inner.writer()
+    }
+    fn data_for_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+        self.record(RoleCall::DataForVolume(*vol_ulid));
+        self.inner.data_for_volume(vol_ulid)
+    }
+    fn read_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+        self.record(RoleCall::ReadVolume(*vol_ulid));
+        self.inner.read_volume(vol_ulid)
+    }
+    fn read_head_with_ancestors(
+        &self,
+        vol_ulid: &Ulid,
+        ancestors: &[Ulid],
+    ) -> Arc<dyn ObjectStore> {
+        self.record(RoleCall::ReadHeadWithAncestors(
+            *vol_ulid,
+            ancestors.to_vec(),
+        ));
+        self.inner.read_head_with_ancestors(vol_ulid, ancestors)
+    }
+    fn peer_verifier_store(&self) -> Arc<dyn ObjectStore> {
+        self.record(RoleCall::PeerVerifier);
+        self.inner.peer_verifier_store()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

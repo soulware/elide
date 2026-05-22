@@ -398,11 +398,13 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::GenerateFilemap { volume, snap_ulid } => {
-            // Demand-fetches segment bodies from the ancestor chain
-            // for filemap generation: cross-volume reads, so
-            // coordinator-wide.
-            let store = ctx.stores.writer();
-            let result = generate_filemap_op(&volume, snap_ulid, &ctx.data_dir, &store).await;
+            // Demand-fetches segment bodies from the leaf + ancestor
+            // chain. The minted store needs `by_id/<leaf>/*` plus one
+            // `by_id/<ancestor>/*` per provenance entry — that's the
+            // `volume-ro` head-with-ancestors scope. `generate_filemap_op`
+            // mints it internally once vol_ulid is resolved from the
+            // by_name symlink.
+            let result = generate_filemap_op(&volume, snap_ulid, &ctx.data_dir, &ctx.stores).await;
             let env: Envelope<GenerateFilemapReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -936,7 +938,6 @@ pub(crate) async fn snapshot_volume_kind(
     snapshot_locks: &SnapshotLockRegistry,
     kind: elide_core::signing::SnapshotKind,
 ) -> Result<SnapshotReply, IpcError> {
-    let store = core.stores.writer();
     let link = core.data_dir.join("by_name").join(vol_name);
     let fork_dir = std::fs::canonicalize(&link)
         .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
@@ -956,6 +957,14 @@ pub(crate) async fn snapshot_volume_kind(
 
     let volume_id = elide_coordinator::upload::derive_names(&fork_dir)
         .map_err(|e| IpcError::internal(format!("deriving volume id: {e}")))?;
+    // Every store op below writes under `by_id/<vol>/` (segment drain,
+    // GC handoff apply, snapshot manifest publish). That prefix is
+    // owned by `coord-data`; `coord-writer` is `names/*` + `events/*`
+    // + `coordinators/<sub>/*` only and would 403 on the snapshot PUT.
+    // Mirrors the same fix in `release_volume_op` (commit 4e6950f).
+    let vol_ulid = ulid::Ulid::from_string(&volume_id)
+        .map_err(|e| IpcError::internal(format!("vol dir name not a valid ULID: {e}")))?;
+    let store = core.stores.data_for_volume(&vol_ulid);
 
     let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir);
     let _guard = lock.lock_owned().await;
@@ -1122,11 +1131,42 @@ async fn generate_filemap_op(
     vol_name: &str,
     snap_arg: Option<ulid::Ulid>,
     data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> Result<GenerateFilemapReply, IpcError> {
     let link = data_dir.join("by_name").join(vol_name);
     let fork_dir = std::fs::canonicalize(&link)
         .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
+
+    // Mint a `volume-ro` view scoped to the leaf + its ancestor chain
+    // so the range fetcher inside `generate_snapshot_filemap` can read
+    // segment bodies under any of those prefixes. Each ancestor's
+    // ULID comes from a chain walk: every ancestor has its own
+    // `volume.provenance` planted by `pull_skeleton_chain`, so walking
+    // `parent → parent → …` from local disk reconstructs the full
+    // list without an S3 round-trip.
+    let vol_ulid = fork_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|s| ulid::Ulid::from_string(s).ok())
+        .ok_or_else(|| IpcError::internal(format!("vol dir name not a ULID: {vol_name}")))?;
+    let by_id_dir = data_dir.join("by_id");
+    let mut ancestors: Vec<ulid::Ulid> = Vec::new();
+    let mut cursor_dir = fork_dir.clone();
+    while let Ok(lineage) = elide_core::signing::read_lineage_verifying_signature(
+        &cursor_dir,
+        elide_core::signing::VOLUME_PUB_FILE,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+    ) {
+        let Some(p) = lineage.parent else { break };
+        let parent_ulid = ulid::Ulid::from_string(&p.volume_ulid)
+            .map_err(|e| IpcError::internal(format!("ancestor ULID {:?}: {e}", p.volume_ulid)))?;
+        ancestors.push(parent_ulid);
+        cursor_dir = by_id_dir.join(&p.volume_ulid);
+        if !cursor_dir.exists() {
+            break;
+        }
+    }
+    let store = stores.read_head_with_ancestors(&vol_ulid, &ancestors);
 
     let snap_ulid = match snap_arg {
         Some(u) => u,
@@ -3071,8 +3111,10 @@ mod tests {
     async fn generate_filemap_unknown_volume_returns_err() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
-        let store = mem_store();
-        let err = generate_filemap_op("ghost", None, tmp.path(), &store)
+        let stores: Arc<dyn elide_coordinator::stores::ScopedStores> = Arc::new(
+            elide_coordinator::stores::PassthroughStores::new(mem_store()),
+        );
+        let err = generate_filemap_op("ghost", None, tmp.path(), &stores)
             .await
             .expect_err("ghost volume should error");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -3088,8 +3130,10 @@ mod tests {
         let by_name = tmp.path().join("by_name");
         std::fs::create_dir_all(&by_name).unwrap();
         std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
-        let store = mem_store();
-        let err = generate_filemap_op("vol", None, tmp.path(), &store)
+        let stores: Arc<dyn elide_coordinator::stores::ScopedStores> = Arc::new(
+            elide_coordinator::stores::PassthroughStores::new(mem_store()),
+        );
+        let err = generate_filemap_op("vol", None, tmp.path(), &stores)
             .await
             .expect_err("no snapshot should error");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -3105,10 +3149,12 @@ mod tests {
         let by_name = tmp.path().join("by_name");
         std::fs::create_dir_all(&by_name).unwrap();
         std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
-        let store = mem_store();
+        let stores: Arc<dyn elide_coordinator::stores::ScopedStores> = Arc::new(
+            elide_coordinator::stores::PassthroughStores::new(mem_store()),
+        );
         // Valid ULID, but no matching snapshots/<ulid>.manifest on disk.
         let bogus = ulid::Ulid::from_string("01J0000000000000000000000V").unwrap();
-        let err = generate_filemap_op("vol", Some(bogus), tmp.path(), &store)
+        let err = generate_filemap_op("vol", Some(bogus), tmp.path(), &stores)
             .await
             .expect_err("missing manifest should error");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -3118,7 +3164,109 @@ mod tests {
         );
     }
 
-    // skip_empty_intermediates tests now live in crate::claim::tests.
+    // ── credential-routing regressions ────────────────────────────────────
+    //
+    // Each verb has exactly one defensible role for each store op it
+    // performs. A misrouting (e.g. `writer()` for a `by_id/` write)
+    // gets a 403 from Tigris and a silent half-published state.
+    // These tests pin down the choice via [`RecordingStores`] so the
+    // routing can't quietly regress.
+
+    #[tokio::test]
+    async fn snapshot_volume_kind_routes_through_data_for_volume() {
+        // Regression for the user-visible 2026-05-21 bug: stop's
+        // snapshot publish (and the GC handoff apply + drain) write
+        // under `by_id/<vol>/`, which needs per-vol `coord-data`. Using
+        // `writer()` (coord-writer) produced silent 403s on Tigris.
+        //
+        // We can't run the full snapshot through this unit test (it
+        // needs a live volume daemon for the `promote_wal` IPC), but
+        // the credential pick happens BEFORE that IPC: pass-through
+        // until promote_wal fails, then inspect the spy.
+        use elide_coordinator::stores::{
+            PassthroughStores, RecordingStores, RoleCall, ScopedStores,
+        };
+        use elide_coordinator::volume_state::PID_FILE;
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let by_name = data_dir.join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
+        // Fake a running daemon by writing our own pid — passes the
+        // is_running() gate without a real subprocess.
+        std::fs::write(vol_dir.join(PID_FILE), std::process::id().to_string()).unwrap();
+
+        let identity = std::sync::Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir).unwrap(),
+        );
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let passthrough: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(Arc::clone(&mem)));
+        let recording = RecordingStores::wrap(passthrough);
+
+        let core = CoordinatorCore {
+            data_dir: Arc::new(data_dir.to_path_buf()),
+            stores: recording.clone(),
+            identity,
+        };
+        let locks = SnapshotLockRegistry::default();
+
+        // promote_wal will fail (no control.sock) — that's after the
+        // credential pick at the top of the function.
+        let _ = snapshot_volume_kind(
+            "vol",
+            &core,
+            &locks,
+            elide_core::signing::SnapshotKind::Stop,
+        )
+        .await;
+
+        let calls = recording.calls();
+        assert_eq!(
+            calls,
+            vec![RoleCall::DataForVolume(vol_ulid)],
+            "stop's snapshot publish must mint coord-data for the vol_ulid; \
+             got {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_filemap_routes_through_read_head_with_ancestors() {
+        // `generate_filemap_op` demand-fetches segment bodies under
+        // `by_id/<leaf>/segments/` and ancestor prefixes. The right
+        // role is `volume-ro` scoped to the leaf + ancestor chain
+        // (`read_head_with_ancestors`), never `coord-writer`.
+        use elide_coordinator::stores::{
+            PassthroughStores, RecordingStores, RoleCall, ScopedStores,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let vol_ulid = ulid::Ulid::from_string(vol_ulid_str).unwrap();
+        let vol_dir = tmp.path().join("by_id").join(vol_ulid_str);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let by_name = tmp.path().join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
+
+        let inner: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(mem_store()));
+        let recording = RecordingStores::wrap(inner);
+        let stores: Arc<dyn ScopedStores> = recording.clone();
+
+        // The op errors with NotFound (no snapshot manifest on disk)
+        // AFTER the chain walk + store mint. The spy captures the
+        // role selection; no provenance file means ancestors == [].
+        let _ = generate_filemap_op("vol", None, tmp.path(), &stores).await;
+
+        assert_eq!(
+            recording.calls(),
+            vec![RoleCall::ReadHeadWithAncestors(vol_ulid, vec![])],
+            "generate-filemap must route through read_head_with_ancestors (volume-ro)"
+        );
+    }
 
     // ── bound_ublk_id / remove_volume ─────────────────────────────────────
 

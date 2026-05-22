@@ -1267,8 +1267,7 @@ pub(crate) async fn hydrate_or_route(
                 .expect("fetch_position returned OwnedByUs => record is Some")
                 .0
                 .size;
-            crate::start_remote::hydrate_remote_owned(volume_name, vol_ulid, size, store, core)
-                .await
+            crate::start_remote::hydrate_remote_owned(volume_name, vol_ulid, size, core).await
         }
         OwnershipPosition::OwnedByOther {
             coord_id: held_by, ..
@@ -2291,6 +2290,69 @@ mod tests {
         let (after, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
         assert_eq!(after.state, NameState::Released);
         assert_eq!(after.handoff_snapshot, Some(snap));
+    }
+
+    #[tokio::test]
+    async fn release_routes_by_id_writes_through_data_for_volume() {
+        // Pin the credential routing for the non-force `release` path
+        // (regression for commit 4e6950f). The synthesised handoff
+        // manifest goes under `by_id/<vol>/snapshots/`, so the PUT
+        // must ride per-vol `coord-data` — not `coord-writer`. A
+        // `RecordingStores` wrapper captures every method `release`
+        // calls on `ScopedStores`; we assert at least one
+        // `DataForVolume(vol)` lands.
+        use elide_coordinator::stores::{
+            PassthroughStores, RecordingStores, RoleCall, ScopedStores,
+        };
+
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+
+        let vol_ulid = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), None);
+
+        let keytmp = TempDir::new().unwrap();
+        let sk = elide_core::signing::generate_keypair(keytmp.path(), "k", "p").unwrap();
+        elide_coordinator::key_shadow::write(data_dir.path(), vol_ulid, &sk.to_bytes()).unwrap();
+
+        let identity = std::sync::Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir.path())
+                .unwrap(),
+        );
+
+        let mut rec = NameRecord::live_minimal(vol_ulid, SAMPLE_SIZE);
+        rec.state = NameState::Stopped;
+        rec.coordinator_id = Some(identity.coordinator_id_str().to_owned());
+        ns::create_name_record(&store, "vol", &rec).await.unwrap();
+
+        let passthrough: Arc<dyn ScopedStores> =
+            Arc::new(PassthroughStores::new(Arc::clone(&store)));
+        let recording = RecordingStores::wrap(passthrough);
+
+        let ctx = IpcContext {
+            data_dir: Arc::new(data_dir.path().to_path_buf()),
+            registry: crate::import::new_registry(),
+            fork_registry: crate::fork::new_registry(),
+            fetch_registry: crate::fetch::new_registry(),
+            claim_registry: crate::claim::new_registry(),
+            evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            snapshot_locks: SnapshotLockRegistry::default(),
+            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            readiness_tracker: elide_coordinator::new_readiness_tracker(),
+            stores: recording.clone(),
+            identity,
+            credentialer: None,
+        };
+
+        let _ = release_volume_op("vol", &ctx)
+            .await
+            .expect("never-ran release must succeed");
+
+        let calls = recording.calls();
+        assert!(
+            calls.contains(&RoleCall::DataForVolume(vol_ulid)),
+            "release must route `by_id/<vol>/snapshots/` writes through \
+             data_for_volume({vol_ulid}); got {calls:?}"
+        );
     }
 
     #[tokio::test]
