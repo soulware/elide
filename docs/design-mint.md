@@ -337,7 +337,7 @@ Refresh cadences, distinct, in increasing trust cost:
   credential, appends `elide:Volume`/`exp`, calls `assume-role`, then
   vends the resulting keypair to the volume over the local handshake. On demand per fetch
   episode for non-lazy volumes; kept warm and refreshed proactively for
-  lazy ones (the `coord-data` cache pattern). The volume holds no
+  lazy ones (the `volume-rw` cache pattern). The volume holds no
   macaroon; the keypair `DateLessThan` is the only lifetime here.
 - **Discharge macaroon** — when a third-party caveat is present, fetched
   from the identity authority on its own shorter cadence.
@@ -778,7 +778,7 @@ definition below):
 
 | Role | `aud` | `exp` | `sub` | `elide:Volume` |
 |---|---|---|---|---|
-| `coord-data` | ● | ● | ● | ● |
+| `volume-rw` | ● | ● | ● | ● |
 | `coord-writer` | ● | ● | ● | |
 | `coord-base` | ● | ● | ● | |
 | `volume-ro` | ● | ● | | ● |
@@ -819,7 +819,7 @@ Elide's coordinator authenticates to mint and assumes **four roles**:
 |---|---|---|
 | `coord-base` | read-only `names/* coordinators/* events/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
 | `coord-writer` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`) | the non-exposed mutation paths |
-| `coord-data` | per-volume `by_id/<vol>/*` read+write (**Split B** — per-volume) | the coordinator, cached per vol_ulid |
+| `volume-rw` | per-volume `by_id/<vol>/*` read+write (**Split B** — per-volume) | the coordinator, cached per vol_ulid |
 | `volume-ro` | per-volume lineage read, vended to the volume process | the coordinator (assumes), the volume (holds the keypair) |
 
 **Why not the per-purpose split (Split A).** `design-iam-key-model.md`'s
@@ -851,7 +851,7 @@ Two splits survive on their own merits, not Split A's:
   LAN/internet-exposed and must hold a credential that *structurally*
   cannot mutate state or read `by_id/` bodies. A hard containment
   boundary, not an operational nicety.
-- **`coord-data` is per-volume** (Split B) because it crosses into
+- **`volume-rw` is per-volume** (Split B) because it crosses into
   per-volume blast-radius territory and is cheap precisely because
   mint vends it ephemerally — see *Why Split B is viable now*.
 
@@ -872,7 +872,7 @@ Two consequences shape every TTL below:
   read-only window is justified by it being the narrowest scope in the
   system.
 
-### `coord-data` (Split B — per-volume)
+### `volume-rw` (Split B — per-volume)
 
 Per-volume `by_id/` writer. Assumed by the coordinator the first time it
 writes a given volume within a TTL window; the returned keypair is cached
@@ -891,9 +891,9 @@ prefix.
 
 GC and the reaper cross volume boundaries (read ancestor/input prefixes,
 delete a consumed prefix). GC *input reads* compose by assuming `volume-ro`
-for the inputs alongside `coord-data` for the output volume rather than
-widening `coord-data`'s policy. (Reaper delete of a volume's own prefix is
-covered by `coord-data` on that volume.)
+for the inputs alongside `volume-rw` for the output volume rather than
+widening `volume-rw`'s policy. (Reaper delete of a volume's own prefix is
+covered by `volume-rw` on that volume.)
 
 ### `coord-writer`
 
@@ -950,7 +950,7 @@ two read paths:
 2. **Coordinator-side ancestor reads** — `prefetch_indexes` (warm-start
    `.idx` chain walk) and claim-time `pull_readonly_op` (ancestor
    skeleton + manifest reads). The coordinator's own per-volume
-   `coord-data` is single-prefix, so cross-ancestor reads ride
+   `volume-rw` is single-prefix, so cross-ancestor reads ride
    `volume-ro` with the appropriate `request.ancestors` body.
 
 - **Required caveats:** `elide:Volume`, `aud=mint`, `exp`
@@ -968,7 +968,7 @@ two read paths:
     attenuation + one `assume-role`).
   - *Lazy:* cache-miss demand-fetch is synchronous to guest I/O, so the
     coordinator keeps a warm keypair cached per `vol_ulid` and refreshes
-    it proactively (the `coord-data` cache pattern), handing the volume a
+    it proactively (the `volume-rw` cache pattern), handing the volume a
     still-valid keypair off the hot path. Revocation window is the
     keypair `DateLessThan`, bounded by the minimal blast radius (read one
     volume's lineage).
@@ -991,7 +991,7 @@ one of them:
 
 Per-volume **attribution** is obtained for free regardless of Split B —
 every `AssumeRole` already logs the `elide:Volume` caveat (§ *Audit log*).
-Split B's *additional* value over a coordinator-wide `coord-data` is
+Split B's *additional* value over a coordinator-wide `volume-rw` is
 purely per-volume IAM *enforcement* (the "modest" confused-deputy catch).
 The remaining cost is `AssumeRole` call volume: ~one mint round-trip per
 active volume per TTL window per coordinator, gated by Tigris IAM rate
@@ -1032,7 +1032,7 @@ makes it safe to be the *only* credential held by the LAN/internet-
 exposed peer-fetch HTTP verifier: a compromise of the exposed surface
 can neither mutate state nor read segment bodies
 (`design-iam-key-model.md` § *IAM-layer invariants*). The write-capable
-`coord-writer` and `coord-data` roles stay separate and are held only
+`coord-writer` and `volume-rw` roles stay separate and are held only
 by the non-exposed mutation paths. `coord-base` must never accrete a
 write action or any `by_id/` read; doing so silently breaks
 exposed-surface containment.
@@ -1159,7 +1159,7 @@ to three roles:
 pub trait ScopedStores {
     fn base_ro(&self)               -> Arc<dyn ReadStore>;       // coord-base
     fn writer(&self)                -> Arc<dyn ObjectStore>;     // coord-writer
-    fn data_for_volume(&self, v: &Ulid) -> Arc<dyn ObjectStore>; // coord-data
+    fn volume_rw(&self, v: &Ulid) -> Arc<dyn ObjectStore>; // volume-rw
 }
 ```
 
@@ -1173,7 +1173,7 @@ path uses `writer()` for its *entire* `names/`+`events/`+own-
 mutation (`coord-writer`'s policy holds `s3:GetObject` on those
 prefixes), so a name-claim/force-release CAS (`GET` ETag → conditional
 `PUT`) runs wholly on one credential and is never split. It uses
-`data_for_volume(v)` for that volume's `by_id/`. Read-only paths and
+`volume_rw(v)` for that volume's `by_id/`. Read-only paths and
 the exposed peer-fetch verifier use `base_ro()`. There is **no
 prefix-routing wrapper**: which credential a path wields is explicit at
 the acquisition site and visible in review, not a runtime dispatch on
@@ -1197,7 +1197,7 @@ unauthorized: a path holding `base_ro()` cannot call a mutating method
 because it does not exist on the type. This is the one boundary where
 the type safety is load-bearing — `coord-base` is the credential the
 LAN/internet-exposed verifier holds. `writer()` and
-`data_for_volume()` keep the full `ObjectStore` surface (they feed
+`volume_rw()` keep the full `ObjectStore` surface (they feed
 existing mixed-prefix helpers that legitimately need it; confusing the
 two is an over-privilege *within the trusted coordinator*, not an
 exposed-surface break). The concrete impls of those two carry a
@@ -1215,12 +1215,12 @@ parameter plumbing.
 **Keypair cache and proactive refresh.** Each role's `assume-role`
 yields a short-lived Tigris keypair; the coordinator caches it and the
 `object_store` instance built from it, keyed by role (and by
-`vol_ulid` for `coord-data`). A background task refreshes each entry
+`vol_ulid` for `volume-rw`). A background task refreshes each entry
 before its `DateLessThan` (the *TTL principle*: TTL is the maximum
 revocation latency, so refresh well inside it — e.g. at half-life),
 rebuilding the `object_store` on rotation; a brief refresh stall is
 absorbed by the WAL for writes and is off the hot path for reads
-(`coord-base`/`coord-writer` 1h, `coord-data` 24h, `volume-ro` 1h;
+(`coord-base`/`coord-writer` 1h, `volume-rw` 24h, `volume-ro` 1h;
 freshness for `volume-ro` is § *Elide as customer*'s split-by-volume-mode
 rule).
 First use assumes lazily. `PassthroughStores` stays the impl for the
@@ -1238,7 +1238,7 @@ refinement is for each role to hand back the *operations its policy
 authorizes* rather than a generic store: `coord-writer` →
 `NameClaims` / `EventJournal` (get + append, **no** `delete` method —
 the `events/` append-only invariant as a type, not a policy-template
-property) / `OwnIdentity`; `coord-data` → `VolumeData`; `coord-base`
+property) / `OwnIdentity`; `volume-rw` → `VolumeData`; `coord-base`
 → `ControlPlaneReader`. This makes wrong-prefix keys unconstructable
 (S3 key layout moves inside the typed store, off the `format!` sites
 scattered across `upload.rs`/`claim.rs`/`name_store.rs`/…) and the
@@ -1367,7 +1367,7 @@ prematurely.
    The force-release fence is gap-free via the per-request ETag-
    conditional `names/<name>` read (fence coincident with the S3 CAS).
 5. **Mid-path wildcard verification.** Not on the v1 critical path:
-   `coord-data` uses a single-volume *trailing* wildcard
+   `volume-rw` uses a single-volume *trailing* wildcard
    (`by_id/{{caveat "elide:Volume"}}/*`), `volume-ro` uses exact ancestor
    ARNs, and `coord-base` touches no `by_id/` at all — none need mid-path
    `*`. It is only a constraint on a future role wanting
@@ -1388,11 +1388,11 @@ prematurely.
    or should callers just re-call `AssumeRole` on expiry? STS does the
    latter; same answer probably right here. Worth being explicit.
 9. **Tigris IAM rate-limit headroom — gates Split B.** This is no longer a
-   "defer unless workload demands" item: per-volume `coord-data` (Split B)
+   "defer unless workload demands" item: per-volume `volume-rw` (Split B)
    makes `AssumeRole` volume scale with active volumes — roughly one mint
    round-trip per active volume per TTL window per coordinator, each one a
    Tigris `CreatePolicy`+`CreateAccessKey`+`AttachUserPolicy` sequence.
-   Tigris publishes no IAM rate limit. The 24h `coord-data` TTL is the
+   Tigris publishes no IAM rate limit. The 24h `volume-rw` TTL is the
    primary knob (longer → fewer mints, larger leaked-key window); mint-side
    per-root rate limiting / burst smoothing may also be needed. Measuring
    Tigris IAM headroom at realistic volume counts is the gate before Split B
@@ -1403,12 +1403,12 @@ prematurely.
     multi-coordinator dashboarding. The exact API boundary between them
     (does the console talk to mint over the same `/v1/assume-role`, or via
     a privileged management interface?) is TBD.
-11. **GC / reaper cross-volume composition under per-volume `coord-data`.**
-    `coord-data` is scoped to a single volume's `by_id/<vol>/*`. GC reads
+11. **GC / reaper cross-volume composition under per-volume `volume-rw`.**
+    `volume-rw` is scoped to a single volume's `by_id/<vol>/*`. GC reads
     input/ancestor prefixes that belong to *other* volumes and the reaper
     deletes a fully-consumed volume's prefix. The sketched answer (GC input
     reads via a separately-assumed `volume-ro`; the output write and the
-    reaper's own-prefix delete via `coord-data` on the target volume) is
+    reaper's own-prefix delete via `volume-rw` on the target volume) is
     stated in the role inventory but not fully specified — the exact set of
     roles a GC pass assumes, and whether the reaper's delete wants its own
     narrower role, is open.
@@ -1426,7 +1426,7 @@ prematurely.
     inside the per-volume orchestrator, consuming HEAD's
     `Superseded` edges. `coord-writer`'s `ListBucket` statement
     is removed from its role template and from the inventory
-    above; `coord-data` never had it. The bucket-global
+    above; `volume-rw` never had it. The bucket-global
     enumeration hole closes entirely. Orphan reclamation (the
     one remaining LIST need) is an explicit operator-privileged
     maintenance pass, deliberately outside the runtime surface

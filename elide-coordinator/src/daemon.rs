@@ -466,7 +466,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
 
                 // Per-volume drain / GC / prefetch loop. The task
                 // mints its own per-purpose handles off `stores`:
-                // `coord-data` for drain/GC writes, `coord-writer` for
+                // `volume-rw` for drain/GC writes, `coord-writer` for
                 // peer discovery's `events/<name>/` reads, and
                 // `volume-ro` (own + ancestors) for the prefetch
                 // chain walk.

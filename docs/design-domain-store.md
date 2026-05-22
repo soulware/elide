@@ -23,12 +23,12 @@ credential-scoped store handles:
 pub trait ScopedStores {
     fn base_ro(&self)                   -> Arc<dyn ReadStore>;      // coord-base
     fn writer(&self)                    -> Arc<dyn ObjectStore>;    // coord-writer
-    fn data_for_volume(&self, v: &Ulid) -> Arc<dyn ObjectStore>;    // coord-data
+    fn volume_rw(&self, v: &Ulid) -> Arc<dyn ObjectStore>;    // volume-rw
 }
 ```
 
 `base_ro` is already narrow (the exposed-verifier boundary justified
-the surface reduction). `writer` and `data_for_volume` keep the full
+the surface reduction). `writer` and `volume_rw` keep the full
 `object_store::ObjectStore` surface. The consequences:
 
 - **215 `Arc<dyn ObjectStore>` occurrences across 23 files in
@@ -77,7 +77,7 @@ pub trait DomainStores: Send + Sync {
     // coord-base-backed (read only)
     fn event_journal_ro(&self)   -> Arc<dyn EventJournalReader>;
 
-    // coord-data-backed
+    // volume-rw-backed
     fn volume_data(&self, v: &Ulid) -> Arc<dyn VolumeData>;
 
     // coord-base-backed
@@ -216,7 +216,7 @@ above `sub`.
 | Publish endpoint | `PUT coordinators/<sub>/peer-endpoint.toml` | `publish_endpoint(PeerEndpoint)` |
 | Read others' pubkey | (cross-coord) | this is a *reader* op — see `ControlPlaneReader` |
 
-### `VolumeData::segments()` (`coord-data`, `by_id/<vol>/segments/<date>/<ulid>`)
+### `VolumeData::segments()` (`volume-rw`, `by_id/<vol>/segments/<date>/<ulid>`)
 
 | Op | Today | Domain shape |
 |---|---|---|
@@ -230,7 +230,7 @@ above `sub`.
 (memory `feedback_parse_dont_validate`). The date partition is
 computed inside the handle from the `Ulid` timestamp.
 
-### `VolumeData::snapshots()` (`coord-data`, `by_id/<vol>/snapshots/`)
+### `VolumeData::snapshots()` (`volume-rw`, `by_id/<vol>/snapshots/`)
 
 | Op | Today | Domain shape |
 |---|---|---|
@@ -241,7 +241,7 @@ computed inside the handle from the `Ulid` timestamp.
 | Read LATEST pointer | `GET snapshots/LATEST` | `read_latest() -> Option<LatestPointer>` |
 | CAS LATEST pointer | conditional `PUT` | `advance_latest(prev, new) -> Result<LatestPointer, LatestConflict>` |
 
-### `VolumeData::retention()` (`coord-data`, `by_id/<vol>/retention/`)
+### `VolumeData::retention()` (`volume-rw`, `by_id/<vol>/retention/`)
 
 | Op | Today | Domain shape |
 |---|---|---|
@@ -249,7 +249,7 @@ computed inside the handle from the `Ulid` timestamp.
 | Read supersessions | `GET by_id/<vol>/HEAD` | enumerated from the per-vol HEAD; no separate retention read op |
 | Delete (reaper) | `delete` | `delete_supersession(ulid)` |
 
-### `VolumeData::head()` (`coord-data`, `by_id/<vol>/HEAD`)
+### `VolumeData::head()` (`volume-rw`, `by_id/<vol>/HEAD`)
 
 The post-snapshot delta from `design-segment-index.md`. Sole writer
 is the per-volume tick loop; readers are warm-start claim,
@@ -263,7 +263,7 @@ recovery, fork.
 
 No CAS — the document is justified in `design-segment-index.md`.
 
-### `VolumeData::metadata()` (`coord-data`, `by_id/<vol>/volume.{pub,provenance}`)
+### `VolumeData::metadata()` (`volume-rw`, `by_id/<vol>/volume.{pub,provenance}`)
 
 | Op | Today | Domain shape |
 |---|---|---|
@@ -354,7 +354,7 @@ code, because the *type* of the handle determines the prefix.
 The new traits are introduced **alongside** `ScopedStores`, not in
 place of it. `DomainStores` is implemented by the same concrete types
 (`PassthroughStores`, mint-backed); call sites migrate one operation
-class at a time. `writer()` and `data_for_volume()` remain until
+class at a time. `writer()` and `volume_rw()` remain until
 their last caller is gone, then disappear.
 
 This is the only viable cascade strategy at 221 occurrences: an
@@ -373,7 +373,7 @@ value. The migration is per-object:
    cluster. *Landed in PR #414.* `VolumeData` is the per-volume
    handle vended by `ScopedStores::volume_data(&vol_ulid)` —
    intentionally a **concrete struct, not a trait**: there is one
-   impl, no reader/writer split (every op rides one `coord-data`
+   impl, no reader/writer split (every op rides one `volume-rw`
    credential), and tests substitute an `InMemory` `ObjectStore`
    underneath rather than a second impl. Sub-views (`HeadView<'_>`,
    `MetadataView<'_>`) are returned by inherent methods so callers

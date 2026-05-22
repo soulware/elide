@@ -221,7 +221,7 @@ pub(crate) async fn force_release_volume_op(
     // initial record read) ride the coordinator-wide `coord-writer`
     // credential. Operations on `by_id/<dead_vol>/` (volume.pub,
     // LATEST, manifest, HEAD, segments, the synthesised manifest
-    // write) ride a per-volume `coord-data` credential minted
+    // write) ride a per-volume `volume-rw` credential minted
     // specifically for `dead_vol_ulid` — `coord-writer` has no
     // access to `by_id/` at all (see `mint/examples/elide_roles/`).
     // Both creds are mintable by this coordinator for any vol_ulid;
@@ -254,7 +254,7 @@ pub(crate) async fn force_release_volume_op(
 
     // Mint the per-volume credential now that we know `dead_vol_ulid`.
     // All by_id/<dead_vol>/* ops below ride this store.
-    let dead_store = stores.data_for_volume(&dead_vol_ulid);
+    let dead_store = stores.volume_rw(&dead_vol_ulid);
     let dead_vd = stores.volume_data(&dead_vol_ulid);
 
     // Recovery pipeline: fetch dead fork's pubkey, then synthesise a
@@ -441,7 +441,7 @@ pub(crate) async fn release_volume_op(
 
     // `release` straddles two role scopes: `coord-writer` for the
     // `names/<name>` flip + the `events/<name>/` emission, and per-vol
-    // `coord-data` for the `by_id/<vol>/snapshots/` promote / publish.
+    // `volume-rw` for the `by_id/<vol>/snapshots/` promote / publish.
     // `coord-writer` has no access to `by_id/` (see
     // `mint/examples/elide_roles/`), so the typed [`VolumeData`] is
     // constructed once `vol_ulid` is known and threaded into each
@@ -917,7 +917,7 @@ fn materialise_handoff_locally(
 /// sentinel renames).
 ///
 /// Writes under `by_id/<vol>/snapshots/` — must ride the per-vol
-/// `coord-data` credential, hence the typed [`VolumeData`] argument.
+/// `volume-rw` credential, hence the typed [`VolumeData`] argument.
 async fn promote_stop_in_store(
     vd: &elide_coordinator::volume_data::VolumeData,
     snap_ulid: ulid::Ulid,
@@ -1534,7 +1534,7 @@ pub(crate) async fn notify_volume_ready_op(
 /// `NotifyVolumeReady` once the volume confirms it has rehydrated.
 ///
 /// Deletes under `by_id/<vol>/snapshots/` — must ride the per-vol
-/// `coord-data` credential, hence the typed [`VolumeData`] argument.
+/// `volume-rw` credential, hence the typed [`VolumeData`] argument.
 async fn cleanup_stop_snapshots(
     fork_dir: &Path,
     vd: &elide_coordinator::volume_data::VolumeData,
@@ -2293,14 +2293,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_routes_by_id_writes_through_data_for_volume() {
+    async fn release_routes_by_id_writes_through_volume_rw() {
         // Pin the credential routing for the non-force `release` path
         // (regression for commit 4e6950f). The synthesised handoff
         // manifest goes under `by_id/<vol>/snapshots/`, so the PUT
-        // must ride per-vol `coord-data` — not `coord-writer`. A
+        // must ride per-vol `volume-rw` — not `coord-writer`. A
         // `RecordingStores` wrapper captures every method `release`
         // calls on `ScopedStores`; we assert at least one
-        // `DataForVolume(vol)` lands.
+        // `VolumeRw(vol)` lands.
         use elide_coordinator::stores::{
             PassthroughStores, RecordingStores, RoleCall, ScopedStores,
         };
@@ -2349,9 +2349,9 @@ mod tests {
 
         let calls = recording.calls();
         assert!(
-            calls.contains(&RoleCall::DataForVolume(vol_ulid)),
+            calls.contains(&RoleCall::VolumeRw(vol_ulid)),
             "release must route `by_id/<vol>/snapshots/` writes through \
-             data_for_volume({vol_ulid}); got {calls:?}"
+             volume_rw({vol_ulid}); got {calls:?}"
         );
     }
 

@@ -32,7 +32,7 @@ set is already enumerated, signed, and reachable without a LIST:
 
 The code is already split along this line. `prefetch_indexes` (the
 warm-start claim path) *"anchors on a signed manifest and never lists
-segments/ or retention/"*. The LIST path, `pull_indexes_via_list`,
+segments/ or retention/"*. The LIST path, `pull_indexes_for_head`,
 exists for exactly one reason, stated in its own doc comment:
 *"segments past the latest snapshot"* — the WAL-drain tail, plus GC
 outputs and reaper deletions in that same post-snapshot window. The
@@ -67,7 +67,7 @@ the not-yet-sealed delta — a single object, whole-object overwrite,
 by_id/<vol_ulid>/HEAD        (single fixed key, like snapshots/LATEST)
 ```
 
-`coord-data`, same axis as the data it indexes. Body: the current
+`volume-rw`, same axis as the data it indexes. Body: the current
 delta — the set of `Added` segment ULIDs, the set of `Superseded`
 edges (each with the wall-clock instant it was recorded), and the set
 of `Tombstoned` ULIDs. Sorted; no signature (see *Derived state*).
@@ -420,13 +420,13 @@ Removing it from the runtime does not remove the need:
 
 | Site | Today | After |
 |---|---|---|
-| `prefetch.rs:442` (`pull_indexes_via_list`) | LIST `segments/` | manifest ∪ HEAD |
+| `prefetch.rs:442` (`pull_indexes_for_head`) | LIST `segments/` | manifest ∪ HEAD |
 | `prefetch.rs:643` (`list_supersessions`) | LIST `retention/` | `Superseded` entries in HEAD |
 | `fork.rs:670` | LIST `segments/` to verify pins present | manifest ∪ HEAD membership check |
 | `recovery.rs:165` (force-release synthesis) | LIST `segments/` to re-sign | manifest ∪ HEAD; synthesised manifest absorbs HEAD |
 | `reaper.rs:80` | LIST `retention/`, separate task | `Superseded` entries in HEAD; reap step folded into the per-volume tick loop |
 
-`pull_indexes_via_list` and `list_supersessions` collapse into one
+`pull_indexes_for_head` and `list_supersessions` collapse into one
 manifest-anchored HEAD GET; `force_snapshot_now`'s "synthesise from
 whatever is in S3 including segments past the latest snapshot" becomes
 "latest manifest ∪ HEAD", and the synthesised handoff manifest it

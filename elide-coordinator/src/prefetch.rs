@@ -29,7 +29,7 @@
 //
 // `prefetch_indexes` therefore performs no `LIST segments/` and no
 // `LIST retention/`. Operator-initiated capture of pre-snapshot bucket
-// state (e.g. `force_snapshot_now`) goes through `pull_indexes_via_list`
+// state (e.g. `force_snapshot_now`) goes through `pull_indexes_for_head`
 // instead, which retains the LIST + retention-marker filter.
 //
 // After this runs, Volume::open will find the .idx files, rebuild_segments and
@@ -389,7 +389,7 @@ async fn prefetch_fork(
     //     fork (or one that has never published a snapshot) — there's
     //     nothing for warm-start to fetch. Operator-initiated capture
     //     of pre-snapshot bucket state belongs in
-    //     [`pull_indexes_via_list`], not here.
+    //     [`pull_indexes_for_head`], not here.
     let anchor: Option<String> = match branch_ulid {
         Some(b) => Some(b.to_owned()),
         None => elide_core::volume::latest_snapshot(fork_dir)
@@ -427,7 +427,7 @@ async fn prefetch_fork(
 /// per-`.idx` fetches; no LIST. The warm-start claim path uses
 /// [`prefetch_indexes`] instead, which anchors on a signed manifest
 /// only and skips HEAD.
-pub async fn pull_indexes_via_list(
+pub async fn pull_indexes_for_head(
     store: &Arc<dyn ObjectStore>,
     fork_dir: &Path,
     volume_id: &str,
@@ -1386,7 +1386,7 @@ mod tests {
     /// Fresh writable head with no published snapshot: warm-start
     /// `prefetch_indexes` is a no-op (manifest-anchored, nothing to
     /// anchor on). Operator-initiated capture of pre-snapshot bucket
-    /// state belongs in [`pull_indexes_via_list`].
+    /// state belongs in [`pull_indexes_for_head`].
     #[tokio::test]
     async fn prefetch_indexes_is_noop_for_root_without_snapshot() {
         let tmp = TempDir::new().unwrap();
@@ -1440,12 +1440,12 @@ mod tests {
     }
 
     /// HEAD awareness: an input segment listed in HEAD's `Superseded`
-    /// map must be skipped during `pull_indexes_via_list`. The warm-
+    /// map must be skipped during `pull_indexes_for_head`. The warm-
     /// start `prefetch_indexes` path anchors on the manifest only and
     /// never reads HEAD; the HEAD-aware path here is the one operator
     /// IPCs use to capture post-snapshot bucket state.
     #[tokio::test]
-    async fn pull_via_list_skips_segments_superseded_in_head() {
+    async fn pull_for_head_skips_segments_superseded_in_head() {
         let tmp = TempDir::new().unwrap();
         let by_id = tmp.path().join("by_id");
         let root_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
@@ -1514,7 +1514,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = pull_indexes_via_list(&store, &root_dir, root_ulid_str, &vk, None)
+        let result = pull_indexes_for_head(&store, &root_dir, root_ulid_str, &vk, None)
             .await
             .unwrap();
         assert_eq!(result.fetched, 1, "only the GC output should be fetched");

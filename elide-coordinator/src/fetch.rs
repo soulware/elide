@@ -155,7 +155,7 @@ pub(crate) async fn start_fetch(
 
     // `latest_snapshot_in_store` reads `by_id/<vol>/snapshots/`; `coord-writer`
     // has no `by_id/` grant, so mint a per-vol `volume-ro` once vol_ulid is
-    // known. The orchestrator below already mints its own per-vol coord-data
+    // known. The orchestrator below already mints its own per-vol volume-rw
     // for the actual fetch body.
     let read_store = ctx.core.stores.read_volume(&vol_ulid);
     let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &read_store).await? {
@@ -223,12 +223,17 @@ async fn run_orchestrator(
     let data_dir: PathBuf = (*ctx.core.data_dir).clone();
     let by_id_dir = data_dir.join("by_id");
     let fork_dir = by_id_dir.join(vol_ulid.to_string());
-    let store = ctx.core.stores.data_for_volume(&vol_ulid);
+    // Fetch is pure-read against S3 (every write lands on local disk),
+    // so the leaf ops ride `volume-ro`. The ancestor chain spans other
+    // `by_id/<ancestor>/` prefixes, so `pull_ancestor_chain` mints a
+    // per-ULID `read_volume` view per ancestor rather than reusing the
+    // leaf-scoped credential — which would 403 on every ancestor.
+    let store = ctx.core.stores.read_volume(&vol_ulid);
 
     // Stage 1. Pull ancestor skeleton chain (volume.pub +
     // volume.provenance per ancestor). Stops at the first ancestor
     // that's already on disk.
-    pull_ancestor_chain(vol_ulid, &data_dir, &by_id_dir, &store, &job).await?;
+    pull_ancestor_chain(vol_ulid, &data_dir, &by_id_dir, &ctx.core.stores, &job).await?;
 
     // Stage 2. Fetch the basis manifest if not already present, then
     // verify it under the volume's `volume.pub`. Manifest signature
@@ -347,7 +352,7 @@ async fn pull_ancestor_chain(
     leaf_ulid: Ulid,
     data_dir: &Path,
     by_id_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
     job: &FetchJob,
 ) -> Result<(), IpcError> {
     use elide_core::volume::resolve_ancestor_dir;
@@ -359,7 +364,11 @@ async fn pull_ancestor_chain(
             break;
         }
         job.line(format!("pulling ancestor {vol_ulid}"));
-        let reply = pull_readonly_op(vol_ulid, data_dir, store, None).await?;
+        // Each iteration touches a distinct `by_id/<vol_ulid>/` prefix —
+        // mint a per-ULID `volume-ro` view rather than reusing one
+        // leaf-scoped credential (which would 403 on every ancestor).
+        let store = stores.read_volume(&vol_ulid);
+        let reply = pull_readonly_op(vol_ulid, data_dir, &store, None).await?;
         next = reply.parent;
     }
     Ok(())
@@ -582,9 +591,36 @@ mod tests {
         assert!(
             !calls.iter().any(|c| matches!(
                 c,
-                RoleCall::DataForVolume(_) | RoleCall::ReadHeadWithAncestors(_, _)
+                RoleCall::VolumeRw(_) | RoleCall::ReadHeadWithAncestors(_, _)
             )),
-            "front-half must not burn a coord-data or chain mint; got {calls:?}"
+            "front-half must not burn a volume-rw or chain mint; got {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_ancestor_chain_mints_volume_ro_per_ulid() {
+        // The orchestrator's ancestor walk touches a distinct
+        // `by_id/<u>/` prefix per iteration. It must mint a per-ULID
+        // `volume-ro` view — reusing one leaf-scoped credential (the
+        // pre-fix shape) 403s on every ancestor. The pull itself fails
+        // here (empty store), but the credential pick for the leaf is
+        // recorded before that.
+        let data_dir = TempDir::new().unwrap();
+        let by_id_dir = data_dir.path().join("by_id");
+
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let passthrough: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(mem));
+        let recording = RecordingStores::wrap(passthrough);
+        let stores: Arc<dyn ScopedStores> = recording.clone();
+
+        let leaf = ulid::Ulid::new();
+        let job = FetchJob::new();
+        let _ = pull_ancestor_chain(leaf, data_dir.path(), &by_id_dir, &stores, &job).await;
+
+        assert_eq!(
+            recording.calls(),
+            vec![RoleCall::ReadVolume(leaf)],
+            "ancestor pull must mint volume-ro per ULID, never volume-rw"
         );
     }
 }

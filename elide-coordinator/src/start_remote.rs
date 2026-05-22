@@ -43,14 +43,14 @@ pub(crate) async fn hydrate_remote_owned(
     let by_id_dir = core.data_dir.join("by_id");
     let fork_dir = by_id_dir.join(vol_ulid.to_string());
 
-    // Skeleton chain is a per-ancestor walk: each iteration touches one
-    // `by_id/<u>/` prefix, so mint a per-ULID `volume-ro` view inside
-    // the loop rather than threading a single broad credential. The
-    // leaf read paths below ride per-vol `coord-data`; `coord-writer`
-    // has no `by_id/` access at all.
+    // Hydrate is pure-read against S3 — every write lands on local
+    // disk. Both the skeleton chain and the leaf basis ride `volume-ro`.
+    // The chain is a per-ancestor walk: each iteration touches one
+    // `by_id/<u>/` prefix, so it mints a per-ULID `read_volume` view
+    // inside the loop rather than threading a single broad credential.
     pull_skeleton_chain(vol_ulid, &core.data_dir, &by_id_dir, &core.stores).await?;
 
-    let leaf_store = core.stores.data_for_volume(&vol_ulid);
+    let leaf_store = core.stores.read_volume(&vol_ulid);
     let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &leaf_store).await? {
         Some((snap_ulid, kind)) => {
             install_basis_under_leaf(vol_ulid, snap_ulid, kind, &fork_dir, &leaf_store).await?;
@@ -381,13 +381,13 @@ mod tests {
 
     #[tokio::test]
     async fn hydrate_remote_owned_routes_per_ulid() {
-        // `hydrate_remote_owned` touches:
+        // `hydrate_remote_owned` is pure-read against S3 (every write
+        // lands on local disk), so every op rides `volume-ro`:
         //   - `by_id/<leaf>/volume.{pub,provenance}` (read_volume per
         //     ancestor in pull_skeleton_chain — one iteration for a root)
-        //   - `by_id/<leaf>/snapshots/LATEST` (data_for_volume(leaf))
-        // Coord-writer has no `by_id/` grant, so neither op may ride
-        // it. Regression for the 2026-05-21 fix that dropped the
-        // threaded coord-writer store from `start_volume_op`.
+        //   - `by_id/<leaf>/snapshots/LATEST` (read_volume(leaf))
+        // Coord-writer has no `by_id/` grant and `volume-rw` is the
+        // write credential — neither belongs on this path.
         let coord_dir = TempDir::new().unwrap();
         let data_dir = TempDir::new().unwrap();
         let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
@@ -414,15 +414,13 @@ mod tests {
         let calls = recording.calls();
         assert!(
             calls.contains(&RoleCall::ReadVolume(leaf)),
-            "skeleton pull must use volume-ro per ULID; got {calls:?}"
+            "hydrate reads must use volume-ro per ULID; got {calls:?}"
         );
         assert!(
-            calls.contains(&RoleCall::DataForVolume(leaf)),
-            "leaf-side reads must use coord-data(leaf); got {calls:?}"
-        );
-        assert!(
-            !calls.contains(&RoleCall::Writer),
-            "hydrate must not burn a coord-writer mint; got {calls:?}"
+            !calls
+                .iter()
+                .any(|c| matches!(c, RoleCall::VolumeRw(_) | RoleCall::Writer)),
+            "hydrate is pure-read — no volume-rw or coord-writer mint; got {calls:?}"
         );
     }
 }

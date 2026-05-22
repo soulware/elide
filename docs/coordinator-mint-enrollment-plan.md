@@ -32,7 +32,7 @@ has completed successfully.
   trusted side channel first.
 - **C — exchange fan-out.** Once approved, the command exchanges the
   ticket once per role in the canonical inventory (`coord-base`,
-  `coord-writer`, `coord-data`, `volume-ro`) — body `{ts, role}`, same
+  `coord-writer`, `volume-rw`, `volume-ro`) — body `{ts, role}`, same
   PoP — and writes each re-minted credential to
   `credentials/<role>` (mode `0600`). The pending record is not
   consumed per exchange (multi-use until the ticket `exp`), so one
@@ -86,10 +86,10 @@ failure on first S3 touch.
    `mint_stores.rs`, `ROLE_VOLUME_RO` in `mint_client.rs`. Introduce one
    `pub const COORD_ENROLL_ROLES: &[&str]` (single source of truth) used
    by the exchange fan-out **and** the startup gate **and** referenced
-   by the existing stores, so the three can never drift. `coord-data`
+   by the existing stores, so the three can never drift. `volume-rw`
    is per-volume only at `assume-role` time (the `elide:Volume`
    narrowing caveat) — enrollment still produces exactly one
-   `credentials/coord-data`.
+   `credentials/volume-rw`.
 
 5. **All-or-nothing per run, idempotent per file.** If C partially
    completes and the ticket then expires, decision (2) re-enrolls and
@@ -163,7 +163,7 @@ elide coord enroll [--data-dir <dir>] <bootstrap-macaroon | file | ->
 
 Walked the full sequence end-to-end with the `mint` binary alone
 (server + reference client + operator subcommands) over a UDS, against
-a 4-role config (`coord-base`, `coord-writer`, `coord-data`,
+a 4-role config (`coord-base`, `coord-writer`, `volume-rw`,
 `volume-ro`), fake minter. Findings that shaped the plan above:
 
 1. **The split CLI is the wrong operator surface — confirms the

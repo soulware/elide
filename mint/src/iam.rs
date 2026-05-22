@@ -52,7 +52,7 @@ pub trait KeypairMinter: Send + Sync {
 /// Build a mint-issued IAM policy name.
 ///
 /// Format: `mint_<role>_<scope>_<expiry>_<nonce>`
-/// - `role`: role slug (e.g. `coord-data`, `volume-ro`).
+/// - `role`: role slug (e.g. `volume-rw`, `volume-ro`).
 /// - `scope`: volume ULID for volume-scoped roles, `global` otherwise.
 /// - `expiry`: basic ISO 8601 UTC (`YYYYMMDDTHHMMSSZ`) of the policy's
 ///   `DateLessThan` — sorts lexically = chronologically in the Tigris
@@ -163,13 +163,13 @@ mod tests {
     #[test]
     fn policy_name_shape() {
         let expiry = "2026-05-21T14:30:00Z".parse::<DateTime<Utc>>().unwrap();
-        let scoped = policy_name("coord-data", Some("01JD8K3FQ9R0YHGWZV5XPMNTAB"), expiry);
+        let scoped = policy_name("volume-rw", Some("01JD8K3FQ9R0YHGWZV5XPMNTAB"), expiry);
         assert!(
-            scoped.starts_with("mint_coord-data_01JD8K3FQ9R0YHGWZV5XPMNTAB_20260521T143000Z_"),
+            scoped.starts_with("mint_volume-rw_01JD8K3FQ9R0YHGWZV5XPMNTAB_20260521T143000Z_"),
             "got {scoped}"
         );
-        // 4 (mint) + 1 + 10 (coord-data) + 1 + 26 + 1 + 16 + 1 + 8 = 68
-        assert_eq!(scoped.len(), 68);
+        // 4 (mint) + 1 + 9 (volume-rw) + 1 + 26 + 1 + 16 + 1 + 8 = 67
+        assert_eq!(scoped.len(), 67);
         assert!(scoped.len() <= 128);
 
         let global = policy_name("coord-base", None, expiry);

@@ -181,12 +181,12 @@ pub async fn run_volume_tasks(
         .map(|n| format!(" ({n})"))
         .unwrap_or_default();
 
-    // Per-vol coord-data store for drain/GC writes under
+    // Per-vol volume-rw store for drain/GC writes under
     // `by_id/<vol>/`. Peer-discovery reads `events/<name>/` and runs
     // on coord-base. Prefetch crosses ancestor prefixes so it mints
     // `volume-ro` itself inside `prefetch_indexes`.
     let data_store = match parsed_ulid {
-        Some(u) => stores.data_for_volume(&u),
+        Some(u) => stores.volume_rw(&u),
         None => stores.writer(),
     };
 
@@ -287,7 +287,7 @@ pub async fn run_volume_tasks(
 
     // Readonly forks (pulled ancestors + imported bases) never accept
     // writes, so drain/GC ticks are wasted work — and worse, the first
-    // tick would assume `coord-data` for the volume, burning a mint
+    // tick would assume `volume-rw` for the volume, burning a mint
     // round-trip + IAM key on a credential that's never used. Re-check
     // the marker each tick so a readonly→writable transition
     // (`hydrate_remote_owned` strips the marker on a successful

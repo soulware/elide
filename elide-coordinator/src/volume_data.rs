@@ -2,7 +2,7 @@
 //!
 //! Third slice of the domain-typed store layer
 //! (`docs/design-domain-store.md`). [`VolumeData`] is the per-volume
-//! handle; it carves the volume's `coord-data` prefix into
+//! handle; it carves the volume's `volume-rw` prefix into
 //! object-class sub-accessors that callers name explicitly. The
 //! currently-populated sub-accessors are:
 //!
@@ -26,7 +26,7 @@
 //!   verification (`get_range`), and DELETE for the retention reaper.
 //!
 //! `VolumeData` is a concrete struct, not a trait. There is one
-//! impl, no reader/writer split (every op rides one `coord-data`
+//! impl, no reader/writer split (every op rides one `volume-rw`
 //! credential), and no test-only impl (tests substitute an
 //! `InMemory` `ObjectStore` underneath). If a second impl becomes
 //! useful later, splitting back into a trait is mechanical.
@@ -47,7 +47,7 @@ use crate::portable::{
 use crate::segment_head::{self, ParseHeadError, SegmentHead};
 
 /// Per-volume domain handle, scoped to `by_id/<vol>/…` on the
-/// `coord-data` credential. Acquired via
+/// `volume-rw` credential. Acquired via
 /// [`crate::stores::ScopedStores::volume_data`]. Cheap to clone (the
 /// inner store is `Arc<dyn ObjectStore>`).
 #[derive(Clone)]
