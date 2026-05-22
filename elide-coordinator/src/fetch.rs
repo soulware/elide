@@ -122,9 +122,9 @@ pub(crate) async fn start_fetch(
     // Synchronous front-half: name resolution + latest-snapshot lookup
     // so we can fail fast (NotFound on either) without registering a
     // doomed-to-fail job. The actual body-warm work runs detached.
-    let store = ctx.core.stores.writer();
+    let writer = ctx.core.stores.writer();
     let coord_id = ctx.core.identity.coordinator_id_str();
-    let (vol_ulid, size_bytes, owned_by_us) = resolve_name(&volume_name, &store, coord_id).await?;
+    let (vol_ulid, size_bytes, owned_by_us) = resolve_name(&volume_name, &writer, coord_id).await?;
 
     // `fetch` is a *foreign* read: it pulls another coordinator's
     // volume to local readonly state so we can browse it or fork
@@ -153,7 +153,12 @@ pub(crate) async fn start_fetch(
         return Err(IpcError::conflict(hint));
     }
 
-    let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &store).await? {
+    // `latest_snapshot_in_store` reads `by_id/<vol>/snapshots/`; `coord-writer`
+    // has no `by_id/` grant, so mint a per-vol `volume-ro` once vol_ulid is
+    // known. The orchestrator below already mints its own per-vol coord-data
+    // for the actual fetch body.
+    let read_store = ctx.core.stores.read_volume(&vol_ulid);
+    let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &read_store).await? {
         Some(u) => u,
         None => {
             return Err(IpcError::not_found(format!(
@@ -520,4 +525,66 @@ fn write_fetched_marker(
         .map_err(|e| IpcError::internal(format!("writing volume.fetched: {e}")))?;
     let _ = owner_coordinator_id;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use elide_coordinator::identity::CoordinatorIdentity;
+    use elide_coordinator::name_store as ns;
+    use elide_coordinator::stores::{PassthroughStores, RecordingStores, RoleCall, ScopedStores};
+    use elide_core::name_record::NameRecord;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn start_fetch_resolves_name_with_writer_then_snapshot_with_read_volume() {
+        // `start_fetch` reads `names/<name>` (coord-writer) then peeks
+        // `by_id/<vol>/snapshots/LATEST` (volume-ro). The second op
+        // must NOT ride coord-writer — coord-writer has no `by_id/`
+        // grant and would 403 on Tigris.
+        let coord_dir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let passthrough: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(Arc::clone(&mem)));
+        let recording = RecordingStores::wrap(passthrough);
+        let stores: Arc<dyn ScopedStores> = recording.clone();
+
+        // Foreign-owned name: `start_fetch` flows past the owned-by-us
+        // hint and reaches the snapshot lookup.
+        let vol_ulid = ulid::Ulid::new();
+        let mut rec = NameRecord::live_minimal(vol_ulid, 1024 * 1024);
+        rec.coordinator_id = Some("foreign-coord".into());
+        ns::create_name_record(&mem, "vol", &rec).await.unwrap();
+
+        let ctx = FetchContext {
+            core: crate::inbound::CoordinatorCore {
+                data_dir: Arc::new(data_dir.path().to_path_buf()),
+                stores,
+                identity,
+            },
+            registry: new_registry(),
+        };
+        // No snapshot in the store → NotFound, but only after both
+        // store-selection calls have landed in the spy.
+        let _ = start_fetch("vol".to_owned(), ctx).await;
+
+        let calls = recording.calls();
+        assert!(
+            calls.contains(&RoleCall::Writer),
+            "resolve_name must use coord-writer; got {calls:?}"
+        );
+        assert!(
+            calls.contains(&RoleCall::ReadVolume(vol_ulid)),
+            "latest-snapshot lookup must use volume-ro for vol_ulid {vol_ulid}; got {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                RoleCall::DataForVolume(_) | RoleCall::ReadHeadWithAncestors(_, _)
+            )),
+            "front-half must not burn a coord-data or chain mint; got {calls:?}"
+        );
+    }
 }

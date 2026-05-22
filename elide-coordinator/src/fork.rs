@@ -366,7 +366,11 @@ impl ForkOrchestrator {
 
         if source_dir.join("volume.readonly").exists() {
             let snap_ulid = if self.force_snapshot {
-                let store = self.ctx.core.stores.writer();
+                // `force_snapshot_now_op` reads `by_id/<source>/segments/`
+                // and PUTs the new manifest under `by_id/<source>/snapshots/`,
+                // so it rides per-vol `coord-data` for the source — not
+                // `coord-writer`, which has no `by_id/` access.
+                let store = self.ctx.core.stores.data_for_volume(&source_vol_ulid);
                 let reply =
                     force_snapshot_now_op(source_vol_ulid, &self.ctx.core.data_dir, &store).await?;
                 self.parent_key_hex = Some(reply.attestation_pubkey_hex.clone());

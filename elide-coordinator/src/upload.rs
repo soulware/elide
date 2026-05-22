@@ -495,7 +495,10 @@ pub async fn upload_snapshot_metadata(
         let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
         let snapshots = vd.snapshots();
 
-        let key = snapshots.manifest_key(snap_ulid);
+        let key = match kind {
+            elide_core::signing::SnapshotKind::User => snapshots.manifest_key(snap_ulid),
+            elide_core::signing::SnapshotKind::Stop => snapshots.stop_manifest_key(snap_ulid),
+        };
         let put_result = match kind {
             elide_core::signing::SnapshotKind::User => {
                 snapshots

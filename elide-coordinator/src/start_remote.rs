@@ -37,21 +37,28 @@ pub(crate) async fn hydrate_remote_owned(
     volume_name: &str,
     vol_ulid: Ulid,
     size_bytes: u64,
-    store: &Arc<dyn ObjectStore>,
     core: &CoordinatorCore,
 ) -> Result<(), IpcError> {
     let started = std::time::Instant::now();
     let by_id_dir = core.data_dir.join("by_id");
     let fork_dir = by_id_dir.join(vol_ulid.to_string());
 
-    pull_skeleton_chain(vol_ulid, &core.data_dir, &by_id_dir, store).await?;
+    // Skeleton chain is a per-ancestor walk: each iteration touches one
+    // `by_id/<u>/` prefix, so mint a per-ULID `volume-ro` view inside
+    // the loop rather than threading a single broad credential. The
+    // leaf read paths below ride per-vol `coord-data`; `coord-writer`
+    // has no `by_id/` access at all.
+    pull_skeleton_chain(vol_ulid, &core.data_dir, &by_id_dir, &core.stores).await?;
 
-    let basis_snapshot = match latest_snapshot_in_store(vol_ulid, store).await? {
+    let leaf_store = core.stores.data_for_volume(&vol_ulid);
+    let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &leaf_store).await? {
         Some((snap_ulid, kind)) => {
-            install_basis_under_leaf(vol_ulid, snap_ulid, kind, &fork_dir, store).await?;
+            install_basis_under_leaf(vol_ulid, snap_ulid, kind, &fork_dir, &leaf_store).await?;
             snap_ulid
         }
-        None => install_basis_under_parent(volume_name, &fork_dir, &by_id_dir, store).await?,
+        None => {
+            install_basis_under_parent(volume_name, &fork_dir, &by_id_dir, &core.stores).await?
+        }
     };
 
     elide_core::config::VolumeConfig {
@@ -130,14 +137,15 @@ async fn pull_skeleton_chain(
     leaf_ulid: Ulid,
     data_dir: &Path,
     by_id_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> Result<(), IpcError> {
     let mut next: Option<Ulid> = Some(leaf_ulid);
     while let Some(u) = next.take() {
         if by_id_dir.join(u.to_string()).exists() {
             break;
         }
-        let reply = pull_readonly_op(u, data_dir, store, None).await?;
+        let store = stores.read_volume(&u);
+        let reply = pull_readonly_op(u, data_dir, &store, None).await?;
         next = reply.parent;
     }
     Ok(())
@@ -199,7 +207,7 @@ async fn install_basis_under_parent(
     volume_name: &str,
     fork_dir: &Path,
     by_id_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> Result<Ulid, IpcError> {
     let lineage = elide_core::signing::read_lineage_verifying_signature(
         fork_dir,
@@ -229,17 +237,18 @@ async fn install_basis_under_parent(
     // Claim resolves the handoff via the promoted `<ulid>.manifest`
     // key (release promotes stop → user before flipping), so the
     // parent's basis is always a User-kind manifest here.
+    let parent_store = stores.read_volume(&parent_vol);
     fetch_and_verify_manifest(
         parent_vol,
         parent_snap,
         elide_core::signing::SnapshotKind::User,
         &parent_dir,
         &manifest_vk,
-        store,
+        &parent_store,
     )
     .await?;
     elide_coordinator::prefetch::pull_indexes_for_snapshot(
-        store,
+        &parent_store,
         &parent_dir,
         &parent.volume_ulid,
         parent_snap,
@@ -333,4 +342,87 @@ fn plant_by_name_symlink(
     std::os::unix::fs::symlink(format!("../by_id/{vol_ulid}"), &link)
         .map_err(|e| IpcError::internal(format!("creating by_name/{volume_name}: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use elide_coordinator::identity::CoordinatorIdentity;
+    use elide_coordinator::stores::{PassthroughStores, RecordingStores, RoleCall, ScopedStores};
+    use elide_core::signing::{ProvenanceLineage, VOLUME_PROVENANCE_FILE, write_provenance};
+    use object_store::PutPayload;
+    use object_store::path::Path as StorePath;
+    use rand_core::OsRng;
+    use tempfile::TempDir;
+
+    /// Upload a root-shape `volume.pub` and `volume.provenance` for
+    /// `vol_ulid` to the in-memory store so `pull_skeleton_chain` can
+    /// pull + verify them.
+    async fn upload_root_skeleton(store: &Arc<dyn ObjectStore>, vol_ulid: Ulid) {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let vk = signing_key.verifying_key();
+
+        let pub_key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+        let pub_hex: String = vk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let pub_body = format!("{pub_hex}\n");
+        store
+            .put(&pub_key, PutPayload::from(pub_body.into_bytes()))
+            .await
+            .unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let lineage = ProvenanceLineage::default();
+        write_provenance(tmp.path(), &signing_key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
+        let body = std::fs::read(tmp.path().join(VOLUME_PROVENANCE_FILE)).unwrap();
+        let prov_key = StorePath::from(format!("by_id/{vol_ulid}/{VOLUME_PROVENANCE_FILE}"));
+        store.put(&prov_key, PutPayload::from(body)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hydrate_remote_owned_routes_per_ulid() {
+        // `hydrate_remote_owned` touches:
+        //   - `by_id/<leaf>/volume.{pub,provenance}` (read_volume per
+        //     ancestor in pull_skeleton_chain — one iteration for a root)
+        //   - `by_id/<leaf>/snapshots/LATEST` (data_for_volume(leaf))
+        // Coord-writer has no `by_id/` grant, so neither op may ride
+        // it. Regression for the 2026-05-21 fix that dropped the
+        // threaded coord-writer store from `start_volume_op`.
+        let coord_dir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let leaf = Ulid::new();
+        upload_root_skeleton(&mem, leaf).await;
+
+        let passthrough: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(Arc::clone(&mem)));
+        let recording = RecordingStores::wrap(passthrough);
+        let stores: Arc<dyn ScopedStores> = recording.clone();
+
+        let core = crate::inbound::CoordinatorCore {
+            data_dir: Arc::new(data_dir.path().to_path_buf()),
+            stores,
+            identity,
+        };
+
+        // Root leaf with no snapshot → `install_basis_under_parent`
+        // errors with "no published snapshot". Routing decisions made
+        // before that landed in the spy.
+        let _ = hydrate_remote_owned("vol", leaf, 1024 * 1024, &core).await;
+
+        let calls = recording.calls();
+        assert!(
+            calls.contains(&RoleCall::ReadVolume(leaf)),
+            "skeleton pull must use volume-ro per ULID; got {calls:?}"
+        );
+        assert!(
+            calls.contains(&RoleCall::DataForVolume(leaf)),
+            "leaf-side reads must use coord-data(leaf); got {calls:?}"
+        );
+        assert!(
+            !calls.contains(&RoleCall::Writer),
+            "hydrate must not burn a coord-writer mint; got {calls:?}"
+        );
+    }
 }
