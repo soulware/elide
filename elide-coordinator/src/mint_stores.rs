@@ -341,13 +341,28 @@ impl MintScopedStores {
     }
 
     /// Block until the mint endpoint accepts a `coord-base`
-    /// `assume-role`. Used at startup so the coordinator survives mint
-    /// coming up after it (systemd ordering, fresh box, etc.) instead
-    /// of failing on the first S3 op.
+    /// `assume-role`, then eagerly warm the `coord-base` credential.
+    ///
+    /// Used at startup so the coordinator survives mint coming up after
+    /// it (systemd ordering, fresh box, etc.) instead of failing on the
+    /// first S3 op. `coord-base` is the always-held control-plane
+    /// credential, so the first op that touches it — a claim, a
+    /// peer-fetch verification — should not be the one to pay its
+    /// ~0.5s `assume-role`: assume it now and seed the cache. The probe
+    /// proves mint is reachable; the warm-up populates `base`'s cache.
+    /// Warm-up failure is non-fatal — the lazy path still mints on
+    /// first use, so a transient blip just defers the cost.
     pub async fn wait_for_ready(&self) -> std::io::Result<()> {
         self.endpoint
             .wait_for_ready(ROLE_COORD_BASE, COORD_CONTROL_TTL_SECS)
-            .await
+            .await?;
+        if let Err(e) = self.base.ensure().await {
+            tracing::warn!(
+                "[coordinator] coord-base warm-up failed ({e}); \
+                 first control-plane op will assume it lazily"
+            );
+        }
+        Ok(())
     }
 }
 
