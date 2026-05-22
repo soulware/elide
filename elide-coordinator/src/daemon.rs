@@ -162,7 +162,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             )?,
         );
         let auth =
-            elide_peer_fetch::auth::AuthState::new(stores.peer_verifier_store(), lineage_store);
+            elide_peer_fetch::auth::AuthState::new(stores.base_object_store(), lineage_store);
         let ctx = elide_peer_fetch::server::ServerContext::new(auth, data_dir.as_ref().clone());
         peer_fetch_server = Some((addr, ctx));
     }

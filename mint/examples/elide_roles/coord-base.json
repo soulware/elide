@@ -7,7 +7,8 @@
     "Resource": [
       "arn:aws:s3:::{{tenant.bucket}}/names/*",
       "arn:aws:s3:::{{tenant.bucket}}/coordinators/*",
-      "arn:aws:s3:::{{tenant.bucket}}/events/*"
+      "arn:aws:s3:::{{tenant.bucket}}/events/*",
+      "arn:aws:s3:::{{tenant.bucket}}/meta/*"
     ],
     "Condition": {
       "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}

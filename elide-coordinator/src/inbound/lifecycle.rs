@@ -1667,7 +1667,7 @@ mod tests {
         vol_ulid: ulid::Ulid,
         vk: &ed25519_dalek::VerifyingKey,
     ) {
-        let key = StorePath::from(format!("by_id/{vol_ulid}/volume.pub"));
+        let key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
         let body = format!("{}\n", hex(&vk.to_bytes()));
         store
             .put(&key, PutPayload::from(body.into_bytes()))

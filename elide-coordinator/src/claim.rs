@@ -731,7 +731,7 @@ impl ClaimOrchestrator {
         // Discovery reads events/<name>/HEAD, coordinators/<other>/coordinator.pub,
         // and coordinators/<other>/peer-endpoint.toml — all RO and all cross-
         // coordinator, so the correct credential is coord-base.
-        let store_base = self.ctx.core.stores.peer_verifier_store();
+        let store_base = self.ctx.core.stores.base_object_store();
         let journal = self.ctx.core.stores.event_journal_ro();
         if let Some(discovered) = elide_coordinator::peer_discovery::discover_peer_for_claim(
             &store_base,
@@ -763,10 +763,10 @@ impl ClaimOrchestrator {
             }
             self.job
                 .append(ClaimAttachEvent::PullingAncestor { vol_ulid });
-            // Ancestor reads are GETs only — read-scoped `volume-ro`
-            // is enough (and avoids reaching for write-capable
-            // `volume-rw` we never use on this path).
-            let store = self.ctx.core.stores.read_volume(&vol_ulid);
+            // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
+            // bucket-wide objects covered by the warm `coord-base`
+            // credential, so chain discovery costs no per-hop mint.
+            let store = self.ctx.core.stores.base_object_store();
             self.pulled_guard.record(vol_ulid);
             let reply = pull_readonly_op(
                 vol_ulid,
@@ -811,7 +811,7 @@ impl ClaimOrchestrator {
         // `by_id/<released>/snapshots/` — GET only, so `volume-ro` is
         // the right scope.
         let store = self.ctx.core.stores.read_volume(&self.released_vol_ulid);
-        let base_ro = self.ctx.core.stores.peer_verifier_store();
+        let base_ro = self.ctx.core.stores.base_object_store();
         let key = resolve_handoff_key_via_recovery(
             self.released_vol_ulid,
             self.handoff_snap,
@@ -1126,7 +1126,7 @@ pub(crate) async fn skip_empty_intermediates_impl(
 
         // Pure-read manifest fetch — `volume-ro` is the right scope.
         let store = stores.read_volume(&effective_vol);
-        let base_ro = stores.peer_verifier_store();
+        let base_ro = stores.base_object_store();
         let (manifest, _verifier) = elide_coordinator::recovery::fetch_verified_handoff_manifest(
             &store,
             &base_ro,
@@ -1158,10 +1158,9 @@ pub(crate) async fn skip_empty_intermediates_impl(
             job.append(ClaimAttachEvent::PullingAncestor {
                 vol_ulid: parent_vol_ulid,
             });
-            // Ancestor pull is GET-only — `volume-ro` suffices, and is
-            // the least-privileged credential that grants read on
-            // `by_id/<ancestor>/*`.
-            let parent_store = stores.read_volume(&parent_vol_ulid);
+            // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
+            // bucket-wide objects on the warm `coord-base` credential.
+            let parent_store = stores.base_object_store();
             guard.record(parent_vol_ulid);
             let _ = pull_readonly_op(parent_vol_ulid, data_dir, &parent_store, peer).await?;
         }

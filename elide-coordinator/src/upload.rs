@@ -311,12 +311,27 @@ pub async fn drain_pending(
 /// (marker + .manifest) is covered by a single empty sentinel at
 /// `uploaded/snapshots/<ulid>`.
 async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
+    let vol_ulid = match Ulid::from_string(volume_id) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!("[upload] volume_id {volume_id} is not a ULID: {e}");
+            return;
+        }
+    };
     let pub_key_path = vol_dir.join("volume.pub");
     match std::fs::read(&pub_key_path) {
         Ok(bytes) => {
             let sentinel = upload_sentinel(vol_dir, "volume.pub");
             if !is_already_uploaded(&sentinel, &bytes) {
-                match upload_small_bytes(&bytes, volume_id, "volume.pub", MIME_TEXT, store).await {
+                match upload_small_bytes(
+                    &bytes,
+                    &StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid)),
+                    "volume.pub",
+                    MIME_TEXT,
+                    store,
+                )
+                .await
+                {
                     Ok(()) => {
                         if let Err(e) = mark_uploaded(&sentinel, &bytes) {
                             warn!("failed to mark volume.pub sentinel: {e}");
@@ -337,7 +352,7 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
             if !is_already_uploaded(&sentinel, &bytes) {
                 match upload_small_bytes(
                     &bytes,
-                    volume_id,
+                    &StorePath::from(elide_core::store_keys::meta_provenance_key(vol_ulid)),
                     elide_core::signing::VOLUME_PROVENANCE_FILE,
                     MIME_TEXT,
                     store,
@@ -395,13 +410,12 @@ pub async fn upload_volume_pub_initial(
 /// Sibling to [`upload_volume_pub_initial`]: extends the same
 /// "`names/<name>` only ever points at a `vol_ulid` whose immutable
 /// trust artefacts are already in the bucket" invariant from
-/// `volume.pub` to `volume.provenance`. Provenance is needed by the
-/// peer-fetch auth pipeline's lineage walk (which fetches
-/// `by_id/<vol_ulid>/volume.provenance` to reconstruct ancestry) and
-/// by `pull_readonly` for ancestor materialisation. Without this
-/// eager publish, the window between `mark_claimed` and the daemon's
-/// later metadata-drain pass is one in which every peer-fetch
-/// request 401s on a 404 from S3.
+/// `volume.pub` to `volume.provenance`. Provenance is needed by
+/// `pull_readonly` for ancestor materialisation, which fetches
+/// `meta/<vol_ulid>.provenance` from S3 to reconstruct ancestry.
+/// Without this eager publish, the window between `mark_claimed` and
+/// the daemon's later metadata-drain pass is one in which every such
+/// request 404s.
 ///
 /// Crash-safety story matches the `volume.pub` case: if the
 /// coordinator dies after this call but before `mark_initial` /
@@ -424,17 +438,16 @@ pub async fn upload_volume_provenance_initial(
 
 async fn upload_small_bytes(
     data: &[u8],
-    volume_id: &str,
-    remote_name: &str,
+    key: &StorePath,
+    label: &str,
     content_type: &'static str,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let len = data.len();
-    let key = StorePath::from(format!("by_id/{volume_id}/{remote_name}"));
     let started = Instant::now();
-    put_with_content_type(store, &key, Bytes::copy_from_slice(data), content_type)
+    put_with_content_type(store, key, Bytes::copy_from_slice(data), content_type)
         .await
-        .with_context(|| format!("uploading {remote_name} to {key}"))?;
+        .with_context(|| format!("uploading {label} to {key}"))?;
     info!("[upload] {key} ({len} bytes in {:.2?})", started.elapsed());
     Ok(())
 }
@@ -752,7 +765,9 @@ mod tests {
         assert_eq!(result.upload_failed, 0);
         assert_eq!(result.promote_failed, 0);
 
-        let pub_key = StorePath::from(format!("by_id/{VOL_ULID}/volume.pub"));
+        let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(
+            ulid::Ulid::from_string(VOL_ULID).expect("VOL_ULID is a valid ULID"),
+        ));
         let got = store.get(&pub_key).await.expect("volume.pub not in store");
         let bytes = got.bytes().await.unwrap();
         assert_eq!(bytes.as_ref(), fake_pub);
@@ -826,7 +841,9 @@ mod tests {
         // works, re-drain sees a matching `uploaded/volume.pub` and skips —
         // the object remains absent. If gating is broken (e.g. reverted to
         // mtime), the object reappears.
-        let pub_key = StorePath::from(format!("by_id/{VOL_ULID}/volume.pub"));
+        let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(
+            ulid::Ulid::from_string(VOL_ULID).expect("VOL_ULID is a valid ULID"),
+        ));
         store.delete(&pub_key).await.unwrap();
 
         drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();

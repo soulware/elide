@@ -77,11 +77,8 @@ pub async fn pull_volume_skeleton(
     // Two independent GETs — fire concurrently so per-ancestor pull
     // latency is bounded by the slowest, not the sum. Each side tries
     // the peer first and falls through to S3 on any non-200 response.
-    let pub_key = StorePath::from(format!("by_id/{volume_id}/volume.pub"));
-    let provenance_key = StorePath::from(format!(
-        "by_id/{volume_id}/{}",
-        elide_core::signing::VOLUME_PROVENANCE_FILE
-    ));
+    let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
+    let provenance_key = StorePath::from(elide_core::store_keys::meta_provenance_key(vol_ulid));
     let (pub_bytes, provenance_bytes) = tokio::try_join!(
         fetch_skeleton_file(
             store,
@@ -247,14 +244,14 @@ mod tests {
         let prov_bytes = b"prov-bytes\n";
         store
             .put(
-                &StorePath::from(format!("by_id/{vol_id}/volume.pub")),
+                &StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid)),
                 bytes::Bytes::from_static(pub_bytes).into(),
             )
             .await
             .unwrap();
         store
             .put(
-                &StorePath::from(format!("by_id/{vol_id}/volume.provenance")),
+                &StorePath::from(elide_core::store_keys::meta_provenance_key(vol_ulid)),
                 bytes::Bytes::from_static(prov_bytes).into(),
             )
             .await
@@ -292,14 +289,14 @@ mod tests {
         let prov_bytes = b"y";
         store
             .put(
-                &StorePath::from(format!("by_id/{vol_id}/volume.pub")),
+                &StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid)),
                 bytes::Bytes::from_static(pub_bytes).into(),
             )
             .await
             .unwrap();
         store
             .put(
-                &StorePath::from(format!("by_id/{vol_id}/volume.provenance")),
+                &StorePath::from(elide_core::store_keys::meta_provenance_key(vol_ulid)),
                 bytes::Bytes::from_static(prov_bytes).into(),
             )
             .await

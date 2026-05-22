@@ -444,20 +444,25 @@ listing is all-or-nothing. Acceptable for the writer. No
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::<bucket>/by_id/*/volume.pub",
-      "arn:aws:s3:::<bucket>/by_id/*/volume.provenance",
+      "arn:aws:s3:::<bucket>/meta/*",
       "arn:aws:s3:::<bucket>/names/*",
-      "arn:aws:s3:::<bucket>/coordinators/*/coordinator.pub"
+      "arn:aws:s3:::<bucket>/coordinators/*"
     ]
   }]
 }
 ```
 
-No segment-body access. No write actions. The wildcard suffixes
-depend on Tigris's S3-compatible IAM supporting `*` mid-resource —
-verify before relying on it; if not supported, fall back to listing
-volumes explicitly or scoping to `by_id/*` for `s3:GetObject` (with
-the loss that peer-fetch could then read segment bodies it shouldn't).
+No segment-body access. No write actions. `volume.pub` and
+`volume.provenance` live under the flat top-level `meta/` prefix
+(`meta/<ulid>.pub`, `meta/<ulid>.provenance` — see
+`formats.md`), so `meta/*` is a *trailing* wildcard. This matters
+because Tigris IAM matches `*` **only** as a trailing wildcard — a
+suffix-constrained `by_id/*/volume.pub` matches nothing (verified
+empirically). The `meta/` prefix exists precisely so this metadata can
+be granted bucket-wide without a mid-resource wildcard.
+`coordinators/*` is likewise trailing; it grants the whole
+per-coordinator prefix rather than just `coordinator.pub`, since
+`coordinators/*/coordinator.pub` would be mid-resource.
 
 ### Per-volume read-only key
 
@@ -521,10 +526,11 @@ small amount of policy size and nothing else.
   keys are individually scoped, and a leak of any one bounds the
   damage to that key's policy. Containment of the admin key itself
   is discussed in § "Admin key containment".
-- **Wildcard resource patterns.** Several policies above (peer-fetch
-  in particular) rely on mid-resource wildcards
-  (`by_id/*/volume.pub`). Verify Tigris's S3 IAM supports this
-  pattern before relying on it.
+- **Wildcard resource patterns.** Every policy uses only *trailing*
+  wildcards (`meta/*`, `names/*`, `by_id/<ulid>/*`). Tigris IAM does
+  not match `*` mid-resource (verified empirically), which is why
+  `volume.pub` / `volume.provenance` live under the flat `meta/`
+  prefix rather than nested in `by_id/<ulid>/`.
 
 ## Volume fetch
 
@@ -558,8 +564,6 @@ the claim key.
 - **Tigris policy size limit** under deep ancestor chains. Likely
   not a concern in practice (fork depth ≤ small numbers) but
   unverified.
-- **Tigris wildcard semantics** in resource ARNs (mid-resource `*`).
-  The peer-fetch policy depends on this; verify before relying.
 - **Writer key rotation cadence.** `DateLessThan` is not used; a
   scheduled rotation flow (operator-triggered or time-based) is
   open.

@@ -364,10 +364,10 @@ async fn pull_ancestor_chain(
             break;
         }
         job.line(format!("pulling ancestor {vol_ulid}"));
-        // Each iteration touches a distinct `by_id/<vol_ulid>/` prefix —
-        // mint a per-ULID `volume-ro` view rather than reusing one
-        // leaf-scoped credential (which would 403 on every ancestor).
-        let store = stores.read_volume(&vol_ulid);
+        // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
+        // bucket-wide objects on the warm `coord-base` credential, so
+        // the whole chain walk needs no per-ancestor mint.
+        let store = stores.base_object_store();
         let reply = pull_readonly_op(vol_ulid, data_dir, &store, None).await?;
         next = reply.parent;
     }

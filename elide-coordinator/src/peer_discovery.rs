@@ -125,7 +125,7 @@ async fn find_releaser(
 /// published endpoint, store error) collapses to `None`.
 ///
 /// `store` must be a `coord-base`-scoped handle (e.g.
-/// `ScopedStores::peer_verifier_store`). Every read this function
+/// `ScopedStores::base_object_store`). Every read this function
 /// makes is cross-coordinator: `events/<name>/HEAD`,
 /// `coordinators/<other>/coordinator.pub`, and
 /// `coordinators/<other>/peer-endpoint.toml`. `coord-base` is the

@@ -402,15 +402,17 @@ by_id/01KN4Q7WCJNQ9SCK4KKY5888AJ/20260401/01KN4Q887YGPWMG4CBHCZPZN4Q
 
 **Volume public key:**
 ```
-by_id/<volume-ulid>/volume.pub
+meta/<volume-ulid>.pub
 ```
 
 Uploaded once at first drain. Enables segment signature verification on any host (trust-on-first-use).
 
 **Volume provenance:**
 ```
-by_id/<volume-ulid>/volume.provenance
+meta/<volume-ulid>.provenance
 ```
+
+`volume.pub` and `volume.provenance` are stored under a flat top-level `meta/` prefix — `meta/<ulid>.pub`, `meta/<ulid>.provenance` — not nested in the per-volume `by_id/<ulid>/` prefix that holds segments and snapshots. The flat layout makes `meta/*` a *trailing* wildcard, which Tigris IAM resource ARNs match (mid-resource `*` is not supported). A credential can therefore be granted bucket-wide read of this metadata (`coord-base` carries `meta/*`) without also granting the per-volume bulk data — so a coordinator walks an ancestor chain's provenance with one warm credential rather than minting one per hop. The local volume directory still keeps both files inside `by_id/<ulid>/`; only the object-store key differs.
 
 Written at import, fork, and create time and uploaded with `volume.pub` so any host can verify lineage and segment signatures locally. The file is a custom line-oriented format (not TOML), Ed25519-signed by the volume's own key. Fields:
 
@@ -580,10 +582,10 @@ All volumes use a flat layout with fixed filenames directly in the volume direct
 <vol_dir>/volume.key        — Ed25519 private key (32 bytes; never uploaded; absent on readonly volumes)
 ```
 
-S3 locations:
+S3 locations (flat top-level `meta/` prefix — see *Volume provenance* above):
 ```
-by_id/<volume-ulid>/volume.pub
-by_id/<volume-ulid>/volume.provenance
+meta/<volume-ulid>.pub
+meta/<volume-ulid>.provenance
 ```
 
 **Readonly volumes have no private key.** `elide-import` generates an ephemeral keypair in memory, uses it to sign all segments and the provenance file, writes `volume.pub` and `volume.provenance` to disk, then discards the private key. `volume.key` is never written. Since a readonly volume can never accept new writes, the private key has no use after import completes.

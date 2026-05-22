@@ -4,7 +4,11 @@
     "Sid": "ReadWriteSingleVolume",
     "Effect": "Allow",
     "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-    "Resource": ["arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"],
+    "Resource": [
+      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*",
+      "arn:aws:s3:::{{tenant.bucket}}/meta/{{caveat "elide:Volume"}}.provenance",
+      "arn:aws:s3:::{{tenant.bucket}}/meta/{{caveat "elide:Volume"}}.pub"
+    ],
     "Condition": {
       "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
     }
