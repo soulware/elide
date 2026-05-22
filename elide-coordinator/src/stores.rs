@@ -257,7 +257,7 @@ pub enum RoleCall {
     VolumeRw(Ulid),
     ReadVolume(Ulid),
     ReadHeadWithAncestors(Ulid, Vec<Ulid>),
-    PeerVerifier,
+    BaseObjectStore,
 }
 
 /// `ScopedStores` decorator that records every method call and
@@ -334,7 +334,7 @@ impl ScopedStores for RecordingStores {
         self.inner.read_head_with_ancestors(vol_ulid, ancestors)
     }
     fn base_object_store(&self) -> Arc<dyn ObjectStore> {
-        self.record(RoleCall::PeerVerifier);
+        self.record(RoleCall::BaseObjectStore);
         self.inner.base_object_store()
     }
 }
