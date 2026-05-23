@@ -4,6 +4,7 @@
 //! real wire sequence — `CreateAccessKey` → `CreatePolicy` →
 //! `AttachUserPolicy`, SigV4-signed, form-encoded — and the error path.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +23,10 @@ struct Recorder {
     /// If set, the server replies 400 with a Throttling ErrorResponse
     /// instead of the success XML, on the request whose Action matches.
     fail_on: Option<&'static str>,
+    /// How many *initial* `fail_on` attempts to throttle before falling
+    /// through to the success branch. `0` (the default) means always
+    /// fail; a positive value lets the retry loop recover.
+    transient_failures: Option<Arc<AtomicUsize>>,
 }
 
 fn action_of(body: &str) -> String {
@@ -44,12 +49,22 @@ async fn handler(
     rec.seen.lock().unwrap().push((action.clone(), signed));
 
     if rec.fail_on == Some(action.as_str()) {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            "<ErrorResponse><Error><Code>Throttling</Code>\
-             <Message>rate exceeded</Message></Error></ErrorResponse>"
-                .to_string(),
-        );
+        let still_throttle = match &rec.transient_failures {
+            Some(counter) => counter
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n > 0 { Some(n - 1) } else { None }
+                })
+                .is_ok(),
+            None => true,
+        };
+        if still_throttle {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "<ErrorResponse><Error><Code>SlowDown</Code>\
+                 <Message>please reduce your request rate</Message></Error></ErrorResponse>"
+                    .to_string(),
+            );
+        }
     }
 
     let xml = match action.as_str() {
@@ -140,13 +155,17 @@ async fn iam_error_maps_to_backend_unavailable() {
             Duration::from_secs(60),
         )
         .await
-        .expect_err("CreatePolicy 400 must fail the mint");
+        .expect_err("persistent throttling must fail the mint");
     let MintError::Backend(msg) = err;
-    assert!(msg.contains("Throttling"), "got: {msg}");
-    assert!(msg.contains("rate exceeded"), "got: {msg}");
+    assert!(msg.contains("SlowDown"), "got: {msg}");
+    assert!(
+        msg.contains("please reduce your request rate"),
+        "got: {msg}"
+    );
 
-    // The key was created before the failing CreatePolicy; mint does no
-    // rollback (an unattached key grants nothing — IAM default-deny).
+    // The retry loop exhausts MAX_ATTEMPTS=4 on CreatePolicy; the
+    // initial CreateAccessKey succeeded once and is not rolled back
+    // (an unattached key grants nothing — IAM default-deny).
     let actions: Vec<String> = rec
         .seen
         .lock()
@@ -154,5 +173,55 @@ async fn iam_error_maps_to_backend_unavailable() {
         .iter()
         .map(|(a, _)| a.clone())
         .collect();
-    assert_eq!(actions, ["CreateAccessKey", "CreatePolicy"]);
+    assert_eq!(
+        actions,
+        [
+            "CreateAccessKey",
+            "CreatePolicy",
+            "CreatePolicy",
+            "CreatePolicy",
+            "CreatePolicy",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn recovers_from_transient_slowdown() {
+    let rec = Recorder {
+        fail_on: Some("CreatePolicy"),
+        transient_failures: Some(Arc::new(AtomicUsize::new(2))),
+        ..Recorder::default()
+    };
+    let endpoint = spawn_mock(rec.clone()).await;
+    let minter = TigrisMinter::with_endpoint(&admin(), endpoint).unwrap();
+
+    let kp = minter
+        .mint_keypair(
+            "mint_test_global_20260521T000000Z_deadbeef",
+            r#"{"Version":"2012-10-17"}"#,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("third CreatePolicy attempt succeeds");
+    assert_eq!(kp.access_key_id, "tid_live123");
+
+    // CreateAccessKey once, CreatePolicy thrown back twice then
+    // accepted, AttachUserPolicy once.
+    let actions: Vec<String> = rec
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(a, _)| a.clone())
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "CreateAccessKey",
+            "CreatePolicy",
+            "CreatePolicy",
+            "CreatePolicy",
+            "AttachUserPolicy",
+        ]
+    );
 }

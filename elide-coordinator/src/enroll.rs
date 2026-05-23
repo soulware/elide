@@ -109,7 +109,7 @@ async fn enroll_request(
     let sig = BASE64.encode(identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
     let auth = format!("Macaroon {}", mac.encode());
 
-    let (status, text) = post(
+    let (status, text, _retry_after) = post(
         &cfg.url,
         cfg.connect_timeout,
         cfg.request_timeout,
@@ -152,7 +152,7 @@ async fn exchange_request(
     let sig = BASE64.encode(identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
     let auth = format!("Macaroon {}", mac.encode());
 
-    let (status, text) = post(
+    let (status, text, _retry_after) = post(
         &cfg.url,
         cfg.connect_timeout,
         cfg.request_timeout,

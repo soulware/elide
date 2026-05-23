@@ -26,6 +26,7 @@ use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
 use aws_sigv4::sign::v4;
 use chrono::Utc;
+use rand_core::{OsRng, RngCore};
 
 use crate::config::AdminCredential;
 use crate::iam::{KeypairMinter, MintError, MintedKeypair};
@@ -36,6 +37,16 @@ const DEFAULT_ENDPOINT: &str = "https://iam.storage.dev";
 /// Tigris is not region-aware for IAM; it accepts AWS's `us-east-1`.
 const SIGNING_REGION: &str = "us-east-1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-IAM-call retry budget for transient Tigris failures (`SlowDown`,
+/// `Throttling`, 429/5xx, transport glitches). 4 attempts with
+/// 200/400/800ms exponential backoff (±50% jitter) — total worst-case
+/// sleep ~1.4s, well inside both `REQUEST_TIMEOUT` and the mint's
+/// caller-facing `503 Retry-After: 5` contract (`docs/design-mint.md`
+/// § *Failure modes*).
+const MAX_ATTEMPTS: u32 = 4;
+const BASE_BACKOFF: Duration = Duration::from_millis(200);
+const MAX_BACKOFF: Duration = Duration::from_millis(1600);
 
 /// Internal failure surface. Every variant maps to
 /// [`MintError::Backend`] at the [`KeypairMinter`] boundary — the HTTP
@@ -66,6 +77,49 @@ fn transport(e: reqwest::Error) -> TigrisError {
         src = s.source();
     }
     TigrisError::Transport(msg)
+}
+
+impl TigrisError {
+    /// Whether this failure looks like a transient Tigris-side condition
+    /// worth retrying. Throttle codes (`SlowDown`, `Throttling*`,
+    /// `TooManyRequests`, `RequestLimitExceeded`, `RequestThrottled`),
+    /// 429/5xx HTTP status, and any reqwest transport error are
+    /// retryable. Build/signing/parse failures are deterministic — a
+    /// retry won't help.
+    fn is_retryable(&self) -> bool {
+        match self {
+            TigrisError::Service { code, .. } => matches!(
+                code.as_str(),
+                "SlowDown"
+                    | "Throttling"
+                    | "ThrottlingException"
+                    | "TooManyRequests"
+                    | "RequestLimitExceeded"
+                    | "RequestThrottled"
+            ),
+            TigrisError::Unexpected { status, .. } => {
+                matches!(*status, 429 | 500 | 502 | 503 | 504)
+            }
+            TigrisError::Transport(_) => true,
+            TigrisError::HttpBuild(_) | TigrisError::Signing(_) | TigrisError::Parse(_) => false,
+        }
+    }
+}
+
+/// Exponential backoff with ±50% jitter. `attempt` is zero-based: 0 →
+/// ~200ms, 1 → ~400ms, 2 → ~800ms, 3+ → ~1600ms cap. Jitter prevents
+/// a thundering herd of concurrent `assume-role` retries hitting the
+/// IAM endpoint in lockstep.
+fn backoff_with_jitter(attempt: u32) -> Duration {
+    let shift = attempt.min(3);
+    let base_ms = (BASE_BACKOFF.as_millis() as u64)
+        .checked_shl(shift)
+        .unwrap_or(u64::MAX)
+        .min(MAX_BACKOFF.as_millis() as u64);
+    let half = base_ms / 2;
+    let span = half.saturating_mul(2).saturating_add(1);
+    let jitter = (OsRng.next_u64() % span) as i64 - half as i64;
+    Duration::from_millis(((base_ms as i64) + jitter).max(1) as u64)
 }
 
 /// The Tigris IAM Query-API client: an admin credential plus a reqwest
@@ -141,7 +195,38 @@ impl TigrisMinter {
         self.send(body).await.map(|_| ())
     }
 
+    /// Send `body` with bounded retry on transient Tigris failures
+    /// (throttle codes, 429/5xx, transport glitches). The individual
+    /// IAM operations are all safe to repeat: a retried
+    /// `CreateAccessKey` whose first attempt was rejected mints
+    /// nothing extra, and even a retried call that silently succeeded
+    /// on the first attempt only leaves an unattached key (no policy
+    /// = IAM default-deny, the same partial-failure shape the
+    /// no-rollback design already accepts — `mint_keypair`).
     async fn send(&self, body: String) -> Result<String, TigrisError> {
+        let mut attempt: u32 = 0;
+        loop {
+            match self.send_once(body.clone()).await {
+                Ok(text) => return Ok(text),
+                Err(e) if e.is_retryable() && attempt + 1 < MAX_ATTEMPTS => {
+                    let delay = backoff_with_jitter(attempt);
+                    tracing::warn!(
+                        target: "mint::tigris",
+                        attempt = attempt + 1,
+                        max_attempts = MAX_ATTEMPTS,
+                        backoff_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "transient Tigris IAM failure; retrying",
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn send_once(&self, body: String) -> Result<String, TigrisError> {
         let url = &self.endpoint;
         let now = SystemTime::now();
 

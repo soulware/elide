@@ -28,6 +28,30 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
+/// Coordinator-side 503 retry budget for `assume-role`. Three attempts
+/// total — mint already absorbs short Tigris throttle bursts with its
+/// own per-IAM-call retry, so a 503 reaching here implies a sustained
+/// condition; a tight outer budget keeps a stuck control-plane op from
+/// blocking for tens of seconds.
+const MAX_503_RETRIES: u32 = 3;
+/// Floor / ceiling applied to the mint-supplied `Retry-After`. The
+/// floor prevents tight loops if mint ever emits `0`; the ceiling
+/// keeps total wait bounded even if mint asks for a long pause.
+const RETRY_AFTER_FLOOR: Duration = Duration::from_secs(1);
+const RETRY_AFTER_CEILING: Duration = Duration::from_secs(8);
+const RETRY_AFTER_FALLBACK: Duration = Duration::from_secs(2);
+
+/// Clamp the mint-supplied `Retry-After` (seconds) to a sane band, or
+/// fall back to a small default when the header was absent or zero.
+fn retry_after_delay(retry_after_secs: Option<u64>) -> Duration {
+    match retry_after_secs {
+        Some(0) | None => RETRY_AFTER_FALLBACK,
+        Some(s) => Duration::from_secs(s)
+            .max(RETRY_AFTER_FLOOR)
+            .min(RETRY_AFTER_CEILING),
+    }
+}
+
 use elide_coordinator::config::MintConfig;
 use elide_coordinator::identity::CoordinatorIdentity;
 
@@ -216,6 +240,11 @@ fn uds_socket(url: &str) -> Option<&str> {
     url.trim().strip_prefix("unix:")
 }
 
+/// Returns `(status, body, retry_after_secs)`. The retry-after value
+/// is parsed from the response `Retry-After` header when present and
+/// expressed in seconds (mint always emits seconds —
+/// `docs/design-mint.md` § *Failure modes*); the HTTP-date form is
+/// not parsed.
 pub(crate) async fn post(
     cfg_url: &str,
     connect_timeout: Duration,
@@ -224,7 +253,7 @@ pub(crate) async fn post(
     auth: &str,
     sig: &str,
     body: String,
-) -> io::Result<(u16, String)> {
+) -> io::Result<(u16, String, Option<u64>)> {
     match uds_socket(cfg_url) {
         Some(socket) => post_uds(socket, request_timeout, endpoint, auth, sig, body).await,
         None => {
@@ -250,7 +279,7 @@ async fn post_tcp(
     auth: &str,
     sig: &str,
     body: String,
-) -> io::Result<(u16, String)> {
+) -> io::Result<(u16, String, Option<u64>)> {
     let client = reqwest::Client::builder()
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
@@ -280,11 +309,16 @@ async fn post_tcp(
             }
         })?;
     let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
     let text = resp
         .text()
         .await
         .map_err(|e| io::Error::other(format!("reading mint response: {e}")))?;
-    Ok((status, text))
+    Ok((status, text, retry_after))
 }
 
 /// HTTP-over-UDS leg — `reqwest` has no UDS support, so this drops to
@@ -297,7 +331,7 @@ async fn post_uds(
     auth: &str,
     sig: &str,
     body: String,
-) -> io::Result<(u16, String)> {
+) -> io::Result<(u16, String, Option<u64>)> {
     use http_body_util::{BodyExt, Full};
     use hyper_util::client::legacy::Client;
     use hyper_util::rt::TokioExecutor;
@@ -332,13 +366,22 @@ async fn post_uds(
             }
         })?;
     let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
     let bytes = resp
         .into_body()
         .collect()
         .await
         .map_err(|e| io::Error::other(format!("reading mint uds response: {e}")))?
         .to_bytes();
-    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+    Ok((
+        status,
+        String::from_utf8_lossy(&bytes).into_owned(),
+        retry_after,
+    ))
 }
 
 pub(crate) fn json_str_field(body: &str, key: &str) -> io::Result<String> {
@@ -377,6 +420,14 @@ impl MintEndpoint {
     /// at `/v1/assume-role` with the `coordinator.key` PoP, and return
     /// the vended Tigris keypair. `extra_body` carries role-specific
     /// PoP-signed request fields (e.g. `volume-ro`'s `ancestors`).
+    ///
+    /// Transient `503` responses (mint's signal for Tigris-side
+    /// throttling or backend unavailability, `docs/design-mint.md`
+    /// § *Failure modes*) are retried a bounded number of times,
+    /// honouring `Retry-After` clamped to a sane band. Mint also
+    /// performs its own per-IAM-call retry before surfacing 503, so
+    /// reaching this loop already implies a sustained backend
+    /// condition, not a one-shot burst.
     pub async fn assume_role(
         &self,
         role: &str,
@@ -394,51 +445,84 @@ impl MintEndpoint {
                 ),
             )
         })?;
-        let mut mac = WireMacaroon::decode(&stored)?;
 
-        let now = now_unix()?;
-        let exp = now.saturating_add(ttl_secs);
-        // The credential does not expire; the role gate requires `exp`.
-        // Bound it, then apply any role-specific narrowing.
-        mac.attenuate(CAVEAT_EXP, &exp.to_string());
-        for (n, v) in narrowing {
-            mac.attenuate(n, v);
-        }
+        let mut attempt: u32 = 0;
+        let (text, exp) = loop {
+            attempt += 1;
+            // Each attempt re-attenuates from the stored macaroon and
+            // signs a fresh body — `exp` and `ts` shift with the
+            // current clock so the issued credential's lifetime is
+            // measured from the successful attempt, not the first try.
+            let mut mac = WireMacaroon::decode(&stored)?;
+            let now = now_unix()?;
+            let exp = now.saturating_add(ttl_secs);
+            // The credential does not expire; the role gate requires
+            // `exp`. Bound it, then apply any role-specific narrowing.
+            mac.attenuate(CAVEAT_EXP, &exp.to_string());
+            for (n, v) in narrowing {
+                mac.attenuate(n, v);
+            }
 
-        // Build the exact body bytes once: they are both signed (via
-        // BLAKE3(body)) and sent. Mint hashes the raw bytes before
-        // parsing, so no canonicalization step may sit between.
-        let mut obj = serde_json::Map::new();
-        obj.insert("ts".into(), now.into());
-        obj.insert("role".into(), role.into());
-        obj.insert("ttl_seconds".into(), ttl_secs.into());
-        for (k, v) in extra_body {
-            obj.insert((*k).to_owned(), v.clone());
-        }
-        let body = serde_json::Value::Object(obj).to_string();
+            // Build the exact body bytes once: they are both signed
+            // (via BLAKE3(body)) and sent. Mint hashes the raw bytes
+            // before parsing, so no canonicalization step may sit
+            // between.
+            let mut obj = serde_json::Map::new();
+            obj.insert("ts".into(), now.into());
+            obj.insert("role".into(), role.into());
+            obj.insert("ttl_seconds".into(), ttl_secs.into());
+            for (k, v) in extra_body {
+                obj.insert((*k).to_owned(), v.clone());
+            }
+            let body = serde_json::Value::Object(obj).to_string();
 
-        let sig = BASE64.encode(self.identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
-        let auth = format!("Macaroon {}", mac.encode());
+            let sig = BASE64.encode(self.identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
+            let auth = format!("Macaroon {}", mac.encode());
 
-        let (status, text) = post(
-            &self.url,
-            self.connect_timeout,
-            self.request_timeout,
-            "/v1/assume-role",
-            &auth,
-            &sig,
-            body,
-        )
-        .await?;
+            let (status, text, retry_after) = post(
+                &self.url,
+                self.connect_timeout,
+                self.request_timeout,
+                "/v1/assume-role",
+                &auth,
+                &sig,
+                body,
+            )
+            .await?;
 
-        if status != 200 {
+            if status == 200 {
+                break (text, exp);
+            }
+
             // mint's error model is deliberately coarse (401/400/503);
             // surface status + a short body for the operator log.
             let snippet: String = text.chars().take(200).collect();
+            if status == 503 && attempt < MAX_503_RETRIES {
+                let delay = retry_after_delay(retry_after);
+                warn!(
+                    "[coordinator] mint assume-role for {role} returned 503 \
+                     (retry-after={}s, body={snippet:?}); retrying in {:?} (attempt {attempt}/{MAX_503_RETRIES})",
+                    retry_after
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "<absent>".into()),
+                    delay,
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            if status == 503 {
+                warn!(
+                    "[coordinator] mint assume-role for {role} exhausted 503 retries \
+                     (retry-after={}s, body={snippet:?})",
+                    retry_after
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "<absent>".into()),
+                );
+            }
             return Err(io::Error::other(format!(
                 "mint assume-role for {role} returned {status}: {snippet}"
             )));
-        }
+        };
 
         let access_key_id = json_str_field(&text, "access_key_id")?;
         let secret_access_key = json_str_field(&text, "secret_access_key")?;
@@ -662,5 +746,19 @@ mod tests {
             Some("mint/mint_data/mint.sock")
         );
         assert_eq!(uds_socket("https://mint.host:8085"), None);
+    }
+
+    #[test]
+    fn retry_after_delay_clamps() {
+        // Absent or zero header → fallback, not a tight loop.
+        assert_eq!(retry_after_delay(None), RETRY_AFTER_FALLBACK);
+        assert_eq!(retry_after_delay(Some(0)), RETRY_AFTER_FALLBACK);
+        // Values inside the band pass through unchanged.
+        assert_eq!(retry_after_delay(Some(3)), Duration::from_secs(3));
+        // Below floor → floor.
+        assert_eq!(retry_after_delay(Some(1)), RETRY_AFTER_FLOOR);
+        // Above ceiling → ceiling (mint asking for a long pause does
+        // not block control-plane ops for that long).
+        assert_eq!(retry_after_delay(Some(60)), RETRY_AFTER_CEILING);
     }
 }
