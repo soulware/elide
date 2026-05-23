@@ -6,7 +6,7 @@
 //! architecture*). A call site picks the role matching the purpose of
 //! its code path. A mutation path uses [`ScopedStores::writer`] for
 //! its whole `names/`+`events/`+own-`coordinators/` interaction; the
-//! `coord-writer` policy holds `GetObject` on those prefixes, so the
+//! `coord-rw` policy holds `GetObject` on those prefixes, so the
 //! reads inside a name-claim CAS run on the same credential as the
 //! conditional write.
 //!
@@ -15,7 +15,7 @@
 //!   exposed peer-fetch verifier holds. Returns a narrow [`ReadStore`]
 //!   so a holder can read and `head` only.
 //!
-//! * [`ScopedStores::writer`] — `coord-writer`. Coordinator-wide
+//! * [`ScopedStores::writer`] — `coord-rw`. Coordinator-wide
 //!   write: `names/`, `events/` (get + append), own
 //!   `coordinators/<sub>/`, and `ListBucket`.
 //!
@@ -103,7 +103,7 @@ pub trait ScopedStores: Send + Sync {
     /// Read-only paths and the exposed verifier.
     fn base_ro(&self) -> Arc<dyn ReadStore>;
 
-    /// `coord-writer`: coordinator-wide write authority. Mutation
+    /// `coord-rw`: coordinator-wide write authority. Mutation
     /// paths use this end-to-end (the reads in a CAS included).
     fn writer(&self) -> Arc<dyn ObjectStore>;
 
@@ -144,7 +144,7 @@ pub trait ScopedStores: Send + Sync {
     fn base_object_store(&self) -> Arc<dyn ObjectStore>;
 
     /// Full read+write handle for the per-name event log
-    /// (`events/<name>/…`). Backed by both `coord-writer` (for
+    /// (`events/<name>/…`). Backed by both `coord-rw` (for
     /// emit's CAS, which runs wholly on one credential) and
     /// `coord-ro` (for the inherited reads, which need
     /// cross-coordinator pubkey lookups in `list_and_verify`).
@@ -169,7 +169,7 @@ pub trait ScopedStores: Send + Sync {
     }
 
     /// Full read+write handle for the `names/<name>` claim records.
-    /// Backed by both `coord-writer` (for the `mark_*` CAS verbs,
+    /// Backed by both `coord-rw` (for the `mark_*` CAS verbs,
     /// which run wholly on one credential per mutation) and
     /// `coord-ro` (for the inherited reads). The trait exposes no
     /// untyped `update` / `overwrite` — every state change is a typed

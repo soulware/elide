@@ -1,7 +1,7 @@
 //! Mint-backed [`ScopedStores`] (`docs/design-mint.md` § *Coordinator
 //! store architecture*).
 //!
-//! Each coordinator role (`coord-ro`, `coord-writer`, and one
+//! Each coordinator role (`coord-ro`, `coord-rw`, and one
 //! `volume-rw` per volume) is a [`RoleStore`] facade over a Tigris
 //! keypair that mint vends via `assume-role`. The facade implements
 //! [`ObjectStore`] and acquires its keypair lazily on first use,
@@ -38,8 +38,7 @@ use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::stores::{ReadOnlyAdapter, ReadStore, ScopedStores};
 
 use crate::mint_client::{
-    MintEndpoint, ROLE_COORD_RO, ROLE_COORD_WRITER, ROLE_VOLUME_RO, ROLE_VOLUME_RW,
-    VOLUME_RO_TTL_SECS,
+    MintEndpoint, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO, ROLE_VOLUME_RW, VOLUME_RO_TTL_SECS,
 };
 
 const CAVEAT_VOLUME: &str = "elide:Volume";
@@ -325,7 +324,7 @@ impl MintScopedStores {
         let writer = Arc::new(RoleStore::new(
             endpoint.clone(),
             store_cfg.clone(),
-            ROLE_COORD_WRITER,
+            ROLE_COORD_RW,
             COORD_CONTROL_TTL_SECS,
             None,
         ));
@@ -498,7 +497,7 @@ mod tests {
 
     #[test]
     fn non_volume_ro_roles_emit_no_extra_body() {
-        for role in [ROLE_COORD_RO, ROLE_COORD_WRITER, ROLE_VOLUME_RW] {
+        for role in [ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RW] {
             assert!(extra_body_for(role, &[Ulid::new()]).is_empty());
         }
     }

@@ -1526,8 +1526,8 @@ mod tests {
     async fn claim_bucket_op_routes_only_through_writer_and_base_ro() {
         // The bucket-side claim never touches `by_id/`. It reads
         // names/<name> (coord-ro via name_claims_ro-equivalent
-        // reads), writes the name flip (coord-writer), and emits an
-        // event (coord-writer + coord-ro reads). Mirror what
+        // reads), writes the name flip (coord-rw), and emits an
+        // event (coord-rw + coord-ro reads). Mirror what
         // `start_claim` does at its store-pick site (`stores.writer()`
         // + `stores.event_journal()` + `stores.name_claims()`) and
         // assert the recorded role set is exactly `{Writer,
@@ -1583,7 +1583,7 @@ mod tests {
         for call in &calls {
             assert!(
                 matches!(call, RoleCall::Writer | RoleCall::BaseObjectStore),
-                "claim's bucket side must only mint coord-writer / coord-ro; \
+                "claim's bucket side must only mint coord-rw / coord-ro; \
                  saw {call:?} in {calls:?}"
             );
         }

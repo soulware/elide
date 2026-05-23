@@ -372,7 +372,7 @@ impl ForkOrchestrator {
                 // `force_snapshot_now_op` reads `by_id/<source>/segments/`
                 // and PUTs the new manifest under `by_id/<source>/snapshots/`,
                 // so it rides per-vol `volume-rw` for the source — not
-                // `coord-writer`, which has no `by_id/` access.
+                // `coord-rw`, which has no `by_id/` access.
                 let store = self.ctx.core.stores.volume_rw(&source_vol_ulid);
                 let reply =
                     force_snapshot_now_op(source_vol_ulid, &self.ctx.core.data_dir, &store).await?;

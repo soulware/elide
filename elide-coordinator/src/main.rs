@@ -189,7 +189,7 @@ async fn run() -> Result<()> {
                 enroll::assert_enrolled(&config.data_dir)?;
                 tracing::info!(
                     "[coordinator] store: mint-backed scoped \
-                     (coord-ro / coord-writer / volume-rw); reachability \
+                     (coord-ro / coord-rw / volume-rw); reachability \
                      and conditional-PUT are validated lazily on first \
                      assume-role per role"
                 );

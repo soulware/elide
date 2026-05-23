@@ -421,7 +421,7 @@ mod tests {
             !calls
                 .iter()
                 .any(|c| matches!(c, RoleCall::VolumeRw(_) | RoleCall::Writer)),
-            "hydrate is pure-read — no volume-rw or coord-writer mint; got {calls:?}"
+            "hydrate is pure-read — no volume-rw or coord-rw mint; got {calls:?}"
         );
     }
 }

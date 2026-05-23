@@ -22,7 +22,7 @@ credential-scoped store handles:
 ```rust
 pub trait ScopedStores {
     fn base_ro(&self)                   -> Arc<dyn ReadStore>;      // coord-ro
-    fn writer(&self)                    -> Arc<dyn ObjectStore>;    // coord-writer
+    fn writer(&self)                    -> Arc<dyn ObjectStore>;    // coord-rw
     fn volume_rw(&self, v: &Ulid) -> Arc<dyn ObjectStore>;    // volume-rw
 }
 ```
@@ -68,7 +68,7 @@ narrow handle they actually need.
 
 ```rust
 pub trait DomainStores: Send + Sync {
-    // coord-writer-backed (write side); coord-ro-backed reads
+    // coord-rw-backed (write side); coord-ro-backed reads
     // inherited via the reader supertrait
     fn name_claims(&self)        -> Arc<dyn NameClaims>;
     fn event_journal(&self)      -> Arc<dyn EventJournal>;
@@ -110,7 +110,7 @@ pub trait EventJournal: EventJournalReader {
 
 Why split: a read-only path needs `coord-ro` (the only role whose
 policy grants `coordinators/<other>/*` reads, required by
-`list_and_verify`'s pubkey lookup); the emit CAS needs `coord-writer`
+`list_and_verify`'s pubkey lookup); the emit CAS needs `coord-rw`
 end-to-end (the `docs/design-mint.md` "one credential per mutation"
 rule). A single handle that hides the fan-out internally
 (`BucketEventJournal` holds both stores and routes reads to base,
@@ -118,7 +118,7 @@ writes to writer) is the impl shape; the trait split lets a read-only
 caller carry a strictly narrower type.
 
 The same shape applies to `NameClaims` (`read` is `coord-ro`-fit;
-`try_claim` / `release` / `force_release` need `coord-writer`) and
+`try_claim` / `release` / `force_release` need `coord-rw`) and
 `OwnIdentity` (other coordinators' identity material is reader-only;
 self-publish is writer).
 
@@ -157,7 +157,7 @@ plus the `vol_ulid`).
 The complete coordinator-side object surface, by handle. Each row is
 "what the call sites already do today, restated as a domain op".
 
-### `NameClaims` (`coord-writer` for mutations, `coord-ro` for reads)
+### `NameClaims` (`coord-rw` for mutations, `coord-ro` for reads)
 
 The `names/<name>` record carries a small state machine
 (`Live`/`Stopped`/`Released`/`Readonly`) plus ownership identity.
@@ -184,11 +184,11 @@ call so they are impossible to bypass at the call site.
 Same reader/writer split as `EventJournal`: pure-read sites
 (`Request::ResolveName`, the read for `size` after rebind) take
 `&dyn NameClaimsReader` and cannot mutate at the type level. Each
-`mark_*` runs its full read-modify-write on `coord-writer` (the
+`mark_*` runs its full read-modify-write on `coord-rw` (the
 "one credential per mutation" rule); the inherited `read` goes on
 `coord-ro`.
 
-### `EventJournal` (`coord-writer` for emit, `coord-ro` for reads)
+### `EventJournal` (`coord-rw` for emit, `coord-ro` for reads)
 
 | Op | Today | Domain shape | Trait |
 |---|---|---|---|
@@ -204,7 +204,7 @@ event because the operation does not exist. The privileged offline
 reaper (if/when introduced) is a separate handle wielding an elevated
 credential, not a method here.
 
-### `OwnIdentity` (`coord-writer`, `coordinators/<sub>/...`)
+### `OwnIdentity` (`coord-rw`, `coordinators/<sub>/...`)
 
 The coordinator's own published identity material (pubkey, peer
 endpoint records). One handle per coordinator; no per-key parameters

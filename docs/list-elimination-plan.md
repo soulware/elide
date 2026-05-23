@@ -2,13 +2,13 @@
 
 Remove every `s3:ListBucket` use from the coordinator runtime. Each
 prefix LIST becomes a deterministic GET; then the `ListBucket`
-statement is deleted from `coord-writer`'s role template and from
+statement is deleted from `coord-rw`'s role template and from
 `design-mint.md` (resolves open question #12). The decision stands
 independent of whether Tigris can prefix-scope `ListBucket` — that is
 parked (`design-mint.md` #12); this work is the backend-portable answer
 and a long-wanted perf win regardless.
 
-Authority: `design-mint.md` § *`coord-writer`* / open question #12.
+Authority: `design-mint.md` § *`coord-rw`* / open question #12.
 Related: `design-volume-event-log.md` (event HEAD pointer),
 `design-peer-segment-fetch.md`.
 
@@ -20,7 +20,7 @@ Related: `design-volume-event-log.md` (event HEAD pointer),
 | `by_id/<vol>/snapshots/` | `inbound/lifecycle.rs:777`, `inbound/lifecycle.rs:1502` | the *set* of snapshots, for cleanup/delete | `volume-rw`/`writer` |
 | `by_id/<vol>/segments/` | `prefetch.rs:442`, `fork.rs:670`, `recovery.rs:165` | the live segment-ULID set for the volume | `volume-rw` |
 | `by_id/<vol>/retention/` | `prefetch.rs:643` (`list_supersessions`), `reaper.rs:80` | GC supersession markers (input→output) | `volume-rw` |
-| `events/<name>/` | `peer_discovery.rs:171`, `volume_event_store.rs:155/253` | the event-record set / head for a name | `coord-writer` |
+| `events/<name>/` | `peer_discovery.rs:171`, `volume_event_store.rs:155/253` | the event-record set / head for a name | `coord-rw` |
 
 `config.rs:289` (`probe`, bare `by_id/`) is the *non*-mint passthrough
 reachability check — not on the mint path, out of scope.
@@ -42,7 +42,7 @@ bijective for a live name but **not stable over time**:
   rendezvous, rename — and *cannot* move to per-vol: a claiming
   coordinator finds the volume **through the name**; it does not know
   the new `vol_ulid` until it reads the name. This is the event log,
-  `events/<name>/`, under `coord-writer`.
+  `events/<name>/`, under `coord-rw`.
 - **`by_id/<vol_ulid>/`** — the data (segments/snapshots/retention),
   per-*vol_ulid*, under `volume-rw`. A name walks through a sequence
   of `vol_ulid`s over its life (fork lineage); a `vol_ulid`'s data
@@ -224,7 +224,7 @@ handoff/fork references the per-name event spine already carries.
 
   Replaces `peer_discovery.rs:171`, `volume_event_store.rs:155/253`.
   Key shape coordinated with `design-volume-event-log.md`. Runs under
-  `coord-writer`. *N* is a tuning param (default ≈16), not pinned by
+  `coord-rw`. *N* is a tuning param (default ≈16), not pinned by
   the design.
 
 #### Access patterns (always bounded; no unbounded path exists)
@@ -294,7 +294,7 @@ GET or a known-key PUT/DELETE — no LIST.
    `by_id/<vol>/snapshots/<date>/S2.manifest` then bumps
    `by_id/<vol>/snapshots/LATEST → S2` (bare ULID, `User` only). Both
    writes are per-vol, **`volume-rw` only** — no event, no
-   `coord-writer`.
+   `coord-rw`.
 2. **Release (A).** A seals the handoff/stop snapshot `Sh` (it knows
    `Sh`'s ULID directly — it just minted it), CASes `names/myvol`
    Live→Released, then appends to `events/myvol/`: CAS `HEAD` with
@@ -417,7 +417,7 @@ Ordered so each phase builds on the prior.
   `prefetch`/`recovery`/`fork-verify` *and* `prefetch` supersession +
   `reaper`; rebuild defines the proptested reconcile invariant.
 - **P5 — drop the grant.** Delete `s3:ListBucket` from
-  `mint/examples/elide_roles/coord-writer.json`, the §*`coord-writer`*
+  `mint/examples/elide_roles/coord-rw.json`, the §*`coord-rw`*
   policy, and the role-inventory table in `design-mint.md`. End state:
   no role carries `ListBucket`. The structural guarantee is the role
   policy itself — any errant `.list(` against a mint-backed store
@@ -438,7 +438,7 @@ a snapshot). No on-disk format negotiation, no runtime dual path.
   injection between object PUT and index append (proptest-guardian
   scope).
 - End-to-end on the Tigris VM with `volume-rw` carrying no
-  `ListBucket` and `coord-writer`'s `ListBucket` removed.
+  `ListBucket` and `coord-rw`'s `ListBucket` removed.
 
 ## Out of scope / revisit later
 

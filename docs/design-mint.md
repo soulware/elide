@@ -766,7 +766,7 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `invite` | string | scalar | mint, on first start / rotate | Gate only — invite macaroon must carry the current value. |
 | `exp` | uint64 (unix s) | scalar | issuer | Gate — caps granted TTL (`min(req, role.max, exp−now)`); multiple narrow to the minimum. |
 | `role` | string | scalar | mint, at the enrollment exchange | Gate **and** selects the role policy — the single role this credential carries; always present, and the request's asserted `request.role` must equal it. |
-| `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on all `coord-*`; defines the credential macaroon. Templated as `{{caveat "sub"}}` in `coord-writer`'s own-identity statement (`coordinators/{{caveat "sub"}}/*`). |
+| `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on all `coord-*`; defines the credential macaroon. Templated as `{{caveat "sub"}}` in `coord-rw`'s own-identity statement (`coordinators/{{caveat "sub"}}/*`). |
 | `cnf` | string (`ed25519:<pub>`, scalar-encoded) | scalar | coordinator-self-asserted alongside `sub` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ BLAKE3(body)` (freshness `ts` rides in the body), verified against this key. Makes the credential key-bound (not a bearer) and authenticates the request body. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 
@@ -779,7 +779,7 @@ definition below):
 | Role | `aud` | `exp` | `sub` | `elide:Volume` |
 |---|---|---|---|---|
 | `volume-rw` | ● | ● | ● | ● |
-| `coord-writer` | ● | ● | ● | |
+| `coord-rw` | ● | ● | ● | |
 | `coord-ro` | ● | ● | ● | |
 | `volume-ro` | ● | ● | | ● |
 
@@ -801,7 +801,7 @@ Notes:
   `cnf` (#16). No list-valued caveat type is needed (#6
   resolved): the only list-shaped input, the ancestor set, is
   `request.ancestors` in the PoP-signed body, not a caveat.
-- **`sub` templates only in `coord-writer`'s own-identity statement**
+- **`sub` templates only in `coord-rw`'s own-identity statement**
   (`coordinators/{{caveat "sub"}}/*`, own-prefix write). Everywhere
   else `sub` is a gate only; the other statements use prefix
   wildcards (`names/*`, `events/*`) and `coord-ro` reads
@@ -818,7 +818,7 @@ Elide's coordinator authenticates to mint and assumes **four roles**:
 | Role | Scope | Held by |
 |---|---|---|
 | `coord-ro` | read-only `names/* coordinators/* events/* meta/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
-| `coord-writer` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`) | the non-exposed mutation paths |
+| `coord-rw` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`) | the non-exposed mutation paths |
 | `volume-rw` | per-volume `by_id/<vol>/*` read+write, plus that volume's `meta/<vol>.{provenance,pub}` (**Split B** — per-volume) | the coordinator, cached per vol_ulid |
 | `volume-ro` | per-volume lineage read, vended to the volume process | the coordinator (assumes), the volume (holds the keypair) |
 
@@ -831,7 +831,7 @@ key's blast radius and to enforce the IAM-layer invariants
 (`events/` append-only, `coordinators/` immutable).
 
 Mint dissolves both premises. It **is** the policy-rendering broker:
-the IAM-layer invariants live in `coord-writer`'s multi-statement
+the IAM-layer invariants live in `coord-rw`'s multi-statement
 policy *template* (no `s3:DeleteObject` on `events/` or
 `coordinators/`), not in key partitioning. And the keys it vends are
 short-lived, on-demand, never persisted — the operational cost that
@@ -839,7 +839,7 @@ made consolidation expensive is gone (the same argument *Why Split B
 is viable now* makes). Per-purpose **attribution** is free regardless,
 from the `assume-role` audit log. What a per-purpose split would still
 uniquely catch — a *vended Tigris keypair* leaking without the
-identity key, within one TTL window — is narrow: every `coord-writer`
+identity key, within one TTL window — is narrow: every `coord-rw`
 key is held by the one trusted coordinator process, which on
 compromise can re-assume any role it is enrolled for anyway. The split
 bought far more against a single persistent admin key than it does
@@ -897,7 +897,7 @@ for the inputs alongside `volume-rw` for the output volume rather than
 widening `volume-rw`'s policy. (Reaper delete of a volume's own prefix is
 covered by `volume-rw` on that volume.)
 
-### `coord-writer`
+### `coord-rw`
 
 Coordinator-wide write authority: name claim / rename / force-release
 / rollback (`names/`), event-journal appends and reads (`events/`),
@@ -1049,7 +1049,7 @@ can neither mutate state nor read segment bodies
 weaken this — it carries only the signed, already-public
 `volume.provenance` / `volume.pub`, never segment bodies, which stay in
 `by_id/`. The write-capable
-`coord-writer` and `volume-rw` roles stay separate and are held only
+`coord-rw` and `volume-rw` roles stay separate and are held only
 by the non-exposed mutation paths. `coord-ro` must never accrete a
 write action or any `by_id/` read; doing so silently breaks
 exposed-surface containment.
@@ -1175,7 +1175,7 @@ to three roles:
 ```rust
 pub trait ScopedStores {
     fn base_ro(&self)               -> Arc<dyn ReadStore>;       // coord-ro
-    fn writer(&self)                -> Arc<dyn ObjectStore>;     // coord-writer
+    fn writer(&self)                -> Arc<dyn ObjectStore>;     // coord-rw
     fn volume_rw(&self, v: &Ulid) -> Arc<dyn ObjectStore>; // volume-rw
 }
 ```
@@ -1187,7 +1187,7 @@ already wired).
 **Role is a property of the code path, not of the key.** A mutation
 path uses `writer()` for its *entire* `names/`+`events/`+own-
 `coordinators/` interaction — including the reads that are part of a
-mutation (`coord-writer`'s policy holds `s3:GetObject` on those
+mutation (`coord-rw`'s policy holds `s3:GetObject` on those
 prefixes), so a name-claim/force-release CAS (`GET` ETag → conditional
 `PUT`) runs wholly on one credential and is never split. It uses
 `volume_rw(v)` for that volume's `by_id/`. Read-only paths and
@@ -1208,7 +1208,7 @@ not a convention.
 ```
 
 `get`/`head` only — no `put`, `delete`, or `list` (no role carries
-`ListBucket`; see `coord-writer` above). The exposed-surface
+`ListBucket`; see `coord-rw` above). The exposed-surface
 containment boundary is made *unrepresentable*, not merely
 unauthorized: a path holding `base_ro()` cannot call a mutating method
 because it does not exist on the type. This is the one boundary where
@@ -1237,7 +1237,7 @@ before its `DateLessThan` (the *TTL principle*: TTL is the maximum
 revocation latency, so refresh well inside it — e.g. at half-life),
 rebuilding the `object_store` on rotation; a brief refresh stall is
 absorbed by the WAL for writes and is off the hot path for reads
-(`coord-ro`/`coord-writer` 1h, `volume-rw` 24h, `volume-ro` 1h;
+(`coord-ro`/`coord-rw` 1h, `volume-rw` 24h, `volume-ro` 1h;
 freshness for `volume-ro` is § *Elide as customer*'s split-by-volume-mode
 rule).
 First use assumes lazily. `PassthroughStores` stays the impl for the
@@ -1252,7 +1252,7 @@ provisions the `credentials/<role>` files.
 handles above are the *minimum* credential boundary —
 `ObjectStore`/`ReadStore` typed by verb surface. The intended next
 refinement is for each role to hand back the *operations its policy
-authorizes* rather than a generic store: `coord-writer` →
+authorizes* rather than a generic store: `coord-rw` →
 `NameClaims` / `EventJournal` (get + append, **no** `delete` method —
 the `events/` append-only invariant as a type, not a policy-template
 property) / `OwnIdentity`; `volume-rw` → `VolumeData`; `coord-ro`
@@ -1441,7 +1441,7 @@ prematurely.
     CAS'd `names/<name>` record, not a snapshot LIST. The
     standalone reaper task is gone — reap is a tick-folded step
     inside the per-volume orchestrator, consuming HEAD's
-    `Superseded` edges. `coord-writer`'s `ListBucket` statement
+    `Superseded` edges. `coord-rw`'s `ListBucket` statement
     is removed from its role template and from the inventory
     above; `volume-rw` never had it. The bucket-global
     enumeration hole closes entirely. Orphan reclamation (the

@@ -32,7 +32,7 @@ has completed successfully.
   trusted side channel first.
 - **C — exchange fan-out.** Once approved, the command exchanges the
   ticket once per role in the canonical inventory (`coord-ro`,
-  `coord-writer`, `volume-rw`, `volume-ro`) — body `{ts, role}`, same
+  `coord-rw`, `volume-rw`, `volume-ro`) — body `{ts, role}`, same
   PoP — and writes each re-minted credential to
   `credentials/<role>` (mode `0600`). The pending record is not
   consumed per exchange (multi-use until the ticket `exp`), so one
@@ -163,7 +163,7 @@ elide coord enroll [--data-dir <dir>] <invite-macaroon | file | ->
 
 Walked the full sequence end-to-end with the `mint` binary alone
 (server + reference client + operator subcommands) over a UDS, against
-a 4-role config (`coord-ro`, `coord-writer`, `volume-rw`,
+a 4-role config (`coord-ro`, `coord-rw`, `volume-rw`,
 `volume-ro`), fake minter. Findings that shaped the plan above:
 
 1. **The split CLI is the wrong operator surface — confirms the

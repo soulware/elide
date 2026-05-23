@@ -67,17 +67,13 @@ const NONCE_LEN: usize = 16;
 /// `elide:Volume` narrowing caveat); enrollment still mints exactly one
 /// `credentials/volume-rw`.
 pub(crate) const ROLE_COORD_RO: &str = "coord-ro";
-pub(crate) const ROLE_COORD_WRITER: &str = "coord-writer";
+pub(crate) const ROLE_COORD_RW: &str = "coord-rw";
 pub(crate) const ROLE_VOLUME_RW: &str = "volume-rw";
 pub(crate) const ROLE_VOLUME_RO: &str = "volume-ro";
 
 /// Every role the coordinator enrols for, in fan-out order.
-pub(crate) const COORD_ENROLL_ROLES: &[&str] = &[
-    ROLE_COORD_RO,
-    ROLE_COORD_WRITER,
-    ROLE_VOLUME_RW,
-    ROLE_VOLUME_RO,
-];
+pub(crate) const COORD_ENROLL_ROLES: &[&str] =
+    &[ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RW, ROLE_VOLUME_RO];
 
 const CAVEAT_EXP: &str = "exp";
 const CAVEAT_VOLUME: &str = "elide:Volume";
