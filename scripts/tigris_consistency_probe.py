@@ -262,7 +262,7 @@ def classify_get(status, body, v_old, v_new):
     return "other"
 
 
-def run_repin(bucket, pin_a, pin_b, iterations, ak, sk, st):
+def run_repin(bucket, pin_a, pin_b, iterations, recheck_delays, ak, sk, st):
     prefix = f"probe/{uuid.uuid4().hex[:8]}"
     print(
         f"REPIN: bucket={bucket} pin_a={pin_a} pin_b={pin_b} "
@@ -347,6 +347,37 @@ def run_repin(bucket, pin_a, pin_b, iterations, ak, sk, st):
               f"p99={fmt_ms(percentile(info['lat'], 99))}")
         print()
 
+    if recheck_delays:
+        elapsed = 0
+        for delay in recheck_delays:
+            sleep_for = delay - elapsed
+            if sleep_for > 0:
+                print(f"sleeping {sleep_for}s before recheck at +{delay}s ...")
+                time.sleep(sleep_for)
+                elapsed = delay
+            print(f"=== recheck at +{delay}s ===")
+            recheck = {
+                f"GET pin_a (+{delay}s)": {"hdr": a_hdr, "tally": {}, "regions": {}},
+                f"GET pin_b (+{delay}s)": {"hdr": b_hdr, "tally": {}, "regions": {}},
+                f"GET no-pin (+{delay}s)": {"hdr": {}, "tally": {}, "regions": {}},
+            }
+            for seq in range(iterations):
+                key = f"{prefix}/{seq}"
+                v_old = f"v_old_{seq}".encode()
+                v_new = f"v_new_{seq}".encode()
+                for label, info in recheck.items():
+                    status, hdrs, body = s3_request("GET", bucket, key, b"", info["hdr"], ak, sk, st)
+                    outcome = classify_get(status, body, v_old, v_new)
+                    info["tally"][outcome] = info["tally"].get(outcome, 0) + 1
+                    r = serving_region(hdrs)
+                    if r:
+                        info["regions"][r] = info["regions"].get(r, 0) + 1
+            for label, info in recheck.items():
+                print(f"{label}:")
+                print(f"  outcomes: {info['tally']}")
+                print(f"  served by: {info['regions'] or '(no region header)'}")
+            print()
+
     print("cleaning up probe keys...")
     deleted = 0
     for seq in range(iterations):
@@ -374,6 +405,9 @@ def main():
     ap.add_argument("--repin-region", default="",
                     help="enable repin test: PUT v_old pinned to --pin-region, "
                          "PUT v_new pinned to this region, then GET via each pin")
+    ap.add_argument("--recheck-after", default="",
+                    help="comma-separated delays in seconds for repin rechecks "
+                         "(e.g. '30,300,1800'); re-issues all three GETs at each")
     args = ap.parse_args()
 
     ak = os.environ.get("AWS_ACCESS_KEY_ID")
@@ -385,8 +419,11 @@ def main():
     if args.repin_region:
         if not args.pin_region:
             raise SystemExit("--repin-region requires --pin-region")
+        recheck_delays = []
+        if args.recheck_after:
+            recheck_delays = sorted(int(s) for s in args.recheck_after.split(","))
         run_repin(args.bucket, args.pin_region, args.repin_region,
-                  args.iterations, ak, sk, st)
+                  args.iterations, recheck_delays, ak, sk, st)
         return
 
     run(args.bucket, args.pin_region, args.iterations, args.overwrite,
