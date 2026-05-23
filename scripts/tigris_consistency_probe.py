@@ -124,11 +124,11 @@ def fmt_ms(secs):
     return f"{secs * 1000:.0f}ms"
 
 
-def run(bucket, pin_region, iterations, overwrite, ak, sk, st):
+def run(bucket, pin_region, iterations, overwrite, consistent_puts, ak, sk, st):
     prefix = f"probe/{uuid.uuid4().hex[:8]}"
     print(
-        f"bucket={bucket} pin={pin_region} iterations={iterations} "
-        f"overwrite={overwrite} prefix={prefix}"
+        f"bucket={bucket} pin={pin_region or '(none)'} iterations={iterations} "
+        f"overwrite={overwrite} consistent_puts={consistent_puts} prefix={prefix}"
     )
 
     plain_ok = plain_stale = plain_404 = plain_err = 0
@@ -136,7 +136,11 @@ def run(bucket, pin_region, iterations, overwrite, ak, sk, st):
     put_lat, plain_lat, cons_lat = [], [], []
     put_regions, plain_regions, cons_regions = {}, {}, {}
 
-    pin_headers = {"X-Tigris-Regions": pin_region}
+    put_headers = {}
+    if pin_region:
+        put_headers["X-Tigris-Regions"] = pin_region
+    if consistent_puts:
+        put_headers["X-Tigris-Consistent"] = "true"
     cons_headers = {"X-Tigris-Consistent": "true"}
 
     for seq in range(iterations):
@@ -144,10 +148,10 @@ def run(bucket, pin_region, iterations, overwrite, ak, sk, st):
         expected = f"v{seq}".encode()
 
         if overwrite:
-            s3_request("PUT", bucket, key, b"v_initial", pin_headers, ak, sk, st)
+            s3_request("PUT", bucket, key, b"v_initial", put_headers, ak, sk, st)
 
         t0 = time.perf_counter()
-        status, hdrs, body = s3_request("PUT", bucket, key, expected, pin_headers, ak, sk, st)
+        status, hdrs, body = s3_request("PUT", bucket, key, expected, put_headers, ak, sk, st)
         put_lat.append(time.perf_counter() - t0)
         if status != 200:
             print(f"  [PUT fail]    seq={seq} status={status} body={body[:120]!r}")
@@ -233,11 +237,13 @@ def run(bucket, pin_region, iterations, overwrite, ak, sk, st):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bucket", default="elide-global-test")
-    ap.add_argument("--pin-region", default="nrt",
-                    help="region to pin PUTs to (X-Tigris-Regions)")
+    ap.add_argument("--pin-region", default="",
+                    help="region to pin PUTs to (X-Tigris-Regions); empty for no pin")
     ap.add_argument("-n", "--iterations", type=int, default=100)
     ap.add_argument("--overwrite", action="store_true",
                     help="write v_initial, then overwrite, then read")
+    ap.add_argument("--consistent-puts", action="store_true",
+                    help="also send X-Tigris-Consistent: true on PUTs")
     args = ap.parse_args()
 
     ak = os.environ.get("AWS_ACCESS_KEY_ID")
@@ -246,7 +252,8 @@ def main():
     if not ak or not sk:
         raise SystemExit("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set")
 
-    run(args.bucket, args.pin_region, args.iterations, args.overwrite, ak, sk, st)
+    run(args.bucket, args.pin_region, args.iterations, args.overwrite,
+        args.consistent_puts, ak, sk, st)
 
 
 if __name__ == "__main__":
