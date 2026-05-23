@@ -142,7 +142,14 @@ def run(bucket, pin_region, iterations, overwrite, consistent_puts, single_key, 
         put_headers["X-Tigris-Regions"] = pin_region
     if consistent_puts:
         put_headers["X-Tigris-Consistent"] = "true"
+
+    plain_get_headers = {}
+    if pin_region:
+        plain_get_headers["X-Tigris-Regions"] = pin_region
+
     cons_headers = {"X-Tigris-Consistent": "true"}
+    if pin_region:
+        cons_headers["X-Tigris-Regions"] = pin_region
 
     fixed_key = f"{prefix}/key"
     for seq in range(iterations):
@@ -164,9 +171,9 @@ def run(bucket, pin_region, iterations, overwrite, consistent_puts, single_key, 
         if r:
             put_regions[r] = put_regions.get(r, 0) + 1
 
-        # Plain GET (no consistency header).
+        # Plain GET (no consistency header; pin region applied if set).
         t0 = time.perf_counter()
-        status, hdrs, body = s3_request("GET", bucket, key, b"", {}, ak, sk, st)
+        status, hdrs, body = s3_request("GET", bucket, key, b"", plain_get_headers, ak, sk, st)
         plain_lat.append(time.perf_counter() - t0)
         r = serving_region(hdrs)
         if r:
