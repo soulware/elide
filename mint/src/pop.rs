@@ -1,5 +1,5 @@
 //! Holder-of-key proof for the `cnf` caveat
-//! (`docs/design-mint.md` § *Coordinator bootstrap*, § *Authentication*;
+//! (`docs/design-mint.md` § *Credential macaroon & lifecycle*, § *Authentication*;
 //! open question #16).
 //!
 //! The credential macaroon is **key-bound, not a bearer**: mint honours an

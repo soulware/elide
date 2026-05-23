@@ -113,7 +113,7 @@ impl Macaroon {
     /// The trailing MAC. This is the holder-of-key PoP anchor: the
     /// `elide:CoordKey` proof signs over `tail ‖ BLAKE3(body)`, so the
     /// tail binds the proof to *this* exact attenuated macaroon
-    /// (`docs/design-mint.md` § *Coordinator bootstrap*, [`crate::pop`]).
+    /// (`docs/design-mint.md` § *Credential macaroon & lifecycle*, [`crate::pop`]).
     pub fn tail(&self) -> &[u8; 32] {
         &self.mac
     }

@@ -236,9 +236,9 @@ enum CoordCommand {
         /// `coordinator.toml` in the working directory.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Bootstrap macaroon: the macaroon text inline, a file path,
+        /// Invite macaroon: the macaroon text inline, a file path,
         /// or `-` for stdin. Distributed out of band by the operator.
-        bootstrap: String,
+        invite: String,
         /// Overall bound on waiting for operator approval (humantime,
         /// e.g. `30m`). Defaults to the daemon's own default.
         #[arg(long)]
@@ -1325,7 +1325,7 @@ fn main() {
             }
             CoordCommand::Enroll {
                 config,
-                bootstrap,
+                invite,
                 timeout,
                 force,
             } => {
@@ -1336,7 +1336,7 @@ fn main() {
                 let e = coord_enroll(
                     cli_data_dir.as_deref(),
                     config.as_deref(),
-                    &bootstrap,
+                    &invite,
                     timeout.as_deref(),
                     force,
                 );
@@ -1495,7 +1495,7 @@ fn coord_run(cli_data_dir: Option<&Path>, config: Option<&Path>) -> std::io::Err
 fn coord_enroll(
     cli_data_dir: Option<&Path>,
     config: Option<&Path>,
-    bootstrap: &str,
+    invite: &str,
     timeout: Option<&str>,
     force: bool,
 ) -> std::io::Error {
@@ -1520,9 +1520,9 @@ fn coord_enroll(
     if force {
         cmd.arg("--force");
     }
-    // Positional bootstrap last, so a value like `-` (stdin) is
+    // Positional invite last, so a value like `-` (stdin) is
     // unambiguous after the flags.
-    cmd.arg(bootstrap);
+    cmd.arg(invite);
     let err = cmd.exec();
     std::io::Error::other(format!("execing {}: {err}", bin.display()))
 }

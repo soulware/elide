@@ -1,4 +1,4 @@
-//! Persisted mint state: the current bootstrap nonce and the transient
+//! Persisted mint state: the current invite nonce and the transient
 //! pending-enrollment table (`docs/design-mint.md` § *Enrollment*).
 //!
 //! On-disk layout — a directory of files so the lifecycle is
@@ -7,15 +7,15 @@
 //! ```text
 //! <data_dir>/
 //!   root_key               32-byte macaroon root key (hex), mode 0600
-//!   bootstrap              current random nonce (hex), mode 0600
-//!   pending/<sub>.json     {pub, bootstrap, first_seen, peer_ip}
+//!   invite                 current random nonce (hex), mode 0600
+//!   pending/<sub>.json     {pub, invite, first_seen, peer_ip}
 //!   approved/<sub>         empty marker; mtime = approval time
 //! ```
 //!
 //! The root key is the symmetric secret mint both mints and verifies
 //! macaroons with (the "root key" of the Macaroons paper) — generated
 //! on first start, never leaving the process, mirroring the elide
-//! coordinator's `coordinator.key`. The bootstrap nonce shares its
+//! coordinator's `coordinator.key`. The invite nonce shares its
 //! custody. The pending
 //! table is **transient, not a registry**: a record is *not* consumed
 //! at exchange (the credential ticket is multi-use until its `exp`, so
@@ -41,9 +41,9 @@ use serde::{Deserialize, Serialize};
 pub struct Pending {
     /// The self-asserted `cnf` value (`ed25519:<b64 pub>`).
     pub pubkey: String,
-    /// The bootstrap nonce this enrollment was opened under; rotation
+    /// The invite nonce this enrollment was opened under; rotation
     /// drops records whose nonce is no longer current.
-    pub bootstrap: String,
+    pub invite: String,
     /// First-seen unix seconds (kept stable across idempotent retries).
     pub first_seen: u64,
     /// Peer IP at first sight, for the operator's out-of-band check.
@@ -168,7 +168,7 @@ pub struct Store {
 
 impl Store {
     /// Open (creating the layout if absent). Loads the persisted
-    /// bootstrap nonce, minting and persisting one on first start.
+    /// invite nonce, minting and persisting one on first start.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Store> {
         let dir = dir.into();
         fs::create_dir_all(dir.join("pending"))?;
@@ -179,12 +179,12 @@ impl Store {
             root_key,
             guard: Mutex::new(()),
         };
-        if !store.bootstrap_path().exists() {
+        if !store.invite_path().exists() {
             let _g = store
                 .guard
                 .lock()
                 .map_err(|_| io::Error::other("poisoned"))?;
-            write_0600(&store.bootstrap_path(), fresh_nonce().as_bytes())?;
+            write_0600(&store.invite_path(), fresh_nonce().as_bytes())?;
         }
         Ok(store)
     }
@@ -194,8 +194,8 @@ impl Store {
         self.root_key
     }
 
-    fn bootstrap_path(&self) -> PathBuf {
-        self.dir.join("bootstrap")
+    fn invite_path(&self) -> PathBuf {
+        self.dir.join("invite")
     }
     fn pending_path(&self, sub: &str) -> PathBuf {
         self.dir.join("pending").join(format!("{sub}.json"))
@@ -204,27 +204,25 @@ impl Store {
         self.dir.join("approved").join(sub)
     }
 
-    /// The current bootstrap nonce — the value a presented bootstrap
-    /// macaroon's `bootstrap` caveat must equal.
-    pub fn current_bootstrap(&self) -> io::Result<String> {
-        Ok(fs::read_to_string(self.bootstrap_path())?
-            .trim()
-            .to_string())
+    /// The current invite nonce — the value a presented invite
+    /// macaroon's `invite` caveat must equal.
+    pub fn current_invite(&self) -> io::Result<String> {
+        Ok(fs::read_to_string(self.invite_path())?.trim().to_string())
     }
 
-    /// Draw and persist a new bootstrap nonce, then drop every pending
+    /// Draw and persist a new invite nonce, then drop every pending
     /// record not opened under it (rotation cancels in-flight
-    /// enrollments; outstanding primaries are unaffected).
-    pub fn rotate_bootstrap(&self) -> io::Result<String> {
+    /// enrollments; outstanding credentials are unaffected).
+    pub fn rotate_invite(&self) -> io::Result<String> {
         let _g = self
             .guard
             .lock()
             .map_err(|_| io::Error::other("poisoned"))?;
         let nonce = fresh_nonce();
-        write_0600(&self.bootstrap_path(), nonce.as_bytes())?;
+        write_0600(&self.invite_path(), nonce.as_bytes())?;
         for sub in self.pending_subs()? {
             if let Ok(p) = self.read_pending(&sub)
-                && p.bootstrap != nonce
+                && p.invite != nonce
             {
                 let _ = fs::remove_file(self.pending_path(&sub));
                 let _ = fs::remove_file(self.approved_path(&sub));
@@ -256,7 +254,7 @@ impl Store {
         &self,
         sub: &str,
         pubkey: &str,
-        bootstrap: &str,
+        invite: &str,
         peer_ip: &str,
         now_unix: u64,
     ) -> Result<Recorded, StateError> {
@@ -276,7 +274,7 @@ impl Store {
         }
         let rec = Pending {
             pubkey: pubkey.to_string(),
-            bootstrap: bootstrap.to_string(),
+            invite: invite.to_string(),
             first_seen: now_unix,
             peer_ip: peer_ip.to_string(),
         };
@@ -391,10 +389,10 @@ mod tests {
     const PUBB: &str = "ed25519:BBBB";
 
     #[test]
-    fn bootstrap_persists_and_is_stable_across_open() {
+    fn invite_persists_and_is_stable_across_open() {
         let d = tempfile::tempdir().unwrap();
-        let n1 = Store::open(d.path()).unwrap().current_bootstrap().unwrap();
-        let n2 = Store::open(d.path()).unwrap().current_bootstrap().unwrap();
+        let n1 = Store::open(d.path()).unwrap().current_invite().unwrap();
+        let n2 = Store::open(d.path()).unwrap().current_invite().unwrap();
         assert_eq!(n1, n2, "restart preserves the nonce");
         assert!(!n1.is_empty());
     }
@@ -433,10 +431,10 @@ mod tests {
     #[test]
     fn rotate_changes_nonce_and_drops_noncurrent_pending() {
         let (_d, s) = store();
-        let old = s.current_bootstrap().unwrap();
+        let old = s.current_invite().unwrap();
         s.record_pending("01ARZ", PUBA, &old, "1.2.3.4", 100)
             .unwrap();
-        let new = s.rotate_bootstrap().unwrap();
+        let new = s.rotate_invite().unwrap();
         assert_ne!(old, new);
         assert!(
             s.get_pending("01ARZ").unwrap().is_none(),
@@ -447,7 +445,7 @@ mod tests {
     #[test]
     fn record_is_idempotent_for_same_pub_and_conflicts_on_different() {
         let (_d, s) = store();
-        let b = s.current_bootstrap().unwrap();
+        let b = s.current_invite().unwrap();
         assert_eq!(
             s.record_pending("01ARZ", PUBA, &b, "ip", 1).unwrap(),
             Recorded::Created
@@ -467,7 +465,7 @@ mod tests {
     #[test]
     fn approve_requires_existing_pending_and_persists() {
         let (_d, s) = store();
-        let b = s.current_bootstrap().unwrap();
+        let b = s.current_invite().unwrap();
         assert!(!s.approve("01ARZ").unwrap(), "no pending → not approved");
         s.record_pending("01ARZ", PUBA, &b, "ip", 1).unwrap();
         assert!(!s.is_approved("01ARZ"));
@@ -482,7 +480,7 @@ mod tests {
     #[test]
     fn gc_drops_old_records_approved_or_not() {
         let (_d, s) = store();
-        let b = s.current_bootstrap().unwrap();
+        let b = s.current_invite().unwrap();
         s.record_pending("old", PUBA, &b, "ip", 0).unwrap();
         s.record_pending("old-approved", PUBB, &b, "ip", 0).unwrap();
         s.approve("old-approved").unwrap();
@@ -501,7 +499,7 @@ mod tests {
     #[test]
     fn malformed_sub_rejected() {
         let (_d, s) = store();
-        let b = s.current_bootstrap().unwrap();
+        let b = s.current_invite().unwrap();
         for bad in ["../etc", "a/b", "", "."] {
             assert!(matches!(
                 s.record_pending(bad, PUBA, &b, "ip", 1),
@@ -513,7 +511,7 @@ mod tests {
     #[test]
     fn list_flags_anomalous_shared_pub() {
         let (_d, s) = store();
-        let b = s.current_bootstrap().unwrap();
+        let b = s.current_invite().unwrap();
         s.record_pending("subX", PUBA, &b, "ip", 1).unwrap();
         s.record_pending("subY", PUBA, &b, "ip", 1).unwrap();
         let rows = s.list(10).unwrap();

@@ -15,7 +15,7 @@ caveats*): `aud` (RFC 7519), `exp` (RFC 7519), `sub` (RFC 7519 — the
 opaque principal; Elide puts a coordinator ULID here), `cnf` (RFC 7800
 holder-of-key, scalar-encoded `ed25519:<pub>`). Coined, mint-specific:
 `op` (endpoint partition — positively required at every endpoint, never
-absence-tested), `role`, `bootstrap` (the rotation nonce). Elide's only
+absence-tested), `role`, `invite` (the rotation nonce). Elide's only
 namespaced caveat is `elide:Volume`.
 
 ## Flow
@@ -23,8 +23,8 @@ namespaced caveat is `elide:Volume`.
 **Enrollment** (`docs/design-mint.md` § *Enrollment*):
 
 ```
-mint bootstrap             -> reusable non-expiring bootstrap macaroon
-                              (op=enroll, aud, current bootstrap nonce)
+mint invite                -> reusable non-expiring invite macaroon
+                              (op=enroll, aud, current invite nonce)
 client attenuates sub+cnf, PoP
   POST /v1/enroll          -> pending record (keyed by sub) + short
                               intermediate (op=enroll-exchange)
@@ -39,7 +39,7 @@ operator: mint enroll list / approve <sub>   (verify cnf fingerprint
 `elide:Volume`, …) and `POST /v1/assume-role` + PoP → role gate →
 policy render → Tigris keypair.
 
-`mint bootstrap rotate` draws a new nonce and cancels in-flight
+`mint invite --rotate` draws a new nonce and cancels in-flight
 enrollments; outstanding primaries are unaffected.
 
 ## Modules
@@ -52,10 +52,10 @@ enrollments; outstanding primaries are unaffected.
 - `pop` — the `cnf` holder-of-key gate. Ed25519 over
   `tail ‖ BLAKE3(raw-body)`; freshness `ts` rides in the body. Required
   on all three operations in the Elide path.
-- `issuance` — `mint_bootstrap` / `mint_intermediate` / `mint_primary`
+- `issuance` — `mint_invite` / `mint_intermediate` / `mint_primary`
   (each a fresh chain from root) + `bound_identity`.
-- `state` — persisted bootstrap nonce + transient pending table, a
-  directory of files (`bootstrap`, `pending/<sub>.json`,
+- `state` — persisted invite nonce + transient pending table, a
+  directory of files (`invite`, `pending/<sub>.json`,
   `approved/<sub>`) so the lifecycle is `ls`-inspectable. Idempotent
   same-`(sub,pub)`, conflict on a different key, GC of stale unapproved,
   consume-on-exchange.
@@ -88,7 +88,7 @@ clap CLI (`--config` defaults to `mint.toml`). Server + operator:
 
 ```sh
 mint serve   --config mint-demo.toml [--tigris]      # --tigris = real Tigris IAM; else fake minter
-mint bootstrap --config mint-demo.toml               # print the bootstrap macaroon
+mint invite    --config mint-demo.toml               # print the invite macaroon
 mint enroll list    --config mint-demo.toml
 mint enroll approve --config mint-demo.toml <sub>    # shows the fingerprint, interactive y/N; --yes for automation
 ```
@@ -98,7 +98,7 @@ Client (the coordinator's half; identity under `./mint_client`):
 ```sh
 mint client keygen
 mint client fingerprint                                  # operator compares this during `enroll approve`
-mint client enroll      --id <sub> <macaroon|file|->     # bootstrap is the final positional arg
+mint client enroll      --id <sub> <macaroon|file|->     # invite is the final positional arg
 mint client exchange                                     # exit 2 until approved, then saves the primary
 mint client assume-role --request '{"prefix":"demo/x"}' [--caveat N=V] <role>
                                                          # request body is opaque pass-through

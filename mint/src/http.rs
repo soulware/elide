@@ -323,8 +323,8 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
 }
 
 /// `POST /v1/enroll` (`docs/design-mint.md` § *Enrollment* (1)). The
-/// client presents the coordinator-attenuated bootstrap macaroon
-/// (`op=enroll`, current `bootstrap`, self-asserted `sub`/`cnf`) and a
+/// client presents the coordinator-attenuated invite macaroon
+/// (`op=enroll`, current `invite`, self-asserted `sub`/`cnf`) and a
 /// PoP. Mint records a **pending** record keyed by `sub` and returns a
 /// short-lived credential ticket. Always `200` for an accepted
 /// (new or idempotent) `(sub, pub)`; conflicts and auth failures are
@@ -368,10 +368,10 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         audit("denied:wrong_op", &caveats);
         return unauthorized(&request_id);
     }
-    let current = match state.store.current_bootstrap() {
+    let current = match state.store.current_invite() {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, "read bootstrap nonce");
+            tracing::error!(error = %e, "read invite nonce");
             return respond(
                 &request_id,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -379,12 +379,12 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
             );
         }
     };
-    if !scalar_is(&caveats, name::BOOTSTRAP, &current) {
-        audit("denied:stale_bootstrap", &caveats);
+    if !scalar_is(&caveats, name::INVITE, &current) {
+        audit("denied:stale_invite", &caveats);
         return unauthorized(&request_id);
     }
 
-    // PoP is mandatory here (the bootstrap is bearer until the client
+    // PoP is mandatory here (the invite is bearer until the client
     // attenuates cnf; NotKeyBound means it didn't, so a captured copy
     // could enrol). Body is the freshness ts only.
     let proof = match pop_proof(&headers) {

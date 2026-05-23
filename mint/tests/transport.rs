@@ -15,7 +15,7 @@ use mint::audit::AuditLog;
 use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
-use mint::issuance::mint_bootstrap;
+use mint::issuance::mint_invite;
 use mint::state::Store;
 
 mod common;
@@ -48,13 +48,13 @@ fn config() -> Config {
 
 #[tokio::test]
 async fn full_flow_over_unix_socket() {
-    // Server state with a seeded root key so client-side bootstrap
+    // Server state with a seeded root key so client-side invite
     // macaroons minted from ROOT verify.
     let srv_dir = tempfile::tempdir().expect("srv tempdir");
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(srv_dir.path().join("root_key"), root_hex).expect("seed root_key");
     let store = Arc::new(Store::open(srv_dir.path()).expect("store"));
-    let nonce = store.current_bootstrap().expect("nonce");
+    let nonce = store.current_invite().expect("nonce");
     let state = AppState {
         config: Arc::new(config()),
         minter: Arc::new(FakeMinter::new()),
@@ -79,13 +79,13 @@ async fn full_flow_over_unix_socket() {
     let url = format!("unix:{}", sock.display());
     let cdir = tempfile::tempdir().expect("client tempdir");
     mint::client::keygen(cdir.path(), false).expect("keygen");
-    let bootstrap = mint_bootstrap(&ROOT, "mint", &nonce).encode();
+    let invite = mint_invite(&ROOT, "mint", &nonce).encode();
 
     // enroll → credential ticket persisted client-side.
     mint::client::enroll(
         cdir.path(),
         &url,
-        &bootstrap,
+        &invite,
         SUB,
         mint::client::CREDENTIAL_TICKET_FILE,
     )

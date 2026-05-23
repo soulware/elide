@@ -64,7 +64,7 @@ pub struct RawConfig {
     /// defence).
     pub audience: String,
     /// Directory for mint's persisted state — the macaroon root key
-    /// (`root_key`, generated on first start), the current bootstrap
+    /// (`root_key`, generated on first start), the current invite
     /// nonce, and the transient pending-enrollment table, all under one
     /// custody (`docs/design-mint.md` § *Enrollment*, § *Mint
     /// configuration*). A relative value
@@ -197,7 +197,7 @@ pub const DEFAULT_SOCKET_NAME: &str = "mint.sock";
 pub struct Config {
     pub audience: String,
     /// Persisted-state directory: the root key (generated on first
-    /// start), bootstrap nonce, and pending table all share this
+    /// start), invite nonce, and pending table all share this
     /// custody. Defaults to `mint_data` when the config omits
     /// `data_dir`. The root key itself is owned by
     /// [`crate::state::Store`], not parsed from config.

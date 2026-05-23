@@ -34,7 +34,7 @@ pub const CREDENTIAL_TICKET_FILE: &str = "credential.ticket";
 /// Per-role credentials live one file per role under this directory:
 /// `credentials/<role>`. Kept distinct from the flat `credential.ticket`
 /// so the `credential.` name is never overloaded (`docs/design-mint.md`
-/// § *Coordinator bootstrap*).
+/// § *Credential macaroon & lifecycle*).
 pub const CREDENTIALS_DIR: &str = "credentials";
 
 /// The default on-disk path (under the client dir) for the credential
@@ -152,7 +152,7 @@ fn now_unix() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 
-/// Resolve a `--bootstrap` argument, in precedence order:
+/// Resolve a `--invite` argument, in precedence order:
 /// `-` → stdin; an inline macaroon (the value itself decodes — the
 /// strict `mcrn1` magic + structure check makes this an unambiguous
 /// discriminator, no real file path collides); otherwise a file path.
@@ -160,15 +160,14 @@ fn read_macaroon_arg(src: &str) -> Result<Macaroon, ClientError> {
     if src == "-" {
         let mut s = String::new();
         io::stdin().read_to_string(&mut s)?;
-        return Macaroon::decode(s.trim()).map_err(|_| ClientError::BadFile("bootstrap macaroon"));
+        return Macaroon::decode(s.trim()).map_err(|_| ClientError::BadFile("invite macaroon"));
     }
     if let Ok(m) = Macaroon::decode(src.trim()) {
         return Ok(m); // inline macaroon text
     }
-    let text = fs::read_to_string(src).map_err(|_| {
-        ClientError::BadFile("bootstrap (not an inline macaroon nor a readable file)")
-    })?;
-    Macaroon::decode(text.trim()).map_err(|_| ClientError::BadFile("bootstrap macaroon"))
+    let text = fs::read_to_string(src)
+        .map_err(|_| ClientError::BadFile("invite (not an inline macaroon nor a readable file)"))?;
+    Macaroon::decode(text.trim()).map_err(|_| ClientError::BadFile("invite macaroon"))
 }
 
 /// Listener target parsed from `--url` (`docs/design-mint.md`
@@ -306,7 +305,7 @@ fn caveat_gloss(cav: &Caveat) -> &'static str {
         name::CNF => "bound to this client's key — proof-of-possession",
         name::EXP => "expiry, unix seconds",
         name::ROLE => "restricts the assumable role",
-        name::BOOTSTRAP => "current bootstrap nonce",
+        name::INVITE => "current invite nonce",
         _ => "",
     }
 }
@@ -334,22 +333,22 @@ fn describe(label: &str, m: &Macaroon) {
     }
 }
 
-/// `mint client enroll`: attenuate the bootstrap macaroon with this
+/// `mint client enroll`: attenuate the invite macaroon with this
 /// identity's `sub`/`cnf`, prove possession, receive + persist the
 /// credential ticket.
 pub async fn enroll(
     dir: &Path,
     base_url: &str,
-    bootstrap_src: &str,
+    invite_src: &str,
     sub: &str,
     out: &str,
 ) -> Result<(), ClientError> {
     let seed = load_seed(dir)?;
     let cnf = pop::cnf_value(&seed);
-    let presented = read_macaroon_arg(bootstrap_src)?
+    let presented = read_macaroon_arg(invite_src)?
         .attenuate(Caveat::scalar(name::SUB, sub))
         .attenuate(Caveat::scalar(name::CNF, cnf.clone()));
-    eprintln!("enroll: attenuating the operator's bootstrap macaroon with your identity");
+    eprintln!("enroll: attenuating the operator's invite macaroon with your identity");
     eprintln!("  sub = {sub}  (the principal you are claiming)");
     eprintln!(
         "  cnf = {}  (your client key — binds the token to you)",
@@ -654,13 +653,13 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_arg_accepts_inline_or_file_and_rejects_neither() {
-        let wire = crate::issuance::mint_bootstrap(&[1u8; 32], "mint", "nonce").encode();
+    fn invite_arg_accepts_inline_or_file_and_rejects_neither() {
+        let wire = crate::issuance::mint_invite(&[1u8; 32], "mint", "nonce").encode();
         // inline: the value itself is the macaroon
         assert!(read_macaroon_arg(&wire).is_ok());
         // file path containing it
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("boot.txt");
+        let p = d.path().join("invite.txt");
         fs::write(&p, format!("{wire}\n")).unwrap();
         assert!(read_macaroon_arg(p.to_str().unwrap()).is_ok());
         // neither a macaroon nor a readable file → clear error, no panic

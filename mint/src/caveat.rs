@@ -35,8 +35,8 @@ pub mod name {
     pub const OP: &str = "op";
     /// Restricts the assumable role. Optional.
     pub const ROLE: &str = "role";
-    /// Carried only by the bootstrap macaroon; the current nonce.
-    pub const BOOTSTRAP: &str = "bootstrap";
+    /// Carried only by the invite macaroon; the current nonce.
+    pub const INVITE: &str = "invite";
 }
 
 /// `op` caveat values. Mint stamps one at every point it mints; each

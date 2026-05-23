@@ -1,9 +1,9 @@
 //! End-to-end enrollment (`docs/design-mint.md` § *Enrollment*):
-//! reusable bootstrap macaroon → client self-asserts `sub`/`cnf` at
+//! reusable invite macaroon → client self-asserts `sub`/`cnf` at
 //! `POST /v1/enroll` (pending record + credential ticket) → operator
 //! approval → `POST /v1/enroll-exchange` (403 until approved, then the
 //! non-expiring credential) → the credential attenuates and assumes a role.
-//! Plus the refusals that matter: stale bootstrap, wrong-key PoP,
+//! Plus the refusals that matter: stale invite, wrong-key PoP,
 //! bearer (no cnf), no pending record, conflicting key for a `sub`.
 
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,7 @@ use mint::caveat::{Caveat, EffectiveCaveats, Resolved, name, op};
 use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
-use mint::issuance::{mint_bootstrap, mint_credential_ticket};
+use mint::issuance::{mint_credential_ticket, mint_invite};
 use mint::macaroon::Macaroon;
 use mint::pop;
 use mint::state::Store;
@@ -146,10 +146,10 @@ fn field(body: &str, key: &str) -> Macaroon {
     Macaroon::decode(v[key].as_str().expect("field present")).expect("decode")
 }
 
-/// The client's self-asserted bootstrap: the reusable bootstrap
+/// The client's self-asserted invite: the reusable invite
 /// macaroon with `sub`/`cnf` appended for `seed`.
-fn client_bootstrap(nonce: &str, seed: &[u8; 32]) -> Macaroon {
-    mint_bootstrap(&ROOT, "mint", nonce)
+fn client_invite(nonce: &str, seed: &[u8; 32]) -> Macaroon {
+    mint_invite(&ROOT, "mint", nonce)
         .attenuate(Caveat::scalar(name::SUB, SUB))
         .attenuate(Caveat::scalar(name::CNF, pop::cnf_value(seed)))
 }
@@ -157,8 +157,8 @@ fn client_bootstrap(nonce: &str, seed: &[u8; 32]) -> Macaroon {
 #[tokio::test]
 async fn full_flow_enroll_approve_exchange_then_assume_role() {
     let (app, audit, store, _dir) = app();
-    let nonce = store.current_bootstrap().unwrap();
-    let cb = client_bootstrap(&nonce, &COORD_SEED);
+    let nonce = store.current_invite().unwrap();
+    let cb = client_invite(&nonce, &COORD_SEED);
 
     // (1) enroll → pending + ticket
     let (status, body) = parts(
@@ -281,8 +281,8 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
 #[tokio::test]
 async fn idempotent_reenroll_same_pair() {
     let (app, _a, store, _dir) = app();
-    let nonce = store.current_bootstrap().unwrap();
-    let cb = client_bootstrap(&nonce, &COORD_SEED);
+    let nonce = store.current_invite().unwrap();
+    let cb = client_invite(&nonce, &COORD_SEED);
     for _ in 0..2 {
         let (status, _) = parts(
             app.clone()
@@ -298,12 +298,12 @@ async fn idempotent_reenroll_same_pair() {
 #[tokio::test]
 async fn conflicting_key_for_same_sub_is_opaque_401() {
     let (app, _a, store, _dir) = app();
-    let nonce = store.current_bootstrap().unwrap();
+    let nonce = store.current_invite().unwrap();
     let (s, _) = parts(
         app.clone()
             .oneshot(signed(
                 "/v1/enroll",
-                &client_bootstrap(&nonce, &COORD_SEED),
+                &client_invite(&nonce, &COORD_SEED),
                 &COORD_SEED,
                 "",
             ))
@@ -316,7 +316,7 @@ async fn conflicting_key_for_same_sub_is_opaque_401() {
     let (s, _) = parts(
         app.oneshot(signed(
             "/v1/enroll",
-            &client_bootstrap(&nonce, &OTHER_SEED),
+            &client_invite(&nonce, &OTHER_SEED),
             &OTHER_SEED,
             "",
         ))
@@ -328,11 +328,11 @@ async fn conflicting_key_for_same_sub_is_opaque_401() {
 }
 
 #[tokio::test]
-async fn stale_bootstrap_nonce_is_opaque_401() {
+async fn stale_invite_nonce_is_opaque_401() {
     let (app, _a, store, _dir) = app();
-    let stale = store.current_bootstrap().unwrap();
-    let cb = client_bootstrap(&stale, &COORD_SEED);
-    store.rotate_bootstrap().unwrap(); // current nonce moves on
+    let stale = store.current_invite().unwrap();
+    let cb = client_invite(&stale, &COORD_SEED);
+    store.rotate_invite().unwrap(); // current nonce moves on
     let (status, _) = parts(
         app.oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
             .await
@@ -345,9 +345,9 @@ async fn stale_bootstrap_nonce_is_opaque_401() {
 #[tokio::test]
 async fn enroll_pop_by_wrong_key_is_opaque_401() {
     let (app, _a, store, _dir) = app();
-    let nonce = store.current_bootstrap().unwrap();
+    let nonce = store.current_invite().unwrap();
     // cnf bound to COORD_SEED, but the request is signed by OTHER_SEED.
-    let cb = client_bootstrap(&nonce, &COORD_SEED);
+    let cb = client_invite(&nonce, &COORD_SEED);
     let (status, _) = parts(
         app.oneshot(signed("/v1/enroll", &cb, &OTHER_SEED, ""))
             .await
@@ -358,12 +358,12 @@ async fn enroll_pop_by_wrong_key_is_opaque_401() {
 }
 
 #[tokio::test]
-async fn bearer_bootstrap_without_cnf_is_opaque_401() {
+async fn bearer_invite_without_cnf_is_opaque_401() {
     let (app, _a, store, _dir) = app();
-    let nonce = store.current_bootstrap().unwrap();
-    // sub but no cnf, and no PoP header: a captured bootstrap copy must
+    let nonce = store.current_invite().unwrap();
+    // sub but no cnf, and no PoP header: a captured invite copy must
     // not enrol. NotKeyBound is a refusal here.
-    let cb = mint_bootstrap(&ROOT, "mint", &nonce).attenuate(Caveat::scalar(name::SUB, SUB));
+    let cb = mint_invite(&ROOT, "mint", &nonce).attenuate(Caveat::scalar(name::SUB, SUB));
     let req = Request::builder()
         .method("POST")
         .uri("/v1/enroll")
