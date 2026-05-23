@@ -13,6 +13,7 @@
 //! prototype ships [`iam::FakeMinter`] so the whole flow runs without a
 //! live account.
 
+pub mod admin;
 pub mod audit;
 pub mod caveat;
 pub mod client;

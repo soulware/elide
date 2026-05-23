@@ -22,7 +22,6 @@ use mint::audit::AuditLog;
 use mint::config::{Backend, Config, Listener};
 use mint::http::{AppState, router};
 use mint::iam::{FakeMinter, KeypairMinter};
-use mint::issuance::mint_invite;
 use mint::state::Store;
 use mint::tigris::TigrisMinter;
 
@@ -379,31 +378,6 @@ async fn open_store(
     }
 }
 
-/// The `assume-role` keypair minter matching `cfg.backend`. `Local`
-/// returns the deterministic fake; `Tigris` builds a real
-/// [`TigrisMinter`] — the latter only happens through `open_store`'s
-/// own admin-credential branch, so this is for `serve`'s minter slot
-/// (operator commands don't issue keypairs).
-fn pick_minter(cfg: &Config) -> Result<Arc<dyn KeypairMinter>, Box<dyn std::error::Error>> {
-    match cfg.backend {
-        Backend::Local => {
-            tracing::warn!(
-                "backend = \"local\": assume-role uses the FAKE keypair minter \
-                 — it returns a deterministic non-production keypair. The \
-                 enroll/exchange flow is real either way."
-            );
-            Ok(Arc::new(FakeMinter::new()))
-        }
-        Backend::Tigris => {
-            let admin = cfg.admin.as_ref().ok_or(
-                "backend = \"tigris\" requires a Tigris admin credential in the \
-                 environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)",
-            )?;
-            Ok(Arc::new(TigrisMinter::new(admin)?))
-        }
-    }
-}
-
 async fn serve(
     config: &Path,
     bind_override: Option<SocketAddr>,
@@ -415,21 +389,30 @@ async fn serve(
         .init();
 
     let config = Arc::new(load(config)?);
-    let minter = pick_minter(&config)?;
     let (store, tigris) = open_store(&config).await?;
     let store = Arc::new(store);
-    // Long-running serve: keep `mint-rw` refreshed before
-    // `DateLessThan` and the invite cache fresh with `If-None-Match`
-    // (~30 s, cheap 304 on the common path). Operator commands skip
-    // both — their keypair expires on its own.
-    if let Some(h) = tigris {
+
+    // `assume-role` minter: in tigris mode reuse the `TigrisMinter` we
+    // already built for `mint-rw` vending; in local mode the
+    // deterministic fake. Long-running serve also spawns a background
+    // task that re-mints `mint-rw` before its `DateLessThan` and the
+    // invite-cache refresher.
+    let minter: Arc<dyn KeypairMinter> = if let Some(h) = tigris {
         let _refresh = mint::mint_rw::spawn_refresh(
-            h.minter,
+            h.minter.clone(),
             config.tenant.bucket.clone(),
             h.provider,
             h.expiration,
         );
-    }
+        h.minter
+    } else {
+        tracing::warn!(
+            "backend = \"local\": assume-role uses the FAKE keypair minter \
+             — it returns a deterministic non-production keypair. The \
+             enroll/exchange flow is real either way."
+        );
+        Arc::new(FakeMinter::new())
+    };
     let _invite_refresh = store.spawn_invite_refresh(mint::state::INVITE_REFRESH_INTERVAL);
     // Steady-state /v1/enroll reads the invite from a local cache that
     // a background task keeps fresh with `If-None-Match` (~30 s, cheap
@@ -463,6 +446,11 @@ async fn serve(
     };
     match transport {
         Listener::Tcp(addr) => {
+            // No admin endpoints on TCP — they would expose
+            // approve/revoke to anything that can reach the port
+            // (`docs/design-mint.md` § *Mint state in the tenant
+            // bucket*). Operators bind a UDS listener for the admin
+            // surface; coordinators (clients) hit TCP only.
             let listener = tokio::net::TcpListener::bind(addr).await?;
             tracing::info!(%addr, "mint listening (tcp)");
             axum::serve(listener, router(state)).await?;
@@ -475,37 +463,52 @@ async fn serve(
             let listener = tokio::net::UnixListener::bind(&path)?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
             tracing::info!(path = %path.display(), "mint listening (uds)");
-            axum::serve(listener, router(state)).await?;
+            // UDS-only: admin routes are mounted alongside the public
+            // ones, gated by the socket file's filesystem permission.
+            let app = mint::admin::mount(router(state.clone()), state);
+            axum::serve(listener, app).await?;
         }
     }
     Ok(())
 }
 
+/// Resolve the operator-side admin target from the config's listener.
+/// `Listener::Uds(path)` is the production operator path; `Tcp` is
+/// accepted for local-only setups (the admin routes are only mounted
+/// when serve is bound to UDS, so a TCP-only deployment returns 404
+/// and the command surfaces a clean error).
+fn admin_target(cfg: &Config) -> mint::admin::AdminTarget<'_> {
+    match &cfg.listener {
+        Listener::Uds(p) => mint::admin::AdminTarget::Uds(p),
+        Listener::Tcp(addr) => {
+            // Construct a leaked &str for the lifetime of this CLI process —
+            // safe because clap-parsed Config lives until main returns.
+            let url: &'static str = Box::leak(format!("http://{addr}").into_boxed_str());
+            mint::admin::AdminTarget::Tcp(url)
+        }
+    }
+}
+
 async fn invite(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = load(config)?;
-    let (store, _tigris) = open_store(&config).await?;
-    let nonce = if rotate {
-        let n = store.rotate_invite().await?;
-        eprintln!("rotated invite nonce; in-flight enrollments cancelled");
-        n
+    let target = admin_target(&config);
+    let resp = if rotate {
+        eprintln!("rotating invite nonce; in-flight enrollments cancelled");
+        mint::admin::rotate_invite(target).await?
     } else {
-        store.current_invite().await?
+        mint::admin::get_invite(target).await?
     };
-    let mac = mint_invite(&store.root_key(), &config.audience, &nonce);
     eprintln!(
         "invite macaroon for audience={} (non-expiring, reusable)",
         config.audience
     );
-    println!("{}", mac.encode());
+    println!("{}", resp.macaroon);
     Ok(())
 }
 
 async fn enroll_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    use mint::state::EnrollmentState;
     let config = load(config)?;
-    let (store, _tigris) = open_store(&config).await?;
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
-    let rows = store.list(now).await?;
+    let rows = mint::admin::list_enrollments(admin_target(&config)).await?;
     if rows.is_empty() {
         eprintln!("no enrollments");
         return Ok(());
@@ -515,14 +518,10 @@ async fn enroll_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         "SUB", "STATE", "FINGERPRINT", "PEER", "AGE(s)"
     );
     for r in rows {
-        let state = match r.state {
-            EnrollmentState::Pending => "pending",
-            EnrollmentState::Approved => "approved",
-        };
         println!(
             "{:<28} {:<9} {:<18} {:<16} {:>7} {}",
             r.sub,
-            state,
+            r.state,
             r.fingerprint,
             r.peer_ip.as_deref().unwrap_or("-"),
             r.age_seconds,
@@ -540,19 +539,24 @@ async fn enroll_approve(
     use std::io::Write;
 
     let config = load(config)?;
-    let (store, _tigris) = open_store(&config).await?;
-    let pending = store
-        .get_pending(sub)
-        .await?
+    let target = admin_target(&config);
+    // Read the pending row from the daemon so the operator's
+    // fingerprint check matches what's on the server side, not what
+    // the CLI thinks should be there.
+    let rows = mint::admin::list_enrollments(target).await?;
+    let pending = rows
+        .into_iter()
+        .find(|r| r.sub == sub && r.state == "pending")
         .ok_or_else(|| format!("no pending enrollment for sub {sub}"))?;
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
-    let fp = mint::state::fingerprint(&pending.pubkey);
 
     eprintln!("pending enrollment:");
     eprintln!("  sub:         {sub}");
-    eprintln!("  fingerprint: {fp}");
-    eprintln!("  peer:        {}", pending.peer_ip);
-    eprintln!("  age:         {}s", now.saturating_sub(pending.first_seen));
+    eprintln!("  fingerprint: {}", pending.fingerprint);
+    eprintln!(
+        "  peer:        {}",
+        pending.peer_ip.as_deref().unwrap_or("-")
+    );
+    eprintln!("  age:         {}s", pending.age_seconds);
 
     if !yes {
         eprint!(
@@ -568,16 +572,25 @@ async fn enroll_approve(
         }
     }
 
-    let now_iso = chrono::Utc::now().to_rfc3339();
-    store.approve(sub, &pending.pubkey, &now_iso).await?;
-    eprintln!("approved {sub} (registry entry written; pending record deleted)");
+    let req = mint::admin::ApproveRequest {
+        sub: sub.to_owned(),
+        pubkey: pending.pubkey,
+    };
+    let resp = mint::admin::approve_enrollment(admin_target(&config), &req).await?;
+    eprintln!(
+        "approved {sub} (registry entry written at {}; pending record deleted)",
+        resp.approved_at
+    );
     Ok(())
 }
 
 async fn enroll_revoke(config: &Path, sub: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config = load(config)?;
-    let (store, _tigris) = open_store(&config).await?;
-    if store.revoke(sub).await? {
+    let req = mint::admin::RevokeRequest {
+        sub: sub.to_owned(),
+    };
+    let resp = mint::admin::revoke_enrollment(admin_target(&config), &req).await?;
+    if resp.revoked {
         eprintln!("revoked approved/{sub}; next enroll requires fresh approval");
         Ok(())
     } else {
