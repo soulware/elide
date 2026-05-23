@@ -1521,4 +1521,71 @@ mod tests {
             Some(encode_hex(&override_pubkey_bytes).as_str())
         );
     }
+
+    #[tokio::test]
+    async fn claim_bucket_op_routes_only_through_writer_and_base_ro() {
+        // The bucket-side claim never touches `by_id/`. It reads
+        // names/<name> (coord-base via name_claims_ro-equivalent
+        // reads), writes the name flip (coord-writer), and emits an
+        // event (coord-writer + coord-base reads). Mirror what
+        // `start_claim` does at its store-pick site (`stores.writer()`
+        // + `stores.event_journal()` + `stores.name_claims()`) and
+        // assert the recorded role set is exactly `{Writer,
+        // BaseObjectStore}` — never volume-rw/volume-ro/etc, which
+        // would silently 403 against names/<name>.
+        use elide_coordinator::stores::{RecordingStores, RoleCall, ScopedStores};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // names/vol = Released, no local fork → claim_volume_bucket_op
+        // takes the MustClaimFresh path (no key shadow / reconcile
+        // setup needed).
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(Ulid::new(), 1 << 30);
+        rec.state = elide_core::name_record::NameState::Released;
+        rec.coordinator_id = None;
+        rec.handoff_snapshot = Some(Ulid::new());
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(coord_dir.path())
+                .unwrap(),
+        );
+
+        let inner: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(Arc::clone(&store)));
+        let recording = RecordingStores::wrap(inner);
+        // Mirror start_claim's three picks.
+        let writer = recording.writer();
+        let journal = recording.event_journal();
+        let claims = recording.name_claims();
+
+        let reply = claim_volume_bucket_op(
+            "vol",
+            data_dir,
+            &writer,
+            journal.as_ref(),
+            claims.as_ref(),
+            &identity,
+        )
+        .await
+        .expect("claim must surface MustClaimFresh, not error");
+        assert!(
+            matches!(reply, ClaimReply::MustClaimFresh { .. }),
+            "no local fork → MustClaimFresh; got {reply:?}"
+        );
+
+        let calls = recording.calls();
+        assert!(!calls.is_empty(), "expected at least one role call");
+        for call in &calls {
+            assert!(
+                matches!(call, RoleCall::Writer | RoleCall::BaseObjectStore),
+                "claim's bucket side must only mint coord-writer / coord-base; \
+                 saw {call:?} in {calls:?}"
+            );
+        }
+    }
 }

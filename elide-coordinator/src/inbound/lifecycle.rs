@@ -2356,6 +2356,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_release_routes_dead_fork_writes_through_volume_rw_and_names_through_writer() {
+        // `force_release_volume_op` is split across two credentials by
+        // design (see the comment at the top of the op):
+        //   - by_id/<dead_vol>/* (volume.pub read, segment list, the
+        //     synthesised manifest write) → per-vol volume-rw minted
+        //     for `dead_vol_ulid`
+        //   - names/<name> CAS + events/<name>/ entry → coord-writer
+        // A regression that routed the synthesised manifest write
+        // through `writer()` would silently 403 on Tigris (coord-writer
+        // has no by_id/ access). This test pins both halves.
+        use elide_coordinator::stores::{
+            PassthroughStores, RecordingStores, RoleCall, ScopedStores,
+        };
+
+        let (store, identity, dead_vol, _seg, _td) = force_release_fixture("vol").await;
+        let passthrough: Arc<dyn ScopedStores> =
+            Arc::new(PassthroughStores::new(Arc::clone(&store)));
+        let recording = RecordingStores::wrap(passthrough);
+
+        let _ = force_release_volume_op(
+            "vol",
+            TempDir::new().unwrap().path(),
+            &(recording.clone() as Arc<dyn ScopedStores>),
+            &identity,
+        )
+        .await
+        .expect("force-release should succeed in this fixture");
+
+        let calls = recording.calls();
+        // Per-vol writes (synthesised manifest, segment list reads) ride
+        // volume-rw for the dead fork's ULID, not some other vol.
+        assert!(
+            calls.contains(&RoleCall::VolumeRw(dead_vol)),
+            "force-release must route by_id/{dead_vol}/* through \
+             volume_rw({dead_vol}); got {calls:?}"
+        );
+        // Coord-writer covers names/<vol> + events/<vol>/.
+        assert!(
+            calls.contains(&RoleCall::Writer),
+            "force-release must mint coord-writer for names/<vol> CAS; \
+             got {calls:?}"
+        );
+        // No volume-ro: force-release reads + writes by_id/<dead_vol>/*
+        // in one credential (recovery path needs both, so it mints
+        // volume-rw not the read-only sibling).
+        for call in &calls {
+            assert!(
+                !matches!(
+                    call,
+                    RoleCall::ReadVolume(_) | RoleCall::ReadHeadWithAncestors(_, _)
+                ),
+                "force-release must not mint volume-ro; saw {call:?} in {calls:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn stop_op_halts_locally_when_bucket_says_released() {
         // Bug-2 reproducer: bucket is Released (e.g. from a partial
         // earlier release), daemon is still running on this host. Stop

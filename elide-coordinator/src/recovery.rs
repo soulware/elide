@@ -995,4 +995,49 @@ mod tests {
             .expect_err("missing manifest must refuse");
         assert!(matches!(err, ResolveHandoffError::ManifestRead(_)));
     }
+
+    #[tokio::test]
+    async fn resolve_reads_manifest_from_data_store_and_pubkey_from_base_ro_store() {
+        // Two-store contract pin. The existing happy-path test passes
+        // the same store for both args, which would silently still
+        // pass if a refactor swapped them internally. Use two distinct
+        // backing stores and place each object only in its "correct"
+        // store: manifest in data_store, coordinator.pub in
+        // base_ro_store. A regression that read the pub from
+        // data_store (or the manifest from base_ro_store) would error
+        // because the requested object is absent in the other store.
+        //
+        // Anchors the cross-coord pubkey routing rule (memo
+        // `project_cross_coord_pubkey_reads.md`): every caller of
+        // resolve_handoff_verifier must wire the coord-base credential
+        // into the second arg — wiring volume-rw/volume-ro there would
+        // silently 403 on Tigris.
+        let data_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let base_ro_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dead_vol = Ulid::new();
+
+        // Recovering coordinator's pub published ONLY in base_ro_store.
+        let identity = coordinator_with_published_pub(&base_ro_store).await;
+
+        // Synthesised manifest published ONLY in data_store.
+        let published = mint_and_publish_synthesised_snapshot(
+            &data_store,
+            dead_vol,
+            &[Ulid::new()],
+            identity.as_ref(),
+            identity.coordinator_id_str(),
+        )
+        .await
+        .unwrap();
+
+        let outcome =
+            resolve_handoff_verifier(&data_store, &base_ro_store, dead_vol, published.snap_ulid)
+                .await
+                .expect(
+                    "manifest in data_store + pub in base_ro_store must succeed; \
+                     failure means resolve_handoff_verifier reads the wrong store \
+                     for one of the two objects",
+                );
+        assert!(matches!(outcome, HandoffVerifier::Synthesised { .. }));
+    }
 }
