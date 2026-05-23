@@ -39,7 +39,7 @@ max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
 
 [[role]]
-name = "coord-base"
+name = "coord-ro"
 required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h

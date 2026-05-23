@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(scoped.len(), 67);
         assert!(scoped.len() <= 128);
 
-        let global = policy_name("coord-base", None, expiry);
-        assert!(global.starts_with("mint_coord-base_global_20260521T143000Z_"));
+        let global = policy_name("coord-ro", None, expiry);
+        assert!(global.starts_with("mint_coord-ro_global_20260521T143000Z_"));
     }
 }

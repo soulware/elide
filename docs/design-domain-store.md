@@ -21,7 +21,7 @@ credential-scoped store handles:
 
 ```rust
 pub trait ScopedStores {
-    fn base_ro(&self)                   -> Arc<dyn ReadStore>;      // coord-base
+    fn base_ro(&self)                   -> Arc<dyn ReadStore>;      // coord-ro
     fn writer(&self)                    -> Arc<dyn ObjectStore>;    // coord-writer
     fn volume_rw(&self, v: &Ulid) -> Arc<dyn ObjectStore>;    // volume-rw
 }
@@ -68,19 +68,19 @@ narrow handle they actually need.
 
 ```rust
 pub trait DomainStores: Send + Sync {
-    // coord-writer-backed (write side); coord-base-backed reads
+    // coord-writer-backed (write side); coord-ro-backed reads
     // inherited via the reader supertrait
     fn name_claims(&self)        -> Arc<dyn NameClaims>;
     fn event_journal(&self)      -> Arc<dyn EventJournal>;
     fn own_identity(&self)       -> Arc<dyn OwnIdentity>;
 
-    // coord-base-backed (read only)
+    // coord-ro-backed (read only)
     fn event_journal_ro(&self)   -> Arc<dyn EventJournalReader>;
 
     // volume-rw-backed
     fn volume_data(&self, v: &Ulid) -> Arc<dyn VolumeData>;
 
-    // coord-base-backed
+    // coord-ro-backed
     fn control_reader(&self)     -> Arc<dyn ControlPlaneReader>;
 }
 ```
@@ -108,7 +108,7 @@ pub trait EventJournal: EventJournalReader {
 }
 ```
 
-Why split: a read-only path needs `coord-base` (the only role whose
+Why split: a read-only path needs `coord-ro` (the only role whose
 policy grants `coordinators/<other>/*` reads, required by
 `list_and_verify`'s pubkey lookup); the emit CAS needs `coord-writer`
 end-to-end (the `docs/design-mint.md` "one credential per mutation"
@@ -117,7 +117,7 @@ rule). A single handle that hides the fan-out internally
 writes to writer) is the impl shape; the trait split lets a read-only
 caller carry a strictly narrower type.
 
-The same shape applies to `NameClaims` (`read` is `coord-base`-fit;
+The same shape applies to `NameClaims` (`read` is `coord-ro`-fit;
 `try_claim` / `release` / `force_release` need `coord-writer`) and
 `OwnIdentity` (other coordinators' identity material is reader-only;
 self-publish is writer).
@@ -157,7 +157,7 @@ plus the `vol_ulid`).
 The complete coordinator-side object surface, by handle. Each row is
 "what the call sites already do today, restated as a domain op".
 
-### `NameClaims` (`coord-writer` for mutations, `coord-base` for reads)
+### `NameClaims` (`coord-writer` for mutations, `coord-ro` for reads)
 
 The `names/<name>` record carries a small state machine
 (`Live`/`Stopped`/`Released`/`Readonly`) plus ownership identity.
@@ -186,9 +186,9 @@ Same reader/writer split as `EventJournal`: pure-read sites
 `&dyn NameClaimsReader` and cannot mutate at the type level. Each
 `mark_*` runs its full read-modify-write on `coord-writer` (the
 "one credential per mutation" rule); the inherited `read` goes on
-`coord-base`.
+`coord-ro`.
 
-### `EventJournal` (`coord-writer` for emit, `coord-base` for reads)
+### `EventJournal` (`coord-writer` for emit, `coord-ro` for reads)
 
 | Op | Today | Domain shape | Trait |
 |---|---|---|---|
@@ -274,7 +274,7 @@ No CAS — the document is justified in `design-segment-index.md`.
 
 Two fixed keys per volume — small enough to be flat methods.
 
-### `ControlPlaneReader` (`coord-base`)
+### `ControlPlaneReader` (`coord-ro`)
 
 Existing `ReadStore`, retyped. The peer-fetch verifier still needs
 the cross-crate `Arc<dyn ObjectStore>` escape hatch

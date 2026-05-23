@@ -780,7 +780,7 @@ definition below):
 |---|---|---|---|---|
 | `volume-rw` | ● | ● | ● | ● |
 | `coord-writer` | ● | ● | ● | |
-| `coord-base` | ● | ● | ● | |
+| `coord-ro` | ● | ● | ● | |
 | `volume-ro` | ● | ● | | ● |
 
 Non-caveat template inputs (the other three substitution classes,
@@ -804,9 +804,9 @@ Notes:
 - **`sub` templates only in `coord-writer`'s own-identity statement**
   (`coordinators/{{caveat "sub"}}/*`, own-prefix write). Everywhere
   else `sub` is a gate only; the other statements use prefix
-  wildcards (`names/*`, `events/*`) and `coord-base` reads
+  wildcards (`names/*`, `events/*`) and `coord-ro` reads
   `coordinators/*`.
-- **`coord-base` is the read-only baseline every coordinator holds**, and
+- **`coord-ro` is the read-only baseline every coordinator holds**, and
   the only credential the LAN/internet-exposed peer-fetch verifier holds.
   Coordinator-wide read of `names/*` / `coordinators/*` / `events/*` /
   `meta/*`, gated by `sub` like the other `coord-*` roles.
@@ -817,7 +817,7 @@ Elide's coordinator authenticates to mint and assumes **four roles**:
 
 | Role | Scope | Held by |
 |---|---|---|
-| `coord-base` | read-only `names/* coordinators/* events/* meta/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
+| `coord-ro` | read-only `names/* coordinators/* events/* meta/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
 | `coord-writer` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`) | the non-exposed mutation paths |
 | `volume-rw` | per-volume `by_id/<vol>/*` read+write, plus that volume's `meta/<vol>.{provenance,pub}` (**Split B** — per-volume) | the coordinator, cached per vol_ulid |
 | `volume-ro` | per-volume lineage read, vended to the volume process | the coordinator (assumes), the volume (holds the keypair) |
@@ -847,7 +847,7 @@ against ephemeral broker-vended keys held by one principal.
 
 Two splits survive on their own merits, not Split A's:
 
-- **`coord-base` is separate** because the peer-fetch verifier is
+- **`coord-ro` is separate** because the peer-fetch verifier is
   LAN/internet-exposed and must hold a credential that *structurally*
   cannot mutate state or read `by_id/` bodies. A hard containment
   boundary, not an operational nicety.
@@ -956,7 +956,7 @@ two read paths:
    `request.ancestors` body. The provenance/pub skeleton reads that
    *discover* the chain (`pull_readonly_op`, and the skeleton pulls
    inside `prefetch_indexes`) are **not** `volume-ro` — they hit only
-   `meta/*` and ride the warm `coord-base` credential, so chain
+   `meta/*` and ride the warm `coord-ro` credential, so chain
    discovery costs no per-ancestor mint.
 
 - **Required caveats:** `elide:Volume`, `aud=mint`, `exp`
@@ -1004,7 +1004,7 @@ active volume per TTL window per coordinator, gated by Tigris IAM rate
 limits (*Open questions* #9). The 24h TTL is the primary knob: longer →
 fewer mints, larger leaked-key window.
 
-### `coord-base`
+### `coord-ro`
 
 The baseline read-only credential every coordinator holds. Covers the
 control-plane public state a coordinator reads as a matter of course:
@@ -1041,7 +1041,7 @@ credential — the per-ancestor `volume-ro` mint for chain discovery is
 gone. The flat `meta/` prefix exists so `meta/*` is a trailing
 wildcard (Tigris does not match `*` mid-resource).
 
-**Invariant: `coord-base` is read-only and `by_id/`-free.** This is what
+**Invariant: `coord-ro` is read-only and `by_id/`-free.** This is what
 makes it safe to be the *only* credential held by the LAN/internet-
 exposed peer-fetch HTTP verifier: a compromise of the exposed surface
 can neither mutate state nor read segment bodies
@@ -1050,12 +1050,12 @@ weaken this — it carries only the signed, already-public
 `volume.provenance` / `volume.pub`, never segment bodies, which stay in
 `by_id/`. The write-capable
 `coord-writer` and `volume-rw` roles stay separate and are held only
-by the non-exposed mutation paths. `coord-base` must never accrete a
+by the non-exposed mutation paths. `coord-ro` must never accrete a
 write action or any `by_id/` read; doing so silently breaks
 exposed-surface containment.
 
 The peer-fetch verifier needs no dedicated role and no `by_id/` access:
-it uses `coord-base` for the gap-free fence (per-request ETag-
+it uses `coord-ro` for the gap-free fence (per-request ETag-
 conditional `names/<name>` read, coincident with the `release --force`
 S3 CAS) and the requester-pubkey check (`coordinators/<B>/
 coordinator.pub`), and verifies lineage against the serving peer's
@@ -1174,7 +1174,7 @@ to three roles:
 
 ```rust
 pub trait ScopedStores {
-    fn base_ro(&self)               -> Arc<dyn ReadStore>;       // coord-base
+    fn base_ro(&self)               -> Arc<dyn ReadStore>;       // coord-ro
     fn writer(&self)                -> Arc<dyn ObjectStore>;     // coord-writer
     fn volume_rw(&self, v: &Ulid) -> Arc<dyn ObjectStore>; // volume-rw
 }
@@ -1194,7 +1194,7 @@ prefixes), so a name-claim/force-release CAS (`GET` ETag → conditional
 the exposed peer-fetch verifier use `base_ro()`. There is **no
 prefix-routing wrapper**: which credential a path wields is explicit at
 the acquisition site and visible in review, not a runtime dispatch on
-key strings. The boundary the doc requires ("`coord-base` must never
+key strings. The boundary the doc requires ("`coord-ro` must never
 accrete a `by_id/` read") is then a property the type system carries,
 not a convention.
 
@@ -1212,7 +1212,7 @@ not a convention.
 containment boundary is made *unrepresentable*, not merely
 unauthorized: a path holding `base_ro()` cannot call a mutating method
 because it does not exist on the type. This is the one boundary where
-the type safety is load-bearing — `coord-base` is the credential the
+the type safety is load-bearing — `coord-ro` is the credential the
 LAN/internet-exposed verifier holds. `writer()` and
 `volume_rw()` keep the full `ObjectStore` surface (they feed
 existing mixed-prefix helpers that legitimately need it; confusing the
@@ -1237,7 +1237,7 @@ before its `DateLessThan` (the *TTL principle*: TTL is the maximum
 revocation latency, so refresh well inside it — e.g. at half-life),
 rebuilding the `object_store` on rotation; a brief refresh stall is
 absorbed by the WAL for writes and is off the hot path for reads
-(`coord-base`/`coord-writer` 1h, `volume-rw` 24h, `volume-ro` 1h;
+(`coord-ro`/`coord-writer` 1h, `volume-rw` 24h, `volume-ro` 1h;
 freshness for `volume-ro` is § *Elide as customer*'s split-by-volume-mode
 rule).
 First use assumes lazily. `PassthroughStores` stays the impl for the
@@ -1255,7 +1255,7 @@ refinement is for each role to hand back the *operations its policy
 authorizes* rather than a generic store: `coord-writer` →
 `NameClaims` / `EventJournal` (get + append, **no** `delete` method —
 the `events/` append-only invariant as a type, not a policy-template
-property) / `OwnIdentity`; `volume-rw` → `VolumeData`; `coord-base`
+property) / `OwnIdentity`; `volume-rw` → `VolumeData`; `coord-ro`
 → `ControlPlaneReader`. This makes wrong-prefix keys unconstructable
 (S3 key layout moves inside the typed store, off the `format!` sites
 scattered across `upload.rs`/`claim.rs`/`name_store.rs`/…) and the
@@ -1378,7 +1378,7 @@ prematurely.
    overlap window, a re-issue-on-rotate flow. Tied to #14. Probably
    defer to v2.
 4. **Peer-fetch scope — settled.** There is no dedicated peer-fetch
-   role; the verifier uses `coord-base` (read-only `names/*` /
+   role; the verifier uses `coord-ro` (read-only `names/*` /
    `coordinators/*` / `events/*`). Lineage is verified by the serving
    peer against its own *local* signed `volume.provenance`, not via S3.
    The force-release fence is gap-free via the per-request ETag-
@@ -1386,7 +1386,7 @@ prematurely.
 5. **Mid-path wildcard verification.** Not on the v1 critical path:
    `volume-rw` uses a single-volume *trailing* wildcard
    (`by_id/{{caveat "elide:Volume"}}/*`), `volume-ro` uses exact ancestor
-   ARNs, and `coord-base` touches no `by_id/` at all — none need mid-path
+   ARNs, and `coord-ro` touches no `by_id/` at all — none need mid-path
    `*`. It is only a constraint on a future role wanting
    `by_id/*/<something>` shape. Empirical test still worth running once,
    but does not block the current inventory.

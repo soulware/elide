@@ -31,7 +31,7 @@ has completed successfully.
   (existing code, not ours), matching the printed fingerprint through a
   trusted side channel first.
 - **C — exchange fan-out.** Once approved, the command exchanges the
-  ticket once per role in the canonical inventory (`coord-base`,
+  ticket once per role in the canonical inventory (`coord-ro`,
   `coord-writer`, `volume-rw`, `volume-ro`) — body `{ts, role}`, same
   PoP — and writes each re-minted credential to
   `credentials/<role>` (mode `0600`). The pending record is not
@@ -82,7 +82,7 @@ failure on first S3 touch.
    `MintConfig` stays as-is (`url` + timeouts only).
 
 4. **Canonical role inventory consolidated.** The four role-name
-   constants are currently split: `ROLE_COORD_BASE/_WRITER/_DATA` in
+   constants are currently split: `ROLE_COORD_RO/_WRITER/_DATA` in
    `mint_stores.rs`, `ROLE_VOLUME_RO` in `mint_client.rs`. Introduce one
    `pub const COORD_ENROLL_ROLES: &[&str]` (single source of truth) used
    by the exchange fan-out **and** the startup gate **and** referenced
@@ -163,7 +163,7 @@ elide coord enroll [--data-dir <dir>] <invite-macaroon | file | ->
 
 Walked the full sequence end-to-end with the `mint` binary alone
 (server + reference client + operator subcommands) over a UDS, against
-a 4-role config (`coord-base`, `coord-writer`, `volume-rw`,
+a 4-role config (`coord-ro`, `coord-writer`, `volume-rw`,
 `volume-ro`), fake minter. Findings that shaped the plan above:
 
 1. **The split CLI is the wrong operator surface — confirms the

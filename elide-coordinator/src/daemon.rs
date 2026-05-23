@@ -143,7 +143,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         // Server context for the inbound HTTP listener. The auth state
         // reads `coordinator.pub` and the ETag-conditional
         // `names/<name>` (steps 2–3, the gap-free force-release fence)
-        // via the read-only `coord-base` credential — the exposed
+        // via the read-only `coord-ro` credential — the exposed
         // verifier holds no write-capable key. Lineage (step 4) is
         // verified against a
         // separate local store rooted at `data_dir`: the peer walks the

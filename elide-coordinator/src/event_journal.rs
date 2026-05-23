@@ -198,7 +198,7 @@ impl From<ConditionalPutError> for EventError {
 /// compile time. The split mirrors [`crate::stores::ReadStore`] vs
 /// `ObjectStore`: credential scope becomes type scope.
 ///
-/// Backed by the `coord-base` role — reads on `events/*` and on
+/// Backed by the `coord-ro` role — reads on `events/*` and on
 /// `coordinators/<other>/*` (the latter is what `list_and_verify`
 /// needs for cross-coordinator pubkey resolution; `coord-writer`'s
 /// policy does not grant it).
@@ -235,7 +235,7 @@ pub trait EventJournalReader: Send + Sync {
 ///
 /// Extends [`EventJournalReader`] with the mutating [`Self::emit`].
 /// Backed by both `coord-writer` (for the emit CAS, which runs wholly
-/// on one credential per `docs/design-mint.md`) and `coord-base` (for
+/// on one credential per `docs/design-mint.md`) and `coord-ro` (for
 /// the inherited read methods, which need cross-coord pubkey reads
 /// for verify).
 ///
@@ -273,7 +273,7 @@ pub trait EventJournal: EventJournalReader {
     }
 }
 
-/// Read-only `EventJournalReader` over a `coord-base`-scoped store.
+/// Read-only `EventJournalReader` over a `coord-ro`-scoped store.
 /// Constructed by [`crate::stores::ScopedStores::event_journal_ro`].
 pub struct ReadOnlyEventJournal {
     reader: Arc<dyn ObjectStore>,
@@ -287,7 +287,7 @@ impl ReadOnlyEventJournal {
 
 /// Full `EventJournal` impl. Holds two credential-scoped store
 /// handles: `writer` (`coord-writer`) for the emit CAS, and `reader`
-/// (`coord-base`) for read methods + signature-verify pubkey reads.
+/// (`coord-ro`) for read methods + signature-verify pubkey reads.
 pub struct BucketEventJournal {
     writer: Arc<dyn ObjectStore>,
     reader: Arc<dyn ObjectStore>,

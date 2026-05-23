@@ -4,7 +4,7 @@
 //! (`docs/design-domain-store.md`). Wraps the existing
 //! [`crate::name_store`] primitive (S3 CAS) and the
 //! [`crate::lifecycle`] state-machine verbs (`mark_*`) behind a typed
-//! trait pair: [`NameClaimsReader`] (read-only, coord-base) and
+//! trait pair: [`NameClaimsReader`] (read-only, coord-ro) and
 //! [`NameClaims`] (full read+write, coord-writer for mutations).
 //!
 //! The split mirrors [`EventJournalReader`] vs [`EventJournal`] and
@@ -50,7 +50,7 @@ pub trait NameClaimsReader: Send + Sync {
 /// [`NameClaimsReader`] with the state-machine verbs. Each `mark_*`
 /// runs its full read-modify-write on the `coord-writer` credential
 /// (one credential per mutation — the `docs/design-mint.md` rule),
-/// inherited reads stay on `coord-base`.
+/// inherited reads stay on `coord-ro`.
 ///
 /// Acquired via [`crate::stores::ScopedStores::name_claims`].
 ///
@@ -149,7 +149,7 @@ pub trait NameClaims: NameClaimsReader {
     async fn reconcile_marker(&self, vol_dir: &Path, volume_name: &str, coord_id: &str);
 }
 
-/// Read-only `NameClaimsReader` over a `coord-base`-scoped store.
+/// Read-only `NameClaimsReader` over a `coord-ro`-scoped store.
 pub struct ReadOnlyNameClaims {
     reader: Arc<dyn ObjectStore>,
 }
@@ -170,7 +170,7 @@ impl NameClaimsReader for ReadOnlyNameClaims {
 }
 
 /// Full `NameClaims` impl. `writer` (`coord-writer`) carries every
-/// `mark_*` call's full read-modify-write; `reader` (`coord-base`)
+/// `mark_*` call's full read-modify-write; `reader` (`coord-ro`)
 /// carries pure reads.
 pub struct BucketNameClaims {
     writer: Arc<dyn ObjectStore>,

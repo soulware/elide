@@ -365,7 +365,7 @@ async fn pull_ancestor_chain(
         }
         job.line(format!("pulling ancestor {vol_ulid}"));
         // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
-        // bucket-wide objects on the warm `coord-base` credential, so
+        // bucket-wide objects on the warm `coord-ro` credential, so
         // the whole chain walk needs no per-ancestor mint.
         let store = stores.base_object_store();
         let reply = pull_readonly_op(vol_ulid, data_dir, &store, None).await?;
@@ -598,10 +598,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_ancestor_chain_rides_coord_base_not_per_ulid_volume_ro() {
+    async fn pull_ancestor_chain_rides_coord_ro_not_per_ulid_volume_ro() {
         // The ancestor walk pulls only `meta/<ulid>.{provenance,pub}`
         // skeletons — bucket-wide objects covered by the warm
-        // `coord-base` credential. It must ride `base_object_store`,
+        // `coord-ro` credential. It must ride `base_object_store`,
         // never mint a per-ULID `volume-ro` (or `volume-rw`) view. The
         // pull itself fails here (empty store), but the credential pick
         // is recorded before that.
@@ -620,7 +620,7 @@ mod tests {
         assert_eq!(
             recording.calls(),
             vec![RoleCall::BaseObjectStore],
-            "ancestor skeleton pull must ride coord-base, never a per-ULID volume-ro mint"
+            "ancestor skeleton pull must ride coord-ro, never a per-ULID volume-ro mint"
         );
     }
 }

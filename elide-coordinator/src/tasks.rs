@@ -183,7 +183,7 @@ pub async fn run_volume_tasks(
 
     // Per-vol volume-rw store for drain/GC writes under
     // `by_id/<vol>/`. Peer-discovery reads `events/<name>/` and runs
-    // on coord-base. Prefetch crosses ancestor prefixes so it mints
+    // on coord-ro. Prefetch crosses ancestor prefixes so it mints
     // `volume-ro` itself inside `prefetch_indexes`.
     let data_store = match parsed_ulid {
         Some(u) => stores.volume_rw(&u),

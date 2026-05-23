@@ -10,7 +10,7 @@
 //! reads inside a name-claim CAS run on the same credential as the
 //! conditional write.
 //!
-//! * [`ScopedStores::base_ro`] — `coord-base`. The read-only
+//! * [`ScopedStores::base_ro`] — `coord-ro`. The read-only
 //!   control-plane baseline, and the credential the LAN/internet-
 //!   exposed peer-fetch verifier holds. Returns a narrow [`ReadStore`]
 //!   so a holder can read and `head` only.
@@ -43,7 +43,7 @@ use crate::event_journal::{
 use crate::name_claims::{BucketNameClaims, NameClaims, NameClaimsReader, ReadOnlyNameClaims};
 use crate::volume_data::VolumeData;
 
-/// Read-only S3 surface — `coord-base`. Exposes `get` and `head`. A
+/// Read-only S3 surface — `coord-ro`. Exposes `get` and `head`. A
 /// holder can read individual objects; the containment boundary the
 /// exposed peer-fetch verifier relies on is carried by this type.
 #[async_trait]
@@ -55,7 +55,7 @@ pub trait ReadStore: Send + Sync {
 /// Adapts any [`ObjectStore`] down to the read-only [`ReadStore`]
 /// surface. The passthrough / local-store impl returns this over its
 /// single inner store; the mint-backed impl returns it over the
-/// `coord-base`-keyed store.
+/// `coord-ro`-keyed store.
 pub struct ReadOnlyAdapter {
     inner: Arc<dyn ObjectStore>,
 }
@@ -99,7 +99,7 @@ impl ReadStore for Arc<dyn ObjectStore> {
 /// store; with the mint-backed impl they are distinct mint-vended
 /// keypairs.
 pub trait ScopedStores: Send + Sync {
-    /// `coord-base`: read-only `names/* coordinators/* events/*`.
+    /// `coord-ro`: read-only `names/* coordinators/* events/*`.
     /// Read-only paths and the exposed verifier.
     fn base_ro(&self) -> Arc<dyn ReadStore>;
 
@@ -133,10 +133,10 @@ pub trait ScopedStores: Send + Sync {
     fn read_head_with_ancestors(&self, vol_ulid: &Ulid, ancestors: &[Ulid])
     -> Arc<dyn ObjectStore>;
 
-    /// The `coord-base` store as a plain [`ObjectStore`]. Reads the
+    /// The `coord-ro` store as a plain [`ObjectStore`]. Reads the
     /// coordinator-wide control-plane prefixes plus `meta/*` (every
     /// volume's `volume.provenance` / `volume.pub`); the read-only
-    /// guarantee rests on `coord-base`'s IAM policy. Used for the
+    /// guarantee rests on `coord-ro`'s IAM policy. Used for the
     /// ancestor-skeleton pulls (`meta/` is bucket-wide, so chain
     /// discovery needs no per-volume credential) and by the peer-fetch
     /// verifier (`elide_peer_fetch::auth::AuthState`), which lives in a
@@ -146,7 +146,7 @@ pub trait ScopedStores: Send + Sync {
     /// Full read+write handle for the per-name event log
     /// (`events/<name>/…`). Backed by both `coord-writer` (for
     /// emit's CAS, which runs wholly on one credential) and
-    /// `coord-base` (for the inherited reads, which need
+    /// `coord-ro` (for the inherited reads, which need
     /// cross-coordinator pubkey lookups in `list_and_verify`).
     /// First slice of the domain-typed store layer
     /// (`docs/design-domain-store.md`); the trait deliberately has
@@ -159,7 +159,7 @@ pub trait ScopedStores: Send + Sync {
         ))
     }
 
-    /// Read-only handle for the per-name event log — `coord-base`
+    /// Read-only handle for the per-name event log — `coord-ro`
     /// scope. A holder cannot call `emit`, so pure-read call sites
     /// (`volume events` IPC, peer-discovery) carry no over-privilege
     /// at the type level either. Mirrors the
@@ -171,7 +171,7 @@ pub trait ScopedStores: Send + Sync {
     /// Full read+write handle for the `names/<name>` claim records.
     /// Backed by both `coord-writer` (for the `mark_*` CAS verbs,
     /// which run wholly on one credential per mutation) and
-    /// `coord-base` (for the inherited reads). The trait exposes no
+    /// `coord-ro` (for the inherited reads). The trait exposes no
     /// untyped `update` / `overwrite` — every state change is a typed
     /// `mark_*` verb.
     fn name_claims(&self) -> Arc<dyn NameClaims> {
@@ -182,7 +182,7 @@ pub trait ScopedStores: Send + Sync {
     }
 
     /// Read-only handle for the `names/<name>` claim records —
-    /// `coord-base` scope. A holder cannot invoke any `mark_*` verb
+    /// `coord-ro` scope. A holder cannot invoke any `mark_*` verb
     /// at the type level. Used by `Request::ResolveName`,
     /// `bucket_position::fetch_position`, and the few pure-display
     /// readers.

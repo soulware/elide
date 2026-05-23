@@ -285,7 +285,7 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::StatusRemote { volume } => {
-            // Reads names/<volume> only — the read-only coord-base
+            // Reads names/<volume> only — the read-only coord-ro
             // credential.
             let store = ctx.stores.base_ro();
             let result = volume_status_remote_typed(
@@ -481,7 +481,7 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::VolumeEvents { volume, num } => {
-            // Pure-read IPC: read-only journal handle (coord-base) — the
+            // Pure-read IPC: read-only journal handle (coord-ro) — the
             // type system rules out an accidental emit on the IPC perimeter.
             let journal = ctx.stores.event_journal_ro();
             let result = volume_events_typed(&volume, journal.as_ref(), num).await;
@@ -2247,7 +2247,7 @@ async fn resolve_peer_endpoint_for_volume(
     let vol_dir = data_dir.join("by_id").join(volume_ulid.to_string());
     let volume_name = elide_coordinator::tasks::read_volume_name(&vol_dir)?;
     // Cross-coordinator RO reads: events/<name>/HEAD + coordinators/<other>/* —
-    // coord-base scope. The read-only journal carries that.
+    // coord-ro scope. The read-only journal carries that.
     let store = stores.base_object_store();
     let journal = stores.event_journal_ro();
     elide_coordinator::peer_discovery::discover_peer_for_claim(
@@ -3334,7 +3334,7 @@ mod tests {
              through volume_rw({vol_ulid}); got {calls:?}"
         );
         // Coordinator-wide writes (names/<vol>, events/<vol>/) mint
-        // coord-writer plus coord-base reads (the name_claims +
+        // coord-writer plus coord-ro reads (the name_claims +
         // event_journal facades wrap both).
         assert!(
             calls.contains(&RoleCall::Writer),
@@ -3343,7 +3343,7 @@ mod tests {
         // No read-only single-volume credential should appear: every
         // create-time read is on local disk, and the only S3 reads
         // are the conditional-PUT preflights inside name_claims/
-        // event_journal which ride coord-base via the facade.
+        // event_journal which ride coord-ro via the facade.
         for call in &calls {
             assert!(
                 !matches!(

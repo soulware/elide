@@ -289,7 +289,7 @@ be a PoC.
 Once mint is split out, the coordinator cannot write S3 with ambient
 admin creds: to mutate it must call `mint /v1/assume-role` with a
 macaroon and obtain a write-capable keypair (`volume-rw`, `coord-names`,
-the Split-A writer roles). Reads need only `coord-base`, the read-only
+the Split-A writer roles). Reads need only `coord-ro`, the read-only
 baseline every coordinator already holds. "Every S3 mutation is
 authorised" then holds *architecturally* — enforced by IAM at the single
 point write credentials are acquired — rather than by scattered

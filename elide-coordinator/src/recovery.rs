@@ -352,7 +352,7 @@ impl std::error::Error for ResolveHandoffError {}
 ///
 /// `data_store` is scoped to `by_id/<vol_ulid>/` (`volume-rw`) and
 /// reads the manifest. `base_ro_store` is the coordinator-wide
-/// `coord-base` read scope and is used only to fetch the recovering
+/// `coord-ro` read scope and is used only to fetch the recovering
 /// coordinator's `coordinators/<id>/coordinator.pub` — a key outside
 /// any single volume's `by_id/` prefix and therefore not reachable
 /// under `volume-rw`. The split mirrors `volume release --force`'s
@@ -1009,7 +1009,7 @@ mod tests {
         //
         // Anchors the cross-coord pubkey routing rule (memo
         // `project_cross_coord_pubkey_reads.md`): every caller of
-        // resolve_handoff_verifier must wire the coord-base credential
+        // resolve_handoff_verifier must wire the coord-ro credential
         // into the second arg — wiring volume-rw/volume-ro there would
         // silently 403 on Tigris.
         let data_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
