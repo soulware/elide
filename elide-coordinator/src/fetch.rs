@@ -153,7 +153,7 @@ pub(crate) async fn start_fetch(
         return Err(IpcError::conflict(hint));
     }
 
-    // `latest_snapshot_in_store` reads `by_id/<vol>/snapshots/`; `coord-writer`
+    // `latest_snapshot_in_store` reads `by_id/<vol>/snapshots/`; `coord-rw`
     // has no `by_id/` grant, so mint a per-vol `volume-ro` once vol_ulid is
     // known. The orchestrator below already mints its own per-vol volume-rw
     // for the actual fetch body.
@@ -365,7 +365,7 @@ async fn pull_ancestor_chain(
         }
         job.line(format!("pulling ancestor {vol_ulid}"));
         // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
-        // bucket-wide objects on the warm `coord-base` credential, so
+        // bucket-wide objects on the warm `coord-ro` credential, so
         // the whole chain walk needs no per-ancestor mint.
         let store = stores.base_object_store();
         let reply = pull_readonly_op(vol_ulid, data_dir, &store, None).await?;
@@ -547,9 +547,9 @@ mod tests {
 
     #[tokio::test]
     async fn start_fetch_resolves_name_with_writer_then_snapshot_with_read_volume() {
-        // `start_fetch` reads `names/<name>` (coord-writer) then peeks
+        // `start_fetch` reads `names/<name>` (coord-rw) then peeks
         // `by_id/<vol>/snapshots/LATEST` (volume-ro). The second op
-        // must NOT ride coord-writer — coord-writer has no `by_id/`
+        // must NOT ride coord-rw — coord-rw has no `by_id/`
         // grant and would 403 on Tigris.
         let coord_dir = TempDir::new().unwrap();
         let data_dir = TempDir::new().unwrap();
@@ -582,7 +582,7 @@ mod tests {
         let calls = recording.calls();
         assert!(
             calls.contains(&RoleCall::Writer),
-            "resolve_name must use coord-writer; got {calls:?}"
+            "resolve_name must use coord-rw; got {calls:?}"
         );
         assert!(
             calls.contains(&RoleCall::ReadVolume(vol_ulid)),
@@ -598,10 +598,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_ancestor_chain_rides_coord_base_not_per_ulid_volume_ro() {
+    async fn pull_ancestor_chain_rides_coord_ro_not_per_ulid_volume_ro() {
         // The ancestor walk pulls only `meta/<ulid>.{provenance,pub}`
         // skeletons — bucket-wide objects covered by the warm
-        // `coord-base` credential. It must ride `base_object_store`,
+        // `coord-ro` credential. It must ride `base_object_store`,
         // never mint a per-ULID `volume-ro` (or `volume-rw`) view. The
         // pull itself fails here (empty store), but the credential pick
         // is recorded before that.
@@ -620,7 +620,7 @@ mod tests {
         assert_eq!(
             recording.calls(),
             vec![RoleCall::BaseObjectStore],
-            "ancestor skeleton pull must ride coord-base, never a per-ULID volume-ro mint"
+            "ancestor skeleton pull must ride coord-ro, never a per-ULID volume-ro mint"
         );
     }
 }

@@ -218,11 +218,11 @@ pub(crate) async fn force_release_volume_op(
 
     // Two credentials are involved. Operations on `names/<name>` and
     // `events/<name>/` (the name-flip CAS, the journal entry, the
-    // initial record read) ride the coordinator-wide `coord-writer`
+    // initial record read) ride the coordinator-wide `coord-rw`
     // credential. Operations on `by_id/<dead_vol>/` (volume.pub,
     // LATEST, manifest, HEAD, segments, the synthesised manifest
     // write) ride a per-volume `volume-rw` credential minted
-    // specifically for `dead_vol_ulid` — `coord-writer` has no
+    // specifically for `dead_vol_ulid` — `coord-rw` has no
     // access to `by_id/` at all (see `mint/examples/elide_roles/`).
     // Both creds are mintable by this coordinator for any vol_ulid;
     // there is no ownership check at mint time, by design for the
@@ -439,10 +439,10 @@ pub(crate) async fn release_volume_op(
     let started = std::time::Instant::now();
     info!("[release {volume_name}] start");
 
-    // `release` straddles two role scopes: `coord-writer` for the
+    // `release` straddles two role scopes: `coord-rw` for the
     // `names/<name>` flip + the `events/<name>/` emission, and per-vol
     // `volume-rw` for the `by_id/<vol>/snapshots/` promote / publish.
-    // `coord-writer` has no access to `by_id/` (see
+    // `coord-rw` has no access to `by_id/` (see
     // `mint/examples/elide_roles/`), so the typed [`VolumeData`] is
     // constructed once `vol_ulid` is known and threaded into each
     // by_id/ op.
@@ -2297,7 +2297,7 @@ mod tests {
         // Pin the credential routing for the non-force `release` path
         // (regression for commit 4e6950f). The synthesised handoff
         // manifest goes under `by_id/<vol>/snapshots/`, so the PUT
-        // must ride per-vol `volume-rw` — not `coord-writer`. A
+        // must ride per-vol `volume-rw` — not `coord-rw`. A
         // `RecordingStores` wrapper captures every method `release`
         // calls on `ScopedStores`; we assert at least one
         // `VolumeRw(vol)` lands.
@@ -2362,9 +2362,9 @@ mod tests {
         //   - by_id/<dead_vol>/* (volume.pub read, segment list, the
         //     synthesised manifest write) → per-vol volume-rw minted
         //     for `dead_vol_ulid`
-        //   - names/<name> CAS + events/<name>/ entry → coord-writer
+        //   - names/<name> CAS + events/<name>/ entry → coord-rw
         // A regression that routed the synthesised manifest write
-        // through `writer()` would silently 403 on Tigris (coord-writer
+        // through `writer()` would silently 403 on Tigris (coord-rw
         // has no by_id/ access). This test pins both halves.
         use elide_coordinator::stores::{
             PassthroughStores, RecordingStores, RoleCall, ScopedStores,
@@ -2395,7 +2395,7 @@ mod tests {
         // Coord-writer covers names/<vol> + events/<vol>/.
         assert!(
             calls.contains(&RoleCall::Writer),
-            "force-release must mint coord-writer for names/<vol> CAS; \
+            "force-release must mint coord-rw for names/<vol> CAS; \
              got {calls:?}"
         );
         // No volume-ro: force-release reads + writes by_id/<dead_vol>/*

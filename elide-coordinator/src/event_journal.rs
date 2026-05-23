@@ -198,9 +198,9 @@ impl From<ConditionalPutError> for EventError {
 /// compile time. The split mirrors [`crate::stores::ReadStore`] vs
 /// `ObjectStore`: credential scope becomes type scope.
 ///
-/// Backed by the `coord-base` role — reads on `events/*` and on
+/// Backed by the `coord-ro` role — reads on `events/*` and on
 /// `coordinators/<other>/*` (the latter is what `list_and_verify`
-/// needs for cross-coordinator pubkey resolution; `coord-writer`'s
+/// needs for cross-coordinator pubkey resolution; `coord-rw`'s
 /// policy does not grant it).
 ///
 /// Acquired via [`crate::stores::ScopedStores::event_journal_ro`].
@@ -234,8 +234,8 @@ pub trait EventJournalReader: Send + Sync {
 /// type-level property.
 ///
 /// Extends [`EventJournalReader`] with the mutating [`Self::emit`].
-/// Backed by both `coord-writer` (for the emit CAS, which runs wholly
-/// on one credential per `docs/design-mint.md`) and `coord-base` (for
+/// Backed by both `coord-rw` (for the emit CAS, which runs wholly
+/// on one credential per `docs/design-mint.md`) and `coord-ro` (for
 /// the inherited read methods, which need cross-coord pubkey reads
 /// for verify).
 ///
@@ -245,7 +245,7 @@ pub trait EventJournal: EventJournalReader {
     /// Mint a fresh event, sign it with `identity`, and append it.
     /// Holds the in-process per-name emit lock for the duration of
     /// the read-modify-write. The whole CAS (HEAD GET → HEAD PUT →
-    /// record PUT) runs on the `coord-writer` credential — never
+    /// record PUT) runs on the `coord-rw` credential — never
     /// split mid-mutation.
     async fn emit(
         &self,
@@ -273,7 +273,7 @@ pub trait EventJournal: EventJournalReader {
     }
 }
 
-/// Read-only `EventJournalReader` over a `coord-base`-scoped store.
+/// Read-only `EventJournalReader` over a `coord-ro`-scoped store.
 /// Constructed by [`crate::stores::ScopedStores::event_journal_ro`].
 pub struct ReadOnlyEventJournal {
     reader: Arc<dyn ObjectStore>,
@@ -286,8 +286,8 @@ impl ReadOnlyEventJournal {
 }
 
 /// Full `EventJournal` impl. Holds two credential-scoped store
-/// handles: `writer` (`coord-writer`) for the emit CAS, and `reader`
-/// (`coord-base`) for read methods + signature-verify pubkey reads.
+/// handles: `writer` (`coord-rw`) for the emit CAS, and `reader`
+/// (`coord-ro`) for read methods + signature-verify pubkey reads.
 pub struct BucketEventJournal {
     writer: Arc<dyn ObjectStore>,
     reader: Arc<dyn ObjectStore>,
@@ -533,7 +533,7 @@ impl EventJournal for BucketEventJournal {
         let lock = name_emit_lock(name);
         let _guard = lock.lock().await;
 
-        // CAS runs wholly on coord-writer: the design-mint rule is that
+        // CAS runs wholly on coord-rw: the design-mint rule is that
         // a mutation path uses one credential end-to-end, including the
         // reads that are part of the mutation.
         let head = read_head_via(self.writer.as_ref(), name).await?;

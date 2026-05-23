@@ -1,7 +1,7 @@
 //! Mint-backed [`ScopedStores`] (`docs/design-mint.md` § *Coordinator
 //! store architecture*).
 //!
-//! Each coordinator role (`coord-base`, `coord-writer`, and one
+//! Each coordinator role (`coord-ro`, `coord-rw`, and one
 //! `volume-rw` per volume) is a [`RoleStore`] facade over a Tigris
 //! keypair that mint vends via `assume-role`. The facade implements
 //! [`ObjectStore`] and acquires its keypair lazily on first use,
@@ -38,8 +38,7 @@ use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::stores::{ReadOnlyAdapter, ReadStore, ScopedStores};
 
 use crate::mint_client::{
-    MintEndpoint, ROLE_COORD_BASE, ROLE_COORD_WRITER, ROLE_VOLUME_RO, ROLE_VOLUME_RW,
-    VOLUME_RO_TTL_SECS,
+    MintEndpoint, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO, ROLE_VOLUME_RW, VOLUME_RO_TTL_SECS,
 };
 
 const CAVEAT_VOLUME: &str = "elide:Volume";
@@ -318,14 +317,14 @@ impl MintScopedStores {
         let base = Arc::new(RoleStore::new(
             endpoint.clone(),
             store_cfg.clone(),
-            ROLE_COORD_BASE,
+            ROLE_COORD_RO,
             COORD_CONTROL_TTL_SECS,
             None,
         ));
         let writer = Arc::new(RoleStore::new(
             endpoint.clone(),
             store_cfg.clone(),
-            ROLE_COORD_WRITER,
+            ROLE_COORD_RW,
             COORD_CONTROL_TTL_SECS,
             None,
         ));
@@ -340,12 +339,12 @@ impl MintScopedStores {
         }
     }
 
-    /// Block until the mint endpoint accepts a `coord-base`
-    /// `assume-role`, then eagerly warm the `coord-base` credential.
+    /// Block until the mint endpoint accepts a `coord-ro`
+    /// `assume-role`, then eagerly warm the `coord-ro` credential.
     ///
     /// Used at startup so the coordinator survives mint coming up after
     /// it (systemd ordering, fresh box, etc.) instead of failing on the
-    /// first S3 op. `coord-base` is the always-held control-plane
+    /// first S3 op. `coord-ro` is the always-held control-plane
     /// credential, so the first op that touches it — a claim, a
     /// peer-fetch verification — should not be the one to pay its
     /// ~0.5s `assume-role`: assume it now and seed the cache. The probe
@@ -354,11 +353,11 @@ impl MintScopedStores {
     /// first use, so a transient blip just defers the cost.
     pub async fn wait_for_ready(&self) -> std::io::Result<()> {
         self.endpoint
-            .wait_for_ready(ROLE_COORD_BASE, COORD_CONTROL_TTL_SECS)
+            .wait_for_ready(ROLE_COORD_RO, COORD_CONTROL_TTL_SECS)
             .await?;
         if let Err(e) = self.base.ensure().await {
             tracing::warn!(
-                "[coordinator] coord-base warm-up failed ({e}); \
+                "[coordinator] coord-ro warm-up failed ({e}); \
                  first control-plane op will assume it lazily"
             );
         }
@@ -498,7 +497,7 @@ mod tests {
 
     #[test]
     fn non_volume_ro_roles_emit_no_extra_body() {
-        for role in [ROLE_COORD_BASE, ROLE_COORD_WRITER, ROLE_VOLUME_RW] {
+        for role in [ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RW] {
             assert!(extra_body_for(role, &[Ulid::new()]).is_empty());
         }
     }

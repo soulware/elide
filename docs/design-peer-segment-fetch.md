@@ -484,7 +484,7 @@ signed `volume.provenance` lineage — not on a capability the serving
 peer delegated. The serving coordinator verifies that fact locally
 against state both peers already share, mint off the peer path: no
 shared secret, and revocation rides the same force-release CAS fence
-(`design-mint.md` § *Trust model* / § *`coord-base`*).
+(`design-mint.md` § *Trust model* / § *`coord-ro`*).
 
 The `PeerFetchToken` is already an instance of the holder-of-key
 pattern used mint-side for `elide:CoordKey` (`design-mint.md`): a token

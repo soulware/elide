@@ -189,7 +189,7 @@ async fn run() -> Result<()> {
                 enroll::assert_enrolled(&config.data_dir)?;
                 tracing::info!(
                     "[coordinator] store: mint-backed scoped \
-                     (coord-base / coord-writer / volume-rw); reachability \
+                     (coord-ro / coord-rw / volume-rw); reachability \
                      and conditional-PUT are validated lazily on first \
                      assume-role per role"
                 );
@@ -199,7 +199,7 @@ async fn run() -> Result<()> {
                     config.data_dir.clone(),
                     identity.clone(),
                 );
-                // Block here until mint accepts a `coord-base` assume-role,
+                // Block here until mint accepts a `coord-ro` assume-role,
                 // so the coordinator survives mint coming up after it
                 // (systemd ordering, fresh box) instead of failing on the
                 // first S3 op (publish coordinator.pub) with a connect

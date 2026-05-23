@@ -285,7 +285,7 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::StatusRemote { volume } => {
-            // Reads names/<volume> only — the read-only coord-base
+            // Reads names/<volume> only — the read-only coord-ro
             // credential.
             let store = ctx.stores.base_ro();
             let result = volume_status_remote_typed(
@@ -315,7 +315,7 @@ async fn dispatch_json(
             // Mixed: per-volume snapshot publish + names/<volume> flip.
             // Coordinator-wide today; future Tigris work splits this.
             let result = if force {
-                // force-release straddles two role scopes: coord-writer
+                // force-release straddles two role scopes: coord-rw
                 // for names/<name> + events/<name>/, and per-vol
                 // volume-rw for by_id/<dead_vol>/. Pass the
                 // `ScopedStores` so the op can pick the right
@@ -329,7 +329,7 @@ async fn dispatch_json(
                 .await
             } else {
                 // `release_volume_op` straddles two role scopes
-                // (coord-writer for names/<name> + per-vol volume-rw
+                // (coord-rw for names/<name> + per-vol volume-rw
                 // for by_id/<vol>/snapshots/). It picks the right
                 // credential for each step internally; just hand it
                 // the IpcContext.
@@ -415,7 +415,7 @@ async fn dispatch_json(
         }
         Request::NotifyVolumeReady { vol_ulid } => {
             // Deletes under `by_id/<vol>/snapshots/` — needs volume-rw
-            // per-vol, not coord-writer. The op picks the cred via
+            // per-vol, not coord-rw. The op picks the cred via
             // `ScopedStores::volume_data(&vol_ulid)` internally.
             let result = lifecycle::notify_volume_ready_op(
                 vol_ulid,
@@ -481,7 +481,7 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::VolumeEvents { volume, num } => {
-            // Pure-read IPC: read-only journal handle (coord-base) — the
+            // Pure-read IPC: read-only journal handle (coord-ro) — the
             // type system rules out an accidental emit on the IPC perimeter.
             let journal = ctx.stores.event_journal_ro();
             let result = volume_events_typed(&volume, journal.as_ref(), num).await;
@@ -959,7 +959,7 @@ pub(crate) async fn snapshot_volume_kind(
         .map_err(|e| IpcError::internal(format!("deriving volume id: {e}")))?;
     // Every store op below writes under `by_id/<vol>/` (segment drain,
     // GC handoff apply, snapshot manifest publish). That prefix is
-    // owned by `volume-rw`; `coord-writer` is `names/*` + `events/*`
+    // owned by `volume-rw`; `coord-rw` is `names/*` + `events/*`
     // + `coordinators/<sub>/*` only and would 403 on the snapshot PUT.
     // Mirrors the same fix in `release_volume_op` (commit 4e6950f).
     let vol_ulid = ulid::Ulid::from_string(&volume_id)
@@ -1693,7 +1693,7 @@ async fn create_volume_op(
     core: &CoordinatorCore,
 ) -> Result<CreateReply, IpcError> {
     let identity = &core.identity;
-    // `coord-writer` for the names/<name> rollback on Phase-4 failure
+    // `coord-rw` for the names/<name> rollback on Phase-4 failure
     // (see end of function); the by_id/<vol>/{volume.pub,.provenance}
     // uploads go through the per-volume `volume-rw` handle vended by
     // `core.stores.volume_data(&vol_ulid)`.
@@ -2247,7 +2247,7 @@ async fn resolve_peer_endpoint_for_volume(
     let vol_dir = data_dir.join("by_id").join(volume_ulid.to_string());
     let volume_name = elide_coordinator::tasks::read_volume_name(&vol_dir)?;
     // Cross-coordinator RO reads: events/<name>/HEAD + coordinators/<other>/* —
-    // coord-base scope. The read-only journal carries that.
+    // coord-ro scope. The read-only journal carries that.
     let store = stores.base_object_store();
     let journal = stores.event_journal_ro();
     elide_coordinator::peer_discovery::discover_peer_for_claim(
@@ -3198,7 +3198,7 @@ mod tests {
         // Regression for the user-visible 2026-05-21 bug: stop's
         // snapshot publish (and the GC handoff apply + drain) write
         // under `by_id/<vol>/`, which needs per-vol `volume-rw`. Using
-        // `writer()` (coord-writer) produced silent 403s on Tigris.
+        // `writer()` (coord-rw) produced silent 403s on Tigris.
         //
         // We can't run the full snapshot through this unit test (it
         // needs a live volume daemon for the `promote_wal` IPC), but
@@ -3259,7 +3259,7 @@ mod tests {
         // `generate_filemap_op` demand-fetches segment bodies under
         // `by_id/<leaf>/segments/` and ancestor prefixes. The right
         // role is `volume-ro` scoped to the leaf + ancestor chain
-        // (`read_head_with_ancestors`), never `coord-writer`.
+        // (`read_head_with_ancestors`), never `coord-rw`.
         use elide_coordinator::stores::{
             PassthroughStores, RecordingStores, RoleCall, ScopedStores,
         };
@@ -3295,7 +3295,7 @@ mod tests {
         // upload, volume.provenance upload, names/<name> claim) and
         // each must ride the matching role:
         //   - by_id/<vol>/{volume.pub,.provenance} → per-vol volume-rw
-        //   - names/<name> CAS + events/<name>/    → coord-writer
+        //   - names/<name> CAS + events/<name>/    → coord-rw
         // The role pick happens at the top of the op via
         // `core.stores.volume_data(&vol)` and `core.stores.{name_claims,
         // event_journal}()`. A regression that swapped writer↔volume-rw
@@ -3334,16 +3334,16 @@ mod tests {
              through volume_rw({vol_ulid}); got {calls:?}"
         );
         // Coordinator-wide writes (names/<vol>, events/<vol>/) mint
-        // coord-writer plus coord-base reads (the name_claims +
+        // coord-rw plus coord-ro reads (the name_claims +
         // event_journal facades wrap both).
         assert!(
             calls.contains(&RoleCall::Writer),
-            "create must mint coord-writer for names/{{<name>, events}}; got {calls:?}"
+            "create must mint coord-rw for names/{{<name>, events}}; got {calls:?}"
         );
         // No read-only single-volume credential should appear: every
         // create-time read is on local disk, and the only S3 reads
         // are the conditional-PUT preflights inside name_claims/
-        // event_journal which ride coord-base via the facade.
+        // event_journal which ride coord-ro via the facade.
         for call in &calls {
             assert!(
                 !matches!(

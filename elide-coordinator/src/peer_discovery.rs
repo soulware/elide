@@ -124,11 +124,11 @@ async fn find_releaser(
 /// missing/invalid signature, non-`Released` latest event, no
 /// published endpoint, store error) collapses to `None`.
 ///
-/// `store` must be a `coord-base`-scoped handle (e.g.
+/// `store` must be a `coord-ro`-scoped handle (e.g.
 /// `ScopedStores::base_object_store`). Every read this function
 /// makes is cross-coordinator: `events/<name>/HEAD`,
 /// `coordinators/<other>/coordinator.pub`, and
-/// `coordinators/<other>/peer-endpoint.toml`. `coord-base` is the
+/// `coordinators/<other>/peer-endpoint.toml`. `coord-ro` is the
 /// only role whose IAM policy grants reads on `coordinators/*` for
 /// all ids.
 ///

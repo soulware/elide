@@ -45,7 +45,7 @@ pub(crate) async fn hydrate_remote_owned(
 
     // Hydrate is pure-read against S3 — every write lands on local
     // disk. The skeleton chain reads only `meta/*` and rides the warm
-    // `coord-base` credential (no per-ancestor mint); the leaf basis
+    // `coord-ro` credential (no per-ancestor mint); the leaf basis
     // reads `by_id/<leaf>/*` and rides `volume-ro`.
     pull_skeleton_chain(vol_ulid, &core.data_dir, &by_id_dir, &core.stores).await?;
 
@@ -144,7 +144,7 @@ async fn pull_skeleton_chain(
             break;
         }
         // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
-        // bucket-wide objects on the warm `coord-base` credential.
+        // bucket-wide objects on the warm `coord-ro` credential.
         let store = stores.base_object_store();
         let reply = pull_readonly_op(u, data_dir, &store, None).await?;
         next = reply.parent;
@@ -421,7 +421,7 @@ mod tests {
             !calls
                 .iter()
                 .any(|c| matches!(c, RoleCall::VolumeRw(_) | RoleCall::Writer)),
-            "hydrate is pure-read — no volume-rw or coord-writer mint; got {calls:?}"
+            "hydrate is pure-read — no volume-rw or coord-rw mint; got {calls:?}"
         );
     }
 }

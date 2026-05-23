@@ -730,7 +730,7 @@ impl ClaimOrchestrator {
         };
         // Discovery reads events/<name>/HEAD, coordinators/<other>/coordinator.pub,
         // and coordinators/<other>/peer-endpoint.toml — all RO and all cross-
-        // coordinator, so the correct credential is coord-base.
+        // coordinator, so the correct credential is coord-ro.
         let store_base = self.ctx.core.stores.base_object_store();
         let journal = self.ctx.core.stores.event_journal_ro();
         if let Some(discovered) = elide_coordinator::peer_discovery::discover_peer_for_claim(
@@ -764,7 +764,7 @@ impl ClaimOrchestrator {
             self.job
                 .append(ClaimAttachEvent::PullingAncestor { vol_ulid });
             // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
-            // bucket-wide objects covered by the warm `coord-base`
+            // bucket-wide objects covered by the warm `coord-ro`
             // credential, so chain discovery costs no per-hop mint.
             let store = self.ctx.core.stores.base_object_store();
             self.pulled_guard.record(vol_ulid);
@@ -1159,7 +1159,7 @@ pub(crate) async fn skip_empty_intermediates_impl(
                 vol_ulid: parent_vol_ulid,
             });
             // Skeleton pull reads only `meta/<ulid>.{provenance,pub}` —
-            // bucket-wide objects on the warm `coord-base` credential.
+            // bucket-wide objects on the warm `coord-ro` credential.
             let parent_store = stores.base_object_store();
             guard.record(parent_vol_ulid);
             let _ = pull_readonly_op(parent_vol_ulid, data_dir, &parent_store, peer).await?;
@@ -1525,9 +1525,9 @@ mod tests {
     #[tokio::test]
     async fn claim_bucket_op_routes_only_through_writer_and_base_ro() {
         // The bucket-side claim never touches `by_id/`. It reads
-        // names/<name> (coord-base via name_claims_ro-equivalent
-        // reads), writes the name flip (coord-writer), and emits an
-        // event (coord-writer + coord-base reads). Mirror what
+        // names/<name> (coord-ro via name_claims_ro-equivalent
+        // reads), writes the name flip (coord-rw), and emits an
+        // event (coord-rw + coord-ro reads). Mirror what
         // `start_claim` does at its store-pick site (`stores.writer()`
         // + `stores.event_journal()` + `stores.name_claims()`) and
         // assert the recorded role set is exactly `{Writer,
@@ -1583,7 +1583,7 @@ mod tests {
         for call in &calls {
             assert!(
                 matches!(call, RoleCall::Writer | RoleCall::BaseObjectStore),
-                "claim's bucket side must only mint coord-writer / coord-base; \
+                "claim's bucket side must only mint coord-rw / coord-ro; \
                  saw {call:?} in {calls:?}"
             );
         }
