@@ -215,7 +215,11 @@ calls that vend `mint-rw` (and refresh it before expiry), but never
 touches `s3:*`. Consequences:
 
 - A request-handler bug that exposes the in-handler S3 credential
-  leaks `mint-rw`-scoped write to `_mint/*` — not org admin.
+  leaks `_mint/*`-scoped read/write/delete plus bucket-wide
+  `ListBucket` visibility (Tigris IAM accepts only `DateLessThan` as
+  a condition operator, so the `s3:prefix` constraint that would
+  scope LIST to `_mint/` is not expressible — Get/Put/Delete still
+  match only `_mint/*` by Resource). Not org admin either way.
 - Bucket audit logs cleanly separate routine enrollment plumbing
   (`mint-rw` access key) from IAM operations (admin access key).
 - A process-memory compromise still yields admin, because admin must

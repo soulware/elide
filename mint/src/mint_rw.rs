@@ -37,10 +37,18 @@ pub const MINT_RW_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 pub const REFRESH_SAFETY_MARGIN_RATIO: f64 = 0.5;
 
 /// `mint-rw` policy: prefix-scoped S3 read/write/delete on `_mint/*`
-/// plus prefix-conditional `ListBucket` for the rotation/GC walks
+/// plus `ListBucket` for the rotation/GC walks
 /// (`_mint/pending/*` enumeration). The bare bucket appears as a
-/// resource only for `s3:ListBucket`, which is the AWS-mandated shape;
-/// the `s3:prefix` condition keeps that list scoped to `_mint/`.
+/// resource only for `s3:ListBucket`, which is the AWS-mandated shape.
+///
+/// `ListBucket` is **not** further constrained by an `s3:prefix`
+/// condition because Tigris IAM only accepts `DateLessThan` as a
+/// condition operator (probed: a `StringLike` block is rejected with
+/// `Invalid policy document: unsupported condition: StringLike`).
+/// The remaining scope leak is bucket-wide LIST visibility, not
+/// read/write — Get/Put/Delete still match only `_mint/*` by
+/// Resource. Mint always passes `prefix=_mint/...` on its LIST calls
+/// so the functional surface is unchanged.
 ///
 /// `DateLessThan` rendered as the keypair's expiry is what
 /// retires the credential: mint never deletes IAM users or keys
@@ -60,10 +68,7 @@ fn mint_rw_policy_json(bucket: &str, expiry_iso8601: &str) -> String {
       "Effect": "Allow",
       "Action": ["s3:ListBucket"],
       "Resource": ["arn:aws:s3:::{bucket}"],
-      "Condition": {{
-        "StringLike": {{"s3:prefix": ["_mint/*"]}},
-        "DateLessThan": {{"aws:CurrentTime": "{expiry_iso8601}"}}
-      }}
+      "Condition": {{"DateLessThan": {{"aws:CurrentTime": "{expiry_iso8601}"}}}}
     }}
   ]
 }}"#
@@ -237,15 +242,19 @@ mod tests {
     #[test]
     fn policy_json_scopes_to_mint_prefix_and_carries_expiry() {
         let p = mint_rw_policy_json("demo-bucket", "2026-12-31T23:59:59Z");
-        // The data-plane statement targets _mint/* only.
+        // The data-plane statement targets _mint/* only — Get/Put/Delete
+        // cannot escape the prefix even if ListBucket sees the wider
+        // bucket.
         assert!(p.contains(r#""arn:aws:s3:::demo-bucket/_mint/*""#));
-        // The ListBucket statement targets the bucket itself with a
-        // prefix Condition that keeps the list scoped.
+        // The ListBucket statement targets the bucket itself (AWS shape).
         assert!(p.contains(r#""arn:aws:s3:::demo-bucket""#));
-        assert!(p.contains(r#""s3:prefix""#));
-        assert!(p.contains(r#""_mint/*""#));
         // DateLessThan carries the expiry — what retires the keypair.
         assert!(p.contains("2026-12-31T23:59:59Z"));
+        // Tigris IAM only accepts DateLessThan, so we must not emit
+        // any other condition operator (would 4xx at CreatePolicy).
+        assert!(!p.contains("StringLike"));
+        assert!(!p.contains("StringEquals"));
+        assert!(!p.contains(r#""s3:prefix""#));
         // No leakage outside _mint/.
         assert!(!p.contains(r#""arn:aws:s3:::demo-bucket/by_id/*""#));
     }
