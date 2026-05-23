@@ -3,10 +3,12 @@
 // building blocks the inbound ops compose — against a shared
 // `InMemory` bucket plus two `CoordinatorIdentity` instances.
 //
-// Op alphabet: { Create, Release, ReleaseTo, ForceRelease, ClaimReleased }.
+// Op alphabet: { Create, Release, ForceRelease, ClaimReleased, ReclaimLocal }.
 // `Stop` is omitted (it is a single state flip already exhaustively
 // covered by `lifecycle::tests`); `start --remote` is modelled as the
-// `ClaimReleased` op since its bucket-side effect is identical.
+// `ClaimReleased` op since its bucket-side effect is identical;
+// `start --claim` and `claim` against a locally-owned released fork are
+// both modelled by `ReclaimLocal`, differing only in `target_state`.
 //
 // The proptest enforces the invariants the design doc requires after
 // any sequence of ops:
@@ -15,11 +17,15 @@
 //   2. Every `Live`/`Stopped` record names a coordinator we know about.
 //   3. Every `Released` record clears `coordinator_id` and carries a
 //      `handoff_snapshot`.
-//   4. Every `Reserved` record carries a target `coordinator_id` and a
-//      `handoff_snapshot`.
-//   5. Every name's `vol_ulid` has `volume.pub` in the bucket.
-//   6. Every `handoff_snapshot` references a manifest that exists in
-//      the bucket under `by_id/<vol_ulid>/snapshots/YYYYMMDD/`.
+//   4. Every name's `vol_ulid` has `volume.pub` in the bucket.
+//   5. Every `handoff_snapshot`, regardless of record state, references
+//      a manifest that exists in the bucket under
+//      `by_id/<vol_ulid>/snapshots/YYYYMMDD/` and verifies under the
+//      right pubkey. This covers `mark_reclaimed_local`'s explicit
+//      retention rule (Released → Live/Stopped in-place keeps
+//      `handoff_snapshot` because the prior owner's published handoff
+//      remains the valid basis until the new owner writes and
+//      `mark_released` overwrites it).
 //
 // Cases run in a single tokio runtime per test case; ops are
 // interleaved sequentially. The interesting non-trivial races
@@ -36,7 +42,7 @@ use ed25519_dalek::VerifyingKey;
 use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::identity::fetch_coordinator_pub;
 use elide_coordinator::lifecycle::{
-    self, ForceReleaseOutcome, MarkClaimedOutcome, MarkReleasedOutcome,
+    self, ForceReleaseOutcome, MarkClaimedOutcome, MarkReclaimedLocalOutcome, MarkReleasedOutcome,
 };
 use elide_coordinator::name_store as ns;
 use elide_coordinator::recovery;
@@ -59,10 +65,33 @@ const NUM_COORDS: usize = 2;
 
 #[derive(Debug, Clone)]
 enum Op {
-    Create { name: u8, coord: u8 },
-    Release { name: u8, coord: u8 },
-    ForceRelease { name: u8, recovering: u8 },
-    ClaimReleased { name: u8, coord: u8 },
+    Create {
+        name: u8,
+        coord: u8,
+    },
+    Release {
+        name: u8,
+        coord: u8,
+    },
+    ForceRelease {
+        name: u8,
+        recovering: u8,
+    },
+    ClaimReleased {
+        name: u8,
+        coord: u8,
+    },
+    /// In-place reclaim of a Released record where the local fork is
+    /// the same one the record points at. Models `start --claim`
+    /// (`as_live = true`) and `claim` (`as_live = false`). Drives
+    /// `mark_reclaimed_local`, whose retention rule for
+    /// `handoff_snapshot` is otherwise only covered by deterministic
+    /// unit tests in `lifecycle.rs`.
+    ReclaimLocal {
+        name: u8,
+        coord: u8,
+        as_live: bool,
+    },
 }
 
 fn arb_op() -> impl Strategy<Value = Op> {
@@ -73,7 +102,12 @@ fn arb_op() -> impl Strategy<Value = Op> {
         (name.clone(), coord.clone()).prop_map(|(name, coord)| Op::Create { name, coord }),
         (name.clone(), coord.clone()).prop_map(|(name, coord)| Op::Release { name, coord }),
         (name.clone(), rec).prop_map(|(name, recovering)| Op::ForceRelease { name, recovering }),
-        (name, coord).prop_map(|(name, coord)| Op::ClaimReleased { name, coord }),
+        (name.clone(), coord.clone()).prop_map(|(name, coord)| Op::ClaimReleased { name, coord }),
+        (name, coord, any::<bool>()).prop_map(|(name, coord, as_live)| Op::ReclaimLocal {
+            name,
+            coord,
+            as_live,
+        }),
     ]
 }
 
@@ -139,9 +173,8 @@ impl World {
     }
 
     /// Mint and upload a (regular) handoff snapshot manifest signed by
-    /// the volume's own key. Used by `Release` / `ReleaseTo` to
-    /// simulate the drain+snapshot step without a daemon. Returns the
-    /// snapshot ULID.
+    /// the volume's own key. Used by `Release` to simulate the
+    /// drain+snapshot step without a daemon. Returns the snapshot ULID.
     async fn publish_volume_snapshot(&self, vol_ulid: Ulid) -> Option<Ulid> {
         let signer = self.vol_signers.get(&vol_ulid)?;
         let snap_ulid = Ulid::new();
@@ -251,6 +284,37 @@ impl World {
                 )
                 .await;
             }
+
+            Op::ReclaimLocal {
+                name,
+                coord,
+                as_live,
+            } => {
+                let coord_id = self.coords[*coord as usize].coordinator_id_str().to_owned();
+                // Model the "we own the local fork" case: pass the
+                // record's own vol_ulid. ForkMismatch is also a real
+                // production outcome but it has no bucket-side effect
+                // (no record mutation), so exercising the success-path
+                // retention rule is the higher-value target here.
+                let local_vol = match ns::read_name_record(&self.store, name_for(*name)).await {
+                    Ok(Some((rec, _))) => rec.vol_ulid,
+                    _ => return,
+                };
+                let target_state = if *as_live {
+                    NameState::Live
+                } else {
+                    NameState::Stopped
+                };
+                let _: Result<MarkReclaimedLocalOutcome, _> = lifecycle::mark_reclaimed_local(
+                    &self.store,
+                    name_for(*name),
+                    &coord_id,
+                    None,
+                    local_vol,
+                    target_state,
+                )
+                .await;
+            }
         }
     }
 
@@ -354,16 +418,29 @@ impl World {
                         rec.coordinator_id.is_none(),
                         "Released record must clear coordinator_id"
                     );
-                    let snap = rec
-                        .handoff_snapshot
-                        .expect("Released record must carry a handoff_snapshot");
-                    self.verify_handoff_manifest(rec.vol_ulid, snap, name).await;
+                    assert!(
+                        rec.handoff_snapshot.is_some(),
+                        "Released record must carry a handoff_snapshot"
+                    );
                 }
                 NameState::Readonly => {
                     // No coordinator-id constraints; readonly records
                     // are produced by `mark_initial_readonly` only,
                     // which our op alphabet doesn't drive.
                 }
+            }
+
+            // Invariant 5: any handoff_snapshot pointer on any record
+            // must reference a verifiable manifest. For Released this
+            // is the published handoff basis the next claimant will
+            // read; for Live/Stopped (after `mark_reclaimed_local`)
+            // this is the retained prior-owner handoff that stays the
+            // valid basis until the new owner writes and
+            // `mark_released` overwrites it. A regression that clears
+            // the pointer in-place or stamps over it with a bad ULID
+            // would fail here.
+            if let Some(snap) = rec.handoff_snapshot {
+                self.verify_handoff_manifest(rec.vol_ulid, snap, name).await;
             }
         }
     }
@@ -375,8 +452,8 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// After any sequence of {Create, Release, ReleaseTo, ForceRelease,
-    /// ClaimReleased} ops on a shared bucket between two coordinators,
+    /// After any sequence of {Create, Release, ForceRelease,
+    /// ClaimReleased, ReclaimLocal} ops on a shared bucket between two coordinators,
     /// the bucket state remains internally consistent. Each individual
     /// op tolerates wrong-state errors silently — the proptest is
     /// asserting the *invariants*, not the success of any op.
