@@ -332,6 +332,25 @@ enum SimOp {
     /// invoke the fetcher. The oracle is unchanged — eviction is
     /// supposed to be transparent to readers.
     EvictCacheBody,
+    /// Read one block at `lba` mid-sequence and assert it matches
+    /// the oracle (zeros for unwritten LBAs).
+    ///
+    /// The other reads in this proptest are either against an always-
+    /// unwritten LBA (`ReadUnwritten`), immediately after the write
+    /// (`SameContentWrite`, `WriteMulti`), or only as part of the
+    /// end-of-sequence oracle loop after `Crash`. None of them
+    /// exercise the full `lbamap → extent_index → cache/<id>.body →
+    /// fetcher` path at an arbitrary point in the op sequence — so a
+    /// stale `extent_index` entry pointing at a GC-deleted segment, or
+    /// a drain that fails to update lbamap, can only be caught via the
+    /// post-crash rebuild. `ReadAfterDrain` closes that gap by checking
+    /// the in-process read path against the oracle on every fire.
+    ///
+    /// `lba` is in 0..52 to cover the union of the write ranges (Write
+    /// 0..8, WriteZeroes 8..16, PopulateFetched 16..24, WriteLarge
+    /// 24..32, SameContentWrite 32..40, WriteMulti 40..52). Unwritten
+    /// LBAs in that range read back as zeros, which is checked too.
+    ReadAfterDrain { lba: u8 },
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -384,6 +403,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             }
         }),
         Just(SimOp::EvictCacheBody),
+        (0u8..52).prop_map(|lba| SimOp::ReadAfterDrain { lba }),
     ]
 }
 
@@ -968,6 +988,22 @@ proptest! {
                         );
                     }
                 }
+                SimOp::ReadAfterDrain { lba } => {
+                    // Reads must not mint new ULIDs. A demand fetch may
+                    // rehydrate a previously-evicted body into cache/,
+                    // but `cache/` is not in `all_segment_ulids`'s scan
+                    // set (only `wal/`, `pending/`, `index/`) and the
+                    // fetcher re-uses the original segment ULID for any
+                    // re-fetched `index/<id>.idx`, so the ULID set
+                    // must remain identical pre/post.
+                    let _ = vol.read(*lba as u64, 1);
+                    let after = all_segment_ulids(fork_dir);
+                    prop_assert_eq!(
+                        &after,
+                        &ulids_before,
+                        "read mutated ULID set"
+                    );
+                }
             }
         }
     }
@@ -1230,6 +1266,27 @@ proptest! {
                     // verifies the post-eviction read path end to end.
                     let _ = common::capture_and_evict_cache_body(&vol, fork_dir, &store_dir);
                 }
+                SimOp::ReadAfterDrain { lba } => {
+                    // Read in-process against the oracle without
+                    // waiting for the next `Crash`. Catches drain / GC
+                    // / evict outcomes that leave the live volume able
+                    // to serve an LBA only via a rebuild — e.g. a
+                    // stale `extent_index` pointing at a GC-deleted
+                    // segment with no fetcher fallback, or a drain
+                    // that fails to update the in-memory lbamap.
+                    let expected = oracle
+                        .get(&(*lba as u64))
+                        .copied()
+                        .unwrap_or([0u8; 4096]);
+                    let actual = vol.read(*lba as u64, 1).unwrap();
+                    prop_assert_eq!(
+                        actual.as_slice(),
+                        expected.as_slice(),
+                        "lba {} wrong mid-sequence (oracle {})",
+                        lba,
+                        if oracle.contains_key(&(*lba as u64)) { "written" } else { "unwritten" }
+                    );
+                }
             }
         }
     }
@@ -1443,6 +1500,20 @@ proptest! {
                 }
                 SimOp::EvictCacheBody => {
                     let _ = common::capture_and_evict_cache_body(&vol, fork_dir, &store_dir);
+                }
+                SimOp::ReadAfterDrain { lba } => {
+                    let expected = oracle
+                        .get(&(*lba as u64))
+                        .copied()
+                        .unwrap_or([0u8; 4096]);
+                    let actual = vol.read(*lba as u64, 1).unwrap();
+                    prop_assert_eq!(
+                        actual.as_slice(),
+                        expected.as_slice(),
+                        "lba {} wrong mid-sequence (oracle {})",
+                        lba,
+                        if oracle.contains_key(&(*lba as u64)) { "written" } else { "unwritten" }
+                    );
                 }
             }
         }
