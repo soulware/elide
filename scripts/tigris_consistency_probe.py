@@ -244,6 +244,114 @@ def run(bucket, pin_region, iterations, overwrite, consistent_puts, single_key, 
     print(f"deleted {deleted}/{len(keys_to_delete)}")
 
 
+def classify_get(status, body, v_old, v_new):
+    if status == 404:
+        return "404"
+    if status != 200:
+        return "err"
+    if body == v_new:
+        return "new"
+    if body == v_old:
+        return "old"
+    return "other"
+
+
+def run_repin(bucket, pin_a, pin_b, iterations, ak, sk, st):
+    prefix = f"probe/{uuid.uuid4().hex[:8]}"
+    print(
+        f"REPIN: bucket={bucket} pin_a={pin_a} pin_b={pin_b} "
+        f"iterations={iterations} prefix={prefix}"
+    )
+
+    a_hdr = {"X-Tigris-Regions": pin_a}
+    b_hdr = {"X-Tigris-Regions": pin_b}
+
+    paths = {
+        "GET pin_a": {"hdr": a_hdr, "tally": {}, "regions": {}, "lat": []},
+        "GET pin_b": {"hdr": b_hdr, "tally": {}, "regions": {}, "lat": []},
+        "GET (no pin)": {"hdr": {}, "tally": {}, "regions": {}, "lat": []},
+    }
+    put_a_lat, put_b_lat = [], []
+    put_a_regions, put_b_regions = {}, {}
+    put_b_status = {}
+
+    for seq in range(iterations):
+        key = f"{prefix}/{seq}"
+        v_old = f"v_old_{seq}".encode()
+        v_new = f"v_new_{seq}".encode()
+
+        # PUT v_old pinned to pin_a.
+        t0 = time.perf_counter()
+        status, hdrs, body = s3_request("PUT", bucket, key, v_old, a_hdr, ak, sk, st)
+        put_a_lat.append(time.perf_counter() - t0)
+        if status != 200:
+            print(f"  [PUT_A fail]  seq={seq} status={status} body={body[:120]!r}")
+            continue
+        r = serving_region(hdrs)
+        if r:
+            put_a_regions[r] = put_a_regions.get(r, 0) + 1
+
+        # PUT v_new pinned to pin_b (same key).
+        t0 = time.perf_counter()
+        status, hdrs, body = s3_request("PUT", bucket, key, v_new, b_hdr, ak, sk, st)
+        put_b_lat.append(time.perf_counter() - t0)
+        put_b_status[status] = put_b_status.get(status, 0) + 1
+        if status != 200:
+            if status not in (200,):
+                print(f"  [PUT_B {status}] seq={seq} body={body[:120]!r}")
+            continue
+        r = serving_region(hdrs)
+        if r:
+            put_b_regions[r] = put_b_regions.get(r, 0) + 1
+
+        # Three GETs.
+        for label, info in paths.items():
+            t0 = time.perf_counter()
+            status, hdrs, body = s3_request("GET", bucket, key, b"", info["hdr"], ak, sk, st)
+            info["lat"].append(time.perf_counter() - t0)
+            outcome = classify_get(status, body, v_old, v_new)
+            info["tally"][outcome] = info["tally"].get(outcome, 0) + 1
+            r = serving_region(hdrs)
+            if r:
+                info["regions"][r] = info["regions"].get(r, 0) + 1
+            if outcome == "other":
+                print(f"  [{label} other] seq={seq} got={body[:60]!r} status={status}")
+
+    print()
+    print("=== repin results ===")
+    print(f"PUT pin_a={pin_a}:")
+    print(f"  served by: {put_a_regions or '(no region header)'}")
+    print(f"  latency:  p50={fmt_ms(percentile(put_a_lat, 50))} "
+          f"p95={fmt_ms(percentile(put_a_lat, 95))} "
+          f"p99={fmt_ms(percentile(put_a_lat, 99))}")
+    print()
+    print(f"PUT pin_b={pin_b} (repin):")
+    print(f"  served by: {put_b_regions or '(no region header)'}")
+    print(f"  status counts: {put_b_status}")
+    print(f"  latency:  p50={fmt_ms(percentile(put_b_lat, 50))} "
+          f"p95={fmt_ms(percentile(put_b_lat, 95))} "
+          f"p99={fmt_ms(percentile(put_b_lat, 99))}")
+    print()
+    for label, info in paths.items():
+        print(f"{label}:")
+        print(f"  outcomes: {info['tally']}  (new=v_new_<seq>, old=v_old_<seq>)")
+        print(f"  served by: {info['regions'] or '(no region header)'}")
+        print(f"  latency:  p50={fmt_ms(percentile(info['lat'], 50))} "
+              f"p95={fmt_ms(percentile(info['lat'], 95))} "
+              f"p99={fmt_ms(percentile(info['lat'], 99))}")
+        print()
+
+    print("cleaning up probe keys...")
+    deleted = 0
+    for seq in range(iterations):
+        status, _, _ = s3_request(
+            "DELETE", bucket, f"{prefix}/{seq}", b"", {}, ak, sk, st
+        )
+        if status in (200, 204):
+            deleted += 1
+    print(f"deleted {deleted}/{iterations}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bucket", default="elide-global-test")
@@ -257,6 +365,9 @@ def main():
     ap.add_argument("--single-key", action="store_true",
                     help="overwrite a single key across all iterations "
                          "(stress test PUT-after-PUT visibility on one key)")
+    ap.add_argument("--repin-region", default="",
+                    help="enable repin test: PUT v_old pinned to --pin-region, "
+                         "PUT v_new pinned to this region, then GET via each pin")
     args = ap.parse_args()
 
     ak = os.environ.get("AWS_ACCESS_KEY_ID")
@@ -264,6 +375,13 @@ def main():
     st = os.environ.get("AWS_SESSION_TOKEN")
     if not ak or not sk:
         raise SystemExit("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set")
+
+    if args.repin_region:
+        if not args.pin_region:
+            raise SystemExit("--repin-region requires --pin-region")
+        run_repin(args.bucket, args.pin_region, args.repin_region,
+                  args.iterations, ak, sk, st)
+        return
 
     run(args.bucket, args.pin_region, args.iterations, args.overwrite,
         args.consistent_puts, args.single_key, ak, sk, st)
