@@ -98,11 +98,17 @@ def s3_request(method, bucket, key, payload, extra_headers,
             continue  # urllib sets Host from the URL
         req.add_header(k, v)
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last_err = e
+            time.sleep(0.1 * (attempt + 1))
+    return 0, {}, f"network error after retries: {last_err!r}".encode()
 
 
 def serving_region(headers):
