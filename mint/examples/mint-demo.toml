@@ -7,6 +7,7 @@
 # Each role's policy template lives under roles_dir (examples/demo_roles/).
 
 audience = "mint"
+backend = "local"   # default is "tigris"
 # data_dir defaults to mint_data, roles_dir to mint_roles, each resolved
 # against the working directory (not this file's parent); an absolute
 # path is used verbatim. roles_dir is set so the demo runs from mint/:

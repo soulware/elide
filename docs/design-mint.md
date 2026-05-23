@@ -173,9 +173,18 @@ environment; the root key is generated on first start at
 #### On-disk layout
 
 A mint instance is named by its config file: `--config <path>`,
-defaulting to `./mint.toml`. The config declares two optional
-directories, mirroring the elide coordinator's `data_dir`
-(`coordinator.toml`):
+defaulting to `./mint.toml`. The deployment shape is the config's
+**`backend`** field — `"tigris"` (default) puts enrollment state in
+the tenant bucket under `_mint/` and uses real Tigris IAM for
+`assume-role`; `"local"` uses local-filesystem state under `data_dir`
+and the deterministic fake keypair minter (the dev / co-resident
+shape). The same field is read by `mint serve` and the operator
+commands so the nonce printed by `mint invite` matches what `serve`
+verifies on `/v1/enroll` — there is no CLI flag, mismatching
+backends are not representable.
+
+The config also declares two optional directories, mirroring the
+elide coordinator's `data_dir` (`coordinator.toml`):
 
 - **`data_dir`** (default `mint_data`) — holds the macaroon root key
   (`root_key`, 0600) and any third-party discharge keys. Enrollment

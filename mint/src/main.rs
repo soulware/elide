@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use mint::audit::AuditLog;
-use mint::config::{Config, Listener};
+use mint::config::{Backend, Config, Listener};
 use mint::http::{AppState, router};
 use mint::iam::{FakeMinter, KeypairMinter};
 use mint::issuance::mint_invite;
@@ -44,11 +44,6 @@ enum Command {
         /// the listener the config resolves to.
         #[arg(long)]
         bind: Option<SocketAddr>,
-        /// Use the real Tigris IAM minter (requires a Tigris admin
-        /// credential in the environment). Without it, assume-role
-        /// returns a deterministic fake keypair.
-        #[arg(long)]
-        tigris: bool,
     },
     /// Print the invite macaroon (reusable, non-expiring).
     ///
@@ -235,11 +230,7 @@ enum EnrollCmd {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
-        Command::Serve {
-            config,
-            bind,
-            tigris,
-        } => serve(&config, bind, tigris).await,
+        Command::Serve { config, bind } => serve(&config, bind).await,
         Command::Invite { config, rotate } => invite(&config, rotate).await,
         Command::Enroll { cmd } => match cmd {
             EnrollCmd::List { config } => enroll_list(&config).await,
@@ -332,19 +323,90 @@ fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config::load(path)?)
 }
 
-/// Open the persisted state store from the config's `data_dir`. In
-/// the local-filesystem shape (the dev / co-resident default), this is
-/// where `root_key` is read from / generated and the `_mint/` subtree
-/// is rooted. The S3-backed variant (`serve --tigris`) constructs its
-/// `Store` directly in [`serve`] using a self-vended `mint-rw` key.
-async fn open_store_local(cfg: &Config) -> Result<Store, Box<dyn std::error::Error>> {
-    Ok(Store::open_local(&cfg.data_dir).await?)
+/// Bits a long-running `serve` against the Tigris backend needs to
+/// keep the bucket-backed store alive past the initial `mint-rw`
+/// keypair's `DateLessThan`. Operator one-shots drop this and let
+/// their keypair expire by itself.
+struct TigrisHandles {
+    minter: Arc<dyn KeypairMinter>,
+    provider: Arc<mint::mint_rw::SwappableAwsProvider>,
+    expiration: chrono::DateTime<chrono::Utc>,
+}
+
+/// Open the persisted state store dictated by `cfg.backend`. Every
+/// command path goes through this so a macaroon issued by `mint invite`
+/// and verified by `serve` always reads the same nonce (else the
+/// `enroll:denied:stale_invite` footgun fires on the next
+/// `/v1/enroll`).
+///
+/// - `Backend::Tigris`: self-vend a `mint-rw` keypair, route `_mint/*`
+///   I/O through it. Requires an `AWS_*` admin credential in the
+///   environment. The returned [`TigrisHandles`] lets `serve` spawn a
+///   background refresh; operator one-shots drop them.
+/// - `Backend::Local`: `LocalFileSystem` rooted at `<data_dir>/_mint/`,
+///   `root_key` at `<data_dir>/root_key`. The dev / co-resident shape.
+async fn open_store(
+    cfg: &Config,
+) -> Result<(Store, Option<TigrisHandles>), Box<dyn std::error::Error>> {
+    match cfg.backend {
+        Backend::Local => Ok((Store::open_local(&cfg.data_dir).await?, None)),
+        Backend::Tigris => {
+            let admin = cfg.admin.as_ref().ok_or(
+                "backend = \"tigris\" requires a Tigris admin credential in the \
+                 environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY); \
+                 set backend = \"local\" in the config for the dev shape.",
+            )?;
+            let minter: Arc<dyn KeypairMinter> = Arc::new(TigrisMinter::new(admin)?);
+            let (s3, provider, expiration) = mint::mint_rw::build_s3_with_mint_rw(
+                &minter,
+                &cfg.tenant.bucket,
+                cfg.tenant.endpoint.as_deref(),
+                cfg.tenant.region.as_deref(),
+            )
+            .await?;
+            let root_key_path = cfg.data_dir.join("root_key");
+            std::fs::create_dir_all(&cfg.data_dir)?;
+            let store = Store::open_remote(s3, &root_key_path).await?;
+            Ok((
+                store,
+                Some(TigrisHandles {
+                    minter,
+                    provider,
+                    expiration,
+                }),
+            ))
+        }
+    }
+}
+
+/// The `assume-role` keypair minter matching `cfg.backend`. `Local`
+/// returns the deterministic fake; `Tigris` builds a real
+/// [`TigrisMinter`] — the latter only happens through `open_store`'s
+/// own admin-credential branch, so this is for `serve`'s minter slot
+/// (operator commands don't issue keypairs).
+fn pick_minter(cfg: &Config) -> Result<Arc<dyn KeypairMinter>, Box<dyn std::error::Error>> {
+    match cfg.backend {
+        Backend::Local => {
+            tracing::warn!(
+                "backend = \"local\": assume-role uses the FAKE keypair minter \
+                 — it returns a deterministic non-production keypair. The \
+                 enroll/exchange flow is real either way."
+            );
+            Ok(Arc::new(FakeMinter::new()))
+        }
+        Backend::Tigris => {
+            let admin = cfg.admin.as_ref().ok_or(
+                "backend = \"tigris\" requires a Tigris admin credential in the \
+                 environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)",
+            )?;
+            Ok(Arc::new(TigrisMinter::new(admin)?))
+        }
+    }
 }
 
 async fn serve(
     config: &Path,
     bind_override: Option<SocketAddr>,
-    tigris: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -353,52 +415,22 @@ async fn serve(
         .init();
 
     let config = Arc::new(load(config)?);
-
-    // Pick the minter before binding so a misconfigured --tigris fails
-    // fast rather than at the first request.
-    let minter: Arc<dyn KeypairMinter> = if tigris {
-        let admin = config.admin.as_ref().ok_or(
-            "--tigris requires a Tigris admin credential in the environment \
-             (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)",
-        )?;
-        Arc::new(TigrisMinter::new(admin)?)
-    } else {
-        tracing::warn!(
-            "INTERIM: assume-role uses the FAKE keypair minter — it returns a \
-             deterministic non-production keypair. Pass --tigris for real \
-             Tigris keys. The enroll/exchange flow is real either way."
-        );
-        Arc::new(FakeMinter::new())
-    };
-
-    // State backing:
-    // - `--tigris`: self-vend a `mint-rw` keypair scoped to `_mint/*`
-    //   in the tenant bucket, use it for all data-plane I/O. The admin
-    //   credential never signs an `s3:*` call. A background task
-    //   refreshes the keypair before its `DateLessThan`.
-    // - default: LocalFileSystem under `<data_dir>/_mint/`, matching the
-    //   bucket key layout so an operator can `ls` either and see the
-    //   same shape.
-    let store = if tigris {
-        let (s3, provider, expiration) = mint::mint_rw::build_s3_with_mint_rw(
-            &minter,
-            &config.tenant.bucket,
-            config.tenant.endpoint.as_deref(),
-            config.tenant.region.as_deref(),
-        )
-        .await?;
+    let minter = pick_minter(&config)?;
+    let (store, tigris) = open_store(&config).await?;
+    let store = Arc::new(store);
+    // Long-running serve: keep `mint-rw` refreshed before
+    // `DateLessThan` and the invite cache fresh with `If-None-Match`
+    // (~30 s, cheap 304 on the common path). Operator commands skip
+    // both — their keypair expires on its own.
+    if let Some(h) = tigris {
         let _refresh = mint::mint_rw::spawn_refresh(
-            minter.clone(),
+            h.minter,
             config.tenant.bucket.clone(),
-            provider,
-            expiration,
+            h.provider,
+            h.expiration,
         );
-        let root_key_path = config.data_dir.join("root_key");
-        std::fs::create_dir_all(&config.data_dir)?;
-        Arc::new(Store::open_remote(s3, &root_key_path).await?)
-    } else {
-        Arc::new(open_store_local(&config).await?)
-    };
+    }
+    let _invite_refresh = store.spawn_invite_refresh(mint::state::INVITE_REFRESH_INTERVAL);
     // Steady-state /v1/enroll reads the invite from a local cache that
     // a background task keeps fresh with `If-None-Match` (~30 s, cheap
     // 304 on the common path). Rotation by this process updates the
@@ -410,7 +442,7 @@ async fn serve(
         admin_credential = config.admin.is_some(),
         data_dir = %config.data_dir.display(),
         roles_dir = %config.roles_dir.display(),
-        minter = if tigris { "tigris" } else { "fake" },
+        backend = ?config.backend,
         "loaded config"
     );
 
@@ -451,7 +483,7 @@ async fn serve(
 
 async fn invite(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = load(config)?;
-    let store = open_store_local(&config).await?;
+    let (store, _tigris) = open_store(&config).await?;
     let nonce = if rotate {
         let n = store.rotate_invite().await?;
         eprintln!("rotated invite nonce; in-flight enrollments cancelled");
@@ -471,7 +503,7 @@ async fn invite(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::E
 async fn enroll_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use mint::state::EnrollmentState;
     let config = load(config)?;
-    let store = open_store_local(&config).await?;
+    let (store, _tigris) = open_store(&config).await?;
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     let rows = store.list(now).await?;
     if rows.is_empty() {
@@ -508,7 +540,7 @@ async fn enroll_approve(
     use std::io::Write;
 
     let config = load(config)?;
-    let store = open_store_local(&config).await?;
+    let (store, _tigris) = open_store(&config).await?;
     let pending = store
         .get_pending(sub)
         .await?
@@ -544,7 +576,7 @@ async fn enroll_approve(
 
 async fn enroll_revoke(config: &Path, sub: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config = load(config)?;
-    let store = open_store_local(&config).await?;
+    let (store, _tigris) = open_store(&config).await?;
     if store.revoke(sub).await? {
         eprintln!("revoked approved/{sub}; next enroll requires fresh approval");
         Ok(())
