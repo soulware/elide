@@ -134,9 +134,14 @@ Each mint instance is configured with:
    elide coordinator's `coordinator.key`.
    Symmetric, so there is no public half. (v1 is single-root; multi-root
    for federating issuers is out of scope.) The current **`invite`**
-   is persisted alongside the root under the same custody — it must
-   survive restart so the distributed invite macaroon stays valid;
-   only `mint invite --rotate` changes it.
+   is persisted in the tenant bucket at `_mint/invite` (see *Mint
+   state in the tenant bucket*), not on disk — it must survive restart
+   so the distributed invite macaroon stays valid, and keeping it
+   bucket-side lets multiple mint processes share one value (HA /
+   central-custodial deployments). Confidentiality of the invite is
+   not load-bearing: it is distributed out-of-band and is a
+   participation gate, not a secret. Only `mint invite --rotate`
+   changes it.
 2. **Zero or more third-party discharge keys** — one symmetric key per
    identity/discharge authority mint trusts to satisfy a third-party
    caveat. Absent in the minimal self-hosted deployment (no third-party
@@ -150,6 +155,11 @@ Each mint instance is configured with:
    credential is a secret delivered by the environment (systemd
    `LoadCredential=`, a secrets manager); keeping it out of the TOML
    keeps secrets and role definitions on separate management planes.
+   The admin credential is used **only on the IAM plane** —
+   `CreateAccessKey` / `CreatePolicy` / `AttachUserPolicy` for vending
+   role keypairs (`coord-*`, `volume-*`, and mint's own `mint-rw` —
+   see *Mint state in the tenant bucket*). It is never used directly
+   for `s3:*` operations against the tenant bucket.
 4. **A set of role definitions** — see *Role configuration* below.
 5. **Tenant metadata** — bucket name(s), per-tenant settings. v1 is
    single-tenant per instance; multi-tenancy is a v2 question.
@@ -167,9 +177,13 @@ defaulting to `./mint.toml`. The config declares two optional
 directories, mirroring the elide coordinator's `data_dir`
 (`coordinator.toml`):
 
-- **`data_dir`** (default `mint_data`) — persisted state under the same
-  custody as the macaroon root: the current `invite` value and the
-  transient pending-enrollment table.
+- **`data_dir`** (default `mint_data`) — holds the macaroon root key
+  (`root_key`, 0600) and any third-party discharge keys. Enrollment
+  state (the current `invite` nonce, pending records, and the
+  approved-coordinator registry) lives in the tenant bucket under
+  `_mint/` so multiple mint processes can share one logical state
+  (see *Mint state in the tenant bucket*); the bucket-side custodian
+  is a self-vended `mint-rw` keypair, not the admin credential.
 - **`roles_dir`** (default `mint_roles`) — role *policy templates*, one
   file per role (see *Role configuration*).
 
@@ -182,6 +196,84 @@ running two instances is purely `mint.toml` + `mint2.toml` with distinct
 `data_dir` values (and, if desired, a shared `roles_dir`). The override
 flag would be unused surface; its absence is a decision, not an
 oversight.
+
+#### Mint state in the tenant bucket
+
+Enrollment state lives in the same tenant bucket as the volume data
+plane, under a dedicated top-level prefix `_mint/` that no coordinator
+IAM role ever names. Coordinators have no path to it through any
+issued macaroon.
+
+Mint does **not** use its admin credential directly for these bucket
+operations. On startup mint self-vends an internal **`mint-rw`** Tigris
+keypair via the same `KeypairMinter` machinery it uses for `coord-*`
+and `volume-*` keys: `CreateAccessKey + CreatePolicy + AttachUserPolicy`
+with policy scoped to `arn:aws:s3:::{{tenant.bucket}}/_mint/*` (all
+verbs) and a `DateLessThan` matching the existing role-credential
+cadence. The admin credential remains in memory for the IAM-plane
+calls that vend `mint-rw` (and refresh it before expiry), but never
+touches `s3:*`. Consequences:
+
+- A request-handler bug that exposes the in-handler S3 credential
+  leaks `mint-rw`-scoped write to `_mint/*` — not org admin.
+- Bucket audit logs cleanly separate routine enrollment plumbing
+  (`mint-rw` access key) from IAM operations (admin access key).
+- A process-memory compromise still yields admin, because admin must
+  stay resident to vend any role key — that is structural.
+- One scoped key suffices: a separate `mint-ro` for the invite-cache
+  poll would add ceremony with no meaningful blast-radius reduction
+  inside a single process.
+
+```
+_mint/invite                    — single object; body = nonce (hex)
+_mint/pending/<sub>.json        — one per in-flight enrollment;
+                                  small set, GC'd at ticket-exp
+_mint/approved/<sub>            — long-lived; one per ever-approved sub
+                                  body = {pub, approved_at, fingerprint_shown}
+```
+
+The split is intentional: `pending/` is small and LIST-friendly
+(rotation and GC walk it); `approved/` is a growing per-coordinator
+registry queried only by key (HEAD/GET on `<sub>`), never listed on a
+hot path. Merging the two would force every exchange to GET a record
+just to read an approval bit, and every rotation to LIST a set whose
+size is unbounded by design.
+
+Concurrency primitives (multi-instance mint is a goal — see *Admin
+credential custody — deployment shapes* below):
+
+- `record_pending`: `PUT _mint/pending/<sub>.json` with
+  `If-None-Match: *`. On 412, GET the existing record and run the
+  idempotency / `(sub, pub)` conflict check unchanged.
+- `approve`: `PUT _mint/approved/<sub>`, then `DELETE
+  _mint/pending/<sub>.json`. `approved/` writes are idempotent (same
+  body bytes for repeated approvals of the same `(sub, pub)`);
+  re-approval against a *different* pub is a key-rotation
+  acknowledgment and overwrites the registry record.
+- `is_approved` (exchange path): `GET _mint/approved/<sub>` — one
+  round-trip; the record's `pub` must equal the presented ticket's
+  `cnf`.
+- `rotate_invite`: `PUT _mint/invite`, then `LIST _mint/pending/` and
+  `DELETE` every record whose `invite` field is not the new value.
+  `approved/` is not touched.
+- Pending GC: `LIST _mint/pending/`, drop entries past the ticket-exp
+  bound. `approved/` is never GC'd.
+
+Mint processes cache the invite locally with an ETag-conditional
+refresh (~30s): a background poll issues `GET _mint/invite` with
+`If-None-Match: <last-etag>` and accepts the cheap `304 Not Modified`
+when the nonce is unchanged. Steady-state, `/v1/enroll` reads the
+cached value and never blocks on a Tigris round-trip.
+
+**`root_key` does not move.** Enrollment state goes to the bucket;
+the macaroon root key stays on local disk. Two consequences:
+(1) deliberately, a bucket-credential compromise alone cannot mint
+or forge credentials — the attacker would also need filesystem
+access to one of the mint hosts to obtain `root_key`. (2) multi-instance
+mint deployments must replicate `root_key` out-of-band (typically via
+the same secrets-manager mechanism that delivers the admin Tigris
+credential), since instances sharing one `_mint/` prefix must agree
+on the MAC key or they will mint macaroons each other cannot verify.
 
 ### Admin credential custody — deployment shapes
 
@@ -247,9 +339,15 @@ Freshness is a `ts` field **inside the body** (unix seconds, ±skew
 window) — already covered by `BLAKE3(request-body)`, so no separate
 signed term and no header. The persisted file alone is therefore inert:
 the only secret is the identity key the coordinator already protects
-(name-claims, provenance, peer-fetch), and mint keeps no per-coordinator
-registry — the pairing rides every token, and the only enrollment state
-is the transient pending record (§ *Enrollment*).
+(name-claims, provenance, peer-fetch). For verification, mint keeps
+no per-coordinator state — the `(sub, cnf)` pairing rides every token
+and is checked against the macaroon root each call.
+For enrollment workflow only, mint does maintain a long-lived
+registry of approved coordinators (`_mint/approved/<sub>`,
+§ *Enrollment* / *Mint state in the tenant bucket*) so a previously
+approved key can re-enroll without operator intervention; this
+registry is consulted only during enrollment and is never on the
+`assume-role` verification path.
 
 ### Enrollment
 
@@ -259,8 +357,10 @@ coordinator is authorized for — for that many non-expiring,
 single-role credentials.
 
 **Invite macaroon.** At first start mint draws a random nonce — the
-`invite` value — persists it (single current value, same custody as
-the root), and emits the invite macaroon: the root attenuated with
+`invite` value — and persists it at `_mint/invite` in the tenant
+bucket (see *Mint state in the tenant bucket*) so every mint
+process that mounts this tenant sees the same value. It then
+emits the invite macaroon: the root attenuated with
 `op=enroll`, `aud=mint`, `invite=<current>`. It is
 non-expiring, carries no coordinator identity, and is a pure
 participation gate. It is distributed out-of-band and is reusable for
@@ -272,7 +372,8 @@ with `sub=<own id>` (Elide: the coordinator ULID) and
 the private half of `cnf` (the `assume-role` PoP machinery). Mint
 verifies the chain against its root, `op=enroll`, `invite`=current,
 and the PoP against the appended `cnf`; records a **pending enrollment**
-keyed by `sub` — `(sub, pub, invite, first-seen ts, peer ip)`; and
+at `_mint/pending/<sub>.json` —
+`(sub, pub, invite, first-seen ts, peer ip)` — and
 returns a **credential ticket** minted fresh from root: short
 `exp`, `op=enroll-exchange`, the same `sub`/`cnf`, plus a third-party
 caveat when an identity authority is configured. The ticket is
@@ -283,10 +384,19 @@ each a separate credential. A retried request with an identical
 request for the same `sub` with a different pub is a conflict that
 surfaces to the operator and never auto-resolves; a pub seen on a
 different `sub` is anomalous (a new key is a new principal) and
-surfaced. The pending+approval record's lifetime **is** the ticket's:
-it is GC'd on a bound ≥ the credential ticket `exp` whether or not it
-was approved or exchanged, keeping the table transient (bounded by
-`exp`) rather than a registry.
+surfaced. **Re-enrollment fast path.** Before writing the pending
+record, mint checks `_mint/approved/<sub>`: if it exists and its
+`pub` equals the presented `cnf`, no pending record is written —
+exchange (step (3)) will succeed against the existing registry entry
+immediately. If `approved/<sub>` exists with a *different* `pub`, the
+pending record is written as normal and surfaces to the operator as a
+key-rotation acknowledgment (approval there overwrites the registry
+record). The pending record's lifetime is the ticket's: it is GC'd
+on a bound ≥ the credential ticket `exp` if it has not been
+approved by then, or deleted at approval time (step (2)). The
+approved-coordinator entry at `_mint/approved/<sub>` is **not**
+transient — it persists for the life of the coordinator identity and
+is what powers the fast path.
 
 **(2) Operator approval.** `mint enroll approve <sub>` prints the
 pending record's `cnf` fingerprint and requires an interactive y/N
@@ -297,13 +407,18 @@ trust anchor binding `sub` to the rightful key in the minimal
 deployment — it gates approval rather than trailing it; the third-party
 caveat is an additive upgrade, not a replacement. `--yes` skips the
 prompt for automation (the operator then asserts the out-of-band check
-happened).
+happened). On confirmation mint writes `_mint/approved/<sub>` with
+`{pub, approved_at, fingerprint_shown}` and then deletes
+`_mint/pending/<sub>.json` — the registry entry is what later
+exchanges (and re-enrollments via the fast path) consult, so the
+pending record is redundant once approval has fired.
 
 **(3) `POST /v1/enroll-exchange` — the role-authorization point.**
 Before the credential ticket expires the coordinator presents it with a
 `coordinator.key` PoP, a requested `role`, and a discharge for any
 third-party caveat. Mint verifies the chain, `op=enroll-exchange`, the
-PoP, and the discharge; requires the pending record **approved**; and
+PoP, and the discharge; requires `_mint/approved/<sub>` to exist and
+its `pub` to equal the presented ticket's `cnf`; and
 decides **is this `sub` permitted this `role`** here — the discharge
 already proves *who* the coordinator is, so this is the natural place
 to also gate *what* it may assume. The decision layers exactly like the
@@ -315,18 +430,23 @@ the identity authority's discharge attests `(sub, role)` rather than
 `sub` alone (additive central-service upgrade, not a replacement). On
 success mint **re-mints from root** a credential (`op=assume-role`, the
 same `sub`/`cnf`, `aud=mint`, `role=<requested>`, no `exp`, no
-third-party caveat). The pending+approval record is **not** consumed:
-the coordinator exchanges the same ticket again, naming a different
-role, for each credential it needs, until the ticket `exp` GC's the
-record (§ (1)). After expiry, a further role is a fresh pending request
-needing fresh approval — mint holds no standing per-coordinator state
-beyond that bounded window.
+third-party caveat). The `_mint/approved/<sub>` registry entry is
+**not** consumed: the coordinator exchanges the same ticket again,
+naming a different role, for each credential it needs, until the
+ticket `exp`. After ticket expiry, a further role is a fresh
+`/v1/enroll` that re-mints a ticket against the registry — the fast
+path (§ (1)) skips operator approval as long as the registry entry's
+pinned `pub` still matches, so the per-role exchange remains the
+only cadence the operator participates in.
 
 **Rotation.** `mint invite --rotate` draws a new random
-`invite`, persists it, emits a fresh invite macaroon, and
-drops every pending record whose `invite` is not the new value.
-Outstanding primaries are unaffected — they carry no `invite`
-and were re-minted from root. Restart preserves the nonce; only explicit
+`invite`, persists it at `_mint/invite`, emits a fresh invite
+macaroon, then LISTs `_mint/pending/` and deletes every record whose
+`invite` field is not the new value. The
+`_mint/approved/<sub>` registry is **not** touched: an outstanding
+ticket — and the credential it backs — survive rotation, as do the
+re-enrollment fast paths of every previously approved coordinator.
+Restart preserves the nonce (it lives in the bucket); only explicit
 rotation cancels in-flight enrollments.
 
 Refresh cadences, distinct, in increasing trust cost:
@@ -394,8 +514,11 @@ body is the PoP freshness `ts` only; the `/v1/enroll-exchange` body is
 `{ts, role}` — the requested role rides the PoP-signed body (so it is
 authenticated and audited like any exercise field), not a caveat on the
 presented ticket. `/v1/enroll` always returns `200` with a credential
-ticket even for a brand-new `(ulid, pub)` — the pending record is
-created and approval is out-of-band; the coordinator polls
+ticket even for a brand-new `(ulid, pub)`; for a new pairing a pending
+record is created and approval is out-of-band, while for a
+`(sub, pub)` already in `_mint/approved/` no pending record is
+written and `/v1/enroll-exchange` succeeds immediately (fast path,
+§ *Enrollment* (1)). The coordinator polls
 `/v1/enroll-exchange`, which returns `403` until the operator has
 approved, `200` with the role-stamped credential once it has, and the
 same opaque `401` as `assume-role` on any failure (including a role this
@@ -1280,8 +1403,10 @@ Operator / server:
 ```
 mint serve <cfg> [bind]            # HTTP service
 mint invite [--rotate]             # print current invite macaroon / rotate the nonce
-mint enroll list                   # pending: sub, cnf fingerprint, peer ip, age
+mint enroll list                   # sub, state (pending|approved), cnf fingerprint,
+                                   #   peer ip (pending only), age / approved_at
 mint enroll approve <sub>          # approve a pending record
+mint enroll revoke <sub>           # delete an approved/<sub> entry (forces fresh approval on re-enroll)
 mint role list                     # configured roles: name, required caveats, TTL bounds
 mint role inspect <name>           # one role: bounds, policy source, raw template + ref surface
 ```

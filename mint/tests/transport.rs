@@ -53,8 +53,8 @@ async fn full_flow_over_unix_socket() {
     let srv_dir = tempfile::tempdir().expect("srv tempdir");
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(srv_dir.path().join("root_key"), root_hex).expect("seed root_key");
-    let store = Arc::new(Store::open(srv_dir.path()).expect("store"));
-    let nonce = store.current_invite().expect("nonce");
+    let store = Arc::new(Store::open_local(srv_dir.path()).await.expect("store"));
+    let nonce = store.current_invite().await.expect("nonce");
     let state = AppState {
         config: Arc::new(config()),
         minter: Arc::new(FakeMinter::new()),
@@ -109,7 +109,9 @@ async fn full_flow_over_unix_socket() {
     );
 
     // Operator approves, then exchange yields the credential.
-    assert!(store.approve(SUB).expect("approve"));
+    let (cnf, _fp) = mint::client::identity(cdir.path()).expect("client identity");
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    store.approve(SUB, &cnf, &now_iso).await.expect("approve");
     assert!(
         mint::client::exchange(
             cdir.path(),

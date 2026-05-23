@@ -196,7 +196,8 @@ enum RoleCmd {
 
 #[derive(Subcommand)]
 enum EnrollCmd {
-    /// List pending enrollment records.
+    /// List enrollments — pending and approved — with state as a
+    /// column (`docs/design-mint.md` § *Reference client & demo*).
     List {
         #[arg(long, default_value = "mint.toml")]
         config: PathBuf,
@@ -218,6 +219,17 @@ enum EnrollCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Revoke an approved-coordinator registry entry.
+    ///
+    /// After this, the next `/v1/enroll` for `<sub>` falls back to the
+    /// slow path: a fresh pending record requiring a fresh operator
+    /// approval. Outstanding credentials are unaffected.
+    Revoke {
+        #[arg(long, default_value = "mint.toml")]
+        config: PathBuf,
+        /// The opaque principal id whose registry entry to delete.
+        sub: String,
+    },
 }
 
 #[tokio::main]
@@ -228,10 +240,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             tigris,
         } => serve(&config, bind, tigris).await,
-        Command::Invite { config, rotate } => invite(&config, rotate),
+        Command::Invite { config, rotate } => invite(&config, rotate).await,
         Command::Enroll { cmd } => match cmd {
-            EnrollCmd::List { config } => enroll_list(&config),
-            EnrollCmd::Approve { config, sub, yes } => enroll_approve(&config, &sub, yes),
+            EnrollCmd::List { config } => enroll_list(&config).await,
+            EnrollCmd::Approve { config, sub, yes } => enroll_approve(&config, &sub, yes).await,
+            EnrollCmd::Revoke { config, sub } => enroll_revoke(&config, &sub).await,
         },
         Command::Role { cmd } => match cmd {
             RoleCmd::List { config } => role_list(&config),
@@ -319,10 +332,13 @@ fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config::load(path)?)
 }
 
-/// Open the persisted state store from the config's `data_dir`
-/// (defaults to `mint_data` when the config omits it).
-fn open_store(cfg: &Config) -> Result<Store, Box<dyn std::error::Error>> {
-    Ok(Store::open(&cfg.data_dir)?)
+/// Open the persisted state store from the config's `data_dir`. In
+/// the local-filesystem shape (the dev / co-resident default), this is
+/// where `root_key` is read from / generated and the `_mint/` subtree
+/// is rooted. The S3-backed variant (`serve --tigris`) constructs its
+/// `Store` directly in [`serve`] using a self-vended `mint-rw` key.
+async fn open_store_local(cfg: &Config) -> Result<Store, Box<dyn std::error::Error>> {
+    Ok(Store::open_local(&cfg.data_dir).await?)
 }
 
 async fn serve(
@@ -337,7 +353,6 @@ async fn serve(
         .init();
 
     let config = Arc::new(load(config)?);
-    let store = Arc::new(open_store(&config)?);
 
     // Pick the minter before binding so a misconfigured --tigris fails
     // fast rather than at the first request.
@@ -355,6 +370,40 @@ async fn serve(
         );
         Arc::new(FakeMinter::new())
     };
+
+    // State backing:
+    // - `--tigris`: self-vend a `mint-rw` keypair scoped to `_mint/*`
+    //   in the tenant bucket, use it for all data-plane I/O. The admin
+    //   credential never signs an `s3:*` call. A background task
+    //   refreshes the keypair before its `DateLessThan`.
+    // - default: LocalFileSystem under `<data_dir>/_mint/`, matching the
+    //   bucket key layout so an operator can `ls` either and see the
+    //   same shape.
+    let store = if tigris {
+        let (s3, provider, expiration) = mint::mint_rw::build_s3_with_mint_rw(
+            &minter,
+            &config.tenant.bucket,
+            config.tenant.endpoint.as_deref(),
+            config.tenant.region.as_deref(),
+        )
+        .await?;
+        let _refresh = mint::mint_rw::spawn_refresh(
+            minter.clone(),
+            config.tenant.bucket.clone(),
+            provider,
+            expiration,
+        );
+        let root_key_path = config.data_dir.join("root_key");
+        std::fs::create_dir_all(&config.data_dir)?;
+        Arc::new(Store::open_remote(s3, &root_key_path).await?)
+    } else {
+        Arc::new(open_store_local(&config).await?)
+    };
+    // Steady-state /v1/enroll reads the invite from a local cache that
+    // a background task keeps fresh with `If-None-Match` (~30 s, cheap
+    // 304 on the common path). Rotation by this process updates the
+    // cache eagerly; this task picks up rotations by any other instance.
+    let _invite_refresh = store.spawn_invite_refresh(mint::state::INVITE_REFRESH_INTERVAL);
     tracing::info!(
         audience = %config.audience,
         roles = config.roles.len(),
@@ -400,15 +449,15 @@ async fn serve(
     Ok(())
 }
 
-fn invite(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn invite(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = load(config)?;
-    let store = open_store(&config)?;
+    let store = open_store_local(&config).await?;
     let nonce = if rotate {
-        let n = store.rotate_invite()?;
+        let n = store.rotate_invite().await?;
         eprintln!("rotated invite nonce; in-flight enrollments cancelled");
         n
     } else {
-        store.current_invite()?
+        store.current_invite().await?
     };
     let mac = mint_invite(&store.root_key(), &config.audience, &nonce);
     eprintln!(
@@ -419,40 +468,50 @@ fn invite(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-fn enroll_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn enroll_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use mint::state::EnrollmentState;
     let config = load(config)?;
-    let store = open_store(&config)?;
+    let store = open_store_local(&config).await?;
     let now = chrono::Utc::now().timestamp().max(0) as u64;
-    let rows = store.list(now)?;
+    let rows = store.list(now).await?;
     if rows.is_empty() {
-        eprintln!("no pending enrollments");
+        eprintln!("no enrollments");
         return Ok(());
     }
     println!(
-        "{:<28} {:<18} {:<16} {:>7} {:<9} FLAGS",
-        "SUB", "FINGERPRINT", "PEER", "AGE(s)", "APPROVED"
+        "{:<28} {:<9} {:<18} {:<16} {:>7} FLAGS",
+        "SUB", "STATE", "FINGERPRINT", "PEER", "AGE(s)"
     );
     for r in rows {
+        let state = match r.state {
+            EnrollmentState::Pending => "pending",
+            EnrollmentState::Approved => "approved",
+        };
         println!(
-            "{:<28} {:<18} {:<16} {:>7} {:<9} {}",
+            "{:<28} {:<9} {:<18} {:<16} {:>7} {}",
             r.sub,
+            state,
             r.fingerprint,
-            r.peer_ip,
+            r.peer_ip.as_deref().unwrap_or("-"),
             r.age_seconds,
-            if r.approved { "yes" } else { "no" },
             if r.anomalous_pub { "ANOMALOUS-PUB" } else { "" }
         );
     }
     Ok(())
 }
 
-fn enroll_approve(config: &Path, sub: &str, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn enroll_approve(
+    config: &Path,
+    sub: &str,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
     let config = load(config)?;
-    let store = open_store(&config)?;
+    let store = open_store_local(&config).await?;
     let pending = store
-        .get_pending(sub)?
+        .get_pending(sub)
+        .await?
         .ok_or_else(|| format!("no pending enrollment for sub {sub}"))?;
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     let fp = mint::state::fingerprint(&pending.pubkey);
@@ -477,12 +536,20 @@ fn enroll_approve(config: &Path, sub: &str, yes: bool) -> Result<(), Box<dyn std
         }
     }
 
-    if store.approve(sub)? {
-        eprintln!("approved {sub}");
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    store.approve(sub, &pending.pubkey, &now_iso).await?;
+    eprintln!("approved {sub} (registry entry written; pending record deleted)");
+    Ok(())
+}
+
+async fn enroll_revoke(config: &Path, sub: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load(config)?;
+    let store = open_store_local(&config).await?;
+    if store.revoke(sub).await? {
+        eprintln!("revoked approved/{sub}; next enroll requires fresh approval");
         Ok(())
     } else {
-        // Raced away between get_pending and approve (e.g. GC / rotate).
-        Err(format!("no pending enrollment for sub {sub}").into())
+        Err(format!("no approved entry for sub {sub}").into())
     }
 }
 

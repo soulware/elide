@@ -21,6 +21,7 @@ pub mod http;
 pub mod iam;
 pub mod issuance;
 pub mod macaroon;
+pub mod mint_rw;
 pub mod pop;
 pub mod role;
 pub mod state;

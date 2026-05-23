@@ -73,7 +73,7 @@ impl std::io::Write for AuditSink {
     }
 }
 
-fn state_with_audit() -> (
+async fn state_with_audit() -> (
     AppState,
     Arc<Mutex<Vec<u8>>>,
     Arc<FakeMinter>,
@@ -82,7 +82,7 @@ fn state_with_audit() -> (
     let buf = Arc::new(Mutex::new(Vec::new()));
     let minter = Arc::new(FakeMinter::new());
     let dir = tempfile::tempdir().expect("tempdir");
-    // Seed the known root key (hex) so Store::open loads it (vs
+    // Seed the known root key (hex) so Store::open_local loads it (vs
     // generating one) and the macaroons minted with ROOT verify.
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
@@ -90,7 +90,7 @@ fn state_with_audit() -> (
         config: Arc::new(config()),
         minter: minter.clone(),
         audit: Arc::new(AuditLog::new(Box::new(AuditSink(buf.clone())))),
-        store: Arc::new(Store::open(dir.path()).expect("store")),
+        store: Arc::new(Store::open_local(dir.path()).await.expect("store")),
     };
     (state, buf, minter, dir)
 }
@@ -137,7 +137,7 @@ async fn body_string(resp: axum::response::Response) -> (StatusCode, String) {
 
 #[tokio::test]
 async fn happy_path_mints_scoped_keypair() {
-    let (state, audit_buf, minter, _dir) = state_with_audit();
+    let (state, audit_buf, minter, _dir) = state_with_audit().await;
     let app = router(state);
     let m = request_macaroon();
 
@@ -162,7 +162,7 @@ async fn happy_path_mints_scoped_keypair() {
 async fn wrong_op_is_opaque_401() {
     // A correctly key-bound, role-shaped macaroon but op=enroll instead
     // of assume-role: the positive op gate refuses it.
-    let (state, _, _, _dir) = state_with_audit();
+    let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let m = mint(
         &ROOT,
@@ -185,7 +185,7 @@ async fn wrong_op_is_opaque_401() {
 
 #[tokio::test]
 async fn key_bound_without_pop_is_opaque_401() {
-    let (state, _, _, _dir) = state_with_audit();
+    let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let m = request_macaroon();
     let req = Request::builder()
@@ -201,7 +201,7 @@ async fn key_bound_without_pop_is_opaque_401() {
 
 #[tokio::test]
 async fn pop_over_a_different_body_is_401() {
-    let (state, _, _, _dir) = state_with_audit();
+    let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let m = request_macaroon();
     let ts = chrono::Utc::now().timestamp() as u64;
@@ -223,7 +223,7 @@ async fn pop_over_a_different_body_is_401() {
 
 #[tokio::test]
 async fn contradictory_cnf_fails_closed_not_bearer() {
-    let (state, _, _, _dir) = state_with_audit();
+    let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let m = request_macaroon().attenuate(Caveat::scalar(name::CNF, "ed25519:AAAA"));
     let req = Request::builder()
@@ -239,7 +239,7 @@ async fn contradictory_cnf_fails_closed_not_bearer() {
 
 #[tokio::test]
 async fn bad_mac_is_opaque_401() {
-    let (state, _, _, _dir) = state_with_audit();
+    let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let forged = mint(&[1u8; 32], vec![Caveat::scalar(name::OP, op::ASSUME_ROLE)]).encode();
     let req = Request::builder()
@@ -256,7 +256,7 @@ async fn bad_mac_is_opaque_401() {
 async fn missing_required_caveat_is_400() {
     // op=assume-role + aud + role, a plain bearer (no cnf → PoP not
     // required), but no elide:Volume → the role gate denies with 400.
-    let (state, _, _, _dir) = state_with_audit();
+    let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let m = mint(
         &ROOT,
@@ -280,7 +280,7 @@ async fn missing_required_caveat_is_400() {
 
 #[tokio::test]
 async fn no_auth_header_is_401() {
-    let (state, _, _, _dir) = state_with_audit();
+    let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let req = Request::builder()
         .method("POST")

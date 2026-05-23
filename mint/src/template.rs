@@ -229,6 +229,8 @@ mod tests {
     fn tenant() -> Tenant {
         Tenant {
             bucket: "demo".into(),
+            endpoint: None,
+            region: None,
         }
     }
 

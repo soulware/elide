@@ -348,7 +348,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     };
 
     // Opportunistic GC keeps the pending table transient.
-    if let Err(e) = state.store.gc(now_unix, PENDING_MAX_AGE_SECONDS) {
+    if let Err(e) = state.store.gc(now_unix, PENDING_MAX_AGE_SECONDS).await {
         tracing::warn!(error = %e, "pending gc failed");
     }
 
@@ -368,7 +368,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         audit("denied:wrong_op", &caveats);
         return unauthorized(&request_id);
     }
-    let current = match state.store.current_invite() {
+    let current = match state.store.current_invite().await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "read invite nonce");
@@ -410,13 +410,22 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         }
     };
 
-    match state
+    let recorded = match state
         .store
         .record_pending(&sub, &cnf, &current, &caller, now_unix)
+        .await
     {
-        Ok(Recorded::Created) | Ok(Recorded::Idempotent) => {}
+        Ok(r) => r,
         Err(StateError::Io(e)) => {
             tracing::error!(error = %e, "record pending");
+            return respond(
+                &request_id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "service unavailable"}),
+            );
+        }
+        Err(StateError::Store(msg)) => {
+            tracing::error!(error = %msg, "record pending (object store)");
             return respond(
                 &request_id,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -428,7 +437,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
             audit("denied:conflict", &caveats);
             return unauthorized(&request_id);
         }
-    }
+    };
 
     let ticket = issuance::mint_credential_ticket(
         &state.store.root_key(),
@@ -437,7 +446,17 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         &cnf,
         now_unix.saturating_add(CREDENTIAL_TICKET_TTL_SECONDS),
     );
-    audit("pending", &caveats);
+    // Fast path (an existing `approved/<sub>` matches the presented
+    // `cnf`) means /v1/enroll-exchange will succeed immediately on the
+    // returned ticket without any operator action; the slow path
+    // requires `mint enroll approve <sub>` to fire first.
+    audit(
+        match recorded {
+            Recorded::AlreadyApproved => "fast_path",
+            Recorded::Created | Recorded::Idempotent => "pending",
+        },
+        &caveats,
+    );
     respond(
         &request_id,
         StatusCode::OK,
@@ -524,16 +543,32 @@ async fn enroll_exchange(
         }
     };
 
-    // The pending record must exist and its bound key must match the
-    // presented cnf — the approval was for *this* (sub, pub) pair.
-    match state.store.get_pending(&sub) {
-        Ok(Some(p)) if p.pubkey == cnf => {}
+    // The approved-registry entry for this sub must exist and its
+    // pinned pub must match the presented cnf — the operator approved
+    // *this* (sub, pub) pair (`docs/design-mint.md` § *Enrollment* (3)).
+    match state.store.get_approved(&sub).await {
+        Ok(Some(a)) if a.pubkey == cnf => {}
         Ok(_) => {
-            audit("denied:no_pending", &caveats);
-            return unauthorized(&request_id);
+            // The one non-401 authorization outcome: awaited, not a
+            // failure. Includes both "never approved" and "approved
+            // under a different pub" (pending key-rotation re-approval).
+            audit("awaiting_approval", &caveats);
+            return respond(
+                &request_id,
+                StatusCode::FORBIDDEN,
+                json!({"error": "awaiting operator approval"}),
+            );
         }
         Err(StateError::Io(e)) => {
-            tracing::error!(error = %e, "read pending");
+            tracing::error!(error = %e, "read approved");
+            return respond(
+                &request_id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "service unavailable"}),
+            );
+        }
+        Err(StateError::Store(msg)) => {
+            tracing::error!(error = %msg, "read approved (object store)");
             return respond(
                 &request_id,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -544,16 +579,6 @@ async fn enroll_exchange(
             audit("denied:no_pending", &caveats);
             return unauthorized(&request_id);
         }
-    }
-
-    if !state.store.is_approved(&sub) {
-        // The one non-401 authorization outcome: awaited, not a failure.
-        audit("awaiting_approval", &caveats);
-        return respond(
-            &request_id,
-            StatusCode::FORBIDDEN,
-            json!({"error": "awaiting operator approval"}),
-        );
     }
 
     // The requested role rides the PoP-signed body (already verified
@@ -577,10 +602,9 @@ async fn enroll_exchange(
         &cnf,
         &role,
     );
-    // The record is deliberately not consumed: the ticket is multi-use
-    // until its `exp` so one approval yields one credential per role.
-    // GC (opportunistic at /v1/enroll, bounded ≥ ticket `exp`) reclaims
-    // it; mint holds no standing per-coordinator state beyond that.
+    // The approved-registry entry is not consumed: the ticket is
+    // multi-use until its `exp` and the entry powers the re-enrollment
+    // fast path beyond that.
     audit("granted", &caveats);
     respond(
         &request_id,
