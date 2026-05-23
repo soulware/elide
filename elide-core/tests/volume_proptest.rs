@@ -240,13 +240,18 @@ enum SimOp {
     /// LBAs are in range 24..32, disjoint from Write (0..8), WriteZeroes (8..16),
     /// PopulateFetched (16..24), and ReadUnwritten (64).
     WriteLarge { lba: u8, seed: u8 },
-    /// Zero a single LBA.
+    /// Zero `lba_count` blocks starting at `start_lba`.
     ///
-    /// LBAs are in range 8..16 to stay disjoint from Write (0..8),
-    /// PopulateFetched (16..23), and ReadUnwritten (64). The oracle is
-    /// updated immediately with zeros; a subsequent Crash verifies the
-    /// zero survives WAL recovery and rebuild.
-    WriteZeroes { lba: u8 },
+    /// `start_lba` is in 8..16 and `lba_count` is 1..=8, so the zero range
+    /// can stay within the dedicated 8..16 zone or spill into the
+    /// PopulateFetched region (16..24). Spilling exercises ZERO_HASH masking
+    /// existing written extents — the multi-block split arithmetic in
+    /// LbaMap::insert is otherwise unexercised by the rest of the proptest,
+    /// which only ever zeroes a single LBA. The whole-volume TRIM that
+    /// `mkfs.ext4` issues is one large multi-block zero range over mostly
+    /// unwritten LBAs, which this variant also covers when `start_lba +
+    /// lba_count` stays inside the unwritten 8..16 zone.
+    WriteZeroes { start_lba: u8, lba_count: u8 },
     /// Write `[seed; 4096]` to `lba`, then immediately write the same
     /// bytes to the same LBA again. The second write must short-circuit
     /// via the no-op skip path (LBA-map hash compare — lbamap already
@@ -358,7 +363,10 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             lba_b,
             seed
         }),
-        (8u8..16).prop_map(|lba| SimOp::WriteZeroes { lba }),
+        (8u8..16, 1u8..=8).prop_map(|(start_lba, lba_count)| SimOp::WriteZeroes {
+            start_lba,
+            lba_count,
+        }),
         (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::WriteLarge { lba, seed }),
         (0u8..8, 0u8..128u8).prop_map(|(lba, seed)| SimOp::SameContentWrite { lba, seed }),
         (0u8..8, 1u8..8u8).prop_map(|(start_lba, lba_count)| SimOp::ReclaimRange {
@@ -854,10 +862,10 @@ proptest! {
                     let _ = vol.write(*lba_a as u64, &data);
                     let _ = vol.write(*lba_b as u64, &data);
                 }
-                SimOp::WriteZeroes { lba } => {
+                SimOp::WriteZeroes { start_lba, lba_count } => {
                     // write_zeroes appends to the WAL in-place; no new ULID file
                     // is created, so no ULID ordering assertion is needed here.
-                    let _ = vol.write_zeroes(*lba as u64, 1);
+                    let _ = vol.write_zeroes(*start_lba as u64, *lba_count as u32);
                 }
                 SimOp::WriteLarge { lba, seed } => {
                     let data = incompressible_block(*seed);
@@ -1129,10 +1137,15 @@ proptest! {
                     oracle.insert(*lba_a as u64, data);
                     oracle.insert(*lba_b as u64, data);
                 }
-                SimOp::WriteZeroes { lba } => {
-                    let _ = vol.write_zeroes(*lba as u64, 1);
-                    // Oracle records zeros; a subsequent Crash asserts they survive rebuild.
-                    oracle.insert(*lba as u64, [0u8; 4096]);
+                SimOp::WriteZeroes { start_lba, lba_count } => {
+                    let _ = vol.write_zeroes(*start_lba as u64, *lba_count as u32);
+                    // Oracle records zeros for every LBA in the range. Multi-block
+                    // ranges may overlap PopulateFetched LBAs (16..24), in which
+                    // case ZERO_HASH must mask the prior data — the next Crash
+                    // verifies this end to end via the oracle read-back loop.
+                    for i in 0..*lba_count as u64 {
+                        oracle.insert(*start_lba as u64 + i, [0u8; 4096]);
+                    }
                 }
                 SimOp::WriteLarge { lba, seed } => {
                     let data = incompressible_block(*seed);
@@ -1367,9 +1380,11 @@ proptest! {
                     oracle.insert(*lba_a as u64, data);
                     oracle.insert(*lba_b as u64, data);
                 }
-                SimOp::WriteZeroes { lba } => {
-                    let _ = vol.write_zeroes(*lba as u64, 1);
-                    oracle.insert(*lba as u64, [0u8; 4096]);
+                SimOp::WriteZeroes { start_lba, lba_count } => {
+                    let _ = vol.write_zeroes(*start_lba as u64, *lba_count as u32);
+                    for i in 0..*lba_count as u64 {
+                        oracle.insert(*start_lba as u64 + i, [0u8; 4096]);
+                    }
                 }
                 SimOp::WriteLarge { lba, seed } => {
                     let data = incompressible_block(*seed);
