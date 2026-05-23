@@ -123,6 +123,15 @@ pub fn peer_fetch_handle() -> Option<&'static PeerFetchHandle> {
     PEER_FETCH.get().copied().unwrap_or(None)
 }
 
+/// True if `p` is a directory containing at least one entry. Errors
+/// (including `NotFound`) collapse to `false` — the callers that use
+/// this are gating off "directory absent or empty" identically.
+fn dir_has_entries(p: &Path) -> bool {
+    std::fs::read_dir(p)
+        .map(|mut iter| iter.next().is_some())
+        .unwrap_or(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_volume_tasks(
     fork_dir: PathBuf,
@@ -190,16 +199,15 @@ pub async fn run_volume_tasks(
         None => stores.writer(),
     };
 
-    // Prefetch segment indexes on startup if the fork has no local index files.
-    // This covers the common case of a volume pulled from the store with only
-    // the directory skeleton — without .idx files Volume::open cannot rebuild
-    // the LBA map and the volume is unreadable.
-    let has_local_segments = fork_dir.join("index").exists()
-        && fork_dir
-            .join("index")
-            .read_dir()
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
+    // Prefetch segment indexes on startup only when the fork has no
+    // local segments to drive Volume::open from — the "pulled
+    // skeleton" case. An imported or freshly-WAL-flushed fork still
+    // has segments in `pending/` waiting for the drain to upload them
+    // and write `index/<ulid>.idx`; running prefetch there would
+    // race the drain and fail with 404s on segments that exist only
+    // locally so far. Either prefix holding entries is enough to skip.
+    let has_local_segments =
+        dir_has_entries(&fork_dir.join("index")) || dir_has_entries(&fork_dir.join("pending"));
     // Pulled ancestors are populated by the descendant writable fork's
     // `prefetch_indexes` chain walk; running their own per-volume prefetch
     // repeats every LIST/range-GET on the chain.
@@ -550,5 +558,38 @@ mod tests {
         .write(&vol)
         .unwrap();
         assert!(is_pulled_ancestor(&vol));
+    }
+
+    /// `pending/` non-empty means an import (or a fresh WAL flush)
+    /// has produced segments the drain hasn't uploaded yet. Prefetch
+    /// must skip — it would race the drain and 404 on every segment.
+    #[test]
+    fn dir_has_entries_matches_prefetch_skip_gate() {
+        let tmp = TempDir::new().unwrap();
+        let vol = tmp.path().to_path_buf();
+
+        // Fresh-pull skeleton: no index/, no pending/ — prefetch runs.
+        assert!(!dir_has_entries(&vol.join("index")));
+        assert!(!dir_has_entries(&vol.join("pending")));
+
+        // Empty index/ + empty pending/ — still a skeleton.
+        fs::create_dir_all(vol.join("index")).unwrap();
+        fs::create_dir_all(vol.join("pending")).unwrap();
+        assert!(!dir_has_entries(&vol.join("index")));
+        assert!(!dir_has_entries(&vol.join("pending")));
+
+        // Import dropped segments into pending/ — drain hasn't run.
+        // Prefetch must see "has local segments" via the pending side
+        // and skip, even though index/ is still empty.
+        fs::write(vol.join("pending").join("01ARZ"), b"seg").unwrap();
+        assert!(!dir_has_entries(&vol.join("index")));
+        assert!(dir_has_entries(&vol.join("pending")));
+
+        // Drain promoted: pending/ drained back to empty, index/<u>.idx
+        // landed. Still skip prefetch.
+        fs::remove_file(vol.join("pending").join("01ARZ")).unwrap();
+        fs::write(vol.join("index").join("01ARZ.idx"), b"idx").unwrap();
+        assert!(dir_has_entries(&vol.join("index")));
+        assert!(!dir_has_entries(&vol.join("pending")));
     }
 }
