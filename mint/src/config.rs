@@ -105,11 +105,14 @@ pub struct RawConfig {
 pub struct Tenant {
     /// Bucket name; surfaced to templates as `{{tenant.bucket}}`.
     pub bucket: String,
-    /// S3 endpoint URL — set for Tigris (typically
-    /// `https://t3.storage.dev`), omit for AWS S3. Used by `serve
-    /// --tigris` to build the data-plane client that reads and writes
-    /// `_mint/*` under [self-vended `mint-rw` credentials][mint-rw],
-    /// distinct from the IAM endpoint that `tigris.rs` calls.
+    /// S3 endpoint URL. Used by `serve --tigris` to build the
+    /// data-plane client that reads and writes `_mint/*` under
+    /// [self-vended `mint-rw` credentials][mint-rw], distinct from
+    /// the IAM endpoint that `tigris.rs` calls. Omit to use Tigris's
+    /// default S3 endpoint
+    /// ([`crate::mint_rw::DEFAULT_TIGRIS_S3_ENDPOINT`]); set
+    /// explicitly only for a non-Tigris S3-compatible target
+    /// (custom AWS region, MinIO, etc.).
     ///
     /// [mint-rw]: crate::state::Store
     #[serde(default)]

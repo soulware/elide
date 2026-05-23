@@ -23,6 +23,8 @@ socket = "mint_data/mint.sock"        # client: --url unix:mint_data/mint.sock
 
 [tenant]
 bucket = "elide-demo"
+# endpoint = "https://t3.storage.dev"   # default; set for non-Tigris S3
+# region   = "us-east-1"                # default
 
 [[role]]
 name = "volume-ro"

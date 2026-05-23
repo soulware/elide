@@ -31,6 +31,14 @@ use crate::iam::{KeypairMinter, MintedKeypair, policy_name};
 /// key has bounded value. Refresh fires at half-life by default.
 pub const MINT_RW_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
+/// Tigris's S3-compatible endpoint. Mirrors
+/// [`crate::tigris::DEFAULT_ENDPOINT`] for IAM: when `serve --tigris`
+/// is the deployment shape and no explicit `tenant.endpoint` is
+/// configured, this is where the data plane points. Operators who
+/// need a non-Tigris S3-compatible target (custom AWS, MinIO, etc.)
+/// set `tenant.endpoint` explicitly to override.
+pub const DEFAULT_TIGRIS_S3_ENDPOINT: &str = "https://t3.storage.dev";
+
 /// How early before `DateLessThan` to re-mint. At half-life: a transient
 /// IAM outage has the other half of the lifetime to recover before the
 /// credential turns into an outage.
@@ -146,20 +154,23 @@ pub async fn build_s3_with_mint_rw(
     let kp = vend_mint_rw(minter, bucket).await?;
     let expiration = kp.expiration;
     let provider = Arc::new(SwappableAwsProvider::new(aws_credential(&kp)));
-    let mut builder = AmazonS3Builder::new()
+    // Default to Tigris's S3 endpoint when the caller doesn't pin one.
+    // Without this, `AmazonS3Builder` falls back to AWS S3 and the
+    // Tigris-minted access key fails with `InvalidAccessKeyId` on the
+    // first request — the asymmetry-with-IAM footgun the wrapper exists
+    // to avoid (`tigris.rs` already defaults the IAM endpoint).
+    let endpoint = endpoint.unwrap_or(DEFAULT_TIGRIS_S3_ENDPOINT);
+    let builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_credentials(provider.clone())
         // `PutMode::Create` (the only conditional mode mint uses) does
         // not require this; set it anyway so callers reading the
         // backend with `PutMode::Update` semantics get a clean error
         // rather than a confusing one if the surface ever grows.
-        .with_conditional_put(S3ConditionalPut::ETagMatch);
-    if let Some(ep) = endpoint {
-        builder = builder
-            .with_endpoint(ep)
-            .with_virtual_hosted_style_request(false);
-    }
-    builder = builder.with_region(region.unwrap_or("us-east-1"));
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .with_endpoint(endpoint)
+        .with_virtual_hosted_style_request(false)
+        .with_region(region.unwrap_or("us-east-1"));
     let s3 = builder.build().map_err(BuildError::from)?;
     Ok((Arc::new(s3), provider, expiration))
 }
