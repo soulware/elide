@@ -285,14 +285,21 @@ pub async fn run_volume_tasks(
     let mut tick = tokio::time::interval(drain_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    // Readonly forks (pulled ancestors + imported bases) never accept
-    // writes, so drain/GC ticks are wasted work — and worse, the first
-    // tick would assume `volume-rw` for the volume, burning a mint
-    // round-trip + IAM key on a credential that's never used. Re-check
-    // the marker each tick so a readonly→writable transition
+    // Readonly forks (pulled ancestors + imported bases) normally never
+    // accept writes, so drain/GC ticks are wasted work — and worse, the
+    // first tick would assume `volume-rw` for the volume, burning a
+    // mint round-trip + IAM key on a credential that's never used.
+    // Re-check the marker each tick so a readonly→writable transition
     // (`hydrate_remote_owned` strips the marker on a successful
     // `volume start`) starts producing ticks on the next interval
     // without needing to respawn this task.
+    //
+    // Exception: a fresh import is born readonly but its post-import
+    // serve phase populates `pending/` with segments only the
+    // coordinator's drain tick can upload + promote. Suppressing the
+    // tick while `pending/` is non-empty would strand those segments
+    // forever, so the gate below allows the tick through whenever
+    // anything is waiting in `pending/`.
     if fork_dir.join("volume.readonly").exists() {
         info!(
             "[coordinator] {volume_id}{volume_name} is readonly; \
@@ -311,7 +318,9 @@ pub async fn run_volume_tasks(
                 let _ = reply_tx.send(result);
             }
             _ = tick.tick() => {
-                if fork_dir.join("volume.readonly").exists() {
+                if fork_dir.join("volume.readonly").exists()
+                    && pending_dir_is_empty(&fork_dir.join("pending"))
+                {
                     continue;
                 }
                 if matches!(orch.run_tick().await, TickOutcome::Stop) {
@@ -320,6 +329,19 @@ pub async fn run_volume_tasks(
             }
         }
     }
+}
+
+/// True when `pending_dir` contains no committed segment files (i.e.
+/// nothing for `drain_pending` to upload). Ignores `.tmp` half-writes
+/// and treats a missing directory as empty.
+fn pending_dir_is_empty(pending_dir: &Path) -> bool {
+    let entries = match std::fs::read_dir(pending_dir) {
+        Ok(e) => e,
+        Err(_) => return true,
+    };
+    !entries
+        .flatten()
+        .any(|e| e.file_name().to_str().is_some_and(|n| !n.contains('.')))
 }
 
 /// Read the volume name from `volume.toml`, if present and non-empty.
@@ -487,6 +509,32 @@ mod tests {
         .unwrap();
         fs::write(vol.join("volume.readonly"), "").unwrap();
         assert!(!is_pulled_ancestor(&vol));
+    }
+
+    /// Drain gate: a freshly-imported readonly volume in its serve
+    /// phase has pending segments only the coordinator's tick can
+    /// upload + promote. `pending_dir_is_empty` must report `false`
+    /// so the tick gate lets `run_tick()` execute.
+    #[test]
+    fn pending_dir_is_empty_detects_committed_segment() {
+        let tmp = TempDir::new().unwrap();
+        let pending = tmp.path().join("pending");
+        fs::create_dir(&pending).unwrap();
+        // Half-written segment must not count.
+        fs::write(pending.join("01AAAAAAAAAAAAAAAAAAAAAAA1.tmp"), b"x").unwrap();
+        assert!(pending_dir_is_empty(&pending));
+        // Bare ULID = committed segment ready for drain.
+        fs::write(pending.join("01AAAAAAAAAAAAAAAAAAAAAAA2"), b"x").unwrap();
+        assert!(!pending_dir_is_empty(&pending));
+    }
+
+    /// Missing `pending/` directory is the steady state for a
+    /// pulled-ancestor volume — the gate must treat it as empty so
+    /// drain stays correctly suspended.
+    #[test]
+    fn pending_dir_is_empty_treats_missing_dir_as_empty() {
+        let tmp = TempDir::new().unwrap();
+        assert!(pending_dir_is_empty(&tmp.path().join("pending")));
     }
 
     /// Empty-string name is treated as no name — guards against config drift.
