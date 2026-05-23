@@ -1,22 +1,22 @@
-//! Macaroon issuance (`docs/design-mint.md` § *Coordinator bootstrap &
-//! macaroon lifecycle*, § *Enrollment*).
+//! Macaroon issuance (`docs/design-mint.md` § *Credential macaroon &
+//! lifecycle*, § *Enrollment*).
 //!
 //! Every macaroon mint here is a fresh chain **from the root** (only
 //! the root holder can mint; a coordinator can only attenuate). Three
 //! mint points, each stamped with its own positively-required `op`:
 //!
-//! 1. [`mint_bootstrap`] — `op=enroll`, the reusable non-expiring
+//! 1. [`mint_invite`] — `op=enroll`, the reusable non-expiring
 //!    participation gate. No principal identity; carries the current
-//!    `bootstrap` nonce.
+//!    `invite` nonce.
 //! 2. [`mint_credential_ticket`] — `op=enroll-exchange`, short-lived,
 //!    minted at `POST /v1/enroll` once the presented (coordinator-
-//!    attenuated) bootstrap has verified and a pending record exists.
+//!    attenuated) invite has verified and a pending record exists.
 //!    Carries the self-asserted `sub`/`cnf` forward.
 //! 3. [`mint_credential`] — `op=assume-role`, non-expiring, minted at
 //!    `POST /v1/enroll-exchange` after operator approval. Same
 //!    `sub`/`cnf`; no `exp`.
 //!
-//! MAC verification, the `op`/`aud`/`bootstrap` gates, the holder-of-key
+//! MAC verification, the `op`/`aud`/`invite` gates, the holder-of-key
 //! PoP and the pending/approval lookup are the HTTP layer's job (they
 //! need the root, config and the state store). The functions here are
 //! pure given an already-authenticated macaroon.
@@ -47,17 +47,17 @@ pub enum EnrollError {
     Unsatisfiable,
 }
 
-/// The reusable bootstrap macaroon: root attenuated with `op=enroll`,
-/// `aud`, and the current `bootstrap` nonce. Non-expiring, carries no
+/// The reusable invite macaroon: root attenuated with `op=enroll`,
+/// `aud`, and the current `invite` nonce. Non-expiring, carries no
 /// principal identity — a pure participation gate, distributed
 /// out-of-band and reusable for every enrolling client.
-pub fn mint_bootstrap(root: &[u8; 32], audience: &str, bootstrap_nonce: &str) -> Macaroon {
+pub fn mint_invite(root: &[u8; 32], audience: &str, invite_nonce: &str) -> Macaroon {
     macaroon::mint(
         root,
         vec![
             Caveat::scalar(name::OP, op::ENROLL),
             Caveat::scalar(name::AUD, audience),
-            Caveat::scalar(name::BOOTSTRAP, bootstrap_nonce),
+            Caveat::scalar(name::INVITE, invite_nonce),
         ],
     )
 }
@@ -91,7 +91,7 @@ pub fn mint_credential_ticket(
 /// attenuation of the credential ticket (only the root holder can do
 /// this). One credential carries exactly one role — a coordinator
 /// exchanges once per role it needs (`docs/design-mint.md` §
-/// *Coordinator bootstrap*).
+/// *Credential macaroon & lifecycle*).
 pub fn mint_credential(
     root: &[u8; 32],
     audience: &str,
@@ -144,14 +144,14 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_is_enroll_op_no_identity() {
-        let b = mint_bootstrap(&ROOT, "mint", "nonceXYZ");
+    fn invite_is_enroll_op_no_identity() {
+        let b = mint_invite(&ROOT, "mint", "nonceXYZ");
         assert!(b.verify(&ROOT));
         let eff = EffectiveCaveats::new(b.caveats());
         assert_eq!(eff.resolve(name::OP), Resolved::Value(op::ENROLL.into()));
         assert_eq!(eff.resolve(name::AUD), Resolved::Value("mint".into()));
         assert_eq!(
-            eff.resolve(name::BOOTSTRAP),
+            eff.resolve(name::INVITE),
             Resolved::Value("nonceXYZ".into())
         );
         assert_eq!(eff.resolve(name::SUB), Resolved::Absent);

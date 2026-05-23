@@ -9,8 +9,8 @@ has the steady-state `assume-role` half and explicitly defers
 provisioning ("provisions the `credentials/<role>` files — out of scope
 here"). This plan fills that gap.
 
-Authority: `docs/design-mint.md` § *Enrollment*, § *Coordinator
-configuration*, § *Coordinator store architecture*.
+Authority: `docs/design-mint.md` § *Enrollment*, § *Credential macaroon
+& lifecycle*, § *Coordinator store architecture*.
 
 ## Shape: one blocking operator command + a hard startup gate
 
@@ -20,7 +20,7 @@ the daemon **refuses to start** (when `[mint]` is configured) until it
 has completed successfully.
 
 - **A — `POST /v1/enroll`.** The command attenuates the
-  operator-supplied bootstrap macaroon with `sub=<coord-ulid>` and
+  operator-supplied invite macaroon with `sub=<coord-ulid>` and
   `cnf=ed25519:<coordinator.pub>`, PoP-signs the body (`{ts}`) with
   `coordinator.key`, and receives the short-lived credential ticket. It
   prints the `cnf` fingerprint and the exact `mint enroll approve
@@ -66,18 +66,18 @@ failure on first S3 touch.
    and minimal.
 
 2. **Self-healing the ticket-expiry race.** Because the single command
-   holds the bootstrap macaroon for its whole duration, if the ticket
+   holds the invite macaroon for its whole duration, if the ticket
    `exp` passes during the wait-for-approval (operator slow), the
    command transparently re-runs A for a fresh ticket and continues.
-   The split hybrid could not do this (no bootstrap on disk). This is
+   The split hybrid could not do this (no invite on disk). This is
    the main argument for the single-command shape over a daemon
    reconciler. After ticket expiry the mint-side pending record is GC'd
    and needs fresh approval — the command surfaces that it is
    re-enrolling so the operator knows a re-approve is required.
 
-3. **Bootstrap is operator-supplied, never config.** `<mac|file|->`
+3. **Invite is operator-supplied, never config.** `<mac|file|->`
    argument mirroring `mint client enroll`; not a `[mint]` key. The
-   bootstrap is reusable and non-expiring — parking it in
+   invite is reusable and non-expiring — parking it in
    `coordinator.toml` on every host is the surface we explicitly avoid.
    `MintConfig` stays as-is (`url` + timeouts only).
 
@@ -116,11 +116,11 @@ failure on first S3 touch.
 ### CLI surface
 
 ```
-elide coord enroll [--data-dir <dir>] <bootstrap-macaroon | file | ->
+elide coord enroll [--data-dir <dir>] <invite-macaroon | file | ->
                     [--timeout <humantime>] [--force]
 ```
 
-- positional bootstrap source: inline macaroon, a file path, or `-`
+- positional invite source: inline macaroon, a file path, or `-`
   for stdin (same resolution as `mint client enroll`).
 - `--timeout`: overall wait-for-approval bound (default e.g. `30m`);
   on timeout, exit non-zero with the resume instruction (re-run is safe).
@@ -134,11 +134,11 @@ elide coord enroll [--data-dir <dir>] <bootstrap-macaroon | file | ->
 
 - **403 forever** (operator never approves): bounded by `--timeout`;
   clear message, idempotent re-run.
-- **401 at enroll**: bad/stale bootstrap or wrong `op` — fail fast with
+- **401 at enroll**: bad/stale invite or wrong `op` — fail fast with
   the mint error snippet (mint's error model is deliberately coarse).
 - **401 at exchange**: ticket expired — decision (2) re-enrolls
-  automatically; if that also 401s, the bootstrap itself is
-  stale/rotated (`mint bootstrap rotate`) — fail with that diagnosis.
+  automatically; if that also 401s, the invite itself is
+  stale/rotated (`mint invite --rotate`) — fail with that diagnosis.
 - **pub/sub conflict** (mint surfaces a different-key anomaly to the
   operator): exchange keeps returning non-200; the command reports the
   mint snippet so the operator can `mint enroll list` and reconcile.
@@ -147,7 +147,7 @@ elide coord enroll [--data-dir <dir>] <bootstrap-macaroon | file | ->
 
 ## Testing
 
-- Unit (in `enroll.rs`, mirroring `mint_client.rs` tests): bootstrap
+- Unit (in `enroll.rs`, mirroring `mint_client.rs` tests): invite
   attenuation chain (`sub`/`cnf` appended in order), PoP digest over
   `{ts}` / `{ts, role}`, ticket-expiry → re-enroll branch with a fake
   `post`.
@@ -194,7 +194,7 @@ a 4-role config (`coord-base`, `coord-writer`, `volume-rw`,
    and the split-CLI shape then needs a *manual* re-enroll **and**
    re-approve (the pending record is GC'd at `exp`). This concretely
    justifies plan decision (2): the single command, holding the
-   bootstrap for its whole duration, re-enrolls transparently — the
+   invite for its whole duration, re-enrolls transparently — the
    reference client structurally cannot.
 
 5. **Operator side needs no work.** `enroll list` shows the `cnf`
@@ -208,6 +208,6 @@ a 4-role config (`coord-base`, `coord-writer`, `volume-rw`,
   (`assume-role` side, already designed in § *Coordinator store
   architecture*) — credentials themselves never expire, so enrollment
   is converge-once and has no refresh cadence.
-- `mint bootstrap rotate` handling beyond surfacing the diagnosis.
+- `mint invite --rotate` handling beyond surfacing the diagnosis.
 - The future domain-typed S3 layer (§ *Coordinator store architecture*,
   explicitly separate work).

@@ -66,8 +66,8 @@ the caller per request. The macaroon is a pure *capability* (which
 roles this key-bound principal may assume, until when); the per-request
 *exercise* parameters (role, TTL, and any role-specific scoping data
 such as the ancestor set) travel in the request **body**, which is
-covered by the caller's proof-of-possession signature (§ *Coordinator
-bootstrap*). The caller calls `mint`'s HTTP API, presenting the
+covered by the caller's proof-of-possession signature (§ *Credential
+macaroon & lifecycle*). The caller calls `mint`'s HTTP API, presenting the
 (attenuated) macaroon, the PoP-signed body, and any discharge
 macaroons. `mint` verifies the macaroon against its own root and any
 third-party caveats, verifies the PoP signature over the body against
@@ -94,7 +94,7 @@ caller ↔ Tigris S3:  the freshly-minted scoped keypair
 **mint is both issuer and verifier of the credential macaroon.** The
 symmetric macaroon root key lives and dies inside the mint and is never
 distributed: mint mints a caller's credential once (at the enrollment
-exchange — § *Coordinator bootstrap*), and verifies the attenuated
+exchange — § *Credential macaroon & lifecycle*), and verifies the attenuated
 macaroon presented on every `assume-role`. Issuer and verifier being the same process is what
 removes any root-distribution problem — there is no separate authority
 to share the root with, and no "configure mint to trust the
@@ -133,10 +133,10 @@ Each mint instance is configured with:
    mode 0600), loaded thereafter — never a config field, mirroring the
    elide coordinator's `coordinator.key`.
    Symmetric, so there is no public half. (v1 is single-root; multi-root
-   for federating issuers is out of scope.) The current **`bootstrap`**
+   for federating issuers is out of scope.) The current **`invite`**
    is persisted alongside the root under the same custody — it must
-   survive restart so the distributed bootstrap macaroon stays valid;
-   only `mint bootstrap rotate` changes it.
+   survive restart so the distributed invite macaroon stays valid;
+   only `mint invite --rotate` changes it.
 2. **Zero or more third-party discharge keys** — one symmetric key per
    identity/discharge authority mint trusts to satisfy a third-party
    caveat. Absent in the minimal self-hosted deployment (no third-party
@@ -168,7 +168,7 @@ directories, mirroring the elide coordinator's `data_dir`
 (`coordinator.toml`):
 
 - **`data_dir`** (default `mint_data`) — persisted state under the same
-  custody as the macaroon root: the current `bootstrap` value and the
+  custody as the macaroon root: the current `invite` value and the
   transient pending-enrollment table.
 - **`roles_dir`** (default `mint_roles`) — role *policy templates*, one
   file per role (see *Role configuration*).
@@ -203,7 +203,7 @@ The same mint code supports three deployment shapes:
 (2) and (3) differ only in whose Tigris account the admin credential is
 issued against — the mint software is identical.
 
-## Coordinator bootstrap & macaroon lifecycle
+## Credential macaroon & lifecycle
 
 A **credential macaroon** is the mint root attenuated to exactly one
 coordinator identity **and exactly one role**: `op=assume-role`,
@@ -258,21 +258,21 @@ operator-verified key, once, and exchanges it — once per role the
 coordinator is authorized for — for that many non-expiring,
 single-role credentials.
 
-**Bootstrap macaroon.** At first start mint draws a random nonce — the
-`bootstrap` value — persists it (single current value, same custody as
-the root), and emits the bootstrap macaroon: the root attenuated with
-`op=enroll`, `aud=mint`, `bootstrap=<current>`. It is
+**Invite macaroon.** At first start mint draws a random nonce — the
+`invite` value — persists it (single current value, same custody as
+the root), and emits the invite macaroon: the root attenuated with
+`op=enroll`, `aud=mint`, `invite=<current>`. It is
 non-expiring, carries no coordinator identity, and is a pure
 participation gate. It is distributed out-of-band and is reusable for
 every coordinator that enrols against this mint.
 
-**(1) `POST /v1/enroll`.** The client attenuates the bootstrap macaroon
+**(1) `POST /v1/enroll`.** The client attenuates the invite macaroon
 with `sub=<own id>` (Elide: the coordinator ULID) and
 `cnf=ed25519:<own pub>` and presents it with a PoP over the body, by
 the private half of `cnf` (the `assume-role` PoP machinery). Mint
-verifies the chain against its root, `op=enroll`, `bootstrap`=current,
+verifies the chain against its root, `op=enroll`, `invite`=current,
 and the PoP against the appended `cnf`; records a **pending enrollment**
-keyed by `sub` — `(sub, pub, bootstrap, first-seen ts, peer ip)`; and
+keyed by `sub` — `(sub, pub, invite, first-seen ts, peer ip)`; and
 returns a **credential ticket** minted fresh from root: short
 `exp`, `op=enroll-exchange`, the same `sub`/`cnf`, plus a third-party
 caveat when an identity authority is configured. The ticket is
@@ -322,10 +322,10 @@ record (§ (1)). After expiry, a further role is a fresh pending request
 needing fresh approval — mint holds no standing per-coordinator state
 beyond that bounded window.
 
-**Rotation.** `mint bootstrap rotate` draws a new random
-`bootstrap`, persists it, emits a fresh bootstrap macaroon, and
-drops every pending record whose `bootstrap` is not the new value.
-Outstanding primaries are unaffected — they carry no `bootstrap`
+**Rotation.** `mint invite --rotate` draws a new random
+`invite`, persists it, emits a fresh invite macaroon, and
+drops every pending record whose `invite` is not the new value.
+Outstanding primaries are unaffected — they carry no `invite`
 and were re-minted from root. Restart preserves the nonce; only explicit
 rotation cancels in-flight enrollments.
 
@@ -380,7 +380,7 @@ Content-Type: application/json
 ### Enrollment endpoints
 
 ```
-POST /v1/enroll              # bootstrap (+sub/cnf) + PoP
+POST /v1/enroll              # invite (+sub/cnf) + PoP
                              # → 200 credential-ticket macaroon (base64)
 
 POST /v1/enroll-exchange     # credential ticket + PoP + discharge bundle
@@ -406,11 +406,11 @@ same opaque `401` as `assume-role` on any failure (including a role this
 Authentication is identical across all three `op`s — `enroll`,
 `enroll-exchange`, `assume-role`. The `Authorization` header carries the
 presented macaroon, base64-encoded — the coordinator-attenuated
-bootstrap at `/v1/enroll`, the credential ticket at `/v1/enroll-exchange`,
+invite at `/v1/enroll`, the credential ticket at `/v1/enroll-exchange`,
 the attenuated credential at `/v1/assume-role`; any discharge macaroons for
 third-party caveats accompany it (bundle wire format per *Open
 questions* #15; discharges apply to the credential ticket and credential, never
-the bootstrap). The mint verifies the presented macaroon's chain MAC
+the invite). The mint verifies the presented macaroon's chain MAC
 against its own macaroon root, and each discharge against the relevant
 third-party key (see `design-auth-model.md` for the construction).
 
@@ -418,7 +418,7 @@ The request also carries the proof-of-possession the macaroon's
 `cnf` caveat requires: `X-Mint-Coord-Pop` is the base64
 Ed25519 signature, by `coordinator.key`, over `BLAKE3(macaroon-tail ‖
 BLAKE3(request-body))`. Every Elide-path token is key-bound — the
-coordinator appends `cnf` when it attenuates the bootstrap,
+coordinator appends `cnf` when it attenuates the invite,
 and mint carries it through the credential ticket and credential — so PoP is
 required on all three operations. The body it covers differs by
 operation: at `/v1/enroll` it is just the freshness `ts`; at
@@ -441,7 +441,7 @@ enrollment path always seals one, so `enroll`/`enroll-exchange` are
 never bearer.
 
 If verification fails — bad MAC, unknown root, malformed encoding,
-wrong/absent `op` for the endpoint, stale `bootstrap`,
+wrong/absent `op` for the endpoint, stale `invite`,
 missing or bad PoP when `cnf` is present — the mint returns
 `401 Unauthorized` with no further detail (don't help an attacker
 distinguish "wrong key" from "tampered caveats" from "bad PoP"). The
@@ -680,7 +680,7 @@ Coined (mint-specific; no registered equivalent):
 
 - **`op`** (string, scalar). Partitions a token to one mint operation:
   `enroll`, `enroll-exchange`, or `assume-role`. Mint stamps it at every
-  point it mints (bootstrap, credential ticket, credential) and each endpoint
+  point it mints (invite, credential ticket, credential) and each endpoint
   **positively requires** its own value — no endpoint tests for absence.
   Immutable by construction: a coordinator can only append, and a
   contradictory copy is unsatisfiable.
@@ -692,16 +692,16 @@ Coined (mint-specific; no registered equivalent):
   selects the role policy from it and requires the request's asserted
   `request.role` to equal it. There is no role-less ("omnibus")
   credential: a credential carries exactly one role.
-- **`bootstrap`** (string, scalar). Carried only by the bootstrap
+- **`invite`** (string, scalar). Carried only by the invite
   macaroon. Mint stores one current random nonce (persisted, same
-  custody as the root) and rejects any bootstrap whose `bootstrap` value
-  ≠ current. `mint bootstrap rotate` draws a new nonce; equality only,
+  custody as the root) and rejects any invite whose `invite` value
+  ≠ current. `mint invite --rotate` draws a new nonce; equality only,
   no ordering.
 
 ### Namespacing
 
 The standard caveats above (`aud`/`exp`/`sub`/`cnf`/`op`/`role`/
-`bootstrap`) are un-namespaced — they are the mint mechanism, common to
+`invite`) are un-namespaced — they are the mint mechanism, common to
 every consumer. Consumer-specific caveats are conventionally prefixed to
 indicate their issuer or domain. Elide's is:
 
@@ -730,13 +730,13 @@ on occurrence order.
 
 Caveats split into two kinds by where their value originates:
 
-- **Partitioning** — `op`, `bootstrap`, `sub`, `cnf`, `role`.
+- **Partitioning** — `op`, `invite`, `sub`, `cnf`, `role`.
   Identify what the token is for and bind the principal.
-  `op`/`bootstrap` are mint-stamped at each mint point; `sub`/`cnf` are
+  `op`/`invite` are mint-stamped at each mint point; `sub`/`cnf` are
   coordinator-self-asserted inside enrollment and `role` is
   mint-stamped at the enrollment exchange — all three survive into a
   credential only via the re-mint-from-root that follows operator
-  approval (see *Coordinator bootstrap*). A caller never alters any of
+  approval (see *Credential macaroon & lifecycle*). A caller never alters any of
   them — an appended contradictory copy is unsatisfiable and fails
   closed, never silently dropped.
 - **Narrowing** — `elide:Volume`, `exp`. Coordinator-appended,
@@ -763,7 +763,7 @@ role's `required_caveats`) and/or it **feeds** the policy template
 |---|---|---|---|---|
 | `aud` | string | scalar | macaroon issuer | Gate only — must equal `mint`. Cross-service replay defense. |
 | `op` | string | scalar | mint, at each mint point | Gate only — endpoint partition (`enroll` / `enroll-exchange` / `assume-role`); each endpoint positively requires its value. |
-| `bootstrap` | string | scalar | mint, on first start / rotate | Gate only — bootstrap macaroon must carry the current value. |
+| `invite` | string | scalar | mint, on first start / rotate | Gate only — invite macaroon must carry the current value. |
 | `exp` | uint64 (unix s) | scalar | issuer | Gate — caps granted TTL (`min(req, role.max, exp−now)`); multiple narrow to the minimum. |
 | `role` | string | scalar | mint, at the enrollment exchange | Gate **and** selects the role policy — the single role this credential carries; always present, and the request's asserted `request.role` must equal it. |
 | `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on all `coord-*`; defines the credential macaroon. Templated as `{{caveat "sub"}}` in `coord-writer`'s own-identity statement (`coordinators/{{caveat "sub"}}/*`). |
@@ -1279,7 +1279,7 @@ Operator / server:
 
 ```
 mint serve <cfg> [bind]            # HTTP service
-mint bootstrap [rotate]            # print current bootstrap macaroon / rotate the nonce
+mint invite [--rotate]             # print current invite macaroon / rotate the nonce
 mint enroll list                   # pending: sub, cnf fingerprint, peer ip, age
 mint enroll approve <sub>          # approve a pending record
 mint role list                     # configured roles: name, required caveats, TTL bounds
@@ -1312,7 +1312,7 @@ keeps zero `elide-*` deps. It hard-errors at startup without a Tigris
 admin credential in the `AWS_*` environment, so a misconfiguration
 fails fast rather than at the first request. Without `--tigris`,
 `serve` wires the deterministic fake minter (no account needed).
-Consequence for CI: the `bootstrap` / `enroll` / `enroll-exchange` legs
+Consequence for CI: the `invite` / `enroll` / `enroll-exchange` legs
 and the fake-minter `assume-role` are hermetic and run anywhere; the
 real-Tigris `assume-role` end-to-end is VM-only.
 
@@ -1449,8 +1449,8 @@ prematurely.
     maintenance pass, deliberately outside the runtime surface
     (`docs/list-elimination-plan.md` § *Reconcile/repair without
     LIST*).
-13. **Enrollment surface — settled.** See *Coordinator bootstrap* §
-    *Enrollment*: reusable non-expiring bootstrap macaroon → coordinator
+13. **Enrollment surface — settled.** See *Credential macaroon & lifecycle* §
+    *Enrollment*: reusable non-expiring invite macaroon → coordinator
     self-asserts `sub`/`cnf` and `POST /v1/enroll` creates a pending
     record → operator approves a displayed pubkey fingerprint → `POST
     /v1/enroll-exchange {ts, role}` is the **role-authorization point**:
@@ -1461,7 +1461,7 @@ prematurely.
     until its `exp`; the pending+approval record is GC'd at that `exp`
     (one approval covers every per-role exchange in the window), not
     consumed per exchange — transient, bounded by `exp`, still not a
-    registry. `bootstrap` is the rotation knob; `op` partitions the
+    registry. `invite` is the rotation knob; `op` partitions the
     three endpoints. *Open within this question:* whether an operator
     ever needs to authorize a role *set* directly (a per-`sub` allowlist
     persisted in config) rather than relying on policy templating or the
@@ -1469,10 +1469,10 @@ prematurely.
     per-coordinator state.
 14. **Root-key durability.** *Resolved:* mint generates the root key
     on first start and persists it at `<data_dir>/root_key` (64 hex
-    chars, 0600), like the coordinator's identity key; the `bootstrap`
+    chars, 0600), like the coordinator's identity key; the `invite`
     shares this custody. The accepted consequence is that losing
     `data_dir` invalidates every outstanding macaroon — recovery is
-    re-bootstrap + re-enroll, not state restore. Whether `data_dir`
+    re-invite + re-enroll, not state restore. Whether `data_dir`
     warrants backup/replication, and how the root rotates, remain open
     and are tied to rotation (#3).
 15. **Third-party-caveat construction.** Delegation to an identity
@@ -1493,8 +1493,8 @@ prematurely.
 16. **PoP caveat wire detail.** `cnf` is decided (first-party
     holder-of-key; credential is key-bound, not a bearer; the signed
     payload is `BLAKE3(presented-macaroon-tail ‖ BLAKE3(request-body))`
-    so the proof also authenticates the body — see *Coordinator
-    bootstrap*, *Authentication*). The body hash is over the **exact
+    so the proof also authenticates the body — see *Credential macaroon
+    & lifecycle*, *Authentication*). The body hash is over the **exact
     raw bytes received**, hashed before parsing — no JSON
     canonicalization (a canonicalization mismatch is a signature-bypass
     footgun). Freshness is a **±skew window** on a `ts` field carried

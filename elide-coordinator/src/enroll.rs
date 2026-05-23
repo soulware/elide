@@ -7,7 +7,7 @@
 //! ticket lives in memory for the command's duration and never touches
 //! disk — `credentials/<role>` is the only durable enrollment artifact.
 //!
-//! Because the command holds the bootstrap macaroon for its whole
+//! Because the command holds the invite macaroon for its whole
 //! duration it self-heals the ticket-expiry race: if the short-lived
 //! ticket expires before approval lands it transparently re-enrolls
 //! (the operator must then re-approve, since mint GC's the pending
@@ -68,10 +68,10 @@ fn credential_path(data_dir: &Path, role: &str) -> PathBuf {
     credentials_dir(data_dir).join(role)
 }
 
-/// Resolve the bootstrap argument: `-` reads stdin, an inline macaroon
+/// Resolve the invite argument: `-` reads stdin, an inline macaroon
 /// is used verbatim, anything else is a file path. Validated by a
 /// decode at the boundary so a bad source fails here, not at the PoP.
-fn resolve_bootstrap(src: &str) -> io::Result<String> {
+fn resolve_invite(src: &str) -> io::Result<String> {
     let raw = if src == "-" {
         let mut s = String::new();
         io::stdin().read_to_string(&mut s)?;
@@ -83,25 +83,25 @@ fn resolve_bootstrap(src: &str) -> io::Result<String> {
             io::Error::new(
                 e.kind(),
                 format!(
-                    "bootstrap macaroon: {src:?} is neither an inline macaroon nor a readable file: {e}"
+                    "invite macaroon: {src:?} is neither an inline macaroon nor a readable file: {e}"
                 ),
             )
         })?
     };
     let trimmed = raw.trim().to_owned();
     WireMacaroon::decode(&trimmed)
-        .map_err(|e| io::Error::other(format!("bootstrap macaroon failed to decode: {e}")))?;
+        .map_err(|e| io::Error::other(format!("invite macaroon failed to decode: {e}")))?;
     Ok(trimmed)
 }
 
-/// A — `POST /v1/enroll`. Attenuate the bootstrap with `sub`/`cnf`, PoP
+/// A — `POST /v1/enroll`. Attenuate the invite with `sub`/`cnf`, PoP
 /// over `{ts}`, return the credential-ticket macaroon string.
 async fn enroll_request(
     cfg: &MintConfig,
     identity: &CoordinatorIdentity,
-    bootstrap: &str,
+    invite: &str,
 ) -> io::Result<String> {
-    let mut mac = WireMacaroon::decode(bootstrap)?;
+    let mut mac = WireMacaroon::decode(invite)?;
     mac.attenuate(CAVEAT_SUB, identity.coordinator_id_str());
     mac.attenuate(CAVEAT_CNF, &cnf_value(identity));
 
@@ -230,7 +230,7 @@ pub async fn run(
     cfg: &MintConfig,
     identity: &CoordinatorIdentity,
     data_dir: &Path,
-    bootstrap_src: &str,
+    invite_src: &str,
     wait: Duration,
     force: bool,
 ) -> io::Result<()> {
@@ -248,11 +248,11 @@ pub async fn run(
         return Ok(());
     }
 
-    let bootstrap = resolve_bootstrap(bootstrap_src)?;
+    let invite = resolve_invite(invite_src)?;
     let sub = identity.coordinator_id_str();
     let cnf = cnf_value(identity);
 
-    let mut ticket = enroll_request(cfg, identity, &bootstrap).await?;
+    let mut ticket = enroll_request(cfg, identity, &invite).await?;
     info!(
         "[enroll] enrolled sub={sub} cnf-fingerprint={} — now run `mint enroll approve {sub}` \
          on the mint host (match that fingerprint out of band first)",
@@ -290,7 +290,7 @@ pub async fn run(
                         "[enroll] credential ticket expired before approval; re-enrolling — \
                          the operator must re-run `mint enroll approve {sub}`"
                     );
-                    ticket = enroll_request(cfg, identity, &bootstrap).await?;
+                    ticket = enroll_request(cfg, identity, &invite).await?;
                     awaiting = true;
                     break;
                 }
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bootstrap_distinguishes_inline_file_and_garbage() {
+    fn resolve_invite_distinguishes_inline_file_and_garbage() {
         // A real wire macaroon, built the way mint mints one.
         let nonce = [5u8; 16];
         let root = [2u8; 32];
@@ -359,17 +359,17 @@ mod tests {
         buf.extend_from_slice(&ser);
         let inline = BASE64.encode(buf);
 
-        assert_eq!(resolve_bootstrap(&inline).expect("inline"), inline);
+        assert_eq!(resolve_invite(&inline).expect("inline"), inline);
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let f = dir.path().join("bootstrap.mac");
+        let f = dir.path().join("invite.mac");
         std::fs::write(&f, format!("  {inline}\n")).expect("write");
         assert_eq!(
-            resolve_bootstrap(f.to_str().expect("utf8")).expect("file"),
+            resolve_invite(f.to_str().expect("utf8")).expect("file"),
             inline
         );
 
-        assert!(resolve_bootstrap("not-a-macaroon-and-not-a-path").is_err());
+        assert!(resolve_invite("not-a-macaroon-and-not-a-path").is_err());
     }
 
     #[test]

@@ -94,9 +94,9 @@ enum Command {
         /// Override the data_dir from the config file.
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Bootstrap macaroon: the macaroon text inline, a file path,
+        /// Invite macaroon: the macaroon text inline, a file path,
         /// or `-` for stdin. Distributed out of band by the operator.
-        bootstrap: String,
+        invite: String,
         /// Overall bound on waiting for operator approval (humantime).
         #[arg(long, default_value = "30m", value_parser = parse_humantime)]
         timeout: std::time::Duration,
@@ -265,7 +265,7 @@ async fn run() -> Result<()> {
         Command::Enroll {
             config,
             data_dir,
-            bootstrap,
+            invite,
             timeout,
             force,
         } => {
@@ -290,7 +290,7 @@ async fn run() -> Result<()> {
                 mint_cfg,
                 &identity,
                 &config.data_dir,
-                &bootstrap,
+                &invite,
                 timeout,
                 force,
             )

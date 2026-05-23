@@ -9,7 +9,7 @@
 //! when the real minter is wired (`docs/design-mint.md` § *Reference
 //! client & demo*: "no stub backend").
 //!
-//! `bootstrap` / `enroll` are the operator side. The networked
+//! `invite` / `enroll` are the operator side. The networked
 //! `mint client` (the coordinator's half) is the staged tail.
 
 use std::net::SocketAddr;
@@ -22,7 +22,7 @@ use mint::audit::AuditLog;
 use mint::config::{Config, Listener};
 use mint::http::{AppState, router};
 use mint::iam::{FakeMinter, KeypairMinter};
-use mint::issuance::mint_bootstrap;
+use mint::issuance::mint_invite;
 use mint::state::Store;
 use mint::tigris::TigrisMinter;
 
@@ -50,13 +50,13 @@ enum Command {
         #[arg(long)]
         tigris: bool,
     },
-    /// Print the bootstrap macaroon (reusable, non-expiring).
+    /// Print the invite macaroon (reusable, non-expiring).
     ///
     /// The macaroon goes to stdout for piping; diagnostics to stderr.
-    Bootstrap {
+    Invite {
         #[arg(long, default_value = "mint.toml")]
         config: PathBuf,
-        /// Draw a new bootstrap nonce first, cancelling in-flight
+        /// Draw a new invite nonce first, cancelling in-flight
         /// enrollments (outstanding credentials are unaffected).
         #[arg(long)]
         rotate: bool,
@@ -94,7 +94,7 @@ enum ClientCmd {
     /// Print this identity's `cnf` value + fingerprint (what the
     /// operator compares out of band before `enroll approve`).
     Fingerprint,
-    /// Attenuate the bootstrap macaroon with `sub`/`cnf`, enrol, and
+    /// Attenuate the invite macaroon with `sub`/`cnf`, enrol, and
     /// save the returned credential ticket.
     Enroll {
         /// mint endpoint: `http(s)://host:port` (TCP) or
@@ -108,10 +108,10 @@ enum ClientCmd {
         /// ticket to.
         #[arg(long, default_value_t = mint::client::CREDENTIAL_TICKET_FILE.to_string())]
         out: String,
-        /// Bootstrap macaroon: the macaroon text inline, a file path,
+        /// Invite macaroon: the macaroon text inline, a file path,
         /// or `-` for stdin.
-        #[arg(value_name = "BOOTSTRAP")]
-        bootstrap: String,
+        #[arg(value_name = "INVITE")]
+        invite: String,
     },
     /// Exchange the credential ticket for the credential (after
     /// approval). Exits 2 while still awaiting operator approval.
@@ -228,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             tigris,
         } => serve(&config, bind, tigris).await,
-        Command::Bootstrap { config, rotate } => bootstrap(&config, rotate),
+        Command::Invite { config, rotate } => invite(&config, rotate),
         Command::Enroll { cmd } => match cmd {
             EnrollCmd::List { config } => enroll_list(&config),
             EnrollCmd::Approve { config, sub, yes } => enroll_approve(&config, &sub, yes),
@@ -262,11 +262,11 @@ async fn client_cmd(
         }
         ClientCmd::Enroll {
             url,
-            bootstrap,
+            invite,
             id,
             out,
         } => {
-            mint::client::enroll(&dir, &url, &bootstrap, &id, &out).await?;
+            mint::client::enroll(&dir, &url, &invite, &id, &out).await?;
             eprintln!("  (compare the fingerprint out of band before approving)");
             Ok(())
         }
@@ -400,19 +400,19 @@ async fn serve(
     Ok(())
 }
 
-fn bootstrap(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn invite(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = load(config)?;
     let store = open_store(&config)?;
     let nonce = if rotate {
-        let n = store.rotate_bootstrap()?;
-        eprintln!("rotated bootstrap nonce; in-flight enrollments cancelled");
+        let n = store.rotate_invite()?;
+        eprintln!("rotated invite nonce; in-flight enrollments cancelled");
         n
     } else {
-        store.current_bootstrap()?
+        store.current_invite()?
     };
-    let mac = mint_bootstrap(&store.root_key(), &config.audience, &nonce);
+    let mac = mint_invite(&store.root_key(), &config.audience, &nonce);
     eprintln!(
-        "bootstrap macaroon for audience={} (non-expiring, reusable)",
+        "invite macaroon for audience={} (non-expiring, reusable)",
         config.audience
     );
     println!("{}", mac.encode());
