@@ -124,11 +124,12 @@ def fmt_ms(secs):
     return f"{secs * 1000:.0f}ms"
 
 
-def run(bucket, pin_region, iterations, overwrite, consistent_puts, ak, sk, st):
+def run(bucket, pin_region, iterations, overwrite, consistent_puts, single_key, ak, sk, st):
     prefix = f"probe/{uuid.uuid4().hex[:8]}"
     print(
         f"bucket={bucket} pin={pin_region or '(none)'} iterations={iterations} "
-        f"overwrite={overwrite} consistent_puts={consistent_puts} prefix={prefix}"
+        f"overwrite={overwrite} consistent_puts={consistent_puts} "
+        f"single_key={single_key} prefix={prefix}"
     )
 
     plain_ok = plain_stale = plain_404 = plain_err = 0
@@ -143,11 +144,14 @@ def run(bucket, pin_region, iterations, overwrite, consistent_puts, ak, sk, st):
         put_headers["X-Tigris-Consistent"] = "true"
     cons_headers = {"X-Tigris-Consistent": "true"}
 
+    fixed_key = f"{prefix}/key"
     for seq in range(iterations):
-        key = f"{prefix}/{seq}"
+        key = fixed_key if single_key else f"{prefix}/{seq}"
         expected = f"v{seq}".encode()
 
-        if overwrite:
+        # In single_key mode every iteration's PUT is itself an overwrite of
+        # the previous one, so we skip the explicit v_initial write.
+        if overwrite and not single_key:
             s3_request("PUT", bucket, key, b"v_initial", put_headers, ak, sk, st)
 
         t0 = time.perf_counter()
@@ -224,14 +228,13 @@ def run(bucket, pin_region, iterations, overwrite, consistent_puts, ak, sk, st):
     print()
 
     print("cleaning up probe keys...")
+    keys_to_delete = [fixed_key] if single_key else [f"{prefix}/{i}" for i in range(iterations)]
     deleted = 0
-    for seq in range(iterations):
-        status, _, _ = s3_request(
-            "DELETE", bucket, f"{prefix}/{seq}", b"", {}, ak, sk, st
-        )
+    for k in keys_to_delete:
+        status, _, _ = s3_request("DELETE", bucket, k, b"", {}, ak, sk, st)
         if status in (200, 204):
             deleted += 1
-    print(f"deleted {deleted}/{iterations}")
+    print(f"deleted {deleted}/{len(keys_to_delete)}")
 
 
 def main():
@@ -244,6 +247,9 @@ def main():
                     help="write v_initial, then overwrite, then read")
     ap.add_argument("--consistent-puts", action="store_true",
                     help="also send X-Tigris-Consistent: true on PUTs")
+    ap.add_argument("--single-key", action="store_true",
+                    help="overwrite a single key across all iterations "
+                         "(stress test PUT-after-PUT visibility on one key)")
     args = ap.parse_args()
 
     ak = os.environ.get("AWS_ACCESS_KEY_ID")
@@ -253,7 +259,7 @@ def main():
         raise SystemExit("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set")
 
     run(args.bucket, args.pin_region, args.iterations, args.overwrite,
-        args.consistent_puts, ak, sk, st)
+        args.consistent_puts, args.single_key, ak, sk, st)
 
 
 if __name__ == "__main__":
