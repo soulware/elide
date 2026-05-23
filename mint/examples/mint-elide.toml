@@ -28,8 +28,8 @@ bucket = "elide-demo"
 name = "volume-ro"
 required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
-max_ttl_seconds = 2592000      # 30 days
-default_ttl_seconds = 2592000
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
 
 [[role]]
 name = "volume-rw"
