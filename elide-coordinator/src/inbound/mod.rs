@@ -1398,6 +1398,11 @@ async fn remove_volume(
     // place would orphan a kernel device whose stamped owner points at
     // a now-deleted vol_dir.
     let teardown_id: Option<i32> = bound_ublk_id(&vol_dir);
+    // Capture the pid alongside, before `remove_dir_all` takes the file
+    // with it. `stop`'s IPC ack returns before the daemon's `exit(0)`
+    // fires, so a quick stop → remove sequence can still race the ublk
+    // queue io_uring fds being released.
+    let prev_pid: Option<u32> = crate::ublk_sweep::read_volume_pid(&vol_dir);
 
     import::kill_all_for_volume(&vol_dir);
 
@@ -1429,6 +1434,9 @@ async fn remove_volume(
         .map_err(|e| IpcError::internal(format!("remove failed: {e}")))?;
 
     if let Some(id) = teardown_id {
+        if let Some(pid) = prev_pid {
+            crate::ublk_sweep::wait_for_pid_exit(pid).await;
+        }
         crate::ublk_sweep::teardown_bound_device(&vol_dir, id).await;
     }
 
@@ -1926,6 +1934,13 @@ async fn update_volume_op(
         _ => None,
     };
 
+    // Snapshot the live daemon's pid before the supervisor respawns it
+    // under the new cfg. Used after `shutdown` returns `Acknowledged` to
+    // wait for the OLD process to actually exit (releasing its ublk
+    // queue io_uring fds) before issuing `del_dev`.
+    let prev_pid: Option<u32> =
+        teardown_id.and_then(|_| crate::ublk_sweep::read_volume_pid(&vol_dir));
+
     cfg.write(&vol_dir)
         .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
 
@@ -1948,11 +1963,17 @@ async fn update_volume_op(
     };
 
     // Tear down after shutdown so the kernel's queue io_uring fds are
-    // released before del_dev waits on refcounts. The supervisor's
-    // respawn is racing us, but the new daemon reads the new cfg —
-    // either no ublk, or a different bound id — and never touches the
-    // old kernel device, so there is no conflict.
+    // released before del_dev waits on refcounts. `shutdown` returns
+    // when the daemon's IPC reply lands, which is *before* its
+    // `exit(0)` — wait for the pid to actually exit so the kernel's
+    // refcount on the ublk_device drops. The supervisor's respawn is
+    // racing us, but the new daemon reads the new cfg — either no
+    // ublk, or a different bound id — and never touches the old kernel
+    // device, so there is no conflict.
     if let Some(id) = teardown_id {
+        if let Some(pid) = prev_pid {
+            crate::ublk_sweep::wait_for_pid_exit(pid).await;
+        }
         crate::ublk_sweep::teardown_bound_device(&vol_dir, id).await;
     }
 
