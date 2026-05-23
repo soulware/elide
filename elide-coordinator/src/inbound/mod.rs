@@ -3289,6 +3289,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn create_volume_op_routes_pub_provenance_through_volume_rw_and_name_through_writer() {
+        // `create_volume_op` runs three S3-touching phases (volume.pub
+        // upload, volume.provenance upload, names/<name> claim) and
+        // each must ride the matching role:
+        //   - by_id/<vol>/{volume.pub,.provenance} → per-vol volume-rw
+        //   - names/<name> CAS + events/<name>/    → coord-writer
+        // The role pick happens at the top of the op via
+        // `core.stores.volume_data(&vol)` and `core.stores.{name_claims,
+        // event_journal}()`. A regression that swapped writer↔volume-rw
+        // would silently 403 on Tigris (memo
+        // `project_coordinator_per_volume_scoping.md`).
+        use elide_coordinator::stores::{
+            PassthroughStores, RecordingStores, RoleCall, ScopedStores,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let identity = std::sync::Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir).unwrap(),
+        );
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let passthrough: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(Arc::clone(&mem)));
+        let recording = RecordingStores::wrap(passthrough);
+
+        let core = CoordinatorCore {
+            data_dir: Arc::new(data_dir.to_path_buf()),
+            stores: recording.clone(),
+            identity,
+        };
+
+        let reply = create_volume_op("vol", 4 * 1024 * 1024 * 1024, &[], &core)
+            .await
+            .expect("create must succeed in this fixture");
+        let vol_ulid = reply.vol_ulid;
+
+        let calls = recording.calls();
+        // Per-volume writes (volume.pub, volume.provenance) must mint
+        // volume-rw for this fork's vol_ulid.
+        assert!(
+            calls.contains(&RoleCall::VolumeRw(vol_ulid)),
+            "create must route by_id/<vol>/{{volume.pub, volume.provenance}} \
+             through volume_rw({vol_ulid}); got {calls:?}"
+        );
+        // Coordinator-wide writes (names/<vol>, events/<vol>/) mint
+        // coord-writer plus coord-base reads (the name_claims +
+        // event_journal facades wrap both).
+        assert!(
+            calls.contains(&RoleCall::Writer),
+            "create must mint coord-writer for names/{{<name>, events}}; got {calls:?}"
+        );
+        // No read-only single-volume credential should appear: every
+        // create-time read is on local disk, and the only S3 reads
+        // are the conditional-PUT preflights inside name_claims/
+        // event_journal which ride coord-base via the facade.
+        for call in &calls {
+            assert!(
+                !matches!(
+                    call,
+                    RoleCall::ReadVolume(_) | RoleCall::ReadHeadWithAncestors(_, _)
+                ),
+                "create must not mint per-vol read credentials; saw {call:?} in {calls:?}"
+            );
+        }
+    }
+
     // ── bound_ublk_id / remove_volume ─────────────────────────────────────
 
     /// Build `data_dir/{by_id/<ulid>, by_name/<name>}` for a removable
