@@ -57,12 +57,33 @@ pub enum ConfigError {
     },
 }
 
+/// Deployment shape — picks both the enrollment-state backend and the
+/// `assume-role` keypair minter. `tigris` (the default) is the
+/// production shape: enrollment state lives in `_mint/` in the tenant
+/// bucket (via a self-vended `mint-rw` keypair) and `assume-role`
+/// vends real Tigris keys. `local` is the dev / co-resident shape:
+/// state under `<data_dir>/_mint/`, deterministic fake keypair minter,
+/// no Tigris admin credential required.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    #[default]
+    Tigris,
+    Local,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RawConfig {
     /// The audience name this mint answers to. A macaroon whose
     /// `Audience` caveat differs is rejected (cross-service replay
     /// defence).
     pub audience: String,
+    /// `tigris` (default) or `local`. See [`Backend`]. Both `serve` and
+    /// the operator commands (`invite`, `enroll …`) read this so the
+    /// nonce they print and the nonce serve compares against come from
+    /// the same backend.
+    #[serde(default)]
+    pub backend: Backend,
     /// Directory for mint's persisted state — the macaroon root key
     /// (`root_key`, generated on first start), the current invite
     /// nonce, and the transient pending-enrollment table, all under one
@@ -105,6 +126,23 @@ pub struct RawConfig {
 pub struct Tenant {
     /// Bucket name; surfaced to templates as `{{tenant.bucket}}`.
     pub bucket: String,
+    /// S3 endpoint URL. Used by `serve --tigris` to build the
+    /// data-plane client that reads and writes `_mint/*` under
+    /// [self-vended `mint-rw` credentials][mint-rw], distinct from
+    /// the IAM endpoint that `tigris.rs` calls. Omit to use Tigris's
+    /// default S3 endpoint
+    /// ([`crate::mint_rw::DEFAULT_TIGRIS_S3_ENDPOINT`]); set
+    /// explicitly only for a non-Tigris S3-compatible target
+    /// (custom AWS region, MinIO, etc.).
+    ///
+    /// [mint-rw]: crate::state::Store
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// S3 region; defaults to `us-east-1` (which Tigris accepts as a
+    /// no-op). Override only for non-Tigris S3-compatible backends that
+    /// reject the default.
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 /// Tigris admin credential, read from the standard AWS environment
@@ -214,6 +252,8 @@ pub struct Config {
     /// env is unset (fine for the prototype's faked minter; a real
     /// Tigris minter must check this is `Some`).
     pub admin: Option<AdminCredential>,
+    /// Deployment shape. See [`Backend`].
+    pub backend: Backend,
     pub roles: BTreeMap<String, Role>,
 }
 
@@ -288,6 +328,7 @@ impl Config {
             listener,
             tenant: raw.tenant,
             admin: AdminCredential::from_env(),
+            backend: raw.backend,
             roles,
         })
     }
@@ -527,6 +568,44 @@ policy_file = "volume-ro.json"
         assert!(matches!(
             parse_for_test(&toml, &[("volume-ro.json", "{}")]),
             Err(ConfigError::ConflictingListener)
+        ));
+    }
+
+    #[test]
+    fn backend_defaults_to_tigris_when_omitted() {
+        let c = parse_for_test(SAMPLE, &[("volume-ro.json", "{}")]).expect("parse");
+        assert_eq!(c.backend, Backend::Tigris);
+    }
+
+    #[test]
+    fn backend_local_parses() {
+        let toml = SAMPLE.replace(
+            "audience = \"mint\"",
+            "audience = \"mint\"\nbackend = \"local\"",
+        );
+        let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
+        assert_eq!(c.backend, Backend::Local);
+    }
+
+    #[test]
+    fn backend_tigris_parses_explicitly() {
+        let toml = SAMPLE.replace(
+            "audience = \"mint\"",
+            "audience = \"mint\"\nbackend = \"tigris\"",
+        );
+        let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
+        assert_eq!(c.backend, Backend::Tigris);
+    }
+
+    #[test]
+    fn backend_unknown_value_is_rejected() {
+        let toml = SAMPLE.replace(
+            "audience = \"mint\"",
+            "audience = \"mint\"\nbackend = \"oracle\"",
+        );
+        assert!(matches!(
+            parse_for_test(&toml, &[("volume-ro.json", "{}")]),
+            Err(ConfigError::Toml(_))
         ));
     }
 

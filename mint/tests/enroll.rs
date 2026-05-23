@@ -90,7 +90,7 @@ impl std::io::Write for AuditSink {
 /// (router, audit-buffer, store handle, tempdir guard). The store
 /// handle lets a test play the operator (`approve`); the tempdir must
 /// outlive the app.
-fn app() -> (
+async fn app() -> (
     axum::Router,
     Arc<Mutex<Vec<u8>>>,
     Arc<Store>,
@@ -98,11 +98,11 @@ fn app() -> (
 ) {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let dir = tempfile::tempdir().expect("tempdir");
-    // Seed the known root key (hex) so Store::open loads it (vs
+    // Seed the known root key (hex) so Store::open_local loads it (vs
     // generating one) and the macaroons minted with ROOT verify.
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
-    let store = Arc::new(Store::open(dir.path()).expect("store"));
+    let store = Arc::new(Store::open_local(dir.path()).await.expect("store"));
     let state = AppState {
         config: Arc::new(config()),
         minter: Arc::new(FakeMinter::new()),
@@ -110,6 +110,10 @@ fn app() -> (
         store: store.clone(),
     };
     (router(state), buf, store, dir)
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339()
 }
 
 fn now() -> u64 {
@@ -156,8 +160,8 @@ fn client_invite(nonce: &str, seed: &[u8; 32]) -> Macaroon {
 
 #[tokio::test]
 async fn full_flow_enroll_approve_exchange_then_assume_role() {
-    let (app, audit, store, _dir) = app();
-    let nonce = store.current_invite().unwrap();
+    let (app, audit, store, _dir) = app().await;
+    let nonce = store.current_invite().await.unwrap();
     let cb = client_invite(&nonce, &COORD_SEED);
 
     // (1) enroll → pending + ticket
@@ -188,7 +192,10 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // (3) operator approves the displayed sub
-    assert!(store.approve(SUB).unwrap());
+    store
+        .approve(SUB, &pop::cnf_value(&COORD_SEED), &now_iso())
+        .await
+        .unwrap();
 
     // (4) exchange → non-expiring, role-stamped credential
     let (status, body) = parts(
@@ -280,8 +287,8 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
 
 #[tokio::test]
 async fn idempotent_reenroll_same_pair() {
-    let (app, _a, store, _dir) = app();
-    let nonce = store.current_invite().unwrap();
+    let (app, _a, store, _dir) = app().await;
+    let nonce = store.current_invite().await.unwrap();
     let cb = client_invite(&nonce, &COORD_SEED);
     for _ in 0..2 {
         let (status, _) = parts(
@@ -297,8 +304,8 @@ async fn idempotent_reenroll_same_pair() {
 
 #[tokio::test]
 async fn conflicting_key_for_same_sub_is_opaque_401() {
-    let (app, _a, store, _dir) = app();
-    let nonce = store.current_invite().unwrap();
+    let (app, _a, store, _dir) = app().await;
+    let nonce = store.current_invite().await.unwrap();
     let (s, _) = parts(
         app.clone()
             .oneshot(signed(
@@ -329,10 +336,10 @@ async fn conflicting_key_for_same_sub_is_opaque_401() {
 
 #[tokio::test]
 async fn stale_invite_nonce_is_opaque_401() {
-    let (app, _a, store, _dir) = app();
-    let stale = store.current_invite().unwrap();
+    let (app, _a, store, _dir) = app().await;
+    let stale = store.current_invite().await.unwrap();
     let cb = client_invite(&stale, &COORD_SEED);
-    store.rotate_invite().unwrap(); // current nonce moves on
+    store.rotate_invite().await.unwrap(); // current nonce moves on
     let (status, _) = parts(
         app.oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
             .await
@@ -344,8 +351,8 @@ async fn stale_invite_nonce_is_opaque_401() {
 
 #[tokio::test]
 async fn enroll_pop_by_wrong_key_is_opaque_401() {
-    let (app, _a, store, _dir) = app();
-    let nonce = store.current_invite().unwrap();
+    let (app, _a, store, _dir) = app().await;
+    let nonce = store.current_invite().await.unwrap();
     // cnf bound to COORD_SEED, but the request is signed by OTHER_SEED.
     let cb = client_invite(&nonce, &COORD_SEED);
     let (status, _) = parts(
@@ -359,8 +366,8 @@ async fn enroll_pop_by_wrong_key_is_opaque_401() {
 
 #[tokio::test]
 async fn bearer_invite_without_cnf_is_opaque_401() {
-    let (app, _a, store, _dir) = app();
-    let nonce = store.current_invite().unwrap();
+    let (app, _a, store, _dir) = app().await;
+    let nonce = store.current_invite().await.unwrap();
     // sub but no cnf, and no PoP header: a captured invite copy must
     // not enrol. NotKeyBound is a refusal here.
     let cb = mint_invite(&ROOT, "mint", &nonce).attenuate(Caveat::scalar(name::SUB, SUB));
@@ -376,10 +383,13 @@ async fn bearer_invite_without_cnf_is_opaque_401() {
 }
 
 #[tokio::test]
-async fn exchange_without_a_pending_record_is_opaque_401() {
-    let (app, _a, _store, _dir) = app();
+async fn exchange_without_approval_returns_403_awaiting() {
+    let (app, _a, _store, _dir) = app().await;
     // A perfectly well-formed ticket (minted from root) for a sub
-    // that was never enrolled: no pending record → fail closed.
+    // that was never approved: the exchange-time check is
+    // `_mint/approved/<sub>` exists and its pub matches the cnf, so
+    // an unrecorded sub is indistinguishable from "operator hasn't
+    // approved yet" — both are the 403-awaited outcome.
     let inter = mint_credential_ticket(
         &ROOT,
         "mint",
@@ -393,5 +403,5 @@ async fn exchange_without_a_pending_record_is_opaque_401() {
             .unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

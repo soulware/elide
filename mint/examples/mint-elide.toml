@@ -2,6 +2,7 @@
 # docs/design-mint.md § "Elide as customer: role inventory".
 
 audience = "mint"
+# backend = "tigris"   # default; alternative: "local"
 
 # data_dir / roles_dir: a relative value (including the defaults
 # mint_data / mint_roles) resolves against the working directory, not
@@ -23,13 +24,15 @@ socket = "mint_data/mint.sock"        # client: --url unix:mint_data/mint.sock
 
 [tenant]
 bucket = "elide-demo"
+# endpoint = "https://t3.storage.dev"   # default; set for non-Tigris S3
+# region   = "us-east-1"                # default
 
 [[role]]
 name = "volume-ro"
 required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
-max_ttl_seconds = 2592000      # 30 days
-default_ttl_seconds = 2592000
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
 
 [[role]]
 name = "volume-rw"
