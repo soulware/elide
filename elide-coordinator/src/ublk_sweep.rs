@@ -31,8 +31,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tracing::{debug, info, warn};
+
+use elide_coordinator::volume_state::PID_FILE;
+use elide_core::process::pid_is_alive;
 
 const SYSFS_UBLK_CHAR: &str = "/sys/class/ublk-char";
 
@@ -239,6 +243,44 @@ fn diff(live: &HashSet<i32>, bindings: &HashMap<PathBuf, i32>) -> (Vec<i32>, Vec
         .collect();
     stale.sort_by(|a, b| a.0.cmp(&b.0));
     (orphans, stale)
+}
+
+/// How long to wait for an acknowledged-but-not-yet-exited volume daemon
+/// to finish process teardown before issuing `del_dev`. The kernel only
+/// drops the ublk_device refcount when the daemon's queue io_uring fds
+/// close on exit; without this wait `del_dev` blocks for its full 10 s
+/// timeout (see `PER_DEV_DELETE_TIMEOUT`).
+const POST_SHUTDOWN_EXIT_WAIT: Duration = Duration::from_secs(5);
+const PID_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Read `vol_dir/volume.pid` and return the parsed pid, if any. Absent or
+/// malformed pid files map to `None` — the daemon is not running, or its
+/// pid is unknown; either way the caller has nothing to wait for.
+pub(crate) fn read_volume_pid(vol_dir: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(vol_dir.join(PID_FILE)).ok()?;
+    text.trim().parse().ok()
+}
+
+/// Poll until `pid` exits or `POST_SHUTDOWN_EXIT_WAIT` elapses. Bridges the
+/// gap between `control::shutdown` returning `Acknowledged` (IPC reply
+/// observed) and the daemon's `std::process::exit(0)` actually firing —
+/// the volume writes its reply *before* exiting, so the kernel still
+/// holds references on the ublk_device when the coord proceeds.
+pub(crate) async fn wait_for_pid_exit(pid: u32) {
+    let deadline = tokio::time::Instant::now() + POST_SHUTDOWN_EXIT_WAIT;
+    loop {
+        if !pid_is_alive(pid) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                "[ublk-teardown] pid {pid} still alive after {:?}; proceeding with del_dev anyway",
+                POST_SHUTDOWN_EXIT_WAIT
+            );
+            return;
+        }
+        tokio::time::sleep(PID_POLL_INTERVAL).await;
+    }
 }
 
 /// Tear down a previously-bound kernel ublk device for this volume.
