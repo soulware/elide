@@ -289,17 +289,16 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
 /// Build an InMemory-backed test app so we can exercise `PutMode::Update`
 /// (LocalFileSystem returns `NotImplemented` for it). Mirrors `app()`
 /// otherwise, with a single-kid keyring seeded to `ROOT`.
-async fn app_in_memory() -> (axum::Router, Arc<Store>) {
+async fn app_in_memory() -> (axum::Router, Arc<Mutex<Vec<u8>>>, Arc<Store>) {
+    let buf = Arc::new(Mutex::new(Vec::new()));
     let store = Arc::new(Store::open_in_memory(ROOT).await.expect("store"));
     let state = AppState {
         config: Arc::new(config()),
         minter: Arc::new(FakeMinter::new()),
-        audit: Arc::new(AuditLog::new(Box::new(AuditSink(Arc::new(Mutex::new(
-            Vec::new(),
-        )))))),
+        audit: Arc::new(AuditLog::new(Box::new(AuditSink(buf.clone())))),
         store: store.clone(),
     };
-    (router(state), store)
+    (router(state), buf, store)
 }
 
 #[tokio::test]
@@ -310,7 +309,7 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
     // intervention. Verifies the runtime path of the retain-keychain
     // + lazy-migration design (`docs/design-mint.md` § *Root-key
     // rotation*).
-    let (app, store) = app_in_memory().await;
+    let (app, _audit, store) = app_in_memory().await;
     let nonce = store.current_invite().await.unwrap();
     let cb = client_invite(&nonce, &COORD_SEED);
 
@@ -395,7 +394,7 @@ async fn idempotent_reenroll_same_pair() {
 
 #[tokio::test]
 async fn conflicting_key_for_same_sub_is_opaque_401() {
-    let (app, _a, store, _dir) = app().await;
+    let (app, audit, store, _dir) = app().await;
     let nonce = store.current_invite().await.unwrap();
     let (s, _) = parts(
         app.clone()
@@ -423,6 +422,77 @@ async fn conflicting_key_for_same_sub_is_opaque_401() {
     )
     .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+    // Genuine conflict — the audit tag stays `enroll:denied:conflict`
+    // (the operator-facing distinction the audit log preserves while
+    // the client sees the same opaque 401 as any other failure).
+    let a = String::from_utf8(audit.lock().unwrap().clone()).unwrap();
+    assert!(
+        a.contains("\"outcome\":\"enroll:denied:conflict\""),
+        "audit must tag a genuine pending-conflict as 'enroll:denied:conflict': {a}",
+    );
+}
+
+#[tokio::test]
+async fn re_enroll_over_legacy_unsigned_approved_takes_slow_path() {
+    // The fix for the post-#454 upgrade footgun: a pre-existing
+    // approved record from before the keyring + MAC landed cannot
+    // be deserialised by the current `Approved` struct (missing
+    // kid + mac fields). Before this fix, `record_pending` propagated
+    // `StateError::Corrupt` and the handler tagged it
+    // `enroll:denied:conflict` — opaque 401 with a misleading audit
+    // line, blocking re-enrollment behind a state only inspection of
+    // the bucket could reveal.
+    //
+    // After: a corrupt approved record is treated as "no approved
+    // record" for the fast-path check, the slow path writes a fresh
+    // pending, and the operator can re-approve normally.
+    let (app, audit, store) = app_in_memory().await;
+    let nonce = store.current_invite().await.unwrap();
+
+    // Inject a pre-#454-shaped record at `_mint/approved/<SUB>` —
+    // the body lacks `kid` and `mac`, so deserialising it as the
+    // current `Approved` struct fails.
+    let legacy = serde_json::json!({
+        "pubkey": pop::cnf_value(&COORD_SEED),
+        "approved_at": now_iso(),
+        "fingerprint_shown": "deadbeef00112233",
+    });
+    let body = serde_json::to_vec(&legacy).unwrap();
+    store
+        .objects()
+        .put_opts(
+            &object_store::path::Path::from(format!("_mint/approved/{SUB}")),
+            object_store::PutPayload::from(axum::body::Bytes::from(body)),
+            object_store::PutOptions::default(),
+        )
+        .await
+        .expect("seed legacy approved");
+
+    let (status, _body) = parts(
+        app.oneshot(signed(
+            "/v1/enroll",
+            &client_invite(&nonce, &COORD_SEED),
+            &COORD_SEED,
+            "",
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "re-enroll over a corrupt approved must take the slow path, not 401",
+    );
+    let a = String::from_utf8(audit.lock().unwrap().clone()).unwrap();
+    assert!(
+        a.contains("\"outcome\":\"enroll:pending\""),
+        "audit must show the slow path was taken (enroll:pending), not denied:conflict: {a}",
+    );
+    assert!(
+        !a.contains("\"outcome\":\"enroll:denied:conflict\""),
+        "audit must NOT misreport a corrupt approved as a key conflict: {a}",
+    );
 }
 
 #[tokio::test]

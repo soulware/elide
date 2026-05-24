@@ -412,6 +412,13 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         }
     };
 
+    // Every Err branch returns the same opaque 401 to the client —
+    // the audit tag is the only place we distinguish, so operators
+    // reading mint's log can tell `denied:conflict` (genuine
+    // key-rotation collision against an existing pending) from
+    // `denied:bad_sub` (malformed sub at the boundary) from
+    // `denied:state_error` (something we didn't anticipate). The
+    // client signal is unchanged.
     let recorded = match state
         .store
         .record_pending(&sub, &cnf, &current, &caller, now_unix)
@@ -434,9 +441,21 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
                 json!({"error": "service unavailable"}),
             );
         }
-        // Conflict / BadSub / Corrupt: opaque 401 (don't distinguish).
-        Err(_) => {
+        Err(StateError::Conflict) => {
             audit("denied:conflict", &caveats);
+            return unauthorized(&request_id);
+        }
+        Err(StateError::BadSub) => {
+            audit("denied:bad_sub", &caveats);
+            return unauthorized(&request_id);
+        }
+        Err(e) => {
+            // Corrupt / Forged are handled inside `record_pending` by
+            // falling through to the slow path, so reaching this arm
+            // means a state-error variant we didn't expect to surface
+            // here. Log loudly server-side; client still gets 401.
+            tracing::warn!(error = %e, sub = %sub, "unexpected state error during record_pending");
+            audit("denied:state_error", &caveats);
             return unauthorized(&request_id);
         }
     };
@@ -583,7 +602,12 @@ async fn enroll_exchange(
         // gets no signal that distinguishes it from a missing record,
         // while the audit tag and `Store::get_approved`'s warn-log
         // give operators a forensic trail.
-        Ok(_) | Err(StateError::Forged) => {
+        // `Corrupt` joins `Forged` here for the same reason:
+        // operationally it means "no record we can trust" — a
+        // pre-#454 unsigned body, a partial overwrite, or anything
+        // else that breaks deserialisation. The fix is operator
+        // re-approval, identical to the Forged path.
+        Ok(_) | Err(StateError::Forged | StateError::Corrupt) => {
             audit("awaiting_approval", &caveats);
             return respond(
                 &request_id,
@@ -607,8 +631,16 @@ async fn enroll_exchange(
                 json!({"error": "service unavailable"}),
             );
         }
-        Err(_) => {
-            audit("denied:no_pending", &caveats);
+        Err(StateError::BadSub) => {
+            audit("denied:bad_sub", &caveats);
+            return unauthorized(&request_id);
+        }
+        Err(e) => {
+            // Conflict shouldn't reach `get_approved` (it's a
+            // pending-side error); reaching this arm is the
+            // unforeseen-state case. Log loudly, opaque 401 to client.
+            tracing::warn!(error = %e, sub = %sub, "unexpected state error during get_approved");
+            audit("denied:state_error", &caveats);
             return unauthorized(&request_id);
         }
     }

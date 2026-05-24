@@ -566,7 +566,21 @@ impl Store {
         if !safe_sub(sub) {
             return Err(StateError::BadSub);
         }
-        if let Some(approved) = self.get_approved(sub).await?
+        // Fast-path check: only `Ok(Some(_))` is load-bearing here.
+        // A forged or corrupt approved record (e.g. left over from a
+        // retired-kid generation, or a pre-#454 unsigned body that
+        // can't be deserialised) is operationally equivalent to "no
+        // approved record" — we want the slow path to proceed so the
+        // operator can re-approve cleanly. Propagating Forged/Corrupt
+        // through here would block re-enrollment behind an opaque
+        // 401 with no way for the operator to recover without
+        // manually deleting the bucket object.
+        let approved = match self.get_approved(sub).await {
+            Ok(a) => a,
+            Err(StateError::Forged | StateError::Corrupt) => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(approved) = approved
             && approved.pubkey == pubkey
         {
             return Ok(Recorded::AlreadyApproved);
@@ -1459,6 +1473,59 @@ mod tests {
             s.get_approved("01ARZ").await,
             Err(StateError::Forged)
         ));
+    }
+
+    #[tokio::test]
+    async fn record_pending_falls_through_on_corrupt_approved() {
+        // A pre-#454 unsigned body (or any record that won't
+        // deserialise as the current `Approved` struct) is treated as
+        // "no approved record" for the fast-path check — the slow
+        // path proceeds and writes a fresh pending. Previously this
+        // returned Err(Corrupt) and surfaced as an opaque 401 with
+        // a misleading `denied:conflict` audit tag, blocking
+        // re-enrollment behind a state the operator couldn't see
+        // without inspecting the bucket directly.
+        let (_d, s) = store().await;
+        let legacy_unsigned = serde_json::json!({
+            "pubkey": PUBA,
+            "approved_at": APPROVED_AT,
+            "fingerprint_shown": fingerprint(PUBA),
+            // No kid, no mac — pre-#454 shape.
+        });
+        raw_put_approved(&s, "01ARZ", &legacy_unsigned).await;
+        let invite = s.current_invite().await.unwrap();
+        let recorded = s
+            .record_pending("01ARZ", PUBA, &invite, "ip", 1)
+            .await
+            .expect("record_pending must NOT error on corrupt approved");
+        assert_eq!(recorded, Recorded::Created);
+        // And the pending record now exists so the next /v1/enroll
+        // (with the same pubkey) is idempotent and the operator can
+        // re-approve cleanly.
+        assert!(s.get_pending("01ARZ").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn record_pending_falls_through_on_forged_approved() {
+        // Same defence-in-depth as the Corrupt case: an approved
+        // record under a retired/unknown kid (or with a forged MAC)
+        // should not block re-enrollment.
+        let (_d, s) = store().await;
+        let forged = serde_json::json!({
+            "pubkey": PUBA,
+            "approved_at": APPROVED_AT,
+            "fingerprint_shown": fingerprint(PUBA),
+            "kid": 0,
+            "mac": "00".repeat(32),
+        });
+        raw_put_approved(&s, "01ARZ", &forged).await;
+        let invite = s.current_invite().await.unwrap();
+        let recorded = s
+            .record_pending("01ARZ", PUBA, &invite, "ip", 1)
+            .await
+            .expect("record_pending must NOT error on forged approved");
+        assert_eq!(recorded, Recorded::Created);
+        assert!(s.get_pending("01ARZ").await.unwrap().is_some());
     }
 
     #[tokio::test]
