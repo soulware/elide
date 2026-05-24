@@ -58,8 +58,20 @@ jobs:
       # protects, and the per-op disk-rebuild dominates their runtime.
       # `elide-coordinator/proptest` propagates `elide-core/volume-invariants`
       # so the gc_proptest run gets the drift detection.
+      #
+      # Each step targets named test binaries (not `--tests`) so this
+      # lane runs only the proptest-gated targets. `--tests` would also
+      # re-run every regular unit + integration test in the crate under
+      # the `proptest` feature, doubling those across the two lanes and
+      # producing duplicate failure rows for the same root cause.
       - name: cargo test (elide-core proptests)
-        run: "cargo test -p elide-core --features proptest --tests --no-fail-fast"
+        run: |
+          cargo test -p elide-core --features proptest --no-fail-fast \
+            --test actor_proptest \
+            --test dmat_proptest \
+            --test fork_proptest \
+            --test volume_proptest \
+            --test multi_volume_proptest
 
       # The materialized reproducers are a handful of short, deterministic
       # sequences — cheap enough to run with `volume-invariants` on, which
@@ -71,7 +83,10 @@ jobs:
         run: "cargo test -p elide-core --features proptest,volume-invariants --test volume_reproducers --no-fail-fast"
 
       - name: cargo test (elide-coordinator proptests)
-        run: "cargo test -p elide-coordinator --features proptest --tests --no-fail-fast"
+        run: |
+          cargo test -p elide-coordinator --features proptest --no-fail-fast \
+            --test gc_proptest \
+            --test segment_head_proptest
 
   # `mint` is its own workspace (excluded from the root one), so the
   # jobs above never touch it. This dedicated lane is its entire CI:
