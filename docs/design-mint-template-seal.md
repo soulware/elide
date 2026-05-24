@@ -75,11 +75,15 @@ serves entirely from an immutable in-memory cache loaded at startup
 — the on-disk files are not re-read on the request path.
 
 The seal is replaced by a single explicit operator command,
-`mint seal`. There is no auto-seal-on-start and no hot-reload — a
-running mint instance has exactly one possible state with respect
-to templates: *verified against the current seal, serving from the
-in-memory cache loaded at that verification.* Anything else is
-"not running."
+`mint seal`. The command is purely local — it reads templates,
+signs the manifest under the keyring, and writes the result to
+`<data_dir>/pending-seal.json`. The bucket PUT happens inside
+`mint serve` on the next startup, so the CLI needs no bucket
+credentials of its own. There is no auto-seal-on-start and no
+hot-reload — a running mint instance has exactly one possible
+state with respect to templates: *verified against the current
+canonical seal, serving from the in-memory cache loaded at that
+verification.* Anything else is "not running."
 
 ## The seal object
 
@@ -128,10 +132,10 @@ Fields:
 
 ## The `mint seal` command
 
-A top-level CLI subcommand. Runs whether or not the daemon is up —
-it reads local templates, opens the bucket directly using the same
-credentials the daemon would use (`mint-rw` keypair via the admin
-credential's IAM machinery), and PUTs the seal.
+A top-level CLI subcommand. The authoring step is purely local —
+read templates, hash, MAC under the keyring — and the result is
+written to a pending file on disk for `mint serve` to publish on
+its next startup. The CLI never opens the bucket.
 
 ```
 mint seal [--config <path>]
@@ -142,43 +146,95 @@ Steps:
 1. Load `mint.toml`. Walk every `[[role]]` block.
 2. For each role, read `<roles_dir>/<policy_file>`, hash the bytes
    with BLAKE3, store `(role_name → role_block_with_hash)`.
-3. Open the bucket. Load the keyring (`<data_dir>/root_keys/`).
+3. Load the keyring (`<data_dir>/root_keys/`).
 4. Build the seal JSON, MAC under `keyring.current_kid()`.
-5. `PUT _mint/templates/seal.json` (overwrite — the operator is the
-   authority; no etag-CAS). Audit-log the operation locally with
-   `(kid, sealed_at, per-role hashes)` for diff-on-next-seal
-   forensics.
+5. Write the signed seal to `<data_dir>/pending-seal.json` (atomic
+   tmp+rename, mode 0600). Print a one-line summary to stdout
+   naming the kid, `sealed_at`, and per-role hashes.
 
-Step 3 means `mint seal` needs the same IAM-plane credentials
-`mint serve` uses on first start. In practice the operator runs both
-under the same secrets-manager context.
+That's it. No bucket I/O, no IAM-plane work, no daemon dependency.
+The CLI's required surface is exactly what the operator needs to
+run mint at all: filesystem access to `roles_dir/`, `mint.toml`,
+and `<data_dir>/root_keys/`. Cold `mint seal` against a stopped
+daemon works identically to `mint seal` against a running one —
+both stage the same pending file.
+
+The pending file is signed under the same keyring as approvals and
+credential macaroons. An attacker with fs access to `<data_dir>/`
+already holds the keyring; the pending file is no more sensitive
+than what was already there.
+
+Subsequent `mint seal` invocations overwrite `pending-seal.json`.
+The operator can also discard a pending seal pre-restart by
+removing the file — explicit, easy to undo.
+
+## Publishing on `mint serve` startup
+
+The PUT to the bucket happens inside `mint serve`. On startup,
+before the existing verification path:
+
+1. Load the keyring.
+2. If `<data_dir>/pending-seal.json` exists:
+   - Verify its MAC under the keyring. Invalid kid or bad MAC →
+     refuse to start with the diff and the path to the bad file.
+     This case means the keyring rotated between seal-authoring
+     and serve-startup such that the authoring kid is no longer in
+     the ring; operator re-seals.
+   - `GET _mint/templates/seal.json` (the current canonical seal,
+     if any).
+   - If the canonical seal exists and is **semantically equal** to
+     the pending (same `audience`, same `roles` content including
+     per-template hashes — ignoring `sealed_at`, `kid`, `mac`),
+     delete the pending file and proceed: another host already
+     published this intent.
+   - Otherwise: `PUT _mint/templates/seal.json` (overwrite — the
+     operator is the authority; no etag-CAS), then delete the
+     pending file.
+   - In either case, append an audit entry naming `kid`, the
+     pending's `sealed_at`, the daemon's published-at timestamp,
+     and per-role hashes.
+3. Proceed with startup verification against the canonical bucket
+   seal (next section).
+
+Semantic equality is a small helper, intentionally narrow: a
+strict comparison over the *intent* fields (`audience` and the
+`roles` map with its hashes), ignoring the *metadata* fields
+(`sealed_at`, `kid`, `mac`). This is what handles the
+"every-host-signs / first-restart-wins / subsequent-restarts-
+reconcile" pattern below: identical intent on two hosts produces
+seals that differ only in `sealed_at` (and therefore `mac`), and
+the second host gracefully recognises the bucket already
+represents its intent.
+
+A `mint serve` with no pending file falls through to startup
+verification unchanged — the steady-state path is cheap (no
+extra reads, no extra writes).
 
 ## Startup verification
 
-`mint serve`:
+After the publish-pending step above:
 
-1. Load the keyring (existing path, PR #454).
-2. `GET _mint/templates/seal.json`. If `NotFound`: refuse to start
+1. `GET _mint/templates/seal.json`. If `NotFound`: refuse to start
    with *"no template seal at `_mint/templates/seal.json`; run
    `mint seal` first."* No implicit-first-seal — deleting the seal
    must not silently re-commit whatever's on disk on the next
    restart.
-3. Verify the seal's MAC. If `kid` is not in the ring (retired or
+2. Verify the seal's MAC. If `kid` is not in the ring (retired or
    unknown): refuse to start with the diff. If MAC mismatches under
    the named kid: same.
-4. Load `mint.toml` locally. Compare its role blocks to the seal.
+3. Load `mint.toml` locally. Compare its role blocks to the seal.
    Any drift in `required_caveats`, TTL bounds, etc. → refuse with
    the diff.
-5. For each role, read `<roles_dir>/<policy_file>`, hash, compare to
+4. For each role, read `<roles_dir>/<policy_file>`, hash, compare to
    the seal's `policy_blake3`. Any mismatch → refuse with the diff.
-6. Parse and template-compile each policy file once. Hold parsed
+5. Parse and template-compile each policy file once. Hold parsed
    templates in memory (`Arc<TemplateSet>`).
-7. Proceed to serving.
+6. Proceed to serving.
 
 The cache is immutable for the process lifetime. The request path
 reads it without locking; render-time consults nothing on disk.
 
-The error messages on (2)–(5) name the specific divergence — *"role
+The error messages on (1)–(4) name the specific divergence — *"role
 volume-ro: required_caveats sealed as [elide:Volume, aud, exp], local
 has [aud, exp]; restore the sealed values or run `mint seal` to
 commit the new content."* Refuse-closed is binary; the operator needs
@@ -214,8 +270,8 @@ and reintroduce the tamper window. We do not use `mmap`.
 ### Single instance
 
 ```
-mint seal              # commits initial templates as canonical
-mint serve             # verifies, runs
+mint seal              # stages pending-seal.json locally
+mint serve             # publishes the pending, verifies, runs
 ```
 
 To update templates:
@@ -223,30 +279,46 @@ To update templates:
 ```
 systemctl stop mint
 edit roles_dir/volume-ro.json
-mint seal              # commits the new content
-systemctl start mint   # verifies, runs against new content
+mint seal              # stages the new pending
+systemctl start mint   # publishes + verifies + runs against new content
 ```
 
 The downtime window is the restart itself — small for a stateless
 auth service.
 
-### Multi-instance
+### Multi-instance (recommended: every host signs)
 
-The seal in `_mint/` is the cross-instance agreement. Routine
-update:
+`mint seal` is a purely local operation, so the simplest workflow
+is to run it on every host as part of the same provisioning step
+that drops in the new template files:
 
-1. Provision the new template files to every mint host (Ansible /
-   Salt / whatever already ships `mint.toml`).
-2. Run `mint seal` once, against the bucket, from any host (or from
-   an operator workstation with the right credentials — `mint seal`
-   doesn't require a running daemon).
-3. Rolling-restart mint on every host. Each restart's startup
-   verification confirms the local templates match the new seal.
+1. Provisioning system writes the new template files to every host.
+2. Same provisioning system runs `mint seal` on every host.
+   Each host stages its own `pending-seal.json` over the same
+   template inputs — identical intent, different `sealed_at`.
+3. Rolling-restart every host. The first restart publishes its
+   pending to the bucket. Each subsequent restart, on seeing both
+   its local pending and a bucket seal already representing the
+   same intent (semantic equality), deletes its pending and
+   proceeds. No operator coordination required.
 
-A host that gets restarted before step 1 has been applied to it
-fails startup verification — caught by the orchestrator (the
-rolling-restart fails fast on that host) before any client is
+A host that gets restarted before steps 1–2 have been applied to
+it fails startup verification (local templates don't match the
+bucket seal) — caught by the orchestrator before any client is
 routed to a half-updated instance.
+
+### Multi-instance (alternative: one host signs)
+
+If the operator prefers, `mint seal` can be run on a single host
+(any one) before the rolling restart. The signed host's pending
+publishes on its restart; remaining hosts have no pending file
+and verify against the freshly-published bucket seal. Same end
+state.
+
+Either pattern works because semantic-equality reconcile makes
+"every host signs" benign: redundant pending files don't cause
+extra writes or conflicting intent, they just get cleaned up
+quietly. Pick whichever fits the provisioning pipeline better.
 
 ### Rollout consistency note
 
@@ -330,18 +402,29 @@ operator's nose every time the keyring rotated).
 
 ## Open questions
 
-1. **Bucket credentials for cold `mint seal`.** The CLI needs S3
-   write access to `_mint/templates/seal.json`. Easiest: use the
-   same admin credential the daemon bootstraps from. Alternative:
-   a dedicated `mint-seal` keypair, scoped narrower. Probably not
-   worth the IAM-plane ceremony for v1.
-2. **Where the audit-log entry for `mint seal` lives.** Today
-   mint's audit log is a server-side file; the CLI doesn't have
-   one. Either teach the CLI to append to the same file (mode
-   issues, since it runs as the operator not as mint's UID) or
-   write a separate `seal-audit.log` next to `mint.toml`. The
-   audit is forensic value, not security-critical — both work.
-3. **Whether `mint seal` should pre-render policies and verify they
-   compile against a synthetic caveat set.** Catches "template
-   parses but breaks at render time" at seal time rather than
-   first-request time. Cheap to add; possibly v1.1.
+1. **Whether `mint seal` should pre-render policies and verify
+   they compile against a synthetic caveat set.** Catches
+   "template parses but breaks at render time" at seal time
+   rather than first-request time. Cheap to add; possibly v1.1.
+2. **Behaviour when `pending-seal.json` exists but the keyring no
+   longer holds its kid.** Current design: refuse to start with a
+   clear message and leave the pending file in place, so the
+   operator can inspect it before re-sealing under the current
+   kid. Alternative: delete the pending automatically and fall
+   through to bucket-seal verification (operator re-runs `mint
+   seal` if they meant to). The "leave in place" choice
+   prioritises visibility; revisit if it turns out to be
+   confusing in practice.
+
+## Resolved during design
+
+- **Bucket credentials for cold `mint seal`.** Resolved by
+  deferred-PUT: the CLI never touches the bucket, so no
+  cold-mode credential question. The daemon's existing bootstrap
+  admin credential remains the single principal for `_mint/`
+  writes.
+- **Where the audit-log entry for `mint seal` lives.** Resolved
+  by deferred-PUT: the daemon writes the audit entry on its next
+  startup, when it actually publishes. The pending file carries
+  the CLI-side `sealed_at` so the audit entry can record both
+  "authored at" and "published at" times.
