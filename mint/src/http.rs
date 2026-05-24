@@ -163,7 +163,8 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         audit(base_entry("denied:unauthenticated"));
         return unauthorized(&request_id);
     };
-    if !mac.verify(&state.store.root_key()) {
+    let keyring = state.store.keyring().await;
+    if !mac.verify(&keyring) {
         audit(base_entry("denied:bad_mac"));
         return unauthorized(&request_id);
     }
@@ -356,7 +357,8 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         audit("denied:unauthenticated", &[]);
         return unauthorized(&request_id);
     };
-    if !mac.verify(&state.store.root_key()) {
+    let keyring = state.store.keyring().await;
+    if !mac.verify(&keyring) {
         audit("denied:bad_mac", &[]);
         return unauthorized(&request_id);
     }
@@ -440,7 +442,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     };
 
     let ticket = issuance::mint_credential_ticket(
-        &state.store.root_key(),
+        &keyring,
         &state.config.audience,
         &sub,
         &cnf,
@@ -450,6 +452,30 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     // `cnf`) means /v1/enroll-exchange will succeed immediately on the
     // returned ticket without any operator action; the slow path
     // requires `mint enroll approve <sub>` to fire first.
+    //
+    // Lazy migration: every coordinator restart pings /v1/enroll, so
+    // this is the natural place to drift `_mint/approved/<sub>`
+    // forward to the keyring's current kid (`docs/design-mint.md` §
+    // *Root-key rotation*). Best-effort and untimed; failures are
+    // logged, never blocking — the MAC check in `get_approved` is
+    // what makes correctness load-bearing, not this write.
+    if matches!(recorded, Recorded::AlreadyApproved) {
+        match state.store.migrate_approval_to_current_kid(&sub).await {
+            Ok(true) => tracing::info!(
+                target: "mint::http",
+                sub = %sub,
+                kid = keyring.current_kid(),
+                "approval lazily migrated to current kid",
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                target: "mint::http",
+                sub = %sub,
+                error = %e,
+                "approval lazy migration failed; record still valid under prior kid",
+            ),
+        }
+    }
     audit(
         match recorded {
             Recorded::AlreadyApproved => "fast_path",
@@ -500,7 +526,8 @@ async fn enroll_exchange(
         audit("denied:unauthenticated", &[]);
         return unauthorized(&request_id);
     };
-    if !mac.verify(&state.store.root_key()) {
+    let keyring = state.store.keyring().await;
+    if !mac.verify(&keyring) {
         audit("denied:bad_mac", &[]);
         return unauthorized(&request_id);
     }
@@ -548,10 +575,15 @@ async fn enroll_exchange(
     // *this* (sub, pub) pair (`docs/design-mint.md` § *Enrollment* (3)).
     match state.store.get_approved(&sub).await {
         Ok(Some(a)) if a.pubkey == cnf => {}
-        Ok(_) => {
-            // The one non-401 authorization outcome: awaited, not a
-            // failure. Includes both "never approved" and "approved
-            // under a different pub" (pending key-rotation re-approval).
+        // The one non-401 authorization outcome: awaited, not a
+        // failure. Includes both "never approved" and "approved
+        // under a different pub" (pending key-rotation re-approval).
+        // A `Forged` record (bucket-level tamper, or a record left
+        // behind by a retired kid) is folded in here too: the client
+        // gets no signal that distinguishes it from a missing record,
+        // while the audit tag and `Store::get_approved`'s warn-log
+        // give operators a forensic trail.
+        Ok(_) | Err(StateError::Forged) => {
             audit("awaiting_approval", &caveats);
             return respond(
                 &request_id,
@@ -595,13 +627,7 @@ async fn enroll_exchange(
         }
     };
 
-    let credential = issuance::mint_credential(
-        &state.store.root_key(),
-        &state.config.audience,
-        &sub,
-        &cnf,
-        &role,
-    );
+    let credential = issuance::mint_credential(&keyring, &state.config.audience, &sub, &cnf, &role);
     // The approved-registry entry is not consumed: the ticket is
     // multi-use until its `exp` and the entry powers the re-enrollment
     // fast path beyond that.

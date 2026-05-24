@@ -21,6 +21,7 @@ pub mod config;
 pub mod http;
 pub mod iam;
 pub mod issuance;
+pub mod keyring;
 pub mod macaroon;
 pub mod mint_rw;
 pub mod pop;

@@ -654,7 +654,12 @@ mod tests {
 
     #[test]
     fn invite_arg_accepts_inline_or_file_and_rejects_neither() {
-        let wire = crate::issuance::mint_invite(&[1u8; 32], "mint", "nonce").encode();
+        let wire = crate::issuance::mint_invite(
+            &crate::keyring::Keyring::single([1u8; 32]),
+            "mint",
+            "nonce",
+        )
+        .encode();
         // inline: the value itself is the macaroon
         assert!(read_macaroon_arg(&wire).is_ok());
         // file path containing it
@@ -757,8 +762,13 @@ mod tests {
         ));
 
         // Persist a real minted credential at credentials/write.
-        let cred =
-            crate::issuance::mint_credential(&[7u8; 32], "mint", "coord-1", "ed25519:k", "write");
+        let cred = crate::issuance::mint_credential(
+            &crate::keyring::Keyring::single([7u8; 32]),
+            "mint",
+            "coord-1",
+            "ed25519:k",
+            "write",
+        );
         save_macaroon(dir, &credential_path("write"), &cred.encode()).unwrap();
         assert!(credential_list(dir).is_ok());
         assert!(credential_inspect(dir, "write").is_ok());

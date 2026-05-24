@@ -363,9 +363,11 @@ async fn open_store(
                 cfg.tenant.region.as_deref(),
             )
             .await?;
-            let root_key_path = cfg.data_dir.join("root_key");
             std::fs::create_dir_all(&cfg.data_dir)?;
-            let store = Store::open_remote(s3, &root_key_path).await?;
+            let legacy = cfg.data_dir.join("root_key");
+            let store =
+                Store::open_remote(s3, &cfg.data_dir.join("root_keys"), Some(&legacy), None)
+                    .await?;
             Ok((
                 store,
                 Some(TigrisHandles {
