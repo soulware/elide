@@ -409,6 +409,9 @@ impl Store {
     fn approved_prefix() -> OPath {
         OPath::from(format!("{STATE_PREFIX}/approved"))
     }
+    fn template_seal_key() -> OPath {
+        OPath::from(format!("{STATE_PREFIX}/templates/seal.json"))
+    }
 
     /// Initialise the invite nonce on first start (idempotent), then
     /// populate the local cache from the canonical object.
@@ -964,6 +967,42 @@ impl Store {
             }
         }
         Ok(dropped)
+    }
+
+    /// Read the bucket-canonical template seal, if any. Returns
+    /// `Ok(None)` for an empty bucket (the operator hasn't run
+    /// `mint seal` yet); otherwise the deserialised seal body
+    /// **without** any MAC verification — callers verify against
+    /// their local keyring themselves so the caller's keyring
+    /// snapshot is consistent with whatever else they're checking.
+    pub async fn get_template_seal(&self) -> Result<Option<crate::seal::Seal>, StateError> {
+        match self.objects.get(&Self::template_seal_key()).await {
+            Ok(g) => {
+                let bytes = g.bytes().await?;
+                let seal: crate::seal::Seal =
+                    serde_json::from_slice(&bytes).map_err(|_| StateError::Corrupt)?;
+                Ok(Some(seal))
+            }
+            Err(OsError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write the bucket-canonical template seal (overwrite). The
+    /// operator is the authority for seal content; this is the one
+    /// PUT path. Caller is responsible for having built and MAC'd the
+    /// seal under a kid that is current at publish time — typically
+    /// `mint serve`'s startup, picking up a pending file from disk.
+    pub async fn put_template_seal(&self, seal: &crate::seal::Seal) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec(seal).map_err(|_| StateError::Corrupt)?;
+        self.objects
+            .put_opts(
+                &Self::template_seal_key(),
+                PutPayload::from(Bytes::from(bytes)),
+                PutOptions::default(),
+            )
+            .await?;
+        Ok(())
     }
 
     /// All enrollment rows — pending and approved — for

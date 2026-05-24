@@ -2,9 +2,14 @@
 
 ## Status
 
-Proposed. Follows on from `docs/design-mint.md` § *Mint state in the
-tenant bucket* and § *Root-key rotation* (the keyring landed in
-PR #454). No code yet — this doc is the design.
+Implemented. Follows on from `docs/design-mint.md` § *Mint state in
+the tenant bucket* and § *Root-key rotation* (the keyring landed in
+PR #454). Module: `mint/src/seal.rs`. CLI verb: `mint seal`. Startup
+hook: `mint::seal::publish_pending_and_verify`, called from
+`mint serve` before any listener binds. Tests: 14 unit + 8
+integration, covering the happy path and every refuse-closed case
+(tampered template, missing seal, retired-kid pending, semantic-
+equality reconcile).
 
 ## Why
 

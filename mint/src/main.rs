@@ -65,6 +65,20 @@ enum Command {
         #[command(subcommand)]
         cmd: RoleCmd,
     },
+    /// Operator: stage a new template seal under the current keyring,
+    /// to be published on the next `mint serve` startup.
+    ///
+    /// Reads `roles_dir/` + `mint.toml`, hashes each role's policy
+    /// template, signs the manifest under
+    /// `<data_dir>/root_keys/current`, and writes the result to
+    /// `<data_dir>/pending-seal.json` (mode 0600, atomic). No bucket
+    /// I/O — `mint serve` performs the PUT on its next start, with
+    /// semantic-equality reconcile against whatever is already in
+    /// `_mint/templates/seal.json`.
+    Seal {
+        #[arg(long, default_value = "mint.toml")]
+        config: PathBuf,
+    },
     /// Reference client — the coordinator's half of the flow.
     Client {
         /// Identity + received-macaroon directory (default
@@ -236,6 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             EnrollCmd::Approve { config, sub, yes } => enroll_approve(&config, &sub, yes).await,
             EnrollCmd::Revoke { config, sub } => enroll_revoke(&config, &sub).await,
         },
+        Command::Seal { config } => seal(&config).await,
         Command::Role { cmd } => match cmd {
             RoleCmd::List { config } => role_list(&config),
             RoleCmd::Inspect { config, name } => role_inspect(&config, &name),
@@ -393,6 +408,13 @@ async fn serve(
     let config = Arc::new(load(config)?);
     let (store, tigris) = open_store(&config).await?;
     let store = Arc::new(store);
+
+    // Template seal: publish any pending file on disk, then verify
+    // the canonical seal matches local config + template hashes.
+    // Refuse-closed on any divergence (`docs/design-mint-template-seal.md`).
+    mint::seal::publish_pending_and_verify(&config, &store)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // `assume-role` minter: in tigris mode reuse the `TigrisMinter` we
     // already built for `mint-rw` vending; in local mode the
@@ -598,6 +620,39 @@ async fn enroll_revoke(config: &Path, sub: &str) -> Result<(), Box<dyn std::erro
     } else {
         Err(format!("no approved entry for sub {sub}").into())
     }
+}
+
+/// `mint seal` — stage a pending template seal at
+/// `<data_dir>/pending-seal.json` to be published on the next
+/// `mint serve` startup. Purely local: opens the keyring directly,
+/// hashes each role's already-loaded policy bytes, MACs under the
+/// current kid. No bucket I/O, no daemon dependency.
+async fn seal(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = load(config_path)?;
+    let keyring_dir = cfg.data_dir.join("root_keys");
+    let legacy_singleton = cfg.data_dir.join("root_key");
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    let keyring = mint::keyring::Keyring::open(&keyring_dir, Some(&legacy_singleton), None)
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("open keyring at {}: {e}", keyring_dir.display()).into()
+        })?;
+    let sealed_at = chrono::Utc::now().to_rfc3339();
+    let seal = mint::seal::Seal::build_from_config(&cfg, &keyring, &sealed_at);
+    let pending_path = cfg.data_dir.join("pending-seal.json");
+    mint::seal::write_pending(&pending_path, &seal)?;
+    eprintln!(
+        "staged seal: kid={} sealed_at={} roles=[{}] → {}",
+        seal.kid,
+        seal.sealed_at,
+        seal.roles
+            .iter()
+            .map(|(name, r)| format!("{name}:{}", &r.policy_blake3[..12]))
+            .collect::<Vec<_>>()
+            .join(", "),
+        pending_path.display(),
+    );
+    eprintln!("publish via the next `mint serve` startup");
+    Ok(())
 }
 
 fn role_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
