@@ -57,7 +57,13 @@ use elide_coordinator::identity::CoordinatorIdentity;
 
 use crate::credential::{CredentialIssuer, Credentialer, IssuedCredentials};
 
-const MAGIC: &[u8; 5] = b"mcrn1";
+/// Wire-format magic. v2 added a 2-byte BE `kid` prefix after the
+/// magic, naming the macaroon root-key generation that minted it
+/// (`mint/src/keyring.rs`, `mint/src/macaroon.rs`). The coordinator
+/// preserves the kid bytes through decode → attenuate → encode but
+/// never resolves them — it does not hold the keyring and does not
+/// verify.
+const MAGIC: &[u8; 5] = b"mcrn2";
 const NONCE_LEN: usize = 16;
 
 /// Canonical mint role inventory — the single source of truth shared by
@@ -116,8 +122,12 @@ fn serialize_one(name: &str, value: &str) -> Vec<u8> {
 
 /// A decoded mint macaroon. The coordinator only ever decodes one mint
 /// gave it, appends narrowing caveats, and re-encodes — it has no root
-/// key, so it neither mints nor verifies.
+/// key, so it neither mints nor verifies. The `kid` is preserved
+/// opaquely through the round-trip so re-encoded bytes match what mint
+/// will accept (kid is part of the MAC seed, not the wire-level chain
+/// extension — so attenuation doesn't touch it).
 pub(crate) struct WireMacaroon {
+    kid: u16,
     nonce: [u8; NONCE_LEN],
     caveats: Vec<Caveat>,
     mac: [u8; 32],
@@ -142,6 +152,11 @@ impl WireMacaroon {
         if take(MAGIC.len())? != MAGIC {
             return Err(io::Error::other("credential macaroon: bad magic"));
         }
+        let kid = u16::from_be_bytes(
+            take(2)?
+                .try_into()
+                .map_err(|_| io::Error::other("credential macaroon: truncated"))?,
+        );
         let nonce: [u8; NONCE_LEN] = take(NONCE_LEN)?
             .try_into()
             .map_err(|_| io::Error::other("credential macaroon: truncated"))?;
@@ -163,6 +178,7 @@ impl WireMacaroon {
             return Err(io::Error::other("credential macaroon: trailing bytes"));
         }
         Ok(Self {
+            kid,
             nonce,
             caveats,
             mac,
@@ -189,6 +205,7 @@ impl WireMacaroon {
     pub(crate) fn encode(&self) -> String {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&self.kid.to_be_bytes());
         buf.extend_from_slice(&self.nonce);
         buf.extend_from_slice(&self.mac);
         buf.extend_from_slice(&(self.caveats.len() as u16).to_be_bytes());
@@ -669,11 +686,19 @@ mod tests {
 
     /// Build a wire macaroon the way `mint/src/macaroon.rs` does, so
     /// the coordinator's decode/attenuate/encode is checked against the
-    /// real construction without depending on the mint crate.
-    fn mint_like(root: &[u8; 32], nonce: [u8; NONCE_LEN], caveats: &[(&str, &str)]) -> String {
-        const DOMAIN: &[u8] = b"mint-macaroon-v1";
+    /// real construction without depending on the mint crate. Mirrors
+    /// the v2 wire format: kid bound into the MAC seed and prefixed on
+    /// the wire.
+    fn mint_like(
+        root: &[u8; 32],
+        kid: u16,
+        nonce: [u8; NONCE_LEN],
+        caveats: &[(&str, &str)],
+    ) -> String {
+        const DOMAIN: &[u8] = b"mint-macaroon-v2";
         let mut seed_msg = Vec::new();
         seed_msg.extend_from_slice(DOMAIN);
+        seed_msg.extend_from_slice(&kid.to_be_bytes());
         seed_msg.extend_from_slice(&nonce);
         let mut key = *blake3::keyed_hash(root, &seed_msg).as_bytes();
         for (n, v) in caveats {
@@ -681,6 +706,7 @@ mod tests {
         }
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&kid.to_be_bytes());
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&key);
         buf.extend_from_slice(&(caveats.len() as u16).to_be_bytes());
@@ -694,11 +720,24 @@ mod tests {
     fn decode_then_encode_roundtrips() {
         let wire = mint_like(
             &[7u8; 32],
+            0,
             [3u8; NONCE_LEN],
             &[("aud", "mint"), ("role", "volume-ro")],
         );
         let m = WireMacaroon::decode(&wire).expect("decode");
         assert_eq!(m.caveats.len(), 2);
+        assert_eq!(m.kid, 0);
+        assert_eq!(m.encode(), wire);
+    }
+
+    #[test]
+    fn kid_is_preserved_through_roundtrip() {
+        // Coordinator never minted, never verifies, never rotates —
+        // its only obligation is to hand back the kid bytes it
+        // received so mint's verifier picks the same generation.
+        let wire = mint_like(&[7u8; 32], 5, [3u8; NONCE_LEN], &[("aud", "mint")]);
+        let m = WireMacaroon::decode(&wire).expect("decode");
+        assert_eq!(m.kid, 5);
         assert_eq!(m.encode(), wire);
     }
 
@@ -706,14 +745,14 @@ mod tests {
     fn attenuate_extends_chain_like_mint() {
         let root = [9u8; 32];
         let nonce = [1u8; NONCE_LEN];
-        let base = mint_like(&root, nonce, &[("aud", "mint")]);
+        let base = mint_like(&root, 0, nonce, &[("aud", "mint")]);
         let mut m = WireMacaroon::decode(&base).expect("decode");
         m.attenuate(CAVEAT_EXP, "1700000000");
 
         // The attenuated wire must equal a mint-side macaroon minted
         // with the same caveat appended — proves the trailing-MAC
         // extension is byte-identical.
-        let expected = mint_like(&root, nonce, &[("aud", "mint"), ("exp", "1700000000")]);
+        let expected = mint_like(&root, 0, nonce, &[("aud", "mint"), ("exp", "1700000000")]);
         assert_eq!(m.encode(), expected);
         assert_eq!(m.caveats.len(), 2);
     }

@@ -337,12 +337,16 @@ mod tests {
 
     #[test]
     fn resolve_invite_distinguishes_inline_file_and_garbage() {
-        // A real wire macaroon, built the way mint mints one.
+        // A real wire macaroon, built the way mint mints one. v2
+        // format: kid prefix + the kid bound into the MAC seed
+        // (`mint/src/macaroon.rs::chain_mac`).
         let nonce = [5u8; 16];
         let root = [2u8; 32];
-        const DOMAIN: &[u8] = b"mint-macaroon-v1";
+        let kid: u16 = 0;
+        const DOMAIN: &[u8] = b"mint-macaroon-v2";
         let mut seed = Vec::new();
         seed.extend_from_slice(DOMAIN);
+        seed.extend_from_slice(&kid.to_be_bytes());
         seed.extend_from_slice(&nonce);
         let mut key = *blake3::keyed_hash(&root, &seed).as_bytes();
         let mut ser = Vec::new();
@@ -352,7 +356,8 @@ mod tests {
         ser.extend_from_slice(b"mint");
         key = *blake3::keyed_hash(&key, &ser).as_bytes();
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"mcrn1");
+        buf.extend_from_slice(b"mcrn2");
+        buf.extend_from_slice(&kid.to_be_bytes());
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&key);
         buf.extend_from_slice(&(1u16).to_be_bytes());
