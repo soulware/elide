@@ -176,10 +176,18 @@ before the existing verification path:
 1. Load the keyring.
 2. If `<data_dir>/pending-seal.json` exists:
    - Verify its MAC under the keyring. Invalid kid or bad MAC →
-     refuse to start with the diff and the path to the bad file.
-     This case means the keyring rotated between seal-authoring
-     and serve-startup such that the authoring kid is no longer in
-     the ring; operator re-seals.
+     **fail closed**, leave the pending file in place, and refuse
+     to start with the specific reason and the file path. The
+     pending stays on disk so the operator can inspect what was
+     staged before deciding how to resolve. This case usually
+     means the keyring was rotated and the authoring kid retired
+     between `mint seal` and the restart — operationally
+     surprising and worth surfacing, not silently recovering from.
+     Resolution: either re-run `mint seal` (overwrites the pending
+     under the current kid; same intent if templates are unchanged)
+     or `rm <data_dir>/pending-seal.json` (discards the staged
+     intent, falls back to the existing bucket seal). Then
+     restart.
    - `GET _mint/templates/seal.json` (the current canonical seal,
      if any).
    - If the canonical seal exists and is **semantically equal** to
@@ -406,15 +414,6 @@ operator's nose every time the keyring rotated).
    they compile against a synthetic caveat set.** Catches
    "template parses but breaks at render time" at seal time
    rather than first-request time. Cheap to add; possibly v1.1.
-2. **Behaviour when `pending-seal.json` exists but the keyring no
-   longer holds its kid.** Current design: refuse to start with a
-   clear message and leave the pending file in place, so the
-   operator can inspect it before re-sealing under the current
-   kid. Alternative: delete the pending automatically and fall
-   through to bucket-seal verification (operator re-runs `mint
-   seal` if they meant to). The "leave in place" choice
-   prioritises visibility; revisit if it turns out to be
-   confusing in practice.
 
 ## Resolved during design
 
@@ -428,3 +427,11 @@ operator's nose every time the keyring rotated).
   startup, when it actually publishes. The pending file carries
   the CLI-side `sealed_at` so the audit entry can record both
   "authored at" and "published at" times.
+- **Behaviour when `pending-seal.json` exists but the keyring no
+  longer holds its kid.** Resolved as fail-closed (leave file in
+  place, refuse to start with reason + path). Operator inspects,
+  then either re-runs `mint seal` or `rm`s the file. Auto-discard
+  was considered and rejected — the situations that produce this
+  state (sequencing mistake, compromise response, very-stale
+  pending) are all things the operator wants to be told about,
+  not silently recovered from.
