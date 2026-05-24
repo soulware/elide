@@ -26,6 +26,7 @@ pub mod macaroon;
 pub mod mint_rw;
 pub mod pop;
 pub mod role;
+pub mod seal;
 pub mod state;
 pub mod template;
 pub mod tigris;
