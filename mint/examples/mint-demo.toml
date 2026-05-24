@@ -5,9 +5,13 @@
 # role inventory (see mint-elide.toml for that); it exists only for the
 # invite → enroll → approve → exchange → assume-role walkthrough.
 # Each role's policy template lives under roles_dir (examples/demo_roles/).
+#
+# `mint serve` always talks to a real S3-compatible backend (Tigris,
+# MinIO, AWS). Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
+# environment before starting, and point `tenant.bucket` at a bucket
+# you own.
 
 audience = "mint"
-backend = "local"   # default is "tigris"
 # data_dir defaults to mint_data, roles_dir to mint_roles, each resolved
 # against the working directory (not this file's parent); an absolute
 # path is used verbatim. roles_dir is set so the demo runs from mint/:

@@ -1,8 +1,8 @@
 //! Operator-side HTTP surface — what `mint invite` and `mint enroll …`
-//! call when `backend = "tigris"` so the CLI does not need its own
-//! Tigris admin credential or vend a fresh `mint-rw` keypair per
-//! invocation. These endpoints proxy directly to the running daemon's
-//! [`crate::state::Store`] and macaroon root, never touching IAM.
+//! call so the CLI does not need its own Tigris admin credential or
+//! vend a fresh `mint-rw` keypair per invocation. These endpoints
+//! proxy directly to the running daemon's [`crate::state::Store`]
+//! and macaroon root, never touching IAM.
 //!
 //! Reachability is **UDS-only** by construction: [`router`] is mounted
 //! only when `serve` is bound to a Unix-domain socket
@@ -365,7 +365,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::audit::AuditLog;
-    use crate::config::{Backend, Config};
+    use crate::config::Config;
     use crate::iam::FakeMinter;
     use crate::state::Store;
 
@@ -384,7 +384,6 @@ mod tests {
                     region: None,
                 },
                 admin: None,
-                backend: Backend::Local,
                 roles: Default::default(),
             }),
             minter: Arc::new(FakeMinter::new()),

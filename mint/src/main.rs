@@ -1,13 +1,12 @@
 //! mint entry point (`docs/design-mint.md` § *Reference client &
 //! demo*). clap-derived CLI, matching the elide coordinator's shape.
 //!
-//! `serve` runs the verification/vending HTTP surface. Until the live
-//! Tigris SigV4 minter lands this binary wires [`FakeMinter`] and warns
-//! loudly on every start: the enroll/exchange flow is real, but
-//! `assume-role` returns a **deterministic fake keypair**. This is an
-//! explicit, temporary interim — not a silent optional path — removed
-//! when the real minter is wired (`docs/design-mint.md` § *Reference
-//! client & demo*: "no stub backend").
+//! `serve` runs the verification/vending HTTP surface against Tigris:
+//! self-vended `mint-rw` keypair for `_mint/*` data-plane I/O and a
+//! real `TigrisMinter` for `/v1/assume-role`. There is no in-process
+//! dev backend; test code that needs a Store without a cloud
+//! dependency uses `Store::open_in_memory` / `Store::open_local`
+//! directly, outside the `serve` path.
 //!
 //! `invite` / `enroll` are the operator side. The networked
 //! `mint client` (the coordinator's half) is the staged tail.
@@ -19,9 +18,9 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use mint::audit::AuditLog;
-use mint::config::{Backend, Config, Listener};
+use mint::config::{Config, Listener};
 use mint::http::{AppState, router};
-use mint::iam::{FakeMinter, KeypairMinter};
+use mint::iam::KeypairMinter;
 use mint::state::Store;
 use mint::tigris::TigrisMinter;
 
@@ -347,52 +346,43 @@ struct TigrisHandles {
     expiration: chrono::DateTime<chrono::Utc>,
 }
 
-/// Open the persisted state store dictated by `cfg.backend`. Every
-/// command path goes through this so a macaroon issued by `mint invite`
-/// and verified by `serve` always reads the same nonce (else the
-/// `enroll:denied:stale_invite` footgun fires on the next
-/// `/v1/enroll`).
+/// Open the Tigris-backed persisted-state store: self-vend a
+/// `mint-rw` keypair, route `_mint/*` I/O through it, load the
+/// keyring from `<data_dir>/root_keys/` (migrating any legacy
+/// singleton). Requires an `AWS_*` admin credential in the
+/// environment. The returned [`TigrisHandles`] lets `serve` spawn a
+/// background refresh of the `mint-rw` keypair before its
+/// `DateLessThan`.
 ///
-/// - `Backend::Tigris`: self-vend a `mint-rw` keypair, route `_mint/*`
-///   I/O through it. Requires an `AWS_*` admin credential in the
-///   environment. The returned [`TigrisHandles`] lets `serve` spawn a
-///   background refresh; operator one-shots drop them.
-/// - `Backend::Local`: `LocalFileSystem` rooted at `<data_dir>/_mint/`,
-///   `root_key` at `<data_dir>/root_key`. The dev / co-resident shape.
-async fn open_store(
-    cfg: &Config,
-) -> Result<(Store, Option<TigrisHandles>), Box<dyn std::error::Error>> {
-    match cfg.backend {
-        Backend::Local => Ok((Store::open_local(&cfg.data_dir).await?, None)),
-        Backend::Tigris => {
-            let admin = cfg.admin.as_ref().ok_or(
-                "backend = \"tigris\" requires a Tigris admin credential in the \
-                 environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY); \
-                 set backend = \"local\" in the config for the dev shape.",
-            )?;
-            let minter: Arc<dyn KeypairMinter> = Arc::new(TigrisMinter::new(admin)?);
-            let (s3, provider, expiration) = mint::mint_rw::build_s3_with_mint_rw(
-                &minter,
-                &cfg.tenant.bucket,
-                cfg.tenant.endpoint.as_deref(),
-                cfg.tenant.region.as_deref(),
-            )
-            .await?;
-            std::fs::create_dir_all(&cfg.data_dir)?;
-            let legacy = cfg.data_dir.join("root_key");
-            let store =
-                Store::open_remote(s3, &cfg.data_dir.join("root_keys"), Some(&legacy), None)
-                    .await?;
-            Ok((
-                store,
-                Some(TigrisHandles {
-                    minter,
-                    provider,
-                    expiration,
-                }),
-            ))
-        }
-    }
+/// There is no in-process "local" alternative: dev shapes point at a
+/// real S3-compatible target (Tigris free tier, MinIO). Test code
+/// constructs `Store::open_in_memory` / `Store::open_local` directly,
+/// outside this path.
+async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std::error::Error>> {
+    let admin = cfg.admin.as_ref().ok_or(
+        "mint serve requires a Tigris admin credential in the environment \
+         (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)",
+    )?;
+    let minter: Arc<dyn KeypairMinter> = Arc::new(TigrisMinter::new(admin)?);
+    let (s3, provider, expiration) = mint::mint_rw::build_s3_with_mint_rw(
+        &minter,
+        &cfg.tenant.bucket,
+        cfg.tenant.endpoint.as_deref(),
+        cfg.tenant.region.as_deref(),
+    )
+    .await?;
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    let legacy = cfg.data_dir.join("root_key");
+    let store =
+        Store::open_remote(s3, &cfg.data_dir.join("root_keys"), Some(&legacy), None).await?;
+    Ok((
+        store,
+        TigrisHandles {
+            minter,
+            provider,
+            expiration,
+        },
+    ))
 }
 
 async fn serve(
@@ -416,28 +406,17 @@ async fn serve(
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    // `assume-role` minter: in tigris mode reuse the `TigrisMinter` we
-    // already built for `mint-rw` vending; in local mode the
-    // deterministic fake. Long-running serve also spawns a background
+    // `assume-role` reuses the `TigrisMinter` we already built for
+    // `mint-rw` vending. Long-running serve also spawns a background
     // task that re-mints `mint-rw` before its `DateLessThan` and the
     // invite-cache refresher.
-    let minter: Arc<dyn KeypairMinter> = if let Some(h) = tigris {
-        let _refresh = mint::mint_rw::spawn_refresh(
-            h.minter.clone(),
-            config.tenant.bucket.clone(),
-            h.provider,
-            h.expiration,
-        );
-        h.minter
-    } else {
-        tracing::warn!(
-            "backend = \"local\": assume-role uses the FAKE keypair minter \
-             — it returns a deterministic non-production keypair. The \
-             enroll/exchange flow is real either way."
-        );
-        Arc::new(FakeMinter::new())
-    };
-    let _invite_refresh = store.spawn_invite_refresh(mint::state::INVITE_REFRESH_INTERVAL);
+    let _refresh = mint::mint_rw::spawn_refresh(
+        tigris.minter.clone(),
+        config.tenant.bucket.clone(),
+        tigris.provider,
+        tigris.expiration,
+    );
+    let minter: Arc<dyn KeypairMinter> = tigris.minter;
     // Steady-state /v1/enroll reads the invite from a local cache that
     // a background task keeps fresh with `If-None-Match` (~30 s, cheap
     // 304 on the common path). Rotation by this process updates the
@@ -446,10 +425,8 @@ async fn serve(
     tracing::info!(
         audience = %config.audience,
         roles = config.roles.len(),
-        admin_credential = config.admin.is_some(),
         data_dir = %config.data_dir.display(),
         roles_dir = %config.roles_dir.display(),
-        backend = ?config.backend,
         "loaded config"
     );
 
