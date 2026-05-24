@@ -1267,6 +1267,64 @@ through `hyperlocal`'s `UnixConnector`; the TCP leg stays on
 `reqwest`. mint is its own workspace, so the axum 0.8 dependency is
 contained to it.
 
+#### Proposed: dual-listen (UDS + TCP simultaneously)
+
+The mutual-exclusion of `bind` and `socket` couples two unrelated
+concerns: which transport coordinators (clients) reach mint over, and
+which transport an operator runs admin commands over. They are
+unrelated because admin and public traffic have different audiences
+(human operator on the mint host vs remote coordinator), different
+frequencies (one approval per coordinator vs every assume-role), and
+different auth shapes (filesystem permission on the socket vs the
+macaroon + PoP chain).
+
+Today, picking TCP for coordinators forfeits a working admin path
+(no UDS) and picking UDS for admin forfeits remote coordinators (no
+TCP). Every realistic deployment wants both:
+
+| Deployment | Coordinators reach mint via | Operator admin via |
+|---|---|---|
+| Single-host bundled (`coord run`) | UDS (co-resident) | UDS |
+| Self-hosted multi-host | TCP (off-host) | UDS (local SSH) |
+| Central-custodial (Elide-managed) | TCP (off-host) | UDS (Elide SSH) |
+| Forward-looking k8s / web console | TCP | future authenticated TCP |
+
+**Proposed:** drop the mutual-exclusion check on `bind` and `socket`;
+when both are set, `serve` binds both listeners under a
+`tokio::join!`. The router is split:
+
+- **UDS listener** mounts the public routes
+  (`/v1/assume-role`, `/v1/enroll`, `/v1/enroll-exchange`) *and* the
+  operator routes (`/v1/admin/…` — see *Mint state in the tenant
+  bucket* / *Operator endpoints*). Filesystem permission on the socket
+  is the gate for admin; the macaroon + PoP gate the public routes
+  the same as on TCP.
+- **TCP listener** mounts the public routes *only*. Admin routes are
+  structurally unreachable on this listener — not "returned 404",
+  not "401" — they are not registered in the router the TCP socket
+  serves. This is the property the current admin-on-UDS design
+  relies on; preserving it is non-negotiable.
+
+The "TCP-only, no admin" shape becomes "no `socket` → no admin";
+`mint invite` / `mint enroll …` against such a config fails with a
+clear message ("admin requires `socket` in `mint.toml`"). The
+operator's choice is to add `socket` (and SSH or be on-host to use
+it) or stand up the still-future authenticated-TCP-admin transport.
+
+**What this is not.** A TCP admin surface — that requires a credential
+shape mint does not yet ship (admin macaroon or operator-scoped
+bearer token) plus the audit surface to attribute calls to operators.
+The shape of that work is a separate proposal; it is **additive**
+when it lands (a third optional listener with its own router) and
+does not require revisiting the dual-listen decision here.
+
+**Cost.** One config-validation rule drops; one `serve` branch
+replaces a `match` with `tokio::join!`; the existing UDS-side router
+construction is reused unchanged. No new config keys; no protocol
+change; no client change (coords already pick `unix:` vs `http(s)://`
+via the `[mint] url` scheme, which can now legitimately be either
+even when both listeners exist on the server side).
+
 ### Coordinator configuration
 
 **Proposed.** The coordinator reaches mint through one new
