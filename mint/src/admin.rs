@@ -80,7 +80,8 @@ async fn build_invite(state: &AppState) -> Result<InviteResponse, Response> {
         .current_invite()
         .await
         .map_err(|e| service_unavailable(&format!("read invite: {e}")))?;
-    let mac = mint_invite(&state.store.root_key(), &state.config.audience, &nonce);
+    let keyring = state.store.keyring().await;
+    let mac = mint_invite(&keyring, &state.config.audience, &nonce);
     Ok(InviteResponse {
         macaroon: mac.encode(),
         nonce,
@@ -418,7 +419,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let encoded = v["macaroon"].as_str().unwrap();
         let decoded = crate::macaroon::Macaroon::decode(encoded).expect("decode");
-        assert!(decoded.verify(&[7u8; 32]));
+        assert!(decoded.verify(&crate::keyring::Keyring::single([7u8; 32])));
         assert!(!v["nonce"].as_str().unwrap().is_empty());
     }
 

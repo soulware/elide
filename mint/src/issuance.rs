@@ -22,6 +22,7 @@
 //! pure given an already-authenticated macaroon.
 
 use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op};
+use crate::keyring::Keyring;
 use crate::macaroon::{self, Macaroon};
 use crate::pop;
 
@@ -51,9 +52,9 @@ pub enum EnrollError {
 /// `aud`, and the current `invite` nonce. Non-expiring, carries no
 /// principal identity — a pure participation gate, distributed
 /// out-of-band and reusable for every enrolling client.
-pub fn mint_invite(root: &[u8; 32], audience: &str, invite_nonce: &str) -> Macaroon {
+pub fn mint_invite(keyring: &Keyring, audience: &str, invite_nonce: &str) -> Macaroon {
     macaroon::mint(
-        root,
+        keyring,
         vec![
             Caveat::scalar(name::OP, op::ENROLL),
             Caveat::scalar(name::AUD, audience),
@@ -67,14 +68,14 @@ pub fn mint_invite(root: &[u8; 32], audience: &str, invite_nonce: &str) -> Macar
 /// `exp`. (The third-party caveat for a configured identity authority
 /// is deferred — design *Open questions* #15.)
 pub fn mint_credential_ticket(
-    root: &[u8; 32],
+    keyring: &Keyring,
     audience: &str,
     sub: &str,
     cnf: &str,
     exp_unix: u64,
 ) -> Macaroon {
     macaroon::mint(
-        root,
+        keyring,
         vec![
             Caveat::scalar(name::OP, op::ENROLL_EXCHANGE),
             Caveat::scalar(name::AUD, audience),
@@ -93,14 +94,14 @@ pub fn mint_credential_ticket(
 /// exchanges once per role it needs (`docs/design-mint.md` §
 /// *Credential macaroon & lifecycle*).
 pub fn mint_credential(
-    root: &[u8; 32],
+    keyring: &Keyring,
     audience: &str,
     sub: &str,
     cnf: &str,
     role: &str,
 ) -> Macaroon {
     macaroon::mint(
-        root,
+        keyring,
         vec![
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, audience),
@@ -136,8 +137,11 @@ pub fn bound_identity(token: &Macaroon) -> Result<(String, String), EnrollError>
 mod tests {
     use super::*;
 
-    const ROOT: [u8; 32] = [7u8; 32];
     const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    fn ring() -> Keyring {
+        Keyring::single([7u8; 32])
+    }
 
     fn cnf() -> String {
         pop::cnf_value(&[3u8; 32])
@@ -145,8 +149,9 @@ mod tests {
 
     #[test]
     fn invite_is_enroll_op_no_identity() {
-        let b = mint_invite(&ROOT, "mint", "nonceXYZ");
-        assert!(b.verify(&ROOT));
+        let kr = ring();
+        let b = mint_invite(&kr, "mint", "nonceXYZ");
+        assert!(b.verify(&kr));
         let eff = EffectiveCaveats::new(b.caveats());
         assert_eq!(eff.resolve(name::OP), Resolved::Value(op::ENROLL.into()));
         assert_eq!(eff.resolve(name::AUD), Resolved::Value("mint".into()));
@@ -160,8 +165,9 @@ mod tests {
 
     #[test]
     fn ticket_then_credential_carry_identity_with_distinct_ops() {
-        let ticket = mint_credential_ticket(&ROOT, "mint", SUB, &cnf(), 1_700_000_000);
-        assert!(ticket.verify(&ROOT));
+        let kr = ring();
+        let ticket = mint_credential_ticket(&kr, "mint", SUB, &cnf(), 1_700_000_000);
+        assert!(ticket.verify(&kr));
         let ie = EffectiveCaveats::new(ticket.caveats());
         assert_eq!(
             ie.resolve(name::OP),
@@ -169,8 +175,8 @@ mod tests {
         );
         assert_eq!(ie.not_after(name::EXP), Some(1_700_000_000));
 
-        let cred = mint_credential(&ROOT, "mint", SUB, &cnf(), "volume-ro");
-        assert!(cred.verify(&ROOT));
+        let cred = mint_credential(&kr, "mint", SUB, &cnf(), "volume-ro");
+        assert!(cred.verify(&kr));
         let pe = EffectiveCaveats::new(cred.caveats());
         assert_eq!(
             pe.resolve(name::OP),
@@ -188,7 +194,7 @@ mod tests {
     #[test]
     fn bound_identity_extracts_sub_and_cnf() {
         let m = macaroon::mint(
-            &ROOT,
+            &ring(),
             vec![
                 Caveat::scalar(name::SUB, SUB),
                 Caveat::scalar(name::CNF, cnf()),
@@ -199,14 +205,15 @@ mod tests {
 
     #[test]
     fn missing_or_bad_identity_refused() {
-        let no_cnf = macaroon::mint(&ROOT, vec![Caveat::scalar(name::SUB, SUB)]);
+        let kr = ring();
+        let no_cnf = macaroon::mint(&kr, vec![Caveat::scalar(name::SUB, SUB)]);
         assert_eq!(bound_identity(&no_cnf), Err(EnrollError::MissingCnf));
 
-        let no_sub = macaroon::mint(&ROOT, vec![Caveat::scalar(name::CNF, cnf())]);
+        let no_sub = macaroon::mint(&kr, vec![Caveat::scalar(name::CNF, cnf())]);
         assert_eq!(bound_identity(&no_sub), Err(EnrollError::MissingSub));
 
         let bad_cnf = macaroon::mint(
-            &ROOT,
+            &kr,
             vec![
                 Caveat::scalar(name::SUB, SUB),
                 Caveat::scalar(name::CNF, "ed25519:not-base64!!"),
@@ -220,7 +227,7 @@ mod tests {
         // Appended second, disagreeing sub (only the trailing MAC is
         // needed to append). Must be Unsatisfiable, never the first value.
         let m = macaroon::mint(
-            &ROOT,
+            &ring(),
             vec![
                 Caveat::scalar(name::SUB, SUB),
                 Caveat::scalar(name::CNF, cnf()),

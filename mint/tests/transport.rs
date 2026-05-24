@@ -16,6 +16,7 @@ use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::issuance::mint_invite;
+use mint::keyring::Keyring;
 use mint::state::Store;
 
 mod common;
@@ -79,7 +80,7 @@ async fn full_flow_over_unix_socket() {
     let url = format!("unix:{}", sock.display());
     let cdir = tempfile::tempdir().expect("client tempdir");
     mint::client::keygen(cdir.path(), false).expect("keygen");
-    let invite = mint_invite(&ROOT, "mint", &nonce).encode();
+    let invite = mint_invite(&Keyring::single(ROOT), "mint", &nonce).encode();
 
     // enroll → credential ticket persisted client-side.
     mint::client::enroll(

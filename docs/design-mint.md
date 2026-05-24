@@ -125,15 +125,22 @@ never reaches the caller.
 
 Each mint instance is configured with:
 
-1. **Its own root key** — the single symmetric key mint uses to
-   *both* mint and verify credential macaroons (the "root key" of the
-   Macaroons paper). It never leaves the process and is never shared
-   with a caller or any other authority. It is a 32-byte CSPRNG key
-   generated on first start at `<data_dir>/root_key` (64 hex chars,
-   mode 0600), loaded thereafter — never a config field, mirroring the
-   elide coordinator's `coordinator.key`.
-   Symmetric, so there is no public half. (v1 is single-root; multi-root
-   for federating issuers is out of scope.) The current **`invite`**
+1. **Its own root-key keyring** — an ordered set of `(kid, key)`
+   generations plus a `current` pointer naming the one used to MAC
+   *new* artefacts. Symmetric: mint both mints and verifies under the
+   keyring's keys. The keyring never leaves the process and is never
+   shared with a caller or any other authority. It lives at
+   `<data_dir>/root_keys/<NNNN>` (one 64-hex file per generation,
+   mode 0600) with a small `<data_dir>/root_keys/current` text file
+   naming the active kid — `ls` shows the rotation history without
+   any binary-only state. The historical singleton at
+   `<data_dir>/root_key` is migrated into `root_keys/0000` on first
+   start if present. First start with no legacy file generates a
+   CSPRNG `kid=0`; the caller can optionally seed an existing key
+   (the multi-host shape — see *Root-key rotation*).
+   Verification accepts any kid still in the ring; minting always
+   uses `current`. Rotation procedure lives in *Root-key rotation*
+   below. The current **`invite`**
    is persisted in the tenant bucket at `_mint/invite` (see *Mint
    state in the tenant bucket*), not on disk — it must survive restart
    so the distributed invite macaroon stays valid, and keeping it
@@ -165,10 +172,10 @@ Each mint instance is configured with:
    single-tenant per instance; multi-tenancy is a v2 question.
 
 Role definitions, audience, and tenant metadata are static and
-file-backed. The root key and admin credential are secrets and are
-not plaintext TOML fields — the admin credential comes from the AWS
-environment; the root key is generated on first start at
-`<data_dir>/root_key` (64 hex chars, 0600) and loaded thereafter.
+file-backed. The macaroon keyring and admin credential are secrets and
+are not plaintext TOML fields — the admin credential comes from the
+AWS environment; the keyring lives under `<data_dir>/root_keys/`
+(one 64-hex generation file per kid, plus a `current` pointer).
 
 #### On-disk layout
 
@@ -186,8 +193,9 @@ backends are not representable.
 The config also declares two optional directories, mirroring the
 elide coordinator's `data_dir` (`coordinator.toml`):
 
-- **`data_dir`** (default `mint_data`) — holds the macaroon root key
-  (`root_key`, 0600) and any third-party discharge keys. Enrollment
+- **`data_dir`** (default `mint_data`) — holds the macaroon keyring
+  directory `root_keys/` (one file per generation, mode 0600, plus a
+  `current` pointer) and any third-party discharge keys. Enrollment
   state (the current `invite` nonce, pending records, and the
   approved-coordinator registry) lives in the tenant bucket under
   `_mint/` so multiple mint processes can share one logical state
@@ -242,8 +250,23 @@ _mint/invite                    — single object; body = nonce (hex)
 _mint/pending/<sub>.json        — one per in-flight enrollment;
                                   small set, GC'd at ticket-exp
 _mint/approved/<sub>            — long-lived; one per ever-approved sub
-                                  body = {pub, approved_at, fingerprint_shown}
+                                  body = {pub, approved_at, fingerprint_shown,
+                                          kid, mac}
 ```
+
+Every `_mint/approved/<sub>` body is MAC'd by the keyring generation
+that issued it: `mac = blake3_keyed(keyring[kid], "mint-approved-v1"
+|| len(sub) || sub || len(pub) || pub || len(approved_at) ||
+approved_at || len(fingerprint_shown) || fingerprint_shown)`. The
+`sub` is in the MAC input (not just the object key) so a record
+cannot be copied to a different `<sub>` and still verify. A holder
+of a `mint-rw` bucket credential can `PutObject` to
+`_mint/approved/*` but cannot produce a valid MAC without the
+keyring on local disk; mint's `get_approved` verifies and treats a
+mismatch as "not approved" (the HTTP layer returns the same opaque
+403 awaiting-approval signal so a client cannot distinguish forgery
+from absence). Forgeries are logged loudly server-side for the
+operator's forensic trail.
 
 The split is intentional: `pending/` is small and LIST-friendly
 (rotation and GC walk it); `approved/` is a growing per-coordinator
@@ -258,14 +281,24 @@ credential custody — deployment shapes* below):
 - `record_pending`: `PUT _mint/pending/<sub>.json` with
   `If-None-Match: *`. On 412, GET the existing record and run the
   idempotency / `(sub, pub)` conflict check unchanged.
-- `approve`: `PUT _mint/approved/<sub>`, then `DELETE
-  _mint/pending/<sub>.json`. `approved/` writes are idempotent (same
-  body bytes for repeated approvals of the same `(sub, pub)`);
-  re-approval against a *different* pub is a key-rotation
-  acknowledgment and overwrites the registry record.
+- `approve`: `PUT _mint/approved/<sub>` carrying the body MAC under
+  the keyring's current kid, then `DELETE _mint/pending/<sub>.json`.
+  Re-approval against a *different* pub is a key-rotation
+  acknowledgment and overwrites the registry record (under the
+  current kid).
 - `is_approved` (exchange path): `GET _mint/approved/<sub>` — one
-  round-trip; the record's `pub` must equal the presented ticket's
-  `cnf`.
+  round-trip; the body MAC is verified before any of its fields are
+  trusted, then the record's `pub` must equal the presented ticket's
+  `cnf`. A MAC failure (forged record, or record left over from a
+  retired kid) is collapsed into the same 403 awaiting-approval the
+  client would see for a missing record.
+- `migrate_approval_to_current_kid` (lazy migration): called
+  opportunistically from the `/v1/enroll` fast path after a matched
+  approval. If the record's kid is older than `current_kid`, mint
+  re-MACs and PUTs back with `If-Match: <etag>`; a 412 means the
+  record changed underfoot and the write is silently abandoned. The
+  effect is that every active coordinator drifts its approval forward
+  to the current kid on its next restart, without operator action.
 - `rotate_invite`: `PUT _mint/invite`, then `LIST _mint/pending/` and
   `DELETE` every record whose `invite` field is not the new value.
   `approved/` is not touched.
@@ -278,15 +311,92 @@ refresh (~30s): a background poll issues `GET _mint/invite` with
 when the nonce is unchanged. Steady-state, `/v1/enroll` reads the
 cached value and never blocks on a Tigris round-trip.
 
-**`root_key` does not move.** Enrollment state goes to the bucket;
-the macaroon root key stays on local disk. Two consequences:
+**The keyring does not move.** Enrollment state goes to the bucket;
+every macaroon root key stays on local disk under
+`<data_dir>/root_keys/`. Two consequences:
 (1) deliberately, a bucket-credential compromise alone cannot mint
-or forge credentials — the attacker would also need filesystem
-access to one of the mint hosts to obtain `root_key`. (2) multi-instance
-mint deployments must replicate `root_key` out-of-band (typically via
-the same secrets-manager mechanism that delivers the admin Tigris
-credential), since instances sharing one `_mint/` prefix must agree
-on the MAC key or they will mint macaroons each other cannot verify.
+or forge credentials or approvals — the attacker would also need
+filesystem access to one of the mint hosts to obtain the keyring.
+(2) multi-instance mint deployments must replicate every `(kid, key)`
+out-of-band (typically via the same secrets-manager mechanism that
+delivers the admin Tigris credential), since instances sharing one
+`_mint/` prefix must agree on the keyring or they will mint
+artefacts the sibling cannot verify. Both `Keyring::open` (first
+start) and `Keyring::add_and_promote` (rotation) accept a
+caller-supplied key for this case: the operator provisions one
+instance, captures the generated bytes, then re-runs the same op on
+the peer with the supplied key so both converge on the same kid.
+
+### Root-key rotation
+
+The keyring (`<data_dir>/root_keys/`) is the only secret state on
+mint hosts; it follows a **retain-keychain with lazy migration**
+model. The dominant industry pattern (AWS KMS, HashiCorp Vault
+transit, JWKS, etc.) is to retain old key generations indefinitely
+for verification while shifting new issuance to the current
+generation; mint takes the same shape, with one elaboration that
+falls out of mint owning the records it issues: opportunistic
+re-MAC on natural touch, so approvals drift forward to the current
+kid as their coordinators restart.
+
+**Wire format.** Every macaroon and every `_mint/approved/<sub>`
+record carries the kid that MAC'd it (a 2-byte BE prefix in the
+macaroon binary container; a `kid` JSON field on the approval).
+Verification picks the named kid out of the keyring and replays the
+chain — an absent kid (retired, or never existed) fails verification
+with the same opacity as a bad MAC. The MAC seed binds the kid into
+the chain (`blake3_keyed(key, "mint-macaroon-v2" || kid_be ||
+nonce)`) so a leaked key cannot be replayed under a different kid
+claim.
+
+**Rotation procedure.** Two human steps in the common case:
+
+1. **Add.** `Keyring::add_and_promote` generates (or accepts) a new
+   key, writes the next `<NNNN>` file, repoints `current`. The
+   previous generation stays in the ring for verification. For
+   multi-instance deployments the operator captures the new key
+   bytes and runs the same op on every peer with that key supplied —
+   `add_and_promote` is idempotent for matching bytes, and refuses
+   if the on-disk file disagrees.
+2. **Drain naturally.** Every coordinator restart hits
+   `/v1/enroll`. After a fast-path match the handler observes
+   `record.kid != current_kid` and re-MACs the approval forward,
+   with `If-Match` on the etag for multi-writer safety. Quiescent
+   coordinators stay quiescent — their record sits on its issuing
+   kid until they restart or until the kid is explicitly retired.
+
+The two further admin actions are not part of routine rotation but
+exist for the situations that need them:
+
+3. **Retire** (`Keyring::retire`). Deletes the named kid from the
+   ring. Anything still MAC'd under that kid stops verifying
+   immediately. Per-kid retirement is fully independent — retiring
+   kid 2 in a ring of {0, 1, 2, 3} leaves kids 0, 1, 3 untouched.
+   The set of records killed by `retire(X)` is exactly the records
+   whose body carries `kid == X` — enumerable via a LIST + per-record
+   peek before the operator pulls the trigger.
+4. **Sweep** (`Store::sweep_approvals_to_current_kid`). The
+   force-converge admin operation: re-MAC every `_mint/approved/<sub>`
+   under the current kid in one pass, regardless of natural touch.
+   Used only when an operator wants to retire an older kid without
+   waiting for lazy migration to drain it (e.g. immediate compliance
+   action). Skips records that fail to verify under any kid in the
+   ring — forgeries are never laundered forward.
+
+**Compromise rotation.** If a kid is suspected compromised:
+`retire` it immediately. Records that lazy-migration has already
+drifted forward survive (the active fleet keeps working); dormant
+records under the retired kid die and the corresponding
+coordinators have to re-enroll. Sweeping *before* retire is wrong
+in this case — it could re-MAC a record an attacker just forged
+under the still-trusted old kid.
+
+**Hygiene rotation.** Just `add_and_promote`; no other action
+required. The ring accumulates one entry per cycle; the per-host
+cost is ~32 bytes per kid and `u16` gives 65 535 generations.
+Operators can `retire` ageing kids when ready; the
+sweep-before-retire option is available if they want to migrate
+stragglers first.
 
 ### Admin credential custody — deployment shapes
 
@@ -1663,14 +1773,16 @@ prematurely.
     persisted in config) rather than relying on policy templating or the
     third-party discharge — deferred; it would reintroduce standing
     per-coordinator state.
-14. **Root-key durability.** *Resolved:* mint generates the root key
-    on first start and persists it at `<data_dir>/root_key` (64 hex
-    chars, 0600), like the coordinator's identity key; the `invite`
-    shares this custody. The accepted consequence is that losing
-    `data_dir` invalidates every outstanding macaroon — recovery is
-    re-invite + re-enroll, not state restore. Whether `data_dir`
-    warrants backup/replication, and how the root rotates, remain open
-    and are tied to rotation (#3).
+14. **Root-key durability and rotation.** *Resolved:* mint persists a
+    `(kid, key)` keyring at `<data_dir>/root_keys/` (one 64-hex file
+    per generation, mode 0600, plus a `current` pointer). Rotation
+    is the retain-keychain + lazy-migration shape described in
+    *Root-key rotation*: add generations additively, drain approvals
+    forward on natural coordinator restarts, retire individual kids
+    when ready. Losing `data_dir` still invalidates every outstanding
+    macaroon — recovery is re-invite + re-enroll. Whether `data_dir`
+    warrants backup/replication is a separate operational call from
+    rotation and remains open.
 15. **Third-party-caveat construction.** Delegation to an identity
     authority is a third-party caveat (mint shares a symmetric key per
     discharge authority; the caveat carries a verification key encrypted

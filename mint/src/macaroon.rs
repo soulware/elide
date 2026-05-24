@@ -5,21 +5,25 @@
 //! generalised to free-form named **scalar** caveats:
 //!
 //! ```text
-//! mac_seed = blake3_keyed(root_key, DOMAIN || nonce)
+//! mac_seed = blake3_keyed(keyring[kid], DOMAIN || kid_be || nonce)
 //! mac_i    = blake3_keyed(mac_{i-1}, serialize_one(c_i))
 //! ```
 //!
 //! Each step's key is the previous step's MAC, so any holder of the
 //! trailing MAC can append a caveat (the additive-restriction property)
-//! but cannot remove one. Verification replays the chain from the root
-//! key and constant-time-compares the final MAC.
+//! but cannot remove one. Verification picks the per-token `kid` out of
+//! the wire format, looks it up in the verifier's [`Keyring`], replays
+//! the chain, and constant-time-compares the final MAC. A kid that is
+//! not in the ring (retired, or never existed) fails verification with
+//! the same opacity as a bad MAC.
 //!
 //! Wire format: a binary container, base64-encoded for the
 //! `Authorization: Macaroon <b64>` header (per `docs/design-mint.md`
 //! § *Authentication*):
 //!
 //! ```text
-//! magic   "mcrn1"  (5 bytes)
+//! magic   "mcrn2"  (5 bytes)
+//! kid     u16 BE   (2 bytes — the keyring generation that MAC'd this token)
 //! nonce   16 bytes
 //! mac     32 bytes
 //! count   u16 BE
@@ -36,13 +40,15 @@ use rand_core::{OsRng, RngCore};
 use subtle::ConstantTimeEq;
 
 use crate::caveat::Caveat;
+use crate::keyring::{Keyring, Kid};
 
-const MAGIC: &[u8; 5] = b"mcrn1";
-const DOMAIN: &[u8] = b"mint-macaroon-v1";
+const MAGIC: &[u8; 5] = b"mcrn2";
+const DOMAIN: &[u8] = b"mint-macaroon-v2";
 pub const NONCE_LEN: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Macaroon {
+    kid: Kid,
     nonce: [u8; NONCE_LEN],
     caveats: Vec<Caveat>,
     mac: [u8; 32],
@@ -75,26 +81,34 @@ fn serialize_one(c: &Caveat) -> Vec<u8> {
     out
 }
 
-fn chain_mac(root_key: &[u8; 32], nonce: &[u8; NONCE_LEN], caveats: &[Caveat]) -> [u8; 32] {
-    let mut seed_msg = Vec::with_capacity(DOMAIN.len() + NONCE_LEN);
+/// Chain the MAC under `key`, binding the seed to `kid` so a key
+/// recovered from one generation cannot be replayed under a different
+/// kid claim (paranoia — the verifier already picks the key by kid).
+fn chain_mac(key: &[u8; 32], kid: Kid, nonce: &[u8; NONCE_LEN], caveats: &[Caveat]) -> [u8; 32] {
+    let mut seed_msg = Vec::with_capacity(DOMAIN.len() + 2 + NONCE_LEN);
     seed_msg.extend_from_slice(DOMAIN);
+    seed_msg.extend_from_slice(&kid.to_be_bytes());
     seed_msg.extend_from_slice(nonce);
-    let mut key = *blake3::keyed_hash(root_key, &seed_msg).as_bytes();
+    let mut mac = *blake3::keyed_hash(key, &seed_msg).as_bytes();
     for c in caveats {
         let step = serialize_one(c);
-        key = *blake3::keyed_hash(&key, &step).as_bytes();
+        mac = *blake3::keyed_hash(&mac, &step).as_bytes();
     }
-    key
+    mac
 }
 
-/// Mint a macaroon under `root_key`. Mint is the issuer *and* verifier
-/// of the credential macaroon (the root never leaves the process — see
-/// `docs/design-mint.md` § *Trust model*); this is the issuer side.
-pub fn mint(root_key: &[u8; 32], caveats: Vec<Caveat>) -> Macaroon {
+/// Mint a macaroon under the keyring's **current** generation. Mint is
+/// the issuer *and* verifier of the credential macaroon (the root never
+/// leaves the process — see `docs/design-mint.md` § *Trust model*);
+/// this is the issuer side.
+pub fn mint(keyring: &Keyring, caveats: Vec<Caveat>) -> Macaroon {
+    let kid = keyring.current_kid();
+    let key = keyring.current_key();
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
-    let mac = chain_mac(root_key, &nonce, &caveats);
+    let mac = chain_mac(key, kid, &nonce, &caveats);
     Macaroon {
+        kid,
         nonce,
         caveats,
         mac,
@@ -102,6 +116,10 @@ pub fn mint(root_key: &[u8; 32], caveats: Vec<Caveat>) -> Macaroon {
 }
 
 impl Macaroon {
+    pub fn kid(&self) -> Kid {
+        self.kid
+    }
+
     pub fn caveats(&self) -> &[Caveat] {
         &self.caveats
     }
@@ -132,17 +150,23 @@ impl Macaroon {
         self
     }
 
-    /// Constant-time MAC verification against `root_key`. Caveat-value
-    /// checks (audience, role, ttl) are the caller's job — see
-    /// [`crate::role`].
-    pub fn verify(&self, root_key: &[u8; 32]) -> bool {
-        let expected = chain_mac(root_key, &self.nonce, &self.caveats);
+    /// Constant-time MAC verification against `keyring`. The token's
+    /// embedded `kid` selects which generation to verify under; an
+    /// absent kid (retired or never existed) fails verification with
+    /// the same opacity as a bad MAC. Caveat-value checks (audience,
+    /// role, ttl) are the caller's job — see [`crate::role`].
+    pub fn verify(&self, keyring: &Keyring) -> bool {
+        let Some(key) = keyring.get(self.kid) else {
+            return false;
+        };
+        let expected = chain_mac(key, self.kid, &self.nonce, &self.caveats);
         expected.ct_eq(&self.mac).into()
     }
 
     pub fn encode(&self) -> String {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&self.kid.to_be_bytes());
         buf.extend_from_slice(&self.nonce);
         buf.extend_from_slice(&self.mac);
         buf.extend_from_slice(&(self.caveats.len() as u16).to_be_bytes());
@@ -158,6 +182,7 @@ impl Macaroon {
         if r.take(MAGIC.len())? != MAGIC {
             return Err(DecodeError::BadMagic);
         }
+        let kid = Kid::from_be_bytes(r.take(2)?.try_into().map_err(|_| DecodeError::Truncated)?);
         let nonce: [u8; NONCE_LEN] = r
             .take(NONCE_LEN)?
             .try_into()
@@ -172,6 +197,7 @@ impl Macaroon {
             return Err(DecodeError::BadCaveat);
         }
         Ok(Macaroon {
+            kid,
             nonce,
             caveats,
             mac,
@@ -225,27 +251,27 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    fn root() -> [u8; 32] {
-        [7u8; 32]
+    fn ring() -> Keyring {
+        Keyring::single([7u8; 32])
     }
 
     #[test]
     fn mint_verify_roundtrip() {
         let m = mint(
-            &root(),
+            &ring(),
             vec![
                 Caveat::scalar("Audience", "mint"),
                 Caveat::scalar("elide:Volume", "01ARZ"),
             ],
         );
-        assert!(m.verify(&root()));
-        assert!(!m.verify(&[9u8; 32]));
+        assert!(m.verify(&ring()));
+        assert!(!m.verify(&Keyring::single([9u8; 32])));
     }
 
     #[test]
     fn encode_decode_roundtrip() {
         let m = mint(
-            &root(),
+            &ring(),
             vec![
                 Caveat::scalar("Audience", "mint"),
                 Caveat::scalar("elide:Volume", "01ARZ"),
@@ -255,28 +281,65 @@ mod tests {
         let wire = m.encode();
         let back = Macaroon::decode(&wire).expect("decode");
         assert_eq!(m, back);
-        assert!(back.verify(&root()));
+        assert!(back.verify(&ring()));
     }
 
     #[test]
     fn attenuation_only_narrows_and_still_verifies() {
-        let m = mint(&root(), vec![Caveat::scalar("Audience", "mint")]);
+        let m = mint(&ring(), vec![Caveat::scalar("Audience", "mint")]);
         let attenuated = m.attenuate(Caveat::scalar("elide:Volume", "01ARZ"));
-        assert!(attenuated.verify(&root()));
+        assert!(attenuated.verify(&ring()));
         assert_eq!(attenuated.caveats().len(), 2);
     }
 
     #[test]
     fn tampered_caveat_fails_verify() {
-        let m = mint(&root(), vec![Caveat::scalar("elide:Volume", "good")]);
+        let m = mint(&ring(), vec![Caveat::scalar("elide:Volume", "good")]);
         let mut tampered = Macaroon::decode(&m.encode()).expect("decode");
         tampered.caveats[0] = Caveat::scalar("elide:Volume", "evil");
-        assert!(!tampered.verify(&root()));
+        assert!(!tampered.verify(&ring()));
+    }
+
+    #[test]
+    fn tampered_kid_fails_verify_even_if_key_exists() {
+        // A macaroon's MAC seeds with its kid, so swapping the kid bytes
+        // on the wire (even to one whose key is in the ring) breaks the
+        // chain.
+        let dir = tempfile::tempdir().unwrap();
+        let mut kr = Keyring::open(&dir.path().join("rk"), None, None).unwrap();
+        kr.add_and_promote(&dir.path().join("rk"), None).unwrap();
+        // Mint under kid=1, then forge a copy that claims kid=0.
+        let m = mint(&kr, vec![Caveat::scalar("Audience", "mint")]);
+        assert_eq!(m.kid(), 1);
+        let mut forged = Macaroon::decode(&m.encode()).unwrap();
+        forged.kid = 0;
+        assert!(!forged.verify(&kr));
     }
 
     #[test]
     fn garbage_decode_is_error_not_panic() {
         assert!(Macaroon::decode("not base64!!!").is_err());
         assert!(Macaroon::decode(&BASE64.encode([0u8; 3])).is_err());
+    }
+
+    #[test]
+    fn token_minted_under_old_kid_still_verifies_until_retired() {
+        // The whole point of the keyring: rotation is additive until
+        // explicit retirement.
+        let dir = tempfile::tempdir().unwrap();
+        let rk = dir.path().join("rk");
+        let mut kr = Keyring::open(&rk, None, None).unwrap();
+        let token_under_zero = mint(&kr, vec![Caveat::scalar("Audience", "mint")]);
+        let new_kid = kr.add_and_promote(&rk, None).unwrap();
+        assert_eq!(new_kid, 1);
+        assert!(
+            token_under_zero.verify(&kr),
+            "old token verifies because kid=0 is still in the ring"
+        );
+        kr.retire(&rk, 0).unwrap();
+        assert!(
+            !token_under_zero.verify(&kr),
+            "after retire(0) the old token fails — by design"
+        );
     }
 }

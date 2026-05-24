@@ -16,6 +16,7 @@ use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::issuance::{mint_credential_ticket, mint_invite};
+use mint::keyring::Keyring;
 use mint::macaroon::Macaroon;
 use mint::pop;
 use mint::state::Store;
@@ -153,7 +154,7 @@ fn field(body: &str, key: &str) -> Macaroon {
 /// The client's self-asserted invite: the reusable invite
 /// macaroon with `sub`/`cnf` appended for `seed`.
 fn client_invite(nonce: &str, seed: &[u8; 32]) -> Macaroon {
-    mint_invite(&ROOT, "mint", nonce)
+    mint_invite(&Keyring::single(ROOT), "mint", nonce)
         .attenuate(Caveat::scalar(name::SUB, SUB))
         .attenuate(Caveat::scalar(name::CNF, pop::cnf_value(seed)))
 }
@@ -174,7 +175,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let ticket = field(&body, "credential.ticket");
-    assert!(ticket.verify(&ROOT));
+    assert!(ticket.verify(&Keyring::single(ROOT)));
 
     // (2) exchange before approval → 403 (awaited, not a failure)
     let (status, _) = parts(
@@ -212,7 +213,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let credential = field(&body, "credential");
-    assert!(credential.verify(&ROOT));
+    assert!(credential.verify(&Keyring::single(ROOT)));
     let eff = EffectiveCaveats::new(credential.caveats());
     assert_eq!(
         eff.resolve(name::OP),
@@ -283,6 +284,96 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
 
     let a = String::from_utf8(audit.lock().unwrap().clone()).unwrap();
     assert!(a.contains("\"outcome\":\"exchange:granted\""), "audit: {a}");
+}
+
+/// Build an InMemory-backed test app so we can exercise `PutMode::Update`
+/// (LocalFileSystem returns `NotImplemented` for it). Mirrors `app()`
+/// otherwise, with a single-kid keyring seeded to `ROOT`.
+async fn app_in_memory() -> (axum::Router, Arc<Store>) {
+    let store = Arc::new(Store::open_in_memory(ROOT).await.expect("store"));
+    let state = AppState {
+        config: Arc::new(config()),
+        minter: Arc::new(FakeMinter::new()),
+        audit: Arc::new(AuditLog::new(Box::new(AuditSink(Arc::new(Mutex::new(
+            Vec::new(),
+        )))))),
+        store: store.clone(),
+    };
+    (router(state), store)
+}
+
+#[tokio::test]
+async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
+    // Rotation procedure: kid=0 approves; operator rotates keyring;
+    // coordinator restarts → next /v1/enroll fast-path drifts the
+    // record forward to the new current kid, with no operator
+    // intervention. Verifies the runtime path of the retain-keychain
+    // + lazy-migration design (`docs/design-mint.md` § *Root-key
+    // rotation*).
+    let (app, store) = app_in_memory().await;
+    let nonce = store.current_invite().await.unwrap();
+    let cb = client_invite(&nonce, &COORD_SEED);
+
+    // (1) initial enroll + operator approval under kid=0
+    let (status, _) = parts(
+        app.clone()
+            .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    store
+        .approve(SUB, &pop::cnf_value(&COORD_SEED), &now_iso())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_approved(SUB).await.unwrap().unwrap().kid,
+        0,
+        "approval starts under kid=0"
+    );
+
+    // (2) operator rotates the keyring: a second key joins as
+    // current. (In production this is `mint admin keyring rekey-add`;
+    // here we swap directly.)
+    use std::collections::BTreeMap;
+    let mut ring = BTreeMap::new();
+    ring.insert(0, ROOT);
+    ring.insert(1, [99u8; 32]);
+    store
+        .set_keyring(Keyring::from_parts(ring, 1).unwrap())
+        .await;
+    // The record is still trustable — kid=0 is still in the ring.
+    assert_eq!(
+        store.get_approved(SUB).await.unwrap().unwrap().kid,
+        0,
+        "record stays on its issuing kid until migrated",
+    );
+
+    // (3) coordinator restarts → re-runs /v1/enroll. Fast path matches
+    // (same sub/cnf) and the handler opportunistically re-MACs.
+    let (status, _) = parts(
+        app.clone()
+            .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        store.get_approved(SUB).await.unwrap().unwrap().kid,
+        1,
+        "lazy migration drifted the record to the current kid",
+    );
+
+    // (4) operator can now safely retire kid=0; nothing of value is
+    // still under it. A second enroll is a no-op for the kid.
+    let mut ring = BTreeMap::new();
+    ring.insert(1, [99u8; 32]);
+    store
+        .set_keyring(Keyring::from_parts(ring, 1).unwrap())
+        .await;
+    assert!(store.get_approved(SUB).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -370,7 +461,8 @@ async fn bearer_invite_without_cnf_is_opaque_401() {
     let nonce = store.current_invite().await.unwrap();
     // sub but no cnf, and no PoP header: a captured invite copy must
     // not enrol. NotKeyBound is a refusal here.
-    let cb = mint_invite(&ROOT, "mint", &nonce).attenuate(Caveat::scalar(name::SUB, SUB));
+    let cb = mint_invite(&Keyring::single(ROOT), "mint", &nonce)
+        .attenuate(Caveat::scalar(name::SUB, SUB));
     let req = Request::builder()
         .method("POST")
         .uri("/v1/enroll")
@@ -391,7 +483,7 @@ async fn exchange_without_approval_returns_403_awaiting() {
     // an unrecorded sub is indistinguishable from "operator hasn't
     // approved yet" — both are the 403-awaited outcome.
     let inter = mint_credential_ticket(
-        &ROOT,
+        &Keyring::single(ROOT),
         "mint",
         SUB,
         &pop::cnf_value(&COORD_SEED),

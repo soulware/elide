@@ -13,25 +13,33 @@
 //! _mint/invite                 current random nonce (one object)
 //! _mint/pending/<sub>.json     transient (sub, pub, invite, first_seen, peer_ip);
 //!                              GC'd at ticket-exp, deleted at approve()
-//! _mint/approved/<sub>         long-lived {pub, approved_at, fingerprint_shown};
-//!                              powers the re-enrollment fast path
+//! _mint/approved/<sub>         long-lived {pub, approved_at, fingerprint_shown,
+//!                              kid, mac}; powers the re-enrollment fast path
 //! ```
 //!
-//! The macaroon `root_key` does **not** live in object storage — it is
+//! **Every approved-registry entry carries a MAC over its body keyed by
+//! the keyring generation that issued it.** A holder of a `mint-rw`
+//! bucket credential can `PutObject` to `_mint/approved/<sub>`, so the
+//! object body cannot be trusted on its own — only mint instances
+//! holding the corresponding [`Keyring`] key can produce a valid MAC.
+//! [`Store::get_approved`] re-derives and constant-time-compares; a
+//! mismatch is treated as if the record were absent (logged loudly
+//! server-side; opaque to the client).
+//!
+//! The macaroon keyring does **not** live in object storage — it is
 //! the master mint secret and stays on local disk
-//! (`<data_dir>/root_key`, 0600). For multi-instance deployments
-//! operators replicate it out-of-band (e.g. systemd `LoadCredential=`),
-//! since instances sharing a `_mint/` prefix must agree on the MAC key
-//! or they mint mutually-unverifiable macaroons.
+//! (`<data_dir>/root_keys/`, mode 0600 per file). For multi-instance
+//! deployments operators replicate it out-of-band (e.g. systemd
+//! `LoadCredential=`), since instances sharing a `_mint/` prefix must
+//! agree on every `(kid, key)` or they mint and approve in a way the
+//! sibling cannot verify.
 //!
 //! Concurrency: `record_pending` uses `PutMode::Create`
 //! (`If-None-Match: *`) so multi-instance writes are serialised
 //! bucket-side; the conditional primitive is the only ordering
 //! mint relies on — no in-process mutex.
 
-use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -46,7 +54,10 @@ use object_store::{
 };
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
+
+use crate::keyring::{Keyring, Kid};
 
 /// Top-level prefix for mint state inside whatever bucket / directory
 /// the backing [`ObjectStore`] is rooted at — see *Mint state in the
@@ -70,6 +81,13 @@ pub struct Pending {
 /// One approved-coordinator registry entry (`_mint/approved/<sub>`).
 /// Long-lived; written at `approve()`, consulted by every subsequent
 /// `/v1/enroll` (fast path) and `/v1/enroll-exchange`.
+///
+/// The record carries its own MAC under the keyring generation that
+/// issued it. A bucket-level forgery (anyone with `mint-rw` PUT access
+/// to `_mint/*`) cannot produce a valid MAC, because the keyring stays
+/// on local disk. [`Store::get_approved`] verifies and returns the
+/// record only if the MAC matches; a mismatch is treated as if the
+/// record were absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approved {
     /// The pinned `cnf` value the operator confirmed. A later
@@ -82,6 +100,12 @@ pub struct Approved {
     /// The fingerprint shown to the operator at approval, recorded so
     /// audits can re-derive what was on screen at the moment of consent.
     pub fingerprint_shown: String,
+    /// Keyring generation that MAC'd this record. Retired kids fail
+    /// verification — that is the rotation invalidation step.
+    pub kid: Kid,
+    /// BLAKE3-keyed MAC over the body, hex-encoded. See
+    /// [`approval_mac`] for the exact input domain-separation.
+    pub mac: String,
 }
 
 /// What `record_pending` did.
@@ -111,12 +135,33 @@ pub enum StateError {
     Conflict,
     #[error("corrupt enrollment record")]
     Corrupt,
+    /// An approved-registry entry's MAC did not validate under any kid
+    /// in the keyring — either a bucket-level forgery, a record left
+    /// over from a retired kid, or storage corruption. The HTTP layer
+    /// treats this as "not approved" (returns 403 awaiting_approval)
+    /// and logs loudly server-side; the client gets no signal that
+    /// distinguishes it from a missing record.
+    #[error("approval MAC verification failed")]
+    Forged,
 }
 
 impl From<OsError> for StateError {
     fn from(e: OsError) -> Self {
         StateError::Store(e.to_string())
     }
+}
+
+/// Outcome counts from a [`Store::sweep_approvals_to_current_kid`] run.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Records re-MAC'd from an older kid to the current kid.
+    pub rekeyed: usize,
+    /// Records already on the current kid; left untouched.
+    pub already_current: usize,
+    /// Records skipped because their MAC did not validate under any
+    /// kid in the ring, or because the body was corrupt. Each skip is
+    /// logged with the sub and the kid the record claimed.
+    pub skipped: usize,
 }
 
 /// Lifecycle bucket of an enrollment row for `mint enroll list`.
@@ -171,45 +216,48 @@ pub fn fingerprint(pubkey_value: &str) -> String {
         .collect()
 }
 
-fn write_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, path)
+/// Domain separator for approval-record MACs. Distinct from the
+/// macaroon DOMAIN so the same key cannot be tricked into producing an
+/// approval MAC that doubles as a credential MAC or vice versa.
+const APPROVAL_DOMAIN: &[u8] = b"mint-approved-v1";
+
+/// MAC over an approval record body. `sub` is included even though it
+/// is encoded in the object key, so a record cannot be copied to a
+/// different `<sub>` and still verify (cross-record substitution).
+/// Every variable-length field is length-prefixed to prevent
+/// canonicalization ambiguity.
+fn approval_mac(
+    key: &[u8; 32],
+    sub: &str,
+    pubkey: &str,
+    approved_at: &str,
+    fingerprint_shown: &str,
+) -> [u8; 32] {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(APPROVAL_DOMAIN);
+    append_len_prefixed(&mut msg, sub.as_bytes());
+    append_len_prefixed(&mut msg, pubkey.as_bytes());
+    append_len_prefixed(&mut msg, approved_at.as_bytes());
+    append_len_prefixed(&mut msg, fingerprint_shown.as_bytes());
+    *blake3::keyed_hash(key, &msg).as_bytes()
 }
 
-/// Load the macaroon root key from `path` (64 hex chars → 32 bytes),
-/// generating a fresh CSPRNG one (hex, mode 0600) on first start. Hex
-/// so the secret is a single ASCII line — backup/transport friendly
-/// (an operator who loses it loses every outstanding macaroon).
-fn load_or_generate_root_key(path: &Path) -> io::Result<[u8; 32]> {
-    match fs::read_to_string(path) {
-        Ok(text) => decode_root_key(text.trim())
-            .ok_or_else(|| io::Error::other(format!("{}: not 64 hex chars", path.display()))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut key = [0u8; 32];
-            OsRng.fill_bytes(&mut key);
-            write_0600(path, encode_root_key(&key).as_bytes())?;
-            Ok(key)
-        }
-        Err(e) => Err(e),
-    }
+fn append_len_prefixed(out: &mut Vec<u8>, field: &[u8]) {
+    out.extend_from_slice(&(field.len() as u32).to_be_bytes());
+    out.extend_from_slice(field);
 }
 
-fn encode_root_key(key: &[u8; 32]) -> String {
-    key.iter().map(|b| format!("{b:02x}")).collect()
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn decode_root_key(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
+fn unhex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
         return None;
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
 }
@@ -225,10 +273,13 @@ fn decode_root_key(hex: &str) -> Option<[u8; 32]> {
 /// of a full body fetch (`docs/design-mint.md` § *Mint state in the
 /// tenant bucket*).
 pub struct Store {
-    /// The macaroon root, loaded (or generated on first start) from
-    /// `<data_dir>/root_key`. Symmetric: mint both mints and verifies
-    /// with it. Copied out via [`Store::root_key`]; never logged.
-    root_key: [u8; 32],
+    /// The macaroon keyring — generations loaded from
+    /// `<data_dir>/root_keys/`. Symmetric: mint both mints and verifies
+    /// with the keys here. Wrapped in `RwLock` so rotation admin paths
+    /// can swap it; the steady-state minting and verification paths
+    /// snapshot via [`Store::keyring`] and read without holding the
+    /// lock across awaits.
+    keyring: Arc<RwLock<Arc<Keyring>>>,
     objects: Arc<dyn ObjectStore>,
     invite_cache: Arc<RwLock<InviteSnapshot>>,
 }
@@ -248,47 +299,71 @@ pub const INVITE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::fr
 
 impl Store {
     /// Local-filesystem backend rooted at `dir` — the dev / co-resident
-    /// shape. `dir/root_key` is loaded or generated; everything else
-    /// lives under `dir/_mint/`, matching the bucket-side layout key for
-    /// key so an operator can `ls` either and see the same structure.
+    /// shape. `dir/root_keys/` holds the keyring (migrated from
+    /// `dir/root_key` if the legacy singleton is present); everything
+    /// else lives under `dir/_mint/`, matching the bucket-side layout
+    /// key for key so an operator can `ls` either and see the same
+    /// structure.
     pub async fn open_local(dir: impl Into<PathBuf>) -> io::Result<Store> {
+        Self::open_local_with_initial_key(dir, None).await
+    }
+
+    /// Like [`Self::open_local`] but accepts an operator-supplied
+    /// initial key for the first-start case (the multi-host shape:
+    /// every instance is launched with the same seed so all instances
+    /// converge on the same `kid=0`).
+    pub async fn open_local_with_initial_key(
+        dir: impl Into<PathBuf>,
+        initial_key: Option<[u8; 32]>,
+    ) -> io::Result<Store> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
-        let root_key = load_or_generate_root_key(&dir.join("root_key"))?;
+        std::fs::create_dir_all(&dir)?;
+        let keyring = Keyring::open(
+            &dir.join("root_keys"),
+            Some(&dir.join("root_key")),
+            initial_key,
+        )
+        .map_err(io::Error::other)?;
         // LocalFileSystem rejects paths that don't exist; create the
         // _mint subtree so the first PUT lands. (PUTs auto-create
         // intermediate directories, but the prefix root must exist.)
-        fs::create_dir_all(dir.join(STATE_PREFIX))?;
+        std::fs::create_dir_all(dir.join(STATE_PREFIX))?;
         let lfs = LocalFileSystem::new_with_prefix(&dir).map_err(io::Error::other)?;
-        let store = Store::with_object_store(root_key, Arc::new(lfs));
+        let store = Store::with_object_store(keyring, Arc::new(lfs));
         store.ensure_invite().await.map_err(io::Error::other)?;
         Ok(store)
     }
 
     /// Bucket-backed store. `objects` is a [`ObjectStore`] whose root
     /// is the tenant bucket; the `_mint/` prefix is applied to every
-    /// key. `root_key_path` is the local file the macaroon root is
-    /// loaded or generated from (see *`root_key` does not move*).
+    /// key. `keyring_dir` is the local directory the macaroon keyring
+    /// is loaded from / written to. `legacy_singleton` migrates an
+    /// older `<data_dir>/root_key` if present. `initial_key` seeds the
+    /// first-start case for multi-host deployments.
     pub async fn open_remote(
         objects: Arc<dyn ObjectStore>,
-        root_key_path: &Path,
+        keyring_dir: &Path,
+        legacy_singleton: Option<&Path>,
+        initial_key: Option<[u8; 32]>,
     ) -> io::Result<Store> {
-        let root_key = load_or_generate_root_key(root_key_path)?;
-        let store = Store::with_object_store(root_key, objects);
+        let keyring =
+            Keyring::open(keyring_dir, legacy_singleton, initial_key).map_err(io::Error::other)?;
+        let store = Store::with_object_store(keyring, objects);
         store.ensure_invite().await.map_err(io::Error::other)?;
         Ok(store)
     }
 
-    /// In-memory backend, root key supplied directly. For tests.
+    /// In-memory backend with a one-key keyring supplied directly.
+    /// For tests.
     pub async fn open_in_memory(root_key: [u8; 32]) -> io::Result<Store> {
-        let store = Store::with_object_store(root_key, Arc::new(InMemory::new()));
+        let store = Store::with_object_store(Keyring::single(root_key), Arc::new(InMemory::new()));
         store.ensure_invite().await.map_err(io::Error::other)?;
         Ok(store)
     }
 
-    fn with_object_store(root_key: [u8; 32], objects: Arc<dyn ObjectStore>) -> Store {
+    fn with_object_store(keyring: Keyring, objects: Arc<dyn ObjectStore>) -> Store {
         Store {
-            root_key,
+            keyring: Arc::new(RwLock::new(Arc::new(keyring))),
             objects,
             invite_cache: Arc::new(RwLock::new(InviteSnapshot {
                 value: String::new(),
@@ -297,9 +372,20 @@ impl Store {
         }
     }
 
-    /// The macaroon root key. Symmetric — used to both mint and verify.
-    pub fn root_key(&self) -> [u8; 32] {
-        self.root_key
+    /// Snapshot the current keyring as an `Arc`. Steady-state minting
+    /// and verification go through this — the lock is held only for
+    /// the `Arc::clone`, not across the actual MAC work.
+    pub async fn keyring(&self) -> Arc<Keyring> {
+        self.keyring.read().await.clone()
+    }
+
+    /// Replace the in-memory keyring. The on-disk store is the
+    /// canonical source; callers that have mutated disk via
+    /// [`Keyring::add_and_promote`] / [`Keyring::retire`] should swap
+    /// the in-memory copy here so subsequent handlers see the new
+    /// generations.
+    pub async fn set_keyring(&self, keyring: Keyring) {
+        *self.keyring.write().await = Arc::new(keyring);
     }
 
     /// Direct access to the underlying object store. For diagnostics
@@ -516,6 +602,11 @@ impl Store {
     /// deletes the now-redundant pending record. Always overwrites an
     /// existing approval (a different `pubkey` is a key-rotation
     /// acknowledgment). The pending delete is best-effort.
+    ///
+    /// The record is MAC'd under the current keyring generation, so a
+    /// later [`Self::get_approved`] rejects any record whose body has
+    /// been tampered with at the bucket level or that was minted under
+    /// a now-retired kid.
     pub async fn approve(
         &self,
         sub: &str,
@@ -525,10 +616,22 @@ impl Store {
         if !safe_sub(sub) {
             return Err(StateError::BadSub);
         }
+        let fingerprint_shown = fingerprint(pubkey);
+        let kr = self.keyring().await;
+        let kid = kr.current_kid();
+        let mac = approval_mac(
+            kr.current_key(),
+            sub,
+            pubkey,
+            now_iso8601,
+            &fingerprint_shown,
+        );
         let rec = Approved {
             pubkey: pubkey.to_string(),
             approved_at: now_iso8601.to_string(),
-            fingerprint_shown: fingerprint(pubkey),
+            fingerprint_shown,
+            kid,
+            mac: hex32(&mac),
         };
         let bytes = serde_json::to_vec(&rec).map_err(|_| StateError::Corrupt)?;
         self.objects
@@ -581,20 +684,51 @@ impl Store {
     /// The approved-registry entry for `sub`, if any. Used at
     /// `/v1/enroll-exchange` to verify the operator's binding, and at
     /// `/v1/enroll` to take the fast path on a matching `pubkey`.
+    ///
+    /// The record's MAC is verified under the keyring before it is
+    /// returned: a record under a retired kid, a bucket-level forgery,
+    /// or a partial overwrite all surface as [`StateError::Forged`].
+    /// Callers that want to treat a forgery the same as an absent
+    /// record (the HTTP layer's policy — don't leak forensic signal to
+    /// the client) should map both to "not approved" themselves.
     pub async fn get_approved(&self, sub: &str) -> Result<Option<Approved>, StateError> {
         if !safe_sub(sub) {
             return Err(StateError::BadSub);
         }
-        match self.objects.get(&Self::approved_key(sub)).await {
-            Ok(g) => {
-                let bytes = g.bytes().await?;
-                serde_json::from_slice(&bytes)
-                    .map(Some)
-                    .map_err(|_| StateError::Corrupt)
-            }
-            Err(OsError::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
+        let bytes = match self.objects.get(&Self::approved_key(sub)).await {
+            Ok(g) => g.bytes().await?,
+            Err(OsError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let rec: Approved = serde_json::from_slice(&bytes).map_err(|_| StateError::Corrupt)?;
+        let kr = self.keyring().await;
+        let Some(key) = kr.get(rec.kid) else {
+            tracing::warn!(
+                target: "mint::state",
+                sub,
+                kid = rec.kid,
+                "approved record claims a kid not in the keyring; treating as forged"
+            );
+            return Err(StateError::Forged);
+        };
+        let expected = approval_mac(
+            key,
+            sub,
+            &rec.pubkey,
+            &rec.approved_at,
+            &rec.fingerprint_shown,
+        );
+        let actual = unhex32(&rec.mac).ok_or(StateError::Corrupt)?;
+        if !bool::from(expected.ct_eq(&actual)) {
+            tracing::warn!(
+                target: "mint::state",
+                sub,
+                kid = rec.kid,
+                "approved record MAC mismatch; treating as forged"
+            );
+            return Err(StateError::Forged);
         }
+        Ok(Some(rec))
     }
 
     async fn pending_subs(&self) -> Result<Vec<String>, StateError> {
@@ -619,6 +753,201 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Lazy migration: if `_mint/approved/<sub>` is on an older kid,
+    /// re-MAC it under `current_kid` and PUT back with `If-Match` on
+    /// the etag we just read. Called opportunistically by the enroll
+    /// fast path so each coordinator's record drifts forward to the
+    /// current kid on its next restart, without any global sweep.
+    ///
+    /// Best-effort by design: a missing record, a kid mismatch already
+    /// at current, a 412 (concurrent rotation / revoke racing us), or
+    /// a body that no longer verifies are all silent no-ops returning
+    /// `Ok(false)`. `Ok(true)` means a migration write actually
+    /// happened. The caller never branches on the return value beyond
+    /// logging — verification-time correctness is provided by the MAC
+    /// check in `get_approved`, not by this method completing.
+    pub async fn migrate_approval_to_current_kid(&self, sub: &str) -> Result<bool, StateError> {
+        if !safe_sub(sub) {
+            return Err(StateError::BadSub);
+        }
+        let key = Self::approved_key(sub);
+        let g = match self.objects.get(&key).await {
+            Ok(g) => g,
+            Err(OsError::NotFound { .. }) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let etag = g.meta.e_tag.clone();
+        let version = g.meta.version.clone();
+        let bytes = g.bytes().await?;
+        let rec: Approved = match serde_json::from_slice(&bytes) {
+            Ok(r) => r,
+            Err(_) => return Ok(false),
+        };
+        let kr = self.keyring().await;
+        if rec.kid == kr.current_kid() {
+            return Ok(false);
+        }
+        // Verify under the old kid before migrating; we never re-MAC a
+        // record we couldn't validate as authentic in the first place.
+        let Some(old_key) = kr.get(rec.kid) else {
+            return Ok(false);
+        };
+        let expected_old = approval_mac(
+            old_key,
+            sub,
+            &rec.pubkey,
+            &rec.approved_at,
+            &rec.fingerprint_shown,
+        );
+        let actual = match unhex32(&rec.mac) {
+            Some(a) => a,
+            None => return Ok(false),
+        };
+        if !bool::from(expected_old.ct_eq(&actual)) {
+            return Ok(false);
+        }
+        let new_mac = approval_mac(
+            kr.current_key(),
+            sub,
+            &rec.pubkey,
+            &rec.approved_at,
+            &rec.fingerprint_shown,
+        );
+        let next = Approved {
+            pubkey: rec.pubkey,
+            approved_at: rec.approved_at,
+            fingerprint_shown: rec.fingerprint_shown,
+            kid: kr.current_kid(),
+            mac: hex32(&new_mac),
+        };
+        let body = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
+        let opts = PutOptions::from(PutMode::Update(object_store::UpdateVersion {
+            e_tag: etag,
+            version,
+        }));
+        match self
+            .objects
+            .put_opts(&key, PutPayload::from(Bytes::from(body)), opts)
+            .await
+        {
+            Ok(_) => Ok(true),
+            // 412 (Precondition) means the record changed under us —
+            // most commonly a peer mint just migrated it (idempotent
+            // race), or the operator revoked. Either way: don't retry,
+            // don't error.
+            Err(OsError::Precondition { .. }) => Ok(false),
+            // `LocalFileSystem` returns `NotImplemented` for
+            // `PutMode::Update` — dev backend, single-process, no
+            // multi-writer concerns. Treat as a quiet no-op so the
+            // dev shape doesn't error out on rotation; the record
+            // stays valid under its old kid and the next attempt
+            // (against an S3 backend in production) will migrate it.
+            Err(OsError::NotImplemented) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Re-MAC every approval record under the keyring's current
+    /// generation (rotation step 2 — `docs/design-mint.md` §
+    /// *Root-key rotation*). Verifies each record under any kid still
+    /// in the ring before re-emitting it, so a forged or tampered
+    /// record is skipped (logged + reported in the return value),
+    /// never propagated under a new MAC. Returns the count of records
+    /// re-MAC'd and the count skipped.
+    ///
+    /// Safe to run repeatedly — a record already at `current_kid`
+    /// re-serialises to identical bytes. Intended to be invoked once
+    /// per rotation by an admin command; the steady-state HTTP path
+    /// does not call it.
+    pub async fn sweep_approvals_to_current_kid(&self) -> Result<SweepReport, StateError> {
+        let mut report = SweepReport::default();
+        let kr = self.keyring().await;
+        let new_kid = kr.current_kid();
+        let new_key = kr.current_key();
+        for sub in self.approved_subs().await? {
+            // Read raw so we can decide what to do with a forged record
+            // (skip + count) instead of inheriting `get_approved`'s
+            // policy of erroring.
+            let bytes = match self.objects.get(&Self::approved_key(&sub)).await {
+                Ok(g) => g.bytes().await?,
+                Err(OsError::NotFound { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let rec: Approved = match serde_json::from_slice(&bytes) {
+                Ok(r) => r,
+                Err(_) => {
+                    report.skipped += 1;
+                    tracing::warn!(target: "mint::state", sub, "sweep: corrupt body");
+                    continue;
+                }
+            };
+            // Verify under whatever kid the record claims; any kid
+            // still in the ring is acceptable input to the sweep.
+            let Some(old_key) = kr.get(rec.kid) else {
+                report.skipped += 1;
+                tracing::warn!(
+                    target: "mint::state",
+                    sub,
+                    kid = rec.kid,
+                    "sweep: record under unknown kid"
+                );
+                continue;
+            };
+            let expected = approval_mac(
+                old_key,
+                &sub,
+                &rec.pubkey,
+                &rec.approved_at,
+                &rec.fingerprint_shown,
+            );
+            let actual = match unhex32(&rec.mac) {
+                Some(a) => a,
+                None => {
+                    report.skipped += 1;
+                    continue;
+                }
+            };
+            if !bool::from(expected.ct_eq(&actual)) {
+                report.skipped += 1;
+                tracing::warn!(
+                    target: "mint::state",
+                    sub,
+                    kid = rec.kid,
+                    "sweep: MAC mismatch; skipping"
+                );
+                continue;
+            }
+            if rec.kid == new_kid {
+                report.already_current += 1;
+                continue;
+            }
+            let new_mac = approval_mac(
+                new_key,
+                &sub,
+                &rec.pubkey,
+                &rec.approved_at,
+                &rec.fingerprint_shown,
+            );
+            let next = Approved {
+                pubkey: rec.pubkey,
+                approved_at: rec.approved_at,
+                fingerprint_shown: rec.fingerprint_shown,
+                kid: new_kid,
+                mac: hex32(&new_mac),
+            };
+            let bytes = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
+            self.objects
+                .put_opts(
+                    &Self::approved_key(&sub),
+                    PutPayload::from(Bytes::from(bytes)),
+                    PutOptions::default(),
+                )
+                .await?;
+            report.rekeyed += 1;
+        }
+        Ok(report)
     }
 
     /// Drop pending records older than `max_age_seconds`. The bound is
@@ -650,8 +979,17 @@ impl Store {
         let approved_subs = self.approved_subs().await?;
         let mut approveds: Vec<(String, Approved)> = Vec::new();
         for sub in approved_subs {
-            if let Some(a) = self.get_approved(&sub).await? {
-                approveds.push((sub, a));
+            match self.get_approved(&sub).await {
+                Ok(Some(a)) => approveds.push((sub, a)),
+                Ok(None) => {}
+                // A forged or retired-kid entry must not poison the
+                // whole `mint enroll list` view — it has already been
+                // logged inside `get_approved`. Skipping it here is
+                // consistent with the HTTP layer's "treat as absent"
+                // policy and matches what the operator would otherwise
+                // see if they retried after the bad record was cleared.
+                Err(StateError::Forged) => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -733,6 +1071,7 @@ fn fresh_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     async fn store() -> (tempfile::TempDir, Store) {
         let d = tempfile::tempdir().expect("tempdir");
@@ -764,13 +1103,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_key_generated_once_and_stable_across_open() {
+    async fn keyring_generated_once_and_stable_across_open() {
         let d = tempfile::tempdir().unwrap();
-        let r1 = Store::open_local(d.path()).await.unwrap().root_key();
-        let r2 = Store::open_local(d.path()).await.unwrap().root_key();
+        let r1 = *Store::open_local(d.path())
+            .await
+            .unwrap()
+            .keyring()
+            .await
+            .current_key();
+        let r2 = *Store::open_local(d.path())
+            .await
+            .unwrap()
+            .keyring()
+            .await
+            .current_key();
         assert_eq!(r1, r2, "restart preserves the key");
         assert_ne!(r1, [0u8; 32], "key is random, not zero");
-        let f = d.path().join("root_key");
+        let f = d.path().join("root_keys").join("0000");
         assert_eq!(
             std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
             0o600
@@ -780,18 +1129,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_key_seeded_file_is_loaded() {
+    async fn legacy_root_key_file_migrated_into_keyring() {
         let d = tempfile::tempdir().unwrap();
         let hex: String = [7u8; 32].iter().map(|b| format!("{b:02x}")).collect();
         std::fs::write(d.path().join("root_key"), hex).unwrap();
-        assert_eq!(
-            Store::open_local(d.path()).await.unwrap().root_key(),
-            [7u8; 32]
+        let store = Store::open_local(d.path()).await.unwrap();
+        let kr = store.keyring().await;
+        assert_eq!(kr.current_kid(), 0);
+        assert_eq!(kr.current_key(), &[7u8; 32]);
+        assert!(
+            d.path().join("root_keys").join("0000").exists(),
+            "migrated into the new layout"
+        );
+        assert!(
+            !d.path().join("root_key").exists(),
+            "legacy singleton removed"
         );
     }
 
     #[tokio::test]
-    async fn root_key_bad_format_is_an_error() {
+    async fn first_start_with_supplied_initial_key() {
+        // Multi-host shape: operator launches every instance with the
+        // same key so they all converge on the same kid=0.
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open_local_with_initial_key(d.path(), Some([7u8; 32]))
+            .await
+            .unwrap();
+        assert_eq!(store.keyring().await.current_key(), &[7u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn keyring_malformed_root_key_file_is_an_error() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("root_key"), b"not hex").unwrap();
         assert!(Store::open_local(d.path()).await.is_err());
@@ -1001,6 +1369,254 @@ mod tests {
         let after = s.rotate_invite().await.unwrap();
         assert_ne!(before, after);
         assert_eq!(s.current_invite().await.unwrap(), after);
+    }
+
+    // ---- Approval-MAC / keyring-rotation behaviour ----
+
+    /// Write a raw JSON body directly to `_mint/approved/<sub>` via the
+    /// backing object store. Simulates a bucket-level attacker that
+    /// holds a `mint-rw` credential (PUT on `_mint/*`) but does not
+    /// have the macaroon keyring on local disk — every test that asks
+    /// "could this be forged?" exercises this path.
+    async fn raw_put_approved(store: &Store, sub: &str, body: &serde_json::Value) {
+        let key = Store::approved_key(sub);
+        let bytes = serde_json::to_vec(body).unwrap();
+        store
+            .objects
+            .put_opts(
+                &key,
+                PutPayload::from(Bytes::from(bytes)),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn approved_record_round_trips_with_mac() {
+        let (_d, s) = store().await;
+        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        let got = s.get_approved("01ARZ").await.unwrap().expect("present");
+        let kr = s.keyring().await;
+        assert_eq!(got.kid, kr.current_kid());
+        assert_eq!(got.mac.len(), 64, "32-byte mac as hex");
+    }
+
+    #[tokio::test]
+    async fn forged_unsigned_put_rejected_as_forged() {
+        let (_d, s) = store().await;
+        // A bucket-level write of a record that omits the MAC entirely
+        // (or, equivalently, supplies any random value) must not be
+        // honoured by `get_approved`.
+        let forged = serde_json::json!({
+            "pubkey": PUBA,
+            "approved_at": APPROVED_AT,
+            "fingerprint_shown": fingerprint(PUBA),
+            "kid": 0,
+            "mac": "00".repeat(32),
+        });
+        raw_put_approved(&s, "01ARZ", &forged).await;
+        assert!(matches!(
+            s.get_approved("01ARZ").await,
+            Err(StateError::Forged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_copied_to_a_different_sub_fails_to_verify() {
+        // The MAC binds `sub` into its input, so an attacker who copies
+        // a valid record verbatim from `_mint/approved/subA` to
+        // `_mint/approved/subB` cannot replay it under the new sub.
+        let (_d, s) = store().await;
+        s.approve("subA", PUBA, APPROVED_AT).await.unwrap();
+        let real = s.get_approved("subA").await.unwrap().expect("present");
+        let body = serde_json::to_value(&real).unwrap();
+        raw_put_approved(&s, "subB", &body).await;
+        assert!(matches!(
+            s.get_approved("subB").await,
+            Err(StateError::Forged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_under_retired_kid_is_forged() {
+        // Even an authentic record dies when its kid leaves the ring.
+        // This is the rotation invalidation step (`retire(kid)`) doing
+        // its job — old approvals stop verifying the moment the kid is
+        // removed from the keyring.
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open_local(d.path()).await.unwrap();
+        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        // Rotate the keyring on disk, then retire the original kid.
+        let mut kr = (*s.keyring().await).clone();
+        let rk = d.path().join("root_keys");
+        kr.add_and_promote(&rk, None).unwrap();
+        kr.retire(&rk, 0).unwrap();
+        s.set_keyring(kr).await;
+        assert!(matches!(
+            s.get_approved("01ARZ").await,
+            Err(StateError::Forged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_under_old_kid_still_verifies_until_retired() {
+        // The retain-keychain shape: rotation is additive. An approval
+        // minted under kid=0 keeps verifying after a new kid joins the
+        // ring, because verification picks the key by kid.
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open_local(d.path()).await.unwrap();
+        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        let mut kr = (*s.keyring().await).clone();
+        let rk = d.path().join("root_keys");
+        kr.add_and_promote(&rk, None).unwrap();
+        s.set_keyring(kr).await;
+        // get_approved still returns the original record — the new kid
+        // is current, but kid=0 is still in the ring for verification.
+        let got = s.get_approved("01ARZ").await.unwrap().expect("present");
+        assert_eq!(got.kid, 0, "record stays on its issuing kid");
+    }
+
+    /// Build a two-kid in-memory keyring `{0 → key_0, 1 → key_1}` with
+    /// kid=1 as current. Used by the lazy-migration tests, which need
+    /// a backend that implements `PutMode::Update` (`LocalFileSystem`
+    /// returns `NotImplemented`; `InMemory` and the production S3
+    /// backend both do).
+    fn ring_two_keys(key_0: [u8; 32], key_1: [u8; 32]) -> Keyring {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(0, key_0);
+        map.insert(1, key_1);
+        Keyring::from_parts(map, 1).expect("from_parts")
+    }
+
+    #[tokio::test]
+    async fn lazy_migration_drifts_record_to_current_kid() {
+        // The runtime path: a coordinator restart triggers re-MAC of
+        // its approval forward to the current kid. The record's body
+        // is unchanged except for `kid` and `mac`; subsequent reads
+        // verify under the new kid.
+        let s = Store::open_in_memory([1u8; 32]).await.unwrap();
+        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.set_keyring(ring_two_keys([1u8; 32], [2u8; 32])).await;
+        let migrated = s.migrate_approval_to_current_kid("01ARZ").await.unwrap();
+        assert!(migrated, "first call moves it forward");
+        let after = s.get_approved("01ARZ").await.unwrap().expect("present");
+        assert_eq!(after.kid, 1);
+        assert_eq!(after.pubkey, PUBA, "body content unchanged");
+        let again = s.migrate_approval_to_current_kid("01ARZ").await.unwrap();
+        assert!(!again, "already at current kid → no-op");
+    }
+
+    #[tokio::test]
+    async fn lazy_migration_refuses_forged_record() {
+        // A forged record at the old kid must not be re-MAC'd forward
+        // under the new kid — that would launder it into validity.
+        let s = Store::open_in_memory([1u8; 32]).await.unwrap();
+        let forged = serde_json::json!({
+            "pubkey": PUBA,
+            "approved_at": APPROVED_AT,
+            "fingerprint_shown": fingerprint(PUBA),
+            "kid": 0,
+            "mac": "00".repeat(32),
+        });
+        raw_put_approved(&s, "01ARZ", &forged).await;
+        s.set_keyring(ring_two_keys([1u8; 32], [2u8; 32])).await;
+        let migrated = s.migrate_approval_to_current_kid("01ARZ").await.unwrap();
+        assert!(!migrated, "forged record is not re-MAC'd forward");
+        // And the record still fails to verify under the new kid: the
+        // MAC didn't change, and the new kid's key wouldn't match it
+        // either.
+        assert!(matches!(
+            s.get_approved("01ARZ").await,
+            Err(StateError::Forged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sweep_rekeys_old_records_skips_forged() {
+        // The admin sweep is the explicit "consolidate before retire"
+        // path. Mixes a real record at kid=0, a forged record at
+        // kid=0, and a record already at current — the sweep moves the
+        // first, skips the second, leaves the third alone.
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open_local(d.path()).await.unwrap();
+        s.approve("real-old", PUBA, APPROVED_AT).await.unwrap();
+        let forged = serde_json::json!({
+            "pubkey": PUBB,
+            "approved_at": APPROVED_AT,
+            "fingerprint_shown": fingerprint(PUBB),
+            "kid": 0,
+            "mac": "00".repeat(32),
+        });
+        raw_put_approved(&s, "forged", &forged).await;
+        let mut kr = (*s.keyring().await).clone();
+        let rk = d.path().join("root_keys");
+        kr.add_and_promote(&rk, None).unwrap();
+        s.set_keyring(kr).await;
+        // A record approved AFTER the rotation already sits on the new
+        // kid — the sweep should report it as already_current.
+        s.approve("on-current", PUBA, APPROVED_AT).await.unwrap();
+        let report = s.sweep_approvals_to_current_kid().await.unwrap();
+        assert_eq!(report.rekeyed, 1, "real-old moved forward");
+        assert_eq!(report.skipped, 1, "forged not laundered");
+        assert_eq!(report.already_current, 1, "on-current untouched");
+        assert_eq!(s.get_approved("real-old").await.unwrap().unwrap().kid, 1);
+        assert!(matches!(
+            s.get_approved("forged").await,
+            Err(StateError::Forged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn intermediate_kid_retire_does_not_affect_other_kids() {
+        // Per-kid retire is independent: removing kid 1 from a ring of
+        // {0, 1, 2} leaves records under 0 and 2 verifying as before.
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open_local(d.path()).await.unwrap();
+        s.approve("under-0", PUBA, APPROVED_AT).await.unwrap();
+        // Rotate to kid 1, approve a second record there.
+        let mut kr = (*s.keyring().await).clone();
+        let rk = d.path().join("root_keys");
+        kr.add_and_promote(&rk, None).unwrap();
+        s.set_keyring(kr).await;
+        s.approve("under-1", PUBB, APPROVED_AT).await.unwrap();
+        // Rotate again to kid 2, approve a third.
+        let mut kr = (*s.keyring().await).clone();
+        kr.add_and_promote(&rk, None).unwrap();
+        s.set_keyring(kr).await;
+        s.approve("under-2", PUBA, APPROVED_AT).await.unwrap();
+        // Now retire only the intermediate kid 1. `under-0` and
+        // `under-2` should still verify; `under-1` should not.
+        let mut kr = (*s.keyring().await).clone();
+        kr.retire(&rk, 1).unwrap();
+        s.set_keyring(kr).await;
+        assert!(s.get_approved("under-0").await.unwrap().is_some());
+        assert!(s.get_approved("under-2").await.unwrap().is_some());
+        assert!(matches!(
+            s.get_approved("under-1").await,
+            Err(StateError::Forged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_skips_forged_records_without_failing() {
+        // `mint enroll list` must not crash because one record was
+        // forged or under a retired kid; that record is silently
+        // dropped from the view (logged inside get_approved).
+        let (_d, s) = store().await;
+        s.approve("good", PUBA, APPROVED_AT).await.unwrap();
+        let forged = serde_json::json!({
+            "pubkey": PUBB,
+            "approved_at": APPROVED_AT,
+            "fingerprint_shown": fingerprint(PUBB),
+            "kid": 0,
+            "mac": "00".repeat(32),
+        });
+        raw_put_approved(&s, "bad", &forged).await;
+        let rows = s.list(0).await.unwrap();
+        let subs: Vec<&str> = rows.iter().map(|r| r.sub.as_str()).collect();
+        assert!(subs.contains(&"good"));
+        assert!(!subs.contains(&"bad"), "forged entry filtered from list");
     }
 
     #[tokio::test]

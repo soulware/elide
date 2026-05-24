@@ -12,6 +12,7 @@ use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::issuance::mint_credential;
+use mint::keyring::Keyring;
 use mint::macaroon::{Macaroon, mint};
 use mint::pop;
 use mint::state::Store;
@@ -103,7 +104,7 @@ fn far_future() -> u64 {
 /// attenuated per request with a tighter `exp` and an `elide:Volume`.
 fn request_macaroon() -> Macaroon {
     mint_credential(
-        &ROOT,
+        &Keyring::single(ROOT),
         "mint",
         SUB,
         &pop::cnf_value(&COORD_SEED),
@@ -165,7 +166,7 @@ async fn wrong_op_is_opaque_401() {
     let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let m = mint(
-        &ROOT,
+        &Keyring::single(ROOT),
         vec![
             Caveat::scalar(name::OP, op::ENROLL),
             Caveat::scalar(name::AUD, "mint"),
@@ -241,7 +242,11 @@ async fn contradictory_cnf_fails_closed_not_bearer() {
 async fn bad_mac_is_opaque_401() {
     let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
-    let forged = mint(&[1u8; 32], vec![Caveat::scalar(name::OP, op::ASSUME_ROLE)]).encode();
+    let forged = mint(
+        &Keyring::single([1u8; 32]),
+        vec![Caveat::scalar(name::OP, op::ASSUME_ROLE)],
+    )
+    .encode();
     let req = Request::builder()
         .method("POST")
         .uri("/v1/assume-role")
@@ -259,7 +264,7 @@ async fn missing_required_caveat_is_400() {
     let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let m = mint(
-        &ROOT,
+        &Keyring::single(ROOT),
         vec![
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, "mint"),
