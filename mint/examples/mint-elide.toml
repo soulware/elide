@@ -2,7 +2,6 @@
 # docs/design-mint.md § "Elide as customer: role inventory".
 
 audience = "mint"
-# backend = "tigris"   # default; alternative: "local"
 
 # data_dir / roles_dir: a relative value (including the defaults
 # mint_data / mint_roles) resolves against the working directory, not

@@ -154,7 +154,7 @@ Each mint instance is configured with:
    caveat. Absent in the minimal self-hosted deployment (no third-party
    caveat); present when an identity authority such as the managed login
    service is in use.
-3. **One Tigris admin credential** (per backend), held in memory. It is
+3. **One Tigris admin credential**, held in memory. It is
    read from the standard AWS environment variables
    (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, optionally
    `AWS_SESSION_TOKEN`) — the same convention the elide coordinator uses
@@ -180,15 +180,15 @@ AWS environment; the keyring lives under `<data_dir>/root_keys/`
 #### On-disk layout
 
 A mint instance is named by its config file: `--config <path>`,
-defaulting to `./mint.toml`. The deployment shape is the config's
-**`backend`** field — `"tigris"` (default) puts enrollment state in
-the tenant bucket under `_mint/` and uses real Tigris IAM for
-`assume-role`; `"local"` uses local-filesystem state under `data_dir`
-and the deterministic fake keypair minter (the dev / co-resident
-shape). The same field is read by `mint serve` and the operator
-commands so the nonce printed by `mint invite` matches what `serve`
-verifies on `/v1/enroll` — there is no CLI flag, mismatching
-backends are not representable.
+defaulting to `./mint.toml`. `mint serve` always runs against a
+real S3-compatible backend: enrollment state in the tenant bucket
+under `_mint/` (via the self-vended `mint-rw` keypair) and real
+Tigris IAM for `assume-role`. There is no in-process dev backend;
+operators wanting to exercise the flow without a public Tigris
+account point at MinIO or a Tigris free-tier bucket. Test code
+that needs a `Store` without a cloud dependency uses
+`Store::open_in_memory` / `Store::open_local` directly, outside
+the `serve` path.
 
 The config also declares two optional directories, mirroring the
 elide coordinator's `data_dir` (`coordinator.toml`):
