@@ -385,6 +385,12 @@ mint, or at a coord whose primary's `vid` field was extracted.
 
 ## Verification: two enforcement points, one auth service
 
+Coord and mint **both verify the bundle independently** on the paths
+they sit on. Mint does not trust coord's check — it re-runs the
+verification from scratch. This is defense in depth: a compromised
+coord can still make `/v1/assume-role` calls, but cannot bypass
+mint's check by claiming "I already verified."
+
 - **Coordinator** verifies the bundle on every operator IPC verb.
   Walks its stored primary with `K_coord`, recovers `K_vid_org` from
   the primary's TPC `vid` field, verifies the per-op discharge with
@@ -393,15 +399,47 @@ mint, or at a coord whose primary's `vid` field was extracted.
   primary if `K_vid_org` has rotated (see *Tenancy and enrollment*
   above).
 - **Mint** verifies on every `assume-role` call that issues
-  write-capable creds (`volume-rw`, `coord-names`, Split-A writers).
-  Reads (`coord-ro`) remain unauthenticated. Mint re-derives `K_coord`
-  from its root + `coord_ulid` to verify the primary, then uses the
-  `K_vid_org` it holds in state to verify the discharge. Same `OrgId`
-  / `CoordId` / `Op` / `Volume` caveat checks as coord. This is the
-  architectural chokepoint from
+  write-capable creds. Re-derives `K_coord` from its root + the
+  `CoordId` caveat on the presented primary, walks the primary,
+  recovers (and cross-checks against state) `K_vid_org`, verifies
+  the discharge, checks the same caveats. This is the architectural
+  chokepoint from
   [`design-auth-model.md`](design-auth-model.md#proposed-operator-tokens-gate-s3-writes-not-verbs);
   the third-party-caveat anchor sits on the primary mint issued at
   coord enrollment.
+
+### What each verifier checks
+
+| Check | Coord | Mint |
+|---|---|---|
+| Primary MAC | uses stored `K_coord` | re-derives `K_coord` from `K_M + coord_ulid` (extracts `coord_ulid` from the `CoordId` caveat) |
+| Recover `K_vid_org` from primary's TPC vid | via primary's chain auth value | same — and cross-checks against `K_vid_org` already in mint state |
+| Discharge MAC under `K_vid_org` | yes | yes |
+| Discharge first-party caveats (`Op`, `Volume`, `NotAfter`) | matches the dispatched IPC verb | matches the `assume-role` request shape |
+| `OrgId` matches enrolled org | matches coord's enrolled OrgId | matches mint's OrgId (must be the same — coord is enrolled to this mint) |
+| `CoordId` on the primary | matches coord's own ULID | used to derive `K_coord`, and used to scope what the call may authorise (mint only grants `volume-rw` for volumes this coord owns, `coord-names` only within this coord's authority, etc.) |
+
+### Which ops reach mint
+
+Not every operator IPC verb passes through `/v1/assume-role`. Mint's
+verifier sees the bundle only on S3-write paths.
+
+| IPC verb shape | Coord verifies | Mint verifies |
+|---|---|---|
+| Read-only at coord (`volume list`, `volume status` from local index) | yes | not reached |
+| Local-state mutation only (`volume register`, local `volume remove`) | yes | not reached |
+| S3 read needed | yes | `coord-ro` cred path (existing, no operator discharge) |
+| S3 write needed (`volume claim`, `volume release`, `volume snapshot`, `volume create` writing `names/`) | yes | yes — coord forwards `(primary, discharge)` with the assume-role call |
+
+### Caller authentication is separate
+
+Mint's bundle verification proves the *operator* authorised this
+specific op. It does not prove the *caller* is a legitimate coord.
+Coord-to-mint caller authentication uses mint's existing
+cred-issuance auth path (the volume-macaroon-keyed mechanism mint
+already has — unchanged by this design). Both are required for mint
+to issue write-capable creds: caller-auth proves it's a real coord,
+the bundle proves a human authorised the op.
 
 Both verifiers trust the **same** auth service via `K_vid_org`.
 Removing one enforcement point doesn't silently lose the other.
