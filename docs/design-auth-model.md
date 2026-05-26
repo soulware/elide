@@ -303,8 +303,10 @@ verifier, with a single root that never leaves it (`design-mint.md` §
 issues* — it enters as a **third-party-caveat discharge**: the
 coordinator holds a primary macaroon; a write window additionally
 requires a discharge from an identity authority (the managed `elide
-login` service) attesting a human authorised it. This is the
-*third-party caveats for authentication* direction below.
+operator login` service) attesting a human authorised it. The concrete
+shape of that auth service — login flow, session/discharge macaroons,
+multi-tenancy, enrollment, API surface — lives in
+[`design-auth-service.md`](design-auth-service.md).
 
 ### Until then
 
@@ -314,7 +316,11 @@ The only PoC change worth making before mint is moving the hook from
 `remove` (misleading: local-cache-only) to `claim` / `release` (genuine
 shared-S3-state mutations).
 
-## Open questions
+## Open questions (legacy PoC)
+
+These apply to the PoC operator-token surface above; the central
+auth service design in
+[`design-auth-service.md`](design-auth-service.md) supersedes them.
 
 - **Bootstrap.** First-ever `elide token create` against a fresh
   coordinator has no offline escape hatch (there is no
@@ -330,20 +336,6 @@ shared-S3-state mutations).
 
 These do not affect the design above; they describe extensions that slot
 in cleanly when the threat model or deployment shape warrants them.
-
-- **Third-party caveats for authentication.** The model above is
-  authorisation-only: possession of an operator token is treated as
-  operator identity. A future extension adds *third-party caveats* — a
-  caveat that says "valid only if the bearer also presents a discharge
-  macaroon from `<auth_service>` attesting predicate P." This adds a real
-  authentication step (SSO, webauthn, whatever the auth service does)
-  tied to each token use, with the discharge's lifetime acting as the
-  session length. The chained-MAC construction already accommodates this
-  — third-party caveats are just another `Caveat` variant whose body is
-  `(location_uri, caveat_id, vid_key)`. None of the existing `Op` /
-  `Volume` / `NotAfter` surface needs to change. This is the mechanism
-  behind option (b) in *Proposed: operator tokens gate S3 writes, not
-  verbs*.
 - **Root key in a separate signing process.** Today the coordinator
   holds the root key in memory. Splitting it into a standalone signing
   service reduces blast radius (coordinator compromise can no longer
