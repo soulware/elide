@@ -128,17 +128,92 @@ the primary's `caveat_id` (using `K_M-A`) or by walking the primary
 with `K_coord` (using the vid field). Mint stays stateless across
 coords.
 
-**Rotation.** `K_M-A` rotation is the only routine rotation event.
-When the auth service rotates `K_M-A`, every existing primary's
-`caveat_id` becomes undecryptable by the new key — fresh discharges
-can no longer be issued against the old primary. Resolution is
-pull-on-verify-fail: when the CLI's `/v1/discharge` call fails with
-a caveat_id decode error, the CLI fetches a fresh primary from coord
-(which fetches a fresh primary from mint via `GET /v1/coord/primary`).
-Mint re-issues with a fresh `K_vid_coord-X` and a `caveat_id`
-encoded under the new `K_M-A`. Coord swaps its stored primary; the
-CLI gets the new caveat_id from coord and retries the discharge
-fetch. Bounded by one retry per in-flight verification.
+See *Key rotation* below for how `K_M-A` and `K_M` are rotated.
+
+## Key rotation
+
+Three keys can be rotated. All use a grace-window + pull-on-verify-fail
+mechanic; differences are in the blast radius and re-issuance scope.
+
+### `K_M-A` rotation (auth service ↔ mint wrapping key)
+
+Triggered by routine auth-service-side rotation, or if `K_M-A` is
+suspected compromised. Mint runs with both `K_M-A_old` and `K_M-A_new`
+during a grace window.
+
+When `K_M-A` rotates, every existing primary's `caveat_id` becomes
+undecodable by the new key — the auth service can no longer recover
+`K_vid_coord-X` from those `caveat_id`s, so fresh discharges can't be
+issued against old primaries.
+
+Resolution is **pull-on-verify-fail**: when the CLI's `/v1/discharge`
+call fails with a caveat_id decode error, the CLI signals coord to
+refresh. Coord fetches a fresh primary from mint via `GET
+/v1/coord/primary`. Mint re-issues with a fresh `K_vid_coord-X` and a
+`caveat_id` encoded under the new `K_M-A`. Coord swaps its stored
+primary; the CLI fetches the new `caveat_id` from coord and retries
+the discharge request. Bounded by one retry per in-flight verification.
+
+`K_coord` is unaffected — the primary's chain key derivation doesn't
+involve `K_M-A`. Only the TPC's caveat_id and (by convention) the
+`K_vid_coord-X` change.
+
+### `K_M` rotation (mint's root)
+
+The heaviest event in the system. Triggered by routine mint-root
+rotation (annual / biennial) or if `K_M` is suspected compromised
+(catastrophic — anyone with `K_M` can mint primaries for any coord).
+
+When `K_M` rotates, every `K_coord = HKDF(K_M, coord_ulid)` changes.
+Mint can no longer verify primaries it issued under `K_M_old` unless
+it keeps the old key around.
+
+Mechanism:
+
+1. Mint admin runs `elide-mint rotate-root`. Mint generates `K_M_new`,
+   retains `K_M_old` as a fallback for a configurable grace window
+   (default days; configurable down to hours for emergency rotations).
+2. During the grace window, mint verifies presented primaries with
+   both keys: tries `K_coord_new` first, falls back to `K_coord_old`.
+   Either accepts.
+3. Each coord, on its next mint interaction (assume-role, primary
+   refresh, or proactive heartbeat), is detected as still on the old
+   primary. Mint re-issues:
+   - Computes `K_coord_new = HKDF(K_M_new, coord_ulid)`
+   - Generates fresh `K_vid_coord-X` (rotated together with K_M as a
+     matter of policy)
+   - Mints new primary MAC'd with `K_coord_new`
+   - Returns `(K_coord_new, new primary)` to coord
+4. Coord swaps both `K_coord` and the primary atomically in `data_dir`.
+5. After the grace window expires, mint drops `K_M_old`. Coords still
+   on old primaries become unverifiable at mint until they re-enroll
+   manually.
+
+Coord's local IPC verification is unaffected throughout — `K_coord`
+and its stored primary stay consistent (they were issued together).
+The break is purely at the mint verifier on `assume-role` calls.
+
+For emergency rotation (suspected `K_M` leak), the grace window should
+be aggressive and mint should signal all coords to refresh
+proactively rather than waiting for normal contact. Coords offline
+for the entire window require manual re-enrollment.
+
+### `K_session` rotation (auth-service-only)
+
+Trivial: only the auth service holds `K_session`. Rotation
+invalidates all existing sessions; operators re-run `elide operator
+login` to obtain fresh ones. No coord- or mint-side impact.
+
+Grace window optional — the auth service can keep `K_session_old` to
+honour in-flight sessions until their `NotAfter` expiry, then drop it.
+
+### Summary
+
+| Key | Affects | Coord-side impact | Failure mode if not refreshed |
+|---|---|---|---|
+| `K_M-A` | TPC `caveat_id` becomes undecodable; discharges can't be issued against old primary | Stored primary needs refresh (one round-trip to mint) | CLI's `/v1/discharge` fails caveat_id decode |
+| `K_M` | Per-coord `K_coord` changes; mint can no longer verify old primaries | Both stored `K_coord` and primary need refresh | Coord's `assume-role` calls fail at mint after grace window |
+| `K_session` | All sessions invalidated | None | Existing sessions stop verifying at auth service; operator runs `login` again |
 
 ## Login flow
 
