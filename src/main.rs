@@ -133,45 +133,6 @@ enum Command {
         #[command(subcommand)]
         command: CoordCommand,
     },
-
-    /// Mint operator tokens. Tokens are minted by the coordinator and
-    /// stored per-coordinator in `~/.elide/tokens.toml` (keyed by
-    /// data_dir), so gated verbs like `volume remove` pick them up
-    /// without `--token`.
-    Token {
-        #[command(subcommand)]
-        command: TokenCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum TokenCommand {
-    /// Mint a coordinator-wide operator token via the coordinator's
-    /// IPC socket. Prints it to stdout and upserts it into
-    /// `~/.elide/tokens.toml` keyed by this coordinator's data_dir, so
-    /// gated verbs pick it up automatically. The CLI narrows the token
-    /// per use; the minted form is not itself authorised for any verb.
-    Create {
-        /// Token lifetime. Defaults to 30 days. Accepts humantime
-        /// durations like `7d`, `12h`, `30m` — short values are
-        /// useful for tests.
-        #[arg(long, default_value = "30d")]
-        expires: humantime::Duration,
-    },
-
-    /// List stored operator tokens from `~/.elide/tokens.toml`: one
-    /// row per coordinator, showing its data_dir, the token nonce, and
-    /// when it expires.
-    List,
-
-    /// Remove a stored token from `~/.elide/tokens.toml`, selected by
-    /// its nonce (as shown by `elide token list`). Independent of the
-    /// filesystem, so a stale entry can be cleaned up after its
-    /// coordinator is gone.
-    Remove {
-        /// Token nonce, copied from `elide token list`.
-        nonce: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -476,11 +437,6 @@ enum VolumeCommand {
         /// unflushed. Use only if you don't need the local-only state.
         #[arg(long)]
         force: bool,
-        /// Operator token. Falls back to `ELIDE_OPERATOR_TOKEN`, then
-        /// to this coordinator's entry in `~/.elide/tokens.toml`. Mint
-        /// with `elide token create`.
-        #[arg(long, env = "ELIDE_OPERATOR_TOKEN", hide_env_values = true)]
-        token: Option<String>,
     },
 
     /// Stop a running volume (flushes WAL, drains pending, publishes an
@@ -951,13 +907,11 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Remove { name, force, token } => {
+            VolumeCommand::Remove { name, force } => {
                 // Resolve `name` → ULID once, locally, against the
-                // `by_name/<name>` symlink. The token gets attenuated
-                // for *this* ULID and the wire request carries the same
-                // ULID, so the coordinator never re-reads `by_name`
-                // during the remove (eliminates a CLI→coord rotation
-                // TOCTOU on the name binding).
+                // `by_name/<name>` symlink. The resolved ULID is what
+                // the coordinator removes, so the bucket-side `names/`
+                // record never re-enters the deletion decision.
                 let volume_ulid = match resolve_local_volume_ulid(&data_dir, &name)
                     .and_then(|s| ulid::Ulid::from_string(&s).ok())
                 {
@@ -970,34 +924,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-                let stored = match elide::operator_token::resolve(token.as_deref(), &data_dir) {
-                    Ok(Some(t)) => t,
-                    Ok(None) => {
-                        eprintln!(
-                            "error: {}",
-                            elide::operator_token::missing_token_hint(
-                                elide_coordinator::macaroon::OperatorOp::Remove,
-                            ),
-                        );
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("error: read operator token: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                let wire = match elide::operator_token::attenuate_for(
-                    &stored,
-                    elide_coordinator::macaroon::OperatorOp::Remove,
-                    volume_ulid,
-                ) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("error: operator token malformed: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                if let Err(e) = coord.remove_volume(volume_ulid, force, wire) {
+                if let Err(e) = coord.remove_volume(volume_ulid, force) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -1343,104 +1270,6 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
-        },
-
-        Command::Token { command } => match command {
-            TokenCommand::Create { expires } => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let expires_unix = now.saturating_add(expires.as_secs());
-                match coord.mint_operator_token(expires_unix) {
-                    Ok(reply) => {
-                        println!("{}", reply.token);
-                        match elide::operator_token::store_token(&data_dir, &reply.token) {
-                            Ok(path) => eprintln!(
-                                "minted operator token: nonce={} expires_unix={} stored={}",
-                                reply.nonce_hex,
-                                reply.expires_unix,
-                                path.display(),
-                            ),
-                            Err(e) => {
-                                eprintln!(
-                                    "minted operator token: nonce={} expires_unix={}",
-                                    reply.nonce_hex, reply.expires_unix,
-                                );
-                                eprintln!("warning: could not store token: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            TokenCommand::List => match elide::operator_token::list_tokens() {
-                Ok((path, entries)) => {
-                    if entries.is_empty() {
-                        println!("no tokens stored in {}", path.display());
-                    } else {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let dd_w = entries
-                            .iter()
-                            .map(|e| e.data_dir.len())
-                            .max()
-                            .unwrap_or(8)
-                            .max(8);
-                        println!("# {}", path.display());
-                        println!(
-                            "{:<dd_w$}  {:<32}  EXPIRES",
-                            "DATA-DIR",
-                            "NONCE",
-                            dd_w = dd_w
-                        );
-                        for e in &entries {
-                            let nonce = e.nonce_hex.as_deref().unwrap_or("<unparseable>");
-                            let expires = match e.expires_unix {
-                                Some(t) if t > now => format!(
-                                    "in {} ({t})",
-                                    humantime::format_duration(std::time::Duration::from_secs(
-                                        t - now
-                                    )),
-                                ),
-                                Some(t) => format!("EXPIRED ({t})"),
-                                None => "?".to_owned(),
-                            };
-                            println!(
-                                "{:<dd_w$}  {:<32}  {}",
-                                e.data_dir,
-                                nonce,
-                                expires,
-                                dd_w = dd_w
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            },
-
-            TokenCommand::Remove { nonce } => match elide::operator_token::remove_token(&nonce) {
-                Ok(Some(dd)) => {
-                    eprintln!("removed operator token nonce={nonce} (data_dir={dd})");
-                }
-                Ok(None) => {
-                    eprintln!("error: no stored token with nonce {nonce}");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            },
         },
     }
 }

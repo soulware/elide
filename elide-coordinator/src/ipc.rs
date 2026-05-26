@@ -213,37 +213,14 @@ pub enum Request {
     /// Remove the local instance of a volume: `by_name/<volume>`
     /// symlink + `by_id/<vol_ulid>/` directory. Bucket records are
     /// untouched. With `force = false`, refuses if `pending/` or
-    /// `wal/` is non-empty.
-    ///
-    /// Gated on an attenuated operator token (see
-    /// [`Request::MintOperatorToken`] and `docs/design-auth-model.md`).
-    /// The CLI resolves the user-typed name to a ULID via
-    /// [`Request::ResolveName`] before sending; the resolved ULID is
-    /// carried both on the wire and inside the operator token's
-    /// `Volume` caveat, so the coordinator never re-reads
-    /// `names/<name>` for an authorisation decision. This eliminates a
-    /// rotation-between-CLI-and-coord TOCTOU on the name binding.
-    /// Absent or invalid token → `Envelope::Err { kind: "forbidden" }`.
+    /// `wal/` is non-empty. The CLI resolves the user-typed name to a
+    /// ULID before sending so the coordinator never re-reads
+    /// `names/<name>` for the deletion decision.
     Remove {
         volume_ulid: Ulid,
         #[serde(default)]
         force: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        operator_token: Option<String>,
     },
-    /// Mint a coordinator-wide operator token. The CLI calls this when
-    /// the operator runs `elide token create`. The minted token carries
-    /// `Role::Operator` and a `NotAfter` at `expires_unix`; the
-    /// per-token random nonce lives on the macaroon struct (not as a
-    /// caveat) and is what the coordinator audit log records. The
-    /// token does *not* carry `Op` or `Volume` — the CLI narrows those
-    /// per use via attenuation before presenting the token to a gated
-    /// verb.
-    ///
-    /// Trust floor: socket reachability. Mint cannot be gated by a
-    /// token that doesn't exist yet, and on-host socket access is
-    /// already the floor for every other coordinator operation.
-    MintOperatorToken { expires_unix: u64 },
     // ── Read-only history ────────────────────────────────────────────
     /// Read the per-name event log for `volume`, newest first,
     /// verifying each entry's signature against the emitting
@@ -608,20 +585,6 @@ pub struct StoreCredsReply {
 pub struct PeerClaimerTokenReply {
     pub token: String,
     pub issued_at: u64,
-}
-
-/// Reply for [`Request::MintOperatorToken`]. The encoded macaroon is
-/// what the CLI upserts into `~/.elide/tokens.toml` keyed by the
-/// coordinator's data_dir (or the operator passes via `--token` /
-/// `ELIDE_OPERATOR_TOKEN`). `nonce_hex` and
-/// `expires_unix` are returned alongside so the CLI can log what was
-/// just minted — useful for matching `token create` events to later
-/// `operator_token::authn` log lines.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MintOperatorTokenReply {
-    pub token: String,
-    pub nonce_hex: String,
-    pub expires_unix: u64,
 }
 
 /// Reply for [`Request::Register`]. The macaroon is base64-encoded;

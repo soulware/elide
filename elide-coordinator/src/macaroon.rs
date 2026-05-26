@@ -29,11 +29,6 @@
 //       Scope    (tag 1): u8 (0 = credentials, 1 = fetch worker)
 //       Pid      (tag 2): i32 BE
 //       NotAfter (tag 3): u64 BE  (unix seconds)
-//       Role     (tag 4): u8 (0 = operator)
-//       Op       (tag 5): u8 (0 = remove)
-//
-// `Role` and `Op` are operator-token caveats; volume macaroons never
-// carry them. See `docs/design-auth-model.md`.
 
 use std::io;
 
@@ -48,15 +43,9 @@ const TAG_VOLUME: u8 = 0;
 const TAG_SCOPE: u8 = 1;
 const TAG_PID: u8 = 2;
 const TAG_NOT_AFTER: u8 = 3;
-const TAG_ROLE: u8 = 4;
-const TAG_OP: u8 = 5;
 
 const SCOPE_CREDENTIALS: u8 = 0;
 const SCOPE_FETCH_WORKER: u8 = 1;
-
-const ROLE_OPERATOR: u8 = 0;
-
-const OP_REMOVE: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -91,70 +80,12 @@ impl Scope {
     }
 }
 
-/// Distinguishes operator-issued tokens (human CLI users) from
-/// volume-process tokens. Volume tokens carry [`Scope`] instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    /// Operator macaroon: not PID-bound, gates destructive coordinator
-    /// verbs. Minted by [`mint_operator`], attenuated per use by the
-    /// CLI. See `docs/design-auth-model.md`.
-    Operator,
-}
-
-impl Role {
-    fn to_byte(self) -> u8 {
-        match self {
-            Self::Operator => ROLE_OPERATOR,
-        }
-    }
-
-    fn from_byte(b: u8) -> Option<Self> {
-        match b {
-            ROLE_OPERATOR => Some(Self::Operator),
-            _ => None,
-        }
-    }
-}
-
-/// Coordinator operations gated by an operator token. Exhaustive: the
-/// dispatcher hands [`verify_operator`] the variant for the verb it is
-/// about to execute, and the verifier requires the chain to carry the
-/// matching [`Caveat::Op`]. New gated verbs slot in as new variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperatorOp {
-    Remove,
-}
-
-impl OperatorOp {
-    fn to_byte(self) -> u8 {
-        match self {
-            Self::Remove => OP_REMOVE,
-        }
-    }
-
-    fn from_byte(b: u8) -> Option<Self> {
-        match b {
-            OP_REMOVE => Some(Self::Remove),
-            _ => None,
-        }
-    }
-
-    /// Lowercase verb name for logs and CLI integration.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Remove => "remove",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Caveat {
     Volume(String),
     Scope(Scope),
     Pid(i32),
     NotAfter(u64),
-    Role(Role),
-    Op(OperatorOp),
 }
 
 #[derive(Debug, Clone)]
@@ -211,30 +142,12 @@ impl Macaroon {
         })
     }
 
-    /// First [`Caveat::Role`] in the chain, if any. Operator tokens
-    /// always carry `Role::Operator`; volume tokens carry none.
-    pub fn role(&self) -> Option<Role> {
-        self.caveats.iter().find_map(|c| match c {
-            Caveat::Role(r) => Some(*r),
-            _ => None,
-        })
-    }
-
-    /// First [`Caveat::Op`] in the chain, if any. The CLI appends this
-    /// at use time per the design in `docs/design-auth-model.md`.
-    pub fn op(&self) -> Option<OperatorOp> {
-        self.caveats.iter().find_map(|c| match c {
-            Caveat::Op(o) => Some(*o),
-            _ => None,
-        })
-    }
-
     /// Smallest `NotAfter` in the chain, if any. AND-of-predicates
     /// evaluation means the narrowest bound always binds — useful for
     /// surfacing "when does this token effectively expire" in audit
     /// or diagnostic output. The per-caveat enforcement in
-    /// [`check_caveats`] / [`check_operator_caveats`] already rejects
-    /// any expired link, so this is purely a reporting helper.
+    /// [`check_caveats`] already rejects any expired link, so this is
+    /// purely a reporting helper.
     pub fn narrowest_not_after(&self) -> Option<u64> {
         self.caveats.iter().fold(None, |acc, c| match c {
             Caveat::NotAfter(t) => Some(acc.map_or(*t, |e: u64| e.min(*t))),
@@ -347,8 +260,7 @@ pub struct VerifyCtx<'a> {
 
 /// A volume identity that has just emerged from a verifier. The inner
 /// field is module-private: the only way to obtain a `Verified<Ulid>`
-/// is through [`check_caveats`] (volume-daemon tokens) or
-/// [`verify_operator`] (operator tokens). Downstream code that resolves
+/// is through [`check_caveats`]. Downstream code that resolves
 /// volume-scoped state (registry lookup, segment fetch, IAM teardown)
 /// consumes the receipt instead of a bare `Ulid`, so the only way to
 /// reach those code paths is via a successful verification of *this*
@@ -380,120 +292,10 @@ impl<T> Verified<T> {
     /// the bin's tests can construct one even though the lib they link
     /// against is a non-test build). Production code physically cannot
     /// reach this constructor — every non-test code path that consumes
-    /// a `Verified<Ulid>` must obtain it from [`check_caveats`] or
-    /// [`verify_operator`].
+    /// a `Verified<Ulid>` must obtain it from [`check_caveats`].
     pub fn for_test(inner: T) -> Self {
         Self(inner)
     }
-}
-
-/// Mint an operator macaroon. The root token is coordinator-wide: no
-/// `Volume` or `Op` caveats. The CLI narrows per use by appending
-/// `Op(<verb>)`, `Volume(<target>)`, and a short `NotAfter` before
-/// sending the token to the coordinator.
-///
-/// `expires_unix` is required (no indefinite operator tokens). The
-/// per-token nonce that gives the token its audit identity is the
-/// struct-level nonce minted inside [`mint`] — operator tokens do not
-/// carry a separate nonce caveat. See `docs/design-auth-model.md`.
-pub fn mint_operator(root_key: &[u8; 32], expires_unix: u64) -> Macaroon {
-    mint(
-        root_key,
-        vec![Caveat::Role(Role::Operator), Caveat::NotAfter(expires_unix)],
-    )
-}
-
-/// Runtime context for operator-token caveat evaluation. Operator
-/// tokens carry no `Pid` or `Scope`, so they need a parallel context
-/// to [`VerifyCtx`].
-pub struct VerifyOperatorCtx {
-    pub now_unix: u64,
-    pub op: OperatorOp,
-    pub op_volume: Ulid,
-}
-
-/// Reasons an operator token may be rejected. Coarse on the wire (the
-/// IPC `Err` body collapses to a single string), but the typed enum is
-/// kept locally so the audit log can record the specific reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperatorReject {
-    Malformed,
-    BadMac,
-    WrongRole,
-    Expired,
-    WrongOp,
-    VolumeMismatch,
-    MissingVolume,
-    MissingOp,
-}
-
-/// Evaluate every caveat against `ctx`. Returns `Ok(())` if all
-/// predicates hold, otherwise the matching [`OperatorReject`]. Does
-/// NOT verify the MAC — call [`verify`] first.
-///
-/// Operator tokens are an AND of: `Role::Operator`, every `NotAfter`
-/// in the chain in the future, every `Op` equal to `ctx.op`, every
-/// `Volume` equal to `ctx.op_volume`. The root token alone is
-/// insufficient — `MissingVolume` / `MissingOp` reject any chain that
-/// did not get narrowed at the CLI.
-pub fn check_operator_caveats(m: &Macaroon, ctx: &VerifyOperatorCtx) -> Result<(), OperatorReject> {
-    let expected_volume_str = ctx.op_volume.to_string();
-    let mut saw_role = false;
-    let mut saw_volume = false;
-    let mut saw_op = false;
-    for c in &m.caveats {
-        match c {
-            Caveat::Role(Role::Operator) => saw_role = true,
-            Caveat::NotAfter(t) => {
-                if ctx.now_unix >= *t {
-                    return Err(OperatorReject::Expired);
-                }
-            }
-            Caveat::Op(o) => {
-                saw_op = true;
-                if *o != ctx.op {
-                    return Err(OperatorReject::WrongOp);
-                }
-            }
-            Caveat::Volume(v) => {
-                saw_volume = true;
-                if v != &expected_volume_str {
-                    return Err(OperatorReject::VolumeMismatch);
-                }
-            }
-            // Volume-macaroon caveats have no place on an operator
-            // token — fail closed.
-            Caveat::Scope(_) | Caveat::Pid(_) => return Err(OperatorReject::WrongRole),
-        }
-    }
-    if !saw_role {
-        return Err(OperatorReject::WrongRole);
-    }
-    if !saw_op {
-        return Err(OperatorReject::MissingOp);
-    }
-    if !saw_volume {
-        return Err(OperatorReject::MissingVolume);
-    }
-    Ok(())
-}
-
-/// Top-level operator-token check. Parses the wire form, verifies the
-/// MAC chain against `root_key`, then evaluates every caveat against
-/// `ctx`. Returns the parsed macaroon and a [`Verified<Ulid>`] receipt
-/// carrying the authorised volume (equal to `ctx.op_volume` by
-/// construction — the check has just passed).
-pub fn verify_operator(
-    root_key: &[u8; 32],
-    encoded: &str,
-    ctx: &VerifyOperatorCtx,
-) -> Result<(Macaroon, Verified<Ulid>), OperatorReject> {
-    let m = Macaroon::parse(encoded).map_err(|_| OperatorReject::Malformed)?;
-    if !verify(root_key, &m) {
-        return Err(OperatorReject::BadMac);
-    }
-    check_operator_caveats(&m, ctx)?;
-    Ok((m, Verified(ctx.op_volume)))
 }
 
 /// Evaluate every caveat against `ctx`. On success returns a
@@ -530,11 +332,6 @@ pub fn check_caveats(m: &Macaroon, ctx: &VerifyCtx<'_>) -> Result<Verified<Ulid>
                     return Err("macaroon expired");
                 }
             }
-            // Role/Op caveats belong to operator tokens; a volume
-            // macaroon presented through this verifier is malformed
-            // if it carries either.
-            Caveat::Role(_) => return Err("role caveat not valid for volume macaroon"),
-            Caveat::Op(_) => return Err("op caveat not valid for volume macaroon"),
         }
     }
     if !saw_volume {
@@ -585,14 +382,6 @@ fn write_one(c: &Caveat, out: &mut Vec<u8>) {
             out.push(TAG_NOT_AFTER);
             out.extend_from_slice(&t.to_be_bytes());
         }
-        Caveat::Role(r) => {
-            out.push(TAG_ROLE);
-            out.push(r.to_byte());
-        }
-        Caveat::Op(o) => {
-            out.push(TAG_OP);
-            out.push(o.to_byte());
-        }
     }
 }
 
@@ -628,20 +417,6 @@ fn deserialize_caveats(blob: &[u8]) -> io::Result<Vec<Caveat>> {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(bytes);
                 Caveat::NotAfter(u64::from_be_bytes(a))
-            }
-            TAG_ROLE => {
-                let b = read_u8(&mut cur)?;
-                Caveat::Role(
-                    Role::from_byte(b)
-                        .ok_or_else(|| io::Error::other(format!("unknown role: {b}")))?,
-                )
-            }
-            TAG_OP => {
-                let b = read_u8(&mut cur)?;
-                Caveat::Op(
-                    OperatorOp::from_byte(b)
-                        .ok_or_else(|| io::Error::other(format!("unknown op: {b}")))?,
-                )
             }
             _ => return Err(io::Error::other(format!("unknown caveat tag: {tag}"))),
         };
@@ -708,7 +483,6 @@ mod tests {
 
     const ULID_A_STR: &str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
     const ULID_B_STR: &str = "01JQBBBBBBBBBBBBBBBBBBBBBB";
-    const ULID_C_STR: &str = "01JQCCCCCCCCCCCCCCCCCCCCCC";
 
     fn ulid_a() -> Ulid {
         Ulid::from_string(ULID_A_STR).unwrap()
@@ -716,10 +490,6 @@ mod tests {
 
     fn ulid_b() -> Ulid {
         Ulid::from_string(ULID_B_STR).unwrap()
-    }
-
-    fn ulid_c() -> Ulid {
-        Ulid::from_string(ULID_C_STR).unwrap()
     }
 
     fn sample_caveats() -> Vec<Caveat> {
@@ -964,196 +734,5 @@ mod tests {
             ],
         );
         assert_ne!(a.mac, b.mac);
-    }
-
-    // ── operator tokens ───────────────────────────────────────────────
-
-    const T_NOW: u64 = 1_750_000_000;
-    const ROOT_EXPIRES: u64 = T_NOW + 30 * 86_400;
-    const USE_EXPIRES: u64 = T_NOW + 60;
-
-    fn op_ctx(op: OperatorOp, op_volume: Ulid, now: u64) -> VerifyOperatorCtx {
-        VerifyOperatorCtx {
-            now_unix: now,
-            op,
-            op_volume,
-        }
-    }
-
-    fn attenuated_operator_token(
-        expiry_root: u64,
-        op: OperatorOp,
-        vol: Ulid,
-        expiry_use: u64,
-    ) -> String {
-        mint_operator(&key(), expiry_root)
-            .attenuate(Caveat::Op(op))
-            .attenuate(Caveat::Volume(vol.to_string()))
-            .attenuate(Caveat::NotAfter(expiry_use))
-            .encode()
-    }
-
-    #[test]
-    fn mint_operator_carries_role_and_expiry() {
-        let m = mint_operator(&key(), ROOT_EXPIRES);
-        assert_eq!(m.role(), Some(Role::Operator));
-        assert_eq!(m.not_after(), Some(ROOT_EXPIRES));
-        assert!(m.volume().is_none());
-        assert!(m.op().is_none());
-        assert!(verify(&key(), &m));
-    }
-
-    #[test]
-    fn mint_operator_produces_unique_struct_nonces() {
-        // The per-token random nonce on the struct gives each operator
-        // token its own audit identity even if minted with identical
-        // expiry. This is the only place "two operator tokens with the
-        // same expires_unix" produces distinct identities; the rebase
-        // dropped the caveat-level nonce so this property must hold
-        // via the struct nonce alone.
-        let a = mint_operator(&key(), ROOT_EXPIRES);
-        let b = mint_operator(&key(), ROOT_EXPIRES);
-        assert_ne!(a.nonce_hex(), b.nonce_hex());
-    }
-
-    #[test]
-    fn verify_operator_happy_path_after_cli_attenuation() {
-        let t = attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, ulid_a(), USE_EXPIRES);
-        let (m, verified) =
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap();
-        assert_eq!(m.op(), Some(OperatorOp::Remove));
-        assert_eq!(m.volume(), Some(ulid_a()));
-        assert_eq!(verified.copy_inner(), ulid_a());
-    }
-
-    #[test]
-    fn verify_operator_rejects_wire_token_use_expired() {
-        let t = attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, ulid_a(), T_NOW - 1);
-        assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap_err(),
-            OperatorReject::Expired,
-        );
-    }
-
-    #[test]
-    fn verify_operator_rejects_when_root_expired_even_if_use_window_open() {
-        // Root expiry is in the past; attenuation cannot widen authority.
-        let t = attenuated_operator_token(T_NOW - 1, OperatorOp::Remove, ulid_a(), USE_EXPIRES);
-        assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap_err(),
-            OperatorReject::Expired,
-        );
-    }
-
-    #[test]
-    fn verify_operator_rejects_bad_mac() {
-        let mut t =
-            attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, ulid_a(), USE_EXPIRES);
-        // Flip a byte inside the MAC region: format is
-        // `v2.<nonce>.<mac>.<blob>`. The MAC section starts after the
-        // second dot.
-        let nonce_dot = t.find('.').unwrap();
-        let mac_dot = nonce_dot + 1 + t[nonce_dot + 1..].find('.').unwrap();
-        let pos = mac_dot + 2;
-        let bytes = unsafe { t.as_bytes_mut() };
-        bytes[pos] = if bytes[pos] == b'a' { b'b' } else { b'a' };
-        assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap_err(),
-            OperatorReject::BadMac,
-        );
-    }
-
-    #[test]
-    fn verify_operator_rejects_volume_macaroon_presented_as_operator() {
-        // Volume-scoped token must never authenticate operator verbs.
-        // The exact OperatorReject variant depends on chain order: the
-        // matching-volume case fails at the Scope caveat (WrongRole);
-        // the mismatching-volume case fails at the Volume caveat
-        // (VolumeMismatch). Both reject, which is the property we need.
-        let mismatching = mint(&key(), sample_caveats());
-        assert_eq!(
-            verify_operator(
-                &key(),
-                &mismatching.encode(),
-                &op_ctx(OperatorOp::Remove, ulid_b(), T_NOW),
-            )
-            .unwrap_err(),
-            OperatorReject::VolumeMismatch,
-        );
-
-        let matching = mint(
-            &key(),
-            vec![
-                Caveat::Volume(ULID_B_STR.to_owned()),
-                Caveat::Scope(Scope::Credentials),
-                Caveat::Pid(12345),
-            ],
-        );
-        assert_eq!(
-            verify_operator(
-                &key(),
-                &matching.encode(),
-                &op_ctx(OperatorOp::Remove, ulid_b(), T_NOW),
-            )
-            .unwrap_err(),
-            OperatorReject::WrongRole,
-        );
-    }
-
-    #[test]
-    fn verify_operator_rejects_wrong_op_in_chain() {
-        // Wire token attenuated for Remove; verifier asked about a
-        // different op. (Today only Remove exists, so the only way to
-        // produce WrongOp via this path is via the CLI dispatcher
-        // mis-routing — the test guards against that.) For now the
-        // failure shape we can exercise is "no Op caveat at all":
-        // returns MissingOp.
-        let t = mint_operator(&key(), ROOT_EXPIRES)
-            .attenuate(Caveat::Volume(ULID_A_STR.to_owned()))
-            .attenuate(Caveat::NotAfter(USE_EXPIRES))
-            .encode();
-        assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap_err(),
-            OperatorReject::MissingOp,
-        );
-    }
-
-    #[test]
-    fn verify_operator_rejects_volume_mismatch() {
-        let t = attenuated_operator_token(ROOT_EXPIRES, OperatorOp::Remove, ulid_a(), USE_EXPIRES);
-        assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_c(), T_NOW)).unwrap_err(),
-            OperatorReject::VolumeMismatch,
-        );
-    }
-
-    #[test]
-    fn verify_operator_rejects_missing_volume() {
-        // CLI must always attenuate by volume — a chain without one
-        // is rejected.
-        let t = mint_operator(&key(), ROOT_EXPIRES)
-            .attenuate(Caveat::Op(OperatorOp::Remove))
-            .attenuate(Caveat::NotAfter(USE_EXPIRES))
-            .encode();
-        assert_eq!(
-            verify_operator(&key(), &t, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)).unwrap_err(),
-            OperatorReject::MissingVolume,
-        );
-    }
-
-    #[test]
-    fn operator_attenuation_cannot_relax_root_expiry() {
-        // Append a far-future NotAfter via attenuation. The original
-        // tight root NotAfter remains in the chain and still binds
-        // because evaluation is AND-of-predicates.
-        let m = mint_operator(&key(), T_NOW - 1)
-            .attenuate(Caveat::Op(OperatorOp::Remove))
-            .attenuate(Caveat::Volume(ULID_A_STR.to_owned()))
-            .attenuate(Caveat::NotAfter(T_NOW + 86_400));
-        assert!(verify(&key(), &m));
-        assert_eq!(
-            check_operator_caveats(&m, &op_ctx(OperatorOp::Remove, ulid_a(), T_NOW)),
-            Err(OperatorReject::Expired),
-        );
     }
 }

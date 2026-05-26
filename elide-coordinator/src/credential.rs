@@ -42,8 +42,7 @@ pub struct IssuedCredentials {
 ///
 /// The argument is [`Verified<Ulid>`] rather than a bare `Ulid`: the
 /// only way to construct one in production is by going through
-/// [`crate::macaroon::check_caveats`] or
-/// [`crate::macaroon::verify_operator`], so the trait *declares* that
+/// [`crate::macaroon::check_caveats`], so the trait *declares* that
 /// it can only be called for an authorised volume.
 ///
 /// `issue` is async because the mint-backed impl calls out to the

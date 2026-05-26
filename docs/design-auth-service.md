@@ -8,27 +8,27 @@ established in
 concrete shape of the *third-party-caveat discharge* anchor mint
 requires for write-capable cred issuance.
 
-**Status: proposed. Not yet implemented.** Replaces the local
-operator-token issuer (the PoC documented in
-[`design-auth-model.md`](design-auth-model.md#operator-tokens)) with
-a central auth service and a third-party-caveat discharge flow.
+**Status: proposed. Not yet implemented.** The prior local
+operator-token PoC has been removed from the codebase; operator IPC
+verbs are currently ungated. This design re-introduces operator
+authorisation via a central auth service and a third-party-caveat
+discharge flow.
 
 ## Principle
 
-The PoC mints operator tokens locally on the coordinator and trusts
-"can reach the unix socket" as the identity floor. The settled
-direction removes that local-mint surface entirely:
+The PoC minted operator tokens locally on the coordinator and trusted
+"can reach the unix socket" as the identity floor. That surface has
+been removed (see *Migration from PoC* below). The settled direction:
 
 - The **central auth service** is the sole issuer of operator session
   macaroons and per-op discharges.
-- The **coordinator** becomes a verifier only — it holds the auth
-  service's verification key but cannot mint operator tokens.
-- The **`~/.elide/tokens.toml`** file and `Request::MintOperatorToken`
-  IPC verb both go away.
+- The **coordinator** is a verifier only — it holds the auth service's
+  verification key and cannot mint operator tokens.
+- Operator IPC verbs are currently **ungated** pending this design.
 
-Every operator IPC verb requires a valid session **and** a fresh
-discharge. Volume↔coord IPC (PID-bound volume macaroons) is unchanged
-— the new gate is on operator IPC only.
+Once landed, every operator IPC verb requires a valid session **and**
+a fresh discharge. Volume↔coord IPC (PID-bound volume macaroons) is
+unchanged — the new gate is on operator IPC only.
 
 ## Tenancy and enrollment
 
@@ -105,9 +105,9 @@ in-flight session at most.
 
 `elide operator login` supports two modes. The CLI selects mode by
 whether `ELIDE_OPERATOR_API_KEY` is set; both end at the same
-artefact (a session macaroon stored once, per-user, replacing
-`~/.elide/tokens.toml`), so coord and mint cannot tell which mode
-produced a given session.
+artefact — a session macaroon stored once, per-user, in a single file
+under `~/.elide/` — so coord and mint cannot tell which mode produced
+a given session.
 
 The stored session is org-scoped (mandatory `OrgId` caveat) and
 covers every coordinator within that org that trusts the same auth
@@ -592,16 +592,14 @@ Out of scope for the initial design.
 
 ## Migration from PoC
 
-Clean break. The change that lands the central auth service removes:
+Clean break. The PoC operator-token surface has already been removed
+from the codebase (`~/.elide/tokens.toml`, `Request::MintOperatorToken`,
+the `OperatorOp` / `verify_operator` plumbing, the `elide token`
+subcommands). Operator IPC verbs are currently ungated; the central
+auth service will re-gate them uniformly when it lands.
 
-- `~/.elide/tokens.toml`
-- `Request::MintOperatorToken` IPC verb
-- The `OperatorOp` / `verify_operator` PoC plumbing
-- Coord-side root-key state used to mint operator tokens
-
-No compatibility shim. Operators with existing PoC tokens must run
-`elide operator login` against the new auth service. Coords stood up
-under the PoC must be re-enrolled via `elide-coordinator setup
+No compatibility shim. Operators with stale `~/.elide/tokens.toml`
+files must remove them manually. Coords that were stood up under the
+PoC must be re-enrolled via `elide-coordinator setup
 --enrollment-token` after their org has been activated (mint
-enrollment). Cleanup of stale on-disk state is manual; no migration
-tooling ships.
+enrollment). No migration tooling ships.
