@@ -15,11 +15,13 @@ Two distinct auth surfaces layer on that foundation:
   short-lived read-only S3 credentials. Implemented. Construction
   and registration flow live in `architecture.md`.
 - **Operator authorisation** — gates every operator IPC verb via a
-  mint-issued primary macaroon (one per coord, cached at coord) and
-  an auth-service-issued wide discharge (one per `(session, coord)`,
-  vouched on cache miss via `/v1/discharge/verify`), with the CLI
-  attenuating the wide discharge per IPC for `(Op, Volume)` binding.
-  Design lives in
+  mint-issued primary macaroon (one per coord, held by coord) and
+  an auth-service-issued wide discharge (one per `(session, coord)`).
+  CLI attenuates the wide discharge per IPC for `(Op, Volume)`
+  binding. Coord holds no chain key and no discharge key: it
+  forwards bundles to mint for cryptographic verification, caches
+  mint's verdict for the discharge's NotAfter, and clears caveats
+  against the live IPC context. Design lives in
   [`design-auth-service.md`](design-auth-service.md); not yet
   implemented. Operator IPC verbs are ungated in the codebase today.
 
@@ -46,17 +48,18 @@ attested.**
 - An operator discharge attests "a human authorised this op against
   this coordinator." The trust source is the human's identity
   provider, not coord. Coord must not be able to forge that claim,
-  so coord is excluded from issuance entirely: mint issues primaries
-  (mint is the org's identity hub) and the auth service issues
-  discharges (the auth service is the human-identity authority).
-  Coord and mint trust discharges *on receipt* — coord via the
-  cached vouch obtained from `/v1/discharge/verify` at auth, mint
-  via the same mechanism on its assume-role path. Neither holds any
-  discharge-MAC key.
+  so coord is excluded from issuance and from verification: mint
+  issues primaries (mint is the org's identity hub) and the auth
+  service issues discharges (the auth service is the human-identity
+  authority). Mint is also the verifier — it holds the chain key
+  and can recover the discharge HMAC key from the TPC's `VID` or
+  `CID`. Coord holds no key material; it forwards bundles to mint
+  for verification, caches the verdict, and clears caveats locally.
 
-The mint-and-auth-service split for the operator chain is therefore
-specific to that chain. It is not a general "centralise all macaroon
-issuance" principle.
+The trust circle for discharge minting and verification is
+`{auth, mint}`. Coord is outside it. The mint-and-auth-service split
+for the operator chain is therefore specific to that chain. It is
+not a general "centralise all macaroon issuance" principle.
 
 ## Isolation model
 
@@ -150,32 +153,44 @@ in-coordinator checks.
 
 ### Issuer and the human-authorisation point
 
-Two issuers, separated by capability:
+Following the [canonical macaroon
+shape](https://github.com/superfly/macaroon/blob/main/macaroon-thought.md):
 
-- **Mint** holds `K_M`, the primary-macaroon MAC root. Mint mints
-  one primary per coord at enrollment; the primary carries a
-  third-party caveat naming the auth service. Coord receives
-  `K_coord = HKDF(K_M, coord_ulid)` so it can verify its own
-  primary's chain locally.
-- **The auth service** holds `K_disch`, the discharge MAC root.
-  Auth mints wide discharges (one per `(session, coord)`, ~5 min)
-  and verifies them on demand via `/v1/discharge/verify`. Coord and
-  mint hold no discharge-MAC key — they trust discharges *on
-  receipt* via the cached vouch.
+- **Mint** holds `K_M`, the primary-macaroon MAC root, and shares
+  `K_M-A` with auth (per-org wrapping key for third-party-caveat
+  `CID`s). Mint mints one primary per coord at enrollment with a
+  TPC carrying `VID` and `CID`. **Mint is also the verifier** — it
+  holds `K_M` (derives `K_coord` on demand to walk any primary's
+  chain) and `K_M-A` (decrypts `CID` to recover the per-coord
+  ephemeral discharge key `r`). Verification at mint is offline.
+- **The auth service** holds `K_M-A` (shared with mint) and
+  `K_session`. Auth mints wide discharges (one per `(session,
+  coord)`, ~5 min) by decrypting the primary's `CID` with `K_M-A`
+  to recover `r`, then MACs the discharge under `r`. Auth does not
+  sit on the verification path at runtime.
+
+**Coord holds no chain key, no discharge key.** It receives the
+primary at enrollment and stores the bytes. On each operator IPC,
+coord forwards `(primary, wide_discharge)` to mint for verification
+via `/v1/discharge/verify`, caches mint's verdict for the wide
+discharge's NotAfter, and clears caveats locally against the live
+IPC context.
 
 The TPC binding is woven into the primary's HMAC chain, so the
 discharge requirement cannot be stripped by any party who cannot
-mint primaries. Combined with `K_disch` living only at auth, this
-makes the auth-service round-trip a **non-bypassable property of
-every accepted operator IPC**, enforced by the math (the TPC is in
-the chain; the discharge MAC is only verifiable by auth) and by
-audit (every accepted bundle must trace to a `/discharge/verify`
-call at auth within the cache TTL).
+mint primaries. Combined with the trust circle for discharge
+mint/verify being `{auth, mint}`, this makes the auth-service
+round-trip a **non-bypassable property of every accepted operator
+IPC**, enforced by the math (the TPC is in the chain; verification
+requires `K_M` and `K_M-A`) and by audit (every accepted IPC must
+trace through mint's verification log to auth's issuance log within
+the cache TTL).
 
-The CLI further narrows the wide discharge per IPC by appending
+The CLI narrows the wide discharge per IPC by appending
 bearer-attenuation caveats (`Op`, `Volume`, tight `NotAfter`,
-optional `Nonce`). Coord verifies the attenuation chain locally
-from the cached wide's trailing tag — no auth round-trip per IPC.
+optional `Nonce`). Coord can read these from the wire bytes and
+clear them against the IPC context without any cryptographic
+verification — chain extension is keyless.
 
 The concrete shape of that auth service — login flow, session and
 discharge protocol, multi-tenancy, enrollment, API surface — lives
