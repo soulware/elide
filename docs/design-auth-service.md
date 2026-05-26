@@ -222,10 +222,12 @@ attenuation caveats per IPC:
   Op       = "snapshot"
   Volume   = "myvm"
   NotAfter = now + 5s        (tight per-IPC bound)
-  Nonce    = <random 16B>    (optional, for replay-sensitive verbs)
 ```
 
-CLI sends `(attenuated_discharge, IPC body)` to coord.
+CLI sends `(attenuated_discharge, IPC body)` to coord. The tight
+`NotAfter` bounds the per-IPC bundle's replay window; operator IPC
+verbs are idempotent at the coord layer, so this is the only
+replay defence needed.
 
 ### Coord: forward and clear
 
@@ -237,7 +239,9 @@ stored primary out of `data_dir` and runs the following.
 2. **Cache lookup on `wide_bytes`** in coord's verification cache.
    - **Cache hit**: the wide bytes have already been verified by
      mint within their `NotAfter` window. Skip to step 4.
-   - **Cache miss**: forward `(primary, wide_bytes)` to mint at
+   - **Cache miss**: coord first attenuates its primary with a
+     freshness `NotAfter` (see *Coord attenuates the primary* below),
+     then forwards `(attenuated_primary, wide_bytes)` to mint at
      `<mint>/v1/discharge/verify`. Mint returns `{valid: true,
      expires_at: <NotAfter>, caveats: {...}}` or `{valid: false,
      reason: "..."}`. On valid, cache `(wide_bytes → expires_at,
@@ -257,8 +261,6 @@ stored primary out of `data_dir` and runs the following.
    - `Op` (from attenuation) matches the dispatched verb.
    - `Volume` (from attenuation) matches the IPC's target.
    - all `NotAfter` values are still in the future.
-   - `Nonce` (if present) hasn't been seen recently (per-verb,
-     per-volume nonce cache at coord).
 4. If all caveats clear, dispatch. If any fails, reject. Clearing
    results are never cached — the context changes every IPC.
 
@@ -266,6 +268,30 @@ Coord does **not** verify the primary's chain MAC, the wide
 discharge's MAC, or recover `r` from `VID`. It holds no key material
 that would let it do so. All cryptographic verification happens at
 mint (or, transitively, was done by mint and cached).
+
+### Coord attenuates the primary before forwarding to mint
+
+Coord's stored primary is long-lived. To avoid forwarding a
+long-lived token unattenuated, coord attaches a fresh per-forward
+`NotAfter` caveat to the primary chain before any forward to mint
+(both `/v1/discharge/verify` and `/v1/assume-role`):
+
+```
+primary-attenuation per forward:
+  NotAfter = now + 5s
+```
+
+Chain extension is keyless — coord can append to its primary's
+trailing tag without holding `K_coord`. Mint walks the (slightly
+longer) primary chain and clears the per-forward `NotAfter` as part
+of its normal caveat AND-evaluation.
+
+This is good macaroon discipline: every macaroon leaving coord is
+attenuated as tightly as the use case allows. The bundle's
+effective lifetime is already bounded by the discharge attenuation's
+`NotAfter`, so this doesn't enable a new security property — but it
+keeps the rule "always attenuate tightly" honest at both layers and
+gives mint's audit log a per-forward freshness marker.
 
 ### Mint: verification on `/v1/discharge/verify` and on assume-role
 
@@ -281,7 +307,10 @@ Both endpoints share a single verification routine:
 
 1. Walk the primary's chain with `K_coord` (re-derived from `K_M +
    coord_ulid`, extracted from the primary's first-party `CoordId`
-   caveat). Confirm the trailing MAC. At the TPC, hold `T_n`.
+   caveat). The chain now includes coord's per-forward `NotAfter`
+   attenuation; confirm the trailing MAC and that the per-forward
+   `NotAfter` is still in the future. At the TPC, hold `T_n` from
+   when the TPC was originally added.
 2. Decrypt `VID` with `T_n` → recover `r`. (Or, equivalently, decrypt
    `CID` with `K_M-A` — both paths yield the same `r`. Mint uses
    whichever it has cached or finds convenient.)
@@ -304,9 +333,7 @@ unnecessarily.
 Verification results are cacheable; clearing results are not. The
 former is a function of (bytes, key) and is stable for the
 discharge's lifetime; the latter is a function of (caveat, live
-context) and changes every IPC. Each verifier holds two caches —
-one for the cacheable side of verification, one for nonce-based
-replay defence during clearing.
+context) and changes every IPC.
 
 ### Wide-discharge verification cache (coord-side)
 
@@ -320,6 +347,11 @@ verification verdict — the MAC over a fixed byte sequence is
 deterministic and mint's verdict over fixed bytes doesn't change
 between calls.
 
+The cache is keyed on the *wide* bytes only, not the attenuation.
+Each IPC has a fresh attenuation, but the wide bytes are stable
+across IPCs within the wide discharge's lifetime, so cache hits
+dominate.
+
 Cache size is bounded by (active sessions) × (coords per session) ×
 (turnover within `NotAfter` window). For typical operator load this
 is a handful of entries per coord.
@@ -328,19 +360,11 @@ is a handful of entries per coord.
 
 Same shape as coord's cache. Lets mint skip redundant chain walks
 when coord's `/discharge/verify` call is followed by an
-`/assume-role` call within the same window.
-
-### Nonce cache (optional, per-verb, at coord)
-
-Key: `(volume, op, nonce)`. Value: presence. TTL: matches the
-attenuation `NotAfter` plus a small jitter.
-
-Populated during clearing when a verb is configured to require
-freshness. Used to reject replays within the attenuation window.
-Most IPC verbs are idempotent at the coord layer and do not need a
-nonce cache; this is opt-in per verb. Not a cache of clearing
-results — it's a small store the freshness predicate consults to
-clear the `Nonce` caveat.
+`/assume-role` call within the same window. Keyed on wide bytes
+only — coord's per-forward primary attenuation changes the primary
+chain per call, but mint walks the (short) attenuation suffix
+locally and re-uses the cached `r` recovered from the underlying
+primary's `VID`.
 
 ## Forgery model
 
@@ -385,7 +409,7 @@ The design produces three correlated audit streams:
   verification (coord_id from primary, discharge nonce = CID,
   expires_at).
 - **Coord log**: every operator IPC accepted (op, volume, subject,
-  attenuation nonce if any).
+  wide discharge nonce `= CID`).
 
 The audit invariant: every accepted IPC at coord must trace through
 a `/discharge/verify` (or `/assume-role` verification) at mint,
@@ -490,7 +514,7 @@ INFO operator_token::authn event=accept op=snapshot volume=myvm
 
 ## Cadence
 
-Three lifetimes, three refresh rhythms.
+Four lifetimes, four refresh rhythms.
 
 **Sessions: ~7 days, refreshed only by re-running `elide operator
 login`.** Default lifetime is auth-service policy. There is no
@@ -504,15 +528,26 @@ its derived form.
 on cache miss.** CLI caches in memory. After expiry, the next
 operator IPC triggers a fresh fetch from auth.
 
-**Attenuations: per IPC, ~5s NotAfter, tight enough to bound replay
-within the wide discharge's window.** Built by the CLI before
-sending each IPC; not cached.
+**CLI discharge attenuations: per IPC, ~5s NotAfter.** Built by the
+CLI before sending each IPC; not cached. Carries `Op`, `Volume`,
+and `NotAfter`.
+
+**Coord primary attenuations: per forward to mint, ~5s NotAfter.**
+Built by coord before each `/v1/discharge/verify` or
+`/v1/assume-role` call; not cached. Carries just `NotAfter`. Keeps
+the primary tight on the wire even though the underlying primary
+in `data_dir` is long-lived.
 
 **Replay window.** Within the attenuation `NotAfter` a specific
-attenuated discharge is theoretically replayable on coord. Most
-operator IPC verbs are idempotent at the coord layer. For
-replay-sensitive verbs the attenuation carries a `Nonce` field that
-coord caches and rejects on replay.
+attenuated discharge is theoretically replayable on coord. Operator
+IPC verbs are idempotent at the coord layer (`/v1/discharge/verify`
+returns the same yes/no for the same bytes; `/v1/assume-role`
+returns equivalent short-lived creds), so the 5s replay window
+doesn't grant additional authority. No nonce caching is needed at
+coord or mint in the initial design. If a future non-idempotent op
+appears that's replay-sensitive, a `Nonce` caveat plus a
+recent-nonce store at the relevant verifier can be added per verb
+without changing the surrounding design.
 
 ## Reachability
 
@@ -695,13 +730,13 @@ response: { "primary_macaroon": "<base64 macaroon>" }
 ```
 
 `POST /v1/discharge/verify` (coord-authenticated) — verify a wide
-discharge. Coord forwards the primary and wide discharge bytes; mint
-runs the verification routine described in *Mint: verification* and
-returns the verdict + caveats.
+discharge. Coord forwards a per-forward-attenuated primary and the
+wide discharge bytes; mint runs the verification routine described
+in *Mint: verification* and returns the verdict + caveats.
 
 ```json
 request:  {
-  "primary": "<base64 macaroon>",
+  "primary": "<base64 macaroon, attenuated by coord with per-forward NotAfter>",
   "wide_discharge": "<base64 macaroon>"
 }
 response: {
@@ -721,8 +756,8 @@ Or 200 with `{"valid": false, "reason": "expired" | "mac_mismatch" |
 
 Mint's existing cred-issuance endpoints (`/v1/assume-role` and
 friends) are unchanged in shape but now additionally accept and
-verify a `(primary, attenuated discharge)` bundle for ops that
-require operator authorisation.
+verify a `(per-forward-attenuated primary, attenuated discharge)`
+bundle for ops that require operator authorisation.
 
 ### Coord — CLI-facing
 

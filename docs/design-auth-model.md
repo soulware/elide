@@ -187,10 +187,11 @@ trace through mint's verification log to auth's issuance log within
 the cache TTL).
 
 The CLI narrows the wide discharge per IPC by appending
-bearer-attenuation caveats (`Op`, `Volume`, tight `NotAfter`,
-optional `Nonce`). Coord can read these from the wire bytes and
-clear them against the IPC context without any cryptographic
-verification — chain extension is keyless.
+bearer-attenuation caveats (`Op`, `Volume`, tight `NotAfter`). Coord
+itself attenuates its long-lived primary with a per-forward
+`NotAfter` before every call to mint, on the same "always
+attenuate tightly" principle. Coord and mint clear both attenuations
+against their respective request contexts.
 
 The concrete shape of that auth service — login flow, session and
 discharge protocol, multi-tenancy, enrollment, API surface — lives
