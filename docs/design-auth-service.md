@@ -390,6 +390,49 @@ holder can decrypt. **Each coord's `K_vid` is independent** —
 compromise of one coord cannot produce discharges that verify
 against any other coord's primary.
 
+### Why `K_coord` is shared with coord at enrollment
+
+Mint shares `K_coord` (the primary's chain start key) with coord at
+enrollment so coord can verify operator IPC offline. Without
+`K_coord`, every operator IPC verb would require a round-trip to
+mint (mint walks the chain, recovers `K_vid_coord-X`, verifies the
+discharge, returns OK/reject). Sharing the chain key buys offline
+local verification.
+
+**What `K_coord` at coord enables that's otherwise unavailable:**
+
+- Walking the primary's chain to verify its MAC
+- Recovering `K_vid_coord-X` from the primary's `vid` field (which
+  is encrypted under an intermediate chain auth value, only
+  computable starting from `K_coord`)
+- Therefore: verifying per-op discharges locally
+
+That's the full list. Bearer attenuation — the macaroon paper's
+defining capability of "anyone holding the macaroon can append
+caveats" — is **independent of `K_coord`**: attenuation only needs
+the *trailing* signature, which is part of the serialised macaroon
+itself. A coord without `K_coord` could still append freshness
+nonces, delegation caveats, or any other narrowing before forwarding
+to mint. The paper's bearer-attenuation property is preserved
+either way.
+
+**What sharing `K_coord` with coord costs:**
+
+A compromised coord-A can recover `K_vid_coord-A` from its primary's
+`vid` and use it to forge discharges that pass MAC verification for
+*coord-A's primary only*. Mint's per-coord role-scoping confines the
+authorised ops to coord-A's own resources (which the attacker
+already controls by virtue of compromising coord-A), so no
+cross-coord escalation. The forgery is detectable via audit-anchor
+divergence (a discharge presented at mint that has no corresponding
+issuance at the auth service).
+
+The choice to share is justified by offline verification alone. The
+alternative — `K_coord` stays at mint, every operator IPC pays a
+mint round-trip — is documented as a deferred option for deployments
+where mint co-location makes the round-trip cheap or where stricter
+forgery prevention is required.
+
 ## Identity and policy
 
 The per-op discharge carries three identity claims:
@@ -846,6 +889,43 @@ The macaroon construction accommodates it cleanly (a discharge
 caveat `AllowedCoords=[A, B]` plus a verifier check that the
 verifying coord's ULID is in the list); the auth service would need
 a per-coord policy surface. Out of scope for the initial design.
+
+## Mint-only verification (deferred)
+
+The initial design shares `K_coord` with coord at enrollment so
+coord can verify operator IPC offline. An alternative is to keep
+`K_coord` at mint only and require coord to forward every operator
+IPC bundle to mint for verification.
+
+Trade-offs:
+
+- **Latency.** Every operator IPC pays a mint round-trip — typically
+  tens to hundreds of ms over WAN, sub-ms over a local socket. Today
+  most operator IPC is interactive (`elide volume claim` etc.); the
+  latency hit would be visible.
+- **Mint availability.** Mint becomes a hard dependency for every
+  operator IPC, not just S3-write paths. Mint outage halts operator
+  IPC entirely.
+- **Mint load.** Proportional to all operator IPC, not just
+  S3-writes.
+- **Cleaner forgery story.** A compromised coord no longer leaks
+  `K_vid_coord-X` (no `K_coord` to walk the chain with), so it
+  cannot forge discharges at all. Audit becomes "one log at mint =
+  one log at auth-service" rather than "watch for divergence."
+- **Bearer attenuation is preserved.** It does not require
+  `K_coord` (only the macaroon's trailing signature, which is part
+  of the serialised macaroon itself). Coord can still attach
+  freshness nonces or delegation caveats by attenuating the primary
+  or discharge before forwarding to mint.
+
+The current design judges that the offline-verification gain
+outweighs the marginal forgery-prevention improvement (per-coord
+`K_vid` already bounds compromise blast radius to that coord's own
+resources via mint's per-coord role-scoping). Mint-only verification
+slots in cleanly if a future deployment shape inverts that
+trade-off — e.g., mint co-located with coord (no round-trip cost) or
+a security model where coord compromise is materially more likely
+than today.
 
 ## Migration from PoC
 
