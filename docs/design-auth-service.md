@@ -67,15 +67,25 @@ no per-coord state. The keys established at enrollment are:
 
 - `K_M` — mint's root MAC key. Generated at mint setup, never leaves
   mint.
-- `K_vid_org` — a per-org symmetric key shared between mint and the
-  auth service. Established at mint-enrollment. Used as the **vid
-  key** in third-party caveats: mint embeds `K_vid_org` into each
-  coord's primary macaroon (so the macaroon's holder can recover it
-  during verification), and the auth service uses `K_vid_org` to sign
-  every discharge it issues for org X.
-- `K_coord = HKDF(K_M, coord_ulid)` — a per-coord MAC key. Mint
-  re-derives it on demand from `K_M`; coord receives a copy at
-  enrollment for verifying its own primary.
+- `K_M-A` — a per-org symmetric key shared between mint and the auth
+  service. Established at mint-enrollment. **Not the discharge key
+  itself** — it is the wrapping key used to encode the `caveat_id`
+  field of each coord's third-party caveat, so the auth service can
+  recover the per-coord `K_vid` at discharge-issuance time.
+- `K_vid_coord-X` — **per-coord random key**, generated fresh by
+  mint at each coord's enrollment. This is the canonical macaroon
+  `K_vid` (the key under which the third-party authority MACs
+  discharges). Embedded in coord-X's primary macaroon's `vid` field
+  (encrypted under the chain auth value, so coord-X can recover it
+  during verification) and also embedded in the TPC's `caveat_id`
+  (AEAD-encrypted under `K_M-A`, so the auth service can recover it
+  on demand from the caveat_id alone — no per-coord state at the
+  auth service).
+- `K_coord = HKDF(K_M, coord_ulid)` — a per-coord MAC key for the
+  primary macaroon's chain. Mint re-derives it on demand from `K_M`;
+  coord receives a copy at enrollment for verifying its own primary.
+- `K_session` — auth-service-only root key for session macaroons.
+  Never leaves the auth service.
 
 **Mint ↔ auth service** — slow cadence, once per org lifetime plus
 occasional rotation.
@@ -86,8 +96,8 @@ occasional rotation.
 3. Mint admin runs `elide-mint setup --enrollment-token <token>`.
 4. Mint POSTs `<auth>/v1/mint/enroll` with the token.
 5. Auth service verifies the token, records org X as activated,
-   generates `K_vid_org`, and returns it to mint.
-6. Mint persists `K_vid_org` + auth-service URL + OrgId.
+   generates `K_M-A`, and returns it to mint.
+6. Mint persists `K_M-A` + auth-service URL + OrgId.
 
 **Coord ↔ mint** — per-coord deployment cadence. Extends the existing
 coord-mint enrollment with primary-macaroon issuance.
@@ -98,42 +108,47 @@ coord-mint enrollment with primary-macaroon issuance.
    <token>`.
 3. Coord POSTs to mint with the token.
 4. Mint verifies the token, allocates `coord_ulid`, derives
-   `K_coord = HKDF(K_M, coord_ulid)`, and mints a **primary macaroon**
-   for this coord:
+   `K_coord = HKDF(K_M, coord_ulid)`, generates a fresh random
+   `K_vid_coord-X` (32 bytes), and mints a **primary macaroon** for
+   this coord:
    - First-party caveats: `CoordId=<coord_ulid>, OrgId=X`
-   - Third-party caveat: `(location=<auth-url>, caveat_id="discharge/<OrgId>", vid=K_vid_org)`
-     — i.e., the vid that auth-service discharges will use is
-     `K_vid_org`, embedded so the chain-key holder can recover it
+   - Third-party caveat:
+     `(location=<auth-url>, caveat_id, vid)` where
+     `caveat_id = AEAD-encrypt(K_M-A, K_vid_coord-X ‖ OrgId ‖ coord_ulid)`
+     and `vid = encrypt(K_vid_coord-X, current chain auth value)`
    - Chain MAC'd with `K_coord`
 5. Mint returns to coord: `coord_ulid`, `K_coord`, the primary
    macaroon, auth-service URL, `OrgId`.
 6. Coord persists all of the above in its `data_dir`.
 
 After enrollment, coord verifies operator IPC bundles locally with
-no round-trip to mint or the auth service.
+no round-trip to mint or the auth service. Mint does not retain
+`K_vid_coord-X` after enrollment — it can recover it on demand from
+the primary's `caveat_id` (using `K_M-A`) or by walking the primary
+with `K_coord` (using the vid field). Mint stays stateless across
+coords.
 
-**K_vid_org rotation.** Rotation is mint↔auth-service business.
-When the auth service rotates `K_vid_org`, every existing primary
-macaroon's TPC vid is stale — discharges signed with the new
-`K_vid_org` won't verify against the old vid embedded in the
-primary. Resolution is pull-on-verify-fail: when a coord's discharge
-verification fails on an otherwise well-formed bundle, the coord
-asks mint (`GET /v1/coord/primary`) for a fresh primary embedding
-the current `K_vid_org`, swaps its stored primary, and retries. Mint
-keeps `K_vid_org` fresh via its existing auth-service relationship;
-coord lazily catches up. The auth service is responsible for
-overlapping rotation windows long enough that pull-on-fail is
-bounded by one retry per in-flight verification at most.
+**Rotation.** `K_M-A` rotation is the only routine rotation event.
+When the auth service rotates `K_M-A`, every existing primary's
+`caveat_id` becomes undecryptable by the new key — fresh discharges
+can no longer be issued against the old primary. Resolution is
+pull-on-verify-fail: when the CLI's `/v1/discharge` call fails with
+a caveat_id decode error, the CLI fetches a fresh primary from coord
+(which fetches a fresh primary from mint via `GET /v1/coord/primary`).
+Mint re-issues with a fresh `K_vid_coord-X` and a `caveat_id`
+encoded under the new `K_M-A`. Coord swaps its stored primary; the
+CLI gets the new caveat_id from coord and retries the discharge
+fetch. Bounded by one retry per in-flight verification.
 
 ## Login flow
 
 `elide operator login` supports two modes. The CLI selects mode by
 whether `ELIDE_OPERATOR_API_KEY` is set; both end at the same
-artefact — a **session discharge** stored once, per-user, in a file
-under `~/.elide/`. ("Session" is shorthand: structurally it's a
-macaroon signed under `K_vid_org` with broad caveats — `Subject`,
-`OrgId`, `NotAfter+7d` — that the CLI later trades to the auth
-service for per-op discharges.)
+artefact — a **session macaroon** stored once, per-user, in a file
+under `~/.elide/`. Structurally it's a macaroon signed under
+`K_session` (an auth-service-only root key) with caveats `(Subject,
+OrgId, NotAfter+7d)`. The session is a CLI ↔ auth-service credential
+only — coord and mint never see it.
 
 The stored session is org-scoped (mandatory `OrgId` caveat) and
 covers every coordinator within that org. Operators in multiple
@@ -150,8 +165,8 @@ local laptop; SSH is the expected calling context, not an edge case.
    they SSH'd from, not the server), enters the code, completes
    authentication, and — for multi-org operators — picks an org from
    the auth service's UI mid-flow. The auth service mints the session
-   discharge bound to the selected org.
-4. `/v1/login/poll` returns the session discharge; CLI stores it.
+   macaroon bound to the selected org.
+4. `/v1/login/poll` returns the session macaroon; CLI stores it.
 
 `elide operator login --org <name>` is an explicit override for
 scriptable cases. For single-org operators the auth service may skip
@@ -168,7 +183,7 @@ convention.
 2. Caller sets `ELIDE_OPERATOR_API_KEY=<key>` and runs `elide
    operator login`.
 3. CLI POSTs `<auth>/v1/login/api-key` with the key, receives a
-   session discharge, stores it.
+   session macaroon, stores it.
 
 The key is read from the environment, never accepted on argv (would
 appear in `ps`). The auth service typically issues shorter-lived
@@ -177,26 +192,41 @@ sessions for API-key logins than for interactive ones, and may add a
 distinguish automated from human actions — both are
 auth-service-side policy, not CLI surface.
 
-**Per-IPC discharge fetch.** The session is *not* what coord/mint
-see. For each operator IPC verb, the CLI:
+**Per-IPC discharge fetch.** Each per-op discharge is signed under
+the **target coord's** `K_vid_coord-X`, so it only verifies against
+that one coord's primary. The CLI needs to know the target coord's
+`caveat_id` to ask for a discharge that binds to it.
 
-1. POSTs the session discharge to `<auth>/v1/discharge` with the
-   narrowing it needs (`op=Release, volume=myvm, ttl_seconds=60`).
-2. Auth service validates the session against its own state,
-   confirms the requested narrowing is within session policy, and
-   mints a **per-op discharge**: macaroon signed under `K_vid_org`
-   with caveats `(Subject, OrgId, Op, Volume, NotAfter=now+60s)`.
-3. CLI sends `(per-op discharge, IPC body)` to coord. The session
-   discharge never leaves the CLI ↔ auth-service channel.
+For each operator IPC verb the CLI:
+
+1. Knows it's about to call coord-X (from CLI config or first-hop
+   resolve). Fetches coord-X's `caveat_id` from coord directly if
+   not cached (coord exposes it; the value is not secret — it's
+   only useful when paired with the auth service holding `K_M-A`).
+2. POSTs to `<auth>/v1/discharge` with the session macaroon in
+   `Authorization: Bearer`, body
+   `{caveat_id, op: "Release", volume: "myvm", ttl_seconds: 60}`.
+3. Auth service:
+   - Verifies the session macaroon with `K_session`
+   - AEAD-decrypts `caveat_id` with `K_M-A` → recovers
+     `(K_vid_coord-X, OrgId, coord_ulid)`
+   - Cross-checks the decoded `OrgId` against the session's `OrgId`
+   - Applies its policy (is this Subject allowed to do this op on
+     this volume against this coord?)
+   - Mints a per-op discharge signed under `K_vid_coord-X` with
+     caveats `(Subject, OrgId, CoordId=coord_ulid, Op, Volume,
+     NotAfter=now+60s)`
+4. CLI sends `(per-op discharge, IPC body)` to coord-X. The session
+   never leaves the CLI ↔ auth-service channel.
 
 ## Reachability
 
 The auth service must be reachable from two places:
 
-- **Mint** — at mint enrollment (to obtain `K_vid_org`) and for
-  `K_vid_org` rotation. Coord and mint do not contact the auth
-  service to verify sessions or discharges (both are verified
-  locally with keys held since enrollment).
+- **Mint** — at mint enrollment (to obtain `K_M-A`) and for `K_M-A`
+  rotation. Coord and mint do not contact the auth service to
+  verify sessions or discharges (both are verified locally with keys
+  held since enrollment).
 - **The operator's CLI machine** — for `elide operator login` and
   per-IPC `/v1/discharge` fetches. The interactive flow also needs
   the auth service reachable from the operator's laptop browser.
@@ -214,39 +244,47 @@ No new primitive. The design uses macaroons' built-in **third-party
 caveat** mechanism to compose a mint-issued primary with auth-service
 discharges, without any party holding another's signing key.
 
-Three artefacts:
+Three artefacts (plus the session, which is a CLI ↔ auth-service
+credential only):
 
 **1. Primary macaroon.** Mint-issued, coord-held. One per coord,
-minted at coord enrollment.
+minted at coord enrollment. Each coord's primary has its own
+randomly-generated `K_vid_coord-X` — discharges signed under one
+coord's `K_vid` only verify against that coord's primary.
 
 - First-party caveats: `CoordId=<coord_ulid>, OrgId=<org>`
-- Third-party caveat: `(location=<auth-url>, caveat_id="discharge/<org>", vid=K_vid_org)`
+- Third-party caveat: `(location=<auth-url>, caveat_id, vid)`
+  - `caveat_id = AEAD-encrypt(K_M-A, K_vid_coord-X ‖ OrgId ‖ coord_ulid)`
+  - `vid = encrypt(K_vid_coord-X, current chain auth value)`
 - Chain MAC'd with `K_coord = HKDF(K_M, coord_ulid)`
 
-Coord stores this primary. Mint stays stateless (re-derives `K_coord`
-on demand).
+Coord stores this primary. Mint stays stateless (re-derives
+`K_coord` and recovers `K_vid_coord-X` on demand — either from
+`caveat_id` via `K_M-A`, or by walking the chain via `K_coord`).
 
-**2. Session discharge.** Auth-service-issued, CLI-held. One per
+**2. Session macaroon.** Auth-service-issued, CLI-held. One per
 operator login, ~7 day lifetime.
 
 - Caveats: `Subject=<sub>, OrgId=<org>, NotAfter=<login_time+7d>`
-- Chain MAC'd with `K_vid_org` as root
+- Chain MAC'd with `K_session` as root (auth-service-only key)
 
 Used only between the CLI and the auth service. Coord and mint
 never see it.
 
 **3. Per-op discharge.** Auth-service-issued, ~60s lifetime. One per
-operator IPC verb.
+operator IPC verb, **bound to a specific target coord**.
 
-- Caveats: `Subject, OrgId, Op, Volume, NotAfter=now+60s` (plus
-  optional `User` for display; optional `MachineAccount=true` for
-  non-interactive sessions)
-- Chain MAC'd with `K_vid_org` as root
+- Caveats: `Subject, OrgId, CoordId, Op, Volume, NotAfter=now+60s`
+  (plus optional `User` for display; optional `MachineAccount=true`
+  for non-interactive sessions)
+- Chain MAC'd with the target coord's `K_vid_coord-X` as root
 
 The CLI obtains a per-op discharge by presenting its session
-discharge to `<auth>/v1/discharge`. The auth service validates the
-session, applies its policy, and mints the narrowed per-op discharge.
-The CLI sends `(per-op discharge, IPC body)` to coord.
+macaroon and the target coord's `caveat_id` to `<auth>/v1/discharge`.
+The auth service verifies the session, decrypts the `caveat_id` to
+recover `K_vid_coord-X`, applies its policy, and mints the discharge
+under `K_vid_coord-X`. The CLI sends `(per-op discharge, IPC body)`
+to coord.
 
 Replacing the PoC's CLI-side `Macaroon::attenuate` with an
 auth-service round-trip is the audit point: the auth service is the
@@ -259,21 +297,23 @@ When coord receives an operator IPC:
 
 1. Coord walks its **stored primary macaroon** with `K_coord`,
    computing successive auth values.
-2. At the third-party caveat, coord recovers `K_vid_org` from the
-   caveat's `vid` field (the chain auth value at that point is the
-   decryption key — standard macaroon TPC mechanic).
+2. At the third-party caveat, coord recovers `K_vid_coord-X` from
+   the caveat's `vid` field (the chain auth value at that point is
+   the decryption key — standard macaroon TPC mechanic).
 3. Coord verifies the **per-op discharge**'s MAC chain with
-   `K_vid_org` as root.
-4. Coord checks every first-party caveat: `CoordId` matches its own
-   ULID, `OrgId` matches its enrolled OrgId, `Op` matches the
-   dispatched verb, `Volume` matches the target, `NotAfter` is in
-   the future.
+   `K_vid_coord-X` as root.
+4. Coord checks every first-party caveat: `CoordId` (on both primary
+   and discharge) matches its own ULID, `OrgId` matches its enrolled
+   OrgId, `Op` matches the dispatched verb, `Volume` matches the
+   target, `NotAfter` is in the future.
 5. If all pass, dispatch. If any fail, reject.
 
 The key property: coord never needed the auth service's signing
-authority directly. The auth service's discharge key (`K_vid_org`)
-reaches coord through the primary's `vid` field, which only the
-primary's chain holder can decrypt.
+authority directly. The discharge key (`K_vid_coord-X`) reaches coord
+through the primary's `vid` field, which only the primary's chain
+holder can decrypt. **Each coord's `K_vid` is independent** —
+compromise of one coord cannot produce discharges that verify
+against any other coord's primary.
 
 ## Identity and policy
 
@@ -377,11 +417,13 @@ Normally one-to-one. Divergences are forensic signal:
 | present | present | Normal |
 | present | absent | Discharge issued but never used — cancelled CLI, network drop |
 | present | duplicate | Replay within window — investigate |
-| absent | present | Should be impossible — `K_vid_org` has leaked, or coord's primary embeds the wrong vid |
+| absent | present | Should be impossible — the verifying coord's `K_vid_coord-X` has leaked, or `K_M-A` has leaked |
 
 The "should be impossible" row is the security-relevant one. If it
-ever fires, `K_vid_org` has leaked — either at the auth service, at
-mint, or at a coord whose primary's `vid` field was extracted.
+ever fires for a specific coord, that coord's `K_vid_coord-X` has
+been extracted (from its primary's vid). If it fires across many
+coords, `K_M-A` has leaked (anyone with `K_M-A` can decrypt any
+coord's `caveat_id` to recover its `K_vid`).
 
 ## Verification: two enforcement points, one auth service
 
@@ -392,18 +434,19 @@ coord can still make `/v1/assume-role` calls, but cannot bypass
 mint's check by claiming "I already verified."
 
 - **Coordinator** verifies the bundle on every operator IPC verb.
-  Walks its stored primary with `K_coord`, recovers `K_vid_org` from
-  the primary's TPC `vid` field, verifies the per-op discharge with
-  `K_vid_org`, then checks every first-party caveat. No round-trip
-  to mint or the auth service on verify; pull-on-fail refresh of the
-  primary if `K_vid_org` has rotated (see *Tenancy and enrollment*
-  above).
+  Walks its stored primary with `K_coord`, recovers `K_vid_coord-X`
+  from the primary's TPC `vid` field, verifies the per-op discharge
+  with `K_vid_coord-X`, then checks every first-party caveat. No
+  round-trip to mint or the auth service on verify; pull-on-fail
+  refresh of the primary if `K_M-A` has rotated (see *Tenancy and
+  enrollment* above).
 - **Mint** verifies on every `assume-role` call that issues
   write-capable creds. Re-derives `K_coord` from its root + the
   `CoordId` caveat on the presented primary, walks the primary,
-  recovers (and cross-checks against state) `K_vid_org`, verifies
-  the discharge, checks the same caveats. This is the architectural
-  chokepoint from
+  recovers `K_vid_coord-X` from the primary's `vid` (and may
+  cross-check by AEAD-decrypting the `caveat_id` with `K_M-A`),
+  verifies the discharge, checks the same caveats. This is the
+  architectural chokepoint from
   [`design-auth-model.md`](design-auth-model.md#proposed-operator-tokens-gate-s3-writes-not-verbs);
   the third-party-caveat anchor sits on the primary mint issued at
   coord enrollment.
@@ -413,8 +456,8 @@ mint's check by claiming "I already verified."
 | Check | Coord | Mint |
 |---|---|---|
 | Primary MAC | uses stored `K_coord` | re-derives `K_coord` from `K_M + coord_ulid` (extracts `coord_ulid` from the `CoordId` caveat) |
-| Recover `K_vid_org` from primary's TPC vid | via primary's chain auth value | same — and cross-checks against `K_vid_org` already in mint state |
-| Discharge MAC under `K_vid_org` | yes | yes |
+| Recover `K_vid_coord-X` from primary's TPC vid | via primary's chain auth value | same — may also cross-check by decoding `caveat_id` with `K_M-A` |
+| Discharge MAC under `K_vid_coord-X` | yes | yes |
 | Discharge first-party caveats (`Op`, `Volume`, `NotAfter`) | matches the dispatched IPC verb | matches the `assume-role` request shape |
 | `OrgId` matches enrolled org | matches coord's enrolled OrgId | matches mint's OrgId (must be the same — coord is enrolled to this mint) |
 | `CoordId` on the primary | matches coord's own ULID | used to derive `K_coord`, and used to scope what the call may authorise (mint only grants `volume-rw` for volumes this coord owns, `coord-names` only within this coord's authority, etc.) |
@@ -441,7 +484,8 @@ already has — unchanged by this design). Both are required for mint
 to issue write-capable creds: caller-auth proves it's a real coord,
 the bundle proves a human authorised the op.
 
-Both verifiers trust the **same** auth service via `K_vid_org`.
+Both verifiers trust the **same** auth service via `K_M-A` (the
+wrapping key) and the per-coord `K_vid_coord-X` it produces.
 Removing one enforcement point doesn't silently lose the other.
 
 ## API surface
@@ -504,9 +548,12 @@ Response 200:
 { "discharge": "<macaroon>", "expires_at": "..." }
 ```
 
-The returned `discharge` is a macaroon MAC'd under `K_vid_org` with
-caveats `(Subject, OrgId, Op, Volume, NotAfter)`. 401 session
-expired, 403 policy denies, 422 unknown op.
+The request body also includes the target coord's `caveat_id` (the
+opaque blob from coord's primary's TPC, which the CLI fetched from
+coord). The returned `discharge` is a macaroon MAC'd under that
+coord's `K_vid_coord-X` (recovered by AEAD-decrypting `caveat_id`
+with `K_M-A`) with caveats `(Subject, OrgId, CoordId, Op, Volume,
+NotAfter)`. 401 session expired, 403 policy denies, 422 unknown op.
 
 **Auth service — mint-facing.**
 
@@ -522,22 +569,22 @@ Response 200:
 ```json
 {
   "org_id": "org_7vh3...",
-  "k_vid_org": "<base64 32-byte symmetric key>"
+  "k_m_a": "<base64 32-byte symmetric key>"
 }
 ```
 
-400 invalid / expired / already-used token. `k_vid_org` is the
-per-org symmetric key used as the third-party-caveat vid: mint
-embeds it in every coord's primary macaroon, and the auth service
-MACs every discharge for org X with it. The auth service may rotate
-`k_vid_org` (see *Tenancy and enrollment*).
+400 invalid / expired / already-used token. `K_M-A` is the per-org
+symmetric wrapping key: mint encrypts each coord's `K_vid_coord-X`
+under `K_M-A` to form the TPC `caveat_id`, and the auth service
+decrypts that `caveat_id` on every `/v1/discharge` call to recover
+the `K_vid` for the target coord.
 
-`GET /v1/mint/k-vid` (mint-authenticated; mint presents its
+`GET /v1/mint/k-m-a` (mint-authenticated; mint presents its
 own-issued bearer credential established at enrollment) — fetches
-the current `K_vid_org` after rotation.
+the current `K_M-A` after rotation.
 
 ```json
-{ "k_vid_org": "<base64>" }
+{ "k_m_a": "<base64>" }
 ```
 
 **Mint — coord-facing.**
@@ -563,14 +610,25 @@ Response 200:
 
 `k_coord = HKDF(K_M, coord_ulid)`. The `primary_macaroon` carries
 caveats `(CoordId, OrgId)` plus a third-party caveat
-`(location=<auth_service_url>, caveat_id="discharge/<OrgId>",
-vid=K_vid_org)`. Coord persists the full response in `data_dir`.
-Mint stays stateless (re-derives `k_coord` on demand from its root +
-`coord_ulid`).
+`(location=<auth_service_url>, caveat_id, vid)` where `caveat_id` is
+`AEAD-encrypt(K_M-A, K_vid_coord-X ‖ OrgId ‖ coord_ulid)` and `vid`
+encrypts `K_vid_coord-X` under the chain auth value. Coord persists
+the full response in `data_dir`. Mint stays stateless (re-derives
+`k_coord` on demand from its root + `coord_ulid`).
+
+`GET /v1/coord/caveat-id` (anonymous, served by coord on a local
+endpoint) — the CLI fetches the coord's TPC `caveat_id` to include
+in its `/v1/discharge` request. Not secret; just the blob from the
+primary's TPC.
+
+```json
+{ "caveat_id": "<base64>" }
+```
 
 `GET /v1/coord/primary` (coord-authenticated via the cred-issuance
-path) — fetches a fresh primary embedding the current `K_vid_org`.
-Used by coord on pull-on-verify-fail.
+path; called by coord against mint) — fetches a fresh primary
+embedding the current `K_M-A`-derived `caveat_id`. Used by coord on
+pull-on-verify-fail after `K_M-A` rotation.
 
 ```json
 { "primary_macaroon": "<base64 macaroon>" }
@@ -606,11 +664,11 @@ service:
 endpoint = "https://auth.elide.example/"
 ```
 
-Mint persists its OrgId, `K_vid_org`, and the auth-service URL to
-its own state at `elide-mint setup --enrollment-token` time.
-`K_vid_org` is refreshed via auth-service rotation, after which mint
-re-issues fresh primary macaroons to coords on demand (see
-*Tenancy and enrollment* above).
+Mint persists its OrgId, `K_M-A`, and the auth-service URL to its
+own state at `elide-mint setup --enrollment-token` time. `K_M-A`
+is refreshed via auth-service rotation, after which mint re-issues
+fresh primary macaroons to coords on demand (see *Tenancy and
+enrollment* above).
 
 ## Mint as auth (demo only)
 
@@ -625,14 +683,14 @@ demo-enabled = false   # default
 
 When `true`, mint serves `/v1/login/*` and `/v1/discharge` alongside
 its cred-issuance routes, rubber-stamping every request — no browser,
-no real authentication. Mint generates a `K_vid_org` for itself at
-demo startup (no auth-service round-trip), embeds it in every
-primary macaroon it issues, and signs all discharges with the same
-key. The coord codepath is identical to prod: verify primary with
-`K_coord`, recover `K_vid_org` from the primary's vid, verify
-discharge with `K_vid_org`. Enrollment tokens are also
-rubber-stamped: a coord can enroll with any token (or none) and is
-assigned `OrgId=demo`.
+no real authentication. Mint generates `K_M-A` and `K_session` for
+itself at demo startup (no auth-service round-trip), generates a
+fresh `K_vid_coord-X` per coord enrollment, embeds it in that
+coord's primary, and signs discharges under it. The coord codepath
+is identical to prod: verify primary with `K_coord`, recover
+`K_vid_coord-X` from the primary's vid, verify discharge with
+`K_vid_coord-X`. Enrollment tokens are also rubber-stamped: a coord
+can enroll with any token (or none) and is assigned `OrgId=demo`.
 
 Two startup-time safety checks when `demo-enabled = true`:
 
