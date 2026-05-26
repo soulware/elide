@@ -8,22 +8,55 @@ The underlying macaroon construction — chained keyed-BLAKE3 MAC,
 per-token struct-level nonce, AND-of-predicates caveat evaluation —
 is documented in
 [`architecture.md`](architecture.md#proposed-s3-credential-distribution-via-macaroons).
-Two macaroon classes layer on that foundation:
+Two distinct auth surfaces layer on that foundation:
 
-- **Volume macaroons** — minted on `register`, PID-bound, scope-bound.
-  Used by volume processes to request short-lived read-only S3
-  credentials. Implemented. Construction and registration flow live in
-  `architecture.md`.
-- **Operator session and discharge macaroons** — issued by a central
-  auth service, not the coordinator. Gate every operator IPC verb via
-  a session + per-op discharge. Design lives in
+- **Volume macaroons** — minted by the coordinator on `register`,
+  PID-bound, scope-bound. Used by volume processes to request
+  short-lived read-only S3 credentials. Implemented. Construction
+  and registration flow live in `architecture.md`.
+- **Operator authorisation** — gates every operator IPC verb via a
+  mint-issued primary macaroon (one per coord, cached at coord) and
+  an auth-service-issued wide discharge (one per `(session, coord)`,
+  vouched on cache miss via `/v1/discharge/verify`), with the CLI
+  attenuating the wide discharge per IPC for `(Op, Volume)` binding.
+  Design lives in
   [`design-auth-service.md`](design-auth-service.md); not yet
   implemented. Operator IPC verbs are ungated in the codebase today.
 
 The remaining sections cover the isolation model that frames what
-either macaroon class can and cannot enforce, and the settled
-principle that operator authorisation gates S3 *writes* — not a
-hand-enumerated verb list — once the central auth service lands.
+either surface can and cannot enforce, and the settled principle
+that operator authorisation gates S3 *writes* — not a hand-enumerated
+verb list — once the central auth service lands.
+
+## Two surfaces, two trust sources
+
+The two surfaces have different issuers because they attest different
+kinds of claim. The organising principle is: **the issuer of an
+attestation is whoever is the trust source for the claim being
+attested.**
+
+- A volume macaroon attests "this PID is volume V on this
+  coordinator, scoped to S, valid until T." Every component of that
+  claim is coord-local: coord spawned the process, owns the IPC
+  socket (SO_PEERCRED is the live check), and owns the volume
+  registration table. Coord is the trust source, so coord is the
+  issuer. A compromised coord could "forge" a volume macaroon, but
+  that is indistinguishable from coord lying about its own state —
+  there is no upstream party whose attestation is being faked.
+- An operator discharge attests "a human authorised this op against
+  this coordinator." The trust source is the human's identity
+  provider, not coord. Coord must not be able to forge that claim,
+  so coord is excluded from issuance entirely: mint issues primaries
+  (mint is the org's identity hub) and the auth service issues
+  discharges (the auth service is the human-identity authority).
+  Coord and mint trust discharges *on receipt* — coord via the
+  cached vouch obtained from `/v1/discharge/verify` at auth, mint
+  via the same mechanism on its assume-role path. Neither holds any
+  discharge-MAC key.
+
+The mint-and-auth-service split for the operator chain is therefore
+specific to that chain. It is not a general "centralise all macaroon
+issuance" principle.
 
 ## Isolation model
 
@@ -47,16 +80,18 @@ process cannot request credentials for `othervm`, so it cannot read,
 write, or delete `othervm`'s S3 objects even with full local filesystem
 access.
 
-**What operator macaroons will provide — audit + ceremony, not access
-control.** Once the central auth service lands, operator IPC verbs
-will require a session + per-op discharge. This raises the bar over
-bare socket access and provides an audit trail centred on the auth
-service. It does not prevent a compromised local process from
-achieving the same effect via direct filesystem manipulation (`rm
--rf` on the volume dir achieves `remove` without going through the
-coordinator). The value is auditability, forced ceremony for S3
-mutations, and per-request attenuation — not a hard security boundary
-against a local attacker.
+**What operator authorisation will provide — audit + ceremony, not
+access control.** Once the central auth service lands, operator IPC
+verbs will require a mint-issued primary (held by coord) plus an
+auth-service-issued discharge (vouched at auth on first sight,
+cached at coord), attenuated by the CLI per IPC. This raises the
+bar over bare socket access and produces a centralised audit trail
+anchored at the auth service. It does not prevent a compromised
+local process from achieving the same effect via direct filesystem
+manipulation (`rm -rf` on the volume dir achieves `remove` without
+going through the coordinator). The value is auditability, forced
+ceremony for S3 mutations, and per-IPC CLI attenuation — not a hard
+security boundary against a local attacker.
 
 **Summary:**
 
@@ -64,7 +99,7 @@ against a local attacker.
 |---|---|---|
 | S3 data | IAM credential scoping + macaroon gating | AWS + coordinator |
 | Local filesystem | uid separation / namespacing | OS (not yet implemented) |
-| Coordinator mutations | Operator session + discharge (planned) | Coordinator + mint, once the central auth service lands |
+| Coordinator mutations | Operator primary + cached auth-service discharge (planned) | Coordinator + mint, once the central auth service lands |
 
 ## Proposed: operator tokens gate S3 writes, not verbs
 
@@ -115,16 +150,36 @@ in-coordinator checks.
 
 ### Issuer and the human-authorisation point
 
-The mint cutover settles the issuer: mint is the sole issuer and
-verifier, with a single root that never leaves it (`design-mint.md` §
-*Trust model*). Human authorisation does not enter by *which authority
-issues* — it enters as a **third-party-caveat discharge**: the
-coordinator holds a primary macaroon; a write window additionally
-requires a discharge from an identity authority (the managed `elide
-operator login` service) attesting a human authorised it. The concrete
-shape of that auth service — login flow, session/discharge macaroons,
-multi-tenancy, enrollment, API surface — lives in
-[`design-auth-service.md`](design-auth-service.md).
+Two issuers, separated by capability:
+
+- **Mint** holds `K_M`, the primary-macaroon MAC root. Mint mints
+  one primary per coord at enrollment; the primary carries a
+  third-party caveat naming the auth service. Coord receives
+  `K_coord = HKDF(K_M, coord_ulid)` so it can verify its own
+  primary's chain locally.
+- **The auth service** holds `K_disch`, the discharge MAC root.
+  Auth mints wide discharges (one per `(session, coord)`, ~5 min)
+  and verifies them on demand via `/v1/discharge/verify`. Coord and
+  mint hold no discharge-MAC key — they trust discharges *on
+  receipt* via the cached vouch.
+
+The TPC binding is woven into the primary's HMAC chain, so the
+discharge requirement cannot be stripped by any party who cannot
+mint primaries. Combined with `K_disch` living only at auth, this
+makes the auth-service round-trip a **non-bypassable property of
+every accepted operator IPC**, enforced by the math (the TPC is in
+the chain; the discharge MAC is only verifiable by auth) and by
+audit (every accepted bundle must trace to a `/discharge/verify`
+call at auth within the cache TTL).
+
+The CLI further narrows the wide discharge per IPC by appending
+bearer-attenuation caveats (`Op`, `Volume`, tight `NotAfter`,
+optional `Nonce`). Coord verifies the attenuation chain locally
+from the cached wide's trailing tag — no auth round-trip per IPC.
+
+The concrete shape of that auth service — login flow, session and
+discharge protocol, multi-tenancy, enrollment, API surface — lives
+in [`design-auth-service.md`](design-auth-service.md).
 
 ## Future directions
 
