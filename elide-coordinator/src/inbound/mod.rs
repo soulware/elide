@@ -68,13 +68,11 @@ use elide_coordinator::config::{StoreSection, store_config};
 use elide_coordinator::ipc::{
     self, ClaimAttachEvent, ClaimStartReply, CreateReply, Envelope, EvictReply, ForkAttachEvent,
     ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply,
-    IpcError, MintOperatorTokenReply, PeerClaimerTokenReply, PullReadonlyReply, RegisterReply,
-    ReleaseReply, Request, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
-    StoreCredsReply, UpdateReply, VolumeEventsReply,
+    IpcError, PeerClaimerTokenReply, PullReadonlyReply, RegisterReply, ReleaseReply, Request,
+    SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
+    VolumeEventsReply,
 };
-use elide_coordinator::macaroon::{
-    self, Caveat, Macaroon, OperatorOp, OperatorReject, Scope, VerifyCtx, VerifyOperatorCtx,
-};
+use elide_coordinator::macaroon::{self, Caveat, Macaroon, Scope, VerifyCtx};
 use elide_coordinator::volume_state::{
     FETCH_PID_FILE, IMPORTING_FILE, PID_FILE, write_released_marker,
 };
@@ -427,26 +425,10 @@ async fn dispatch_json(
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::Remove {
-            volume_ulid,
-            force,
-            operator_token,
-        } => {
-            let verified = match require_operator_token(
-                operator_token.as_deref(),
-                OperatorOp::Remove,
-                volume_ulid,
-                ctx.identity.macaroon_root(),
-            ) {
-                Ok(v) => v,
-                Err(env) => {
-                    let _ = ipc::write_message(writer, &env).await;
-                    return;
-                }
-            };
+        Request::Remove { volume_ulid, force } => {
             let store = ctx.stores.writer();
             let result = remove_volume(
-                verified,
+                volume_ulid,
                 force,
                 &ctx.data_dir,
                 Some(&store),
@@ -460,24 +442,6 @@ async fn dispatch_json(
                 credentialer.release_volume_ro(*vol_ulid).await;
             }
             let env: Envelope<()> = result.map(|_| ()).into();
-            let _ = ipc::write_message(writer, &env).await;
-        }
-        Request::MintOperatorToken { expires_unix } => {
-            let m = macaroon::mint_operator(ctx.identity.macaroon_root(), expires_unix);
-            let nonce_hex = m.nonce_hex();
-            tracing::info!(
-                target: "operator_token::authn",
-                event = "mint",
-                macaroon_nonce = %nonce_hex,
-                expires_unix,
-                "minted operator token",
-            );
-            let reply = MintOperatorTokenReply {
-                token: m.encode(),
-                nonce_hex,
-                expires_unix,
-            };
-            let env: Envelope<MintOperatorTokenReply> = Envelope::ok(reply);
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::VolumeEvents { volume, num } => {
@@ -581,93 +545,6 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
             crate::shutdown::trigger(keep_volumes);
         }
-    }
-}
-
-// ── Operator-token gate ──────────────────────────────────────────────────────
-
-/// Verify an attenuated operator macaroon before dispatching a gated
-/// verb. On success, emits the `operator_token::authn` audit event and
-/// returns `Ok`. On failure, returns an `Envelope::Err` ready for the
-/// caller to write back to the peer.
-///
-/// The caller hands in the typed [`OperatorOp`] it is about to
-/// dispatch and the target volume name; the verifier requires the
-/// chain to carry matching `Op` and `Volume` caveats. The wire
-/// rejection string is intentionally coarse — the local audit log
-/// records the specific [`OperatorReject`] reason.
-fn require_operator_token(
-    encoded: Option<&str>,
-    op: OperatorOp,
-    op_volume: ulid::Ulid,
-    root_key: &[u8; 32],
-) -> Result<macaroon::Verified<ulid::Ulid>, Envelope<()>> {
-    let op_volume_str = op_volume.to_string();
-    let Some(encoded) = encoded else {
-        tracing::warn!(
-            target: "operator_token::authn",
-            event = "reject",
-            op = op.as_str(),
-            volume = %op_volume_str,
-            reason = "missing",
-            "rejected operator request: no token presented",
-        );
-        return Err(Envelope::err(IpcError::forbidden(format!(
-            "{} requires an operator token; run `elide token create` (writes \
-             ~/.elide/tokens.toml for this coordinator), or pass it via --token \
-             or ELIDE_OPERATOR_TOKEN",
-            op.as_str()
-        ))));
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let ctx = VerifyOperatorCtx {
-        now_unix: now,
-        op,
-        op_volume,
-    };
-    match macaroon::verify_operator(root_key, encoded, &ctx) {
-        Ok((m, verified)) => {
-            tracing::info!(
-                target: "operator_token::authn",
-                event = "verify",
-                op = op.as_str(),
-                volume = %op_volume_str,
-                macaroon_nonce = %m.nonce_hex(),
-                "authenticated operator request",
-            );
-            Ok(verified)
-        }
-        Err(reject) => {
-            tracing::warn!(
-                target: "operator_token::authn",
-                event = "reject",
-                op = op.as_str(),
-                volume = %op_volume_str,
-                reason = ?reject,
-                "rejected operator token",
-            );
-            Err(Envelope::err(IpcError::forbidden(format!(
-                "operator token rejected ({})",
-                operator_reject_wire(reject)
-            ))))
-        }
-    }
-}
-
-/// Coarse wire string for a rejection reason. Finer-grained detail
-/// would help an attacker probe token state, so the wire collapses
-/// reasons into broader categories; the precise [`OperatorReject`]
-/// variant is still recorded locally via the audit log.
-fn operator_reject_wire(r: OperatorReject) -> &'static str {
-    match r {
-        OperatorReject::Malformed | OperatorReject::BadMac => "invalid token",
-        OperatorReject::Expired => "expired",
-        OperatorReject::WrongRole => "wrong role",
-        OperatorReject::WrongOp | OperatorReject::MissingOp => "wrong op",
-        OperatorReject::VolumeMismatch | OperatorReject::MissingVolume => "wrong volume",
     }
 }
 
@@ -1328,14 +1205,13 @@ async fn volume_events_typed(
 /// `force = true` skips the second check, accepting that any local-only
 /// pending segments or unflushed WAL records will be discarded.
 async fn remove_volume(
-    verified: macaroon::Verified<ulid::Ulid>,
+    volume_ulid: ulid::Ulid,
     force: bool,
     data_dir: &Path,
     store: Option<&Arc<dyn ObjectStore>>,
     coord_id: Option<&str>,
 ) -> Result<Option<ulid::Ulid>, IpcError> {
     use elide_coordinator::volume_state::VolumeLifecycle;
-    let volume_ulid = verified.copy_inner();
     let volume_ulid_str = volume_ulid.to_string();
     let vol_dir_path = data_dir.join("by_id").join(&volume_ulid_str);
     let (vol_dir, shape) = VolumeLifecycle::resolve(&vol_dir_path)
@@ -2618,10 +2494,6 @@ mod tests {
         ulid::Ulid::from_string(s).unwrap()
     }
 
-    fn verified_from(s: &str) -> macaroon::Verified<ulid::Ulid> {
-        macaroon::Verified::for_test(ulid_from(s))
-    }
-
     #[test]
     fn register_succeeds_when_peer_pid_matches_volume_pid() {
         let tmp = TempDir::new().unwrap();
@@ -3463,7 +3335,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
-        remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
+        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists(), "by_id dir should be removed");
@@ -3484,7 +3356,7 @@ mod tests {
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAB";
         let (vol_dir, link) =
             setup_removable_volume(tmp.path(), "vol", vol_ulid_str, Some(99), true);
-        remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
+        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3502,7 +3374,7 @@ mod tests {
             Some(5),
             false, // no STOPPED_FILE
         );
-        let err = remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
+        let err = remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .expect_err("running volume should be rejected");
         assert_eq!(err.kind, IpcErrorKind::Conflict);
@@ -3520,7 +3392,7 @@ mod tests {
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAD";
         let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
         write_released_marker(&vol_dir, ulid::Ulid::new()).unwrap();
-        remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
+        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists(), "by_id dir should be removed");
@@ -3543,7 +3415,7 @@ mod tests {
         }
         .write(&vol_dir)
         .unwrap();
-        remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
+        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3557,7 +3429,7 @@ mod tests {
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAF";
         let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, false);
         std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
-        remove_volume(verified_from(vol_ulid_str), false, tmp.path(), None, None)
+        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3569,15 +3441,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
         // ULID with no `by_id/<ulid>` directory → not_found.
-        let err = remove_volume(
-            macaroon::Verified::for_test(ulid::Ulid::new()),
-            false,
-            tmp.path(),
-            None,
-            None,
-        )
-        .await
-        .expect_err("absent volume should be NotFound");
+        let err = remove_volume(ulid::Ulid::new(), false, tmp.path(), None, None)
+            .await
+            .expect_err("absent volume should be NotFound");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
     }
 
@@ -3596,7 +3462,7 @@ mod tests {
         create_name_record(&store, "vol", &record).await.unwrap();
 
         remove_volume(
-            verified_from(vol_ulid_str),
+            ulid_from(vol_ulid_str),
             false,
             tmp.path(),
             Some(&store),
@@ -3619,7 +3485,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
 
         remove_volume(
-            verified_from(vol_ulid_str),
+            ulid_from(vol_ulid_str),
             false,
             tmp.path(),
             Some(&store),
@@ -3651,7 +3517,7 @@ mod tests {
         create_name_record(&store, "vol", &record).await.unwrap();
 
         remove_volume(
-            verified_from(vol_ulid_str),
+            ulid_from(vol_ulid_str),
             false,
             tmp.path(),
             Some(&store),
@@ -3683,7 +3549,7 @@ mod tests {
         create_name_record(&store, "vol", &record).await.unwrap();
 
         remove_volume(
-            verified_from(vol_ulid_str),
+            ulid_from(vol_ulid_str),
             false,
             tmp.path(),
             Some(&store),
