@@ -639,14 +639,15 @@ fn role_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     println!(
-        "{:<16} {:>7} {:>7} {:>7}  REQUIRED-CAVEATS",
-        "NAME", "MIN", "DEF", "MAX"
+        "{:<24} {:>5} {:>7} {:>7} {:>7}  REQUIRED-CAVEATS",
+        "NAME", "TPC", "MIN", "DEF", "MAX"
     );
     // config.roles is a BTreeMap, so iteration is name-sorted.
     for r in config.roles.values() {
         println!(
-            "{:<16} {:>7} {:>7} {:>7}  {}",
+            "{:<24} {:>5} {:>7} {:>7} {:>7}  {}",
             r.name,
+            if r.issues_with_tpc { "yes" } else { "no" },
             r.min_ttl_seconds,
             r.default_ttl_seconds,
             r.max_ttl_seconds,
@@ -678,6 +679,10 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
         } else {
             role.required_caveats.join(", ")
         }
+    );
+    eprintln!(
+        "  issues_with_tpc:  {}",
+        if role.issues_with_tpc { "yes" } else { "no" }
     );
     eprintln!("  audience:         {}", config.audience);
     eprintln!("  tenant.bucket:    {}", config.tenant.bucket);

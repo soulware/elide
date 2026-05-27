@@ -39,6 +39,15 @@ required_caveats = ["sub", "elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
+issues_with_tpc = true
+
+[[role]]
+name = "volume-rw-background"
+required_caveats = ["sub", "elide:Volume", "aud", "exp"]
+min_ttl_seconds = 60
+max_ttl_seconds = 86400        # 24h
+default_ttl_seconds = 86400
+policy_file = "volume-rw.json"
 
 [[role]]
 name = "coord-ro"
@@ -53,3 +62,12 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
+issues_with_tpc = true
+
+[[role]]
+name = "coord-rw-background"
+required_caveats = ["sub", "aud", "exp"]
+min_ttl_seconds = 60
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
+policy_file = "coord-rw.json"
