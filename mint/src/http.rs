@@ -68,6 +68,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/assume-role", post(assume_role))
         .route("/v1/enroll", post(enroll))
         .route("/v1/enroll-exchange", post(enroll_exchange))
+        .route("/v1/verify", post(discharge_verify))
         .with_state(state)
 }
 
@@ -717,4 +718,131 @@ fn denied_tag(d: &Denied) -> &'static str {
         Denied::Expired => "expired",
         Denied::TtlTooShort => "ttl_too_short",
     }
+}
+
+#[derive(Deserialize)]
+struct VerifyRequest {
+    /// Base64 macaroon — the primary credential, optionally
+    /// per-forward attenuated by the caller before forwarding.
+    primary: String,
+    /// Base64 discharge macaroons, one per TPC on the primary
+    /// (positional matching for the initial single-TPC design).
+    /// Empty when the primary carries no TPCs (e.g. background
+    /// roles); the verifier returns valid in that case if the
+    /// chain MAC checks out.
+    #[serde(default)]
+    discharges: Vec<String>,
+}
+
+/// `POST /v1/verify`. Receives `(primary, discharges)`,
+/// walks the primary's chain under the keyring, recovers `r` from
+/// each TPC's VID, verifies the matching discharge's chain under
+/// `r`, recurses to fixpoint on nested TPCs. On success returns the
+/// aggregated first-party caveats and the minimum `NotAfter` across
+/// every verified macaroon — the caller (coord) uses those to clear
+/// against live request context. On any failure returns a coarse
+/// reason string for audit / forensics; the cross-IPC face of this
+/// is mediated by the caller, which collapses to the canonical
+/// opaque error.
+async fn discharge_verify(
+    State(state): State<AppState>,
+    _headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    let req: VerifyRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return verify_failure(&request_id, "bad_request"),
+    };
+
+    let primary = match Macaroon::decode(&req.primary) {
+        Ok(m) => m,
+        Err(_) => return verify_failure(&request_id, "primary_decode"),
+    };
+
+    let mut decoded_discharges: Vec<Macaroon> = Vec::with_capacity(req.discharges.len());
+    for d in &req.discharges {
+        match Macaroon::decode(d) {
+            Ok(m) => decoded_discharges.push(m),
+            Err(_) => return verify_failure(&request_id, "discharge_decode"),
+        }
+    }
+
+    let keyring = state.store.keyring().await;
+    let Some(primary_key) = keyring.get(primary.kid()) else {
+        return verify_failure(&request_id, "unknown_kid");
+    };
+
+    // Queue-walk: every queued macaroon is verified under its key,
+    // every TPC it carries spawns a deferred discharge check that
+    // adds the matched discharge to the queue under the recovered
+    // `r`. Initial design is single-TPC, single-discharge with
+    // positional matching; the queue shape generalises cleanly to
+    // multi-TPC and nested-TPC bundles once a CID-based matcher
+    // exists.
+    let mut verified_chains: Vec<Vec<Caveat>> = Vec::new();
+    let mut discharge_cursor = 0usize;
+    let mut work: std::collections::VecDeque<(Macaroon, [u8; 32])> =
+        std::collections::VecDeque::new();
+    work.push_back((primary, *primary_key));
+
+    while let Some((mac, key)) = work.pop_front() {
+        let Some(sites) = mac.verify_collecting_tpcs(&key) else {
+            return verify_failure(&request_id, "mac_mismatch");
+        };
+        for site in sites {
+            let Ok(r) = crate::tpc::decrypt_vid(&site.t_n_minus_1, site.vid) else {
+                return verify_failure(&request_id, "vid_decrypt");
+            };
+            let Some(discharge) = decoded_discharges.get(discharge_cursor) else {
+                return verify_failure(&request_id, "tpc_undischarged");
+            };
+            discharge_cursor += 1;
+            work.push_back((discharge.clone(), r));
+        }
+        verified_chains.push(mac.caveats().to_vec());
+    }
+
+    if discharge_cursor != decoded_discharges.len() {
+        return verify_failure(&request_id, "excess_discharges");
+    }
+
+    // Aggregate first-party caveats across every verified macaroon.
+    // Mint is caveat-vocabulary-agnostic — it returns the raw chain
+    // and lets the caller pick out the names it cares about. The
+    // `not_after` field is the one mint-side computed value: the
+    // minimum across every NotAfter the bundle carries.
+    let mut aggregated: Vec<serde_json::Value> = Vec::new();
+    let mut min_not_after: Option<u64> = None;
+    for chain in &verified_chains {
+        for c in chain {
+            if let Caveat::FirstParty { name, value } = c {
+                aggregated.push(json!({"name": name, "value": value}));
+                if name == crate::caveat::name::EXP
+                    && let Ok(v) = value.parse::<u64>()
+                {
+                    min_not_after = Some(min_not_after.map_or(v, |m| m.min(v)));
+                }
+            }
+        }
+    }
+
+    respond(
+        &request_id,
+        StatusCode::OK,
+        json!({
+            "valid": true,
+            "expires_at": min_not_after,
+            "caveats": aggregated,
+        }),
+    )
+}
+
+fn verify_failure(request_id: &str, reason: &'static str) -> Response {
+    respond(
+        request_id,
+        StatusCode::OK,
+        json!({"valid": false, "reason": reason}),
+    )
 }
