@@ -114,6 +114,109 @@ fn aead_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
         .expect("AES-GCM-SIV encrypt: internal buffer growth")
 }
 
+fn aead_decrypt(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, TpcError> {
+    let cipher = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(key));
+    cipher
+        .decrypt(Nonce::from_slice(&FIXED_NONCE), ciphertext)
+        .map_err(|_| TpcError::Aead)
+}
+
+/// Why a TPC decrypt or parse failed. Deliberately coarse — a verifier
+/// returning these to a client should collapse them to one opaque
+/// failure (the indistinguishability rule from
+/// `docs/design-mint.md` § *Authentication*); the variants are for
+/// audit and tests.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TpcError {
+    /// AEAD tag mismatch — wrong key, tampered ciphertext, or
+    /// otherwise corrupt input.
+    #[error("AEAD authentication failed")]
+    Aead,
+    /// Decrypted plaintext is shorter than the minimum the layout
+    /// requires (32 bytes of `r` plus two length prefixes).
+    #[error("plaintext truncated")]
+    Truncated,
+    /// A length-prefixed field claims a length past the end of the
+    /// plaintext.
+    #[error("length-prefix overrun")]
+    Overrun,
+    /// Decrypted bytes that should be UTF-8 (the `client_id` or
+    /// `org_id`) are not.
+    #[error("non-utf-8 field")]
+    BadUtf8,
+    /// Trailing bytes after the last parsed field — the plaintext
+    /// is longer than the layout says it should be.
+    #[error("trailing bytes")]
+    Trailing,
+}
+
+/// The plaintext bound into a CID by [`encrypt_cid`], recovered by
+/// [`decrypt_cid`]. `r` is the per-client discharge-recovery key;
+/// `client_id` and `org_id` are the bound identity strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CidPlaintext {
+    pub r: [u8; 32],
+    pub client_id: String,
+    pub org_id: String,
+}
+
+/// Decrypt `VID` under the chain tag `T_{n-1}` to recover `r`. The
+/// verifier walks the primary's chain up to the TPC step, captures
+/// the chain tag at that position, and calls this to obtain the
+/// discharge-MAC key without ever needing `K_M-A`.
+pub fn decrypt_vid(t_n_minus_1: &[u8; 32], vid: &[u8]) -> Result<[u8; 32], TpcError> {
+    let plaintext = aead_decrypt(t_n_minus_1, vid)?;
+    plaintext
+        .as_slice()
+        .try_into()
+        .map_err(|_| TpcError::Truncated)
+}
+
+/// Decrypt `CID` under `K_M-A` to recover `(r, client_id, org_id)`.
+/// The alternate path to `r` for parties that hold `K_M-A` (mint,
+/// and auth at discharge-issuance time) — yields the same `r` as
+/// [`decrypt_vid`] for the same primary, plus the bound identity
+/// strings as a cross-check.
+pub fn decrypt_cid(k_m_a: &[u8; 32], cid: &[u8]) -> Result<CidPlaintext, TpcError> {
+    let plaintext = aead_decrypt(k_m_a, cid)?;
+    parse_cid_plaintext(&plaintext)
+}
+
+fn parse_cid_plaintext(buf: &[u8]) -> Result<CidPlaintext, TpcError> {
+    if buf.len() < 32 {
+        return Err(TpcError::Truncated);
+    }
+    let r: [u8; 32] = buf[..32].try_into().expect("32-byte slice");
+    let mut pos = 32;
+    let client_id = read_length_prefixed_str(buf, &mut pos)?;
+    let org_id = read_length_prefixed_str(buf, &mut pos)?;
+    if pos != buf.len() {
+        return Err(TpcError::Trailing);
+    }
+    Ok(CidPlaintext {
+        r,
+        client_id,
+        org_id,
+    })
+}
+
+fn read_length_prefixed_str(buf: &[u8], pos: &mut usize) -> Result<String, TpcError> {
+    if *pos + 4 > buf.len() {
+        return Err(TpcError::Truncated);
+    }
+    let len = u32::from_be_bytes(buf[*pos..*pos + 4].try_into().expect("4-byte slice")) as usize;
+    *pos += 4;
+    let end = pos.checked_add(len).ok_or(TpcError::Overrun)?;
+    if end > buf.len() {
+        return Err(TpcError::Overrun);
+    }
+    let s = std::str::from_utf8(&buf[*pos..end])
+        .map_err(|_| TpcError::BadUtf8)?
+        .to_owned();
+    *pos = end;
+    Ok(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +296,82 @@ mod tests {
         let mut t2 = [4u8; 32];
         t2[0] ^= 0x01;
         assert_ne!(encrypt_vid(&t1, &r), encrypt_vid(&t2, &r));
+    }
+
+    #[test]
+    fn vid_round_trips_under_correct_tag() {
+        let t = [4u8; 32];
+        let r = [5u8; 32];
+        let vid = encrypt_vid(&t, &r);
+        assert_eq!(decrypt_vid(&t, &vid).expect("decrypt"), r);
+    }
+
+    #[test]
+    fn vid_decrypt_fails_under_wrong_tag() {
+        let t = [4u8; 32];
+        let r = [5u8; 32];
+        let vid = encrypt_vid(&t, &r);
+        let mut wrong = t;
+        wrong[0] ^= 0x80;
+        assert_eq!(decrypt_vid(&wrong, &vid), Err(TpcError::Aead));
+    }
+
+    #[test]
+    fn vid_decrypt_fails_on_tampered_ciphertext() {
+        // AES-GCM-SIV's authentication tag should detect a single
+        // bit-flip — that's the misuse-resistance property we lean on.
+        let t = [4u8; 32];
+        let r = [5u8; 32];
+        let mut vid = encrypt_vid(&t, &r);
+        vid[0] ^= 0x01;
+        assert_eq!(decrypt_vid(&t, &vid), Err(TpcError::Aead));
+    }
+
+    #[test]
+    fn cid_round_trips_to_bound_identity() {
+        let k_m_a = [3u8; 32];
+        let r = [7u8; 32];
+        let cid = encrypt_cid(&k_m_a, &r, "01ARZ", "org_demo");
+        let pt = decrypt_cid(&k_m_a, &cid).expect("decrypt");
+        assert_eq!(pt.r, r);
+        assert_eq!(pt.client_id, "01ARZ");
+        assert_eq!(pt.org_id, "org_demo");
+    }
+
+    #[test]
+    fn cid_decrypt_fails_under_wrong_k_m_a() {
+        let k_m_a = [3u8; 32];
+        let r = [7u8; 32];
+        let cid = encrypt_cid(&k_m_a, &r, "01ARZ", "org_demo");
+        let mut wrong = k_m_a;
+        wrong[31] ^= 0x40;
+        assert_eq!(decrypt_cid(&wrong, &cid), Err(TpcError::Aead));
+    }
+
+    #[test]
+    fn cid_decrypt_recovers_exact_field_bytes() {
+        // Empty `org_id` and unicode `client_id` exercise the
+        // length-prefix parser at its boundaries.
+        let k_m_a = [3u8; 32];
+        let r = [9u8; 32];
+        let cid = encrypt_cid(&k_m_a, &r, "01ÆØÅ", "");
+        let pt = decrypt_cid(&k_m_a, &cid).expect("decrypt");
+        assert_eq!(pt.client_id, "01ÆØÅ");
+        assert_eq!(pt.org_id, "");
+    }
+
+    #[test]
+    fn cid_and_vid_agree_on_r() {
+        // The whole point of the dual-path construction: mint can
+        // recover `r` either by walking the chain (VID) or by
+        // decrypting CID under K_M-A — both yield the same key.
+        let k_m_a = [3u8; 32];
+        let r = derive_r(&[1u8; 32], "01ARZ", 0);
+        let tail = [11u8; 32];
+        let vid = encrypt_vid(&tail, &r);
+        let cid = encrypt_cid(&k_m_a, &r, "01ARZ", "org_demo");
+        let via_vid = decrypt_vid(&tail, &vid).expect("vid");
+        let via_cid = decrypt_cid(&k_m_a, &cid).expect("cid").r;
+        assert_eq!(via_vid, via_cid);
     }
 }

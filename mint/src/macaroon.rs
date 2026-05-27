@@ -163,6 +163,34 @@ pub fn mint(keyring: &Keyring, caveats: Vec<Caveat>) -> Macaroon {
     }
 }
 
+/// Mint a macaroon under a raw 32-byte key — the keyring-less twin
+/// of [`mint`], used when the issuer holds the key directly. Discharge
+/// macaroons go through this path: they're MAC'd under the per-client
+/// ephemeral `r`, not under any entry in mint's root keyring, so the
+/// issuer supplies `(key, kid)` directly. `kid` is a free label the
+/// verifier must agree on; auth and mint use [`DISCHARGE_KID`] by
+/// convention.
+pub fn mint_under_key(key: &[u8; 32], kid: Kid, caveats: Vec<Caveat>) -> Macaroon {
+    let mut nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let mac = chain_mac(key, kid, &nonce, &caveats);
+    Macaroon {
+        kid,
+        nonce,
+        caveats,
+        mac,
+    }
+}
+
+/// `kid` value the discharge-issuing path uses. The kid slot in a
+/// discharge's wire format doesn't index any keyring (the discharge
+/// is MAC'd under the per-client ephemeral `r`), but the value
+/// participates in the chain seed so issuer and verifier must agree.
+/// 0 is the convention; it is unrelated to mint's root-keyring `kid=0`
+/// because verification of a discharge takes `r` directly via
+/// [`Macaroon::verify_under_key`] rather than looking the kid up.
+pub const DISCHARGE_KID: Kid = 0;
+
 impl Macaroon {
     pub fn kid(&self) -> Kid {
         self.kid
@@ -207,6 +235,18 @@ impl Macaroon {
         let Some(key) = keyring.get(self.kid) else {
             return false;
         };
+        self.verify_under_key(key)
+    }
+
+    /// Constant-time MAC verification against a raw 32-byte key. The
+    /// keyring-less twin of [`verify`](Self::verify), used when the
+    /// verifier holds the key directly rather than via a generation
+    /// lookup — discharge macaroons, which are MAC'd under the
+    /// per-client ephemeral `r` rather than under any keyring entry,
+    /// verify through this path. The `kid` slot still participates in
+    /// the chain seed, so issuer and verifier must agree on whatever
+    /// label the issuer used.
+    pub fn verify_under_key(&self, key: &[u8; 32]) -> bool {
         let expected = chain_mac(key, self.kid, &self.nonce, &self.caveats);
         expected.ct_eq(&self.mac).into()
     }
@@ -417,6 +457,62 @@ mod tests {
             )],
         );
         assert_ne!(fp.tail(), tp.tail());
+    }
+
+    #[test]
+    fn mint_under_key_round_trips_under_same_key() {
+        // The keyring-less mint/verify pair used for discharges.
+        let r = [9u8; 32];
+        let m = mint_under_key(
+            &r,
+            DISCHARGE_KID,
+            vec![
+                Caveat::scalar("Subject", "usr_abc"),
+                Caveat::scalar("CoordId", "01ARZ"),
+                Caveat::scalar("NotAfter", "1700000000"),
+            ],
+        );
+        assert_eq!(m.kid(), DISCHARGE_KID);
+        assert!(m.verify_under_key(&r));
+    }
+
+    #[test]
+    fn verify_under_key_rejects_wrong_key() {
+        let r = [9u8; 32];
+        let m = mint_under_key(
+            &r,
+            DISCHARGE_KID,
+            vec![Caveat::scalar("Subject", "usr_abc")],
+        );
+        let mut wrong = r;
+        wrong[15] ^= 0x80;
+        assert!(!m.verify_under_key(&wrong));
+    }
+
+    #[test]
+    fn verify_under_key_rejects_tampered_caveat() {
+        let r = [9u8; 32];
+        let m = mint_under_key(&r, DISCHARGE_KID, vec![Caveat::scalar("CoordId", "01ARZ")]);
+        let mut forged = Macaroon::decode(&m.encode()).unwrap();
+        forged.caveats[0] = Caveat::scalar("CoordId", "01EVIL");
+        assert!(!forged.verify_under_key(&r));
+    }
+
+    #[test]
+    fn discharge_kid_distinct_from_keyring_kid_zero() {
+        // A discharge minted under r=0xFF.. with DISCHARGE_KID happens
+        // to share the kid label "0" with a hypothetical kid-0 keyring
+        // entry; the chain MAC still verifies under `r` (which is what
+        // matters) and does not verify against the keyring's key at
+        // that same kid label.
+        let r = [0xff; 32];
+        let m = mint_under_key(
+            &r,
+            DISCHARGE_KID,
+            vec![Caveat::scalar("Subject", "usr_abc")],
+        );
+        assert!(m.verify_under_key(&r));
+        assert!(!m.verify(&ring())); // ring's kid=0 is [7u8; 32], not [0xff; 32]
     }
 
     #[test]
