@@ -111,18 +111,28 @@ fn serialize_one(c: &Caveat) -> Vec<u8> {
     }
 }
 
-/// Chain the MAC under `key`, binding the seed to `kid` so a key
-/// recovered from one generation cannot be replayed under a different
-/// kid claim (paranoia — the verifier already picks the key by kid).
-fn chain_mac(key: &[u8; 32], kid: Kid, nonce: &[u8; NONCE_LEN], caveats: &[Caveat]) -> [u8; 32] {
+/// Initial chain tag: keyed BLAKE3 over `DOMAIN || kid || nonce`. The
+/// kid is bound here so a key recovered from one generation cannot be
+/// replayed under a different kid claim.
+fn seed_mac(key: &[u8; 32], kid: Kid, nonce: &[u8; NONCE_LEN]) -> [u8; 32] {
     let mut seed_msg = Vec::with_capacity(DOMAIN.len() + 2 + NONCE_LEN);
     seed_msg.extend_from_slice(DOMAIN);
     seed_msg.extend_from_slice(&kid.to_be_bytes());
     seed_msg.extend_from_slice(nonce);
-    let mut mac = *blake3::keyed_hash(key, &seed_msg).as_bytes();
+    *blake3::keyed_hash(key, &seed_msg).as_bytes()
+}
+
+/// One step of the chain MAC: `BLAKE3-keyed(prev_mac, serialize_one(c))`.
+fn step_mac(prev: &[u8; 32], c: &Caveat) -> [u8; 32] {
+    *blake3::keyed_hash(prev, &serialize_one(c)).as_bytes()
+}
+
+/// Walk the chain end-to-end. Used by [`Macaroon::verify`] and by
+/// [`mint`] when no TPC is being stamped.
+fn chain_mac(key: &[u8; 32], kid: Kid, nonce: &[u8; NONCE_LEN], caveats: &[Caveat]) -> [u8; 32] {
+    let mut mac = seed_mac(key, kid, nonce);
     for c in caveats {
-        let step = serialize_one(c);
-        mac = *blake3::keyed_hash(&mac, &step).as_bytes();
+        mac = step_mac(&mac, c);
     }
     mac
 }
@@ -131,6 +141,14 @@ fn chain_mac(key: &[u8; 32], kid: Kid, nonce: &[u8; NONCE_LEN], caveats: &[Cavea
 /// the issuer *and* verifier of the credential macaroon (the root never
 /// leaves the process — see `docs/design-mint.md` § *Trust model*);
 /// this is the issuer side.
+///
+/// Mint stamps a third-party caveat onto an issued credential by
+/// calling [`Macaroon::attenuate`] with a `Caveat::ThirdParty` value:
+/// chain extension is keyless (the trailing MAC is enough), so a TPC
+/// appended at issuance is byte-identical to one inserted into the
+/// initial chain — the MAC is incremental and additive. The TPC
+/// `vid` reads the appended-to credential's [`tail`](Macaroon::tail)
+/// as `T_{n-1}`. [`crate::tpc`] holds the AEAD primitives.
 pub fn mint(keyring: &Keyring, caveats: Vec<Caveat>) -> Macaroon {
     let kid = keyring.current_kid();
     let key = keyring.current_key();
