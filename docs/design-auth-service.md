@@ -24,7 +24,7 @@ two of the role credentials mint already issues at coord enrollment
   `coord-rw-background`, `volume-rw-background`) carry no TPC and
   are not primaries.
 - **Discharge anchor** — the specific primary coord nominates when
-  it forwards a bundle on `/v1/discharge/verify`. Every primary
+  it forwards a bundle on `/v1/verify`. Every primary
   shares the same `r` and `CID` (see *Keys* below), so the choice
   is arbitrary; coord uses `coord-rw` by convention because every
   coord holds it.
@@ -338,7 +338,7 @@ nominated discharge-anchor primary (`coord-rw` by convention) from
    - **Cache miss**: coord first attenuates its nominated primary
      with a freshness `NotAfter` (see *Coord attenuates the primary*
      below), then forwards `(attenuated_primary, [wide_bytes])` to
-     mint at `<mint>/v1/discharge/verify`. The discharge list is a
+     mint at `<mint>/v1/verify`. The discharge list is a
      flat bag — length 1 in the initial design. Mint returns
      `{valid: true, expires_at: <NotAfter>, caveats: {...}}` or
      `{valid: false, reason: "..."}`. On valid, cache `(wide_bytes
@@ -373,7 +373,7 @@ mint (or, transitively, was done by mint and cached).
 The stored primaries are long-lived. To avoid forwarding a
 long-lived credential unattenuated, coord attaches a fresh
 per-forward `NotAfter` caveat to the chain of whichever primary it
-is forwarding before any call to mint (both `/v1/discharge/verify`
+is forwarding before any call to mint (both `/v1/verify`
 with the nominated discharge-anchor and `/v1/assume-role` with the
 role-specific credential):
 
@@ -394,11 +394,11 @@ effective lifetime is already bounded by the discharge attenuation's
 keeps the rule "always attenuate tightly" honest at both layers and
 gives mint's audit log a per-forward freshness marker.
 
-### Mint: verification on `/v1/discharge/verify` and on assume-role
+### Mint: verification on `/v1/verify` and on assume-role
 
 Mint exposes two endpoints that handle bundle verification:
 
-- `/v1/discharge/verify` — called by coord when coord has a cache
+- `/v1/verify` — called by coord when coord has a cache
   miss on a wide discharge. Returns the verification verdict.
 - `/v1/assume-role` (existing) — called by coord when it needs
   write-capable S3 creds. Mint re-verifies the bundle from scratch
@@ -439,7 +439,7 @@ single-TPC shape is the N=1 case.
    attenuate each independently.
 
 Mint holds its own verification cache keyed by wide-discharge bytes
-so a coord's `/discharge/verify` call followed by an `/assume-role`
+so a coord's `/verify` call followed by an `/assume-role`
 call within the same window doesn't repeat the chain walk
 unnecessarily.
 
@@ -455,7 +455,7 @@ context) and changes every IPC.
 Key: `wide_discharge_bytes` (or hash). Value: `(expires_at,
 caveats)`. TTL: until `expires_at`.
 
-Populated on cache miss via a one-shot mint round-trip (`/discharge/verify`).
+Populated on cache miss via a one-shot mint round-trip (`/verify`).
 Once populated, all subsequent IPCs that present the same wide
 discharge skip the mint round-trip until expiry. Same bytes, same
 verification verdict — the MAC over a fixed byte sequence is
@@ -474,7 +474,7 @@ is a handful of entries per coord.
 ### Wide-discharge verification cache (mint-side)
 
 Same shape as coord's cache. Lets mint skip redundant chain walks
-when coord's `/discharge/verify` call is followed by an
+when coord's `/verify` call is followed by an
 `/assume-role` call within the same window. Keyed on wide bytes
 only — coord's per-forward primary attenuation changes the primary
 chain per call, but mint walks the (short) attenuation suffix
@@ -495,7 +495,7 @@ What each party can do under compromise:
   clearing* (accepting an IPC that should have been rejected) or
   *lying about cache hits* (skipping the mint forward for unseen
   bytes). Both are detectable at audit: every accepted IPC at coord
-  should trace through `/discharge/verify` at mint (which has its
+  should trace through `/verify` at mint (which has its
   own log) which should trace to `/v1/discharge` at auth.
 - **Mint rooted**: holds `K_M` (can derive any `K_coord`, can walk
   any primary's chain, can recover any `r` from `VID`) and `K_M-A`
@@ -508,7 +508,7 @@ What each party can do under compromise:
 - **Auth rooted**: holds `K_M-A` and `K_session`. Can mint
   discharges for any coord (decrypts any `CID`, recovers `r`, signs
   discharges). Same trust-circle property. Auth-side audit is
-  self-attesting in this case — but mint's `/discharge/verify` log
+  self-attesting in this case — but mint's `/verify` log
   is a secondary signal.
 
 Forgery requires `K_M`, `K_M-A`, or being mint/auth itself. None of
@@ -520,14 +520,14 @@ The design produces three correlated audit streams:
 
 - **Auth log**: every `/v1/discharge` issuance (subject, coord_id
   via decoded CID, expires_at).
-- **Mint log**: every `/v1/discharge/verify` and every assume-role
+- **Mint log**: every `/v1/verify` and every assume-role
   verification (coord_id from primary, discharge nonce = CID,
   expires_at).
 - **Coord log**: every operator IPC accepted (op, volume, subject,
   wide discharge nonce `= CID`).
 
 The audit invariant: every accepted IPC at coord must trace through
-a `/discharge/verify` (or `/assume-role` verification) at mint,
+a `/verify` (or `/assume-role` verification) at mint,
 which must trace to a `/v1/discharge` issuance at auth, all within
 the wide discharge's `NotAfter` window.
 
@@ -696,14 +696,14 @@ CLI before sending each IPC; not cached. Carries `Op`, `Volume`,
 and `NotAfter`.
 
 **Coord primary attenuations: per forward to mint, ~5s NotAfter.**
-Built by coord before each `/v1/discharge/verify` or
+Built by coord before each `/v1/verify` or
 `/v1/assume-role` call; not cached. Carries just `NotAfter`. Keeps
 the primary tight on the wire even though the underlying primary
 in `data_dir` is long-lived.
 
 **Replay window.** Within the attenuation `NotAfter` a specific
 attenuated discharge is theoretically replayable on coord. Operator
-IPC verbs are idempotent at the coord layer (`/v1/discharge/verify`
+IPC verbs are idempotent at the coord layer (`/v1/verify`
 returns the same yes/no for the same bytes; `/v1/assume-role`
 returns equivalent short-lived creds), so the 5s replay window
 doesn't grant additional authority. No nonce caching is needed at
@@ -903,7 +903,7 @@ Refreshing a primary after `K_M-A` rotation is also done via
 a fresh credential under a fresh TPC). No dedicated
 `/v1/coord/primary` endpoint exists.
 
-`POST /v1/discharge/verify` (coord-authenticated) — verify a bundle.
+`POST /v1/verify` (coord-authenticated) — verify a bundle.
 Coord forwards a per-forward-attenuated primary (its nominated
 discharge-anchor) and the list of discharge bytes; mint runs the
 verification routine described in *Mint: verification* and returns

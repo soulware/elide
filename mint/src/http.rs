@@ -68,7 +68,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/assume-role", post(assume_role))
         .route("/v1/enroll", post(enroll))
         .route("/v1/enroll-exchange", post(enroll_exchange))
-        .route("/v1/discharge/verify", post(discharge_verify))
+        .route("/v1/verify", post(discharge_verify))
         .with_state(state)
 }
 
@@ -734,7 +734,7 @@ struct VerifyRequest {
     discharges: Vec<String>,
 }
 
-/// `POST /v1/discharge/verify`. Receives `(primary, discharges)`,
+/// `POST /v1/verify`. Receives `(primary, discharges)`,
 /// walks the primary's chain under the keyring, recovers `r` from
 /// each TPC's VID, verifies the matching discharge's chain under
 /// `r`, recurses to fixpoint on nested TPCs. On success returns the

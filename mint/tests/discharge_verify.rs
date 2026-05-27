@@ -1,4 +1,4 @@
-//! `/v1/discharge/verify`: mint walks a `(primary, discharges)` bundle,
+//! `/v1/verify`: mint walks a `(primary, discharges)` bundle,
 //! recovers `r` for each TPC, verifies the matched discharge's chain
 //! under `r`, returns aggregated caveats. End-to-end through the HTTP
 //! handler.
@@ -126,7 +126,7 @@ async fn verify_request(
     .to_string();
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/discharge/verify")
+        .uri("/v1/verify")
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap();

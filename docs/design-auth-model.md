@@ -193,7 +193,7 @@ shape](https://github.com/superfly/macaroon/blob/main/macaroon-thought.md):
 role credentials at enrollment and stores the bytes. On each
 operator IPC, coord forwards the bundle (the role credential it
 nominates as the discharge anchor, plus the attenuated discharge)
-to mint for verification via `/v1/discharge/verify`, caches mint's
+to mint for verification via `/v1/verify`, caches mint's
 verdict for the wide discharge's NotAfter, and clears caveats
 locally against the live IPC context.
 
