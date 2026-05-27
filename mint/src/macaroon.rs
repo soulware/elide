@@ -1,8 +1,8 @@
 //! Generic chained-MAC macaroon.
 //!
-//! Same construction as the elide coordinator's v2 macaroon
-//! (`elide-coordinator/src/macaroon.rs`) and `docs/design-auth-model.md`,
-//! generalised to free-form named **scalar** caveats:
+//! Standard chained-keyed-BLAKE3 construction over free-form named
+//! **scalar** caveats, with the per-step type tag that lets a chain
+//! interleave first-party and third-party caveats:
 //!
 //! ```text
 //! mac_seed = blake3_keyed(keyring[kid], DOMAIN || kid_be || nonce)

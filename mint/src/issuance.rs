@@ -2,14 +2,14 @@
 //! lifecycle*, § *Enrollment*).
 //!
 //! Every macaroon mint here is a fresh chain **from the root** (only
-//! the root holder can mint; a coordinator can only attenuate). Three
+//! the root holder can mint; a client can only attenuate). Three
 //! mint points, each stamped with its own positively-required `op`:
 //!
 //! 1. [`mint_invite`] — `op=enroll`, the reusable non-expiring
 //!    participation gate. No principal identity; carries the current
 //!    `invite` nonce.
 //! 2. [`mint_credential_ticket`] — `op=enroll-exchange`, short-lived,
-//!    minted at `POST /v1/enroll` once the presented (coordinator-
+//!    minted at `POST /v1/enroll` once the presented (client-
 //!    attenuated) invite has verified and a pending record exists.
 //!    Carries the self-asserted `sub`/`cnf` forward.
 //! 3. [`mint_credential`] — `op=assume-role`, non-expiring, minted at
@@ -90,7 +90,7 @@ pub fn mint_credential_ticket(
 /// exchange: `op=assume-role`, `aud`, the same `sub`/`cnf`, the
 /// `role` it was authorized for, **no** `exp`. A fresh chain, not an
 /// attenuation of the credential ticket (only the root holder can do
-/// this). One credential carries exactly one role — a coordinator
+/// this). One credential carries exactly one role — a client
 /// exchanges once per role it needs (`docs/design-mint.md` §
 /// *Credential macaroon & lifecycle*).
 pub fn mint_credential(

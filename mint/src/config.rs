@@ -72,11 +72,9 @@ pub struct RawConfig {
     /// (`root_key`, generated on first start), the current invite
     /// nonce, and the transient pending-enrollment table, all under one
     /// custody (`docs/design-mint.md` § *Enrollment*, § *Mint
-    /// configuration*). A relative value
-    /// (including the default `mint_data`) resolves against the current
-    /// working directory, not the config file's parent — the same rule
-    /// the elide coordinator uses for `data_dir`; an absolute path is
-    /// used verbatim.
+    /// configuration*). A relative value (including the default
+    /// `mint_data`) resolves against the current working directory,
+    /// not the config file's parent; an absolute path is used verbatim.
     #[serde(default)]
     pub data_dir: Option<String>,
     /// Directory holding role policy-template files, one per role
@@ -92,13 +90,12 @@ pub struct RawConfig {
     #[serde(default)]
     pub bind: Option<String>,
     /// Unix-domain-socket listener path — the bundled single-host dev
-    /// shape (coordinator + mint co-resident, matching `coord run` /
-    /// `coord start`). Selecting it is what makes a mint instance
-    /// local-only: no port, no accidental network exposure, no
-    /// same-host TLS, filesystem-permission scoped. Mutually exclusive
-    /// with `bind`. Same resolution rule as `data_dir` (relative
-    /// against cwd, absolute verbatim); an empty value selects UDS at
-    /// the default `<data_dir>/mint.sock`.
+    /// shape (client + mint co-resident). Selecting it is what makes a
+    /// mint instance local-only: no port, no accidental network
+    /// exposure, no same-host TLS, filesystem-permission scoped.
+    /// Mutually exclusive with `bind`. Same resolution rule as
+    /// `data_dir` (relative against cwd, absolute verbatim); an empty
+    /// value selects UDS at the default `<data_dir>/mint.sock`.
     #[serde(default)]
     pub socket: Option<String>,
     pub tenant: Tenant,
@@ -154,8 +151,8 @@ pub struct Tenant {
 }
 
 /// Tigris admin credential, read from the standard AWS environment
-/// variables — the same convention the elide coordinator uses for its
-/// IAM-mode admin credential. It is deliberately **not** in the TOML
+/// variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+/// optional `AWS_SESSION_TOKEN`). Deliberately **not** in the TOML
 /// config: the credential is a secret delivered by the environment
 /// (systemd `LoadCredential=`, a secrets manager, …), never committed
 /// alongside role definitions.
@@ -237,7 +234,7 @@ pub enum Listener {
     /// The network shapes. TLS terminated ahead of or by mint.
     Tcp(SocketAddr),
     /// The single-host dev shape. Recreated on bind (stale dentry
-    /// removed first), chmod `0o666` so a non-root coordinator can
+    /// removed first), chmod `0o666` so a non-root client can
     /// connect.
     Uds(PathBuf),
 }

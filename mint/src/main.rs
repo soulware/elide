@@ -1,5 +1,5 @@
 //! mint entry point (`docs/design-mint.md` § *Reference client &
-//! demo*). clap-derived CLI, matching the elide coordinator's shape.
+//! demo*). clap-derived CLI.
 //!
 //! `serve` runs the verification/vending HTTP surface against Tigris:
 //! self-vended `mint-rw` keypair for `_mint/*` data-plane I/O and a
@@ -9,7 +9,7 @@
 //! directly, outside the `serve` path.
 //!
 //! `invite` / `enroll` are the operator side. The networked
-//! `mint client` (the coordinator's half) is the staged tail.
+//! `mint client` (the caller's half of the flow) is the staged tail.
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -78,7 +78,7 @@ enum Command {
         #[arg(long, default_value = "mint.toml")]
         config: PathBuf,
     },
-    /// Reference client — the coordinator's half of the flow.
+    /// Reference client — the caller's half of the flow.
     Client {
         /// Identity + received-macaroon directory (default
         /// `./mint_client`, analogous to the server's `./mint_data`).
@@ -108,7 +108,7 @@ enum ClientCmd {
         /// `unix:<socket-path>` (the single-host UDS shape).
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
-        /// Opaque principal id — the `sub` (Elide: coordinator ULID).
+        /// Opaque principal id — the `sub` (typically a ULID).
         #[arg(long)]
         id: String,
         /// Filename (under the client dir) to write the credential
@@ -219,14 +219,14 @@ enum EnrollCmd {
     Approve {
         #[arg(long, default_value = "mint.toml")]
         config: PathBuf,
-        /// The opaque principal id (Elide: the coordinator ULID).
+        /// The opaque principal id (typically a ULID).
         sub: String,
         /// Skip the interactive confirmation (automation only — you are
         /// asserting the fingerprint was verified out of band).
         #[arg(long)]
         yes: bool,
     },
-    /// Revoke an approved-coordinator registry entry.
+    /// Revoke an approved-client registry entry.
     ///
     /// After this, the next `/v1/enroll` for `<sub>` falls back to the
     /// slow path: a fresh pending record requiring a fresh operator
@@ -451,15 +451,15 @@ async fn serve(
             // approve/revoke to anything that can reach the port
             // (`docs/design-mint.md` § *Mint state in the tenant
             // bucket*). Operators bind a UDS listener for the admin
-            // surface; coordinators (clients) hit TCP only.
+            // surface; clients hit TCP only.
             let listener = tokio::net::TcpListener::bind(addr).await?;
             tracing::info!(%addr, "mint listening (tcp)");
             axum::serve(listener, router(state)).await?;
         }
         Listener::Uds(path) => {
-            // Coordinator UDS idiom: clear the stale dentry, bind, then
-            // chmod 0o666 so a non-root coordinator can connect (the
-            // socket inherits the binding process's umask otherwise).
+            // UDS idiom: clear the stale dentry, bind, then chmod
+            // 0o666 so a non-root client can connect (the socket
+            // inherits the binding process's umask otherwise).
             let _ = std::fs::remove_file(&path);
             let listener = tokio::net::UnixListener::bind(&path)?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;

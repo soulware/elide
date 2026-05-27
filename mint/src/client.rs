@@ -1,16 +1,15 @@
-//! Reference client — the coordinator's half of the flow
+//! Reference client — what a mint caller does end-to-end
 //! (`docs/design-mint.md` § *Reference client & demo*). Lives in `mint/`
-//! with no `elide-*` deps; it is also the conformance surface the
+//! with no external deps; it is also the conformance surface the
 //! integration tests exercise.
 //!
-//! Identity is a `.key`/`.pub` pair, mirroring the elide coordinator
-//! convention (`elide-coordinator/src/identity.rs`): lowercase hex of
-//! the 32-byte Ed25519 material with a trailing newline; the private
-//! `client.key` is mode 0600. Both live under a client directory
-//! defaulting to `./mint_client` (analogous to the server's
-//! `./mint_data`), overridable with `--client-dir`. The credential
-//! ticket and credential received from the server are persisted there
-//! too (file names are `--out`/`--in` overridable), so the client is
+//! Identity is a `.key`/`.pub` pair: lowercase hex of the 32-byte
+//! Ed25519 material with a trailing newline; the private `client.key`
+//! is mode 0600. Both live under a client directory defaulting to
+//! `./mint_client` (analogous to the server's `./mint_data`),
+//! overridable with `--client-dir`. The credential ticket and
+//! credential received from the server are persisted there too (file
+//! names are `--out`/`--in` overridable), so the client is
 //! self-contained.
 
 use std::fs;

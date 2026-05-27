@@ -11,10 +11,9 @@
 //! `AttachUserPolicy`. mint **never** deletes or lists keys: a keypair
 //! lives until the `DateLessThan` already rendered into its policy
 //! document expires (§ *Cleanup*), so the full IAM surface
-//! (`DeleteAccessKey` / `DeletePolicy` / `Detach` / `ListPolicies`)
-//! that the elide coordinator's per-volume model needs is intentionally
-//! absent here. Ported rather than shared because `mint/` stays free of
-//! `elide-*` dependencies (it is destined to be a standalone project).
+//! (`DeleteAccessKey` / `DeletePolicy` / `Detach` / `ListPolicies`) is
+//! intentionally absent here. Self-contained because `mint/` is
+//! destined to be a standalone project with no external dependencies.
 //!
 //! Tigris quirk: `AttachUserPolicy` takes the **access key ID** in the
 //! `UserName` slot — Tigris has no IAM users; policies attach to keys.

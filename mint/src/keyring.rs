@@ -9,7 +9,7 @@
 //! ```text
 //! add(new)        — write next file, repoint `current`; old still verifies
 //! sweep approvals — re-MAC every _mint/approved/<sub> under current
-//! drain creds     — coordinators re-exchange naturally under current
+//! drain creds     — clients re-exchange naturally under current
 //! retire(old)     — delete the old kid; anything still under it now fails
 //! ```
 //!
