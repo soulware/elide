@@ -25,7 +25,7 @@ use tower::ServiceExt;
 mod common;
 
 const ROOT: [u8; 32] = [42u8; 32];
-const COORD_SEED: [u8; 32] = [7u8; 32];
+const CLIENT_SEED: [u8; 32] = [7u8; 32];
 const OTHER_SEED: [u8; 32] = [9u8; 32];
 const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
@@ -163,12 +163,12 @@ fn client_invite(nonce: &str, seed: &[u8; 32]) -> Macaroon {
 async fn full_flow_enroll_approve_exchange_then_assume_role() {
     let (app, audit, store, _dir) = app().await;
     let nonce = store.current_invite().await.unwrap();
-    let cb = client_invite(&nonce, &COORD_SEED);
+    let cb = client_invite(&nonce, &CLIENT_SEED);
 
     // (1) enroll → pending + ticket
     let (status, body) = parts(
         app.clone()
-            .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+            .oneshot(signed("/v1/enroll", &cb, &CLIENT_SEED, ""))
             .await
             .unwrap(),
     )
@@ -183,7 +183,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
             .oneshot(signed(
                 "/v1/enroll-exchange",
                 &ticket,
-                &COORD_SEED,
+                &CLIENT_SEED,
                 r#","role":"volume-ro""#,
             ))
             .await
@@ -194,7 +194,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
 
     // (3) operator approves the displayed sub
     store
-        .approve(SUB, &pop::cnf_value(&COORD_SEED), &now_iso())
+        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
         .await
         .unwrap();
 
@@ -204,7 +204,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
             .oneshot(signed(
                 "/v1/enroll-exchange",
                 &ticket,
-                &COORD_SEED,
+                &CLIENT_SEED,
                 r#","role":"volume-ro""#,
             ))
             .await
@@ -222,7 +222,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     assert_eq!(eff.resolve(name::SUB), Resolved::Value(SUB.into()));
     assert_eq!(
         eff.resolve(name::CNF),
-        Resolved::Value(pop::cnf_value(&COORD_SEED))
+        Resolved::Value(pop::cnf_value(&CLIENT_SEED))
     );
     assert_eq!(eff.resolve(name::ROLE), Resolved::Value("volume-ro".into()));
     assert_eq!(eff.not_after(name::EXP), None, "credential does not expire");
@@ -235,7 +235,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
             .oneshot(signed(
                 "/v1/enroll-exchange",
                 &ticket,
-                &COORD_SEED,
+                &CLIENT_SEED,
                 r#","role":"volume-rw""#,
             ))
             .await
@@ -255,7 +255,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
             .oneshot(signed(
                 "/v1/enroll-exchange",
                 &ticket,
-                &COORD_SEED,
+                &CLIENT_SEED,
                 r#","role":"nope""#,
             ))
             .await
@@ -272,7 +272,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
         app.oneshot(signed(
             "/v1/assume-role",
             &req,
-            &COORD_SEED,
+            &CLIENT_SEED,
             r#","role":"volume-ro","ttl_seconds":3600"#,
         ))
         .await
@@ -311,19 +311,19 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
     // rotation*).
     let (app, _audit, store) = app_in_memory().await;
     let nonce = store.current_invite().await.unwrap();
-    let cb = client_invite(&nonce, &COORD_SEED);
+    let cb = client_invite(&nonce, &CLIENT_SEED);
 
     // (1) initial enroll + operator approval under kid=0
     let (status, _) = parts(
         app.clone()
-            .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+            .oneshot(signed("/v1/enroll", &cb, &CLIENT_SEED, ""))
             .await
             .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     store
-        .approve(SUB, &pop::cnf_value(&COORD_SEED), &now_iso())
+        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
         .await
         .unwrap();
     assert_eq!(
@@ -353,7 +353,7 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
     // (same sub/cnf) and the handler opportunistically re-MACs.
     let (status, _) = parts(
         app.clone()
-            .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+            .oneshot(signed("/v1/enroll", &cb, &CLIENT_SEED, ""))
             .await
             .unwrap(),
     )
@@ -379,11 +379,11 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
 async fn idempotent_reenroll_same_pair() {
     let (app, _a, store, _dir) = app().await;
     let nonce = store.current_invite().await.unwrap();
-    let cb = client_invite(&nonce, &COORD_SEED);
+    let cb = client_invite(&nonce, &CLIENT_SEED);
     for _ in 0..2 {
         let (status, _) = parts(
             app.clone()
-                .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+                .oneshot(signed("/v1/enroll", &cb, &CLIENT_SEED, ""))
                 .await
                 .unwrap(),
         )
@@ -400,8 +400,8 @@ async fn conflicting_key_for_same_sub_is_opaque_401() {
         app.clone()
             .oneshot(signed(
                 "/v1/enroll",
-                &client_invite(&nonce, &COORD_SEED),
-                &COORD_SEED,
+                &client_invite(&nonce, &CLIENT_SEED),
+                &CLIENT_SEED,
                 "",
             ))
             .await
@@ -453,7 +453,7 @@ async fn re_enroll_over_legacy_unsigned_approved_takes_slow_path() {
     // the body lacks `kid` and `mac`, so deserialising it as the
     // current `Approved` struct fails.
     let legacy = serde_json::json!({
-        "pubkey": pop::cnf_value(&COORD_SEED),
+        "pubkey": pop::cnf_value(&CLIENT_SEED),
         "approved_at": now_iso(),
         "fingerprint_shown": "deadbeef00112233",
     });
@@ -471,8 +471,8 @@ async fn re_enroll_over_legacy_unsigned_approved_takes_slow_path() {
     let (status, _body) = parts(
         app.oneshot(signed(
             "/v1/enroll",
-            &client_invite(&nonce, &COORD_SEED),
-            &COORD_SEED,
+            &client_invite(&nonce, &CLIENT_SEED),
+            &CLIENT_SEED,
             "",
         ))
         .await
@@ -499,10 +499,10 @@ async fn re_enroll_over_legacy_unsigned_approved_takes_slow_path() {
 async fn stale_invite_nonce_is_opaque_401() {
     let (app, _a, store, _dir) = app().await;
     let stale = store.current_invite().await.unwrap();
-    let cb = client_invite(&stale, &COORD_SEED);
+    let cb = client_invite(&stale, &CLIENT_SEED);
     store.rotate_invite().await.unwrap(); // current nonce moves on
     let (status, _) = parts(
-        app.oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+        app.oneshot(signed("/v1/enroll", &cb, &CLIENT_SEED, ""))
             .await
             .unwrap(),
     )
@@ -514,8 +514,8 @@ async fn stale_invite_nonce_is_opaque_401() {
 async fn enroll_pop_by_wrong_key_is_opaque_401() {
     let (app, _a, store, _dir) = app().await;
     let nonce = store.current_invite().await.unwrap();
-    // cnf bound to COORD_SEED, but the request is signed by OTHER_SEED.
-    let cb = client_invite(&nonce, &COORD_SEED);
+    // cnf bound to CLIENT_SEED, but the request is signed by OTHER_SEED.
+    let cb = client_invite(&nonce, &CLIENT_SEED);
     let (status, _) = parts(
         app.oneshot(signed("/v1/enroll", &cb, &OTHER_SEED, ""))
             .await
@@ -596,12 +596,12 @@ issues_with_tpc = true
 async fn tpc_role_credential_carries_third_party_caveat() {
     let (app, store, _dir) = tpc_app().await;
     let nonce = store.current_invite().await.unwrap();
-    let cb = client_invite(&nonce, &COORD_SEED);
+    let cb = client_invite(&nonce, &CLIENT_SEED);
 
     // enroll
     let (status, body) = parts(
         app.clone()
-            .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+            .oneshot(signed("/v1/enroll", &cb, &CLIENT_SEED, ""))
             .await
             .unwrap(),
     )
@@ -611,7 +611,7 @@ async fn tpc_role_credential_carries_third_party_caveat() {
 
     // approve
     store
-        .approve(SUB, &pop::cnf_value(&COORD_SEED), &now_iso())
+        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
         .await
         .unwrap();
 
@@ -622,7 +622,7 @@ async fn tpc_role_credential_carries_third_party_caveat() {
         let extra = format!(r#","role":"{role}""#);
         async move {
             let (status, body) = parts(
-                app.oneshot(signed("/v1/enroll-exchange", &ticket, &COORD_SEED, &extra))
+                app.oneshot(signed("/v1/enroll-exchange", &ticket, &CLIENT_SEED, &extra))
                     .await
                     .unwrap(),
             )
@@ -683,17 +683,17 @@ async fn tpc_credential_is_deterministic_for_same_coord() {
     // restarts.
     let (app, store, _dir) = tpc_app().await;
     let nonce = store.current_invite().await.unwrap();
-    let cb = client_invite(&nonce, &COORD_SEED);
+    let cb = client_invite(&nonce, &CLIENT_SEED);
     let (_, body) = parts(
         app.clone()
-            .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+            .oneshot(signed("/v1/enroll", &cb, &CLIENT_SEED, ""))
             .await
             .unwrap(),
     )
     .await;
     let ticket = field(&body, "credential.ticket");
     store
-        .approve(SUB, &pop::cnf_value(&COORD_SEED), &now_iso())
+        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
         .await
         .unwrap();
 
@@ -702,7 +702,7 @@ async fn tpc_credential_is_deterministic_for_same_coord() {
             .oneshot(signed(
                 "/v1/enroll-exchange",
                 &ticket,
-                &COORD_SEED,
+                &CLIENT_SEED,
                 r#","role":"coord-rw""#,
             ))
             .await
@@ -715,7 +715,7 @@ async fn tpc_credential_is_deterministic_for_same_coord() {
             .oneshot(signed(
                 "/v1/enroll-exchange",
                 &ticket,
-                &COORD_SEED,
+                &CLIENT_SEED,
                 r#","role":"coord-rw""#,
             ))
             .await
@@ -748,11 +748,11 @@ async fn exchange_without_approval_returns_403_awaiting() {
         &Keyring::single(ROOT),
         "mint",
         SUB,
-        &pop::cnf_value(&COORD_SEED),
+        &pop::cnf_value(&CLIENT_SEED),
         now() + 600,
     );
     let (status, _) = parts(
-        app.oneshot(signed("/v1/enroll-exchange", &inter, &COORD_SEED, ""))
+        app.oneshot(signed("/v1/enroll-exchange", &inter, &CLIENT_SEED, ""))
             .await
             .unwrap(),
     )

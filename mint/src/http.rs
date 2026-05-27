@@ -42,11 +42,11 @@ use crate::state::{Recorded, StateError, Store};
 use crate::template::render_policy;
 
 /// Credential-ticket lifetime. The ticket is multi-use within this
-/// window: one operator approval, then the coordinator exchanges it
-/// once per role it needs (§ *Enrollment*). 10 min is a deliberate
-/// choice — comfortably enough to mint the handful (3–4) of per-role
-/// credentials a coordinator holds, while keeping the pending record
-/// (and so the approval) short-lived. If it lapses the client just
+/// window: one operator approval, then the client exchanges it once
+/// per role it needs (§ *Enrollment*). 10 min is a deliberate choice
+/// — comfortably enough to mint the handful (3–4) of per-role
+/// credentials a client holds, while keeping the pending record (and
+/// so the approval) short-lived. If it lapses the client just
 /// re-enrols (idempotent for the same `(sub, pub)` → fresh ticket);
 /// a *new* role after expiry needs a fresh approval, by design.
 const CREDENTIAL_TICKET_TTL_SECONDS: u64 = 600;
@@ -321,7 +321,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
 }
 
 /// `POST /v1/enroll` (`docs/design-mint.md` § *Enrollment* (1)). The
-/// client presents the coordinator-attenuated invite macaroon
+/// client presents the client-attenuated invite macaroon
 /// (`op=enroll`, current `invite`, self-asserted `sub`/`cnf`) and a
 /// PoP. Mint records a **pending** record keyed by `sub` and returns a
 /// short-lived credential ticket. Always `200` for an accepted
@@ -469,7 +469,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     // returned ticket without any operator action; the slow path
     // requires `mint enroll approve <sub>` to fire first.
     //
-    // Lazy migration: every coordinator restart pings /v1/enroll, so
+    // Lazy migration: every client restart pings /v1/enroll, so
     // this is the natural place to drift `_mint/approved/<sub>`
     // forward to the keyring's current kid (`docs/design-mint.md` §
     // *Root-key rotation*). Best-effort and untimed; failures are

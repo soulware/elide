@@ -21,8 +21,8 @@ use tower::ServiceExt;
 mod common;
 
 const ROOT: [u8; 32] = [42u8; 32];
-/// Stands in for the coordinator's Ed25519 identity-key seed.
-const COORD_SEED: [u8; 32] = [7u8; 32];
+/// Stands in for the client's Ed25519 identity-key seed.
+const CLIENT_SEED: [u8; 32] = [7u8; 32];
 const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 fn config() -> Config {
@@ -107,7 +107,7 @@ fn request_macaroon() -> Macaroon {
         &Keyring::single(ROOT),
         "mint",
         SUB,
-        &pop::cnf_value(&COORD_SEED),
+        &pop::cnf_value(&CLIENT_SEED),
         "volume-ro",
     )
     .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
@@ -117,7 +117,7 @@ fn request_macaroon() -> Macaroon {
 fn signed_request(m: &Macaroon, inner_fields: &str) -> Request<Body> {
     let ts = chrono::Utc::now().timestamp() as u64;
     let body = format!("{{\"ts\":{ts},{inner_fields}}}");
-    let sig = pop::client_signature(&COORD_SEED, m.tail(), body.as_bytes());
+    let sig = pop::client_signature(&CLIENT_SEED, m.tail(), body.as_bytes());
     Request::builder()
         .method("POST")
         .uri("/v1/assume-role")
@@ -172,7 +172,7 @@ async fn wrong_op_is_opaque_401() {
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar("elide:Volume", "VOL1"),
             Caveat::scalar(name::EXP, far_future().to_string()),
-            Caveat::scalar(name::CNF, pop::cnf_value(&COORD_SEED)),
+            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
         ],
     );
     let (status, _) = body_string(
@@ -207,7 +207,7 @@ async fn pop_over_a_different_body_is_401() {
     let m = request_macaroon();
     let ts = chrono::Utc::now().timestamp() as u64;
     let signed = format!(r#"{{"ts":{ts},"role":"volume-ro","ancestors":["ANC1"]}}"#);
-    let sig = pop::client_signature(&COORD_SEED, m.tail(), signed.as_bytes());
+    let sig = pop::client_signature(&CLIENT_SEED, m.tail(), signed.as_bytes());
     let req = Request::builder()
         .method("POST")
         .uri("/v1/assume-role")

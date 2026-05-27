@@ -4,7 +4,7 @@
 //!
 //! The credential macaroon is **key-bound, not a bearer**: mint honours an
 //! `assume-role` request only when it carries a fresh Ed25519 signature,
-//! by `coordinator.key`, over
+//! by the client's identity key, over
 //!
 //! ```text
 //! BLAKE3( macaroon-tail(32) ‖ BLAKE3(raw-request-body) )
@@ -23,11 +23,11 @@
 //!
 //! Resolution of `cnf` goes through the tri-state
 //! [`Resolved`]: `Absent` ⇒ the macaroon is a plain bearer (no PoP
-//! required — generic non-Elide callers); `Value` ⇒ PoP **required**;
-//! `Unsatisfiable` ⇒ **reject**. The last is the downgrade defence: a
-//! holder can append caveats with only the trailing MAC, so an
-//! appended contradictory `cnf` must fail closed here, never
-//! resolve to "absent" and silently drop the PoP requirement.
+//! required); `Value` ⇒ PoP **required**; `Unsatisfiable` ⇒ **reject**.
+//! The last is the downgrade defence: a holder can append caveats
+//! with only the trailing MAC, so an appended contradictory `cnf`
+//! must fail closed here, never resolve to "absent" and silently
+//! drop the PoP requirement.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -165,18 +165,18 @@ pub fn check(
 
 /// The `cnf` caveat value for an Ed25519 seed:
 /// `ed25519:<base64 pubkey>`. This is the reference for what the
-/// issuance path seals into the credential; a coordinator's identity key
+/// issuance path seals into the credential; the client's identity-key
 /// seed produces the value mint must verify against.
 pub fn cnf_value(seed: &[u8; 32]) -> String {
     let vk = SigningKey::from_bytes(seed).verifying_key();
     format!("{ED25519_PREFIX}{}", BASE64.encode(vk.to_bytes()))
 }
 
-/// Validate an `cnf` caveat value (`ed25519:<base64 pubkey>`)
-/// is well-formed *and* a usable Ed25519 verifying key. The issuance
-/// path uses this to reject a malformed operator-supplied `--coord-pub`
-/// at enrollment-token mint time rather than letting it fail opaquely
-/// at the coordinator's first `assume-role`.
+/// Validate a `cnf` caveat value (`ed25519:<base64 pubkey>`) is
+/// well-formed *and* a usable Ed25519 verifying key. The issuance
+/// path uses this at enrollment to reject a malformed key bound into
+/// the credential rather than letting it fail opaquely at the
+/// client's first `assume-role`.
 pub fn validate_cnf(value: &str) -> Result<(), PopReject> {
     let raw = parse_cnf(value)?;
     VerifyingKey::from_bytes(&raw)
@@ -185,10 +185,11 @@ pub fn validate_cnf(value: &str) -> Result<(), PopReject> {
 }
 
 /// Reference client signature: sign `digest(tail, body)` with the
-/// coordinator key seed, returning the `X-Mint-Pop` header value.
-/// The caller must have already embedded the freshness `ts` field in
-/// `body` (it is covered by the signature via `BLAKE3(body)`). This is
-/// exactly what a coordinator does per `assume-role`; mint never calls it.
+/// client's identity-key seed, returning the `X-Mint-Pop` header
+/// value. The caller must have already embedded the freshness `ts`
+/// field in `body` (it is covered by the signature via
+/// `BLAKE3(body)`). This is exactly what a client does per
+/// `assume-role`; mint never calls it.
 pub fn client_signature(seed: &[u8; 32], tail: &[u8; 32], body: &[u8]) -> String {
     let sig = SigningKey::from_bytes(seed).sign(&digest(tail, body));
     BASE64.encode(sig.to_bytes())

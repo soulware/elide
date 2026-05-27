@@ -95,9 +95,10 @@ fn resolved_map(caveats: &[Caveat]) -> BTreeMap<String, String> {
 /// Render `policy_template` into a concrete IAM policy JSON string.
 ///
 /// `request` is the **PoP-verified** request body (its provenance is
-/// `coordinator.key`, bound to this macaroon and moment — see
-/// [`crate::pop`]); it is exposed as the `request.*` namespace. The
-/// caller must verify the PoP signature *before* passing the body here.
+/// the client's identity key, bound to this macaroon and moment —
+/// see [`crate::pop`]); it is exposed as the `request.*` namespace.
+/// The caller must verify the PoP signature *before* passing the
+/// body here.
 /// Each substitution class has a distinct, explicit trust provenance:
 /// `caveat.*` MAC-bound, `request.*` PoP-bound, `tenant.*` config,
 /// `system.*` mint-computed.

@@ -49,8 +49,8 @@ pub fn router(state: AppState) -> Router {
 
 #[derive(Serialize, Deserialize)]
 pub struct InviteResponse {
-    /// Base64-encoded invite macaroon — the `mcrn1`-prefixed bytes the
-    /// coordinator presents at `/v1/enroll`.
+    /// Base64-encoded invite macaroon — the bytes a client presents
+    /// at `/v1/enroll`.
     pub macaroon: String,
     /// The underlying nonce, for human-readable diagnostics
     /// (`mint invite` prints it alongside the macaroon).

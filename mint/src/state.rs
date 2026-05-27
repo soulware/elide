@@ -1,5 +1,5 @@
 //! Mint enrollment state: the current invite nonce, the transient
-//! pending-enrollment table, and the long-lived approved-coordinator
+//! pending-enrollment table, and the long-lived approved-client
 //! registry (`docs/design-mint.md` § *Enrollment* / *Mint state in the
 //! tenant bucket*).
 //!
@@ -83,7 +83,7 @@ pub struct Pending {
     pub peer_ip: String,
 }
 
-/// One approved-coordinator registry entry (`_mint/approved/<sub>`).
+/// One approved-client registry entry (`_mint/approved/<sub>`).
 /// Long-lived; written at `approve()`, consulted by every subsequent
 /// `/v1/enroll` (fast path) and `/v1/enroll-exchange`.
 ///
@@ -875,7 +875,7 @@ impl Store {
     /// Lazy migration: if `_mint/approved/<sub>` is on an older kid,
     /// re-MAC it under `current_kid` and PUT back with `If-Match` on
     /// the etag we just read. Called opportunistically by the enroll
-    /// fast path so each coordinator's record drifts forward to the
+    /// fast path so each client's record drifts forward to the
     /// current kid on its next restart, without any global sweep.
     ///
     /// Best-effort by design: a missing record, a kid mismatch already
@@ -1738,9 +1738,9 @@ mod tests {
 
     #[tokio::test]
     async fn lazy_migration_drifts_record_to_current_kid() {
-        // The runtime path: a coordinator restart triggers re-MAC of
-        // its approval forward to the current kid. The record's body
-        // is unchanged except for `kid` and `mac`; subsequent reads
+        // The runtime path: a client restart triggers re-MAC of its
+        // approval forward to the current kid. The record's body is
+        // unchanged except for `kid` and `mac`; subsequent reads
         // verify under the new kid.
         let s = Store::open_in_memory([1u8; 32]).await.unwrap();
         s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();

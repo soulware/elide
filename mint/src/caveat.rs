@@ -30,7 +30,7 @@ pub mod name {
     /// RFC 7519 expiry, unix seconds; multiple narrow to the minimum.
     pub const EXP: &str = "exp";
     /// RFC 7519 subject — the opaque principal the credential is bound
-    /// to (Elide: a coordinator ULID).
+    /// to (typically a stable identifier of the client — e.g. a ULID).
     pub const SUB: &str = "sub";
     /// RFC 7800 confirmation — the holder-of-key, scalar-encoded
     /// `ed25519:<pub>` (not the JWT `cnf` JSON object).
