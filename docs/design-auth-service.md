@@ -198,16 +198,21 @@ nested TPCs* below.
 
 ### Fetching the wide discharge
 
-When the CLI is about to call coord-X for an operator IPC and
-doesn't have a cached non-expired wide discharge for `(session,
-coord-X)`:
+The CLI learns coord-X's `CID` lazily, via a challenge response on
+the operator IPC itself. There is no separate discovery endpoint —
+the IPC carries the discovery.
 
-1. CLI fetches coord-X's `CID` once (it's the routing blob from the
-   primary's TPC; coord exposes it via a local read endpoint — the
-   value isn't secret, it's only useful when paired with `K_M-A`
-   which only mint and auth hold).
+When the CLI is about to call coord-X for an operator IPC:
+
+1. If the CLI has no cached non-expired wide discharge for
+   `(session, coord-X)`, it issues the IPC without a discharge.
+   Coord responds `401 { cid: "<base64>", auth_url: "..." }` where
+   `cid` is the `CID` from coord's primary's TPC. (Coord 401s the
+   same way for a presented discharge whose nonce doesn't match
+   coord's current `CID` — see *Coord: forward and clear*.)
 2. CLI POSTs `<auth>/v1/discharge` with the session in
-   `Authorization: Bearer`, body `{cid: "<base64>"}`.
+   `Authorization: Bearer`, body `{cid: "<base64>"}` using the
+   `cid` from the challenge.
 3. Auth verifies the session under `K_session`, AEAD-decrypts `CID`
    with `K_M-A` → recovers `(r, CoordId, OrgId)`. Cross-checks the
    decoded `OrgId` against the session's `OrgId`. Applies its policy
@@ -216,7 +221,17 @@ coord-X)`:
    - Caveats `(Subject, OrgId, CoordId, NotAfter=now+5min)`.
    - Chain-MAC'd under `r`.
    - Nonce equals `CID`.
-4. CLI stores the discharge in memory, keyed by `(session, coord-X)`.
+4. CLI stores the discharge in memory, keyed by `(session, coord-X)`,
+   and caches the `CID` keyed by `coord-X` so subsequent first-IPCs
+   to the same coord can skip the challenge by attaching the
+   already-fetched discharge directly.
+5. CLI retries the IPC with the attenuated discharge.
+
+Subsequent IPCs within the discharge's lifetime go direct: the CLI
+attaches the still-valid attenuated discharge and the IPC succeeds
+without a challenge. The 401 path runs once per coord per
+discharge lifetime, plus once on `K_M-A` rotation (see *Key
+rotation*).
 
 ### Attenuating per IPC
 
@@ -242,11 +257,18 @@ replay defence needed.
 Coord receives `(attenuated_discharge, IPC body)`. It pulls its
 stored primary out of `data_dir` and runs the following.
 
-1. **Split the attenuated discharge** into `(wide_bytes,
+1. **Challenge if missing or wrong-CID.** Coord reads its primary's
+   `CID` from the TPC and the presented discharge's nonce (both are
+   plain byte reads — no key needed). If the IPC carries no
+   discharge, or the discharge's nonce does not equal coord's
+   `CID`, respond `401 { cid: <primary CID>, auth_url }` and stop.
+   The CLI fetches a fresh discharge against that `CID` and
+   retries. No mint round-trip on this path.
+2. **Split the attenuated discharge** into `(wide_bytes,
    attenuation_chain)` at the wide discharge's trailing tag.
-2. **Cache lookup on `wide_bytes`** in coord's verification cache.
+3. **Cache lookup on `wide_bytes`** in coord's verification cache.
    - **Cache hit**: the wide bytes have already been verified by
-     mint within their `NotAfter` window. Skip to step 4.
+     mint within their `NotAfter` window. Skip to step 5.
    - **Cache miss**: coord first attenuates its primary with a
      freshness `NotAfter` (see *Coord attenuates the primary* below),
      then forwards `(attenuated_primary, [wide_bytes])` to mint at
@@ -254,8 +276,10 @@ stored primary out of `data_dir` and runs the following.
      — length 1 in the initial design. Mint returns `{valid: true,
      expires_at: <NotAfter>, caveats: {...}}` or `{valid: false,
      reason: "..."}`. On valid, cache `(wide_bytes → expires_at,
-     caveats)`. On invalid, reject the IPC.
-3. **Clear every caveat** across the primary (which coord can read
+     caveats)`. On invalid, reject the IPC (do not 401 — invalid
+     means the CID matched but the discharge MAC didn't, which is
+     not a routine miss).
+4. **Clear every caveat** across the primary (which coord can read
    without verifying), the wide discharge (caveats returned by
    mint), and the attenuation chain (which coord can read directly
    from `attenuation_chain` — chain extension is keyless, so coord
@@ -270,7 +294,7 @@ stored primary out of `data_dir` and runs the following.
    - `Op` (from attenuation) matches the dispatched verb.
    - `Volume` (from attenuation) matches the IPC's target.
    - all `NotAfter` values are still in the future.
-4. If all caveats clear, dispatch. If any fails, reject. Clearing
+5. If all caveats clear, dispatch. If any fails, reject. Clearing
    results are never cached — the context changes every IPC.
 
 Coord does **not** verify the primary's chain MAC, the wide
@@ -660,14 +684,26 @@ existing primary's `CID` becomes undecodable by the new key — auth
 can no longer recover `r` from those `CID`s, so fresh discharges
 can't be issued against old primaries.
 
-Resolution is pull-on-verify-fail: when the CLI's `/v1/discharge`
-call fails with a CID-decode error, the CLI signals coord to
-refresh. Coord fetches a fresh primary from mint via
-`GET /v1/coord/primary`. Mint re-issues with a fresh `r`, fresh
-`VID` (under the new chain tag), and fresh `CID` (encrypted under
-the new `K_M-A`). Coord swaps the stored primary. The CLI fetches
-the new `CID` from coord and retries the discharge request. Bounded
-by one retry per in-flight verification.
+Resolution is pull-on-verify-fail. The cascade:
+
+1. CLI's `/v1/discharge` call to auth fails with `422 CID decode
+   error` — auth recognises the `CID` was AEAD'd under the old
+   `K_M-A`.
+2. CLI signals coord to refresh its primary (a local IPC, separate
+   from the operator IPCs). Coord fetches a fresh primary from
+   mint via `GET /v1/coord/primary`. Mint re-issues with a fresh
+   `r`, fresh `VID` (under the new chain tag), and fresh `CID`
+   (encrypted under the new `K_M-A`). Coord atomically swaps the
+   stored primary.
+3. CLI retries the operator IPC. With no valid discharge cached
+   (the old one's nonce is the old `CID`), coord 401s with the
+   new `CID`. CLI fetches a fresh discharge against the new
+   `CID` and retries the IPC.
+
+Bounded by one refresh + one challenge round per in-flight IPC
+during the rotation grace window. The challenge flow makes the
+post-refresh CID re-discovery free — it is the same 401 path used
+on first contact.
 
 ### `K_M` rotation (mint's root)
 
@@ -706,7 +742,7 @@ sessions until their `NotAfter` expiry, then drop it.
 
 | Key | Affects | Resolution path |
 |---|---|---|
-| `K_M-A` | `CID` undecodable; discharges can't be issued against old primary | CLI signals coord; coord refreshes primary; CLI retries `/v1/discharge` |
+| `K_M-A` | `CID` undecodable; discharges can't be issued against old primary | CLI signals coord; coord refreshes primary; CLI retries IPC and gets a 401 with the new `CID` |
 | `K_M` | Per-coord `K_coord` changes; primaries need re-issue | Mint re-issues primaries on next interaction; grace window covers in-flight |
 | `r` | Per-coord; rotated with primary | Automatic on primary re-issue |
 | `K_session` | Sessions invalidated | Operators re-run `login` |
@@ -838,14 +874,32 @@ list)` bundle for ops that require operator authorisation.
 
 ### Coord — CLI-facing
 
-`GET /v1/coord/cid` (local socket; anonymous within the host's IPC
-trust boundary) — exposes the `CID` from coord's stored primary's
-TPC. Not secret; just routing metadata for the CLI to include in its
-`/v1/discharge` request.
+Operator IPC verbs (local socket) — coord's existing surface. Every
+verb gets the same auth shape: a `(wide_discharge, attenuation)`
+bundle is expected in the request; on missing or wrong-`CID`
+discharge, coord responds:
 
-```json
-response: { "cid": "<base64>" }
 ```
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Macaroon
+Content-Type: application/json
+
+{ "cid": "<base64>", "auth_url": "https://auth.elide.example/" }
+```
+
+The CLI uses the `cid` from the challenge to fetch a wide discharge
+from `auth_url` (see *Per-IPC flow*), then retries the IPC. The
+discharge's nonce equals the challenge's `cid`, so this is also the
+binding check on the retry. There is no separate `/v1/coord/cid`
+endpoint — the IPC carries the discovery.
+
+`POST /v1/coord/refresh-primary` (local socket; operator-signal
+shape, not gated by a wide discharge — it carries no authority
+itself, it just tells coord its `CID` is stale). Used by the CLI
+when its `/v1/discharge` call fails with a `CID` decode error
+after `K_M-A` rotation. Coord fetches a fresh primary from mint and
+swaps atomically; the next operator IPC's 401 carries the new
+`CID`.
 
 ## Config
 
