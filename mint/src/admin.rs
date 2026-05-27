@@ -1,42 +1,126 @@
-//! Operator-side HTTP surface — what `mint invite` and `mint enroll …`
+//! Admin-side HTTP surface — what `mint invite` and `mint enroll …`
 //! call so the CLI does not need its own Tigris admin credential or
 //! vend a fresh `mint-rw` keypair per invocation. These endpoints
 //! proxy directly to the running daemon's [`crate::state::Store`]
 //! and macaroon root, never touching IAM.
 //!
-//! Reachability is **UDS-only** by construction: [`router`] is mounted
-//! only when `serve` is bound to a Unix-domain socket
-//! (`docs/design-mint.md` § *Transport*). Filesystem permission on the
-//! socket file is the auth gate — operators on the host can call;
-//! anyone reaching the bucket-facing TCP listener cannot, because the
-//! routes are not registered there. A request to one of these paths
-//! against a TCP-only deployment returns the usual `404 Not Found`.
+//! Auth: every admin request carries `Authorization: Macaroon <b64>`
+//! holding a mint-issued **admin macaroon** (`op=admin`). The
+//! bootstrap admin macaroon is written to `<data_dir>/admin.bootstrap`
+//! on first start — the human operator captures it out of band, then
+//! immediately mints per-human admin tokens via
+//! `/v1/admin/token/mint`. Per-human tokens are scoped via the
+//! optional `scope` caveat to specific admin verb tags
+//! ([`crate::caveat::admin_scope`]); an absent `scope` is super-admin.
 //!
-//! The auth simplification — UDS only, no per-request macaroon — is
-//! deliberate. The operator role is "the principal that can write the
-//! mint root key's filesystem". A second cryptographic gate above
-//! that would be redundant; a second non-cryptographic gate that
-//! could be bypassed by a leaked admin token would be worse than what
-//! we have. Multi-host operator access (a real future need) calls for
-//! an explicit admin macaroon, not a bolt-on token; that work is
-//! tracked separately.
+//! Admin macaroons are bearer (no PoP). Identity for audit comes
+//! from the `sub` caveat the issuer stamped in. Revocation is via
+//! keyring kid rotation in v1; a per-nonce revocation list lands
+//! when there's a need to revoke a single token without burning the
+//! whole kid.
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::caveat::{EffectiveCaveats, Resolved, SCOPE, admin_scope, name, op as op_value};
 use crate::http::AppState;
-use crate::issuance::mint_invite;
+use crate::issuance::{mint_admin_token, mint_invite};
+use crate::macaroon::Macaroon;
 use crate::state::{EnrollmentState, EnrollmentView, Store};
 
-/// Admin routes mounted only on UDS — see module docs.
+/// Result of a successful admin-macaroon verification — the bound
+/// `sub` for audit and any further scope checks the handler wants
+/// to do.
+struct AdminContext {
+    #[allow(dead_code)] // logged via the audit-todo path; reserved for future per-sub policy
+    sub: String,
+}
+
+/// Verify the admin macaroon on the request and check it covers
+/// `required_scope`. Returns the verified `AdminContext` on success,
+/// or a ready-to-return 401 response on any failure (the coarse
+/// "every failure is opaque 401" convention shared with the rest of
+/// the HTTP surface). `required_scope` is one of
+/// [`crate::caveat::admin_scope`].
+async fn verify_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+    required_scope: &str,
+) -> Result<AdminContext, Response> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Macaroon "))
+        .ok_or_else(unauthorized_response)?;
+    let mac = Macaroon::decode(token).map_err(|_| unauthorized_response())?;
+
+    let keyring = state.store.keyring().await;
+    if !mac.verify(&keyring) {
+        return Err(unauthorized_response());
+    }
+
+    let caveats = mac.caveats();
+    let eff = EffectiveCaveats::new(caveats);
+    if !is_value(&eff.resolve(name::OP), op_value::ADMIN) {
+        return Err(unauthorized_response());
+    }
+    if !is_value(&eff.resolve(name::AUD), &state.config.audience) {
+        return Err(unauthorized_response());
+    }
+    if let Some(exp) = eff.not_after(name::EXP) {
+        let now = Utc::now().timestamp().max(0) as u64;
+        if exp <= now {
+            return Err(unauthorized_response());
+        }
+    }
+    let sub = match eff.resolve(name::SUB) {
+        Resolved::Value(s) => s,
+        _ => return Err(unauthorized_response()),
+    };
+    // Scope check: absent caveat = super-admin (all verbs). Present
+    // caveat = comma-list; the required tag must appear in the list.
+    // `Unsatisfiable` (two disagreeing scope copies the holder
+    // appended) fails closed — never silently read as absent.
+    match eff.resolve(SCOPE) {
+        Resolved::Absent => {} // super-admin
+        Resolved::Value(s) => {
+            if !scope_covers(&s, required_scope) {
+                return Err(unauthorized_response());
+            }
+        }
+        Resolved::Unsatisfiable => return Err(unauthorized_response()),
+    }
+
+    Ok(AdminContext { sub })
+}
+
+fn is_value(r: &Resolved, expected: &str) -> bool {
+    matches!(r, Resolved::Value(v) if v == expected)
+}
+
+fn scope_covers(scope_list: &str, required: &str) -> bool {
+    scope_list.split(',').any(|s| s.trim() == required)
+}
+
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_vec(&json!({"error": "unauthorized"})).unwrap_or_else(|_| b"{}".to_vec()),
+    )
+        .into_response()
+}
+
+/// Admin routes. Every route gates on an admin macaroon (see module
+/// docs); routes are now safe to mount on any listener.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/admin/invite", get(handle_get_invite))
@@ -44,7 +128,84 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/enrollments", get(handle_list_enrollments))
         .route("/v1/admin/enroll/approve", post(handle_approve))
         .route("/v1/admin/enroll/revoke", post(handle_revoke))
+        .route("/v1/admin/token/mint", post(handle_mint_admin_token))
         .with_state(state)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AdminTokenMintRequest {
+    /// Human identifier — stamped into the new token's `sub` for
+    /// audit. Free-text; mint treats it as opaque.
+    pub sub: String,
+    /// Optional comma-list of scope tags
+    /// ([`crate::caveat::admin_scope`]) the new token may exercise.
+    /// `None` = super-admin (all verbs).
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Optional unix-seconds expiry. `None` = non-expiring.
+    #[serde(default)]
+    pub exp: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AdminTokenMintResponse {
+    pub macaroon: String,
+}
+
+async fn handle_mint_admin_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<AdminTokenMintRequest>,
+) -> Response {
+    if let Err(r) = verify_admin(&state, &headers, admin_scope::TOKEN_MINT).await {
+        return r;
+    }
+    // The caller's authority is exactly the scope they hold. If the
+    // caller is super-admin they may mint anything; if they have a
+    // scoped token, they can only mint at-or-narrower than their own
+    // scope. This is plain macaroon attenuation semantics applied to
+    // the issuance call: a holder can only narrow.
+    if let Some(requested) = req.scope.as_deref()
+        && !caller_can_grant(&state, &headers, requested).await
+    {
+        return unauthorized_response();
+    }
+    let keyring = state.store.keyring().await;
+    let mac = mint_admin_token(
+        &keyring,
+        &state.config.audience,
+        &req.sub,
+        req.scope.as_deref(),
+        req.exp,
+    );
+    json_ok(AdminTokenMintResponse {
+        macaroon: mac.encode(),
+    })
+}
+
+/// Re-verify the caller's macaroon to inspect its scope, returning
+/// whether every tag in `requested_scope` is covered. Super-admin
+/// callers (no scope caveat) cover any request.
+async fn caller_can_grant(_state: &AppState, headers: &HeaderMap, requested_scope: &str) -> bool {
+    let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Macaroon "))
+    else {
+        return false;
+    };
+    let Ok(mac) = Macaroon::decode(token) else {
+        return false;
+    };
+    let eff = EffectiveCaveats::new(mac.caveats());
+    match eff.resolve(SCOPE) {
+        Resolved::Absent => true, // super-admin grants anything
+        Resolved::Value(caller_scope) => requested_scope.split(',').all(|tag| {
+            let tag = tag.trim();
+            caller_scope.split(',').any(|t| t.trim() == tag)
+        }),
+        Resolved::Unsatisfiable => false,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -57,14 +218,20 @@ pub struct InviteResponse {
     pub nonce: String,
 }
 
-async fn handle_get_invite(State(state): State<AppState>) -> Response {
+async fn handle_get_invite(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = verify_admin(&state, &headers, admin_scope::INVITE_READ).await {
+        return r;
+    }
     match build_invite(&state).await {
         Ok(r) => json_ok(r),
         Err(s) => s,
     }
 }
 
-async fn handle_rotate_invite(State(state): State<AppState>) -> Response {
+async fn handle_rotate_invite(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = verify_admin(&state, &headers, admin_scope::INVITE_ROTATE).await {
+        return r;
+    }
     if let Err(e) = state.store.rotate_invite().await {
         return service_unavailable(&format!("rotate invite: {e}"));
     }
@@ -117,7 +284,10 @@ impl From<EnrollmentView> for EnrollmentRow {
     }
 }
 
-async fn handle_list_enrollments(State(state): State<AppState>) -> Response {
+async fn handle_list_enrollments(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = verify_admin(&state, &headers, admin_scope::ENROLL_LIST).await {
+        return r;
+    }
     let now = Utc::now().timestamp().max(0) as u64;
     match state.store.list(now).await {
         Ok(rows) => json_ok(
@@ -142,8 +312,12 @@ pub struct ApproveResponse {
 
 async fn handle_approve(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::Json(req): axum::Json<ApproveRequest>,
 ) -> Response {
+    if let Err(r) = verify_admin(&state, &headers, admin_scope::ENROLL_APPROVE).await {
+        return r;
+    }
     let approved_at = Utc::now().to_rfc3339();
     match state
         .store
@@ -167,8 +341,12 @@ pub struct RevokeResponse {
 
 async fn handle_revoke(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::Json(req): axum::Json<RevokeRequest>,
 ) -> Response {
+    if let Err(r) = verify_admin(&state, &headers, admin_scope::ENROLL_REVOKE).await {
+        return r;
+    }
     match state.store.revoke(&req.sub).await {
         Ok(revoked) => json_ok(RevokeResponse { revoked }),
         Err(e) => service_unavailable(&format!("revoke: {e}")),
@@ -400,6 +578,31 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8")
     }
 
+    /// A super-admin macaroon for the test keyring (always `[7u8;
+    /// 32]` in these tests). Most tests use this; the
+    /// scope-checking tests mint scoped tokens directly.
+    fn super_admin_token() -> String {
+        let mac = crate::issuance::mint_admin_token(
+            &crate::keyring::Keyring::single([7u8; 32]),
+            "mint",
+            "test-super",
+            None,
+            None,
+        );
+        format!("Macaroon {}", mac.encode())
+    }
+
+    fn scoped_token(scope: &str) -> String {
+        let mac = crate::issuance::mint_admin_token(
+            &crate::keyring::Keyring::single([7u8; 32]),
+            "mint",
+            "test-scoped",
+            Some(scope),
+            None,
+        );
+        format!("Macaroon {}", mac.encode())
+    }
+
     #[tokio::test]
     async fn get_invite_returns_macaroon_and_nonce() {
         let store = Arc::new(Store::open_in_memory([7u8; 32]).await.unwrap());
@@ -409,6 +612,7 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/v1/admin/invite")
+                    .header("authorization", super_admin_token())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -433,6 +637,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/admin/invite/rotate")
+                    .header("authorization", super_admin_token())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -463,6 +668,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/admin/enroll/approve")
                     .header("content-type", "application/json")
+                    .header("authorization", super_admin_token())
                     .body(Body::from(r#"{"sub":"01ARZ","pubkey":"ed25519:AAA"}"#))
                     .unwrap(),
             )
@@ -478,6 +684,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/admin/enroll/revoke")
                     .header("content-type", "application/json")
+                    .header("authorization", super_admin_token())
                     .body(Body::from(r#"{"sub":"01ARZ"}"#))
                     .unwrap(),
             )
@@ -509,6 +716,7 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/v1/admin/enrollments")
+                    .header("authorization", super_admin_token())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -524,5 +732,172 @@ mod tests {
             .collect();
         assert_eq!(by_sub.get("subP"), Some(&"pending"));
         assert_eq!(by_sub.get("subQ"), Some(&"approved"));
+    }
+
+    // ── Macaroon gating ────────────────────────────────────────────
+
+    async fn make_app() -> axum::Router {
+        let store = Arc::new(Store::open_in_memory([7u8; 32]).await.unwrap());
+        router(make_state(store))
+    }
+
+    fn invite_get(auth: Option<&str>) -> Request<Body> {
+        let mut req = Request::builder().method("GET").uri("/v1/admin/invite");
+        if let Some(a) = auth {
+            req = req.header("authorization", a);
+        }
+        req.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_authorization_rejected() {
+        let app = make_app().await;
+        let resp = app.oneshot(invite_get(None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn malformed_authorization_rejected() {
+        let app = make_app().await;
+        let resp = app
+            .oneshot(invite_get(Some("Macaroon not-base64!!")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_signed_by_wrong_root_rejected() {
+        let app = make_app().await;
+        // App's keyring is [7u8; 32]; mint a "super-admin" under a
+        // different root and present it.
+        let mac = crate::issuance::mint_admin_token(
+            &crate::keyring::Keyring::single([9u8; 32]),
+            "mint",
+            "imposter",
+            None,
+            None,
+        );
+        let auth = format!("Macaroon {}", mac.encode());
+        let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_op_rejected() {
+        // A credential-shaped macaroon (op=assume-role) cannot be
+        // used as an admin token — even when MAC'd under the same
+        // root.
+        let app = make_app().await;
+        let mac = crate::issuance::mint_credential(
+            &crate::keyring::Keyring::single([7u8; 32]),
+            "mint",
+            "01ARZ",
+            "ed25519:AAA",
+            "volume-rw",
+        );
+        let auth = format!("Macaroon {}", mac.encode());
+        let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_rejected() {
+        let app = make_app().await;
+        let mac = crate::issuance::mint_admin_token(
+            &crate::keyring::Keyring::single([7u8; 32]),
+            "other-mint", // app's audience is "mint"
+            "alice",
+            None,
+            None,
+        );
+        let auth = format!("Macaroon {}", mac.encode());
+        let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn expired_token_rejected() {
+        let app = make_app().await;
+        let mac = crate::issuance::mint_admin_token(
+            &crate::keyring::Keyring::single([7u8; 32]),
+            "mint",
+            "alice",
+            None,
+            Some(1), // unix-epoch second 1 — long past
+        );
+        let auth = format!("Macaroon {}", mac.encode());
+        let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn scoped_token_covering_verb_accepted() {
+        let app = make_app().await;
+        let auth = scoped_token(admin_scope::INVITE_READ);
+        let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn scoped_token_not_covering_verb_rejected() {
+        let app = make_app().await;
+        // Token only allows enroll-approve; the request is for
+        // invite-read.
+        let auth = scoped_token(admin_scope::ENROLL_APPROVE);
+        let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn multi_scope_token_accepted_for_any_listed_verb() {
+        let app = make_app().await;
+        let auth = scoped_token(&format!(
+            "{},{}",
+            admin_scope::INVITE_READ,
+            admin_scope::ENROLL_APPROVE
+        ));
+        let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mint_endpoint_attenuates() {
+        // A scoped caller can only mint a token at or narrower than
+        // their own scope: macaroon-style attenuation enforced at
+        // the endpoint.
+        let app = make_app().await;
+        let scoped_auth = scoped_token(&format!(
+            "{},{}",
+            admin_scope::TOKEN_MINT,
+            admin_scope::INVITE_READ
+        ));
+        // Allowed: minting a token with a strictly-narrower scope.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/admin/token/mint")
+            .header("authorization", &scoped_auth)
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"sub":"bob","scope":"{}"}}"#,
+                admin_scope::INVITE_READ
+            )))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Refused: minting a token with a wider scope the caller
+        // doesn't hold.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/admin/token/mint")
+            .header("authorization", &scoped_auth)
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"sub":"bob","scope":"{}"}}"#,
+                admin_scope::ENROLL_REVOKE
+            )))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
