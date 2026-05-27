@@ -1,15 +1,20 @@
-//! Named scalar caveats.
+//! Caveats: first-party scalar and third-party.
 //!
 //! The mint is caveat-vocabulary-agnostic (see `docs/design-mint.md`
-//! § *Macaroon caveat conventions*): it does not hard-code which caveat
-//! names are meaningful. A caveat is a `(name, value)` pair; **every
-//! caveat is scalar**. There is no list-valued caveat type — the only
-//! list-shaped input a role ever needed (the `volume-ro` ancestor set)
-//! rides the PoP-signed request body as `request.ancestors`, not the
-//! caveat chain (design-mint.md § *All caveats are scalar*). This keeps
-//! the macaroon library to scalar caveats plus the holder-of-key
-//! extension, with no chain whose effective value depends on
-//! occurrence order.
+//! § *Macaroon caveat conventions*): it does not hard-code which
+//! first-party caveat names are meaningful. A first-party caveat is a
+//! `(name, value)` pair; **every first-party caveat is scalar**. There
+//! is no list-valued caveat type — the only list-shaped input a role
+//! ever needed (the `volume-ro` ancestor set) rides the PoP-signed
+//! request body as `request.ancestors`, not the caveat chain
+//! (design-mint.md § *All caveats are scalar*).
+//!
+//! Third-party caveats carry `(location, VID, CID)` and discharge
+//! verification (`docs/design-auth-service.md`); they're not scalar
+//! and don't participate in name-based resolution. Mint appends them
+//! at issuance when the role has `issues_with_tpc = true`; they ride
+//! in the same chain as first-party caveats but the wire format
+//! distinguishes them with a per-step type byte.
 
 use std::collections::BTreeSet;
 
@@ -47,18 +52,67 @@ pub mod op {
     pub const ASSUME_ROLE: &str = "assume-role";
 }
 
-/// A single named scalar caveat in a macaroon's chain.
+/// One step in a macaroon's caveat chain. A chain interleaves
+/// first-party scalar caveats (the common case) and third-party
+/// caveats (issued by mint when a role's `issues_with_tpc = true`).
+/// Position in the chain matters for third-party caveats: the
+/// verifier uses the chain tag *before* the TPC step to recover the
+/// discharge key, so re-ordering would break verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Caveat {
-    pub name: String,
-    pub value: String,
+pub enum Caveat {
+    /// `(name, value)` scalar caveat. Name-based resolution and
+    /// attenuation semantics live in [`EffectiveCaveats`].
+    FirstParty { name: String, value: String },
+    /// Third-party caveat: requires a discharge MAC'd under the key
+    /// `r` recoverable from `vid` (and from `cid` by an authority
+    /// holding `K_M-A` — see [`docs/design-auth-service.md`]). Carries
+    /// `location` for the client to know which authority to ask.
+    ThirdParty {
+        location: String,
+        vid: Vec<u8>,
+        cid: Vec<u8>,
+    },
 }
 
 impl Caveat {
+    /// Construct a first-party scalar caveat. The naming carries
+    /// over from when `Caveat` itself was the scalar type.
     pub fn scalar(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
+        Self::FirstParty {
             name: name.into(),
             value: value.into(),
+        }
+    }
+
+    /// Construct a third-party caveat. The issuer is mint; no other
+    /// code path constructs one (callers can only attenuate with
+    /// first-party caveats via the trailing MAC).
+    pub fn third_party(
+        location: impl Into<String>,
+        vid: impl Into<Vec<u8>>,
+        cid: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self::ThirdParty {
+            location: location.into(),
+            vid: vid.into(),
+            cid: cid.into(),
+        }
+    }
+
+    /// First-party name, or `None` for a third-party caveat. Used by
+    /// audit/display callers that present caveats by name.
+    pub fn first_party_name(&self) -> Option<&str> {
+        match self {
+            Self::FirstParty { name, .. } => Some(name),
+            Self::ThirdParty { .. } => None,
+        }
+    }
+
+    /// First-party value, or `None` for a third-party caveat.
+    pub fn first_party_value(&self) -> Option<&str> {
+        match self {
+            Self::FirstParty { value, .. } => Some(value),
+            Self::ThirdParty { .. } => None,
         }
     }
 }
@@ -85,9 +139,11 @@ pub enum Resolved {
 /// The effective view of a caveat chain. The one place "what does this
 /// caveat mean" is decided, shared by the gate ([`crate::role`]), the
 /// policy renderer ([`crate::template`]), and the holder-of-key check
-/// ([`crate::pop`]). Every caveat is scalar: repeated occurrences must
-/// agree (→ `Value`); ≥2 distinct → `Unsatisfiable`. `NotAfter` is
-/// handled out of band ([`Self::not_after`], numeric minimum).
+/// ([`crate::pop`]). Every first-party caveat is scalar: repeated
+/// occurrences must agree (→ `Value`); ≥2 distinct → `Unsatisfiable`.
+/// Third-party caveats are skipped by every method here — they don't
+/// carry a name/value and don't participate in name-based resolution
+/// (their semantic is "discharge required", verified separately).
 pub struct EffectiveCaveats<'a> {
     caveats: &'a [Caveat],
 }
@@ -100,13 +156,12 @@ impl<'a> EffectiveCaveats<'a> {
     /// Resolve `name` against the chain under AND semantics. The single
     /// definition of the caveat's effective meaning; tri-state so no
     /// consumer can collapse "absent" into "unsatisfiable" (see
-    /// [`Resolved`]).
+    /// [`Resolved`]). Third-party caveats are skipped.
     pub fn resolve(&self, name: &str) -> Resolved {
-        let mut occ = self
-            .caveats
-            .iter()
-            .filter(|c| c.name == name)
-            .map(|c| c.value.as_str());
+        let mut occ = self.caveats.iter().filter_map(|c| match c {
+            Caveat::FirstParty { name: n, value } if n == name => Some(value.as_str()),
+            _ => None,
+        });
         let Some(first) = occ.next() else {
             return Resolved::Absent;
         };
@@ -117,13 +172,15 @@ impl<'a> EffectiveCaveats<'a> {
         }
     }
 
-    /// Distinct caveat names in first-occurrence order.
+    /// Distinct first-party caveat names in first-occurrence order.
     pub fn names(&self) -> Vec<&'a str> {
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
         for c in self.caveats {
-            if seen.insert(c.name.as_str()) {
-                out.push(c.name.as_str());
+            if let Caveat::FirstParty { name, .. } = c
+                && seen.insert(name.as_str())
+            {
+                out.push(name.as_str());
             }
         }
         out
@@ -136,8 +193,10 @@ impl<'a> EffectiveCaveats<'a> {
     pub fn not_after(&self, name: &str) -> Option<u64> {
         self.caveats
             .iter()
-            .filter(|c| c.name == name)
-            .filter_map(|c| c.value.parse::<u64>().ok())
+            .filter_map(|c| match c {
+                Caveat::FirstParty { name: n, value } if n == name => value.parse::<u64>().ok(),
+                _ => None,
+            })
             .min()
     }
 }
