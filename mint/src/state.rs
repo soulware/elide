@@ -64,6 +64,11 @@ use crate::keyring::{Keyring, Kid};
 /// tenant bucket*.
 pub const STATE_PREFIX: &str = "_mint";
 
+/// Filename for the on-disk K_M-A under `<data_dir>/`. 64-hex-byte
+/// file, mode 0600 — same custody discipline as the keyring's
+/// `root_keys/`. See `docs/design-auth-service.md` § *Keys*.
+pub const K_M_A_FILE: &str = "k_m_a";
+
 /// One pending-enrollment record (`_mint/pending/<sub>.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
@@ -103,6 +108,15 @@ pub struct Approved {
     /// Keyring generation that MAC'd this record. Retired kids fail
     /// verification — that is the rotation invalidation step.
     pub kid: Kid,
+    /// The coord's per-coord discharge-key epoch. `r = HKDF(K_M,
+    /// "r-coord-" || coord_ulid || r_epoch)`; bumping `r_epoch`
+    /// invalidates every existing TPC/CID for this coord without
+    /// touching the keyring. Operator-driven; defaults to 0 at
+    /// approval time. Bumps land via a separate admin verb (out of
+    /// scope here) and are covered by the body MAC like every other
+    /// field.
+    #[serde(default)]
+    pub r_epoch: u32,
     /// BLAKE3-keyed MAC over the body, hex-encoded. See
     /// [`approval_mac`] for the exact input domain-separation.
     pub mac: String,
@@ -232,6 +246,7 @@ fn approval_mac(
     pubkey: &str,
     approved_at: &str,
     fingerprint_shown: &str,
+    r_epoch: u32,
 ) -> [u8; 32] {
     let mut msg = Vec::new();
     msg.extend_from_slice(APPROVAL_DOMAIN);
@@ -239,12 +254,23 @@ fn approval_mac(
     append_len_prefixed(&mut msg, pubkey.as_bytes());
     append_len_prefixed(&mut msg, approved_at.as_bytes());
     append_len_prefixed(&mut msg, fingerprint_shown.as_bytes());
+    msg.extend_from_slice(&r_epoch.to_be_bytes());
     *blake3::keyed_hash(key, &msg).as_bytes()
 }
 
 fn append_len_prefixed(out: &mut Vec<u8>, field: &[u8]) {
     out.extend_from_slice(&(field.len() as u32).to_be_bytes());
     out.extend_from_slice(field);
+}
+
+/// Write `contents` to `path` mode 0600 via an atomic rename — same
+/// custody discipline as the keyring's per-kid files.
+fn write_key_file(path: &Path, contents: &str) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, path)
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -280,6 +306,14 @@ pub struct Store {
     /// snapshot via [`Store::keyring`] and read without holding the
     /// lock across awaits.
     keyring: Arc<RwLock<Arc<Keyring>>>,
+    /// The auth-service wrapping key. `None` for a mint configured
+    /// without `[auth]` — issuance for any role with
+    /// `issues_with_tpc = true` is then refused (validated at config
+    /// load). In demo mode mint generates K_M-A itself at first
+    /// start; in prod the auth-service binary provisions it via
+    /// `/v1/mint/enroll` (separate PR). Immutable for the lifetime
+    /// of the process — rotation lands on a new Store via restart.
+    k_m_a: Option<Arc<[u8; 32]>>,
     objects: Arc<dyn ObjectStore>,
     invite_cache: Arc<RwLock<InviteSnapshot>>,
 }
@@ -364,12 +398,53 @@ impl Store {
     fn with_object_store(keyring: Keyring, objects: Arc<dyn ObjectStore>) -> Store {
         Store {
             keyring: Arc::new(RwLock::new(Arc::new(keyring))),
+            k_m_a: None,
             objects,
             invite_cache: Arc::new(RwLock::new(InviteSnapshot {
                 value: String::new(),
                 etag: None,
             })),
         }
+    }
+
+    /// Load or — when `demo_enabled` is true and the file is absent —
+    /// generate the K_M-A wrapping key under `<dir>/k_m_a`. Mutates
+    /// `self.k_m_a`. Called from the bootstrap path once the Store
+    /// has been opened and the auth-mode is known from config.
+    ///
+    /// On disk: 64 ASCII hex characters (the canonical 32-byte
+    /// representation, matching the keyring's per-generation files),
+    /// no newline, mode 0600. Same custody discipline as the
+    /// keyring — anyone with filesystem read on `data_dir` already
+    /// has the keys mint depends on.
+    pub fn init_k_m_a(&mut self, dir: &Path, demo_enabled: bool) -> io::Result<()> {
+        let path = dir.join(K_M_A_FILE);
+        let bytes = match std::fs::read_to_string(&path) {
+            Ok(s) => unhex32(s.trim())
+                .ok_or_else(|| io::Error::other(format!("{path:?}: not 64 hex bytes")))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if !demo_enabled {
+                    return Err(io::Error::other(format!(
+                        "K_M-A absent at {path:?}; mint requires auth-service \
+                         enrollment or [auth] demo_enabled = true"
+                    )));
+                }
+                let mut fresh = [0u8; 32];
+                rand_core::OsRng.fill_bytes(&mut fresh);
+                write_key_file(&path, &hex32(&fresh))?;
+                fresh
+            }
+            Err(e) => return Err(e),
+        };
+        self.k_m_a = Some(Arc::new(bytes));
+        Ok(())
+    }
+
+    /// `Some` when [`init_k_m_a`] has loaded or generated the key;
+    /// `None` for a Store opened in no-auth mode (tests, mint
+    /// configurations without `[auth]`).
+    pub fn k_m_a(&self) -> Option<&[u8; 32]> {
+        self.k_m_a.as_deref()
     }
 
     /// Snapshot the current keyring as an `Arc`. Steady-state minting
@@ -636,18 +711,23 @@ impl Store {
         let fingerprint_shown = fingerprint(pubkey);
         let kr = self.keyring().await;
         let kid = kr.current_kid();
+        // Fresh approval starts at r_epoch = 0; admin verbs bump it
+        // independently (out of scope here).
+        let r_epoch: u32 = 0;
         let mac = approval_mac(
             kr.current_key(),
             sub,
             pubkey,
             now_iso8601,
             &fingerprint_shown,
+            r_epoch,
         );
         let rec = Approved {
             pubkey: pubkey.to_string(),
             approved_at: now_iso8601.to_string(),
             fingerprint_shown,
             kid,
+            r_epoch,
             mac: hex32(&mac),
         };
         let bytes = serde_json::to_vec(&rec).map_err(|_| StateError::Corrupt)?;
@@ -734,6 +814,7 @@ impl Store {
             &rec.pubkey,
             &rec.approved_at,
             &rec.fingerprint_shown,
+            rec.r_epoch,
         );
         let actual = unhex32(&rec.mac).ok_or(StateError::Corrupt)?;
         if !bool::from(expected.ct_eq(&actual)) {
@@ -817,6 +898,7 @@ impl Store {
             &rec.pubkey,
             &rec.approved_at,
             &rec.fingerprint_shown,
+            rec.r_epoch,
         );
         let actual = match unhex32(&rec.mac) {
             Some(a) => a,
@@ -831,12 +913,14 @@ impl Store {
             &rec.pubkey,
             &rec.approved_at,
             &rec.fingerprint_shown,
+            rec.r_epoch,
         );
         let next = Approved {
             pubkey: rec.pubkey,
             approved_at: rec.approved_at,
             fingerprint_shown: rec.fingerprint_shown,
             kid: kr.current_kid(),
+            r_epoch: rec.r_epoch,
             mac: hex32(&new_mac),
         };
         let body = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
@@ -918,6 +1002,7 @@ impl Store {
                 &rec.pubkey,
                 &rec.approved_at,
                 &rec.fingerprint_shown,
+                rec.r_epoch,
             );
             let actual = match unhex32(&rec.mac) {
                 Some(a) => a,
@@ -946,12 +1031,14 @@ impl Store {
                 &rec.pubkey,
                 &rec.approved_at,
                 &rec.fingerprint_shown,
+                rec.r_epoch,
             );
             let next = Approved {
                 pubkey: rec.pubkey,
                 approved_at: rec.approved_at,
                 fingerprint_shown: rec.fingerprint_shown,
                 kid: new_kid,
+                r_epoch: rec.r_epoch,
                 mac: hex32(&new_mac),
             };
             let bytes = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
@@ -1135,6 +1222,41 @@ mod tests {
     const PUBA: &str = "ed25519:AAAA";
     const PUBB: &str = "ed25519:BBBB";
     const APPROVED_AT: &str = "2026-05-23T12:00:00Z";
+
+    #[tokio::test]
+    async fn k_m_a_generated_on_first_start_with_demo_enabled() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open_local(d.path()).await.unwrap();
+        s.init_k_m_a(d.path(), true).expect("init");
+        let first = *s.k_m_a().expect("present");
+        // File exists and is mode 0600.
+        let meta = std::fs::metadata(d.path().join(K_M_A_FILE)).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        // Restart loads the same bytes.
+        let mut s2 = Store::open_local(d.path()).await.unwrap();
+        s2.init_k_m_a(d.path(), true).expect("init");
+        assert_eq!(first, *s2.k_m_a().expect("present"));
+    }
+
+    #[tokio::test]
+    async fn k_m_a_absent_without_demo_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open_local(d.path()).await.unwrap();
+        let err = s.init_k_m_a(d.path(), false).expect_err("must refuse");
+        assert!(format!("{err}").contains("K_M-A"));
+    }
+
+    #[tokio::test]
+    async fn k_m_a_loads_existing_file_even_without_demo() {
+        // Once an operator has provisioned K_M-A (via auth-service
+        // enrollment in production, or via demo-mode first-start),
+        // subsequent starts don't need demo_enabled to load it.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(K_M_A_FILE), hex32(&[7u8; 32])).unwrap();
+        let mut s = Store::open_local(d.path()).await.unwrap();
+        s.init_k_m_a(d.path(), false).expect("loads");
+        assert_eq!(*s.k_m_a().unwrap(), [7u8; 32]);
+    }
 
     #[tokio::test]
     async fn invite_persists_and_is_stable_across_open() {

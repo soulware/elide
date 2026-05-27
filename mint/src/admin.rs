@@ -384,6 +384,7 @@ mod tests {
                     region: None,
                 },
                 admin: None,
+                auth: None,
                 roles: Default::default(),
             }),
             minter: Arc::new(FakeMinter::new()),
