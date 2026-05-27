@@ -187,6 +187,16 @@ pub struct RawRole {
     /// (so a role `name` with a path separator is rejected too).
     #[serde(default)]
     pub policy_file: Option<String>,
+    /// Whether mint appends a third-party caveat to every credential
+    /// it mints for this role. Drives the operator-initiated vs
+    /// background split (`docs/design-mint.md` § *Elide as customer*
+    /// and `docs/design-auth-service.md`): operator-write roles set
+    /// `true`; read roles and background-write variants leave it
+    /// `false`. Issuance unconditionally appends the TPC when set;
+    /// verification unconditionally requires a discharge for any TPC
+    /// it walks.
+    #[serde(default)]
+    pub issues_with_tpc: bool,
 }
 
 /// Resolved listener transport — a per-deployment-shape choice, not a
@@ -251,6 +261,12 @@ pub struct Role {
     /// The role's IAM-policy handlebars template, read from
     /// [`policy_path`](Role::policy_path) at load.
     pub policy: String,
+    /// When `true`, mint appends a third-party caveat (see
+    /// `docs/design-auth-service.md`) to every credential it mints
+    /// for this role. The TPC location is the configured auth
+    /// service; verification of the resulting credential at
+    /// `assume-role` requires a matching discharge.
+    pub issues_with_tpc: bool,
 }
 
 impl Config {
@@ -290,6 +306,7 @@ impl Config {
                 default_ttl_seconds: r.default_ttl_seconds,
                 policy_path,
                 policy,
+                issues_with_tpc: r.issues_with_tpc,
             };
             if roles.insert(r.name.clone(), role).is_some() {
                 return Err(ConfigError::DuplicateRole(r.name));
@@ -476,6 +493,22 @@ policy_file = "volume-ro.json"
             Config::from_toml_str(&toml),
             Err(ConfigError::ReadPolicyFile { .. })
         ));
+    }
+
+    #[test]
+    fn issues_with_tpc_defaults_to_false() {
+        let c = parse_for_test(SAMPLE, &[("volume-ro.json", "{}")]).expect("parse");
+        assert!(!c.roles["volume-ro"].issues_with_tpc);
+    }
+
+    #[test]
+    fn issues_with_tpc_is_parsed() {
+        let toml = SAMPLE.replace(
+            "policy_file = \"volume-ro.json\"",
+            "policy_file = \"volume-ro.json\"\nissues_with_tpc = true",
+        );
+        let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
+        assert!(c.roles["volume-ro"].issues_with_tpc);
     }
 
     #[test]
