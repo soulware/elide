@@ -186,6 +186,14 @@ coord for the next 5 min," without binding to a specific op or
 volume. Per-op narrowing happens via CLI attenuation per IPC (see
 *Per-IPC flow*).
 
+The initial design has exactly one TPC in the primary (pointing to
+auth) and therefore one wide discharge per bundle. The construction
+admits multiple TPCs on the primary (each adding an independent
+discharge requirement) and nested TPCs (a discharge that itself
+carries a TPC, requiring its own discharge); the verifier and the
+wire shape are built for either. See *Extensibility: multiple and
+nested TPCs* below.
+
 ## Per-IPC flow
 
 ### Fetching the wide discharge
@@ -241,8 +249,9 @@ stored primary out of `data_dir` and runs the following.
      mint within their `NotAfter` window. Skip to step 4.
    - **Cache miss**: coord first attenuates its primary with a
      freshness `NotAfter` (see *Coord attenuates the primary* below),
-     then forwards `(attenuated_primary, wide_bytes)` to mint at
-     `<mint>/v1/discharge/verify`. Mint returns `{valid: true,
+     then forwards `(attenuated_primary, [wide_bytes])` to mint at
+     `<mint>/v1/discharge/verify`. The discharge list is a flat bag
+     — length 1 in the initial design. Mint returns `{valid: true,
      expires_at: <NotAfter>, caveats: {...}}` or `{valid: false,
      reason: "..."}`. On valid, cache `(wide_bytes → expires_at,
      caveats)`. On invalid, reject the IPC.
@@ -303,25 +312,38 @@ Mint exposes two endpoints that handle bundle verification:
   write-capable S3 creds. Mint re-verifies the bundle from scratch
   (defense in depth) before issuing creds.
 
-Both endpoints share a single verification routine:
+Both endpoints share a single verification routine. It is written
+as a queue walk so it handles multiple TPCs on the primary and
+nested TPCs inside discharges without special-casing — the initial
+single-TPC shape is the N=1 case.
 
 1. Walk the primary's chain with `K_coord` (re-derived from `K_M +
    coord_ulid`, extracted from the primary's first-party `CoordId`
    caveat). The chain now includes coord's per-forward `NotAfter`
    attenuation; confirm the trailing MAC and that the per-forward
-   `NotAfter` is still in the future. At the TPC, hold `T_n` from
-   when the TPC was originally added.
-2. Decrypt `VID` with `T_n` → recover `r`. (Or, equivalently, decrypt
-   `CID` with `K_M-A` — both paths yield the same `r`. Mint uses
-   whichever it has cached or finds convenient.)
-3. Verify the wide discharge's MAC chain under `r`. Confirm the
-   nonce equals the primary's `CID` (the binding check).
-4. (Verify endpoint) Return verdict + wide discharge's caveats to
-   coord.
-5. (Assume-role endpoint) Walk the attenuation chain forward from
-   the wide's trailing tag, verify the trailing MAC, AND-evaluate
-   all caveats against the assume-role request shape, then issue
-   creds.
+   `NotAfter` is still in the future. For each TPC encountered,
+   queue `(T_n, CID_n, location_n)`.
+2. For each queued TPC, find a discharge in the request's
+   `discharges` bundle whose nonce equals `CID_n`. Recover `r_n` by
+   decrypting `VID_n` with `T_n` (or, equivalently, decrypting
+   `CID_n` with `K_M-A` — both paths yield the same `r_n`; mint
+   uses whichever it has cached or finds convenient).
+3. Verify the matched discharge's MAC chain under `r_n`. If the
+   discharge's own chain contains further TPCs, queue them and
+   continue. Recurse to fixpoint.
+4. Confirm every queued TPC matched a discharge and every MAC
+   verified. Any unmatched TPC or failed MAC → return `{valid:
+   false, reason}`.
+5. (Verify endpoint) Aggregate caveats across the primary and every
+   verified discharge. Return verdict + aggregated caveats + the
+   minimum `NotAfter` across all macaroons.
+6. (Assume-role endpoint) For each discharge that carries a CLI
+   attenuation chain, walk the attenuation forward from the
+   discharge's trailing tag, verify the trailing MAC, and
+   AND-evaluate the attenuation caveats against the assume-role
+   request shape. Then issue creds. The initial design attenuates
+   only the single auth discharge; with multiple TPCs the CLI may
+   attenuate each independently.
 
 Mint holds its own verification cache keyed by wide-discharge bytes
 so a coord's `/discharge/verify` call followed by an `/assume-role`
@@ -428,6 +450,54 @@ The two `present accept` divergence rows are unambiguous forgery
 signals. The first (`absent issuance, present verify`) indicates
 `K_M-A` or `K_M` leakage. The second (`absent verify, present
 accept`) indicates a compromised coord skipping the mint forward.
+
+## Extensibility: multiple and nested TPCs
+
+The macaroon construction admits two natural extensions to the
+single-TPC shape used today. Both are supported by the verification
+routine and the wire surface as designed; they are listed here so
+the initial implementation doesn't accidentally close the door.
+
+**Multiple flat TPCs on the primary.** Mint can enrol a primary
+with more than one TPC, each pointing at a different third party
+and each carrying its own `(VID_n, CID_n)` with its own ephemeral
+`r_n`. Every TPC must be discharged for the bundle to verify; the
+bundle's `discharges` list grows to one entry per TPC.
+
+Use cases this opens up:
+- A second TPC pointing to a per-org compliance / audit service
+  (every operator IPC requires both auth-service approval and a
+  compliance discharge).
+- Step-up auth for high-privilege ops (primary requires a base
+  discharge plus a step-up discharge from a distinct flow).
+- A break-glass TPC for emergency ops, discharged by a separate
+  service.
+
+**Nested TPCs.** A discharge is itself a macaroon, so it can carry
+its own TPC pointing at a further third party. The verifier walks
+the discharge's chain just as it walks the primary's chain; when
+it encounters a TPC inside the discharge, it queues `(T_n, CID_n,
+location_n)` and looks for a matching nested discharge in the same
+flat `discharges` bag.
+
+Use cases this opens up:
+- Auth-service mints a discharge whose own TPC requires a
+  passkey-service discharge (auth + passkey, without auth needing
+  to integrate passkey directly).
+- Delegated discharge: auth-service's discharge requires a
+  discharge from a customer-controlled service before it is
+  valid.
+
+The cryptography is just recursion of the basic TPC mechanism — no
+new primitives. The API shape (flat `discharges` list, matched by
+nonce) accommodates either extension without a wire change. The
+verifier's queue walk handles either without a routine change.
+
+Out of scope for the initial implementation: caching shape for
+multi-discharge bundles (each discharge could in principle be
+cached independently by its bytes; today we cache the single
+discharge whole), per-TPC CLI attenuation ergonomics, and the
+specifics of any second issuer's wire protocol.
 
 ## Login flow
 
@@ -729,15 +799,17 @@ coord on pull-on-verify-fail after `K_M-A` rotation.
 response: { "primary_macaroon": "<base64 macaroon>" }
 ```
 
-`POST /v1/discharge/verify` (coord-authenticated) — verify a wide
-discharge. Coord forwards a per-forward-attenuated primary and the
-wide discharge bytes; mint runs the verification routine described
-in *Mint: verification* and returns the verdict + caveats.
+`POST /v1/discharge/verify` (coord-authenticated) — verify a bundle.
+Coord forwards a per-forward-attenuated primary and the list of
+discharge bytes; mint runs the verification routine described in
+*Mint: verification* and returns the verdict + aggregated caveats.
 
 ```json
 request:  {
   "primary": "<base64 macaroon, attenuated by coord with per-forward NotAfter>",
-  "wide_discharge": "<base64 macaroon>"
+  "discharges": [
+    "<base64 macaroon>"
+  ]
 }
 response: {
   "valid": true,
@@ -751,13 +823,18 @@ response: {
 }
 ```
 
+The `discharges` list is a flat bag — verification matches by
+nonce, so order does not matter and nesting (a TPC inside a
+discharge) is handled by the verifier's queue walk, not by the
+wire shape. Length is 1 in the initial design.
+
 Or 200 with `{"valid": false, "reason": "expired" | "mac_mismatch" |
-"unknown_coord" | ...}`.
+"unknown_coord" | "tpc_undischarged" | ...}`.
 
 Mint's existing cred-issuance endpoints (`/v1/assume-role` and
 friends) are unchanged in shape but now additionally accept and
-verify a `(per-forward-attenuated primary, attenuated discharge)`
-bundle for ops that require operator authorisation.
+verify a `(per-forward-attenuated primary, attenuated discharges
+list)` bundle for ops that require operator authorisation.
 
 ### Coord — CLI-facing
 
