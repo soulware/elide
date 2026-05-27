@@ -22,17 +22,22 @@
 //! § *Authentication*):
 //!
 //! ```text
-//! magic   "mcrn2"  (5 bytes)
+//! magic   "mcrn3"  (5 bytes)
 //! kid     u16 BE   (2 bytes — the keyring generation that MAC'd this token)
 //! nonce   16 bytes
 //! mac     32 bytes
 //! count   u16 BE
-//! repeated serialize_one(caveat)  // u32 name-len, name, u32 val-len, val
+//! repeated serialize_one(caveat):
+//!   type  u8                           // 0 = first-party, 1 = third-party
+//!   if first-party:                    // u32 name-len, name, u32 val-len, val
+//!   if third-party:                    // u32 loc-len, loc, u32 vid-len, vid, u32 cid-len, cid
 //! ```
 //!
 //! `serialize_one` is the canonical per-caveat encoding fed into the
 //! MAC chain; the same bytes appear on the wire so a decoded macaroon
-//! re-MACs identically.
+//! re-MACs identically. v3 extends v2 with the per-step type byte to
+//! disambiguate first-party from third-party caveats; v2-shaped
+//! macaroons (no type byte) do not interoperate.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -42,9 +47,17 @@ use subtle::ConstantTimeEq;
 use crate::caveat::Caveat;
 use crate::keyring::{Keyring, Kid};
 
-const MAGIC: &[u8; 5] = b"mcrn2";
-const DOMAIN: &[u8] = b"mint-macaroon-v2";
+const MAGIC: &[u8; 5] = b"mcrn3";
+const DOMAIN: &[u8] = b"mint-macaroon-v3";
 pub const NONCE_LEN: usize = 16;
+
+/// Per-step type tag in the wire format and in the MAC-chain digest.
+/// First-party = 0; third-party = 1. Encoded as the first byte of
+/// every `serialize_one` output so a TPC can never be confused with a
+/// first-party caveat whose name happens to start with a length-byte
+/// pattern.
+const TYPE_FIRST_PARTY: u8 = 0;
+const TYPE_THIRD_PARTY: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Macaroon {
@@ -71,14 +84,31 @@ pub enum DecodeError {
 }
 
 fn serialize_one(c: &Caveat) -> Vec<u8> {
-    let name = c.name.as_bytes();
-    let val = c.value.as_bytes();
-    let mut out = Vec::with_capacity(name.len() + val.len() + 8);
-    out.extend_from_slice(&(name.len() as u32).to_be_bytes());
-    out.extend_from_slice(name);
-    out.extend_from_slice(&(val.len() as u32).to_be_bytes());
-    out.extend_from_slice(val);
-    out
+    match c {
+        Caveat::FirstParty { name, value } => {
+            let name = name.as_bytes();
+            let val = value.as_bytes();
+            let mut out = Vec::with_capacity(1 + 8 + name.len() + val.len());
+            out.push(TYPE_FIRST_PARTY);
+            out.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            out.extend_from_slice(name);
+            out.extend_from_slice(&(val.len() as u32).to_be_bytes());
+            out.extend_from_slice(val);
+            out
+        }
+        Caveat::ThirdParty { location, vid, cid } => {
+            let loc = location.as_bytes();
+            let mut out = Vec::with_capacity(1 + 12 + loc.len() + vid.len() + cid.len());
+            out.push(TYPE_THIRD_PARTY);
+            out.extend_from_slice(&(loc.len() as u32).to_be_bytes());
+            out.extend_from_slice(loc);
+            out.extend_from_slice(&(vid.len() as u32).to_be_bytes());
+            out.extend_from_slice(vid);
+            out.extend_from_slice(&(cid.len() as u32).to_be_bytes());
+            out.extend_from_slice(cid);
+            out
+        }
+    }
 }
 
 /// Chain the MAC under `key`, binding the seed to `kid` so a key
@@ -240,10 +270,31 @@ impl<'a> Reader<'a> {
         String::from_utf8(bytes.to_vec()).map_err(|_| DecodeError::BadCaveat)
     }
 
+    fn byte(&mut self) -> Result<u8, DecodeError> {
+        let b = self.take(1)?;
+        Ok(b[0])
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
+        let len = self.u32()?;
+        Ok(self.take(len)?.to_vec())
+    }
+
     fn caveat(&mut self) -> Result<Caveat, DecodeError> {
-        let name = self.string()?;
-        let value = self.string()?;
-        Ok(Caveat { name, value })
+        match self.byte()? {
+            TYPE_FIRST_PARTY => {
+                let name = self.string()?;
+                let value = self.string()?;
+                Ok(Caveat::FirstParty { name, value })
+            }
+            TYPE_THIRD_PARTY => {
+                let location = self.string()?;
+                let vid = self.bytes()?;
+                let cid = self.bytes()?;
+                Ok(Caveat::ThirdParty { location, vid, cid })
+            }
+            _ => Err(DecodeError::BadCaveat),
+        }
     }
 }
 
@@ -282,6 +333,72 @@ mod tests {
         let back = Macaroon::decode(&wire).expect("decode");
         assert_eq!(m, back);
         assert!(back.verify(&ring()));
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_with_third_party() {
+        // Mixed chain: first-party caveats interleaved with a TPC.
+        // Exercises the v3 type-tagged wire format end-to-end.
+        let m = mint(
+            &ring(),
+            vec![
+                Caveat::scalar("Audience", "mint"),
+                Caveat::third_party("https://auth.example/", vec![1u8; 28], vec![2u8; 60]),
+                Caveat::scalar("NotAfter", "1700000000"),
+            ],
+        );
+        let wire = m.encode();
+        let back = Macaroon::decode(&wire).expect("decode");
+        assert_eq!(m, back);
+        assert!(back.verify(&ring()));
+        // The TPC sits at chain position 1.
+        match &back.caveats()[1] {
+            Caveat::ThirdParty { location, vid, cid } => {
+                assert_eq!(location, "https://auth.example/");
+                assert_eq!(vid, &vec![1u8; 28]);
+                assert_eq!(cid, &vec![2u8; 60]);
+            }
+            other => panic!("expected ThirdParty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tampered_tpc_field_fails_verify() {
+        let m = mint(
+            &ring(),
+            vec![
+                Caveat::scalar("Audience", "mint"),
+                Caveat::third_party("https://auth.example/", vec![1u8; 28], vec![2u8; 60]),
+            ],
+        );
+        let mut tampered = Macaroon::decode(&m.encode()).expect("decode");
+        // Swap a byte in the VID — chain MAC must reject.
+        match &mut tampered.caveats[1] {
+            Caveat::ThirdParty { vid, .. } => vid[0] ^= 0x80,
+            other => panic!("expected ThirdParty, got {other:?}"),
+        }
+        assert!(!tampered.verify(&ring()));
+    }
+
+    #[test]
+    fn type_tag_distinguishes_first_from_third_party() {
+        // Two macaroons with the same string fields, one as first-party
+        // ("loc","value") and one as third-party (location=..., vid+cid
+        // chosen so the bytes "look similar"). Their chain MACs must
+        // differ — the type byte enforces the distinction.
+        let fp = mint(
+            &ring(),
+            vec![Caveat::scalar("https://auth.example/", "abc")],
+        );
+        let tp = mint(
+            &ring(),
+            vec![Caveat::third_party(
+                "https://auth.example/",
+                b"a".to_vec(),
+                b"bc".to_vec(),
+            )],
+        );
+        assert_ne!(fp.tail(), tp.tail());
     }
 
     #[test]

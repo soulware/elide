@@ -9,6 +9,8 @@
 use std::io::Write;
 use std::sync::Mutex;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
 
 use crate::caveat::Caveat;
@@ -35,9 +37,20 @@ pub struct AuditCaveat {
 pub fn sanitise_caveats(caveats: &[Caveat]) -> Vec<AuditCaveat> {
     caveats
         .iter()
-        .map(|c| AuditCaveat {
-            name: c.name.clone(),
-            value: c.value.clone(),
+        .map(|c| match c {
+            Caveat::FirstParty { name, value } => AuditCaveat {
+                name: name.clone(),
+                value: value.clone(),
+            },
+            // Third-party caveats record the discharge location and
+            // the CID nonce only — the VID is omitted (it's a
+            // ciphertext over the per-coord key `r`; the operator
+            // forensic value is the location and the CID linkage to
+            // the auth-issuance log, not the cipher).
+            Caveat::ThirdParty { location, cid, .. } => AuditCaveat {
+                name: format!("tpc:{location}"),
+                value: BASE64.encode(cid),
+            },
         })
         .collect()
 }

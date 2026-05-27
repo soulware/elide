@@ -337,26 +337,28 @@ mod tests {
 
     #[test]
     fn resolve_invite_distinguishes_inline_file_and_garbage() {
-        // A real wire macaroon, built the way mint mints one. v2
-        // format: kid prefix + the kid bound into the MAC seed
+        // A real wire macaroon, built the way mint mints one. v3
+        // format: kid prefix + per-caveat type byte (`0`=first-party)
+        // bound into both the MAC seed and the wire
         // (`mint/src/macaroon.rs::chain_mac`).
         let nonce = [5u8; 16];
         let root = [2u8; 32];
         let kid: u16 = 0;
-        const DOMAIN: &[u8] = b"mint-macaroon-v2";
+        const DOMAIN: &[u8] = b"mint-macaroon-v3";
         let mut seed = Vec::new();
         seed.extend_from_slice(DOMAIN);
         seed.extend_from_slice(&kid.to_be_bytes());
         seed.extend_from_slice(&nonce);
         let mut key = *blake3::keyed_hash(&root, &seed).as_bytes();
         let mut ser = Vec::new();
+        ser.push(0u8); // type tag: first-party
         ser.extend_from_slice(&(3u32).to_be_bytes());
         ser.extend_from_slice(b"aud");
         ser.extend_from_slice(&(4u32).to_be_bytes());
         ser.extend_from_slice(b"mint");
         key = *blake3::keyed_hash(&key, &ser).as_bytes();
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"mcrn2");
+        buf.extend_from_slice(b"mcrn3");
         buf.extend_from_slice(&kid.to_be_bytes());
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&key);

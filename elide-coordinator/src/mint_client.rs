@@ -57,14 +57,20 @@ use elide_coordinator::identity::CoordinatorIdentity;
 
 use crate::credential::{CredentialIssuer, Credentialer, IssuedCredentials};
 
-/// Wire-format magic. v2 added a 2-byte BE `kid` prefix after the
-/// magic, naming the macaroon root-key generation that minted it
-/// (`mint/src/keyring.rs`, `mint/src/macaroon.rs`). The coordinator
-/// preserves the kid bytes through decode → attenuate → encode but
-/// never resolves them — it does not hold the keyring and does not
-/// verify.
-const MAGIC: &[u8; 5] = b"mcrn2";
+/// Wire-format magic. v3 added a per-caveat type byte to the
+/// serialised chain step so third-party caveats (carrying
+/// `(location, VID, CID)`) can ride alongside first-party scalar
+/// caveats (`mint/src/macaroon.rs`). The coordinator preserves
+/// third-party caveats opaquely through decode → attenuate → encode;
+/// it only ever appends first-party narrowing caveats, never TPCs
+/// (only mint at issuance constructs those).
+const MAGIC: &[u8; 5] = b"mcrn3";
 const NONCE_LEN: usize = 16;
+
+/// Per-step type tag in the wire format. Must match
+/// `mint/src/macaroon.rs`.
+const TYPE_FIRST_PARTY: u8 = 0;
+const TYPE_THIRD_PARTY: u8 = 1;
 
 /// Canonical mint role inventory — the single source of truth shared by
 /// the enrollment fan-out (`crate::enroll`), the `[mint]` startup gate,
@@ -99,25 +105,62 @@ pub(crate) fn now_unix() -> io::Result<u64> {
         .map_err(|e| io::Error::other(format!("system clock before unix epoch: {e}")))
 }
 
-/// One scalar `(name, value)` caveat. Mirrors `mint/src/caveat.rs`.
+/// One step in the macaroon's caveat chain. Mirrors
+/// `mint/src/caveat.rs::Caveat`. The coordinator only ever appends
+/// first-party caveats; third-party caveats are preserved opaquely
+/// through the decode → attenuate → encode round-trip so re-encoded
+/// bytes match what mint will accept.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Caveat {
-    name: String,
-    value: String,
+enum Caveat {
+    FirstParty {
+        name: String,
+        value: String,
+    },
+    ThirdParty {
+        location: String,
+        vid: Vec<u8>,
+        cid: Vec<u8>,
+    },
 }
 
 /// Canonical per-caveat encoding fed into the MAC chain; the same
 /// bytes appear on the wire so a decoded macaroon re-MACs identically
 /// (`mint/src/macaroon.rs`).
-fn serialize_one(name: &str, value: &str) -> Vec<u8> {
-    let n = name.as_bytes();
-    let v = value.as_bytes();
-    let mut out = Vec::with_capacity(n.len() + v.len() + 8);
-    out.extend_from_slice(&(n.len() as u32).to_be_bytes());
-    out.extend_from_slice(n);
-    out.extend_from_slice(&(v.len() as u32).to_be_bytes());
-    out.extend_from_slice(v);
-    out
+fn serialize_one(c: &Caveat) -> Vec<u8> {
+    match c {
+        Caveat::FirstParty { name, value } => {
+            let n = name.as_bytes();
+            let v = value.as_bytes();
+            let mut out = Vec::with_capacity(1 + 8 + n.len() + v.len());
+            out.push(TYPE_FIRST_PARTY);
+            out.extend_from_slice(&(n.len() as u32).to_be_bytes());
+            out.extend_from_slice(n);
+            out.extend_from_slice(&(v.len() as u32).to_be_bytes());
+            out.extend_from_slice(v);
+            out
+        }
+        Caveat::ThirdParty { location, vid, cid } => {
+            let loc = location.as_bytes();
+            let mut out = Vec::with_capacity(1 + 12 + loc.len() + vid.len() + cid.len());
+            out.push(TYPE_THIRD_PARTY);
+            out.extend_from_slice(&(loc.len() as u32).to_be_bytes());
+            out.extend_from_slice(loc);
+            out.extend_from_slice(&(vid.len() as u32).to_be_bytes());
+            out.extend_from_slice(vid);
+            out.extend_from_slice(&(cid.len() as u32).to_be_bytes());
+            out.extend_from_slice(cid);
+            out
+        }
+    }
+}
+
+/// Build the first-party caveat shape, the only kind the coordinator
+/// ever appends via attenuation.
+fn first_party(name: impl Into<String>, value: impl Into<String>) -> Caveat {
+    Caveat::FirstParty {
+        name: name.into(),
+        value: value.into(),
+    }
 }
 
 /// A decoded mint macaroon. The coordinator only ever decodes one mint
@@ -170,9 +213,7 @@ impl WireMacaroon {
         );
         let mut caveats = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            let name = read_string(&buf, &mut pos)?;
-            let value = read_string(&buf, &mut pos)?;
-            caveats.push(Caveat { name, value });
+            caveats.push(read_caveat(&buf, &mut pos)?);
         }
         if pos != buf.len() {
             return Err(io::Error::other("credential macaroon: trailing bytes"));
@@ -185,17 +226,17 @@ impl WireMacaroon {
         })
     }
 
-    /// Append `(name, value)`, extending the chain with only the
-    /// trailing MAC. Caveats are AND-evaluated, so this can only
-    /// restrict authority — the additive-restriction property that
-    /// lets a non-root holder attenuate.
+    /// Append `(name, value)` as a first-party caveat, extending the
+    /// chain with only the trailing MAC. Caveats are AND-evaluated,
+    /// so this can only restrict authority — the additive-restriction
+    /// property that lets a non-root holder attenuate. The coordinator
+    /// never appends third-party caveats; only mint at issuance
+    /// constructs those.
     pub(crate) fn attenuate(&mut self, name: &str, value: &str) {
-        let step = serialize_one(name, value);
+        let c = first_party(name, value);
+        let step = serialize_one(&c);
         self.mac = *blake3::keyed_hash(&self.mac, &step).as_bytes();
-        self.caveats.push(Caveat {
-            name: name.to_owned(),
-            value: value.to_owned(),
-        });
+        self.caveats.push(c);
     }
 
     pub(crate) fn tail(&self) -> &[u8; 32] {
@@ -210,13 +251,13 @@ impl WireMacaroon {
         buf.extend_from_slice(&self.mac);
         buf.extend_from_slice(&(self.caveats.len() as u16).to_be_bytes());
         for c in &self.caveats {
-            buf.extend_from_slice(&serialize_one(&c.name, &c.value));
+            buf.extend_from_slice(&serialize_one(c));
         }
         BASE64.encode(buf)
     }
 }
 
-fn read_string(buf: &[u8], pos: &mut usize) -> io::Result<String> {
+fn read_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> io::Result<&'a [u8]> {
     let lead = pos
         .checked_add(4)
         .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
@@ -229,12 +270,39 @@ fn read_string(buf: &[u8], pos: &mut usize) -> io::Result<String> {
     let end = lead
         .checked_add(len)
         .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
-    let bytes = buf
+    let out = buf
         .get(lead..end)
         .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
     *pos = end;
-    String::from_utf8(bytes.to_vec())
+    Ok(out)
+}
+
+fn read_string(buf: &[u8], pos: &mut usize) -> io::Result<String> {
+    String::from_utf8(read_bytes(buf, pos)?.to_vec())
         .map_err(|_| io::Error::other("credential macaroon: caveat not utf-8"))
+}
+
+fn read_caveat(buf: &[u8], pos: &mut usize) -> io::Result<Caveat> {
+    let tag = *buf
+        .get(*pos)
+        .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
+    *pos += 1;
+    match tag {
+        TYPE_FIRST_PARTY => {
+            let name = read_string(buf, pos)?;
+            let value = read_string(buf, pos)?;
+            Ok(Caveat::FirstParty { name, value })
+        }
+        TYPE_THIRD_PARTY => {
+            let location = read_string(buf, pos)?;
+            let vid = read_bytes(buf, pos)?.to_vec();
+            let cid = read_bytes(buf, pos)?.to_vec();
+            Ok(Caveat::ThirdParty { location, vid, cid })
+        }
+        _ => Err(io::Error::other(
+            "credential macaroon: unknown caveat type tag",
+        )),
+    }
 }
 
 /// `BLAKE3(tail ‖ BLAKE3(body))` — the digest the PoP signature
@@ -687,31 +755,32 @@ mod tests {
     /// Build a wire macaroon the way `mint/src/macaroon.rs` does, so
     /// the coordinator's decode/attenuate/encode is checked against the
     /// real construction without depending on the mint crate. Mirrors
-    /// the v2 wire format: kid bound into the MAC seed and prefixed on
-    /// the wire.
+    /// the v3 wire format: per-caveat type byte + length-prefixed
+    /// fields, kid bound into the MAC seed.
     fn mint_like(
         root: &[u8; 32],
         kid: u16,
         nonce: [u8; NONCE_LEN],
         caveats: &[(&str, &str)],
     ) -> String {
-        const DOMAIN: &[u8] = b"mint-macaroon-v2";
+        let cs: Vec<Caveat> = caveats.iter().map(|(n, v)| first_party(*n, *v)).collect();
+        const DOMAIN: &[u8] = b"mint-macaroon-v3";
         let mut seed_msg = Vec::new();
         seed_msg.extend_from_slice(DOMAIN);
         seed_msg.extend_from_slice(&kid.to_be_bytes());
         seed_msg.extend_from_slice(&nonce);
         let mut key = *blake3::keyed_hash(root, &seed_msg).as_bytes();
-        for (n, v) in caveats {
-            key = *blake3::keyed_hash(&key, &serialize_one(n, v)).as_bytes();
+        for c in &cs {
+            key = *blake3::keyed_hash(&key, &serialize_one(c)).as_bytes();
         }
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&kid.to_be_bytes());
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&key);
-        buf.extend_from_slice(&(caveats.len() as u16).to_be_bytes());
-        for (n, v) in caveats {
-            buf.extend_from_slice(&serialize_one(n, v));
+        buf.extend_from_slice(&(cs.len() as u16).to_be_bytes());
+        for c in &cs {
+            buf.extend_from_slice(&serialize_one(c));
         }
         BASE64.encode(buf)
     }

@@ -292,9 +292,9 @@ fn abbrev(s: &str) -> String {
 /// narration explains *why* each line is there. mint is
 /// caveat-vocabulary-agnostic; an unrecognised name glosses to nothing
 /// and is still shown verbatim.
-fn caveat_gloss(cav: &Caveat) -> &'static str {
-    match cav.name.as_str() {
-        name::OP => match cav.value.as_str() {
+fn caveat_gloss(cav_name: &str, cav_value: &str) -> &'static str {
+    match cav_name {
+        name::OP => match cav_value {
             op::ENROLL => "participation gate — enroll only",
             op::ENROLL_EXCHANGE => "redeem-once — may only be exchanged for a credential",
             op::ASSUME_ROLE => "the working credential — mints role keypairs",
@@ -316,19 +316,29 @@ fn caveat_gloss(cav: &Caveat) -> &'static str {
 fn describe(label: &str, m: &Macaroon) {
     eprintln!("  {label} — {} caveat(s):", m.caveats().len());
     for c in m.caveats() {
-        let mut shown = abbrev(&c.value);
-        let exp_instant = (c.name == name::EXP)
-            .then(|| c.value.parse::<i64>().ok())
-            .flatten()
-            .and_then(|s| chrono::DateTime::from_timestamp(s, 0));
-        if let Some(dt) = exp_instant {
-            shown = format!("{shown} ({})", dt.format("%Y-%m-%dT%H:%M:%SZ"));
-        }
-        let gloss = caveat_gloss(c);
-        if gloss.is_empty() {
-            eprintln!("    {:<10} {shown}", c.name);
-        } else {
-            eprintln!("    {:<10} {shown}  — {gloss}", c.name);
+        match c {
+            Caveat::FirstParty { name, value } => {
+                let mut shown = abbrev(value);
+                let exp_instant = (name == name::EXP)
+                    .then(|| value.parse::<i64>().ok())
+                    .flatten()
+                    .and_then(|s| chrono::DateTime::from_timestamp(s, 0));
+                if let Some(dt) = exp_instant {
+                    shown = format!("{shown} ({})", dt.format("%Y-%m-%dT%H:%M:%SZ"));
+                }
+                let gloss = caveat_gloss(name, value);
+                if gloss.is_empty() {
+                    eprintln!("    {:<10} {shown}", name);
+                } else {
+                    eprintln!("    {:<10} {shown}  — {gloss}", name);
+                }
+            }
+            Caveat::ThirdParty { location, .. } => {
+                eprintln!(
+                    "    {:<10} {location}  — discharge required from this authority",
+                    "tpc"
+                );
+            }
         }
     }
 }
@@ -526,12 +536,12 @@ pub async fn assume_role(
     Ok(text)
 }
 
-/// First value of caveat `name` in `m`, if present.
-fn caveat_value<'a>(m: &'a Macaroon, name: &str) -> Option<&'a str> {
-    m.caveats()
-        .iter()
-        .find(|c| c.name == name)
-        .map(|c| c.value.as_str())
+/// First value of first-party caveat `name` in `m`, if present.
+fn caveat_value<'a>(m: &'a Macaroon, target: &str) -> Option<&'a str> {
+    m.caveats().iter().find_map(|c| match c {
+        Caveat::FirstParty { name, value } if name == target => Some(value.as_str()),
+        _ => None,
+    })
 }
 
 /// Decode the held credential for `role` from `credentials/<role>`.
