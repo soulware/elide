@@ -314,6 +314,11 @@ pub struct Store {
     /// `/v1/mint/enroll` (separate PR). Immutable for the lifetime
     /// of the process — rotation lands on a new Store via restart.
     k_m_a: Option<Arc<[u8; 32]>>,
+    /// The org this mint serves. Paired with `k_m_a`: both come from
+    /// auth-service enrollment in production, both are generated
+    /// locally in demo mode (where mint assigns `OrgId = "demo"`).
+    /// `None` when `k_m_a` is `None`.
+    org_id: Option<String>,
     objects: Arc<dyn ObjectStore>,
     invite_cache: Arc<RwLock<InviteSnapshot>>,
 }
@@ -399,6 +404,7 @@ impl Store {
         Store {
             keyring: Arc::new(RwLock::new(Arc::new(keyring))),
             k_m_a: None,
+            org_id: None,
             objects,
             invite_cache: Arc::new(RwLock::new(InviteSnapshot {
                 value: String::new(),
@@ -437,6 +443,12 @@ impl Store {
             Err(e) => return Err(e),
         };
         self.k_m_a = Some(Arc::new(bytes));
+        // Demo mode assigns the conventional OrgId; production
+        // deployments will receive OrgId from auth-service enrollment
+        // alongside K_M-A and persist it separately.
+        if self.org_id.is_none() {
+            self.org_id = Some("demo".to_string());
+        }
         Ok(())
     }
 
@@ -445,6 +457,13 @@ impl Store {
     /// configurations without `[auth]`).
     pub fn k_m_a(&self) -> Option<&[u8; 32]> {
         self.k_m_a.as_deref()
+    }
+
+    /// The org this mint serves (`Some("demo")` in demo mode; set by
+    /// auth-service enrollment in production). Paired with
+    /// [`k_m_a`](Self::k_m_a) — both `Some` or both `None`.
+    pub fn org_id(&self) -> Option<&str> {
+        self.org_id.as_deref()
     }
 
     /// Snapshot the current keyring as an `Arc`. Steady-state minting

@@ -127,14 +127,11 @@ fn scalar_is(caveats: &[Caveat], n: &str, expected: &str) -> bool {
     )
 }
 
-/// The detached PoP from `X-Mint-Coord-Pop`, if syntactically present.
+/// The detached PoP from `X-Mint-Pop`, if syntactically present.
 /// A malformed header is a hard `Err` (caller maps to 401); absence is
 /// `Ok(None)` (caller decides whether key-binding is required).
 fn pop_proof(headers: &HeaderMap) -> Result<Option<pop::Proof>, ()> {
-    match headers
-        .get("x-mint-coord-pop")
-        .and_then(|v| v.to_str().ok())
-    {
+    match headers.get("x-mint-pop").and_then(|v| v.to_str().ok()) {
         Some(sig) => pop::Proof::from_b64(sig).map(Some).map_err(|_| ()),
         None => Ok(None),
     }
@@ -592,8 +589,10 @@ async fn enroll_exchange(
     // The approved-registry entry for this sub must exist and its
     // pinned pub must match the presented cnf — the operator approved
     // *this* (sub, pub) pair (`docs/design-mint.md` § *Enrollment* (3)).
-    match state.store.get_approved(&sub).await {
-        Ok(Some(a)) if a.pubkey == cnf => {}
+    // The record also carries `r_epoch`, the input to TPC `r`
+    // derivation for credentials that carry a TPC.
+    let r_epoch = match state.store.get_approved(&sub).await {
+        Ok(Some(a)) if a.pubkey == cnf => a.r_epoch,
         // The one non-401 authorization outcome: awaited, not a
         // failure. Includes both "never approved" and "approved
         // under a different pub" (pending key-rotation re-approval).
@@ -643,7 +642,7 @@ async fn enroll_exchange(
             audit("denied:state_error", &caveats);
             return unauthorized(&request_id);
         }
-    }
+    };
 
     // The requested role rides the PoP-signed body (already verified
     // above), so it is authenticated. Floor authorization (§
@@ -659,7 +658,44 @@ async fn enroll_exchange(
         }
     };
 
-    let credential = issuance::mint_credential(&keyring, &state.config.audience, &sub, &cnf, &role);
+    let mut credential =
+        issuance::mint_credential(&keyring, &state.config.audience, &sub, &cnf, &role);
+
+    // Operator-write roles carry a third-party caveat. Append it as a
+    // chain extension off the just-minted credential's tail — the
+    // chain MAC is incremental, so this is byte-identical to having
+    // stamped the TPC inline at issuance. Config and Store invariants
+    // guarantee the inputs are present when the role flag is set.
+    if state.config.roles[&role].issues_with_tpc {
+        let Some(auth) = state.config.auth.as_ref() else {
+            tracing::error!("TPC-bearing role without [auth] reached issuance");
+            return respond(
+                &request_id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "service unavailable"}),
+            );
+        };
+        let Some(k_m_a) = state.store.k_m_a() else {
+            tracing::error!("TPC-bearing role minted but K_M-A not loaded");
+            return respond(
+                &request_id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "service unavailable"}),
+            );
+        };
+        let Some(org_id) = state.store.org_id() else {
+            tracing::error!("TPC-bearing role minted but OrgId not set");
+            return respond(
+                &request_id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "service unavailable"}),
+            );
+        };
+        let r = crate::tpc::derive_r(keyring.current_key(), &sub, r_epoch);
+        let tpc_caveat =
+            crate::tpc::build_caveat(credential.tail(), &r, k_m_a, &sub, org_id, &auth.endpoint);
+        credential = credential.attenuate(tpc_caveat);
+    }
     // The approved-registry entry is not consumed: the ticket is
     // multi-use until its `exp` and the entry powers the re-enrollment
     // fast path beyond that.

@@ -13,6 +13,13 @@ license = "MIT OR Apache-2.0"
 description = "Macaroon-authenticated scoped-credential vending for Tigris (prototype). Standalone-OSS-to-be; lives in the elide repo during the design phase."
 
 [dependencies]
+# AES-GCM-SIV is misuse-resistant: nonce reuse with the same key is
+# safe by construction. We use it with a fixed nonce so the
+# (K_M-A, plaintext) → CID mapping is deterministic — two
+# operator-write credentials for the same coord must produce the
+# same CID for one discharge to satisfy both
+# (`docs/design-auth-service.md` § *Keys*).
+aes-gcm-siv          = "0.11"
 async-trait          = "0.1"
 aws-credential-types = "1"
 aws-sigv4            = { version = "1", default-features = false, features = ["sign-http", "http1"] }

@@ -132,7 +132,7 @@ fn signed(uri: &str, m: &Macaroon, seed: &[u8; 32], extra: &str) -> Request<Body
         .method("POST")
         .uri(uri)
         .header("authorization", format!("Macaroon {}", m.encode()))
-        .header("x-mint-coord-pop", sig)
+        .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap()
@@ -542,6 +542,198 @@ async fn bearer_invite_without_cnf_is_opaque_401() {
         .unwrap();
     let (status, _) = parts(app.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A separate harness with `[auth]` configured and two operator-write
+/// roles, so the exchange path stamps a TPC. Mirrors `app()` but
+/// builds Store with `init_k_m_a` and a config that includes the
+/// `[auth]` block.
+async fn tpc_app() -> (axum::Router, Arc<Store>, tempfile::TempDir) {
+    const TOML_TPC: &str = r#"
+audience = "mint"
+[tenant]
+bucket = "demo-bucket"
+[auth]
+endpoint = "https://auth.example/"
+demo_enabled = true
+[[role]]
+name = "coord-rw"
+required_caveats = ["aud"]
+min_ttl_seconds = 60
+max_ttl_seconds = 3600
+default_ttl_seconds = 900
+policy_file = "rw.json"
+issues_with_tpc = true
+[[role]]
+name = "volume-rw"
+required_caveats = ["aud"]
+min_ttl_seconds = 60
+max_ttl_seconds = 3600
+default_ttl_seconds = 900
+policy_file = "rw.json"
+issues_with_tpc = true
+"#;
+    let cfg = common::parse_config(TOML_TPC, &[("rw.json", VOLUME_RW_POLICY)]);
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
+    let mut store_inner = Store::open_local(dir.path()).await.expect("store");
+    store_inner
+        .init_k_m_a(dir.path(), true)
+        .expect("init k_m_a");
+    let store = Arc::new(store_inner);
+    let state = AppState {
+        config: Arc::new(cfg),
+        minter: Arc::new(FakeMinter::new()),
+        audit: Arc::new(AuditLog::new(Box::new(AuditSink(buf)))),
+        store: store.clone(),
+    };
+    (router(state), store, dir)
+}
+
+#[tokio::test]
+async fn tpc_role_credential_carries_third_party_caveat() {
+    let (app, store, _dir) = tpc_app().await;
+    let nonce = store.current_invite().await.unwrap();
+    let cb = client_invite(&nonce, &COORD_SEED);
+
+    // enroll
+    let (status, body) = parts(
+        app.clone()
+            .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let ticket = field(&body, "credential.ticket");
+
+    // approve
+    store
+        .approve(SUB, &pop::cnf_value(&COORD_SEED), &now_iso())
+        .await
+        .unwrap();
+
+    // exchange both operator-write roles
+    let exchange = |role: &str| {
+        let app = app.clone();
+        let ticket = ticket.clone();
+        let extra = format!(r#","role":"{role}""#);
+        async move {
+            let (status, body) = parts(
+                app.oneshot(signed("/v1/enroll-exchange", &ticket, &COORD_SEED, &extra))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "body: {body}");
+            field(&body, "credential")
+        }
+    };
+    let coord_rw = exchange("coord-rw").await;
+    let volume_rw = exchange("volume-rw").await;
+
+    // Both verify under the same root: chain MAC includes the TPC.
+    let ring = Keyring::single(ROOT);
+    assert!(coord_rw.verify(&ring));
+    assert!(volume_rw.verify(&ring));
+
+    // Last caveat in each is a ThirdParty with the configured location.
+    let coord_tpc = coord_rw.caveats().last().expect("at least one caveat");
+    let volume_tpc = volume_rw.caveats().last().expect("at least one caveat");
+    match (coord_tpc, volume_tpc) {
+        (
+            Caveat::ThirdParty {
+                location: loc_a,
+                vid: vid_a,
+                cid: cid_a,
+            },
+            Caveat::ThirdParty {
+                location: loc_b,
+                vid: vid_b,
+                cid: cid_b,
+            },
+        ) => {
+            assert_eq!(loc_a, "https://auth.example/");
+            assert_eq!(loc_a, loc_b);
+            // One discharge serves both: CID is identical across the
+            // operator-write credentials because both share the same
+            // `r`, `coord_ulid`, and `org_id` plaintext under the same
+            // `K_M-A`.
+            assert_eq!(cid_a, cid_b, "CID must match across operator-write creds");
+            // But VID differs: each chain reaches a different tag at
+            // the TPC position (different first-party caveats =
+            // different T_{n-1}), so the AEAD output differs even
+            // though `r` is the same.
+            assert_ne!(
+                vid_a, vid_b,
+                "VID must differ across chains with different first-party caveats"
+            );
+        }
+        (a, b) => panic!("expected ThirdParty caveats; got {a:?} and {b:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tpc_credential_is_deterministic_for_same_coord() {
+    // Re-minting (e.g. on a fresh exchange of the same ticket) must
+    // produce the same CID — that's the property mint_credential
+    // depends on for "one discharge serves both" to hold across
+    // restarts.
+    let (app, store, _dir) = tpc_app().await;
+    let nonce = store.current_invite().await.unwrap();
+    let cb = client_invite(&nonce, &COORD_SEED);
+    let (_, body) = parts(
+        app.clone()
+            .oneshot(signed("/v1/enroll", &cb, &COORD_SEED, ""))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let ticket = field(&body, "credential.ticket");
+    store
+        .approve(SUB, &pop::cnf_value(&COORD_SEED), &now_iso())
+        .await
+        .unwrap();
+
+    let one = parts(
+        app.clone()
+            .oneshot(signed(
+                "/v1/enroll-exchange",
+                &ticket,
+                &COORD_SEED,
+                r#","role":"coord-rw""#,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await
+    .1;
+    let two = parts(
+        app.clone()
+            .oneshot(signed(
+                "/v1/enroll-exchange",
+                &ticket,
+                &COORD_SEED,
+                r#","role":"coord-rw""#,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await
+    .1;
+    let cred1 = field(&one, "credential");
+    let cred2 = field(&two, "credential");
+    match (cred1.caveats().last(), cred2.caveats().last()) {
+        (
+            Some(Caveat::ThirdParty { cid: cid1, .. }),
+            Some(Caveat::ThirdParty { cid: cid2, .. }),
+        ) => {
+            assert_eq!(cid1, cid2, "CID must be deterministic across re-mints");
+        }
+        other => panic!("expected ThirdParty tails; got {other:?}"),
+    }
 }
 
 #[tokio::test]

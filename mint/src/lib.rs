@@ -30,6 +30,7 @@ pub mod seal;
 pub mod state;
 pub mod template;
 pub mod tigris;
+pub mod tpc;
 
 pub use caveat::{Caveat, Resolved};
 pub use config::Config;

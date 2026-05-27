@@ -204,7 +204,7 @@ async fn post(
             let resp = reqwest::Client::new()
                 .post(format!("{base}{endpoint}"))
                 .header("authorization", auth)
-                .header("x-mint-coord-pop", sig)
+                .header("x-mint-pop", sig)
                 .header("content-type", "application/json")
                 .body(body)
                 .send()
@@ -239,7 +239,7 @@ async fn post_uds(
         .method(hyper::Method::POST)
         .uri(uri)
         .header("authorization", auth)
-        .header("x-mint-coord-pop", sig)
+        .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Full::new(bytes::Bytes::from(body)))
         .map_err(|e| ClientError::Uds(e.to_string()))?;
