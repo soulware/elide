@@ -5,12 +5,12 @@
 //!
 //! Three operations:
 //!
-//! - [`derive_r`] — `r = BLAKE3-derive-key("elide-mint r-coord v1",
-//!   K_M || coord_ulid || r_epoch)`. Deterministic in its inputs, so
+//! - [`derive_r`] — `r = BLAKE3-derive-key("mint tpc r-key v1",
+//!   K_M || client_id || r_epoch)`. Deterministic in its inputs, so
 //!   mint can re-derive `r` on every exchange call without storing
-//!   per-coord state. Bumping `r_epoch` (in `_mint/approved/<sub>`)
+//!   per-client state. Bumping `r_epoch` (in `_mint/approved/<sub>`)
 //!   rolls `r` to a fresh value, invalidating every existing CID for
-//!   the coord.
+//!   the client.
 //!
 //! - [`encrypt_vid`] — AES-GCM-SIV(T_{n-1}, plaintext = `r`) with
 //!   a fixed all-zero nonce. T_{n-1} is the chain tag at the TPC's
@@ -19,19 +19,19 @@
 //!   what lets the verifier recover `r` from VID alone.
 //!
 //! - [`encrypt_cid`] — AES-GCM-SIV(K_M-A, plaintext =
-//!   `r || lp(coord_ulid) || lp(org_id)`) with the same fixed nonce.
+//!   `r || lp(client_id) || lp(org_id)`) with the same fixed nonce.
 //!   Length-prefix every variable field so two different
-//!   `(coord_ulid, org_id)` pairs can't produce the same plaintext.
-//!   CID is identical across both operator-write credentials for one
-//!   coord because the plaintext is identical — that's the property
-//!   that lets one discharge satisfy both.
+//!   `(client_id, org_id)` pairs can't produce the same plaintext.
+//!   CID is identical across credentials a client carries that share
+//!   `r` — that's the property that lets one discharge satisfy
+//!   several of the client's credentials at once.
 //!
 //! **Nonce reuse safety.** AES-GCM-SIV is misuse-resistant by
 //! construction: nonce reuse with the same key is safe (the
 //! ciphertext+tag are a deterministic function of the plaintext
 //! alone). We exploit that to make CID deterministic — same inputs
-//! yield byte-identical CID, the property that lets the two
-//! operator-write credentials share one CID.
+//! yield byte-identical CID, the property that lets multiple
+//! credentials share one CID.
 
 use aes_gcm_siv::{
     Aes256GcmSiv, Key, Nonce,
@@ -41,22 +41,22 @@ use aes_gcm_siv::{
 use crate::caveat::Caveat;
 
 /// Domain-separation context for `r` derivation. Bumping this string
-/// rotates every coord's `r` cluster-wide; `r_epoch` is the per-coord
+/// rotates every client's `r` cluster-wide; `r_epoch` is the per-client
 /// equivalent.
-const R_KDF_CONTEXT: &str = "elide-mint r-coord v1";
+const R_KDF_CONTEXT: &str = "mint tpc r-key v1";
 
 /// Fixed all-zero nonce. AES-GCM-SIV's misuse-resistance is what makes
 /// this safe — see module docs.
 const FIXED_NONCE: [u8; 12] = [0u8; 12];
 
-/// Per-coord discharge-recovery key. The KDF is keyed by `K_M`
+/// Per-client discharge-recovery key. The KDF is keyed by `K_M`
 /// directly via BLAKE3's `derive_key` (KMAC-shaped, domain-separated
 /// by the context string), so a leaked `r` doesn't reveal `K_M` or
-/// any sibling coord's `r`.
-pub fn derive_r(k_m: &[u8; 32], coord_ulid: &str, r_epoch: u32) -> [u8; 32] {
-    let mut key_material = Vec::with_capacity(32 + coord_ulid.len() + 4);
+/// any sibling client's `r`.
+pub fn derive_r(k_m: &[u8; 32], client_id: &str, r_epoch: u32) -> [u8; 32] {
+    let mut key_material = Vec::with_capacity(32 + client_id.len() + 4);
     key_material.extend_from_slice(k_m);
-    key_material.extend_from_slice(coord_ulid.as_bytes());
+    key_material.extend_from_slice(client_id.as_bytes());
     key_material.extend_from_slice(&r_epoch.to_be_bytes());
     blake3::derive_key(R_KDF_CONTEXT, &key_material)
 }
@@ -68,15 +68,15 @@ pub fn encrypt_vid(t_n_minus_1: &[u8; 32], r: &[u8; 32]) -> Vec<u8> {
     aead_encrypt(t_n_minus_1, r)
 }
 
-/// Encrypt `r ‖ lp(coord_ulid) ‖ lp(org_id)` under `K_M-A` to produce
+/// Encrypt `r ‖ lp(client_id) ‖ lp(org_id)` under `K_M-A` to produce
 /// `CID`. Length-prefixing prevents
-/// `(coord, org) = (("ab","cd"), ("abcd",""))` collisions; `r` is
+/// `(client, org) = (("ab","cd"), ("abcd",""))` collisions; `r` is
 /// fixed-size so doesn't need prefixing.
-pub fn encrypt_cid(k_m_a: &[u8; 32], r: &[u8; 32], coord_ulid: &str, org_id: &str) -> Vec<u8> {
-    let mut plaintext = Vec::with_capacity(32 + 8 + coord_ulid.len() + org_id.len());
+pub fn encrypt_cid(k_m_a: &[u8; 32], r: &[u8; 32], client_id: &str, org_id: &str) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(32 + 8 + client_id.len() + org_id.len());
     plaintext.extend_from_slice(r);
-    plaintext.extend_from_slice(&(coord_ulid.len() as u32).to_be_bytes());
-    plaintext.extend_from_slice(coord_ulid.as_bytes());
+    plaintext.extend_from_slice(&(client_id.len() as u32).to_be_bytes());
+    plaintext.extend_from_slice(client_id.as_bytes());
     plaintext.extend_from_slice(&(org_id.len() as u32).to_be_bytes());
     plaintext.extend_from_slice(org_id.as_bytes());
     aead_encrypt(k_m_a, &plaintext)
@@ -92,14 +92,14 @@ pub fn build_caveat(
     tail: &[u8; 32],
     r: &[u8; 32],
     k_m_a: &[u8; 32],
-    coord_ulid: &str,
+    client_id: &str,
     org_id: &str,
     location: impl Into<String>,
 ) -> Caveat {
     Caveat::ThirdParty {
         location: location.into(),
         vid: encrypt_vid(tail, r),
-        cid: encrypt_cid(k_m_a, r, coord_ulid, org_id),
+        cid: encrypt_cid(k_m_a, r, client_id, org_id),
     }
 }
 
@@ -127,18 +127,18 @@ mod tests {
     }
 
     #[test]
-    fn r_differs_per_coord_and_per_epoch() {
+    fn r_differs_per_client_and_per_epoch() {
         let k_m = [9u8; 32];
         let a = derive_r(&k_m, "01ARZ", 0);
         let b = derive_r(&k_m, "01BXY", 0);
         let c = derive_r(&k_m, "01ARZ", 1);
-        assert_ne!(a, b, "different coord_ulid must produce different r");
+        assert_ne!(a, b, "different client_id must produce different r");
         assert_ne!(a, c, "different r_epoch must produce different r");
     }
 
     #[test]
     fn r_independent_of_unrelated_k_m_bits() {
-        // A leak of one coord's r must not yield a sibling's r.
+        // A leak of one client's r must not yield a sibling's r.
         let k_m = [9u8; 32];
         let mut other_k_m = k_m;
         other_k_m[0] ^= 0x80;
@@ -157,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn cid_changes_per_coord_org_and_r() {
+    fn cid_changes_per_client_org_and_r() {
         let k_m_a = [3u8; 32];
         let r0 = [7u8; 32];
         let r1 = [8u8; 32];
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn cid_plaintext_lengths_prevent_boundary_collision() {
-        // (coord="ab", org="cd") vs (coord="abcd", org="") must not
+        // (client="ab", org="cd") vs (client="abcd", org="") must not
         // collide. Without length prefixing the two concatenations
         // would be identical (both end up `..abcd..`).
         let k_m_a = [3u8; 32];

@@ -127,14 +127,11 @@ fn scalar_is(caveats: &[Caveat], n: &str, expected: &str) -> bool {
     )
 }
 
-/// The detached PoP from `X-Mint-Coord-Pop`, if syntactically present.
+/// The detached PoP from `X-Mint-Pop`, if syntactically present.
 /// A malformed header is a hard `Err` (caller maps to 401); absence is
 /// `Ok(None)` (caller decides whether key-binding is required).
 fn pop_proof(headers: &HeaderMap) -> Result<Option<pop::Proof>, ()> {
-    match headers
-        .get("x-mint-coord-pop")
-        .and_then(|v| v.to_str().ok())
-    {
+    match headers.get("x-mint-pop").and_then(|v| v.to_str().ok()) {
         Some(sig) => pop::Proof::from_b64(sig).map(Some).map_err(|_| ()),
         None => Ok(None),
     }

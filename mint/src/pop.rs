@@ -15,10 +15,10 @@
 //! hash binds it to this exact request (the body the policy renders
 //! from). Freshness is the `ts` field *inside* the body — already
 //! covered by `BLAKE3(body)`, so there is no separate signed term and
-//! no `X-Mint-Coord-Pop-Ts` header; within a ±skew window it bounds
+//! no `X-Mint-Pop-Ts` header; within a ±skew window it bounds
 //! replay (#16: stateless `iat`-skew, no mint-issued nonce — DPoP's
 //! resolved tradeoff; prior art RFC 7800 / RFC 9449). Only the
-//! detached signature stays a header (`X-Mint-Coord-Pop`): it cannot
+//! detached signature stays a header (`X-Mint-Pop`): it cannot
 //! live in the body it signs.
 //!
 //! Resolution of `cnf` goes through the tri-state
@@ -76,11 +76,11 @@ pub enum PopReject {
 /// JSON body field carrying the per-request freshness timestamp (unix
 /// seconds). It rides *in the body* — not a header — so it is already
 /// covered by the PoP signature via `BLAKE3(body)`; no separate signed
-/// term, no `X-Mint-Coord-Pop-Ts` header.
+/// term, no `X-Mint-Pop-Ts` header.
 pub const TS_FIELD: &str = "ts";
 
 /// The request-side proof: just the Ed25519 signature, from the
-/// `X-Mint-Coord-Pop` header. Freshness (`ts`) is a body field, not
+/// `X-Mint-Pop` header. Freshness (`ts`) is a body field, not
 /// part of this struct — it is authenticated transitively by the
 /// signature over the body.
 pub struct Proof {
@@ -88,7 +88,7 @@ pub struct Proof {
 }
 
 impl Proof {
-    /// Parse from `X-Mint-Coord-Pop` (base64 64-byte signature).
+    /// Parse from `X-Mint-Pop` (base64 64-byte signature).
     pub fn from_b64(sig_b64: &str) -> Result<Proof, PopReject> {
         let raw = BASE64
             .decode(sig_b64.trim())
@@ -185,7 +185,7 @@ pub fn validate_cnf(value: &str) -> Result<(), PopReject> {
 }
 
 /// Reference client signature: sign `digest(tail, body)` with the
-/// coordinator key seed, returning the `X-Mint-Coord-Pop` header value.
+/// coordinator key seed, returning the `X-Mint-Pop` header value.
 /// The caller must have already embedded the freshness `ts` field in
 /// `body` (it is covered by the signature via `BLAKE3(body)`). This is
 /// exactly what a coordinator does per `assume-role`; mint never calls it.

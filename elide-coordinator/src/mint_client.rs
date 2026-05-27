@@ -369,7 +369,7 @@ async fn post_tcp(
     let resp = client
         .post(format!("{}{endpoint}", base.trim_end_matches('/')))
         .header("authorization", auth)
-        .header("x-mint-coord-pop", sig)
+        .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(body)
         .send()
@@ -424,7 +424,7 @@ async fn post_uds(
         .method(hyper::Method::POST)
         .uri(uri)
         .header("authorization", auth)
-        .header("x-mint-coord-pop", sig)
+        .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Full::new(bytes::Bytes::from(body)))
         .map_err(|e| io::Error::other(format!("building mint uds request: {e}")))?;

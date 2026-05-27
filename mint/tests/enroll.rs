@@ -132,7 +132,7 @@ fn signed(uri: &str, m: &Macaroon, seed: &[u8; 32], extra: &str) -> Request<Body
         .method("POST")
         .uri(uri)
         .header("authorization", format!("Macaroon {}", m.encode()))
-        .header("x-mint-coord-pop", sig)
+        .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap()

@@ -122,7 +122,7 @@ fn signed_request(m: &Macaroon, inner_fields: &str) -> Request<Body> {
         .method("POST")
         .uri("/v1/assume-role")
         .header("authorization", format!("Macaroon {}", m.encode()))
-        .header("x-mint-coord-pop", sig)
+        .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap()
@@ -212,7 +212,7 @@ async fn pop_over_a_different_body_is_401() {
         .method("POST")
         .uri("/v1/assume-role")
         .header("authorization", format!("Macaroon {}", m.encode()))
-        .header("x-mint-coord-pop", sig)
+        .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Body::from(format!(
             r#"{{"ts":{ts},"role":"volume-ro","ancestors":["EVIL"]}}"#
