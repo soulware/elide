@@ -765,8 +765,19 @@ required_caveats = ["elide:Volume"]
 min_ttl_seconds = 60
 max_ttl_seconds = 604800     # 7 days
 default_ttl_seconds = 86400  # 1 day
+issues_with_tpc = false      # default; no operator-discharge required
 # template: <roles_dir>/volume-ro.json (the default; no policy_file needed)
 ```
+
+A role that requires operator authorisation at `assume-role` sets
+`issues_with_tpc = true`; mint then appends a third-party caveat to
+every credential it mints for that role, pointing at the auth
+service named in mint's `[auth]` block. The TPC mechanism, the
+shared `r` derivation, and the discharge lifecycle are documented
+in [`design-auth-service.md`](design-auth-service.md). From the
+role-config perspective the only knob is this boolean — issuance
+unconditionally appends the TPC when set; verification
+unconditionally requires a discharge for any TPC it walks.
 
 ```jsonc
 // <roles_dir>/volume-ro.json
@@ -1025,7 +1036,9 @@ definition below):
 | Role | `aud` | `exp` | `sub` | `elide:Volume` |
 |---|---|---|---|---|
 | `volume-rw` | ● | ● | ● | ● |
+| `volume-rw-background` | ● | ● | ● | ● |
 | `coord-rw` | ● | ● | ● | |
+| `coord-rw-background` | ● | ● | ● | |
 | `coord-ro` | ● | ● | ● | |
 | `volume-ro` | ● | ● | | ● |
 
@@ -1059,14 +1072,37 @@ Notes:
 
 ## Elide as customer: role inventory
 
-Elide's coordinator authenticates to mint and assumes **four roles**:
+Elide's coordinator authenticates to mint and assumes **six roles**.
+Write authority splits along a second axis — operator-initiated vs
+background — orthogonal to the per-purpose/per-volume scoping. The
+operator-initiated write roles carry a TPC (`issues_with_tpc =
+true`) and require an operator discharge at assume-role time; the
+background variants have identical IAM scope but no TPC, and are
+used only by coord-internal automation (GC, drain, reaper, startup
+reconciliation). See
+[`design-auth-service.md`](design-auth-service.md) for the
+discharge mechanism and
+[`design-auth-model.md`](design-auth-model.md) for the
+operator-initiated vs background distinction.
 
-| Role | Scope | Held by |
-|---|---|---|
-| `coord-ro` | read-only `names/* coordinators/* events/* meta/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
-| `coord-rw` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`) | the non-exposed mutation paths |
-| `volume-rw` | per-volume `by_id/<vol>/*` read+write, plus that volume's `meta/<vol>.{provenance,pub}` (**Split B** — per-volume) | the coordinator, cached per vol_ulid |
-| `volume-ro` | per-volume lineage read, vended to the volume process | the coordinator (assumes), the volume (holds the keypair) |
+| Role | Scope | TPC | Held by |
+|---|---|---|---|
+| `coord-ro` | read-only `names/* coordinators/* events/* meta/*` | no | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
+| `coord-rw` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`) | yes | operator-initiated mutation paths |
+| `coord-rw-background` | identical scope to `coord-rw` | no | background coord work (startup reconciliation, the few non-IPC coord-wide writes) |
+| `volume-rw` | per-volume `by_id/<vol>/*` read+write, plus that volume's `meta/<vol>.{provenance,pub}` (**Split B** — per-volume) | yes | operator-initiated per-volume writes (snapshot publish, fork, force-release) |
+| `volume-rw-background` | identical scope to `volume-rw` | no | background per-volume writes (drain, GC, reaper) |
+| `volume-ro` | per-volume lineage read, vended to the volume process | no | the coordinator (assumes), the volume (holds the keypair) |
+
+The IAM policy template is shared between each operator/background
+pair (`volume-rw` and `volume-rw-background` use the same
+`policy_file`; same for `coord-rw`). The pair differs only in the
+TPC on the issued credential — same chain construction otherwise,
+same `K_coord`, same first-party caveats. This is the
+"distinction is structural at the artefact level" rule from
+[`design-auth-model.md`](design-auth-model.md): a role either
+carries a TPC or it doesn't, and the verifier's chain walk reacts
+to its presence unconditionally.
 
 **Why not the per-purpose split (Split A).** `design-iam-key-model.md`'s
 in-process model fragmented the writer into one role per top-level
@@ -1179,6 +1215,30 @@ GET — latest-pointer (`snapshots/LATEST`,
 bucket-global enumeration is an explicit operator maintenance verb,
 authenticated separately, outside the coordinator runtime
 (`docs/list-elimination-plan.md` § *Reconcile/repair without LIST*).
+
+### `coord-rw-background` and `volume-rw-background`
+
+The background siblings of `coord-rw` and `volume-rw`. Same scope,
+same policy template (each pair shares one `policy_file`), same
+required caveats, same TTL bounds, same chain construction. The
+single difference is `issues_with_tpc = false` — mint mints the
+credential without a TPC, so `assume-role` requires no operator
+discharge.
+
+Held by background coord paths only — startup reconciliation,
+`run_volume_tasks` (drain, GC, reaper), and the few non-IPC
+coord-wide writes. Operator-initiated paths (`inbound/`,
+`claim.rs`, `fork.rs`, `fetch.rs` write half) load the
+TPC-carrying parent instead. The selection is by which credential
+file the codepath opens; mint sees no caller intent and applies no
+heuristic.
+
+Audit log surfaces the split via the role name on every
+`assume-role` call: a mutation under `volume-rw-background` is
+coord-attested; one under `volume-rw` is operator-attested (and
+carries a discharge subject in the same log line). This is the
+mechanism by which "operator-initiated mutations are operator-
+attested" is observable post-hoc.
 
 ### `volume-ro`
 
