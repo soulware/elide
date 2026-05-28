@@ -21,13 +21,12 @@
 //! detached signature stays a header (`X-Mint-Pop`): it cannot
 //! live in the body it signs.
 //!
-//! Resolution of `cnf` goes through the tri-state
-//! [`Resolved`]: `Absent` ⇒ the macaroon is a plain bearer (no PoP
-//! required); `Value` ⇒ PoP **required**; `Unsatisfiable` ⇒ **reject**.
-//! The last is the downgrade defence: a holder can append caveats
-//! with only the trailing MAC, so an appended contradictory `cnf`
-//! must fail closed here, never resolve to "absent" and silently
-//! drop the PoP requirement.
+//! Resolution of `cnf` is enforced uniformly. Only a single sealed
+//! `cnf` whose PoP verifies opens the gate; `Absent` and
+//! `Unsatisfiable` are both rejects. The `Unsatisfiable` arm is the
+//! downgrade defence — a holder can append caveats with only the
+//! trailing MAC, so an appended contradictory `cnf` must fail closed
+//! here.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -44,21 +43,14 @@ const ED25519_PREFIX: &str = "ed25519:";
 /// prototype; a real deployment tunes this against clock skew.
 pub const SKEW_SECONDS: u64 = 60;
 
-/// Outcome of a successful PoP evaluation.
-#[derive(Debug, PartialEq, Eq)]
-pub enum PopOutcome {
-    /// No `cnf` — the macaroon is a plain bearer.
-    NotKeyBound,
-    /// `cnf` present and the request proved possession.
-    Verified,
-}
-
 /// Why a PoP evaluation was refused. The HTTP layer maps **every**
 /// variant to an opaque `401` (don't help an attacker distinguish
 /// causes — `docs/design-mint.md` § *Authentication*); the variant is
 /// for the audit log / tests only.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PopReject {
+    #[error("cnf absent")]
+    NoCnf,
     #[error("contradictory cnf")]
     Unsatisfiable,
     #[error("malformed cnf")]
@@ -142,9 +134,9 @@ pub fn check(
     body: &[u8],
     proof: Option<Proof>,
     now_unix: u64,
-) -> Result<PopOutcome, PopReject> {
+) -> Result<(), PopReject> {
     let key = match EffectiveCaveats::new(caveats).resolve(CNF_CAVEAT) {
-        Resolved::Absent => return Ok(PopOutcome::NotKeyBound),
+        Resolved::Absent => return Err(PopReject::NoCnf),
         Resolved::Unsatisfiable => return Err(PopReject::Unsatisfiable),
         Resolved::Value(k) => parse_cnf(&k)?,
     };
@@ -160,7 +152,7 @@ pub fn check(
     if now_unix.abs_diff(ts) > SKEW_SECONDS {
         return Err(PopReject::Stale);
     }
-    Ok(PopOutcome::Verified)
+    Ok(())
 }
 
 /// The `cnf` caveat value for an Ed25519 seed:
@@ -217,11 +209,11 @@ mod tests {
     const TAIL: [u8; 32] = [9u8; 32];
 
     #[test]
-    fn absent_coordkey_is_bearer() {
+    fn absent_cnf_is_rejected() {
         let cv = vec![Caveat::scalar("Audience", "mint")];
         assert_eq!(
             check(&cv, &TAIL, &body(1000, ""), None, 1000),
-            Ok(PopOutcome::NotKeyBound)
+            Err(PopReject::NoCnf)
         );
     }
 
@@ -231,10 +223,7 @@ mod tests {
         let cv = vec![Caveat::scalar(CNF_CAVEAT, key)];
         let b = body(1000, ",\"role\":\"x\"");
         let p = proof_for(&sk, &TAIL, &b);
-        assert_eq!(
-            check(&cv, &TAIL, &b, Some(p), 1000),
-            Ok(PopOutcome::Verified)
-        );
+        assert_eq!(check(&cv, &TAIL, &b, Some(p), 1000), Ok(()));
     }
 
     #[test]
@@ -319,11 +308,10 @@ mod tests {
     }
 
     #[test]
-    fn contradictory_coordkey_fails_closed_not_bearer() {
-        // The downgrade defence: an appended second, different
-        // cnf must reject — never resolve to Absent and
-        // drop the PoP requirement (which would make a captured
-        // credential a usable bearer).
+    fn contradictory_cnf_fails_closed() {
+        // The downgrade defence: an appended second, different cnf
+        // resolves Unsatisfiable, even though the original would have
+        // verified.
         let (_, key) = signer();
         let cv = vec![
             Caveat::scalar(CNF_CAVEAT, key),

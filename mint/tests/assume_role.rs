@@ -121,7 +121,7 @@ fn signed_request(m: &Macaroon, inner_fields: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/assume-role")
-        .header("authorization", format!("Macaroon {}", m.encode()))
+        .header("authorization", format!("MintV1 {}", m.encode()))
         .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Body::from(body))
@@ -192,7 +192,7 @@ async fn key_bound_without_pop_is_opaque_401() {
     let req = Request::builder()
         .method("POST")
         .uri("/v1/assume-role")
-        .header("authorization", format!("Macaroon {}", m.encode()))
+        .header("authorization", format!("MintV1 {}", m.encode()))
         .header("content-type", "application/json")
         .body(Body::from(r#"{"role":"volume-ro","ancestors":[]}"#))
         .unwrap();
@@ -211,7 +211,7 @@ async fn pop_over_a_different_body_is_401() {
     let req = Request::builder()
         .method("POST")
         .uri("/v1/assume-role")
-        .header("authorization", format!("Macaroon {}", m.encode()))
+        .header("authorization", format!("MintV1 {}", m.encode()))
         .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Body::from(format!(
@@ -230,7 +230,7 @@ async fn contradictory_cnf_fails_closed_not_bearer() {
     let req = Request::builder()
         .method("POST")
         .uri("/v1/assume-role")
-        .header("authorization", format!("Macaroon {}", m.encode()))
+        .header("authorization", format!("MintV1 {}", m.encode()))
         .header("content-type", "application/json")
         .body(Body::from(r#"{"role":"volume-ro","ancestors":[]}"#))
         .unwrap();
@@ -259,8 +259,8 @@ async fn bad_mac_is_opaque_401() {
 
 #[tokio::test]
 async fn missing_required_caveat_is_400() {
-    // op=assume-role + aud + role, a plain bearer (no cnf → PoP not
-    // required), but no elide:Volume → the role gate denies with 400.
+    // A cnf-bound, PoP-signed macaroon passes auth but carries no
+    // elide:Volume → the role gate denies with 400.
     let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let m = mint(
@@ -269,16 +269,11 @@ async fn missing_required_caveat_is_400() {
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::ROLE, "volume-ro"),
+            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
             Caveat::scalar(name::EXP, far_future().to_string()),
         ],
-    )
-    .encode();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/assume-role")
-        .header("authorization", format!("Macaroon {m}"))
-        .body(Body::from(r#"{"role":"volume-ro"}"#))
-        .unwrap();
+    );
+    let req = signed_request(&m, r#""role":"volume-ro""#);
     let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }

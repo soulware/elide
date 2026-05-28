@@ -24,7 +24,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
+// STANDARD base64 carries the PoP signature in `X-Mint-Pop` — mint's
+// `pop::Proof::from_b64` expects it. Macaroon-wire base64 lives on
+// [`WireMacaroon::encode`] / `decode` and uses base64url-no-pad.
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -57,20 +61,16 @@ use elide_coordinator::identity::CoordinatorIdentity;
 
 use crate::credential::{CredentialIssuer, Credentialer, IssuedCredentials};
 
-/// Wire-format magic. v3 added a per-caveat type byte to the
-/// serialised chain step so third-party caveats (carrying
-/// `(location, VID, CID)`) can ride alongside first-party scalar
-/// caveats (`mint/src/macaroon.rs`). The coordinator preserves
-/// third-party caveats opaquely through decode → attenuate → encode;
-/// it only ever appends first-party narrowing caveats, never TPCs
-/// (only mint at issuance constructs those).
-const MAGIC: &[u8; 5] = b"mcrn3";
+/// Wire prefix for a base64url-encoded mint macaroon — must match
+/// `mint::macaroon::WIRE_PREFIX`. `mnt1` = mint macaroon, wire
+/// generation 1.
+const WIRE_PREFIX: &str = "mnt1_";
 const NONCE_LEN: usize = 16;
 
-/// Per-step type tag in the wire format. Must match
-/// `mint/src/macaroon.rs`.
-const TYPE_FIRST_PARTY: u8 = 0;
-const TYPE_THIRD_PARTY: u8 = 1;
+/// Per-step type tag in the canonical MsgPack encoding (first element
+/// of every caveat array). Must match `mint/src/macaroon.rs`.
+const TYPE_FIRST_PARTY: u64 = 0;
+const TYPE_THIRD_PARTY: u64 = 1;
 
 /// Canonical mint role inventory — the single source of truth shared by
 /// the enrollment fan-out (`crate::enroll`), the `[mint]` startup gate,
@@ -123,35 +123,29 @@ enum Caveat {
     },
 }
 
-/// Canonical per-caveat encoding fed into the MAC chain; the same
-/// bytes appear on the wire so a decoded macaroon re-MACs identically
-/// (`mint/src/macaroon.rs`).
+/// Canonical per-caveat MsgPack encoding — first-party: `[0, name,
+/// value]`; third-party: `[1, location, vid, cid]`. The same bytes
+/// appear in the wire envelope and as the BLAKE3-keyed-hash input to
+/// each chain step, so a decoded macaroon re-MACs identically. Must
+/// match `mint/src/macaroon.rs::serialize_one`.
 fn serialize_one(c: &Caveat) -> Vec<u8> {
+    let mut out = Vec::new();
     match c {
         Caveat::FirstParty { name, value } => {
-            let n = name.as_bytes();
-            let v = value.as_bytes();
-            let mut out = Vec::with_capacity(1 + 8 + n.len() + v.len());
-            out.push(TYPE_FIRST_PARTY);
-            out.extend_from_slice(&(n.len() as u32).to_be_bytes());
-            out.extend_from_slice(n);
-            out.extend_from_slice(&(v.len() as u32).to_be_bytes());
-            out.extend_from_slice(v);
-            out
+            rmp::encode::write_array_len(&mut out, 3).expect("vec writer");
+            rmp::encode::write_uint(&mut out, TYPE_FIRST_PARTY).expect("vec writer");
+            rmp::encode::write_str(&mut out, name).expect("vec writer");
+            rmp::encode::write_str(&mut out, value).expect("vec writer");
         }
         Caveat::ThirdParty { location, vid, cid } => {
-            let loc = location.as_bytes();
-            let mut out = Vec::with_capacity(1 + 12 + loc.len() + vid.len() + cid.len());
-            out.push(TYPE_THIRD_PARTY);
-            out.extend_from_slice(&(loc.len() as u32).to_be_bytes());
-            out.extend_from_slice(loc);
-            out.extend_from_slice(&(vid.len() as u32).to_be_bytes());
-            out.extend_from_slice(vid);
-            out.extend_from_slice(&(cid.len() as u32).to_be_bytes());
-            out.extend_from_slice(cid);
-            out
+            rmp::encode::write_array_len(&mut out, 4).expect("vec writer");
+            rmp::encode::write_uint(&mut out, TYPE_THIRD_PARTY).expect("vec writer");
+            rmp::encode::write_str(&mut out, location).expect("vec writer");
+            rmp::encode::write_bin(&mut out, vid).expect("vec writer");
+            rmp::encode::write_bin(&mut out, cid).expect("vec writer");
         }
     }
+    out
 }
 
 /// Build the first-party caveat shape, the only kind the coordinator
@@ -178,44 +172,34 @@ pub(crate) struct WireMacaroon {
 
 impl WireMacaroon {
     pub(crate) fn decode(s: &str) -> io::Result<Self> {
-        let buf = BASE64
-            .decode(s.trim())
-            .map_err(|_| io::Error::other("credential macaroon: base64 decode failed"))?;
-        let mut pos = 0usize;
-        let mut take = |n: usize| -> io::Result<&[u8]> {
-            let end = pos
-                .checked_add(n)
-                .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
-            let slice = buf
-                .get(pos..end)
-                .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
-            pos = end;
-            Ok(slice)
-        };
-        if take(MAGIC.len())? != MAGIC {
-            return Err(io::Error::other("credential macaroon: bad magic"));
+        let body = s
+            .trim()
+            .strip_prefix(WIRE_PREFIX)
+            .ok_or_else(|| io::Error::other("credential macaroon: missing mnt1_ prefix"))?;
+        let buf = BASE64_URL
+            .decode(body)
+            .map_err(|_| io::Error::other("credential macaroon: base64url decode failed"))?;
+        let mut r: &[u8] = &buf;
+
+        let env_len = rmp::decode::read_array_len(&mut r)
+            .map_err(|_| io::Error::other("credential macaroon: truncated"))?;
+        if env_len != 4 {
+            return Err(io::Error::other("credential macaroon: envelope shape"));
         }
-        let kid = u16::from_be_bytes(
-            take(2)?
-                .try_into()
-                .map_err(|_| io::Error::other("credential macaroon: truncated"))?,
-        );
-        let nonce: [u8; NONCE_LEN] = take(NONCE_LEN)?
-            .try_into()
+        let kid_u64: u64 = rmp::decode::read_int(&mut r)
             .map_err(|_| io::Error::other("credential macaroon: truncated"))?;
-        let mac: [u8; 32] = take(32)?
+        let kid: u16 = kid_u64
             .try_into()
+            .map_err(|_| io::Error::other("credential macaroon: kid overflow"))?;
+        let nonce = read_bin_fixed::<NONCE_LEN>(&mut r)?;
+        let mac = read_bin_fixed::<32>(&mut r)?;
+        let count = rmp::decode::read_array_len(&mut r)
             .map_err(|_| io::Error::other("credential macaroon: truncated"))?;
-        let count = u16::from_be_bytes(
-            take(2)?
-                .try_into()
-                .map_err(|_| io::Error::other("credential macaroon: truncated"))?,
-        );
         let mut caveats = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            caveats.push(read_caveat(&buf, &mut pos)?);
+            caveats.push(decode_caveat(&mut r)?);
         }
-        if pos != buf.len() {
+        if !r.is_empty() {
             return Err(io::Error::other("credential macaroon: trailing bytes"));
         }
         Ok(Self {
@@ -245,58 +229,78 @@ impl WireMacaroon {
 
     pub(crate) fn encode(&self) -> String {
         let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&self.kid.to_be_bytes());
-        buf.extend_from_slice(&self.nonce);
-        buf.extend_from_slice(&self.mac);
-        buf.extend_from_slice(&(self.caveats.len() as u16).to_be_bytes());
+        rmp::encode::write_array_len(&mut buf, 4).expect("vec writer");
+        rmp::encode::write_uint(&mut buf, self.kid as u64).expect("vec writer");
+        rmp::encode::write_bin(&mut buf, &self.nonce).expect("vec writer");
+        rmp::encode::write_bin(&mut buf, &self.mac).expect("vec writer");
+        let count: u32 = self
+            .caveats
+            .len()
+            .try_into()
+            .expect("caveat count fits u32");
+        rmp::encode::write_array_len(&mut buf, count).expect("vec writer");
         for c in &self.caveats {
             buf.extend_from_slice(&serialize_one(c));
         }
-        BASE64.encode(buf)
+        let mut out = String::with_capacity(WIRE_PREFIX.len() + (buf.len() * 4 / 3 + 4));
+        out.push_str(WIRE_PREFIX);
+        BASE64_URL.encode_string(&buf, &mut out);
+        out
     }
 }
 
-fn read_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> io::Result<&'a [u8]> {
-    let lead = pos
-        .checked_add(4)
+fn read_bin_fixed<const N: usize>(r: &mut &[u8]) -> io::Result<[u8; N]> {
+    let len = rmp::decode::read_bin_len(r)
+        .map_err(|_| io::Error::other("credential macaroon: truncated"))? as usize;
+    if len != N {
+        return Err(io::Error::other("credential macaroon: bin length"));
+    }
+    let (head, tail) = r
+        .split_at_checked(N)
         .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
-    let len_bytes: [u8; 4] = buf
-        .get(*pos..lead)
-        .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?
+    let arr: [u8; N] = head
         .try_into()
         .map_err(|_| io::Error::other("credential macaroon: truncated"))?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    let end = lead
-        .checked_add(len)
-        .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
-    let out = buf
-        .get(lead..end)
-        .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
-    *pos = end;
-    Ok(out)
+    *r = tail;
+    Ok(arr)
 }
 
-fn read_string(buf: &[u8], pos: &mut usize) -> io::Result<String> {
-    String::from_utf8(read_bytes(buf, pos)?.to_vec())
+fn read_str_owned(r: &mut &[u8]) -> io::Result<String> {
+    let len = rmp::decode::read_str_len(r)
+        .map_err(|_| io::Error::other("credential macaroon: truncated"))? as usize;
+    let (head, tail) = r
+        .split_at_checked(len)
+        .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
+    *r = tail;
+    String::from_utf8(head.to_vec())
         .map_err(|_| io::Error::other("credential macaroon: caveat not utf-8"))
 }
 
-fn read_caveat(buf: &[u8], pos: &mut usize) -> io::Result<Caveat> {
-    let tag = *buf
-        .get(*pos)
+fn read_bin_owned(r: &mut &[u8]) -> io::Result<Vec<u8>> {
+    let len = rmp::decode::read_bin_len(r)
+        .map_err(|_| io::Error::other("credential macaroon: truncated"))? as usize;
+    let (head, tail) = r
+        .split_at_checked(len)
         .ok_or_else(|| io::Error::other("credential macaroon: truncated"))?;
-    *pos += 1;
-    match tag {
-        TYPE_FIRST_PARTY => {
-            let name = read_string(buf, pos)?;
-            let value = read_string(buf, pos)?;
+    *r = tail;
+    Ok(head.to_vec())
+}
+
+fn decode_caveat(r: &mut &[u8]) -> io::Result<Caveat> {
+    let arr_len = rmp::decode::read_array_len(r)
+        .map_err(|_| io::Error::other("credential macaroon: truncated"))?;
+    let tag: u64 =
+        rmp::decode::read_int(r).map_err(|_| io::Error::other("credential macaroon: truncated"))?;
+    match (tag, arr_len) {
+        (0, 3) => {
+            let name = read_str_owned(r)?;
+            let value = read_str_owned(r)?;
             Ok(Caveat::FirstParty { name, value })
         }
-        TYPE_THIRD_PARTY => {
-            let location = read_string(buf, pos)?;
-            let vid = read_bytes(buf, pos)?.to_vec();
-            let cid = read_bytes(buf, pos)?.to_vec();
+        (1, 4) => {
+            let location = read_str_owned(r)?;
+            let vid = read_bin_owned(r)?;
+            let cid = read_bin_owned(r)?;
             Ok(Caveat::ThirdParty { location, vid, cid })
         }
         _ => Err(io::Error::other(
@@ -558,7 +562,7 @@ impl MintEndpoint {
             let body = serde_json::Value::Object(obj).to_string();
 
             let sig = BASE64.encode(self.identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
-            let auth = format!("Macaroon {}", mac.encode());
+            let auth = format!("MintV1 {}", mac.encode());
 
             let (status, text, retry_after) = post(
                 &self.url,
@@ -755,8 +759,8 @@ mod tests {
     /// Build a wire macaroon the way `mint/src/macaroon.rs` does, so
     /// the coordinator's decode/attenuate/encode is checked against the
     /// real construction without depending on the mint crate. Mirrors
-    /// the v3 wire format: per-caveat type byte + length-prefixed
-    /// fields, kid bound into the MAC seed.
+    /// the v4 wire format: canonical MsgPack envelope, base64url-no-pad
+    /// encoded, `mnt1_` prefix.
     fn mint_like(
         root: &[u8; 32],
         kid: u16,
@@ -764,7 +768,7 @@ mod tests {
         caveats: &[(&str, &str)],
     ) -> String {
         let cs: Vec<Caveat> = caveats.iter().map(|(n, v)| first_party(*n, *v)).collect();
-        const DOMAIN: &[u8] = b"mint-macaroon-v3";
+        const DOMAIN: &[u8] = b"mint-macaroon-v4";
         let mut seed_msg = Vec::new();
         seed_msg.extend_from_slice(DOMAIN);
         seed_msg.extend_from_slice(&kid.to_be_bytes());
@@ -774,15 +778,15 @@ mod tests {
             key = *blake3::keyed_hash(&key, &serialize_one(c)).as_bytes();
         }
         let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&kid.to_be_bytes());
-        buf.extend_from_slice(&nonce);
-        buf.extend_from_slice(&key);
-        buf.extend_from_slice(&(cs.len() as u16).to_be_bytes());
+        rmp::encode::write_array_len(&mut buf, 4).unwrap();
+        rmp::encode::write_uint(&mut buf, kid as u64).unwrap();
+        rmp::encode::write_bin(&mut buf, &nonce).unwrap();
+        rmp::encode::write_bin(&mut buf, &key).unwrap();
+        rmp::encode::write_array_len(&mut buf, cs.len() as u32).unwrap();
         for c in &cs {
             buf.extend_from_slice(&serialize_one(c));
         }
-        BASE64.encode(buf)
+        format!("{WIRE_PREFIX}{}", BASE64_URL.encode(buf))
     }
 
     #[test]

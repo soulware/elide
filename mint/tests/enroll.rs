@@ -131,7 +131,7 @@ fn signed(uri: &str, m: &Macaroon, seed: &[u8; 32], extra: &str) -> Request<Body
     Request::builder()
         .method("POST")
         .uri(uri)
-        .header("authorization", format!("Macaroon {}", m.encode()))
+        .header("authorization", format!("MintV1 {}", m.encode()))
         .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Body::from(body))
@@ -530,13 +530,13 @@ async fn bearer_invite_without_cnf_is_opaque_401() {
     let (app, _a, store, _dir) = app().await;
     let nonce = store.current_invite().await.unwrap();
     // sub but no cnf, and no PoP header: a captured invite copy must
-    // not enrol. NotKeyBound is a refusal here.
+    // not enrol.
     let cb = mint_invite(&Keyring::single(ROOT), "mint", &nonce)
         .attenuate(Caveat::scalar(name::SUB, SUB));
     let req = Request::builder()
         .method("POST")
         .uri("/v1/enroll")
-        .header("authorization", format!("Macaroon {}", cb.encode()))
+        .header("authorization", format!("MintV1 {}", cb.encode()))
         .header("content-type", "application/json")
         .body(Body::from(format!(r#"{{"ts":{}}}"#, now())))
         .unwrap();

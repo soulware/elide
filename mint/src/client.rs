@@ -197,7 +197,7 @@ async fn post(
     body: String,
 ) -> Result<(u16, String), ClientError> {
     let sig = pop::client_signature(seed, mac.tail(), body.as_bytes());
-    let auth = format!("Macaroon {}", mac.encode());
+    let auth = format!("MintV1 {}", mac.encode());
     match parse_target(base_url) {
         Target::Tcp(base) => {
             let resp = reqwest::Client::new()

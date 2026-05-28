@@ -107,7 +107,7 @@ async fn enroll_request(
 
     let body = format!(r#"{{"ts":{}}}"#, now_unix()?);
     let sig = BASE64.encode(identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
-    let auth = format!("Macaroon {}", mac.encode());
+    let auth = format!("MintV1 {}", mac.encode());
 
     let (status, text, _retry_after) = post(
         &cfg.url,
@@ -150,7 +150,7 @@ async fn exchange_request(
         serde_json::Value::from(role)
     );
     let sig = BASE64.encode(identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
-    let auth = format!("Macaroon {}", mac.encode());
+    let auth = format!("MintV1 {}", mac.encode());
 
     let (status, text, _retry_after) = post(
         &cfg.url,
@@ -337,34 +337,33 @@ mod tests {
 
     #[test]
     fn resolve_invite_distinguishes_inline_file_and_garbage() {
-        // A real wire macaroon, built the way mint mints one. v3
-        // format: kid prefix + per-caveat type byte (`0`=first-party)
-        // bound into both the MAC seed and the wire
-        // (`mint/src/macaroon.rs::chain_mac`).
+        // A real wire macaroon, built the way mint mints one. v4
+        // format: canonical-MsgPack envelope, base64url-no-pad, mnt1_
+        // prefix (`mint/src/macaroon.rs`).
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
         let nonce = [5u8; 16];
         let root = [2u8; 32];
         let kid: u16 = 0;
-        const DOMAIN: &[u8] = b"mint-macaroon-v3";
+        const DOMAIN: &[u8] = b"mint-macaroon-v4";
         let mut seed = Vec::new();
         seed.extend_from_slice(DOMAIN);
         seed.extend_from_slice(&kid.to_be_bytes());
         seed.extend_from_slice(&nonce);
         let mut key = *blake3::keyed_hash(&root, &seed).as_bytes();
         let mut ser = Vec::new();
-        ser.push(0u8); // type tag: first-party
-        ser.extend_from_slice(&(3u32).to_be_bytes());
-        ser.extend_from_slice(b"aud");
-        ser.extend_from_slice(&(4u32).to_be_bytes());
-        ser.extend_from_slice(b"mint");
+        rmp::encode::write_array_len(&mut ser, 3).unwrap();
+        rmp::encode::write_uint(&mut ser, 0).unwrap();
+        rmp::encode::write_str(&mut ser, "aud").unwrap();
+        rmp::encode::write_str(&mut ser, "mint").unwrap();
         key = *blake3::keyed_hash(&key, &ser).as_bytes();
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"mcrn3");
-        buf.extend_from_slice(&kid.to_be_bytes());
-        buf.extend_from_slice(&nonce);
-        buf.extend_from_slice(&key);
-        buf.extend_from_slice(&(1u16).to_be_bytes());
+        rmp::encode::write_array_len(&mut buf, 4).unwrap();
+        rmp::encode::write_uint(&mut buf, kid as u64).unwrap();
+        rmp::encode::write_bin(&mut buf, &nonce).unwrap();
+        rmp::encode::write_bin(&mut buf, &key).unwrap();
+        rmp::encode::write_array_len(&mut buf, 1).unwrap();
         buf.extend_from_slice(&ser);
-        let inline = BASE64.encode(buf);
+        let inline = format!("mnt1_{}", B64URL.encode(buf));
 
         assert_eq!(resolve_invite(&inline).expect("inline"), inline);
 

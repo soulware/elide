@@ -590,12 +590,25 @@ above); each is minted once, at the enrollment exchange for its role.
 
 ## Protocol
 
+Four endpoints. `/v1/assume-role` and `/v1/verify` share a single
+**verify+clear** core: walk the primary's chain MAC, recursively verify
+discharges by recovering `r` from each TPC's `VID` to fixpoint, then
+clear the standard first-party caveats (`aud`, `op=assume-role`,
+`cnf`+PoP, `exp`/per-forward `NotAfter`). `/v1/verify` returns the
+cleared bundle's caveats and minimum `NotAfter` so the caller can
+cache the verdict. `/v1/assume-role` runs the same verify+clear and
+then **assumes the role** — clears the role-specific narrowing caveats
+(`elide:Volume`, ancestors), renders the role policy, mints a Tigris
+keypair. `/v1/enroll` and `/v1/enroll-exchange` are the one-time
+bootstrap that exchanges a coord's self-asserted invite attenuation
+for a mint-issued role credential.
+
 ### `assume-role`
 
 ```
 POST /v1/assume-role
 Host: <mint-instance>
-Authorization: Macaroon <base64-encoded macaroon>
+Authorization: MintV1 mnt1_<b64url-primary>[,mnt1_<b64url-discharge>...]
 X-Mint-Coord-Pop: <base64 Ed25519 signature>
 Content-Type: application/json
 
@@ -620,6 +633,42 @@ Content-Type: application/json
 }
 ```
 
+### `verify`
+
+```
+POST /v1/verify
+Host: <mint-instance>
+Authorization: MintV1 mnt1_<b64url-primary>[,mnt1_<b64url-discharge>...]
+X-Mint-Coord-Pop: <base64 Ed25519 signature>
+Content-Type: application/json
+
+{
+  "ts": 1747000000
+}
+```
+
+Response:
+
+```
+200 OK
+Content-Type: application/json
+
+{
+  "valid": true,
+  "expires_at": 1747000600,
+  "caveats": [{"name": "aud", "value": "mint"}, ...]
+}
+```
+
+The bundle is the same shape coord would forward to `/v1/assume-role`
+— same primary, same discharges, same per-forward `NotAfter`
+attenuation on the primary. The two endpoints share the verify+clear
+core described above. The `op` caveat at both is `assume-role`: `op`
+names the authority a token carries, not the protocol verb. The
+caller queries authority validity at `/v1/verify`, exercises it at
+`/v1/assume-role`; mint clears the same caveats on the same bundle in
+both cases.
+
 ### Enrollment endpoints
 
 ```
@@ -631,7 +680,7 @@ POST /v1/enroll-exchange     # credential ticket + PoP + discharge bundle
                              # → 200 credential macaroon (base64), role-stamped
 ```
 
-Both carry the macaroon in `Authorization: Macaroon <base64>` and the
+Both carry the macaroon in `Authorization: MintV1 mnt1_<b64url>` and the
 PoP in `X-Mint-Coord-Pop` exactly as `assume-role`. The `/v1/enroll`
 body is the PoP freshness `ts` only; the `/v1/enroll-exchange` body is
 `{ts, role}` — the requested role rides the PoP-signed body (so it is
@@ -649,28 +698,29 @@ same opaque `401` as `assume-role` on any failure (including a role this
 
 ### Authentication
 
-Authentication is identical across all three `op`s — `enroll`,
-`enroll-exchange`, `assume-role`. The `Authorization` header carries the
-presented macaroon, base64-encoded — the coordinator-attenuated
-invite at `/v1/enroll`, the credential ticket at `/v1/enroll-exchange`,
-the attenuated credential at `/v1/assume-role`; any discharge macaroons for
-third-party caveats accompany it (bundle wire format per *Open
-questions* #15; discharges apply to the credential ticket and credential, never
-the invite). The mint verifies the presented macaroon's chain MAC
+Authentication is identical at every endpoint that accepts a macaroon.
+The `Authorization` header carries the presented macaroon,
+base64-encoded — the coordinator-attenuated invite at `/v1/enroll`, the
+credential ticket at `/v1/enroll-exchange`, the attenuated credential
+at `/v1/assume-role` and `/v1/verify`; any discharge macaroons for
+third-party caveats accompany it in the request body (bundle wire
+format per *Open questions* #15; discharges apply to the credential
+ticket and credential, never the invite). The mint verifies the presented macaroon's chain MAC
 against its own macaroon root, and each discharge against the relevant
 third-party key (see `design-auth-model.md` for the construction).
 
 The request also carries the proof-of-possession the macaroon's
 `cnf` caveat requires: `X-Mint-Coord-Pop` is the base64
 Ed25519 signature, by `coordinator.key`, over `BLAKE3(macaroon-tail ‖
-BLAKE3(request-body))`. Every Elide-path token is key-bound — the
-coordinator appends `cnf` when it attenuates the invite,
-and mint carries it through the credential ticket and credential — so PoP is
-required on all three operations. The body it covers differs by
-operation: at `/v1/enroll` it is just the freshness `ts`; at
-`/v1/enroll-exchange` it is `{ts, role}` (the requested role is
-authenticated by the same signature); at `/v1/assume-role` it is the
-full exercise body (§ *Request body*). The freshness timestamp is **not** a header — it is a
+BLAKE3(request-body))`. Every macaroon at these endpoints carries `cnf` — the
+coordinator appends it when attenuating the invite, mint carries it
+through the credential ticket and credential — and PoP is required on
+all four endpoints. The body it covers differs by endpoint: at
+`/v1/enroll` it is just the freshness `ts`; at `/v1/enroll-exchange`
+it is `{ts, role}` (the requested role is authenticated by the same
+signature); at `/v1/verify` it is `{ts, discharges}` (the discharge
+bundle is authenticated by the same signature); at `/v1/assume-role`
+it is the full exercise body (§ *Request body*). The freshness timestamp is **not** a header — it is a
 `ts` field (unix seconds) *inside the body*, already covered by
 `BLAKE3(request-body)`, so it needs no separate signed term. Only the
 detached signature is a header (it cannot live in the body it signs).
@@ -680,15 +730,13 @@ itself a footgun) and the presented macaroon's tail, verifies the
 signature against the sealed `cnf`, and **then** reads `ts`
 from the now-authenticated body and rejects it if outside the skew
 window. Only after the signature verifies does any `request.*` body
-field — `ts` included — become a trusted input. A macaroon that carries
-no `cnf` is a plain bearer and no PoP is required: this
-applies only to a non-Elide caller at `/v1/assume-role`; the Elide
-enrollment path always seals one, so `enroll`/`enroll-exchange` are
-never bearer.
+field — `ts` included — become a trusted input. `cnf` is mandatory at
+every endpoint that accepts a macaroon: absent, contradictory, or
+malformed `cnf` — and any other PoP failure — resolves as `401`.
 
 If verification fails — bad MAC, unknown root, malformed encoding,
 wrong/absent `op` for the endpoint, stale `invite`,
-missing or bad PoP when `cnf` is present — the mint returns
+missing or bad PoP — the mint returns
 `401 Unauthorized` with no further detail (don't help an attacker
 distinguish "wrong key" from "tampered caveats" from "bad PoP"). The
 sole non-`401` authorization outcome is `/v1/enroll-exchange` returning
@@ -710,10 +758,10 @@ namespace; a role's policy template is the only thing that decides which
 fields matter, by referencing them (strict mode — a template referencing
 an absent `request.X` fails closed). Conventional fields:
 
-- `ts` (required when the macaroon is key-bound): the PoP freshness
-  timestamp, unix seconds. Carried here, not in a header, so it is
-  covered by the signature over the body; mint rejects it outside the
-  ±skew window. Absent/garbled on a key-bound request ⇒ `401`.
+- `ts` (required): the PoP freshness timestamp, unix seconds. Carried
+  here, not in a header, so it is covered by the signature over the
+  body; mint rejects it outside the ±skew window. Absent/garbled ⇒
+  `401`.
 - `role` (required, asserting): the caller's **independently-stated
   intent** — the role this subsystem believes it is exercising, sourced
   from its own config, **not** echoed from the loaded credential. Mint
@@ -935,12 +983,15 @@ Borrowed (RFC 7519 / RFC 7800):
 
 Coined (mint-specific; no registered equivalent):
 
-- **`op`** (string, scalar). Partitions a token to one mint operation:
-  `enroll`, `enroll-exchange`, or `assume-role`. Mint stamps it at every
-  point it mints (invite, credential ticket, credential) and each endpoint
-  **positively requires** its own value — no endpoint tests for absence.
-  Immutable by construction: a coordinator can only append, and a
-  contradictory copy is unsatisfiable.
+- **`op`** (string, scalar). Names the authority a token carries:
+  `enroll`, `enroll-exchange`, or `assume-role`. Mint stamps it at
+  every point it mints (invite, credential ticket, credential). Each
+  endpoint **positively requires** the value it accepts: `/v1/enroll`
+  ⇒ `enroll`, `/v1/enroll-exchange` ⇒ `enroll-exchange`,
+  `/v1/assume-role` and `/v1/verify` ⇒ `assume-role` (verify queries
+  the same authority assume-role exercises). No endpoint tests for
+  absence. Immutable by construction: a coordinator can only append,
+  and a contradictory copy is unsatisfiable.
 - **`role`** (string, scalar). The single role this credential may
   assume — **always present** on a credential. Mint stamps it into the
   root chain at the enrollment exchange (§ *Enrollment* (3)) — the

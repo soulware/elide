@@ -41,6 +41,7 @@ object_store         = { version = "0.11", features = ["aws"] }
 quick-xml            = "0.38"
 rand_core            = { version = "0.6", features = ["getrandom"] }
 reqwest              = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
+rmp                  = "0.8"
 serde                = { version = "1", features = ["derive"] }
 serde_json           = "1"
 subtle               = "2"
