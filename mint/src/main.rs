@@ -496,7 +496,11 @@ async fn serve(
         audit: Arc::new(AuditLog::new(Box::new(std::io::stdout()))),
         store,
     };
-    let app = mint::admin::mount(router(state.clone()), state);
+    let demo_auth = state.config.auth.as_ref().is_some_and(|a| a.demo_enabled);
+    let mut app = mint::admin::mount(router(state.clone()), state.clone());
+    if demo_auth {
+        app = mint::auth::mount(app, state);
+    }
     match transport {
         Listener::Tcp(addr) => {
             let listener = tokio::net::TcpListener::bind(addr).await?;

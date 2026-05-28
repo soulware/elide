@@ -15,6 +15,7 @@
 
 pub mod admin;
 pub mod audit;
+pub mod auth;
 pub mod caveat;
 pub mod client;
 pub mod config;
