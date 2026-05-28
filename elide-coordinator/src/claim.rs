@@ -1053,12 +1053,17 @@ async fn resolve_handoff_key_via_recovery(
 ///
 /// Each iteration:
 ///   1. Read the current effective fork's signed `volume.provenance` to find
-///      its `parent` ref.
+///      its `parent` ref (if any).
 ///   2. Fetch and verify its handoff manifest from S3.
-///   3. If `max(segment_ulids) < parent.snapshot_ulid`, the fork produced no
-///      writes of its own (every segment is inherited) — advance to its
-///      parent and loop.
-///   4. Otherwise, stop.
+///   3. Decide emptiness:
+///      * Non-root: empty if `max(segment_ulids) < parent.snapshot_ulid` —
+///        every segment was inherited from the parent.
+///      * Root: empty if `segment_ulids` is empty — the fork has no content
+///        and no ancestor to fall back to.
+///   4. If non-root and empty, advance to the parent and loop. If non-root
+///      and non-empty, return this fork. If root and non-empty, return this
+///      fork. If root and empty, error: the entire chain is empty, so pinning
+///      a new fork here would produce a volume that can never serve a read.
 ///
 /// On loop advance, also pulls the parent's directory locally if not already
 /// present — chain-pull in stage 3 stops at the first existing dir, but the
@@ -1102,20 +1107,6 @@ pub(crate) async fn skip_empty_intermediates_impl(
                 .map_err(|e| {
                     IpcError::internal(format!("reading provenance for {effective_vol}: {e}"))
                 })?;
-        let Some(parent) = lineage.parent else {
-            // Root volume — nothing to skip to.
-            break;
-        };
-        let parent_vol_ulid = Ulid::from_string(&parent.volume_ulid).map_err(|e| {
-            IpcError::internal(format!(
-                "malformed parent volume_ulid in {effective_vol}: {e}"
-            ))
-        })?;
-        let parent_snap_ulid = Ulid::from_string(&parent.snapshot_ulid).map_err(|e| {
-            IpcError::internal(format!(
-                "malformed parent snapshot_ulid in {effective_vol}: {e}"
-            ))
-        })?;
 
         // Verify and read this fork's handoff manifest. The fallback pubkey
         // for a non-recovery manifest is the fork's own `volume.pub` on disk;
@@ -1139,6 +1130,32 @@ pub(crate) async fn skip_empty_intermediates_impl(
         .map_err(|e| {
             IpcError::internal(format!(
                 "fetching handoff manifest {effective_vol}/{effective_snap}: {e}"
+            ))
+        })?;
+
+        let Some(parent) = lineage.parent else {
+            // Root volume. The function's contract is "deepest non-empty
+            // ancestor", so a root with zero segments is a contract
+            // violation — pinning a new fork here would yield a volume
+            // whose every read demand-fetches NotFound.
+            if manifest.segment_ulids.is_empty() {
+                return Err(IpcError::conflict(format!(
+                    "empty ancestor chain: claim source walked to root \
+                     {effective_vol}/{effective_snap} with no segments; \
+                     cannot pin a new fork to a chain with no data"
+                )));
+            }
+            break;
+        };
+
+        let parent_vol_ulid = Ulid::from_string(&parent.volume_ulid).map_err(|e| {
+            IpcError::internal(format!(
+                "malformed parent volume_ulid in {effective_vol}: {e}"
+            ))
+        })?;
+        let parent_snap_ulid = Ulid::from_string(&parent.snapshot_ulid).map_err(|e| {
+            IpcError::internal(format!(
+                "malformed parent snapshot_ulid in {effective_vol}: {e}"
             ))
         })?;
 
@@ -1422,18 +1439,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_fork_with_no_parent_is_not_skipped() {
-        // Released name points at a root volume (no parent). Even if its
-        // handoff manifest is empty, there's nothing to skip to.
+    async fn root_fork_with_segments_is_returned() {
+        // Released name points at a non-empty root (no parent). Returns
+        // the root as-is — no ancestor to skip to, contract satisfied.
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         let mut mint = UlidMint::new(Ulid::nil());
+        let seg_a = mint.next();
         let r_snap = mint.next();
         let r = build_fork(data_dir, mint.next(), r_snap, None);
-        // Empty manifest — but no parent to redirect to.
-        upload_handoff_manifest(&store, &r, &[]).await;
+        upload_handoff_manifest(&store, &r, &[seg_a]).await;
 
         let job = ClaimJob::new();
         let stores = passthrough(store);
@@ -1452,6 +1469,95 @@ mod tests {
         .unwrap();
         assert_eq!(vol, r.vol);
         assert_eq!(snap, r.snap);
+    }
+
+    #[tokio::test]
+    async fn empty_root_with_no_parent_errors() {
+        // Released name points at a root volume that has no segments and
+        // no parent — pinning a new fork here would produce a volume
+        // whose every read demand-fetches NotFound. The contract is
+        // "non-empty ancestor", so this is rejected at the claim layer.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut mint = UlidMint::new(Ulid::nil());
+        let r_snap = mint.next();
+        let r = build_fork(data_dir, mint.next(), r_snap, None);
+        upload_handoff_manifest(&store, &r, &[]).await;
+
+        let job = ClaimJob::new();
+        let stores = passthrough(store);
+        let err = skip_empty_intermediates_impl(
+            &job,
+            "vol",
+            r.vol,
+            r.snap,
+            None,
+            data_dir,
+            &stores,
+            None,
+            &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
+        )
+        .await
+        .expect_err("empty root violates the non-empty-ancestor contract");
+        assert_eq!(err.kind, elide_core::ipc::IpcErrorKind::Conflict);
+        assert!(
+            err.message.contains("empty ancestor chain"),
+            "error should name the empty-chain condition: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_of_empties_to_empty_root_errors() {
+        // R(empty) → F1(empty) → F2(empty, released). The walk skips
+        // F2 → F1 → R, then finds R itself has no segments. Reject
+        // rather than silently pin the new fork to a dead chain.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut mint = UlidMint::new(Ulid::nil());
+        let r_snap = mint.next();
+        let f1_snap = mint.next();
+        let f2_snap = mint.next();
+
+        let r = build_fork(data_dir, mint.next(), r_snap, None);
+        let f1 = build_fork(data_dir, mint.next(), f1_snap, Some(&r));
+        let f2 = build_fork(data_dir, mint.next(), f2_snap, Some(&f1));
+
+        upload_handoff_manifest(&store, &r, &[]).await;
+        upload_handoff_manifest(&store, &f1, &[]).await;
+        upload_handoff_manifest(&store, &f2, &[]).await;
+
+        let job = ClaimJob::new();
+        let stores = passthrough(store);
+        let err = skip_empty_intermediates_impl(
+            &job,
+            "vol",
+            f2.vol,
+            f2.snap,
+            None,
+            data_dir,
+            &stores,
+            None,
+            &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
+        )
+        .await
+        .expect_err("chain of empties terminating in empty root must error");
+        assert_eq!(err.kind, elide_core::ipc::IpcErrorKind::Conflict);
+        assert!(
+            err.message.contains("empty ancestor chain"),
+            "error should name the empty-chain condition: {}",
+            err.message
+        );
+        // The error should name the root we reached, not the released vol.
+        assert!(
+            err.message.contains(&r.vol.to_string()),
+            "error should identify the empty root: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
