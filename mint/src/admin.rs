@@ -4,7 +4,7 @@
 //! proxy directly to the running daemon's [`crate::state::Store`]
 //! and macaroon root, never touching IAM.
 //!
-//! Auth: every admin request carries `Authorization: Macaroon <b64>`
+//! Auth: every admin request carries `Authorization: MintV1 mnt1_<b64url>`
 //! holding a mint-issued **admin macaroon** (`op=admin`). The
 //! bootstrap admin macaroon is written to `<data_dir>/admin.bootstrap`
 //! on first start — the human operator captures it out of band, then
@@ -58,7 +58,7 @@ async fn verify_admin(
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Macaroon "))
+        .and_then(|s| s.strip_prefix("MintV1 "))
         .ok_or_else(unauthorized_response)?;
     let mac = Macaroon::decode(token).map_err(|_| unauthorized_response())?;
 
@@ -190,7 +190,7 @@ async fn caller_can_grant(_state: &AppState, headers: &HeaderMap, requested_scop
     let Some(token) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Macaroon "))
+        .and_then(|s| s.strip_prefix("MintV1 "))
     else {
         return false;
     };
@@ -589,7 +589,7 @@ mod tests {
             None,
             None,
         );
-        format!("Macaroon {}", mac.encode())
+        format!("MintV1 {}", mac.encode())
     }
 
     fn scoped_token(scope: &str) -> String {
@@ -600,7 +600,7 @@ mod tests {
             Some(scope),
             None,
         );
-        format!("Macaroon {}", mac.encode())
+        format!("MintV1 {}", mac.encode())
     }
 
     #[tokio::test]
@@ -778,7 +778,7 @@ mod tests {
             None,
             None,
         );
-        let auth = format!("Macaroon {}", mac.encode());
+        let auth = format!("MintV1 {}", mac.encode());
         let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -796,7 +796,7 @@ mod tests {
             "ed25519:AAA",
             "volume-rw",
         );
-        let auth = format!("Macaroon {}", mac.encode());
+        let auth = format!("MintV1 {}", mac.encode());
         let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -811,7 +811,7 @@ mod tests {
             None,
             None,
         );
-        let auth = format!("Macaroon {}", mac.encode());
+        let auth = format!("MintV1 {}", mac.encode());
         let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -826,7 +826,7 @@ mod tests {
             None,
             Some(1), // unix-epoch second 1 — long past
         );
-        let auth = format!("Macaroon {}", mac.encode());
+        let auth = format!("MintV1 {}", mac.encode());
         let resp = app.oneshot(invite_get(Some(&auth))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }

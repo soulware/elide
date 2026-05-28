@@ -1496,6 +1496,7 @@ dependencies = [
  "quick-xml 0.38.4",
  "rand_core 0.6.4",
  "reqwest",
+ "rmp",
  "serde",
  "serde_json",
  "subtle",
@@ -2012,6 +2013,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]

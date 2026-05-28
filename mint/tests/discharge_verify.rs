@@ -8,12 +8,13 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use mint::audit::AuditLog;
-use mint::caveat::Caveat;
+use mint::caveat::{Caveat, name, op};
 use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::keyring::Keyring;
 use mint::macaroon::{self, DISCHARGE_KID, Macaroon};
+use mint::pop;
 use mint::state::Store;
 use mint::tpc;
 use tower::ServiceExt;
@@ -22,6 +23,7 @@ mod common;
 
 const ROOT: [u8; 32] = [42u8; 32];
 const K_M_A: [u8; 32] = [13u8; 32];
+const CLIENT_SEED: [u8; 32] = [7u8; 32];
 const CLIENT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const ORG_ID: &str = "demo";
 const AUTH_URL: &str = "https://auth.example/";
@@ -84,15 +86,18 @@ async fn app() -> (axum::Router, tempfile::TempDir) {
 }
 
 /// Build a TPC-bearing primary the way mint's issuance path would,
-/// using the public APIs.
+/// using the public APIs. Includes the universal caveats verify+clear
+/// requires: `op=assume-role`, `aud`, `cnf` for the test client.
 fn build_primary(r_epoch: u32) -> Macaroon {
     let ring = Keyring::single(ROOT);
     let cred = macaroon::mint(
         &ring,
         vec![
-            Caveat::scalar("aud", "mint"),
-            Caveat::scalar("sub", CLIENT_ID),
-            Caveat::scalar("role", "volume-rw"),
+            Caveat::scalar(name::OP, op::ASSUME_ROLE),
+            Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::SUB, CLIENT_ID),
+            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(name::ROLE, "volume-rw"),
         ],
     );
     let r = tpc::derive_r(&ROOT, CLIENT_ID, r_epoch);
@@ -114,19 +119,38 @@ fn build_discharge(r: [u8; 32]) -> Macaroon {
     )
 }
 
+/// Send a verify request with the bundle in `Authorization: MintV1
+/// <primary>[,<discharge>...]` and `{ts}` in the body, PoP-signed
+/// under the test client seed against the primary's tail.
 async fn verify_request(
     app: axum::Router,
     primary: &str,
     discharges: &[&str],
 ) -> (StatusCode, String) {
-    let body = serde_json::json!({
-        "primary": primary,
-        "discharges": discharges,
-    })
-    .to_string();
+    verify_request_pop_seed(app, primary, discharges, &CLIENT_SEED).await
+}
+
+async fn verify_request_pop_seed(
+    app: axum::Router,
+    primary: &str,
+    discharges: &[&str],
+    pop_seed: &[u8; 32],
+) -> (StatusCode, String) {
+    let ts = chrono::Utc::now().timestamp() as u64;
+    let body = format!("{{\"ts\":{ts}}}");
+    let primary_mac = Macaroon::decode(primary).expect("decode primary for tail");
+    let sig = pop::client_signature(pop_seed, primary_mac.tail(), body.as_bytes());
+    let mut auth = String::from("MintV1 ");
+    auth.push_str(primary);
+    for d in discharges {
+        auth.push(',');
+        auth.push_str(d);
+    }
     let req = Request::builder()
         .method("POST")
         .uri("/v1/verify")
+        .header("authorization", auth)
+        .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap();
@@ -208,9 +232,11 @@ async fn verifies_tpc_free_chain_with_no_discharges() {
     let plain = macaroon::mint(
         &ring,
         vec![
-            Caveat::scalar("aud", "mint"),
-            Caveat::scalar("sub", CLIENT_ID),
-            Caveat::scalar("role", "volume-rw-background"),
+            Caveat::scalar(name::OP, op::ASSUME_ROLE),
+            Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::SUB, CLIENT_ID),
+            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(name::ROLE, "volume-rw-background"),
         ],
     );
     let (status, body) = verify_request(app, &plain.encode(), &[]).await;
@@ -226,20 +252,21 @@ async fn rejects_tampered_primary() {
     let r = tpc::derive_r(&ROOT, CLIENT_ID, 0);
     let discharge = build_discharge(r);
 
-    // Decode → tamper a caveat → re-encode without re-MACing.
-    let mut bad = Macaroon::decode(&primary.encode()).unwrap();
-    // SAFETY: tests live in the same workspace; we mutate via the
-    // wire round-trip to avoid touching internals.
+    // Tamper a byte in the wire-encoded primary without re-MACing.
     let bad_enc = {
-        let dec = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, bad.encode())
-            .unwrap();
-        let _ = &mut bad;
-        // Flip a byte in the body (not at MAC offset).
-        let mut bytes = dec;
+        let wire = primary.encode();
+        let body = wire.strip_prefix(macaroon::WIRE_PREFIX).unwrap();
+        let mut bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, body)
+                .unwrap();
         // Last byte sits in a caveat value; flipping it breaks the chain.
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+        format!(
+            "{}{}",
+            macaroon::WIRE_PREFIX,
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes,)
+        )
     };
 
     let (_status, body) = verify_request(app, &bad_enc, &[&discharge.encode()]).await;

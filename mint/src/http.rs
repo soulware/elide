@@ -36,7 +36,7 @@ use crate::config::Config;
 use crate::iam::{self, KeypairMinter};
 use crate::issuance;
 use crate::macaroon::Macaroon;
-use crate::pop::{self, PopOutcome};
+use crate::pop;
 use crate::role::{self, Denied};
 use crate::state::{Recorded, StateError, Store};
 use crate::template::render_policy;
@@ -103,11 +103,45 @@ fn unauthorized(request_id: &str) -> Response {
     )
 }
 
-/// Pull the bearer macaroon out of `Authorization: Macaroon <b64>`.
-fn extract_macaroon(headers: &HeaderMap) -> Option<Macaroon> {
+/// A `(primary, discharges)` bundle parsed from
+/// `Authorization: MintV1 mnt1_<b64url>[,mnt1_<b64url>...]`. Primary is
+/// positionally first; discharges follow in the order they
+/// position-match the primary's TPCs. Used at the verify+clear
+/// endpoints.
+pub struct Bundle {
+    pub primary: Macaroon,
+    pub discharges: Vec<Macaroon>,
+}
+
+/// Parse `Authorization: MintV1 <m>[,<m>...]` into a bundle. Single
+/// macaroon → bundle with empty discharges. The scheme name is
+/// `MintV1` at every macaroon-bearing endpoint; the payload's
+/// per-macaroon `mnt1_` prefix keeps individual macaroons greppable
+/// in logs even when concatenated.
+fn extract_bundle(headers: &HeaderMap) -> Option<Bundle> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let b64 = raw.strip_prefix("Macaroon ")?;
-    Macaroon::decode(b64).ok()
+    let payload = raw.strip_prefix("MintV1 ")?;
+    let mut parts = payload.split(',').map(|s| s.trim());
+    let primary = Macaroon::decode(parts.next()?).ok()?;
+    let mut discharges = Vec::new();
+    for p in parts {
+        discharges.push(Macaroon::decode(p).ok()?);
+    }
+    Some(Bundle {
+        primary,
+        discharges,
+    })
+}
+
+/// Pull a single bearer macaroon out of `Authorization: MintV1 <m>`.
+/// Used at single-credential endpoints (enrollment, admin); rejects
+/// a comma-separated bundle.
+fn extract_macaroon(headers: &HeaderMap) -> Option<Macaroon> {
+    let bundle = extract_bundle(headers)?;
+    if !bundle.discharges.is_empty() {
+        return None;
+    }
+    Some(bundle.primary)
 }
 
 fn peer_ip(headers: &HeaderMap) -> String {
@@ -138,6 +172,128 @@ fn pop_proof(headers: &HeaderMap) -> Result<Option<pop::Proof>, ()> {
     }
 }
 
+/// Output of [`verify_and_clear`]: the primary, the union of verified
+/// caveats across the bundle, and the bundle-wide minimum `NotAfter`.
+pub struct ClearedBundle {
+    pub primary: Macaroon,
+    pub aggregated_caveats: Vec<Caveat>,
+    /// Minimum `exp` across the primary and every verified discharge,
+    /// if any are present. `None` means the bundle carries no `exp`.
+    pub expires_at: Option<u64>,
+}
+
+/// Why verify+clear refused a bundle. The HTTP layer translates each
+/// variant per endpoint — `/v1/verify` returns `{valid:false, reason}`,
+/// `/v1/assume-role` returns an opaque `401`. The `reason` strings
+/// are stable identifiers for audit / forensics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyClearError {
+    Auth(&'static str),
+    Pop,
+    AudClear,
+    OpClear,
+    Expired,
+}
+
+impl VerifyClearError {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            VerifyClearError::Auth(r) => r,
+            VerifyClearError::Pop => "pop",
+            VerifyClearError::AudClear => "aud_clear",
+            VerifyClearError::OpClear => "op_clear",
+            VerifyClearError::Expired => "expired",
+        }
+    }
+}
+
+/// Walk the bundle's chain MACs (primary first, then each discharge
+/// under the `r` recovered from its matched TPC's `VID`, recursing to
+/// fixpoint on nested TPCs), then clear the universal first-party
+/// caveats — `aud` ≡ `expected_aud`, `op` ≡ `expected_op`, `cnf`+PoP
+/// against the primary's tail and the raw request body, and `exp` (if
+/// present) in the future. Both bundle endpoints
+/// (`/v1/assume-role`, `/v1/verify`) invoke this; assume-role layers
+/// role-specific clearing and IAM issuance on top of the result.
+///
+/// Returns the union of caveats across the bundle and the
+/// bundle-wide minimum `NotAfter` — the verify endpoint returns
+/// these verbatim; assume-role hands the caveats to [`role::authorize`]
+/// for the role-specific gate.
+pub fn verify_and_clear(
+    bundle: &Bundle,
+    keyring: &crate::keyring::Keyring,
+    proof: Option<pop::Proof>,
+    body: &[u8],
+    now_unix: u64,
+    expected_aud: &str,
+    expected_op: &str,
+) -> Result<ClearedBundle, VerifyClearError> {
+    let primary_key = keyring
+        .get(bundle.primary.kid())
+        .ok_or(VerifyClearError::Auth("unknown_kid"))?;
+
+    let mut aggregated: Vec<Caveat> = Vec::new();
+    let mut discharge_cursor = 0usize;
+    let mut work: std::collections::VecDeque<(Macaroon, [u8; 32])> =
+        std::collections::VecDeque::new();
+    work.push_back((bundle.primary.clone(), *primary_key));
+
+    while let Some((mac, key)) = work.pop_front() {
+        let sites = mac
+            .verify_collecting_tpcs(&key)
+            .ok_or(VerifyClearError::Auth("mac_mismatch"))?;
+        for site in sites {
+            let r = crate::tpc::decrypt_vid(&site.t_n_minus_1, site.vid)
+                .map_err(|_| VerifyClearError::Auth("vid_decrypt"))?;
+            let discharge = bundle
+                .discharges
+                .get(discharge_cursor)
+                .ok_or(VerifyClearError::Auth("tpc_undischarged"))?;
+            discharge_cursor += 1;
+            work.push_back((discharge.clone(), r));
+        }
+        aggregated.extend(mac.caveats().iter().cloned());
+    }
+    if discharge_cursor != bundle.discharges.len() {
+        return Err(VerifyClearError::Auth("excess_discharges"));
+    }
+
+    // PoP is checked against the primary's caveats with the primary's
+    // tail — the principal whose chain is being exercised. Discharges
+    // carry their own `cnf` caveats but they are not request-time
+    // PoP'd (the per-forward freshness is the primary's per-forward
+    // `NotAfter` attenuation).
+    pop::check(
+        bundle.primary.caveats(),
+        bundle.primary.tail(),
+        body,
+        proof,
+        now_unix,
+    )
+    .map_err(|_| VerifyClearError::Pop)?;
+
+    let eff = EffectiveCaveats::new(&aggregated);
+    if !matches!(eff.resolve(name::AUD), Resolved::Value(v) if v == expected_aud) {
+        return Err(VerifyClearError::AudClear);
+    }
+    if !matches!(eff.resolve(name::OP), Resolved::Value(v) if v == expected_op) {
+        return Err(VerifyClearError::OpClear);
+    }
+    let expires_at = eff.not_after(name::EXP);
+    if let Some(exp) = expires_at
+        && exp <= now_unix
+    {
+        return Err(VerifyClearError::Expired);
+    }
+
+    Ok(ClearedBundle {
+        primary: bundle.primary.clone(),
+        aggregated_caveats: aggregated,
+        expires_at,
+    })
+}
+
 async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     let caller = peer_ip(&headers);
@@ -156,24 +312,39 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         tigris_access_key_id: None,
     };
 
-    // --- Authentication: any failure is an opaque 401. ---
-    let Some(mac) = extract_macaroon(&headers) else {
+    // --- Bundle + PoP extraction. ---
+    let Some(bundle) = extract_bundle(&headers) else {
         audit(base_entry("denied:unauthenticated"));
         return unauthorized(&request_id);
     };
-    let keyring = state.store.keyring().await;
-    if !mac.verify(&keyring) {
-        audit(base_entry("denied:bad_mac"));
-        return unauthorized(&request_id);
-    }
-    let caveats = mac.caveats().to_vec();
-    // Positive op gate: this endpoint serves op=assume-role only.
-    if !scalar_is(&caveats, name::OP, op::ASSUME_ROLE) {
-        audit(base_entry("denied:wrong_op"));
-        return unauthorized(&request_id);
-    }
+    let proof = match pop_proof(&headers) {
+        Ok(p) => p,
+        Err(()) => {
+            audit(base_entry("denied:pop"));
+            return unauthorized(&request_id);
+        }
+    };
 
-    let nonce_hex = mac.nonce_hex();
+    // --- Verify+clear: shared with /v1/verify. Walks chain MACs,
+    // resolves discharges, clears aud/op/cnf+PoP/exp. ---
+    let keyring = state.store.keyring().await;
+    let cleared = match verify_and_clear(
+        &bundle,
+        &keyring,
+        proof,
+        &body,
+        now_unix,
+        &state.config.audience,
+        op::ASSUME_ROLE,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            audit(base_entry(&format!("denied:{}", e.reason())));
+            return unauthorized(&request_id);
+        }
+    };
+    let caveats = cleared.aggregated_caveats;
+    let nonce_hex = cleared.primary.nonce_hex();
     let entry = |outcome: &str, role: &str, ttl: Option<u64>, key: Option<String>| AuditEntry {
         timestamp: now.to_rfc3339(),
         request_id: request_id.clone(),
@@ -186,22 +357,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         tigris_access_key_id: key,
     };
 
-    // --- Holder-of-key PoP (cnf). Enforced before anything reads the
-    // body: the proof signs the exact raw bytes, so a verified PoP is
-    // what makes the request.* template inputs trustworthy. ---
-    let proof = match pop_proof(&headers) {
-        Ok(p) => p,
-        Err(()) => {
-            audit(entry("denied:pop", "", None, None));
-            return unauthorized(&request_id);
-        }
-    };
-    if pop::check(&caveats, mac.tail(), &body, proof, now_unix).is_err() {
-        audit(entry("denied:pop", "", None, None));
-        return unauthorized(&request_id);
-    }
-
-    // --- Request body (the exact bytes the PoP covers). ---
+    // --- Request body (the exact bytes the PoP already covered). ---
     let Ok(req) = serde_json::from_slice::<AssumeRoleBody>(&body) else {
         audit(entry("denied:bad_request", "", None, None));
         return respond(
@@ -384,9 +540,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         return unauthorized(&request_id);
     }
 
-    // PoP is mandatory here (the invite is bearer until the client
-    // attenuates cnf; NotKeyBound means it didn't, so a captured copy
-    // could enrol). Body is the freshness ts only.
+    // Body is the freshness ts only.
     let proof = match pop_proof(&headers) {
         Ok(p) => p,
         Err(()) => {
@@ -394,12 +548,9 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
             return unauthorized(&request_id);
         }
     };
-    match pop::check(&caveats, mac.tail(), &body, proof, now_unix) {
-        Ok(PopOutcome::Verified) => {}
-        Ok(PopOutcome::NotKeyBound) | Err(_) => {
-            audit("denied:pop", &caveats);
-            return unauthorized(&request_id);
-        }
+    if pop::check(&caveats, mac.tail(), &body, proof, now_unix).is_err() {
+        audit("denied:pop", &caveats);
+        return unauthorized(&request_id);
     }
 
     let (sub, cnf) = match issuance::bound_identity(&mac) {
@@ -571,12 +722,9 @@ async fn enroll_exchange(
             return unauthorized(&request_id);
         }
     };
-    match pop::check(&caveats, mac.tail(), &body, proof, now_unix) {
-        Ok(PopOutcome::Verified) => {}
-        Ok(PopOutcome::NotKeyBound) | Err(_) => {
-            audit("denied:pop", &caveats);
-            return unauthorized(&request_id);
-        }
+    if pop::check(&caveats, mac.tail(), &body, proof, now_unix).is_err() {
+        audit("denied:pop", &caveats);
+        return unauthorized(&request_id);
     }
 
     let (sub, cnf) = match issuance::bound_identity(&mac) {
@@ -720,120 +868,61 @@ fn denied_tag(d: &Denied) -> &'static str {
     }
 }
 
-#[derive(Deserialize)]
-struct VerifyRequest {
-    /// Base64 macaroon — the primary credential, optionally
-    /// per-forward attenuated by the caller before forwarding.
-    primary: String,
-    /// Base64 discharge macaroons, one per TPC on the primary
-    /// (positional matching for the initial single-TPC design).
-    /// Empty when the primary carries no TPCs (e.g. background
-    /// roles); the verifier returns valid in that case if the
-    /// chain MAC checks out.
-    #[serde(default)]
-    discharges: Vec<String>,
-}
-
-/// `POST /v1/verify`. Receives `(primary, discharges)`,
-/// walks the primary's chain under the keyring, recovers `r` from
-/// each TPC's VID, verifies the matching discharge's chain under
-/// `r`, recurses to fixpoint on nested TPCs. On success returns the
-/// aggregated first-party caveats and the minimum `NotAfter` across
-/// every verified macaroon — the caller (coord) uses those to clear
-/// against live request context. On any failure returns a coarse
-/// reason string for audit / forensics; the cross-IPC face of this
-/// is mediated by the caller, which collapses to the canonical
-/// opaque error.
+/// `POST /v1/verify`. The bundle (`primary` + any discharges) is in
+/// `Authorization: MintV1 mnt1_<…>,mnt1_<…>`; the body is `{ts}` only —
+/// PoP freshness, signed under the primary's `cnf` over the request
+/// bytes. Runs the shared [`verify_and_clear`] core (chain MACs +
+/// `aud`/`op`/`cnf`+PoP/`exp` clears) and returns the verdict + the
+/// aggregated cleared caveats + the bundle-wide minimum `NotAfter`.
+/// The caller (coord) caches the verdict by the bundle's wire bytes
+/// for the lifetime of `expires_at`.
 async fn discharge_verify(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
+    let now_unix = Utc::now().timestamp().max(0) as u64;
 
-    let req: VerifyRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(_) => return verify_failure(&request_id, "bad_request"),
+    let Some(bundle) = extract_bundle(&headers) else {
+        return verify_failure(&request_id, "bundle_decode");
     };
-
-    let primary = match Macaroon::decode(&req.primary) {
-        Ok(m) => m,
-        Err(_) => return verify_failure(&request_id, "primary_decode"),
+    let proof = match pop_proof(&headers) {
+        Ok(p) => p,
+        Err(()) => return verify_failure(&request_id, "pop_header"),
     };
-
-    let mut decoded_discharges: Vec<Macaroon> = Vec::with_capacity(req.discharges.len());
-    for d in &req.discharges {
-        match Macaroon::decode(d) {
-            Ok(m) => decoded_discharges.push(m),
-            Err(_) => return verify_failure(&request_id, "discharge_decode"),
-        }
-    }
-
     let keyring = state.store.keyring().await;
-    let Some(primary_key) = keyring.get(primary.kid()) else {
-        return verify_failure(&request_id, "unknown_kid");
+    let cleared = match verify_and_clear(
+        &bundle,
+        &keyring,
+        proof,
+        &body,
+        now_unix,
+        &state.config.audience,
+        op::ASSUME_ROLE,
+    ) {
+        Ok(c) => c,
+        Err(e) => return verify_failure(&request_id, e.reason()),
     };
 
-    // Queue-walk: every queued macaroon is verified under its key,
-    // every TPC it carries spawns a deferred discharge check that
-    // adds the matched discharge to the queue under the recovered
-    // `r`. Initial design is single-TPC, single-discharge with
-    // positional matching; the queue shape generalises cleanly to
-    // multi-TPC and nested-TPC bundles once a CID-based matcher
-    // exists.
-    let mut verified_chains: Vec<Vec<Caveat>> = Vec::new();
-    let mut discharge_cursor = 0usize;
-    let mut work: std::collections::VecDeque<(Macaroon, [u8; 32])> =
-        std::collections::VecDeque::new();
-    work.push_back((primary, *primary_key));
-
-    while let Some((mac, key)) = work.pop_front() {
-        let Some(sites) = mac.verify_collecting_tpcs(&key) else {
-            return verify_failure(&request_id, "mac_mismatch");
-        };
-        for site in sites {
-            let Ok(r) = crate::tpc::decrypt_vid(&site.t_n_minus_1, site.vid) else {
-                return verify_failure(&request_id, "vid_decrypt");
-            };
-            let Some(discharge) = decoded_discharges.get(discharge_cursor) else {
-                return verify_failure(&request_id, "tpc_undischarged");
-            };
-            discharge_cursor += 1;
-            work.push_back((discharge.clone(), r));
-        }
-        verified_chains.push(mac.caveats().to_vec());
-    }
-
-    if discharge_cursor != decoded_discharges.len() {
-        return verify_failure(&request_id, "excess_discharges");
-    }
-
-    // Aggregate first-party caveats across every verified macaroon.
-    // Mint is caveat-vocabulary-agnostic — it returns the raw chain
-    // and lets the caller pick out the names it cares about. The
-    // `not_after` field is the one mint-side computed value: the
-    // minimum across every NotAfter the bundle carries.
-    let mut aggregated: Vec<serde_json::Value> = Vec::new();
-    let mut min_not_after: Option<u64> = None;
-    for chain in &verified_chains {
-        for c in chain {
-            if let Caveat::FirstParty { name, value } = c {
-                aggregated.push(json!({"name": name, "value": value}));
-                if name == crate::caveat::name::EXP
-                    && let Ok(v) = value.parse::<u64>()
-                {
-                    min_not_after = Some(min_not_after.map_or(v, |m| m.min(v)));
-                }
-            }
-        }
-    }
+    // Aggregated first-party caveats — mint is caveat-vocabulary-
+    // agnostic and hands the raw set back to the caller for live
+    // context clearing (CoordId, Volume, op-attenuation, etc.).
+    let aggregated: Vec<serde_json::Value> = cleared
+        .aggregated_caveats
+        .iter()
+        .filter_map(|c| match c {
+            Caveat::FirstParty { name, value } => Some(json!({"name": name, "value": value})),
+            Caveat::ThirdParty { .. } => None,
+        })
+        .collect();
 
     respond(
         &request_id,
         StatusCode::OK,
         json!({
             "valid": true,
-            "expires_at": min_not_after,
+            "expires_at": cleared.expires_at,
             "caveats": aggregated,
         }),
     )

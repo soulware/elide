@@ -1,8 +1,8 @@
 //! Generic chained-MAC macaroon.
 //!
-//! Standard chained-keyed-BLAKE3 construction over free-form named
-//! **scalar** caveats, with the per-step type tag that lets a chain
-//! interleave first-party and third-party caveats:
+//! Standard chained-keyed-BLAKE3 construction over named **scalar**
+//! caveats, with a per-step type tag that lets a chain interleave
+//! first-party and third-party caveats:
 //!
 //! ```text
 //! mac_seed = blake3_keyed(keyring[kid], DOMAIN || kid_be || nonce)
@@ -17,47 +17,46 @@
 //! not in the ring (retired, or never existed) fails verification with
 //! the same opacity as a bad MAC.
 //!
-//! Wire format: a binary container, base64-encoded for the
-//! `Authorization: Macaroon <b64>` header (per `docs/design-mint.md`
-//! § *Authentication*):
+//! Wire format: canonical MsgPack envelope, base64url-no-pad encoded,
+//! prefixed with `mnt1_` for log greppability. Per
+//! `docs/design-mint.md` § *Authentication*, macaroons ship in
+//! `Authorization: MintV1 mnt1_<b64url>[,mnt1_<b64url>...]` (bundles at
+//! the verify+clear endpoints) or as a lone `Authorization: MintV1
+//! mnt1_<b64url>` (single-credential enrollment endpoints).
 //!
 //! ```text
-//! magic   "mcrn3"  (5 bytes)
-//! kid     u16 BE   (2 bytes — the keyring generation that MAC'd this token)
-//! nonce   16 bytes
-//! mac     32 bytes
-//! count   u16 BE
-//! repeated serialize_one(caveat):
-//!   type  u8                           // 0 = first-party, 1 = third-party
-//!   if first-party:                    // u32 name-len, name, u32 val-len, val
-//!   if third-party:                    // u32 loc-len, loc, u32 vid-len, vid, u32 cid-len, cid
+//! envelope             [kid (uint), nonce (bin), mac (bin), [caveats]]
+//! first-party caveat   [0, name (str), value (str)]
+//! third-party caveat   [1, location (str), vid (bin), cid (bin)]
 //! ```
 //!
-//! `serialize_one` is the canonical per-caveat encoding fed into the
-//! MAC chain; the same bytes appear on the wire so a decoded macaroon
-//! re-MACs identically. v3 extends v2 with the per-step type byte to
-//! disambiguate first-party from third-party caveats; v2-shaped
-//! macaroons (no type byte) do not interoperate.
+//! `serialize_one` is the per-caveat canonical-MsgPack encoding fed
+//! into the MAC chain; the same bytes appear in the envelope so a
+//! decoded macaroon re-MACs identically.
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use rand_core::{OsRng, RngCore};
 use subtle::ConstantTimeEq;
 
 use crate::caveat::Caveat;
 use crate::keyring::{Keyring, Kid};
 
-const MAGIC: &[u8; 5] = b"mcrn3";
-const DOMAIN: &[u8] = b"mint-macaroon-v3";
+/// Wire prefix for a base64url-encoded mint macaroon. Makes each
+/// macaroon individually greppable in logs even when concatenated
+/// into a bundle (`mnt1_AbCd...,mnt1_EfGh...`). `mnt1` = "mint
+/// macaroon, wire generation 1".
+pub const WIRE_PREFIX: &str = "mnt1_";
+
+const DOMAIN: &[u8] = b"mint-macaroon-v4";
 pub const NONCE_LEN: usize = 16;
 
-/// Per-step type tag in the wire format and in the MAC-chain digest.
-/// First-party = 0; third-party = 1. Encoded as the first byte of
-/// every `serialize_one` output so a TPC can never be confused with a
-/// first-party caveat whose name happens to start with a length-byte
-/// pattern.
-const TYPE_FIRST_PARTY: u8 = 0;
-const TYPE_THIRD_PARTY: u8 = 1;
+/// Per-step type tag in the canonical MsgPack encoding (first element
+/// of every caveat array). First-party = 0; third-party = 1. The tag
+/// is part of `serialize_one`'s output, so a TPC can never be confused
+/// with a first-party caveat under the MAC chain.
+const TYPE_FIRST_PARTY: u64 = 0;
+const TYPE_THIRD_PARTY: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Macaroon {
@@ -86,42 +85,38 @@ pub struct TpcSite<'a> {
 /// `docs/design-mint.md` § *Authentication*).
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
-    #[error("base64 decode failed")]
+    #[error("missing mnt1_ prefix")]
+    BadPrefix,
+    #[error("base64url decode failed")]
     Base64,
     #[error("truncated macaroon")]
     Truncated,
-    #[error("bad magic")]
-    BadMagic,
     #[error("invalid caveat encoding")]
     BadCaveat,
 }
 
+/// Canonical per-caveat MsgPack encoding. Used both as the wire
+/// representation inside the envelope's caveats array and as the
+/// MAC-chain input — see [`step_mac`]. Writing to `Vec<u8>` is
+/// infallible; the `expect` documents that invariant.
 fn serialize_one(c: &Caveat) -> Vec<u8> {
+    let mut out = Vec::new();
     match c {
         Caveat::FirstParty { name, value } => {
-            let name = name.as_bytes();
-            let val = value.as_bytes();
-            let mut out = Vec::with_capacity(1 + 8 + name.len() + val.len());
-            out.push(TYPE_FIRST_PARTY);
-            out.extend_from_slice(&(name.len() as u32).to_be_bytes());
-            out.extend_from_slice(name);
-            out.extend_from_slice(&(val.len() as u32).to_be_bytes());
-            out.extend_from_slice(val);
-            out
+            rmp::encode::write_array_len(&mut out, 3).expect("vec writer");
+            rmp::encode::write_uint(&mut out, TYPE_FIRST_PARTY).expect("vec writer");
+            rmp::encode::write_str(&mut out, name).expect("vec writer");
+            rmp::encode::write_str(&mut out, value).expect("vec writer");
         }
         Caveat::ThirdParty { location, vid, cid } => {
-            let loc = location.as_bytes();
-            let mut out = Vec::with_capacity(1 + 12 + loc.len() + vid.len() + cid.len());
-            out.push(TYPE_THIRD_PARTY);
-            out.extend_from_slice(&(loc.len() as u32).to_be_bytes());
-            out.extend_from_slice(loc);
-            out.extend_from_slice(&(vid.len() as u32).to_be_bytes());
-            out.extend_from_slice(vid);
-            out.extend_from_slice(&(cid.len() as u32).to_be_bytes());
-            out.extend_from_slice(cid);
-            out
+            rmp::encode::write_array_len(&mut out, 4).expect("vec writer");
+            rmp::encode::write_uint(&mut out, TYPE_THIRD_PARTY).expect("vec writer");
+            rmp::encode::write_str(&mut out, location).expect("vec writer");
+            rmp::encode::write_bin(&mut out, vid).expect("vec writer");
+            rmp::encode::write_bin(&mut out, cid).expect("vec writer");
         }
     }
+    out
 }
 
 /// Initial chain tag: keyed BLAKE3 over `DOMAIN || kid || nonce`. The
@@ -218,7 +213,7 @@ impl Macaroon {
     }
 
     /// The trailing MAC. This is the holder-of-key PoP anchor: the
-    /// `elide:CoordKey` proof signs over `tail ‖ BLAKE3(body)`, so the
+    /// `cnf` proof signs over `tail ‖ BLAKE3(body)`, so the
     /// tail binds the proof to *this* exact attenuated macaroon
     /// (`docs/design-mint.md` § *Credential macaroon & lifecycle*, [`crate::pop`]).
     pub fn tail(&self) -> &[u8; 32] {
@@ -292,39 +287,64 @@ impl Macaroon {
         }
     }
 
+    /// Serialize to the wire form: `mnt1_<base64url-no-pad>` of the
+    /// canonical-MsgPack envelope.
     pub fn encode(&self) -> String {
         let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&self.kid.to_be_bytes());
-        buf.extend_from_slice(&self.nonce);
-        buf.extend_from_slice(&self.mac);
-        buf.extend_from_slice(&(self.caveats.len() as u16).to_be_bytes());
+        rmp::encode::write_array_len(&mut buf, 4).expect("vec writer");
+        rmp::encode::write_uint(&mut buf, self.kid as u64).expect("vec writer");
+        rmp::encode::write_bin(&mut buf, &self.nonce).expect("vec writer");
+        rmp::encode::write_bin(&mut buf, &self.mac).expect("vec writer");
+        // Caveats array: the elements are the same canonical MsgPack
+        // bytes used as MAC-chain inputs (`serialize_one`), so the
+        // envelope embeds them by extending the buffer directly.
+        let count: u32 = self
+            .caveats
+            .len()
+            .try_into()
+            .expect("caveat count fits u32");
+        rmp::encode::write_array_len(&mut buf, count).expect("vec writer");
         for c in &self.caveats {
             buf.extend_from_slice(&serialize_one(c));
         }
-        BASE64.encode(buf)
+        let mut out = String::with_capacity(WIRE_PREFIX.len() + (buf.len() * 4 / 3 + 4));
+        out.push_str(WIRE_PREFIX);
+        BASE64.encode_string(&buf, &mut out);
+        out
     }
 
+    /// Parse the wire form. Every error variant maps to the same
+    /// opaque `401` at the HTTP layer — see `docs/design-mint.md`
+    /// § *Authentication*.
     pub fn decode(s: &str) -> Result<Macaroon, DecodeError> {
-        let buf = BASE64.decode(s.trim()).map_err(|_| DecodeError::Base64)?;
-        let mut r = Reader::new(&buf);
-        if r.take(MAGIC.len())? != MAGIC {
-            return Err(DecodeError::BadMagic);
+        let body = s
+            .trim()
+            .strip_prefix(WIRE_PREFIX)
+            .ok_or(DecodeError::BadPrefix)?;
+        let buf = BASE64.decode(body).map_err(|_| DecodeError::Base64)?;
+        let mut r: &[u8] = &buf;
+
+        let env_len = rmp::decode::read_array_len(&mut r).map_err(|_| DecodeError::Truncated)?;
+        if env_len != 4 {
+            return Err(DecodeError::BadCaveat);
         }
-        let kid = Kid::from_be_bytes(r.take(2)?.try_into().map_err(|_| DecodeError::Truncated)?);
-        let nonce: [u8; NONCE_LEN] = r
-            .take(NONCE_LEN)?
-            .try_into()
-            .map_err(|_| DecodeError::Truncated)?;
-        let mac: [u8; 32] = r.take(32)?.try_into().map_err(|_| DecodeError::Truncated)?;
-        let count = u16::from_be_bytes(r.take(2)?.try_into().map_err(|_| DecodeError::Truncated)?);
+
+        let kid_u64: u64 = rmp::decode::read_int(&mut r).map_err(|_| DecodeError::Truncated)?;
+        let kid: Kid = kid_u64.try_into().map_err(|_| DecodeError::BadCaveat)?;
+
+        let nonce = read_bin_fixed::<NONCE_LEN>(&mut r)?;
+        let mac = read_bin_fixed::<32>(&mut r)?;
+
+        let count = rmp::decode::read_array_len(&mut r).map_err(|_| DecodeError::Truncated)?;
         let mut caveats = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            caveats.push(r.caveat()?);
+            caveats.push(decode_caveat(&mut r)?);
         }
+
         if !r.is_empty() {
             return Err(DecodeError::BadCaveat);
         }
+
         Ok(Macaroon {
             kid,
             nonce,
@@ -334,66 +354,47 @@ impl Macaroon {
     }
 }
 
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
+fn read_bin_fixed<const N: usize>(r: &mut &[u8]) -> Result<[u8; N], DecodeError> {
+    let len = rmp::decode::read_bin_len(r).map_err(|_| DecodeError::Truncated)? as usize;
+    if len != N {
+        return Err(DecodeError::BadCaveat);
+    }
+    let (head, tail) = r.split_at_checked(N).ok_or(DecodeError::Truncated)?;
+    let arr: [u8; N] = head.try_into().map_err(|_| DecodeError::Truncated)?;
+    *r = tail;
+    Ok(arr)
 }
 
-impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
+fn read_str(r: &mut &[u8]) -> Result<String, DecodeError> {
+    let len = rmp::decode::read_str_len(r).map_err(|_| DecodeError::Truncated)? as usize;
+    let (head, tail) = r.split_at_checked(len).ok_or(DecodeError::Truncated)?;
+    *r = tail;
+    String::from_utf8(head.to_vec()).map_err(|_| DecodeError::BadCaveat)
+}
 
-    fn is_empty(&self) -> bool {
-        self.pos == self.buf.len()
-    }
+fn read_bin(r: &mut &[u8]) -> Result<Vec<u8>, DecodeError> {
+    let len = rmp::decode::read_bin_len(r).map_err(|_| DecodeError::Truncated)? as usize;
+    let (head, tail) = r.split_at_checked(len).ok_or(DecodeError::Truncated)?;
+    *r = tail;
+    Ok(head.to_vec())
+}
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
-        let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated)?;
-        let slice = self.buf.get(self.pos..end).ok_or(DecodeError::Truncated)?;
-        self.pos = end;
-        Ok(slice)
-    }
-
-    fn u32(&mut self) -> Result<usize, DecodeError> {
-        let b: [u8; 4] = self
-            .take(4)?
-            .try_into()
-            .map_err(|_| DecodeError::Truncated)?;
-        Ok(u32::from_be_bytes(b) as usize)
-    }
-
-    fn string(&mut self) -> Result<String, DecodeError> {
-        let len = self.u32()?;
-        let bytes = self.take(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| DecodeError::BadCaveat)
-    }
-
-    fn byte(&mut self) -> Result<u8, DecodeError> {
-        let b = self.take(1)?;
-        Ok(b[0])
-    }
-
-    fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
-        let len = self.u32()?;
-        Ok(self.take(len)?.to_vec())
-    }
-
-    fn caveat(&mut self) -> Result<Caveat, DecodeError> {
-        match self.byte()? {
-            TYPE_FIRST_PARTY => {
-                let name = self.string()?;
-                let value = self.string()?;
-                Ok(Caveat::FirstParty { name, value })
-            }
-            TYPE_THIRD_PARTY => {
-                let location = self.string()?;
-                let vid = self.bytes()?;
-                let cid = self.bytes()?;
-                Ok(Caveat::ThirdParty { location, vid, cid })
-            }
-            _ => Err(DecodeError::BadCaveat),
+fn decode_caveat(r: &mut &[u8]) -> Result<Caveat, DecodeError> {
+    let arr_len = rmp::decode::read_array_len(r).map_err(|_| DecodeError::Truncated)?;
+    let tag: u64 = rmp::decode::read_int(r).map_err(|_| DecodeError::Truncated)?;
+    match (tag, arr_len) {
+        (0, 3) => {
+            let name = read_str(r)?;
+            let value = read_str(r)?;
+            Ok(Caveat::FirstParty { name, value })
         }
+        (1, 4) => {
+            let location = read_str(r)?;
+            let vid = read_bin(r)?;
+            let cid = read_bin(r)?;
+            Ok(Caveat::ThirdParty { location, vid, cid })
+        }
+        _ => Err(DecodeError::BadCaveat),
     }
 }
 
@@ -429,6 +430,7 @@ mod tests {
             ],
         );
         let wire = m.encode();
+        assert!(wire.starts_with(WIRE_PREFIX));
         let back = Macaroon::decode(&wire).expect("decode");
         assert_eq!(m, back);
         assert!(back.verify(&ring()));
@@ -436,8 +438,6 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip_with_third_party() {
-        // Mixed chain: first-party caveats interleaved with a TPC.
-        // Exercises the v3 type-tagged wire format end-to-end.
         let m = mint(
             &ring(),
             vec![
@@ -450,7 +450,6 @@ mod tests {
         let back = Macaroon::decode(&wire).expect("decode");
         assert_eq!(m, back);
         assert!(back.verify(&ring()));
-        // The TPC sits at chain position 1.
         match &back.caveats()[1] {
             Caveat::ThirdParty { location, vid, cid } => {
                 assert_eq!(location, "https://auth.example/");
@@ -471,7 +470,6 @@ mod tests {
             ],
         );
         let mut tampered = Macaroon::decode(&m.encode()).expect("decode");
-        // Swap a byte in the VID — chain MAC must reject.
         match &mut tampered.caveats[1] {
             Caveat::ThirdParty { vid, .. } => vid[0] ^= 0x80,
             other => panic!("expected ThirdParty, got {other:?}"),
@@ -502,7 +500,6 @@ mod tests {
 
     #[test]
     fn mint_under_key_round_trips_under_same_key() {
-        // The keyring-less mint/verify pair used for discharges.
         let r = [9u8; 32];
         let m = mint_under_key(
             &r,
@@ -541,10 +538,6 @@ mod tests {
 
     #[test]
     fn verify_collecting_tpcs_returns_chain_tags_in_chain_order() {
-        // A chain with two TPCs interleaved with first-party caveats.
-        // The captured t_{n-1} for each TPC must equal the chain tag
-        // mint *would* have produced just before appending the TPC —
-        // we cross-check by replaying the chain on a truncated copy.
         let r = ring();
         let m = mint(
             &r,
@@ -559,14 +552,7 @@ mod tests {
         assert_eq!(sites.len(), 2);
         assert_eq!(sites[0].location, "https://auth1/");
         assert_eq!(sites[1].location, "https://auth2/");
-
-        // Cross-check chain tags by replaying truncated chains.
-        let prefix_to_first_tpc = mint(&r, vec![Caveat::scalar("aud", "mint")]);
-        // The truncated mint has a fresh nonce so we can't compare
-        // tails directly. Instead, verify that the captured tag
-        // satisfies what mint would step from.
         assert_ne!(sites[0].t_n_minus_1, sites[1].t_n_minus_1);
-        let _ = prefix_to_first_tpc; // kept for narrative — tags differ
     }
 
     #[test]
@@ -597,11 +583,6 @@ mod tests {
 
     #[test]
     fn discharge_kid_distinct_from_keyring_kid_zero() {
-        // A discharge minted under r=0xFF.. with DISCHARGE_KID happens
-        // to share the kid label "0" with a hypothetical kid-0 keyring
-        // entry; the chain MAC still verifies under `r` (which is what
-        // matters) and does not verify against the keyring's key at
-        // that same kid label.
         let r = [0xff; 32];
         let m = mint_under_key(
             &r,
@@ -630,13 +611,9 @@ mod tests {
 
     #[test]
     fn tampered_kid_fails_verify_even_if_key_exists() {
-        // A macaroon's MAC seeds with its kid, so swapping the kid bytes
-        // on the wire (even to one whose key is in the ring) breaks the
-        // chain.
         let dir = tempfile::tempdir().unwrap();
         let mut kr = Keyring::open(&dir.path().join("rk"), None, None).unwrap();
         kr.add_and_promote(&dir.path().join("rk"), None).unwrap();
-        // Mint under kid=1, then forge a copy that claims kid=0.
         let m = mint(&kr, vec![Caveat::scalar("Audience", "mint")]);
         assert_eq!(m.kid(), 1);
         let mut forged = Macaroon::decode(&m.encode()).unwrap();
@@ -646,28 +623,38 @@ mod tests {
 
     #[test]
     fn garbage_decode_is_error_not_panic() {
-        assert!(Macaroon::decode("not base64!!!").is_err());
-        assert!(Macaroon::decode(&BASE64.encode([0u8; 3])).is_err());
+        assert!(Macaroon::decode("not-prefixed").is_err());
+        assert!(Macaroon::decode("mnt1_!!!").is_err());
+        assert!(Macaroon::decode(&format!("{WIRE_PREFIX}{}", BASE64.encode([0u8; 3]))).is_err());
     }
 
     #[test]
     fn token_minted_under_old_kid_still_verifies_until_retired() {
-        // The whole point of the keyring: rotation is additive until
-        // explicit retirement.
         let dir = tempfile::tempdir().unwrap();
         let rk = dir.path().join("rk");
         let mut kr = Keyring::open(&rk, None, None).unwrap();
         let token_under_zero = mint(&kr, vec![Caveat::scalar("Audience", "mint")]);
         let new_kid = kr.add_and_promote(&rk, None).unwrap();
         assert_eq!(new_kid, 1);
-        assert!(
-            token_under_zero.verify(&kr),
-            "old token verifies because kid=0 is still in the ring"
-        );
+        assert!(token_under_zero.verify(&kr));
         kr.retire(&rk, 0).unwrap();
-        assert!(
-            !token_under_zero.verify(&kr),
-            "after retire(0) the old token fails — by design"
-        );
+        assert!(!token_under_zero.verify(&kr));
+    }
+
+    #[test]
+    fn wire_has_mnt1_prefix_and_is_base64url() {
+        // The wire must be base64url-no-pad (no `+`, `/`, `=` chars,
+        // only A-Z a-z 0-9 - _) so it's safe to drop into URLs, log
+        // lines, and comma-separated bundles without quoting hazards.
+        let m = mint(&ring(), vec![Caveat::scalar("aud", "mint")]);
+        let wire = m.encode();
+        assert!(wire.starts_with(WIRE_PREFIX));
+        let body = wire.strip_prefix(WIRE_PREFIX).unwrap();
+        for c in body.chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '-' || c == '_',
+                "non-base64url char {c:?} in wire {wire}"
+            );
+        }
     }
 }
