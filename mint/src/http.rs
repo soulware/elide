@@ -118,7 +118,7 @@ pub struct Bundle {
 /// `MintV1` at every macaroon-bearing endpoint; the payload's
 /// per-macaroon `mnt1_` prefix keeps individual macaroons greppable
 /// in logs even when concatenated.
-fn extract_bundle(headers: &HeaderMap) -> Option<Bundle> {
+pub fn extract_bundle(headers: &HeaderMap) -> Option<Bundle> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let payload = raw.strip_prefix("MintV1 ")?;
     let mut parts = payload.split(',').map(|s| s.trim());
@@ -165,7 +165,12 @@ fn scalar_is(caveats: &[Caveat], n: &str, expected: &str) -> bool {
 /// The detached PoP from `X-Mint-Pop`, if syntactically present.
 /// A malformed header is a hard `Err` (caller maps to 401); absence is
 /// `Ok(None)` (caller decides whether key-binding is required).
-fn pop_proof(headers: &HeaderMap) -> Result<Option<pop::Proof>, ()> {
+// The error variant carries no information by design — every PoP
+// failure collapses to opaque 401 at the HTTP layer (audit log is
+// where the variant lives, not the wire). The unit error type makes
+// the call-site shape unambiguous.
+#[allow(clippy::result_unit_err)]
+pub fn pop_proof(headers: &HeaderMap) -> Result<Option<pop::Proof>, ()> {
     match headers.get("x-mint-pop").and_then(|v| v.to_str().ok()) {
         Some(sig) => pop::Proof::from_b64(sig).map(Some).map_err(|_| ()),
         None => Ok(None),
@@ -216,28 +221,48 @@ impl VerifyClearError {
 /// (`/v1/assume-role`, `/v1/verify`) invoke this; assume-role layers
 /// role-specific clearing and IAM issuance on top of the result.
 ///
+/// The bundle's *primary* may be either:
+///
+/// 1. **Mint-issued** — `kid` matches a generation in mint's keyring;
+///    the chain seed verifies under `K_M`. This is the long-lived
+///    credential path (coord-side `assume-role`, `enroll-exchange`).
+/// 2. **Auth-issued discharge** — `kid == DISCHARGE_KID`; the chain
+///    seed verifies under `r` derived from `(K_M-A, nonce)`. This is
+///    the per-action operator-authority path (`admin:*` endpoints under
+///    the consolidation, or any future verifier of standalone
+///    discharges).
+///
+/// The two paths use *different* key sources (`K_M` vs. `K_M-A`-derived
+/// `r`) — no code path conflates them; an attacker without `K_M-A`
+/// cannot produce a discharge that verifies, and an attacker without
+/// `K_M` cannot produce a mint-issued primary that verifies.
+///
 /// Returns the union of caveats across the bundle and the
 /// bundle-wide minimum `NotAfter` — the verify endpoint returns
 /// these verbatim; assume-role hands the caveats to [`role::authorize`]
 /// for the role-specific gate.
+// Each input is independently meaningful at every call site (keyring +
+// K_M-A + body + expected caveats are all separate concerns). A
+// builder/struct wrapper would obscure that without removing any
+// coupling.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_and_clear(
     bundle: &Bundle,
     keyring: &crate::keyring::Keyring,
+    k_m_a: Option<&[u8; 32]>,
     proof: Option<pop::Proof>,
     body: &[u8],
     now_unix: u64,
     expected_aud: &str,
     expected_op: &str,
 ) -> Result<ClearedBundle, VerifyClearError> {
-    let primary_key = keyring
-        .get(bundle.primary.kid())
-        .ok_or(VerifyClearError::Auth("unknown_kid"))?;
+    let primary_key = resolve_primary_key(&bundle.primary, keyring, k_m_a)?;
 
     let mut aggregated: Vec<Caveat> = Vec::new();
     let mut discharge_cursor = 0usize;
     let mut work: std::collections::VecDeque<(Macaroon, [u8; 32])> =
         std::collections::VecDeque::new();
-    work.push_back((bundle.primary.clone(), *primary_key));
+    work.push_back((bundle.primary.clone(), primary_key));
 
     while let Some((mac, key)) = work.pop_front() {
         let sites = mac
@@ -294,6 +319,41 @@ pub fn verify_and_clear(
     })
 }
 
+/// Resolve the chain-MAC seed key for the bundle's primary. Two
+/// disjoint paths, distinguished structurally:
+///
+/// - **Mint-issued primary**: `primary.kid()` matches a generation in
+///   the keyring → seed key is `keyring.get(kid)`. The chain MAC then
+///   verifies under `K_M`.
+/// - **Auth-issued discharge**: `primary.kid() == DISCHARGE_KID` →
+///   seed key is `auth::derive_discharge_r(K_M-A, primary.nonce())`.
+///   The chain MAC then verifies under `r` recovered from `K_M-A`.
+///
+/// Anything else (unknown kid, or `DISCHARGE_KID` with no `K_M-A`
+/// available) is `Auth("unknown_kid")`. The two paths use *different*
+/// key sources by construction — there is no code path that admits
+/// one's bytes under the other's key.
+fn resolve_primary_key(
+    primary: &Macaroon,
+    keyring: &crate::keyring::Keyring,
+    k_m_a: Option<&[u8; 32]>,
+) -> Result<[u8; 32], VerifyClearError> {
+    // Dispatch on the kid sentinel first: discharges use the reserved
+    // `DISCHARGE_KID` and never appear in the keyring. Checking this
+    // before the keyring lookup keeps the two paths cleanly disjoint
+    // even if the keyring were ever extended past the sentinel.
+    if primary.kid() == crate::macaroon::DISCHARGE_KID {
+        let Some(k_m_a) = k_m_a else {
+            return Err(VerifyClearError::Auth("unknown_kid"));
+        };
+        return Ok(crate::auth::derive_discharge_r(k_m_a, primary.nonce()));
+    }
+    keyring
+        .get(primary.kid())
+        .copied()
+        .ok_or(VerifyClearError::Auth("unknown_kid"))
+}
+
 async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     let caller = peer_ip(&headers);
@@ -331,6 +391,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     let cleared = match verify_and_clear(
         &bundle,
         &keyring,
+        state.store.k_m_a(),
         proof,
         &body,
         now_unix,
@@ -895,6 +956,7 @@ async fn discharge_verify(
     let cleared = match verify_and_clear(
         &bundle,
         &keyring,
+        state.store.k_m_a(),
         proof,
         &body,
         now_unix,

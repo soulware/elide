@@ -181,6 +181,21 @@ pub fn mint(keyring: &Keyring, caveats: Vec<Caveat>) -> Macaroon {
 pub fn mint_under_key(key: &[u8; 32], kid: Kid, caveats: Vec<Caveat>) -> Macaroon {
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
+    mint_under_key_with_nonce(key, kid, nonce, caveats)
+}
+
+/// As [`mint_under_key`] but with a caller-supplied nonce. Used when
+/// the issuer needs to derive `key` *from* the nonce — the demo
+/// discharge path does this: it picks a fresh nonce, derives `r` via
+/// BLAKE3 keyed by `K_M-A` over the nonce, then MAC's the chain under
+/// `r`. The same derivation at the verifier recovers `r` from the
+/// nonce alone — no extra state to track.
+pub fn mint_under_key_with_nonce(
+    key: &[u8; 32],
+    kid: Kid,
+    nonce: [u8; NONCE_LEN],
+    caveats: Vec<Caveat>,
+) -> Macaroon {
     let mac = chain_mac(key, kid, &nonce, &caveats);
     Macaroon {
         kid,
@@ -190,14 +205,17 @@ pub fn mint_under_key(key: &[u8; 32], kid: Kid, caveats: Vec<Caveat>) -> Macaroo
     }
 }
 
-/// `kid` value the discharge-issuing path uses. The kid slot in a
-/// discharge's wire format doesn't index any keyring (the discharge
-/// is MAC'd under the per-client ephemeral `r`), but the value
-/// participates in the chain seed so issuer and verifier must agree.
-/// 0 is the convention; it is unrelated to mint's root-keyring `kid=0`
-/// because verification of a discharge takes `r` directly via
-/// [`Macaroon::verify_under_key`] rather than looking the kid up.
-pub const DISCHARGE_KID: Kid = 0;
+/// `kid` sentinel for discharges. The kid slot of a discharge's wire
+/// format doesn't index mint's root keyring — the discharge is MAC'd
+/// under the per-client ephemeral `r` — but it does participate in the
+/// chain seed, so issuer and verifier must agree on its value. We
+/// reserve `u16::MAX` so it cannot collide with any keyring generation;
+/// the keyring monotonically increments from 0 and would have to
+/// rotate 65 535 times to clash. `verify_and_clear`'s
+/// `resolve_primary_key` dispatches on this value: kid in the keyring
+/// → mint-issued primary verified under `K_M`; kid == `DISCHARGE_KID`
+/// → auth-issued discharge verified under `r` recovered from `K_M-A`.
+pub const DISCHARGE_KID: Kid = Kid::MAX;
 
 impl Macaroon {
     pub fn kid(&self) -> Kid {
@@ -582,7 +600,11 @@ mod tests {
     }
 
     #[test]
-    fn discharge_kid_distinct_from_keyring_kid_zero() {
+    fn discharge_kid_sentinel_is_unreachable_via_keyring() {
+        // DISCHARGE_KID is reserved (Kid::MAX) so it never collides
+        // with a keyring generation. Verifying a discharge under
+        // `r` directly works (right key); verifying via the keyring
+        // fails because the keyring never holds an entry at this kid.
         let r = [0xff; 32];
         let m = mint_under_key(
             &r,
@@ -590,7 +612,8 @@ mod tests {
             vec![Caveat::scalar("Subject", "usr_abc")],
         );
         assert!(m.verify_under_key(&r));
-        assert!(!m.verify(&ring())); // ring's kid=0 is [7u8; 32], not [0xff; 32]
+        assert!(!m.verify(&ring()));
+        assert_eq!(DISCHARGE_KID, Kid::MAX);
     }
 
     #[test]

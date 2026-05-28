@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -31,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::caveat::{EffectiveCaveats, Resolved, SCOPE, admin_scope, name, op as op_value};
-use crate::http::AppState;
+use crate::http::{AppState, verify_and_clear};
 use crate::issuance::{mint_admin_token, mint_invite};
 use crate::macaroon::Macaroon;
 use crate::state::{EnrollmentState, EnrollmentView, Store};
@@ -123,7 +124,10 @@ fn unauthorized_response() -> Response {
 /// docs); routes are now safe to mount on any listener.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/v1/admin/invite", get(handle_get_invite))
+        .route(
+            "/v1/admin/invite",
+            get(handle_get_invite).post(handle_post_invite),
+        )
         .route("/v1/admin/invite/rotate", post(handle_rotate_invite))
         .route("/v1/admin/enrollments", get(handle_list_enrollments))
         .route("/v1/admin/enroll/approve", post(handle_approve))
@@ -226,6 +230,65 @@ async fn handle_get_invite(State(state): State<AppState>, headers: HeaderMap) ->
         Ok(r) => json_ok(r),
         Err(s) => s,
     }
+}
+
+/// Discharge-authenticated read of the current invite. The bundle's
+/// primary is an auth-issued discharge (`kid=DISCHARGE_KID`, MAC'd
+/// under `r = derive_discharge_r(K_M-A, nonce)`); verify+clear
+/// confirms the discharge under K_M-A-recovered `r`, the operator's
+/// PoP against the discharge's `cnf`, and that the discharge carries
+/// `op=admin:invite-read`.
+async fn handle_post_invite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = verify_discharge(&state, &headers, &body, ADMIN_INVITE_READ).await {
+        return r;
+    }
+    match build_invite(&state).await {
+        Ok(r) => json_ok(r),
+        Err(s) => s,
+    }
+}
+
+/// Action vocabulary stamped into discharges. Each admin endpoint
+/// requires its own specific `op` value; verify+clear rejects a
+/// discharge carrying any other action.
+const ADMIN_INVITE_READ: &str = "admin:invite-read";
+
+/// Run verify+clear against the request bundle in
+/// `Authorization: MintV1 mnt1_<discharge>`. The discharge must carry
+/// `op == expected_op`, an `exp` in the future, and a `cnf` whose
+/// matching Ed25519 private key signed `X-Mint-Pop` over
+/// `tail ‖ BLAKE3(body)`. Every failure collapses to opaque 401.
+async fn verify_discharge(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &[u8],
+    expected_op: &str,
+) -> Result<(), Response> {
+    let Some(bundle) = crate::http::extract_bundle(headers) else {
+        return Err(unauthorized_response());
+    };
+    let proof = match crate::http::pop_proof(headers) {
+        Ok(p) => p,
+        Err(()) => return Err(unauthorized_response()),
+    };
+    let keyring = state.store.keyring().await;
+    let now_unix = chrono::Utc::now().timestamp().max(0) as u64;
+    verify_and_clear(
+        &bundle,
+        &keyring,
+        state.store.k_m_a(),
+        proof,
+        body,
+        now_unix,
+        &state.config.audience,
+        expected_op,
+    )
+    .map(|_| ())
+    .map_err(|_| unauthorized_response())
 }
 
 async fn handle_rotate_invite(State(state): State<AppState>, headers: HeaderMap) -> Response {
