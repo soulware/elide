@@ -50,7 +50,40 @@ pub mod op {
     pub const ENROLL: &str = "enroll";
     pub const ENROLL_EXCHANGE: &str = "enroll-exchange";
     pub const ASSUME_ROLE: &str = "assume-role";
+    /// Mint admin operations — `/v1/admin/*`. Authenticates a human
+    /// managing mint state (rotating the invite, approving / revoking
+    /// client enrollments, minting / revoking further admin tokens).
+    /// Distinct chain from the client `enroll`/`assume-role` family
+    /// even though both are MAC'd under the same root key.
+    pub const ADMIN: &str = "admin";
 }
+
+/// Admin scope tags. The optional `scope` caveat on an admin macaroon
+/// is a comma-separated list of these tags; an absent caveat means
+/// **super-admin** (every verb). Verifiers compare the endpoint's
+/// fixed tag against the comma-list; mint stays vocabulary-agnostic
+/// in that the tag strings are matched as opaque strings, not
+/// interpreted.
+pub mod admin_scope {
+    /// Rotate the invite nonce.
+    pub const INVITE_ROTATE: &str = "invite-rotate";
+    /// Read the invite macaroon + nonce.
+    pub const INVITE_READ: &str = "invite-read";
+    /// List pending + approved enrollments.
+    pub const ENROLL_LIST: &str = "enroll-list";
+    /// Approve a pending client enrollment.
+    pub const ENROLL_APPROVE: &str = "enroll-approve";
+    /// Revoke an approved client.
+    pub const ENROLL_REVOKE: &str = "enroll-revoke";
+    /// Mint a new admin macaroon (per-human delegation).
+    pub const TOKEN_MINT: &str = "token-mint";
+    /// Revoke an admin macaroon by nonce.
+    pub const TOKEN_REVOKE: &str = "token-revoke";
+}
+
+/// First-party caveat name for the admin `scope` list. Carried on
+/// non-super-admin tokens.
+pub const SCOPE: &str = "scope";
 
 /// One step in a macaroon's caveat chain. A chain interleaves
 /// first-party scalar caveats (the common case) and third-party

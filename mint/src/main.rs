@@ -358,6 +358,37 @@ struct TigrisHandles {
 /// real S3-compatible target (Tigris free tier, MinIO). Test code
 /// constructs `Store::open_in_memory` / `Store::open_local` directly,
 /// outside this path.
+/// Mint a super-admin bootstrap macaroon and write it to
+/// `<data_dir>/admin.bootstrap` (mode 0600). The first-start hook
+/// for `serve`; the operator captures the file out of band, mints
+/// per-human admin tokens via `/v1/admin/token/mint`, and then
+/// rotates the keyring to retire this one. Mint refuses to overwrite
+/// an existing file — first-start detection is the caller's job.
+async fn write_bootstrap_admin(
+    cfg: &Config,
+    store: &Store,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = cfg.data_dir.join("admin.bootstrap");
+    let keyring = store.keyring().await;
+    let mac = mint::issuance::mint_admin_token(
+        &keyring,
+        &cfg.audience,
+        "bootstrap",
+        None, // super-admin
+        None, // non-expiring
+    );
+    let bytes = mac.encode();
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, &path)?;
+    tracing::warn!(
+        path = %path.display(),
+        "wrote bootstrap admin macaroon — capture out of band, mint per-human tokens via /v1/admin/token/mint, then rotate the keyring to retire this one"
+    );
+    Ok(())
+}
+
 async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std::error::Error>> {
     let admin = cfg.admin.as_ref().ok_or(
         "mint serve requires a Tigris admin credential in the environment \
@@ -396,8 +427,28 @@ async fn serve(
         .init();
 
     let config = Arc::new(load(config)?);
+
+    // First start = keyring directory empty before open_store.
+    // open_store generates `root_keys/0000` if absent, so checking
+    // before is the only reliable signal. The bootstrap admin
+    // macaroon is written exactly once, on this transition; later
+    // starts never re-create it, so an operator who has captured
+    // and removed it never sees it re-appear.
+    let is_first_start = !config.data_dir.join("root_keys").join("0000").exists()
+        && !config.data_dir.join("root_key").exists();
+
     let (store, tigris) = open_store(&config).await?;
     let store = Arc::new(store);
+
+    // Bootstrap admin macaroon (`docs/design-mint.md` § *Admin
+    // macaroon*). Super-admin, non-expiring, `sub=bootstrap` —
+    // captured out of band by the operator who runs `mint serve`
+    // for the first time, then revoked (by minting per-human tokens
+    // and rotating the keyring) so production never relies on this
+    // one-shot artefact.
+    if is_first_start && !config.data_dir.join("admin.bootstrap").exists() {
+        write_bootstrap_admin(&config, &store).await?;
+    }
 
     // Template seal: publish any pending file on disk, then verify
     // the canonical seal matches local config + template hashes.
@@ -445,16 +496,12 @@ async fn serve(
         audit: Arc::new(AuditLog::new(Box::new(std::io::stdout()))),
         store,
     };
+    let app = mint::admin::mount(router(state.clone()), state);
     match transport {
         Listener::Tcp(addr) => {
-            // No admin endpoints on TCP — they would expose
-            // approve/revoke to anything that can reach the port
-            // (`docs/design-mint.md` § *Mint state in the tenant
-            // bucket*). Operators bind a UDS listener for the admin
-            // surface; clients hit TCP only.
             let listener = tokio::net::TcpListener::bind(addr).await?;
             tracing::info!(%addr, "mint listening (tcp)");
-            axum::serve(listener, router(state)).await?;
+            axum::serve(listener, app).await?;
         }
         Listener::Uds(path) => {
             // UDS idiom: clear the stale dentry, bind, then chmod
@@ -464,9 +511,6 @@ async fn serve(
             let listener = tokio::net::UnixListener::bind(&path)?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
             tracing::info!(path = %path.display(), "mint listening (uds)");
-            // UDS-only: admin routes are mounted alongside the public
-            // ones, gated by the socket file's filesystem permission.
-            let app = mint::admin::mount(router(state.clone()), state);
             axum::serve(listener, app).await?;
         }
     }

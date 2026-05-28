@@ -112,6 +112,34 @@ pub fn mint_credential(
     )
 }
 
+/// Mint an admin macaroon — the bearer credential a human ops user
+/// presents on `/v1/admin/*`. `op=admin`, `aud`, `sub` (human
+/// identifier, free-text), optional `scope` (comma-list of admin
+/// verb tags from [`crate::caveat::admin_scope`]; an empty list is
+/// **super-admin**), optional `exp` (unix seconds; `None` =
+/// non-expiring). Distinct chain from the client `enroll`/
+/// `assume-role` family even though both MAC under the same root.
+pub fn mint_admin_token(
+    keyring: &Keyring,
+    audience: &str,
+    sub: &str,
+    scope: Option<&str>,
+    exp_unix: Option<u64>,
+) -> Macaroon {
+    let mut caveats = vec![
+        Caveat::scalar(name::OP, op::ADMIN),
+        Caveat::scalar(name::AUD, audience),
+        Caveat::scalar(name::SUB, sub),
+    ];
+    if let Some(s) = scope {
+        caveats.push(Caveat::scalar(crate::caveat::SCOPE, s));
+    }
+    if let Some(e) = exp_unix {
+        caveats.push(Caveat::scalar(name::EXP, e.to_string()));
+    }
+    macaroon::mint(keyring, caveats)
+}
+
 /// Extract the bound `(sub, cnf)` from an already-MAC-verified
 /// macaroon, tri-state-safe: a contradictory copy of either fails
 /// closed (never silently read as the first value), and `cnf` is
