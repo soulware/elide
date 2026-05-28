@@ -11,9 +11,12 @@
 //! `invite` / `enroll` are the operator side. The networked
 //! `mint client` (the caller's half of the flow) is the staged tail.
 
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -496,16 +499,29 @@ async fn serve(
         audit: Arc::new(AuditLog::new(Box::new(std::io::stdout()))),
         store,
     };
-    let demo_auth = state.config.auth.as_ref().is_some_and(|a| a.demo_enabled);
-    let mut app = mint::admin::mount(router(state.clone()), state.clone());
-    if demo_auth {
-        app = mint::auth::mount(app, state);
-    }
-    match transport {
+
+    // The mint role's app (admin routes are merged onto the same router
+    // because they share the mint-listener; admin is a mint-internal
+    // operator surface, not an auth-role concern).
+    let mint_app = mint::admin::mount(router(state.clone()), state.clone());
+
+    // The auth role lives on its own UDS when `[auth].demo_enabled =
+    // true`. mint-as-auth is structurally not mint: separate listener,
+    // separate router, no shared HTTP path. Production deploys run a
+    // standalone auth-service binary instead — mint never opens this
+    // socket without `demo_enabled`.
+    let auth_socket = state
+        .config
+        .auth
+        .as_ref()
+        .and_then(|a| a.socket.clone())
+        .filter(|_| state.config.auth.as_ref().is_some_and(|a| a.demo_enabled));
+
+    let mint_listener: Pin<Box<dyn Future<Output = io::Result<()>> + Send>> = match transport {
         Listener::Tcp(addr) => {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             tracing::info!(%addr, "mint listening (tcp)");
-            axum::serve(listener, app).await?;
+            Box::pin(async move { axum::serve(listener, mint_app).await })
         }
         Listener::Uds(path) => {
             // UDS idiom: clear the stale dentry, bind, then chmod
@@ -515,7 +531,28 @@ async fn serve(
             let listener = tokio::net::UnixListener::bind(&path)?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
             tracing::info!(path = %path.display(), "mint listening (uds)");
-            axum::serve(listener, app).await?;
+            Box::pin(async move { axum::serve(listener, mint_app).await })
+        }
+    };
+
+    match auth_socket {
+        Some(path) => {
+            let auth_app = mint::auth::router(state);
+            let _ = std::fs::remove_file(&path);
+            let auth_listener = tokio::net::UnixListener::bind(&path)?;
+            // Tighter mode than mint's listener: only the binding user
+            // and group can fetch discharges. Demo-only; production
+            // auth-service binds its own socket with its own policy.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))?;
+            tracing::info!(path = %path.display(), "auth listening (uds)");
+            let auth_fut = async move { axum::serve(auth_listener, auth_app).await };
+            // `try_join!` fails-fast: a fault on either listener
+            // brings the process down. Both listeners are required for
+            // a working demo, so partial-up is never the right state.
+            tokio::try_join!(mint_listener, auth_fut)?;
+        }
+        None => {
+            mint_listener.await?;
         }
     }
     Ok(())

@@ -117,14 +117,22 @@ pub struct RawAuth {
     /// stamps and returned to coords on the 401 challenge response.
     /// Required when `[auth]` is present.
     pub endpoint: String,
-    /// When `true`, mint mounts the auth-service route handlers
-    /// itself (`/v1/login/*`, `/v1/discharge`) and rubber-stamps every
-    /// login. Generates `K_M-A` and `K_session` on first start. Demo /
-    /// test only. Mint refuses to start with `demo_enabled = true`
-    /// unless it is bound to loopback or UDS — see
-    /// `docs/design-auth-service.md` § *Mint as auth (demo only)*.
+    /// When `true`, mint colocates the auth-service role and binds its
+    /// own UDS for `/v1/discharge`. Demo / test only. Generates
+    /// `K_M-A` and `K_session` on first start. Mint refuses to start
+    /// with `demo_enabled = true` unless mint itself is bound to
+    /// loopback or UDS — see `docs/design-auth-service.md` § *Mint as
+    /// auth (demo only)*.
     #[serde(default)]
     pub demo_enabled: bool,
+    /// UDS path the colocated auth role binds for `/v1/discharge` when
+    /// `demo_enabled = true`. Path-only (UDS-only) — the auth role
+    /// never listens on TCP in demo mode. Defaults to
+    /// `<data_dir>/auth.sock` when omitted; ignored entirely when
+    /// `demo_enabled = false` (production deployments run a separate
+    /// auth-service binary on its own listener).
+    #[serde(default)]
+    pub socket: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -250,6 +258,11 @@ pub const DEFAULT_SOCKET_NAME: &str = "mint.sock";
 pub struct Auth {
     pub endpoint: String,
     pub demo_enabled: bool,
+    /// UDS path the demo auth role binds for `/v1/discharge`. Resolved
+    /// from `[auth].socket` (explicit) or `<data_dir>/auth.sock`
+    /// (default). `None` when `demo_enabled = false` — production
+    /// deploys run a separate auth-service binary.
+    pub socket: Option<PathBuf>,
 }
 
 /// Validated configuration, ready to serve.
@@ -354,9 +367,17 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("mint_data"));
         let listener = resolve_listener(raw.bind.as_deref(), raw.socket.as_deref(), &data_dir)?;
-        let auth = raw.auth.map(|a| Auth {
-            endpoint: a.endpoint,
-            demo_enabled: a.demo_enabled,
+        let auth = raw.auth.map(|a| {
+            let socket = a.demo_enabled.then(|| {
+                a.socket
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| data_dir.join("auth.sock"))
+            });
+            Auth {
+                endpoint: a.endpoint,
+                demo_enabled: a.demo_enabled,
+                socket,
+            }
         });
         // A role that requires a TPC needs an `[auth]` block to point
         // it at. Refusing here keeps the issuance path
