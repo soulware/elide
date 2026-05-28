@@ -418,6 +418,86 @@ The same mint code supports three deployment shapes:
 (2) and (3) differ only in whose Tigris account the admin credential is
 issued against — the mint software is identical.
 
+## Operator authorization
+
+Mint's admin endpoints — `POST /v1/admin/invite`,
+`POST /v1/admin/invite/rotate`, `GET /v1/admin/enrollments`,
+`POST /v1/admin/enroll/approve`, `POST /v1/admin/enroll/revoke` — are
+the operator's surface for managing invites and approving coordinator
+enrollments. They are mounted on the UDS listener only
+(§ *Proposed: dual-listen*); UDS filesystem permission gates
+**transport**, not authority. Every admin call still carries the
+`MintV1 <bundle>` Authorization shape used everywhere else — a
+primary plus an auth-service discharge — so each call is exercised by
+a specific operator under a specific authorization policy, and the
+audit log can attribute actions to humans rather than to "whoever
+could `connect(2)` to the socket".
+
+### CLI service token
+
+The primary in an admin bundle is a long-lived **CLI service token**
+written by mint at first start and read by the local `mint` CLI on
+each invocation. Its caveats are the minimum needed to anchor the
+bundle:
+
+```
+caveats:
+  aud  = mint
+  role = admin
+  TPC:   location = auth-service, VID/CID encrypted under K_M-A
+```
+
+No `cnf`, no `exp`, no other caveats. Operator identity and per-call
+freshness ride on the discharge (§ *Authentication*); the service
+token's job is to anchor the third-party caveat so each admin call
+requires a fresh auth-service discharge. `role = admin` fits the same
+machinery as the other roles (§ *Role configuration*) — it is a
+normal role primary whose endpoint surface happens to be the admin
+set rather than `assume-role`.
+
+**Generation.** Mint mints the service token at first start under
+`K_M`, with a fresh nonce, and writes it to `<data_dir>/cli-token`
+(mode 0640: mint user + a local-operator group). It is not a
+network secret: the bundle is inert without a fresh discharge from
+auth-service, and any process without UDS access cannot reach mint
+at all. Local-filesystem reach is therefore the only reach it needs.
+
+**Distribution.** None. The mint CLI on the same host reads
+`<data_dir>/cli-token` directly. No copy-paste, no out-of-band
+channel, no deployer secrets pipeline. Cross-host operator access is
+out of scope here; remote operators interact with mint through the
+coordinator for non-admin paths, or wait for a future
+authenticated-TCP admin transport (§ *Proposed: dual-listen* — *What
+this is not*).
+
+**Rotation.** `mint cli-token rotate` mints a fresh token under the
+same `K_M` (new nonce) and overwrites `<data_dir>/cli-token`. Old
+tokens remain verifiable until a revocation mechanism lands (see
+*Open questions*); the discharge layer gates every individual call
+regardless.
+
+**Lifetime.** Effectively the deployment's. Per-call freshness is
+supplied by the discharge's short `exp` and the per-request PoP, so
+a long-lived service token does not weaken any property the per-call
+check enforces.
+
+### Why not gate admin on filesystem permission alone
+
+UDS permission gates transport; it does not say which human is
+calling. Two reasons we still require the bundle on top:
+
+- **Identity attribution.** Multiple local users may share UDS
+  access (the operator, the mint process, an unrelated service in the
+  same group). The audit log needs to record which human performed
+  `enroll approve`; without a discharge bound to an operator's `cnf`
+  that identity is unrecoverable from the request.
+- **Authorization policy lives at auth-service.** "Who may operate
+  this mint" is a policy decision belonging to the central
+  authorization service, not to whoever was added to the mint group
+  on the host. The discharge mechanism is the explicit interface where
+  that policy is enforced; collapsing to filesystem permission would
+  put the policy in `/etc/group`.
+
 ## Credential macaroon & lifecycle
 
 A **credential macaroon** is the mint root attenuated to exactly one
@@ -700,14 +780,16 @@ same opaque `401` as `assume-role` on any failure (including a role this
 
 Authentication is identical at every endpoint that accepts a macaroon.
 The `Authorization` header carries the presented macaroon,
-base64-encoded — the coordinator-attenuated invite at `/v1/enroll`, the
-credential ticket at `/v1/enroll-exchange`, the attenuated credential
-at `/v1/assume-role` and `/v1/verify`; any discharge macaroons for
-third-party caveats accompany it in the request body (bundle wire
-format per *Open questions* #15; discharges apply to the credential
-ticket and credential, never the invite). The mint verifies the presented macaroon's chain MAC
-against its own macaroon root, and each discharge against the relevant
-third-party key (see `design-auth-model.md` for the construction).
+base64url-encoded — the coordinator-attenuated invite at `/v1/enroll`,
+the credential ticket at `/v1/enroll-exchange`, the attenuated
+credential at `/v1/assume-role` and `/v1/verify`, the CLI service
+token at every `/v1/admin/*` endpoint (§ *Operator authorization*);
+any discharge macaroons for third-party caveats are included in the
+same `MintV1` bundle (discharges apply to the credential ticket, the
+credential, and the service token, never the invite). The mint
+verifies the presented macaroon's chain MAC against its own macaroon
+root, and each discharge against the relevant third-party key (see
+[`design-auth-model.md`](design-auth-model.md) for the construction).
 
 The request also carries the proof-of-possession the macaroon's
 `cnf` caveat requires: `X-Mint-Coord-Pop` is the base64
@@ -1496,8 +1578,11 @@ which transport an operator runs admin commands over. They are
 unrelated because admin and public traffic have different audiences
 (human operator on the mint host vs remote coordinator), different
 frequencies (one approval per coordinator vs every assume-role), and
-different auth shapes (filesystem permission on the socket vs the
-macaroon + PoP chain).
+different transport constraints (admin is local-only by construction;
+public traffic crosses hosts). Both use the same `MintV1` bundle
+shape for authority (§ *Operator authorization*); UDS filesystem
+permission gates which processes may reach the admin routes at all,
+not what authority those processes may exercise once connected.
 
 Today, picking TCP for coordinators forfeits a working admin path
 (no UDS) and picking UDS for admin forfeits remote coordinators (no
@@ -1518,8 +1603,10 @@ when both are set, `serve` binds both listeners under a
   (`/v1/assume-role`, `/v1/enroll`, `/v1/enroll-exchange`) *and* the
   operator routes (`/v1/admin/…` — see *Mint state in the tenant
   bucket* / *Operator endpoints*). Filesystem permission on the socket
-  is the gate for admin; the macaroon + PoP gate the public routes
-  the same as on TCP.
+  gates *transport*; the `MintV1` bundle (CLI service token +
+  auth-service discharge + PoP, § *Operator authorization*) gates
+  *authority* on the admin routes, exactly as the same bundle shape
+  gates `/v1/assume-role` on either listener.
 - **TCP listener** mounts the public routes *only*. Admin routes are
   structurally unreachable on this listener — not "returned 404",
   not "401" — they are not registered in the router the TCP socket
@@ -1532,12 +1619,14 @@ clear message ("admin requires `socket` in `mint.toml`"). The
 operator's choice is to add `socket` (and SSH or be on-host to use
 it) or stand up the still-future authenticated-TCP-admin transport.
 
-**What this is not.** A TCP admin surface — that requires a credential
-shape mint does not yet ship (admin macaroon or operator-scoped
-bearer token) plus the audit surface to attribute calls to operators.
-The shape of that work is a separate proposal; it is **additive**
-when it lands (a third optional listener with its own router) and
-does not require revisiting the dual-listen decision here.
+**What this is not.** A TCP admin surface. The bundle shape exists
+(§ *Operator authorization*), but the CLI service token is
+distributed by local-filesystem read of `<data_dir>/cli-token`; a
+cross-host operator would need a separate distribution path for the
+token, and that reintroduces all the network-credential concerns the
+local-only model collapses. A future TCP admin transport is therefore
+**additive** when it lands (a third optional listener with its own
+router) and does not require revisiting the dual-listen decision here.
 
 **Cost.** One config-validation rule drops; one `serve` branch
 replaces a `match` with `tokio::join!`; the existing UDS-side router
