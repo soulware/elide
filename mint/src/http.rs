@@ -305,9 +305,16 @@ pub fn verify_and_clear(
     if !matches!(eff.resolve(name::OP), Resolved::Value(v) if v == expected_op) {
         return Err(VerifyClearError::OpClear);
     }
-    let expires_at = eff.not_after(name::EXP);
-    if let Some(exp) = expires_at
-        && exp <= now_unix
+    // Two deadline names bind: `exp` (the credential's own expiry) and
+    // `NotAfter` (borne by discharges and by per-IPC / per-forward
+    // attenuations). The minimum across both is the bundle's effective
+    // deadline — the tightest attenuation wins.
+    let expires_at = match (eff.not_after(name::EXP), eff.not_after(name::NOT_AFTER)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    if let Some(deadline) = expires_at
+        && deadline <= now_unix
     {
         return Err(VerifyClearError::Expired);
     }
