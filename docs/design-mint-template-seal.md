@@ -84,11 +84,20 @@ The seal is replaced by a single explicit operator command,
 signs the manifest under the keyring, and writes the result to
 `<data_dir>/pending-seal.json`. The bucket PUT happens inside
 `mint serve` on the next startup, so the CLI needs no bucket
-credentials of its own. There is no auto-seal-on-start and no
-hot-reload — a running mint instance has exactly one possible
-state with respect to templates: *verified against the current
-canonical seal, serving from the in-memory cache loaded at that
-verification.* Anything else is "not running."
+credentials of its own.
+
+On a **genuine first start** — no pending file *and* no bucket seal —
+`mint serve` auto-seals the on-disk templates as the
+trust-on-first-use baseline rather than refusing. The initial seal is
+TOFU either way: an explicit `mint seal` would bless whatever is on
+disk at that moment too, so doing it on first start is
+cryptographically equivalent and removes the seal-then-serve ordering
+step. Every *later* template change still requires an explicit
+`mint seal` — startup refuses-closed on any mismatch against the
+pinned baseline. There is no hot-reload: a running mint instance has
+exactly one possible state with respect to templates — *verified
+against the current canonical seal, serving from the in-memory cache
+loaded at that verification* — and anything else is "not running."
 
 ## The seal object
 

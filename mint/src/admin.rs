@@ -466,8 +466,18 @@ pub enum AdminClientError {
     Malformed(String),
 }
 
-/// Reach the running mint over the same listener `serve` is bound to.
-pub enum AdminTarget<'a> {
+/// Reach the running mint over the same listener `serve` is bound to,
+/// carrying the admin macaroon the gated routes require. `auth` is the
+/// bare macaroon (no `MintV1 ` prefix); the caller resolves it (env
+/// override, then the on-disk bootstrap). `None` sends no credential —
+/// the server then answers 401, which is the actionable signal that no
+/// admin macaroon was found.
+pub struct AdminTarget<'a> {
+    pub transport: AdminTransport<'a>,
+    pub auth: Option<String>,
+}
+
+pub enum AdminTransport<'a> {
     /// Unix-domain socket — the production operator path.
     Uds(&'a std::path::Path),
     /// TCP base URL — convenience for tests / dev where the operator
@@ -520,9 +530,10 @@ async fn request(
     endpoint: &str,
     body: Option<String>,
 ) -> Result<(u16, String), AdminClientError> {
-    match target {
-        AdminTarget::Tcp(base) => request_tcp(base, method, endpoint, body).await,
-        AdminTarget::Uds(socket) => request_uds(socket, method, endpoint, body).await,
+    let auth = target.auth.as_deref();
+    match target.transport {
+        AdminTransport::Tcp(base) => request_tcp(base, method, endpoint, auth, body).await,
+        AdminTransport::Uds(socket) => request_uds(socket, method, endpoint, auth, body).await,
     }
 }
 
@@ -530,6 +541,7 @@ async fn request_tcp(
     base: &str,
     method: &str,
     endpoint: &str,
+    auth: Option<&str>,
     body: Option<String>,
 ) -> Result<(u16, String), AdminClientError> {
     let client = reqwest::Client::new();
@@ -538,6 +550,9 @@ async fn request_tcp(
         "POST" => client.post(format!("{base}{endpoint}")),
         m => return Err(AdminClientError::Transport(format!("bad method {m}"))),
     };
+    if let Some(mac) = auth {
+        rb = rb.header("authorization", format!("MintV1 {mac}"));
+    }
     if let Some(b) = body {
         rb = rb.header("content-type", "application/json").body(b);
     }
@@ -557,6 +572,7 @@ async fn request_uds(
     socket: &std::path::Path,
     method: &str,
     endpoint: &str,
+    auth: Option<&str>,
     body: Option<String>,
 ) -> Result<(u16, String), AdminClientError> {
     use http_body_util::{BodyExt, Full};
@@ -567,6 +583,9 @@ async fn request_uds(
         Client::builder(TokioExecutor::new()).build(hyperlocal::UnixConnector);
     let uri: hyper::Uri = hyperlocal::Uri::new(socket, endpoint).into();
     let mut builder = hyper::Request::builder().method(method).uri(uri);
+    if let Some(mac) = auth {
+        builder = builder.header("authorization", format!("MintV1 {mac}"));
+    }
     if body.is_some() {
         builder = builder.header("content-type", "application/json");
     }

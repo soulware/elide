@@ -1809,6 +1809,18 @@ A worked `examples/` script chains them: `serve` (background) →
 (once per role) → `client assume-role`, printing the returned Tigris
 keypair.
 
+**Operator auth.** The operator commands (`invite`, `enroll
+list/approve/revoke`) hit macaroon-gated admin endpoints and must
+present an admin macaroon. The first command to create the keyring —
+`mint seal` or `mint serve` — writes a one-shot super-admin bootstrap
+macaroon to `<data_dir>/admin.bootstrap` (mode 0600); the operator
+commands read it from there by default, or from `$MINT_ADMIN_TOKEN`
+(a per-human token minted via `/v1/admin/token/mint`). It is issued
+at keyring genesis, so deleting it after capture does not resurrect
+it. `serve` also auto-seals the templates on a genuine first start
+(see [`design-mint-template-seal.md`](design-mint-template-seal.md)),
+so the demo needs no explicit `mint seal` step.
+
 **Backend.** `serve --tigris` selects the real Tigris IAM minter — a
 self-contained AWS IAM Query-API client (`CreateAccessKey` →
 `CreatePolicy` → `AttachUserPolicy`, SigV4-signed against

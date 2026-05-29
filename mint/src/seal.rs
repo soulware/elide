@@ -358,16 +358,38 @@ pub async fn publish_pending_and_verify(
         remove_pending(&pending_path).map_err(|e| e.to_string())?;
     }
 
-    // (2) Bucket seal must exist.
-    let bucket_seal = store
+    // (2) Bucket seal: auto-seal on a genuine first start. If no
+    // pending was staged (step 1 above) and the bucket carries no
+    // seal, this is the first time mint has run against this bucket —
+    // establish the trust-on-first-use baseline from the on-disk
+    // templates. The initial seal is TOFU either way: an explicit
+    // `mint seal` would bless whatever is on disk now too, so doing it
+    // here is cryptographically equivalent and removes the
+    // seal-then-serve ordering footgun. Any *later* template change
+    // still requires an explicit re-seal — step (3) refuses-closed on
+    // a mismatch against the now-pinned baseline.
+    let bucket_seal = match store
         .get_template_seal()
         .await
         .map_err(|e| format!("read bucket seal: {e}"))?
-        .ok_or_else(|| {
-            "no template seal at _mint/templates/seal.json — run `mint seal` \
-             first (the daemon publishes the staged pending on its next start)"
-                .to_string()
-        })?;
+    {
+        Some(seal) => seal,
+        None => {
+            let seal = Seal::build_from_config(config, &keyring, &chrono::Utc::now().to_rfc3339());
+            store
+                .put_template_seal(&seal)
+                .await
+                .map_err(|e| format!("PUT auto-seal: {e}"))?;
+            tracing::warn!(
+                kid = seal.kid,
+                roles = seal.roles.len(),
+                "no template seal found — auto-sealed the on-disk templates as \
+                 the trust-on-first-use baseline; run `mint seal` to re-seal \
+                 after any intentional template change"
+            );
+            seal
+        }
+    };
 
     // (3) Verify MAC + diff against local config.
     bucket_seal.verify(&keyring).map_err(|e| {
@@ -418,6 +440,34 @@ policy_file = "volume-ro.json"
 
     fn config() -> Config {
         parse_for_test(SAMPLE_TOML, &[("volume-ro.json", "{\"Statement\":[]}")]).expect("parse")
+    }
+
+    #[tokio::test]
+    async fn auto_seals_on_first_start_then_verifies_idempotently() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = config();
+        cfg.data_dir = tmp.path().to_path_buf();
+        let store = crate::state::Store::open_in_memory([9u8; 32])
+            .await
+            .expect("store");
+
+        // First start: no pending file, no bucket seal — the on-disk
+        // templates are auto-sealed as the baseline, then verified.
+        publish_pending_and_verify(&cfg, &store)
+            .await
+            .expect("auto-seal on first start");
+        let sealed = store
+            .get_template_seal()
+            .await
+            .expect("read")
+            .expect("seal present after auto-seal");
+        assert_eq!(sealed.roles.len(), cfg.roles.len());
+
+        // Second start: the bucket seal now exists and matches the
+        // config, so it is verified without a re-PUT.
+        publish_pending_and_verify(&cfg, &store)
+            .await
+            .expect("idempotent second start");
     }
 
     #[test]
