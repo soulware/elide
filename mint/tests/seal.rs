@@ -90,20 +90,26 @@ async fn happy_path_stage_publish_verify() {
 }
 
 #[tokio::test]
-async fn missing_bucket_seal_refuses_start() {
+async fn missing_bucket_seal_auto_seals_on_first_start() {
     let (_d, cfg, store) = setup().await;
-    // No pending, no bucket seal: fail-closed.
-    let err = publish_pending_and_verify(&cfg, &store)
+    // No pending, no bucket seal: this is a genuine first start, so
+    // the on-disk templates are auto-sealed as the trust-on-first-use
+    // baseline rather than refused.
+    publish_pending_and_verify(&cfg, &store)
         .await
-        .expect_err("must refuse to start without a seal");
-    assert!(
-        err.contains("no template seal"),
-        "error should name the missing seal: {err}",
-    );
-    assert!(
-        err.contains("mint seal"),
-        "error should suggest the fix: {err}"
-    );
+        .expect("first start auto-seals");
+    let bucket = store
+        .get_template_seal()
+        .await
+        .unwrap()
+        .expect("bucket seal present after auto-seal");
+    bucket.verify(&*store.keyring().await).unwrap();
+    assert!(bucket.diff_against_config(&cfg).is_empty());
+
+    // A restart with no pending re-verifies the same baseline.
+    publish_pending_and_verify(&cfg, &store)
+        .await
+        .expect("restart verifies the auto-sealed baseline");
 }
 
 #[tokio::test]
@@ -257,12 +263,15 @@ async fn pending_with_corrupt_body_refuses_start() {
 }
 
 #[tokio::test]
-async fn empty_bucket_with_no_pending_refuses_start() {
-    // Sanity: no operator has run `mint seal` ever — startup is
-    // refused with a clear "run mint seal first" message.
+async fn empty_bucket_with_no_pending_auto_seals() {
+    // No operator has run `mint seal` ever: the first start auto-seals
+    // the on-disk templates (trust-on-first-use) instead of refusing.
     let (_d, cfg, store) = setup().await;
-    let err = publish_pending_and_verify(&cfg, &store)
+    publish_pending_and_verify(&cfg, &store)
         .await
-        .expect_err("must refuse without seal");
-    assert!(err.contains("no template seal"));
+        .expect("first start auto-seals");
+    assert!(
+        store.get_template_seal().await.unwrap().is_some(),
+        "a baseline seal is published on first start"
+    );
 }
