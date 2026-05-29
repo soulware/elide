@@ -90,14 +90,13 @@ struct DischargeRequest {
     cnf: String,
 }
 
-/// Mount the discharge router. The caller decides whether to mount
-/// based on `[auth].demo_enabled`; if not mounted, `/v1/discharge`
-/// returns 404 (the demo capability is absent).
-pub fn mount(base: Router, state: AppState) -> Router {
-    base.merge(router(state))
-}
-
-fn router(state: AppState) -> Router {
+/// Build the auth-role router. The caller binds it to its own
+/// listener — the auth role lives on a *separate* socket from the
+/// mint role, never sharing a router with `/v1/assume-role`,
+/// `/v1/admin/*`, or any mint-issued-credential endpoint. Demo
+/// callers reach it at the path in `[auth].socket`
+/// (defaults to `<data_dir>/auth.sock`).
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/discharge", post(issue_discharge))
         .with_state(state)

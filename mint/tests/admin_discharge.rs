@@ -62,7 +62,14 @@ impl std::io::Write for AuditSink {
     }
 }
 
-async fn app() -> (Router, tempfile::TempDir) {
+/// (mint_router, auth_router, tempdir). The two routers live on
+/// *different* listeners in production (`main.rs` binds the auth role
+/// to its own UDS); the tests preserve that boundary by routing
+/// `/v1/discharge` to `auth_router` and everything else to
+/// `mint_router`. State is shared because `K_M-A` is the same value
+/// at both roles — the boundary is the listener / router, not the
+/// underlying secret material.
+async fn app() -> (Router, Router, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join("root_key"), root_hex).expect("root_key");
@@ -78,9 +85,9 @@ async fn app() -> (Router, tempfile::TempDir) {
         )))))),
         store: Arc::new(store),
     };
-    let app = auth::mount(router(state.clone()), state.clone());
-    let app = mint::admin::mount(app, state);
-    (app, dir)
+    let mint_router = mint::admin::mount(router(state.clone()), state.clone());
+    let auth_router = auth::router(state);
+    (mint_router, auth_router, dir)
 }
 
 async fn body_string(resp: axum::response::Response) -> (StatusCode, String) {
@@ -95,9 +102,10 @@ fn now() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 
-/// Request a discharge from mint-as-auth for the given action,
-/// bound to the operator's pubkey.
-async fn fetch_discharge(app: Router, action: &str) -> Macaroon {
+/// Request a discharge from the auth role on its dedicated router.
+/// In production this hits a separate UDS socket; the test preserves
+/// the boundary by routing this call to `auth_router` exclusively.
+async fn fetch_discharge(auth_router: Router, action: &str) -> Macaroon {
     let req_body = serde_json::json!({
         "ts": now(),
         "action": action,
@@ -110,7 +118,7 @@ async fn fetch_discharge(app: Router, action: &str) -> Macaroon {
         .header("content-type", "application/json")
         .body(Body::from(req_body))
         .unwrap();
-    let (status, body) = body_string(app.oneshot(req).await.unwrap()).await;
+    let (status, body) = body_string(auth_router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK, "discharge body: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     Macaroon::decode(v["discharge"].as_str().expect("discharge field")).expect("decode")
@@ -118,11 +126,11 @@ async fn fetch_discharge(app: Router, action: &str) -> Macaroon {
 
 #[tokio::test]
 async fn happy_path_discharge_then_invite_read() {
-    let (app, _dir) = app().await;
-    let discharge = fetch_discharge(app.clone(), "admin:invite-read").await;
+    let (mint_router, auth_router, _dir) = app().await;
+    let discharge = fetch_discharge(auth_router, "admin:invite-read").await;
     assert_eq!(discharge.kid(), DISCHARGE_KID);
 
-    // Now POST /v1/admin/invite with the discharge + PoP.
+    // Now POST /v1/admin/invite (on the mint router) with the discharge + PoP.
     let body = format!(r#"{{"ts":{}}}"#, now());
     let sig = pop::client_signature(&OPERATOR_SEED, discharge.tail(), body.as_bytes());
     let req = Request::builder()
@@ -133,7 +141,7 @@ async fn happy_path_discharge_then_invite_read() {
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap();
-    let (status, body) = body_string(app.oneshot(req).await.unwrap()).await;
+    let (status, body) = body_string(mint_router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK, "invite body: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert!(v["macaroon"].as_str().is_some(), "no macaroon in {body}");
@@ -144,8 +152,8 @@ async fn happy_path_discharge_then_invite_read() {
 async fn wrong_action_discharge_rejected() {
     // Discharge minted for a different action — verify+clear should
     // reject because the endpoint clears op=admin:invite-read.
-    let (app, _dir) = app().await;
-    let discharge = fetch_discharge(app.clone(), "admin:enroll-approve").await;
+    let (mint_router, auth_router, _dir) = app().await;
+    let discharge = fetch_discharge(auth_router, "admin:enroll-approve").await;
     let body = format!(r#"{{"ts":{}}}"#, now());
     let sig = pop::client_signature(&OPERATOR_SEED, discharge.tail(), body.as_bytes());
     let req = Request::builder()
@@ -155,14 +163,14 @@ async fn wrong_action_discharge_rejected() {
         .header("x-mint-pop", sig)
         .body(Body::from(body))
         .unwrap();
-    let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
+    let (status, _) = body_string(mint_router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn pop_signed_by_wrong_key_rejected() {
-    let (app, _dir) = app().await;
-    let discharge = fetch_discharge(app.clone(), "admin:invite-read").await;
+    let (mint_router, auth_router, _dir) = app().await;
+    let discharge = fetch_discharge(auth_router, "admin:invite-read").await;
     let body = format!(r#"{{"ts":{}}}"#, now());
     // Sign with a key that doesn't match the cnf in the discharge.
     let other_seed = [99u8; 32];
@@ -174,7 +182,7 @@ async fn pop_signed_by_wrong_key_rejected() {
         .header("x-mint-pop", sig)
         .body(Body::from(body))
         .unwrap();
-    let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
+    let (status, _) = body_string(mint_router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -183,7 +191,7 @@ async fn forged_discharge_under_wrong_kma_rejected() {
     // An attacker tries to forge a discharge by minting one under
     // wrong K_M-A. verify_and_clear's resolve_primary_key recovers `r`
     // from the (correct) K_M-A and the chain MAC fails.
-    let (app, _dir) = app().await;
+    let (mint_router, _auth_router, _dir) = app().await;
     let wrong_k_m_a = [99u8; 32];
     let mut nonce = [0u8; 16];
     use rand_core::{OsRng, RngCore};
@@ -209,8 +217,31 @@ async fn forged_discharge_under_wrong_kma_rejected() {
         .header("x-mint-pop", sig)
         .body(Body::from(body))
         .unwrap();
-    let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
+    let (status, _) = body_string(mint_router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn discharge_route_not_on_mint_router() {
+    // Structural guard: the mint router must not expose /v1/discharge.
+    // If a request to /v1/discharge hits the mint router, mint-as-auth
+    // and mint roles are sharing a listener — exactly what this PR is
+    // structured to prevent.
+    let (mint_router, _auth_router, _dir) = app().await;
+    let req_body = serde_json::json!({
+        "ts": now(),
+        "action": "admin:invite-read",
+        "cnf": pop::cnf_value(&OPERATOR_SEED),
+    })
+    .to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/discharge")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body))
+        .unwrap();
+    let (status, _) = body_string(mint_router.oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -218,7 +249,7 @@ async fn old_get_path_still_works_with_admin_macaroon() {
     // Sanity: the migration is additive — the existing
     // `GET /v1/admin/invite` path still works with an admin macaroon
     // until the follow-up PR removes it.
-    let (app, _dir) = app().await;
+    let (mint_router, _auth_router, _dir) = app().await;
     let admin = mint::issuance::mint_admin_token(
         &mint::keyring::Keyring::single(ROOT),
         "mint",
@@ -232,6 +263,6 @@ async fn old_get_path_still_works_with_admin_macaroon() {
         .header("authorization", format!("MintV1 {}", admin.encode()))
         .body(Body::empty())
         .unwrap();
-    let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
+    let (status, _) = body_string(mint_router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK);
 }
