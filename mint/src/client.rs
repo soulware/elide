@@ -17,6 +17,8 @@ use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 
@@ -186,9 +188,8 @@ fn parse_target(base_url: &str) -> Target<'_> {
     }
 }
 
-/// POST `body` to `<base_url><endpoint>` with the macaroon + PoP,
-/// return `(status, text)`. The transport is selected by the `--url`
-/// scheme; auth is unchanged across both.
+/// POST `body` to `<base_url><endpoint>` with a single mint-issued
+/// macaroon + its PoP. The transport is selected by the `--url` scheme.
 async fn post(
     base_url: &str,
     endpoint: &str,
@@ -198,62 +199,106 @@ async fn post(
 ) -> Result<(u16, String), ClientError> {
     let sig = pop::client_signature(seed, mac.tail(), body.as_bytes());
     let auth = format!("MintV1 {}", mac.encode());
+    let headers = [
+        ("authorization", auth),
+        ("x-mint-pop", sig),
+        ("content-type", "application/json".into()),
+    ];
+    send(base_url, endpoint, &headers, body).await
+}
+
+/// POST a `(primary, discharges)` bundle: the `Authorization` header
+/// carries the primary followed by each discharge, comma-separated; the
+/// PoP signs the body under the **primary's** tail (the principal whose
+/// chain is being exercised). This is the wire shape mint's
+/// `extract_bundle` + `verify_and_clear` expect.
+async fn post_bundle(
+    base_url: &str,
+    endpoint: &str,
+    primary: &Macaroon,
+    discharges: &[Macaroon],
+    seed: &[u8; 32],
+    body: String,
+) -> Result<(u16, String), ClientError> {
+    let sig = pop::client_signature(seed, primary.tail(), body.as_bytes());
+    let mut auth = format!("MintV1 {}", primary.encode());
+    for d in discharges {
+        auth.push(',');
+        auth.push_str(&d.encode());
+    }
+    let headers = [
+        ("authorization", auth),
+        ("x-mint-pop", sig),
+        ("content-type", "application/json".into()),
+    ];
+    send(base_url, endpoint, &headers, body).await
+}
+
+/// POST a JSON body with no authentication. The discharge endpoint
+/// carries no caller credential in the demo (the operator session that
+/// would authorise it is deferred — see `design-auth-service.md`
+/// § *Mint as auth*); the CID in the body is the only input.
+async fn post_json(
+    base_url: &str,
+    endpoint: &str,
+    body: String,
+) -> Result<(u16, String), ClientError> {
+    let headers = [("content-type", "application/json".into())];
+    send(base_url, endpoint, &headers, body).await
+}
+
+/// Transport leg shared by every POST. Selects TCP or HTTP-over-UDS by
+/// the `--url` scheme and applies `headers` verbatim. `reqwest` has no
+/// UDS support, so the UDS branch drops to `hyper` directly via
+/// `hyperlocal`'s `UnixConnector`; its transport errors collapse to a
+/// single string — there is nothing the caller branches on.
+async fn send(
+    base_url: &str,
+    endpoint: &str,
+    headers: &[(&str, String)],
+    body: String,
+) -> Result<(u16, String), ClientError> {
     match parse_target(base_url) {
         Target::Tcp(base) => {
-            let resp = reqwest::Client::new()
-                .post(format!("{base}{endpoint}"))
-                .header("authorization", auth)
-                .header("x-mint-pop", sig)
-                .header("content-type", "application/json")
-                .body(body)
-                .send()
-                .await?;
+            let mut req = reqwest::Client::new().post(format!("{base}{endpoint}"));
+            for (k, v) in headers {
+                req = req.header(*k, v);
+            }
+            let resp = req.body(body).send().await?;
             let status = resp.status().as_u16();
             Ok((status, resp.text().await?))
         }
-        Target::Uds(socket) => post_uds(socket, endpoint, &auth, &sig, body).await,
+        Target::Uds(socket) => {
+            use http_body_util::{BodyExt, Full};
+            use hyper_util::client::legacy::Client;
+            use hyper_util::rt::TokioExecutor;
+
+            let client: Client<_, Full<bytes::Bytes>> =
+                Client::builder(TokioExecutor::new()).build(hyperlocal::UnixConnector);
+            let uri: hyper::Uri = hyperlocal::Uri::new(socket, endpoint).into();
+            let mut builder = hyper::Request::builder()
+                .method(hyper::Method::POST)
+                .uri(uri);
+            for (k, v) in headers {
+                builder = builder.header(*k, v);
+            }
+            let req = builder
+                .body(Full::new(bytes::Bytes::from(body)))
+                .map_err(|e| ClientError::Uds(e.to_string()))?;
+            let resp = client
+                .request(req)
+                .await
+                .map_err(|e| ClientError::Uds(e.to_string()))?;
+            let status = resp.status().as_u16();
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| ClientError::Uds(e.to_string()))?
+                .to_bytes();
+            Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+        }
     }
-}
-
-/// HTTP-over-UDS leg. `reqwest` has no UDS support, so this is the one
-/// place the client drops to `hyper` directly, dialing the socket via
-/// `hyperlocal`'s `UnixConnector`. Transport errors collapse to a
-/// single string — there is nothing the caller branches on, only
-/// surfaces.
-async fn post_uds(
-    socket: &str,
-    endpoint: &str,
-    auth: &str,
-    sig: &str,
-    body: String,
-) -> Result<(u16, String), ClientError> {
-    use http_body_util::{BodyExt, Full};
-    use hyper_util::client::legacy::Client;
-    use hyper_util::rt::TokioExecutor;
-
-    let client: Client<_, Full<bytes::Bytes>> =
-        Client::builder(TokioExecutor::new()).build(hyperlocal::UnixConnector);
-    let uri: hyper::Uri = hyperlocal::Uri::new(socket, endpoint).into();
-    let req = hyper::Request::builder()
-        .method(hyper::Method::POST)
-        .uri(uri)
-        .header("authorization", auth)
-        .header("x-mint-pop", sig)
-        .header("content-type", "application/json")
-        .body(Full::new(bytes::Bytes::from(body)))
-        .map_err(|e| ClientError::Uds(e.to_string()))?;
-    let resp = client
-        .request(req)
-        .await
-        .map_err(|e| ClientError::Uds(e.to_string()))?;
-    let status = resp.status().as_u16();
-    let bytes = resp
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| ClientError::Uds(e.to_string()))?
-        .to_bytes();
-    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn json_field(body: &str, key: &'static str) -> Result<String, ClientError> {
@@ -523,16 +568,79 @@ pub async fn assume_role(
         mac = mac.attenuate(Caveat::scalar(n.as_str(), v.as_str()));
     }
     eprintln!(
-        "  appended exp={exp} + {} narrowing caveat(s); → POST {base_url}/v1/assume-role",
+        "  appended exp={exp} + {} narrowing caveat(s)",
         caveats.len()
     );
+
+    // Operator-write credentials carry a third-party caveat: fetch a
+    // discharge for each before forwarding. Discovery (auth location +
+    // CID) is read straight off the held credential — the mint-only
+    // loop's stand-in for coord's 401 challenge.
+    let discharges = fetch_discharges(&mac).await?;
+    if !discharges.is_empty() {
+        // Per-forward freshness: tighten the primary's own chain before
+        // it leaves the client, mirroring coord's per-forward NotAfter.
+        let primary_deadline = now_unix().saturating_add(PER_FORWARD_NOT_AFTER_SECONDS);
+        mac = mac.attenuate(Caveat::scalar(
+            name::NOT_AFTER,
+            primary_deadline.to_string(),
+        ));
+        eprintln!(
+            "  attached {} discharge(s); per-forward NotAfter={primary_deadline} on the primary",
+            discharges.len()
+        );
+    }
+
+    eprintln!("  → POST {base_url}/v1/assume-role");
     let body = build_request_body(request_src, role, ttl_seconds, now_unix())?;
-    let (status, text) = post(base_url, "/v1/assume-role", &mac, &seed, body).await?;
+    let (status, text) =
+        post_bundle(base_url, "/v1/assume-role", &mac, &discharges, &seed, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }
     eprintln!("  ← 200 — mint verified the chain + PoP and minted a scoped Tigris keypair:");
     Ok(text)
+}
+
+/// Per-IPC discharge attenuation window (`design-auth-service.md`
+/// § *Attenuating per IPC*). Tight: the bundle is verified immediately.
+const PER_IPC_NOT_AFTER_SECONDS: u64 = 30;
+
+/// Per-forward primary attenuation window (`design-auth-service.md`
+/// § *Coord attenuates the primary before forwarding to mint*).
+const PER_FORWARD_NOT_AFTER_SECONDS: u64 = 30;
+
+/// For each third-party caveat on `primary`, fetch a discharge from its
+/// `location` and tighten it with a per-IPC `NotAfter`. A credential
+/// with no third-party caveat yields an empty list, and the bundle is a
+/// bare primary — the non-operator-write path is unchanged.
+async fn fetch_discharges(primary: &Macaroon) -> Result<Vec<Macaroon>, ClientError> {
+    let mut discharges = Vec::new();
+    for c in primary.caveats() {
+        let Caveat::ThirdParty { location, cid, .. } = c else {
+            continue;
+        };
+        eprintln!("  credential carries a third-party caveat → fetching discharge from {location}");
+        let mut discharge = fetch_discharge(location, cid).await?;
+        let deadline = now_unix().saturating_add(PER_IPC_NOT_AFTER_SECONDS);
+        discharge = discharge.attenuate(Caveat::scalar(name::NOT_AFTER, deadline.to_string()));
+        eprintln!("    ← discharge received; per-IPC NotAfter={deadline}");
+        discharges.push(discharge);
+    }
+    Ok(discharges)
+}
+
+/// POST the CID to the authority's `/v1/discharge` and decode the
+/// returned discharge macaroon.
+async fn fetch_discharge(location: &str, cid: &[u8]) -> Result<Macaroon, ClientError> {
+    let cid_b64 = BASE64.encode(cid);
+    let body = serde_json::json!({ "cid": cid_b64 }).to_string();
+    let (status, text) = post_json(location, "/v1/discharge", body).await?;
+    if status != 200 {
+        return Err(ClientError::Server { status, body: text });
+    }
+    let discharge = json_field(&text, "discharge")?;
+    Macaroon::decode(&discharge).map_err(|_| ClientError::BadFile("discharge"))
 }
 
 /// First value of first-party caveat `name` in `m`, if present.

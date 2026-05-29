@@ -42,6 +42,11 @@ pub mod name {
     pub const ROLE: &str = "role";
     /// Carried only by the invite macaroon; the current nonce.
     pub const INVITE: &str = "invite";
+    /// Discharge / attenuation deadline, unix seconds; multiple narrow
+    /// to the minimum. Distinct from `exp`: borne by auth-issued
+    /// discharges and by per-IPC / per-forward chain attenuations,
+    /// where the holder bounds a bearer chain it cannot re-key.
+    pub const NOT_AFTER: &str = "NotAfter";
 }
 
 /// `op` caveat values. Mint stamps one at every point it mints; each

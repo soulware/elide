@@ -24,8 +24,10 @@ Two distinct auth surfaces layer on that foundation:
   it forwards bundles to mint for cryptographic verification, caches
   mint's verdict for the discharge's NotAfter, and clears caveats
   against the live IPC context. Design lives in
-  [`design-auth-service.md`](design-auth-service.md); not yet
-  implemented. Operator IPC verbs are ungated in the codebase today.
+  [`design-auth-service.md`](design-auth-service.md). Mint's
+  verification routine and the demo discharge issuer are implemented
+  and exercised by the mint CLI as mint's first client; coord-side
+  gating is not — operator IPC verbs are ungated in the codebase today.
 
 The remaining sections cover the isolation model that frames what
 either surface can and cannot enforce, and the settled principle

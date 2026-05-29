@@ -1802,6 +1802,7 @@ mint client exchange     --role <role>                   # 403 until approved �
 mint client credential list                              # held per-role credentials (local-only)
 mint client credential inspect <role>                    # narrate one credential's caveat chain
 mint client assume-role  --request '{"prefix":"x"}'          # role from the credential → Tigris keypair
+                                                             #   (TPC-bearing role → auto-fetches + attaches a discharge)
 ```
 
 A worked `examples/` script chains them: `serve` (background) →
@@ -1824,8 +1825,13 @@ real-Tigris `assume-role` end-to-end is VM-only.
 
 **Demo role config** is a minimal `read` / `write` pair over a single
 `{{request.prefix}}` (shipped as `examples/mint-demo.toml`) — distinct from
-the full Elide role inventory below; it exists only to exercise the
-issuance path.
+the full Elide role inventory below. `read` exercises plain issuance;
+`write` sets `issues_with_tpc = true` and the config colocates the demo
+auth role (`[auth] demo_enabled`), so `assume-role write` exercises the
+operator-authorisation loop: the reference client reads the credential's
+third-party caveat, fetches a discharge from the auth socket, attenuates
+it per-IPC and the primary per-forward, and presents the bundle. This is
+the mint CLI proving the consumption side before any `elide-*` client.
 
 ### Audit log
 

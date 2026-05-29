@@ -1,9 +1,11 @@
 # Minimal demo config (docs/design-mint.md § "Reference client & demo").
 #
-# Two roles — `read` / `write` over a single {{request.prefix}} — just
-# enough to exercise the issuance path end-to-end. This is NOT the Elide
-# role inventory (see mint-elide.toml for that); it exists only for the
-# invite → enroll → approve → exchange → assume-role walkthrough.
+# Two roles — `read` / `write` over a single {{request.prefix}}. `read`
+# exercises plain issuance (invite → enroll → approve → exchange →
+# assume-role); `write` adds the operator-authorisation loop — it carries
+# a third-party caveat, so assume-role is refused until the client fetches
+# a discharge from [auth] and attaches it. This is NOT the Elide role
+# inventory (see mint-elide.toml for that).
 # Each role's policy template lives under roles_dir (examples/demo_roles/).
 #
 # `mint serve` always talks to a real S3-compatible backend (Tigris,
@@ -30,6 +32,16 @@ socket = "mint_data/mint.sock"        # client: --url unix:mint_data/mint.sock
 [tenant]
 bucket = "mint-demo"
 
+# Colocate the auth-service role so this single mint process closes the
+# operator-authorisation loop end-to-end (no separate auth binary). With
+# demo_enabled, mint binds a second UDS for /v1/discharge, generates its
+# own K_M-A / K_session, and rubber-stamps every discharge request.
+# endpoint is the location stamped on every third-party caveat — the
+# address the client posts a CID to; it points back at this same socket.
+[auth]
+endpoint = "unix:mint_data/auth.sock"
+demo_enabled = true
+
 [[role]]
 name = "read"
 required_caveats = ["sub", "aud", "exp"]
@@ -37,9 +49,13 @@ min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 
+# issues_with_tpc binds a third-party caveat into the issued credential:
+# assume-role refuses it until the client fetches and attaches a
+# discharge from [auth].endpoint.
 [[role]]
 name = "write"
 required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300
+issues_with_tpc = true

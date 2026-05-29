@@ -9,7 +9,17 @@ authorisation** — and is the concrete shape of the
 *third-party-caveat discharge* anchor mint requires for
 operator-attested cred issuance.
 
-**Status: proposed. Not yet implemented.**
+**Status: partially implemented.** Mint's verification routine
+(`/v1/verify` plus the assume-role bundle check) and the demo discharge
+issuer (mint-as-auth `/v1/discharge`, operator-write CID arm) are built
+and exercised end-to-end by the mint CLI as the first client — `mint
+client assume-role` on a TPC-bearing role fetches a discharge and
+presents the bundle (see
+[`design-mint.md`](design-mint.md#reference-client--demo)). The
+standalone auth-service binary — which owns operator sessions and
+login — plus the coord-side forward-and-clear and the verification
+caches remain proposed. (Sessions and login are an auth-service
+concern only; mint-as-auth never grows them.)
 
 ## Terminology
 
@@ -1017,30 +1027,32 @@ handlers itself:
 demo-enabled = false   # default
 ```
 
-When `true`, mint serves `/v1/login/*` and `/v1/discharge` alongside
-its cred-issuance and verification routes, rubber-stamping every
-login — no browser, no real authentication. Mint generates `K_M-A`
-and `K_session` for itself at demo startup (no auth-service
-round-trip). Enrollment tokens are also rubber-stamped: a coord can
-enroll with any token (or none) and is assigned `OrgId=demo`. The
-coord codepath is identical to prod: forward bundle to mint for
-verification, cache verdict, clear caveats.
+When `true`, mint serves `/v1/discharge` on its own UDS alongside its
+cred-issuance and verification routes, and generates `K_M-A` for itself
+at demo startup (no auth-service round-trip). **There is no session or
+login layer on mint-as-auth — not deferred, never.** Operator sessions,
+`/v1/login/*`, and `K_session` belong exclusively to the standalone
+auth-service binary; the demo discharge endpoint authenticates nothing,
+so the CID in the request body is its only input. Enrollment tokens are
+likewise rubber-stamped: a coord can enroll with any token (or none) and
+is assigned `OrgId=demo`. The coord codepath is identical to prod:
+forward bundle to mint for verification, cache verdict, clear caveats.
 
 Two startup-time safety checks when `demo-enabled = true`:
 
 - Mint refuses to start unless bound to loopback / UDS.
-- Mint logs `WARN auth=demo: all operator sessions are unauthenticated`
-  at startup and per issued session.
+- Mint logs `WARN auth=demo: discharges are issued without operator
+  authentication` at startup and per issued discharge.
 
 Both are config-time checks, not per-request branches — the verifier
 in coord and mint stays unconditional. The mint binary has no
-webauthn / OIDC / SAML code; production auth implementations live in
-the separate auth service binary only.
+webauthn / OIDC / SAML / session code; production auth implementations
+live in the separate auth service binary only.
 
-The canonical test-fixture pattern is **demo mint + non-interactive
-login**: a single mint process with `demo-enabled = true` bound to a
-UDS, plus `ELIDE_OPERATOR_API_KEY=test` on the harness. The full
-wire flow runs end-to-end with no browser and no `#[cfg(test)]`
+The canonical test-fixture pattern is a single mint process with
+`demo-enabled = true` bound to a UDS; the client fetches a discharge
+against a TPC's CID with no session in the request. The full wire flow
+runs end-to-end with no browser, no API key, and no `#[cfg(test)]`
 shortcuts anywhere.
 
 ## Deployment shapes
