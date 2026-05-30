@@ -9,37 +9,41 @@
 //! discharge was minted, so this module can later move out of the mint
 //! binary without disturbing the verifier.
 //!
-//! Wire (`POST /v1/discharge`) — two request shapes, two discharge
-//! kinds, distinguished structurally by their fields:
+//! Session gate (`docs/design-auth-service.md` § *Login flow*): every
+//! `/v1/discharge` request must carry `Authorization: Bearer
+//! <session>` — a session macaroon minted by `POST /v1/login` under
+//! `K_session`. The demo accepts any subject at login (no password);
+//! the session is the *gate* on discharge issuance, and its `Subject`
+//! is what each discharge attests. Production auth-service authenticates
+//! login for real and issues sessions over its own wire; the gate shape
+//! is the same.
+//!
+//! Wire (`POST /v1/login`):
 //!
 //! ```text
-//! 200 OK (either shape):
-//!   { "discharge": "mnt1_<base64url>" }
-//!
-//! (a) Third-party-caveat discharge — operator-write credentials:
-//!   { "cid": "<base64url>" }
-//! (b) Standalone admin bearer — the /v1/admin/* authority path:
-//!   { "ts": <unix>,
-//!     "action": "admin:invite-read" | "admin:enroll-approve" | ...,
-//!     "cnf":    "ed25519:<base64 pubkey>" }
+//! request body:  { "subject": "<opaque>" }
+//! 200 OK:        { "session": "mnt1_<base64url>" }
 //! ```
 //!
-//! Discharge construction:
+//! Wire (`POST /v1/discharge`):
 //!
-//! - **(a) TPC discharge.** `r`, the bound `client_id` and `org_id` are
-//!   recovered from `cid` under `K_M-A` (`tpc::decrypt_cid`) — no `K_M`,
-//!   no per-client state. Macaroon at `kid = DISCHARGE_KID`, chain MAC'd
-//!   under that `r`, caveats `Subject`, `OrgId`, `ClientId`, `NotAfter`.
-//!   Mint's verifier recovers the same `r` from the matching primary's
-//!   `vid` (`tpc::decrypt_vid`) — the two recover identical keys by
-//!   construction.
-//! - **(b) Admin bearer.** Fresh 16-byte nonce; `r =
-//!   BLAKE3-derive-key("mint discharge r-key v1", K_M-A || nonce)`.
-//!   Macaroon at `kid = DISCHARGE_KID`, chain MAC'd under `r`, caveats
-//!   `aud=mint`, `op=<action>`, `cnf=<requester pub>`, `exp=now + 5 min`.
-//!   Mint's verifier reconstructs `r` from the same `(K_M-A, nonce)`
-//!   when this discharge is presented as the bundle primary — cheap,
-//!   stateless, no per-discharge ledger.
+//! ```text
+//! Authorization: Bearer mnt1_<session>
+//! request body:  { "cid": "<base64url of the credential's TPC CID>" }
+//! 200 OK:        { "discharge": "mnt1_<base64url>" }
+//! ```
+//!
+//! Discharge construction: decrypt `cid` under `K_M-A`
+//! ([`tpc::decrypt_cid`]) to recover `(r, client_id, org_id)` — no
+//! `K_M`, no per-client state — and reject if `org_id` is not the org
+//! this role serves. Mint a **wide** macaroon at `kid = DISCHARGE_KID`,
+//! chain MAC'd under that `r`, caveats `Subject` (the session subject),
+//! `OrgId`, `ClientId`, `NotAfter`. No `op`: per-op narrowing is the
+//! caller's attenuation onto the primary (the PoP'd credential), so one
+//! discharge satisfies every op that primary is attenuated for. Mint's
+//! verifier recovers the same `r` from the primary's `vid`
+//! ([`tpc::decrypt_vid`]) — the two recover identical keys by
+//! construction.
 //!
 //! Demo gate: `[auth].demo_enabled` must be true *and* the request must
 //! have arrived over the UDS listener (we never expose discharge
@@ -49,22 +53,18 @@
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use chrono::Utc;
-use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::caveat::{Caveat, name};
+use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op};
 use crate::http::AppState;
-use crate::macaroon::{
-    DISCHARGE_KID, Macaroon, NONCE_LEN, mint_under_key, mint_under_key_with_nonce,
-};
-use crate::pop;
+use crate::macaroon::{DISCHARGE_KID, Macaroon, NONCE_LEN, SESSION_KID, mint_under_key};
 use crate::tpc;
 
 /// BLAKE3 derive-key context for the per-discharge MAC key. The
@@ -78,25 +78,15 @@ const R_KDF_CONTEXT: &str = "mint discharge r-key v1";
 /// own policy.
 const DISCHARGE_EXP_SECONDS: u64 = 300;
 
-/// Freshness window on the request's in-body `ts`.
-const TS_SKEW_SECONDS: u64 = 60;
+/// Demo session lifetime — `~7 days` per `docs/design-auth-service.md`
+/// § *Cadence*. The operator re-runs `mint login` when it lapses.
+const SESSION_EXP_SECONDS: u64 = 7 * 24 * 60 * 60;
 
-/// Required prefix for the `action` body field in the initial cut. Real
-/// auth-service may issue discharges for non-`admin:*` ops too;
-/// demo-mint only mints discharges for admin actions until a clear use
-/// case emerges otherwise.
-const ACTION_PREFIX: &str = "admin:";
-
-/// Demo subject stamped on operator-write discharges. The production
-/// auth service derives `Subject` from the authenticated operator
-/// session; demo-mint has no session layer (see
-/// `design-auth-service.md` § *Mint as auth*), so every demo discharge
-/// is attributed to this placeholder.
-const DEMO_SUBJECT: &str = "usr_demo";
-
-/// Derive the per-discharge MAC key from `K_M-A` and the discharge's
-/// nonce. Verifier and issuer compute the same function, so no shared
-/// state — same input → same `r`.
+/// Derive the per-discharge MAC key from `K_M-A` and a discharge's
+/// nonce. The discharge-as-primary verification path
+/// ([`crate::http`] `resolve_primary_key`) recovers `r` this way for a
+/// standalone discharge; the CID-arm discharge below is keyed by the
+/// CID's `r` instead.
 pub fn derive_discharge_r(k_m_a: &[u8; 32], nonce: &[u8; NONCE_LEN]) -> [u8; 32] {
     let mut km = Vec::with_capacity(32 + NONCE_LEN);
     km.extend_from_slice(k_m_a);
@@ -104,22 +94,17 @@ pub fn derive_discharge_r(k_m_a: &[u8; 32], nonce: &[u8; NONCE_LEN]) -> [u8; 32]
     blake3::derive_key(R_KDF_CONTEXT, &km)
 }
 
-/// The two discharge-request shapes, disjoint in their required fields
-/// so serde routes by structure alone. A TPC discharge satisfies a
-/// third-party caveat on an operator-write credential; an admin bearer
-/// is the standalone authority a human presents on `/v1/admin/*`. The
-/// verifier stays unconditional — only issuance forks here.
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum DischargeRequest {
-    /// Operator-write: discharge the third-party caveat named by `cid`.
-    Tpc { cid: String },
-    /// Standalone admin bearer.
-    Admin {
-        ts: u64,
-        action: String,
-        cnf: String,
-    },
+struct DischargeRequest {
+    /// Base64url of the credential's third-party-caveat `CID`. The auth
+    /// role decrypts it under `K_M-A` to recover the discharge key `r`
+    /// and the bound `(client_id, org_id)`.
+    cid: String,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    subject: String,
 }
 
 /// Build the auth-role router. The caller binds it to its own
@@ -130,105 +115,147 @@ enum DischargeRequest {
 /// (defaults to `<data_dir>/auth.sock`).
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/v1/login", post(issue_session))
         .route("/v1/discharge", post(issue_discharge))
         .with_state(state)
 }
 
-async fn issue_discharge(State(state): State<AppState>, body: Bytes) -> Response {
+/// Mint a demo session macaroon under `K_session`: caveats
+/// `op=session`, `Subject=<subject>`, `NotAfter=now+7d`. A fresh chain
+/// (not an attenuation), keyed by `K_session`, so it is structurally
+/// distinct from every mint-issued macaroon and verifiable only by this
+/// role.
+fn mint_session(k_session: &[u8; 32], subject: &str, now_unix: u64) -> Macaroon {
+    let not_after = now_unix + SESSION_EXP_SECONDS;
+    mint_under_key(
+        k_session,
+        SESSION_KID,
+        vec![
+            Caveat::scalar(name::OP, op::SESSION),
+            Caveat::scalar("Subject", subject),
+            Caveat::scalar(name::NOT_AFTER, not_after.to_string()),
+        ],
+    )
+}
+
+/// Verify a session presented in `Authorization: Bearer <session>`:
+/// chain MAC under `K_session`, `op=session`, and a non-expired
+/// `NotAfter`. Returns the session's `Subject` on success. Every
+/// failure is the opaque `()` the caller maps to `401`.
+#[allow(clippy::result_unit_err)]
+pub fn verify_session(
+    k_session: &[u8; 32],
+    headers: &HeaderMap,
+    now_unix: u64,
+) -> Result<String, ()> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(())?;
+    let mac = Macaroon::decode(token.trim()).map_err(|_| ())?;
+    if !mac.verify_under_key(k_session) {
+        return Err(());
+    }
+    let eff = EffectiveCaveats::new(mac.caveats());
+    if !matches!(eff.resolve(name::OP), Resolved::Value(v) if v == op::SESSION) {
+        return Err(());
+    }
+    if let Some(not_after) = eff.not_after(name::NOT_AFTER)
+        && not_after <= now_unix
+    {
+        return Err(());
+    }
+    match eff.resolve("Subject") {
+        Resolved::Value(subject) => Ok(subject),
+        _ => Err(()),
+    }
+}
+
+/// `POST /v1/login` — the demo login. Accepts any `subject` with no
+/// password (the demo does not authenticate the human); production
+/// auth-service runs a real login here (device-code / API-key, see
+/// `docs/design-auth-service.md` § *Login flow*) and issues the same
+/// session shape.
+async fn issue_session(State(state): State<AppState>, body: Bytes) -> Response {
+    let Some(k_session) = state.store.k_session().copied() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "k_session unavailable");
+    };
+    let req: LoginRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "bad request"),
+    };
+    if req.subject.is_empty() {
+        return error(StatusCode::BAD_REQUEST, "empty subject");
+    }
+    let now_unix = Utc::now().timestamp().max(0) as u64;
+    let session = mint_session(&k_session, &req.subject, now_unix);
+    (
+        StatusCode::OK,
+        axum::Json(json!({"session": session.encode()})),
+    )
+        .into_response()
+}
+
+/// `POST /v1/discharge` — session-gated wide discharge for a credential's
+/// third-party caveat. The session's `Subject` is what the discharge
+/// attests; the `cid` recovers `(r, client_id, org_id)` under `K_M-A`,
+/// cross-checked against the org this role serves.
+async fn issue_discharge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let Some(k_m_a) = state.store.k_m_a().copied() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "k_m_a unavailable");
+    };
+    let Some(k_session) = state.store.k_session().copied() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "k_session unavailable");
+    };
+
+    let now_unix = Utc::now().timestamp().max(0) as u64;
+    let subject = match verify_session(&k_session, &headers, now_unix) {
+        Ok(s) => s,
+        Err(()) => return error(StatusCode::UNAUTHORIZED, "session required"),
     };
 
     let req: DischargeRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(_) => return error(StatusCode::BAD_REQUEST, "bad request"),
     };
+    let cid = match BASE64.decode(req.cid.trim()) {
+        Ok(b) => b,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "bad cid"),
+    };
+    // Recover `r` and the bound identity from the CID under K_M-A — the
+    // dual of the verifier's VID path. A `cid` that fails to decrypt
+    // signals a `K_M-A` rotation (422), distinct from a malformed
+    // request (400).
+    let pt = match tpc::decrypt_cid(&k_m_a, &cid) {
+        Ok(pt) => pt,
+        Err(_) => return error(StatusCode::UNPROCESSABLE_ENTITY, "cid decrypt"),
+    };
+    if state.store.org_id() != Some(pt.org_id.as_str()) {
+        return error(StatusCode::FORBIDDEN, "org mismatch");
+    }
 
-    let now_unix = Utc::now().timestamp().max(0) as u64;
-    let minted = match req {
-        DischargeRequest::Tpc { cid } => issue_tpc_discharge(&k_m_a, &cid, now_unix),
-        DischargeRequest::Admin { ts, action, cnf } => {
-            issue_admin_discharge(&state, &k_m_a, ts, &action, &cnf, now_unix)
-        }
-    };
-    let discharge = match minted {
-        Ok(d) => d,
-        Err((status, msg)) => return error(status, msg),
-    };
+    let not_after = now_unix + DISCHARGE_EXP_SECONDS;
+    let discharge = mint_under_key(
+        &pt.r,
+        DISCHARGE_KID,
+        vec![
+            Caveat::scalar("Subject", &subject),
+            Caveat::scalar("OrgId", pt.org_id),
+            Caveat::scalar("ClientId", pt.client_id),
+            Caveat::scalar(name::NOT_AFTER, not_after.to_string()),
+        ],
+    );
 
     (
         StatusCode::OK,
         axum::Json(json!({"discharge": discharge.encode()})),
     )
         .into_response()
-}
-
-/// (a) Operator-write TPC discharge. The `cid` recovers `(r, client_id,
-/// org_id)` under `K_M-A`; the discharge is MAC'd under that `r` and
-/// carries the bound identity plus a fresh `NotAfter`. A `cid` that
-/// fails to decrypt signals a `K_M-A` rotation to the caller (422) —
-/// distinct from a malformed request (400).
-fn issue_tpc_discharge(
-    k_m_a: &[u8; 32],
-    cid_b64: &str,
-    now_unix: u64,
-) -> Result<Macaroon, (StatusCode, &'static str)> {
-    let cid = BASE64
-        .decode(cid_b64)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad cid"))?;
-    let pt = tpc::decrypt_cid(k_m_a, &cid)
-        .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, "cid decrypt"))?;
-
-    let not_after = now_unix + DISCHARGE_EXP_SECONDS;
-    Ok(mint_under_key(
-        &pt.r,
-        DISCHARGE_KID,
-        vec![
-            Caveat::scalar("Subject", DEMO_SUBJECT),
-            Caveat::scalar("OrgId", pt.org_id),
-            Caveat::scalar("ClientId", pt.client_id),
-            Caveat::scalar(name::NOT_AFTER, not_after.to_string()),
-        ],
-    ))
-}
-
-/// (b) Standalone admin bearer. Self-describing: a fresh nonce derives
-/// `r` under `K_M-A`, and the discharge is presented as the bundle
-/// primary on `/v1/admin/*`.
-fn issue_admin_discharge(
-    state: &AppState,
-    k_m_a: &[u8; 32],
-    ts: u64,
-    action: &str,
-    cnf: &str,
-    now_unix: u64,
-) -> Result<Macaroon, (StatusCode, &'static str)> {
-    if now_unix.abs_diff(ts) > TS_SKEW_SECONDS {
-        return Err((StatusCode::BAD_REQUEST, "stale ts"));
-    }
-    if !action.starts_with(ACTION_PREFIX) {
-        return Err((StatusCode::BAD_REQUEST, "unsupported action"));
-    }
-    if pop::validate_cnf(cnf).is_err() {
-        return Err((StatusCode::BAD_REQUEST, "bad cnf"));
-    }
-
-    let mut nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
-    let r = derive_discharge_r(k_m_a, &nonce);
-
-    let exp = now_unix + DISCHARGE_EXP_SECONDS;
-    Ok(mint_under_key_with_nonce(
-        &r,
-        DISCHARGE_KID,
-        nonce,
-        vec![
-            Caveat::scalar(name::AUD, &state.config.audience),
-            Caveat::scalar(name::OP, action),
-            Caveat::scalar(name::CNF, cnf),
-            Caveat::scalar(name::EXP, exp.to_string()),
-        ],
-    ))
 }
 
 fn error(status: StatusCode, msg: &'static str) -> Response {
@@ -238,7 +265,61 @@ fn error(status: StatusCode, msg: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macaroon::Macaroon;
+    use crate::macaroon::mint_under_key_with_nonce;
+    use rand_core::{OsRng, RngCore};
+
+    fn bearer(session: &Macaroon) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", session.encode()).parse().unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn session_round_trips_and_returns_subject() {
+        let k = [21u8; 32];
+        let s = mint_session(&k, "operator-alice", 1_000);
+        assert_eq!(
+            verify_session(&k, &bearer(&s), 1_000),
+            Ok("operator-alice".to_string())
+        );
+    }
+
+    #[test]
+    fn session_under_wrong_key_rejected() {
+        let s = mint_session(&[21u8; 32], "alice", 1_000);
+        assert_eq!(verify_session(&[22u8; 32], &bearer(&s), 1_000), Err(()));
+    }
+
+    #[test]
+    fn expired_session_rejected() {
+        let s = mint_session(&[21u8; 32], "alice", 1_000);
+        let later = 1_000 + SESSION_EXP_SECONDS + 1;
+        assert_eq!(verify_session(&[21u8; 32], &bearer(&s), later), Err(()));
+    }
+
+    #[test]
+    fn missing_bearer_rejected() {
+        assert_eq!(
+            verify_session(&[21u8; 32], &HeaderMap::new(), 1_000),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn non_session_op_rejected() {
+        let m = mint_under_key(
+            &[21u8; 32],
+            SESSION_KID,
+            vec![
+                Caveat::scalar(name::OP, "not-session"),
+                Caveat::scalar("Subject", "alice"),
+            ],
+        );
+        assert_eq!(verify_session(&[21u8; 32], &bearer(&m), 1_000), Err(()));
+    }
 
     #[test]
     fn r_is_deterministic_in_nonce_and_kma() {
@@ -262,10 +343,9 @@ mod tests {
 
     #[test]
     fn issued_discharge_round_trips_under_recovered_r() {
-        // Mint a discharge as the auth role would, then recover `r`
-        // from the nonce + K_M-A as the mint role's verifier will and
-        // confirm the chain MAC verifies. This is the core property
-        // the demo issuer relies on.
+        // The discharge-as-primary property the verifier's
+        // resolve_primary_key path relies on: recover `r` from
+        // (K_M-A, nonce) and confirm the chain MAC verifies.
         let k_m_a = [3u8; 32];
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
@@ -278,14 +358,13 @@ mod tests {
                 Caveat::scalar(name::AUD, "mint"),
                 Caveat::scalar(name::OP, "admin:invite-read"),
                 Caveat::scalar(name::CNF, "ed25519:AAAA"),
-                Caveat::scalar(name::EXP, "1700000000"),
+                Caveat::scalar(name::NOT_AFTER, "1700000000"),
             ],
         );
         let wire = discharge.encode();
         let decoded = Macaroon::decode(&wire).expect("decode");
         let recovered = derive_discharge_r(&k_m_a, decoded.nonce());
         assert!(decoded.verify_under_key(&recovered));
-        // Wrong K_M-A: cannot recover the matching r.
         let mut wrong = k_m_a;
         wrong[31] ^= 0x01;
         let bad = derive_discharge_r(&wrong, decoded.nonce());

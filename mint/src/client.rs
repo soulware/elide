@@ -234,10 +234,10 @@ async fn post_bundle(
     send(base_url, endpoint, &headers, body).await
 }
 
-/// POST a JSON body with no authentication. The discharge endpoint
-/// carries no caller credential in the demo (the operator session that
-/// would authorise it is deferred — see `design-auth-service.md`
-/// § *Mint as auth*); the CID in the body is the only input.
+/// POST a JSON body with no authentication. Used for `/v1/login`, which
+/// is itself the unauthenticated entry point that mints the session;
+/// the gated `/v1/discharge` call carries that session as a Bearer via
+/// [`send`].
 async fn post_json(
     base_url: &str,
     endpoint: &str,
@@ -630,12 +630,30 @@ async fn fetch_discharges(primary: &Macaroon) -> Result<Vec<Macaroon>, ClientErr
     Ok(discharges)
 }
 
-/// POST the CID to the authority's `/v1/discharge` and decode the
-/// returned discharge macaroon.
+/// Log in at the authority (`POST /v1/login`) and return the session
+/// bearer that gates discharge issuance. The demo accepts any subject
+/// with no password (`design-auth-service.md` § *Login flow*).
+async fn login(location: &str, subject: &str) -> Result<String, ClientError> {
+    let body = serde_json::json!({ "subject": subject }).to_string();
+    let (status, text) = post_json(location, "/v1/login", body).await?;
+    if status != 200 {
+        return Err(ClientError::Server { status, body: text });
+    }
+    json_field(&text, "session")
+}
+
+/// Log in, then POST the CID to the authority's `/v1/discharge` under
+/// the session bearer and decode the returned discharge macaroon. The
+/// session's `Subject` is what the discharge attests.
 async fn fetch_discharge(location: &str, cid: &[u8]) -> Result<Macaroon, ClientError> {
+    let session = login(location, "operator").await?;
     let cid_b64 = BASE64.encode(cid);
     let body = serde_json::json!({ "cid": cid_b64 }).to_string();
-    let (status, text) = post_json(location, "/v1/discharge", body).await?;
+    let headers = [
+        ("content-type", "application/json".into()),
+        ("authorization", format!("Bearer {session}")),
+    ];
+    let (status, text) = send(location, "/v1/discharge", &headers, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }

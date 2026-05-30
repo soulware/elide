@@ -69,6 +69,14 @@ pub const STATE_PREFIX: &str = "_mint";
 /// `root_keys/`. See `docs/design-auth-service.md` § *Keys*.
 pub const K_M_A_FILE: &str = "k_m_a";
 
+/// Filename for the on-disk K_session under `<data_dir>/`. Same
+/// 64-hex-byte, mode-0600 shape as [`K_M_A_FILE`]. Auth-service-only in
+/// production (mint never holds it); generated locally **only** when
+/// mint colocates the demo auth role (`[auth].demo_enabled`), where it
+/// roots the CLI ↔ auth session macaroons (`docs/design-auth-service.md`
+/// § *Login flow*).
+pub const K_SESSION_FILE: &str = "k_session";
+
 /// One pending-enrollment record (`_mint/pending/<sub>.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
@@ -314,6 +322,13 @@ pub struct Store {
     /// `/v1/mint/enroll` (separate PR). Immutable for the lifetime
     /// of the process — rotation lands on a new Store via restart.
     k_m_a: Option<Arc<[u8; 32]>>,
+    /// The session-signing root for the colocated demo auth role
+    /// (`docs/design-auth-service.md` § *Login flow*). `None` outside
+    /// demo mode — mint proper never signs or verifies sessions; they
+    /// are a CLI ↔ auth-service credential only. Generated locally at
+    /// first start when `[auth].demo_enabled`. Immutable for the
+    /// lifetime of the process.
+    k_session: Option<Arc<[u8; 32]>>,
     /// The org this mint serves. Paired with `k_m_a`: both come from
     /// auth-service enrollment in production, both are generated
     /// locally in demo mode (where mint assigns `OrgId = "demo"`).
@@ -404,6 +419,7 @@ impl Store {
         Store {
             keyring: Arc::new(RwLock::new(Arc::new(keyring))),
             k_m_a: None,
+            k_session: None,
             org_id: None,
             objects,
             invite_cache: Arc::new(RwLock::new(InviteSnapshot {
@@ -457,6 +473,36 @@ impl Store {
     /// configurations without `[auth]`).
     pub fn k_m_a(&self) -> Option<&[u8; 32]> {
         self.k_m_a.as_deref()
+    }
+
+    /// Load or generate the demo session-signing key under
+    /// `<dir>/k_session`. Only the colocated demo auth role calls this
+    /// (`[auth].demo_enabled`); production mint never holds K_session,
+    /// so there is no non-demo arm. Same on-disk shape and custody as
+    /// [`init_k_m_a`]: 64 ASCII hex, mode 0600, generated on first
+    /// start and reused thereafter.
+    pub fn init_k_session(&mut self, dir: &Path) -> io::Result<()> {
+        let path = dir.join(K_SESSION_FILE);
+        let bytes = match std::fs::read_to_string(&path) {
+            Ok(s) => unhex32(s.trim())
+                .ok_or_else(|| io::Error::other(format!("{path:?}: not 64 hex bytes")))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let mut fresh = [0u8; 32];
+                rand_core::OsRng.fill_bytes(&mut fresh);
+                write_key_file(&path, &hex32(&fresh))?;
+                fresh
+            }
+            Err(e) => return Err(e),
+        };
+        self.k_session = Some(Arc::new(bytes));
+        Ok(())
+    }
+
+    /// `Some` only when the colocated demo auth role has loaded or
+    /// generated K_session via [`init_k_session`]; `None` everywhere
+    /// else (mint proper never signs or verifies sessions).
+    pub fn k_session(&self) -> Option<&[u8; 32]> {
+        self.k_session.as_deref()
     }
 
     /// The org this mint serves (`Some("demo")` in demo mode; set by
@@ -1255,6 +1301,21 @@ mod tests {
         let mut s2 = Store::open_local(d.path()).await.unwrap();
         s2.init_k_m_a(d.path(), true).expect("init");
         assert_eq!(first, *s2.k_m_a().expect("present"));
+    }
+
+    #[tokio::test]
+    async fn k_session_generated_on_first_start_and_reloaded() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open_local(d.path()).await.unwrap();
+        assert!(s.k_session().is_none(), "absent until init");
+        s.init_k_session(d.path()).expect("init");
+        let first = *s.k_session().expect("present");
+        let meta = std::fs::metadata(d.path().join(K_SESSION_FILE)).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        // Restart loads the same bytes — and K_session is independent of K_M-A.
+        let mut s2 = Store::open_local(d.path()).await.unwrap();
+        s2.init_k_session(d.path()).expect("init");
+        assert_eq!(first, *s2.k_session().expect("present"));
     }
 
     #[tokio::test]

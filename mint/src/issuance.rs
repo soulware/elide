@@ -112,32 +112,60 @@ pub fn mint_credential(
     )
 }
 
-/// Mint an admin macaroon — the bearer credential a human ops user
-/// presents on `/v1/admin/*`. `op=admin`, `aud`, `sub` (human
-/// identifier, free-text), optional `scope` (comma-list of admin
-/// verb tags from [`crate::caveat::admin_scope`]; an empty list is
-/// **super-admin**), optional `exp` (unix seconds; `None` =
-/// non-expiring). Distinct chain from the client `enroll`/
-/// `assume-role` family even though both MAC under the same root.
-pub fn mint_admin_token(
+/// Fixed `client_id` bound into the CLI service token's third-party
+/// caveat. The cli-token is the deployment's admin-plane primary, not
+/// a per-operator credential, so its `r`-cluster is a single fixed
+/// scope — one deployment, one admin plane
+/// (`docs/design-mint.md` § *CLI service token*).
+pub const CLI_TOKEN_CLIENT_ID: &str = "cli-token";
+
+/// The cli-token's TPC `r` epoch. Fixed at 0; rotation (which would
+/// bump it to invalidate outstanding discharges) is deferred.
+const CLI_TOKEN_R_EPOCH: u32 = 0;
+
+/// Mint the **CLI service token** — the deployment's admin-plane
+/// primary (`docs/design-mint.md` § *CLI service token*). A mint-issued
+/// chain carrying `aud` and `cnf` (the mint-generated machine key the
+/// operator CLI signs PoP with), plus a single third-party caveat at
+/// `location` that the auth service discharges.
+///
+/// No `op` and no `exp` on the base token: the operator attenuates
+/// `op=admin:<verb>` per call (so the op binds to that call's PoP over
+/// the attenuated tail), and per-call freshness rides on the discharge.
+/// The token is inert without a fresh discharge satisfying the TPC.
+///
+/// `r` for the TPC is `derive_r(K_M, "cli-token", 0)`; the verifier
+/// recovers it from the TPC's `VID` (chain-tag-keyed), the auth service
+/// from the `CID` (`K_M-A`-keyed) — both yield this same `r`.
+pub fn mint_cli_token(
     keyring: &Keyring,
+    k_m_a: &[u8; 32],
     audience: &str,
-    sub: &str,
-    scope: Option<&str>,
-    exp_unix: Option<u64>,
+    cnf: &str,
+    org_id: &str,
+    location: &str,
 ) -> Macaroon {
-    let mut caveats = vec![
-        Caveat::scalar(name::OP, op::ADMIN),
-        Caveat::scalar(name::AUD, audience),
-        Caveat::scalar(name::SUB, sub),
-    ];
-    if let Some(s) = scope {
-        caveats.push(Caveat::scalar(crate::caveat::SCOPE, s));
-    }
-    if let Some(e) = exp_unix {
-        caveats.push(Caveat::scalar(name::EXP, e.to_string()));
-    }
-    macaroon::mint(keyring, caveats)
+    let base = macaroon::mint(
+        keyring,
+        vec![
+            Caveat::scalar(name::AUD, audience),
+            Caveat::scalar(name::CNF, cnf),
+        ],
+    );
+    let r = crate::tpc::derive_r(
+        keyring.current_key(),
+        CLI_TOKEN_CLIENT_ID,
+        CLI_TOKEN_R_EPOCH,
+    );
+    let tpc = crate::tpc::build_caveat(
+        base.tail(),
+        &r,
+        k_m_a,
+        CLI_TOKEN_CLIENT_ID,
+        org_id,
+        location,
+    );
+    base.attenuate(tpc)
 }
 
 /// Extract the bound `(sub, cnf)` from an already-MAC-verified

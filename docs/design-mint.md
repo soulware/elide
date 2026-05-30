@@ -195,7 +195,11 @@ elide coordinator's `data_dir` (`coordinator.toml`):
 
 - **`data_dir`** (default `mint_data`) — holds the macaroon keyring
   directory `root_keys/` (one file per generation, mode 0600, plus a
-  `current` pointer) and any third-party discharge keys. Enrollment
+  `current` pointer) and any third-party discharge keys. When `[auth]`
+  is configured it also holds the admin-plane `cli-token` + its machine
+  key `cli-token.key` (§ *CLI service token*) and the operator's
+  `cli-session` from `mint login`; the colocated demo additionally
+  generates `k_m_a` and `k_session` here. Enrollment
   state (the current `invite` nonce, pending records, and the
   approved-coordinator registry) lives in the tenant bucket under
   `_mint/` so multiple mint processes can share one logical state
@@ -421,10 +425,12 @@ issued against — the mint software is identical.
 ## Operator authorization
 
 Mint's admin endpoints — `POST /v1/admin/invite`,
-`POST /v1/admin/invite/rotate`, `GET /v1/admin/enrollments`,
+`POST /v1/admin/invite/rotate`, `POST /v1/admin/enrollments`,
 `POST /v1/admin/enroll/approve`, `POST /v1/admin/enroll/revoke` — are
 the operator's surface for managing invites and approving coordinator
-enrollments. They are mounted on the UDS listener only
+enrollments. Every endpoint is a `POST` (even the reads), because the
+proof-of-possession signs over the request body and every call carries
+one. They are mounted on the UDS listener only
 (§ *Proposed: dual-listen*); UDS filesystem permission gates
 **transport**, not authority. Every admin call still carries the
 `MintV1 <bundle>` Authorization shape used everywhere else — a
@@ -435,49 +441,73 @@ could `connect(2)` to the socket".
 
 ### CLI service token
 
-The primary in an admin bundle is a long-lived **CLI service token**
-written by mint at first start and read by the local `mint` CLI on
-each invocation. Its caveats are the minimum needed to anchor the
-bundle:
+The primary in an admin bundle is a long-lived **CLI service token** —
+the deployment's machine identity for the admin plane — written by mint
+at first start and read by the local `mint` CLI on each invocation. Its
+caveats are the minimum needed to anchor the bundle:
 
 ```
 caveats:
-  aud  = mint
-  role = admin
-  TPC:   location = auth-service, VID/CID encrypted under K_M-A
+  aud = mint
+  cnf = ed25519:<machine pubkey>
+  TPC:  location = auth-service, VID/CID encrypted under K_M-A
 ```
 
-No `cnf`, no `exp`, no other caveats. Operator identity and per-call
-freshness ride on the discharge (§ *Authentication*); the service
-token's job is to anchor the third-party caveat so each admin call
-requires a fresh auth-service discharge. `role = admin` fits the same
-machinery as the other roles (§ *Role configuration*) — it is a
-normal role primary whose endpoint surface happens to be the admin
-set rather than `assume-role`.
+No `op` and no `exp` on the base token. The operator attenuates
+`op=admin:<verb>` onto the service token per call, so the verb binds to
+that call's proof-of-possession over the attenuated tail; one endpoint
+clears exactly its own verb. Per-call freshness rides on the discharge.
+The token is inert without a fresh auth-service discharge satisfying its
+third-party caveat.
 
-**Generation.** Mint mints the service token at first start under
-`K_M`, with a fresh nonce, and writes it to `<data_dir>/cli-token`
-(mode 0640: mint user + a local-operator group). It is not a
-network secret: the bundle is inert without a fresh discharge from
-auth-service, and any process without UDS access cannot reach mint
-at all. Local-filesystem reach is therefore the only reach it needs.
+**Two identities.** The admin plane separates the *machine* from the
+*human*:
 
-**Distribution.** None. The mint CLI on the same host reads
-`<data_dir>/cli-token` directly. No copy-paste, no out-of-band
-channel, no deployer secrets pipeline. Cross-host operator access is
-out of scope here; remote operators interact with mint through the
-coordinator for non-admin paths, or wait for a future
-authenticated-TCP admin transport (§ *Proposed: dual-listen* — *What
-this is not*).
+- The **machine key** is the service token's `cnf`. Mint generates the
+  keypair at first start — the token is minted before any operator key
+  exists — and writes the seed to `<data_dir>/cli-token.key`. The CLI
+  signs every admin request's PoP with it. It attests "this is the
+  deployment's CLI", not which human is driving it.
+- The **human session** is what `mint login` obtains from the auth
+  service and gates discharge issuance. The auth service stamps the
+  session's `Subject` into each discharge, so the audit log attributes
+  `enroll approve` to a human even though the PoP is the machine's.
 
-**Rotation.** `mint cli-token rotate` mints a fresh token under the
-same `K_M` (new nonce) and overwrites `<data_dir>/cli-token`. Old
+**Generation.** Mint mints the service token at first start under `K_M`
+(fresh nonce) and writes `<data_dir>/cli-token` together with the
+machine-key seed `<data_dir>/cli-token.key`, both mode 0600. Neither is
+a network secret: the bundle is inert without a fresh discharge, and any
+process without UDS access cannot reach mint at all. Local-filesystem
+reach is the only reach either needs.
+
+**Distribution.** None. The mint CLI on the same host reads both files
+directly. No copy-paste, no out-of-band channel, no deployer secrets
+pipeline. Cross-host operator access is out of scope here; remote
+operators interact with mint through the coordinator for non-admin
+paths, or wait for a future authenticated-TCP admin transport
+(§ *Proposed: dual-listen* — *What this is not*).
+
+**Login & discharge.** `mint login` authenticates at the auth service
+and stores the session — `<data_dir>/cli-session` in the colocated
+demo, `~/.elide/` for a standalone auth service (see
+[`design-auth-service.md`](design-auth-service.md) § *Login flow*). On
+each admin call the CLI fetches a **wide discharge** for the service
+token's third-party caveat from `POST <auth>/v1/discharge` (gated by the
+session, recovering the discharge key from the caveat's `CID` under
+`K_M-A`). The discharge carries `Subject` and a short `NotAfter` and
+**no** `op`, so one fetch satisfies every verb. The CLI then attenuates
+the call's `op=admin:<verb>` onto the service token, bundles `[service
+token, discharge]`, and PoP-signs the attenuated tail with the machine
+key.
+
+**Rotation.** `mint cli-token rotate` re-mints the token under `K_M`
+(new nonce, fresh machine keypair) and overwrites both files. Old
 tokens remain verifiable until a revocation mechanism lands (see
 *Open questions*); the discharge layer gates every individual call
 regardless.
 
 **Lifetime.** Effectively the deployment's. Per-call freshness is
-supplied by the discharge's short `exp` and the per-request PoP, so
+supplied by the discharge's short `NotAfter` and the per-request PoP, so
 a long-lived service token does not weaken any property the per-call
 check enforces.
 
@@ -489,8 +519,10 @@ calling. Two reasons we still require the bundle on top:
 - **Identity attribution.** Multiple local users may share UDS
   access (the operator, the mint process, an unrelated service in the
   same group). The audit log needs to record which human performed
-  `enroll approve`; without a discharge bound to an operator's `cnf`
-  that identity is unrecoverable from the request.
+  `enroll approve`; the discharge's `Subject` — established at `mint
+  login` and stamped by the auth service — is that record. Without it
+  the human is unrecoverable from the request (the PoP only attests the
+  shared machine key).
 - **Authorization policy lives at auth-service.** "Who may operate
   this mint" is a policy decision belonging to the central
   authorization service, not to whoever was added to the mint group
@@ -1783,6 +1815,7 @@ Operator / server:
 
 ```
 mint serve <cfg> [bind]            # HTTP service
+mint login [--subject <s>]         # operator session for the admin plane (gates discharge issuance)
 mint invite [--rotate]             # print current invite macaroon / rotate the nonce
 mint enroll list                   # sub, state (pending|approved), cnf fingerprint,
                                    #   peer ip (pending only), age / approved_at
@@ -1806,19 +1839,19 @@ mint client assume-role  --request '{"prefix":"x"}'          # role from the cre
 ```
 
 A worked `examples/` script chains them: `serve` (background) →
-`client enroll` → operator `enroll approve` → `client exchange --role`
-(once per role) → `client assume-role`, printing the returned Tigris
-keypair.
+operator `login` → `client enroll` → operator `enroll approve` →
+`client exchange --role` (once per role) → `client assume-role`,
+printing the returned Tigris keypair.
 
 **Operator auth.** The operator commands (`invite`, `enroll
-list/approve/revoke`) hit macaroon-gated admin endpoints and must
-present an admin macaroon. The first command to create the keyring —
-`mint seal` or `mint serve` — writes a one-shot super-admin bootstrap
-macaroon to `<data_dir>/admin.bootstrap` (mode 0600); the operator
-commands read it from there by default, or from `$MINT_ADMIN_TOKEN`
-(a per-human token minted via `/v1/admin/token/mint`). It is issued
-at keyring genesis, so deleting it after capture does not resurrect
-it. `serve` also auto-seals the templates on a genuine first start
+list/approve/revoke`) hit discharge-gated admin endpoints
+(§ *Operator authorization*). `mint serve` writes the **cli-token** and
+its machine key (`<data_dir>/cli-token` + `cli-token.key`, mode 0600)
+at first start; the operator runs `mint login` once to obtain a session,
+and each command then fetches a wide discharge for the cli-token's
+third-party caveat and presents `[cli-token, discharge]` + a PoP. There
+is no bearer admin macaroon. `serve` also auto-seals the templates on a
+genuine first start
 (see [`design-mint-template-seal.md`](design-mint-template-seal.md)),
 so the demo needs no explicit `mint seal` step.
 

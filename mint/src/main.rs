@@ -20,6 +20,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use rand_core::{OsRng, RngCore};
+
 use mint::audit::AuditLog;
 use mint::config::{Config, Listener};
 use mint::http::{AppState, router};
@@ -45,6 +47,20 @@ enum Command {
         /// the listener the config resolves to.
         #[arg(long)]
         bind: Option<SocketAddr>,
+    },
+    /// Operator: log in at the auth service, storing the session that
+    /// gates discharge issuance (`<data_dir>/cli-session`).
+    ///
+    /// The demo auth role accepts any subject with no password; the
+    /// session it returns is the gate on `/v1/discharge`, not an
+    /// identity. Re-run when the session lapses (~7 days).
+    Login {
+        #[arg(long, default_value = "mint.toml")]
+        config: PathBuf,
+        /// Opaque operator subject, stamped into issued discharges for
+        /// audit. Any value is accepted in the demo.
+        #[arg(long, default_value = "operator")]
+        subject: String,
     },
     /// Print the invite macaroon (reusable, non-expiring).
     ///
@@ -246,6 +262,7 @@ enum EnrollCmd {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
         Command::Serve { config, bind } => serve(&config, bind).await,
+        Command::Login { config, subject } => login(&config, &subject).await,
         Command::Invite { config, rotate } => invite(&config, rotate).await,
         Command::Enroll { cmd } => match cmd {
             EnrollCmd::List { config } => enroll_list(&config).await,
@@ -361,50 +378,59 @@ struct TigrisHandles {
 /// real S3-compatible target (Tigris free tier, MinIO). Test code
 /// constructs `Store::open_in_memory` / `Store::open_local` directly,
 /// outside this path.
-/// Mint a super-admin bootstrap macaroon and write it to
-/// `<data_dir>/admin.bootstrap` (mode 0600). The first-start hook
-/// for `serve`; the operator captures the file out of band, mints
-/// per-human admin tokens via `/v1/admin/token/mint`, and then
-/// rotates the keyring to retire this one.
+/// Mint the **CLI service token** and its machine keypair at first
+/// start, writing `<data_dir>/cli-token` + `<data_dir>/cli-token.key`
+/// (`docs/design-mint.md` § *CLI service token*). The operator CLI on
+/// the same host reads both: the token is the admin-plane primary, the
+/// key is what it signs proof-of-possession with. Mint generates the
+/// keypair here because the token is minted before any operator key
+/// exists.
 ///
-/// Issued at **keyring genesis** — the one moment the keyring is
-/// created, detected by [`is_keyring_genesis`] *before* the keyring is
-/// opened. Both `mint seal` and `mint serve` call this on that
-/// transition, whichever runs first, so the bootstrap is written
-/// exactly once per data dir regardless of seal/serve ordering and is
-/// never resurrected when the operator deletes the captured file (the
-/// keyring already exists by then, so genesis is false).
-fn write_bootstrap_admin(
-    data_dir: &Path,
-    audience: &str,
-    keyring: &mint::keyring::Keyring,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let path = data_dir.join("admin.bootstrap");
-    let mac = mint::issuance::mint_admin_token(
-        keyring,
-        audience,
-        "bootstrap",
-        None, // super-admin
-        None, // non-expiring
+/// Requires `[auth]` (so `K_M-A` is present): admin endpoints are
+/// discharge-gated, so a mint with no auth service has no admin plane
+/// and no cli-token to mint — that case returns `Ok(())` and writes
+/// nothing. Refuses to overwrite; first-start detection is the
+/// caller's job.
+async fn write_cli_token(cfg: &Config, store: &Store) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(k_m_a) = store.k_m_a().copied() else {
+        return Ok(()); // no auth → no admin plane → no cli-token
+    };
+    let auth = cfg
+        .auth
+        .as_ref()
+        .ok_or("cli-token: K_M-A present without an [auth] block")?;
+    let org_id = store.org_id().unwrap_or("demo").to_string();
+
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    let cnf = mint::pop::cnf_value(&seed);
+
+    let keyring = store.keyring().await;
+    let mac = mint::issuance::mint_cli_token(
+        &keyring,
+        &k_m_a,
+        &cfg.audience,
+        &cnf,
+        &org_id,
+        &auth.endpoint,
     );
-    let bytes = mac.encode();
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, &path)?;
-    tracing::warn!(
-        path = %path.display(),
-        "wrote bootstrap admin macaroon — capture out of band, mint per-human tokens via /v1/admin/token/mint, then rotate the keyring to retire this one"
+
+    write_0600(&cfg.data_dir.join("cli-token"), mac.encode().as_bytes())?;
+    let seed_hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+    write_0600(&cfg.data_dir.join("cli-token.key"), seed_hex.as_bytes())?;
+    tracing::info!(
+        data_dir = %cfg.data_dir.display(),
+        "wrote cli-token + cli-token.key (admin-plane identity for the local operator CLI)"
     );
     Ok(())
 }
 
-/// Whether the keyring does not yet exist for this data dir. True only
-/// on the very first `mint seal` / `mint serve`, which creates it.
-/// Must be sampled before the keyring is opened. The bootstrap admin
-/// macaroon is issued on this transition (see [`write_bootstrap_admin`]).
-fn is_keyring_genesis(data_dir: &Path) -> bool {
-    !data_dir.join("root_keys").join("0000").exists() && !data_dir.join("root_key").exists()
+/// Atomic 0600 write — tmp file, chmod, rename.
+fn write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, path)
 }
 
 async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std::error::Error>> {
@@ -422,8 +448,19 @@ async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std:
     .await?;
     std::fs::create_dir_all(&cfg.data_dir)?;
     let legacy = cfg.data_dir.join("root_key");
-    let store =
+    let mut store =
         Store::open_remote(s3, &cfg.data_dir.join("root_keys"), Some(&legacy), None).await?;
+    // K_M-A is needed wherever `[auth]` is configured (TPC verification
+    // and demo discharge issuance). Demo mode generates it locally;
+    // production loads what auth-service enrollment provisioned.
+    // K_session is purely the colocated demo auth role's session root —
+    // generated only under `demo_enabled`.
+    if let Some(auth) = &cfg.auth {
+        store.init_k_m_a(&cfg.data_dir, auth.demo_enabled)?;
+        if auth.demo_enabled {
+            store.init_k_session(&cfg.data_dir)?;
+        }
+    }
     Ok((
         store,
         TigrisHandles {
@@ -446,24 +483,23 @@ async fn serve(
 
     let config = Arc::new(load(config)?);
 
-    // Keyring genesis must be sampled before open_store creates the
-    // keyring. See `write_bootstrap_admin`.
-    let keyring_genesis = is_keyring_genesis(&config.data_dir);
+    // First start = keyring directory empty before open_store.
+    // open_store generates `root_keys/0000` if absent, so checking
+    // before is the only reliable signal. The cli-token is minted
+    // exactly once, on this transition; later starts never re-create
+    // it (the existing file is left in place).
+    let is_first_start = !config.data_dir.join("root_keys").join("0000").exists()
+        && !config.data_dir.join("root_key").exists();
 
     let (store, tigris) = open_store(&config).await?;
     let store = Arc::new(store);
 
-    // Bootstrap admin macaroon (`docs/design-mint.md` § *Admin
-    // macaroon*). Super-admin, non-expiring, `sub=bootstrap` —
-    // captured out of band by the operator on first start, then
-    // retired (mint per-human tokens, rotate the keyring). Issued at
-    // keyring genesis only, so deleting `admin.bootstrap` after capture
-    // never resurrects it. If `mint seal` ran first it created the
-    // keyring and issued the bootstrap already, so genesis is false
-    // here and serve does not double-issue.
-    if keyring_genesis {
-        let keyring = store.keyring().await;
-        write_bootstrap_admin(&config.data_dir, &config.audience, &keyring)?;
+    // CLI service token (`docs/design-mint.md` § *CLI service token*):
+    // the admin-plane primary + machine key the local operator CLI
+    // reads. Written once on first start when an auth service is
+    // configured.
+    if is_first_start && !config.data_dir.join("cli-token").exists() {
+        write_cli_token(&config, &store).await?;
     }
 
     // Template seal: publish any pending file on disk, then verify
@@ -577,48 +613,71 @@ async fn serve(
 /// when serve is bound to UDS, so a TCP-only deployment returns 404
 /// and the command surfaces a clean error).
 fn admin_target(cfg: &Config) -> mint::admin::AdminTarget<'_> {
-    let transport = match &cfg.listener {
-        Listener::Uds(p) => mint::admin::AdminTransport::Uds(p),
+    match &cfg.listener {
+        Listener::Uds(p) => mint::admin::AdminTarget::Uds(p),
         Listener::Tcp(addr) => {
             // Construct a leaked &str for the lifetime of this CLI process —
             // safe because clap-parsed Config lives until main returns.
             let url: &'static str = Box::leak(format!("http://{addr}").into_boxed_str());
-            mint::admin::AdminTransport::Tcp(url)
+            mint::admin::AdminTarget::Tcp(url)
         }
-    };
-    mint::admin::AdminTarget {
-        transport,
-        auth: resolve_admin_token(cfg),
     }
 }
 
-/// The admin macaroon to present on `/v1/admin/*`, in precedence order:
-/// the `MINT_ADMIN_TOKEN` env var (a per-human token minted via
-/// `/v1/admin/token/mint`), else the one-shot bootstrap macaroon at
-/// `<data_dir>/admin.bootstrap`. `None` if neither is present — the
-/// command then fails with the server's 401, which names the gap.
-fn resolve_admin_token(cfg: &Config) -> Option<String> {
-    if let Ok(tok) = std::env::var("MINT_ADMIN_TOKEN") {
-        let tok = tok.trim().to_string();
-        if !tok.is_empty() {
-            return Some(tok);
-        }
-    }
-    let path = cfg.data_dir.join("admin.bootstrap");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+/// The demo auth socket the operator logs in / fetches discharges over.
+/// Present only when `[auth].demo_enabled = true` — the only auth
+/// backend that exists in-tree. Production runs a separate auth-service
+/// binary; wiring the operator to that endpoint is out of scope here.
+fn auth_socket(cfg: &Config) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    cfg.auth
+        .as_ref()
+        .and_then(|a| a.socket.clone())
+        .ok_or_else(|| {
+            "operator plane requires a colocated demo auth role \
+             ([auth].demo_enabled = true); no auth socket is configured"
+                .into()
+        })
+}
+
+/// `mint login` — trivially authenticate at the demo auth role and
+/// persist the session that gates discharge issuance.
+async fn login(config: &Path, subject: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = load(config)?;
+    let socket = auth_socket(&cfg)?;
+    let session = mint::operator::login(&socket, subject).await?;
+    mint::operator::save_session(&cfg.data_dir, &session)?;
+    eprintln!(
+        "logged in as {subject}; session saved to {}",
+        cfg.data_dir.join(mint::operator::SESSION_FILE).display()
+    );
+    Ok(())
+}
+
+/// Assemble the operator's admin-plane authority for one CLI
+/// invocation: load the cli-token + machine key, load the session
+/// (`mint login`), and fetch a fresh wide discharge over the auth
+/// socket. The returned discharge satisfies every admin verb; each
+/// admin call attenuates its own `op` onto the cli-token.
+async fn operator_session(
+    cfg: &Config,
+) -> Result<(mint::operator::Operator, mint::Macaroon), Box<dyn std::error::Error>> {
+    let operator = mint::operator::Operator::load(&cfg.data_dir)?;
+    let session = mint::operator::load_session(&cfg.data_dir)?;
+    let socket = auth_socket(cfg)?;
+    let discharge =
+        mint::operator::fetch_discharge(&socket, &session, &operator.cid_b64()?).await?;
+    Ok((operator, discharge))
 }
 
 async fn invite(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = load(config)?;
+    let (op, discharge) = operator_session(&config).await?;
     let target = admin_target(&config);
     let resp = if rotate {
         eprintln!("rotating invite nonce; in-flight enrollments cancelled");
-        mint::admin::rotate_invite(target).await?
+        mint::admin::rotate_invite(target, &op, &discharge).await?
     } else {
-        mint::admin::get_invite(target).await?
+        mint::admin::get_invite(target, &op, &discharge).await?
     };
     eprintln!(
         "invite macaroon for audience={} (non-expiring, reusable)",
@@ -630,7 +689,8 @@ async fn invite(config: &Path, rotate: bool) -> Result<(), Box<dyn std::error::E
 
 async fn enroll_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let config = load(config)?;
-    let rows = mint::admin::list_enrollments(admin_target(&config)).await?;
+    let (op, discharge) = operator_session(&config).await?;
+    let rows = mint::admin::list_enrollments(admin_target(&config), &op, &discharge).await?;
     if rows.is_empty() {
         eprintln!("no enrollments");
         return Ok(());
@@ -661,11 +721,12 @@ async fn enroll_approve(
     use std::io::Write;
 
     let config = load(config)?;
+    let (op, discharge) = operator_session(&config).await?;
     let target = admin_target(&config);
     // Read the pending row from the daemon so the operator's
     // fingerprint check matches what's on the server side, not what
     // the CLI thinks should be there.
-    let rows = mint::admin::list_enrollments(target).await?;
+    let rows = mint::admin::list_enrollments(target, &op, &discharge).await?;
     let pending = rows
         .into_iter()
         .find(|r| r.sub == sub && r.state == "pending")
@@ -698,7 +759,8 @@ async fn enroll_approve(
         sub: sub.to_owned(),
         pubkey: pending.pubkey,
     };
-    let resp = mint::admin::approve_enrollment(admin_target(&config), &req).await?;
+    let resp =
+        mint::admin::approve_enrollment(admin_target(&config), &op, &discharge, &req).await?;
     eprintln!(
         "approved {sub} (registry entry written at {}; pending record deleted)",
         resp.approved_at
@@ -708,10 +770,11 @@ async fn enroll_approve(
 
 async fn enroll_revoke(config: &Path, sub: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config = load(config)?;
+    let (op, discharge) = operator_session(&config).await?;
     let req = mint::admin::RevokeRequest {
         sub: sub.to_owned(),
     };
-    let resp = mint::admin::revoke_enrollment(admin_target(&config), &req).await?;
+    let resp = mint::admin::revoke_enrollment(admin_target(&config), &op, &discharge, &req).await?;
     if resp.revoked {
         eprintln!("revoked approved/{sub}; next enroll requires fresh approval");
         Ok(())
@@ -729,24 +792,11 @@ async fn seal(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load(config_path)?;
     let keyring_dir = cfg.data_dir.join("root_keys");
     let legacy_singleton = cfg.data_dir.join("root_key");
-    // Sample before Keyring::open creates the keyring: if seal is the
-    // first command to touch this data dir, it issues the bootstrap
-    // admin macaroon so the subsequent serve has it (serve sees a
-    // non-genesis keyring and does not re-issue).
-    let keyring_genesis = is_keyring_genesis(&cfg.data_dir);
     std::fs::create_dir_all(&cfg.data_dir)?;
     let keyring = mint::keyring::Keyring::open(&keyring_dir, Some(&legacy_singleton), None)
         .map_err(|e| -> Box<dyn std::error::Error> {
             format!("open keyring at {}: {e}", keyring_dir.display()).into()
         })?;
-    if keyring_genesis {
-        write_bootstrap_admin(&cfg.data_dir, &cfg.audience, &keyring)?;
-        eprintln!(
-            "wrote bootstrap admin macaroon → {} (capture it; admin commands \
-             read it or $MINT_ADMIN_TOKEN)",
-            cfg.data_dir.join("admin.bootstrap").display(),
-        );
-    }
     let sealed_at = chrono::Utc::now().to_rfc3339();
     let seal = mint::seal::Seal::build_from_config(&cfg, &keyring, &sealed_at);
     let pending_path = cfg.data_dir.join("pending-seal.json");
@@ -840,45 +890,4 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
     eprintln!("  policy template:");
     println!("{}", role.policy);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mint::keyring::Keyring;
-    use mint::macaroon::Macaroon;
-    use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn keyring_genesis_flips_once_the_keyring_exists() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        assert!(is_keyring_genesis(tmp.path()), "empty data dir is genesis");
-        std::fs::create_dir_all(tmp.path().join("root_keys")).expect("mkdir");
-        std::fs::write(tmp.path().join("root_keys").join("0000"), b"k").expect("write key");
-        assert!(
-            !is_keyring_genesis(tmp.path()),
-            "keyring present is not genesis"
-        );
-    }
-
-    #[test]
-    fn legacy_singleton_key_also_counts_as_non_genesis() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join("root_key"), b"k").expect("write legacy key");
-        assert!(!is_keyring_genesis(tmp.path()));
-    }
-
-    #[test]
-    fn bootstrap_admin_is_a_decodable_0600_macaroon() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let keyring = Keyring::single([1u8; 32]);
-        write_bootstrap_admin(tmp.path(), "mint", &keyring).expect("write bootstrap");
-
-        let path = tmp.path().join("admin.bootstrap");
-        let text = std::fs::read_to_string(&path).expect("read bootstrap");
-        Macaroon::decode(text.trim()).expect("bootstrap decodes as a macaroon");
-
-        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "bootstrap must be 0600");
-    }
 }

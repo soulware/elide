@@ -1,7 +1,7 @@
 # Minimal demo config (docs/design-mint.md § "Reference client & demo").
 #
 # Two roles — `read` / `write` over a single {{request.prefix}}. `read`
-# exercises plain issuance (invite → enroll → approve → exchange →
+# exercises plain issuance (login → invite → enroll → approve → exchange →
 # assume-role); `write` adds the operator-authorisation loop — it carries
 # a third-party caveat, so assume-role is refused until the client fetches
 # a discharge from [auth] and attaches it. This is NOT the Elide role
@@ -29,18 +29,24 @@ socket = "mint_data/mint.sock"        # client: --url unix:mint_data/mint.sock
 # For a TCP listener instead, replace the line above with:
 #   bind = "127.0.0.1:8085"           # client: --url http://127.0.0.1:8085
 
+# Auth service (docs/design-auth-service.md): where third-party caveats
+# point, and whether mint colocates a demo auth role.
+[auth]
+# Auth-service URL — the `location` stamped into every TPC. In the
+# single-host demo the operator reaches the auth role over the socket
+# below, so a `unix:` location is the honest value.
+endpoint = "unix:mint_data/auth.sock"
+# Colocate the auth role on its own UDS instead of a separate
+# auth-service binary. Demo / single-host only; generates K_M-A and
+# K_session on first start.
+demo_enabled = true
+# UDS the colocated auth role binds for /v1/login + /v1/discharge,
+# separate from mint.sock above. Defaults to <data_dir>/auth.sock;
+# ignored when demo_enabled = false.
+socket = "mint_data/auth.sock"
+
 [tenant]
 bucket = "mint-demo"
-
-# Colocate the auth-service role so this single mint process closes the
-# operator-authorisation loop end-to-end (no separate auth binary). With
-# demo_enabled, mint binds a second UDS for /v1/discharge, generates its
-# own K_M-A / K_session, and rubber-stamps every discharge request.
-# endpoint is the location stamped on every third-party caveat — the
-# address the client posts a CID to; it points back at this same socket.
-[auth]
-endpoint = "unix:mint_data/auth.sock"
-demo_enabled = true
 
 [[role]]
 name = "read"
