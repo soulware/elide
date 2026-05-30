@@ -5,8 +5,9 @@
 //! credential is refused until the client fetches a discharge from the
 //! authority and attaches it to the bundle. This drives the real client
 //! (`mint::client::assume_role`) over two live UDS listeners — the mint
-//! router and the colocated demo-auth router — exactly the
-//! `demo mint + no session` fixture from `design-auth-service.md`.
+//! router and the colocated demo-auth router. The client logs in at the
+//! auth role (`/v1/login`) and presents the session on `/v1/discharge`,
+//! which is session-gated (`design-auth-service.md` § *Login flow*).
 
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
@@ -68,9 +69,10 @@ async fn state(dir: &std::path::Path) -> AppState {
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.join("root_key"), root_hex).expect("root_key");
     let k_m_a_hex: String = K_M_A.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(dir.join("k_m_a"), k_m_a_hex).expect("k_m_a");
+    std::fs::write(dir.join(mint::state::K_M_A_FILE), k_m_a_hex).expect("k_m_a");
     let mut store = Store::open_local(dir).await.expect("store");
     store.init_k_m_a(dir, true).expect("init_k_m_a");
+    store.init_k_session(dir).expect("init_k_session");
     AppState {
         config: Arc::new(config()),
         minter: Arc::new(FakeMinter::new()),
@@ -140,6 +142,13 @@ async fn write_credential_assumes_role_only_after_fetching_a_discharge() {
         ),
         "credential should carry a third-party caveat at {auth_location}"
     );
+
+    // The client logs in at the auth role first (`mint client login`);
+    // assume_role on a TPC-bearing credential reads that saved session
+    // and presents it on the session-gated `/v1/discharge`.
+    client::login_cmd(client_dir.path(), &auth_location, "operator")
+        .await
+        .expect("client login");
 
     // The full loop: assume_role reads the TPC, fetches a discharge from
     // the auth socket, attaches it, and mint vends a scoped keypair.

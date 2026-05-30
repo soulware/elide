@@ -29,6 +29,10 @@ use crate::state::fingerprint;
 
 const KEY_FILE: &str = "client.key";
 const PUB_FILE: &str = "client.pub";
+/// The auth-service session (from `mint client login`) that gates
+/// discharge issuance for TPC-bearing roles. Held in the client dir,
+/// mode 0600, like the identity key.
+pub const SESSION_FILE: &str = "cli-session";
 /// Default `enroll --out` / `exchange --in`: the credential ticket —
 /// the short-lived, redeem-once token you trade in at the exchange.
 pub const CREDENTIAL_TICKET_FILE: &str = "credential.ticket";
@@ -234,10 +238,10 @@ async fn post_bundle(
     send(base_url, endpoint, &headers, body).await
 }
 
-/// POST a JSON body with no authentication. The discharge endpoint
-/// carries no caller credential in the demo (the operator session that
-/// would authorise it is deferred — see `design-auth-service.md`
-/// § *Mint as auth*); the CID in the body is the only input.
+/// POST a JSON body with no authentication. Used for `/v1/login`, which
+/// is itself the unauthenticated entry point that mints the session;
+/// the gated `/v1/discharge` call carries that session as a Bearer via
+/// [`send`].
 async fn post_json(
     base_url: &str,
     endpoint: &str,
@@ -576,7 +580,7 @@ pub async fn assume_role(
     // discharge for each before forwarding. Discovery (auth location +
     // CID) is read straight off the held credential — the mint-only
     // loop's stand-in for coord's 401 challenge.
-    let discharges = fetch_discharges(&mac).await?;
+    let discharges = fetch_discharges(dir, &mac).await?;
     if !discharges.is_empty() {
         // Per-forward freshness: tighten the primary's own chain before
         // it leaves the client, mirroring coord's per-forward NotAfter.
@@ -613,15 +617,28 @@ const PER_FORWARD_NOT_AFTER_SECONDS: u64 = 30;
 /// For each third-party caveat on `primary`, fetch a discharge from its
 /// `location` and tighten it with a per-IPC `NotAfter`. A credential
 /// with no third-party caveat yields an empty list, and the bundle is a
-/// bare primary — the non-operator-write path is unchanged.
-async fn fetch_discharges(primary: &Macaroon) -> Result<Vec<Macaroon>, ClientError> {
+/// bare primary — the non-operator-write path is unchanged. The session
+/// (from `mint client login`) is loaded lazily, only when a third-party
+/// caveat is actually present, so non-TPC roles need no login.
+async fn fetch_discharges(dir: &Path, primary: &Macaroon) -> Result<Vec<Macaroon>, ClientError> {
+    let has_tpc = primary
+        .caveats()
+        .iter()
+        .any(|c| matches!(c, Caveat::ThirdParty { .. }));
+    if !has_tpc {
+        return Ok(Vec::new());
+    }
+    // One session covers every third-party caveat on this credential;
+    // load it once (and surface a clear "run mint client login" if the
+    // operator skipped that step).
+    let session = load_session(dir)?;
     let mut discharges = Vec::new();
     for c in primary.caveats() {
         let Caveat::ThirdParty { location, cid, .. } = c else {
             continue;
         };
         eprintln!("  credential carries a third-party caveat → fetching discharge from {location}");
-        let mut discharge = fetch_discharge(location, cid).await?;
+        let mut discharge = fetch_discharge(location, cid, &session).await?;
         let deadline = now_unix().saturating_add(PER_IPC_NOT_AFTER_SECONDS);
         discharge = discharge.attenuate(Caveat::scalar(name::NOT_AFTER, deadline.to_string()));
         eprintln!("    ← discharge received; per-IPC NotAfter={deadline}");
@@ -630,12 +647,71 @@ async fn fetch_discharges(primary: &Macaroon) -> Result<Vec<Macaroon>, ClientErr
     Ok(discharges)
 }
 
-/// POST the CID to the authority's `/v1/discharge` and decode the
-/// returned discharge macaroon.
-async fn fetch_discharge(location: &str, cid: &[u8]) -> Result<Macaroon, ClientError> {
+/// Log in at the authority (`POST /v1/login`) and return the session
+/// bearer that gates discharge issuance. The demo accepts any subject
+/// with no password (`design-auth-service.md` § *Login flow*).
+async fn login(location: &str, subject: &str) -> Result<String, ClientError> {
+    let body = serde_json::json!({ "subject": subject }).to_string();
+    let (status, text) = post_json(location, "/v1/login", body).await?;
+    if status != 200 {
+        return Err(ClientError::Server { status, body: text });
+    }
+    json_field(&text, "session")
+}
+
+/// `mint client login`: log in at the auth service and persist the
+/// session to `<dir>/cli-session` (mode 0600), so a later `assume-role`
+/// on a TPC-bearing role presents it on `/v1/discharge`. The auth `url`
+/// is the same `unix:`/`http(s):` shape as the mint `--url`.
+pub async fn login_cmd(dir: &Path, url: &str, subject: &str) -> Result<(), ClientError> {
+    let session = login(url, subject).await?;
+    fs::create_dir_all(dir)?;
+    write_0600(&dir.join(SESSION_FILE), session.as_bytes())?;
+    eprintln!(
+        "logged in as {subject} at {url}; session saved to {}",
+        dir.join(SESSION_FILE).display()
+    );
+    Ok(())
+}
+
+/// Remove the saved session (`mint client logout`). Returns whether a
+/// session file was present — a no-op logout is `Ok(false)`, not an
+/// error.
+pub fn logout(dir: &Path) -> Result<bool, ClientError> {
+    match fs::remove_file(dir.join(SESSION_FILE)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(ClientError::Io(e)),
+    }
+}
+
+/// Load the saved session, validated as a decodable macaroon. A missing
+/// one points the operator at `mint client login`.
+fn load_session(dir: &Path) -> Result<String, ClientError> {
+    let text = read_text(
+        &dir.join(SESSION_FILE),
+        "run `mint client login --url <auth-url>` first",
+    )?;
+    let trimmed = text.trim();
+    Macaroon::decode(trimmed).map_err(|_| ClientError::BadFile("session"))?;
+    Ok(trimmed.to_string())
+}
+
+/// POST the CID to the authority's `/v1/discharge` under the session
+/// bearer and decode the returned discharge macaroon. The session's
+/// `Subject` is what the discharge attests.
+async fn fetch_discharge(
+    location: &str,
+    cid: &[u8],
+    session: &str,
+) -> Result<Macaroon, ClientError> {
     let cid_b64 = BASE64.encode(cid);
     let body = serde_json::json!({ "cid": cid_b64 }).to_string();
-    let (status, text) = post_json(location, "/v1/discharge", body).await?;
+    let headers = [
+        ("content-type", "application/json".into()),
+        ("authorization", format!("Bearer {session}")),
+    ];
+    let (status, text) = send(location, "/v1/discharge", &headers, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }
@@ -727,6 +803,16 @@ pub fn client_dir(arg: Option<PathBuf>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logout_removes_session_and_is_idempotent() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(!logout(d.path()).unwrap()); // nothing to remove
+        fs::write(d.path().join(SESSION_FILE), "x").unwrap();
+        assert!(logout(d.path()).unwrap()); // existed → removed
+        assert!(!d.path().join(SESSION_FILE).exists());
+        assert!(!logout(d.path()).unwrap()); // idempotent
+    }
 
     #[test]
     fn keygen_writes_pair_and_is_no_clobber() {

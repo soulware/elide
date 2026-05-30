@@ -25,6 +25,7 @@ pub mod issuance;
 pub mod keyring;
 pub mod macaroon;
 pub mod mint_rw;
+pub mod operator;
 pub mod pop;
 pub mod role;
 pub mod seal;

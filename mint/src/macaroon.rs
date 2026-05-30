@@ -217,6 +217,16 @@ pub fn mint_under_key_with_nonce(
 /// → auth-issued discharge verified under `r` recovered from `K_M-A`.
 pub const DISCHARGE_KID: Kid = Kid::MAX;
 
+/// `kid` sentinel for demo auth-role sessions. Like [`DISCHARGE_KID`]
+/// it does not index mint's root keyring — sessions are MAC'd under
+/// `K_session` — but it participates in the chain seed, so issuer and
+/// verifier (both the colocated demo auth role) must agree on it.
+/// Reserved one below `DISCHARGE_KID` for the same
+/// won't-collide-with-a-keyring-generation reason. Sessions never pass
+/// through `verify_and_clear`, so this value is purely the auth role's
+/// own self-consistency label.
+pub const SESSION_KID: Kid = Kid::MAX - 1;
+
 impl Macaroon {
     pub fn kid(&self) -> Kid {
         self.kid
