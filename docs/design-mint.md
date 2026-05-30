@@ -1830,18 +1830,21 @@ client only reads it; `--id` is the opaque `sub`):
 
 ```
 mint client keygen                                       # → client.key/.pub
+mint client login        --url <auth-url>                # → cli-session (needed for TPC roles)
 mint client enroll       --id <sub> <macaroon|file|->    # → credential.ticket
 mint client exchange     --role <role>                   # 403 until approved → credentials/<role>
 mint client credential list                              # held per-role credentials (local-only)
 mint client credential inspect <role>                    # narrate one credential's caveat chain
 mint client assume-role  --request '{"prefix":"x"}'          # role from the credential → Tigris keypair
-                                                             #   (TPC-bearing role → auto-fetches + attaches a discharge)
+                                                             #   (TPC-bearing role → fetches + attaches a discharge
+                                                             #    under the session from `client login`)
 ```
 
 A worked `examples/` script chains them: `serve` (background) →
 operator `login` → `client enroll` → operator `enroll approve` →
-`client exchange --role` (once per role) → `client assume-role`,
-printing the returned Tigris keypair.
+`client exchange --role` (once per role) → `client login` (for a
+TPC-bearing role) → `client assume-role`, printing the returned Tigris
+keypair.
 
 **Operator auth.** The operator commands (`invite`, `enroll
 list/approve/revoke`) hit discharge-gated admin endpoints

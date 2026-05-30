@@ -120,6 +120,20 @@ enum ClientCmd {
     /// Print this identity's `cnf` value + fingerprint (what the
     /// operator compares out of band before `enroll approve`).
     Fingerprint,
+    /// Log in at the auth service and save the session that gates
+    /// discharge issuance for TPC-bearing roles (`credentials/<role>`
+    /// carrying a third-party caveat). Run once before `assume-role` on
+    /// such a role; the session is stored in the client dir (~7 days).
+    Login {
+        /// Auth-service endpoint: `unix:<socket-path>` (the single-host
+        /// demo shape) or `http(s)://host:port`.
+        #[arg(long)]
+        url: String,
+        /// Opaque subject, stamped into issued discharges for audit.
+        /// Any value is accepted in the demo.
+        #[arg(long, default_value = "operator")]
+        subject: String,
+    },
     /// Attenuate the invite macaroon with `sub`/`cnf`, enrol, and
     /// save the returned credential ticket.
     Enroll {
@@ -295,6 +309,10 @@ async fn client_cmd(
             let (cnf, fp) = mint::client::identity(&dir)?;
             println!("cnf={cnf}");
             println!("fingerprint={fp}");
+            Ok(())
+        }
+        ClientCmd::Login { url, subject } => {
+            mint::client::login_cmd(&dir, &url, &subject).await?;
             Ok(())
         }
         ClientCmd::Enroll {

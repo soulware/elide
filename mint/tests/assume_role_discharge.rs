@@ -143,6 +143,13 @@ async fn write_credential_assumes_role_only_after_fetching_a_discharge() {
         "credential should carry a third-party caveat at {auth_location}"
     );
 
+    // The client logs in at the auth role first (`mint client login`);
+    // assume_role on a TPC-bearing credential reads that saved session
+    // and presents it on the session-gated `/v1/discharge`.
+    client::login_cmd(client_dir.path(), &auth_location, "operator")
+        .await
+        .expect("client login");
+
     // The full loop: assume_role reads the TPC, fetches a discharge from
     // the auth socket, attaches it, and mint vends a scoped keypair.
     let mint_url = format!("unix:{}", mint_sock.display());
