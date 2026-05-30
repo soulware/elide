@@ -135,6 +135,17 @@ pub fn load_session(data_dir: &Path) -> Result<String, OperatorError> {
     Ok(trimmed.to_string())
 }
 
+/// Remove the saved session (`mint logout`). Returns whether a session
+/// file was present — a no-op logout (nothing to remove) is `Ok(false)`,
+/// not an error.
+pub fn clear_session(data_dir: &Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(data_dir.join(SESSION_FILE)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// `mint login`: trivially authenticate at the demo auth role and
 /// return the session bearer. The demo accepts any subject with no
 /// password; production auth-service authenticates here for real and
@@ -312,6 +323,23 @@ mod tests {
         .encode();
         save_session(dir.path(), &session).unwrap();
         assert_eq!(load_session(dir.path()).unwrap(), session);
+    }
+
+    #[test]
+    fn clear_session_removes_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing to remove yet.
+        assert!(!clear_session(dir.path()).unwrap());
+        let session = crate::macaroon::mint_under_key(
+            &[1u8; 32],
+            crate::macaroon::SESSION_KID,
+            vec![Caveat::scalar(name::SUB, "alice")],
+        )
+        .encode();
+        save_session(dir.path(), &session).unwrap();
+        assert!(clear_session(dir.path()).unwrap()); // existed → removed
+        assert!(load_session(dir.path()).is_err()); // gone
+        assert!(!clear_session(dir.path()).unwrap()); // idempotent
     }
 
     #[test]

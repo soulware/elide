@@ -1816,6 +1816,7 @@ Operator / server:
 ```
 mint serve <cfg> [bind]            # HTTP service
 mint login [--subject <s>]         # operator session for the admin plane (gates discharge issuance)
+mint logout                        # remove the saved operator session
 mint invite [--rotate]             # print current invite macaroon / rotate the nonce
 mint enroll list                   # sub, state (pending|approved), cnf fingerprint,
                                    #   peer ip (pending only), age / approved_at
@@ -1831,6 +1832,7 @@ client only reads it; `--id` is the opaque `sub`):
 ```
 mint client keygen                                       # → client.key/.pub
 mint client login        --url <auth-url>                # → cli-session (needed for TPC roles)
+mint client logout                                       # remove the saved client session
 mint client enroll       --id <sub> <macaroon|file|->    # → credential.ticket
 mint client exchange     --role <role>                   # 403 until approved → credentials/<role>
 mint client credential list                              # held per-role credentials (local-only)

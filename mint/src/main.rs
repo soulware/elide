@@ -62,6 +62,12 @@ enum Command {
         #[arg(long, default_value = "operator")]
         subject: String,
     },
+    /// Operator: remove the saved session (`<data_dir>/cli-session`).
+    /// Admin commands then require a fresh `mint login`.
+    Logout {
+        #[arg(long, default_value = "mint.toml")]
+        config: PathBuf,
+    },
     /// Print the invite macaroon (reusable, non-expiring).
     ///
     /// The macaroon goes to stdout for piping; diagnostics to stderr.
@@ -134,6 +140,10 @@ enum ClientCmd {
         #[arg(long, default_value = "operator")]
         subject: String,
     },
+    /// Remove the saved session (`<client_dir>/cli-session`). A later
+    /// `assume-role` on a TPC-bearing role then requires a fresh
+    /// `client login`.
+    Logout,
     /// Attenuate the invite macaroon with `sub`/`cnf`, enrol, and
     /// save the returned credential ticket.
     Enroll {
@@ -141,7 +151,8 @@ enum ClientCmd {
         /// `unix:<socket-path>` (the single-host UDS shape).
         #[arg(long, default_value = "http://127.0.0.1:8085")]
         url: String,
-        /// Opaque principal id — the `sub` (typically a ULID).
+        /// Opaque principal id — the `sub`. Any path-safe string
+        /// (`[A-Za-z0-9._-]`, ≤256 chars); not required to be a ULID.
         #[arg(long)]
         id: String,
         /// Filename (under the client dir) to write the credential
@@ -252,7 +263,8 @@ enum EnrollCmd {
     Approve {
         #[arg(long, default_value = "mint.toml")]
         config: PathBuf,
-        /// The opaque principal id (typically a ULID).
+        /// The opaque principal id (any path-safe string; not required
+        /// to be a ULID).
         sub: String,
         /// Skip the interactive confirmation (automation only — you are
         /// asserting the fingerprint was verified out of band).
@@ -277,6 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
         Command::Serve { config, bind } => serve(&config, bind).await,
         Command::Login { config, subject } => login(&config, &subject).await,
+        Command::Logout { config } => logout(&config),
         Command::Invite { config, rotate } => invite(&config, rotate).await,
         Command::Enroll { cmd } => match cmd {
             EnrollCmd::List { config } => enroll_list(&config).await,
@@ -313,6 +326,15 @@ async fn client_cmd(
         }
         ClientCmd::Login { url, subject } => {
             mint::client::login_cmd(&dir, &url, &subject).await?;
+            Ok(())
+        }
+        ClientCmd::Logout => {
+            let path = dir.join(mint::client::SESSION_FILE);
+            if mint::client::logout(&dir)? {
+                eprintln!("logged out; removed {}", path.display());
+            } else {
+                eprintln!("not logged in (no session at {})", path.display());
+            }
             Ok(())
         }
         ClientCmd::Enroll {
@@ -668,6 +690,18 @@ async fn login(config: &Path, subject: &str) -> Result<(), Box<dyn std::error::E
         "logged in as {subject}; session saved to {}",
         cfg.data_dir.join(mint::operator::SESSION_FILE).display()
     );
+    Ok(())
+}
+
+/// `mint logout` — remove the saved operator session.
+fn logout(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = load(config)?;
+    let path = cfg.data_dir.join(mint::operator::SESSION_FILE);
+    if mint::operator::clear_session(&cfg.data_dir)? {
+        eprintln!("logged out; removed {}", path.display());
+    } else {
+        eprintln!("not logged in (no session at {})", path.display());
+    }
     Ok(())
 }
 

@@ -674,6 +674,17 @@ pub async fn login_cmd(dir: &Path, url: &str, subject: &str) -> Result<(), Clien
     Ok(())
 }
 
+/// Remove the saved session (`mint client logout`). Returns whether a
+/// session file was present — a no-op logout is `Ok(false)`, not an
+/// error.
+pub fn logout(dir: &Path) -> Result<bool, ClientError> {
+    match fs::remove_file(dir.join(SESSION_FILE)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(ClientError::Io(e)),
+    }
+}
+
 /// Load the saved session, validated as a decodable macaroon. A missing
 /// one points the operator at `mint client login`.
 fn load_session(dir: &Path) -> Result<String, ClientError> {
@@ -792,6 +803,16 @@ pub fn client_dir(arg: Option<PathBuf>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logout_removes_session_and_is_idempotent() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(!logout(d.path()).unwrap()); // nothing to remove
+        fs::write(d.path().join(SESSION_FILE), "x").unwrap();
+        assert!(logout(d.path()).unwrap()); // existed → removed
+        assert!(!d.path().join(SESSION_FILE).exists());
+        assert!(!logout(d.path()).unwrap()); // idempotent
+    }
 
     #[test]
     fn keygen_writes_pair_and_is_no_clobber() {
