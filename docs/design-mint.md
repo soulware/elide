@@ -721,7 +721,7 @@ for a mint-issued role credential.
 POST /v1/assume-role
 Host: <mint-instance>
 Authorization: MintV1 mnt1_<b64url-primary>[,mnt1_<b64url-discharge>...]
-X-Mint-Coord-Pop: <base64 Ed25519 signature>
+X-Mint-Pop: <base64 Ed25519 signature>
 Content-Type: application/json
 
 {
@@ -751,7 +751,7 @@ Content-Type: application/json
 POST /v1/verify
 Host: <mint-instance>
 Authorization: MintV1 mnt1_<b64url-primary>[,mnt1_<b64url-discharge>...]
-X-Mint-Coord-Pop: <base64 Ed25519 signature>
+X-Mint-Pop: <base64 Ed25519 signature>
 Content-Type: application/json
 
 {
@@ -793,7 +793,7 @@ POST /v1/enroll-exchange     # credential ticket + PoP + discharge bundle
 ```
 
 Both carry the macaroon in `Authorization: MintV1 mnt1_<b64url>` and the
-PoP in `X-Mint-Coord-Pop` exactly as `assume-role`. The `/v1/enroll`
+PoP in `X-Mint-Pop` exactly as `assume-role`. The `/v1/enroll`
 body is the PoP freshness `ts` only; the `/v1/enroll-exchange` body is
 `{ts, role}` — the requested role rides the PoP-signed body (so it is
 authenticated and audited like any exercise field), not a caveat on the
@@ -824,7 +824,7 @@ root, and each discharge against the relevant third-party key (see
 [`design-auth-model.md`](design-auth-model.md) for the construction).
 
 The request also carries the proof-of-possession the macaroon's
-`cnf` caveat requires: `X-Mint-Coord-Pop` is the base64
+`cnf` caveat requires: `X-Mint-Pop` is the base64
 Ed25519 signature, by `coordinator.key`, over `BLAKE3(macaroon-tail ‖
 BLAKE3(request-body))`. Every macaroon at these endpoints carries `cnf` — the
 coordinator appends it when attenuating the invite, mint carries it
@@ -2068,10 +2068,10 @@ prematurely.
     `cnf` PoP key, RFC 9449 DPoP). Tail-binding pins the proof to the
     exact macaroon, body-hash binding to the exact request, the in-body
     `ts` + skew window bounds replay. The signature stays a header
-    (`X-Mint-Coord-Pop`) — it cannot live in the body it signs; folding
+    (`X-Mint-Pop`) — it cannot live in the body it signs; folding
     it in as a structural envelope would reintroduce a framing/
     canonicalization boundary. What remains is only the encoding
-    (working draft: `X-Mint-Coord-Pop` base64 Ed25519 signature, body
+    (working draft: `X-Mint-Pop` base64 Ed25519 signature, body
     `ts` unix seconds, skew bound) — an implementation detail, not a
     design fork.
 
