@@ -64,18 +64,19 @@ use crate::keyring::{Keyring, Kid};
 /// tenant bucket*.
 pub const STATE_PREFIX: &str = "_mint";
 
-/// Filename for the on-disk K_M-A under `<data_dir>/`. 64-hex-byte
-/// file, mode 0600 — same custody discipline as the keyring's
-/// `root_keys/`. See `docs/design-auth-service.md` § *Keys*.
-pub const K_M_A_FILE: &str = "k_m_a";
+/// Filename for the on-disk K_M-A (the TPC-CID wrapping key shared with
+/// the auth service) under `<data_dir>/`. 64-hex-byte file, mode 0600 —
+/// same custody discipline as the keyring's `root_keys/`. See
+/// `docs/design-auth-service.md` § *Keys*.
+pub const K_M_A_FILE: &str = "auth-shared.key";
 
-/// Filename for the on-disk K_session under `<data_dir>/`. Same
-/// 64-hex-byte, mode-0600 shape as [`K_M_A_FILE`]. Auth-service-only in
-/// production (mint never holds it); generated locally **only** when
-/// mint colocates the demo auth role (`[auth].demo_enabled`), where it
-/// roots the CLI ↔ auth session macaroons (`docs/design-auth-service.md`
-/// § *Login flow*).
-pub const K_SESSION_FILE: &str = "k_session";
+/// Filename for the on-disk K_session (the login-session root) under
+/// `<data_dir>/`. Same 64-hex-byte, mode-0600 shape as [`K_M_A_FILE`].
+/// Auth-service-only in production (mint never holds it); generated
+/// locally **only** when mint colocates the demo auth role
+/// (`[auth].demo_enabled`), where it roots the CLI ↔ auth session
+/// macaroons (`docs/design-auth-service.md` § *Login flow*).
+pub const K_SESSION_FILE: &str = "auth-session.key";
 
 /// One pending-enrollment record (`_mint/pending/<sub>.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

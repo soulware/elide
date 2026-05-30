@@ -71,7 +71,7 @@ async fn app() -> (axum::Router, tempfile::TempDir) {
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join("root_key"), root_hex).expect("root_key");
     let k_m_a_hex: String = K_M_A.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(dir.path().join("k_m_a"), k_m_a_hex).expect("k_m_a");
+    std::fs::write(dir.path().join(mint::state::K_M_A_FILE), k_m_a_hex).expect("k_m_a");
     let mut store = Store::open_local(dir.path()).await.expect("store");
     store.init_k_m_a(dir.path(), true).expect("init_k_m_a");
     let state = AppState {

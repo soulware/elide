@@ -69,7 +69,7 @@ async fn state(dir: &std::path::Path) -> AppState {
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.join("root_key"), root_hex).expect("root_key");
     let k_m_a_hex: String = K_M_A.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(dir.join("k_m_a"), k_m_a_hex).expect("k_m_a");
+    std::fs::write(dir.join(mint::state::K_M_A_FILE), k_m_a_hex).expect("k_m_a");
     let mut store = Store::open_local(dir).await.expect("store");
     store.init_k_m_a(dir, true).expect("init_k_m_a");
     store.init_k_session(dir).expect("init_k_session");

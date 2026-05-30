@@ -195,11 +195,13 @@ elide coordinator's `data_dir` (`coordinator.toml`):
 
 - **`data_dir`** (default `mint_data`) — holds the macaroon keyring
   directory `root_keys/` (one file per generation, mode 0600, plus a
-  `current` pointer) and any third-party discharge keys. When `[auth]`
-  is configured it also holds the admin-plane `cli-token` + its machine
-  key `cli-token.key` (§ *CLI service token*) and the operator's
+  `current` pointer). When `[auth]` is configured it also holds
+  `auth-shared.key` (K_M-A — the TPC-CID wrapping key shared with the
+  auth service) and the admin-plane `cli-token` + its machine key
+  `cli-token.key` (§ *CLI service token*) plus the operator's
   `cli-session` from `mint login`; the colocated demo additionally
-  generates `k_m_a` and `k_session` here. Enrollment
+  generates `auth-session.key` (K_session — the login-session root)
+  here. Enrollment
   state (the current `invite` nonce, pending records, and the
   approved-coordinator registry) lives in the tenant bucket under
   `_mint/` so multiple mint processes can share one logical state
