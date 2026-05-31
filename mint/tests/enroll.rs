@@ -104,11 +104,14 @@ async fn app() -> (
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
     let store = Arc::new(Store::open_local(dir.path()).await.expect("store"));
+    let cfg = config();
+    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
     let state = AppState {
-        config: Arc::new(config()),
+        config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),
         audit: Arc::new(AuditLog::new(Box::new(AuditSink(buf.clone())))),
         store: store.clone(),
+        seal,
     };
     (router(state), buf, store, dir)
 }
@@ -292,11 +295,14 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
 async fn app_in_memory() -> (axum::Router, Arc<Mutex<Vec<u8>>>, Arc<Store>) {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let store = Arc::new(Store::open_in_memory(ROOT).await.expect("store"));
+    let cfg = config();
+    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
     let state = AppState {
-        config: Arc::new(config()),
+        config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),
         audit: Arc::new(AuditLog::new(Box::new(AuditSink(buf.clone())))),
         store: store.clone(),
+        seal,
     };
     (router(state), buf, store)
 }
@@ -584,11 +590,13 @@ tpc = { location = "https://auth.example/v1/discharge" }
         .init_k_m_a(dir.path(), true)
         .expect("init k_m_a");
     let store = Arc::new(store_inner);
+    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
     let state = AppState {
         config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),
         audit: Arc::new(AuditLog::new(Box::new(AuditSink(buf)))),
         store: store.clone(),
+        seal,
     };
     (router(state), store, dir)
 }

@@ -87,11 +87,14 @@ async fn state_with_audit() -> (
     // generating one) and the macaroons minted with ROOT verify.
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
+    let cfg = config();
+    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
     let state = AppState {
-        config: Arc::new(config()),
+        config: Arc::new(cfg),
         minter: minter.clone(),
         audit: Arc::new(AuditLog::new(Box::new(AuditSink(buf.clone())))),
         store: Arc::new(Store::open_local(dir.path()).await.expect("store")),
+        seal,
     };
     (state, buf, minter, dir)
 }
@@ -289,4 +292,52 @@ async fn no_auth_header_is_401() {
         .unwrap();
     let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn dormant_closes_assume_role_and_readiness() {
+    // A mint that came up without a verifiable seal closes the
+    // role-rendering plane and reports not-ready, while liveness stays up.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
+    let state = AppState {
+        config: Arc::new(config()),
+        minter: Arc::new(FakeMinter::new()),
+        audit: Arc::new(AuditLog::new(Box::new(std::io::sink()))),
+        store: Arc::new(Store::open_local(dir.path()).await.expect("store")),
+        seal: Arc::new(mint::sealed_cache::SealState::Dormant),
+    };
+    let app = router(state);
+
+    // assume-role: the seal gate fires before authentication, so even an
+    // otherwise-valid request gets 503 not-sealed (never mints a keypair).
+    let m = request_macaroon();
+    let req = signed_request(&m, r#""role":"volume-ro","ttl_seconds":3600"#);
+    let (status, body) = body_string(app.clone().oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert!(body.contains("not sealed"), "body: {body}");
+
+    // /readyz not-ready, /healthz still ok.
+    let ready = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let live = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(live.status(), StatusCode::OK);
 }

@@ -7,7 +7,7 @@
 //! happened — it only evaluates caveat *values*.
 
 use crate::caveat::{EffectiveCaveats, Resolved, name};
-use crate::config::{Config, Role};
+use crate::sealed_cache::ServedSurface;
 
 const AUDIENCE_CAVEAT: &str = name::AUD;
 const NOT_AFTER_CAVEAT: &str = name::EXP;
@@ -36,36 +36,37 @@ pub enum Denied {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Granted {
-    pub role: Role,
+    /// The granted role's name. The policy bytes to render are looked up
+    /// from the served surface by this name.
+    pub role_name: String,
     /// Effective lifetime in seconds after clamping.
     pub ttl_seconds: u64,
 }
 
-/// Evaluate an assume-role request against config.
+/// Evaluate an assume-role request against the **sealed** surface, not
+/// the live config: `required_caveats`, the TTL bounds, and the audience
+/// are the values the operator sealed, so a drifted `roles_dir/` or
+/// `mint.toml` cannot widen them at render time.
 ///
 /// `requested_ttl` is the caller's `ttl_seconds` body field (already
 /// defaulted to the role's `default_ttl_seconds` by the caller if the
 /// field was absent). `now_unix` is the current time.
 pub fn authorize(
-    cfg: &Config,
+    surface: &ServedSurface,
     caveats: &[crate::caveat::Caveat],
     requested_role: &str,
     requested_ttl: u64,
     now_unix: u64,
 ) -> Result<Granted, Denied> {
-    let role = cfg
-        .roles
-        .get(requested_role)
-        .ok_or(Denied::UnknownRole)?
-        .clone();
+    let role = surface.role(requested_role).ok_or(Denied::UnknownRole)?;
 
     let eff = EffectiveCaveats::new(caveats);
 
     // Audience: cross-service replay defence. Must resolve to a single
-    // value equal to the configured name; absent or unsatisfiable both
-    // fail closed.
+    // value equal to the sealed name; absent or unsatisfiable both fail
+    // closed.
     match eff.resolve(AUDIENCE_CAVEAT) {
-        Resolved::Value(a) if a == cfg.audience => {}
+        Resolved::Value(a) if a == surface.audience() => {}
         _ => return Err(Denied::WrongAudience),
     }
 
@@ -107,17 +108,23 @@ pub fn authorize(
     }
     let ttl_seconds = requested_ttl.min(role.max_ttl_seconds).min(remaining);
 
-    Ok(Granted { role, ttl_seconds })
+    Ok(Granted {
+        role_name: requested_role.to_string(),
+        ttl_seconds,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::caveat::Caveat;
-    use crate::config::Config;
+    use crate::keyring::Keyring;
 
-    fn cfg() -> Config {
-        crate::config::parse_for_test(
+    /// The sealed surface authorize evaluates against — built from a
+    /// config exactly as startup's adopt path does. The keyring is
+    /// arbitrary; serving reads only audience + the sealed role fields.
+    fn surface() -> ServedSurface {
+        let cfg = crate::config::parse_for_test(
             r#"
 audience = "mint"
 [tenant]
@@ -132,7 +139,8 @@ policy_file = "volume-ro.json"
 "#,
             &[("volume-ro.json", "{}")],
         )
-        .expect("cfg")
+        .expect("cfg");
+        ServedSurface::from_config(&cfg, &Keyring::single([7u8; 32]), "t")
     }
 
     fn good_caveats(not_after: u64) -> Vec<Caveat> {
@@ -146,13 +154,20 @@ policy_file = "volume-ro.json"
 
     #[test]
     fn happy_path_clamps_to_max() {
-        let g = authorize(&cfg(), &good_caveats(1_000_000), "volume-ro", 5000, 1000).unwrap();
+        let g = authorize(
+            &surface(),
+            &good_caveats(1_000_000),
+            "volume-ro",
+            5000,
+            1000,
+        )
+        .unwrap();
         assert_eq!(g.ttl_seconds, 1000); // role max
     }
 
     #[test]
     fn ttl_capped_by_not_after() {
-        let g = authorize(&cfg(), &good_caveats(1300), "volume-ro", 900, 1000).unwrap();
+        let g = authorize(&surface(), &good_caveats(1300), "volume-ro", 900, 1000).unwrap();
         assert_eq!(g.ttl_seconds, 300); // not_after - now
     }
 
@@ -161,7 +176,7 @@ policy_file = "volume-ro.json"
         let mut cv = good_caveats(1_000_000);
         cv[0] = Caveat::scalar(name::AUD, "other");
         assert_eq!(
-            authorize(&cfg(), &cv, "volume-ro", 800, 1000),
+            authorize(&surface(), &cv, "volume-ro", 800, 1000),
             Err(Denied::WrongAudience)
         );
     }
@@ -174,7 +189,7 @@ policy_file = "volume-ro.json"
             Caveat::scalar(name::EXP, "1000000"),
         ];
         assert_eq!(
-            authorize(&cfg(), &cv, "volume-ro", 800, 1000),
+            authorize(&surface(), &cv, "volume-ro", 800, 1000),
             Err(Denied::MissingRequiredCaveat("elide:Volume".into()))
         );
     }
@@ -182,7 +197,7 @@ policy_file = "volume-ro.json"
     #[test]
     fn expired_macaroon_denied() {
         assert_eq!(
-            authorize(&cfg(), &good_caveats(500), "volume-ro", 800, 1000),
+            authorize(&surface(), &good_caveats(500), "volume-ro", 800, 1000),
             Err(Denied::Expired)
         );
     }
@@ -190,7 +205,7 @@ policy_file = "volume-ro.json"
     #[test]
     fn unknown_role_denied() {
         assert_eq!(
-            authorize(&cfg(), &good_caveats(1_000_000), "nope", 800, 1000),
+            authorize(&surface(), &good_caveats(1_000_000), "nope", 800, 1000),
             Err(Denied::UnknownRole)
         );
     }
@@ -201,7 +216,7 @@ policy_file = "volume-ro.json"
         // role (wrong per-role credential loaded) → fail closed.
         let cv = good_caveats(1_000_000);
         assert_eq!(
-            authorize(&cfg(), &cv, "coord-names", 800, 1000),
+            authorize(&surface(), &cv, "coord-names", 800, 1000),
             Err(Denied::UnknownRole),
             "coord-names isn't configured here, so UnknownRole comes first"
         );
@@ -210,7 +225,7 @@ policy_file = "volume-ro.json"
         let mut cv = good_caveats(1_000_000);
         cv[1] = Caveat::scalar(name::ROLE, "coord-names");
         assert_eq!(
-            authorize(&cfg(), &cv, "volume-ro", 800, 1000),
+            authorize(&surface(), &cv, "volume-ro", 800, 1000),
             Err(Denied::RoleNotPermitted)
         );
     }
@@ -223,7 +238,7 @@ policy_file = "volume-ro.json"
             Caveat::scalar(name::EXP, "1000000"),
         ];
         assert_eq!(
-            authorize(&cfg(), &cv, "volume-ro", 800, 1000),
+            authorize(&surface(), &cv, "volume-ro", 800, 1000),
             Err(Denied::RoleNotPermitted),
             "a credential with no role caveat is not an omnibus pass"
         );

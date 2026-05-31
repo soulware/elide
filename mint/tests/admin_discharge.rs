@@ -113,13 +113,16 @@ async fn app() -> (Router, Router, tempfile::TempDir) {
     let mut store = Store::open_local(dir.path()).await.expect("store");
     store.init_k_m_a(dir.path(), true).expect("init_k_m_a");
     store.init_k_session(dir.path()).expect("init_k_session");
+    let cfg = config();
+    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
     let state = AppState {
-        config: Arc::new(config()),
+        config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),
         audit: Arc::new(AuditLog::new(Box::new(AuditSink(Arc::new(Mutex::new(
             Vec::new(),
         )))))),
         store: Arc::new(store),
+        seal,
     };
     let mint_router = mint::admin::mount(router(state.clone()), state.clone());
     let auth_router = auth::router(state);

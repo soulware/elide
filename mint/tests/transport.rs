@@ -56,11 +56,14 @@ async fn full_flow_over_unix_socket() {
     std::fs::write(srv_dir.path().join("root_key"), root_hex).expect("seed root_key");
     let store = Arc::new(Store::open_local(srv_dir.path()).await.expect("store"));
     let nonce = store.current_invite().await.expect("nonce");
+    let cfg = config();
+    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
     let state = AppState {
-        config: Arc::new(config()),
+        config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),
         audit: Arc::new(AuditLog::new(Box::new(std::io::sink()))),
         store: store.clone(),
+        seal,
     };
 
     // Bind the socket (listening immediately, so client connects queue

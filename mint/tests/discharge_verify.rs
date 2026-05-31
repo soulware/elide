@@ -76,13 +76,16 @@ async fn app() -> (axum::Router, tempfile::TempDir) {
     std::fs::write(dir.path().join(mint::state::K_M_A_FILE), k_m_a_hex).expect("k_m_a");
     let mut store = Store::open_local(dir.path()).await.expect("store");
     store.init_k_m_a(dir.path(), true).expect("init_k_m_a");
+    let cfg = config();
+    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
     let state = AppState {
-        config: Arc::new(config()),
+        config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),
         audit: Arc::new(AuditLog::new(Box::new(AuditSink(Arc::new(Mutex::new(
             Vec::new(),
         )))))),
         store: Arc::new(store),
+        seal,
     };
     (router(state), dir)
 }

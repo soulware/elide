@@ -543,10 +543,12 @@ async fn serve(
         write_cli_token(&config, &store).await?;
     }
 
-    // Template seal: publish any pending file on disk, then verify
-    // the canonical seal matches local config + template hashes.
-    // Refuse-closed on any divergence (`docs/design-mint-template-seal.md`).
-    mint::seal::publish_pending_and_verify(&config, &store)
+    // Template seal: publish any staged pending file, then resolve the
+    // served surface from the canonical bucket seal — serving from the
+    // local sealed cache (or adopting it from roles_dir/), or running
+    // dormant if there is no verifiable seal this host can satisfy
+    // (`docs/design-mint-template-seal.md` § *Startup*).
+    let seal_state = mint::seal::resolve_startup(&config, &store)
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -588,6 +590,7 @@ async fn serve(
         minter,
         audit: Arc::new(AuditLog::new(Box::new(std::io::stdout()))),
         store,
+        seal: Arc::new(seal_state),
     };
 
     // The mint role's app (admin routes are merged onto the same router
