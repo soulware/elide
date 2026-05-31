@@ -1099,6 +1099,73 @@ Reasonable to add when the deployment grows multi-team workloads on
 shared coords or when finer policy is requested. Not in the initial
 shape.
 
+## Proposed: scope tier on sessions and discharges
+
+Status: proposed, not built. This fixes the *mechanism*; the
+vocabulary (which ops map to which scope) is deliberately left open.
+
+### Gap
+
+`/v1/discharge` makes no authorization decision today: a valid session
+yields a discharge for anything. `op` granularity lives entirely on the
+primary, self-asserted by the operator/CLI (§ *Identity and policy*),
+and the discharge is wide. The two knobs that exist are too far apart —
+a single `op` (`admin:seal`, `assume-role`, `snapshot`, …) is too fine
+to be the unit of *human* grant, and "holds a valid session" is too
+coarse. There is no tier in between at which "this human may approve
+enrollments but not seal" can be expressed.
+
+### Scope
+
+A **scope** is a named class of authority grouping ops — the
+intermediate tier. It is a first-party caveat, granted at login,
+checked at issuance, cleared at verify:
+
+1. **Granted at login, carried on the session.** Login is the trust
+   source for what a human may authorize, so the session carries its
+   granted scope set as `Scope=<name>` caveats (multiple permitted),
+   alongside the existing `(Subject, OrgId, NotAfter)`. Auth-side policy
+   decides the grant; the demo grants all scopes to every subject —
+   login stays wide-open, but the grant is now *explicit* on the
+   session.
+
+2. **Checked and narrowed at `/v1/discharge`.** The discharge request
+   names the scope it needs. Auth verifies the session, requires
+   `requested ∈ session.Scope`, and mints the discharge carrying that
+   one `Scope`. A session lacking the requested scope is refused here —
+   the first real authorization decision `/v1/discharge` makes, distinct
+   from the liveness gate.
+
+3. **Cleared at verify.** The verifier already knows the required `op`.
+   It maps `op → scope` and requires the bundle's discharge to carry a
+   covering `Scope`. This is a *clear* — a per-request predicate over the
+   bundle, never cached — and joins the existing `aud`/`op`/`exp`/PoP
+   clears.
+
+### Fail-closed mapping
+
+The `op → scope` map is a correctness surface, so it is total and
+closed: an `op` with no scope has no covering scope and is
+unauthorizable, never silently wide. Where the map (or scope hierarchy)
+is defined and how it is integrity-protected is TBD; that it fails
+closed is not.
+
+### Relationship to per-op narrowing (above)
+
+Scope is the coarse tier; the deferred `AllowedOps=[...]` is the fine,
+explicit-list tier. They compose: a discharge may carry a `Scope` (broad
+class) and, later, `AllowedOps` (a specific list within it). Scope is the
+unit of *human grant*; `AllowedOps` is the unit of *per-call narrowing*.
+
+### Open
+
+- The partition: which ops/verbs group into which scope, and whether
+  scopes are flat or hierarchical (`infra ⊃ enroll-mgmt`?).
+- Where the `op → scope` map lives and how it is integrity-protected.
+- Whether one session scope-set spans both the mint admin plane
+  (`admin:*`) and the coord data plane (`snapshot`, …), or those are
+  separate scope namespaces.
+
 ## Migration from PoC
 
 Clean break. The PoC operator-token surface has already been removed
