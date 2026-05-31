@@ -568,13 +568,7 @@ async fn serve(
     // 304 on the common path). Rotation by this process updates the
     // cache eagerly; this task picks up rotations by any other instance.
     let _invite_refresh = store.spawn_invite_refresh(mint::state::INVITE_REFRESH_INTERVAL);
-    tracing::info!(
-        audience = %config.audience,
-        roles = config.roles.len(),
-        data_dir = %config.data_dir.display(),
-        roles_dir = %config.roles_dir.display(),
-        "loaded config"
-    );
+    tracing::info!(data_dir = %config.data_dir.display(), "loaded config");
 
     // An explicit --bind forces TCP, overriding the config's resolved
     // listener (the single-host TCP override). Otherwise the config's
