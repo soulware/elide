@@ -29,6 +29,7 @@ pub mod operator;
 pub mod pop;
 pub mod role;
 pub mod seal;
+pub mod sealed_cache;
 pub mod state;
 pub mod template;
 pub mod tigris;

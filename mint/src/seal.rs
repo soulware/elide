@@ -263,7 +263,10 @@ impl Seal {
     }
 }
 
-fn hash_hex(bytes: &[u8]) -> String {
+/// BLAKE3 of `bytes`, hex-encoded — the encoding used for every
+/// `policy_blake3` in the seal, so the sealed cache must hash with this
+/// to compare cached bytes against the seal.
+pub(crate) fn hash_hex(bytes: &[u8]) -> String {
     let h = blake3::hash(bytes);
     hex32(h.as_bytes())
 }
