@@ -12,7 +12,7 @@
 //! Third-party caveats carry `(location, VID, CID)` and discharge
 //! verification (`docs/design-auth-service.md`); they're not scalar
 //! and don't participate in name-based resolution. Mint appends them
-//! at issuance when the role has `issues_with_tpc = true`; they ride
+//! at issuance when the role sets `[role.tpc]`; they ride
 //! in the same chain as first-party caveats but the wire format
 //! distinguishes them with a per-step type byte.
 
@@ -65,7 +65,7 @@ pub mod op {
 
 /// One step in a macaroon's caveat chain. A chain interleaves
 /// first-party scalar caveats (the common case) and third-party
-/// caveats (issued by mint when a role's `issues_with_tpc = true`).
+/// caveats (issued by mint when a role sets `[role.tpc]`).
 /// Position in the chain matters for third-party caveats: the
 /// verifier uses the chain tag *before* the TPC step to recover the
 /// discharge key, so re-ordering would break verification.

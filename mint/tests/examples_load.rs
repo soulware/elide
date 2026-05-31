@@ -35,11 +35,11 @@ fn mint_demo_config_loads() {
 fn mint_elide_config_loads() {
     pin_cwd();
     let cfg = Config::load(&example("mint-elide.toml")).expect("mint-elide.toml");
-    // The Elide inventory carries `issues_with_tpc` roles, which require
-    // an `[auth]` block to point the TPC at.
+    // The Elide inventory carries `[role.tpc]` roles, which require an
+    // `[auth]` block (the TPC is keyed by K_M-A).
     assert!(cfg.auth.is_some(), "TPC roles require [auth]");
     assert!(
-        cfg.roles.values().any(|r| r.issues_with_tpc),
+        cfg.roles.values().any(|r| r.tpc.is_some()),
         "inventory has at least one TPC role"
     );
 }

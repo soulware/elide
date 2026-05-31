@@ -1,6 +1,6 @@
 //! End-to-end operator-write loop: the mint CLI is the client of mint.
 //!
-//! A `write` role configured with `issues_with_tpc = true` produces a
+//! A `write` role configured with `[role.tpc]` produces a
 //! credential bearing a third-party caveat. `assume-role` on that
 //! credential is refused until the client fetches a discharge from the
 //! authority and attaches it to the bundle. This drives the real client
@@ -60,7 +60,7 @@ min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300
 policy_file = "write.json"
-issues_with_tpc = true
+tpc = { location = "unix:/unused-in-this-test" }
 "#;
     common::parse_config(toml, &[("write.json", r#"{"Version":"2012-10-17"}"#)])
 }

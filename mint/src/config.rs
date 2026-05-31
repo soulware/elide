@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -56,8 +56,9 @@ pub enum ConfigError {
         source: std::net::AddrParseError,
     },
     #[error(
-        "role {0} has issues_with_tpc = true but no [auth] block is configured; \
-         set [auth].endpoint or remove the TPC requirement from this role"
+        "role {0} sets [role.tpc] but no [auth] block is configured; the \
+         third-party caveat is keyed by K_M-A, which an [auth] block \
+         provides — add one or drop the [role.tpc] section"
     )]
     TpcRoleWithoutAuth(String),
 }
@@ -101,7 +102,7 @@ pub struct RawConfig {
     pub tenant: Tenant,
     /// Auth-service integration. Optional: a mint configured without
     /// `[auth]` cannot stamp third-party caveats and refuses
-    /// `assume-role` for any role that has `issues_with_tpc = true`.
+    /// `assume-role` for any role that sets `[role.tpc]`.
     /// See `docs/design-auth-service.md`.
     #[serde(default)]
     pub auth: Option<RawAuth>,
@@ -113,9 +114,9 @@ pub struct RawConfig {
 /// itself rubber-stamps the auth-service routes (`demo_enabled`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawAuth {
-    /// Auth service URL, surfaced as the `location` of every TPC mint
-    /// stamps and returned to coords on the 401 challenge response.
-    /// Required when `[auth]` is present.
+    /// Auth service URL, surfaced as the `location` of the operator
+    /// cli-token's third-party caveat (per-role TPC locations live in
+    /// each `[role.tpc]`). Required when `[auth]` is present.
     pub endpoint: String,
     /// When `true`, mint colocates the auth-service role and binds its
     /// own UDS for `/v1/discharge`. Demo / test only. Generates
@@ -221,16 +222,33 @@ pub struct RawRole {
     /// (so a role `name` with a path separator is rejected too).
     #[serde(default)]
     pub policy_file: Option<String>,
-    /// Whether mint appends a third-party caveat to every credential
-    /// it mints for this role. Drives the operator-initiated vs
-    /// background split (`docs/design-mint.md` § *Elide as customer*
-    /// and `docs/design-auth-service.md`): operator-write roles set
-    /// `true`; read roles and background-write variants leave it
-    /// `false`. Issuance unconditionally appends the TPC when set;
-    /// verification unconditionally requires a discharge for any TPC
-    /// it walks.
+    /// Present ⇒ this role issues credentials carrying a third-party
+    /// caveat at `tpc.location`, requiring a discharge at `assume-role`.
+    /// Drives the operator-initiated vs background split
+    /// (`docs/design-mint.md` § *Elide as customer* and
+    /// `docs/design-auth-service.md`): operator-write roles set it; read
+    /// and background-write roles leave it absent. Issuance
+    /// unconditionally appends the TPC when present; verification
+    /// unconditionally requires a discharge for any TPC it walks.
     #[serde(default)]
-    pub issues_with_tpc: bool,
+    pub tpc: Option<RawTpc>,
+}
+
+/// Per-role third-party-caveat config as written in TOML. Its presence
+/// on a `[[role]]` is what makes the role issue a TPC.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawTpc {
+    /// The TPC `location` (macaroon-paper term): where a client fetches
+    /// the discharge. Stamped into every credential the role issues.
+    pub location: String,
+}
+
+/// Resolved per-role TPC config. `Some` ⇒ the role issues a TPC at
+/// `location`; `None` ⇒ it does not. Serialisable + comparable because
+/// it is part of the sealed role surface ([`crate::seal::SealedRole`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tpc {
+    pub location: String,
 }
 
 /// Resolved listener transport — a per-deployment-shape choice, not a
@@ -290,8 +308,8 @@ pub struct Config {
     /// leave it `None`.
     pub admin: Option<AdminCredential>,
     /// Auth-service settings — `None` if the config omits `[auth]`.
-    /// A mint without auth cannot stamp TPCs; roles with
-    /// `issues_with_tpc = true` are refused at startup.
+    /// A mint without auth cannot stamp TPCs; roles that set `[role.tpc]`
+    /// are refused at startup.
     pub auth: Option<Auth>,
     pub roles: BTreeMap<String, Role>,
 }
@@ -311,12 +329,11 @@ pub struct Role {
     /// The role's IAM-policy handlebars template, read from
     /// [`policy_path`](Role::policy_path) at load.
     pub policy: String,
-    /// When `true`, mint appends a third-party caveat (see
-    /// `docs/design-auth-service.md`) to every credential it mints
-    /// for this role. The TPC location is the configured auth
-    /// service; verification of the resulting credential at
-    /// `assume-role` requires a matching discharge.
-    pub issues_with_tpc: bool,
+    /// `Some` ⇒ mint appends a third-party caveat (see
+    /// `docs/design-auth-service.md`) to every credential it mints for
+    /// this role, with `tpc.location` as the caveat's location.
+    /// Verification at `assume-role` then requires a matching discharge.
+    pub tpc: Option<Tpc>,
 }
 
 impl Config {
@@ -356,7 +373,9 @@ impl Config {
                 default_ttl_seconds: r.default_ttl_seconds,
                 policy_path,
                 policy,
-                issues_with_tpc: r.issues_with_tpc,
+                tpc: r.tpc.map(|t| Tpc {
+                    location: t.location,
+                }),
             };
             if roles.insert(r.name.clone(), role).is_some() {
                 return Err(ConfigError::DuplicateRole(r.name));
@@ -379,12 +398,11 @@ impl Config {
                 socket,
             }
         });
-        // A role that requires a TPC needs an `[auth]` block to point
-        // it at. Refusing here keeps the issuance path
-        // unconditional (it always finds an auth endpoint when
-        // `issues_with_tpc` is true).
+        // A role that issues a TPC needs an `[auth]` block: the caveat
+        // is keyed by K_M-A, which only an `[auth]`-configured mint
+        // holds. Refusing here keeps the issuance path unconditional.
         if auth.is_none()
-            && let Some(r) = roles.values().find(|r| r.issues_with_tpc)
+            && let Some(r) = roles.values().find(|r| r.tpc.is_some())
         {
             return Err(ConfigError::TpcRoleWithoutAuth(r.name.clone()));
         }
@@ -568,9 +586,9 @@ policy_file = "volume-ro.json"
     }
 
     #[test]
-    fn issues_with_tpc_defaults_to_false() {
+    fn tpc_defaults_to_none() {
         let c = parse_for_test(SAMPLE, &[("volume-ro.json", "{}")]).expect("parse");
-        assert!(!c.roles["volume-ro"].issues_with_tpc);
+        assert!(c.roles["volume-ro"].tpc.is_none());
     }
 
     /// Inject an `[auth]` block before the first `[[role]]` in
@@ -583,16 +601,18 @@ policy_file = "volume-ro.json"
     }
 
     #[test]
-    fn issues_with_tpc_is_parsed() {
+    fn tpc_section_is_parsed() {
         let toml = with_auth(
             &SAMPLE.replace(
                 "policy_file = \"volume-ro.json\"",
-                "policy_file = \"volume-ro.json\"\nissues_with_tpc = true",
+                "policy_file = \"volume-ro.json\"\n\
+                 tpc = { location = \"https://auth.example/v1/discharge\" }",
             ),
             "endpoint = \"https://auth.example/\"",
         );
         let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
-        assert!(c.roles["volume-ro"].issues_with_tpc);
+        let tpc = c.roles["volume-ro"].tpc.as_ref().expect("tpc present");
+        assert_eq!(tpc.location, "https://auth.example/v1/discharge");
         assert!(c.auth.is_some());
     }
 
@@ -600,7 +620,8 @@ policy_file = "volume-ro.json"
     fn tpc_role_without_auth_block_is_rejected() {
         let toml = SAMPLE.replace(
             "policy_file = \"volume-ro.json\"",
-            "policy_file = \"volume-ro.json\"\nissues_with_tpc = true",
+            "policy_file = \"volume-ro.json\"\n\
+             tpc = { location = \"https://auth.example/v1/discharge\" }",
         );
         assert!(matches!(
             parse_for_test(&toml, &[("volume-ro.json", "{}")]),

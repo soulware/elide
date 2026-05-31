@@ -883,7 +883,7 @@ fn role_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "{:<24} {:>5} {:>7} {:>7} {:>7}  {}",
             r.name,
-            if r.issues_with_tpc { "yes" } else { "no" },
+            if r.tpc.is_some() { "yes" } else { "no" },
             r.min_ttl_seconds,
             r.default_ttl_seconds,
             r.max_ttl_seconds,
@@ -917,8 +917,11 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
         }
     );
     eprintln!(
-        "  issues_with_tpc:  {}",
-        if role.issues_with_tpc { "yes" } else { "no" }
+        "  tpc location:     {}",
+        role.tpc
+            .as_ref()
+            .map(|t| t.location.as_str())
+            .unwrap_or("(none)")
     );
     eprintln!("  audience:         {}", config.audience);
     eprintln!("  tenant.bucket:    {}", config.tenant.bucket);
