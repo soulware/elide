@@ -113,7 +113,10 @@ async fn app() -> (Router, Router, tempfile::TempDir) {
     let mut store = Store::open_local(dir.path()).await.expect("store");
     store.init_k_m_a(dir.path(), true).expect("init_k_m_a");
     store.init_k_session(dir.path()).expect("init_k_session");
-    let cfg = config();
+    let mut cfg = config();
+    // Co-locate data_dir with the store so the seal endpoint's sealed
+    // cache lands under the tempdir, not the cwd.
+    cfg.data_dir = dir.path().to_path_buf();
     let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
     let state = AppState {
         config: Arc::new(cfg),
@@ -331,6 +334,65 @@ async fn operator_client_assembles_accepted_request() {
     assert_eq!(status, StatusCode::OK, "invite body: {resp}");
     let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
     assert!(v["macaroon"].as_str().is_some(), "no macaroon in {resp}");
+}
+
+#[tokio::test]
+async fn seal_endpoint_publishes_and_caches() {
+    // The authoring half: an op=admin:seal discharge lets the operator
+    // publish the template seal. The daemon hashes its own config, PUTs
+    // the bucket seal, and writes its local sealed cache.
+    let (mint_router, auth_router, dir) = app().await;
+    let token = cli_token();
+    let discharge = fetch_discharge(auth_router, &cli_token_cid(&token)).await;
+
+    let body = format!(r#"{{"ts":{}}}"#, now());
+    let req = admin_request(
+        &token,
+        &discharge,
+        "admin:seal",
+        "POST",
+        "/v1/admin/seal",
+        &body,
+    );
+    let (status, resp) = body_string(mint_router.oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "seal body: {resp}");
+
+    let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+    assert!(v["kid"].is_number(), "kid in {resp}");
+    assert!(
+        v["roles"]["volume-rw"].as_str().is_some(),
+        "per-role policy hash in {resp}"
+    );
+
+    // Cache written under data_dir: seal.json + ≥1 content-addressed policy.
+    assert!(
+        dir.path().join("sealed/seal.json").exists(),
+        "sealed/seal.json present"
+    );
+    let policies = std::fs::read_dir(dir.path().join("sealed/policies"))
+        .expect("policies dir")
+        .count();
+    assert!(policies >= 1, "at least one content-addressed policy file");
+}
+
+#[tokio::test]
+async fn seal_requires_the_seal_op() {
+    // The endpoint clears op=admin:seal specifically: a cli-token
+    // attenuated for a different verb cannot seal.
+    let (mint_router, auth_router, _dir) = app().await;
+    let token = cli_token();
+    let discharge = fetch_discharge(auth_router, &cli_token_cid(&token)).await;
+    let body = format!(r#"{{"ts":{}}}"#, now());
+    let req = admin_request(
+        &token,
+        &discharge,
+        OP_INVITE_READ,
+        "POST",
+        "/v1/admin/seal",
+        &body,
+    );
+    let (status, _) = body_string(mint_router.oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

@@ -28,10 +28,13 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::caveat::{EffectiveCaveats, Resolved, name};
 use crate::http::{AppState, verify_and_clear};
 use crate::issuance::mint_invite;
 use crate::macaroon::Macaroon;
 use crate::operator::Operator;
+use crate::seal::Seal;
+use crate::sealed_cache;
 use crate::state::{EnrollmentState, EnrollmentView, Store};
 
 fn unauthorized_response() -> Response {
@@ -55,6 +58,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/enrollments", post(handle_list_enrollments))
         .route("/v1/admin/enroll/approve", post(handle_approve))
         .route("/v1/admin/enroll/revoke", post(handle_revoke))
+        .route("/v1/admin/seal", post(handle_seal))
         .with_state(state)
 }
 
@@ -67,6 +71,7 @@ const ADMIN_INVITE_ROTATE: &str = "admin:invite-rotate";
 const ADMIN_ENROLL_LIST: &str = "admin:enroll-list";
 const ADMIN_ENROLL_APPROVE: &str = "admin:enroll-approve";
 const ADMIN_ENROLL_REVOKE: &str = "admin:enroll-revoke";
+const ADMIN_SEAL: &str = "admin:seal";
 
 #[derive(Serialize, Deserialize)]
 pub struct InviteResponse {
@@ -264,6 +269,88 @@ async fn handle_revoke(State(state): State<AppState>, headers: HeaderMap, body: 
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct SealResponse {
+    /// Keyring generation that MAC'd the published seal.
+    pub kid: crate::keyring::Kid,
+    /// RFC 3339 timestamp the seal was authored.
+    pub sealed_at: String,
+    /// role → `policy_blake3` (hex) — the per-role hashes the CLI prints
+    /// so the operator can eyeball what was committed.
+    pub roles: std::collections::BTreeMap<String, String>,
+}
+
+/// `POST /v1/admin/seal` — author and publish the template seal from the
+/// daemon's **own local** config (`docs/design-mint-template-seal.md` §
+/// *The `mint seal` command*). The request carries only authorisation
+/// (an empty PoP-freshness body); the daemon hashes its already-loaded
+/// `roles_dir/`, MACs the manifest under the keyring, PUTs `seal.json`,
+/// and writes its local sealed cache so it holds a cache for the seal it
+/// just published. The new content goes live on the next restart — the
+/// endpoint does not hot-swap a running daemon's served surface.
+async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    // verify+clear directly (rather than via `verify_discharge`) so we
+    // can name the operator subject — carried in the discharge — in the
+    // seal log.
+    let Some(bundle) = crate::http::extract_bundle(&headers) else {
+        return unauthorized_response();
+    };
+    let proof = match crate::http::pop_proof(&headers) {
+        Ok(p) => p,
+        Err(()) => return unauthorized_response(),
+    };
+    let keyring = state.store.keyring().await;
+    let now_unix = Utc::now().timestamp().max(0) as u64;
+    let cleared = match verify_and_clear(
+        &bundle,
+        &keyring,
+        state.store.k_m_a(),
+        proof,
+        &body,
+        now_unix,
+        &state.config.audience,
+        ADMIN_SEAL,
+    ) {
+        Ok(c) => c,
+        Err(_) => return unauthorized_response(),
+    };
+    let operator = match EffectiveCaveats::new(&cleared.aggregated_caveats).resolve(name::SUB) {
+        Resolved::Value(s) => s.to_string(),
+        Resolved::Absent | Resolved::Unsatisfiable => "unknown".to_string(),
+    };
+
+    let sealed_at = Utc::now().to_rfc3339();
+    let seal = Seal::build_from_config(&state.config, &keyring, &sealed_at);
+    if let Err(e) = state.store.put_template_seal(&seal).await {
+        return service_unavailable(&format!("publish seal: {e}"));
+    }
+    // Cache what we just published so this host serves it after a
+    // restart without re-deriving from `roles_dir/`.
+    let templates = sealed_cache::policies_from_config(&state.config);
+    if let Err(e) = sealed_cache::write(&state.config.data_dir, &seal, &templates) {
+        return service_unavailable(&format!("write sealed cache: {e}"));
+    }
+
+    let roles: std::collections::BTreeMap<String, String> = seal
+        .roles
+        .iter()
+        .map(|(n, r)| (n.clone(), r.policy_blake3.clone()))
+        .collect();
+    tracing::info!(
+        target: "mint::admin",
+        operator = %operator,
+        kid = seal.kid,
+        sealed_at = %sealed_at,
+        roles = roles.len(),
+        "published template seal (restart to serve it)"
+    );
+    json_ok(SealResponse {
+        kid: seal.kid,
+        sealed_at,
+        roles,
+    })
+}
+
 fn json_ok<T: Serialize>(body: T) -> Response {
     let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
     (
@@ -420,6 +507,17 @@ pub async fn revoke_enrollment(
         body,
     )
     .await?;
+    ok_json(status, &resp)
+}
+
+pub async fn seal(
+    target: AdminTarget<'_>,
+    op: &Operator,
+    discharge: &Macaroon,
+) -> Result<SealResponse, AdminClientError> {
+    let body = ts_body();
+    let (status, resp) =
+        authed_post(target, "/v1/admin/seal", op, discharge, ADMIN_SEAL, body).await?;
     ok_json(status, &resp)
 }
 

@@ -838,36 +838,27 @@ async fn enroll_revoke(config: &Path, sub: &str) -> Result<(), Box<dyn std::erro
     }
 }
 
-/// `mint seal` — stage a pending template seal at
-/// `<data_dir>/pending-seal.json` to be published on the next
-/// `mint serve` startup. Purely local: opens the keyring directly,
-/// hashes each role's already-loaded policy bytes, MACs under the
-/// current kid. No bucket I/O, no daemon dependency.
+/// `mint seal` — author and publish the template seal by calling the
+/// running daemon's `POST /v1/admin/seal`, structurally identical to
+/// `mint invite`: an `op=admin:seal` discharge over the operator session.
+/// The daemon hashes its **own local** `roles_dir/`, MACs under the
+/// keyring, PUTs `seal.json`, and caches it. The new content goes live on
+/// the next `mint serve` restart.
 async fn seal(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = load(config_path)?;
-    let keyring_dir = cfg.data_dir.join("root_keys");
-    let legacy_singleton = cfg.data_dir.join("root_key");
-    std::fs::create_dir_all(&cfg.data_dir)?;
-    let keyring = mint::keyring::Keyring::open(&keyring_dir, Some(&legacy_singleton), None)
-        .map_err(|e| -> Box<dyn std::error::Error> {
-            format!("open keyring at {}: {e}", keyring_dir.display()).into()
-        })?;
-    let sealed_at = chrono::Utc::now().to_rfc3339();
-    let seal = mint::seal::Seal::build_from_config(&cfg, &keyring, &sealed_at);
-    let pending_path = cfg.data_dir.join("pending-seal.json");
-    mint::seal::write_pending(&pending_path, &seal)?;
+    let config = load(config_path)?;
+    let (op, discharge) = operator_session(&config).await?;
+    let resp = mint::admin::seal(admin_target(&config), &op, &discharge).await?;
     eprintln!(
-        "staged seal: kid={} sealed_at={} roles=[{}] → {}",
-        seal.kid,
-        seal.sealed_at,
-        seal.roles
+        "published seal: kid={} sealed_at={} roles=[{}]",
+        resp.kid,
+        resp.sealed_at,
+        resp.roles
             .iter()
-            .map(|(name, r)| format!("{name}:{}", &r.policy_blake3[..12]))
+            .map(|(name, hash)| format!("{name}:{}", &hash[..12.min(hash.len())]))
             .collect::<Vec<_>>()
             .join(", "),
-        pending_path.display(),
     );
-    eprintln!("publish via the next `mint serve` startup");
+    eprintln!("restart `mint serve` to serve the new templates");
     Ok(())
 }
 
