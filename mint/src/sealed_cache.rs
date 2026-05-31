@@ -26,7 +26,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::seal::{Seal, SealError, hash_hex};
+use crate::config::Config;
+use crate::keyring::Keyring;
+use crate::seal::{Seal, SealError, SealedRole, hash_hex};
 
 /// Subdirectory of `data_dir` holding the cache.
 const SEALED_DIR: &str = "sealed";
@@ -63,6 +65,94 @@ impl TemplateSet {
     pub fn roles(&self) -> impl Iterator<Item = &str> {
         self.policies.keys().map(String::as_str)
     }
+}
+
+/// Collect a config's already-loaded role policy templates into a
+/// [`TemplateSet`] — the bytes `mint seal` hashes and the cache stores.
+/// Used by startup's adopt path and by tests.
+pub fn policies_from_config(config: &Config) -> TemplateSet {
+    TemplateSet::from_policies(
+        config
+            .roles
+            .iter()
+            .map(|(name, r)| (name.clone(), r.policy.clone()))
+            .collect(),
+    )
+}
+
+/// The complete role surface mint serves from once startup has resolved
+/// a canonical seal: the seal itself (audience + the per-role authority
+/// fields) paired with the verified policy bytes. The request path reads
+/// *only* this — never the live [`Config`], which is staging input to
+/// `mint seal` and may have drifted (`docs/design-mint-template-seal.md`
+/// § *The sealed cache*).
+#[derive(Debug, Clone)]
+pub struct ServedSurface {
+    /// The canonical seal — its `audience` and `roles` (each a
+    /// [`SealedRole`]: required caveats, TTL bounds, `tpc`) are the
+    /// authority surface; the policy *bytes* live in `templates`.
+    pub seal: Seal,
+    /// Verified policy templates, role → bytes.
+    pub templates: TemplateSet,
+}
+
+impl ServedSurface {
+    /// Build the surface straight from a loaded config — the shape
+    /// startup's adopt path produces and tests use. The seal is MAC'd
+    /// under `keyring`; serving itself reads only `audience`, `roles`,
+    /// and the templates.
+    pub fn from_config(config: &Config, keyring: &Keyring, sealed_at: &str) -> Self {
+        ServedSurface {
+            seal: Seal::build_from_config(config, keyring, sealed_at),
+            templates: policies_from_config(config),
+        }
+    }
+
+    /// The sealed audience every served credential is stamped with and
+    /// checked against.
+    pub fn audience(&self) -> &str {
+        &self.seal.audience
+    }
+
+    /// The sealed authority fields for `role`, or `None` if the role is
+    /// not in the sealed surface.
+    pub fn role(&self, role: &str) -> Option<&SealedRole> {
+        self.seal.roles.get(role)
+    }
+
+    /// The sealed policy template for `role`.
+    pub fn policy(&self, role: &str) -> Option<&str> {
+        self.templates.get(role)
+    }
+}
+
+/// A `Serving` state built directly from a loaded config — bypassing the
+/// bucket-seal verification `seal::resolve_startup` performs. Hidden from
+/// docs because production serving must go through `resolve_startup`;
+/// this exists for tests and in-process callers that already trust the
+/// config. The seal is MAC'd under a throwaway keyring (serving reads
+/// only audience/roles/policy).
+#[doc(hidden)]
+pub fn serving_from_config(config: &Config) -> SealState {
+    SealState::Serving(ServedSurface::from_config(
+        config,
+        &Keyring::single([0u8; 32]),
+        "unsealed",
+    ))
+}
+
+/// Whether `mint serve` resolved a canonical seal at startup, and if so
+/// the surface it serves. `Dormant` closes the role-rendering and
+/// issuance planes (`/v1/assume-role`, `/v1/enroll-exchange`) and reports
+/// not-ready, while the auth/admin planes stay live so an operator can
+/// publish the seal that lifts dormancy
+/// (`docs/design-mint-template-seal.md` § *Dormant until sealed*).
+#[derive(Debug, Clone)]
+pub enum SealState {
+    /// No verifiable seal — role-rendering closed, not-ready.
+    Dormant,
+    /// Serving the resolved sealed surface.
+    Serving(ServedSurface),
 }
 
 /// What [`load`] found in `<data_dir>/sealed/`.

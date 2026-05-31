@@ -38,6 +38,7 @@ use crate::issuance;
 use crate::macaroon::Macaroon;
 use crate::pop;
 use crate::role::{self, Denied};
+use crate::sealed_cache::SealState;
 use crate::state::{Recorded, StateError, Store};
 use crate::template::render_policy;
 
@@ -60,16 +61,33 @@ pub struct AppState {
     pub minter: Arc<dyn KeypairMinter>,
     pub audit: Arc<AuditLog>,
     pub store: Arc<Store>,
+    /// The template-seal state resolved at startup. `Dormant` closes
+    /// `/v1/assume-role` + `/v1/enroll-exchange` and `/readyz`; the
+    /// auth/admin planes are seal-independent and stay live
+    /// (`docs/design-mint-template-seal.md` § *Dormant until sealed*).
+    pub seal: Arc<SealState>,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         .route("/v1/assume-role", post(assume_role))
         .route("/v1/enroll", post(enroll))
         .route("/v1/enroll-exchange", post(enroll_exchange))
         .route("/v1/verify", post(discharge_verify))
         .with_state(state)
+}
+
+/// Readiness probe. `200 ready` once a canonical seal is being served;
+/// `503 not sealed` while dormant, so an orchestrator holds a dormant
+/// host out of rotation until an operator seals it and it restarts.
+/// Liveness (`/healthz`) is seal-independent and always `ok`.
+async fn readyz(State(state): State<AppState>) -> Response {
+    match state.seal.as_ref() {
+        SealState::Serving(_) => (StatusCode::OK, "ready").into_response(),
+        SealState::Dormant => (StatusCode::SERVICE_UNAVAILABLE, "not sealed").into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -100,6 +118,18 @@ fn unauthorized(request_id: &str) -> Response {
         request_id,
         StatusCode::UNAUTHORIZED,
         json!({"error": "unauthorized"}),
+    )
+}
+
+/// The role-rendering / issuance planes are closed because mint came up
+/// dormant — no canonical seal at startup. `503` (not a `4xx`): the
+/// request is well-formed, the service simply has nothing sealed to
+/// serve, and recovers when an operator seals and it restarts.
+fn not_sealed(request_id: &str) -> Response {
+    respond(
+        request_id,
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"error": "not sealed"}),
     )
 }
 
@@ -379,6 +409,18 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         tigris_access_key_id: None,
     };
 
+    // --- Seal gate: the role-rendering plane is closed while dormant
+    // (no canonical seal at startup). The sealed surface — not the live
+    // config — is the authority for audience, the role's required
+    // caveats / TTL bounds, and the policy bytes. ---
+    let surface = match state.seal.as_ref() {
+        SealState::Serving(s) => s,
+        SealState::Dormant => {
+            audit(base_entry("denied:not_sealed"));
+            return not_sealed(&request_id);
+        }
+    };
+
     // --- Bundle + PoP extraction. ---
     let Some(bundle) = extract_bundle(&headers) else {
         audit(base_entry("denied:unauthenticated"));
@@ -402,7 +444,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         proof,
         &body,
         now_unix,
-        &state.config.audience,
+        surface.audience(),
         op::ASSUME_ROLE,
     ) {
         Ok(c) => c,
@@ -439,7 +481,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
 
     let requested_ttl = match req.ttl_seconds {
         Some(t) => t,
-        None => match state.config.roles.get(&req.role) {
+        None => match surface.role(&req.role) {
             Some(r) => r.default_ttl_seconds,
             None => {
                 audit(entry("denied:unknown_role", &req.role, None, None));
@@ -452,8 +494,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         },
     };
 
-    let granted = match role::authorize(&state.config, &caveats, &req.role, requested_ttl, now_unix)
-    {
+    let granted = match role::authorize(surface, &caveats, &req.role, requested_ttl, now_unix) {
         Ok(g) => g,
         Err(d) => {
             audit(entry(
@@ -470,15 +511,33 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         }
     };
 
+    // The policy bytes come from the sealed surface, not the live
+    // config. authorize() proved the role is in the surface, so a
+    // missing policy is an internal inconsistency, not a client fault.
+    let Some(policy_template) = surface.policy(&granted.role_name) else {
+        tracing::error!(role = %granted.role_name, "sealed surface has no policy for an authorized role");
+        audit(entry(
+            "denied:policy_render",
+            &granted.role_name,
+            None,
+            None,
+        ));
+        return respond(
+            &request_id,
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "service unavailable"}),
+        );
+    };
+
     let expiry = now + chrono::Duration::seconds(granted.ttl_seconds as i64);
     let expiry_iso = expiry.to_rfc3339();
     let policy = match render_policy(
-        &granted.role.policy,
+        policy_template,
         &state.config.tenant,
         &caveats,
         &request_json,
         &expiry_iso,
-        &granted.role.name,
+        &granted.role_name,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -496,7 +555,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         Resolved::Value(v) => Some(v),
         Resolved::Absent | Resolved::Unsatisfiable => None,
     };
-    let policy_name = iam::policy_name(&granted.role.name, scope.as_deref(), expiry);
+    let policy_name = iam::policy_name(&granted.role_name, scope.as_deref(), expiry);
 
     match state
         .minter
@@ -758,6 +817,17 @@ async fn enroll_exchange(
         });
     };
 
+    // Issuance is seal-gated: minting a credential decides whether the
+    // role carries a TPC (the operator-consent gate), so it reads the
+    // sealed surface, and is closed while dormant.
+    let surface = match state.seal.as_ref() {
+        SealState::Serving(s) => s,
+        SealState::Dormant => {
+            audit("denied:not_sealed", &[]);
+            return not_sealed(&request_id);
+        }
+    };
+
     let Some(mac) = extract_macaroon(&headers) else {
         audit("denied:unauthenticated", &[]);
         return unauthorized(&request_id);
@@ -868,7 +938,7 @@ async fn enroll_exchange(
     // the same opaque 401 as any other (a role this `sub` may not have
     // must not be distinguishable from a bad token).
     let role = match serde_json::from_slice::<ExchangeBody>(&body) {
-        Ok(b) if state.config.roles.contains_key(&b.role) => b.role,
+        Ok(b) if surface.role(&b.role).is_some() => b.role,
         _ => {
             audit("denied:unknown_role", &caveats);
             return unauthorized(&request_id);
@@ -881,9 +951,10 @@ async fn enroll_exchange(
     // Operator-write roles carry a third-party caveat. Append it as a
     // chain extension off the just-minted credential's tail — the
     // chain MAC is incremental, so this is byte-identical to having
-    // stamped the TPC inline at issuance. Config and Store invariants
-    // guarantee K_M-A and OrgId are present when the role sets [role.tpc].
-    if let Some(tpc) = &state.config.roles[&role].tpc {
+    // stamped the TPC inline at issuance. The TPC decision is the sealed
+    // one; Store invariants guarantee K_M-A and OrgId are present when a
+    // sealed role sets `tpc`.
+    if let Some(tpc) = surface.role(&role).and_then(|r| r.tpc.as_ref()) {
         let Some(k_m_a) = state.store.k_m_a() else {
             tracing::error!("TPC-bearing role minted but K_M-A not loaded");
             return respond(
