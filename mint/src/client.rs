@@ -703,14 +703,7 @@ fn load_auth_transport(dir: &Path) -> Result<String, ClientError> {
 /// `http://localhost/v1/discharge`). The host is not dialed — the saved
 /// transport supplies the connection — so only the path is taken.
 fn discharge_path(location: &str) -> Result<String, ClientError> {
-    let uri: hyper::Uri = location
-        .parse()
-        .map_err(|_| ClientError::BadFile("tpc location"))?;
-    let path = uri.path();
-    if path.is_empty() || path == "/" {
-        return Err(ClientError::BadFile("tpc location"));
-    }
-    Ok(path.to_string())
+    crate::tpc::location_path(location).ok_or(ClientError::BadFile("tpc location"))
 }
 
 /// Remove the saved session (`mint client logout`). Returns whether a

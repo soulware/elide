@@ -99,6 +99,44 @@ impl Operator {
         Err(OperatorError::NoTpc)
     }
 
+    /// The request path of the cli-token's third-party-caveat
+    /// `location` — where the operator fetches its discharge. Only the
+    /// path is taken; a separately-supplied transport carries the
+    /// connection, exactly as the enrolling client derives its discharge
+    /// route from a credential's TPC location.
+    fn discharge_path(&self) -> Result<String, OperatorError> {
+        for c in self.cli_token.caveats() {
+            if let Caveat::ThirdParty { location, .. } = c {
+                return crate::tpc::location_path(location)
+                    .ok_or(OperatorError::Malformed("tpc location"));
+            }
+        }
+        Err(OperatorError::NoTpc)
+    }
+
+    /// Fetch a wide discharge for the cli-token's CID over `transport`,
+    /// gated by the session bearer. The discharge route is the path of
+    /// the cli-token's own TPC location; `transport` is the connection
+    /// to the auth role (the demo socket today). One discharge satisfies
+    /// every admin verb — the verb is the operator's per-call
+    /// attenuation onto the cli-token — so the CLI fetches it once per
+    /// invocation.
+    pub async fn fetch_discharge(
+        &self,
+        transport: &Path,
+        session: &str,
+    ) -> Result<Macaroon, OperatorError> {
+        let path = self.discharge_path()?;
+        let body = serde_json::json!({ "cid": self.cid_b64()? }).to_string();
+        let headers = [("authorization", format!("Bearer {session}"))];
+        let (status, text) = post_uds(transport, &path, &headers, body).await?;
+        if status != 200 {
+            return Err(OperatorError::Status { status, body: text });
+        }
+        let discharge = json_field(&text, "discharge")?;
+        Macaroon::decode(&discharge).map_err(|_| OperatorError::Malformed("discharge"))
+    }
+
     /// Build the `(Authorization, X-Mint-Pop)` headers for one admin
     /// call: attenuate `op=<op_value>` onto the cli-token (so the verb
     /// binds to this call's PoP over the attenuated tail), bundle it
@@ -157,25 +195,6 @@ pub async fn login(auth_socket: &Path, subject: &str) -> Result<String, Operator
         return Err(OperatorError::Status { status, body: text });
     }
     json_field(&text, "session")
-}
-
-/// Fetch a wide discharge for the cli-token's CID from the demo auth
-/// role, gated by the session bearer. One discharge satisfies every
-/// admin verb (the verb is the operator's per-call attenuation onto the
-/// cli-token), so the CLI fetches it once per invocation.
-pub async fn fetch_discharge(
-    auth_socket: &Path,
-    session: &str,
-    cid_b64: &str,
-) -> Result<Macaroon, OperatorError> {
-    let body = serde_json::json!({ "cid": cid_b64 }).to_string();
-    let headers = [("authorization", format!("Bearer {session}"))];
-    let (status, text) = post_uds(auth_socket, "/v1/discharge", &headers, body).await?;
-    if status != 200 {
-        return Err(OperatorError::Status { status, body: text });
-    }
-    let discharge = json_field(&text, "discharge")?;
-    Macaroon::decode(&discharge).map_err(|_| OperatorError::Malformed("discharge"))
 }
 
 /// POST `body` to `<endpoint>` on the auth role's UDS with arbitrary
@@ -262,8 +281,14 @@ mod tests {
     fn seed_operator_files(dir: &Path) -> Macaroon {
         let kr = Keyring::single(ROOT);
         let cnf = pop::cnf_value(&MACHINE_SEED);
-        let token =
-            crate::issuance::mint_cli_token(&kr, &K_M_A, "mint", &cnf, "demo", "unix:/auth.sock");
+        let token = crate::issuance::mint_cli_token(
+            &kr,
+            &K_M_A,
+            "mint",
+            &cnf,
+            "demo",
+            "https://auth.example/v1/discharge",
+        );
         std::fs::write(dir.join(CLI_TOKEN_FILE), token.encode()).unwrap();
         let hex: String = MACHINE_SEED.iter().map(|b| format!("{b:02x}")).collect();
         std::fs::write(dir.join(CLI_TOKEN_KEY_FILE), hex).unwrap();
@@ -284,6 +309,16 @@ mod tests {
             None => panic!("token has no TPC"),
         };
         assert_eq!(op.cid_b64().unwrap(), expected);
+    }
+
+    #[test]
+    fn discharge_path_derives_from_cli_token_tpc() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_operator_files(dir.path());
+        let op = Operator::load(dir.path()).unwrap();
+        // The discharge route is the path of the cli-token's own TPC
+        // location — the transport supplies the host.
+        assert_eq!(op.discharge_path().unwrap(), "/v1/discharge");
     }
 
     #[test]

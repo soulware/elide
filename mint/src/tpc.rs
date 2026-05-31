@@ -103,6 +103,20 @@ pub fn build_caveat(
     }
 }
 
+/// The request path of a TPC `location` (a full URL, e.g.
+/// `https://auth.example/v1/discharge`). The location's host is never
+/// dialed — a separately-supplied transport carries the connection — so
+/// only the path is taken. `None` if the location does not parse as a
+/// URI or carries no path (bare authority, or just `/`).
+pub fn location_path(location: &str) -> Option<String> {
+    let uri: hyper::Uri = location.parse().ok()?;
+    let path = uri.path();
+    if path.is_empty() || path == "/" {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 fn aead_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
     let cipher = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(key));
     // AES-GCM-SIV's misuse-resistance makes the fixed-nonce + same-key
@@ -358,6 +372,23 @@ mod tests {
         let pt = decrypt_cid(&k_m_a, &cid).expect("decrypt");
         assert_eq!(pt.client_id, "01ÆØÅ");
         assert_eq!(pt.org_id, "");
+    }
+
+    #[test]
+    fn location_path_takes_only_the_path() {
+        assert_eq!(
+            location_path("https://auth.example/v1/discharge").as_deref(),
+            Some("/v1/discharge")
+        );
+        assert_eq!(
+            location_path("http://localhost/v1/login").as_deref(),
+            Some("/v1/login")
+        );
+        // No path to dial: bare authority or root.
+        assert_eq!(location_path("https://auth.example/"), None);
+        assert_eq!(location_path("https://auth.example"), None);
+        // Not a URI.
+        assert_eq!(location_path(""), None);
     }
 
     #[test]
