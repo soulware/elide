@@ -2,29 +2,21 @@
 
 ## Status
 
-Design revised; implementation landing in slices. Follows on from
-`docs/design-mint.md` § *Mint state in the tenant bucket* and §
-*Root-key rotation* (the keyring landed in PR #454). Modules:
-`mint/src/seal.rs`, `mint/src/sealed_cache.rs`. CLI verb: `mint seal`.
+Implemented as described. Follows on from `docs/design-mint.md` § *Mint
+state in the tenant bucket* and § *Root-key rotation* (the keyring landed
+in PR #454). Modules: `mint/src/seal.rs`, `mint/src/sealed_cache.rs`,
+`mint/src/admin.rs`. CLI verb: `mint seal`.
 
 The earlier flow — a local `mint seal` writing `pending-seal.json`,
 published by `mint serve` on its next startup — is superseded by the
-approach described here: an authenticated `POST /v1/admin/seal`
-against a running daemon, a *dormant-until-sealed* startup state, and
-a local *sealed cache* (`<data_dir>/sealed/`) that mint serves from so
-a host can restart safely during a fleet-wide template update before
-the re-seal.
-
-Implemented so far: the **serving half** — the sealed cache + in-memory
-`TemplateSet`, the dormant-until-sealed startup that resolves a
-`SealState` from the verified bucket seal (serve-cache / adopt /
-dormant), and the request path (`/v1/assume-role`, `/v1/enroll-exchange`)
-reading the *sealed* role surface — audience, `required_caveats`, TTL
-bounds, `tpc`, policy bytes — never the live config. Still pending: the
-**authoring half** — `mint seal` is for now still the local
-`pending-seal.json` write that startup publishes; the authenticated
-`POST /v1/admin/seal` endpoint (and retiring the pending file) is the
-remaining slice. Until then there is still a pending file.
+approach described here: an authenticated `POST /v1/admin/seal` against a
+running daemon, a *dormant-until-sealed* startup state, and a local
+*sealed cache* (`<data_dir>/sealed/`) that mint serves from so a host can
+restart safely during a fleet-wide template update before the re-seal.
+There is no pending file: `mint seal` is an authenticated client call,
+and the request path reads the *sealed* role surface (audience,
+`required_caveats`, TTL bounds, `tpc`, policy bytes) — never the live
+config.
 
 ## Why
 

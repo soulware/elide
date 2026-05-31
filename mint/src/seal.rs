@@ -10,27 +10,21 @@
 //! keyring can produce a valid MAC, the same trust anchor that signs
 //! `_mint/approved/<sub>` (PR #454).
 //!
-//! Authoring is purely local: [`Seal::build_from_config`] takes the
-//! already-loaded [`Config`] (whose roles carry their policy bytes)
-//! and a [`Keyring`], and produces a self-contained, self-verifying
-//! object. The CLI writes it to `<data_dir>/pending-seal.json` via
-//! [`write_pending`]; [`resolve_startup`] picks it up on the next start
-//! and either publishes it (`Store::put_template_seal`) or, if the
-//! bucket already represents the same intent, discards it via
-//! [`Seal::semantically_equal`].
+//! Authoring is an authenticated call to a running daemon:
+//! `POST /v1/admin/seal` ([`crate::admin`]) hashes the daemon's own
+//! already-loaded [`Config`] via [`Seal::build_from_config`], MACs it
+//! under the keyring, PUTs `seal.json`, and writes the local sealed
+//! cache. There is no local staging file.
 //!
-//! [`resolve_startup`] then resolves what the daemon serves: a verified
-//! bucket seal yields a [`SealState::Serving`] surface drawn from the
-//! local sealed cache (or adopted from `roles_dir/`); a missing or
-//! unsatisfiable seal yields [`SealState::Dormant`]. The served policy
-//! bytes live in the immutable [`crate::sealed_cache::TemplateSet`] for
-//! the process lifetime — the request path never re-reads disk.
+//! [`resolve_startup`] resolves what the daemon serves: a verified bucket
+//! seal yields a [`SealState::Serving`] surface drawn from the local
+//! sealed cache (or adopted from `roles_dir/`); a missing or unsatisfiable
+//! seal yields [`SealState::Dormant`]. The served policy bytes live in the
+//! immutable [`crate::sealed_cache::TemplateSet`] for the process
+//! lifetime — the request path never re-reads disk.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -289,63 +283,19 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Read a pending seal from disk, JSON-decoding the body. Returns
-/// `Ok(None)` if the file does not exist; any other I/O or decode
-/// failure surfaces as [`SealError`].
-pub fn read_pending(path: &Path) -> Result<Option<Seal>, SealError> {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let seal: Seal =
-                serde_json::from_slice(&bytes).map_err(|e| SealError::Decode(e.to_string()))?;
-            Ok(Some(seal))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(SealError::Io(e)),
-    }
-}
-
-/// Write a pending seal to disk atomically (tmp + rename, mode 0600).
-/// The pending file is no more sensitive than the keyring it was
-/// signed under; both share the `<data_dir>/` trust boundary.
-pub fn write_pending(path: &Path, seal: &Seal) -> Result<(), SealError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(seal).map_err(|e| SealError::Encode(e.to_string()))?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, &bytes)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-/// Remove a pending seal — the daemon calls this after a successful
-/// publish (or after observing the bucket already represents the same
-/// intent). Treats `NotFound` as success.
-pub fn remove_pending(path: &Path) -> Result<(), SealError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(SealError::Io(e)),
-    }
-}
-
 /// `mint serve` startup: resolve the template-seal state
 /// (`docs/design-mint-template-seal.md` § *Startup*).
 ///
-/// 1. Publish any staged `<data_dir>/pending-seal.json` (the local
-///    authoring path) to the bucket, then remove it.
-/// 2. Load the bucket seal. Missing, or unverifiable under the current
+/// 1. Load the bucket seal. Missing, or unverifiable under the current
 ///    keyring → **dormant** (logged loudly): the auth/admin planes still
-///    run, so an operator can publish a seal that lifts dormancy on the
-///    next restart. This replaces the old auto-seal-on-first-start and
-///    refuse-on-mismatch — mint never commits on-disk bytes as canonical
-///    on its own.
-/// 3. Resolve the served surface from the verified seal: serve the local
+///    run, so an operator can publish a seal (`POST /v1/admin/seal`) that
+///    lifts dormancy on the next restart. Mint never commits on-disk
+///    bytes as canonical on its own.
+/// 2. Resolve the served surface from the verified seal: serve the local
 ///    sealed cache if it satisfies that seal, else adopt the seal from
 ///    `roles_dir/` (writing the cache). A host whose templates can't
 ///    produce the sealed content comes up dormant with the diff.
-/// 4. Drift check (informational): if `roles_dir/` has changed away from
+/// 3. Drift check (informational): if `roles_dir/` has changed away from
 ///    what is served, log loudly — staged-but-unsealed — and serve.
 ///
 /// Only genuine infrastructure failures (bucket unreachable) are `Err`;
@@ -355,48 +305,8 @@ pub async fn resolve_startup(
     store: &crate::state::Store,
 ) -> Result<SealState, String> {
     let keyring = store.keyring().await;
-    let pending_path = config.data_dir.join("pending-seal.json");
 
-    // (1) Publish any staged pending seal, then drop it.
-    if let Some(pending) = read_pending(&pending_path).map_err(|e| e.to_string())? {
-        pending.verify(&keyring).map_err(|e| {
-            format!(
-                "{} is signed under a kid that is no longer in the keyring \
-                 (or its MAC is invalid): {e}. Inspect the file, then either \
-                 re-run `mint seal` to re-sign under the current kid or \
-                 remove the file to discard the staged intent.",
-                pending_path.display(),
-            )
-        })?;
-        let existing = store
-            .get_template_seal()
-            .await
-            .map_err(|e| format!("read bucket seal: {e}"))?;
-        match existing {
-            Some(existing) if existing.semantically_equal(&pending) => {
-                tracing::info!(
-                    pending = %pending_path.display(),
-                    "bucket seal already represents this intent; discarding pending without PUT",
-                );
-            }
-            _ => {
-                store
-                    .put_template_seal(&pending)
-                    .await
-                    .map_err(|e| format!("PUT bucket seal: {e}"))?;
-                tracing::info!(
-                    pending = %pending_path.display(),
-                    kid = pending.kid,
-                    sealed_at = %pending.sealed_at,
-                    roles = pending.roles.len(),
-                    "published staged template seal",
-                );
-            }
-        }
-        remove_pending(&pending_path).map_err(|e| e.to_string())?;
-    }
-
-    // (2) Load + verify the bucket seal. No seal, or one we can't verify
+    // (1) Load + verify the bucket seal. No seal, or one we can't verify
     //     under the current keyring → dormant.
     let bucket_seal = match store
         .get_template_seal()
@@ -423,13 +333,13 @@ pub async fn resolve_startup(
         return Ok(SealState::Dormant);
     }
 
-    // (3) Resolve the served surface; None → this host can't produce the
+    // (2) Resolve the served surface; None → this host can't produce the
     //     sealed content, so dormant.
     let Some(surface) = resolve_surface(config, &keyring, &bucket_seal)? else {
         return Ok(SealState::Dormant);
     };
 
-    // (4) Drift check: what is staged on disk vs what we serve.
+    // (3) Drift check: what is staged on disk vs what we serve.
     let staged = Seal::build_from_config(config, &keyring, &bucket_seal.sealed_at);
     if staged.semantically_equal(&surface.seal) {
         tracing::info!(
@@ -527,7 +437,7 @@ policy_file = "volume-ro.json"
     }
 
     #[tokio::test]
-    async fn dormant_until_pending_published_then_serves_from_cache() {
+    async fn dormant_until_sealed_then_adopts_then_serves_cache() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = config();
         cfg.data_dir = tmp.path().to_path_buf();
@@ -535,8 +445,8 @@ policy_file = "volume-ro.json"
             .await
             .expect("store");
 
-        // First start: no pending, no bucket seal — DORMANT, and mint
-        // never commits the on-disk bytes on its own (no auto-seal).
+        // First start: no bucket seal — DORMANT, and mint never commits
+        // the on-disk bytes on its own.
         assert!(matches!(
             resolve_startup(&cfg, &store).await.expect("startup"),
             SealState::Dormant
@@ -546,22 +456,24 @@ policy_file = "volume-ro.json"
             "dormant start must not write a seal"
         );
 
-        // Operator stages a seal (the local authoring path), then a
-        // restart publishes it, adopts it from roles_dir/, and serves.
+        // A seal is published — what `POST /v1/admin/seal` does: build it
+        // from the daemon's config and PUT it to the bucket.
         let keyring = store.keyring().await;
         let seal = Seal::build_from_config(&cfg, &keyring, "2026-05-31T00:00:00Z");
-        write_pending(&cfg.data_dir.join("pending-seal.json"), &seal).expect("stage");
+        store.put_template_seal(&seal).await.expect("publish");
+
+        // First start after sealing: no local cache yet → adopt from
+        // roles_dir/, write the cache, serve.
         match resolve_startup(&cfg, &store).await.expect("startup") {
             SealState::Serving(surface) => {
                 assert_eq!(surface.seal.roles.len(), cfg.roles.len());
                 assert_eq!(surface.policy("volume-ro").unwrap(), "{\"Statement\":[]}");
             }
-            SealState::Dormant => panic!("should be serving after publish"),
+            SealState::Dormant => panic!("should adopt + serve once a seal exists"),
         }
-        assert!(store.get_template_seal().await.expect("read").is_some());
 
-        // Idempotent restart: the bucket seal is unchanged, so it serves
-        // straight from the local cache.
+        // Restart: the bucket seal is unchanged, so it serves straight
+        // from the local cache.
         assert!(matches!(
             resolve_startup(&cfg, &store).await.expect("startup"),
             SealState::Serving(_)
@@ -750,39 +662,6 @@ policy_file = "volume-ro.json"
         assert_eq!(diffs.len(), 1);
         assert!(diffs[0].contains("volume-ro"));
         assert!(diffs[0].contains("not in seal"));
-    }
-
-    #[test]
-    fn pending_file_roundtrip_atomic_with_0600() {
-        let kr = Keyring::single([7u8; 32]);
-        let seal = Seal::build_from_config(&config(), &kr, "t");
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("pending-seal.json");
-        write_pending(&p, &seal).unwrap();
-        let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "pending file mode");
-        let loaded = read_pending(&p).unwrap().expect("present");
-        assert_eq!(loaded, seal);
-        loaded.verify(&kr).expect("loaded seal still verifies");
-    }
-
-    #[test]
-    fn read_pending_missing_is_ok_none() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("pending-seal.json");
-        assert!(read_pending(&p).unwrap().is_none());
-    }
-
-    #[test]
-    fn remove_pending_is_idempotent() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("pending-seal.json");
-        // missing → ok
-        remove_pending(&p).unwrap();
-        // present → ok
-        fs::write(&p, b"junk").unwrap();
-        remove_pending(&p).unwrap();
-        assert!(!p.exists());
     }
 
     #[test]
