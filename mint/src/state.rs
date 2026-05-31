@@ -316,9 +316,9 @@ pub struct Store {
     /// lock across awaits.
     keyring: Arc<RwLock<Arc<Keyring>>>,
     /// The auth-service wrapping key. `None` for a mint configured
-    /// without `[auth]` — issuance for any role with
-    /// `issues_with_tpc = true` is then refused (validated at config
-    /// load). In demo mode mint generates K_M-A itself at first
+    /// without `[auth]` — issuance for any role that sets `[role.tpc]`
+    /// is then refused (validated at config load). In demo mode mint
+    /// generates K_M-A itself at first
     /// start; in prod the auth-service binary provisions it via
     /// `/v1/mint/enroll` (separate PR). Immutable for the lifetime
     /// of the process — rotation lands on a new Store via restart.

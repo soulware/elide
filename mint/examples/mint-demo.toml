@@ -29,12 +29,13 @@ socket = "mint_data/mint.sock"        # client: --url unix:mint_data/mint.sock
 # For a TCP listener instead, replace the line above with:
 #   bind = "127.0.0.1:8085"           # client: --url http://127.0.0.1:8085
 
-# Auth service (docs/design-auth-service.md): where third-party caveats
-# point, and whether mint colocates a demo auth role.
+# Auth service (docs/design-auth-service.md): the operator cli-token's
+# TPC location, and whether mint colocates a demo auth role.
 [auth]
-# Auth-service URL — the `location` stamped into every TPC. In the
-# single-host demo the operator reaches the auth role over the socket
-# below, so a `unix:` location is the honest value.
+# The `location` stamped into the operator cli-token's TPC. Per-role TPC
+# locations live in each [role.tpc]. In the single-host demo the operator
+# reaches the auth role over the socket below, so a `unix:` location is
+# the honest value.
 endpoint = "unix:mint_data/auth.sock"
 # Colocate the auth role on its own UDS instead of a separate
 # auth-service binary. Demo / single-host only; generates K_M-A and
@@ -55,13 +56,14 @@ min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 
-# issues_with_tpc binds a third-party caveat into the issued credential:
-# assume-role refuses it until the client fetches and attaches a
-# discharge from [auth].endpoint.
 [[role]]
 name = "write"
 required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300
-issues_with_tpc = true
+# [role.tpc] binds a third-party caveat into every credential this role
+# issues: assume-role refuses it until the client fetches a discharge
+# from tpc.location and attaches it.
+[role.tpc]
+location = "unix:mint_data/auth.sock"

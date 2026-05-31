@@ -21,13 +21,13 @@ socket = "mint_data/mint.sock"        # client: --url unix:mint_data/mint.sock
 # For a TCP listener instead, replace the line above with:
 #   bind = "127.0.0.1:8085"           # client: --url http://127.0.0.1:8085
 
-# Auth service (docs/design-auth-service.md). Required because the
-# roles below set issues_with_tpc — the third-party caveat needs a
-# location to point at. Production runs a separate auth-service binary
-# (no demo_enabled, no socket); the operator admin plane authenticates
-# against that endpoint, not a colocated UDS.
+# Auth service (docs/design-auth-service.md). Required because the roles
+# below set [role.tpc] — the third-party caveat is keyed by K_M-A, which
+# only an [auth]-configured mint holds. Production runs a separate
+# auth-service binary (no demo_enabled, no socket); the operator admin
+# plane authenticates against that endpoint, not a colocated UDS.
 [auth]
-endpoint = "https://auth.elide.internal/"   # the `location` stamped into every TPC
+endpoint = "https://auth.elide.internal/"   # the cli-token's TPC location
 
 [tenant]
 bucket = "elide-demo"
@@ -47,7 +47,7 @@ required_caveats = ["sub", "elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
-issues_with_tpc = true
+tpc = { location = "https://auth.elide.internal/" }
 
 [[role]]
 name = "volume-rw-background"
@@ -70,7 +70,7 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
-issues_with_tpc = true
+tpc = { location = "https://auth.elide.internal/" }
 
 [[role]]
 name = "coord-rw-background"

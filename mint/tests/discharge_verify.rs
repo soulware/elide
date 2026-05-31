@@ -42,7 +42,7 @@ min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 policy_file = "volume-rw.json"
-issues_with_tpc = true
+tpc = { location = "https://auth.example/" }
 "#;
 
 #[derive(Clone)]

@@ -882,16 +882,8 @@ async fn enroll_exchange(
     // chain extension off the just-minted credential's tail — the
     // chain MAC is incremental, so this is byte-identical to having
     // stamped the TPC inline at issuance. Config and Store invariants
-    // guarantee the inputs are present when the role flag is set.
-    if state.config.roles[&role].issues_with_tpc {
-        let Some(auth) = state.config.auth.as_ref() else {
-            tracing::error!("TPC-bearing role without [auth] reached issuance");
-            return respond(
-                &request_id,
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({"error": "service unavailable"}),
-            );
-        };
+    // guarantee K_M-A and OrgId are present when the role sets [role.tpc].
+    if let Some(tpc) = &state.config.roles[&role].tpc {
         let Some(k_m_a) = state.store.k_m_a() else {
             tracing::error!("TPC-bearing role minted but K_M-A not loaded");
             return respond(
@@ -910,7 +902,7 @@ async fn enroll_exchange(
         };
         let r = crate::tpc::derive_r(keyring.current_key(), &sub, r_epoch);
         let tpc_caveat =
-            crate::tpc::build_caveat(credential.tail(), &r, k_m_a, &sub, org_id, &auth.endpoint);
+            crate::tpc::build_caveat(credential.tail(), &r, k_m_a, &sub, org_id, &tpc.location);
         credential = credential.attenuate(tpc_caveat);
     }
     // The approved-registry entry is not consumed: the ticket is

@@ -32,11 +32,13 @@ from one-volume-read to bucket-wide-read with no other signal.
 Role-block fields in `mint.toml` (`required_caveats`,
 `min_ttl_seconds`) have the same property: drop `elide:Volume` from
 `required_caveats` and `volume-ro` becomes effectively bucket-wide.
-Starker still is `issues_with_tpc`: it is the operator-consent gate on
-writes (a true setting forces every credential for the role to carry a
-third-party caveat, and so to require a discharge). Flip it to false
-and the human-authorisation requirement disappears with no other
-signal. Every such field has to be inside the seal, not just the
+Starker still is the role's `[role.tpc]` section: its presence is the
+operator-consent gate on writes (it forces every credential for the
+role to carry a third-party caveat, and so to require a discharge),
+and its `location` is where that discharge is fetched. Remove the
+section and the human-authorisation requirement disappears with no
+other signal; repoint its `location` and discharges are sourced
+elsewhere. Every such field has to be inside the seal, not just the
 policy template.
 
 Filesystem write to `roles_dir/` or `mint.toml` is the attacker's
@@ -193,8 +195,8 @@ _mint/templates/seal.json
       "min_ttl_seconds":    60,
       "max_ttl_seconds":    2592000,
       "default_ttl_seconds": 2592000,
-      "issues_with_tpc":    false,
-      "policy_blake3":      "<64 hex>"
+      "policy_blake3":      "<64 hex>",
+      "tpc":                null
     },
     ...
   },
@@ -211,13 +213,15 @@ Fields:
   the fleet.
 - **`roles`** — every field of every `[[role]]` block that bears on
   what mint will render or grant: `required_caveats`, the TTL bounds,
-  and `issues_with_tpc` (the operator-consent gate — when true, every
-  credential for the role carries a third-party caveat and so requires
-  a discharge at `assume-role`; flipping it false would silently drop
-  that requirement, so it must be sealed). The one role-block field
-  *not* sealed is `policy_file`: it is replaced by a `policy_blake3`
-  content hash, because what matters is the bytes the file currently
-  contains, not where the operator put them. The hash is over the raw
+  and `tpc` (the optional third-party-caveat section — its presence is
+  the operator-consent gate, so every credential for the role carries a
+  TPC requiring a discharge at `assume-role`, and its `location` is
+  where that discharge is fetched; removing the section or repointing
+  its `location` must be a sealed change, never silent). The one
+  role-block field *not* sealed is `policy_file`: it is replaced by a
+  `policy_blake3` content hash, because what matters is the bytes the
+  file currently contains, not where the operator put them. The hash is
+  over the raw
   file content; no canonicalisation, no whitespace normalisation.
   `Seal::build_from_config` destructures each role exhaustively, so a
   new role-config field is a compile error until it is consciously

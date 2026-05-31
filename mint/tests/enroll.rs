@@ -563,7 +563,7 @@ min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 policy_file = "rw.json"
-issues_with_tpc = true
+tpc = { location = "https://auth.example/" }
 [[role]]
 name = "volume-rw"
 required_caveats = ["aud"]
@@ -571,7 +571,7 @@ min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 policy_file = "rw.json"
-issues_with_tpc = true
+tpc = { location = "https://auth.example/" }
 "#;
     let cfg = common::parse_config(TOML_TPC, &[("rw.json", VOLUME_RW_POLICY)]);
     let buf = Arc::new(Mutex::new(Vec::new()));
