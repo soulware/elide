@@ -498,13 +498,17 @@ operator's nose every time the keyring rotated).
   only their hashes, not their bytes. Bucket bandwidth is for
   enrollment state, not deploy artefacts.
 - **Config outside the `[[role]]` blocks.** The seal covers the role
-  surface (`audience`, every role block, each policy file) — not the
-  rest of `mint.toml`, which carries host-specific settings that
-  legitimately vary across the fleet (listener address, `data_dir`,
-  the `[auth]` endpoint). The `[auth]` endpoint in particular is left
-  unsealed deliberately: repointing it is a denial-of-service, not an
-  authority escalation, because a discharge from a rogue endpoint
-  still has to verify under the third-party-caveat key mint holds.
+  surface (`audience`, every role block — including each role's
+  `[role.tpc].location` — and each policy file), not the rest of
+  `mint.toml`, which carries host-specific settings that legitimately
+  vary across the fleet (listener address, `data_dir`, the
+  `[demo_auth]` transport, the operator cli-token's `[operator]`
+  location). The operator/demo endpoints in particular are left
+  unsealed deliberately: repointing one is a denial-of-service, not an
+  authority escalation, because a discharge from a rogue endpoint still
+  has to verify under the third-party-caveat key mint holds. (A
+  *role's* `[role.tpc].location` is different — it is part of the
+  sealed role surface.)
 - **Template version stamped in issued credentials.** The credential
   macaroon doesn't carry the template version; the seal at
   render-time governs render-time. Stamping would add a second

@@ -26,9 +26,13 @@ fn mint_demo_config_loads() {
     let cfg = Config::load(&example("mint-demo.toml")).expect("mint-demo.toml");
     // The demo colocates the auth role so the operator admin plane
     // (login / invite / enroll) has a discharge issuer and a cli-token.
-    let auth = cfg.auth.expect("[auth] present");
-    assert!(auth.demo_enabled, "demo colocates the auth role");
-    assert!(auth.socket.is_some(), "demo auth role binds a UDS");
+    let demo = cfg.demo_auth.expect("[demo_auth] present");
+    assert!(demo.enabled, "demo colocates the auth role");
+    assert!(demo.socket.is_some(), "demo auth role binds a UDS");
+    assert!(
+        cfg.operator.is_some(),
+        "demo configures the cli-token location"
+    );
 }
 
 #[test]
@@ -36,8 +40,8 @@ fn mint_elide_config_loads() {
     pin_cwd();
     let cfg = Config::load(&example("mint-elide.toml")).expect("mint-elide.toml");
     // The Elide inventory carries `[role.tpc]` roles, which require an
-    // `[auth]` block (the TPC is keyed by K_M-A).
-    assert!(cfg.auth.is_some(), "TPC roles require [auth]");
+    // `[operator]` integration (the TPC is keyed by K_M-A).
+    assert!(cfg.operator.is_some(), "TPC roles require [operator]");
     assert!(
         cfg.roles.values().any(|r| r.tpc.is_some()),
         "inventory has at least one TPC role"

@@ -63,9 +63,11 @@ const TOML: &str = r#"
 audience = "mint"
 [tenant]
 bucket = "demo-bucket"
-[auth]
-endpoint = "https://auth.example/"
-demo_enabled = true
+[demo_auth]
+enabled = true
+
+[operator]
+location = "https://auth.example/"
 [[role]]
 name = "volume-rw"
 required_caveats = []

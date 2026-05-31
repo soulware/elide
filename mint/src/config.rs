@@ -56,9 +56,9 @@ pub enum ConfigError {
         source: std::net::AddrParseError,
     },
     #[error(
-        "role {0} sets [role.tpc] but no [auth] block is configured; the \
-         third-party caveat is keyed by K_M-A, which an [auth] block \
-         provides — add one or drop the [role.tpc] section"
+        "role {0} sets [role.tpc] but no auth integration is configured; \
+         the third-party caveat is keyed by K_M-A — add [operator] (or \
+         [demo_auth].enabled for the demo) or drop the [role.tpc] section"
     )]
     TpcRoleWithoutAuth(String),
 }
@@ -100,40 +100,48 @@ pub struct RawConfig {
     #[serde(default)]
     pub socket: Option<String>,
     pub tenant: Tenant,
-    /// Auth-service integration. Optional: a mint configured without
-    /// `[auth]` cannot stamp third-party caveats and refuses
-    /// `assume-role` for any role that sets `[role.tpc]`.
-    /// See `docs/design-auth-service.md`.
+    /// Colocated demo auth role (`docs/design-auth-service.md`). Demo /
+    /// single-host only; absent in production.
     #[serde(default)]
-    pub auth: Option<RawAuth>,
+    pub demo_auth: Option<RawDemoAuth>,
+    /// Operator auth-service integration. A mint without `[operator]`
+    /// (and without `[demo_auth].enabled`) cannot stamp third-party
+    /// caveats and refuses `assume-role` for any role that sets
+    /// `[role.tpc]`.
+    #[serde(default)]
+    pub operator: Option<RawOperator>,
     #[serde(rename = "role", default)]
     pub roles: Vec<RawRole>,
 }
 
-/// `[auth]` block: where third-party caveats point and whether mint
-/// itself rubber-stamps the auth-service routes (`demo_enabled`).
+/// `[demo_auth]` block: whether mint colocates the auth-service role and
+/// the UDS it binds. Demo / single-host only; production runs a separate
+/// auth-service binary.
 #[derive(Debug, Clone, Deserialize)]
-pub struct RawAuth {
-    /// Auth service URL, surfaced as the `location` of the operator
-    /// cli-token's third-party caveat (per-role TPC locations live in
-    /// each `[role.tpc]`). Required when `[auth]` is present.
-    pub endpoint: String,
+pub struct RawDemoAuth {
     /// When `true`, mint colocates the auth-service role and binds its
-    /// own UDS for `/v1/discharge`. Demo / test only. Generates
-    /// `K_M-A` and `K_session` on first start. Mint refuses to start
-    /// with `demo_enabled = true` unless mint itself is bound to
-    /// loopback or UDS — see `docs/design-auth-service.md` § *Mint as
-    /// auth (demo only)*.
+    /// own UDS for `/v1/login` + `/v1/discharge`. Generates `K_M-A` and
+    /// `K_session` on first start. Mint refuses to start with
+    /// `enabled = true` unless mint itself is bound to loopback or UDS —
+    /// see `docs/design-auth-service.md` § *Mint as auth (demo only)*.
     #[serde(default)]
-    pub demo_enabled: bool,
-    /// UDS path the colocated auth role binds for `/v1/discharge` when
-    /// `demo_enabled = true`. Path-only (UDS-only) — the auth role
-    /// never listens on TCP in demo mode. Defaults to
-    /// `<data_dir>/auth.sock` when omitted; ignored entirely when
-    /// `demo_enabled = false` (production deployments run a separate
-    /// auth-service binary on its own listener).
+    pub enabled: bool,
+    /// UDS path the colocated auth role binds, and the transport the
+    /// operator/client dial to reach it. Path-only (UDS-only). Defaults
+    /// to `<data_dir>/auth.sock` when omitted; ignored when
+    /// `enabled = false`.
     #[serde(default)]
     pub socket: Option<String>,
+}
+
+/// `[operator]` block: the operator's auth-service integration. Required
+/// whenever any role sets `[role.tpc]` or a cli-token is minted, because
+/// both stamp an operator-side third-party caveat.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawOperator {
+    /// The `location` stamped into the operator cli-token's third-party
+    /// caveat (per-role TPC locations live in each `[role.tpc]`).
+    pub location: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -271,16 +279,22 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8085";
 /// an explicit path.
 pub const DEFAULT_SOCKET_NAME: &str = "mint.sock";
 
-/// Auth-service settings, post-validation.
+/// Colocated demo auth role, post-validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Auth {
-    pub endpoint: String,
-    pub demo_enabled: bool,
-    /// UDS path the demo auth role binds for `/v1/discharge`. Resolved
-    /// from `[auth].socket` (explicit) or `<data_dir>/auth.sock`
-    /// (default). `None` when `demo_enabled = false` — production
-    /// deploys run a separate auth-service binary.
+pub struct DemoAuth {
+    pub enabled: bool,
+    /// UDS the demo auth role binds, and the transport the
+    /// operator/client dial to reach it. Resolved from
+    /// `[demo_auth].socket` (explicit) or `<data_dir>/auth.sock`
+    /// (default). `None` when `enabled = false`.
     pub socket: Option<PathBuf>,
+}
+
+/// Operator auth-service integration, post-validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorAuth {
+    /// The `location` stamped into the operator cli-token's TPC.
+    pub location: String,
 }
 
 /// Validated configuration, ready to serve.
@@ -307,10 +321,14 @@ pub struct Config {
     /// `Store::open_in_memory` instead of the Tigris backend) can
     /// leave it `None`.
     pub admin: Option<AdminCredential>,
-    /// Auth-service settings — `None` if the config omits `[auth]`.
-    /// A mint without auth cannot stamp TPCs; roles that set `[role.tpc]`
-    /// are refused at startup.
-    pub auth: Option<Auth>,
+    /// Colocated demo auth role — `None` if the config omits
+    /// `[demo_auth]`.
+    pub demo_auth: Option<DemoAuth>,
+    /// Operator auth integration — `None` if the config omits
+    /// `[operator]`. A mint without it (and without a demo auth role)
+    /// cannot stamp TPCs; roles that set `[role.tpc]` are refused at
+    /// startup.
+    pub operator: Option<OperatorAuth>,
     pub roles: BTreeMap<String, Role>,
 }
 
@@ -386,24 +404,27 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("mint_data"));
         let listener = resolve_listener(raw.bind.as_deref(), raw.socket.as_deref(), &data_dir)?;
-        let auth = raw.auth.map(|a| {
-            let socket = a.demo_enabled.then(|| {
-                a.socket
+        let demo_auth = raw.demo_auth.map(|d| {
+            let socket = d.enabled.then(|| {
+                d.socket
                     .map(PathBuf::from)
                     .unwrap_or_else(|| data_dir.join("auth.sock"))
             });
-            Auth {
-                endpoint: a.endpoint,
-                demo_enabled: a.demo_enabled,
+            DemoAuth {
+                enabled: d.enabled,
                 socket,
             }
         });
-        // A role that issues a TPC needs an `[auth]` block: the caveat
-        // is keyed by K_M-A, which only an `[auth]`-configured mint
-        // holds. Refusing here keeps the issuance path unconditional.
-        if auth.is_none()
-            && let Some(r) = roles.values().find(|r| r.tpc.is_some())
-        {
+        let operator = raw.operator.map(|o| OperatorAuth {
+            location: o.location,
+        });
+        // A role that issues a TPC needs K_M-A to key the caveat. K_M-A
+        // is generated by a colocated demo auth role and otherwise
+        // provisioned via the operator auth integration, so a TPC role
+        // requires one or the other. Refusing here keeps the issuance
+        // path unconditional.
+        let has_k_m_a = demo_auth.as_ref().is_some_and(|d| d.enabled) || operator.is_some();
+        if !has_k_m_a && let Some(r) = roles.values().find(|r| r.tpc.is_some()) {
             return Err(ConfigError::TpcRoleWithoutAuth(r.name.clone()));
         }
         Ok(Config {
@@ -413,7 +434,8 @@ impl Config {
             listener,
             tenant: raw.tenant,
             admin: AdminCredential::from_env(),
-            auth,
+            demo_auth,
+            operator,
             roles,
         })
     }
@@ -591,29 +613,28 @@ policy_file = "volume-ro.json"
         assert!(c.roles["volume-ro"].tpc.is_none());
     }
 
-    /// Inject an `[auth]` block before the first `[[role]]` in
-    /// SAMPLE. Injecting at `[tenant]` would land `parse_for_test`'s
-    /// `roles_dir = ...` line inside the `[auth]` table after my
-    /// replacement; injecting at `[[role]]` keeps every key in the
-    /// right table.
-    fn with_auth(s: &str, body: &str) -> String {
-        s.replacen("[[role]]", &format!("[auth]\n{body}\n\n[[role]]"), 1)
+    /// Inject a config block (e.g. `[operator]`) before the first
+    /// `[[role]]` in SAMPLE. Injecting at `[tenant]` would land
+    /// `parse_for_test`'s `roles_dir = ...` line inside the injected
+    /// table; injecting at `[[role]]` keeps every key in the right table.
+    fn with_block(s: &str, block: &str) -> String {
+        s.replacen("[[role]]", &format!("{block}\n\n[[role]]"), 1)
     }
 
     #[test]
     fn tpc_section_is_parsed() {
-        let toml = with_auth(
+        let toml = with_block(
             &SAMPLE.replace(
                 "policy_file = \"volume-ro.json\"",
                 "policy_file = \"volume-ro.json\"\n\
                  tpc = { location = \"https://auth.example/v1/discharge\" }",
             ),
-            "endpoint = \"https://auth.example/\"",
+            "[operator]\nlocation = \"https://auth.example/v1/discharge\"",
         );
         let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
         let tpc = c.roles["volume-ro"].tpc.as_ref().expect("tpc present");
         assert_eq!(tpc.location, "https://auth.example/v1/discharge");
-        assert!(c.auth.is_some());
+        assert!(c.operator.is_some());
     }
 
     #[test]
@@ -630,23 +651,29 @@ policy_file = "volume-ro.json"
     }
 
     #[test]
-    fn auth_block_is_parsed() {
-        let toml = with_auth(
+    fn demo_auth_and_operator_blocks_are_parsed() {
+        let toml = with_block(
             SAMPLE,
-            "endpoint = \"https://auth.example/\"\ndemo_enabled = true",
+            "[demo_auth]\nenabled = true\n\n\
+             [operator]\nlocation = \"https://auth.example/v1/discharge\"",
         );
         let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
-        let auth = c.auth.expect("auth present");
-        assert_eq!(auth.endpoint, "https://auth.example/");
-        assert!(auth.demo_enabled);
+        let demo = c.demo_auth.expect("demo_auth present");
+        assert!(demo.enabled);
+        assert!(demo.socket.is_some(), "socket resolves when enabled");
+        assert_eq!(
+            c.operator.expect("operator present").location,
+            "https://auth.example/v1/discharge"
+        );
     }
 
     #[test]
-    fn auth_demo_enabled_defaults_to_false() {
-        let toml = with_auth(SAMPLE, "endpoint = \"https://auth.example/\"");
+    fn demo_auth_enabled_defaults_to_false() {
+        let toml = with_block(SAMPLE, "[demo_auth]\nsocket = \"x.sock\"");
         let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
-        let auth = c.auth.expect("auth present");
-        assert!(!auth.demo_enabled);
+        let demo = c.demo_auth.expect("demo_auth present");
+        assert!(!demo.enabled);
+        assert!(demo.socket.is_none(), "socket ignored when disabled");
     }
 
     #[test]
