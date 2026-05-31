@@ -41,11 +41,11 @@ const MACHINE_SEED: [u8; 32] = [55u8; 32];
 /// The org the demo store serves (`Store::init_k_m_a` assigns `"demo"`).
 /// The cli-token's TPC binds this; `/v1/discharge` cross-checks it.
 const ORG: &str = "demo";
-/// The TPC location — where the cli-token says to fetch a discharge. The
-/// verifier recovers `r` from the `VID` regardless of location, so the
-/// exact string is immaterial to verification; the test calls the auth
-/// router directly.
-const AUTH_LOCATION: &str = "https://auth.example/";
+/// The TPC location — the full discharge URL the cli-token says to fetch
+/// a discharge from. The verifier recovers `r` from the `VID` regardless
+/// of location, so the exact string is immaterial to verification; the
+/// test calls the auth router directly.
+const AUTH_LOCATION: &str = "https://auth.example/v1/discharge";
 
 // The admin action vocabulary mirrors the private `ADMIN_*` consts in
 // `mint::admin`: each endpoint clears exactly its own value, so the
@@ -67,7 +67,7 @@ bucket = "demo-bucket"
 enabled = true
 
 [operator]
-location = "https://auth.example/"
+location = "https://auth.example/v1/discharge"
 [[role]]
 name = "volume-rw"
 required_caveats = []
@@ -75,7 +75,7 @@ min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 policy_file = "volume-rw.json"
-tpc = { location = "https://auth.example/" }
+tpc = { location = "https://auth.example/v1/discharge" }
 "#;
 
 fn config() -> Config {

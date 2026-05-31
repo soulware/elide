@@ -717,8 +717,7 @@ async fn operator_session(
     let operator = mint::operator::Operator::load(&cfg.data_dir)?;
     let session = mint::operator::load_session(&cfg.data_dir)?;
     let socket = auth_socket(cfg)?;
-    let discharge =
-        mint::operator::fetch_discharge(&socket, &session, &operator.cid_b64()?).await?;
+    let discharge = operator.fetch_discharge(&socket, &session).await?;
     Ok((operator, discharge))
 }
 

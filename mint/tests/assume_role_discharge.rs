@@ -54,7 +54,7 @@ bucket = "demo-bucket"
 enabled = true
 
 [operator]
-location = "unix:/unused-in-this-test"
+location = "https://auth.elide.internal/v1/discharge"
 [[role]]
 name = "write"
 required_caveats = ["sub", "aud", "exp"]
@@ -62,7 +62,7 @@ min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300
 policy_file = "write.json"
-tpc = { location = "unix:/unused-in-this-test" }
+tpc = { location = "https://auth.elide.internal/v1/discharge" }
 "#;
     common::parse_config(toml, &[("write.json", r#"{"Version":"2012-10-17"}"#)])
 }

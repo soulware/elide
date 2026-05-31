@@ -452,7 +452,7 @@ caveats are the minimum needed to anchor the bundle:
 caveats:
   aud = mint
   cnf = ed25519:<machine pubkey>
-  TPC:  location = auth-service, VID/CID encrypted under K_M-A
+  TPC:  location = discharge URL (path = discharge route), VID/CID encrypted under K_M-A
 ```
 
 No `op` and no `exp` on the base token. The operator attenuates
@@ -497,7 +497,17 @@ each admin call the CLI fetches a **wide discharge** for the service
 token's third-party caveat from `POST <auth>/v1/discharge` (gated by the
 session, recovering the discharge key from the caveat's `CID` under
 `K_M-A`). The discharge carries `Subject` and a short `NotAfter` and
-**no** `op`, so one fetch satisfies every verb. The CLI then attenuates
+**no** `op`, so one fetch satisfies every verb.
+
+The discharge **route** is the *path* of the service token's own TPC
+`location`; the **transport** that path is dialed over is supplied
+separately — the `[demo_auth]` socket in the colocated demo, a network
+endpoint for a standalone auth service. `location` is the only auth
+endpoint carried as a full URL, because it rides inside the macaroon and
+must be self-contained; `/v1/login` and `/v1/discharge` are otherwise
+fixed routes the CLI dials over that transport, and `mint logout` is
+purely local. This mirrors how an enrolling client derives its discharge
+route from a credential's TPC `location` (§ *Operator authorization*). The CLI then attenuates
 the call's `op=admin:<verb>` onto the service token, bundles `[service
 token, discharge]`, and PoP-signs the attenuated tail with the machine
 key.
