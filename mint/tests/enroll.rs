@@ -544,18 +544,19 @@ async fn bearer_invite_without_cnf_is_opaque_401() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-/// A separate harness with `[auth]` configured and two operator-write
-/// roles, so the exchange path stamps a TPC. Mirrors `app()` but
-/// builds Store with `init_k_m_a` and a config that includes the
-/// `[auth]` block.
+/// A separate harness with `[demo_auth]` + `[operator]` configured and
+/// two operator-write roles, so the exchange path stamps a TPC. Mirrors
+/// `app()` but builds Store with `init_k_m_a` and a config that includes
+/// the auth blocks.
 async fn tpc_app() -> (axum::Router, Arc<Store>, tempfile::TempDir) {
     const TOML_TPC: &str = r#"
 audience = "mint"
 [tenant]
 bucket = "demo-bucket"
-[auth]
-endpoint = "https://auth.example/"
-demo_enabled = true
+[demo_auth]
+enabled = true
+[operator]
+location = "https://auth.example/"
 [[role]]
 name = "coord-rw"
 required_caveats = ["aud"]

@@ -50,9 +50,11 @@ fn config() -> Config {
 audience = "mint"
 [tenant]
 bucket = "demo-bucket"
-[auth]
-endpoint = "unix:/unused-in-this-test"
-demo_enabled = true
+[demo_auth]
+enabled = true
+
+[operator]
+location = "unix:/unused-in-this-test"
 [[role]]
 name = "write"
 required_caveats = ["sub", "aud", "exp"]

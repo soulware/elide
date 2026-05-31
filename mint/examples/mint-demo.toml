@@ -4,8 +4,8 @@
 # exercises plain issuance (login → invite → enroll → approve → exchange →
 # assume-role); `write` adds the operator-authorisation loop — it carries
 # a third-party caveat, so assume-role is refused until the client fetches
-# a discharge from [auth] and attaches it. This is NOT the Elide role
-# inventory (see mint-elide.toml for that).
+# a discharge from the auth role and attaches it. This is NOT the Elide
+# role inventory (see mint-elide.toml for that).
 # Each role's policy template lives under roles_dir (examples/demo_roles/).
 #
 # `mint serve` always talks to a real S3-compatible backend (Tigris,
@@ -29,22 +29,25 @@ socket = "mint_data/mint.sock"        # client: --url unix:mint_data/mint.sock
 # For a TCP listener instead, replace the line above with:
 #   bind = "127.0.0.1:8085"           # client: --url http://127.0.0.1:8085
 
-# Auth service (docs/design-auth-service.md): the operator cli-token's
-# TPC location, and whether mint colocates a demo auth role.
-[auth]
+# Colocate the auth role on its own UDS instead of a separate
+# auth-service binary (docs/design-auth-service.md). Demo / single-host
+# only; generates K_M-A and K_session on first start.
+[demo_auth]
+enabled = true
+# UDS the colocated auth role binds for /v1/login + /v1/discharge,
+# separate from mint.sock above, and the transport the operator/client
+# dial to reach it. Defaults to <data_dir>/auth.sock; ignored when
+# enabled = false.
+socket = "mint_data/auth.sock"
+
+# Operator auth integration. Required because the write role below sets
+# [role.tpc] — the cli-token and role TPCs are keyed by K_M-A.
+[operator]
 # The `location` stamped into the operator cli-token's TPC. Per-role TPC
 # locations live in each [role.tpc]. In the single-host demo the operator
-# reaches the auth role over the socket below, so a `unix:` location is
+# reaches the auth role over [demo_auth].socket, so a `unix:` location is
 # the honest value.
-endpoint = "unix:mint_data/auth.sock"
-# Colocate the auth role on its own UDS instead of a separate
-# auth-service binary. Demo / single-host only; generates K_M-A and
-# K_session on first start.
-demo_enabled = true
-# UDS the colocated auth role binds for /v1/login + /v1/discharge,
-# separate from mint.sock above. Defaults to <data_dir>/auth.sock;
-# ignored when demo_enabled = false.
-socket = "mint_data/auth.sock"
+location = "unix:mint_data/auth.sock"
 
 [tenant]
 bucket = "mint-demo"

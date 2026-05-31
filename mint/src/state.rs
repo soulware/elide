@@ -449,7 +449,7 @@ impl Store {
                 if !demo_enabled {
                     return Err(io::Error::other(format!(
                         "K_M-A absent at {path:?}; mint requires auth-service \
-                         enrollment or [auth] demo_enabled = true"
+                         enrollment or [demo_auth] enabled = true"
                     )));
                 }
                 let mut fresh = [0u8; 32];

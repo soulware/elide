@@ -435,10 +435,10 @@ async fn write_cli_token(cfg: &Config, store: &Store) -> Result<(), Box<dyn std:
     let Some(k_m_a) = store.k_m_a().copied() else {
         return Ok(()); // no auth → no admin plane → no cli-token
     };
-    let auth = cfg
-        .auth
+    let operator = cfg
+        .operator
         .as_ref()
-        .ok_or("cli-token: K_M-A present without an [auth] block")?;
+        .ok_or("cli-token: K_M-A present without an [operator] block")?;
     let org_id = store.org_id().unwrap_or("demo").to_string();
 
     let mut seed = [0u8; 32];
@@ -452,7 +452,7 @@ async fn write_cli_token(cfg: &Config, store: &Store) -> Result<(), Box<dyn std:
         &cfg.audience,
         &cnf,
         &org_id,
-        &auth.endpoint,
+        &operator.location,
     );
 
     write_0600(&cfg.data_dir.join("cli-token"), mac.encode().as_bytes())?;
@@ -490,14 +490,15 @@ async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std:
     let legacy = cfg.data_dir.join("root_key");
     let mut store =
         Store::open_remote(s3, &cfg.data_dir.join("root_keys"), Some(&legacy), None).await?;
-    // K_M-A is needed wherever `[auth]` is configured (TPC verification
-    // and demo discharge issuance). Demo mode generates it locally;
-    // production loads what auth-service enrollment provisioned.
-    // K_session is purely the colocated demo auth role's session root —
-    // generated only under `demo_enabled`.
-    if let Some(auth) = &cfg.auth {
-        store.init_k_m_a(&cfg.data_dir, auth.demo_enabled)?;
-        if auth.demo_enabled {
+    // K_M-A is needed wherever an auth integration is configured (TPC
+    // verification and demo discharge issuance): a colocated demo auth
+    // role generates it locally, otherwise `[operator]` signals that the
+    // auth-service binary provisioned it. K_session is purely the demo
+    // auth role's session root — generated only under `[demo_auth]`.
+    let demo_enabled = cfg.demo_auth.as_ref().is_some_and(|d| d.enabled);
+    if demo_enabled || cfg.operator.is_some() {
+        store.init_k_m_a(&cfg.data_dir, demo_enabled)?;
+        if demo_enabled {
             store.init_k_session(&cfg.data_dir)?;
         }
     }
@@ -594,17 +595,17 @@ async fn serve(
     // operator surface, not an auth-role concern).
     let mint_app = mint::admin::mount(router(state.clone()), state.clone());
 
-    // The auth role lives on its own UDS when `[auth].demo_enabled =
+    // The auth role lives on its own UDS when `[demo_auth].enabled =
     // true`. mint-as-auth is structurally not mint: separate listener,
     // separate router, no shared HTTP path. Production deploys run a
     // standalone auth-service binary instead — mint never opens this
-    // socket without `demo_enabled`.
+    // socket without `[demo_auth]`. (`socket` is `Some` only when
+    // `enabled`, resolved in `Config::from_raw`.)
     let auth_socket = state
         .config
-        .auth
+        .demo_auth
         .as_ref()
-        .and_then(|a| a.socket.clone())
-        .filter(|_| state.config.auth.as_ref().is_some_and(|a| a.demo_enabled));
+        .and_then(|d| d.socket.clone());
 
     let mint_listener: Pin<Box<dyn Future<Output = io::Result<()>> + Send>> = match transport {
         Listener::Tcp(addr) => {
@@ -665,16 +666,16 @@ fn admin_target(cfg: &Config) -> mint::admin::AdminTarget<'_> {
 }
 
 /// The demo auth socket the operator logs in / fetches discharges over.
-/// Present only when `[auth].demo_enabled = true` — the only auth
+/// Present only when `[demo_auth].enabled = true` — the only auth
 /// backend that exists in-tree. Production runs a separate auth-service
 /// binary; wiring the operator to that endpoint is out of scope here.
 fn auth_socket(cfg: &Config) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    cfg.auth
+    cfg.demo_auth
         .as_ref()
-        .and_then(|a| a.socket.clone())
+        .and_then(|d| d.socket.clone())
         .ok_or_else(|| {
             "operator plane requires a colocated demo auth role \
-             ([auth].demo_enabled = true); no auth socket is configured"
+             ([demo_auth].enabled = true); no auth socket is configured"
                 .into()
         })
 }
