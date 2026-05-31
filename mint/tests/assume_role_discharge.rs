@@ -116,7 +116,11 @@ async fn write_credential_assumes_role_only_after_fetching_a_discharge() {
 
     let mint_sock = server_dir.path().join("mint.sock");
     let auth_sock = server_dir.path().join("auth.sock");
-    let auth_location = format!("unix:{}", auth_sock.display());
+    // The credential's TPC location is a full discharge URL (path
+    // source); the client dials the auth socket as the transport, saved
+    // by `client login --url`.
+    let auth_location = "http://localhost/v1/discharge".to_string();
+    let auth_transport = format!("unix:{}", auth_sock.display());
 
     // Bring up the mint router and the colocated demo-auth router on
     // their own sockets, sharing one AppState.
@@ -148,7 +152,7 @@ async fn write_credential_assumes_role_only_after_fetching_a_discharge() {
     // The client logs in at the auth role first (`mint client login`);
     // assume_role on a TPC-bearing credential reads that saved session
     // and presents it on the session-gated `/v1/discharge`.
-    client::login_cmd(client_dir.path(), &auth_location, "operator")
+    client::login_cmd(client_dir.path(), &auth_transport, "operator")
         .await
         .expect("client login");
 

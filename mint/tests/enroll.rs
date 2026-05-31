@@ -564,7 +564,7 @@ min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 policy_file = "rw.json"
-tpc = { location = "https://auth.example/" }
+tpc = { location = "https://auth.example/v1/discharge" }
 [[role]]
 name = "volume-rw"
 required_caveats = ["aud"]
@@ -572,7 +572,7 @@ min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 policy_file = "rw.json"
-tpc = { location = "https://auth.example/" }
+tpc = { location = "https://auth.example/v1/discharge" }
 "#;
     let cfg = common::parse_config(TOML_TPC, &[("rw.json", VOLUME_RW_POLICY)]);
     let buf = Arc::new(Mutex::new(Vec::new()));
@@ -656,7 +656,7 @@ async fn tpc_role_credential_carries_third_party_caveat() {
                 cid: cid_b,
             },
         ) => {
-            assert_eq!(loc_a, "https://auth.example/");
+            assert_eq!(loc_a, "https://auth.example/v1/discharge");
             assert_eq!(loc_a, loc_b);
             // One discharge serves both: CID is identical across the
             // operator-write credentials because both share the same
