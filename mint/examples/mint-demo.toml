@@ -67,6 +67,9 @@ max_ttl_seconds = 900
 default_ttl_seconds = 300
 # [role.tpc] binds a third-party caveat into every credential this role
 # issues: assume-role refuses it until the client fetches a discharge
-# from tpc.location and attaches it.
+# from tpc.location and attaches it. location is the full discharge URL
+# (path included); the client supplies the transport via `mint client
+# login --url`, so in the single-host demo the host below is a placeholder
+# and the client dials [demo_auth].socket.
 [role.tpc]
-location = "unix:mint_data/auth.sock"
+location = "http://localhost/v1/discharge"

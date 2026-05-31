@@ -33,6 +33,12 @@ const PUB_FILE: &str = "client.pub";
 /// discharge issuance for TPC-bearing roles. Held in the client dir,
 /// mode 0600, like the identity key.
 pub const SESSION_FILE: &str = "cli-session";
+/// The auth-service transport saved at `mint client login` — the `--url`
+/// the client dialed (e.g. `unix:<sock>` or `http(s)://host`). Reused to
+/// reach `/v1/discharge` at assume-role time: a credential's TPC
+/// `location` is a full URL that supplies only the request *path*, while
+/// this supplies *how to connect* (the Bun `fetch(url, {unix})` split).
+const AUTH_TRANSPORT_FILE: &str = "auth-transport";
 /// Default `enroll --out` / `exchange --in`: the credential ticket —
 /// the short-lived, redeem-once token you trade in at the exchange.
 pub const CREDENTIAL_TICKET_FILE: &str = "credential.ticket";
@@ -628,17 +634,21 @@ async fn fetch_discharges(dir: &Path, primary: &Macaroon) -> Result<Vec<Macaroon
     if !has_tpc {
         return Ok(Vec::new());
     }
-    // One session covers every third-party caveat on this credential;
-    // load it once (and surface a clear "run mint client login" if the
-    // operator skipped that step).
+    // One session + transport cover every third-party caveat on this
+    // credential; load them once (and surface a clear "run mint client
+    // login" if the operator skipped that step).
     let session = load_session(dir)?;
+    let transport = load_auth_transport(dir)?;
     let mut discharges = Vec::new();
     for c in primary.caveats() {
         let Caveat::ThirdParty { location, cid, .. } = c else {
             continue;
         };
-        eprintln!("  credential carries a third-party caveat → fetching discharge from {location}");
-        let mut discharge = fetch_discharge(location, cid, &session).await?;
+        eprintln!(
+            "  credential carries a third-party caveat → fetching discharge \
+             from {location} (via {transport})"
+        );
+        let mut discharge = fetch_discharge(&transport, location, cid, &session).await?;
         let deadline = now_unix().saturating_add(PER_IPC_NOT_AFTER_SECONDS);
         discharge = discharge.attenuate(Caveat::scalar(name::NOT_AFTER, deadline.to_string()));
         eprintln!("    ← discharge received; per-IPC NotAfter={deadline}");
@@ -667,11 +677,40 @@ pub async fn login_cmd(dir: &Path, url: &str, subject: &str) -> Result<(), Clien
     let session = login(url, subject).await?;
     fs::create_dir_all(dir)?;
     write_0600(&dir.join(SESSION_FILE), session.as_bytes())?;
+    // Persist the transport so a later `assume-role` can reach
+    // `/v1/discharge` over the same connection — the credential's TPC
+    // `location` carries only the path.
+    write_0600(&dir.join(AUTH_TRANSPORT_FILE), url.as_bytes())?;
     eprintln!(
         "logged in as {subject} at {url}; session saved to {}",
         dir.join(SESSION_FILE).display()
     );
     Ok(())
+}
+
+/// Load the auth-service transport saved at `mint client login`. A
+/// missing one points the operator at `mint client login`, the same as a
+/// missing session.
+fn load_auth_transport(dir: &Path) -> Result<String, ClientError> {
+    read_text(
+        &dir.join(AUTH_TRANSPORT_FILE),
+        "run `mint client login --url <auth-url>` first",
+    )
+    .map(|s| s.trim().to_string())
+}
+
+/// The request path of a TPC `location` (a full URL, e.g.
+/// `http://localhost/v1/discharge`). The host is not dialed — the saved
+/// transport supplies the connection — so only the path is taken.
+fn discharge_path(location: &str) -> Result<String, ClientError> {
+    let uri: hyper::Uri = location
+        .parse()
+        .map_err(|_| ClientError::BadFile("tpc location"))?;
+    let path = uri.path();
+    if path.is_empty() || path == "/" {
+        return Err(ClientError::BadFile("tpc location"));
+    }
+    Ok(path.to_string())
 }
 
 /// Remove the saved session (`mint client logout`). Returns whether a
@@ -701,6 +740,7 @@ fn load_session(dir: &Path) -> Result<String, ClientError> {
 /// bearer and decode the returned discharge macaroon. The session's
 /// `Subject` is what the discharge attests.
 async fn fetch_discharge(
+    transport: &str,
     location: &str,
     cid: &[u8],
     session: &str,
@@ -711,7 +751,8 @@ async fn fetch_discharge(
         ("content-type", "application/json".into()),
         ("authorization", format!("Bearer {session}")),
     ];
-    let (status, text) = send(location, "/v1/discharge", &headers, body).await?;
+    let path = discharge_path(location)?;
+    let (status, text) = send(transport, &path, &headers, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }

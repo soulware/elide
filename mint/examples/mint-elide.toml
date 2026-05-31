@@ -47,7 +47,7 @@ required_caveats = ["sub", "elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
-tpc = { location = "https://auth.elide.internal/" }
+tpc = { location = "https://auth.elide.internal/v1/discharge" }
 
 [[role]]
 name = "volume-rw-background"
@@ -70,7 +70,7 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
-tpc = { location = "https://auth.elide.internal/" }
+tpc = { location = "https://auth.elide.internal/v1/discharge" }
 
 [[role]]
 name = "coord-rw-background"
