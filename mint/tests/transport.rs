@@ -75,7 +75,9 @@ async fn full_flow_over_unix_socket() {
     let store = Arc::new(store_inner);
     let nonce = store.current_invite().await.expect("nonce");
     let cfg = config();
-    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
+    let seal = Arc::new(arc_swap::ArcSwap::from_pointee(
+        mint::sealed_cache::serving_from_config(&cfg),
+    ));
     let state = AppState {
         config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),

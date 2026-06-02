@@ -105,6 +105,13 @@ impl std::io::Write for AuditSink {
 /// are the same values at both roles — the boundary is the listener /
 /// router, not the underlying secret material.
 async fn app() -> (Router, Router, tempfile::TempDir) {
+    app_seeded(true).await
+}
+
+/// As [`app`], but `serving` chooses the initial seal state: `true` for a
+/// serving surface (the common case), `false` for **dormant** — the
+/// cold-box state a `mint seal` call lifts live without a restart.
+async fn app_seeded(serving: bool) -> (Router, Router, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join("root_key"), root_hex).expect("root_key");
@@ -117,7 +124,12 @@ async fn app() -> (Router, Router, tempfile::TempDir) {
     // Co-locate data_dir with the store so the seal endpoint's sealed
     // cache lands under the tempdir, not the cwd.
     cfg.data_dir = dir.path().to_path_buf();
-    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
+    let initial = if serving {
+        mint::sealed_cache::serving_from_config(&cfg)
+    } else {
+        mint::sealed_cache::SealState::Dormant
+    };
+    let seal = Arc::new(arc_swap::ArcSwap::from_pointee(initial));
     let state = AppState {
         config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),
@@ -374,6 +386,51 @@ async fn seal_endpoint_publishes_and_caches() {
         .expect("policies dir")
         .count();
     assert!(policies >= 1, "at least one content-addressed policy file");
+}
+
+#[tokio::test]
+async fn seal_serves_live_without_restart() {
+    // The cold-box scenario: a daemon that came up dormant (no seal at
+    // startup) is sealed over the admin plane and serves the new surface
+    // immediately — no restart. Proven through /readyz flipping 503 → 200
+    // on the same running router, exercising the ArcSwap end to end.
+    let (mint_router, auth_router, _dir) = app_seeded(false).await;
+    let token = cli_token();
+    let discharge = fetch_discharge(auth_router, &cli_token_cid(&token)).await;
+
+    let readyz = || {
+        Request::builder()
+            .method("GET")
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // Dormant: readiness is 503.
+    let (status, _) = body_string(mint_router.clone().oneshot(readyz()).await.unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "dormant before seal"
+    );
+
+    // Seal over the admin plane.
+    let body = format!(r#"{{"ts":{}}}"#, now());
+    let req = admin_request(
+        &token,
+        &discharge,
+        "admin:seal",
+        "POST",
+        "/v1/admin/seal",
+        &body,
+    );
+    let (status, resp) = body_string(mint_router.clone().oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "seal body: {resp}");
+
+    // Live swap: readiness is now 200 — the new surface is served without
+    // any restart.
+    let (status, _) = body_string(mint_router.oneshot(readyz()).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "serving immediately after seal");
 }
 
 #[tokio::test]

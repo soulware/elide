@@ -34,7 +34,7 @@ use crate::issuance::mint_invite;
 use crate::macaroon::Macaroon;
 use crate::operator::Operator;
 use crate::seal::Seal;
-use crate::sealed_cache;
+use crate::sealed_cache::{self, SealState, ServedSurface};
 use crate::state::{EnrollmentState, EnrollmentView, Store};
 
 fn unauthorized_response() -> Response {
@@ -376,13 +376,26 @@ async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: By
         .iter()
         .map(|(n, r)| (n.clone(), r.policy_blake3.clone()))
         .collect();
+
+    // Swap this host's served surface to the seal it just authored. The
+    // surface satisfies that seal by construction (it is built from the
+    // same config), so the new content goes live here immediately —
+    // dormant or not — without a restart. In-flight requests finish
+    // against the surface they loaded (`docs/design-mint-template-seal.md`
+    // § *Dormant until sealed*).
+    let surface = ServedSurface {
+        seal: seal.clone(),
+        templates,
+    };
+    state.seal.store(Arc::new(SealState::Serving(surface)));
+
     tracing::info!(
         target: "mint::admin",
         operator = %operator,
         kid = seal.kid,
         sealed_at = %sealed_at,
         roles = roles.len(),
-        "published template seal (restart to serve it)"
+        "published template seal (now serving)"
     );
     json_ok(SealResponse {
         kid: seal.kid,

@@ -20,6 +20,7 @@ description = "Macaroon-authenticated scoped-credential vending for Tigris (prot
 # same CID for one discharge to satisfy both
 # (`docs/design-auth-service.md` § *Keys*).
 aes-gcm-siv          = "0.11"
+arc-swap             = "1"
 async-trait          = "0.1"
 aws-credential-types = "1"
 aws-sigv4            = { version = "1", default-features = false, features = ["sign-http", "http1"] }

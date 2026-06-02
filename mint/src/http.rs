@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -61,11 +62,13 @@ pub struct AppState {
     pub minter: Arc<dyn KeypairMinter>,
     pub audit: Arc<AuditLog>,
     pub store: Arc<Store>,
-    /// The template-seal state resolved at startup. `Dormant` closes
-    /// `/v1/assume-role` + `/v1/enroll-exchange` and `/readyz`; the
-    /// auth/admin planes are seal-independent and stay live
+    /// The template-seal state. `Dormant` closes `/v1/assume-role` +
+    /// `/v1/enroll-exchange` and `/readyz`; the auth/admin planes are
+    /// seal-independent and stay live. Held in an `ArcSwap` so the host
+    /// that runs `mint seal` can replace its served surface live — the
+    /// request path `.load()`s the current state per request
     /// (`docs/design-mint-template-seal.md` § *Dormant until sealed*).
-    pub seal: Arc<SealState>,
+    pub seal: Arc<ArcSwap<SealState>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -84,7 +87,7 @@ pub fn router(state: AppState) -> Router {
 /// host out of rotation until an operator seals it and it restarts.
 /// Liveness (`/healthz`) is seal-independent and always `ok`.
 async fn readyz(State(state): State<AppState>) -> Response {
-    match state.seal.as_ref() {
+    match state.seal.load().as_ref() {
         SealState::Serving(_) => (StatusCode::OK, "ready").into_response(),
         SealState::Dormant => (StatusCode::SERVICE_UNAVAILABLE, "not sealed").into_response(),
     }
@@ -402,7 +405,8 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     // (no canonical seal at startup). The sealed surface — not the live
     // config — is the authority for audience, the role's required
     // caveats / TTL bounds, and the policy bytes. ---
-    let surface = match state.seal.as_ref() {
+    let seal = state.seal.load();
+    let surface = match seal.as_ref() {
         SealState::Serving(s) => s,
         SealState::Dormant => {
             audit(base_entry("denied:not_sealed"));
@@ -857,7 +861,8 @@ async fn enroll_exchange(
     // Issuance is seal-gated: minting a credential decides whether the
     // role carries a TPC (the operator-consent gate), so it reads the
     // sealed surface, and is closed while dormant.
-    let surface = match state.seal.as_ref() {
+    let seal = state.seal.load();
+    let surface = match seal.as_ref() {
         SealState::Serving(s) => s,
         SealState::Dormant => {
             audit("denied:not_sealed", &[]);

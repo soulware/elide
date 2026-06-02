@@ -77,7 +77,9 @@ async fn app() -> (axum::Router, tempfile::TempDir) {
     let mut store = Store::open_local(dir.path()).await.expect("store");
     store.init_k_m_a(dir.path(), true).expect("init_k_m_a");
     let cfg = config();
-    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
+    let seal = Arc::new(arc_swap::ArcSwap::from_pointee(
+        mint::sealed_cache::serving_from_config(&cfg),
+    ));
     let state = AppState {
         config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),

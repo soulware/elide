@@ -88,7 +88,9 @@ async fn state_with_audit() -> (
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
     let cfg = config();
-    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
+    let seal = Arc::new(arc_swap::ArcSwap::from_pointee(
+        mint::sealed_cache::serving_from_config(&cfg),
+    ));
     let state = AppState {
         config: Arc::new(cfg),
         minter: minter.clone(),
@@ -306,7 +308,9 @@ async fn dormant_closes_assume_role_and_readiness() {
         minter: Arc::new(FakeMinter::new()),
         audit: Arc::new(AuditLog::new(Box::new(std::io::sink()))),
         store: Arc::new(Store::open_local(dir.path()).await.expect("store")),
-        seal: Arc::new(mint::sealed_cache::SealState::Dormant),
+        seal: Arc::new(arc_swap::ArcSwap::from_pointee(
+            mint::sealed_cache::SealState::Dormant,
+        )),
     };
     let app = router(state);
 

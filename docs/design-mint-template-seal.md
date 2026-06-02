@@ -133,13 +133,19 @@ has to make that distinction. It realises the design's intent —
 could not, because there was no running daemon to seal against on a
 cold box.
 
-Moving from dormant to serving requires a restart. The seal endpoint
-publishes the canonical seal; it does not live-swap a running
-daemon's templates. A running mint instance therefore has exactly one
-template state for its lifetime — *dormant*, or *verified against the
-seal that existed at startup and serving from the cache loaded then* —
-and any change is a restart. The dormant→serving transition is not
-special-cased; it obeys the same single-state principle as a re-seal.
+The host that authors a seal (`POST /v1/admin/seal`) swaps its own
+served surface live. After PUTting `seal.json` and writing its sealed
+cache, it builds the surface from its own config — which satisfies the
+seal it just authored by construction — and atomically replaces what it
+was serving (an `ArcSwap`; in-flight requests finish against the surface
+they started on). So `mint seal` takes effect immediately on the host it
+runs against, whether that host was dormant or already serving an
+earlier seal. Other hosts do not watch the bucket; they adopt the new
+canonical seal on their next restart (see *Startup*), so a fleet still
+converges through a rolling restart — the authoring host is simply the
+first to flip. The swap is the last step and has no side effects: PUT
+bucket → write cache → swap, so a crash before the swap leaves bucket
+and cache consistent and a restart resolves to the same surface.
 
 ### The sealed cache
 
@@ -257,8 +263,11 @@ Daemon side:
    `sealed_at`, the operator subject, and per-role hashes.
 5. Write the sealed cache to `<data_dir>/sealed/` from the bytes just
    hashed — the sealing host now holds a cache for the seal it
-   published (it still keeps serving its prior state until restarted).
-6. Return the kid, `sealed_at`, and per-role hashes to the client,
+   published.
+6. Atomically swap the served surface to the one just sealed; the new
+   content is live on this host immediately, dormant or not. In-flight
+   requests finish against the surface they started on.
+7. Return the kid, `sealed_at`, and per-role hashes to the client,
    which prints a one-line summary.
 
 The daemon seals its **own local** `roles_dir/` — there is no
@@ -364,20 +373,18 @@ window. We do not use `mmap`.
 
 ```
 mint serve              # comes up dormant — no seal yet
-mint seal               # authenticated; daemon hashes local templates, publishes
-systemctl restart mint  # loads the seal, serves roles
+mint seal               # authenticated; daemon hashes local templates, publishes, and serves
 ```
 
 To update templates:
 
 ```
 edit roles_dir/volume-ro.json   # via config-management
-mint seal                       # re-publishes the seal over the new content
-systemctl restart mint          # adopts the new seal, serves
+mint seal                       # re-publishes over the new content and serves it
 ```
 
-The seal call needs no downtime; the restart is the only window —
-small for a stateless auth service.
+The seal call needs no downtime and no restart — the host it runs
+against swaps to the new content the moment it publishes.
 
 ### Multi-instance
 
@@ -386,8 +393,9 @@ exactly as `mint.toml` is. To (re)seal the fleet:
 
 1. Provisioning writes the template files to every host.
 2. Operator runs `mint seal` once, against any one running host.
-   That daemon hashes its local templates and publishes `seal.json`.
-3. Rolling-restart the fleet. On restart each host sees the seal has
+   That daemon hashes its local templates, publishes `seal.json`, and
+   swaps its own surface to serve the new content immediately.
+3. Rolling-restart the other hosts. On restart each sees the seal has
    advanced past its cache, adopts it by re-deriving its cache from its
    own local templates, and serves. A host provisioning hasn't reached,
    or whose files were tampered, can't reconcile to the new seal and
@@ -395,9 +403,10 @@ exactly as `mint.toml` is. To (re)seal the fleet:
    orchestrator until it is reprovisioned and restarted.
 
 A fleet brought up from cold comes up all-dormant; the single seal in
-step 2 plus the rolling restart in step 3 brings every host to
-serving. No host needs shell access for the seal — it is a network
-call to one daemon, gated by an operator discharge.
+step 2 brings the host it runs against to serving, and the rolling
+restart in step 3 brings the rest. No host needs shell access for the
+seal — it is a network call to one daemon, gated by an operator
+discharge.
 
 ### Restart before re-seal is safe
 
@@ -469,12 +478,11 @@ operator's nose every time the keyring rotated).
 
 ## What's out of scope
 
-- **Hot reload.** `POST /v1/admin/seal` publishes the canonical
-  seal; it does not live-swap a running daemon's in-memory templates.
-  Every transition — dormant→serving or one sealed state→another — is
-  a restart. The single-state principle (a running process has
-  exactly one template state for its lifetime) is worth the small
-  restart cost.
+- **Fleet-wide live reload.** The host that runs `mint seal` swaps its
+  own served surface live (see *Dormant until sealed*), but other hosts
+  do not watch the bucket seal — they adopt a new canonical seal on
+  their next restart, not the moment it is published. A fleet converges
+  through a rolling restart, not a push.
 - **Auto-seal.** Mint never commits on-disk bytes as canonical on its
   own. The dormant state makes the first seal an explicit operator
   action like every later one, and removes the "operator deletes the
@@ -529,10 +537,11 @@ operator's nose every time the keyring rotated).
   `seal.json`," and dormant is the same safe behaviour for both —
   serve no roles, wait for an explicit seal, never re-commit on-disk
   bytes silently.
-- **Restart between seal and serving.** Kept, not engineered away.
-  The dormant→serving transition is a restart (single-state
-  principle), the same as any re-seal; the alternative is hot reload,
-  which is out of scope.
+- **Restart between seal and serving.** Engineered away on the
+  authoring host: `POST /v1/admin/seal` swaps that host's served
+  surface live, dormant or not. Other hosts still pick up a new
+  canonical seal on their next restart — a rolling restart, not a
+  fleet-wide push (see *Fleet-wide live reload*).
 - **Restart-before-reseal must stay safe.** Resolved by the sealed
   cache: serving reads `<data_dir>/sealed/` (verified against the
   canonical seal), not `roles_dir/`, so a host can restart during the

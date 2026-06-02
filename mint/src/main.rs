@@ -584,7 +584,7 @@ async fn serve(
         minter,
         audit: Arc::new(AuditLog::new(Box::new(std::io::stdout()))),
         store,
-        seal: Arc::new(seal_state),
+        seal: Arc::new(arc_swap::ArcSwap::from_pointee(seal_state)),
     };
 
     // The mint role's app (admin routes are merged onto the same router
