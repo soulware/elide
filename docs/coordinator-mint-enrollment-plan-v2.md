@@ -30,12 +30,12 @@ is the approver's, on the mint host:
 
 | Gate | Discharged against | Presented by | When |
 |---|---|---|---|
-| **request** | the invite's TPC `CID` | this command, at `/v1/enroll` | step A |
+| **enroll** | the invite's TPC `CID` | this command, at `/v1/enroll` | step A |
 | **approve** | (admin-plane discharge) | `mint enroll approve`, separate operator | step B |
-| **initialize** | the ticket's TPC `CID` | this command, at `/v1/enroll-exchange` | step C |
+| **exchange** | the ticket's TPC `CID` | this command, at `/v1/enroll-exchange` | step C |
 
-The operator who runs `elide coord enroll` is the *requesting* and
-*initializing* operator (the same human is allowed; mint records each
+The operator who runs `elide coord enroll` is the *enrolling* and
+*exchanging* operator (the same human is allowed; mint records each
 `Subject` regardless). They must be **logged in** — the command fetches
 both discharges from the auth service using a stored operator session.
 The *approving* operator is whoever runs `mint enroll approve` on the
@@ -50,8 +50,8 @@ completed successfully.
 
 - **A — `POST /v1/enroll`.** The command attenuates the
   operator-supplied invite macaroon with `sub=<coord-ulid>` and
-  `cnf=ed25519:<coordinator.pub>`, **fetches a requesting discharge** for
-  the invite's TPC (route derived from the TPC `location`; gated by the
+  `cnf=ed25519:<coordinator.pub>`, **fetches an enroll-gate discharge**
+  for the invite's TPC (route derived from the TPC `location`; gated by the
   operator session), bundles `[invite ⊕ sub/cnf, discharge]`, PoP-signs
   the body (`{ts}`) with `coordinator.key`, and receives the short-lived
   **credential ticket** (which carries its own TPC). It prints the `cnf`
@@ -63,11 +63,11 @@ completed successfully.
   on the mint host, matching the printed fingerprint through a trusted
   side channel first.
 - **C — exchange fan-out.** Once approved, the command **fetches one
-  initializing discharge** for the ticket's TPC, then exchanges the
+  exchange-gate discharge** for the ticket's TPC, then exchanges the
   ticket once per role in the canonical inventory (`coord-ro`,
   `coord-rw`, `volume-rw`, `volume-ro`) — bundle `[ticket, discharge]`,
   body `{ts, role}`, same PoP — and writes each re-minted credential to
-  `credentials/<role>` (mode `0600`). One initializing discharge covers
+  `credentials/<role>` (mode `0600`). One exchange-gate discharge covers
   all four exchanges within its `NotAfter`; the approved record is not
   consumed per exchange.
 
@@ -95,18 +95,18 @@ role(s) and pointing at `elide coord enroll`. The `[mint]`-absent branch
 
 2. **Operator session is a prerequisite; discharges are fetched, not
    stored.** The command requires a live operator session (from `elide
-   operator login`); it fetches the requesting and initializing
+   operator login`); it fetches the enroll-gate and exchange-gate
    discharges on demand and holds them only in memory for the call. The
    discharge route is derived from each macaroon's TPC `location`, so no
    separate `--auth-url` flag is needed (the transport may still come
    from config / the session). Discharges are short-lived (~5 min) — the
-   command fetches the initializing discharge **after** approval, so it
+   command fetches the exchange-gate discharge **after** approval, so it
    is fresh for the fan-out, and re-fetches if a leg outlives it.
 
 3. **Self-healing the ticket-and-discharge expiry race.** Because the
    single command holds the invite for its whole duration, if the ticket
    `exp` passes during the wait-for-approval (operator slow), the command
-   transparently re-runs A — re-fetching the requesting discharge and
+   transparently re-runs A — re-fetching the enroll-gate discharge and
    re-enrolling — and continues. (After ticket expiry the mint-side
    pending record is GC'd and needs fresh approval; the command surfaces
    that it is re-enrolling so the operator knows a re-approve is
@@ -179,16 +179,16 @@ elide coord enroll [--data-dir <dir>] <invite-macaroon | file | ->
 - **Auth unreachable** (cannot fetch a discharge): fail with a clear
   "auth service unreachable — enrollment needs a logged-in operator"
   message; re-run is safe.
-- **Discharge `403`** (session valid but policy denies request- or
-  initialize-scope): surface the auth error; this Subject is not
-  permitted to enroll/initialize coordinators.
+- **Discharge `403`** (session valid but policy denies the `enroll` or
+  `exchange` scope): surface the auth error; this Subject is not
+  permitted to enroll or exchange-collect for coordinators.
 - **403 forever at exchange** (operator never approves): bounded by
   `--timeout`; clear message, idempotent re-run.
 - **401 at enroll**: bad/stale invite, wrong `op`, or an unsatisfied
-  invite TPC (missing/expired requesting discharge) — fail fast with the
+  invite TPC (missing/expired enroll-gate discharge) — fail fast with the
   mint error snippet.
 - **401 at exchange**: ticket expired, or the ticket TPC undischarged
-  (initializing discharge missing/expired) — decision (3) re-fetches and
+  (exchange-gate discharge missing/expired) — decision (3) re-fetches and
   retries; if a fresh ticket also 401s, the invite itself is
   stale/rotated (`mint invite --rotate`) — fail with that diagnosis.
 - **pub/sub conflict**: exchange keeps returning non-200; the command
@@ -209,7 +209,7 @@ elide coord enroll [--data-dir <dir>] <invite-macaroon | file | ->
   command with `--timeout` short, drive `mint enroll approve`, assert all
   four `credentials/<role>` files appear and decode, and that a second
   run is idempotent. The demo path exercises the full
-  request/initialize discharge legs end-to-end without a standalone auth
+  enroll/exchange discharge legs end-to-end without a standalone auth
   service.
 - Startup gate: `serve` with `[mint]` and an empty `credentials/` fails
   with the expected message; with all four present, proceeds.

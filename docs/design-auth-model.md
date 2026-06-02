@@ -17,9 +17,9 @@ Two distinct auth surfaces layer on that foundation:
 - **Operator authorisation** — gates coordinator **enrollment** and the
   **mint admin plane**, not runtime S3 writes. Operator authority is
   established at enrollment via three TPC gates, each discharged by a
-  logged-in operator: a TPC on the shared invite (the *requesting*
+  logged-in operator: a TPC on the shared invite (the *enrolling*
   operator, at `/v1/enroll`), a TPC on the credential ticket mint returns
-  (the *initializing* operator, at `/v1/enroll-exchange`), and the
+  (the *exchanging* operator, at `/v1/enroll-exchange`), and the
   *approving* operator's confirmation of the coordinator's key in
   between. The role credentials mint then issues carry **no** TPC — they
   are long-lived service tokens, and `assume-role` is app-driven. The
@@ -94,10 +94,10 @@ access.
 **What operator authorisation provides — audit + ceremony at
 enrollment, not runtime access control.** Operator authority is an
 enrollment-time attestation: bringing a coordinator into the fleet
-requires a *requesting* operator's discharge, an *approving* operator's
-confirmation, and an *initializing* operator's discharge when the
+requires an *enrolling* operator's discharge, an *approving* operator's
+confirmation, and an *exchanging* operator's discharge when the
 coordinator first pulls its credentials — all three attributed to humans
-in the audit trail (`requested_by`, `approved_by`, and the initializing
+in the audit trail (`requested_by`, `approved_by`, and the exchanging
 `Subject`); each mint admin verb requires a fresh operator discharge. This raises the bar over bare socket access and
 produces a centralised audit trail anchored at the auth service. It does
 not gate a coordinator's runtime S3 writes — those run on the
@@ -137,11 +137,11 @@ and require no per-write human attestation.
 The places a human decision is required:
 
 - **Enrollment** — three gates, each a TPC discharged by a logged-in
-  operator, none of them on a credential. A *requesting* operator
+  operator, none of them on a credential. A *enrolling* operator
   authorises a coordinator to attempt enrollment (a TPC on the shared
   invite); an *approving* operator — possibly a different human —
   confirms the coordinator's key (an admin-plane discharge); an
-  *initializing* operator is present when the coordinator first pulls its
+  *exchanging* operator is present when the coordinator first pulls its
   credentials (a TPC on the credential ticket, at `/v1/enroll-exchange`).
   All three identities are recorded. After that the coordinator holds
   TPC-free service credentials.
@@ -182,7 +182,7 @@ shape](https://github.com/superfly/macaroon/blob/main/macaroon-thought.md):
 **Coord holds no chain key and no discharge key, and is not on the
 discharge path.** The discharge is presented to mint by the party
 holding it — the coordinator at `/v1/enroll` and `/v1/enroll-exchange`
-(the requesting and initializing operators' discharges, conveyed to it),
+(the enrolling and exchanging operators' discharges, conveyed to it),
 the mint CLI at the admin endpoints. The TPC binding is woven into the
 invite's, the ticket's, and the service token's HMAC chains, so the
 discharge requirement cannot be stripped by any party who cannot mint

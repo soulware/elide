@@ -10,15 +10,15 @@ and is the concrete shape of the discharge anchors mint relies on.
 Operator authority is exercised at **three points, all at the mint
 boundary**, never on a runtime data path:
 
-- **Enrollment request** — the invite macaroon carries a TPC, so a
+- **Enroll** — the invite macaroon carries a TPC, so a
   coordinator can only attempt `/v1/enroll` when a logged-in operator
-  has discharged it (the *requesting* operator; see
+  has discharged it (the *enrolling* operator; see
   [`design-mint.md`](design-mint.md) § *Enrollment*).
-- **Credential issuance** — the credential ticket returned by
+- **Exchange** — the credential ticket returned by
   `/v1/enroll` carries its own TPC, so a coordinator can only pull its
   role credentials at `/v1/enroll-exchange` when a logged-in operator
-  discharges it (the *initializing* operator).
-- **Mint admin plane** — the CLI service token carries a TPC, so every
+  discharges it (the *exchanging* operator).
+- **Mint admin plane** (where *approve* lives) — the CLI service token carries a TPC, so every
   `/v1/admin/*` verb (invite management, enrollment approval) requires a
   fresh operator discharge (the *approving* operator and other admins;
   see [`design-mint.md`](design-mint.md) § *Operator authorization*).
@@ -43,10 +43,10 @@ There is no separate operator-auth credential artefact. Operator
 authority rides two third-party caveats already present in the system:
 
 - **Invite TPC** — the third-party caveat on the shared invite macaroon
-  (one per mint/org). Discharged by the *requesting* operator at
+  (one per mint/org). Discharged by the *enrolling* operator at
   `/v1/enroll`.
 - **Ticket TPC** — the third-party caveat on the credential ticket mint
-  returns from `/v1/enroll`. Discharged by the *initializing* operator
+  returns from `/v1/enroll`. Discharged by the *exchanging* operator
   at `/v1/enroll-exchange`.
 - **Admin-token TPC** — the third-party caveat on the mint CLI service
   token. Discharged by an operator on each `/v1/admin/*` call.
@@ -185,11 +185,11 @@ Slow cadence — once per org lifetime plus occasional rotation.
 ### Coord ↔ mint enrollment
 
 Per-coord deployment cadence, following the mint enrollment flow
-([`design-mint.md`](design-mint.md) § *Enrollment*): the *requesting*
+([`design-mint.md`](design-mint.md) § *Enrollment*): the *enrolling*
 operator discharges the invite's TPC and the coordinator self-asserts
 `sub`/`cnf` at `/v1/enroll`, which returns a short-lived **credential
 ticket** carrying its own TPC; the *approving* operator approves; then
-the *initializing* operator discharges the ticket's TPC and the
+the *exchanging* operator discharges the ticket's TPC and the
 coordinator presents `[ticket, discharge]` at `/v1/enroll-exchange`,
 which — checking mint's approved registry — issues each role credential.
 The exchange produces **four role credentials**, none of which carries a
@@ -211,13 +211,13 @@ neither on a credential, each `(location=<auth-url>, VID, CID)` with
 `VID = AEAD(T, r)` and `CID = AEAD(K_M-A, r ‖ OrgId)`:
 
 - The **invite's** TPC wraps `r_inv`. The invite is shared, so its `CID`
-  is the same for every coordinator; one requesting discharge can enroll
-  any number of coordinators in its window.
+  is the same for every coordinator; one enroll-gate discharge can bring
+  in any number of coordinators in its window.
 - The **ticket's** TPC wraps `r_xchg` (a distinct per-org key, so a
   distinct `CID` auth can police separately). The ticket is
   per-coordinator (carries its own `sub`/`cnf`), but its `CID` is
-  org-wide, so one initializing discharge can exchange every role — and
-  initialize several coordinators — within its window.
+  org-wide, so one exchange-gate discharge can exchange every role — and
+  serve several coordinators — within its window.
 
 Both discharges attest an org-wide operator authorisation, not a
 coord-specific one; the specific coordinator is pinned by its `sub`/`cnf`
@@ -240,13 +240,13 @@ see it.
 **2. Invite.** Mint-issued, distributed out-of-band, one per mint/org,
 non-expiring. First-party `(op=enroll, aud=mint, invite=<nonce>)` plus a
 TPC `(location, VID, CID)` whose `CID` wraps `r_inv` (§ *Coord ↔ mint
-enrollment*). Chain-MAC'd under `K_M`. Discharged by the requesting
+enrollment*). Chain-MAC'd under `K_M`. Discharged by the enrolling
 operator at `/v1/enroll`.
 
 **3. Credential ticket.** Mint-issued at `/v1/enroll`, coord-held in
 memory across the wait for approval. Short-lived. First-party
 `(op=enroll-exchange, sub, cnf, aud=mint, exp)` plus a TPC whose `CID`
-wraps `r_xchg`. Chain-MAC'd under `K_M`. Discharged by the initializing
+wraps `r_xchg`. Chain-MAC'd under `K_M`. Discharged by the exchanging
 operator at `/v1/enroll-exchange`, where it is also PoP-bound to the
 coordinator's `cnf` and checked against the approved registry.
 
@@ -258,8 +258,8 @@ authorization*). Chain-MAC'd under `K_M`. The operator attenuates
 
 **5. Discharge.** Auth-issued, CLI-held. Short-lived (~5 min). Caveats
 `(Subject, OrgId, Scope, NotAfter)` — the `Scope` first-party caveat
-names the authority class auth authorised (`enroll:request`,
-`enroll:initialize`, or `admin`), and is what the gate clears against.
+names the authority class auth authorised (`enroll`,
+`exchange`, or `admin`), and is what the gate clears against.
 Chain-MAC'd under the `r_tpc` recovered from the target `CID`; its nonce
 equals that `CID`. One discharge satisfies one TPC. The operator may
 attenuate it before use (e.g. the admin CLI appends `op=admin:<verb>`).
@@ -284,18 +284,18 @@ it as a `Scope` first-party caveat; mint clears that caveat against the
 scope the gate requires. Mint verifies inline. No coordinator sits on the
 verification path, and there is nothing to cache between calls.
 
-### Enrollment-request discharge
+### Enroll-gate discharge
 
-When the requesting operator brings a coordinator in:
+When the enrolling operator brings a coordinator in:
 
 1. The operator's CLI POSTs `<auth>/v1/discharge` with the session in
    `Authorization: Bearer`, body `{cid: "<base64>", scope:
-   "enroll:request"}`, where `cid` is the invite's `CID` (fixed for the
+   "enroll"}`, where `cid` is the invite's `CID` (fixed for the
    org; it travels with the invite).
 2. Auth verifies the session under `K_session`, AEAD-decrypts `CID` with
    `K_M-A` → recovers `(r_inv, OrgId)`, cross-checks the decoded `OrgId`
-   against the session's, requires `enroll:request ∈ session.scopes`,
-   and mints a discharge: caveats `(Subject, OrgId, Scope=enroll:request,
+   against the session's, requires `enroll ∈ session.scopes`,
+   and mints a discharge: caveats `(Subject, OrgId, Scope=enroll,
    NotAfter=now+5min)`, chain-MAC'd under `r_inv`, nonce = `CID`. A
    session lacking the scope → `403`.
 3. The operator conveys the discharge to the coordinator (inert bytes).
@@ -304,26 +304,26 @@ When the requesting operator brings a coordinator in:
 4. Mint walks the invite's chain under `K_M`, recovers `r_inv` from the
    TPC's `VID` (or from the `CID` under `K_M-A`), verifies the
    discharge's MAC under `r_inv`, and clears its caveats (`OrgId`
-   matches, `Scope` is `enroll:request`, `NotAfter` in the future). It
+   matches, `Scope` is `enroll`, `NotAfter` in the future). It
    records `requested_by = Subject` on the pending enrollment.
 
 One discharge serves any number of `/v1/enroll` calls in its window — it
 is org-wide, not coord-bound.
 
-### Credential-issuance discharge
+### Exchange-gate discharge
 
-When the initializing operator brings an approved coordinator online:
+When the exchanging operator brings an approved coordinator online:
 
 1. The CLI fetches a discharge against the **ticket's** `CID` (the
-   coordinator's ticket carries it), `scope: "enroll:initialize"` — auth
-   recovers `r_xchg`, requires `enroll:initialize ∈ session.scopes`, and
-   mints `(Subject, OrgId, Scope=enroll:initialize, NotAfter)` with
+   coordinator's ticket carries it), `scope: "exchange"` — auth
+   recovers `r_xchg`, requires `exchange ∈ session.scopes`, and
+   mints `(Subject, OrgId, Scope=exchange, NotAfter)` with
    nonce = the ticket `CID`.
 2. The operator conveys the discharge to the coordinator. The
    coordinator presents `[ticket, discharge]` + PoP at
    `/v1/enroll-exchange`, once per role.
 3. Mint walks the ticket's chain under `K_M`, verifies the discharge
-   under `r_xchg`, clears its `Scope` against `enroll:initialize`,
+   under `r_xchg`, clears its `Scope` against `exchange`,
    verifies the PoP against the ticket's `cnf`, requires
    `_mint/approved/<sub>` to match, and mints the TPC-free role
    credential. One discharge covers every role exchanged in its window.
@@ -397,7 +397,7 @@ The design produces two correlated audit streams:
   OrgId, expires_at).
 - **Mint log**: every discharge verified at the boundary — at
   `/v1/enroll` (the invite TPC, stamped `requested_by`), at
-  `/v1/enroll-exchange` (the ticket TPC, stamped the initializing
+  `/v1/enroll-exchange` (the ticket TPC, stamped the exchanging
   `Subject`), and at each `/v1/admin/*` call (the service-token TPC,
   stamped the operator `Subject`, e.g. `approved_by` on `enroll
   approve`).
@@ -517,19 +517,19 @@ A discharge carries three claims:
   username or email — those change. The auth service is responsible
   for keeping `Subject` stable for a given human across renames and
   IdP changes. It is what mint records as `requested_by` / `approved_by`.
-- **Scope is the authority class auth granted** — `enroll:request`,
-  `enroll:initialize`, or `admin`. Auth issues it only if the session
+- **Scope is the authority class auth granted** — `enroll`,
+  `exchange`, or `admin`. Auth issues it only if the session
   carries it; mint clears it against the scope each gate requires. This
-  is the dimension that lets "may initialize but not administer" be
+  is the dimension that lets "may exchange but not administer" be
   expressed (§ *Scope tier*).
 
 The discharge carries no per-op or per-volume narrowing in the initial
 protocol caveats (see *Deferred* below). The admin plane binds the verb
 via the CLI's `op=admin:<verb>` attenuation, cleared at mint; the
-enrollment-request and credential-issuance discharges are org-wide
+enroll-gate and exchange-gate discharges are org-wide
 (coord-specificity comes from the macaroon's `sub`/`cnf` + PoP). All
-access control — allow-listing, RBAC, which Subject may request,
-initialize, or administer — lives at the auth service and is exercised
+access control — allow-listing, RBAC, which Subject may enroll,
+exchange, or administer — lives at the auth service and is exercised
 at `/v1/discharge` issuance time.
 
 Mint log shape (admin verb):
@@ -552,9 +552,9 @@ Non-interactive (API-key) sessions are typically shorter (e.g. 1
 hour); the API key is the long-lived credential and the session is
 its derived form.
 
-**Discharges: ~5 minutes, fetched per request / initialize / admin
+**Discharges: ~5 minutes, fetched per enroll / exchange / admin
 call.** The CLI caches a discharge in memory for the window; within it,
-an operator may request or initialize several coordinators, or run
+an operator may enroll or exchange several coordinators, or run
 several admin verbs, without re-fetching. After expiry, the next call
 triggers a fresh fetch
 from auth.
@@ -697,13 +697,13 @@ exchange. Response shape matches `/login/poll` success.
 `POST /v1/discharge` (Bearer session) — issue a discharge for a TPC.
 
 ```json
-request:  { "cid": "<base64>", "scope": "enroll:request" }
+request:  { "cid": "<base64>", "scope": "enroll" }
 response: { "discharge": "<base64 macaroon>", "expires_at": "..." }
 ```
 
 The `cid` is the invite's, the ticket's, or the CLI service token's
-`CID`; `scope` is the authority class requested (`enroll:request`,
-`enroll:initialize`, or `admin`). Auth requires `scope ∈ session.scopes`
+`CID`; `scope` is the authority class requested (`enroll`,
+`exchange`, or `admin`). Auth requires `scope ∈ session.scopes`
 and stamps it as a `Scope` caveat on the returned discharge, which is
 otherwise `(Subject, OrgId, NotAfter)`, chain-MAC'd under the `r_tpc`
 recovered from `CID`, nonce = `CID`. `401` session expired, `403` session
@@ -730,10 +730,10 @@ rotation.
 
 Coord enrollment reuses the mint enrollment flow
 ([`design-mint.md`](design-mint.md) § *Enrollment*): `POST /v1/enroll`
-(invite ⊕ `sub`/`cnf` + PoP + the requesting operator's discharge)
+(invite ⊕ `sub`/`cnf` + PoP + the enrolling operator's discharge)
 records a pending enrollment and returns a **credential ticket** carrying
 its own TPC; after operator approval, `POST /v1/enroll-exchange`
-(`[ticket, initializing-operator discharge]` + PoP + `{ts, role}`,
+(`[ticket, exchanging-operator discharge]` + PoP + `{ts, role}`,
 checked against the approved registry) yields each of the four role
 credentials. None of the credentials embeds a TPC. The OrgId and
 auth-service URL are returned alongside the first credential mint issues.
@@ -859,7 +859,7 @@ admin delegation grows multi-team; not in the initial shape.
 The scope mechanism is **core** (§ *Discharge flows*): every session
 carries a granted scope set, every `/v1/discharge` names a scope auth
 checks against it, and every gate clears the discharge's `Scope` caveat.
-Three baseline scopes ship — `enroll:request`, `enroll:initialize`,
+Three baseline scopes ship — `enroll`, `exchange`,
 `admin` — one per gate. A *finer* vocabulary on the same mechanism is
 proposed below.
 
@@ -883,7 +883,7 @@ granted at login, checked at issuance, cleared at verify:
 
 3. **Cleared at verify.** Each gate knows the scope it requires and
    clears the discharge's `Scope` against it (`/v1/enroll` →
-   `enroll:request`, `/v1/enroll-exchange` → `enroll:initialize`,
+   `enroll`, `/v1/enroll-exchange` → `exchange`,
    `/v1/admin/*` → `admin`). A per-request predicate, never cached,
    joining the existing `aud`/`op`/`exp`/PoP clears.
 

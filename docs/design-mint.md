@@ -604,16 +604,16 @@ registry is consulted only during enrollment and is never on the
 
 Enrollment binds a coordinator's self-asserted `sub`/`cnf` to an
 operator-approved key, gates that binding behind **three operator
-decisions** — a *request*, an *approval*, and an *initialization*, none
-of which need be made by the same human — and then issues that many
-non-expiring, single-role credentials.
+decisions** — *enroll*, *approve*, and *exchange*, none of which need be
+made by the same human — and then issues that many non-expiring,
+single-role credentials.
 
 **Three operator gates, then none.** Enrollment is the only place a live
-operator participates. A *requesting* operator authorizes a coordinator
-to attempt enrollment at all (the invite gate, step (1)); an *approving*
-operator confirms the coordinator's key (the approval gate, step (2));
-an *initializing* operator is present when the coordinator first pulls
-its role credentials (the ticket gate, step (3)). Each gate is a
+operator participates. An *enrolling* operator authorizes a coordinator
+to begin enrollment at all (the enroll gate, step (1)); an *approving*
+operator confirms the coordinator's key (the approve gate, step (2));
+an *exchanging* operator is present when the coordinator first pulls
+its role credentials (the exchange gate, step (3)). Each gate is a
 third-party caveat discharged by a logged-in operator; the three may be
 different people, and mint records each `Subject` so the audit log
 attributes every decision to a human.
@@ -623,7 +623,7 @@ tokens**: `assume-role` — swapping a credential for a Tigris keypair — is
 credential; operator authority lives entirely at enrollment, not at
 runtime.
 
-**Invite macaroon — the request gate.** At first start mint draws a
+**Invite macaroon — the enroll gate.** At first start mint draws a
 random nonce — the `invite` value — persists it at `_mint/invite` in the
 tenant bucket (see *Mint state in the tenant bucket*) so every mint
 process that mounts this tenant sees the same value, and emits the
@@ -637,9 +637,9 @@ discharge, so a coordinator can attempt enrollment only when a logged-in
 operator has authorized the request. Confidentiality of the invite is
 not load-bearing — the third-party caveat, not secrecy, is the gate.
 
-**(1) `POST /v1/enroll` — the request.** The requesting operator, logged
+**(1) `POST /v1/enroll` — the request.** The enrolling operator, logged
 in at the auth service, fetches a discharge for the invite's
-third-party caveat at scope `enroll:request` (auth issues it only if the
+third-party caveat at scope `enroll` (auth issues it only if the
 operator's session carries that scope) and conveys it to the coordinator
 (inert bytes — the discharge is useless without the rest of the bundle). The coordinator
 attenuates the invite with `sub=<own id>` (Elide: the coordinator ULID)
@@ -647,13 +647,13 @@ and `cnf=ed25519:<own pub>` and presents `[invite ⊕ sub/cnf, coordinator
 PoP over the body, operator discharge]`. Mint verifies the chain against
 its root (`op=enroll`, `invite`=current), the PoP against the appended
 `cnf`, and the discharge against the invite's third-party caveat —
-clearing its `Scope` to `enroll:request`; it
+clearing its `Scope` to `enroll`; it
 records a **pending enrollment** at `_mint/pending/<sub>.json` —
 `(sub, pub, invite, requested_by, first-seen ts, peer ip)`, where
 `requested_by` is the discharge's `Subject` — and returns a **credential
 ticket**: a macaroon minted fresh from root with `op=enroll-exchange`,
 the same `sub`/`cnf`, `aud=mint`, a short `exp`, and **its own
-third-party caveat** (the ticket gate — a distinct `CID` from the
+third-party caveat** (the exchange gate — a distinct `CID` from the
 invite's) requiring an operator discharge at exchange. The ticket is
 role-agnostic and multi-use until its `exp`; the coordinator holds it in
 memory across the wait for approval. A retried request with an identical
@@ -665,7 +665,7 @@ is anomalous (a new key is a new principal) and surfaced.
 checks `_mint/approved/<sub>`: if it exists and its `pub` equals the
 presented `cnf`, no pending record is written — the returned ticket
 exchanges against the existing registry entry immediately, with no
-second approval (the ticket gate still applies). If `approved/<sub>`
+second approval (the exchange gate still applies). If `approved/<sub>`
 exists with a *different* `pub`, a pending record is written as normal
 and surfaces to the operator as a key-rotation acknowledgment (approval
 there overwrites the registry record). The pending record's lifetime is
@@ -674,7 +674,7 @@ by then, or deleted at approval time (step (2)). The approved entry at
 `_mint/approved/<sub>` is **not** transient — it persists for the life
 of the coordinator identity and powers the fast path.
 
-**(2) Operator approval — the approval gate.** `mint enroll approve
+**(2) Operator approval — the approve gate.** `mint enroll approve
 <sub>` is an admin-plane call (§ *Operator authorization*), so it
 carries the **approving** operator's own auth-service discharge at scope
 `admin` — a possibly different human, whose `Subject` the auth service
@@ -696,15 +696,15 @@ in-flight pending record. Mint does not enforce `approved_by ≠
 requested_by` — a single operator may both request and approve — but
 both identities are recorded.
 
-**(3) `POST /v1/enroll-exchange` — the ticket gate.** Collecting the
-role credentials is the operator *initializing the client*, so it is
-gated too. An *initializing* operator (logged in, possibly a third
+**(3) `POST /v1/enroll-exchange` — the exchange gate.** Collecting the
+role credentials is an operator *bringing the client online*, so it is
+gated too. An *exchanging* operator (logged in, possibly a third
 human) fetches a discharge for the ticket's third-party caveat at scope
-`enroll:initialize` and conveys it to the coordinator. The coordinator
+`exchange` and conveys it to the coordinator. The coordinator
 presents `[ticket, operator discharge]` with a `coordinator.key` PoP over
 the body `{ts, role}`, once per role it needs. Mint verifies the ticket
 chain (`op=enroll-exchange`, the short `exp`), the discharge against the
-ticket's TPC — clearing its `Scope` to `enroll:initialize` — and the PoP
+ticket's TPC — clearing its `Scope` to `exchange` — and the PoP
 against the ticket's `cnf`; requires `_mint/approved/<sub>` to exist with
 a `pub` equal to that `cnf`; and decides **is this `sub` permitted this
 `role`**. The decision has a
@@ -718,9 +718,9 @@ success mint **re-mints from root** a credential (`op=assume-role`, the
 same `sub`/`cnf`, `aud=mint`, `role=<requested>`, no `exp`, **no
 third-party caveat**). The ticket is not consumed per role — one
 discharge satisfies its TPC for every role exchanged within the
-discharge's window, so the initializing operator participates once. A
+discharge's window, so the exchanging operator participates once. A
 coordinator that has lost local state re-collects its credentials by
-re-enrolling, which re-runs the ticket gate: re-materializing a
+re-enrolling, which re-runs the exchange gate: re-materializing a
 machine's credentials is itself an operator action.
 
 **Rotation.** `mint invite --rotate` draws a new random
@@ -839,25 +839,25 @@ both cases.
 ### Enrollment endpoints
 
 ```
-POST /v1/enroll              # invite (⊕ sub/cnf) + requesting-operator discharge in MintV1 bundle
+POST /v1/enroll              # invite (⊕ sub/cnf) + enrolling-operator discharge in MintV1 bundle
                              # X-Mint-Pop; body {ts}
                              # → 200 credential ticket (base64); fast path → proceed to exchange
 
-POST /v1/enroll-exchange     # ticket + initializing-operator discharge in MintV1 bundle
+POST /v1/enroll-exchange     # ticket + exchanging-operator discharge in MintV1 bundle
                              # X-Mint-Pop; body {ts, role}
                              # → 200 credential macaroon (base64), role-stamped
                              #   403 until approved · 401 on PoP/discharge/role failure
 ```
 
 `/v1/enroll` carries the coordinator-attenuated invite in `Authorization:
-MintV1 mnt1_<b64url>` together with the requesting operator's discharge
+MintV1 mnt1_<b64url>` together with the enrolling operator's discharge
 in the same bundle, the PoP in `X-Mint-Pop`, and `{ts}` in the body.
 Mint verifies the chain, the discharge against the invite's TPC, and the
 PoP; records a pending enrollment (or none, on the fast path) and
 returns a **credential ticket** carrying its own TPC (§ *Enrollment*
 (1)).
 
-`/v1/enroll-exchange` carries the **ticket** plus the initializing
+`/v1/enroll-exchange` carries the **ticket** plus the exchanging
 operator's discharge in the `MintV1` bundle, the PoP in `X-Mint-Pop`,
 and `{ts, role}` in the body (the requested role rides the PoP-signed
 body, so it is authenticated and audited like any exercise field). Mint
@@ -877,7 +877,7 @@ the attenuated credential at `/v1/assume-role` and `/v1/verify`, the CLI
 service token at every `/v1/admin/*` endpoint (§ *Operator
 authorization*). Any discharge macaroons for third-party caveats are
 included in the same `MintV1` bundle; a TPC is present on the invite
-(the request gate), the ticket (the initialize gate), and the CLI
+(the enroll gate), the ticket (the exchange gate), and the CLI
 service token (the admin plane), **never on a credential**, so those are
 the bundles that carry a discharge. The mint verifies the presented
 chain MAC against its own macaroon root, and each discharge against the
@@ -1844,10 +1844,10 @@ client only reads it; `--id` is the opaque `sub`):
 
 ```
 mint client keygen                                       # → client.key/.pub
-mint client login        --url <auth-url>                # → cli-session (needed to enroll AND exchange: discharges the invite + ticket gates)
+mint client login        --url <auth-url>                # → cli-session (needed to enroll AND exchange: discharges the invite + exchange gates)
 mint client logout                                       # remove the saved client session
-mint client enroll       --id <sub> <macaroon|file|->    # attaches the requesting-operator discharge → credential ticket
-mint client exchange     --role <role>                   # ticket + initializing-operator discharge; 403 until approved → credentials/<role>
+mint client enroll       --id <sub> <macaroon|file|->    # attaches the enrolling-operator discharge → credential ticket
+mint client exchange     --role <role>                   # ticket + exchanging-operator discharge; 403 until approved → credentials/<role>
 mint client credential list                              # held per-role credentials (local-only)
 mint client credential inspect <role>                    # narrate one credential's caveat chain
 mint client assume-role  --request '{"prefix":"x"}'          # role from the credential → Tigris keypair
@@ -1890,8 +1890,8 @@ the full Elide role inventory below. Both are plain key-bound roles;
 neither credential carries a TPC. The operator-authorisation loop is
 exercised at **enrollment**, not at `assume-role`: the config colocates
 the demo auth role (`[auth] demo_enabled`), so `client enroll` discharges
-the invite's TPC (the request gate) and `client exchange` discharges the
-ticket's TPC (the ticket gate), each fetching a discharge from the auth
+the invite's TPC (the enroll gate) and `client exchange` discharges the
+ticket's TPC (the exchange gate), each fetching a discharge from the auth
 socket and presenting the bundle. `assume-role` against either role then
 needs no discharge. This is the mint CLI proving the consumption side
 before any `elide-*` client.
@@ -2026,17 +2026,17 @@ prematurely.
     LIST*).
 13. **Enrollment surface — settled.** See § *Enrollment*: **three
     operator gates, each a third-party caveat on a carried macaroon**. A
-    reusable non-expiring invite carries the *request* TPC → the
-    requesting operator discharges it and the coordinator self-asserts
+    reusable non-expiring invite carries the *enroll* TPC → the
+    enrolling operator discharges it and the coordinator self-asserts
     `sub`/`cnf` at `POST /v1/enroll`, which records a pending record
     (`requested_by`) and returns a short-lived **ticket** carrying its
     own *ticket* TPC → the approving operator approves a displayed pubkey
     fingerprint via the admin plane, recording `_mint/approved/<sub>`
-    (`approved_by`) → the initializing operator discharges the ticket's
+    (`approved_by`) → the exchanging operator discharges the ticket's
     TPC and the coordinator presents `[ticket, discharge]` + PoP at `POST
     /v1/enroll-exchange {ts, role}`, which re-mints a single-role
     credential from root with **no third-party caveat**. Three operator
-    decisions are captured (request + approve + initialize, none required
+    decisions are captured (enroll + approve + exchange, none required
     to differ); after that a credential is a long-lived service token and
     `assume-role` is operator-free. Role authorization gates `(sub,
     role)` at exchange — floor is "role is in the mint config" (per-`sub`
@@ -2063,12 +2063,12 @@ prematurely.
     authority; the holder presents discharge macaroons).
     `design-auth-model.md` documents only scalar first-party caveats
     today; the third-party construction and its discharge-bundle wire
-    format on the invite at `/v1/enroll` (request gate), the ticket at
-    `/v1/enroll-exchange` (initialize gate), and the CLI service token
+    format on the invite at `/v1/enroll` (enroll gate), the ticket at
+    `/v1/enroll-exchange` (exchange gate), and the CLI service token
     (admin plane) need specifying. The anchor split is settled: the
     minimal self-hosted deployment is anchored by operator approval of a
     displayed fingerprint (§ *Enrollment*); the third-party caveats on
-    the invite and the ticket are the requesting- and initializing-operator
+    the invite and the ticket are the enrolling- and exchanging-operator
     gates layered on top. Open within this question: because credentials
     do not expire and carry no TPC, periodic re-attestation of a
     coordinator (e.g. a managed customer who left) is enforced by
