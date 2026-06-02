@@ -48,33 +48,74 @@ pub enum EnrollError {
     Unsatisfiable,
 }
 
+/// Fixed `client_id` bound into the **invite's** third-party caveat (the
+/// enroll gate). The invite is shared org-wide, so its `r`-cluster is a
+/// single fixed scope — one org, one enroll gate — and its `CID` is the
+/// same for every enrolling coordinator, so one enroll-gate discharge can
+/// bring in any number of them (`docs/design-auth-service.md` § *Coord ↔
+/// mint enrollment*).
+pub const INVITE_CLIENT_ID: &str = "invite";
+
+/// Fixed `client_id` bound into the **credential ticket's** third-party
+/// caveat (the exchange gate). Distinct from [`INVITE_CLIENT_ID`] so the
+/// two gates derive distinct keys (`r_inv` ≠ `r_xchg`) — a discharge for
+/// one anchor is not MAC-valid against the other. Still org-wide (not
+/// per-coordinator): one exchange-gate discharge exchanges every role for
+/// every approved coordinator in its window.
+pub const TICKET_CLIENT_ID: &str = "ticket";
+
+/// The enroll-gate and exchange-gate `r` epochs. Fixed at 0; rotation
+/// re-mints the anchor (`mint invite --rotate` / a fresh ticket) and
+/// draws a fresh `r` from a fresh keyring generation, so no per-epoch
+/// bump is needed here.
+const ANCHOR_R_EPOCH: u32 = 0;
+
 /// The reusable invite macaroon: root attenuated with `op=enroll`,
-/// `aud`, and the current `invite` nonce. Non-expiring, carries no
-/// principal identity — a pure participation gate, distributed
-/// out-of-band and reusable for every enrolling client.
-pub fn mint_invite(keyring: &Keyring, audience: &str, invite_nonce: &str) -> Macaroon {
-    macaroon::mint(
+/// `aud`, the current `invite` nonce, **and the enroll-gate third-party
+/// caveat** at `location`. Non-expiring, carries no principal identity —
+/// a pure participation gate, distributed out-of-band and reusable for
+/// every enrolling client. The TPC is what makes it a *gate* rather than
+/// a free pass: it is inert without a fresh enrolling-operator discharge
+/// (`docs/design-mint.md` § *Enrollment*).
+pub fn mint_invite(
+    keyring: &Keyring,
+    k_m_a: &[u8; 32],
+    audience: &str,
+    invite_nonce: &str,
+    org_id: &str,
+    location: &str,
+) -> Macaroon {
+    let base = macaroon::mint(
         keyring,
         vec![
             Caveat::scalar(name::OP, op::ENROLL),
             Caveat::scalar(name::AUD, audience),
             Caveat::scalar(name::INVITE, invite_nonce),
         ],
-    )
+    );
+    let r = crate::tpc::derive_r(keyring.current_key(), INVITE_CLIENT_ID, ANCHOR_R_EPOCH);
+    let tpc = crate::tpc::build_caveat(base.tail(), &r, k_m_a, INVITE_CLIENT_ID, org_id, location);
+    base.attenuate(tpc)
 }
 
 /// The short-lived credential ticket handed back from `POST /v1/enroll`:
-/// `op=enroll-exchange`, `aud`, the self-asserted `sub`/`cnf`, and an
-/// `exp`. (The third-party caveat for a configured identity authority
-/// is deferred — design *Open questions* #15.)
+/// `op=enroll-exchange`, `aud`, the self-asserted `sub`/`cnf`, an `exp`,
+/// **and the exchange-gate third-party caveat** at `location` (a distinct
+/// `CID` from the invite's). The TPC is the exchange gate: the ticket is
+/// inert without a fresh exchanging-operator discharge
+/// (`docs/design-mint.md` § *Enrollment* (3)).
+#[allow(clippy::too_many_arguments)]
 pub fn mint_credential_ticket(
     keyring: &Keyring,
+    k_m_a: &[u8; 32],
     audience: &str,
     sub: &str,
     cnf: &str,
     exp_unix: u64,
+    org_id: &str,
+    location: &str,
 ) -> Macaroon {
-    macaroon::mint(
+    let base = macaroon::mint(
         keyring,
         vec![
             Caveat::scalar(name::OP, op::ENROLL_EXCHANGE),
@@ -83,7 +124,10 @@ pub fn mint_credential_ticket(
             Caveat::scalar(name::CNF, cnf),
             Caveat::scalar(name::EXP, exp_unix.to_string()),
         ],
-    )
+    );
+    let r = crate::tpc::derive_r(keyring.current_key(), TICKET_CLIENT_ID, ANCHOR_R_EPOCH);
+    let tpc = crate::tpc::build_caveat(base.tail(), &r, k_m_a, TICKET_CLIENT_ID, org_id, location);
+    base.attenuate(tpc)
 }
 
 /// The non-expiring credential, re-minted from root at a successful
@@ -203,10 +247,22 @@ mod tests {
         pop::cnf_value(&[3u8; 32])
     }
 
+    const K_M_A: [u8; 32] = [42u8; 32];
+    const LOCATION: &str = "https://auth.example/v1/discharge";
+
+    /// Count the third-party caveats on a macaroon — the enroll/exchange
+    /// gate lands as exactly one.
+    fn tpc_count(m: &Macaroon) -> usize {
+        m.caveats()
+            .iter()
+            .filter(|c| matches!(c, Caveat::ThirdParty { .. }))
+            .count()
+    }
+
     #[test]
-    fn invite_is_enroll_op_no_identity() {
+    fn invite_is_enroll_op_no_identity_with_gate_tpc() {
         let kr = ring();
-        let b = mint_invite(&kr, "mint", "nonceXYZ");
+        let b = mint_invite(&kr, &K_M_A, "mint", "nonceXYZ", "org_demo", LOCATION);
         assert!(b.verify(&kr));
         let eff = EffectiveCaveats::new(b.caveats());
         assert_eq!(eff.resolve(name::OP), Resolved::Value(op::ENROLL.into()));
@@ -217,12 +273,23 @@ mod tests {
         );
         assert_eq!(eff.resolve(name::SUB), Resolved::Absent);
         assert_eq!(eff.resolve(name::CNF), Resolved::Absent);
+        // The enroll gate: exactly one third-party caveat.
+        assert_eq!(tpc_count(&b), 1);
     }
 
     #[test]
     fn ticket_then_credential_carry_identity_with_distinct_ops() {
         let kr = ring();
-        let ticket = mint_credential_ticket(&kr, "mint", SUB, &cnf(), 1_700_000_000);
+        let ticket = mint_credential_ticket(
+            &kr,
+            &K_M_A,
+            "mint",
+            SUB,
+            &cnf(),
+            1_700_000_000,
+            "org_demo",
+            LOCATION,
+        );
         assert!(ticket.verify(&kr));
         let ie = EffectiveCaveats::new(ticket.caveats());
         assert_eq!(
@@ -230,6 +297,8 @@ mod tests {
             Resolved::Value(op::ENROLL_EXCHANGE.into())
         );
         assert_eq!(ie.not_after(name::EXP), Some(1_700_000_000));
+        // The exchange gate: the ticket carries its own TPC.
+        assert_eq!(tpc_count(&ticket), 1);
 
         let cred = mint_credential(&kr, "mint", SUB, &cnf(), "volume-ro");
         assert!(cred.verify(&kr));
@@ -243,6 +312,9 @@ mod tests {
         assert_eq!(pe.resolve(name::ROLE), Resolved::Value("volume-ro".into()));
         // The credential does not expire.
         assert_eq!(pe.not_after(name::EXP), None);
+        // A credential carries no third-party caveat — operator authority
+        // lives entirely at the enroll/exchange gates, not at assume-role.
+        assert_eq!(tpc_count(&cred), 0);
         // Fresh chain, not an attenuation of the credential ticket.
         assert_ne!(cred.nonce(), ticket.nonce());
     }

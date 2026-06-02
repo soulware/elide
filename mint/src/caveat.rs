@@ -47,6 +47,27 @@ pub mod name {
     /// discharges and by per-IPC / per-forward chain attenuations,
     /// where the holder bounds a bearer chain it cannot re-key.
     pub const NOT_AFTER: &str = "NotAfter";
+    /// Authority class a discharge attests, named at `/v1/discharge` and
+    /// cleared by the gate that consumes the discharge
+    /// (`docs/design-auth-service.md` § *Scope tier*). Carried as a
+    /// granted set on a session (membership-checked at issuance) and as a
+    /// single value on a discharge (scalar-cleared at the gate).
+    pub const SCOPE: &str = "Scope";
+}
+
+/// `Scope` caveat values — the authority classes auth grants and each
+/// gate clears (`docs/design-auth-service.md` § *Scope tier*). One per
+/// enrollment gate; namespaced under `mint:` so a session's scope set can
+/// span services.
+pub mod scope {
+    /// The enroll gate — discharges the invite's TPC at `/v1/enroll`.
+    pub const MINT_ENROLL: &str = "mint:enroll";
+    /// The exchange gate — discharges the ticket's TPC at
+    /// `/v1/enroll-exchange`.
+    pub const MINT_EXCHANGE: &str = "mint:exchange";
+    /// The admin plane — discharges the cli-token's TPC at every
+    /// `/v1/admin/*` verb.
+    pub const MINT_ADMIN: &str = "mint:admin";
 }
 
 /// `op` caveat values. Mint stamps one at every point it mints; each
@@ -181,6 +202,17 @@ impl<'a> EffectiveCaveats<'a> {
         } else {
             Resolved::Unsatisfiable
         }
+    }
+
+    /// Whether any occurrence of `name` equals `value` — membership, not
+    /// the scalar-AND of [`Self::resolve`]. A caveat carrying a *set*
+    /// (the granted `Scope` list on a session) has multiple disagreeing
+    /// occurrences by design, so `resolve` would read it `Unsatisfiable`;
+    /// this asks the set-membership question instead.
+    pub fn contains(&self, name: &str, value: &str) -> bool {
+        self.caveats.iter().any(
+            |c| matches!(c, Caveat::FirstParty { name: n, value: v } if n == name && v == value),
+        )
     }
 
     /// Distinct first-party caveat names in first-occurrence order.

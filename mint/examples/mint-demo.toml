@@ -40,15 +40,15 @@ enabled = true
 # enabled = false.
 socket = "mint_data/auth.sock"
 
-# Operator auth integration. Required because the write role below sets
-# [role.tpc] — the cli-token and role TPCs are keyed by K_M-A.
+# Operator auth integration. Required: it supplies the discharge location
+# stamped into the enroll gate (invite), exchange gate (ticket), and admin
+# gate (cli-token), all keyed by K_M-A.
 [operator]
-# The full discharge URL stamped into the operator cli-token's TPC
-# (path included); the operator derives its discharge route from this
-# location's path and dials [demo_auth].socket as the transport. The
+# The full discharge URL stamped into the enroll/exchange/admin gate TPCs
+# (path included); the operator/client derives its discharge route from
+# this location's path and dials [demo_auth].socket as the transport. The
 # host is never resolved in the demo (the socket is the connection), so
-# it reads the same as production. Per-role TPC locations live in each
-# [role.tpc].
+# it reads the same as production.
 location = "https://auth.elide.internal/v1/discharge"
 
 [tenant]
@@ -67,11 +67,3 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300
-# [role.tpc] binds a third-party caveat into every credential this role
-# issues: assume-role refuses it until the client fetches a discharge
-# from tpc.location and attaches it. location is the full discharge URL
-# (path included); the client supplies the transport via `mint client
-# login --url`, so in the demo the host is never dialed and the client
-# dials [demo_auth].socket.
-[role.tpc]
-location = "https://auth.elide.internal/v1/discharge"

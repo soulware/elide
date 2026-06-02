@@ -28,7 +28,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::caveat::{EffectiveCaveats, Resolved, name};
+use crate::caveat::{EffectiveCaveats, Resolved, name, scope};
 use crate::http::{AppState, verify_and_clear};
 use crate::issuance::mint_invite;
 use crate::macaroon::Macaroon;
@@ -118,7 +118,7 @@ async fn verify_discharge(
     };
     let keyring = state.store.keyring().await;
     let now_unix = chrono::Utc::now().timestamp().max(0) as u64;
-    verify_and_clear(
+    let cleared = verify_and_clear(
         &bundle,
         &keyring,
         state.store.k_m_a(),
@@ -128,8 +128,19 @@ async fn verify_discharge(
         &state.config.audience,
         expected_op,
     )
-    .map(|_| ())
-    .map_err(|_| unauthorized_response())
+    .map_err(|_| unauthorized_response())?;
+    // The admin plane clears the discharge's `Scope` against
+    // `mint:admin` (`docs/design-auth-service.md` § *Scope tier*): a
+    // session that obtained only an enroll- or exchange-scope discharge
+    // cannot drive an admin verb, even though the verb itself rides the
+    // cli-token's per-call `op=admin:<verb>` attenuation.
+    if !matches!(
+        EffectiveCaveats::new(&cleared.aggregated_caveats).resolve(name::SCOPE),
+        Resolved::Value(v) if v == scope::MINT_ADMIN
+    ) {
+        return Err(unauthorized_response());
+    }
+    Ok(())
 }
 
 async fn handle_rotate_invite(
@@ -155,8 +166,31 @@ async fn build_invite(state: &AppState) -> Result<InviteResponse, Response> {
         .current_invite()
         .await
         .map_err(|e| service_unavailable(&format!("read invite: {e}")))?;
+    // The invite carries the enroll gate, so minting one requires the
+    // auth integration that stamps its TPC. A mint with no auth has no
+    // enrollment plane — there is no PoP-only fallback, by design
+    // (`docs/design-mint.md` § *Enrollment*).
+    let k_m_a = state.store.k_m_a().copied().ok_or_else(|| {
+        service_unavailable("invite requires an auth integration (K_M-A) for its enroll gate")
+    })?;
+    let location = state
+        .config
+        .operator
+        .as_ref()
+        .map(|o| o.location.as_str())
+        .ok_or_else(|| {
+            service_unavailable("invite requires an [operator] block for its discharge location")
+        })?;
+    let org_id = state.store.org_id().unwrap_or("demo").to_string();
     let keyring = state.store.keyring().await;
-    let mac = mint_invite(&keyring, &state.config.audience, &nonce);
+    let mac = mint_invite(
+        &keyring,
+        &k_m_a,
+        &state.config.audience,
+        &nonce,
+        &org_id,
+        location,
+    );
     Ok(InviteResponse {
         macaroon: mac.encode(),
         nonce,

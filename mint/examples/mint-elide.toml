@@ -21,13 +21,14 @@ socket = "mint_data/mint.sock"        # client: --url unix:mint_data/mint.sock
 # For a TCP listener instead, replace the line above with:
 #   bind = "127.0.0.1:8085"           # client: --url http://127.0.0.1:8085
 
-# Operator auth integration (docs/design-auth-service.md). Required
-# because the roles below set [role.tpc] — the third-party caveat is keyed
-# by K_M-A, which the auth integration provides. Production runs a
-# separate auth-service binary (no [demo_auth]); the operator admin plane
+# Operator auth integration (docs/design-auth-service.md). Required: it
+# supplies the discharge location for the enroll gate (invite), the
+# exchange gate (ticket), and the admin gate (cli-token), each keyed by
+# K_M-A which the auth integration provides. Production runs a separate
+# auth-service binary (no [demo_auth]); the operator admin plane
 # authenticates against that service, not a colocated UDS.
 [operator]
-location = "https://auth.elide.internal/"   # the cli-token's TPC location
+location = "https://auth.elide.internal/v1/discharge"   # the gate discharge location
 
 [tenant]
 bucket = "elide-demo"
@@ -47,15 +48,6 @@ required_caveats = ["sub", "elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
-tpc = { location = "https://auth.elide.internal/v1/discharge" }
-
-[[role]]
-name = "volume-rw-background"
-required_caveats = ["sub", "elide:Volume", "aud", "exp"]
-min_ttl_seconds = 60
-max_ttl_seconds = 86400        # 24h
-default_ttl_seconds = 86400
-policy_file = "volume-rw.json"
 
 [[role]]
 name = "coord-ro"
@@ -70,12 +62,3 @@ required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
-tpc = { location = "https://auth.elide.internal/v1/discharge" }
-
-[[role]]
-name = "coord-rw-background"
-required_caveats = ["sub", "aud", "exp"]
-min_ttl_seconds = 60
-max_ttl_seconds = 3600         # 1h
-default_ttl_seconds = 3600
-policy_file = "coord-rw.json"

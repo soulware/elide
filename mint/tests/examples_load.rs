@@ -39,11 +39,17 @@ fn mint_demo_config_loads() {
 fn mint_elide_config_loads() {
     pin_cwd();
     let cfg = Config::load(&example("mint-elide.toml")).expect("mint-elide.toml");
-    // The Elide inventory carries `[role.tpc]` roles, which require an
-    // `[operator]` integration (the TPC is keyed by K_M-A).
-    assert!(cfg.operator.is_some(), "TPC roles require [operator]");
+    // The Elide inventory needs an `[operator]` integration: enrollment
+    // is operator-gated (the invite + ticket carry the enroll/exchange
+    // gates, keyed by K_M-A).
     assert!(
-        cfg.roles.values().any(|r| r.tpc.is_some()),
-        "inventory has at least one TPC role"
+        cfg.operator.is_some(),
+        "enrollment gates require [operator]"
     );
+    // The four-role inventory: coord-ro/coord-rw/volume-ro/volume-rw,
+    // none carrying a third-party caveat (operator authority moved to
+    // enrollment).
+    let mut names: Vec<&str> = cfg.roles.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["coord-ro", "coord-rw", "volume-ro", "volume-rw"]);
 }

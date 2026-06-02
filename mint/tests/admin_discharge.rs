@@ -189,7 +189,8 @@ async fn login(auth_router: Router, subject: &str) -> String {
 /// first.
 async fn fetch_discharge(auth_router: Router, cid_b64: &str) -> Macaroon {
     let session = login(auth_router.clone(), "operator-alice").await;
-    let req_body = serde_json::json!({ "cid": cid_b64 }).to_string();
+    // The admin plane clears the discharge's Scope against `mint:admin`.
+    let req_body = serde_json::json!({ "cid": cid_b64, "scope": "mint:admin" }).to_string();
     let req = Request::builder()
         .method("POST")
         .uri("/v1/discharge")
