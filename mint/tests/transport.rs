@@ -161,7 +161,10 @@ async fn full_flow_over_unix_socket() {
     // Operator approves, then exchange yields the credential.
     let (cnf, _fp) = mint::client::identity(cdir.path()).expect("client identity");
     let now_iso = chrono::Utc::now().to_rfc3339();
-    store.approve(SUB, &cnf, &now_iso).await.expect("approve");
+    store
+        .approve(SUB, &cnf, "usr_op", &now_iso)
+        .await
+        .expect("approve");
     assert!(
         mint::client::exchange(
             cdir.path(),

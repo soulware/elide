@@ -691,6 +691,17 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         }
     };
 
+    // The enrolling operator's identity, from the enroll-gate discharge's
+    // `Subject` — recorded on the pending entry as `requested_by`. A
+    // discharge always carries it; absence is a malformed discharge.
+    let requested_by = match EffectiveCaveats::new(&caveats).resolve("Subject") {
+        Resolved::Value(s) => s,
+        _ => {
+            audit("denied:identity", &caveats);
+            return unauthorized(&request_id);
+        }
+    };
+
     // Every Err branch returns the same opaque 401 to the client —
     // the audit tag is the only place we distinguish, so operators
     // reading mint's log can tell `denied:conflict` (genuine
@@ -700,7 +711,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     // client signal is unchanged.
     let recorded = match state
         .store
-        .record_pending(&sub, &cnf, &current, &caller, now_unix)
+        .record_pending(&sub, &cnf, &current, &requested_by, &caller, now_unix)
         .await
     {
         Ok(r) => r,

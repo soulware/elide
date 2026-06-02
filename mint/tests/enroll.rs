@@ -261,7 +261,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
 
     // (3) operator approves the displayed sub
     store
-        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
+        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), "usr_op", &now_iso())
         .await
         .unwrap();
 
@@ -403,7 +403,7 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
     .await;
     assert_eq!(status, StatusCode::OK);
     store
-        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
+        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), "usr_op", &now_iso())
         .await
         .unwrap();
     assert_eq!(
@@ -661,7 +661,7 @@ async fn gates_carry_tpc_but_credential_does_not() {
 
     // approve, then exchange → a TPC-free credential.
     store
-        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
+        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), "usr_op", &now_iso())
         .await
         .unwrap();
     let (status, body) = parts(

@@ -108,7 +108,7 @@ async fn verify_discharge(
     headers: &HeaderMap,
     body: &[u8],
     expected_op: &str,
-) -> Result<(), Response> {
+) -> Result<String, Response> {
     let Some(bundle) = crate::http::extract_bundle(headers) else {
         return Err(unauthorized_response());
     };
@@ -140,7 +140,12 @@ async fn verify_discharge(
     ) {
         return Err(unauthorized_response());
     }
-    Ok(())
+    // The operator's `Subject` from the discharge — the audit-bearing
+    // identity each admin verb records (e.g. `approved_by` on approve).
+    match EffectiveCaveats::new(&cleared.aggregated_caveats).resolve("Subject") {
+        Resolved::Value(s) => Ok(s),
+        _ => Err(unauthorized_response()),
+    }
 }
 
 async fn handle_rotate_invite(
@@ -261,9 +266,10 @@ async fn handle_approve(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = verify_discharge(&state, &headers, &body, ADMIN_ENROLL_APPROVE).await {
-        return r;
-    }
+    let approved_by = match verify_discharge(&state, &headers, &body, ADMIN_ENROLL_APPROVE).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let req: ApproveRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(_) => return unauthorized_response(),
@@ -271,7 +277,7 @@ async fn handle_approve(
     let approved_at = Utc::now().to_rfc3339();
     match state
         .store
-        .approve(&req.sub, &req.pubkey, &approved_at)
+        .approve(&req.sub, &req.pubkey, &approved_by, &approved_at)
         .await
     {
         Ok(()) => json_ok(ApproveResponse { approved_at }),
