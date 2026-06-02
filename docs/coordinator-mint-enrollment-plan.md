@@ -1,5 +1,10 @@
 # Coordinator-side mint enrollment — implementation plan
 
+**Superseded by [`coordinator-mint-enrollment-plan-v2.md`](coordinator-mint-enrollment-plan-v2.md)**,
+which threads the three operator-discharge gates (request / initialize /
+admin) through the command. This doc predates that model and treats
+`/v1/enroll` and `/v1/enroll-exchange` as PoP-only; kept for history.
+
 Implements the coordinator's half of mint enrollment: the thing that
 actually writes `<data_dir>/credentials/<role>`. The mint server
 (`/v1/enroll`, `/v1/enroll-exchange`, operator approve) and the generic
