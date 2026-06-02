@@ -15,7 +15,7 @@ running daemon, a *dormant-until-sealed* startup state, and a local
 restart safely during a fleet-wide template update before the re-seal.
 There is no pending file: `mint seal` is an authenticated client call,
 and the request path reads the *sealed* role surface (audience,
-`required_caveats`, TTL bounds, `tpc`, policy bytes) — never the live
+`required_caveats`, TTL bounds, policy bytes) — never the live
 config.
 
 ## Why
@@ -34,13 +34,7 @@ from one-volume-read to bucket-wide-read with no other signal.
 Role-block fields in `mint.toml` (`required_caveats`,
 `min_ttl_seconds`) have the same property: drop `elide:Volume` from
 `required_caveats` and `volume-ro` becomes effectively bucket-wide.
-Starker still is the role's `[role.tpc]` section: its presence is the
-operator-consent gate on writes (it forces every credential for the
-role to carry a third-party caveat, and so to require a discharge),
-and its `location` is where that discharge is fetched. Remove the
-section and the human-authorisation requirement disappears with no
-other signal; repoint its `location` and discharges are sourced
-elsewhere. Every such field has to be inside the seal, not just the
+Every such field has to be inside the seal, not just the
 policy template.
 
 Filesystem write to `roles_dir/` or `mint.toml` is the attacker's
@@ -197,8 +191,7 @@ _mint/templates/seal.json
       "min_ttl_seconds":    60,
       "max_ttl_seconds":    2592000,
       "default_ttl_seconds": 2592000,
-      "policy_blake3":      "<64 hex>",
-      "tpc":                null
+      "policy_blake3":      "<64 hex>"
     },
     ...
   },
@@ -214,12 +207,7 @@ Fields:
   `aud=mint` are part of the policy surface and must agree across
   the fleet.
 - **`roles`** — every field of every `[[role]]` block that bears on
-  what mint will render or grant: `required_caveats`, the TTL bounds,
-  and `tpc` (the optional third-party-caveat section — its presence is
-  the operator-consent gate, so every credential for the role carries a
-  TPC requiring a discharge at `assume-role`, and its `location` is
-  where that discharge is fetched; removing the section or repointing
-  its `location` must be a sealed change, never silent). The one
+  what mint will render or grant: `required_caveats` and the TTL bounds. The one
   role-block field *not* sealed is `policy_file`: it is replaced by a
   `policy_blake3` content hash, because what matters is the bytes the
   file currently contains, not where the operator put them. The hash is
@@ -500,17 +488,14 @@ operator's nose every time the keyring rotated).
   only their hashes, not their bytes. Bucket bandwidth is for
   enrollment state, not deploy artefacts.
 - **Config outside the `[[role]]` blocks.** The seal covers the role
-  surface (`audience`, every role block — including each role's
-  `[role.tpc].location` — and each policy file), not the rest of
+  surface (`audience`, every role block and each policy file), not the rest of
   `mint.toml`, which carries host-specific settings that legitimately
   vary across the fleet (listener address, `data_dir`, the
   `[demo_auth]` transport, the operator cli-token's `[operator]`
   location). The operator/demo endpoints in particular are left
   unsealed deliberately: repointing one is a denial-of-service, not an
   authority escalation, because a discharge from a rogue endpoint still
-  has to verify under the third-party-caveat key mint holds. (A
-  *role's* `[role.tpc].location` is different — it is part of the
-  sealed role surface.)
+  has to verify under the third-party-caveat key mint holds.
 - **Template version stamped in issued credentials.** The credential
   macaroon doesn't carry the template version; the seal at
   render-time governs render-time. Stamping would add a second
