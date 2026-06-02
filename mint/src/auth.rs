@@ -63,7 +63,7 @@ use axum::routing::post;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op, scope};
@@ -98,18 +98,22 @@ pub fn derive_discharge_r(k_m_a: &[u8; 32], nonce: &[u8; NONCE_LEN]) -> [u8; 32]
     blake3::derive_key(R_KDF_CONTEXT, &km)
 }
 
-#[derive(Deserialize)]
-struct DischargeRequest {
+/// The `/v1/discharge` request body. Shared with the client side
+/// (`crate::operator`) so the bytes a caller serialises and the bytes
+/// the handler deserialises are one type — a missing or misnamed field
+/// is a compile error, not a runtime 400.
+#[derive(Deserialize, Serialize)]
+pub(crate) struct DischargeRequest {
     /// Base64url of the anchor's third-party-caveat `CID` (the invite's,
     /// the ticket's, or the cli-token's). The auth role decrypts it under
     /// `K_M-A` to recover the discharge key `r` and the bound
     /// `(client_id, org_id)`.
-    cid: String,
+    pub(crate) cid: String,
     /// The authority class the caller needs — `mint:enroll`,
     /// `mint:exchange`, or `mint:admin`. Auth issues only if the session
     /// grants it, and stamps it as the discharge's `Scope` caveat for the
     /// gate to clear (`docs/design-auth-service.md` § *Discharge flows*).
-    scope: String,
+    pub(crate) scope: String,
 }
 
 /// A verified session's claims: the `Subject` the discharge attests and
