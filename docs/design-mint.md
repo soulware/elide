@@ -497,10 +497,12 @@ and stores the session — `<data_dir>/cli-session` in the colocated
 demo, `~/.elide/` for a standalone auth service (see
 [`design-auth-service.md`](design-auth-service.md) § *Login flow*). On
 each admin call the CLI fetches a **discharge** for the service
-token's third-party caveat from `POST <auth>/v1/discharge` (gated by the
-session, recovering the discharge key from the caveat's `CID` under
-`K_M-A`). The discharge carries `Subject` and a short `NotAfter` and
-**no** `op`, so one fetch satisfies every verb.
+token's third-party caveat from `POST <auth>/v1/discharge` at scope
+`admin` (gated by the session, which must carry that scope; recovering
+the discharge key from the caveat's `CID` under `K_M-A`). The discharge
+carries `Subject`, `Scope=admin`, and a short `NotAfter` and **no** `op`,
+so one fetch satisfies every verb (the verb binds via the per-call
+attenuation).
 
 The discharge **route** is the *path* of the service token's own TPC
 `location`; the **transport** that path is dialed over is supplied
@@ -637,13 +639,15 @@ not load-bearing — the third-party caveat, not secrecy, is the gate.
 
 **(1) `POST /v1/enroll` — the request.** The requesting operator, logged
 in at the auth service, fetches a discharge for the invite's
-third-party caveat and conveys it to the coordinator (inert bytes — the
-discharge is useless without the rest of the bundle). The coordinator
+third-party caveat at scope `enroll:request` (auth issues it only if the
+operator's session carries that scope) and conveys it to the coordinator
+(inert bytes — the discharge is useless without the rest of the bundle). The coordinator
 attenuates the invite with `sub=<own id>` (Elide: the coordinator ULID)
 and `cnf=ed25519:<own pub>` and presents `[invite ⊕ sub/cnf, coordinator
 PoP over the body, operator discharge]`. Mint verifies the chain against
 its root (`op=enroll`, `invite`=current), the PoP against the appended
-`cnf`, and the discharge against the invite's third-party caveat; it
+`cnf`, and the discharge against the invite's third-party caveat —
+clearing its `Scope` to `enroll:request`; it
 records a **pending enrollment** at `_mint/pending/<sub>.json` —
 `(sub, pub, invite, requested_by, first-seen ts, peer ip)`, where
 `requested_by` is the discharge's `Subject` — and returns a **credential
@@ -672,8 +676,9 @@ of the coordinator identity and powers the fast path.
 
 **(2) Operator approval — the approval gate.** `mint enroll approve
 <sub>` is an admin-plane call (§ *Operator authorization*), so it
-carries the **approving** operator's own auth-service discharge — a
-possibly different human, whose `Subject` the auth service stamps. It
+carries the **approving** operator's own auth-service discharge at scope
+`admin` — a possibly different human, whose `Subject` the auth service
+stamps. It
 prints the pending record's `cnf` fingerprint and requires an
 interactive y/N confirmation (default no); the operator confirms only
 after matching it, through a trusted side channel, against what the
@@ -694,14 +699,15 @@ both identities are recorded.
 **(3) `POST /v1/enroll-exchange` — the ticket gate.** Collecting the
 role credentials is the operator *initializing the client*, so it is
 gated too. An *initializing* operator (logged in, possibly a third
-human) fetches a discharge for the ticket's third-party caveat and
-conveys it to the coordinator. The coordinator presents `[ticket,
-operator discharge]` with a `coordinator.key` PoP over the body
-`{ts, role}`, once per role it needs. Mint verifies the ticket chain
-(`op=enroll-exchange`, the short `exp`), the discharge against the
-ticket's TPC, and the PoP against the ticket's `cnf`; requires
-`_mint/approved/<sub>` to exist with a `pub` equal to that `cnf`; and
-decides **is this `sub` permitted this `role`**. The decision has a
+human) fetches a discharge for the ticket's third-party caveat at scope
+`enroll:initialize` and conveys it to the coordinator. The coordinator
+presents `[ticket, operator discharge]` with a `coordinator.key` PoP over
+the body `{ts, role}`, once per role it needs. Mint verifies the ticket
+chain (`op=enroll-exchange`, the short `exp`), the discharge against the
+ticket's TPC — clearing its `Scope` to `enroll:initialize` — and the PoP
+against the ticket's `cnf`; requires `_mint/approved/<sub>` to exist with
+a `pub` equal to that `cnf`; and decides **is this `sub` permitted this
+`role`**. The decision has a
 floor and an upgrade: the **floor** (minimal self-hosted deployment) is
 that `role` names a role in the mint config with no per-`sub`
 restriction — role policies scope per coordinator by templating on
