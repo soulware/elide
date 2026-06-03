@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -31,7 +32,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::audit::{AuditEntry, AuditLog, sanitise_caveats};
-use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op};
+use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op, scope};
 use crate::config::Config;
 use crate::iam::{self, KeypairMinter};
 use crate::issuance;
@@ -61,11 +62,13 @@ pub struct AppState {
     pub minter: Arc<dyn KeypairMinter>,
     pub audit: Arc<AuditLog>,
     pub store: Arc<Store>,
-    /// The template-seal state resolved at startup. `Dormant` closes
-    /// `/v1/assume-role` + `/v1/enroll-exchange` and `/readyz`; the
-    /// auth/admin planes are seal-independent and stay live
+    /// The template-seal state. `Dormant` closes `/v1/assume-role` +
+    /// `/v1/enroll-exchange` and `/readyz`; the auth/admin planes are
+    /// seal-independent and stay live. Held in an `ArcSwap` so the host
+    /// that runs `mint seal` can replace its served surface live — the
+    /// request path `.load()`s the current state per request
     /// (`docs/design-mint-template-seal.md` § *Dormant until sealed*).
-    pub seal: Arc<SealState>,
+    pub seal: Arc<ArcSwap<SealState>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -84,7 +87,7 @@ pub fn router(state: AppState) -> Router {
 /// host out of rotation until an operator seals it and it restarts.
 /// Liveness (`/healthz`) is seal-independent and always `ok`.
 async fn readyz(State(state): State<AppState>) -> Response {
-    match state.seal.as_ref() {
+    match state.seal.load().as_ref() {
         SealState::Serving(_) => (StatusCode::OK, "ready").into_response(),
         SealState::Dormant => (StatusCode::SERVICE_UNAVAILABLE, "not sealed").into_response(),
     }
@@ -161,17 +164,6 @@ pub fn extract_bundle(headers: &HeaderMap) -> Option<Bundle> {
         primary,
         discharges,
     })
-}
-
-/// Pull a single bearer macaroon out of `Authorization: MintV1 <m>`.
-/// Used at single-credential endpoints (enrollment, admin); rejects
-/// a comma-separated bundle.
-fn extract_macaroon(headers: &HeaderMap) -> Option<Macaroon> {
-    let bundle = extract_bundle(headers)?;
-    if !bundle.discharges.is_empty() {
-        return None;
-    }
-    Some(bundle.primary)
 }
 
 fn peer_ip(headers: &HeaderMap) -> String {
@@ -413,7 +405,8 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     // (no canonical seal at startup). The sealed surface — not the live
     // config — is the authority for audience, the role's required
     // caveats / TTL bounds, and the policy bytes. ---
-    let surface = match state.seal.as_ref() {
+    let seal = state.seal.load();
+    let surface = match seal.as_ref() {
         SealState::Serving(s) => s,
         SealState::Dormant => {
             audit(base_entry("denied:not_sealed"));
@@ -634,23 +627,50 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         tracing::warn!(error = %e, "pending gc failed");
     }
 
-    let Some(mac) = extract_macaroon(&headers) else {
+    // The bundle is the client-attenuated invite (`op=enroll`, current
+    // `invite`, self-asserted `sub`/`cnf`) plus the enrolling operator's
+    // discharge for the invite's enroll-gate TPC. `verify_and_clear`
+    // walks the chain under `K_M`, recovers the TPC's `r` from its `VID`,
+    // verifies the discharge, and clears `aud`/`op=enroll`/PoP/`exp`
+    // (the discharge's short `NotAfter` rides the deadline clear).
+    let Some(bundle) = extract_bundle(&headers) else {
         audit("denied:unauthenticated", &[]);
         return unauthorized(&request_id);
     };
+    let proof = match pop_proof(&headers) {
+        Ok(p) => p,
+        Err(()) => {
+            audit("denied:pop", &[]);
+            return unauthorized(&request_id);
+        }
+    };
     let keyring = state.store.keyring().await;
-    if !mac.verify(&keyring) {
-        audit("denied:bad_mac", &[]);
-        return unauthorized(&request_id);
-    }
-    let caveats = mac.caveats().to_vec();
+    let cleared = match verify_and_clear(
+        &bundle,
+        &keyring,
+        state.store.k_m_a(),
+        proof,
+        &body,
+        now_unix,
+        &state.config.audience,
+        op::ENROLL,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            audit(&format!("denied:{}", e.reason()), &[]);
+            return unauthorized(&request_id);
+        }
+    };
+    let caveats = cleared.aggregated_caveats;
 
-    if !scalar_is(&caveats, name::OP, op::ENROLL)
-        || !scalar_is(&caveats, name::AUD, &state.config.audience)
-    {
-        audit("denied:wrong_op", &caveats);
+    // The enroll gate clears the discharge's `Scope` against
+    // `mint:enroll`: a session that only obtained an exchange- or
+    // admin-scope discharge cannot open an enrollment.
+    if !scalar_is(&caveats, name::SCOPE, scope::MINT_ENROLL) {
+        audit("denied:scope", &caveats);
         return unauthorized(&request_id);
     }
+
     let current = match state.store.current_invite().await {
         Ok(c) => c,
         Err(e) => {
@@ -667,22 +687,20 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         return unauthorized(&request_id);
     }
 
-    // Body is the freshness ts only.
-    let proof = match pop_proof(&headers) {
-        Ok(p) => p,
-        Err(()) => {
-            audit("denied:pop", &caveats);
+    let (sub, cnf) = match issuance::bound_identity(&cleared.primary) {
+        Ok(v) => v,
+        Err(_) => {
+            audit("denied:identity", &caveats);
             return unauthorized(&request_id);
         }
     };
-    if pop::check(&caveats, mac.tail(), &body, proof, now_unix).is_err() {
-        audit("denied:pop", &caveats);
-        return unauthorized(&request_id);
-    }
 
-    let (sub, cnf) = match issuance::bound_identity(&mac) {
-        Ok(v) => v,
-        Err(_) => {
+    // The enrolling operator's identity, from the enroll-gate discharge's
+    // `Subject` — recorded on the pending entry as `requested_by`. A
+    // discharge always carries it; absence is a malformed discharge.
+    let requested_by = match EffectiveCaveats::new(&caveats).resolve("Subject") {
+        Resolved::Value(s) => s,
+        _ => {
             audit("denied:identity", &caveats);
             return unauthorized(&request_id);
         }
@@ -697,7 +715,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     // client signal is unchanged.
     let recorded = match state
         .store
-        .record_pending(&sub, &cnf, &current, &caller, now_unix)
+        .record_pending(&sub, &cnf, &current, &requested_by, &caller, now_unix)
         .await
     {
         Ok(r) => r,
@@ -736,12 +754,35 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         }
     };
 
+    // The ticket carries the exchange-gate TPC, so it needs the same
+    // auth integration the invite did. A discharge cleared above implies
+    // these are present, but fail closed if not.
+    let Some(k_m_a) = state.store.k_m_a().copied() else {
+        tracing::error!("enroll: K_M-A not loaded; cannot stamp the exchange gate");
+        return respond(
+            &request_id,
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "service unavailable"}),
+        );
+    };
+    let Some(location) = state.config.operator.as_ref().map(|o| o.location.as_str()) else {
+        tracing::error!("enroll: no [operator] block; cannot stamp the exchange gate");
+        return respond(
+            &request_id,
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "service unavailable"}),
+        );
+    };
+    let org_id = state.store.org_id().unwrap_or("demo").to_string();
     let ticket = issuance::mint_credential_ticket(
         &keyring,
+        &k_m_a,
         &state.config.audience,
         &sub,
         &cnf,
         now_unix.saturating_add(CREDENTIAL_TICKET_TTL_SECONDS),
+        &org_id,
+        location,
     );
     // Fast path (an existing `approved/<sub>` matches the presented
     // `cnf`) means /v1/enroll-exchange will succeed immediately on the
@@ -820,7 +861,8 @@ async fn enroll_exchange(
     // Issuance is seal-gated: minting a credential decides whether the
     // role carries a TPC (the operator-consent gate), so it reads the
     // sealed surface, and is closed while dormant.
-    let surface = match state.seal.as_ref() {
+    let seal = state.seal.load();
+    let surface = match seal.as_ref() {
         SealState::Serving(s) => s,
         SealState::Dormant => {
             audit("denied:not_sealed", &[]);
@@ -828,44 +870,49 @@ async fn enroll_exchange(
         }
     };
 
-    let Some(mac) = extract_macaroon(&headers) else {
+    // The bundle is the credential ticket plus the exchanging operator's
+    // discharge for the ticket's exchange-gate TPC. `verify_and_clear`
+    // walks the chain under `K_M`, verifies the discharge against the
+    // ticket's TPC, and clears `aud`/`op=enroll-exchange`/PoP and the
+    // deadline (the ticket's `exp` ∧ the discharge's `NotAfter`).
+    let Some(bundle) = extract_bundle(&headers) else {
         audit("denied:unauthenticated", &[]);
         return unauthorized(&request_id);
     };
-    let keyring = state.store.keyring().await;
-    if !mac.verify(&keyring) {
-        audit("denied:bad_mac", &[]);
-        return unauthorized(&request_id);
-    }
-    let caveats = mac.caveats().to_vec();
-
-    if !scalar_is(&caveats, name::OP, op::ENROLL_EXCHANGE)
-        || !scalar_is(&caveats, name::AUD, &state.config.audience)
-    {
-        audit("denied:wrong_op", &caveats);
-        return unauthorized(&request_id);
-    }
-    match EffectiveCaveats::new(&caveats).not_after(name::EXP) {
-        Some(exp) if exp > now_unix => {}
-        _ => {
-            audit("denied:expired", &caveats);
-            return unauthorized(&request_id);
-        }
-    }
-
     let proof = match pop_proof(&headers) {
         Ok(p) => p,
         Err(()) => {
-            audit("denied:pop", &caveats);
+            audit("denied:pop", &[]);
             return unauthorized(&request_id);
         }
     };
-    if pop::check(&caveats, mac.tail(), &body, proof, now_unix).is_err() {
-        audit("denied:pop", &caveats);
+    let keyring = state.store.keyring().await;
+    let cleared = match verify_and_clear(
+        &bundle,
+        &keyring,
+        state.store.k_m_a(),
+        proof,
+        &body,
+        now_unix,
+        &state.config.audience,
+        op::ENROLL_EXCHANGE,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            audit(&format!("denied:{}", e.reason()), &[]);
+            return unauthorized(&request_id);
+        }
+    };
+    let caveats = cleared.aggregated_caveats;
+
+    // The exchange gate clears the discharge's `Scope` against
+    // `mint:exchange`.
+    if !scalar_is(&caveats, name::SCOPE, scope::MINT_EXCHANGE) {
+        audit("denied:scope", &caveats);
         return unauthorized(&request_id);
     }
 
-    let (sub, cnf) = match issuance::bound_identity(&mac) {
+    let (sub, cnf) = match issuance::bound_identity(&cleared.primary) {
         Ok(v) => v,
         Err(_) => {
             audit("denied:identity", &caveats);
@@ -876,10 +923,8 @@ async fn enroll_exchange(
     // The approved-registry entry for this sub must exist and its
     // pinned pub must match the presented cnf — the operator approved
     // *this* (sub, pub) pair (`docs/design-mint.md` § *Enrollment* (3)).
-    // The record also carries `r_epoch`, the input to TPC `r`
-    // derivation for credentials that carry a TPC.
-    let r_epoch = match state.store.get_approved(&sub).await {
-        Ok(Some(a)) if a.pubkey == cnf => a.r_epoch,
+    match state.store.get_approved(&sub).await {
+        Ok(Some(a)) if a.pubkey == cnf => {}
         // The one non-401 authorization outcome: awaited, not a
         // failure. Includes both "never approved" and "approved
         // under a different pub" (pending key-rotation re-approval).
@@ -945,37 +990,13 @@ async fn enroll_exchange(
         }
     };
 
-    let mut credential =
-        issuance::mint_credential(&keyring, &state.config.audience, &sub, &cnf, &role);
+    // A credential carries no third-party caveat — operator authority is
+    // exercised at the enroll/exchange gates above, never at
+    // `assume-role` (`docs/design-mint.md` § *Credential macaroon &
+    // lifecycle*). Every role's credential is a uniform key-bound service
+    // token.
+    let credential = issuance::mint_credential(&keyring, &state.config.audience, &sub, &cnf, &role);
 
-    // Operator-write roles carry a third-party caveat. Append it as a
-    // chain extension off the just-minted credential's tail — the
-    // chain MAC is incremental, so this is byte-identical to having
-    // stamped the TPC inline at issuance. The TPC decision is the sealed
-    // one; Store invariants guarantee K_M-A and OrgId are present when a
-    // sealed role sets `tpc`.
-    if let Some(tpc) = surface.role(&role).and_then(|r| r.tpc.as_ref()) {
-        let Some(k_m_a) = state.store.k_m_a() else {
-            tracing::error!("TPC-bearing role minted but K_M-A not loaded");
-            return respond(
-                &request_id,
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({"error": "service unavailable"}),
-            );
-        };
-        let Some(org_id) = state.store.org_id() else {
-            tracing::error!("TPC-bearing role minted but OrgId not set");
-            return respond(
-                &request_id,
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({"error": "service unavailable"}),
-            );
-        };
-        let r = crate::tpc::derive_r(keyring.current_key(), &sub, r_epoch);
-        let tpc_caveat =
-            crate::tpc::build_caveat(credential.tail(), &r, k_m_a, &sub, org_id, &tpc.location);
-        credential = credential.attenuate(tpc_caveat);
-    }
     // The approved-registry entry is not consumed: the ticket is
     // multi-use until its `exp` and the entry powers the re-enrollment
     // fast path beyond that.

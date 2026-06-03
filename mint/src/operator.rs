@@ -24,7 +24,7 @@ use std::path::Path;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 
-use crate::caveat::{Caveat, name};
+use crate::caveat::{Caveat, name, scope};
 use crate::macaroon::Macaroon;
 use crate::pop;
 
@@ -114,11 +114,11 @@ impl Operator {
         Err(OperatorError::NoTpc)
     }
 
-    /// Fetch a wide discharge for the cli-token's CID over `transport`,
-    /// gated by the session bearer. The discharge route is the path of
-    /// the cli-token's own TPC location; `transport` is the connection
-    /// to the auth role (the demo socket today). One discharge satisfies
-    /// every admin verb — the verb is the operator's per-call
+    /// Fetch a discharge for the cli-token's CID over `transport`, gated
+    /// by the session bearer and scoped `mint:admin`. The discharge route
+    /// is the path of the cli-token's own TPC location; `transport` is the
+    /// connection to the auth role (the demo socket today). One discharge
+    /// satisfies every admin verb — the verb is the operator's per-call
     /// attenuation onto the cli-token — so the CLI fetches it once per
     /// invocation.
     pub async fn fetch_discharge(
@@ -127,7 +127,7 @@ impl Operator {
         session: &str,
     ) -> Result<Macaroon, OperatorError> {
         let path = self.discharge_path()?;
-        let body = serde_json::json!({ "cid": self.cid_b64()? }).to_string();
+        let body = self.discharge_request_body()?;
         let headers = [("authorization", format!("Bearer {session}"))];
         let (status, text) = post_uds(transport, &path, &headers, body).await?;
         if status != 200 {
@@ -135,6 +135,18 @@ impl Operator {
         }
         let discharge = json_field(&text, "discharge")?;
         Macaroon::decode(&discharge).map_err(|_| OperatorError::Malformed("discharge"))
+    }
+
+    /// The `/v1/discharge` request body for the cli-token's CID at the
+    /// admin scope. Built from the handler's own [`crate::auth::DischargeRequest`]
+    /// so the field set the daemon expects cannot drift from what the CLI
+    /// sends.
+    fn discharge_request_body(&self) -> Result<String, OperatorError> {
+        let req = crate::auth::DischargeRequest {
+            cid: self.cid_b64()?,
+            scope: scope::MINT_ADMIN.to_string(),
+        };
+        serde_json::to_string(&req).map_err(|_| OperatorError::Malformed("discharge request"))
     }
 
     /// Build the `(Authorization, X-Mint-Pop)` headers for one admin
@@ -319,6 +331,23 @@ mod tests {
         // The discharge route is the path of the cli-token's own TPC
         // location — the transport supplies the host.
         assert_eq!(op.discharge_path().unwrap(), "/v1/discharge");
+    }
+
+    #[test]
+    fn discharge_request_body_carries_cid_and_admin_scope() {
+        // Regression: the admin discharge fetch must POST the `mint:admin`
+        // scope. An earlier cut sent only `cid`, so `/v1/discharge` (whose
+        // DischargeRequest now requires `scope`) rejected every operator
+        // admin verb with a 400 before it reached the gate. Deserialise
+        // through the handler's own type so the field set is the one the
+        // daemon expects.
+        let dir = tempfile::tempdir().unwrap();
+        seed_operator_files(dir.path());
+        let op = Operator::load(dir.path()).unwrap();
+        let body = op.discharge_request_body().expect("body");
+        let req: crate::auth::DischargeRequest = serde_json::from_str(&body).expect("deserialise");
+        assert_eq!(req.cid, op.cid_b64().unwrap());
+        assert_eq!(req.scope, scope::MINT_ADMIN);
     }
 
     #[test]

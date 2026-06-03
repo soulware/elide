@@ -22,7 +22,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 
-use crate::caveat::{Caveat, name, op};
+use crate::caveat::{Caveat, name, op, scope};
 use crate::macaroon::Macaroon;
 use crate::pop;
 use crate::state::fingerprint;
@@ -30,14 +30,15 @@ use crate::state::fingerprint;
 const KEY_FILE: &str = "client.key";
 const PUB_FILE: &str = "client.pub";
 /// The auth-service session (from `mint client login`) that gates
-/// discharge issuance for TPC-bearing roles. Held in the client dir,
-/// mode 0600, like the identity key.
+/// discharge issuance at the enroll and exchange gates. Held in the
+/// client dir, mode 0600, like the identity key.
 pub const SESSION_FILE: &str = "cli-session";
 /// The auth-service transport saved at `mint client login` — the `--url`
 /// the client dialed (e.g. `unix:<sock>` or `http(s)://host`). Reused to
-/// reach `/v1/discharge` at assume-role time: a credential's TPC
-/// `location` is a full URL that supplies only the request *path*, while
-/// this supplies *how to connect* (the Bun `fetch(url, {unix})` split).
+/// reach `/v1/discharge` when fetching the enroll-/exchange-gate
+/// discharges: the gate TPC's `location` is a full URL that supplies only
+/// the request *path*, while this supplies *how to connect* (the Bun
+/// `fetch(url, {unix})` split).
 const AUTH_TRANSPORT_FILE: &str = "auth-transport";
 /// Default `enroll --out` / `exchange --in`: the credential ticket —
 /// the short-lived, redeem-once token you trade in at the exchange.
@@ -196,25 +197,6 @@ fn parse_target(base_url: &str) -> Target<'_> {
         Some(path) => Target::Uds(path),
         None => Target::Tcp(base_url),
     }
-}
-
-/// POST `body` to `<base_url><endpoint>` with a single mint-issued
-/// macaroon + its PoP. The transport is selected by the `--url` scheme.
-async fn post(
-    base_url: &str,
-    endpoint: &str,
-    mac: &Macaroon,
-    seed: &[u8; 32],
-    body: String,
-) -> Result<(u16, String), ClientError> {
-    let sig = pop::client_signature(seed, mac.tail(), body.as_bytes());
-    let auth = format!("MintV1 {}", mac.encode());
-    let headers = [
-        ("authorization", auth),
-        ("x-mint-pop", sig),
-        ("content-type", "application/json".into()),
-    ];
-    send(base_url, endpoint, &headers, body).await
 }
 
 /// POST a `(primary, discharges)` bundle: the `Authorization` header
@@ -418,9 +400,14 @@ pub async fn enroll(
         "  cnf = {}  (your client key — binds the token to you)",
         abbrev(&cnf)
     );
+    // The invite carries the enroll gate (a third-party caveat): fetch
+    // an enrolling-operator discharge at scope `mint:enroll` and present
+    // it alongside. Requires a logged-in session (`mint client login`).
+    let discharges = gate_discharges(dir, &presented, scope::MINT_ENROLL).await?;
     eprintln!("  → POST {base_url}/v1/enroll  (signed with your client key)");
     let body = format!(r#"{{"ts":{}}}"#, now_unix());
-    let (status, text) = post(base_url, "/v1/enroll", &presented, &seed, body).await?;
+    let (status, text) =
+        post_bundle(base_url, "/v1/enroll", &presented, &discharges, &seed, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }
@@ -457,6 +444,10 @@ pub async fn exchange(
         in_path.display()
     );
     describe("credential ticket (what you hold)", &ticket);
+    // The ticket carries the exchange gate: fetch an exchanging-operator
+    // discharge at scope `mint:exchange` and present it alongside. One
+    // discharge covers every role exchanged within its window.
+    let discharges = gate_discharges(dir, &ticket, scope::MINT_EXCHANGE).await?;
     eprintln!(
         "  → POST {base_url}/v1/enroll-exchange  role={role}  (signed with your client key — proof-of-possession)"
     );
@@ -465,7 +456,15 @@ pub async fn exchange(
         now_unix(),
         serde_json::Value::from(role)
     );
-    let (status, text) = post(base_url, "/v1/enroll-exchange", &ticket, &seed, body).await?;
+    let (status, text) = post_bundle(
+        base_url,
+        "/v1/enroll-exchange",
+        &ticket,
+        &discharges,
+        &seed,
+        body,
+    )
+    .await?;
     match status {
         200 => {
             let credential = json_field(&text, "credential")?;
@@ -582,29 +581,13 @@ pub async fn assume_role(
         caveats.len()
     );
 
-    // Operator-write credentials carry a third-party caveat: fetch a
-    // discharge for each before forwarding. Discovery (auth location +
-    // CID) is read straight off the held credential — the mint-only
-    // loop's stand-in for coord's 401 challenge.
-    let discharges = fetch_discharges(dir, &mac).await?;
-    if !discharges.is_empty() {
-        // Per-forward freshness: tighten the primary's own chain before
-        // it leaves the client, mirroring coord's per-forward NotAfter.
-        let primary_deadline = now_unix().saturating_add(PER_FORWARD_NOT_AFTER_SECONDS);
-        mac = mac.attenuate(Caveat::scalar(
-            name::NOT_AFTER,
-            primary_deadline.to_string(),
-        ));
-        eprintln!(
-            "  attached {} discharge(s); per-forward NotAfter={primary_deadline} on the primary",
-            discharges.len()
-        );
-    }
-
+    // A credential carries no third-party caveat — operator authority was
+    // exercised at enrollment, not here — so `assume-role` presents a
+    // bare primary with no discharge (`docs/design-auth-service.md`
+    // § *No runtime discharge*).
     eprintln!("  → POST {base_url}/v1/assume-role");
     let body = build_request_body(request_src, role, ttl_seconds, now_unix())?;
-    let (status, text) =
-        post_bundle(base_url, "/v1/assume-role", &mac, &discharges, &seed, body).await?;
+    let (status, text) = post_bundle(base_url, "/v1/assume-role", &mac, &[], &seed, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }
@@ -612,46 +595,36 @@ pub async fn assume_role(
     Ok(text)
 }
 
-/// Per-IPC discharge attenuation window (`design-auth-service.md`
-/// § *Attenuating per IPC*). Tight: the bundle is verified immediately.
-const PER_IPC_NOT_AFTER_SECONDS: u64 = 30;
-
-/// Per-forward primary attenuation window (`design-auth-service.md`
-/// § *Coord attenuates the primary before forwarding to mint*).
-const PER_FORWARD_NOT_AFTER_SECONDS: u64 = 30;
-
-/// For each third-party caveat on `primary`, fetch a discharge from its
-/// `location` and tighten it with a per-IPC `NotAfter`. A credential
-/// with no third-party caveat yields an empty list, and the bundle is a
-/// bare primary — the non-operator-write path is unchanged. The session
-/// (from `mint client login`) is loaded lazily, only when a third-party
-/// caveat is actually present, so non-TPC roles need no login.
-async fn fetch_discharges(dir: &Path, primary: &Macaroon) -> Result<Vec<Macaroon>, ClientError> {
-    let has_tpc = primary
+/// Fetch an operator discharge for each third-party caveat on `anchor`
+/// (the invite at enroll, the ticket at exchange) at the named `scope`,
+/// to present alongside the anchor. The session + transport (from `mint
+/// client login`) are loaded here, so the gates require a logged-in
+/// operator. An anchor with no TPC yields an empty list.
+async fn gate_discharges(
+    dir: &Path,
+    anchor: &Macaroon,
+    scope: &str,
+) -> Result<Vec<Macaroon>, ClientError> {
+    let has_tpc = anchor
         .caveats()
         .iter()
         .any(|c| matches!(c, Caveat::ThirdParty { .. }));
     if !has_tpc {
         return Ok(Vec::new());
     }
-    // One session + transport cover every third-party caveat on this
-    // credential; load them once (and surface a clear "run mint client
-    // login" if the operator skipped that step).
     let session = load_session(dir)?;
     let transport = load_auth_transport(dir)?;
     let mut discharges = Vec::new();
-    for c in primary.caveats() {
+    for c in anchor.caveats() {
         let Caveat::ThirdParty { location, cid, .. } = c else {
             continue;
         };
         eprintln!(
-            "  credential carries a third-party caveat → fetching discharge \
+            "  anchor carries the {scope} gate → fetching discharge \
              from {location} (via {transport})"
         );
-        let mut discharge = fetch_discharge(&transport, location, cid, &session).await?;
-        let deadline = now_unix().saturating_add(PER_IPC_NOT_AFTER_SECONDS);
-        discharge = discharge.attenuate(Caveat::scalar(name::NOT_AFTER, deadline.to_string()));
-        eprintln!("    ← discharge received; per-IPC NotAfter={deadline}");
+        let discharge = fetch_discharge(&transport, location, cid, &session, scope).await?;
+        eprintln!("    ← discharge received");
         discharges.push(discharge);
     }
     Ok(discharges)
@@ -729,17 +702,20 @@ fn load_session(dir: &Path) -> Result<String, ClientError> {
     Ok(trimmed.to_string())
 }
 
-/// POST the CID to the authority's `/v1/discharge` under the session
-/// bearer and decode the returned discharge macaroon. The session's
-/// `Subject` is what the discharge attests.
+/// POST the CID + requested `scope` to the authority's `/v1/discharge`
+/// under the session bearer and decode the returned discharge macaroon.
+/// The session's `Subject` is what the discharge attests; auth issues
+/// only if the session grants `scope`, and stamps it as the discharge's
+/// `Scope` caveat for the gate to clear.
 async fn fetch_discharge(
     transport: &str,
     location: &str,
     cid: &[u8],
     session: &str,
+    scope: &str,
 ) -> Result<Macaroon, ClientError> {
     let cid_b64 = BASE64.encode(cid);
-    let body = serde_json::json!({ "cid": cid_b64 }).to_string();
+    let body = serde_json::json!({ "cid": cid_b64, "scope": scope }).to_string();
     let headers = [
         ("content-type", "application/json".into()),
         ("authorization", format!("Bearer {session}")),
@@ -893,8 +869,11 @@ mod tests {
     fn invite_arg_accepts_inline_or_file_and_rejects_neither() {
         let wire = crate::issuance::mint_invite(
             &crate::keyring::Keyring::single([1u8; 32]),
+            &[9u8; 32],
             "mint",
             "nonce",
+            "org_demo",
+            "https://auth.example/v1/discharge",
         )
         .encode();
         // inline: the value itself is the macaroon

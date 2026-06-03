@@ -584,7 +584,7 @@ async fn serve(
         minter,
         audit: Arc::new(AuditLog::new(Box::new(std::io::stdout()))),
         store,
-        seal: Arc::new(seal_state),
+        seal: Arc::new(arc_swap::ArcSwap::from_pointee(seal_state)),
     };
 
     // The mint role's app (admin routes are merged onto the same router
@@ -863,15 +863,14 @@ fn role_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     println!(
-        "{:<24} {:>5} {:>7} {:>7} {:>7}  REQUIRED-CAVEATS",
-        "NAME", "TPC", "MIN", "DEF", "MAX"
+        "{:<24} {:>7} {:>7} {:>7}  REQUIRED-CAVEATS",
+        "NAME", "MIN", "DEF", "MAX"
     );
     // config.roles is a BTreeMap, so iteration is name-sorted.
     for r in config.roles.values() {
         println!(
-            "{:<24} {:>5} {:>7} {:>7} {:>7}  {}",
+            "{:<24} {:>7} {:>7} {:>7}  {}",
             r.name,
-            if r.tpc.is_some() { "yes" } else { "no" },
             r.min_ttl_seconds,
             r.default_ttl_seconds,
             r.max_ttl_seconds,
@@ -903,13 +902,6 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
         } else {
             role.required_caveats.join(", ")
         }
-    );
-    eprintln!(
-        "  tpc location:     {}",
-        role.tpc
-            .as_ref()
-            .map(|t| t.location.as_str())
-            .unwrap_or("(none)")
     );
     eprintln!("  audience:         {}", config.audience);
     eprintln!("  tenant.bucket:    {}", config.tenant.bucket);

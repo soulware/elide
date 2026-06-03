@@ -29,19 +29,23 @@
 //!
 //! ```text
 //! Authorization: Bearer mnt1_<session>
-//! request body:  { "cid": "<base64url of the credential's TPC CID>" }
+//! request body:  { "cid": "<base64url of the anchor's TPC CID>",
+//!                  "scope": "mint:enroll" | "mint:exchange" | "mint:admin" }
 //! 200 OK:        { "discharge": "mnt1_<base64url>" }
+//! 403:           session valid but does not grant the requested scope
 //! ```
 //!
-//! Discharge construction: decrypt `cid` under `K_M-A`
-//! ([`tpc::decrypt_cid`]) to recover `(r, client_id, org_id)` — no
-//! `K_M`, no per-client state — and reject if `org_id` is not the org
-//! this role serves. Mint a **wide** macaroon at `kid = DISCHARGE_KID`,
-//! chain MAC'd under that `r`, caveats `Subject` (the session subject),
-//! `OrgId`, `ClientId`, `NotAfter`. No `op`: per-op narrowing is the
-//! caller's attenuation onto the primary (the PoP'd credential), so one
-//! discharge satisfies every op that primary is attenuated for. Mint's
-//! verifier recovers the same `r` from the primary's `vid`
+//! Discharge construction: require `scope ∈ session.scopes` (the
+//! authorization decision; `403` otherwise), then decrypt `cid` under
+//! `K_M-A` ([`tpc::decrypt_cid`]) to recover `(r, client_id, org_id)` —
+//! no `K_M`, no per-client state — and reject if `org_id` is not the org
+//! this role serves. Mint a macaroon at `kid = DISCHARGE_KID`, chain
+//! MAC'd under that `r`, caveats `Subject` (the session subject),
+//! `OrgId`, `ClientId`, `Scope` (the requested class, cleared by the
+//! gate), `NotAfter`. No `op`: per-op narrowing is the caller's
+//! attenuation onto the primary (the PoP'd anchor), so one discharge
+//! satisfies every op that primary is attenuated for. Mint's verifier
+//! recovers the same `r` from the primary's `vid`
 //! ([`tpc::decrypt_vid`]) — the two recover identical keys by
 //! construction.
 //!
@@ -59,10 +63,10 @@ use axum::routing::post;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op};
+use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op, scope};
 use crate::http::AppState;
 use crate::macaroon::{DISCHARGE_KID, Macaroon, NONCE_LEN, SESSION_KID, mint_under_key};
 use crate::tpc;
@@ -94,12 +98,29 @@ pub fn derive_discharge_r(k_m_a: &[u8; 32], nonce: &[u8; NONCE_LEN]) -> [u8; 32]
     blake3::derive_key(R_KDF_CONTEXT, &km)
 }
 
-#[derive(Deserialize)]
-struct DischargeRequest {
-    /// Base64url of the credential's third-party-caveat `CID`. The auth
-    /// role decrypts it under `K_M-A` to recover the discharge key `r`
-    /// and the bound `(client_id, org_id)`.
-    cid: String,
+/// The `/v1/discharge` request body. Shared with the client side
+/// (`crate::operator`) so the bytes a caller serialises and the bytes
+/// the handler deserialises are one type — a missing or misnamed field
+/// is a compile error, not a runtime 400.
+#[derive(Deserialize, Serialize)]
+pub(crate) struct DischargeRequest {
+    /// Base64url of the anchor's third-party-caveat `CID` (the invite's,
+    /// the ticket's, or the cli-token's). The auth role decrypts it under
+    /// `K_M-A` to recover the discharge key `r` and the bound
+    /// `(client_id, org_id)`.
+    pub(crate) cid: String,
+    /// The authority class the caller needs — `mint:enroll`,
+    /// `mint:exchange`, or `mint:admin`. Auth issues only if the session
+    /// grants it, and stamps it as the discharge's `Scope` caveat for the
+    /// gate to clear (`docs/design-auth-service.md` § *Discharge flows*).
+    pub(crate) scope: String,
+}
+
+/// A verified session's claims: the `Subject` the discharge attests and
+/// the granted `Scope` set the issuance check is made against.
+pub struct SessionClaims {
+    pub subject: String,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -121,10 +142,13 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Mint a demo session macaroon under `K_session`: caveats
-/// `op=session`, `Subject=<subject>`, `NotAfter=now+7d`. A fresh chain
-/// (not an attenuation), keyed by `K_session`, so it is structurally
-/// distinct from every mint-issued macaroon and verifiable only by this
-/// role.
+/// `op=session`, `Subject=<subject>`, the granted `Scope` set, and
+/// `NotAfter=now+7d`. A fresh chain (not an attenuation), keyed by
+/// `K_session`, so it is structurally distinct from every mint-issued
+/// macaroon and verifiable only by this role. The demo grants **every**
+/// scope to every subject — login stays wide-open, but the grant is
+/// explicit on the session (`docs/design-auth-service.md` § *Scope
+/// tier*); production auth-service decides the grant per its own policy.
 fn mint_session(k_session: &[u8; 32], subject: &str, now_unix: u64) -> Macaroon {
     let not_after = now_unix + SESSION_EXP_SECONDS;
     mint_under_key(
@@ -133,6 +157,9 @@ fn mint_session(k_session: &[u8; 32], subject: &str, now_unix: u64) -> Macaroon 
         vec![
             Caveat::scalar(name::OP, op::SESSION),
             Caveat::scalar("Subject", subject),
+            Caveat::scalar(name::SCOPE, scope::MINT_ENROLL),
+            Caveat::scalar(name::SCOPE, scope::MINT_EXCHANGE),
+            Caveat::scalar(name::SCOPE, scope::MINT_ADMIN),
             Caveat::scalar(name::NOT_AFTER, not_after.to_string()),
         ],
     )
@@ -140,14 +167,15 @@ fn mint_session(k_session: &[u8; 32], subject: &str, now_unix: u64) -> Macaroon 
 
 /// Verify a session presented in `Authorization: Bearer <session>`:
 /// chain MAC under `K_session`, `op=session`, and a non-expired
-/// `NotAfter`. Returns the session's `Subject` on success. Every
-/// failure is the opaque `()` the caller maps to `401`.
+/// `NotAfter`. Returns the session's `Subject` and granted `Scope` set
+/// on success. Every failure is the opaque `()` the caller maps to
+/// `401`.
 #[allow(clippy::result_unit_err)]
 pub fn verify_session(
     k_session: &[u8; 32],
     headers: &HeaderMap,
     now_unix: u64,
-) -> Result<String, ()> {
+) -> Result<SessionClaims, ()> {
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -166,8 +194,16 @@ pub fn verify_session(
     {
         return Err(());
     }
+    let scopes = mac
+        .caveats()
+        .iter()
+        .filter_map(|c| match c {
+            Caveat::FirstParty { name: n, value } if n == name::SCOPE => Some(value.clone()),
+            _ => None,
+        })
+        .collect();
     match eff.resolve("Subject") {
-        Resolved::Value(subject) => Ok(subject),
+        Resolved::Value(subject) => Ok(SessionClaims { subject, scopes }),
         _ => Err(()),
     }
 }
@@ -214,8 +250,8 @@ async fn issue_discharge(
     };
 
     let now_unix = Utc::now().timestamp().max(0) as u64;
-    let subject = match verify_session(&k_session, &headers, now_unix) {
-        Ok(s) => s,
+    let claims = match verify_session(&k_session, &headers, now_unix) {
+        Ok(c) => c,
         Err(()) => return error(StatusCode::UNAUTHORIZED, "session required"),
     };
 
@@ -223,6 +259,12 @@ async fn issue_discharge(
         Ok(r) => r,
         Err(_) => return error(StatusCode::BAD_REQUEST, "bad request"),
     };
+    // The authorization decision `/v1/discharge` makes: the session must
+    // grant the requested scope. Distinct from the liveness gate above —
+    // a valid session that lacks the scope is `403`, not `401`.
+    if !claims.scopes.iter().any(|s| s == &req.scope) {
+        return error(StatusCode::FORBIDDEN, "scope not granted");
+    }
     let cid = match BASE64.decode(req.cid.trim()) {
         Ok(b) => b,
         Err(_) => return error(StatusCode::BAD_REQUEST, "bad cid"),
@@ -244,9 +286,10 @@ async fn issue_discharge(
         &pt.r,
         DISCHARGE_KID,
         vec![
-            Caveat::scalar("Subject", &subject),
+            Caveat::scalar("Subject", &claims.subject),
             Caveat::scalar("OrgId", pt.org_id),
             Caveat::scalar("ClientId", pt.client_id),
+            Caveat::scalar(name::SCOPE, &req.scope),
             Caveat::scalar(name::NOT_AFTER, not_after.to_string()),
         ],
     );
@@ -278,34 +321,33 @@ mod tests {
     }
 
     #[test]
-    fn session_round_trips_and_returns_subject() {
+    fn session_round_trips_and_returns_subject_and_scopes() {
         let k = [21u8; 32];
         let s = mint_session(&k, "operator-alice", 1_000);
-        assert_eq!(
-            verify_session(&k, &bearer(&s), 1_000),
-            Ok("operator-alice".to_string())
-        );
+        let claims = verify_session(&k, &bearer(&s), 1_000).expect("valid session");
+        assert_eq!(claims.subject, "operator-alice");
+        // The demo grants every scope.
+        assert!(claims.scopes.iter().any(|s| s == scope::MINT_ENROLL));
+        assert!(claims.scopes.iter().any(|s| s == scope::MINT_EXCHANGE));
+        assert!(claims.scopes.iter().any(|s| s == scope::MINT_ADMIN));
     }
 
     #[test]
     fn session_under_wrong_key_rejected() {
         let s = mint_session(&[21u8; 32], "alice", 1_000);
-        assert_eq!(verify_session(&[22u8; 32], &bearer(&s), 1_000), Err(()));
+        assert!(verify_session(&[22u8; 32], &bearer(&s), 1_000).is_err());
     }
 
     #[test]
     fn expired_session_rejected() {
         let s = mint_session(&[21u8; 32], "alice", 1_000);
         let later = 1_000 + SESSION_EXP_SECONDS + 1;
-        assert_eq!(verify_session(&[21u8; 32], &bearer(&s), later), Err(()));
+        assert!(verify_session(&[21u8; 32], &bearer(&s), later).is_err());
     }
 
     #[test]
     fn missing_bearer_rejected() {
-        assert_eq!(
-            verify_session(&[21u8; 32], &HeaderMap::new(), 1_000),
-            Err(())
-        );
+        assert!(verify_session(&[21u8; 32], &HeaderMap::new(), 1_000).is_err());
     }
 
     #[test]
@@ -318,7 +360,7 @@ mod tests {
                 Caveat::scalar("Subject", "alice"),
             ],
         );
-        assert_eq!(verify_session(&[21u8; 32], &bearer(&m), 1_000), Err(()));
+        assert!(verify_session(&[21u8; 32], &bearer(&m), 1_000).is_err());
     }
 
     #[test]

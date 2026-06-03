@@ -11,28 +11,38 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use mint::audit::AuditLog;
-use mint::caveat::{Caveat, EffectiveCaveats, Resolved, name, op};
+use mint::caveat::{Caveat, EffectiveCaveats, Resolved, name, op, scope};
 use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::issuance::{mint_credential_ticket, mint_invite};
 use mint::keyring::Keyring;
-use mint::macaroon::Macaroon;
+use mint::macaroon::{DISCHARGE_KID, Macaroon, mint_under_key};
 use mint::pop;
-use mint::state::Store;
+use mint::state::{K_M_A_FILE, Store};
+use mint::tpc;
 use tower::ServiceExt;
 
 mod common;
 
 const ROOT: [u8; 32] = [42u8; 32];
+/// The mint↔auth wrapping key. Pre-seeded on the store so the enroll
+/// handler can stamp the gate TPCs, and reused by [`signed`] to mint the
+/// operator discharge each gate clears.
+const K_M_A: [u8; 32] = [13u8; 32];
 const CLIENT_SEED: [u8; 32] = [7u8; 32];
 const OTHER_SEED: [u8; 32] = [9u8; 32];
 const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const ORG_ID: &str = "demo";
+/// Discharge location stamped into the invite/ticket gate TPCs.
+const AUTH_URL: &str = "https://auth.example/v1/discharge";
 
 const TOML_TEMPLATE: &str = r#"
 audience = "mint"
 [tenant]
 bucket = "demo-bucket"
+[operator]
+location = "https://auth.example/v1/discharge"
 [[role]]
 name = "volume-ro"
 required_caveats = ["elide:Volume", "aud", "exp"]
@@ -103,9 +113,17 @@ async fn app() -> (
     // generating one) and the macaroons minted with ROOT verify.
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
-    let store = Arc::new(Store::open_local(dir.path()).await.expect("store"));
+    let k_m_a_hex: String = K_M_A.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.path().join(K_M_A_FILE), k_m_a_hex).expect("seed k_m_a");
+    let mut store_inner = Store::open_local(dir.path()).await.expect("store");
+    store_inner
+        .init_k_m_a(dir.path(), true)
+        .expect("init k_m_a");
+    let store = Arc::new(store_inner);
     let cfg = config();
-    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
+    let seal = Arc::new(arc_swap::ArcSwap::from_pointee(
+        mint::sealed_cache::serving_from_config(&cfg),
+    ));
     let state = AppState {
         config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),
@@ -128,13 +146,54 @@ fn far_future() -> u64 {
     now() + 365 * 24 * 3600
 }
 
+/// The operator-discharge scope a gate-bearing primary needs, inferred
+/// from its `op`. `assume-role` (a TPC-free credential) needs none.
+fn gate_scope(m: &Macaroon) -> Option<&'static str> {
+    match EffectiveCaveats::new(m.caveats()).resolve(name::OP) {
+        Resolved::Value(v) if v == op::ENROLL => Some(scope::MINT_ENROLL),
+        Resolved::Value(v) if v == op::ENROLL_EXCHANGE => Some(scope::MINT_EXCHANGE),
+        _ => None,
+    }
+}
+
+/// Mint the operator discharge a gate clears, the way auth (or the
+/// colocated demo) would: recover `r` from the anchor's TPC `CID` under
+/// `K_M-A` and chain-MAC a discharge carrying `(Subject, OrgId, Scope,
+/// NotAfter)` under it, at `DISCHARGE_KID`.
+fn gate_discharge(cid: &[u8], scope: &str) -> Macaroon {
+    let pt = tpc::decrypt_cid(&K_M_A, cid).expect("cid decrypts under K_M-A");
+    mint_under_key(
+        &pt.r,
+        DISCHARGE_KID,
+        vec![
+            Caveat::scalar("Subject", "usr_test"),
+            Caveat::scalar("OrgId", pt.org_id),
+            Caveat::scalar(name::SCOPE, scope),
+            Caveat::scalar(name::NOT_AFTER, far_future().to_string()),
+        ],
+    )
+}
+
+/// Build a signed request, presenting the primary plus — for the enroll
+/// and exchange gates — a fresh operator discharge for each TPC the
+/// primary carries (the operator's half of the gate). The PoP signs the
+/// body under the *primary's* tail, as the client does.
 fn signed(uri: &str, m: &Macaroon, seed: &[u8; 32], extra: &str) -> Request<Body> {
     let body = format!("{{\"ts\":{}{extra}}}", now());
     let sig = pop::client_signature(seed, m.tail(), body.as_bytes());
+    let mut auth = format!("MintV1 {}", m.encode());
+    if let Some(scope) = gate_scope(m) {
+        for c in m.caveats() {
+            if let Caveat::ThirdParty { cid, .. } = c {
+                auth.push(',');
+                auth.push_str(&gate_discharge(cid, scope).encode());
+            }
+        }
+    }
     Request::builder()
         .method("POST")
         .uri(uri)
-        .header("authorization", format!("MintV1 {}", m.encode()))
+        .header("authorization", auth)
         .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Body::from(body))
@@ -157,9 +216,16 @@ fn field(body: &str, key: &str) -> Macaroon {
 /// The client's self-asserted invite: the reusable invite
 /// macaroon with `sub`/`cnf` appended for `seed`.
 fn client_invite(nonce: &str, seed: &[u8; 32]) -> Macaroon {
-    mint_invite(&Keyring::single(ROOT), "mint", nonce)
-        .attenuate(Caveat::scalar(name::SUB, SUB))
-        .attenuate(Caveat::scalar(name::CNF, pop::cnf_value(seed)))
+    mint_invite(
+        &Keyring::single(ROOT),
+        &K_M_A,
+        "mint",
+        nonce,
+        ORG_ID,
+        AUTH_URL,
+    )
+    .attenuate(Caveat::scalar(name::SUB, SUB))
+    .attenuate(Caveat::scalar(name::CNF, pop::cnf_value(seed)))
 }
 
 #[tokio::test]
@@ -197,7 +263,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
 
     // (3) operator approves the displayed sub
     store
-        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
+        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), "usr_op", &now_iso())
         .await
         .unwrap();
 
@@ -294,9 +360,21 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
 /// otherwise, with a single-kid keyring seeded to `ROOT`.
 async fn app_in_memory() -> (axum::Router, Arc<Mutex<Vec<u8>>>, Arc<Store>) {
     let buf = Arc::new(Mutex::new(Vec::new()));
-    let store = Arc::new(Store::open_in_memory(ROOT).await.expect("store"));
+    let mut store_inner = Store::open_in_memory(ROOT).await.expect("store");
+    // The in-memory store still needs K_M-A to stamp the gate TPCs;
+    // load the known key off a scratch dir (the bytes live in memory
+    // after init, so the dir need not outlive this call).
+    let kdir = tempfile::tempdir().expect("tempdir");
+    let k_m_a_hex: String = K_M_A.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(kdir.path().join(K_M_A_FILE), k_m_a_hex).expect("seed k_m_a");
+    store_inner
+        .init_k_m_a(kdir.path(), true)
+        .expect("init k_m_a");
+    let store = Arc::new(store_inner);
     let cfg = config();
-    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
+    let seal = Arc::new(arc_swap::ArcSwap::from_pointee(
+        mint::sealed_cache::serving_from_config(&cfg),
+    ));
     let state = AppState {
         config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),
@@ -329,7 +407,7 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
     .await;
     assert_eq!(status, StatusCode::OK);
     store
-        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
+        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), "usr_op", &now_iso())
         .await
         .unwrap();
     assert_eq!(
@@ -537,8 +615,15 @@ async fn bearer_invite_without_cnf_is_opaque_401() {
     let nonce = store.current_invite().await.unwrap();
     // sub but no cnf, and no PoP header: a captured invite copy must
     // not enrol.
-    let cb = mint_invite(&Keyring::single(ROOT), "mint", &nonce)
-        .attenuate(Caveat::scalar(name::SUB, SUB));
+    let cb = mint_invite(
+        &Keyring::single(ROOT),
+        &K_M_A,
+        "mint",
+        &nonce,
+        ORG_ID,
+        AUTH_URL,
+    )
+    .attenuate(Caveat::scalar(name::SUB, SUB));
     let req = Request::builder()
         .method("POST")
         .uri("/v1/enroll")
@@ -550,64 +635,19 @@ async fn bearer_invite_without_cnf_is_opaque_401() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-/// A separate harness with `[demo_auth]` + `[operator]` configured and
-/// two operator-write roles, so the exchange path stamps a TPC. Mirrors
-/// `app()` but builds Store with `init_k_m_a` and a config that includes
-/// the auth blocks.
-async fn tpc_app() -> (axum::Router, Arc<Store>, tempfile::TempDir) {
-    const TOML_TPC: &str = r#"
-audience = "mint"
-[tenant]
-bucket = "demo-bucket"
-[demo_auth]
-enabled = true
-[operator]
-location = "https://auth.example/"
-[[role]]
-name = "coord-rw"
-required_caveats = ["aud"]
-min_ttl_seconds = 60
-max_ttl_seconds = 3600
-default_ttl_seconds = 900
-policy_file = "rw.json"
-tpc = { location = "https://auth.example/v1/discharge" }
-[[role]]
-name = "volume-rw"
-required_caveats = ["aud"]
-min_ttl_seconds = 60
-max_ttl_seconds = 3600
-default_ttl_seconds = 900
-policy_file = "rw.json"
-tpc = { location = "https://auth.example/v1/discharge" }
-"#;
-    let cfg = common::parse_config(TOML_TPC, &[("rw.json", VOLUME_RW_POLICY)]);
-    let buf = Arc::new(Mutex::new(Vec::new()));
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
-    let mut store_inner = Store::open_local(dir.path()).await.expect("store");
-    store_inner
-        .init_k_m_a(dir.path(), true)
-        .expect("init k_m_a");
-    let store = Arc::new(store_inner);
-    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
-    let state = AppState {
-        config: Arc::new(cfg),
-        minter: Arc::new(FakeMinter::new()),
-        audit: Arc::new(AuditLog::new(Box::new(AuditSink(buf)))),
-        store: store.clone(),
-        seal,
-    };
-    (router(state), store, dir)
-}
-
+/// The new invariant: operator authority rides the enroll/exchange
+/// gates, not the credential. The invite and the ticket each carry a
+/// third-party caveat; the exchanged credential carries none.
 #[tokio::test]
-async fn tpc_role_credential_carries_third_party_caveat() {
-    let (app, store, _dir) = tpc_app().await;
+async fn gates_carry_tpc_but_credential_does_not() {
+    let (app, _audit, store, _dir) = app().await;
     let nonce = store.current_invite().await.unwrap();
     let cb = client_invite(&nonce, &CLIENT_SEED);
 
-    // enroll
+    // The invite (enroll gate) carries exactly one third-party caveat.
+    assert_eq!(tpc_count(&cb), 1, "invite carries the enroll-gate TPC");
+
+    // enroll → ticket, which carries its own (exchange-gate) TPC.
     let (status, body) = parts(
         app.clone()
             .oneshot(signed("/v1/enroll", &cb, &CLIENT_SEED, ""))
@@ -617,132 +657,92 @@ async fn tpc_role_credential_carries_third_party_caveat() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let ticket = field(&body, "credential.ticket");
+    assert_eq!(
+        tpc_count(&ticket),
+        1,
+        "ticket carries the exchange-gate TPC"
+    );
 
-    // approve
+    // approve, then exchange → a TPC-free credential.
     store
-        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
+        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), "usr_op", &now_iso())
         .await
         .unwrap();
-
-    // exchange both operator-write roles
-    let exchange = |role: &str| {
-        let app = app.clone();
-        let ticket = ticket.clone();
-        let extra = format!(r#","role":"{role}""#);
-        async move {
-            let (status, body) = parts(
-                app.oneshot(signed("/v1/enroll-exchange", &ticket, &CLIENT_SEED, &extra))
-                    .await
-                    .unwrap(),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK, "body: {body}");
-            field(&body, "credential")
-        }
-    };
-    let coord_rw = exchange("coord-rw").await;
-    let volume_rw = exchange("volume-rw").await;
-
-    // Both verify under the same root: chain MAC includes the TPC.
-    let ring = Keyring::single(ROOT);
-    assert!(coord_rw.verify(&ring));
-    assert!(volume_rw.verify(&ring));
-
-    // Last caveat in each is a ThirdParty with the configured location.
-    let coord_tpc = coord_rw.caveats().last().expect("at least one caveat");
-    let volume_tpc = volume_rw.caveats().last().expect("at least one caveat");
-    match (coord_tpc, volume_tpc) {
-        (
-            Caveat::ThirdParty {
-                location: loc_a,
-                vid: vid_a,
-                cid: cid_a,
-            },
-            Caveat::ThirdParty {
-                location: loc_b,
-                vid: vid_b,
-                cid: cid_b,
-            },
-        ) => {
-            assert_eq!(loc_a, "https://auth.example/v1/discharge");
-            assert_eq!(loc_a, loc_b);
-            // One discharge serves both: CID is identical across the
-            // operator-write credentials because both share the same
-            // `r`, `coord_ulid`, and `org_id` plaintext under the same
-            // `K_M-A`.
-            assert_eq!(cid_a, cid_b, "CID must match across operator-write creds");
-            // But VID differs: each chain reaches a different tag at
-            // the TPC position (different first-party caveats =
-            // different T_{n-1}), so the AEAD output differs even
-            // though `r` is the same.
-            assert_ne!(
-                vid_a, vid_b,
-                "VID must differ across chains with different first-party caveats"
-            );
-        }
-        (a, b) => panic!("expected ThirdParty caveats; got {a:?} and {b:?}"),
-    }
-}
-
-#[tokio::test]
-async fn tpc_credential_is_deterministic_for_same_coord() {
-    // Re-minting (e.g. on a fresh exchange of the same ticket) must
-    // produce the same CID — that's the property mint_credential
-    // depends on for "one discharge serves both" to hold across
-    // restarts.
-    let (app, store, _dir) = tpc_app().await;
-    let nonce = store.current_invite().await.unwrap();
-    let cb = client_invite(&nonce, &CLIENT_SEED);
-    let (_, body) = parts(
-        app.clone()
-            .oneshot(signed("/v1/enroll", &cb, &CLIENT_SEED, ""))
-            .await
-            .unwrap(),
+    let (status, body) = parts(
+        app.oneshot(signed(
+            "/v1/enroll-exchange",
+            &ticket,
+            &CLIENT_SEED,
+            r#","role":"volume-ro""#,
+        ))
+        .await
+        .unwrap(),
     )
     .await;
-    let ticket = field(&body, "credential.ticket");
-    store
-        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), &now_iso())
-        .await
-        .unwrap();
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let credential = field(&body, "credential");
+    assert_eq!(tpc_count(&credential), 0, "credential carries no TPC");
+}
 
-    let one = parts(
-        app.clone()
-            .oneshot(signed(
-                "/v1/enroll-exchange",
-                &ticket,
-                &CLIENT_SEED,
-                r#","role":"coord-rw""#,
-            ))
-            .await
-            .unwrap(),
-    )
-    .await
-    .1;
-    let two = parts(
-        app.clone()
-            .oneshot(signed(
-                "/v1/enroll-exchange",
-                &ticket,
-                &CLIENT_SEED,
-                r#","role":"coord-rw""#,
-            ))
-            .await
-            .unwrap(),
-    )
-    .await
-    .1;
-    let cred1 = field(&one, "credential");
-    let cred2 = field(&two, "credential");
-    match (cred1.caveats().last(), cred2.caveats().last()) {
-        (
-            Some(Caveat::ThirdParty { cid: cid1, .. }),
-            Some(Caveat::ThirdParty { cid: cid2, .. }),
-        ) => {
-            assert_eq!(cid1, cid2, "CID must be deterministic across re-mints");
-        }
-        other => panic!("expected ThirdParty tails; got {other:?}"),
-    }
+/// Count third-party caveats on a macaroon.
+fn tpc_count(m: &Macaroon) -> usize {
+    m.caveats()
+        .iter()
+        .filter(|c| matches!(c, Caveat::ThirdParty { .. }))
+        .count()
+}
+
+/// The enroll gate bites: a bare invite with no operator discharge
+/// cannot open an enrollment, even with a valid PoP.
+#[tokio::test]
+async fn enroll_without_operator_discharge_is_opaque_401() {
+    let (app, _a, store, _dir) = app().await;
+    let nonce = store.current_invite().await.unwrap();
+    let cb = client_invite(&nonce, &CLIENT_SEED);
+    let body = format!(r#"{{"ts":{}}}"#, now());
+    let sig = pop::client_signature(&CLIENT_SEED, cb.tail(), body.as_bytes());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/enroll")
+        .header("authorization", format!("MintV1 {}", cb.encode()))
+        .header("x-mint-pop", sig)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, _) = parts(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The scope clear bites: a discharge for the invite's TPC carrying the
+/// wrong scope (`mint:exchange`, not `mint:enroll`) does not clear the
+/// enroll gate.
+#[tokio::test]
+async fn enroll_with_wrong_scope_discharge_is_opaque_401() {
+    let (app, _a, store, _dir) = app().await;
+    let nonce = store.current_invite().await.unwrap();
+    let cb = client_invite(&nonce, &CLIENT_SEED);
+    let cid = cb
+        .caveats()
+        .iter()
+        .find_map(|c| match c {
+            Caveat::ThirdParty { cid, .. } => Some(cid.clone()),
+            _ => None,
+        })
+        .expect("invite carries a TPC");
+    let wrong = gate_discharge(&cid, scope::MINT_EXCHANGE);
+    let body = format!(r#"{{"ts":{}}}"#, now());
+    let sig = pop::client_signature(&CLIENT_SEED, cb.tail(), body.as_bytes());
+    let auth = format!("MintV1 {},{}", cb.encode(), wrong.encode());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/enroll")
+        .header("authorization", auth)
+        .header("x-mint-pop", sig)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, _) = parts(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -755,10 +755,13 @@ async fn exchange_without_approval_returns_403_awaiting() {
     // approved yet" — both are the 403-awaited outcome.
     let inter = mint_credential_ticket(
         &Keyring::single(ROOT),
+        &K_M_A,
         "mint",
         SUB,
         &pop::cnf_value(&CLIENT_SEED),
         now() + 600,
+        ORG_ID,
+        AUTH_URL,
     );
     let (status, _) = parts(
         app.oneshot(signed("/v1/enroll-exchange", &inter, &CLIENT_SEED, ""))

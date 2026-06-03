@@ -86,6 +86,10 @@ pub struct Pending {
     /// The invite nonce this enrollment was opened under; rotation
     /// drops records whose nonce is no longer current.
     pub invite: String,
+    /// The enrolling operator's `Subject`, taken from the enroll-gate
+    /// discharge at `/v1/enroll` — *who* authorised this enrollment
+    /// request (`docs/design-mint.md` § *Enrollment* (1)).
+    pub requested_by: String,
     /// First-seen unix seconds (kept stable across idempotent retries).
     pub first_seen: u64,
     /// Peer IP at first sight, for the operator's out-of-band check.
@@ -109,6 +113,10 @@ pub struct Approved {
     /// approval; a different `pubkey` for the same `sub` is treated as
     /// a key-rotation request and requires fresh approval.
     pub pubkey: String,
+    /// The approving operator's `Subject`, taken from the admin-plane
+    /// discharge at `mint enroll approve` — *who* confirmed the key
+    /// (`docs/design-mint.md` § *Enrollment* (2)). Part of the body MAC.
+    pub approved_by: String,
     /// RFC 3339 timestamp the operator approved the pairing.
     pub approved_at: String,
     /// The fingerprint shown to the operator at approval, recorded so
@@ -249,10 +257,12 @@ const APPROVAL_DOMAIN: &[u8] = b"mint-approved-v1";
 /// different `<sub>` and still verify (cross-record substitution).
 /// Every variable-length field is length-prefixed to prevent
 /// canonicalization ambiguity.
+#[allow(clippy::too_many_arguments)]
 fn approval_mac(
     key: &[u8; 32],
     sub: &str,
     pubkey: &str,
+    approved_by: &str,
     approved_at: &str,
     fingerprint_shown: &str,
     r_epoch: u32,
@@ -261,6 +271,7 @@ fn approval_mac(
     msg.extend_from_slice(APPROVAL_DOMAIN);
     append_len_prefixed(&mut msg, sub.as_bytes());
     append_len_prefixed(&mut msg, pubkey.as_bytes());
+    append_len_prefixed(&mut msg, approved_by.as_bytes());
     append_len_prefixed(&mut msg, approved_at.as_bytes());
     append_len_prefixed(&mut msg, fingerprint_shown.as_bytes());
     msg.extend_from_slice(&r_epoch.to_be_bytes());
@@ -696,11 +707,13 @@ impl Store {
     /// A different `pub` for an existing approved `sub` falls through
     /// to the normal pending path, surfacing as a key-rotation request
     /// the operator must re-approve.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_pending(
         &self,
         sub: &str,
         pubkey: &str,
         invite: &str,
+        requested_by: &str,
         peer_ip: &str,
         now_unix: u64,
     ) -> Result<Recorded, StateError> {
@@ -729,6 +742,7 @@ impl Store {
         let rec = Pending {
             pubkey: pubkey.to_string(),
             invite: invite.to_string(),
+            requested_by: requested_by.to_string(),
             first_seen: now_unix,
             peer_ip: peer_ip.to_string(),
         };
@@ -769,6 +783,7 @@ impl Store {
         &self,
         sub: &str,
         pubkey: &str,
+        approved_by: &str,
         now_iso8601: &str,
     ) -> Result<(), StateError> {
         if !safe_sub(sub) {
@@ -784,12 +799,14 @@ impl Store {
             kr.current_key(),
             sub,
             pubkey,
+            approved_by,
             now_iso8601,
             &fingerprint_shown,
             r_epoch,
         );
         let rec = Approved {
             pubkey: pubkey.to_string(),
+            approved_by: approved_by.to_string(),
             approved_at: now_iso8601.to_string(),
             fingerprint_shown,
             kid,
@@ -878,6 +895,7 @@ impl Store {
             key,
             sub,
             &rec.pubkey,
+            &rec.approved_by,
             &rec.approved_at,
             &rec.fingerprint_shown,
             rec.r_epoch,
@@ -962,6 +980,7 @@ impl Store {
             old_key,
             sub,
             &rec.pubkey,
+            &rec.approved_by,
             &rec.approved_at,
             &rec.fingerprint_shown,
             rec.r_epoch,
@@ -977,12 +996,14 @@ impl Store {
             kr.current_key(),
             sub,
             &rec.pubkey,
+            &rec.approved_by,
             &rec.approved_at,
             &rec.fingerprint_shown,
             rec.r_epoch,
         );
         let next = Approved {
             pubkey: rec.pubkey,
+            approved_by: rec.approved_by,
             approved_at: rec.approved_at,
             fingerprint_shown: rec.fingerprint_shown,
             kid: kr.current_kid(),
@@ -1066,6 +1087,7 @@ impl Store {
                 old_key,
                 &sub,
                 &rec.pubkey,
+                &rec.approved_by,
                 &rec.approved_at,
                 &rec.fingerprint_shown,
                 rec.r_epoch,
@@ -1095,12 +1117,14 @@ impl Store {
                 new_key,
                 &sub,
                 &rec.pubkey,
+                &rec.approved_by,
                 &rec.approved_at,
                 &rec.fingerprint_shown,
                 rec.r_epoch,
             );
             let next = Approved {
                 pubkey: rec.pubkey,
+                approved_by: rec.approved_by,
                 approved_at: rec.approved_at,
                 fingerprint_shown: rec.fingerprint_shown,
                 kid: new_kid,
@@ -1425,7 +1449,7 @@ mod tests {
     async fn rotate_changes_nonce_and_drops_noncurrent_pending() {
         let (_d, s) = store().await;
         let old = s.current_invite().await.unwrap();
-        s.record_pending("01ARZ", PUBA, &old, "1.2.3.4", 100)
+        s.record_pending("01ARZ", PUBA, &old, "usr_op", "1.2.3.4", 100)
             .await
             .unwrap();
         let new = s.rotate_invite().await.unwrap();
@@ -1440,8 +1464,12 @@ mod tests {
     async fn rotate_does_not_touch_approved_registry() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
-        s.record_pending("01ARZ", PUBA, &b, "ip", 1).await.unwrap();
-        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 1)
+            .await
+            .unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         s.rotate_invite().await.unwrap();
         assert!(
             s.get_approved("01ARZ").await.unwrap().is_some(),
@@ -1454,16 +1482,20 @@ mod tests {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
         assert_eq!(
-            s.record_pending("01ARZ", PUBA, &b, "ip", 1).await.unwrap(),
+            s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 1)
+                .await
+                .unwrap(),
             Recorded::Created
         );
         assert_eq!(
-            s.record_pending("01ARZ", PUBA, &b, "ip2", 9).await.unwrap(),
+            s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip2", 9)
+                .await
+                .unwrap(),
             Recorded::Idempotent
         );
         assert_eq!(s.get_pending("01ARZ").await.unwrap().unwrap().first_seen, 1);
         assert!(matches!(
-            s.record_pending("01ARZ", PUBB, &b, "ip", 1).await,
+            s.record_pending("01ARZ", PUBB, &b, "usr_op", "ip", 1).await,
             Err(StateError::Conflict)
         ));
     }
@@ -1472,11 +1504,17 @@ mod tests {
     async fn fast_path_skips_pending_when_approved_pub_matches() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
-        s.record_pending("01ARZ", PUBA, &b, "ip", 1).await.unwrap();
-        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 1)
+            .await
+            .unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         // Re-enroll with the same pub — the fast path kicks in.
         assert_eq!(
-            s.record_pending("01ARZ", PUBA, &b, "ip", 2).await.unwrap(),
+            s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 2)
+                .await
+                .unwrap(),
             Recorded::AlreadyApproved
         );
         assert!(
@@ -1489,11 +1527,17 @@ mod tests {
     async fn key_rotation_surfaces_as_fresh_pending() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
-        s.record_pending("01ARZ", PUBA, &b, "ip", 1).await.unwrap();
-        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 1)
+            .await
+            .unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         // Same sub, different pub — falls through to slow path.
         assert_eq!(
-            s.record_pending("01ARZ", PUBB, &b, "ip", 2).await.unwrap(),
+            s.record_pending("01ARZ", PUBB, &b, "usr_op", "ip", 2)
+                .await
+                .unwrap(),
             Recorded::Created
         );
         let pending = s.get_pending("01ARZ").await.unwrap().unwrap();
@@ -1508,15 +1552,21 @@ mod tests {
     async fn approve_writes_registry_and_deletes_pending() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
-        s.record_pending("01ARZ", PUBA, &b, "ip", 1).await.unwrap();
-        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 1)
+            .await
+            .unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         assert!(s.get_approved("01ARZ").await.unwrap().is_some());
         assert!(
             s.get_pending("01ARZ").await.unwrap().is_none(),
             "pending deleted at approval"
         );
         // Re-approval is idempotent at the registry level.
-        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         assert!(s.get_approved("01ARZ").await.unwrap().is_some());
     }
 
@@ -1524,8 +1574,12 @@ mod tests {
     async fn revoke_removes_registry_entry() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
-        s.record_pending("01ARZ", PUBA, &b, "ip", 1).await.unwrap();
-        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 1)
+            .await
+            .unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         assert!(s.revoke("01ARZ").await.unwrap());
         assert!(s.get_approved("01ARZ").await.unwrap().is_none());
         assert!(
@@ -1534,7 +1588,9 @@ mod tests {
         );
         // Next enroll falls back to the slow path.
         assert_eq!(
-            s.record_pending("01ARZ", PUBA, &b, "ip", 3).await.unwrap(),
+            s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 3)
+                .await
+                .unwrap(),
             Recorded::Created
         );
     }
@@ -1543,14 +1599,16 @@ mod tests {
     async fn gc_drops_old_pending_only_never_approved() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
-        s.record_pending("old-pending", PUBA, &b, "ip", 0)
+        s.record_pending("old-pending", PUBA, &b, "usr_op", "ip", 0)
             .await
             .unwrap();
-        s.record_pending("kept-approved", PUBB, &b, "ip", 0)
+        s.record_pending("kept-approved", PUBB, &b, "usr_op", "ip", 0)
             .await
             .unwrap();
-        s.approve("kept-approved", PUBB, APPROVED_AT).await.unwrap();
-        s.record_pending("fresh", PUBA, &b, "ip", 950)
+        s.approve("kept-approved", PUBB, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        s.record_pending("fresh", PUBA, &b, "usr_op", "ip", 950)
             .await
             .unwrap();
         let dropped = s.gc(1_000, 100).await.unwrap();
@@ -1569,7 +1627,7 @@ mod tests {
         let b = s.current_invite().await.unwrap();
         for bad in ["../etc", "a/b", "", "."] {
             assert!(matches!(
-                s.record_pending(bad, PUBA, &b, "ip", 1).await,
+                s.record_pending(bad, PUBA, &b, "usr_op", "ip", 1).await,
                 Err(StateError::BadSub)
             ));
         }
@@ -1579,9 +1637,15 @@ mod tests {
     async fn list_unifies_pending_and_approved_with_state_column() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
-        s.record_pending("subP", PUBA, &b, "ip", 1).await.unwrap();
-        s.record_pending("subQ", PUBB, &b, "ip", 1).await.unwrap();
-        s.approve("subQ", PUBB, APPROVED_AT).await.unwrap();
+        s.record_pending("subP", PUBA, &b, "usr_op", "ip", 1)
+            .await
+            .unwrap();
+        s.record_pending("subQ", PUBB, &b, "usr_op", "ip", 1)
+            .await
+            .unwrap();
+        s.approve("subQ", PUBB, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         let rows = s.list(10).await.unwrap();
         let by_sub: std::collections::HashMap<_, _> =
             rows.iter().map(|r| (r.sub.as_str(), r.state)).collect();
@@ -1594,8 +1658,12 @@ mod tests {
     async fn list_flags_anomalous_shared_pub() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
-        s.record_pending("subX", PUBA, &b, "ip", 1).await.unwrap();
-        s.record_pending("subY", PUBA, &b, "ip", 1).await.unwrap();
+        s.record_pending("subX", PUBA, &b, "usr_op", "ip", 1)
+            .await
+            .unwrap();
+        s.record_pending("subY", PUBA, &b, "usr_op", "ip", 1)
+            .await
+            .unwrap();
         let rows = s.list(10).await.unwrap();
         let pendings: Vec<_> = rows
             .iter()
@@ -1610,7 +1678,7 @@ mod tests {
         let s = Store::open_in_memory([1u8; 32]).await.unwrap();
         let inv = s.current_invite().await.unwrap();
         assert!(!inv.is_empty());
-        s.record_pending("01ARZ", PUBA, &inv, "ip", 1)
+        s.record_pending("01ARZ", PUBA, &inv, "usr_op", "ip", 1)
             .await
             .unwrap();
         assert!(s.get_pending("01ARZ").await.unwrap().is_some());
@@ -1651,7 +1719,9 @@ mod tests {
     #[tokio::test]
     async fn approved_record_round_trips_with_mac() {
         let (_d, s) = store().await;
-        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         let got = s.get_approved("01ARZ").await.unwrap().expect("present");
         let kr = s.keyring().await;
         assert_eq!(got.kid, kr.current_kid());
@@ -1667,6 +1737,7 @@ mod tests {
         let forged = serde_json::json!({
             "pubkey": PUBA,
             "approved_at": APPROVED_AT,
+            "approved_by": "usr_op",
             "fingerprint_shown": fingerprint(PUBA),
             "kid": 0,
             "mac": "00".repeat(32),
@@ -1698,7 +1769,7 @@ mod tests {
         raw_put_approved(&s, "01ARZ", &legacy_unsigned).await;
         let invite = s.current_invite().await.unwrap();
         let recorded = s
-            .record_pending("01ARZ", PUBA, &invite, "ip", 1)
+            .record_pending("01ARZ", PUBA, &invite, "usr_op", "ip", 1)
             .await
             .expect("record_pending must NOT error on corrupt approved");
         assert_eq!(recorded, Recorded::Created);
@@ -1717,6 +1788,7 @@ mod tests {
         let forged = serde_json::json!({
             "pubkey": PUBA,
             "approved_at": APPROVED_AT,
+            "approved_by": "usr_op",
             "fingerprint_shown": fingerprint(PUBA),
             "kid": 0,
             "mac": "00".repeat(32),
@@ -1724,7 +1796,7 @@ mod tests {
         raw_put_approved(&s, "01ARZ", &forged).await;
         let invite = s.current_invite().await.unwrap();
         let recorded = s
-            .record_pending("01ARZ", PUBA, &invite, "ip", 1)
+            .record_pending("01ARZ", PUBA, &invite, "usr_op", "ip", 1)
             .await
             .expect("record_pending must NOT error on forged approved");
         assert_eq!(recorded, Recorded::Created);
@@ -1737,7 +1809,9 @@ mod tests {
         // a valid record verbatim from `_mint/approved/subA` to
         // `_mint/approved/subB` cannot replay it under the new sub.
         let (_d, s) = store().await;
-        s.approve("subA", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("subA", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         let real = s.get_approved("subA").await.unwrap().expect("present");
         let body = serde_json::to_value(&real).unwrap();
         raw_put_approved(&s, "subB", &body).await;
@@ -1755,7 +1829,9 @@ mod tests {
         // removed from the keyring.
         let d = tempfile::tempdir().unwrap();
         let s = Store::open_local(d.path()).await.unwrap();
-        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         // Rotate the keyring on disk, then retire the original kid.
         let mut kr = (*s.keyring().await).clone();
         let rk = d.path().join("root_keys");
@@ -1775,7 +1851,9 @@ mod tests {
         // ring, because verification picks the key by kid.
         let d = tempfile::tempdir().unwrap();
         let s = Store::open_local(d.path()).await.unwrap();
-        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         let mut kr = (*s.keyring().await).clone();
         let rk = d.path().join("root_keys");
         kr.add_and_promote(&rk, None).unwrap();
@@ -1805,7 +1883,9 @@ mod tests {
         // unchanged except for `kid` and `mac`; subsequent reads
         // verify under the new kid.
         let s = Store::open_in_memory([1u8; 32]).await.unwrap();
-        s.approve("01ARZ", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         s.set_keyring(ring_two_keys([1u8; 32], [2u8; 32])).await;
         let migrated = s.migrate_approval_to_current_kid("01ARZ").await.unwrap();
         assert!(migrated, "first call moves it forward");
@@ -1824,6 +1904,7 @@ mod tests {
         let forged = serde_json::json!({
             "pubkey": PUBA,
             "approved_at": APPROVED_AT,
+            "approved_by": "usr_op",
             "fingerprint_shown": fingerprint(PUBA),
             "kid": 0,
             "mac": "00".repeat(32),
@@ -1849,10 +1930,13 @@ mod tests {
         // first, skips the second, leaves the third alone.
         let d = tempfile::tempdir().unwrap();
         let s = Store::open_local(d.path()).await.unwrap();
-        s.approve("real-old", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("real-old", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         let forged = serde_json::json!({
             "pubkey": PUBB,
             "approved_at": APPROVED_AT,
+            "approved_by": "usr_op",
             "fingerprint_shown": fingerprint(PUBB),
             "kid": 0,
             "mac": "00".repeat(32),
@@ -1864,7 +1948,9 @@ mod tests {
         s.set_keyring(kr).await;
         // A record approved AFTER the rotation already sits on the new
         // kid — the sweep should report it as already_current.
-        s.approve("on-current", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("on-current", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         let report = s.sweep_approvals_to_current_kid().await.unwrap();
         assert_eq!(report.rekeyed, 1, "real-old moved forward");
         assert_eq!(report.skipped, 1, "forged not laundered");
@@ -1882,18 +1968,24 @@ mod tests {
         // {0, 1, 2} leaves records under 0 and 2 verifying as before.
         let d = tempfile::tempdir().unwrap();
         let s = Store::open_local(d.path()).await.unwrap();
-        s.approve("under-0", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("under-0", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         // Rotate to kid 1, approve a second record there.
         let mut kr = (*s.keyring().await).clone();
         let rk = d.path().join("root_keys");
         kr.add_and_promote(&rk, None).unwrap();
         s.set_keyring(kr).await;
-        s.approve("under-1", PUBB, APPROVED_AT).await.unwrap();
+        s.approve("under-1", PUBB, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         // Rotate again to kid 2, approve a third.
         let mut kr = (*s.keyring().await).clone();
         kr.add_and_promote(&rk, None).unwrap();
         s.set_keyring(kr).await;
-        s.approve("under-2", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("under-2", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         // Now retire only the intermediate kid 1. `under-0` and
         // `under-2` should still verify; `under-1` should not.
         let mut kr = (*s.keyring().await).clone();
@@ -1913,10 +2005,13 @@ mod tests {
         // forged or under a retired kid; that record is silently
         // dropped from the view (logged inside get_approved).
         let (_d, s) = store().await;
-        s.approve("good", PUBA, APPROVED_AT).await.unwrap();
+        s.approve("good", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
         let forged = serde_json::json!({
             "pubkey": PUBB,
             "approved_at": APPROVED_AT,
+            "approved_by": "usr_op",
             "fingerprint_shown": fingerprint(PUBB),
             "kid": 0,
             "mac": "00".repeat(32),

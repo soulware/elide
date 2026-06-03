@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -55,12 +55,6 @@ pub enum ConfigError {
         #[source]
         source: std::net::AddrParseError,
     },
-    #[error(
-        "role {0} sets [role.tpc] but no auth integration is configured; \
-         the third-party caveat is keyed by K_M-A — add [operator] (or \
-         [demo_auth].enabled for the demo) or drop the [role.tpc] section"
-    )]
-    TpcRoleWithoutAuth(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,8 +100,7 @@ pub struct RawConfig {
     pub demo_auth: Option<RawDemoAuth>,
     /// Operator auth-service integration. A mint without `[operator]`
     /// (and without `[demo_auth].enabled`) cannot stamp third-party
-    /// caveats and refuses `assume-role` for any role that sets
-    /// `[role.tpc]`.
+    /// caveats, so it has no enrollment plane — `/v1/enroll` fails closed.
     #[serde(default)]
     pub operator: Option<RawOperator>,
     #[serde(rename = "role", default)]
@@ -135,12 +128,14 @@ pub struct RawDemoAuth {
 }
 
 /// `[operator]` block: the operator's auth-service integration. Required
-/// whenever any role sets `[role.tpc]` or a cli-token is minted, because
-/// both stamp an operator-side third-party caveat.
+/// for enrollment and the admin plane — it supplies the discharge
+/// `location` stamped into the invite's enroll gate, the ticket's
+/// exchange gate, and the cli-token's admin gate.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawOperator {
-    /// The `location` stamped into the operator cli-token's third-party
-    /// caveat (per-role TPC locations live in each `[role.tpc]`).
+    /// The discharge `location` stamped into the enroll-gate (invite),
+    /// exchange-gate (ticket), and admin-gate (cli-token) third-party
+    /// caveats. Where a client/operator fetches the discharge.
     pub location: String,
 }
 
@@ -230,33 +225,6 @@ pub struct RawRole {
     /// (so a role `name` with a path separator is rejected too).
     #[serde(default)]
     pub policy_file: Option<String>,
-    /// Present ⇒ this role issues credentials carrying a third-party
-    /// caveat at `tpc.location`, requiring a discharge at `assume-role`.
-    /// Drives the operator-initiated vs background split
-    /// (`docs/design-mint.md` § *Elide as customer* and
-    /// `docs/design-auth-service.md`): operator-write roles set it; read
-    /// and background-write roles leave it absent. Issuance
-    /// unconditionally appends the TPC when present; verification
-    /// unconditionally requires a discharge for any TPC it walks.
-    #[serde(default)]
-    pub tpc: Option<RawTpc>,
-}
-
-/// Per-role third-party-caveat config as written in TOML. Its presence
-/// on a `[[role]]` is what makes the role issue a TPC.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RawTpc {
-    /// The TPC `location` (macaroon-paper term): where a client fetches
-    /// the discharge. Stamped into every credential the role issues.
-    pub location: String,
-}
-
-/// Resolved per-role TPC config. `Some` ⇒ the role issues a TPC at
-/// `location`; `None` ⇒ it does not. Serialisable + comparable because
-/// it is part of the sealed role surface ([`crate::seal::SealedRole`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tpc {
-    pub location: String,
 }
 
 /// Resolved listener transport — a per-deployment-shape choice, not a
@@ -326,8 +294,8 @@ pub struct Config {
     pub demo_auth: Option<DemoAuth>,
     /// Operator auth integration — `None` if the config omits
     /// `[operator]`. A mint without it (and without a demo auth role)
-    /// cannot stamp TPCs; roles that set `[role.tpc]` are refused at
-    /// startup.
+    /// cannot stamp the enroll/exchange/admin gates, so enrollment and
+    /// the admin plane fail closed.
     pub operator: Option<OperatorAuth>,
     pub roles: BTreeMap<String, Role>,
 }
@@ -347,11 +315,6 @@ pub struct Role {
     /// The role's IAM-policy handlebars template, read from
     /// [`policy_path`](Role::policy_path) at load.
     pub policy: String,
-    /// `Some` ⇒ mint appends a third-party caveat (see
-    /// `docs/design-auth-service.md`) to every credential it mints for
-    /// this role, with `tpc.location` as the caveat's location.
-    /// Verification at `assume-role` then requires a matching discharge.
-    pub tpc: Option<Tpc>,
 }
 
 impl Config {
@@ -391,9 +354,6 @@ impl Config {
                 default_ttl_seconds: r.default_ttl_seconds,
                 policy_path,
                 policy,
-                tpc: r.tpc.map(|t| Tpc {
-                    location: t.location,
-                }),
             };
             if roles.insert(r.name.clone(), role).is_some() {
                 return Err(ConfigError::DuplicateRole(r.name));
@@ -418,15 +378,6 @@ impl Config {
         let operator = raw.operator.map(|o| OperatorAuth {
             location: o.location,
         });
-        // A role that issues a TPC needs K_M-A to key the caveat. K_M-A
-        // is generated by a colocated demo auth role and otherwise
-        // provisioned via the operator auth integration, so a TPC role
-        // requires one or the other. Refusing here keeps the issuance
-        // path unconditional.
-        let has_k_m_a = demo_auth.as_ref().is_some_and(|d| d.enabled) || operator.is_some();
-        if !has_k_m_a && let Some(r) = roles.values().find(|r| r.tpc.is_some()) {
-            return Err(ConfigError::TpcRoleWithoutAuth(r.name.clone()));
-        }
         Ok(Config {
             audience: raw.audience,
             data_dir,
@@ -607,47 +558,12 @@ policy_file = "volume-ro.json"
         ));
     }
 
-    #[test]
-    fn tpc_defaults_to_none() {
-        let c = parse_for_test(SAMPLE, &[("volume-ro.json", "{}")]).expect("parse");
-        assert!(c.roles["volume-ro"].tpc.is_none());
-    }
-
     /// Inject a config block (e.g. `[operator]`) before the first
     /// `[[role]]` in SAMPLE. Injecting at `[tenant]` would land
     /// `parse_for_test`'s `roles_dir = ...` line inside the injected
     /// table; injecting at `[[role]]` keeps every key in the right table.
     fn with_block(s: &str, block: &str) -> String {
         s.replacen("[[role]]", &format!("{block}\n\n[[role]]"), 1)
-    }
-
-    #[test]
-    fn tpc_section_is_parsed() {
-        let toml = with_block(
-            &SAMPLE.replace(
-                "policy_file = \"volume-ro.json\"",
-                "policy_file = \"volume-ro.json\"\n\
-                 tpc = { location = \"https://auth.example/v1/discharge\" }",
-            ),
-            "[operator]\nlocation = \"https://auth.example/v1/discharge\"",
-        );
-        let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
-        let tpc = c.roles["volume-ro"].tpc.as_ref().expect("tpc present");
-        assert_eq!(tpc.location, "https://auth.example/v1/discharge");
-        assert!(c.operator.is_some());
-    }
-
-    #[test]
-    fn tpc_role_without_auth_block_is_rejected() {
-        let toml = SAMPLE.replace(
-            "policy_file = \"volume-ro.json\"",
-            "policy_file = \"volume-ro.json\"\n\
-             tpc = { location = \"https://auth.example/v1/discharge\" }",
-        );
-        assert!(matches!(
-            parse_for_test(&toml, &[("volume-ro.json", "{}")]),
-            Err(ConfigError::TpcRoleWithoutAuth(role)) if role == "volume-ro"
-        ));
     }
 
     #[test]

@@ -41,11 +41,9 @@ const SEAL_DOMAIN: &[u8] = b"mint-templates-seal-v1";
 
 /// Sealed view of one role: every field of the `[[role]]` block that
 /// bears on what mint will render or grant — TTL bounds, required-caveat
-/// set, the TPC section (`tpc`: present ⇒ the role issues a third-party
-/// caveat at `tpc.location`, the operator-consent gate on writes), and
-/// the policy template's content hash. The only role-block field
-/// deliberately left unsealed is `policy_file` (the filename): what
-/// matters is the bytes it currently contains — hashed into
+/// set, and the policy template's content hash. The only role-block
+/// field deliberately left unsealed is `policy_file` (the filename):
+/// what matters is the bytes it currently contains — hashed into
 /// `policy_blake3` — not where the operator put them.
 ///
 /// [`Seal::build_from_config`] destructures the role exhaustively, so
@@ -64,7 +62,6 @@ pub struct SealedRole {
     /// BLAKE3 of the role's policy template file content, hex-encoded.
     pub policy_blake3: String,
     pub required_caveats: Vec<String>,
-    pub tpc: Option<crate::config::Tpc>,
 }
 
 /// The complete seal: every role, plus the audience. MAC'd under one
@@ -124,7 +121,6 @@ impl Seal {
                 default_ttl_seconds,
                 policy_path: _, // location, not authority — bytes hashed below
                 policy,
-                tpc,
             } = role;
             roles.insert(
                 name.clone(),
@@ -134,7 +130,6 @@ impl Seal {
                     min_ttl_seconds: *min_ttl_seconds,
                     policy_blake3: hash_hex(policy.as_bytes()),
                     required_caveats: required_caveats.clone(),
-                    tpc: tpc.clone(),
                 },
             );
         }
@@ -220,12 +215,6 @@ impl Seal {
                 diffs.push(format!(
                     "role {name}: required_caveats sealed as {:?}, local has {:?}",
                     sealed.required_caveats, role.required_caveats
-                ));
-            }
-            if sealed.tpc != role.tpc {
-                diffs.push(format!(
-                    "role {name}: tpc sealed as {:?}, local has {:?}",
-                    sealed.tpc, role.tpc
                 ));
             }
             if sealed.min_ttl_seconds != role.min_ttl_seconds
@@ -532,44 +521,6 @@ policy_file = "volume-ro.json"
             .required_caveats
             .clear();
         assert!(matches!(seal.verify(&kr), Err(SealError::BadMac)));
-    }
-
-    #[test]
-    fn tpc_is_sealed() {
-        // The TPC section is the operator-consent gate on writes:
-        // adding/removing it (or repointing its location) changes whether
-        // a role's credentials require a discharge, and from where. It
-        // must be inside both the MAC body and the config diff, or it
-        // could be mutated without a re-seal.
-        use crate::config::Tpc;
-        let tpc = || {
-            Some(Tpc {
-                location: "https://auth.example/v1/discharge".to_string(),
-            })
-        };
-        let kr = Keyring::single([7u8; 32]);
-        let mut seal = Seal::build_from_config(&config(), &kr, "t");
-        assert!(seal.roles["volume-ro"].tpc.is_none());
-
-        // Part of the MAC body: adding a TPC invalidates the seal.
-        seal.roles.get_mut("volume-ro").unwrap().tpc = tpc();
-        assert!(matches!(seal.verify(&kr), Err(SealError::BadMac)));
-
-        // Part of the intent: a seal pinning a different TPC than the
-        // local config is reported by the diff (re-MAC first so we
-        // exercise the diff, not the MAC check).
-        let mac = seal.compute_mac(kr.current_key());
-        seal.mac = hex32(&mac);
-        let diffs = seal.diff_against_config(&config());
-        assert_eq!(diffs.len(), 1, "diff: {diffs:?}");
-        assert!(diffs[0].contains("tpc"), "diff: {diffs:?}");
-
-        // Part of semantic equality: it gates the "serve cache" decision,
-        // so two seals differing only in the TPC must not reconcile.
-        let a = Seal::build_from_config(&config(), &kr, "t");
-        let mut b = a.clone();
-        b.roles.get_mut("volume-ro").unwrap().tpc = tpc();
-        assert!(!a.semantically_equal(&b));
     }
 
     #[test]

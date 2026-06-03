@@ -17,17 +17,24 @@ use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::issuance::mint_invite;
 use mint::keyring::Keyring;
-use mint::state::Store;
+use mint::state::{K_M_A_FILE, Store};
 
 mod common;
 
 const ROOT: [u8; 32] = [42u8; 32];
+const K_M_A: [u8; 32] = [13u8; 32];
 const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const ORG_ID: &str = "demo";
+const AUTH_URL: &str = "https://auth.example/v1/discharge";
 
 const TOML: &str = r#"
 audience = "mint"
 [tenant]
 bucket = "demo-bucket"
+[demo_auth]
+enabled = true
+[operator]
+location = "https://auth.example/v1/discharge"
 [[role]]
 name = "volume-rw"
 required_caveats = ["aud"]
@@ -54,10 +61,23 @@ async fn full_flow_over_unix_socket() {
     let srv_dir = tempfile::tempdir().expect("srv tempdir");
     let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(srv_dir.path().join("root_key"), root_hex).expect("seed root_key");
-    let store = Arc::new(Store::open_local(srv_dir.path()).await.expect("store"));
+    let k_m_a_hex: String = K_M_A.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(srv_dir.path().join(K_M_A_FILE), k_m_a_hex).expect("seed k_m_a");
+    let mut store_inner = Store::open_local(srv_dir.path()).await.expect("store");
+    // Colocated demo auth: K_M-A keys the gate TPCs, K_session the
+    // operator login the client performs before enrolling.
+    store_inner
+        .init_k_m_a(srv_dir.path(), true)
+        .expect("init k_m_a");
+    store_inner
+        .init_k_session(srv_dir.path())
+        .expect("init k_session");
+    let store = Arc::new(store_inner);
     let nonce = store.current_invite().await.expect("nonce");
     let cfg = config();
-    let seal = Arc::new(mint::sealed_cache::serving_from_config(&cfg));
+    let seal = Arc::new(arc_swap::ArcSwap::from_pointee(
+        mint::sealed_cache::serving_from_config(&cfg),
+    ));
     let state = AppState {
         config: Arc::new(cfg),
         minter: Arc::new(FakeMinter::new()),
@@ -76,14 +96,42 @@ async fn full_flow_over_unix_socket() {
         std::fs::metadata(&sock).expect("stat").permissions().mode() & 0o777,
         0o666,
     );
+    // The demo auth role on its own UDS, also over the transport seam:
+    // the client fetches its enroll/exchange discharges here.
+    let auth_sock = srv_dir.path().join("auth.sock");
+    let auth_listener = tokio::net::UnixListener::bind(&auth_sock).expect("bind auth uds");
+    std::fs::set_permissions(&auth_sock, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+    let auth_state = state.clone();
     tokio::spawn(async move {
         axum::serve(listener, router(state)).await.expect("serve");
+    });
+    tokio::spawn(async move {
+        axum::serve(auth_listener, mint::auth::router(auth_state))
+            .await
+            .expect("serve auth");
     });
 
     let url = format!("unix:{}", sock.display());
     let cdir = tempfile::tempdir().expect("client tempdir");
     mint::client::keygen(cdir.path(), false).expect("keygen");
-    let invite = mint_invite(&Keyring::single(ROOT), "mint", &nonce).encode();
+    // Log in at the auth socket so enroll/exchange can fetch their gate
+    // discharges (the client persists the session + this transport).
+    mint::client::login_cmd(
+        cdir.path(),
+        &format!("unix:{}", auth_sock.display()),
+        "operator",
+    )
+    .await
+    .expect("client login over uds");
+    let invite = mint_invite(
+        &Keyring::single(ROOT),
+        &K_M_A,
+        "mint",
+        &nonce,
+        ORG_ID,
+        AUTH_URL,
+    )
+    .encode();
 
     // enroll → credential ticket persisted client-side.
     mint::client::enroll(
@@ -115,7 +163,10 @@ async fn full_flow_over_unix_socket() {
     // Operator approves, then exchange yields the credential.
     let (cnf, _fp) = mint::client::identity(cdir.path()).expect("client identity");
     let now_iso = chrono::Utc::now().to_rfc3339();
-    store.approve(SUB, &cnf, &now_iso).await.expect("approve");
+    store
+        .approve(SUB, &cnf, "usr_op", &now_iso)
+        .await
+        .expect("approve");
     assert!(
         mint::client::exchange(
             cdir.path(),

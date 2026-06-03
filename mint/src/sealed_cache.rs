@@ -89,7 +89,7 @@ pub fn policies_from_config(config: &Config) -> TemplateSet {
 #[derive(Debug, Clone)]
 pub struct ServedSurface {
     /// The canonical seal — its `audience` and `roles` (each a
-    /// [`SealedRole`]: required caveats, TTL bounds, `tpc`) are the
+    /// [`SealedRole`]: required caveats, TTL bounds) are the
     /// authority surface; the policy *bytes* live in `templates`.
     pub seal: Seal,
     /// Verified policy templates, role → bytes.

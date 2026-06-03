@@ -28,13 +28,13 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::caveat::{EffectiveCaveats, Resolved, name};
+use crate::caveat::{EffectiveCaveats, Resolved, name, scope};
 use crate::http::{AppState, verify_and_clear};
 use crate::issuance::mint_invite;
 use crate::macaroon::Macaroon;
 use crate::operator::Operator;
 use crate::seal::Seal;
-use crate::sealed_cache;
+use crate::sealed_cache::{self, SealState, ServedSurface};
 use crate::state::{EnrollmentState, EnrollmentView, Store};
 
 fn unauthorized_response() -> Response {
@@ -108,7 +108,7 @@ async fn verify_discharge(
     headers: &HeaderMap,
     body: &[u8],
     expected_op: &str,
-) -> Result<(), Response> {
+) -> Result<String, Response> {
     let Some(bundle) = crate::http::extract_bundle(headers) else {
         return Err(unauthorized_response());
     };
@@ -118,7 +118,7 @@ async fn verify_discharge(
     };
     let keyring = state.store.keyring().await;
     let now_unix = chrono::Utc::now().timestamp().max(0) as u64;
-    verify_and_clear(
+    let cleared = verify_and_clear(
         &bundle,
         &keyring,
         state.store.k_m_a(),
@@ -128,8 +128,24 @@ async fn verify_discharge(
         &state.config.audience,
         expected_op,
     )
-    .map(|_| ())
-    .map_err(|_| unauthorized_response())
+    .map_err(|_| unauthorized_response())?;
+    // The admin plane clears the discharge's `Scope` against
+    // `mint:admin` (`docs/design-auth-service.md` § *Scope tier*): a
+    // session that obtained only an enroll- or exchange-scope discharge
+    // cannot drive an admin verb, even though the verb itself rides the
+    // cli-token's per-call `op=admin:<verb>` attenuation.
+    if !matches!(
+        EffectiveCaveats::new(&cleared.aggregated_caveats).resolve(name::SCOPE),
+        Resolved::Value(v) if v == scope::MINT_ADMIN
+    ) {
+        return Err(unauthorized_response());
+    }
+    // The operator's `Subject` from the discharge — the audit-bearing
+    // identity each admin verb records (e.g. `approved_by` on approve).
+    match EffectiveCaveats::new(&cleared.aggregated_caveats).resolve("Subject") {
+        Resolved::Value(s) => Ok(s),
+        _ => Err(unauthorized_response()),
+    }
 }
 
 async fn handle_rotate_invite(
@@ -155,8 +171,31 @@ async fn build_invite(state: &AppState) -> Result<InviteResponse, Response> {
         .current_invite()
         .await
         .map_err(|e| service_unavailable(&format!("read invite: {e}")))?;
+    // The invite carries the enroll gate, so minting one requires the
+    // auth integration that stamps its TPC. A mint with no auth has no
+    // enrollment plane — there is no PoP-only fallback, by design
+    // (`docs/design-mint.md` § *Enrollment*).
+    let k_m_a = state.store.k_m_a().copied().ok_or_else(|| {
+        service_unavailable("invite requires an auth integration (K_M-A) for its enroll gate")
+    })?;
+    let location = state
+        .config
+        .operator
+        .as_ref()
+        .map(|o| o.location.as_str())
+        .ok_or_else(|| {
+            service_unavailable("invite requires an [operator] block for its discharge location")
+        })?;
+    let org_id = state.store.org_id().unwrap_or("demo").to_string();
     let keyring = state.store.keyring().await;
-    let mac = mint_invite(&keyring, &state.config.audience, &nonce);
+    let mac = mint_invite(
+        &keyring,
+        &k_m_a,
+        &state.config.audience,
+        &nonce,
+        &org_id,
+        location,
+    );
     Ok(InviteResponse {
         macaroon: mac.encode(),
         nonce,
@@ -227,9 +266,10 @@ async fn handle_approve(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = verify_discharge(&state, &headers, &body, ADMIN_ENROLL_APPROVE).await {
-        return r;
-    }
+    let approved_by = match verify_discharge(&state, &headers, &body, ADMIN_ENROLL_APPROVE).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let req: ApproveRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(_) => return unauthorized_response(),
@@ -237,7 +277,7 @@ async fn handle_approve(
     let approved_at = Utc::now().to_rfc3339();
     match state
         .store
-        .approve(&req.sub, &req.pubkey, &approved_at)
+        .approve(&req.sub, &req.pubkey, &approved_by, &approved_at)
         .await
     {
         Ok(()) => json_ok(ApproveResponse { approved_at }),
@@ -336,13 +376,26 @@ async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: By
         .iter()
         .map(|(n, r)| (n.clone(), r.policy_blake3.clone()))
         .collect();
+
+    // Swap this host's served surface to the seal it just authored. The
+    // surface satisfies that seal by construction (it is built from the
+    // same config), so the new content goes live here immediately —
+    // dormant or not — without a restart. In-flight requests finish
+    // against the surface they loaded (`docs/design-mint-template-seal.md`
+    // § *Dormant until sealed*).
+    let surface = ServedSurface {
+        seal: seal.clone(),
+        templates,
+    };
+    state.seal.store(Arc::new(SealState::Serving(surface)));
+
     tracing::info!(
         target: "mint::admin",
         operator = %operator,
         kid = seal.kid,
         sealed_at = %sealed_at,
         roles = roles.len(),
-        "published template seal (restart to serve it)"
+        "published template seal (now serving)"
     );
     json_ok(SealResponse {
         kid: seal.kid,
