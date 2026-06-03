@@ -30,10 +30,12 @@ pub mod pop;
 pub mod role;
 pub mod seal;
 pub mod sealed_cache;
+pub mod session;
 pub mod state;
 pub mod template;
 pub mod tigris;
 pub mod tpc;
+pub mod transport;
 
 pub use caveat::{Caveat, Resolved};
 pub use config::Config;

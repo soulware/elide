@@ -114,15 +114,17 @@ async fn full_flow_over_unix_socket() {
     let url = format!("unix:{}", sock.display());
     let cdir = tempfile::tempdir().expect("client tempdir");
     mint::client::keygen(cdir.path(), false).expect("keygen");
-    // Log in at the auth socket so enroll/exchange can fetch their gate
-    // discharges (the client persists the session + this transport).
-    mint::client::login_cmd(
-        cdir.path(),
-        &format!("unix:{}", auth_sock.display()),
-        "operator",
-    )
-    .await
-    .expect("client login over uds");
+    // Point per-user config at a tempdir, then log in at the auth socket so
+    // enroll/exchange can fetch their gate discharges. `mint login` now
+    // persists the shared session + transport under `XDG_CONFIG_HOME/mint`.
+    let cfg_home = tempfile::tempdir().expect("config tempdir");
+    // SAFETY: single-threaded test binary; no other thread reads the env.
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", cfg_home.path()) };
+    let auth_transport = format!("unix:{}", auth_sock.display());
+    let session = mint::session::login(&auth_transport, "operator")
+        .await
+        .expect("shared login over uds");
+    mint::session::save(&session, &auth_transport).expect("persist session");
     let invite = mint_invite(
         &Keyring::single(ROOT),
         &K_M_A,

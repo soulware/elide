@@ -29,17 +29,6 @@ use crate::state::fingerprint;
 
 const KEY_FILE: &str = "client.key";
 const PUB_FILE: &str = "client.pub";
-/// The auth-service session (from `mint client login`) that gates
-/// discharge issuance at the enroll and exchange gates. Held in the
-/// client dir, mode 0600, like the identity key.
-pub const SESSION_FILE: &str = "cli-session";
-/// The auth-service transport saved at `mint client login` — the `--url`
-/// the client dialed (e.g. `unix:<sock>` or `http(s)://host`). Reused to
-/// reach `/v1/discharge` when fetching the enroll-/exchange-gate
-/// discharges: the gate TPC's `location` is a full URL that supplies only
-/// the request *path*, while this supplies *how to connect* (the Bun
-/// `fetch(url, {unix})` split).
-const AUTH_TRANSPORT_FILE: &str = "auth-transport";
 /// Default `enroll --out` / `exchange --in`: the credential ticket —
 /// the short-lived, redeem-once token you trade in at the exchange.
 pub const CREDENTIAL_TICKET_FILE: &str = "credential.ticket";
@@ -60,10 +49,10 @@ pub fn credential_path(role: &str) -> String {
 pub enum ClientError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
-    #[error("http: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("uds http: {0}")]
-    Uds(String),
+    #[error("transport: {0}")]
+    Transport(String),
+    #[error(transparent)]
+    Session(#[from] crate::session::SessionError),
     #[error("{KEY_FILE} already exists in {0} (use --force to overwrite)")]
     KeyExists(String),
     #[error("malformed {0}")]
@@ -182,23 +171,6 @@ fn read_macaroon_arg(src: &str) -> Result<Macaroon, ClientError> {
     Macaroon::decode(text.trim()).map_err(|_| ClientError::BadFile("invite macaroon"))
 }
 
-/// Listener target parsed from `--url` (`docs/design-mint.md`
-/// § *Transport*): a normal `http(s)://host:port` base (TCP — the
-/// network shapes) or `unix:<socket-path>` (UDS — the bundled
-/// single-host dev shape). The request line, macaroon, and Ed25519 PoP
-/// are identical over either; only the connector differs.
-enum Target<'a> {
-    Tcp(&'a str),
-    Uds(&'a str),
-}
-
-fn parse_target(base_url: &str) -> Target<'_> {
-    match base_url.strip_prefix("unix:") {
-        Some(path) => Target::Uds(path),
-        None => Target::Tcp(base_url),
-    }
-}
-
 /// POST a `(primary, discharges)` bundle: the `Authorization` header
 /// carries the primary followed by each discharge, comma-separated; the
 /// PoP signs the body under the **primary's** tail (the principal whose
@@ -226,71 +198,20 @@ async fn post_bundle(
     send(base_url, endpoint, &headers, body).await
 }
 
-/// POST a JSON body with no authentication. Used for `/v1/login`, which
-/// is itself the unauthenticated entry point that mints the session;
-/// the gated `/v1/discharge` call carries that session as a Bearer via
-/// [`send`].
-async fn post_json(
-    base_url: &str,
-    endpoint: &str,
-    body: String,
-) -> Result<(u16, String), ClientError> {
-    let headers = [("content-type", "application/json".into())];
-    send(base_url, endpoint, &headers, body).await
-}
-
-/// Transport leg shared by every POST. Selects TCP or HTTP-over-UDS by
-/// the `--url` scheme and applies `headers` verbatim. `reqwest` has no
-/// UDS support, so the UDS branch drops to `hyper` directly via
-/// `hyperlocal`'s `UnixConnector`; its transport errors collapse to a
-/// single string — there is nothing the caller branches on.
+/// Transport leg shared by every POST — a thin wrapper over
+/// [`crate::transport::post`], which selects TCP or HTTP-over-UDS by the
+/// `--url` scheme. Transport failures collapse to
+/// [`ClientError::Transport`]; there is nothing the caller branches on
+/// beyond the HTTP status.
 async fn send(
     base_url: &str,
     endpoint: &str,
     headers: &[(&str, String)],
     body: String,
 ) -> Result<(u16, String), ClientError> {
-    match parse_target(base_url) {
-        Target::Tcp(base) => {
-            let mut req = reqwest::Client::new().post(format!("{base}{endpoint}"));
-            for (k, v) in headers {
-                req = req.header(*k, v);
-            }
-            let resp = req.body(body).send().await?;
-            let status = resp.status().as_u16();
-            Ok((status, resp.text().await?))
-        }
-        Target::Uds(socket) => {
-            use http_body_util::{BodyExt, Full};
-            use hyper_util::client::legacy::Client;
-            use hyper_util::rt::TokioExecutor;
-
-            let client: Client<_, Full<bytes::Bytes>> =
-                Client::builder(TokioExecutor::new()).build(hyperlocal::UnixConnector);
-            let uri: hyper::Uri = hyperlocal::Uri::new(socket, endpoint).into();
-            let mut builder = hyper::Request::builder()
-                .method(hyper::Method::POST)
-                .uri(uri);
-            for (k, v) in headers {
-                builder = builder.header(*k, v);
-            }
-            let req = builder
-                .body(Full::new(bytes::Bytes::from(body)))
-                .map_err(|e| ClientError::Uds(e.to_string()))?;
-            let resp = client
-                .request(req)
-                .await
-                .map_err(|e| ClientError::Uds(e.to_string()))?;
-            let status = resp.status().as_u16();
-            let bytes = resp
-                .into_body()
-                .collect()
-                .await
-                .map_err(|e| ClientError::Uds(e.to_string()))?
-                .to_bytes();
-            Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
-        }
-    }
+    crate::transport::post(base_url, endpoint, headers, body)
+        .await
+        .map_err(ClientError::Transport)
 }
 
 fn json_field(body: &str, key: &'static str) -> Result<String, ClientError> {
@@ -402,8 +323,8 @@ pub async fn enroll(
     );
     // The invite carries the enroll gate (a third-party caveat): fetch
     // an enrolling-operator discharge at scope `mint:enroll` and present
-    // it alongside. Requires a logged-in session (`mint client login`).
-    let discharges = gate_discharges(dir, &presented, scope::MINT_ENROLL).await?;
+    // it alongside. Requires a logged-in session (`mint login`).
+    let discharges = gate_discharges(&presented, scope::MINT_ENROLL).await?;
     eprintln!("  → POST {base_url}/v1/enroll  (signed with your client key)");
     let body = format!(r#"{{"ts":{}}}"#, now_unix());
     let (status, text) =
@@ -447,7 +368,7 @@ pub async fn exchange(
     // The ticket carries the exchange gate: fetch an exchanging-operator
     // discharge at scope `mint:exchange` and present it alongside. One
     // discharge covers every role exchanged within its window.
-    let discharges = gate_discharges(dir, &ticket, scope::MINT_EXCHANGE).await?;
+    let discharges = gate_discharges(&ticket, scope::MINT_EXCHANGE).await?;
     eprintln!(
         "  → POST {base_url}/v1/enroll-exchange  role={role}  (signed with your client key — proof-of-possession)"
     );
@@ -597,14 +518,11 @@ pub async fn assume_role(
 
 /// Fetch an operator discharge for each third-party caveat on `anchor`
 /// (the invite at enroll, the ticket at exchange) at the named `scope`,
-/// to present alongside the anchor. The session + transport (from `mint
-/// client login`) are loaded here, so the gates require a logged-in
-/// operator. An anchor with no TPC yields an empty list.
-async fn gate_discharges(
-    dir: &Path,
-    anchor: &Macaroon,
-    scope: &str,
-) -> Result<Vec<Macaroon>, ClientError> {
+/// to present alongside the anchor. The session + transport come from the
+/// shared per-user login ([`crate::session`], written by `mint login`),
+/// so the gates require a logged-in operator. An anchor with no TPC yields
+/// an empty list.
+async fn gate_discharges(anchor: &Macaroon, scope: &str) -> Result<Vec<Macaroon>, ClientError> {
     let has_tpc = anchor
         .caveats()
         .iter()
@@ -612,8 +530,8 @@ async fn gate_discharges(
     if !has_tpc {
         return Ok(Vec::new());
     }
-    let session = load_session(dir)?;
-    let transport = load_auth_transport(dir)?;
+    let session = crate::session::load_session()?;
+    let transport = crate::session::load_transport()?;
     let mut discharges = Vec::new();
     for c in anchor.caveats() {
         let Caveat::ThirdParty { location, cid, .. } = c else {
@@ -630,76 +548,11 @@ async fn gate_discharges(
     Ok(discharges)
 }
 
-/// Log in at the authority (`POST /v1/login`) and return the session
-/// bearer that gates discharge issuance. The demo accepts any subject
-/// with no password (`design-auth-service.md` § *Login flow*).
-async fn login(location: &str, subject: &str) -> Result<String, ClientError> {
-    let body = serde_json::json!({ "subject": subject }).to_string();
-    let (status, text) = post_json(location, "/v1/login", body).await?;
-    if status != 200 {
-        return Err(ClientError::Server { status, body: text });
-    }
-    json_field(&text, "session")
-}
-
-/// `mint client login`: log in at the auth service and persist the
-/// session to `<dir>/cli-session` (mode 0600), so a later `assume-role`
-/// on a TPC-bearing role presents it on `/v1/discharge`. The auth `url`
-/// is the same `unix:`/`http(s):` shape as the mint `--url`.
-pub async fn login_cmd(dir: &Path, url: &str, subject: &str) -> Result<(), ClientError> {
-    let session = login(url, subject).await?;
-    fs::create_dir_all(dir)?;
-    write_0600(&dir.join(SESSION_FILE), session.as_bytes())?;
-    // Persist the transport so a later `assume-role` can reach
-    // `/v1/discharge` over the same connection — the credential's TPC
-    // `location` carries only the path.
-    write_0600(&dir.join(AUTH_TRANSPORT_FILE), url.as_bytes())?;
-    eprintln!(
-        "logged in as {subject} at {url}; session saved to {}",
-        dir.join(SESSION_FILE).display()
-    );
-    Ok(())
-}
-
-/// Load the auth-service transport saved at `mint client login`. A
-/// missing one points the operator at `mint client login`, the same as a
-/// missing session.
-fn load_auth_transport(dir: &Path) -> Result<String, ClientError> {
-    read_text(
-        &dir.join(AUTH_TRANSPORT_FILE),
-        "run `mint client login --url <auth-url>` first",
-    )
-    .map(|s| s.trim().to_string())
-}
-
 /// The request path of a TPC `location` (a full URL, e.g.
 /// `http://localhost/v1/discharge`). The host is not dialed — the saved
 /// transport supplies the connection — so only the path is taken.
 fn discharge_path(location: &str) -> Result<String, ClientError> {
     crate::tpc::location_path(location).ok_or(ClientError::BadFile("tpc location"))
-}
-
-/// Remove the saved session (`mint client logout`). Returns whether a
-/// session file was present — a no-op logout is `Ok(false)`, not an
-/// error.
-pub fn logout(dir: &Path) -> Result<bool, ClientError> {
-    match fs::remove_file(dir.join(SESSION_FILE)) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(ClientError::Io(e)),
-    }
-}
-
-/// Load the saved session, validated as a decodable macaroon. A missing
-/// one points the operator at `mint client login`.
-fn load_session(dir: &Path) -> Result<String, ClientError> {
-    let text = read_text(
-        &dir.join(SESSION_FILE),
-        "run `mint client login --url <auth-url>` first",
-    )?;
-    let trimmed = text.trim();
-    Macaroon::decode(trimmed).map_err(|_| ClientError::BadFile("session"))?;
-    Ok(trimmed.to_string())
 }
 
 /// POST the CID + requested `scope` to the authority's `/v1/discharge`
@@ -815,16 +668,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn logout_removes_session_and_is_idempotent() {
-        let d = tempfile::tempdir().unwrap();
-        assert!(!logout(d.path()).unwrap()); // nothing to remove
-        fs::write(d.path().join(SESSION_FILE), "x").unwrap();
-        assert!(logout(d.path()).unwrap()); // existed → removed
-        assert!(!d.path().join(SESSION_FILE).exists());
-        assert!(!logout(d.path()).unwrap()); // idempotent
-    }
-
-    #[test]
     fn keygen_writes_pair_and_is_no_clobber() {
         let d = tempfile::tempdir().unwrap();
         let (cnf, fp) = keygen(d.path(), false).unwrap();
@@ -922,28 +765,6 @@ mod tests {
         assert!(matches!(
             build_request_body(Some("{not json"), "r", 1, 1),
             Err(ClientError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn url_scheme_selects_transport() {
-        assert!(matches!(
-            parse_target("http://127.0.0.1:8085"),
-            Target::Tcp("http://127.0.0.1:8085")
-        ));
-        assert!(matches!(
-            parse_target("https://mint.example:443"),
-            Target::Tcp(_)
-        ));
-        // `unix:` strips to the bare socket path; the HTTP request path
-        // is the endpoint, supplied separately.
-        assert!(matches!(
-            parse_target("unix:/var/lib/mint/mint.sock"),
-            Target::Uds("/var/lib/mint/mint.sock")
-        ));
-        assert!(matches!(
-            parse_target("unix:relative/mint.sock"),
-            Target::Uds("relative/mint.sock")
         ));
     }
 
