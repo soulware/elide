@@ -136,7 +136,7 @@ enum ClientCmd {
         socket: Option<PathBuf>,
         /// Opaque principal id — the `sub`. Any path-safe string
         /// (`[A-Za-z0-9._-]`, ≤256 chars); not required to be a ULID.
-        #[arg(long)]
+        #[arg(value_name = "ID")]
         id: String,
         /// Filename (under the client dir) to write the credential
         /// ticket to.
