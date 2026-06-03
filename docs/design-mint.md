@@ -179,8 +179,10 @@ AWS environment; the keyring lives under `<data_dir>/root_keys/`
 
 #### On-disk layout
 
-A mint instance is named by its config file: `--config <path>`,
-defaulting to `./mint.toml`. `mint serve` always runs against a
+A mint instance is named by its config file: `--config <path>`, else
+the `MINT_CONFIG` environment variable, else `./mint.toml`. Setting
+`MINT_CONFIG` lets operator commands run from any directory without
+repeating `--config`; an explicit flag still wins. `mint serve` always runs against a
 real S3-compatible backend: enrollment state in the tenant bucket
 under `_mint/` (via the self-vended `mint-rw` keypair) and real
 Tigris IAM for `assume-role`. There is no in-process dev backend;
@@ -504,7 +506,8 @@ and stores the session **per-user** under `$XDG_CONFIG_HOME/mint` (else
 session backs the operator admin plane and `mint client`'s enroll /
 exchange (see [`design-auth-service.md`](design-auth-service.md)
 § *Login flow*). Transport precedence is `--url`, else `--config`'s
-`[demo_auth]` socket, else the remembered `auth-transport`; `mint logout`
+`[demo_auth]` socket (flag, else `MINT_CONFIG`), else the remembered
+`auth-transport`; `mint logout`
 removes the session but leaves the transport, so a later bare
 `mint login` re-authenticates at the same place. On each admin call the
 CLI fetches a **discharge** for the service token's third-party caveat
@@ -1835,7 +1838,8 @@ operator subcommands, and a **reference client** that plays the
 coordinator's half generically (it also doubles as the conformance
 harness `tests/enroll.rs` exercises).
 
-Operator / server:
+Operator / server (every `<cfg>` defaults to `MINT_CONFIG` then
+`./mint.toml` when `--config` is omitted):
 
 ```
 mint serve <cfg> [bind]            # HTTP service
