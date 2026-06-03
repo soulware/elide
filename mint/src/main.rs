@@ -48,10 +48,11 @@ enum Command {
         #[arg(long)]
         bind: Option<SocketAddr>,
     },
-    /// Log in at the auth service and store the per-user session +
-    /// transport (`$XDG_CONFIG_HOME/mint`, else `~/.config/mint`) that
-    /// gate `/v1/discharge`. One login serves both the operator admin
-    /// plane and `mint client`.
+    /// Log in at the auth service; store the session gating `/v1/discharge`.
+    ///
+    /// Persists the per-user session + transport under `$XDG_CONFIG_HOME/mint`
+    /// (else `~/.config/mint`). One login serves both the operator admin plane
+    /// and `mint client`.
     ///
     /// Transport precedence: `--url`, else `--config`'s `[demo_auth]`
     /// socket (flag, else `MINT_CONFIG`), else the transport remembered
@@ -71,9 +72,10 @@ enum Command {
         #[arg(long, default_value = "operator")]
         subject: String,
     },
-    /// Log out: remove the per-user session, leaving the remembered auth
-    /// transport so a later bare `mint login` re-authenticates at the same
-    /// place. Discharge calls then require a fresh login.
+    /// Log out, removing the per-user session (keeps the remembered transport).
+    ///
+    /// A later bare `mint login` re-authenticates at the same place; discharge
+    /// calls require a fresh login until then.
     Logout,
     /// Print the invite macaroon (reusable, non-expiring).
     ///
@@ -96,8 +98,9 @@ enum Command {
         #[command(subcommand)]
         cmd: RoleCmd,
     },
-    /// Operator: stage a new template seal under the current keyring,
-    /// to be published on the next `mint serve` startup.
+    /// Operator: stage a new template seal, published on the next `mint serve`.
+    ///
+    /// Signed under the current keyring.
     ///
     /// Reads `roles_dir/` + `mint.toml`, hashes each role's policy
     /// template, signs the manifest under
@@ -112,8 +115,7 @@ enum Command {
     },
     /// Reference client — the caller's half of the flow.
     Client {
-        /// Identity + received-macaroon directory (default
-        /// `./mint_client`, analogous to the server's `./mint_data`).
+        /// Identity + received-macaroon directory (default `./mint_client`).
         #[arg(long)]
         client_dir: Option<PathBuf>,
         #[command(subcommand)]
@@ -123,12 +125,14 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ClientCmd {
-    /// Print this identity's `cnf` value + fingerprint (what the
-    /// operator compares out of band before `enroll approve`). The
+    /// Print this identity's `cnf` value + fingerprint.
+    ///
+    /// The operator compares this out of band before `enroll approve`. The
     /// identity is minted on first use, so this also creates it.
     Fingerprint,
-    /// Attenuate the invite macaroon with `sub`/`cnf`, enrol, and
-    /// save the returned credential ticket.
+    /// Attenuate the invite, enrol, and save the credential ticket.
+    ///
+    /// Attenuates the invite macaroon with `sub`/`cnf`.
     Enroll {
         /// UDS path of the local mint daemon. Defaults to the
         /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
@@ -147,8 +151,9 @@ enum ClientCmd {
         #[arg(value_name = "INVITE")]
         invite: String,
     },
-    /// Exchange the credential ticket for the credential (after
-    /// approval). Exits 2 while still awaiting operator approval.
+    /// Exchange the credential ticket for the credential.
+    ///
+    /// Run after approval; exits 2 while still awaiting operator approval.
     Exchange {
         /// UDS path of the local mint daemon. Defaults to the
         /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
