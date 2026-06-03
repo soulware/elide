@@ -854,8 +854,8 @@ async fn enroll_revoke(config: &Path, sub: &str) -> Result<(), Box<dyn std::erro
 /// running daemon's `POST /v1/admin/seal`, structurally identical to
 /// `mint invite`: an `op=admin:seal` discharge over the operator session.
 /// The daemon hashes its **own local** `roles_dir/`, MACs under the
-/// keyring, PUTs `seal.json`, and caches it. The new content goes live on
-/// the next `mint serve` restart.
+/// keyring, PUTs `seal.json`, and caches it. The new content goes live
+/// immediately — no restart.
 async fn seal(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let config = load(config_path)?;
     let (op, discharge) = operator_session(&config).await?;
@@ -870,7 +870,6 @@ async fn seal(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             .collect::<Vec<_>>()
             .join(", "),
     );
-    eprintln!("restart `mint serve` to serve the new templates");
     Ok(())
 }
 

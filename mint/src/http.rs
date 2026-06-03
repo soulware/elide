@@ -84,7 +84,7 @@ pub fn router(state: AppState) -> Router {
 
 /// Readiness probe. `200 ready` once a canonical seal is being served;
 /// `503 not sealed` while dormant, so an orchestrator holds a dormant
-/// host out of rotation until an operator seals it and it restarts.
+/// host out of rotation until an operator seals it.
 /// Liveness (`/healthz`) is seal-independent and always `ok`.
 async fn readyz(State(state): State<AppState>) -> Response {
     match state.seal.load().as_ref() {
@@ -127,7 +127,7 @@ fn unauthorized(request_id: &str) -> Response {
 /// The role-rendering / issuance planes are closed because mint came up
 /// dormant — no canonical seal at startup. `503` (not a `4xx`): the
 /// request is well-formed, the service simply has nothing sealed to
-/// serve, and recovers when an operator seals and it restarts.
+/// serve, and recovers when an operator seals this host.
 fn not_sealed(request_id: &str) -> Response {
     respond(
         request_id,
