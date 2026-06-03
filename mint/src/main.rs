@@ -83,7 +83,7 @@ enum Command {
         #[command(subcommand)]
         cmd: RoleCmd,
     },
-    /// Operator: stage a new template seal, published on the next `mint serve`.
+    /// Operator: seal the current role configuration.
     Seal {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
