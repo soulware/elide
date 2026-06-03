@@ -42,30 +42,25 @@ enum Command {
     Serve {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
-        /// TCP `host:port` override. Forces the TCP transport, taking
-        /// precedence over the config's `bind`/`socket`. Omit to use
-        /// the listener the config resolves to.
+        /// TCP `host:port` to bind.
         #[arg(long)]
         bind: Option<SocketAddr>,
     },
     /// Log in at the auth service; store the session gating `/v1/discharge`.
     Login {
         /// Auth-service endpoint: `unix:<socket-path>` or
-        /// `http(s)://host:port`. Overwrites the remembered transport.
+        /// `http(s)://host:port`.
         #[arg(long)]
         url: Option<String>,
         /// Derive the auth transport from a mint config's auth-role
-        /// socket, when `--url` is omitted.
+        /// socket.
         #[arg(long, env = "MINT_CONFIG")]
         config: Option<PathBuf>,
         /// Opaque subject, stamped into issued discharges for audit.
         #[arg(long, default_value = "operator")]
         subject: String,
     },
-    /// Log out, removing the per-user session (keeps the remembered transport).
-    ///
-    /// A later bare `mint login` re-authenticates at the same place; discharge
-    /// calls require a fresh login until then.
+    /// Log out, removing the per-user session.
     Logout,
     /// Print the invite macaroon (reusable, non-expiring).
     ///
@@ -114,8 +109,7 @@ enum ClientCmd {
     ///
     /// Attenuates the invite macaroon with `sub`/`cnf`.
     Enroll {
-        /// UDS path of the local mint daemon. Defaults to the
-        /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
+        /// UDS path of the local mint daemon.
         #[arg(long)]
         socket: Option<PathBuf>,
         /// Opaque principal id — the `sub`. Any path-safe string
@@ -135,8 +129,7 @@ enum ClientCmd {
     ///
     /// Run after approval; exits 2 while still awaiting operator approval.
     Exchange {
-        /// UDS path of the local mint daemon. Defaults to the
-        /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
+        /// UDS path of the local mint daemon.
         #[arg(long)]
         socket: Option<PathBuf>,
         /// Credential-ticket filename (under the client dir) to present.
@@ -158,8 +151,7 @@ enum ClientCmd {
     },
     /// Assume a role with the held credential; prints the keypair JSON.
     AssumeRole {
-        /// UDS path of the local mint daemon. Defaults to the
-        /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
+        /// UDS path of the local mint daemon.
         #[arg(long)]
         socket: Option<PathBuf>,
         /// Credential filename (under the client dir) to exercise.
