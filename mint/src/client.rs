@@ -13,7 +13,7 @@
 //! self-contained.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -151,22 +151,11 @@ fn now_unix() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 
-/// Resolve a `--invite` argument, in precedence order:
-/// `-` → stdin; an inline macaroon (the value itself decodes — the
-/// strict `mcrn1` magic + structure check makes this an unambiguous
-/// discriminator, no real file path collides); otherwise a file path.
-fn read_macaroon_arg(src: &str) -> Result<Macaroon, ClientError> {
-    if src == "-" {
-        let mut s = String::new();
-        io::stdin().read_to_string(&mut s)?;
-        return Macaroon::decode(s.trim()).map_err(|_| ClientError::BadFile("invite macaroon"));
-    }
-    if let Ok(m) = Macaroon::decode(src.trim()) {
-        return Ok(m); // inline macaroon text
-    }
-    let text = fs::read_to_string(src)
-        .map_err(|_| ClientError::BadFile("invite (not an inline macaroon nor a readable file)"))?;
-    Macaroon::decode(text.trim()).map_err(|_| ClientError::BadFile("invite macaroon"))
+/// Decode an inline invite macaroon argument. The macaroon is passed
+/// verbatim (the operator hands you the encoded string); there is no
+/// file or stdin source.
+fn parse_invite(src: &str) -> Result<Macaroon, ClientError> {
+    Macaroon::decode(src.trim()).map_err(|_| ClientError::BadFile("invite macaroon"))
 }
 
 /// POST a `(primary, discharges)` bundle: the `Authorization` header
@@ -310,7 +299,7 @@ pub async fn enroll(
 ) -> Result<(), ClientError> {
     let seed = load_seed(dir)?;
     let cnf = pop::cnf_value(&seed);
-    let presented = read_macaroon_arg(invite_src)?
+    let presented = parse_invite(invite_src)?
         .attenuate(Caveat::scalar(name::SUB, sub))
         .attenuate(Caveat::scalar(name::CNF, cnf.clone()));
     eprintln!("enroll: attenuating the operator's invite macaroon with your identity");
@@ -422,12 +411,12 @@ fn parse_caveats(args: &[String]) -> Result<Vec<(String, String)>, ClientError> 
         .collect()
 }
 
-/// Resolve `--request` (inline JSON, `@file`, or `-` for stdin) and
-/// merge it under the client-owned `ts`/`role`/`ttl_seconds` (those are
-/// the conventional fields the client sets and signs; a value supplied
-/// for them in `--request` is overwritten, not trusted). Pure +
-/// ts-injected for testability. mint is body-field-agnostic — every
-/// other `request.*` field is opaque pass-through.
+/// Merge the inline `--request` JSON under the client-owned
+/// `ts`/`role`/`ttl_seconds` (those are the conventional fields the
+/// client sets and signs; a value supplied for them in `--request` is
+/// overwritten, not trusted). Pure + ts-injected for testability. mint
+/// is body-field-agnostic — every other `request.*` field is opaque
+/// pass-through.
 fn build_request_body(
     request_src: Option<&str>,
     role: &str,
@@ -436,22 +425,11 @@ fn build_request_body(
 ) -> Result<String, ClientError> {
     let mut obj = match request_src {
         None => serde_json::Map::new(),
-        Some(src) => {
-            let raw = if src == "-" {
-                let mut s = String::new();
-                io::stdin().read_to_string(&mut s)?;
-                s
-            } else if let Some(path) = src.strip_prefix('@') {
-                fs::read_to_string(path)?
-            } else {
-                src.to_string()
-            };
-            match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(serde_json::Value::Object(m)) => m,
-                Ok(_) => return Err(ClientError::BadRequest("not an object")),
-                Err(_) => return Err(ClientError::BadRequest("invalid JSON")),
-            }
-        }
+        Some(src) => match serde_json::from_str::<serde_json::Value>(src) {
+            Ok(serde_json::Value::Object(m)) => m,
+            Ok(_) => return Err(ClientError::BadRequest("not an object")),
+            Err(_) => return Err(ClientError::BadRequest("invalid JSON")),
+        },
     };
     obj.insert("ts".into(), ts.into());
     obj.insert("role".into(), role.into());
@@ -702,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn invite_arg_accepts_inline_or_file_and_rejects_neither() {
+    fn invite_arg_accepts_inline_and_rejects_non_macaroon() {
         let wire = crate::issuance::mint_invite(
             &crate::keyring::Keyring::single([1u8; 32]),
             &[9u8; 32],
@@ -712,16 +690,12 @@ mod tests {
             "https://auth.example/v1/discharge",
         )
         .encode();
-        // inline: the value itself is the macaroon
-        assert!(read_macaroon_arg(&wire).is_ok());
-        // file path containing it
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("invite.txt");
-        fs::write(&p, format!("{wire}\n")).unwrap();
-        assert!(read_macaroon_arg(p.to_str().unwrap()).is_ok());
-        // neither a macaroon nor a readable file → clear error, no panic
+        // inline: the value itself is the macaroon (surrounding whitespace trimmed)
+        assert!(parse_invite(&wire).is_ok());
+        assert!(parse_invite(&format!("  {wire}\n")).is_ok());
+        // anything that does not decode → clear error, no panic
         assert!(matches!(
-            read_macaroon_arg("/no/such/path-and-not-a-macaroon"),
+            parse_invite("not-a-macaroon"),
             Err(ClientError::BadFile(_))
         ));
     }
