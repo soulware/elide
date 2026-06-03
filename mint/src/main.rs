@@ -48,26 +48,33 @@ enum Command {
         #[arg(long)]
         bind: Option<SocketAddr>,
     },
-    /// Operator: log in at the auth service, storing the session that
-    /// gates discharge issuance (`<data_dir>/cli-session`).
+    /// Log in at the auth service and store the per-user session +
+    /// transport (`$XDG_CONFIG_HOME/mint`, else `~/.config/mint`) that
+    /// gate `/v1/discharge`. One login serves both the operator admin
+    /// plane and `mint client`.
     ///
-    /// The demo auth role accepts any subject with no password; the
-    /// session it returns is the gate on `/v1/discharge`, not an
-    /// identity. Re-run when the session lapses (~7 days).
+    /// Transport precedence: `--url`, else `--config`'s `[demo_auth]`
+    /// socket, else the transport remembered from a prior login. The demo
+    /// auth role accepts any subject with no password; re-run when the
+    /// session lapses (~7 days).
     Login {
-        #[arg(long, default_value = "mint.toml")]
-        config: PathBuf,
-        /// Opaque operator subject, stamped into issued discharges for
-        /// audit. Any value is accepted in the demo.
+        /// Auth-service endpoint: `unix:<socket-path>` or
+        /// `http(s)://host:port`. Overwrites the remembered transport.
+        #[arg(long)]
+        url: Option<String>,
+        /// Derive the auth transport from a mint config's `[demo_auth]`
+        /// socket, when `--url` is omitted.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Opaque subject, stamped into issued discharges for audit. Any
+        /// value is accepted in the demo.
         #[arg(long, default_value = "operator")]
         subject: String,
     },
-    /// Operator: remove the saved session (`<data_dir>/cli-session`).
-    /// Admin commands then require a fresh `mint login`.
-    Logout {
-        #[arg(long, default_value = "mint.toml")]
-        config: PathBuf,
-    },
+    /// Log out: remove the per-user session, leaving the remembered auth
+    /// transport so a later bare `mint login` re-authenticates at the same
+    /// place. Discharge calls then require a fresh login.
+    Logout,
     /// Print the invite macaroon (reusable, non-expiring).
     ///
     /// The macaroon goes to stdout for piping; diagnostics to stderr.
@@ -126,24 +133,6 @@ enum ClientCmd {
     /// Print this identity's `cnf` value + fingerprint (what the
     /// operator compares out of band before `enroll approve`).
     Fingerprint,
-    /// Log in at the auth service and save the session that gates
-    /// discharge issuance for TPC-bearing roles (`credentials/<role>`
-    /// carrying a third-party caveat). Run once before `assume-role` on
-    /// such a role; the session is stored in the client dir (~7 days).
-    Login {
-        /// Auth-service endpoint: `unix:<socket-path>` (the single-host
-        /// demo shape) or `http(s)://host:port`.
-        #[arg(long)]
-        url: String,
-        /// Opaque subject, stamped into issued discharges for audit.
-        /// Any value is accepted in the demo.
-        #[arg(long, default_value = "operator")]
-        subject: String,
-    },
-    /// Remove the saved session (`<client_dir>/cli-session`). A later
-    /// `assume-role` on a TPC-bearing role then requires a fresh
-    /// `client login`.
-    Logout,
     /// Attenuate the invite macaroon with `sub`/`cnf`, enrol, and
     /// save the returned credential ticket.
     Enroll {
@@ -288,8 +277,12 @@ enum EnrollCmd {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
         Command::Serve { config, bind } => serve(&config, bind).await,
-        Command::Login { config, subject } => login(&config, &subject).await,
-        Command::Logout { config } => logout(&config),
+        Command::Login {
+            url,
+            config,
+            subject,
+        } => login(url, config, &subject).await,
+        Command::Logout => logout(),
         Command::Invite { config, rotate } => invite(&config, rotate).await,
         Command::Enroll { cmd } => match cmd {
             EnrollCmd::List { config } => enroll_list(&config).await,
@@ -322,19 +315,6 @@ async fn client_cmd(
             let (cnf, fp) = mint::client::identity(&dir)?;
             println!("cnf={cnf}");
             println!("fingerprint={fp}");
-            Ok(())
-        }
-        ClientCmd::Login { url, subject } => {
-            mint::client::login_cmd(&dir, &url, &subject).await?;
-            Ok(())
-        }
-        ClientCmd::Logout => {
-            let path = dir.join(mint::client::SESSION_FILE);
-            if mint::client::logout(&dir)? {
-                eprintln!("logged out; removed {}", path.display());
-            } else {
-                eprintln!("not logged in (no session at {})", path.display());
-            }
             Ok(())
         }
         ClientCmd::Enroll {
@@ -662,59 +642,81 @@ fn admin_target(cfg: &Config) -> mint::admin::AdminTarget<'_> {
     }
 }
 
-/// The demo auth socket the operator logs in / fetches discharges over.
-/// Present only when `[demo_auth].enabled = true` — the only auth
-/// backend that exists in-tree. Production runs a separate auth-service
-/// binary; wiring the operator to that endpoint is out of scope here.
-fn auth_socket(cfg: &Config) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    cfg.demo_auth
+/// Derive the auth transport from a mint config's colocated demo auth
+/// role: `unix:<[demo_auth].socket>`. Present only when
+/// `[demo_auth].enabled = true` — the only auth backend that exists
+/// in-tree. Production runs a separate auth-service binary, reached via
+/// `mint login --url`.
+fn config_auth_transport(cfg: &Config) -> Result<String, Box<dyn std::error::Error>> {
+    let socket = cfg
+        .demo_auth
         .as_ref()
         .and_then(|d| d.socket.clone())
-        .ok_or_else(|| {
-            "operator plane requires a colocated demo auth role \
-             ([demo_auth].enabled = true); no auth socket is configured"
-                .into()
-        })
+        .ok_or(
+            "config has no colocated demo auth role \
+             ([demo_auth].enabled = true); pass --url instead",
+        )?;
+    Ok(format!("unix:{}", socket.display()))
 }
 
-/// `mint login` — trivially authenticate at the demo auth role and
-/// persist the session that gates discharge issuance.
-async fn login(config: &Path, subject: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = load(config)?;
-    let socket = auth_socket(&cfg)?;
-    let session = mint::operator::login(&socket, subject).await?;
-    mint::operator::save_session(&cfg.data_dir, &session)?;
+/// Resolve the auth transport for `mint login`: `--url`, else `--config`'s
+/// `[demo_auth]` socket, else the transport remembered from a prior login.
+fn resolve_login_transport(
+    url: Option<String>,
+    config: Option<PathBuf>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(url) = url {
+        return Ok(url);
+    }
+    if let Some(config) = config {
+        return config_auth_transport(&load(&config)?);
+    }
+    Ok(mint::session::load_transport()?)
+}
+
+/// `mint login` — authenticate at the auth role and persist the per-user
+/// session + transport that gate `/v1/discharge` for both planes.
+async fn login(
+    url: Option<String>,
+    config: Option<PathBuf>,
+    subject: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let transport = resolve_login_transport(url, config)?;
+    let session = mint::session::login(&transport, subject).await?;
+    mint::session::save(&session, &transport)?;
     eprintln!(
-        "logged in as {subject}; session saved to {}",
-        cfg.data_dir.join(mint::operator::SESSION_FILE).display()
+        "logged in as {subject} at {transport}; session saved to {}",
+        mint::session::dir()?.display()
     );
     Ok(())
 }
 
-/// `mint logout` — remove the saved operator session.
-fn logout(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = load(config)?;
-    let path = cfg.data_dir.join(mint::operator::SESSION_FILE);
-    if mint::operator::clear_session(&cfg.data_dir)? {
-        eprintln!("logged out; removed {}", path.display());
+/// `mint logout` — remove the per-user session, leaving the remembered
+/// auth transport in place.
+fn logout() -> Result<(), Box<dyn std::error::Error>> {
+    if mint::session::clear_session()? {
+        eprintln!("logged out; removed the session (auth transport kept)");
     } else {
-        eprintln!("not logged in (no session at {})", path.display());
+        eprintln!(
+            "not logged in (no session at {})",
+            mint::session::dir()?.display()
+        );
     }
     Ok(())
 }
 
-/// Assemble the operator's admin-plane authority for one CLI
-/// invocation: load the cli-token + machine key, load the session
-/// (`mint login`), and fetch a fresh wide discharge over the auth
-/// socket. The returned discharge satisfies every admin verb; each
-/// admin call attenuates its own `op` onto the cli-token.
+/// Assemble the operator's admin-plane authority for one CLI invocation:
+/// load the cli-token + machine key (from `data_dir`), load the per-user
+/// session + transport (`mint login`), and fetch a fresh wide discharge.
+/// The returned discharge satisfies every admin verb; each admin call
+/// attenuates its own `op` onto the cli-token.
 async fn operator_session(
     cfg: &Config,
 ) -> Result<(mint::operator::Operator, mint::Macaroon), Box<dyn std::error::Error>> {
     let operator = mint::operator::Operator::load(&cfg.data_dir)?;
-    let session = mint::operator::load_session(&cfg.data_dir)?;
-    let socket = auth_socket(cfg)?;
-    let discharge = operator.fetch_discharge(&socket, &session).await?;
+    let session = mint::session::load_session()?;
+    let transport = mint::session::load_transport()?;
+    let discharge = operator.fetch_discharge(&transport, &session).await?;
     Ok((operator, discharge))
 }
 

@@ -198,10 +198,11 @@ elide coordinator's `data_dir` (`coordinator.toml`):
   `current` pointer). When `[auth]` is configured it also holds
   `auth-shared.key` (K_M-A — the TPC-CID wrapping key shared with the
   auth service) and the admin-plane `cli-token` + its machine key
-  `cli-token.key` (§ *CLI service token*) plus the operator's
-  `cli-session` from `mint login`; the colocated demo additionally
+  `cli-token.key` (§ *CLI service token*); the colocated demo additionally
   generates `auth-session.key` (K_session — the login-session root)
-  here. Enrollment
+  here. The operator's login **session** is not kept here — it is
+  per-user under `~/.config/mint`, shared with `mint client`
+  (§ *CLI service token* — *Login & discharge*). Enrollment
   state (the current `invite` nonce, pending records, and the
   approved-coordinator registry) lives in the tenant bucket under
   `_mint/` so multiple mint processes can share one logical state
@@ -493,21 +494,27 @@ paths, or wait for a future authenticated-TCP admin transport
 (§ *Proposed: dual-listen* — *What this is not*).
 
 **Login & discharge.** `mint login` authenticates at the auth service
-and stores the session — `<data_dir>/cli-session` in the colocated
-demo, `~/.elide/` for a standalone auth service (see
-[`design-auth-service.md`](design-auth-service.md) § *Login flow*). On
-each admin call the CLI fetches a **discharge** for the service
-token's third-party caveat from `POST <auth>/v1/discharge` at scope
-`mint:admin` (gated by the session, which must carry that scope; recovering
-the discharge key from the caveat's `CID` under `K_M-A`). The discharge
-carries `Subject`, `Scope=mint:admin`, and a short `NotAfter` and **no** `op`,
-so one fetch satisfies every verb (the verb binds via the per-call
-attenuation).
+and stores the session **per-user** under `$XDG_CONFIG_HOME/mint` (else
+`~/.config/mint`), alongside the auth **transport** it dialled
+(`auth-transport`). One login serves both planes: the same all-scopes
+session backs the operator admin plane and `mint client`'s enroll /
+exchange (see [`design-auth-service.md`](design-auth-service.md)
+§ *Login flow*). Transport precedence is `--url`, else `--config`'s
+`[demo_auth]` socket, else the remembered `auth-transport`; `mint logout`
+removes the session but leaves the transport, so a later bare
+`mint login` re-authenticates at the same place. On each admin call the
+CLI fetches a **discharge** for the service token's third-party caveat
+from `POST <auth>/v1/discharge` at scope `mint:admin` (gated by the
+session, which must carry that scope; recovering the discharge key from
+the caveat's `CID` under `K_M-A`). The discharge carries `Subject`,
+`Scope=mint:admin`, and a short `NotAfter` and **no** `op`, so one fetch
+satisfies every verb (the verb binds via the per-call attenuation).
 
 The discharge **route** is the *path* of the service token's own TPC
-`location`; the **transport** that path is dialed over is supplied
-separately — the `[demo_auth]` socket in the colocated demo, a network
-endpoint for a standalone auth service. `location` is the only auth
+`location`; the **transport** that path is dialed over is the one
+remembered at `mint login` (`auth-transport`) — the `[demo_auth]` socket
+in the colocated demo, a network endpoint for a standalone auth service.
+`location` is the only auth
 endpoint carried as a full URL, because it rides inside the macaroon and
 must be self-contained; `/v1/login` and `/v1/discharge` are otherwise
 fixed routes the CLI dials over that transport, and `mint logout` is
@@ -1828,8 +1835,8 @@ Operator / server:
 
 ```
 mint serve <cfg> [bind]            # HTTP service
-mint login [--subject <s>]         # operator session for the admin plane (gates discharge issuance)
-mint logout                        # remove the saved operator session
+mint login [--url <u>|--config <c>] [--subject <s>]  # auth session for the admin plane AND `mint client` (gates discharge issuance); remembers the transport
+mint logout                        # remove the session (keeps the remembered auth transport)
 mint invite [--rotate]             # print current invite macaroon / rotate the nonce
 mint enroll list                   # sub, state (pending|approved), cnf fingerprint,
                                    #   peer ip (pending only), age / approved_at
@@ -1844,8 +1851,8 @@ client only reads it; `--id` is the opaque `sub`):
 
 ```
 mint client keygen                                       # → client.key/.pub
-mint client login        --url <auth-url>                # → cli-session (needed to enroll AND exchange: discharges the invite + exchange gates)
-mint client logout                                       # remove the saved client session
+# Log in once with the shared top-level `mint login` (above); enroll and
+# exchange use that session to discharge the invite + exchange gates.
 mint client enroll       --id <sub> <macaroon|file|->    # attaches the enrolling-operator discharge → credential ticket
 mint client exchange     --role <role>                   # ticket + exchanging-operator discharge; 403 until approved → credentials/<role>
 mint client credential list                              # held per-role credentials (local-only)
@@ -1855,9 +1862,9 @@ mint client assume-role  --request '{"prefix":"x"}'          # role from the cre
 ```
 
 A worked `examples/` script chains them: `serve` (background) →
-operator `login` → `client login` → `client enroll` → operator `enroll
-approve` → `client exchange --role` (once per role) → `client
-assume-role`, printing the returned Tigris keypair.
+`mint login` → `client enroll` → operator `enroll approve` → `client
+exchange --role` (once per role) → `client assume-role`, printing the
+returned Tigris keypair.
 
 **Operator auth.** The operator commands (`invite`, `enroll
 list/approve/revoke`) hit discharge-gated admin endpoints

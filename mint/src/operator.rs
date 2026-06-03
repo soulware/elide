@@ -9,15 +9,14 @@
 //!
 //! - the **machine key** — the cli-token's `cnf`, held in
 //!   `<data_dir>/cli-token.key`, which signs every admin request's PoP;
-//! - the **human session** — minted by `mint login` and held in
-//!   `<data_dir>/cli-session`, which gates discharge issuance at the
-//!   auth role.
+//! - the **human session** — minted by `mint login` and held per-user by
+//!   [`crate::session`], which gates discharge issuance at the auth role.
 //!
-//! This module loads that identity, drives `login` / `fetch_discharge`
-//! over the demo auth socket, and assembles the `(Authorization,
-//! X-Mint-Pop)` header pair for a single admin call. The admin client
-//! functions in [`crate::admin`] call [`Operator::authorize`] per
-//! request; the verifier side is [`crate::http::verify_and_clear`].
+//! This module loads the machine identity, fetches a discharge over the
+//! session's transport ([`Operator::fetch_discharge`]), and assembles the
+//! `(Authorization, X-Mint-Pop)` header pair for a single admin call. The
+//! admin client functions in [`crate::admin`] call [`Operator::authorize`]
+//! per request; the verifier side is [`crate::http::verify_and_clear`].
 
 use std::path::Path;
 
@@ -33,8 +32,6 @@ pub const CLI_TOKEN_FILE: &str = "cli-token";
 /// The cli-token's machine key seed (64 ASCII hex, mode 0600) — what
 /// the operator CLI signs PoP with.
 pub const CLI_TOKEN_KEY_FILE: &str = "cli-token.key";
-/// The demo session minted by `mint login` (gates discharge issuance).
-pub const SESSION_FILE: &str = "cli-session";
 
 /// Why an operator-plane step failed. Coarse on purpose — the operator
 /// CLI surfaces these to a human, not to a peer service.
@@ -123,13 +120,18 @@ impl Operator {
     /// invocation.
     pub async fn fetch_discharge(
         &self,
-        transport: &Path,
+        transport: &str,
         session: &str,
     ) -> Result<Macaroon, OperatorError> {
         let path = self.discharge_path()?;
         let body = self.discharge_request_body()?;
-        let headers = [("authorization", format!("Bearer {session}"))];
-        let (status, text) = post_uds(transport, &path, &headers, body).await?;
+        let headers = [
+            ("content-type", "application/json".to_string()),
+            ("authorization", format!("Bearer {session}")),
+        ];
+        let (status, text) = crate::transport::post(transport, &path, &headers, body)
+            .await
+            .map_err(OperatorError::Transport)?;
         if status != 200 {
             return Err(OperatorError::Status { status, body: text });
         }
@@ -165,91 +167,6 @@ impl Operator {
     }
 }
 
-/// Persist a session macaroon to `<data_dir>/cli-session` (mode 0600).
-/// Parse-don't-validate: only a decodable macaroon is written.
-pub fn save_session(data_dir: &Path, session: &str) -> Result<(), OperatorError> {
-    Macaroon::decode(session.trim()).map_err(|_| OperatorError::Malformed("session"))?;
-    write_0600(&data_dir.join(SESSION_FILE), session.trim().as_bytes())
-        .map_err(|e| OperatorError::Io(e.to_string()))
-}
-
-/// Load the session from `<data_dir>/cli-session`, validated as a
-/// decodable macaroon. A missing file points the operator at
-/// `mint login`.
-pub fn load_session(data_dir: &Path) -> Result<String, OperatorError> {
-    let path = data_dir.join(SESSION_FILE);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| OperatorError::Io(format!("{}: {e} (run `mint login`)", path.display())))?;
-    let trimmed = text.trim();
-    Macaroon::decode(trimmed).map_err(|_| OperatorError::Malformed("session"))?;
-    Ok(trimmed.to_string())
-}
-
-/// Remove the saved session (`mint logout`). Returns whether a session
-/// file was present — a no-op logout (nothing to remove) is `Ok(false)`,
-/// not an error.
-pub fn clear_session(data_dir: &Path) -> std::io::Result<bool> {
-    match std::fs::remove_file(data_dir.join(SESSION_FILE)) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// `mint login`: trivially authenticate at the demo auth role and
-/// return the session bearer. The demo accepts any subject with no
-/// password; production auth-service authenticates here for real and
-/// issues the same session shape.
-pub async fn login(auth_socket: &Path, subject: &str) -> Result<String, OperatorError> {
-    let body = serde_json::json!({ "subject": subject }).to_string();
-    let (status, text) = post_uds(auth_socket, "/v1/login", &[], body).await?;
-    if status != 200 {
-        return Err(OperatorError::Status { status, body: text });
-    }
-    json_field(&text, "session")
-}
-
-/// POST `body` to `<endpoint>` on the auth role's UDS with arbitrary
-/// headers, returning `(status, text)`. `reqwest` has no UDS support,
-/// so this dials the socket via `hyperlocal`'s `UnixConnector` — the
-/// same leg the enrolling client uses for the mint socket.
-async fn post_uds(
-    socket: &Path,
-    endpoint: &str,
-    headers: &[(&str, String)],
-    body: String,
-) -> Result<(u16, String), OperatorError> {
-    use http_body_util::{BodyExt, Full};
-    use hyper_util::client::legacy::Client;
-    use hyper_util::rt::TokioExecutor;
-
-    let client: Client<_, Full<bytes::Bytes>> =
-        Client::builder(TokioExecutor::new()).build(hyperlocal::UnixConnector);
-    let uri: hyper::Uri = hyperlocal::Uri::new(socket, endpoint).into();
-    let mut builder = hyper::Request::builder()
-        .method(hyper::Method::POST)
-        .uri(uri)
-        .header("content-type", "application/json");
-    for (k, v) in headers {
-        builder = builder.header(*k, v);
-    }
-    let req = builder
-        .body(Full::new(bytes::Bytes::from(body)))
-        .map_err(|e| OperatorError::Transport(e.to_string()))?;
-    let resp = client
-        .request(req)
-        .await
-        .map_err(|e| OperatorError::Transport(e.to_string()))?;
-    let status = resp.status().as_u16();
-    let bytes = resp
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| OperatorError::Transport(e.to_string()))?
-        .to_bytes();
-    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
-}
-
 fn json_field(body: &str, key: &'static str) -> Result<String, OperatorError> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -268,15 +185,6 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
         *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
     }
     Some(out)
-}
-
-/// Atomic 0600 write — tmp file, chmod, rename.
-fn write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -374,45 +282,6 @@ mod tests {
         let proof = pop::Proof::from_b64(&sig).expect("proof");
         let cnf = vec![Caveat::scalar(name::CNF, pop::cnf_value(&MACHINE_SEED))];
         assert!(pop::check(&cnf, primary.tail(), body, Some(proof), 1700000000).is_ok());
-    }
-
-    #[test]
-    fn session_save_load_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = crate::macaroon::mint_under_key(
-            &[1u8; 32],
-            crate::macaroon::SESSION_KID,
-            vec![Caveat::scalar(name::SUB, "alice")],
-        )
-        .encode();
-        save_session(dir.path(), &session).unwrap();
-        assert_eq!(load_session(dir.path()).unwrap(), session);
-    }
-
-    #[test]
-    fn clear_session_removes_and_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        // Nothing to remove yet.
-        assert!(!clear_session(dir.path()).unwrap());
-        let session = crate::macaroon::mint_under_key(
-            &[1u8; 32],
-            crate::macaroon::SESSION_KID,
-            vec![Caveat::scalar(name::SUB, "alice")],
-        )
-        .encode();
-        save_session(dir.path(), &session).unwrap();
-        assert!(clear_session(dir.path()).unwrap()); // existed → removed
-        assert!(load_session(dir.path()).is_err()); // gone
-        assert!(!clear_session(dir.path()).unwrap()); // idempotent
-    }
-
-    #[test]
-    fn load_session_absent_is_io_error() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            load_session(dir.path()),
-            Err(OperatorError::Io(_))
-        ));
     }
 
     #[test]
