@@ -398,8 +398,8 @@ struct TigrisHandles {
 /// real S3-compatible target (Tigris free tier, MinIO). Test code
 /// constructs `Store::open_in_memory` / `Store::open_local` directly,
 /// outside this path.
-/// Mint the **admin service token** and its machine keypair at first
-/// start, writing `<data_dir>/admin-service` + `<data_dir>/admin-service.key`
+/// Mint the **admin service token** and its machine keypair, writing
+/// `<data_dir>/admin-service` + `<data_dir>/admin-service.key`
 /// (`docs/design-mint.md` § *Admin service token*). The operator CLI on
 /// the same host reads both: the token is the admin-plane primary, the
 /// key is what it signs proof-of-possession with. Mint generates the
@@ -409,8 +409,9 @@ struct TigrisHandles {
 /// Requires `[auth]` (so `K_M-A` is present): admin endpoints are
 /// discharge-gated, so a mint with no auth service has no admin plane
 /// and no admin-service to mint — that case returns `Ok(())` and writes
-/// nothing. Refuses to overwrite; first-start detection is the
-/// caller's job.
+/// nothing. The caller invokes this when either file is absent; both are
+/// (re)written, so a partial pair (e.g. a crash mid-write) is repaired
+/// with a fresh keypair.
 async fn write_admin_service(
     cfg: &Config,
     store: &Store,
@@ -507,22 +508,18 @@ async fn serve(
 
     let config = Arc::new(load(config)?);
 
-    // First start = keyring directory empty before open_store.
-    // open_store generates `root_keys/0000` if absent, so checking
-    // before is the only reliable signal. The admin-service is minted
-    // exactly once, on this transition; later starts never re-create
-    // it (the existing file is left in place).
-    let is_first_start = !config.data_dir.join("root_keys").join("0000").exists()
-        && !config.data_dir.join("root_key").exists();
-
     let (store, tigris) = open_store(&config).await?;
     let store = Arc::new(store);
 
     // admin service token (`docs/design-mint.md` § *Admin service token*):
-    // the admin-plane primary + machine key the local operator CLI
-    // reads. Written once on first start when an auth service is
-    // configured.
-    if is_first_start && !config.data_dir.join("admin-service").exists() {
+    // the admin-plane primary + machine key the local operator CLI reads.
+    // (Re)minted whenever either file is absent and an auth service is
+    // configured — so a fresh deployment provisions it, a lost or partial
+    // pair self-heals on restart, and enabling [auth] on an existing
+    // deployment picks it up.
+    let have_admin_service = config.data_dir.join("admin-service").exists()
+        && config.data_dir.join("admin-service.key").exists();
+    if !have_admin_service {
         write_admin_service(&config, &store).await?;
     }
 

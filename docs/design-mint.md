@@ -470,8 +470,8 @@ third-party caveat.
 *human*:
 
 - The **machine key** is the service token's `cnf`. Mint generates the
-  keypair at first start — the token is minted before any operator key
-  exists — and writes the seed to `<data_dir>/admin-service.key`. The CLI
+  keypair when its files are absent — the token is minted before any
+  operator key exists — and writes the seed to `<data_dir>/admin-service.key`. The CLI
   signs every admin request's PoP with it. It attests "this is the
   deployment's CLI", not which human is driving it.
 - The **human session** is what `mint login` obtains from the auth
@@ -479,12 +479,16 @@ third-party caveat.
   session's `Subject` into each discharge, so the audit log attributes
   `enroll approve` to a human even though the PoP is the machine's.
 
-**Generation.** Mint mints the service token at first start under `K_M`
-(fresh nonce) and writes `<data_dir>/admin-service` together with the
-machine-key seed `<data_dir>/admin-service.key`, both mode 0600. Neither is
-a network secret: the bundle is inert without a fresh discharge, and any
-process without UDS access cannot reach mint at all. Local-filesystem
-reach is the only reach either needs.
+**Generation.** `mint serve` mints the service token whenever either
+file is absent — a fresh deployment, a lost or partial pair, or `[auth]`
+enabled on an existing deployment — under `K_M` (fresh nonce), writing
+`<data_dir>/admin-service` together with the machine-key seed
+`<data_dir>/admin-service.key`, both mode 0600. Re-minting is safe: the
+`cnf` lives inside the token and nothing pins it out of band, so a
+regenerated pair is simply a new valid identity (any lost copy is inert
+without its key). Neither file is a network secret: the bundle is inert
+without a fresh discharge, and any process without UDS access cannot
+reach mint at all. Local-filesystem reach is the only reach either needs.
 
 **Distribution.** None. The mint CLI on the same host reads both files
 directly. No copy-paste, no out-of-band channel, no deployer secrets
@@ -1870,7 +1874,7 @@ returned Tigris keypair.
 list/approve/revoke`) hit discharge-gated admin endpoints
 (§ *Operator authorization*). `mint serve` writes the **admin-service** and
 its machine key (`<data_dir>/admin-service` + `admin-service.key`, mode 0600)
-at first start; the operator runs `mint login` once to obtain a session,
+whenever either is absent; the operator runs `mint login` once to obtain a session,
 and each command then fetches a discharge for the admin-service's
 third-party caveat and presents `[admin-service, discharge]` + a PoP. There
 is no bearer admin macaroon. `serve` also auto-seals the templates on a
