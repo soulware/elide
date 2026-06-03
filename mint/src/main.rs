@@ -54,12 +54,11 @@ enum Command {
         /// `http(s)://host:port`. Overwrites the remembered transport.
         #[arg(long)]
         url: Option<String>,
-        /// Derive the auth transport from a mint config's `[demo_auth]`
+        /// Derive the auth transport from a mint config's auth-role
         /// socket, when `--url` is omitted.
         #[arg(long, env = "MINT_CONFIG")]
         config: Option<PathBuf>,
-        /// Opaque subject, stamped into issued discharges for audit. Any
-        /// value is accepted in the demo.
+        /// Opaque subject, stamped into issued discharges for audit.
         #[arg(long, default_value = "operator")]
         subject: String,
     },
@@ -216,8 +215,7 @@ enum RoleCmd {
 
 #[derive(Subcommand)]
 enum EnrollCmd {
-    /// List enrollments — pending and approved — with state as a
-    /// column (`docs/design-mint.md` § *Reference client & demo*).
+    /// List enrollments — pending and approved — with state as a column.
     List {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
