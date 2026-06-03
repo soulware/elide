@@ -1,9 +1,9 @@
 //! End-to-end demo-auth flow for the admin surface. The operator holds
-//! the deployment's **cli-token** (a mint-issued primary with a machine
+//! the deployment's **admin-service** (a mint-issued primary with a machine
 //! `cnf` and a third-party caveat), logs in at the demo auth role
 //! (`POST /v1/login`), fetches a **wide** discharge for that token's TPC
 //! (`POST /v1/discharge`), then per call attenuates `op=admin:<verb>`
-//! onto the cli-token and presents `[cli-token, discharge]` as a
+//! onto the admin-service and presents `[admin-service, discharge]` as a
 //! `MintV1` bundle with a proof-of-possession over the attenuated tail.
 //!
 //! Exercises the full bundle verifier path the migrated `/v1/admin/*`
@@ -34,14 +34,14 @@ mod common;
 
 const ROOT: [u8; 32] = [42u8; 32];
 const K_M_A: [u8; 32] = [13u8; 32];
-/// The cli-token's machine key — mint-generated at first start, the
+/// The admin-service's machine key — mint-generated at first start, the
 /// `cnf` the operator CLI signs PoP with. Fixed here so the test can
-/// re-mint the same cli-token and sign for it.
+/// re-mint the same admin-service and sign for it.
 const MACHINE_SEED: [u8; 32] = [55u8; 32];
 /// The org the demo store serves (`Store::init_k_m_a` assigns `"demo"`).
-/// The cli-token's TPC binds this; `/v1/discharge` cross-checks it.
+/// The admin-service's TPC binds this; `/v1/discharge` cross-checks it.
 const ORG: &str = "demo";
-/// The TPC location — the full discharge URL the cli-token says to fetch
+/// The TPC location — the full discharge URL the admin-service says to fetch
 /// a discharge from. The verifier recovers `r` from the `VID` regardless
 /// of location, so the exact string is immaterial to verification; the
 /// test calls the auth router directly.
@@ -49,7 +49,7 @@ const AUTH_LOCATION: &str = "https://auth.example/v1/discharge";
 
 // The admin action vocabulary mirrors the private `ADMIN_*` consts in
 // `mint::admin`: each endpoint clears exactly its own value, so the
-// operator must attenuate the matching `op` onto the cli-token.
+// operator must attenuate the matching `op` onto the admin-service.
 const OP_INVITE_READ: &str = "admin:invite-read";
 const OP_INVITE_ROTATE: &str = "admin:invite-rotate";
 const OP_ENROLL_LIST: &str = "admin:enroll-list";
@@ -156,25 +156,25 @@ fn now() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 
-/// Mint the deployment's cli-token exactly as `main.rs` does at first
+/// Mint the deployment's admin-service exactly as `main.rs` does at first
 /// start: a mint-issued chain carrying `aud` + the machine `cnf`, plus
 /// the auth-location TPC. Keyed by the store's root (`kid=0`).
-fn cli_token() -> Macaroon {
+fn admin_service() -> Macaroon {
     let kr = Keyring::single(ROOT);
     let cnf = pop::cnf_value(&MACHINE_SEED);
-    mint::issuance::mint_cli_token(&kr, &K_M_A, "mint", &cnf, ORG, AUTH_LOCATION)
+    mint::issuance::mint_admin_service_token(&kr, &K_M_A, "mint", &cnf, ORG, AUTH_LOCATION)
 }
 
-/// Read the base64 `CID` off the cli-token's third-party caveat — what
+/// Read the base64 `CID` off the admin-service's third-party caveat — what
 /// the operator CLI POSTs to `/v1/discharge` to ask the auth role for a
 /// discharge satisfying that caveat.
-fn cli_token_cid(token: &Macaroon) -> String {
+fn admin_service_cid(token: &Macaroon) -> String {
     for c in token.caveats() {
         if let Caveat::ThirdParty { cid, .. } = c {
             return BASE64.encode(cid);
         }
     }
-    panic!("cli-token has no third-party caveat");
+    panic!("admin-service has no third-party caveat");
 }
 
 /// Trivially log in at the demo auth role (`POST /v1/login`), returning
@@ -194,7 +194,7 @@ async fn login(auth_router: Router, subject: &str) -> String {
     v["session"].as_str().expect("session field").to_string()
 }
 
-/// Fetch a wide discharge for the cli-token's CID from the auth role on
+/// Fetch a wide discharge for the admin-service's CID from the auth role on
 /// its dedicated router. In production this hits a separate UDS socket;
 /// the test preserves the boundary by routing it to `auth_router`
 /// exclusively. `/v1/discharge` requires a session bearer, so we log in
@@ -217,7 +217,7 @@ async fn fetch_discharge(auth_router: Router, cid_b64: &str) -> Macaroon {
 }
 
 /// Assemble the per-call admin request: attenuate `op` onto the
-/// cli-token, build the `MintV1 <cli-token>,<discharge>` bundle, and
+/// admin-service, build the `MintV1 <admin-service>,<discharge>` bundle, and
 /// PoP-sign the attenuated tail with the machine key over `body`.
 fn admin_request(
     token: &Macaroon,
@@ -243,8 +243,8 @@ fn admin_request(
 #[tokio::test]
 async fn happy_path_discharge_then_invite_read() {
     let (mint_router, auth_router, _dir) = app().await;
-    let token = cli_token();
-    let discharge = fetch_discharge(auth_router, &cli_token_cid(&token)).await;
+    let token = admin_service();
+    let discharge = fetch_discharge(auth_router, &admin_service_cid(&token)).await;
     assert_eq!(discharge.kid(), DISCHARGE_KID);
 
     let body = format!(r#"{{"ts":{}}}"#, now());
@@ -266,12 +266,12 @@ async fn happy_path_discharge_then_invite_read() {
 #[tokio::test]
 async fn one_wide_discharge_satisfies_every_verb() {
     // The discharge carries no `op` — per-verb narrowing is the
-    // operator's attenuation onto the cli-token. So a single fetched
+    // operator's attenuation onto the admin-service. So a single fetched
     // discharge serves every admin endpoint; only the attenuated `op`
     // (and the route) changes.
     let (mint_router, auth_router, _dir) = app().await;
-    let token = cli_token();
-    let discharge = fetch_discharge(auth_router, &cli_token_cid(&token)).await;
+    let token = admin_service();
+    let discharge = fetch_discharge(auth_router, &admin_service_cid(&token)).await;
 
     let cases: &[(&str, &str, &str, String)] = &[
         (
@@ -323,13 +323,14 @@ async fn operator_client_assembles_accepted_request() {
     // not here (the sandbox forbids socket binds).
     let (mint_router, auth_router, _dir) = app().await;
 
-    // Persist the cli-token + machine key exactly as `mint serve` does,
+    // Persist the admin-service + machine key exactly as `mint serve` does,
     // then load the operator identity from disk.
     let op_dir = tempfile::tempdir().expect("op tempdir");
-    let token = cli_token();
-    std::fs::write(op_dir.path().join("cli-token"), token.encode()).expect("write cli-token");
+    let token = admin_service();
+    std::fs::write(op_dir.path().join("admin-service"), token.encode())
+        .expect("write admin-service");
     let seed_hex: String = MACHINE_SEED.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(op_dir.path().join("cli-token.key"), seed_hex).expect("write key");
+    std::fs::write(op_dir.path().join("admin-service.key"), seed_hex).expect("write key");
     let operator = mint::operator::Operator::load(op_dir.path()).expect("load operator");
 
     let discharge = fetch_discharge(auth_router, &operator.cid_b64().expect("cid")).await;
@@ -355,8 +356,8 @@ async fn seal_endpoint_publishes_and_caches() {
     // publish the template seal. The daemon hashes its own config, PUTs
     // the bucket seal, and writes its local sealed cache.
     let (mint_router, auth_router, dir) = app().await;
-    let token = cli_token();
-    let discharge = fetch_discharge(auth_router, &cli_token_cid(&token)).await;
+    let token = admin_service();
+    let discharge = fetch_discharge(auth_router, &admin_service_cid(&token)).await;
 
     let body = format!(r#"{{"ts":{}}}"#, now());
     let req = admin_request(
@@ -395,8 +396,8 @@ async fn seal_serves_live_without_restart() {
     // immediately — no restart. Proven through /readyz flipping 503 → 200
     // on the same running router, exercising the ArcSwap end to end.
     let (mint_router, auth_router, _dir) = app_seeded(false).await;
-    let token = cli_token();
-    let discharge = fetch_discharge(auth_router, &cli_token_cid(&token)).await;
+    let token = admin_service();
+    let discharge = fetch_discharge(auth_router, &admin_service_cid(&token)).await;
 
     let readyz = || {
         Request::builder()
@@ -435,11 +436,11 @@ async fn seal_serves_live_without_restart() {
 
 #[tokio::test]
 async fn seal_requires_the_seal_op() {
-    // The endpoint clears op=admin:seal specifically: a cli-token
+    // The endpoint clears op=admin:seal specifically: a admin-service
     // attenuated for a different verb cannot seal.
     let (mint_router, auth_router, _dir) = app().await;
-    let token = cli_token();
-    let discharge = fetch_discharge(auth_router, &cli_token_cid(&token)).await;
+    let token = admin_service();
+    let discharge = fetch_discharge(auth_router, &admin_service_cid(&token)).await;
     let body = format!(r#"{{"ts":{}}}"#, now());
     let req = admin_request(
         &token,
@@ -459,8 +460,8 @@ async fn discharge_without_session_rejected() {
     // a well-formed CID but no Authorization is refused before any
     // discharge is minted.
     let (_mint_router, auth_router, _dir) = app().await;
-    let token = cli_token();
-    let req_body = serde_json::json!({ "cid": cli_token_cid(&token) }).to_string();
+    let token = admin_service();
+    let req_body = serde_json::json!({ "cid": admin_service_cid(&token) }).to_string();
     let req = Request::builder()
         .method("POST")
         .uri("/v1/discharge")
@@ -476,7 +477,7 @@ async fn discharge_with_foreign_session_rejected() {
     // A session that verifies under a *different* K_session must not
     // open the gate — the bearer is checked, not merely parsed.
     let (_mint_router, auth_router, _dir) = app().await;
-    let token = cli_token();
+    let token = admin_service();
     let foreign = mint_under_key(
         &[0xAAu8; 32],
         mint::macaroon::SESSION_KID,
@@ -485,7 +486,7 @@ async fn discharge_with_foreign_session_rejected() {
             Caveat::scalar(name::SUB, "intruder"),
         ],
     );
-    let req_body = serde_json::json!({ "cid": cli_token_cid(&token) }).to_string();
+    let req_body = serde_json::json!({ "cid": admin_service_cid(&token) }).to_string();
     let req = Request::builder()
         .method("POST")
         .uri("/v1/discharge")
@@ -499,13 +500,13 @@ async fn discharge_with_foreign_session_rejected() {
 
 #[tokio::test]
 async fn wrong_op_attenuation_rejected() {
-    // The cli-token attenuated for one verb cannot exercise another:
+    // The admin-service attenuated for one verb cannot exercise another:
     // the endpoint clears its own `op`, so presenting an
     // `admin:enroll-approve` attenuation at `/v1/admin/invite` fails
     // op-clearing.
     let (mint_router, auth_router, _dir) = app().await;
-    let token = cli_token();
-    let discharge = fetch_discharge(auth_router, &cli_token_cid(&token)).await;
+    let token = admin_service();
+    let discharge = fetch_discharge(auth_router, &admin_service_cid(&token)).await;
     let body = format!(r#"{{"ts":{}}}"#, now());
     let req = admin_request(
         &token,
@@ -521,11 +522,11 @@ async fn wrong_op_attenuation_rejected() {
 
 #[tokio::test]
 async fn pop_signed_by_wrong_key_rejected() {
-    // The PoP must be over the cli-token's `cnf` (the machine key).
+    // The PoP must be over the admin-service's `cnf` (the machine key).
     // Signing the attenuated tail with a different key fails cnf+PoP.
     let (mint_router, auth_router, _dir) = app().await;
-    let token = cli_token();
-    let discharge = fetch_discharge(auth_router, &cli_token_cid(&token)).await;
+    let token = admin_service();
+    let discharge = fetch_discharge(auth_router, &admin_service_cid(&token)).await;
     let body = format!(r#"{{"ts":{}}}"#, now());
     let attenuated = token.attenuate(Caveat::scalar(name::OP, OP_INVITE_READ));
     let sig = pop::client_signature(&[99u8; 32], attenuated.tail(), body.as_bytes());
@@ -545,11 +546,11 @@ async fn pop_signed_by_wrong_key_rejected() {
 #[tokio::test]
 async fn forged_discharge_under_wrong_r_rejected() {
     // An attacker mints a discharge under a key of their own choosing
-    // (they don't hold K_M-A, so they can't recover the cli-token's
+    // (they don't hold K_M-A, so they can't recover the admin-service's
     // real `r`). verify_and_clear recovers `r` from the TPC's `VID` and
     // the forged discharge fails its chain MAC under that `r`.
     let (mint_router, _auth_router, _dir) = app().await;
-    let token = cli_token();
+    let token = admin_service();
     let forged = mint_under_key(
         &[0x11u8; 32],
         DISCHARGE_KID,
@@ -572,11 +573,11 @@ async fn forged_discharge_under_wrong_r_rejected() {
 }
 
 #[tokio::test]
-async fn cli_token_without_discharge_rejected() {
-    // The cli-token is inert on its own: its third-party caveat is
+async fn admin_service_without_discharge_rejected() {
+    // The admin-service is inert on its own: its third-party caveat is
     // undischarged, so the bundle fails before any clearing.
     let (mint_router, _auth_router, _dir) = app().await;
-    let token = cli_token();
+    let token = admin_service();
     let body = format!(r#"{{"ts":{}}}"#, now());
     let attenuated = token.attenuate(Caveat::scalar(name::OP, OP_INVITE_READ));
     let sig = pop::client_signature(&MACHINE_SEED, attenuated.tail(), body.as_bytes());
@@ -599,8 +600,8 @@ async fn discharge_route_not_on_mint_router() {
     // and mint roles are sharing a listener — exactly what the
     // separate-socket design prevents.
     let (mint_router, _auth_router, _dir) = app().await;
-    let token = cli_token();
-    let req_body = serde_json::json!({ "cid": cli_token_cid(&token) }).to_string();
+    let token = admin_service();
+    let req_body = serde_json::json!({ "cid": admin_service_cid(&token) }).to_string();
     let req = Request::builder()
         .method("POST")
         .uri("/v1/discharge")

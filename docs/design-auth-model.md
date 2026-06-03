@@ -24,7 +24,7 @@ Two distinct auth surfaces layer on that foundation:
   between. The role credentials mint then issues carry **no** TPC — they
   are long-lived service tokens, and `assume-role` is app-driven. The
   same discharge mechanism gates each `/v1/admin/*` verb on mint (a TPC
-  on the CLI service token). Design lives in [`design-mint.md`](design-mint.md)
+  on the admin service token). Design lives in [`design-mint.md`](design-mint.md)
   (the enrollment flow and admin plane) and
   [`design-auth-service.md`](design-auth-service.md) (the
   session/discharge issuer). Mint's verification routine and the demo
@@ -55,7 +55,7 @@ attested.**
   enrollment, or an admin verb." The trust source is the human's
   identity provider, not coord. Coord must not be able to forge that
   claim, so coord is excluded from issuance and from verification: mint
-  stamps the third-party caveats (on the invite and the CLI service
+  stamps the third-party caveats (on the invite and the admin service
   token) and verifies them — it holds `K_M` to walk the chain and can
   recover the discharge HMAC key from the TPC's `VID` or `CID` — and the
   auth service issues the discharges (it is the human-identity
@@ -113,7 +113,7 @@ local attacker.
 |---|---|---|
 | S3 data | IAM credential scoping + macaroon gating | AWS + coordinator |
 | Local filesystem | uid separation / namespacing | OS (not yet implemented) |
-| Coordinator enrollment + mint admin verbs | Operator discharge on the invite / ticket / CLI service token (planned) | mint + auth service, once the central auth service lands |
+| Coordinator enrollment + mint admin verbs | Operator discharge on the invite / ticket / admin service token (planned) | mint + auth service, once the central auth service lands |
 | Coordinator S3 mutations (all) | Role credential alone (no discharge) | mint, via the assume-role gate on the role |
 
 ## Operator authority is established at enrollment
@@ -147,7 +147,7 @@ The places a human decision is required:
   TPC-free service credentials.
 - **Mint administration.** Each `/v1/admin/*` verb (invite management,
   enrollment approval) requires a fresh operator discharge satisfying a
-  TPC on the mint CLI service token.
+  TPC on the mint admin service token.
 
 ### Why this is structural under mint
 
@@ -169,7 +169,7 @@ shape](https://github.com/superfly/macaroon/blob/main/macaroon-thought.md):
 
 - **Mint** holds `K_M` and shares `K_M-A` with auth (per-org wrapping
   key for third-party-caveat `CID`s). It stamps the TPCs on the invite,
-  the credential ticket, and the CLI service token, issues the four
+  the credential ticket, and the admin service token, issues the four
   TPC-free role credentials at enrollment, and **verifies** every
   discharge presented to it (it holds `K_M` to walk the chain and
   `K_M-A` to recover the discharge key from a `CID`). Verification at

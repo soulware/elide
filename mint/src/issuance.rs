@@ -156,19 +156,19 @@ pub fn mint_credential(
     )
 }
 
-/// Fixed `client_id` bound into the CLI service token's third-party
-/// caveat. The cli-token is the deployment's admin-plane primary, not
+/// Fixed `client_id` bound into the admin service token's third-party
+/// caveat. The admin-service is the deployment's admin-plane primary, not
 /// a per-operator credential, so its `r`-cluster is a single fixed
 /// scope — one deployment, one admin plane
-/// (`docs/design-mint.md` § *CLI service token*).
-pub const CLI_TOKEN_CLIENT_ID: &str = "cli-token";
+/// (`docs/design-mint.md` § *Admin service token*).
+pub const ADMIN_SERVICE_CLIENT_ID: &str = "admin-service";
 
-/// The cli-token's TPC `r` epoch. Fixed at 0; rotation (which would
+/// The admin-service's TPC `r` epoch. Fixed at 0; rotation (which would
 /// bump it to invalidate outstanding discharges) is deferred.
-const CLI_TOKEN_R_EPOCH: u32 = 0;
+const ADMIN_SERVICE_R_EPOCH: u32 = 0;
 
-/// Mint the **CLI service token** — the deployment's admin-plane
-/// primary (`docs/design-mint.md` § *CLI service token*). A mint-issued
+/// Mint the **admin service token** — the deployment's admin-plane
+/// primary (`docs/design-mint.md` § *Admin service token*). A mint-issued
 /// chain carrying `aud` and `cnf` (the mint-generated machine key the
 /// operator CLI signs PoP with), plus a single third-party caveat at
 /// `location` that the auth service discharges.
@@ -178,10 +178,10 @@ const CLI_TOKEN_R_EPOCH: u32 = 0;
 /// the attenuated tail), and per-call freshness rides on the discharge.
 /// The token is inert without a fresh discharge satisfying the TPC.
 ///
-/// `r` for the TPC is `derive_r(K_M, "cli-token", 0)`; the verifier
+/// `r` for the TPC is `derive_r(K_M, "admin-service", 0)`; the verifier
 /// recovers it from the TPC's `VID` (chain-tag-keyed), the auth service
 /// from the `CID` (`K_M-A`-keyed) — both yield this same `r`.
-pub fn mint_cli_token(
+pub fn mint_admin_service_token(
     keyring: &Keyring,
     k_m_a: &[u8; 32],
     audience: &str,
@@ -198,14 +198,14 @@ pub fn mint_cli_token(
     );
     let r = crate::tpc::derive_r(
         keyring.current_key(),
-        CLI_TOKEN_CLIENT_ID,
-        CLI_TOKEN_R_EPOCH,
+        ADMIN_SERVICE_CLIENT_ID,
+        ADMIN_SERVICE_R_EPOCH,
     );
     let tpc = crate::tpc::build_caveat(
         base.tail(),
         &r,
         k_m_a,
-        CLI_TOKEN_CLIENT_ID,
+        ADMIN_SERVICE_CLIENT_ID,
         org_id,
         location,
     );

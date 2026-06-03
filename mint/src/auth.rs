@@ -105,7 +105,7 @@ pub fn derive_discharge_r(k_m_a: &[u8; 32], nonce: &[u8; NONCE_LEN]) -> [u8; 32]
 #[derive(Deserialize, Serialize)]
 pub(crate) struct DischargeRequest {
     /// Base64url of the anchor's third-party-caveat `CID` (the invite's,
-    /// the ticket's, or the cli-token's). The auth role decrypts it under
+    /// the ticket's, or the admin-service's). The auth role decrypts it under
     /// `K_M-A` to recover the discharge key `r` and the bound
     /// `(client_id, org_id)`.
     pub(crate) cid: String,

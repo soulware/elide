@@ -65,7 +65,7 @@ pub mod scope {
     /// The exchange gate — discharges the ticket's TPC at
     /// `/v1/enroll-exchange`.
     pub const MINT_EXCHANGE: &str = "mint:exchange";
-    /// The admin plane — discharges the cli-token's TPC at every
+    /// The admin plane — discharges the admin-service's TPC at every
     /// `/v1/admin/*` verb.
     pub const MINT_ADMIN: &str = "mint:admin";
 }

@@ -25,13 +25,13 @@ fn mint_demo_config_loads() {
     pin_cwd();
     let cfg = Config::load(&example("mint-demo.toml")).expect("mint-demo.toml");
     // The demo colocates the auth role so the operator admin plane
-    // (login / invite / enroll) has a discharge issuer and a cli-token.
+    // (login / invite / enroll) has a discharge issuer and a admin-service.
     let demo = cfg.demo_auth.expect("[demo_auth] present");
     assert!(demo.enabled, "demo colocates the auth role");
     assert!(demo.socket.is_some(), "demo auth role binds a UDS");
     assert!(
         cfg.operator.is_some(),
-        "demo configures the cli-token location"
+        "demo configures the admin-service location"
     );
 }
 
