@@ -1864,16 +1864,16 @@ socket, else `<data_dir>/mint.sock`:
 # Log in once with the shared top-level `mint login` (above); enroll and
 # exchange use that session to discharge the invite + exchange gates.
 mint client enroll       --id <sub> <macaroon|file|->    # attaches the enrolling-operator discharge → credential ticket
-mint client exchange     --role <role>                   # ticket + exchanging-operator discharge; 403 until approved → credentials/<role>
+mint client exchange     <role>                          # ticket + exchanging-operator discharge; 403 until approved → credentials/<role>
 mint client credential list                              # held per-role credentials (local-only)
 mint client credential inspect <role>                    # narrate one credential's caveat chain
-mint client assume-role  --request '{"prefix":"x"}'          # role from the credential → Tigris keypair
+mint client assume-role  --request '{"prefix":"x"}' <role>   # role from the credential → Tigris keypair
                                                              #   (no discharge: credentials carry no TPC)
 ```
 
 A worked `examples/` script chains them: `serve` (background) →
 `mint login` → `client enroll` → operator `enroll approve` → `client
-exchange --role` (once per role) → `client assume-role`, printing the
+exchange <role>` (once per role) → `client assume-role`, printing the
 returned Tigris keypair.
 
 **Operator auth.** The operator commands (`invite`, `enroll

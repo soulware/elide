@@ -154,10 +154,6 @@ enum ClientCmd {
         /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
         #[arg(long)]
         socket: Option<PathBuf>,
-        /// Role to exchange the ticket for. One credential per role —
-        /// run `exchange` once per role you are authorized for.
-        #[arg(long)]
-        role: String,
         /// Credential-ticket filename (under the client dir) to present.
         #[arg(long = "in", default_value_t = mint::client::CREDENTIAL_TICKET_FILE.to_string())]
         in_file: String,
@@ -165,6 +161,10 @@ enum ClientCmd {
         /// Defaults to `credentials/<role>`.
         #[arg(long)]
         out: Option<String>,
+        /// Role to exchange the ticket for. One credential per role —
+        /// run `exchange` once per role you are authorized for.
+        #[arg(value_name = "ROLE")]
+        role: String,
     },
     /// Inspect the per-role credentials held on disk (local-only).
     Credential {
