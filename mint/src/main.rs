@@ -142,8 +142,8 @@ enum ClientCmd {
         /// ticket to.
         #[arg(long, default_value_t = mint::client::CREDENTIAL_TICKET_FILE.to_string())]
         out: String,
-        /// Invite macaroon: the macaroon text inline, a file path,
-        /// or `-` for stdin.
+        /// Invite macaroon — the encoded string the operator gave you,
+        /// passed inline.
         #[arg(value_name = "INVITE")]
         invite: String,
     },
@@ -181,10 +181,10 @@ enum ClientCmd {
         /// Defaults to `credentials/<role>`.
         #[arg(long = "in")]
         in_file: Option<String>,
-        /// PoP-signed request body as a JSON object: inline, `@file`,
-        /// or `-` for stdin. Opaque pass-through into `request.*` —
-        /// `ts`/`role`/`ttl_seconds` are client-owned and ignored here.
-        #[arg(long, value_name = "JSON|@FILE|-")]
+        /// PoP-signed request body as an inline JSON object. Opaque
+        /// pass-through into `request.*` — `ts`/`role`/`ttl_seconds` are
+        /// client-owned and ignored here.
+        #[arg(long, value_name = "JSON")]
         request: Option<String>,
         /// Narrowing caveat to attenuate the credential with (repeatable).
         /// Vocabulary-agnostic — e.g. `--caveat elide:Volume=01VOL`.
