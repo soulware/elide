@@ -49,15 +49,6 @@ enum Command {
         bind: Option<SocketAddr>,
     },
     /// Log in at the auth service; store the session gating `/v1/discharge`.
-    ///
-    /// Persists the per-user session + transport under `$XDG_CONFIG_HOME/mint`
-    /// (else `~/.config/mint`). One login serves both the operator admin plane
-    /// and `mint client`.
-    ///
-    /// Transport precedence: `--url`, else `--config`'s `[demo_auth]`
-    /// socket (flag, else `MINT_CONFIG`), else the transport remembered
-    /// from a prior login. The demo auth role accepts any subject with no
-    /// password; re-run when the session lapses (~7 days).
     Login {
         /// Auth-service endpoint: `unix:<socket-path>` or
         /// `http(s)://host:port`. Overwrites the remembered transport.
@@ -99,16 +90,6 @@ enum Command {
         cmd: RoleCmd,
     },
     /// Operator: stage a new template seal, published on the next `mint serve`.
-    ///
-    /// Signed under the current keyring.
-    ///
-    /// Reads `roles_dir/` + `mint.toml`, hashes each role's policy
-    /// template, signs the manifest under
-    /// `<data_dir>/root_keys/current`, and writes the result to
-    /// `<data_dir>/pending-seal.json` (mode 0600, atomic). No bucket
-    /// I/O — `mint serve` performs the PUT on its next start, with
-    /// semantic-equality reconcile against whatever is already in
-    /// `_mint/templates/seal.json`.
     Seal {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
