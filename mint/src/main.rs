@@ -40,7 +40,7 @@ struct Args {
 enum Command {
     /// Run the verification/vending HTTP service.
     Serve {
-        #[arg(long, default_value = "mint.toml")]
+        #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
         /// TCP `host:port` override. Forces the TCP transport, taking
         /// precedence over the config's `bind`/`socket`. Omit to use
@@ -54,9 +54,9 @@ enum Command {
     /// plane and `mint client`.
     ///
     /// Transport precedence: `--url`, else `--config`'s `[demo_auth]`
-    /// socket, else the transport remembered from a prior login. The demo
-    /// auth role accepts any subject with no password; re-run when the
-    /// session lapses (~7 days).
+    /// socket (flag, else `MINT_CONFIG`), else the transport remembered
+    /// from a prior login. The demo auth role accepts any subject with no
+    /// password; re-run when the session lapses (~7 days).
     Login {
         /// Auth-service endpoint: `unix:<socket-path>` or
         /// `http(s)://host:port`. Overwrites the remembered transport.
@@ -64,7 +64,7 @@ enum Command {
         url: Option<String>,
         /// Derive the auth transport from a mint config's `[demo_auth]`
         /// socket, when `--url` is omitted.
-        #[arg(long)]
+        #[arg(long, env = "MINT_CONFIG")]
         config: Option<PathBuf>,
         /// Opaque subject, stamped into issued discharges for audit. Any
         /// value is accepted in the demo.
@@ -79,7 +79,7 @@ enum Command {
     ///
     /// The macaroon goes to stdout for piping; diagnostics to stderr.
     Invite {
-        #[arg(long, default_value = "mint.toml")]
+        #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
         /// Draw a new invite nonce first, cancelling in-flight
         /// enrollments (outstanding credentials are unaffected).
@@ -107,7 +107,7 @@ enum Command {
     /// semantic-equality reconcile against whatever is already in
     /// `_mint/templates/seal.json`.
     Seal {
-        #[arg(long, default_value = "mint.toml")]
+        #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
     },
     /// Reference client — the caller's half of the flow.
@@ -214,13 +214,13 @@ enum CredentialCmd {
 enum RoleCmd {
     /// List configured roles: name, required caveats, TTL bounds.
     List {
-        #[arg(long, default_value = "mint.toml")]
+        #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
     },
     /// Show one role: TTL bounds, required caveats, policy source, and
     /// the raw policy template + the substitution surface it references.
     Inspect {
-        #[arg(long, default_value = "mint.toml")]
+        #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
         /// Role name from the mint config.
         #[arg(value_name = "ROLE")]
@@ -233,7 +233,7 @@ enum EnrollCmd {
     /// List enrollments — pending and approved — with state as a
     /// column (`docs/design-mint.md` § *Reference client & demo*).
     List {
-        #[arg(long, default_value = "mint.toml")]
+        #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
     },
     /// Approve a pending record by its `sub`.
@@ -244,7 +244,7 @@ enum EnrollCmd {
     /// `mint client fingerprint`). `--yes` skips the prompt for
     /// automation.
     Approve {
-        #[arg(long, default_value = "mint.toml")]
+        #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
         /// The opaque principal id (any path-safe string; not required
         /// to be a ULID).
@@ -260,7 +260,7 @@ enum EnrollCmd {
     /// slow path: a fresh pending record requiring a fresh operator
     /// approval. Outstanding credentials are unaffected.
     Revoke {
-        #[arg(long, default_value = "mint.toml")]
+        #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
         /// The opaque principal id whose registry entry to delete.
         sub: String,
