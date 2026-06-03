@@ -113,7 +113,8 @@ async fn full_flow_over_unix_socket() {
 
     let url = format!("unix:{}", sock.display());
     let cdir = tempfile::tempdir().expect("client tempdir");
-    mint::client::keygen(cdir.path(), false).expect("keygen");
+    // No explicit keygen — the client mints its identity lazily on the
+    // first operation that needs it (enroll, below).
     // Point per-user config at a tempdir, then log in at the auth socket so
     // enroll/exchange can fetch their gate discharges. `mint login` now
     // persists the shared session + transport under `XDG_CONFIG_HOME/mint`.
