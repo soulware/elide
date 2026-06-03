@@ -123,15 +123,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ClientCmd {
-    /// Generate a fresh `client.key` / `client.pub` identity pair.
-    Keygen {
-        /// Overwrite an existing identity (a key is an identity —
-        /// off by default).
-        #[arg(long)]
-        force: bool,
-    },
     /// Print this identity's `cnf` value + fingerprint (what the
-    /// operator compares out of band before `enroll approve`).
+    /// operator compares out of band before `enroll approve`). The
+    /// identity is minted on first use, so this also creates it.
     Fingerprint,
     /// Attenuate the invite macaroon with `sub`/`cnf`, enrol, and
     /// save the returned credential ticket.
@@ -304,13 +298,6 @@ async fn client_cmd(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = mint::client::client_dir(client_dir);
     match cmd {
-        ClientCmd::Keygen { force } => {
-            let (cnf, fp) = mint::client::keygen(&dir, force)?;
-            eprintln!("wrote {}/client.key (0600) + client.pub", dir.display());
-            println!("cnf={cnf}");
-            println!("fingerprint={fp}");
-            Ok(())
-        }
         ClientCmd::Fingerprint => {
             let (cnf, fp) = mint::client::identity(&dir)?;
             println!("cnf={cnf}");

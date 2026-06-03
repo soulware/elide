@@ -1850,11 +1850,10 @@ mint role list                     # configured roles: name, required caveats, T
 mint role inspect <name>           # one role: bounds, policy source, raw template + ref surface
 ```
 
-Reference client (the ed25519 keypair is created out-of-band; the
-client only reads it; `--id` is the opaque `sub`):
+Reference client (the ed25519 keypair is minted lazily on first use and
+persisted as `client.key`/`client.pub`; `--id` is the opaque `sub`):
 
 ```
-mint client keygen                                       # → client.key/.pub
 # Log in once with the shared top-level `mint login` (above); enroll and
 # exchange use that session to discharge the invite + exchange gates.
 mint client enroll       --id <sub> <macaroon|file|->    # attaches the enrolling-operator discharge → credential ticket

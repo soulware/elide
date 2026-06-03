@@ -53,8 +53,6 @@ pub enum ClientError {
     Transport(String),
     #[error(transparent)]
     Session(#[from] crate::session::SessionError),
-    #[error("{KEY_FILE} already exists in {0} (use --force to overwrite)")]
-    KeyExists(String),
     #[error("malformed {0}")]
     BadFile(&'static str),
     #[error("{path} not found — {hint}")]
@@ -111,34 +109,34 @@ fn read_text(path: &Path, hint: &'static str) -> Result<String, ClientError> {
     }
 }
 
-/// Generate a fresh Ed25519 identity into `dir`. Refuses to clobber an
-/// existing `client.key` unless `force` (a key *is* an identity —
-/// overwriting it silently is a footgun, same stance as elide).
-/// Returns the `cnf` value and its fingerprint for display.
-pub fn keygen(dir: &Path, force: bool) -> Result<(String, String), ClientError> {
+/// Mint a fresh Ed25519 identity into `dir`, persisting `client.key`
+/// (0600) + `client.pub`, and return the seed. The caller is the first
+/// operation that needs an identity — see [`load_seed`].
+fn generate_identity(dir: &Path) -> Result<[u8; 32], ClientError> {
     fs::create_dir_all(dir)?;
-    let key_path = dir.join(KEY_FILE);
-    if key_path.exists() && !force {
-        return Err(ClientError::KeyExists(dir.display().to_string()));
-    }
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
     let vk = SigningKey::from_bytes(&seed).verifying_key();
-    write_0600(&key_path, format!("{}\n", encode_hex(&seed)).as_bytes())?;
+    write_0600(
+        &dir.join(KEY_FILE),
+        format!("{}\n", encode_hex(&seed)).as_bytes(),
+    )?;
     fs::write(
         dir.join(PUB_FILE),
         format!("{}\n", encode_hex(&vk.to_bytes())),
     )?;
-    let cnf = pop::cnf_value(&seed);
-    Ok((cnf.clone(), fingerprint(&cnf)))
+    Ok(seed)
 }
 
+/// Load this client's identity seed, minting one on first use. A key
+/// *is* an identity, so the first operation that needs one generates and
+/// persists it; every later call reuses the same `client.key`.
 fn load_seed(dir: &Path) -> Result<[u8; 32], ClientError> {
-    let raw = read_text(
-        &dir.join(KEY_FILE),
-        "run `mint client keygen` (or --client-dir to point at an existing identity)",
-    )?;
-    decode_hex_32(&raw)
+    match fs::read_to_string(dir.join(KEY_FILE)) {
+        Ok(raw) => decode_hex_32(&raw),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => generate_identity(dir),
+        Err(e) => Err(ClientError::Io(e)),
+    }
 }
 
 /// `(cnf, fingerprint)` for the identity in `dir` — what the operator
@@ -668,28 +666,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keygen_writes_pair_and_is_no_clobber() {
+    fn first_use_mints_and_persists_a_stable_identity() {
         let d = tempfile::tempdir().unwrap();
-        let (cnf, fp) = keygen(d.path(), false).unwrap();
+        // No key on disk yet — the first identity read mints the pair.
+        assert!(!d.path().join(KEY_FILE).exists());
+        let (cnf, fp) = identity(d.path()).unwrap();
         assert!(cnf.starts_with("ed25519:"));
         assert_eq!(fp.len(), 16); // 8 bytes hex
         assert!(d.path().join(KEY_FILE).exists());
         assert!(d.path().join(PUB_FILE).exists());
-        // identity() round-trips the persisted key to the same cnf.
+        // The identity is stable: a later read reuses the same key.
         assert_eq!(identity(d.path()).unwrap().0, cnf);
-        // no-clobber unless forced
-        assert!(matches!(
-            keygen(d.path(), false),
-            Err(ClientError::KeyExists(_))
-        ));
-        let (cnf2, _) = keygen(d.path(), true).unwrap();
-        assert_ne!(cnf, cnf2, "force regenerates a distinct identity");
     }
 
     #[test]
     fn key_file_is_0600_hex_with_newline() {
         let d = tempfile::tempdir().unwrap();
-        keygen(d.path(), false).unwrap();
+        generate_identity(d.path()).unwrap();
         let raw = fs::read_to_string(d.path().join(KEY_FILE)).unwrap();
         assert!(raw.ends_with('\n'));
         assert_eq!(raw.trim().len(), 64);

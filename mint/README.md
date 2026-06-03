@@ -96,8 +96,7 @@ mint enroll approve --config mint-demo.toml <sub>    # shows the fingerprint, in
 Client (the coordinator's half; identity under `./mint_client`):
 
 ```sh
-mint client keygen
-mint client fingerprint                                  # operator compares this during `enroll approve`
+mint client fingerprint                                  # mints the identity on first use; operator compares this during `enroll approve`
 mint client enroll      --id <sub> <macaroon|file|->     # invite is the final positional arg
 mint client exchange                                     # exit 2 until approved, then saves the primary
 mint client assume-role --request '{"prefix":"demo/x"}' [--caveat N=V] <role>
