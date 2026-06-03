@@ -326,8 +326,9 @@ pub struct SealResponse {
 /// (an empty PoP-freshness body); the daemon hashes its already-loaded
 /// `roles_dir/`, MACs the manifest under the keyring, PUTs `seal.json`,
 /// and writes its local sealed cache so it holds a cache for the seal it
-/// just published. The new content goes live on the next restart — the
-/// endpoint does not hot-swap a running daemon's served surface.
+/// just published. It then hot-swaps this host's served surface to the
+/// seal it authored, so the new content goes live immediately — no
+/// restart. In-flight requests finish against the surface they loaded.
 async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     // verify+clear directly (rather than via `verify_discharge`) so we
     // can name the operator subject — carried in the discharge — in the

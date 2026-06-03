@@ -278,7 +278,7 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
 /// 1. Load the bucket seal. Missing, or unverifiable under the current
 ///    keyring → **dormant** (logged loudly): the auth/admin planes still
 ///    run, so an operator can publish a seal (`POST /v1/admin/seal`) that
-///    lifts dormancy on the next restart. Mint never commits on-disk
+///    lifts dormancy on this host immediately. Mint never commits on-disk
 ///    bytes as canonical on its own.
 /// 2. Resolve the served surface from the verified seal: serve the local
 ///    sealed cache if it satisfies that seal, else adopt the seal from
@@ -304,11 +304,7 @@ pub async fn resolve_startup(
     {
         Some(seal) => seal,
         None => {
-            tracing::warn!(
-                "no template seal in the bucket — running DORMANT: /v1/assume-role \
-                 and /v1/enroll-exchange are closed and /readyz is not-ready until \
-                 an operator runs `mint seal` and the daemon restarts"
-            );
+            tracing::warn!("no roles available until `mint seal` is run");
             return Ok(SealState::Dormant);
         }
     };
@@ -316,8 +312,7 @@ pub async fn resolve_startup(
         tracing::warn!(
             error = %e,
             kid = bucket_seal.kid,
-            "bucket template seal does not verify under the current keyring — \
-             running DORMANT; re-seal under a current kid via `mint seal`, then restart"
+            "seal does not verify under the current keyring — rerun `mint seal` to update"
         );
         return Ok(SealState::Dormant);
     }
@@ -393,8 +388,7 @@ fn resolve_surface(
     }
 
     tracing::warn!(
-        "local templates do not match the bucket seal — running DORMANT:\n  {}\n\
-         deliver the sealed templates to this host and restart, or re-seal.",
+        "local templates do not match the published seal:\n  {}",
         bucket_seal.diff_against_config(config).join("\n  "),
     );
     Ok(None)
