@@ -2,7 +2,7 @@
 //! bundled single-host dev shape. Every other test drives the router
 //! in-process via `tower::oneshot`; this one binds a real
 //! `UnixListener`, serves the router with `axum::serve`, and runs the
-//! reference client over `--url unix:<path>` — exercising the server
+//! reference client over `--socket <path>` — exercising the server
 //! bind+chmod path, the `unix:` scheme parse, and the `hyperlocal`
 //! client leg that `reqwest` cannot do. The macaroon + Ed25519 PoP is
 //! identical to the TCP path, so a green full flow here proves the

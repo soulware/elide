@@ -130,13 +130,13 @@ enum ClientCmd {
     /// Attenuate the invite macaroon with `sub`/`cnf`, enrol, and
     /// save the returned credential ticket.
     Enroll {
-        /// mint endpoint: `http(s)://host:port` (TCP) or
-        /// `unix:<socket-path>` (the single-host UDS shape).
-        #[arg(long, default_value = "http://127.0.0.1:8085")]
-        url: String,
+        /// UDS path of the local mint daemon. Defaults to the
+        /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
+        #[arg(long)]
+        socket: Option<PathBuf>,
         /// Opaque principal id — the `sub`. Any path-safe string
         /// (`[A-Za-z0-9._-]`, ≤256 chars); not required to be a ULID.
-        #[arg(long)]
+        #[arg(value_name = "ID")]
         id: String,
         /// Filename (under the client dir) to write the credential
         /// ticket to.
@@ -150,14 +150,10 @@ enum ClientCmd {
     /// Exchange the credential ticket for the credential (after
     /// approval). Exits 2 while still awaiting operator approval.
     Exchange {
-        /// mint endpoint: `http(s)://host:port` (TCP) or
-        /// `unix:<socket-path>` (the single-host UDS shape).
-        #[arg(long, default_value = "http://127.0.0.1:8085")]
-        url: String,
-        /// Role to exchange the ticket for. One credential per role —
-        /// run `exchange` once per role you are authorized for.
+        /// UDS path of the local mint daemon. Defaults to the
+        /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
         #[arg(long)]
-        role: String,
+        socket: Option<PathBuf>,
         /// Credential-ticket filename (under the client dir) to present.
         #[arg(long = "in", default_value_t = mint::client::CREDENTIAL_TICKET_FILE.to_string())]
         in_file: String,
@@ -165,6 +161,10 @@ enum ClientCmd {
         /// Defaults to `credentials/<role>`.
         #[arg(long)]
         out: Option<String>,
+        /// Role to exchange the ticket for. One credential per role —
+        /// run `exchange` once per role you are authorized for.
+        #[arg(value_name = "ROLE")]
+        role: String,
     },
     /// Inspect the per-role credentials held on disk (local-only).
     Credential {
@@ -173,10 +173,10 @@ enum ClientCmd {
     },
     /// Assume a role with the held credential; prints the keypair JSON.
     AssumeRole {
-        /// mint endpoint: `http(s)://host:port` (TCP) or
-        /// `unix:<socket-path>` (the single-host UDS shape).
-        #[arg(long, default_value = "http://127.0.0.1:8085")]
-        url: String,
+        /// UDS path of the local mint daemon. Defaults to the
+        /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
+        #[arg(long)]
+        socket: Option<PathBuf>,
         /// Credential filename (under the client dir) to exercise.
         /// Defaults to `credentials/<role>`.
         #[arg(long = "in")]
@@ -305,23 +305,25 @@ async fn client_cmd(
             Ok(())
         }
         ClientCmd::Enroll {
-            url,
+            socket,
             invite,
             id,
             out,
         } => {
-            mint::client::enroll(&dir, &url, &invite, &id, &out).await?;
+            let transport = client_transport(socket)?;
+            mint::client::enroll(&dir, &transport, &invite, &id, &out).await?;
             eprintln!("  (compare the fingerprint out of band before approving)");
             Ok(())
         }
         ClientCmd::Exchange {
-            url,
+            socket,
             role,
             in_file,
             out,
         } => {
+            let transport = client_transport(socket)?;
             let out = out.unwrap_or_else(|| mint::client::credential_path(&role));
-            if mint::client::exchange(&dir, &url, &in_file, &role, &out).await? {
+            if mint::client::exchange(&dir, &transport, &in_file, &role, &out).await? {
                 Ok(())
             } else {
                 eprintln!(
@@ -335,17 +337,18 @@ async fn client_cmd(
             CredentialCmd::Inspect { role } => Ok(mint::client::credential_inspect(&dir, &role)?),
         },
         ClientCmd::AssumeRole {
-            url,
+            socket,
             in_file,
             request,
             caveat,
             ttl,
             role,
         } => {
+            let transport = client_transport(socket)?;
             let in_file = in_file.unwrap_or_else(|| mint::client::credential_path(&role));
             let kp = mint::client::assume_role(
                 &dir,
-                &url,
+                &transport,
                 &role,
                 request.as_deref(),
                 &caveat,
@@ -361,6 +364,27 @@ async fn client_cmd(
 
 fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config::load(path)?)
+}
+
+/// Resolve the UDS transport `mint client` dials. `--socket <path>`
+/// wins; else the `MINT_CONFIG` listener socket (the client is
+/// UDS-only, so a TCP-bound config is an error); else the default
+/// `<data_dir>/mint.sock`.
+fn client_transport(socket: Option<PathBuf>) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(path) = socket {
+        return Ok(Listener::Uds(path).dial_url());
+    }
+    if let Ok(cfg_path) = std::env::var("MINT_CONFIG") {
+        return match Config::load_listener(Path::new(&cfg_path))? {
+            uds @ Listener::Uds(_) => Ok(uds.dial_url()),
+            Listener::Tcp(_) => Err(format!(
+                "mint client is UDS-only but MINT_CONFIG ({cfg_path}) selects a TCP \
+                 listener; pass --socket <path>"
+            )
+            .into()),
+        };
+    }
+    Ok(Listener::Uds(mint::config::default_mint_socket()).dial_url())
 }
 
 /// Bits a long-running `serve` against the Tigris backend needs to
@@ -620,10 +644,10 @@ async fn serve(
 fn admin_target(cfg: &Config) -> mint::admin::AdminTarget<'_> {
     match &cfg.listener {
         Listener::Uds(p) => mint::admin::AdminTarget::Uds(p),
-        Listener::Tcp(addr) => {
+        Listener::Tcp(_) => {
             // Construct a leaked &str for the lifetime of this CLI process —
             // safe because clap-parsed Config lives until main returns.
-            let url: &'static str = Box::leak(format!("http://{addr}").into_boxed_str());
+            let url: &'static str = Box::leak(cfg.listener.dial_url().into_boxed_str());
             mint::admin::AdminTarget::Tcp(url)
         }
     }

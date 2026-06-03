@@ -241,11 +241,40 @@ pub enum Listener {
     Uds(PathBuf),
 }
 
+impl Listener {
+    /// The transport string a same-host client dials this listener at:
+    /// `unix:<path>` for UDS, `http://<host>:<port>` for TCP. A wildcard
+    /// bind (`0.0.0.0`/`::`) is rewritten to loopback — it is a bind
+    /// address, not a dialable one.
+    pub fn dial_url(&self) -> String {
+        match self {
+            Listener::Uds(path) => format!("unix:{}", path.display()),
+            Listener::Tcp(addr) if addr.ip().is_unspecified() => {
+                let loopback = if addr.is_ipv4() {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                } else {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                };
+                format!("http://{}", SocketAddr::new(loopback, addr.port()))
+            }
+            Listener::Tcp(addr) => format!("http://{addr}"),
+        }
+    }
+}
+
 /// Default TCP listener when neither `bind` nor `socket` is configured.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8085";
 /// Socket filename under `data_dir` when `socket` is selected without
 /// an explicit path.
 pub const DEFAULT_SOCKET_NAME: &str = "mint.sock";
+/// Persisted-state directory when the config omits `data_dir`.
+pub const DEFAULT_DATA_DIR: &str = "mint_data";
+
+/// The default UDS path `mint serve` binds and `mint client` dials when
+/// no config selects another: `<DEFAULT_DATA_DIR>/<DEFAULT_SOCKET_NAME>`.
+pub fn default_mint_socket() -> PathBuf {
+    PathBuf::from(DEFAULT_DATA_DIR).join(DEFAULT_SOCKET_NAME)
+}
 
 /// Colocated demo auth role, post-validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +351,18 @@ impl Config {
         Self::from_raw(toml::from_str(s)?)
     }
 
+    /// Resolve only the listener from a config file, skipping role and
+    /// policy loading. `mint client` uses this to locate the local
+    /// daemon socket without needing the server's `roles_dir` present.
+    pub fn load_listener(path: &Path) -> Result<Listener, ConfigError> {
+        let raw: RawConfig = toml::from_str(&std::fs::read_to_string(path)?)?;
+        let data_dir = raw
+            .data_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
+        resolve_listener(raw.bind.as_deref(), raw.socket.as_deref(), &data_dir)
+    }
+
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         Self::from_toml_str(&std::fs::read_to_string(path)?)
     }
@@ -362,7 +403,7 @@ impl Config {
         let data_dir = raw
             .data_dir
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("mint_data"));
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
         let listener = resolve_listener(raw.bind.as_deref(), raw.socket.as_deref(), &data_dir)?;
         let demo_auth = raw.demo_auth.map(|d| {
             let socket = d.enabled.then(|| {
@@ -636,6 +677,33 @@ policy_file = "volume-ro.json"
         );
         let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
         assert_eq!(c.listener, Listener::Uds(PathBuf::from("/run/mint.sock")));
+    }
+
+    #[test]
+    fn dial_url_maps_each_listener_shape() {
+        assert_eq!(
+            Listener::Uds(PathBuf::from("/run/mint.sock")).dial_url(),
+            "unix:/run/mint.sock"
+        );
+        // An explicit address dials verbatim.
+        assert_eq!(
+            Listener::Tcp("10.0.0.5:9000".parse().unwrap()).dial_url(),
+            "http://10.0.0.5:9000"
+        );
+        // A wildcard bind is rewritten to loopback — it is not dialable.
+        assert_eq!(
+            Listener::Tcp("0.0.0.0:9000".parse().unwrap()).dial_url(),
+            "http://127.0.0.1:9000"
+        );
+        assert_eq!(
+            Listener::Tcp("[::]:9000".parse().unwrap()).dial_url(),
+            "http://[::1]:9000"
+        );
+    }
+
+    #[test]
+    fn default_mint_socket_is_under_default_data_dir() {
+        assert_eq!(default_mint_socket(), PathBuf::from("mint_data/mint.sock"));
     }
 
     #[test]

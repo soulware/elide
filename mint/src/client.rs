@@ -198,7 +198,7 @@ async fn post_bundle(
 
 /// Transport leg shared by every POST — a thin wrapper over
 /// [`crate::transport::post`], which selects TCP or HTTP-over-UDS by the
-/// `--url` scheme. Transport failures collapse to
+/// transport scheme (`unix:` vs `http(s)://`). Transport failures collapse to
 /// [`ClientError::Transport`]; there is nothing the caller branches on
 /// beyond the HTTP status.
 async fn send(

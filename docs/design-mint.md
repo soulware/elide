@@ -1618,9 +1618,9 @@ top-level config keys:
   selects UDS at the default `<data_dir>/mint.sock`. The socket is
   recreated on bind (stale dentry removed first), chmod `0o666` so a
   non-root coordinator can connect. The reference client targets it
-  with `--url unix:<socket-path>`; the `unix:` scheme is the only
-  thing that differs from the TCP `--url http(s)://host:port` form —
-  the request line, macaroon, and PoP are identical.
+  with `--socket <path>` (UDS-only, same-host); the macaroon and PoP
+  are identical to the TCP leg coordinators use — the transport seam is
+  the only thing that differs.
 
 The server accepts a `tokio::net::UnixListener` directly through
 `axum::serve` (axum 0.8). The client UDS leg is the one place mint
@@ -1705,10 +1705,10 @@ even when both listeners exist on the server side).
 url = "unix:mint/mint_data/mint.sock"   # or "https://mint.host:8085"
 ```
 
-`url` is scheme-discriminated exactly as the reference client's
-`--url` above: `unix:<path>` selects the UDS leg, `http(s)://host:port`
-the TCP leg. UDS paths follow the same resolution rule as mint's own
-(relative resolved against cwd, absolute verbatim). The section is
+`url` is scheme-discriminated by mint's shared transport layer:
+`unix:<path>` selects the UDS leg, `http(s)://host:port` the TCP leg.
+UDS paths follow the same resolution rule as mint's own (relative
+resolved against cwd, absolute verbatim). The section is
 presence-enables, mirroring `[peer_fetch]`.
 
 The section is deliberately thin. The coordinator's mint identity is
@@ -1855,22 +1855,25 @@ mint role inspect <name>           # one role: bounds, policy source, raw templa
 ```
 
 Reference client (the ed25519 keypair is minted lazily on first use and
-persisted as `client.key`/`client.pub`; `--id` is the opaque `sub`):
+persisted as `client.key`/`client.pub`; `<id>` is the opaque `sub`). The
+client is UDS-only, same-host: `enroll`/`exchange`/`assume-role` dial the
+local daemon at `--socket <path>`, else the `MINT_CONFIG` listener
+socket, else `<data_dir>/mint.sock`:
 
 ```
 # Log in once with the shared top-level `mint login` (above); enroll and
 # exchange use that session to discharge the invite + exchange gates.
-mint client enroll       --id <sub> <macaroon|file|->    # attaches the enrolling-operator discharge → credential ticket
-mint client exchange     --role <role>                   # ticket + exchanging-operator discharge; 403 until approved → credentials/<role>
+mint client enroll       <sub> <macaroon|file|->         # attaches the enrolling-operator discharge → credential ticket
+mint client exchange     <role>                          # ticket + exchanging-operator discharge; 403 until approved → credentials/<role>
 mint client credential list                              # held per-role credentials (local-only)
 mint client credential inspect <role>                    # narrate one credential's caveat chain
-mint client assume-role  --request '{"prefix":"x"}'          # role from the credential → Tigris keypair
+mint client assume-role  --request '{"prefix":"x"}' <role>   # role from the credential → Tigris keypair
                                                              #   (no discharge: credentials carry no TPC)
 ```
 
 A worked `examples/` script chains them: `serve` (background) →
 `mint login` → `client enroll` → operator `enroll approve` → `client
-exchange --role` (once per role) → `client assume-role`, printing the
+exchange <role>` (once per role) → `client assume-role`, printing the
 returned Tigris keypair.
 
 **Operator auth.** The operator commands (`invite`, `enroll
