@@ -1,14 +1,14 @@
 //! Operator-plane client identity and auth (`docs/design-mint.md`
-//! § *CLI service token*).
+//! § *Admin service token*).
 //!
 //! The operator runs `mint invite`, `mint enroll …` against the admin
-//! surface. Its authority is the **cli-token** (the deployment's
+//! surface. Its authority is the **admin-service** (the deployment's
 //! machine primary, written by `mint serve` at first start) plus a
 //! fresh auth-service discharge and a per-call proof-of-possession. Two
 //! identities meet here:
 //!
-//! - the **machine key** — the cli-token's `cnf`, held in
-//!   `<data_dir>/cli-token.key`, which signs every admin request's PoP;
+//! - the **machine key** — the admin-service's `cnf`, held in
+//!   `<data_dir>/admin-service.key`, which signs every admin request's PoP;
 //! - the **human session** — minted by `mint login` and held per-user by
 //!   [`crate::session`], which gates discharge issuance at the auth role.
 //!
@@ -27,11 +27,11 @@ use crate::caveat::{Caveat, name, scope};
 use crate::macaroon::Macaroon;
 use crate::pop;
 
-/// The cli-token (admin-plane primary) on disk.
-pub const CLI_TOKEN_FILE: &str = "cli-token";
-/// The cli-token's machine key seed (64 ASCII hex, mode 0600) — what
+/// The admin-service (admin-plane primary) on disk.
+pub const ADMIN_SERVICE_FILE: &str = "admin-service";
+/// The admin-service's machine key seed (64 ASCII hex, mode 0600) — what
 /// the operator CLI signs PoP with.
-pub const CLI_TOKEN_KEY_FILE: &str = "cli-token.key";
+pub const ADMIN_SERVICE_KEY_FILE: &str = "admin-service.key";
 
 /// Why an operator-plane step failed. Coarse on purpose — the operator
 /// CLI surfaces these to a human, not to a peer service.
@@ -41,7 +41,7 @@ pub enum OperatorError {
     Io(String),
     #[error("malformed {0}")]
     Malformed(&'static str),
-    #[error("cli-token carries no third-party caveat to discharge")]
+    #[error("admin-service carries no third-party caveat to discharge")]
     NoTpc,
     #[error("transport: {0}")]
     Transport(String),
@@ -49,46 +49,46 @@ pub enum OperatorError {
     Status { status: u16, body: String },
 }
 
-/// The operator's admin-plane identity: the cli-token and the machine
+/// The operator's admin-plane identity: the admin-service and the machine
 /// key seed it is PoP'd with. Loaded from `<data_dir>` on the host that
 /// also runs `mint serve`.
 pub struct Operator {
-    cli_token: Macaroon,
+    admin_service: Macaroon,
     machine_seed: [u8; 32],
 }
 
 impl Operator {
-    /// Load the cli-token and its machine key from `<data_dir>`. Both
+    /// Load the admin-service and its machine key from `<data_dir>`. Both
     /// are written by `mint serve` at first start; a missing pair means
     /// either no auth service is configured or `serve` has not run.
     pub fn load(data_dir: &Path) -> Result<Operator, OperatorError> {
-        let token_path = data_dir.join(CLI_TOKEN_FILE);
+        let token_path = data_dir.join(ADMIN_SERVICE_FILE);
         let token_text = std::fs::read_to_string(&token_path).map_err(|e| {
             OperatorError::Io(format!(
-                "{}: {e} (run `mint serve` once to mint the cli-token)",
+                "{}: {e} (run `mint serve` once to mint the admin-service)",
                 token_path.display()
             ))
         })?;
-        let cli_token = Macaroon::decode(token_text.trim())
-            .map_err(|_| OperatorError::Malformed("cli-token"))?;
+        let admin_service = Macaroon::decode(token_text.trim())
+            .map_err(|_| OperatorError::Malformed("admin-service"))?;
 
-        let key_path = data_dir.join(CLI_TOKEN_KEY_FILE);
+        let key_path = data_dir.join(ADMIN_SERVICE_KEY_FILE);
         let key_hex = std::fs::read_to_string(&key_path)
             .map_err(|e| OperatorError::Io(format!("{}: {e}", key_path.display())))?;
         let machine_seed =
-            unhex32(key_hex.trim()).ok_or(OperatorError::Malformed("cli-token.key"))?;
+            unhex32(key_hex.trim()).ok_or(OperatorError::Malformed("admin-service.key"))?;
 
         Ok(Operator {
-            cli_token,
+            admin_service,
             machine_seed,
         })
     }
 
-    /// Base64 (standard) of the cli-token's third-party-caveat `CID` —
+    /// Base64 (standard) of the admin-service's third-party-caveat `CID` —
     /// the value POSTed to `/v1/discharge` so the auth role can recover
     /// the discharge key under `K_M-A`.
     pub fn cid_b64(&self) -> Result<String, OperatorError> {
-        for c in self.cli_token.caveats() {
+        for c in self.admin_service.caveats() {
             if let Caveat::ThirdParty { cid, .. } = c {
                 return Ok(BASE64.encode(cid));
             }
@@ -96,13 +96,13 @@ impl Operator {
         Err(OperatorError::NoTpc)
     }
 
-    /// The request path of the cli-token's third-party-caveat
+    /// The request path of the admin-service's third-party-caveat
     /// `location` — where the operator fetches its discharge. Only the
     /// path is taken; a separately-supplied transport carries the
     /// connection, exactly as the enrolling client derives its discharge
     /// route from a credential's TPC location.
     fn discharge_path(&self) -> Result<String, OperatorError> {
-        for c in self.cli_token.caveats() {
+        for c in self.admin_service.caveats() {
             if let Caveat::ThirdParty { location, .. } = c {
                 return crate::tpc::location_path(location)
                     .ok_or(OperatorError::Malformed("tpc location"));
@@ -111,12 +111,12 @@ impl Operator {
         Err(OperatorError::NoTpc)
     }
 
-    /// Fetch a discharge for the cli-token's CID over `transport`, gated
+    /// Fetch a discharge for the admin-service's CID over `transport`, gated
     /// by the session bearer and scoped `mint:admin`. The discharge route
-    /// is the path of the cli-token's own TPC location; `transport` is the
+    /// is the path of the admin-service's own TPC location; `transport` is the
     /// connection to the auth role (the demo socket today). One discharge
     /// satisfies every admin verb — the verb is the operator's per-call
-    /// attenuation onto the cli-token — so the CLI fetches it once per
+    /// attenuation onto the admin-service — so the CLI fetches it once per
     /// invocation.
     pub async fn fetch_discharge(
         &self,
@@ -139,7 +139,7 @@ impl Operator {
         Macaroon::decode(&discharge).map_err(|_| OperatorError::Malformed("discharge"))
     }
 
-    /// The `/v1/discharge` request body for the cli-token's CID at the
+    /// The `/v1/discharge` request body for the admin-service's CID at the
     /// admin scope. Built from the handler's own [`crate::auth::DischargeRequest`]
     /// so the field set the daemon expects cannot drift from what the CLI
     /// sends.
@@ -152,13 +152,13 @@ impl Operator {
     }
 
     /// Build the `(Authorization, X-Mint-Pop)` headers for one admin
-    /// call: attenuate `op=<op_value>` onto the cli-token (so the verb
+    /// call: attenuate `op=<op_value>` onto the admin-service (so the verb
     /// binds to this call's PoP over the attenuated tail), bundle it
     /// with the wide `discharge`, and sign `tail ‖ BLAKE3(body)` with
     /// the machine key. `body` must already carry the freshness `ts`.
     pub fn authorize(&self, discharge: &Macaroon, op_value: &str, body: &[u8]) -> (String, String) {
         let attenuated = self
-            .cli_token
+            .admin_service
             .clone()
             .attenuate(Caveat::scalar(name::OP, op_value));
         let sig = pop::client_signature(&self.machine_seed, attenuated.tail(), body);
@@ -196,12 +196,12 @@ mod tests {
     const K_M_A: [u8; 32] = [13u8; 32];
     const MACHINE_SEED: [u8; 32] = [55u8; 32];
 
-    /// Write a cli-token + key pair into `dir` exactly as `mint serve`
+    /// Write a admin-service + key pair into `dir` exactly as `mint serve`
     /// does, returning the minted token for cross-checking.
     fn seed_operator_files(dir: &Path) -> Macaroon {
         let kr = Keyring::single(ROOT);
         let cnf = pop::cnf_value(&MACHINE_SEED);
-        let token = crate::issuance::mint_cli_token(
+        let token = crate::issuance::mint_admin_service_token(
             &kr,
             &K_M_A,
             "mint",
@@ -209,9 +209,9 @@ mod tests {
             "demo",
             "https://auth.example/v1/discharge",
         );
-        std::fs::write(dir.join(CLI_TOKEN_FILE), token.encode()).unwrap();
+        std::fs::write(dir.join(ADMIN_SERVICE_FILE), token.encode()).unwrap();
         let hex: String = MACHINE_SEED.iter().map(|b| format!("{b:02x}")).collect();
-        std::fs::write(dir.join(CLI_TOKEN_KEY_FILE), hex).unwrap();
+        std::fs::write(dir.join(ADMIN_SERVICE_KEY_FILE), hex).unwrap();
         token
     }
 
@@ -232,11 +232,11 @@ mod tests {
     }
 
     #[test]
-    fn discharge_path_derives_from_cli_token_tpc() {
+    fn discharge_path_derives_from_admin_service_tpc() {
         let dir = tempfile::tempdir().unwrap();
         seed_operator_files(dir.path());
         let op = Operator::load(dir.path()).unwrap();
-        // The discharge route is the path of the cli-token's own TPC
+        // The discharge route is the path of the admin-service's own TPC
         // location — the transport supplies the host.
         assert_eq!(op.discharge_path().unwrap(), "/v1/discharge");
     }
@@ -272,7 +272,7 @@ mod tests {
         let (auth, sig) = op.authorize(&discharge, "admin:invite-read", body);
         assert!(auth.starts_with("MintV1 "));
         assert!(auth.contains(','), "bundle must carry the discharge too");
-        // The PoP verifies against the attenuated cli-token tail under
+        // The PoP verifies against the attenuated admin-service tail under
         // the machine key bound in the token's cnf.
         let primary = auth
             .strip_prefix("MintV1 ")

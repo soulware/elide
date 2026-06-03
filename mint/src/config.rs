@@ -130,11 +130,11 @@ pub struct RawDemoAuth {
 /// `[operator]` block: the operator's auth-service integration. Required
 /// for enrollment and the admin plane — it supplies the discharge
 /// `location` stamped into the invite's enroll gate, the ticket's
-/// exchange gate, and the cli-token's admin gate.
+/// exchange gate, and the admin-service's admin gate.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawOperator {
     /// The discharge `location` stamped into the enroll-gate (invite),
-    /// exchange-gate (ticket), and admin-gate (cli-token) third-party
+    /// exchange-gate (ticket), and admin-gate (admin-service) third-party
     /// caveats. Where a client/operator fetches the discharge.
     pub location: String,
 }
@@ -261,7 +261,7 @@ pub struct DemoAuth {
 /// Operator auth-service integration, post-validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorAuth {
-    /// The `location` stamped into the operator cli-token's TPC.
+    /// The `location` stamped into the operator admin-service's TPC.
     pub location: String,
 }
 

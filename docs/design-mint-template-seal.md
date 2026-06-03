@@ -249,7 +249,7 @@ Client side:
    over the auth socket — the `operator_session()` path shared with
    every admin verb.
 2. `POST /v1/admin/seal` with the operator bundle (`Authorization:
-   MintV1 <attenuated-cli-token>,<discharge>` plus the `X-Mint-Pop`
+   MintV1 <attenuated-admin-service>,<discharge>` plus the `X-Mint-Pop`
    signature). Empty body.
 
 Daemon side:
@@ -278,7 +278,7 @@ from its own local files) the next time it restarts (see *Deployment
 shapes*). This is the "one host signs" semantics.
 
 The first seal on a fresh deployment authenticates with the
-bootstrap `cli-token` that `mint serve` mints at first start. That
+bootstrap `admin-service` that `mint serve` mints at first start. That
 requires filesystem access to `<data_dir>` but **not** to
 `<data_dir>/root_keys/`: the keyring stays the daemon's, and sealing
 never requires a human to read it. Once the first operator is
@@ -499,7 +499,7 @@ operator's nose every time the keyring rotated).
   surface (`audience`, every role block and each policy file), not the rest of
   `mint.toml`, which carries host-specific settings that legitimately
   vary across the fleet (listener address, `data_dir`, the
-  `[demo_auth]` transport, the operator cli-token's `[operator]`
+  `[demo_auth]` transport, the operator admin-service's `[operator]`
   location). The operator/demo endpoints in particular are left
   unsealed deliberately: repointing one is a denial-of-service, not an
   authority escalation, because a discharge from a rogue endpoint still

@@ -18,7 +18,7 @@ boundary**, never on a runtime data path:
   `/v1/enroll` carries its own TPC, so a coordinator can only pull its
   role credentials at `/v1/enroll-exchange` when a logged-in operator
   discharges it (the *exchanging* operator).
-- **Mint admin plane** (where *approve* lives) — the CLI service token carries a TPC, so every
+- **Mint admin plane** (where *approve* lives) — the admin service token carries a TPC, so every
   `/v1/admin/*` verb (invite management, enrollment approval) requires a
   fresh operator discharge (the *approving* operator and other admins;
   see [`design-mint.md`](design-mint.md) § *Operator authorization*).
@@ -48,7 +48,7 @@ authority rides two third-party caveats already present in the system:
 - **Ticket TPC** — the third-party caveat on the credential ticket mint
   returns from `/v1/enroll`. Discharged by the *exchanging* operator
   at `/v1/enroll-exchange`.
-- **Admin-token TPC** — the third-party caveat on the mint CLI service
+- **Admin-token TPC** — the third-party caveat on the mint admin service
   token. Discharged by an operator on each `/v1/admin/*` call.
 - **Discharge** — an auth-issued macaroon that satisfies one of those
   TPCs. Attests `(Subject, OrgId, NotAfter)` — *who* authorised and for
@@ -58,7 +58,7 @@ authority rides two third-party caveats already present in the system:
 
 Operator authority is proven by a discharge from a logged-in operator,
 satisfying a third-party caveat at the **mint boundary** — never on a
-runtime data path. Sessions, the invite, the CLI service token, and
+runtime data path. Sessions, the invite, the admin service token, and
 discharges are all chained-keyed-BLAKE3 macaroons — the same
 construction as volume macaroons in `architecture.md`. One primitive end
 to end.
@@ -74,7 +74,7 @@ evaluation, and isolated verification at a trusted service.
 Three structural properties hold:
 
 - **Mint is the sole holder of `K_M`** (its macaroon root). It chains
-  the invite and the CLI service token under `K_M` and verifies any
+  the invite and the admin service token under `K_M` and verifies any
   bundle presented to it (`/v1/enroll`, the admin endpoints) by walking
   that chain.
 - **Mint and auth share `K_M-A`** (per-org wrapping key for
@@ -142,11 +142,11 @@ ACL.
 The keys established across the system are:
 
 - `K_M` — mint's root MAC key. Generated at mint setup, never leaves
-  mint. Chains the invite macaroon, the CLI service token, and (via
+  mint. Chains the invite macaroon, the admin service token, and (via
   `K_coord`) every role credential.
 - `K_M-A` — per-org AEAD key shared between mint and auth. Used to
   encrypt and decrypt the `CID` field on each third-party caveat (the
-  invite's and the CLI service token's), so auth can recover that TPC's
+  invite's and the admin service token's), so auth can recover that TPC's
   discharge key on demand without holding any per-TPC state.
 - `K_session` — auth-service-only root for sessions. Never leaves auth.
 - `K_coord = HKDF(K_M, coord_ulid)` — per-coord credential chain key.
@@ -154,7 +154,7 @@ The keys established across the system are:
   for a coord. **Coord does not hold this key.** No role credential
   carries a third-party caveat.
 - `r_tpc` — a per-TPC discharge key, one per anchor: the invite
-  (`r_inv`), the credential ticket (`r_xchg`), and the CLI service token
+  (`r_inv`), the credential ticket (`r_xchg`), and the admin service token
   (`r_adm`), each a distinct per-org key. `CID = AEAD-encrypt(K_M-A,
   r_tpc ‖ OrgId)`, so mint and auth both recover `r_tpc` from the `CID`;
   mint can also recover it by walking the anchor macaroon's chain to the
@@ -165,7 +165,7 @@ The keys established across the system are:
   *authorization* dimension — which operator may obtain which discharge —
   rides a `Scope` caveat, not the key (§ *Discharge flows*, § *Scope
   tier*). Rotated by re-minting the anchor macaroon — a fresh invite, a
-  fresh ticket, or `mint cli-token rotate`; see *Key rotation*.
+  fresh ticket, or `mint admin-service rotate`; see *Key rotation*.
 
 ### Mint ↔ auth enrollment
 
@@ -250,7 +250,7 @@ wraps `r_xchg`. Chain-MAC'd under `K_M`. Discharged by the exchanging
 operator at `/v1/enroll-exchange`, where it is also PoP-bound to the
 coordinator's `cnf` and checked against the approved registry.
 
-**4. CLI service token.** Mint-issued, held by the local mint CLI, one
+**4. admin service token.** Mint-issued, held by the local mint CLI, one
 per mint deployment. First-party `(aud=mint, cnf)` plus a TPC whose
 `CID` wraps `r_adm` (see [`design-mint.md`](design-mint.md) § *Operator
 authorization*). Chain-MAC'd under `K_M`. The operator attenuates
@@ -333,7 +333,7 @@ When the exchanging operator brings an approved coordinator online:
 When an operator runs `mint enroll approve` (or any other `/v1/admin/*`
 verb):
 
-1. The CLI fetches a discharge against the CLI service token's `CID`,
+1. The CLI fetches a discharge against the admin service token's `CID`,
    `scope: "mint:admin"` — auth recovers `r_adm`, requires `admin ∈
    session.scopes`, mints `(Subject, OrgId, Scope=mint:admin, NotAfter)` with
    nonce = `CID`. One fetch covers every admin verb in the window; the
@@ -347,7 +347,7 @@ verb):
    for `enroll approve` — records `approved_by = Subject` on the approval
    entry.
 
-The CLI service token, its machine key, and the `op=admin:<verb>`
+The admin service token, its machine key, and the `op=admin:<verb>`
 attenuation are specified in [`design-mint.md`](design-mint.md) §
 *Operator authorization*.
 
@@ -610,14 +610,14 @@ Three keys plus the per-anchor discharge keys can be rotated.
 Triggered by routine auth-service-side rotation, or if `K_M-A` is
 suspected compromised. Auth runs with both `K_M-A_old` and `K_M-A_new`
 during a grace window. When `K_M-A` rotates, the `CID` on the invite and
-on the CLI service token becomes undecodable by the new key — auth can no
+on the admin service token becomes undecodable by the new key — auth can no
 longer recover `r_tpc` from those `CID`s, so fresh discharges can't be
 issued against the old anchors.
 
 Resolution: mint re-mints the affected anchors under the new key. The
 invite is re-minted (`mint invite --rotate` draws a fresh `r_inv` and a
-fresh `CID` under `K_M-A_new`) and redistributed; the CLI service token
-is re-minted by `mint cli-token rotate`. A discharge request against an
+fresh `CID` under `K_M-A_new`) and redistributed; the admin service token
+is re-minted by `mint admin-service rotate`. A discharge request against an
 old `CID` fails with `422 CID decode error`, signalling the operator to
 pick up the fresh invite (or the CLI to re-read the rotated service
 token) and retry. Coordinator credentials carry no `CID` and are
@@ -627,11 +627,11 @@ unaffected.
 
 The heaviest event in the system. Triggered by routine mint-root
 rotation (annual/biennial) or if `K_M` is suspected compromised. When
-`K_M` rotates, the invite, the CLI service token, and every `K_coord =
+`K_M` rotates, the invite, the admin service token, and every `K_coord =
 HKDF(K_M, coord_ulid)` change, so every chain MAC mint issued becomes
 verifiable only under the new root. Mint runs with both `K_M_old` and
 `K_M_new` during a grace window, verifying under the new root first and
-falling back to the old; it re-mints the invite and the CLI service
+falling back to the old; it re-mints the invite and the admin service
 token immediately, and re-mints each coord's role credentials on that
 coord's next interaction (a credential collection or `assume-role`),
 which the coord swaps atomically in `data_dir`. After the grace window
@@ -643,7 +643,7 @@ rotation*.)
 
 `r_inv` and `r_adm` are not rotated independently of their anchors:
 re-minting the invite (`mint invite --rotate`) or running `mint
-cli-token rotate` draws a fresh `r_tpc` as a side effect. There is no
+admin-service rotate` draws a fresh `r_tpc` as a side effect. There is no
 per-coord discharge key to rotate — discharges anchor on the invite and
 the service token, never on a credential.
 
@@ -660,7 +660,7 @@ sessions until their `NotAfter` expiry, then drop it.
 |---|---|---|
 | `K_M-A` | `CID` on invite + service token undecodable; discharges can't be issued | Mint re-mints the invite and service token under the new key; CLI picks up the fresh anchors |
 | `K_M` | Invite, service token, and every `K_coord` change; all chains re-issue | Mint re-mints invite + service token immediately, credentials on next interaction; grace window covers in-flight |
-| `r_tpc` | Discharges against the old `CID` fail | Re-mint the anchor (`invite --rotate` / `cli-token rotate`); no standalone rotation |
+| `r_tpc` | Discharges against the old `CID` fail | Re-mint the anchor (`invite --rotate` / `admin-service rotate`); no standalone rotation |
 | `K_session` | Sessions invalidated | Operators re-run `login` |
 
 ## API surface
@@ -701,7 +701,7 @@ request:  { "cid": "<base64>", "scope": "mint:enroll" }
 response: { "discharge": "<base64 macaroon>", "expires_at": "..." }
 ```
 
-The `cid` is the invite's, the ticket's, or the CLI service token's
+The `cid` is the invite's, the ticket's, or the admin service token's
 `CID`; `scope` is the authority class requested (`mint:enroll`,
 `mint:exchange`, or `mint:admin`). Auth requires `scope ∈ session.scopes`
 and stamps it as a `Scope` caveat on the returned discharge, which is

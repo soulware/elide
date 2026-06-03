@@ -5,16 +5,16 @@
 //! and macaroon root, never touching IAM.
 //!
 //! Auth: every admin request carries the same `MintV1` bundle as the
-//! rest of the surface — the **CLI service token** primary
-//! (`docs/design-mint.md` § *CLI service token*) plus a fresh
+//! rest of the surface — the **admin service token** primary
+//! (`docs/design-mint.md` § *Admin service token*) plus a fresh
 //! auth-service discharge satisfying its third-party caveat, with the
-//! operator's per-call proof-of-possession over the cli-token tail.
-//! The operator attenuates the cli-token with `op=admin:<verb>` per
+//! operator's per-call proof-of-possession over the admin-service tail.
+//! The operator attenuates the admin-service with `op=admin:<verb>` per
 //! call, so each endpoint clears its own specific action
 //! ([`verify_discharge`]). There is no bearer path and no per-human
 //! admin token: the human's authority is the discharge (gated at the
 //! auth service behind `mint login`), the machine identity is the
-//! cli-token's `cnf`.
+//! admin-service's `cnf`.
 
 use std::sync::Arc;
 
@@ -47,7 +47,7 @@ fn unauthorized_response() -> Response {
 }
 
 /// Admin routes. Every route is a `POST` gated by [`verify_discharge`]
-/// — the cli-token bundle + a discharge attenuated to that route's
+/// — the admin-service bundle + a discharge attenuated to that route's
 /// `op=admin:<verb>`. POST (not GET) even for reads, because the
 /// proof-of-possession signs over the request body and every call
 /// carries one.
@@ -63,9 +63,9 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Per-endpoint admin action vocabulary. The operator attenuates the
-/// cli-token with the matching `op=admin:<verb>` before presenting it;
+/// admin-service with the matching `op=admin:<verb>` before presenting it;
 /// each handler clears exactly its own value, so a discharge fetched
-/// (and cli-token attenuated) for one verb cannot exercise another.
+/// (and admin-service attenuated) for one verb cannot exercise another.
 const ADMIN_INVITE_READ: &str = "admin:invite-read";
 const ADMIN_INVITE_ROTATE: &str = "admin:invite-rotate";
 const ADMIN_ENROLL_LIST: &str = "admin:enroll-list";
@@ -95,13 +95,13 @@ async fn handle_invite(State(state): State<AppState>, headers: HeaderMap, body: 
 }
 
 /// Run verify+clear against the request bundle in
-/// `Authorization: MintV1 mnt1_<cli-token>,mnt1_<discharge>`. The
-/// cli-token primary must verify under `K_M`, its third-party caveat
+/// `Authorization: MintV1 mnt1_<admin-service>,mnt1_<discharge>`. The
+/// admin-service primary must verify under `K_M`, its third-party caveat
 /// must be satisfied by the accompanying discharge (under the `r`
 /// recovered from the TPC's `VID`), the aggregated caveats must clear
 /// `op == expected_op` (the operator's per-call attenuation) and
 /// `aud`, any `exp` must be in the future, and the operator's
-/// `X-Mint-Pop` must sign `tail ‖ BLAKE3(body)` under the cli-token's
+/// `X-Mint-Pop` must sign `tail ‖ BLAKE3(body)` under the admin-service's
 /// `cnf`. Every failure collapses to opaque 401.
 async fn verify_discharge(
     state: &AppState,
@@ -133,7 +133,7 @@ async fn verify_discharge(
     // `mint:admin` (`docs/design-auth-service.md` § *Scope tier*): a
     // session that obtained only an enroll- or exchange-scope discharge
     // cannot drive an admin verb, even though the verb itself rides the
-    // cli-token's per-call `op=admin:<verb>` attenuation.
+    // admin-service's per-call `op=admin:<verb>` attenuation.
     if !matches!(
         EffectiveCaveats::new(&cleared.aggregated_caveats).resolve(name::SCOPE),
         Resolved::Value(v) if v == scope::MINT_ADMIN
@@ -441,7 +441,7 @@ pub fn _store_handle(state: &AppState) -> &Arc<Store> {
 //
 // Operator CLI (`mint invite`, `mint enroll …`) reaches the running
 // `serve` over the UDS socket it is bound to and calls the routes
-// above. Every call carries the operator bundle: the cli-token
+// above. Every call carries the operator bundle: the admin-service
 // attenuated with this verb's `op=admin:<verb>`, a fresh auth-service
 // discharge, and a PoP over the attenuated tail — assembled by
 // [`Operator::authorize`]. Living next to the handlers keeps the
@@ -596,7 +596,7 @@ fn body_with_ts<T: Serialize>(req: &T) -> Result<String, AdminClientError> {
     serde_json::to_string(&v).map_err(|e| AdminClientError::Malformed(e.to_string()))
 }
 
-/// POST `body` to `endpoint`, attaching the operator bundle (cli-token
+/// POST `body` to `endpoint`, attaching the operator bundle (admin-service
 /// attenuated with `op_value` + `discharge`) and the PoP over the
 /// attenuated tail.
 async fn authed_post(
