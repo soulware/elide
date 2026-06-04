@@ -116,6 +116,24 @@ impl ServedSurface {
         }
     }
 
+    /// Persist `seal`'s surface to the sealed cache under `data_dir` and
+    /// return the `ServedSurface` to serve. The policy bytes and `[env]`
+    /// values are taken from `config`, which the caller has already
+    /// established satisfies `seal` — the startup adopt path (templates and
+    /// env hash-match a verified bucket seal) or the seal handler (the seal
+    /// was just authored from this same config). This is the tail both
+    /// share once they hold a known-good seal: write the cache, hand back
+    /// the surface.
+    pub fn materialize(config: &Config, seal: &Seal, data_dir: &Path) -> Result<Self, SealError> {
+        let templates = policies_from_config(config);
+        write(data_dir, seal, &templates, &config.env)?;
+        Ok(ServedSurface {
+            seal: seal.clone(),
+            templates,
+            env: config.env.clone(),
+        })
+    }
+
     /// The sealed audience every served credential is stamped with and
     /// checked against.
     pub fn audience(&self) -> &str {

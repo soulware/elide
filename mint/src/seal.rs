@@ -352,12 +352,7 @@ pub async fn resolve_startup(
     // (3) Drift check: what is staged on disk vs what we serve.
     let staged = Seal::build_from_config(config, &keyring, &bucket_seal.sealed_at);
     if staged.semantically_equal(&surface.seal) {
-        tracing::info!(
-            kid = surface.seal.kid,
-            sealed_at = %surface.seal.sealed_at,
-            roles = surface.seal.roles.len(),
-            "template seal verified — serving",
-        );
+        log_now_serving(&surface.seal, None);
     } else {
         tracing::warn!(
             "staged template changes in roles_dir/ are not sealed — serving the \
@@ -366,6 +361,32 @@ pub async fn resolve_startup(
         );
     }
     Ok(SealState::Serving(surface))
+}
+
+/// Emit the canonical "now serving" line whenever a verified seal becomes
+/// this host's served surface — at startup (`operator` is `None`) and after
+/// an in-process reseal (`operator` names who authored it). Same message
+/// string in both, so an operator watching the log sees one consistent
+/// confirmation that a seal is live whether mint was just restarted or
+/// resealed while running.
+pub fn log_now_serving(seal: &Seal, operator: Option<&str>) {
+    match operator {
+        Some(op) => tracing::info!(
+            target: "mint::seal",
+            operator = op,
+            kid = seal.kid,
+            sealed_at = %seal.sealed_at,
+            roles = seal.roles.len(),
+            "template seal verified — serving",
+        ),
+        None => tracing::info!(
+            target: "mint::seal",
+            kid = seal.kid,
+            sealed_at = %seal.sealed_at,
+            roles = seal.roles.len(),
+            "template seal verified — serving",
+        ),
+    }
 }
 
 /// Build the served surface for a verified `bucket_seal`: prefer the
@@ -409,14 +430,9 @@ fn resolve_surface(
     // surface, in which case we write the cache and serve.
     let staged = Seal::build_from_config(config, keyring, &bucket_seal.sealed_at);
     if staged.semantically_equal(bucket_seal) {
-        let templates = sealed_cache::policies_from_config(config);
-        sealed_cache::write(data_dir, bucket_seal, &templates, &config.env)
+        let surface = ServedSurface::materialize(config, bucket_seal, data_dir)
             .map_err(|e| format!("write sealed cache: {e}"))?;
-        return Ok(Some(ServedSurface {
-            seal: bucket_seal.clone(),
-            templates,
-            env: config.env.clone(),
-        }));
+        return Ok(Some(surface));
     }
 
     tracing::warn!(
