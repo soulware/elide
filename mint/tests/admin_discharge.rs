@@ -61,7 +61,7 @@ const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 const TOML: &str = r#"
 audience = "mint"
-[tenant]
+[store]
 bucket = "demo-bucket"
 [demo_auth]
 enabled = true

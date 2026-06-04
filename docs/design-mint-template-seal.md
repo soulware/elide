@@ -162,10 +162,11 @@ window by separating the two roles.
 <data_dir>/sealed/
   seal.json                 # copy of the canonical seal this cache satisfies
   policies/<blake3>         # one file per policy template, content-addressed
+  env.json                  # materialised [env] values, pinned by env_blake3
 ```
 
 The cache is a *derived* artefact — always reconstructable from
-`roles_dir/` + a canonical `seal.json` — so it is not precious; it is
+`roles_dir/` + `[env]` + a canonical `seal.json` — so it is not precious; it is
 content-addressed and `ls`/`cat`-inspectable like the rest of mint's
 on-disk state. The seal holds only hashes, so the bytes have to be
 persisted somewhere for a restarting host to serve last-sealed content
@@ -201,6 +202,7 @@ _mint/templates/seal.json
     },
     ...
   },
+  "env_blake3": "<64 hex>",
   "sealed_at": "2026-05-24T12:00:00Z",
   "kid":       3,
   "mac":       "<64 hex>"
@@ -222,6 +224,13 @@ Fields:
   `Seal::build_from_config` destructures each role exhaustively, so a
   new role-config field is a compile error until it is consciously
   sealed or skipped — the seal cannot fall behind the role surface.
+- **`env_blake3`** — BLAKE3 of the canonical `[env]` serialisation, the
+  pin for the materialised `sealed/env.json`. Binds the operator-defined
+  `{{env.X}}` template values (bucket names, prefixes) into the attested
+  surface: a host serves the env it can reproduce to this hash from its
+  local `[env]`, not the live config, so the concrete resources a minted
+  policy grants on are sealed. A host whose `[env]` can't reproduce the
+  hash goes dormant rather than serve divergent authority.
 - **`sealed_at`** — RFC 3339 timestamp of the seal operation.
   Operator-readable; not load-bearing for any check.
 - **`kid`** — keyring generation that produced the MAC. The

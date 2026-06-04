@@ -159,10 +159,10 @@ enum ClientCmd {
         #[arg(long = "in")]
         in_file: Option<String>,
         /// PoP-signed request body as an inline JSON object. Opaque
-        /// pass-through into `request.*` — `ts`/`role`/`ttl_seconds` are
+        /// pass-through into `req.*` — `ts`/`role`/`ttl_seconds` are
         /// client-owned and ignored here.
         #[arg(long, value_name = "JSON")]
-        request: Option<String>,
+        req: Option<String>,
         /// Narrowing caveat to attenuate the credential with (repeatable).
         /// Vocabulary-agnostic — e.g. `--caveat elide:Volume=01VOL`.
         #[arg(long = "caveat", value_name = "NAME=VALUE")]
@@ -233,7 +233,15 @@ enum EnrollCmd {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    if let Err(e) = run().await {
+        eprintln!("error: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
         Command::Serve { config, bind } => serve(&config, bind).await,
         Command::Login {
@@ -304,7 +312,7 @@ async fn client_cmd(
         ClientCmd::AssumeRole {
             socket,
             in_file,
-            request,
+            req,
             caveat,
             ttl,
             role,
@@ -315,7 +323,7 @@ async fn client_cmd(
                 &dir,
                 &transport,
                 &role,
-                request.as_deref(),
+                req.as_deref(),
                 &caveat,
                 ttl,
                 &in_file,
@@ -441,9 +449,9 @@ async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std:
     let minter: Arc<dyn KeypairMinter> = Arc::new(TigrisMinter::new(admin)?);
     let (s3, provider, expiration) = mint::mint_rw::build_s3_with_mint_rw(
         &minter,
-        &cfg.tenant.bucket,
-        cfg.tenant.endpoint.as_deref(),
-        cfg.tenant.region.as_deref(),
+        &cfg.store.bucket,
+        cfg.store.endpoint.as_deref(),
+        cfg.store.region.as_deref(),
     )
     .await?;
     std::fs::create_dir_all(&cfg.data_dir)?;
@@ -514,7 +522,7 @@ async fn serve(
     // invite-cache refresher.
     let _refresh = mint::mint_rw::spawn_refresh(
         tigris.minter.clone(),
-        config.tenant.bucket.clone(),
+        config.store.bucket.clone(),
         tigris.provider,
         tigris.expiration,
     );
@@ -881,7 +889,7 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
         }
     );
     eprintln!("  audience:         {}", config.audience);
-    eprintln!("  tenant.bucket:    {}", config.tenant.bucket);
+    eprintln!("  store.bucket:     {}", config.store.bucket);
     eprintln!("  policy source:    {}", role.policy_path.display());
 
     // The policy is a request-parameterised template: there is no
@@ -891,8 +899,8 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
     eprintln!("  policy references:");
     for (label, vals) in [
         ("caveat (MAC-bound)", &surface.caveats),
-        ("request (PoP-bound)", &surface.request),
-        ("tenant (config)", &surface.tenant),
+        ("req (PoP-bound)", &surface.req),
+        ("env (config)", &surface.env),
         ("system (mint-computed)", &surface.system),
     ] {
         if !vals.is_empty() {

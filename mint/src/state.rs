@@ -1,11 +1,11 @@
 //! Mint enrollment state: the current invite nonce, the transient
 //! pending-enrollment table, and the long-lived approved-client
 //! registry (`docs/design-mint.md` § *Enrollment* / *Mint state in the
-//! tenant bucket*).
+//! store bucket*).
 //!
 //! State lives behind an [`object_store::ObjectStore`]: in production
 //! the bucket-backed implementation under the `_mint/` prefix of the
-//! tenant bucket (accessed via a self-vended `mint-rw` keypair, not the
+//! store bucket (accessed via a self-vended `mint-rw` keypair, not the
 //! admin credential); in dev / tests a `LocalFileSystem` or `InMemory`
 //! backend. The same key layout applies either way:
 //!
@@ -61,7 +61,7 @@ use crate::keyring::{Keyring, Kid};
 
 /// Top-level prefix for mint state inside whatever bucket / directory
 /// the backing [`ObjectStore`] is rooted at — see *Mint state in the
-/// tenant bucket*.
+/// store bucket*.
 pub const STATE_PREFIX: &str = "_mint";
 
 /// Filename for the on-disk K_M-A (the TPC-CID wrapping key shared with
@@ -317,7 +317,7 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
 /// background task spawned by [`Store::spawn_invite_refresh`] polls
 /// with `If-None-Match` so steady-state reads cost a cheap 304 instead
 /// of a full body fetch (`docs/design-mint.md` § *Mint state in the
-/// tenant bucket*).
+/// store bucket*).
 pub struct Store {
     /// The macaroon keyring — generations loaded from
     /// `<data_dir>/root_keys/`. Symmetric: mint both mints and verifies
@@ -401,7 +401,7 @@ impl Store {
     }
 
     /// Bucket-backed store. `objects` is a [`ObjectStore`] whose root
-    /// is the tenant bucket; the `_mint/` prefix is applied to every
+    /// is the store bucket; the `_mint/` prefix is applied to every
     /// key. `keyring_dir` is the local directory the macaroon keyring
     /// is loaded from / written to. `legacy_singleton` migrates an
     /// older `<data_dir>/root_key` if present. `initial_key` seeds the

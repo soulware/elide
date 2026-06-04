@@ -72,7 +72,7 @@ pub fn authorize(
 
     // The Role caveat is the single role this credential carries
     // (mint-stamped at the enrollment exchange). It must be present and
-    // equal the asserted `requested_role` — `request.role` is the
+    // equal the asserted `requested_role` — `req.role` is the
     // caller's independent statement of intent, so a mismatch means the
     // wrong per-role credential was loaded: fail closed. There is no
     // role-less ("omnibus") credential — absent is also a denial, never
@@ -127,7 +127,7 @@ mod tests {
         let cfg = crate::config::parse_for_test(
             r#"
 audience = "mint"
-[tenant]
+[store]
 bucket = "b"
 [[role]]
 name = "volume-ro"

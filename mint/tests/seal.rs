@@ -21,7 +21,7 @@ use mint::state::Store;
 const SAMPLE_TOML: &str = r#"
 audience = "mint"
 
-[tenant]
+[store]
 bucket = "demo-bucket"
 
 [[role]]
@@ -52,9 +52,9 @@ async fn setup() -> (tempfile::TempDir, Config, Arc<Store>) {
 /// can pick up newly-written-on-disk template content.
 async fn reload_config(d: &tempfile::TempDir) -> Config {
     let toml = SAMPLE_TOML.replacen(
-        "[tenant]",
+        "[store]",
         &format!(
-            "data_dir = {:?}\nroles_dir = {:?}\n[tenant]",
+            "data_dir = {:?}\nroles_dir = {:?}\n[store]",
             d.path().join("data").display().to_string(),
             d.path().join("roles").display().to_string()
         ),

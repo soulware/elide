@@ -39,7 +39,9 @@ const AUTH_URL: &str = "https://auth.example/v1/discharge";
 
 const TOML_TEMPLATE: &str = r#"
 audience = "mint"
-[tenant]
+[store]
+bucket = "demo-bucket"
+[env]
 bucket = "demo-bucket"
 [operator]
 location = "https://auth.example/v1/discharge"
@@ -67,7 +69,7 @@ const POLICY: &str = r#"
   "Statement": [{
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
-    "Resource": ["arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"],
+    "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"],
     "Condition": {"DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}}
   }]
 }

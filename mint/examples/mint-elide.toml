@@ -30,10 +30,16 @@ socket = "mint_data/mint.sock"
 [operator]
 location = "https://auth.elide.internal/v1/discharge"   # the gate discharge location
 
-[tenant]
+[store]
 bucket = "elide-demo"
 # endpoint = "https://t3.storage.dev"   # default; set for non-Tigris S3
 # region   = "us-east-1"                # default
+
+# Surfaced to role policy templates as `{{env.X}}` (flat scalars only).
+# The elide roles grant on `{{env.bucket}}`; here it is the same bucket
+# that holds `_mint/*`, but the two are configured independently.
+[env]
+bucket = "elide-demo"
 
 [[role]]
 name = "volume-ro"

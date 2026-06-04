@@ -6,7 +6,7 @@
 //! `(name, value)` pair; **every first-party caveat is scalar**. There
 //! is no list-valued caveat type — the only list-shaped input a role
 //! ever needed (the `volume-ro` ancestor set) rides the PoP-signed
-//! request body as `request.ancestors`, not the caveat chain
+//! request body as `req.ancestors`, not the caveat chain
 //! (design-mint.md § *All caveats are scalar*).
 //!
 //! Third-party caveats carry `(location, VID, CID)` and discharge

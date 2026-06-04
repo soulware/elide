@@ -360,6 +360,14 @@ async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: By
         Resolved::Absent | Resolved::Unsatisfiable => "unknown".to_string(),
     };
 
+    // A seal must not pin templates that reference undefined `[env]`
+    // values — refuse to publish one (the host keeps serving whatever it
+    // serves now). Not enforced at config load: serving is decoupled from
+    // the live config, so this is the right gate.
+    if let Err(e) = state.config.validate_env_surface() {
+        return unprocessable(&e.to_string());
+    }
+
     let sealed_at = Utc::now().to_rfc3339();
     let seal = Seal::build_from_config(&state.config, &keyring, &sealed_at);
     if let Err(e) = state.store.put_template_seal(&seal).await {
@@ -368,7 +376,9 @@ async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: By
     // Cache what we just published so this host serves it after a
     // restart without re-deriving from `roles_dir/`.
     let templates = sealed_cache::policies_from_config(&state.config);
-    if let Err(e) = sealed_cache::write(&state.config.data_dir, &seal, &templates) {
+    if let Err(e) =
+        sealed_cache::write(&state.config.data_dir, &seal, &templates, &state.config.env)
+    {
         return service_unavailable(&format!("write sealed cache: {e}"));
     }
 
@@ -387,6 +397,7 @@ async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: By
     let surface = ServedSurface {
         seal: seal.clone(),
         templates,
+        env: state.config.env.clone(),
     };
     state.seal.store(Arc::new(SealState::Serving(surface)));
 
@@ -422,6 +433,18 @@ fn service_unavailable(reason: &str) -> Response {
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         serde_json::to_vec(&json!({"error": "service unavailable"}))
             .unwrap_or_else(|_| b"{}".to_vec()),
+    )
+        .into_response()
+}
+
+/// `422` for an operator config defect surfaced at seal authoring (e.g. a
+/// template referencing an undefined `[env]` key). The `reason` is
+/// operator-facing — this is the authenticated admin plane.
+fn unprocessable(reason: &str) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::to_vec(&json!({ "error": reason })).unwrap_or_else(|_| b"{}".to_vec()),
     )
         .into_response()
 }

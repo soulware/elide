@@ -4,7 +4,7 @@
     "Sid": "DemoRead",
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
-    "Resource": ["arn:aws:s3:::{{tenant.bucket}}/{{request.prefix}}/*"],
+    "Resource": ["arn:aws:s3:::{{env.bucket}}/{{req.prefix}}/*"],
     "Condition": {
       "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
     }

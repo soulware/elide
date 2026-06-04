@@ -2,7 +2,7 @@
 //!
 //! Three substitution classes are exposed to a role's policy template:
 //!
-//! - `{{tenant.X}}`            — server-side config (`tenant.bucket`).
+//! - `{{env.X}}`               — server-side config (the `[env]` table).
 //! - `{{caveat "elide:X"}}`    — verified-macaroon caveat, looked up
 //!   through a registered `caveat` helper. Scalars render directly;
 //!   list caveats iterate as `{{#each (caveat "elide:X")}}`.
@@ -16,7 +16,7 @@
 //!    the name as a string argument, so the doc's `:` convention is
 //!    preserved unchanged (no issuer-side rename).
 //! 2. It tightens the "mint ships no policy DSL" property: the only
-//!    template surface is `{{tenant.*}}` / `{{system.*}}` plain paths,
+//!    template surface is `{{env.*}}` / `{{system.*}}` plain paths,
 //!    one `caveat` lookup helper, and the built-in `{{#each}}`. There
 //!    is no arbitrary data-graph traversal.
 //!
@@ -35,7 +35,6 @@ use handlebars::{
 use serde_json::{Map, Value};
 
 use crate::caveat::{Caveat, EffectiveCaveats, Resolved};
-use crate::config::Tenant;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TemplateError {
@@ -53,7 +52,7 @@ pub enum TemplateError {
 /// template referencing a caveat the macaroon doesn't carry — or whose
 /// occurrences contradict — must never mint an unscoped or downgraded
 /// credential. All caveats are scalar; there is no `{{#each}}` over a
-/// caveat (ancestor-style lists are PoP-signed `request.*` data).
+/// caveat (ancestor-style lists are PoP-signed `req.*` data).
 struct CaveatHelper {
     resolved: BTreeMap<String, String>,
 }
@@ -96,15 +95,15 @@ fn resolved_map(caveats: &[Caveat]) -> BTreeMap<String, String> {
 ///
 /// `request` is the **PoP-verified** request body (its provenance is
 /// the client's identity key, bound to this macaroon and moment —
-/// see [`crate::pop`]); it is exposed as the `request.*` namespace.
+/// see [`crate::pop`]); it is exposed as the `req.*` namespace.
 /// The caller must verify the PoP signature *before* passing the
 /// body here.
 /// Each substitution class has a distinct, explicit trust provenance:
-/// `caveat.*` MAC-bound, `request.*` PoP-bound, `tenant.*` config,
+/// `caveat.*` MAC-bound, `req.*` PoP-bound, `env.*` config,
 /// `system.*` mint-computed.
 pub fn render_policy(
     policy_template: &str,
-    tenant: &Tenant,
+    env: &BTreeMap<String, String>,
     caveats: &[Caveat],
     request: &Value,
     expiry_iso8601: &str,
@@ -122,8 +121,10 @@ pub fn render_policy(
         }),
     );
 
-    let mut tenant_map = Map::new();
-    tenant_map.insert("bucket".into(), Value::String(tenant.bucket.clone()));
+    let mut env_map = Map::new();
+    for (k, v) in env {
+        env_map.insert(k.clone(), Value::String(v.clone()));
+    }
 
     let mut system_map = Map::new();
     system_map.insert(
@@ -132,9 +133,9 @@ pub fn render_policy(
     );
 
     let mut data = Map::new();
-    data.insert("tenant".into(), Value::Object(tenant_map));
+    data.insert("env".into(), Value::Object(env_map));
     data.insert("system".into(), Value::Object(system_map));
-    data.insert("request".into(), request.clone());
+    data.insert("req".into(), request.clone());
 
     // Register under the role name so handlebars error messages name
     // the role ("...rendering \"read\"...") instead of the opaque
@@ -147,19 +148,19 @@ pub fn render_policy(
 
 /// The substitution surface a policy template references, grouped by
 /// trust provenance (`docs/design-mint.md` § *Templating*): `caveats`
-/// MAC-bound, `request` PoP-bound, `tenant` config, `system`
+/// MAC-bound, `req` PoP-bound, `env` config, `system`
 /// mint-computed. Each list is sorted and de-duplicated.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TemplateSurface {
     pub caveats: Vec<String>,
-    pub tenant: Vec<String>,
+    pub env: Vec<String>,
     pub system: Vec<String>,
-    pub request: Vec<String>,
+    pub req: Vec<String>,
 }
 
 /// Extract the [`TemplateSurface`] of a policy template by scanning the
-/// four documented token shapes — `{{caveat "name"}}`, `{{tenant.*}}`,
-/// `{{system.*}}`, `{{request.*}}` (with optional `../`/`./` scope
+/// four documented token shapes — `{{caveat "name"}}`, `{{env.*}}`,
+/// `{{system.*}}`, `{{req.*}}` (with optional `../`/`./` scope
 /// prefixes and `(…)` subexpression wrapping). Lets `mint role inspect`
 /// state what a role's policy depends on without rendering it:
 /// rendering needs a live verified request and fails closed on any
@@ -202,12 +203,12 @@ pub fn template_surface(template: &str) -> TemplateSurface {
                 p = rest;
             }
             p = p.strip_prefix("./").unwrap_or(p);
-            let bucket = if p == "tenant" || p.starts_with("tenant.") {
-                Some(&mut s.tenant)
+            let bucket = if p == "env" || p.starts_with("env.") {
+                Some(&mut s.env)
             } else if p == "system" || p.starts_with("system.") {
                 Some(&mut s.system)
-            } else if p == "request" || p.starts_with("request.") {
-                Some(&mut s.request)
+            } else if p == "req" || p.starts_with("req.") {
+                Some(&mut s.req)
             } else {
                 None
             };
@@ -216,7 +217,7 @@ pub fn template_surface(template: &str) -> TemplateSurface {
             }
         }
     }
-    for v in [&mut s.caveats, &mut s.tenant, &mut s.system, &mut s.request] {
+    for v in [&mut s.caveats, &mut s.env, &mut s.system, &mut s.req] {
         v.sort();
         v.dedup();
     }
@@ -227,12 +228,8 @@ pub fn template_surface(template: &str) -> TemplateSurface {
 mod tests {
     use super::*;
 
-    fn tenant() -> Tenant {
-        Tenant {
-            bucket: "demo".into(),
-            endpoint: None,
-            region: None,
-        }
+    fn env() -> BTreeMap<String, String> {
+        BTreeMap::from([("bucket".to_string(), "demo".to_string())])
     }
 
     const TPL: &str = r#"{
@@ -241,9 +238,9 @@ mod tests {
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each request.ancestors}},
-      "arn:aws:s3:::{{../tenant.bucket}}/by_id/{{this}}/*"
+      "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
+      {{#each req.ancestors}},
+      "arn:aws:s3:::{{../env.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],
     "Condition": {"DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}}
@@ -259,7 +256,7 @@ mod tests {
         let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
         let out = render_policy(
             TPL,
-            &tenant(),
+            &env(),
             &caveats,
             &req(&["ANC1", "ANC2"]),
             "2026-05-15T14:30:00Z",
@@ -278,7 +275,7 @@ mod tests {
         // Maximal narrowing — zero ancestors is a coherent grant, not
         // an error: the {{#each}} simply emits nothing.
         let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
-        let out = render_policy(TPL, &tenant(), &caveats, &req(&[]), "t", "volume-ro").unwrap();
+        let out = render_policy(TPL, &env(), &caveats, &req(&[]), "t", "volume-ro").unwrap();
         assert!(out.contains("by_id/VOL1/*"));
         assert!(!out.contains("by_id//*"));
         serde_json::from_str::<Value>(&out).expect("valid json");
@@ -286,16 +283,16 @@ mod tests {
 
     #[test]
     fn unknown_caveat_is_error() {
-        let err = render_policy(r#"{{caveat "nope"}}"#, &tenant(), &[], &req(&[]), "x", "r");
+        let err = render_policy(r#"{{caveat "nope"}}"#, &env(), &[], &req(&[]), "x", "r");
         assert!(matches!(err, Err(TemplateError::Render(_))));
     }
 
     #[test]
     fn missing_request_field_fails_closed() {
-        // Strict mode: a template referencing request.ancestors when
+        // Strict mode: a template referencing req.ancestors when
         // the signed body omitted it must fail the render, not mint.
         let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
-        let err = render_policy(TPL, &tenant(), &caveats, &serde_json::json!({}), "t", "r");
+        let err = render_policy(TPL, &env(), &caveats, &serde_json::json!({}), "t", "r");
         assert!(matches!(err, Err(TemplateError::Render(_))));
     }
 
@@ -304,14 +301,14 @@ mod tests {
         // Operator-facing: the handlebars message must point at the
         // role, not the opaque "Unnamed template".
         let err = render_policy(
-            "{{request.prefix}}",
-            &tenant(),
+            "{{req.prefix}}",
+            &env(),
             &[],
             &serde_json::json!({}),
             "t",
             "read",
         )
-        .expect_err("missing request.prefix must fail closed");
+        .expect_err("missing req.prefix must fail closed");
         let msg = err.to_string();
         assert!(
             msg.contains("\"read\""),
@@ -334,7 +331,7 @@ mod tests {
         ];
         let err = render_policy(
             r#"{{caveat "elide:Volume"}}"#,
-            &tenant(),
+            &env(),
             &caveats,
             &req(&[]),
             "x",
@@ -346,23 +343,23 @@ mod tests {
     #[test]
     fn surface_groups_refs_by_provenance_through_scopes_and_subexprs() {
         // TPL exercises every shape: a scalar caveat, a `../`-scoped
-        // tenant ref inside an #each block, a request.* block path, and
+        // env ref inside an #each block, a req.* block path, and
         // a system.* ref. `{{this}}` and the `each` helper are not data
         // refs and must not leak in.
         let s = template_surface(TPL);
         assert_eq!(s.caveats, vec!["elide:Volume"]);
-        assert_eq!(s.tenant, vec!["tenant.bucket"]); // ../ scope folded
+        assert_eq!(s.env, vec!["env.bucket"]); // ../ scope folded
         assert_eq!(s.system, vec!["system.expiry_iso8601"]);
-        assert_eq!(s.request, vec!["request.ancestors"]);
+        assert_eq!(s.req, vec!["req.ancestors"]);
 
         // Subexpression form `{{#each (caveat "elide:X")}}` and a bare
         // namespace token both resolve; duplicates collapse.
         let s = template_surface(
-            r#"{{caveat "a"}} {{caveat "a"}} {{#each (caveat "b")}}{{tenant}}{{/each}}"#,
+            r#"{{caveat "a"}} {{caveat "a"}} {{#each (caveat "b")}}{{env}}{{/each}}"#,
         );
         assert_eq!(s.caveats, vec!["a", "b"]);
-        assert_eq!(s.tenant, vec!["tenant"]);
-        assert!(s.system.is_empty() && s.request.is_empty());
+        assert_eq!(s.env, vec!["env"]);
+        assert!(s.system.is_empty() && s.req.is_empty());
 
         // Comments/partials contribute nothing.
         assert_eq!(

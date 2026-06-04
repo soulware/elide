@@ -6,29 +6,30 @@
 //! <data_dir>/sealed/
 //!   seal.json            # copy of the canonical seal this cache satisfies
 //!   policies/<blake3>    # one file per policy template, content-addressed
+//!   env.json             # materialised [env] values, pinned by env_blake3
 //! ```
 //!
 //! The cache exists so a restarting host can serve last-sealed content
 //! after `roles_dir/` has drifted (templates updated fleet-wide but not
 //! yet re-sealed) — the seal holds only hashes, so the bytes must live
 //! somewhere a restart can reach. It is a *derived* artefact, always
-//! reconstructable from `roles_dir/` + a canonical `seal.json`, so it is
-//! content-addressed and `ls`/`cat`-inspectable; nothing here is
+//! reconstructable from `roles_dir/` + `[env]` + a canonical `seal.json`,
+//! so it is content-addressed and `ls`/`cat`-inspectable; nothing here is
 //! precious or authoritative on its own.
 //!
 //! This module is the cache's read/write primitives plus the in-memory
 //! [`TemplateSet`] loaded from it. The *policy* of when to write, adopt,
 //! or fall through lives in `mint serve` startup; the cache module only
 //! knows how to persist a verified set and how to load one back while
-//! re-checking each policy's bytes against the hashes the cache's own
-//! `seal.json` pins.
+//! re-checking each policy's bytes (and `env.json`) against the hashes the
+//! cache's own `seal.json` pins.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::keyring::Keyring;
-use crate::seal::{Seal, SealError, SealedRole, hash_hex};
+use crate::seal::{Seal, SealError, SealedRole, canonical_env_bytes, hash_hex};
 
 /// Subdirectory of `data_dir` holding the cache.
 const SEALED_DIR: &str = "sealed";
@@ -36,6 +37,8 @@ const SEALED_DIR: &str = "sealed";
 const POLICIES_DIR: &str = "policies";
 /// The cached copy of the canonical seal the policy files satisfy.
 const SEAL_FILE: &str = "seal.json";
+/// The materialised `[env]` values the seal's `env_blake3` pins.
+const ENV_FILE: &str = "env.json";
 
 /// The immutable, verified set of policy templates mint renders from —
 /// role name → template bytes. Built once at startup (from the cache, or
@@ -94,6 +97,10 @@ pub struct ServedSurface {
     pub seal: Seal,
     /// Verified policy templates, role → bytes.
     pub templates: TemplateSet,
+    /// The sealed `[env]` values (`{{env.X}}`), reproduced from local
+    /// `config.env` and verified against the seal's `env_blake3`. Rendered
+    /// into every policy; the request path reads these, never live config.
+    pub env: BTreeMap<String, String>,
 }
 
 impl ServedSurface {
@@ -105,6 +112,7 @@ impl ServedSurface {
         ServedSurface {
             seal: Seal::build_from_config(config, keyring, sealed_at),
             templates: policies_from_config(config),
+            env: config.env.clone(),
         }
     }
 
@@ -123,6 +131,11 @@ impl ServedSurface {
     /// The sealed policy template for `role`.
     pub fn policy(&self, role: &str) -> Option<&str> {
         self.templates.get(role)
+    }
+
+    /// The sealed `[env]` values rendered into every policy (`{{env.X}}`).
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
     }
 }
 
@@ -173,6 +186,8 @@ pub enum CacheState {
         seal: Seal,
         /// The verified templates, ready to serve.
         templates: TemplateSet,
+        /// The verified `[env]` values, ready to serve.
+        env: BTreeMap<String, String>,
     },
     /// The cache exists but does not hold up: `seal.json` is unparseable,
     /// a referenced policy file is missing, or a policy file's bytes do
@@ -197,10 +212,25 @@ fn sealed_dir(data_dir: &Path) -> PathBuf {
 /// `policies/` is pruned to exactly the hashes `seal` references, so
 /// `ls sealed/policies/` always reflects the current seal and no orphan
 /// blobs accumulate across re-seals.
-pub fn write(data_dir: &Path, seal: &Seal, templates: &TemplateSet) -> Result<(), SealError> {
+pub fn write(
+    data_dir: &Path,
+    seal: &Seal,
+    templates: &TemplateSet,
+    env: &BTreeMap<String, String>,
+) -> Result<(), SealError> {
     let dir = sealed_dir(data_dir);
     let policies = dir.join(POLICIES_DIR);
     std::fs::create_dir_all(&policies)?;
+
+    // Materialise the env beside the policies, pinned the same way: its
+    // bytes must hash to the seal's `env_blake3`, else this is a caller bug.
+    let env_bytes = canonical_env_bytes(env);
+    if hash_hex(&env_bytes) != seal.env_blake3 {
+        return Err(SealError::Encode(
+            "env bytes do not match the seal's env_blake3".into(),
+        ));
+    }
+    write_atomic(&dir.join(ENV_FILE), &env_bytes)?;
 
     let mut keep = std::collections::BTreeSet::new();
     for (role, body) in &templates.policies {
@@ -280,9 +310,36 @@ pub fn load(data_dir: &Path) -> Result<CacheState, SealError> {
         loaded.insert(role.clone(), text);
     }
 
+    let env_bytes = match std::fs::read(dir.join(ENV_FILE)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CacheState::Corrupt {
+                reason: format!("cached {ENV_FILE} is missing"),
+            });
+        }
+        Err(e) => return Err(SealError::Io(e)),
+    };
+    if hash_hex(&env_bytes) != seal.env_blake3 {
+        return Ok(CacheState::Corrupt {
+            reason: format!(
+                "cached {ENV_FILE} bytes do not match pinned env_blake3 {}",
+                seal.env_blake3
+            ),
+        });
+    }
+    let env: BTreeMap<String, String> = match serde_json::from_slice(&env_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(CacheState::Corrupt {
+                reason: format!("cached {ENV_FILE} is not a string map: {e}"),
+            });
+        }
+    };
+
     Ok(CacheState::Loaded {
         seal,
         templates: TemplateSet::from_policies(loaded),
+        env,
     })
 }
 
@@ -325,7 +382,9 @@ mod tests {
     fn config() -> Config {
         let toml = r#"
 audience = "mint"
-[tenant]
+[store]
+bucket = "demo-bucket"
+[env]
 bucket = "demo-bucket"
 [[role]]
 name = "volume-ro"
@@ -345,8 +404,8 @@ policy_file = "volume-rw.json"
         crate::config::parse_for_test(
             toml,
             &[
-                ("volume-ro.json", r#"{"ro":"{{tenant.bucket}}"}"#),
-                ("volume-rw.json", r#"{"rw":"{{tenant.bucket}}"}"#),
+                ("volume-ro.json", r#"{"ro":"{{env.bucket}}"}"#),
+                ("volume-rw.json", r#"{"rw":"{{env.bucket}}"}"#),
             ],
         )
         .expect("parse")
@@ -376,21 +435,20 @@ policy_file = "volume-rw.json"
         let dir = tempfile::tempdir().unwrap();
         let cfg = config();
         let (seal, templates) = seal_and_templates(&cfg);
-        write(dir.path(), &seal, &templates).expect("write");
+        write(dir.path(), &seal, &templates, &cfg.env).expect("write");
 
         match load(dir.path()).expect("load") {
             CacheState::Loaded {
                 seal: got_seal,
                 templates: got,
+                env: got_env,
             } => {
                 assert!(got_seal.semantically_equal(&seal));
+                assert_eq!(got.get("volume-ro").unwrap(), r#"{"ro":"{{env.bucket}}"}"#);
+                assert_eq!(got.get("volume-rw").unwrap(), r#"{"rw":"{{env.bucket}}"}"#);
                 assert_eq!(
-                    got.get("volume-ro").unwrap(),
-                    r#"{"ro":"{{tenant.bucket}}"}"#
-                );
-                assert_eq!(
-                    got.get("volume-rw").unwrap(),
-                    r#"{"rw":"{{tenant.bucket}}"}"#
+                    got_env.get("bucket").map(String::as_str),
+                    Some("demo-bucket")
                 );
             }
             other => panic!("expected Loaded, got {other:?}"),
@@ -402,7 +460,7 @@ policy_file = "volume-rw.json"
         let dir = tempfile::tempdir().unwrap();
         let cfg = config();
         let (seal, templates) = seal_and_templates(&cfg);
-        write(dir.path(), &seal, &templates).expect("write");
+        write(dir.path(), &seal, &templates, &cfg.env).expect("write");
 
         // Two distinct policies → two content-addressed files, each named
         // by its hash.
@@ -418,7 +476,7 @@ policy_file = "volume-rw.json"
 
         // Drop a stale blob in; a re-write must prune it.
         std::fs::write(policies.join("deadbeef"), b"orphan").unwrap();
-        write(dir.path(), &seal, &templates).expect("rewrite");
+        write(dir.path(), &seal, &templates, &cfg.env).expect("rewrite");
         assert!(!policies.join("deadbeef").exists(), "stale blob not pruned");
     }
 
@@ -427,7 +485,7 @@ policy_file = "volume-rw.json"
         let dir = tempfile::tempdir().unwrap();
         let cfg = config();
         let (seal, templates) = seal_and_templates(&cfg);
-        write(dir.path(), &seal, &templates).expect("write");
+        write(dir.path(), &seal, &templates, &cfg.env).expect("write");
 
         // Overwrite one content-addressed file with bytes that no longer
         // hash to its name — the cache's own integrity check must reject.
@@ -446,7 +504,7 @@ policy_file = "volume-rw.json"
         let dir = tempfile::tempdir().unwrap();
         let cfg = config();
         let (seal, templates) = seal_and_templates(&cfg);
-        write(dir.path(), &seal, &templates).expect("write");
+        write(dir.path(), &seal, &templates, &cfg.env).expect("write");
 
         let ro_hash = &seal.roles["volume-ro"].policy_blake3;
         std::fs::remove_file(sealed_dir(dir.path()).join(POLICIES_DIR).join(ro_hash)).unwrap();
@@ -484,15 +542,35 @@ policy_file = "volume-rw.json"
                 ),
                 (
                     "volume-rw".to_string(),
-                    r#"{"rw":"{{tenant.bucket}}"}"#.to_string(),
+                    r#"{"rw":"{{env.bucket}}"}"#.to_string(),
                 ),
             ]
             .into_iter()
             .collect(),
         );
         assert!(matches!(
-            write(dir.path(), &seal, &wrong),
+            write(dir.path(), &seal, &wrong, &cfg.env),
             Err(SealError::Encode(_))
         ));
+    }
+
+    #[test]
+    fn tampered_env_bytes_are_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config();
+        let (seal, templates) = seal_and_templates(&cfg);
+        write(dir.path(), &seal, &templates, &cfg.env).expect("write");
+
+        // Rewrite env.json with bytes that no longer hash to env_blake3 —
+        // the same integrity check policies get, applied to the env.
+        std::fs::write(
+            sealed_dir(dir.path()).join(ENV_FILE),
+            br#"{"bucket":"attacker"}"#,
+        )
+        .unwrap();
+        match load(dir.path()).expect("load") {
+            CacheState::Corrupt { reason } => assert!(reason.contains("env_blake3")),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
     }
 }

@@ -1,6 +1,6 @@
 # Minimal demo config (docs/design-mint.md § "Reference client & demo").
 #
-# Two roles — `read` / `write` over a single {{request.prefix}}. `read`
+# Two roles — `read` / `write` over a single {{req.prefix}}. `read`
 # exercises plain issuance (login → invite → enroll → approve → exchange →
 # assume-role); `write` adds the operator-authorisation loop — it carries
 # a third-party caveat, so assume-role is refused until the client fetches
@@ -10,8 +10,8 @@
 #
 # `mint serve` always talks to a real S3-compatible backend (Tigris,
 # MinIO, AWS). Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
-# environment before starting, and point `tenant.bucket` at a bucket
-# you own.
+# environment before starting, and point `store.bucket` / `env.bucket`
+# at a bucket you own.
 
 audience = "mint"
 # data_dir defaults to mint_data, roles_dir to mint_roles, each resolved
@@ -51,7 +51,18 @@ socket = "mint_data/auth.sock"
 # it reads the same as production.
 location = "https://auth.elide.internal/v1/discharge"
 
-[tenant]
+# Where mint keeps its own enrollment state (`_mint/*`). Operational
+# only — not a template surface.
+[store]
+bucket = "mint-demo"
+# endpoint = "https://t3.storage.dev"   # default; set for non-Tigris S3
+# region   = "us-east-1"                # default
+
+# Values surfaced to role policy templates as `{{env.X}}`. Flat scalars
+# only; nested tables/arrays are rejected. The demo roles reference
+# `{{env.bucket}}` — the store bucket reaches a template only by being
+# restated here.
+[env]
 bucket = "mint-demo"
 
 [[role]]
