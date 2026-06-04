@@ -3,6 +3,14 @@
 
 audience = "mint"
 
+# Operator auth integration (docs/design-auth-service.md). Required: the
+# discharge URL (path included) for the enroll gate (invite), the exchange
+# gate (ticket), and the admin gate (cli-token), each keyed by K_M-A which
+# the auth integration provides. Production runs a separate auth-service
+# binary (no [demo_auth]); the operator admin plane authenticates against
+# that service, not a colocated UDS.
+auth_location = "https://auth.elide.internal/v1/discharge"
+
 # data_dir / roles_dir: a relative value (including the defaults
 # mint_data / mint_roles) resolves against the working directory, not
 # this file's parent; an absolute path is used verbatim. roles_dir is
@@ -20,15 +28,6 @@ roles_dir = "examples/elide_roles"
 socket = "mint_data/mint.sock"
 # For a TCP listener instead, replace the line above with:
 #   bind = "127.0.0.1:8085"
-
-# Operator auth integration (docs/design-auth-service.md). Required: it
-# supplies the discharge location for the enroll gate (invite), the
-# exchange gate (ticket), and the admin gate (cli-token), each keyed by
-# K_M-A which the auth integration provides. Production runs a separate
-# auth-service binary (no [demo_auth]); the operator admin plane
-# authenticates against that service, not a colocated UDS.
-[operator]
-location = "https://auth.elide.internal/v1/discharge"   # the gate discharge location
 
 [store]
 bucket = "elide-demo"

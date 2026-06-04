@@ -61,13 +61,11 @@ const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 const TOML: &str = r#"
 audience = "mint"
+auth_location = "https://auth.example/v1/discharge"
 [store]
 bucket = "demo-bucket"
 [demo_auth]
 enabled = true
-
-[operator]
-location = "https://auth.example/v1/discharge"
 [[role]]
 name = "volume-rw"
 required_caveats = []

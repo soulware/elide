@@ -403,10 +403,10 @@ async fn write_admin_service(
     let Some(k_m_a) = store.k_m_a().copied() else {
         return Ok(()); // no auth → no admin plane → no admin-service
     };
-    let operator = cfg
-        .operator
-        .as_ref()
-        .ok_or("admin-service: K_M-A present without an [operator] block")?;
+    let location = cfg
+        .auth_location
+        .as_deref()
+        .ok_or("admin-service: K_M-A present without auth_location")?;
     let org_id = store.org_id().unwrap_or("demo").to_string();
 
     let mut seed = [0u8; 32];
@@ -420,7 +420,7 @@ async fn write_admin_service(
         &cfg.audience,
         &cnf,
         &org_id,
-        &operator.location,
+        location,
     );
 
     write_0600(&cfg.data_dir.join("admin-service"), mac.encode().as_bytes())?;
@@ -460,11 +460,11 @@ async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std:
         Store::open_remote(s3, &cfg.data_dir.join("root_keys"), Some(&legacy), None).await?;
     // K_M-A is needed wherever an auth integration is configured (TPC
     // verification and demo discharge issuance): a colocated demo auth
-    // role generates it locally, otherwise `[operator]` signals that the
+    // role generates it locally, otherwise `auth_location` signals that the
     // auth-service binary provisioned it. K_session is purely the demo
     // auth role's session root — generated only under `[demo_auth]`.
     let demo_enabled = cfg.demo_auth.as_ref().is_some_and(|d| d.enabled);
-    if demo_enabled || cfg.operator.is_some() {
+    if demo_enabled || cfg.auth_location.is_some() {
         store.init_k_m_a(&cfg.data_dir, demo_enabled)?;
         if demo_enabled {
             store.init_k_session(&cfg.data_dir)?;

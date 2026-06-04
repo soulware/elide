@@ -30,7 +30,7 @@ fn mint_demo_config_loads() {
     assert!(demo.enabled, "demo colocates the auth role");
     assert!(demo.socket.is_some(), "demo auth role binds a UDS");
     assert!(
-        cfg.operator.is_some(),
+        cfg.auth_location.is_some(),
         "demo configures the admin-service location"
     );
 }
@@ -39,12 +39,12 @@ fn mint_demo_config_loads() {
 fn mint_elide_config_loads() {
     pin_cwd();
     let cfg = Config::load(&example("mint-elide.toml")).expect("mint-elide.toml");
-    // The Elide inventory needs an `[operator]` integration: enrollment
-    // is operator-gated (the invite + ticket carry the enroll/exchange
+    // The Elide inventory needs `auth_location`: enrollment is
+    // operator-gated (the invite + ticket carry the enroll/exchange
     // gates, keyed by K_M-A).
     assert!(
-        cfg.operator.is_some(),
-        "enrollment gates require [operator]"
+        cfg.auth_location.is_some(),
+        "enrollment gates require auth_location"
     );
     // The four-role inventory: coord-ro/coord-rw/volume-ro/volume-rw,
     // none carrying a third-party caveat (operator authority moved to

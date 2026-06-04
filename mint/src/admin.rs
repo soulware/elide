@@ -178,14 +178,9 @@ async fn build_invite(state: &AppState) -> Result<InviteResponse, Response> {
     let k_m_a = state.store.k_m_a().copied().ok_or_else(|| {
         service_unavailable("invite requires an auth integration (K_M-A) for its enroll gate")
     })?;
-    let location = state
-        .config
-        .operator
-        .as_ref()
-        .map(|o| o.location.as_str())
-        .ok_or_else(|| {
-            service_unavailable("invite requires an [operator] block for its discharge location")
-        })?;
+    let location = state.config.auth_location.as_deref().ok_or_else(|| {
+        service_unavailable("invite requires auth_location for its discharge location")
+    })?;
     let org_id = state.store.org_id().unwrap_or("demo").to_string();
     let keyring = state.store.keyring().await;
     let mac = mint_invite(

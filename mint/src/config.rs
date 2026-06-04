@@ -108,11 +108,16 @@ pub struct RawConfig {
     /// single-host only; absent in production.
     #[serde(default)]
     pub demo_auth: Option<RawDemoAuth>,
-    /// Operator auth-service integration. A mint without `[operator]`
-    /// (and without `[demo_auth].enabled`) cannot stamp third-party
-    /// caveats, so it has no enrollment plane — `/v1/enroll` fails closed.
+    /// The discharge URL stamped into the enroll-gate (invite),
+    /// exchange-gate (ticket), and admin-gate (admin-service) third-party
+    /// caveats — where a client/operator fetches the discharge. A mint
+    /// without `auth_location` (and without `[demo_auth].enabled`) cannot
+    /// stamp those caveats, so it has no enrollment plane — `/v1/enroll`
+    /// fails closed. The path is the discharge route; the transport it is
+    /// dialed over is resolved separately (`[demo_auth]` socket in the
+    /// colocated demo, the remembered `auth-transport` otherwise).
     #[serde(default)]
-    pub operator: Option<RawOperator>,
+    pub auth_location: Option<String>,
     #[serde(rename = "role", default)]
     pub roles: Vec<RawRole>,
 }
@@ -135,18 +140,6 @@ pub struct RawDemoAuth {
     /// `enabled = false`.
     #[serde(default)]
     pub socket: Option<String>,
-}
-
-/// `[operator]` block: the operator's auth-service integration. Required
-/// for enrollment and the admin plane — it supplies the discharge
-/// `location` stamped into the invite's enroll gate, the ticket's
-/// exchange gate, and the admin-service's admin gate.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RawOperator {
-    /// The discharge `location` stamped into the enroll-gate (invite),
-    /// exchange-gate (ticket), and admin-gate (admin-service) third-party
-    /// caveats. Where a client/operator fetches the discharge.
-    pub location: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -314,13 +307,6 @@ pub struct DemoAuth {
     pub socket: Option<PathBuf>,
 }
 
-/// Operator auth-service integration, post-validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OperatorAuth {
-    /// The `location` stamped into the operator admin-service's TPC.
-    pub location: String,
-}
-
 /// Validated configuration, ready to serve.
 #[derive(Debug)]
 pub struct Config {
@@ -353,11 +339,11 @@ pub struct Config {
     /// Colocated demo auth role — `None` if the config omits
     /// `[demo_auth]`.
     pub demo_auth: Option<DemoAuth>,
-    /// Operator auth integration — `None` if the config omits
-    /// `[operator]`. A mint without it (and without a demo auth role)
-    /// cannot stamp the enroll/exchange/admin gates, so enrollment and
-    /// the admin plane fail closed.
-    pub operator: Option<OperatorAuth>,
+    /// The discharge URL stamped into the enroll/exchange/admin gates —
+    /// `None` if the config omits `auth_location`. A mint without it (and
+    /// without a demo auth role) cannot stamp those gates, so enrollment
+    /// and the admin plane fail closed.
+    pub auth_location: Option<String>,
     pub roles: BTreeMap<String, Role>,
 }
 
@@ -448,9 +434,6 @@ impl Config {
                 socket,
             }
         });
-        let operator = raw.operator.map(|o| OperatorAuth {
-            location: o.location,
-        });
         // `[env]` values must be scalars; the env-key *surface* check
         // (every `{{env.X}}` names a defined key) is deliberately **not**
         // run here — it gates seal authoring, not config load, so a
@@ -470,7 +453,7 @@ impl Config {
             env,
             admin: AdminCredential::from_env(),
             demo_auth,
-            operator,
+            auth_location: raw.auth_location,
             roles,
         })
     }
@@ -719,7 +702,7 @@ policy_file = "r.json"
         ));
     }
 
-    /// Inject a config block (e.g. `[operator]`) before the first
+    /// Inject a config block (e.g. `[demo_auth]`) before the first
     /// `[[role]]` in SAMPLE. Injecting at `[store]` would land
     /// `parse_for_test`'s `roles_dir = ...` line inside the injected
     /// table; injecting at `[[role]]` keeps every key in the right table.
@@ -728,18 +711,20 @@ policy_file = "r.json"
     }
 
     #[test]
-    fn demo_auth_and_operator_blocks_are_parsed() {
-        let toml = with_block(
-            SAMPLE,
-            "[demo_auth]\nenabled = true\n\n\
-             [operator]\nlocation = \"https://auth.example/v1/discharge\"",
+    fn demo_auth_block_and_auth_location_are_parsed() {
+        // `auth_location` is a top-level scalar, so it must precede the
+        // first `[table]` header; `[demo_auth]` injects before `[[role]]`.
+        let toml = with_block(SAMPLE, "[demo_auth]\nenabled = true").replacen(
+            "audience = \"mint\"",
+            "audience = \"mint\"\nauth_location = \"https://auth.example/v1/discharge\"",
+            1,
         );
         let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
         let demo = c.demo_auth.expect("demo_auth present");
         assert!(demo.enabled);
         assert!(demo.socket.is_some(), "socket resolves when enabled");
         assert_eq!(
-            c.operator.expect("operator present").location,
+            c.auth_location.expect("auth_location present"),
             "https://auth.example/v1/discharge"
         );
     }

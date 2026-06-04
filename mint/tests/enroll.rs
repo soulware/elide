@@ -39,12 +39,11 @@ const AUTH_URL: &str = "https://auth.example/v1/discharge";
 
 const TOML_TEMPLATE: &str = r#"
 audience = "mint"
+auth_location = "https://auth.example/v1/discharge"
 [store]
 bucket = "demo-bucket"
 [env]
 bucket = "demo-bucket"
-[operator]
-location = "https://auth.example/v1/discharge"
 [[role]]
 name = "volume-ro"
 required_caveats = ["elide:Volume", "aud", "exp"]

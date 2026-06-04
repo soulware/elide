@@ -765,8 +765,8 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
             json!({"error": "service unavailable"}),
         );
     };
-    let Some(location) = state.config.operator.as_ref().map(|o| o.location.as_str()) else {
-        tracing::error!("enroll: no [operator] block; cannot stamp the exchange gate");
+    let Some(location) = state.config.auth_location.as_deref() else {
+        tracing::error!("enroll: no auth_location; cannot stamp the exchange gate");
         return respond(
             &request_id,
             StatusCode::SERVICE_UNAVAILABLE,

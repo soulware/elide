@@ -14,6 +14,17 @@
 # at a bucket you own.
 
 audience = "mint"
+
+# The full discharge URL (path included) stamped into the enroll gate
+# (invite), exchange gate (ticket), and admin gate (cli-token), all keyed
+# by K_M-A. The operator/client derives its discharge route from this
+# location's path and dials [demo_auth].socket as the transport. The host
+# is never resolved in the demo (the socket is the connection), so it
+# reads the same as production. Required for the enrollment and admin
+# planes; without it (and without [demo_auth].enabled) mint cannot stamp
+# the gates and /v1/enroll fails closed.
+auth_location = "https://auth.elide.internal/v1/discharge"
+
 # data_dir defaults to mint_data, roles_dir to mint_roles, each resolved
 # against the working directory (not this file's parent); an absolute
 # path is used verbatim. roles_dir is set so the demo runs from mint/:
@@ -39,17 +50,6 @@ enabled = true
 # dial to reach it. Defaults to <data_dir>/auth.sock; ignored when
 # enabled = false.
 socket = "mint_data/auth.sock"
-
-# Operator auth integration. Required: it supplies the discharge location
-# stamped into the enroll gate (invite), exchange gate (ticket), and admin
-# gate (cli-token), all keyed by K_M-A.
-[operator]
-# The full discharge URL stamped into the enroll/exchange/admin gate TPCs
-# (path included); the operator/client derives its discharge route from
-# this location's path and dials [demo_auth].socket as the transport. The
-# host is never resolved in the demo (the socket is the connection), so
-# it reads the same as production.
-location = "https://auth.elide.internal/v1/discharge"
 
 # Where mint keeps its own enrollment state (`_mint/*`). Operational
 # only — not a template surface.
