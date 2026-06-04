@@ -141,8 +141,8 @@ Each mint instance is configured with:
    Verification accepts any kid still in the ring; minting always
    uses `current`. Rotation procedure lives in *Root-key rotation*
    below. The current **`invite`**
-   is persisted in the tenant bucket at `_mint/invite` (see *Mint
-   state in the tenant bucket*), not on disk — it must survive restart
+   is persisted in the store bucket at `_mint/invite` (see *Mint
+   state in the store bucket*), not on disk — it must survive restart
    so the distributed invite macaroon stays valid, and keeping it
    bucket-side lets multiple mint processes share one value (HA /
    central-custodial deployments). Confidentiality of the invite is
@@ -165,14 +165,22 @@ Each mint instance is configured with:
    The admin credential is used **only on the IAM plane** —
    `CreateAccessKey` / `CreatePolicy` / `AttachUserPolicy` for vending
    role keypairs (`coord-*`, `volume-*`, and mint's own `mint-rw` —
-   see *Mint state in the tenant bucket*). It is never used directly
-   for `s3:*` operations against the tenant bucket.
+   see *Mint state in the store bucket*). It is never used directly
+   for `s3:*` operations against the store bucket.
 4. **A set of role definitions** — see *Role configuration* below.
-5. **Tenant metadata** — bucket name(s), per-tenant settings. v1 is
-   single-tenant per instance; multi-tenancy is a v2 question.
+5. **Store configuration** (`[store]`) — where mint keeps its own state:
+   `bucket` (the object-store bucket holding `_mint/*` — see below),
+   plus optional `endpoint` and `region` for the S3 client mint builds
+   to reach it. Operational transport only; **never** a template surface.
+6. **Template values** (`[env]`) — a flat table of operator-defined
+   scalar entries, surfaced to role policy templates as `{{env.X}}`
+   (§ *Templating*): the bucket name(s) roles grant on, prefixes, region
+   strings. The only server-side substitution source a role policy reads.
+   Nested tables or arrays under `[env]` are a config error; the store
+   bucket reaches a template only if the operator restates it here.
 
-Role definitions, audience, and tenant metadata are static and
-file-backed. The macaroon keyring and admin credential are secrets and
+Role definitions, audience, store configuration, and `[env]` values are
+static and file-backed. The macaroon keyring and admin credential are secrets and
 are not plaintext TOML fields — the admin credential comes from the
 AWS environment; the keyring lives under `<data_dir>/root_keys/`
 (one 64-hex generation file per kid, plus a `current` pointer).
@@ -183,7 +191,7 @@ A mint instance is named by its config file: `--config <path>`, else
 the `MINT_CONFIG` environment variable, else `./mint.toml`. Setting
 `MINT_CONFIG` lets operator commands run from any directory without
 repeating `--config`; an explicit flag still wins. `mint serve` always runs against a
-real S3-compatible backend: enrollment state in the tenant bucket
+real S3-compatible backend: enrollment state in the store bucket
 under `_mint/` (via the self-vended `mint-rw` keypair) and real
 Tigris IAM for `assume-role`. There is no in-process dev backend;
 operators wanting to exercise the flow without a public Tigris
@@ -206,9 +214,9 @@ elide coordinator's `data_dir` (`coordinator.toml`):
   per-user under `~/.config/mint`, shared with `mint client`
   (§ *Admin service token* — *Login & discharge*). Enrollment
   state (the current `invite` nonce, pending records, and the
-  approved-coordinator registry) lives in the tenant bucket under
+  approved-coordinator registry) lives in the store bucket under
   `_mint/` so multiple mint processes can share one logical state
-  (see *Mint state in the tenant bucket*); the bucket-side custodian
+  (see *Mint state in the store bucket*); the bucket-side custodian
   is a self-vended `mint-rw` keypair, not the admin credential.
 - **`roles_dir`** (default `mint_roles`) — role *policy templates*, one
   file per role (see *Role configuration*).
@@ -223,18 +231,19 @@ running two instances is purely `mint.toml` + `mint2.toml` with distinct
 flag would be unused surface; its absence is a decision, not an
 oversight.
 
-#### Mint state in the tenant bucket
+#### Mint state in the store bucket
 
-Enrollment state lives in the same tenant bucket as the volume data
-plane, under a dedicated top-level prefix `_mint/` that no coordinator
-IAM role ever names. Coordinators have no path to it through any
-issued macaroon.
+Enrollment state lives in the store bucket (`[store].bucket`), under a
+dedicated top-level prefix `_mint/` that no coordinator IAM role ever
+names. Coordinators have no path to it through any issued macaroon. The
+store bucket is configured independently of the bucket(s) roles grant on
+(named via `[env]`) — they need not be the same bucket.
 
 Mint does **not** use its admin credential directly for these bucket
 operations. On startup mint self-vends an internal **`mint-rw`** Tigris
 keypair via the same `KeypairMinter` machinery it uses for `coord-*`
 and `volume-*` keys: `CreateAccessKey + CreatePolicy + AttachUserPolicy`
-with policy scoped to `arn:aws:s3:::{{tenant.bucket}}/_mint/*` (all
+with policy scoped to `arn:aws:s3:::<store.bucket>/_mint/*` (all
 verbs) and a `DateLessThan` matching the existing role-credential
 cadence. The admin credential remains in memory for the IAM-plane
 calls that vend `mint-rw` (and refresh it before expiry), but never
@@ -609,7 +618,7 @@ no per-coordinator state — the `(sub, cnf)` pairing rides every token
 and is checked against the macaroon root each call.
 For enrollment workflow only, mint does maintain a long-lived
 registry of approved coordinators (`_mint/approved/<sub>`,
-§ *Enrollment* / *Mint state in the tenant bucket*) so a previously
+§ *Enrollment* / *Mint state in the store bucket*) so a previously
 approved key can re-enroll without operator intervention; this
 registry is consulted only during enrollment and is never on the
 `assume-role` verification path.
@@ -639,8 +648,8 @@ runtime.
 
 **Invite macaroon — the enroll gate.** At first start mint draws a
 random nonce — the `invite` value — persists it at `_mint/invite` in the
-tenant bucket (see *Mint state in the tenant bucket*) so every mint
-process that mounts this tenant sees the same value, and emits the
+store bucket (see *Mint state in the store bucket*) so every mint
+process sharing that store bucket sees the same value, and emits the
 invite macaroon: the root attenuated with `op=enroll`, `aud=mint`,
 `invite=<current>`, **and a third-party caveat naming the auth service**.
 It is non-expiring, carries no coordinator identity, and is distributed
@@ -919,7 +928,7 @@ received** (hashed before parsing — no JSON canonicalization, which is
 itself a footgun) and the presented macaroon's tail, verifies the
 signature against the sealed `cnf`, and **then** reads `ts`
 from the now-authenticated body and rejects it if outside the skew
-window. Only after the signature verifies does any `request.*` body
+window. Only after the signature verifies does any `req.*` body
 field — `ts` included — become a trusted input. `cnf` is mandatory at
 every endpoint that accepts a macaroon: absent, contradictory, or
 malformed `cnf` — and any other PoP failure — resolves as `401`.
@@ -943,10 +952,10 @@ whole body is covered by the PoP signature (§ *Authentication*), so every
 field is vouched for by `coordinator.key` and bound to this exact
 macaroon and moment. Mint is **body-field-agnostic** in the same way it
 is caveat-vocabulary-agnostic: it does not hard-code which fields are
-meaningful. It parses the verified body into the `request.*` template
+meaningful. It parses the verified body into the `req.*` template
 namespace; a role's policy template is the only thing that decides which
 fields matter, by referencing them (strict mode — a template referencing
-an absent `request.X` fails closed). Conventional fields:
+an absent `req.X` fails closed). Conventional fields:
 
 - `ts` (required): the PoP freshness timestamp, unix seconds. Carried
   here, not in a header, so it is covered by the signature over the
@@ -957,7 +966,7 @@ an absent `request.X` fails closed). Conventional fields:
   from its own config, **not** echoed from the loaded credential. Mint
   takes the authoritative role from the credential's `role` caveat
   (stamped at the enrollment exchange) and selects the policy from it,
-  then requires `request.role` to **equal** that caveat; a mismatch
+  then requires `req.role` to **equal** that caveat; a mismatch
   fails closed. This is not a way to pick a role — it is a guard: a
   subsystem that loaded the wrong per-role credential file states one
   role while the file carries another, and the request is denied
@@ -980,7 +989,7 @@ an absent `request.X` fails closed). Conventional fields:
 On success: the freshly-minted Tigris keypair plus its absolute expiration.
 
 On role mismatch (the credential's `role` is not in config,
-`request.role` disagrees with it, or caveats don't satisfy role
+`req.role` disagrees with it, or caveats don't satisfy role
 requirements): `400 Bad Request` with a generic error.
 
 On Tigris-side failure (rate limit, quota, admin credential rejection):
@@ -1021,9 +1030,9 @@ all of them.
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each request.ancestors}},
-      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{this}}/*"
+      "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
+      {{#each req.ancestors}},
+      "arn:aws:s3:::{{env.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],
     "Condition": {
@@ -1060,8 +1069,20 @@ mandatory: a role whose template file is absent is a config error
 The mint substitutes four classes of variable in the policy template at
 issuance time, each with an explicit, distinct trust provenance:
 
-- `{{tenant.X}}` — values from the mint's tenant configuration (bucket
-  name, etc.), as a plain path. Server-side, never caller-controlled.
+- `{{env.X}}` — values from the mint's `[env]` table, a flat set of
+  operator-defined scalars (bucket name(s), prefixes, region), as a plain
+  path. Server-side, never caller-controlled — and **sealed**: at seal
+  time the `[env]` values are materialised into the sealed surface
+  (`sealed/env.json`, pinned by the seal's `env_blake3`), so the request
+  path renders the *sealed* env, never the live config. Values render as
+  data (a value containing `{{…}}` is inert text, never re-parsed), so
+  there is no template injection. Every `{{env.X}}` a template references
+  must name a key in `[env]`; this is enforced when a seal is authored
+  (`POST /v1/admin/seal`) — a seal cannot pin templates referencing
+  undefined env values — so the gap surfaces at publish time, not as a
+  fail-closed render. It is deliberately *not* checked at config load:
+  serving is decoupled from the live config, so a drifted local template
+  never blocks a host from serving its already-sealed roles.
 - `{{caveat "X"}}` — the verified macaroon's caveat named `X` (MAC-bound,
   rooted in the mint's macaroon root), resolved through a built-in
   `caveat` lookup helper that takes the caveat name as a string argument.
@@ -1070,11 +1091,11 @@ issuance time, each with an explicit, distinct trust provenance:
   namespaced caveat names contain `:`, which is not a legal template path
   segment; it also keeps the caveat surface to a single named lookup
   rather than arbitrary data-graph traversal.
-- `{{request.X}}` — fields from the PoP-verified request body (bound to
+- `{{req.X}}` — fields from the PoP-verified request body (bound to
   `coordinator.key`, this macaroon's tail, and this moment — §
   *Authentication*). Available **only** after the PoP signature is
   verified. Scalars render directly; arrays iterate as
-  `{{#each request.ancestors}}…{{/each}}`. This is the channel for
+  `{{#each req.ancestors}}…{{/each}}`. This is the channel for
   honest-but-unverified scoping data the coordinator computes (e.g. the
   ancestor lineage): mint transmits it into the policy, the PoP
   authenticates *who* asserted it, mint never validates the value.
@@ -1091,13 +1112,13 @@ caveats with only the trailing MAC, neutralise a binding caveat by
 appending a contradictory copy). A reference to a caveat the macaroon
 does not carry, or one that is unsatisfiable, is a hard render failure:
 the request is refused, never minted with a missing or downgraded
-substitution. `{{request.X}}` is likewise strict — an absent field a
+substitution. `{{req.X}}` is likewise strict — an absent field a
 template references fails the render closed.
 
 The mint **does not** ship a general-purpose policy DSL. The entire
-template surface is `{{tenant.*}}` / `{{system.*}}` plain paths, the
-`caveat` scalar lookup helper, `{{request.*}}` fields, and `{{#each}}`
-over a `request.*` array. Conditional blocks, arithmetic, value
+template surface is `{{env.*}}` / `{{system.*}}` plain paths, the
+`caveat` scalar lookup helper, `{{req.*}}` fields, and `{{#each}}`
+over a `req.*` array. Conditional blocks, arithmetic, value
 transformations, and dynamic resource construction beyond straight
 substitution are deliberately out of scope. Roles requiring more
 expressive policies should be split into multiple roles.
@@ -1184,7 +1205,7 @@ Coined (mint-specific; no registered equivalent):
   `(sub, role)` authorization point — so it is not coordinator-appendable
   to widen, and a contradictory second copy is unsatisfiable. Mint
   selects the role policy from it and requires the request's asserted
-  `request.role` to equal it. There is no role-less ("omnibus")
+  `req.role` to equal it. There is no role-less ("omnibus")
   credential: a credential carries exactly one role.
 - **`invite`** (string, scalar). Carried only by the invite
   macaroon. Mint stores one current random nonce (persisted, same
@@ -1214,7 +1235,7 @@ There are no list-valued caveats. Every caveat is a scalar capability
 predicate that attenuates by AND (repeated occurrences must agree;
 `exp` narrows to the numeric minimum). The only list-shaped input
 a role ever needed — the ancestor set for `volume-ro` — is **not** a
-caveat: it rides the PoP-signed request body as `request.ancestors`
+caveat: it rides the PoP-signed request body as `req.ancestors`
 (§ *Request body*, § *Templating*). This keeps the macaroon library to
 scalar caveats plus the holder-of-key extension; no list-valued caveat
 type, no intersection semantics, no chain whose effective value depends
@@ -1259,13 +1280,13 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `op` | string | scalar | mint, at each mint point | Gate only — endpoint partition (`enroll` / `enroll-exchange` / `assume-role`); each endpoint positively requires its value. |
 | `invite` | string | scalar | mint, on first start / rotate | Gate only — invite macaroon must carry the current value. |
 | `exp` | uint64 (unix s) | scalar | issuer | Gate — caps granted TTL (`min(req, role.max, exp−now)`); multiple narrow to the minimum. |
-| `role` | string | scalar | mint, at the enrollment exchange | Gate **and** selects the role policy — the single role this credential carries; always present, and the request's asserted `request.role` must equal it. |
+| `role` | string | scalar | mint, at the enrollment exchange | Gate **and** selects the role policy — the single role this credential carries; always present, and the request's asserted `req.role` must equal it. |
 | `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on all `coord-*`; defines the credential macaroon. Templated as `{{caveat "sub"}}` in `coord-rw`'s own-identity statement (`coordinators/{{caveat "sub"}}/*`). |
 | `cnf` | string (`ed25519:<pub>`, scalar-encoded) | scalar | coordinator-self-asserted alongside `sub` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ BLAKE3(body)` (freshness `ts` rides in the body), verified against this key. Makes the credential key-bound (not a bearer) and authenticates the request body. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 
 The ancestor set is **not** in this table — it is not a caveat. It is
-`request.ancestors` in the PoP-signed body (§ *Request body*).
+`req.ancestors` in the PoP-signed body (§ *Request body*).
 
 Per-role gate matrix (template substitutions are listed in each role's
 definition below):
@@ -1280,10 +1301,10 @@ definition below):
 Non-caveat template inputs (the other three substitution classes,
 listed here so the issuer's surface is unambiguous):
 
-- `{{tenant.X}}` — server-side config; Elide uses `tenant.bucket`. Never
+- `{{env.X}}` — server-side config; Elide uses `env.bucket`. Never
   caller-controlled.
-- `{{request.X}}` — PoP-verified request body; Elide uses
-  `request.ancestors` (the `volume-ro` ancestor lineage). Vouched for
+- `{{req.X}}` — PoP-verified request body; Elide uses
+  `req.ancestors` (the `volume-ro` ancestor lineage). Vouched for
   by `coordinator.key`, never validated by mint.
 - `{{system.X}}` — mint-computed at issuance; Elide uses
   `system.expiry_iso8601`.
@@ -1294,7 +1315,7 @@ Notes:
   inventory requires is the first-party holder-of-key caveat for
   `cnf` (#16). No list-valued caveat type is needed (#6
   resolved): the only list-shaped input, the ancestor set, is
-  `request.ancestors` in the PoP-signed body, not a caveat.
+  `req.ancestors` in the PoP-signed body, not a caveat.
 - **`sub` templates only in `coord-rw`'s own-identity statement**
   (`coordinators/{{caveat "sub"}}/*`, own-prefix write). Everywhere
   else `sub` is a gate only; the other statements use prefix
@@ -1384,7 +1405,7 @@ prefix.
   the window; WAL absorbs a brief refresh stall), and 24h bounds the
   write/delete revocation window on a single volume.
 - **Policy:** `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
-  `arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*`,
+  `arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*`,
   plus the volume's two exact `meta/{{caveat "elide:Volume"}}.provenance`
   and `meta/{{caveat "elide:Volume"}}.pub` objects (the drain uploads
   them; force-release reads `volume.pub`). Single volume only.
@@ -1410,13 +1431,13 @@ partitioning:
 - **Policy:** a multi-statement document, each statement preserving
   the invariant its prefix carries:
   - `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
-    `arn:aws:s3:::{{tenant.bucket}}/names/*`.
+    `arn:aws:s3:::{{env.bucket}}/names/*`.
   - `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-    `arn:aws:s3:::{{tenant.bucket}}/events/*`. **`events/` append-only**
+    `arn:aws:s3:::{{env.bucket}}/events/*`. **`events/` append-only**
     is enforced here — no statement, in any role, grants delete on
     `events/`.
   - `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-    `arn:aws:s3:::{{tenant.bucket}}/coordinators/{{caveat "sub"}}/*`
+    `arn:aws:s3:::{{env.bucket}}/coordinators/{{caveat "sub"}}/*`
     — own-prefix only, via `sub` templating. **`coordinators/`
     immutability** is enforced here; a leaked key can rewrite only
     *this* coordinator's identity, never impersonate another, and
@@ -1437,7 +1458,7 @@ authenticated separately, outside the coordinator runtime
 Per-volume read of one volume's lineage. **Assumed by the coordinator**,
 not the volume: the coordinator attenuates its credential (`elide:Volume`,
 `exp`), puts the honest ancestor lineage in the request body as
-`request.ancestors`, calls `assume-role` with its `coordinator.key` PoP
+`req.ancestors`, calls `assume-role` with its `coordinator.key` PoP
 (which signs the body), and uses the resulting **Tigris keypair** for
 two read paths:
 
@@ -1451,14 +1472,14 @@ two read paths:
    warm-start chain walk reads each ancestor's `by_id/<a>/*` index
    bulk; the coordinator's own per-volume `volume-rw` is single-prefix,
    so these cross-ancestor reads ride `volume-ro` with the appropriate
-   `request.ancestors` body. The provenance/pub skeleton reads that
+   `req.ancestors` body. The provenance/pub skeleton reads that
    *discover* the chain (`pull_readonly_op`, and the skeleton pulls
    inside `prefetch_indexes`) are **not** `volume-ro` — they hit only
    `meta/*` and ride the warm `coord-ro` credential, so chain
    discovery costs no per-ancestor mint.
 
 - **Required caveats:** `elide:Volume`, `aud=mint`, `exp`
-- **Required body:** `request.ancestors` (PoP-signed; the role template
+- **Required body:** `req.ancestors` (PoP-signed; the role template
   references it, so an absent value fails the render closed)
 - **TTL:** 1h. Both consumers tolerate it cleanly: non-lazy volume
   episodes complete in seconds; lazy volumes refresh proactively at
@@ -1477,7 +1498,7 @@ two read paths:
     keypair `DateLessThan`, bounded by the minimal blast radius (read one
     volume's lineage).
 - **Policy:** the per-volume RO shape — exact ARN for self
-  (`{{caveat "elide:Volume"}}`) plus one per `request.ancestors` entry.
+  (`{{caveat "elide:Volume"}}`) plus one per `req.ancestors` entry.
 
 ### Why Split B is viable now
 
@@ -1523,10 +1544,10 @@ endpoint resolution, event-log and peer-discovery reads.
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{tenant.bucket}}/names/*",
-      "arn:aws:s3:::{{tenant.bucket}}/coordinators/*",
-      "arn:aws:s3:::{{tenant.bucket}}/events/*",
-      "arn:aws:s3:::{{tenant.bucket}}/meta/*"
+      "arn:aws:s3:::{{env.bucket}}/names/*",
+      "arn:aws:s3:::{{env.bucket}}/coordinators/*",
+      "arn:aws:s3:::{{env.bucket}}/events/*",
+      "arn:aws:s3:::{{env.bucket}}/meta/*"
     ]
   }]
 }
@@ -1660,7 +1681,7 @@ when both are set, `serve` binds both listeners under a
 
 - **UDS listener** mounts the public routes
   (`/v1/assume-role`, `/v1/enroll`, `/v1/enroll-exchange`) *and* the
-  operator routes (`/v1/admin/…` — see *Mint state in the tenant
+  operator routes (`/v1/admin/…` — see *Mint state in the store
   bucket* / *Operator endpoints*). Filesystem permission on the socket
   gates *transport*; the `MintV1` bundle (admin service token +
   auth-service discharge + PoP, § *Operator authorization*) gates
@@ -1902,7 +1923,7 @@ and the fake-minter `assume-role` are hermetic and run anywhere; the
 real-Tigris `assume-role` end-to-end is VM-only.
 
 **Demo role config** is a minimal `read` / `write` pair over a single
-`{{request.prefix}}` (shipped as `examples/mint-demo.toml`) — distinct from
+`{{req.prefix}}` (shipped as `examples/mint-demo.toml`) — distinct from
 the full Elide role inventory below. Both are plain key-bound roles;
 neither credential carries a TPC. The operator-authorisation loop is
 exercised at **enrollment**, not at `assume-role`: the config colocates
@@ -1984,7 +2005,7 @@ prematurely.
    but does not block the current inventory.
 6. **Caveat library schema — resolved.** No list-valued caveat is
    needed. The only list-shaped input (the `volume-ro` ancestor set)
-   rides the PoP-signed request body as `request.ancestors`, not the
+   rides the PoP-signed request body as `req.ancestors`, not the
    caveat chain. All caveats are scalar; the only macaroon-library
    extension over `design-auth-model.md`'s scalar caveats is the
    holder-of-key caveat (#16). This also removes the occurrence-order

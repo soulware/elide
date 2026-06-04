@@ -29,7 +29,7 @@ const AUTH_URL: &str = "https://auth.example/v1/discharge";
 
 const TOML: &str = r#"
 audience = "mint"
-[tenant]
+[store]
 bucket = "demo-bucket"
 [demo_auth]
 enabled = true

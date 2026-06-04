@@ -4,7 +4,7 @@
     "Sid": "DemoWrite",
     "Effect": "Allow",
     "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-    "Resource": ["arn:aws:s3:::{{tenant.bucket}}/{{request.prefix}}/*"],
+    "Resource": ["arn:aws:s3:::{{env.bucket}}/{{req.prefix}}/*"],
     "Condition": {
       "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
     }

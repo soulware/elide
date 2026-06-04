@@ -12,9 +12,9 @@ pub fn parse_config(toml: &str, roles: &[(&str, &str)]) -> Config {
         std::fs::write(dir.path().join(name), body).expect("write role file");
     }
     let injected = toml.replacen(
-        "[tenant]",
+        "[store]",
         &format!(
-            "roles_dir = {:?}\n[tenant]",
+            "roles_dir = {:?}\n[store]",
             dir.path().display().to_string()
         ),
         1,

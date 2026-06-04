@@ -31,7 +31,9 @@ fn config() -> Config {
 
 const TOML_TEMPLATE: &str = r#"
 audience = "mint"
-[tenant]
+[store]
+bucket = "demo-bucket"
+[env]
 bucket = "demo-bucket"
 [[role]]
 name = "volume-ro"
@@ -49,9 +51,9 @@ const POLICY: &str = r#"
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each request.ancestors}},
-      "arn:aws:s3:::{{../tenant.bucket}}/by_id/{{this}}/*"
+      "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
+      {{#each req.ancestors}},
+      "arn:aws:s3:::{{../env.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],
     "Condition": {"DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}}

@@ -526,7 +526,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     let expiry_iso = expiry.to_rfc3339();
     let policy = match render_policy(
         policy_template,
-        &state.config.tenant,
+        surface.env(),
         &caveats,
         &request_json,
         &expiry_iso,

@@ -1,5 +1,5 @@
 //! Self-vended `mint-rw` Tigris keypair for `_mint/*` data-plane I/O
-//! (`docs/design-mint.md` § *Mint state in the tenant bucket*).
+//! (`docs/design-mint.md` § *Mint state in the store bucket*).
 //!
 //! On `serve --tigris` startup, mint asks its own [`KeypairMinter`] for
 //! an access key scoped to `arn:aws:s3:::<bucket>/_mint/*`, then builds
@@ -33,10 +33,10 @@ pub const MINT_RW_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Tigris's S3-compatible endpoint. Mirrors
 /// [`crate::tigris::DEFAULT_ENDPOINT`] for IAM: when `serve --tigris`
-/// is the deployment shape and no explicit `tenant.endpoint` is
+/// is the deployment shape and no explicit `store.endpoint` is
 /// configured, this is where the data plane points. Operators who
 /// need a non-Tigris S3-compatible target (custom AWS, MinIO, etc.)
-/// set `tenant.endpoint` explicitly to override.
+/// set `store.endpoint` explicitly to override.
 pub const DEFAULT_TIGRIS_S3_ENDPOINT: &str = "https://t3.storage.dev";
 
 /// How early before `DateLessThan` to re-mint. At half-life: a transient
@@ -136,7 +136,7 @@ fn aws_credential(kp: &MintedKeypair) -> AwsCredential {
 /// Build the data-plane `AmazonS3` client backed by a self-vended
 /// `mint-rw` keypair, plus the [`SwappableAwsProvider`] handle the
 /// refresh task uses to rotate credentials. The initial mint runs
-/// synchronously so a misconfigured tenant fails fast at startup
+/// synchronously so a misconfigured store bucket fails fast at startup
 /// rather than at the first request.
 pub async fn build_s3_with_mint_rw(
     minter: &Arc<dyn KeypairMinter>,

@@ -5,9 +5,9 @@
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{tenant.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each request.ancestors}},
-      "arn:aws:s3:::{{../tenant.bucket}}/by_id/{{this}}/*"
+      "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
+      {{#each req.ancestors}},
+      "arn:aws:s3:::{{../env.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],
     "Condition": {

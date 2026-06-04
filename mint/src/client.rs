@@ -57,7 +57,7 @@ pub enum ClientError {
     BadFile(&'static str),
     #[error("{path} not found — {hint}")]
     Missing { path: String, hint: &'static str },
-    #[error("--request must be a JSON object ({0})")]
+    #[error("--req must be a JSON object ({0})")]
     BadRequest(&'static str),
     #[error("--caveat must be NAME=VALUE (got {0:?})")]
     BadCaveat(String),
@@ -411,11 +411,11 @@ fn parse_caveats(args: &[String]) -> Result<Vec<(String, String)>, ClientError> 
         .collect()
 }
 
-/// Merge the inline `--request` JSON under the client-owned
+/// Merge the inline `--req` JSON under the client-owned
 /// `ts`/`role`/`ttl_seconds` (those are the conventional fields the
-/// client sets and signs; a value supplied for them in `--request` is
+/// client sets and signs; a value supplied for them in `--req` is
 /// overwritten, not trusted). Pure + ts-injected for testability. mint
-/// is body-field-agnostic — every other `request.*` field is opaque
+/// is body-field-agnostic — every other `req.*` field is opaque
 /// pass-through.
 fn build_request_body(
     request_src: Option<&str>,
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn request_body_is_opaque_passthrough_with_client_owned_fields() {
-        // No --request: just the client-owned conventional fields.
+        // No --req: just the client-owned conventional fields.
         let b = build_request_body(None, "read", 900, 1000).unwrap();
         let v: serde_json::Value = serde_json::from_str(&b).unwrap();
         assert_eq!(v["ts"], 1000);
