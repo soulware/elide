@@ -52,10 +52,11 @@ socket = "mint_data/auth.sock"
 location = "https://auth.elide.internal/v1/discharge"
 
 # Where mint keeps its own enrollment state (`_mint/*`). Operational
-# only — not a template surface. Optional `endpoint`/`region` configure
-# the S3 client mint builds to reach it.
+# only — not a template surface.
 [store]
 bucket = "mint-demo"
+# endpoint = "https://t3.storage.dev"   # default; set for non-Tigris S3
+# region   = "us-east-1"                # default
 
 # Values surfaced to role policy templates as `{{env.X}}`. Flat scalars
 # only; nested tables/arrays are rejected. The demo roles reference

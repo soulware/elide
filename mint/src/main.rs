@@ -233,7 +233,15 @@ enum EnrollCmd {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    if let Err(e) = run().await {
+        eprintln!("error: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
         Command::Serve { config, bind } => serve(&config, bind).await,
         Command::Login {
