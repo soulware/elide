@@ -34,7 +34,7 @@ use crate::issuance::mint_invite;
 use crate::macaroon::Macaroon;
 use crate::operator::Operator;
 use crate::seal::Seal;
-use crate::sealed_cache::{self, SealState, ServedSurface};
+use crate::sealed_cache::{SealState, ServedSurface};
 use crate::state::{EnrollmentState, EnrollmentView, Store};
 
 fn unauthorized_response() -> Response {
@@ -373,14 +373,13 @@ async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: By
     if let Err(e) = state.store.put_template_seal(&seal).await {
         return service_unavailable(&format!("publish seal: {e}"));
     }
-    // Cache what we just published so this host serves it after a
-    // restart without re-deriving from `roles_dir/`.
-    let templates = sealed_cache::policies_from_config(&state.config);
-    if let Err(e) =
-        sealed_cache::write(&state.config.data_dir, &seal, &templates, &state.config.env)
-    {
-        return service_unavailable(&format!("write sealed cache: {e}"));
-    }
+    // Cache what we just published so this host serves it after a restart
+    // without re-deriving from `roles_dir/`, and take the surface to swap
+    // in below.
+    let surface = match ServedSurface::materialize(&state.config, &seal, &state.config.data_dir) {
+        Ok(s) => s,
+        Err(e) => return service_unavailable(&format!("write sealed cache: {e}")),
+    };
 
     let roles: std::collections::BTreeMap<String, String> = seal
         .roles
@@ -394,21 +393,9 @@ async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: By
     // dormant or not — without a restart. In-flight requests finish
     // against the surface they loaded (`docs/design-mint-template-seal.md`
     // § *Dormant until sealed*).
-    let surface = ServedSurface {
-        seal: seal.clone(),
-        templates,
-        env: state.config.env.clone(),
-    };
     state.seal.store(Arc::new(SealState::Serving(surface)));
 
-    tracing::info!(
-        target: "mint::admin",
-        operator = %operator,
-        kid = seal.kid,
-        sealed_at = %sealed_at,
-        roles = roles.len(),
-        "published template seal (now serving)"
-    );
+    crate::seal::log_now_serving(&seal, Some(&operator));
     json_ok(SealResponse {
         kid: seal.kid,
         sealed_at,
