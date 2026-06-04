@@ -42,40 +42,25 @@ enum Command {
     Serve {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
-        /// TCP `host:port` override. Forces the TCP transport, taking
-        /// precedence over the config's `bind`/`socket`. Omit to use
-        /// the listener the config resolves to.
+        /// TCP `host:port` to bind.
         #[arg(long)]
         bind: Option<SocketAddr>,
     },
     /// Log in at the auth service; store the session gating `/v1/discharge`.
-    ///
-    /// Persists the per-user session + transport under `$XDG_CONFIG_HOME/mint`
-    /// (else `~/.config/mint`). One login serves both the operator admin plane
-    /// and `mint client`.
-    ///
-    /// Transport precedence: `--url`, else `--config`'s `[demo_auth]`
-    /// socket (flag, else `MINT_CONFIG`), else the transport remembered
-    /// from a prior login. The demo auth role accepts any subject with no
-    /// password; re-run when the session lapses (~7 days).
     Login {
         /// Auth-service endpoint: `unix:<socket-path>` or
-        /// `http(s)://host:port`. Overwrites the remembered transport.
+        /// `http(s)://host:port`.
         #[arg(long)]
         url: Option<String>,
-        /// Derive the auth transport from a mint config's `[demo_auth]`
-        /// socket, when `--url` is omitted.
+        /// Derive the auth transport from a mint config's auth-role
+        /// socket.
         #[arg(long, env = "MINT_CONFIG")]
         config: Option<PathBuf>,
-        /// Opaque subject, stamped into issued discharges for audit. Any
-        /// value is accepted in the demo.
+        /// Opaque subject, stamped into issued discharges for audit.
         #[arg(long, default_value = "operator")]
         subject: String,
     },
-    /// Log out, removing the per-user session (keeps the remembered transport).
-    ///
-    /// A later bare `mint login` re-authenticates at the same place; discharge
-    /// calls require a fresh login until then.
+    /// Log out, removing the per-user session.
     Logout,
     /// Print the invite macaroon (reusable, non-expiring).
     ///
@@ -98,17 +83,7 @@ enum Command {
         #[command(subcommand)]
         cmd: RoleCmd,
     },
-    /// Operator: stage a new template seal, published on the next `mint serve`.
-    ///
-    /// Signed under the current keyring.
-    ///
-    /// Reads `roles_dir/` + `mint.toml`, hashes each role's policy
-    /// template, signs the manifest under
-    /// `<data_dir>/root_keys/current`, and writes the result to
-    /// `<data_dir>/pending-seal.json` (mode 0600, atomic). No bucket
-    /// I/O — `mint serve` performs the PUT on its next start, with
-    /// semantic-equality reconcile against whatever is already in
-    /// `_mint/templates/seal.json`.
+    /// Operator: seal the current role configuration.
     Seal {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
@@ -134,8 +109,7 @@ enum ClientCmd {
     ///
     /// Attenuates the invite macaroon with `sub`/`cnf`.
     Enroll {
-        /// UDS path of the local mint daemon. Defaults to the
-        /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
+        /// UDS path of the local mint daemon.
         #[arg(long)]
         socket: Option<PathBuf>,
         /// Opaque principal id — the `sub`. Any path-safe string
@@ -155,8 +129,7 @@ enum ClientCmd {
     ///
     /// Run after approval; exits 2 while still awaiting operator approval.
     Exchange {
-        /// UDS path of the local mint daemon. Defaults to the
-        /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
+        /// UDS path of the local mint daemon.
         #[arg(long)]
         socket: Option<PathBuf>,
         /// Credential-ticket filename (under the client dir) to present.
@@ -178,8 +151,7 @@ enum ClientCmd {
     },
     /// Assume a role with the held credential; prints the keypair JSON.
     AssumeRole {
-        /// UDS path of the local mint daemon. Defaults to the
-        /// `MINT_CONFIG` listener socket, else `<data_dir>/mint.sock`.
+        /// UDS path of the local mint daemon.
         #[arg(long)]
         socket: Option<PathBuf>,
         /// Credential filename (under the client dir) to exercise.
@@ -235,35 +207,23 @@ enum RoleCmd {
 
 #[derive(Subcommand)]
 enum EnrollCmd {
-    /// List enrollments — pending and approved — with state as a
-    /// column (`docs/design-mint.md` § *Reference client & demo*).
+    /// List enrollments — pending and approved — with state as a column.
     List {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
     },
     /// Approve a pending record by its `sub`.
-    ///
-    /// Prints the record's `cnf` fingerprint and asks for an
-    /// interactive y/N confirmation: confirming **is** the trust anchor
-    /// (it must match what the client reports via
-    /// `mint client fingerprint`). `--yes` skips the prompt for
-    /// automation.
     Approve {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
         /// The opaque principal id (any path-safe string; not required
         /// to be a ULID).
         sub: String,
-        /// Skip the interactive confirmation (automation only — you are
-        /// asserting the fingerprint was verified out of band).
+        /// Skip the interactive confirmation.
         #[arg(long)]
         yes: bool,
     },
     /// Revoke an approved-client registry entry.
-    ///
-    /// After this, the next `/v1/enroll` for `<sub>` falls back to the
-    /// slow path: a fresh pending record requiring a fresh operator
-    /// approval. Outstanding credentials are unaffected.
     Revoke {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
