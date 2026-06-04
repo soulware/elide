@@ -213,28 +213,17 @@ enum EnrollCmd {
         config: PathBuf,
     },
     /// Approve a pending record by its `sub`.
-    ///
-    /// Prints the record's `cnf` fingerprint and asks for an
-    /// interactive y/N confirmation: confirming **is** the trust anchor
-    /// (it must match what the client reports via
-    /// `mint client fingerprint`). `--yes` skips the prompt for
-    /// automation.
     Approve {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
         /// The opaque principal id (any path-safe string; not required
         /// to be a ULID).
         sub: String,
-        /// Skip the interactive confirmation (automation only — you are
-        /// asserting the fingerprint was verified out of band).
+        /// Skip the interactive confirmation.
         #[arg(long)]
         yes: bool,
     },
     /// Revoke an approved-client registry entry.
-    ///
-    /// After this, the next `/v1/enroll` for `<sub>` falls back to the
-    /// slow path: a fresh pending record requiring a fresh operator
-    /// approval. Outstanding credentials are unaffected.
     Revoke {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
