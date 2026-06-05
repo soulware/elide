@@ -10,7 +10,7 @@
       "arn:aws:s3:::{{env.bucket}}/meta/{{caveat "elide:Volume"}}.pub"
     ],
     "Condition": {
-      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+      "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
     }
   }]
 }

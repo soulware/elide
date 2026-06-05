@@ -11,7 +11,7 @@
       "arn:aws:s3:::{{env.bucket}}/meta/*"
     ],
     "Condition": {
-      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+      "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
     }
   }]
 }

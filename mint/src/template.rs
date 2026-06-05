@@ -6,7 +6,7 @@
 //! - `{{caveat "elide:X"}}`    — verified-macaroon caveat, looked up
 //!   through a registered `caveat` helper. Scalars render directly;
 //!   list caveats iterate as `{{#each (caveat "elide:X")}}`.
-//! - `{{system.X}}`            — mint-computed (`system.expiry_iso8601`).
+//! - `{{mint.X}}`              — mint-computed (`mint.expiry`).
 //!
 //! Caveats are reached through the `caveat` *helper* — not a
 //! `{{caveat.X}}` data path — for two reasons:
@@ -16,7 +16,7 @@
 //!    the name as a string argument, so the doc's `:` convention is
 //!    preserved unchanged (no issuer-side rename).
 //! 2. It tightens the "mint ships no policy DSL" property: the only
-//!    template surface is `{{env.*}}` / `{{system.*}}` plain paths,
+//!    template surface is `{{env.*}}` / `{{mint.*}}` plain paths,
 //!    one `caveat` lookup helper, and the built-in `{{#each}}`. There
 //!    is no arbitrary data-graph traversal.
 //!
@@ -100,13 +100,13 @@ fn resolved_map(caveats: &[Caveat]) -> BTreeMap<String, String> {
 /// body here.
 /// Each substitution class has a distinct, explicit trust provenance:
 /// `caveat.*` MAC-bound, `req.*` PoP-bound, `env.*` config,
-/// `system.*` mint-computed.
+/// `mint.*` mint-computed.
 pub fn render_policy(
     policy_template: &str,
     env: &BTreeMap<String, String>,
     caveats: &[Caveat],
     request: &Value,
-    expiry_iso8601: &str,
+    expiry: &str,
     role: &str,
 ) -> Result<String, TemplateError> {
     let mut reg = Handlebars::new();
@@ -126,15 +126,12 @@ pub fn render_policy(
         env_map.insert(k.clone(), Value::String(v.clone()));
     }
 
-    let mut system_map = Map::new();
-    system_map.insert(
-        "expiry_iso8601".into(),
-        Value::String(expiry_iso8601.to_string()),
-    );
+    let mut mint_map = Map::new();
+    mint_map.insert("expiry".into(), Value::String(expiry.to_string()));
 
     let mut data = Map::new();
     data.insert("env".into(), Value::Object(env_map));
-    data.insert("system".into(), Value::Object(system_map));
+    data.insert("mint".into(), Value::Object(mint_map));
     data.insert("req".into(), request.clone());
 
     // Register under the role name so handlebars error messages name
@@ -148,19 +145,19 @@ pub fn render_policy(
 
 /// The substitution surface a policy template references, grouped by
 /// trust provenance (`docs/design-mint.md` § *Templating*): `caveats`
-/// MAC-bound, `req` PoP-bound, `env` config, `system`
+/// MAC-bound, `req` PoP-bound, `env` config, `mint`
 /// mint-computed. Each list is sorted and de-duplicated.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TemplateSurface {
     pub caveats: Vec<String>,
     pub env: Vec<String>,
-    pub system: Vec<String>,
+    pub mint: Vec<String>,
     pub req: Vec<String>,
 }
 
 /// Extract the [`TemplateSurface`] of a policy template by scanning the
 /// four documented token shapes — `{{caveat "name"}}`, `{{env.*}}`,
-/// `{{system.*}}`, `{{req.*}}` (with optional `../`/`./` scope
+/// `{{mint.*}}`, `{{req.*}}` (with optional `../`/`./` scope
 /// prefixes and `(…)` subexpression wrapping). Lets `mint role inspect`
 /// state what a role's policy depends on without rendering it:
 /// rendering needs a live verified request and fails closed on any
@@ -205,8 +202,8 @@ pub fn template_surface(template: &str) -> TemplateSurface {
             p = p.strip_prefix("./").unwrap_or(p);
             let bucket = if p == "env" || p.starts_with("env.") {
                 Some(&mut s.env)
-            } else if p == "system" || p.starts_with("system.") {
-                Some(&mut s.system)
+            } else if p == "mint" || p.starts_with("mint.") {
+                Some(&mut s.mint)
             } else if p == "req" || p.starts_with("req.") {
                 Some(&mut s.req)
             } else {
@@ -217,7 +214,7 @@ pub fn template_surface(template: &str) -> TemplateSurface {
             }
         }
     }
-    for v in [&mut s.caveats, &mut s.env, &mut s.system, &mut s.req] {
+    for v in [&mut s.caveats, &mut s.env, &mut s.mint, &mut s.req] {
         v.sort();
         v.dedup();
     }
@@ -243,7 +240,7 @@ mod tests {
       "arn:aws:s3:::{{../env.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],
-    "Condition": {"DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}}
+    "Condition": {"DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}}
   }]
 }"#;
 
@@ -252,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_scalar_caveat_signed_request_list_and_system() {
+    fn renders_scalar_caveat_signed_request_list_and_mint() {
         let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
         let out = render_policy(
             TPL,
@@ -344,12 +341,12 @@ mod tests {
     fn surface_groups_refs_by_provenance_through_scopes_and_subexprs() {
         // TPL exercises every shape: a scalar caveat, a `../`-scoped
         // env ref inside an #each block, a req.* block path, and
-        // a system.* ref. `{{this}}` and the `each` helper are not data
+        // a mint.* ref. `{{this}}` and the `each` helper are not data
         // refs and must not leak in.
         let s = template_surface(TPL);
         assert_eq!(s.caveats, vec!["elide:Volume"]);
         assert_eq!(s.env, vec!["env.bucket"]); // ../ scope folded
-        assert_eq!(s.system, vec!["system.expiry_iso8601"]);
+        assert_eq!(s.mint, vec!["mint.expiry"]);
         assert_eq!(s.req, vec!["req.ancestors"]);
 
         // Subexpression form `{{#each (caveat "elide:X")}}` and a bare
@@ -359,7 +356,7 @@ mod tests {
         );
         assert_eq!(s.caveats, vec!["a", "b"]);
         assert_eq!(s.env, vec!["env"]);
-        assert!(s.system.is_empty() && s.req.is_empty());
+        assert!(s.mint.is_empty() && s.req.is_empty());
 
         // Comments/partials contribute nothing.
         assert_eq!(

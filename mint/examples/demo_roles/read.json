@@ -6,7 +6,7 @@
     "Action": ["s3:GetObject"],
     "Resource": ["arn:aws:s3:::{{env.bucket}}/{{req.prefix}}/*"],
     "Condition": {
-      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+      "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
     }
   }]
 }
