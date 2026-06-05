@@ -92,11 +92,24 @@ async fn state_with_audit() -> (
     let seal = Arc::new(arc_swap::ArcSwap::from_pointee(
         mint::sealed_cache::serving_from_config(&cfg),
     ));
+    // assume-role clears the credential against a present enrolled
+    // record (§ *Revocation*). Approve SUB at the implicit epoch 0 so a
+    // credential minted at epoch 0 with this cnf clears.
+    let store = Store::open_local(dir.path()).await.expect("store");
+    store
+        .approve(
+            SUB,
+            &pop::cnf_value(&CLIENT_SEED),
+            "usr_test",
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        .expect("approve");
     let state = AppState {
         config: Arc::new(cfg),
         minter: minter.clone(),
         audit: Arc::new(AuditLog::new(Box::new(AuditSink(buf.clone())))),
-        store: Arc::new(Store::open_local(dir.path()).await.expect("store")),
+        store: Arc::new(store),
         seal,
     };
     (state, buf, minter, dir)
@@ -115,6 +128,7 @@ fn request_macaroon() -> Macaroon {
         SUB,
         &pop::cnf_value(&CLIENT_SEED),
         "volume-ro",
+        0,
     )
     .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
     .attenuate(Caveat::scalar("elide:Volume", "VOL1"))
@@ -265,7 +279,8 @@ async fn bad_mac_is_opaque_401() {
 
 #[tokio::test]
 async fn missing_required_caveat_is_400() {
-    // A cnf-bound, PoP-signed macaroon passes auth but carries no
+    // A cnf-bound, PoP-signed macaroon that clears the revocation gate
+    // (present enrolled record, matching cnf + epoch) but carries no
     // elide:Volume → the role gate denies with 400.
     let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
@@ -274,8 +289,10 @@ async fn missing_required_caveat_is_400() {
         vec![
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::SUB, SUB),
             Caveat::scalar(name::ROLE, "volume-ro"),
             Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(name::EPOCH, "0"),
             Caveat::scalar(name::EXP, far_future().to_string()),
         ],
     );
@@ -295,6 +312,99 @@ async fn no_auth_header_is_401() {
         .unwrap();
     let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn revoked_credential_is_401() {
+    // A credential that minted fine stops clearing once its sub is
+    // revoked: the enrolled record is gone, so the revocation gate denies
+    // and no second keypair is minted.
+    let (state, _, minter, _dir) = state_with_audit().await;
+    let store = state.store.clone();
+    let app = router(state);
+    let m = request_macaroon();
+
+    let req = signed_request(
+        &m,
+        r#""role":"volume-ro","ttl_seconds":3600,"ancestors":[]"#,
+    );
+    let (status, body) = body_string(app.clone().oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    store
+        .revoke(SUB, "usr_test", &chrono::Utc::now().to_rfc3339())
+        .await
+        .expect("revoke");
+
+    let req = signed_request(
+        &m,
+        r#""role":"volume-ro","ttl_seconds":3600,"ancestors":[]"#,
+    );
+    let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "revoked credential denied"
+    );
+    assert_eq!(minter.calls().len(), 1, "no keypair minted after revoke");
+}
+
+#[tokio::test]
+async fn re_approval_after_revoke_does_not_revive_old_credential() {
+    // The epoch is what presence alone cannot enforce: after revoke +
+    // re-approve, the enrolled record's rev_epoch advances, so a
+    // credential minted before the revocation (epoch 0) stays dead while
+    // a freshly minted one (epoch 1) clears.
+    let (state, _, _minter, _dir) = state_with_audit().await;
+    let store = state.store.clone();
+    let app = router(state);
+    let old = request_macaroon();
+
+    store
+        .revoke(SUB, "usr_test", &chrono::Utc::now().to_rfc3339())
+        .await
+        .expect("revoke");
+    store
+        .approve(
+            SUB,
+            &pop::cnf_value(&CLIENT_SEED),
+            "usr_test",
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        .expect("re-approve");
+
+    let req = signed_request(
+        &old,
+        r#""role":"volume-ro","ttl_seconds":3600,"ancestors":[]"#,
+    );
+    let (status, _) = body_string(app.clone().oneshot(req).await.unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "old-epoch credential stays dead after re-approval"
+    );
+
+    let fresh = mint_credential(
+        &Keyring::single(ROOT),
+        "mint",
+        SUB,
+        &pop::cnf_value(&CLIENT_SEED),
+        "volume-ro",
+        1,
+    )
+    .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
+    .attenuate(Caveat::scalar("elide:Volume", "VOL1"));
+    let req = signed_request(
+        &fresh,
+        r#""role":"volume-ro","ttl_seconds":3600,"ancestors":[]"#,
+    );
+    let (status, body) = body_string(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "new-epoch credential clears; body: {body}"
+    );
 }
 
 #[tokio::test]

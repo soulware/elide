@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/invite/rotate", post(handle_rotate_invite))
         .route("/v1/admin/enrollments", post(handle_list_enrollments))
         .route("/v1/admin/enroll/approve", post(handle_approve))
+        .route("/v1/admin/enroll/revoke", post(handle_revoke))
         .route("/v1/admin/seal", post(handle_seal))
         .with_state(state)
 }
@@ -69,6 +70,7 @@ const ADMIN_INVITE_READ: &str = "admin:invite-read";
 const ADMIN_INVITE_ROTATE: &str = "admin:invite-rotate";
 const ADMIN_ENROLL_LIST: &str = "admin:enroll-list";
 const ADMIN_ENROLL_APPROVE: &str = "admin:enroll-approve";
+const ADMIN_ENROLL_REVOKE: &str = "admin:enroll-revoke";
 const ADMIN_SEAL: &str = "admin:seal";
 
 #[derive(Serialize, Deserialize)]
@@ -275,6 +277,44 @@ async fn handle_approve(
     {
         Ok(()) => json_ok(ApproveResponse { approved_at }),
         Err(e) => service_unavailable(&format!("approve: {e}")),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RevokeRequest {
+    pub sub: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RevokeResponse {
+    pub revoked_at: String,
+    /// High-water revocation epoch written to the tombstone.
+    pub rev_epoch: u64,
+    /// Whether a live enrolled record was present (false when the `sub`
+    /// was already revoked or never enrolled — the tombstone is still
+    /// written/kept, so the call is idempotent and fail-safe).
+    pub was_enrolled: bool,
+}
+
+/// Revoke a coordinator by `sub` — delete its enrolled record and write
+/// the revocation tombstone (`docs/design-mint.md` § *Revocation*).
+async fn handle_revoke(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let revoked_by = match verify_discharge(&state, &headers, &body, ADMIN_ENROLL_REVOKE).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let req: RevokeRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return unauthorized_response(),
+    };
+    let revoked_at = Utc::now().to_rfc3339();
+    match state.store.revoke(&req.sub, &revoked_by, &revoked_at).await {
+        Ok(outcome) => json_ok(RevokeResponse {
+            revoked_at,
+            rev_epoch: outcome.rev_epoch,
+            was_enrolled: outcome.was_enrolled,
+        }),
+        Err(e) => service_unavailable(&format!("revoke: {e}")),
     }
 }
 
@@ -518,6 +558,25 @@ pub async fn approve_enrollment(
         op,
         discharge,
         ADMIN_ENROLL_APPROVE,
+        body,
+    )
+    .await?;
+    ok_json(status, &resp)
+}
+
+pub async fn revoke_enrollment(
+    target: AdminTarget<'_>,
+    op: &Operator,
+    discharge: &Macaroon,
+    req: &RevokeRequest,
+) -> Result<RevokeResponse, AdminClientError> {
+    let body = body_with_ts(req)?;
+    let (status, resp) = authed_post(
+        target,
+        "/v1/admin/enroll/revoke",
+        op,
+        discharge,
+        ADMIN_ENROLL_REVOKE,
         body,
     )
     .await?;

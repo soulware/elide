@@ -223,6 +223,17 @@ enum EnrollCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Revoke a coordinator by its `sub` — kills every credential it
+    /// holds and drops it to the operator-gated slow path.
+    Revoke {
+        #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
+        config: PathBuf,
+        /// The opaque principal id of the coordinator to revoke.
+        sub: String,
+        /// Skip the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -247,6 +258,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Enroll { cmd } => match cmd {
             EnrollCmd::List { config } => enroll_list(&config).await,
             EnrollCmd::Approve { config, sub, yes } => enroll_approve(&config, &sub, yes).await,
+            EnrollCmd::Revoke { config, sub, yes } => enroll_revoke(&config, &sub, yes).await,
         },
         Command::Seal { config } => seal(&config).await,
         Command::Role { cmd } => match cmd {
@@ -792,6 +804,51 @@ async fn enroll_approve(
         "approved {sub} (registry entry written at {}; pending record deleted)",
         resp.approved_at
     );
+    Ok(())
+}
+
+async fn enroll_revoke(
+    config: &Path,
+    sub: &str,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let config = load(config)?;
+    let (op, discharge) = operator_session(&config).await?;
+
+    if !yes {
+        eprintln!("revoke enrollment:");
+        eprintln!("  sub: {sub}");
+        eprint!(
+            "Revoke? This kills every credential this coordinator holds \
+             and drops it to the operator-gated slow path; live S3 access \
+             dies within one keypair TTL. [y/N] "
+        );
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
+            eprintln!("not revoked");
+            std::process::exit(1);
+        }
+    }
+
+    let req = mint::admin::RevokeRequest {
+        sub: sub.to_owned(),
+    };
+    let resp = mint::admin::revoke_enrollment(admin_target(&config), &op, &discharge, &req).await?;
+    if resp.was_enrolled {
+        eprintln!(
+            "revoked {sub} at {} (epoch {}; enrolled record deleted, tombstone written)",
+            resp.revoked_at, resp.rev_epoch
+        );
+    } else {
+        eprintln!(
+            "revoked {sub} at {} (epoch {}; no live enrolled record — tombstone written/kept)",
+            resp.revoked_at, resp.rev_epoch
+        );
+    }
     Ok(())
 }
 

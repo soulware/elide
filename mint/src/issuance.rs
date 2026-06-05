@@ -132,17 +132,24 @@ pub fn mint_credential_ticket(
 
 /// The non-expiring credential, re-minted from root at a successful
 /// exchange: `op=assume-role`, `aud`, the same `sub`/`cnf`, the
-/// `role` it was authorized for, **no** `exp`. A fresh chain, not an
-/// attenuation of the credential ticket (only the root holder can do
-/// this). One credential carries exactly one role — a client
-/// exchanges once per role it needs (`docs/design-mint.md` §
-/// *Credential macaroon & lifecycle*).
+/// `role` it was authorized for, the enrolled record's `rev_epoch` as
+/// an `epoch` caveat, **no** `exp`. A fresh chain, not an attenuation
+/// of the credential ticket (only the root holder can do this). One
+/// credential carries exactly one role — a client exchanges once per
+/// role it needs (`docs/design-mint.md` § *Credential macaroon &
+/// lifecycle*).
+///
+/// `rev_epoch` is the revocation generation `assume-role` later clears
+/// the credential against (`docs/design-mint.md` § *Revocation*): a
+/// revoke bumps the enrolled record's epoch, so a credential minted
+/// before it carries a now-stale value and can never clear again.
 pub fn mint_credential(
     keyring: &Keyring,
     audience: &str,
     sub: &str,
     cnf: &str,
     role: &str,
+    rev_epoch: u64,
 ) -> Macaroon {
     macaroon::mint(
         keyring,
@@ -152,6 +159,7 @@ pub fn mint_credential(
             Caveat::scalar(name::SUB, sub),
             Caveat::scalar(name::CNF, cnf),
             Caveat::scalar(name::ROLE, role),
+            Caveat::scalar(name::EPOCH, rev_epoch.to_string()),
         ],
     )
 }
@@ -300,7 +308,7 @@ mod tests {
         // The exchange gate: the ticket carries its own TPC.
         assert_eq!(tpc_count(&ticket), 1);
 
-        let cred = mint_credential(&kr, "mint", SUB, &cnf(), "volume-ro");
+        let cred = mint_credential(&kr, "mint", SUB, &cnf(), "volume-ro", 7);
         assert!(cred.verify(&kr));
         let pe = EffectiveCaveats::new(cred.caveats());
         assert_eq!(
@@ -310,6 +318,8 @@ mod tests {
         assert_eq!(pe.resolve(name::SUB), Resolved::Value(SUB.into()));
         assert_eq!(pe.resolve(name::CNF), Resolved::Value(cnf()));
         assert_eq!(pe.resolve(name::ROLE), Resolved::Value("volume-ro".into()));
+        // The credential carries the revocation epoch it was minted at.
+        assert_eq!(pe.resolve(name::EPOCH), Resolved::Value("7".into()));
         // The credential does not expire.
         assert_eq!(pe.not_after(name::EXP), None);
         // A credential carries no third-party caveat — operator authority

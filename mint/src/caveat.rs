@@ -40,6 +40,12 @@ pub mod name {
     pub const OP: &str = "op";
     /// Restricts the assumable role. Optional.
     pub const ROLE: &str = "role";
+    /// Per-coordinator revocation epoch. Stamped on a credential at
+    /// `enroll-exchange` from the enrolled record's `rev_epoch`, then
+    /// cleared at `assume-role`: the credential's value must equal the
+    /// enrolled record's current `rev_epoch` or the credential is dead
+    /// (`docs/design-mint.md` § *Revocation*).
+    pub const EPOCH: &str = "epoch";
     /// Carried only by the invite macaroon; the current nonce.
     pub const INVITE: &str = "invite";
     /// Discharge / attenuation deadline, unix seconds; multiple narrow

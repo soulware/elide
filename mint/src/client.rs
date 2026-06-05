@@ -772,6 +772,7 @@ mod tests {
             "coord-1",
             "ed25519:k",
             "write",
+            0,
         );
         save_macaroon(dir, &credential_path("write"), &cred.encode()).unwrap();
         assert!(credential_list(dir).is_ok());
