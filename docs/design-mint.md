@@ -1303,8 +1303,23 @@ only three places, and the routing key to replace it exists at each:
 
 `read_head_with_ancestors` and the `ancestors` argument to
 `provision_volume_ro` are removed; the `Credentials` IPC and mint's
-`assume-role` body carry a single target volume; mint's `issue` drops the
-lineage walk. The mint side gets strictly simpler.
+`assume-role` body carry a single target volume. The mint side gets
+strictly simpler — `provision_volume_ro` no longer expands a list.
+
+**Authorization.** Today the volume's macaroon binds it to its own
+`volume_ulid` (the `volume()` caveat) and never names a target: the
+coordinator derives the lineage and grants self+ancestors, so there is
+nothing to authorize — a volume can only ever obtain its own chain. Once
+the volume **names** the target owner, that property must be re-asserted
+explicitly: the coordinator authorizes each request against
+`target ∈ {self} ∪ lineage(self)`, where `self` is the macaroon-bound
+volume, and refuses otherwise. Without this check a volume could request a
+read credential for any volume. The lineage walk that builds today's grant
+is not deleted — it **relocates** from "construct the ancestor set" to
+"authorize the named target", staying coordinator-side; mint itself only
+ever issues a single-prefix credential for one named volume. Net authority
+is identical to today (read self + ancestors), issued one prefix at a time
+and re-authorized per prefix.
 
 **Cost.** One credential acquisition per *distinct ancestor actually
 demand-fetched* (cached, idle-dropped), versus one chain-spanning
