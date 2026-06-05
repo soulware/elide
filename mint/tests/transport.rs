@@ -29,12 +29,11 @@ const AUTH_URL: &str = "https://auth.example/v1/discharge";
 
 const TOML: &str = r#"
 audience = "mint"
+auth_location = "https://auth.example/v1/discharge"
 [store]
 bucket = "demo-bucket"
 [demo_auth]
 enabled = true
-[operator]
-location = "https://auth.example/v1/discharge"
 [[role]]
 name = "volume-rw"
 required_caveats = ["aud"]

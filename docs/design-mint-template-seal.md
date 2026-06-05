@@ -508,8 +508,8 @@ operator's nose every time the keyring rotated).
   surface (`audience`, every role block and each policy file), not the rest of
   `mint.toml`, which carries host-specific settings that legitimately
   vary across the fleet (listener address, `data_dir`, the
-  `[demo_auth]` transport, the operator admin-service's `[operator]`
-  location). The operator/demo endpoints in particular are left
+  `[demo_auth]` transport, the operator admin-service's `auth_location`).
+  The operator/demo endpoints in particular are left
   unsealed deliberately: repointing one is a denial-of-service, not an
   authority escalation, because a discharge from a rogue endpoint still
   has to verify under the third-party-caveat key mint holds.
