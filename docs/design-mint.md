@@ -1219,6 +1219,14 @@ check:
   *is* the "this token sits in a safe position" assertion; there is no
   separate positional check to forget.
 
+Seal authoring also **lints token shape**: every `{{…}}` must be a
+well-formed `namespace.key` scalar path. A leftover engine-ism
+(`{{#each}}`), a namespace-less or empty token, or an unterminated `{{`
+would fail the render closed, so the lint surfaces it at publish — a
+sealed template is one the renderer can actually render. (Absent *values*
+are not linted: a `req`/`caveat`/`mint` field's value is not known until a
+request, so that stays a render-time strict-mode concern.)
+
 The mint substitutes four classes of variable, each with an explicit,
 distinct trust provenance:
 

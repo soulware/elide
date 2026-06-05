@@ -64,6 +64,8 @@ pub enum ConfigError {
         role: String,
         source: serde_json::Error,
     },
+    #[error("role {role}: policy template has a malformed substitution {token}")]
+    MalformedPolicyToken { role: String, token: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -459,7 +461,7 @@ impl Config {
         })
     }
 
-    /// Gate **seal authoring** (`POST /v1/admin/seal`) on two template
+    /// Gate **seal authoring** (`POST /v1/admin/seal`) on three template
     /// invariants:
     ///
     /// 1. Every policy template parses as JSON. A `{{…}}` token may sit
@@ -469,23 +471,35 @@ impl Config {
     ///    substitutes into the parsed string leaves and re-serialises, so
     ///    a valid-JSON template is the precondition for injection-proof
     ///    rendering (`crate::template`).
-    /// 2. Every `{{env.X}}` a template references names a key present in
+    /// 2. Every `{{…}}` token is a well-formed `namespace.key` scalar path.
+    ///    An engine-ism (`{{#each}}`), a namespace-less or empty token, or
+    ///    an unterminated `{{` would fail the render closed; the lint
+    ///    surfaces it at publish instead, so a sealed template is one the
+    ///    renderer can actually render.
+    /// 3. Every `{{env.X}}` a template references names a key present in
     ///    `[env]` — a seal must not pin templates referencing undefined
     ///    env values.
     ///
-    /// Neither is run at config load: the request path renders the sealed
+    /// None is run at config load: the request path renders the sealed
     /// surface, decoupled from the live config, so a drifted local
     /// template must never block a host from serving its already-sealed
     /// roles. Render-time strict mode is the final backstop if `[env]` is
     /// later mutated to drop a key a sealed template uses.
     pub fn validate_policy_surface(&self) -> Result<(), ConfigError> {
         for role in self.roles.values() {
-            serde_json::from_str::<serde_json::Value>(&role.policy).map_err(|source| {
-                ConfigError::PolicyNotJson {
+            let doc =
+                serde_json::from_str::<serde_json::Value>(&role.policy).map_err(|source| {
+                    ConfigError::PolicyNotJson {
+                        role: role.name.clone(),
+                        source,
+                    }
+                })?;
+            if let Some(token) = crate::template::malformed_tokens(&doc).into_iter().next() {
+                return Err(ConfigError::MalformedPolicyToken {
                     role: role.name.clone(),
-                    source,
-                }
-            })?;
+                    token,
+                });
+            }
             for path in crate::template::template_surface(&role.policy).env {
                 if let Some(key) = path.strip_prefix("env.")
                     && !self.env.contains_key(key)
@@ -662,6 +676,31 @@ policy_file = "r.json"
         assert!(matches!(
             cfg.validate_policy_surface(),
             Err(ConfigError::UndefinedEnvKey { key, .. }) if key == "region"
+        ));
+    }
+
+    #[test]
+    fn malformed_token_passes_load_but_fails_seal_validation() {
+        // An engine-ism the renderer would fail closed on is caught at
+        // seal authoring, not deferred to first render. Like the env-key
+        // check, config load tolerates it (serving is decoupled).
+        let cfg = parse_for_test(ENV_SAMPLE, &[("r.json", r#"{"r":"{{#each items}}"}"#)])
+            .expect("load tolerates a malformed token");
+        assert!(matches!(
+            cfg.validate_policy_surface(),
+            Err(ConfigError::MalformedPolicyToken { token, .. }) if token == "{{#each items}}"
+        ));
+    }
+
+    #[test]
+    fn non_json_template_passes_load_but_fails_seal_validation() {
+        // A token that escaped its string slot makes the template invalid
+        // JSON; the seal gate rejects it before it can ever be rendered.
+        let cfg = parse_for_test(ENV_SAMPLE, &[("r.json", r#"{"r":[{{req.volume}}]}"#)])
+            .expect("load tolerates a non-JSON template");
+        assert!(matches!(
+            cfg.validate_policy_surface(),
+            Err(ConfigError::PolicyNotJson { role, .. }) if role == "r"
         ));
     }
 

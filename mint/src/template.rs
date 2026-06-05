@@ -73,6 +73,23 @@ enum Resolution {
     Malformed,
 }
 
+/// Parse a token's trimmed interior into `(namespace, key)`, or `None` if
+/// it is not a well-formed `namespace.key` scalar path — an unknown
+/// namespace, a missing or empty key, or embedded whitespace (which
+/// catches engine-isms like `#each items`). The single definition of
+/// token *shape*, shared by the renderer, the surface scanner, and the
+/// seal-time lint so all three agree on what is valid.
+fn classify_token(inner: &str) -> Option<(&str, &str)> {
+    if inner.is_empty() || inner.contains(char::is_whitespace) {
+        return None;
+    }
+    let (ns, key) = inner.split_once('.')?;
+    if key.is_empty() {
+        return None;
+    }
+    matches!(ns, "env" | "mint" | "req" | "caveat").then_some((ns, key))
+}
+
 /// Render `policy_template` into a concrete IAM policy JSON string.
 ///
 /// The template is parsed as JSON; substitution happens only into string
@@ -121,15 +138,9 @@ pub fn render_policy(
     }
 
     let resolve = |inner: &str| -> Resolution {
-        if inner.is_empty() || inner.contains(char::is_whitespace) {
-            return Resolution::Malformed;
-        }
-        let Some((ns, key)) = inner.split_once('.') else {
+        let Some((ns, key)) = classify_token(inner) else {
             return Resolution::Malformed;
         };
-        if key.is_empty() {
-            return Resolution::Malformed;
-        }
         let value = match ns {
             "env" => env.get(key).cloned(),
             "mint" => (key == "expiry").then(|| expiry.to_string()),
@@ -137,6 +148,7 @@ pub fn render_policy(
             // Only top-level string fields are substitutable; a non-string
             // (or absent) `req` field fails closed.
             "req" => request.get(key).and_then(Value::as_str).map(str::to_string),
+            // `classify_token` already rejected unknown namespaces.
             _ => return Resolution::Malformed,
         };
         match value {
@@ -252,29 +264,69 @@ pub fn template_surface(template: &str) -> TemplateSurface {
         };
         let inner = after[..close].trim();
         rest = &after[close + 2..];
-        if inner.is_empty() || inner.contains(char::is_whitespace) {
-            continue;
+        if let Some((ns, _key)) = classify_token(inner) {
+            let bucket = match ns {
+                "env" => &mut s.env,
+                "mint" => &mut s.mint,
+                "req" => &mut s.req,
+                "caveat" => &mut s.caveat,
+                _ => continue,
+            };
+            bucket.push(inner.to_string());
         }
-        let Some((ns, key)) = inner.split_once('.') else {
-            continue;
-        };
-        if key.is_empty() {
-            continue;
-        }
-        let bucket = match ns {
-            "env" => &mut s.env,
-            "mint" => &mut s.mint,
-            "req" => &mut s.req,
-            "caveat" => &mut s.caveat,
-            _ => continue,
-        };
-        bucket.push(inner.to_string());
     }
     for v in [&mut s.env, &mut s.mint, &mut s.req, &mut s.caveat] {
         v.sort();
         v.dedup();
     }
     s
+}
+
+/// Report every `{{…}}` token in the parsed template's string leaves that
+/// the renderer would reject as malformed — an unknown namespace, a
+/// missing or empty key, embedded whitespace, an unterminated `{{`, or a
+/// leftover engine-ism like `{{#each}}`. Seal authoring
+/// (`Config::validate_policy_surface`) refuses a template carrying any, so
+/// such a template fails at publish rather than at first render. This is a
+/// *shape* check only: an absent value (a `req`/`caveat`/`mint` field not
+/// known until a request) is not malformed and is not reported here.
+pub fn malformed_tokens(doc: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_malformed(doc, &mut out);
+    out
+}
+
+fn collect_malformed(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => collect_malformed_in_str(s, out),
+        Value::Array(items) => {
+            for item in items {
+                collect_malformed(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for val in map.values() {
+                collect_malformed(val, out);
+            }
+        }
+        Value::Number(_) | Value::Bool(_) | Value::Null => {}
+    }
+}
+
+fn collect_malformed_in_str(s: &str, out: &mut Vec<String>) {
+    let mut rest = s;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            // Unterminated `{{` — `{{` is reserved token syntax.
+            out.push(rest[open..].to_string());
+            return;
+        };
+        if classify_token(after[..close].trim()).is_none() {
+            out.push(rest[open..open + 2 + close + 2].to_string());
+        }
+        rest = &after[close + 2..];
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +512,38 @@ mod tests {
             err.to_string().contains("\"read\""),
             "message should name the role: {err}"
         );
+    }
+
+    #[test]
+    fn malformed_tokens_flags_shape_errors_not_absent_values() {
+        // Shape errors are reported (the seal-time lint); well-formed
+        // tokens — even ones whose value is absent until a request — are
+        // not, because absence is a render-time data concern, not a
+        // template defect.
+        let doc = serde_json::json!({
+            "ok": "arn:{{env.bucket}}/{{req.volume}}",
+            "engineism": "{{#each items}}",
+            "no_namespace": "{{volume}}",
+            "absent_but_well_formed": "{{req.nonesuch}}",
+            "nested": ["{{caveat.sub}}", "{{ bad token }}"],
+        });
+        let bad = malformed_tokens(&doc);
+        assert!(bad.contains(&"{{#each items}}".to_string()), "{bad:?}");
+        assert!(bad.contains(&"{{volume}}".to_string()), "{bad:?}");
+        assert!(bad.contains(&"{{ bad token }}".to_string()), "{bad:?}");
+        assert!(
+            !bad.iter().any(|t| t.contains("env.bucket")
+                || t.contains("req.volume")
+                || t.contains("req.nonesuch")
+                || t.contains("caveat.sub")),
+            "well-formed token reported as malformed: {bad:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_tokens_flags_unterminated() {
+        let doc = serde_json::json!({ "x": "arn:{{req.volume" });
+        assert_eq!(malformed_tokens(&doc), vec!["{{req.volume".to_string()]);
     }
 
     #[test]
