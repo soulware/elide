@@ -1,4 +1,4 @@
-//! Third-party caveat primitives: per-coord `r` derivation and the
+//! Third-party caveat primitives: per-anchor `r` derivation and the
 //! AEAD-encrypted `(VID, CID)` payload mint stamps onto operator-write
 //! credentials (`docs/design-auth-service.md` § *Keys*, § *Coord ↔
 //! mint enrollment*).
@@ -7,10 +7,11 @@
 //!
 //! - [`derive_r`] — `r = BLAKE3-derive-key("mint tpc r-key v1",
 //!   K_M || client_id || r_epoch)`. Deterministic in its inputs, so
-//!   mint can re-derive `r` on every exchange call without storing
-//!   per-client state. Bumping `r_epoch` (in `_mint/clients/enrolled/<sub>`)
-//!   rolls `r` to a fresh value, invalidating every existing CID for
-//!   the client.
+//!   mint re-derives `r` on every call without storing per-client
+//!   state. `r` rolls when `K_M` rotates or an anchor is re-minted
+//!   (`docs/design-auth-service.md` § *`r_tpc` rotation*); the
+//!   `r_epoch` input lets a caller force a roll independently, and
+//!   production anchors (invite, ticket, admin-service) pass `0`.
 //!
 //! - [`encrypt_vid`] — AES-GCM-SIV(T_{n-1}, plaintext = `r`) with
 //!   a fixed all-zero nonce. T_{n-1} is the chain tag at the TPC's
@@ -41,8 +42,8 @@ use aes_gcm_siv::{
 use crate::caveat::Caveat;
 
 /// Domain-separation context for `r` derivation. Bumping this string
-/// rotates every client's `r` cluster-wide; `r_epoch` is the per-client
-/// equivalent.
+/// rotates every `r` cluster-wide; the `r_epoch` argument is the
+/// per-`client_id` equivalent.
 const R_KDF_CONTEXT: &str = "mint tpc r-key v1";
 
 /// Fixed all-zero nonce. AES-GCM-SIV's misuse-resistance is what makes

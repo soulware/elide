@@ -125,15 +125,6 @@ pub struct Enrolled {
     /// Keyring generation that MAC'd this record. Retired kids fail
     /// verification — that is the rotation invalidation step.
     pub kid: Kid,
-    /// The coord's per-coord discharge-key epoch. `r = HKDF(K_M,
-    /// "r-coord-" || coord_ulid || r_epoch)`; bumping `r_epoch`
-    /// invalidates every existing TPC/CID for this coord without
-    /// touching the keyring. Operator-driven; defaults to 0 at
-    /// approval time. Bumps land via a separate admin verb (out of
-    /// scope here) and are covered by the body MAC like every other
-    /// field.
-    #[serde(default)]
-    pub r_epoch: u32,
     /// BLAKE3-keyed MAC over the body, hex-encoded. See
     /// [`approval_mac`] for the exact input domain-separation.
     pub mac: String,
@@ -257,7 +248,6 @@ const APPROVAL_DOMAIN: &[u8] = b"mint-approved-v1";
 /// different `<sub>` and still verify (cross-record substitution).
 /// Every variable-length field is length-prefixed to prevent
 /// canonicalization ambiguity.
-#[allow(clippy::too_many_arguments)]
 fn approval_mac(
     key: &[u8; 32],
     sub: &str,
@@ -265,7 +255,6 @@ fn approval_mac(
     approved_by: &str,
     approved_at: &str,
     fingerprint_shown: &str,
-    r_epoch: u32,
 ) -> [u8; 32] {
     let mut msg = Vec::new();
     msg.extend_from_slice(APPROVAL_DOMAIN);
@@ -274,7 +263,6 @@ fn approval_mac(
     append_len_prefixed(&mut msg, approved_by.as_bytes());
     append_len_prefixed(&mut msg, approved_at.as_bytes());
     append_len_prefixed(&mut msg, fingerprint_shown.as_bytes());
-    msg.extend_from_slice(&r_epoch.to_be_bytes());
     *blake3::keyed_hash(key, &msg).as_bytes()
 }
 
@@ -792,9 +780,6 @@ impl Store {
         let fingerprint_shown = fingerprint(pubkey);
         let kr = self.keyring().await;
         let kid = kr.current_kid();
-        // Fresh approval starts at r_epoch = 0; admin verbs bump it
-        // independently (out of scope here).
-        let r_epoch: u32 = 0;
         let mac = approval_mac(
             kr.current_key(),
             sub,
@@ -802,7 +787,6 @@ impl Store {
             approved_by,
             now_iso8601,
             &fingerprint_shown,
-            r_epoch,
         );
         let rec = Enrolled {
             pubkey: pubkey.to_string(),
@@ -810,7 +794,6 @@ impl Store {
             approved_at: now_iso8601.to_string(),
             fingerprint_shown,
             kid,
-            r_epoch,
             mac: hex32(&mac),
         };
         let bytes = serde_json::to_vec(&rec).map_err(|_| StateError::Corrupt)?;
@@ -898,7 +881,6 @@ impl Store {
             &rec.approved_by,
             &rec.approved_at,
             &rec.fingerprint_shown,
-            rec.r_epoch,
         );
         let actual = unhex32(&rec.mac).ok_or(StateError::Corrupt)?;
         if !bool::from(expected.ct_eq(&actual)) {
@@ -983,7 +965,6 @@ impl Store {
             &rec.approved_by,
             &rec.approved_at,
             &rec.fingerprint_shown,
-            rec.r_epoch,
         );
         let actual = match unhex32(&rec.mac) {
             Some(a) => a,
@@ -999,7 +980,6 @@ impl Store {
             &rec.approved_by,
             &rec.approved_at,
             &rec.fingerprint_shown,
-            rec.r_epoch,
         );
         let next = Enrolled {
             pubkey: rec.pubkey,
@@ -1007,7 +987,6 @@ impl Store {
             approved_at: rec.approved_at,
             fingerprint_shown: rec.fingerprint_shown,
             kid: kr.current_kid(),
-            r_epoch: rec.r_epoch,
             mac: hex32(&new_mac),
         };
         let body = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
@@ -1090,7 +1069,6 @@ impl Store {
                 &rec.approved_by,
                 &rec.approved_at,
                 &rec.fingerprint_shown,
-                rec.r_epoch,
             );
             let actual = match unhex32(&rec.mac) {
                 Some(a) => a,
@@ -1120,7 +1098,6 @@ impl Store {
                 &rec.approved_by,
                 &rec.approved_at,
                 &rec.fingerprint_shown,
-                rec.r_epoch,
             );
             let next = Enrolled {
                 pubkey: rec.pubkey,
@@ -1128,7 +1105,6 @@ impl Store {
                 approved_at: rec.approved_at,
                 fingerprint_shown: rec.fingerprint_shown,
                 kid: new_kid,
-                r_epoch: rec.r_epoch,
                 mac: hex32(&new_mac),
             };
             let bytes = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
