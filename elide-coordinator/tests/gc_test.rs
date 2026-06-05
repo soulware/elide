@@ -295,7 +295,7 @@ fn make_gc_config() -> GcConfig {
 /// tests that call `gc_fork`, which now fetches candidates from S3.
 async fn drain_pending_to_store(
     fork_dir: &std::path::Path,
-    volume_id: &str,
+    vol_ulid: ulid::Ulid,
     store: &Arc<dyn ObjectStore>,
 ) {
     let pending_dir = fork_dir.join("pending");
@@ -309,7 +309,7 @@ async fn drain_pending_to_store(
                 continue;
             }
             let data = fs::read(entry.path()).unwrap();
-            let key = elide_coordinator::upload::segment_key(volume_id, ulid_str.parse().unwrap());
+            let key = elide_coordinator::upload::segment_key(vol_ulid, ulid_str.parse().unwrap());
             store
                 .put(&key, bytes::Bytes::from(data).into())
                 .await
@@ -401,11 +401,7 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     vol.flush_wal().unwrap();
 
     // Promote both pending segments to index/ + cache/ and upload to store.
-    rt.block_on(drain_pending_to_store(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
 
     // Step 3: gc_checkpoint — flush WAL, mint GC output ULIDs.
     // H0 is LBA-dead at this point: lba=0 now points to H1.  gc_fork will
@@ -430,12 +426,8 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
 
     // Step 7: apply_done_handoffs — no bare `gc/<new>` exists (cancelled),
     // so nothing is uploaded or deleted.
-    rt.block_on(apply_done_handoffs(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ))
-    .unwrap();
+    rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store))
+        .unwrap();
 
     // Assert: lba=5 reads back D0 correctly.
     // Without the fix: apply_gc_handoffs removed H0 from the extent index (or
@@ -461,11 +453,7 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     // REF entries now carry materialised body bytes, so the segment must be
     // uploaded to S3 (drain_pending_to_store) before gc_fork can fetch it.
     let u_gc2 = vol.gc_checkpoint_for_test().unwrap();
-    rt.block_on(drain_pending_to_store(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
 
     gc_fork(
         fork_dir,
@@ -475,12 +463,8 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     )
     .unwrap();
     vol.apply_gc_handoffs().unwrap();
-    rt.block_on(apply_done_handoffs(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ))
-    .unwrap();
+    rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store))
+        .unwrap();
 
     // After the corrected sweep, both LBAs must still read correctly.
     let got5 = vol.read(5, 1).expect("read lba=5 after second GC sweep");
@@ -569,11 +553,7 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
     vol.flush_wal().unwrap();
 
     // Step 3: drain pending/ → segments/ and upload to store.  The WAL is now empty.
-    rt.block_on(drain_pending_to_store(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
 
     // Step 4: GcSweep with an empty WAL.
     //
@@ -587,12 +567,8 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
 
     gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
     vol.apply_gc_handoffs().unwrap();
-    rt.block_on(apply_done_handoffs(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ))
-    .unwrap();
+    rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store))
+        .unwrap();
 
     // Step 5: write D2 to lba=0 and flush.  This goes to the current WAL whose
     // ULID is below u_sweep.  After draining, segments/ contains both the GC
@@ -706,12 +682,8 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
 
     gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
     vol.apply_gc_handoffs().unwrap();
-    rt.block_on(apply_done_handoffs(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ))
-    .unwrap();
+    rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store))
+        .unwrap();
 
     // Step 6: drain pending/ — the WAL segment flushed by gc_checkpoint lands
     // in segments/ alongside the GC output.
@@ -790,7 +762,7 @@ fn drain_failure_skips_gc_and_data_survives() {
     vol.flush_wal().unwrap();
     rt.block_on(drain_pending_to_store(
         fork_dir,
-        "00000000000000000000000000",
+        ulid::Ulid::nil(),
         &good_store,
     ));
 
@@ -810,7 +782,7 @@ fn drain_failure_skips_gc_and_data_survives() {
     let drain_result = rt
         .block_on(upload::drain_pending(
             fork_dir,
-            "00000000000000000000000000",
+            ulid::Ulid::nil(),
             &fail_store,
         ))
         .expect("drain_pending itself should not error");
@@ -845,7 +817,7 @@ fn drain_failure_skips_gc_and_data_survives() {
     let drain_result2 = rt
         .block_on(upload::drain_pending(
             fork_dir,
-            "00000000000000000000000000",
+            ulid::Ulid::nil(),
             &good_store,
         ))
         .expect("drain should succeed with good store");
@@ -865,7 +837,7 @@ fn drain_failure_skips_gc_and_data_survives() {
     vol.apply_gc_handoffs().unwrap();
     rt.block_on(apply_done_handoffs(
         fork_dir,
-        "00000000000000000000000000",
+        ulid::Ulid::nil(),
         &good_store,
     ))
     .unwrap();
@@ -945,20 +917,12 @@ fn gc_restart_safety_applied_handoff() {
     vol.write(0, &d0).unwrap();
     vol.write(1, &d1).unwrap();
     vol.flush_wal().unwrap();
-    rt.block_on(drain_pending_to_store(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
 
     // Step 2: overwrite lba=0 with D2, flush, drain.  D0's hash is now dead.
     vol.write(0, &d2).unwrap();
     vol.flush_wal().unwrap();
-    rt.block_on(drain_pending_to_store(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
 
     // Step 3: GC pass — gc_checkpoint mints ULIDs, gc_fork emits the coord
     // plan at gc/<new>.plan describing how to compact S1 and S2.
@@ -999,12 +963,8 @@ fn gc_restart_safety_applied_handoff() {
     // old <input>.idx files), and removes the bare gc/<new> via
     // finalize_gc_handoff. Safe because the extent index already points at
     // the new segment.
-    rt.block_on(apply_done_handoffs(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ))
-    .unwrap();
+    rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store))
+        .unwrap();
 
     // All LBAs must read their last-written values.
     let got0 = vol
@@ -1078,11 +1038,7 @@ fn gc_collect_stats_skips_thin_dedup_ref_segment() {
 
     // Step 4: Drain all pending segments to index/ (no materialise step).
     // S2 retains its thin DedupRef in the .idx file.
-    rt.block_on(drain_pending_to_store(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
 
     // Step 5: gc_checkpoint + gc_fork.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
@@ -1158,11 +1114,7 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
         let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
         let _ = vol.apply_gc_handoffs();
         simulate_coord_cache_evict(fork_dir);
-        let _ = rt.block_on(apply_done_handoffs(
-            fork_dir,
-            "00000000000000000000000000",
-            &store,
-        ));
+        let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
     };
 
     // Oracle: track expected value for each LBA.
@@ -1284,11 +1236,7 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
         let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
         let _ = vol.apply_gc_handoffs();
         simulate_coord_cache_evict(fork_dir);
-        let _ = rt.block_on(apply_done_handoffs(
-            fork_dir,
-            "00000000000000000000000000",
-            &store,
-        ));
+        let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
     };
 
     let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
@@ -1422,11 +1370,7 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
         let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
         let _ = vol.apply_gc_handoffs();
         simulate_coord_cache_evict(fork_dir);
-        let _ = rt.block_on(apply_done_handoffs(
-            fork_dir,
-            "00000000000000000000000000",
-            &store,
-        ));
+        let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
     };
 
     let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
@@ -1597,11 +1541,7 @@ fn gc_bug_h_canonical_body_shadows_live_lba() {
         }
 
         // Drain WAL segment produced by gc_checkpoint's flush (may be empty).
-        rt.block_on(drain_pending_to_store(
-            fork_dir,
-            "00000000000000000000000000",
-            &store,
-        ));
+        rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
     };
 
     let n: u64 = 100;
@@ -1612,11 +1552,7 @@ fn gc_bug_h_canonical_body_shadows_live_lba() {
     // Step 1: write h1 at LBA N → segment S0.
     vol.write(n, &h1_bytes).unwrap();
     vol.flush_wal().unwrap();
-    rt.block_on(drain_pending_to_store(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
 
     // Step 2: snapshot. Pins S0 below the GC floor so later rounds ignore it.
     let _snap = vol.snapshot().unwrap();
@@ -1624,20 +1560,12 @@ fn gc_bug_h_canonical_body_shadows_live_lba() {
     // Step 3: overwrite LBA N with h2 → segment X.
     vol.write(n, &h2_bytes).unwrap();
     vol.flush_wal().unwrap();
-    rt.block_on(drain_pending_to_store(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
 
     // Step 4: write h2 at LBA M (REF, since h2 canonical in X) → segment Y.
     vol.write(m, &h2_bytes).unwrap();
     vol.flush_wal().unwrap();
-    rt.block_on(drain_pending_to_store(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
 
     // Step 5: GC round 1. Sweep packs X + Y into U1.
     run_gc_round(&mut vol);
@@ -1645,11 +1573,7 @@ fn gc_bug_h_canonical_body_shadows_live_lba() {
     // Step 6: rewrite LBA N with h1 (REF to S0) → segment Y'. lbamap[N]=h1.
     vol.write(n, &h1_bytes).unwrap();
     vol.flush_wal().unwrap();
-    rt.block_on(drain_pending_to_store(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    rt.block_on(drain_pending_to_store(fork_dir, ulid::Ulid::nil(), &store));
 
     // Step 7: GC round 2. U1 density 50% → repack; Y' alone → sweep skip.
     // The buggy `extent_live && live_hashes.contains(h2)` arm keeps U1's

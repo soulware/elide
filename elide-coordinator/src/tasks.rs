@@ -171,7 +171,7 @@ pub async fn run_volume_tasks(
         vol_ulid: parsed_ulid,
     };
 
-    let volume_id = match upload::derive_names(&fork_dir) {
+    let vol_ulid = match upload::derive_names(&fork_dir) {
         Ok(id) => id,
         Err(e) => {
             warn!(
@@ -240,7 +240,7 @@ pub async fn run_volume_tasks(
             Ok(r) if r.fetched > 0 || r.snapshots_fetched > 0 || r.hints_fetched > 0 => {
                 if r.fetched > 0 {
                     info!(
-                        "[prefetch {volume_id}{volume_name}] fetched {} index section(s) ({} from peer, {} from store)",
+                        "[prefetch {vol_ulid}{volume_name}] fetched {} index section(s) ({} from peer, {} from store)",
                         r.fetched,
                         r.fetched_from_peer,
                         r.fetched - r.fetched_from_peer,
@@ -248,7 +248,7 @@ pub async fn run_volume_tasks(
                 }
                 if r.snapshots_fetched > 0 {
                     info!(
-                        "[prefetch {volume_id}{volume_name}] fetched {} snapshot artifact(s) ({} from peer, {} from store)",
+                        "[prefetch {vol_ulid}{volume_name}] fetched {} snapshot artifact(s) ({} from peer, {} from store)",
                         r.snapshots_fetched,
                         r.snapshots_from_peer,
                         r.snapshots_fetched - r.snapshots_from_peer,
@@ -256,14 +256,14 @@ pub async fn run_volume_tasks(
                 }
                 if r.hints_fetched > 0 {
                     info!(
-                        "[prefetch {volume_id}{volume_name}] persisted {} prefetch hint(s) for body warming",
+                        "[prefetch {vol_ulid}{volume_name}] persisted {} prefetch hint(s) for body warming",
                         r.hints_fetched,
                     );
                 }
             }
             Ok(_) => {}
             Err(e) => {
-                warn!("[prefetch {volume_id}{volume_name}] error: {e:#}");
+                warn!("[prefetch {vol_ulid}{volume_name}] error: {e:#}");
             }
         }
         // Publish the result so any volume binary blocked on `await-prefetch`
@@ -284,7 +284,7 @@ pub async fn run_volume_tasks(
 
     let mut orch = GcCycleOrchestrator::new(
         fork_dir.clone(),
-        volume_id.clone(),
+        vol_ulid,
         data_store,
         gc_config,
         &snapshot_locks,
@@ -310,7 +310,7 @@ pub async fn run_volume_tasks(
     // anything is waiting in `pending/`.
     if fork_dir.join("volume.readonly").exists() {
         info!(
-            "[coordinator] {volume_id}{volume_name} is readonly; \
+            "[coordinator] {vol_ulid}{volume_name} is readonly; \
              drain/GC ticks suspended until writable"
         );
     }

@@ -86,10 +86,6 @@ impl World {
             expected_live: BTreeSet::new(),
         }
     }
-
-    fn vol_id(&self) -> String {
-        self.vol_ulid.to_string()
-    }
 }
 
 // ── Operations ──────────────────────────────────────────────────────────
@@ -141,13 +137,13 @@ fn build_segment_bytes(signer: &dyn SegmentSigner, inputs: &[Ulid]) -> Vec<u8> {
 
 async fn put_segment(
     store: &Arc<dyn ObjectStore>,
-    vol_id: &str,
+    vol_ulid: Ulid,
     seg_ulid: Ulid,
     signer: &dyn SegmentSigner,
     inputs: &[Ulid],
 ) {
     let bytes = build_segment_bytes(signer, inputs);
-    let key = upload::segment_key(vol_id, seg_ulid);
+    let key = upload::segment_key(vol_ulid, seg_ulid);
     store.put(&key, Bytes::from(bytes).into()).await.unwrap();
 }
 
@@ -157,10 +153,10 @@ async fn run_drain(world: &mut World, head: &mut SegmentHead, count: u8) -> bool
     if count == 0 {
         return false;
     }
-    let vol_id = world.vol_id();
+    let vol_ulid = world.vol_ulid;
     for _ in 0..count {
         let u = world.mint.next();
-        put_segment(&world.store, &vol_id, u, world.signer.as_ref(), &[]).await;
+        put_segment(&world.store, vol_ulid, u, world.signer.as_ref(), &[]).await;
         head.added.insert(u);
         world.expected_live.insert(u);
     }
@@ -182,10 +178,10 @@ async fn run_gc(world: &mut World, head: &mut SegmentHead, input_count: u8) -> b
     // when we're generating fast, so an explicit increment keeps
     // outputs strictly > inputs.
     let output = max.increment().expect("increment");
-    let vol_id = world.vol_id();
+    let vol_ulid = world.vol_ulid;
     put_segment(
         &world.store,
-        &vol_id,
+        vol_ulid,
         output,
         world.signer.as_ref(),
         &inputs,
@@ -209,9 +205,9 @@ async fn run_reap(world: &mut World, head: &mut SegmentHead) -> bool {
     if to_reap.is_empty() {
         return false;
     }
-    let vol_id = world.vol_id();
+    let vol_ulid = world.vol_ulid;
     for input in &to_reap {
-        let key = upload::segment_key(&vol_id, *input);
+        let key = upload::segment_key(vol_ulid, *input);
         // 404 on already-reaped is fine.
         let _ = world.store.delete(&key).await;
     }

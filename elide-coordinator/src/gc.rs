@@ -576,7 +576,7 @@ fn select_buckets(
 /// not running) are absent from the returned vec and retried next tick.
 pub async fn apply_done_handoffs(
     fork_dir: &Path,
-    volume_id: &str,
+    vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<Vec<HandoffOutcome>> {
     let gc_dir = fork_dir.join("gc");
@@ -594,8 +594,6 @@ pub async fn apply_done_handoffs(
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .context("loading volume verifying key")?;
-    let vol_ulid = Ulid::from_string(volume_id)
-        .map_err(|e| anyhow::anyhow!("apply_done_handoffs: volume_id {volume_id}: {e}"))?;
     let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     let cursor = HandoffCursor {
         fork_dir,
@@ -1758,7 +1756,7 @@ mod tests {
     async fn drain_with_repack(
         vol: &mut elide_core::volume::Volume,
         dir: &Path,
-        volume_id: &str,
+        vol_ulid: Ulid,
         store: &Arc<dyn ObjectStore>,
     ) {
         let pending_dir = dir.join("pending");
@@ -1769,7 +1767,7 @@ mod tests {
         for ulid in pending_after_repack {
             let seg_path = pending_dir.join(ulid.to_string());
             let data = fs::read(&seg_path).unwrap();
-            let key = segment_key(volume_id, ulid);
+            let key = segment_key(vol_ulid, ulid);
             store
                 .put(&key, bytes::Bytes::from(data).into())
                 .await
@@ -1788,7 +1786,7 @@ mod tests {
     async fn done_no_gc_dir() {
         let tmp = TempDir::new().unwrap();
         let store = make_store();
-        let outcomes = apply_done_handoffs(tmp.path(), "vol", &store)
+        let outcomes = apply_done_handoffs(tmp.path(), Ulid::nil(), &store)
             .await
             .unwrap();
         assert!(outcomes.is_empty());
@@ -1799,7 +1797,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("gc")).unwrap();
         let store = make_store();
-        let outcomes = apply_done_handoffs(tmp.path(), "vol", &store)
+        let outcomes = apply_done_handoffs(tmp.path(), Ulid::nil(), &store)
             .await
             .unwrap();
         assert!(outcomes.is_empty());
@@ -1816,7 +1814,7 @@ mod tests {
         fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.plan"), "").unwrap();
         fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.staged"), "").unwrap();
         let store = make_store();
-        let outcomes = apply_done_handoffs(tmp.path(), "vol", &store)
+        let outcomes = apply_done_handoffs(tmp.path(), Ulid::nil(), &store)
             .await
             .unwrap();
         assert!(outcomes.is_empty());
@@ -1869,14 +1867,14 @@ mod tests {
         // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
         vol.write(0, &content).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_repack(&mut vol, dir, "00000000000000000000000000", &store).await;
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
         // Step 2: write the same content to lba 1, flush, redact, drain.
         // Same hash H_aa → the write path emits DedupRef(lba=1, H_aa) in S2,
         // carried through unchanged by the thin-DedupRef format.
         vol.write(1, &content).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_repack(&mut vol, dir, "00000000000000000000000000", &store).await;
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
         drop(vol);
 
@@ -1908,9 +1906,7 @@ mod tests {
         // promote IPC (mock copies body to cache and deletes the bare gc/<new>),
         // then finalize_gc_handoff (mock acks; bare file is already gone).
         let _mock = spawn_mock_socket(dir.to_owned()).await;
-        let done = apply_done_handoffs(dir, "00000000000000000000000000", &store)
-            .await
-            .unwrap();
+        let done = apply_done_handoffs(dir, Ulid::nil(), &store).await.unwrap();
         assert!(
             !done.is_empty(),
             "apply_done_handoffs should have processed the handoff"
@@ -1956,11 +1952,11 @@ mod tests {
         // Two distinct payloads so each drain produces its own segment.
         vol.write(0, &[0x11u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_repack(&mut vol, dir, "00000000000000000000000000", &store).await;
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
         vol.write(1, &[0x22u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_repack(&mut vol, dir, "00000000000000000000000000", &store).await;
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
         drop(vol);
 
         // Capture the input segment ULIDs from index/ before GC runs — those
@@ -2712,7 +2708,7 @@ mod tests {
         let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
         vol.write(0, &parent_bytes).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_repack(&mut vol, dir, "00000000000000000000000000", &store).await;
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
         // ── S2: multi-LBA Delta at LBA 100..104, hand-crafted. The child
         //        body is zstd-dict compressed against the parent as
@@ -2736,7 +2732,7 @@ mod tests {
         )
         .unwrap();
         let bytes = fs::read(&delta_pending).unwrap();
-        let key = segment_key("00000000000000000000000000", delta_ulid);
+        let key = segment_key(Ulid::nil(), delta_ulid);
         store
             .put(&key, bytes::Bytes::from(bytes).into())
             .await
@@ -2752,7 +2748,7 @@ mod tests {
         // ── S3: single-LBA overwrite at LBA 102, via the normal path.
         vol.write(102, &overwrite_bytes).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_repack(&mut vol, dir, "00000000000000000000000000", &store).await;
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
         drop(vol);
 
@@ -2845,13 +2841,13 @@ mod tests {
         let block = [0xBBu8; 4096];
         vol.write(0, &block).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_repack(&mut vol, dir, "00000000000000000000000000", &store).await;
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
         // Write a second segment so GC has ≥2 candidates to sweep.
         let block2 = [0xCCu8; 4096];
         vol.write(1, &block2).unwrap();
         vol.flush_wal().unwrap();
-        drain_with_repack(&mut vol, dir, "00000000000000000000000000", &store).await;
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
         drop(vol);
 
@@ -2877,9 +2873,7 @@ mod tests {
 
         // Coordinator completes: upload + promote.
         let _mock = spawn_mock_socket(dir.to_owned()).await;
-        let done = apply_done_handoffs(dir, "00000000000000000000000000", &store)
-            .await
-            .unwrap();
+        let done = apply_done_handoffs(dir, Ulid::nil(), &store).await.unwrap();
         assert!(!done.is_empty(), "handoff should complete");
 
         // Crash + reopen — rebuild from index/*.idx.

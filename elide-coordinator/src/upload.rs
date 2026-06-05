@@ -193,23 +193,22 @@ pub struct DrainResult {
 ///
 /// In the flat layout every volume lives at `<data_dir>/by_id/<ulid>/`.
 /// The directory name is validated as a ULID.
-pub fn derive_names(vol_dir: &Path) -> Result<String> {
+pub fn derive_names(vol_dir: &Path) -> Result<Ulid> {
     let name = vol_dir
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow::anyhow!("vol dir has no name: {}", vol_dir.display()))?;
     ulid::Ulid::from_string(name)
-        .map(|_| name.to_owned())
         .map_err(|e| anyhow::anyhow!("vol dir name is not a valid ULID '{name}': {e}"))
 }
 
 /// Build the object store key for a segment.
 ///
 /// Format: `by_id/<volume_ulid>/segments/YYYYMMDD/<segment_ulid>`
-pub fn segment_key(volume_id: &str, ulid: Ulid) -> StorePath {
+pub fn segment_key(vol_ulid: Ulid, ulid: Ulid) -> StorePath {
     let dt: DateTime<Utc> = ulid.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
-    StorePath::from(format!("by_id/{volume_id}/segments/{date}/{ulid}"))
+    StorePath::from(format!("by_id/{vol_ulid}/segments/{date}/{ulid}"))
 }
 
 /// Upload all committed segments from `pending/` to the object store, then
@@ -228,14 +227,14 @@ pub fn segment_key(volume_id: &str, ulid: Ulid) -> StorePath {
 /// name entry) is re-uploaded on every invocation — all are idempotent and tiny.
 pub async fn drain_pending(
     vol_dir: &Path,
-    volume_id: &str,
+    vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<DrainResult> {
     let pending_dir = vol_dir.join("pending");
 
     // Upload volume metadata before segments so that any host that
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
-    upload_volume_metadata(vol_dir, volume_id, store).await;
+    upload_volume_metadata(vol_dir, vol_ulid, store).await;
 
     // Upload + promote in ULID-ascending order so each promote moves
     // the lowest-ULID pending to committed, preserving
@@ -246,8 +245,6 @@ pub async fn drain_pending(
     let mut upload_failed = 0usize;
     let mut promote_failed = 0usize;
     let mut uploaded_ulids: Vec<Ulid> = Vec::new();
-    let vol_ulid = Ulid::from_string(volume_id)
-        .map_err(|e| anyhow::anyhow!("drain: volume_id {volume_id} is not a ULID: {e}"))?;
     let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     let segments = vd.segments();
 
@@ -310,14 +307,7 @@ pub async fn drain_pending(
 /// directory is inspectable with standard tools. The snapshot pair
 /// (marker + .manifest) is covered by a single empty sentinel at
 /// `uploaded/snapshots/<ulid>`.
-async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn ObjectStore>) {
-    let vol_ulid = match Ulid::from_string(volume_id) {
-        Ok(u) => u,
-        Err(e) => {
-            warn!("[upload] volume_id {volume_id} is not a ULID: {e}");
-            return;
-        }
-    };
+async fn upload_volume_metadata(vol_dir: &Path, vol_ulid: Ulid, store: &Arc<dyn ObjectStore>) {
     let pub_key_path = vol_dir.join("volume.pub");
     match std::fs::read(&pub_key_path) {
         Ok(bytes) => {
@@ -372,7 +362,7 @@ async fn upload_volume_metadata(vol_dir: &Path, volume_id: &str, store: &Arc<dyn
         Err(e) => warn!("failed to read provenance: {e:#}"),
     }
 
-    if let Err(e) = upload_snapshot_metadata(vol_dir, volume_id, store).await {
+    if let Err(e) = upload_snapshot_metadata(vol_dir, vol_ulid, store).await {
         warn!("snapshot upload failed: {e:#}");
     }
 }
@@ -460,7 +450,7 @@ async fn upload_small_bytes(
 /// re-PUT.
 pub async fn upload_snapshot_metadata(
     vol_dir: &Path,
-    volume_id: &str,
+    vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let snap_dir = vol_dir.join("snapshots");
@@ -492,19 +482,6 @@ pub async fn upload_snapshot_metadata(
         let manifest_path = snap_dir.join(name);
         let started = Instant::now();
 
-        // Construct the per-volume handle lazily on the first
-        // manifest in `snap_dir`. `volume_id` is the volume's
-        // directory name and is the ULID the manifest belongs to;
-        // an unparseable `volume_id` is a programmer error upstream
-        // (the daemon validates it) — treat the manifest as
-        // un-uploadable and continue.
-        let vol_ulid = match ulid::Ulid::from_string(volume_id) {
-            Ok(u) => u,
-            Err(e) => {
-                warn!("[upload] snapshot publish: volume_id {volume_id} not a ULID: {e}");
-                continue;
-            }
-        };
         let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
         let snapshots = vd.snapshots();
 
@@ -632,7 +609,7 @@ mod tests {
     #[test]
     fn derive_names_returns_ulid() {
         let id = derive_names(Path::new(&format!("/data/by_id/{VOL_ULID}"))).unwrap();
-        assert_eq!(id, VOL_ULID);
+        assert_eq!(id.to_string(), VOL_ULID);
     }
 
     #[test]
@@ -648,7 +625,7 @@ mod tests {
         let dt: DateTime<Utc> = ulid.datetime().into();
         let expected_date = dt.format("%Y%m%d").to_string();
 
-        let key = segment_key(VOL_ULID, ulid);
+        let key = segment_key(VOL_ULID.parse().unwrap(), ulid);
         assert_eq!(
             key.as_ref(),
             format!("by_id/{VOL_ULID}/segments/{expected_date}/{ulid_str}")
@@ -710,7 +687,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        let result = drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+            .await
+            .unwrap();
 
         assert_eq!(result.uploaded_ulids.len(), 2);
         assert_eq!(result.upload_failed, 0);
@@ -727,8 +706,8 @@ mod tests {
         assert!(cache_dir.join(format!("{ulid2}.body")).exists());
         assert!(cache_dir.join(format!("{ulid2}.present")).exists());
 
-        let key1 = segment_key(VOL_ULID, ulid1.parse().unwrap());
-        let key2 = segment_key(VOL_ULID, ulid2.parse().unwrap());
+        let key1 = segment_key(VOL_ULID.parse().unwrap(), ulid1.parse().unwrap());
+        let key2 = segment_key(VOL_ULID.parse().unwrap(), ulid2.parse().unwrap());
         store
             .head(&key1)
             .await
@@ -760,7 +739,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        let result = drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+            .await
+            .unwrap();
         assert_eq!(result.uploaded_ulids.len(), 0);
         assert_eq!(result.upload_failed, 0);
         assert_eq!(result.promote_failed, 0);
@@ -801,7 +782,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+            .await
+            .unwrap();
 
         let name_key = StorePath::from("names/my-vol");
         assert!(
@@ -835,7 +818,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+            .await
+            .unwrap();
 
         // Delete the store object behind the coordinator's back. If gating
         // works, re-drain sees a matching `uploaded/volume.pub` and skips —
@@ -846,13 +831,17 @@ mod tests {
         ));
         store.delete(&pub_key).await.unwrap();
 
-        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+            .await
+            .unwrap();
 
         assert!(store.head(&pub_key).await.is_err());
 
         // Now change volume.pub content — re-drain must upload.
         std::fs::write(vol_dir.join("volume.pub"), b"rotated").unwrap();
-        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+            .await
+            .unwrap();
         let got = store.get(&pub_key).await.expect("volume.pub re-uploaded");
         assert_eq!(got.bytes().await.unwrap().as_ref(), b"rotated");
     }
@@ -898,7 +887,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
+        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+            .await
+            .unwrap();
 
         // Manifest is in store.
         let vol = ulid::Ulid::from_string(VOL_ULID).unwrap();

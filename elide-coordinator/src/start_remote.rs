@@ -187,11 +187,7 @@ async fn install_basis_under_leaf(
             .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
     fetch_and_verify_manifest(vol_ulid, snap_ulid, kind, fork_dir, &vk, store).await?;
     elide_coordinator::prefetch::pull_indexes_for_snapshot(
-        store,
-        fork_dir,
-        &vol_ulid.to_string(),
-        snap_ulid,
-        &vk,
+        store, fork_dir, vol_ulid, snap_ulid, &vk,
     )
     .await
     .map_err(|e| IpcError::store(format!("pulling indexes for {snap_ulid}: {e:#}")))?;
@@ -251,7 +247,7 @@ async fn install_basis_under_parent(
     elide_coordinator::prefetch::pull_indexes_for_snapshot(
         &parent_store,
         &parent_dir,
-        &parent.volume_ulid,
+        parent_vol,
         parent_snap,
         &manifest_vk,
     )
