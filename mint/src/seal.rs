@@ -254,12 +254,19 @@ impl Seal {
         }
         diffs
     }
+
+    /// Does `env` reproduce the canonical `[env]` hash this seal pins?
+    /// `mint role inspect` asks this to flag local `[env]` drift without
+    /// recomputing the canonical hash itself.
+    pub fn env_matches(&self, env: &BTreeMap<String, String>) -> bool {
+        self.env_blake3 == hash_hex(&canonical_env_bytes(env))
+    }
 }
 
 /// BLAKE3 of `bytes`, hex-encoded — the encoding used for every
 /// `policy_blake3` in the seal, so the sealed cache must hash with this
 /// to compare cached bytes against the seal.
-pub(crate) fn hash_hex(bytes: &[u8]) -> String {
+pub fn hash_hex(bytes: &[u8]) -> String {
     let h = blake3::hash(bytes);
     hex32(h.as_bytes())
 }
