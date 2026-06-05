@@ -259,50 +259,48 @@ pub struct VerifyCtx<'a> {
 }
 
 /// A volume identity that has just emerged from a verifier. The inner
-/// field is module-private: the only way to obtain a `Verified<Ulid>`
-/// is through [`check_caveats`]. Downstream code that resolves
+/// field is module-private: the only way to obtain a `Verified` is
+/// through [`check_caveats`]. Downstream code that resolves
 /// volume-scoped state (registry lookup, segment fetch, IAM teardown)
 /// consumes the receipt instead of a bare `Ulid`, so the only way to
 /// reach those code paths is via a successful verification of *this*
 /// volume — eliminating the "auth said A, but used B" bug shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Verified<T>(T);
+pub struct Verified(Ulid);
 
-impl<T> Verified<T> {
-    pub fn into_inner(self) -> T {
+impl Verified {
+    pub fn into_inner(self) -> Ulid {
         self.0
     }
 
-    pub fn get(&self) -> &T {
+    pub fn get(&self) -> &Ulid {
         &self.0
     }
-}
 
-impl<T: Copy> Verified<T> {
-    pub fn copy_inner(&self) -> T {
+    pub fn copy_inner(&self) -> Ulid {
         self.0
     }
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-impl<T> Verified<T> {
+impl Verified {
     /// Test-only escape: construct a `Verified` without going through a
     /// verifier. Gated on `cfg(test)` (for this crate's own unit tests)
     /// and the `test-helpers` feature (auto-enabled in dev builds so
     /// the bin's tests can construct one even though the lib they link
     /// against is a non-test build). Production code physically cannot
     /// reach this constructor — every non-test code path that consumes
-    /// a `Verified<Ulid>` must obtain it from [`check_caveats`].
-    pub fn for_test(inner: T) -> Self {
+    /// a `Verified` must obtain it from [`check_caveats`].
+    pub fn for_test(inner: Ulid) -> Self {
         Self(inner)
     }
 }
 
 /// Evaluate every caveat against `ctx`. On success returns a
-/// [`Verified<Ulid>`] receipt for the bound volume (equal to
+/// [`Verified`] receipt for the bound volume (equal to
 /// `ctx.volume` by construction). On failure returns a short reason
 /// string. Does NOT verify the MAC — call [`verify`] first.
-pub fn check_caveats(m: &Macaroon, ctx: &VerifyCtx<'_>) -> Result<Verified<Ulid>, &'static str> {
+pub fn check_caveats(m: &Macaroon, ctx: &VerifyCtx<'_>) -> Result<Verified, &'static str> {
     let expected_volume_str = ctx.volume.to_string();
     let mut saw_volume = false;
     let mut saw_scope = false;

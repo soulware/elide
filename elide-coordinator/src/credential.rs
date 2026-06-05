@@ -60,9 +60,9 @@ pub trait CredentialIssuer: Send + Sync {
 /// possessing one is what permits [`CredentialIssuer::issue`] to grant
 /// the `by_id/<target>/*` prefix.
 ///
-/// Parallel to [`Verified<Ulid>`] and composes with it — a `Verified`
+/// Parallel to [`Verified`] and composes with it — a `Verified`
 /// requester is required to produce an `AuthorizedTarget`. The two attest
-/// different facts: `Verified<Ulid>` that the *caller* is macaroon-
+/// different facts: `Verified` that the *caller* is macaroon-
 /// authenticated; `AuthorizedTarget` that the *target* is within the
 /// caller's lineage.
 pub struct AuthorizedTarget(Ulid);
@@ -81,7 +81,7 @@ impl AuthorizedTarget {
 /// This is the sole constructor of [`AuthorizedTarget`], so the check can
 /// neither be skipped nor duplicated.
 pub fn authorize_target(
-    requester: &Verified<Ulid>,
+    requester: &Verified,
     target: Ulid,
     data_dir: &Path,
 ) -> Result<AuthorizedTarget, IpcError> {

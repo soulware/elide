@@ -2145,7 +2145,7 @@ async fn authenticate_volume_macaroon(
     data_dir: &Path,
     peer_pid: Option<i32>,
     macaroon_root: &[u8; 32],
-) -> Result<(Macaroon, macaroon::Verified<ulid::Ulid>), IpcError> {
+) -> Result<(Macaroon, macaroon::Verified), IpcError> {
     let m = Macaroon::parse(macaroon_str)
         .map_err(|e| IpcError::bad_request(format!("parse macaroon: {e}")))?;
     if !macaroon::verify(macaroon_root, &m) {
@@ -2190,10 +2190,7 @@ async fn authenticate_volume_macaroon(
 /// `names/<name>`; a coordinator with no local `by_name` entry for the
 /// volume is not its current local claimer and cannot mint a passing
 /// claimer token.
-fn resolve_volume_name(
-    data_dir: &Path,
-    verified: &macaroon::Verified<ulid::Ulid>,
-) -> Result<String, IpcError> {
+fn resolve_volume_name(data_dir: &Path, verified: &macaroon::Verified) -> Result<String, IpcError> {
     let by_name = data_dir.join("by_name");
     let entries = std::fs::read_dir(&by_name)
         .map_err(|e| IpcError::internal(format!("read by_name: {e}")))?;
