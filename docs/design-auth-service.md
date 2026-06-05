@@ -325,7 +325,7 @@ When the exchanging operator brings an approved coordinator online:
 3. Mint walks the ticket's chain under `K_M`, verifies the discharge
    under `r_xchg`, clears its `Scope` against `mint:exchange`,
    verifies the PoP against the ticket's `cnf`, requires
-   `_mint/approved/<sub>` to match, and mints the TPC-free role
+   `_mint/clients/enrolled/<sub>` to match, and mints the TPC-free role
    credential. One discharge covers every role exchanged in its window.
 
 ### Admin-plane discharge

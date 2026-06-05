@@ -1,5 +1,5 @@
 //! Mint enrollment state: the current invite nonce, the transient
-//! pending-enrollment table, and the long-lived approved-client
+//! pending-enrollment table, and the long-lived enrolled-client
 //! registry (`docs/design-mint.md` § *Enrollment* / *Mint state in the
 //! store bucket*).
 //!
@@ -10,19 +10,19 @@
 //! backend. The same key layout applies either way:
 //!
 //! ```text
-//! _mint/invite                 current random nonce (one object)
-//! _mint/pending/<sub>.json     transient (sub, pub, invite, first_seen, peer_ip);
-//!                              GC'd at ticket-exp, deleted at approve()
-//! _mint/approved/<sub>         long-lived {pub, approved_at, fingerprint_shown,
-//!                              kid, mac}; powers the re-enrollment fast path
+//! _mint/invite                       current random nonce (one object)
+//! _mint/clients/pending/<sub>.json   transient (sub, pub, invite, first_seen, peer_ip);
+//!                                    GC'd at ticket-exp, deleted at approve()
+//! _mint/clients/enrolled/<sub>       long-lived {pub, approved_at, fingerprint_shown,
+//!                                    kid, mac}; powers the re-enrollment fast path
 //! ```
 //!
-//! **Every approved-registry entry carries a MAC over its body keyed by
+//! **Every enrolled-registry entry carries a MAC over its body keyed by
 //! the keyring generation that issued it.** A holder of a `mint-rw`
-//! bucket credential can `PutObject` to `_mint/approved/<sub>`, so the
+//! bucket credential can `PutObject` to `_mint/clients/enrolled/<sub>`, so the
 //! object body cannot be trusted on its own — only mint instances
 //! holding the corresponding [`Keyring`] key can produce a valid MAC.
-//! [`Store::get_approved`] re-derives and constant-time-compares; a
+//! [`Store::get_enrolled`] re-derives and constant-time-compares; a
 //! mismatch is treated as if the record were absent (logged loudly
 //! server-side; opaque to the client).
 //!
@@ -78,7 +78,7 @@ pub const K_M_A_FILE: &str = "auth-shared.key";
 /// macaroons (`docs/design-auth-service.md` § *Login flow*).
 pub const K_SESSION_FILE: &str = "auth-session.key";
 
-/// One pending-enrollment record (`_mint/pending/<sub>.json`).
+/// One pending-enrollment record (`_mint/clients/pending/<sub>.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
     /// The self-asserted `cnf` value (`ed25519:<b64 pub>`).
@@ -96,18 +96,18 @@ pub struct Pending {
     pub peer_ip: String,
 }
 
-/// One approved-client registry entry (`_mint/approved/<sub>`).
+/// One enrolled-client registry entry (`_mint/clients/enrolled/<sub>`).
 /// Long-lived; written at `approve()`, consulted by every subsequent
 /// `/v1/enroll` (fast path) and `/v1/enroll-exchange`.
 ///
 /// The record carries its own MAC under the keyring generation that
 /// issued it. A bucket-level forgery (anyone with `mint-rw` PUT access
 /// to `_mint/*`) cannot produce a valid MAC, because the keyring stays
-/// on local disk. [`Store::get_approved`] verifies and returns the
+/// on local disk. [`Store::get_enrolled`] verifies and returns the
 /// record only if the MAC matches; a mismatch is treated as if the
 /// record were absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Approved {
+pub struct Enrolled {
     /// The pinned `cnf` value the operator confirmed. A later
     /// re-enrollment with the same `(sub, pubkey)` skips operator
     /// approval; a different `pubkey` for the same `sub` is treated as
@@ -146,10 +146,10 @@ pub enum Recorded {
     Created,
     /// Identical `(sub, pub)` already pending — idempotent retry.
     Idempotent,
-    /// `(sub, pub)` already in the approved registry; no pending was
+    /// `(sub, pub)` already in the enrolled registry; no pending was
     /// written, and `/v1/enroll-exchange` will succeed immediately
     /// against the existing approval (fast path).
-    AlreadyApproved,
+    AlreadyEnrolled,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -166,7 +166,7 @@ pub enum StateError {
     Conflict,
     #[error("corrupt enrollment record")]
     Corrupt,
-    /// An approved-registry entry's MAC did not validate under any kid
+    /// An enrolled-registry entry's MAC did not validate under any kid
     /// in the keyring — either a bucket-level forgery, a record left
     /// over from a retired kid, or storage corruption. The HTTP layer
     /// treats this as "not approved" (returns 403 awaiting_approval)
@@ -199,10 +199,10 @@ pub struct SweepReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrollmentState {
     Pending,
-    Approved,
+    Enrolled,
 }
 
-/// One row of `mint enroll list` — the unified pending+approved view.
+/// One row of `mint enroll list` — the unified pending+enrolled view.
 #[derive(Debug, Clone)]
 pub struct EnrollmentView {
     pub sub: String,
@@ -215,7 +215,7 @@ pub struct EnrollmentView {
     /// keep one because re-enrollment moves the IP around).
     pub peer_ip: Option<String>,
     /// Age in seconds since `first_seen` (pending) / `approved_at`
-    /// (approved).
+    /// (enrolled).
     pub age_seconds: u64,
     /// This `pub` is also pending under a *different* `sub` — anomalous
     /// (a new key is a new principal); surfaced, not auto-rejected.
@@ -550,16 +550,16 @@ impl Store {
         OPath::from(format!("{STATE_PREFIX}/invite"))
     }
     fn pending_key(sub: &str) -> OPath {
-        OPath::from(format!("{STATE_PREFIX}/pending/{sub}.json"))
+        OPath::from(format!("{STATE_PREFIX}/clients/pending/{sub}.json"))
     }
-    fn approved_key(sub: &str) -> OPath {
-        OPath::from(format!("{STATE_PREFIX}/approved/{sub}"))
+    fn enrolled_key(sub: &str) -> OPath {
+        OPath::from(format!("{STATE_PREFIX}/clients/enrolled/{sub}"))
     }
     fn pending_prefix() -> OPath {
-        OPath::from(format!("{STATE_PREFIX}/pending"))
+        OPath::from(format!("{STATE_PREFIX}/clients/pending"))
     }
-    fn approved_prefix() -> OPath {
-        OPath::from(format!("{STATE_PREFIX}/approved"))
+    fn enrolled_prefix() -> OPath {
+        OPath::from(format!("{STATE_PREFIX}/clients/enrolled"))
     }
     fn template_seal_key() -> OPath {
         OPath::from(format!("{STATE_PREFIX}/templates/seal.json"))
@@ -670,7 +670,7 @@ impl Store {
     }
 
     /// Draw and persist a new invite nonce, then drop every pending
-    /// record opened under an older nonce. The approved registry is
+    /// record opened under an older nonce. The enrolled registry is
     /// **not** touched: outstanding credentials and the re-enrollment
     /// fast path survive rotation. Returns the new nonce.
     pub async fn rotate_invite(&self) -> Result<String, StateError> {
@@ -699,8 +699,8 @@ impl Store {
 
     /// Record (or idempotently re-confirm) a pending enrollment.
     ///
-    /// Fast path: if `_mint/approved/<sub>` already exists with the
-    /// same `pub`, no pending record is written and `Recorded::AlreadyApproved`
+    /// Fast path: if `_mint/clients/enrolled/<sub>` already exists with the
+    /// same `pub`, no pending record is written and `Recorded::AlreadyEnrolled`
     /// is returned — `/v1/enroll-exchange` will succeed against the
     /// existing registry entry without operator intervention.
     ///
@@ -721,23 +721,23 @@ impl Store {
             return Err(StateError::BadSub);
         }
         // Fast-path check: only `Ok(Some(_))` is load-bearing here.
-        // A forged or corrupt approved record (e.g. left over from a
+        // A forged or corrupt enrolled record (e.g. left over from a
         // retired-kid generation, or a pre-#454 unsigned body that
         // can't be deserialised) is operationally equivalent to "no
-        // approved record" — we want the slow path to proceed so the
+        // enrolled record" — we want the slow path to proceed so the
         // operator can re-approve cleanly. Propagating Forged/Corrupt
         // through here would block re-enrollment behind an opaque
         // 401 with no way for the operator to recover without
         // manually deleting the bucket object.
-        let approved = match self.get_approved(sub).await {
+        let enrolled = match self.get_enrolled(sub).await {
             Ok(a) => a,
             Err(StateError::Forged | StateError::Corrupt) => None,
             Err(e) => return Err(e),
         };
-        if let Some(approved) = approved
-            && approved.pubkey == pubkey
+        if let Some(enrolled) = enrolled
+            && enrolled.pubkey == pubkey
         {
-            return Ok(Recorded::AlreadyApproved);
+            return Ok(Recorded::AlreadyEnrolled);
         }
         let rec = Pending {
             pubkey: pubkey.to_string(),
@@ -769,14 +769,14 @@ impl Store {
         }
     }
 
-    /// Operator approval — writes the long-lived `_mint/approved/<sub>`
+    /// Operator approval — writes the long-lived `_mint/clients/enrolled/<sub>`
     /// registry entry with the operator-confirmed `(sub, pubkey)`, then
     /// deletes the now-redundant pending record. Always overwrites an
     /// existing approval (a different `pubkey` is a key-rotation
     /// acknowledgment). The pending delete is best-effort.
     ///
     /// The record is MAC'd under the current keyring generation, so a
-    /// later [`Self::get_approved`] rejects any record whose body has
+    /// later [`Self::get_enrolled`] rejects any record whose body has
     /// been tampered with at the bucket level or that was minted under
     /// a now-retired kid.
     pub async fn approve(
@@ -804,7 +804,7 @@ impl Store {
             &fingerprint_shown,
             r_epoch,
         );
-        let rec = Approved {
+        let rec = Enrolled {
             pubkey: pubkey.to_string(),
             approved_by: approved_by.to_string(),
             approved_at: now_iso8601.to_string(),
@@ -816,7 +816,7 @@ impl Store {
         let bytes = serde_json::to_vec(&rec).map_err(|_| StateError::Corrupt)?;
         self.objects
             .put_opts(
-                &Self::approved_key(sub),
+                &Self::enrolled_key(sub),
                 PutPayload::from(Bytes::from(bytes)),
                 PutOptions::default(),
             )
@@ -830,14 +830,14 @@ impl Store {
         Ok(())
     }
 
-    /// Remove an approved-registry entry. After this call, the next
+    /// Remove an enrolled-registry entry. After this call, the next
     /// `/v1/enroll` for `<sub>` falls back to the slow path
     /// (operator-gated approval). Returns `true` if a record existed.
     pub async fn revoke(&self, sub: &str) -> Result<bool, StateError> {
         if !safe_sub(sub) {
             return Err(StateError::BadSub);
         }
-        match self.objects.delete(&Self::approved_key(sub)).await {
+        match self.objects.delete(&Self::enrolled_key(sub)).await {
             Ok(()) => Ok(true),
             Err(OsError::NotFound { .. }) => Ok(false),
             Err(e) => Err(e.into()),
@@ -861,7 +861,7 @@ impl Store {
         }
     }
 
-    /// The approved-registry entry for `sub`, if any. Used at
+    /// The enrolled-registry entry for `sub`, if any. Used at
     /// `/v1/enroll-exchange` to verify the operator's binding, and at
     /// `/v1/enroll` to take the fast path on a matching `pubkey`.
     ///
@@ -871,23 +871,23 @@ impl Store {
     /// Callers that want to treat a forgery the same as an absent
     /// record (the HTTP layer's policy — don't leak forensic signal to
     /// the client) should map both to "not approved" themselves.
-    pub async fn get_approved(&self, sub: &str) -> Result<Option<Approved>, StateError> {
+    pub async fn get_enrolled(&self, sub: &str) -> Result<Option<Enrolled>, StateError> {
         if !safe_sub(sub) {
             return Err(StateError::BadSub);
         }
-        let bytes = match self.objects.get(&Self::approved_key(sub)).await {
+        let bytes = match self.objects.get(&Self::enrolled_key(sub)).await {
             Ok(g) => g.bytes().await?,
             Err(OsError::NotFound { .. }) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let rec: Approved = serde_json::from_slice(&bytes).map_err(|_| StateError::Corrupt)?;
+        let rec: Enrolled = serde_json::from_slice(&bytes).map_err(|_| StateError::Corrupt)?;
         let kr = self.keyring().await;
         let Some(key) = kr.get(rec.kid) else {
             tracing::warn!(
                 target: "mint::state",
                 sub,
                 kid = rec.kid,
-                "approved record claims a kid not in the keyring; treating as forged"
+                "enrolled record claims a kid not in the keyring; treating as forged"
             );
             return Err(StateError::Forged);
         };
@@ -906,7 +906,7 @@ impl Store {
                 target: "mint::state",
                 sub,
                 kid = rec.kid,
-                "approved record MAC mismatch; treating as forged"
+                "enrolled record MAC mismatch; treating as forged"
             );
             return Err(StateError::Forged);
         }
@@ -925,19 +925,19 @@ impl Store {
         Ok(out)
     }
 
-    async fn approved_subs(&self) -> Result<Vec<String>, StateError> {
+    async fn enrolled_subs(&self) -> Result<Vec<String>, StateError> {
         let mut out = Vec::new();
-        let mut stream = self.objects.list(Some(&Self::approved_prefix()));
+        let mut stream = self.objects.list(Some(&Self::enrolled_prefix()));
         while let Some(item) = stream.next().await {
             let meta = item?;
-            if let Some(sub) = sub_from_approved_key(meta.location.as_ref()) {
+            if let Some(sub) = sub_from_enrolled_key(meta.location.as_ref()) {
                 out.push(sub);
             }
         }
         Ok(out)
     }
 
-    /// Lazy migration: if `_mint/approved/<sub>` is on an older kid,
+    /// Lazy migration: if `_mint/clients/enrolled/<sub>` is on an older kid,
     /// re-MAC it under `current_kid` and PUT back with `If-Match` on
     /// the etag we just read. Called opportunistically by the enroll
     /// fast path so each client's record drifts forward to the
@@ -949,12 +949,12 @@ impl Store {
     /// `Ok(false)`. `Ok(true)` means a migration write actually
     /// happened. The caller never branches on the return value beyond
     /// logging — verification-time correctness is provided by the MAC
-    /// check in `get_approved`, not by this method completing.
-    pub async fn migrate_approval_to_current_kid(&self, sub: &str) -> Result<bool, StateError> {
+    /// check in `get_enrolled`, not by this method completing.
+    pub async fn migrate_enrollment_to_current_kid(&self, sub: &str) -> Result<bool, StateError> {
         if !safe_sub(sub) {
             return Err(StateError::BadSub);
         }
-        let key = Self::approved_key(sub);
+        let key = Self::enrolled_key(sub);
         let g = match self.objects.get(&key).await {
             Ok(g) => g,
             Err(OsError::NotFound { .. }) => return Ok(false),
@@ -963,7 +963,7 @@ impl Store {
         let etag = g.meta.e_tag.clone();
         let version = g.meta.version.clone();
         let bytes = g.bytes().await?;
-        let rec: Approved = match serde_json::from_slice(&bytes) {
+        let rec: Enrolled = match serde_json::from_slice(&bytes) {
             Ok(r) => r,
             Err(_) => return Ok(false),
         };
@@ -1001,7 +1001,7 @@ impl Store {
             &rec.fingerprint_shown,
             rec.r_epoch,
         );
-        let next = Approved {
+        let next = Enrolled {
             pubkey: rec.pubkey,
             approved_by: rec.approved_by,
             approved_at: rec.approved_at,
@@ -1054,16 +1054,16 @@ impl Store {
         let kr = self.keyring().await;
         let new_kid = kr.current_kid();
         let new_key = kr.current_key();
-        for sub in self.approved_subs().await? {
+        for sub in self.enrolled_subs().await? {
             // Read raw so we can decide what to do with a forged record
-            // (skip + count) instead of inheriting `get_approved`'s
+            // (skip + count) instead of inheriting `get_enrolled`'s
             // policy of erroring.
-            let bytes = match self.objects.get(&Self::approved_key(&sub)).await {
+            let bytes = match self.objects.get(&Self::enrolled_key(&sub)).await {
                 Ok(g) => g.bytes().await?,
                 Err(OsError::NotFound { .. }) => continue,
                 Err(e) => return Err(e.into()),
             };
-            let rec: Approved = match serde_json::from_slice(&bytes) {
+            let rec: Enrolled = match serde_json::from_slice(&bytes) {
                 Ok(r) => r,
                 Err(_) => {
                     report.skipped += 1;
@@ -1122,7 +1122,7 @@ impl Store {
                 &rec.fingerprint_shown,
                 rec.r_epoch,
             );
-            let next = Approved {
+            let next = Enrolled {
                 pubkey: rec.pubkey,
                 approved_by: rec.approved_by,
                 approved_at: rec.approved_at,
@@ -1134,7 +1134,7 @@ impl Store {
             let bytes = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
             self.objects
                 .put_opts(
-                    &Self::approved_key(&sub),
+                    &Self::enrolled_key(&sub),
                     PutPayload::from(Bytes::from(bytes)),
                     PutOptions::default(),
                 )
@@ -1146,7 +1146,7 @@ impl Store {
 
     /// Drop pending records older than `max_age_seconds`. The bound is
     /// ≥ the credential ticket `exp`; once it passes, an unexchanged
-    /// pending is dead weight. The approved registry is **not** GC'd.
+    /// pending is dead weight. The enrolled registry is **not** GC'd.
     pub async fn gc(&self, now_unix: u64, max_age_seconds: u64) -> Result<usize, StateError> {
         let mut dropped = 0;
         for sub in self.pending_subs().await? {
@@ -1196,7 +1196,7 @@ impl Store {
         Ok(())
     }
 
-    /// All enrollment rows — pending and approved — for
+    /// All enrollment rows — pending and enrolled — for
     /// `mint enroll list`. State is a column, not a filter.
     pub async fn list(&self, now_unix: u64) -> Result<Vec<EnrollmentView>, StateError> {
         let pending_subs = self.pending_subs().await?;
@@ -1206,15 +1206,15 @@ impl Store {
                 pendings.push((sub, p));
             }
         }
-        let approved_subs = self.approved_subs().await?;
-        let mut approveds: Vec<(String, Approved)> = Vec::new();
-        for sub in approved_subs {
-            match self.get_approved(&sub).await {
-                Ok(Some(a)) => approveds.push((sub, a)),
+        let enrolled_subs = self.enrolled_subs().await?;
+        let mut enrolleds: Vec<(String, Enrolled)> = Vec::new();
+        for sub in enrolled_subs {
+            match self.get_enrolled(&sub).await {
+                Ok(Some(a)) => enrolleds.push((sub, a)),
                 Ok(None) => {}
                 // A forged or retired-kid entry must not poison the
                 // whole `mint enroll list` view — it has already been
-                // logged inside `get_approved`. Skipping it here is
+                // logged inside `get_enrolled`. Skipping it here is
                 // consistent with the HTTP layer's "treat as absent"
                 // policy and matches what the operator would otherwise
                 // see if they retried after the bad record was cleared.
@@ -1223,7 +1223,7 @@ impl Store {
             }
         }
 
-        let mut out = Vec::with_capacity(pendings.len() + approveds.len());
+        let mut out = Vec::with_capacity(pendings.len() + enrolleds.len());
         for (sub, p) in &pendings {
             let anomalous_pub = pendings
                 .iter()
@@ -1238,7 +1238,7 @@ impl Store {
                 anomalous_pub,
             });
         }
-        for (sub, a) in &approveds {
+        for (sub, a) in &enrolleds {
             // approved_at is RFC 3339; converting to age requires
             // parsing. Best-effort: leave 0 on parse failure rather
             // than failing the whole list.
@@ -1248,7 +1248,7 @@ impl Store {
                 .unwrap_or(0);
             out.push(EnrollmentView {
                 sub: sub.clone(),
-                state: EnrollmentState::Approved,
+                state: EnrollmentState::Enrolled,
                 pubkey: a.pubkey.clone(),
                 fingerprint: a.fingerprint_shown.clone(),
                 peer_ip: None,
@@ -1265,9 +1265,9 @@ impl Ord for EnrollmentState {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use EnrollmentState::*;
         match (self, other) {
-            (Pending, Pending) | (Approved, Approved) => std::cmp::Ordering::Equal,
-            (Pending, Approved) => std::cmp::Ordering::Less,
-            (Approved, Pending) => std::cmp::Ordering::Greater,
+            (Pending, Pending) | (Enrolled, Enrolled) => std::cmp::Ordering::Equal,
+            (Pending, Enrolled) => std::cmp::Ordering::Less,
+            (Enrolled, Pending) => std::cmp::Ordering::Greater,
         }
     }
 }
@@ -1278,15 +1278,15 @@ impl PartialOrd for EnrollmentState {
 }
 
 fn sub_from_pending_key(key: &str) -> Option<String> {
-    let prefix = format!("{STATE_PREFIX}/pending/");
+    let prefix = format!("{STATE_PREFIX}/clients/pending/");
     key.strip_prefix(&prefix)
         .and_then(|s| s.strip_suffix(".json"))
         .filter(|s| safe_sub(s))
         .map(str::to_owned)
 }
 
-fn sub_from_approved_key(key: &str) -> Option<String> {
-    let prefix = format!("{STATE_PREFIX}/approved/");
+fn sub_from_enrolled_key(key: &str) -> Option<String> {
+    let prefix = format!("{STATE_PREFIX}/clients/enrolled/");
     key.strip_prefix(&prefix)
         .filter(|s| safe_sub(s))
         .map(str::to_owned)
@@ -1461,7 +1461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_does_not_touch_approved_registry() {
+    async fn rotate_does_not_touch_enrolled_registry() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
         s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 1)
@@ -1472,8 +1472,8 @@ mod tests {
             .unwrap();
         s.rotate_invite().await.unwrap();
         assert!(
-            s.get_approved("01ARZ").await.unwrap().is_some(),
-            "approved registry survives rotation"
+            s.get_enrolled("01ARZ").await.unwrap().is_some(),
+            "enrolled registry survives rotation"
         );
     }
 
@@ -1515,7 +1515,7 @@ mod tests {
             s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 2)
                 .await
                 .unwrap(),
-            Recorded::AlreadyApproved
+            Recorded::AlreadyEnrolled
         );
         assert!(
             s.get_pending("01ARZ").await.unwrap().is_none(),
@@ -1544,8 +1544,8 @@ mod tests {
         assert_eq!(pending.pubkey, PUBB);
         // The old approval is still there; exchange would still match
         // PUBA only — until the operator re-approves PUBB.
-        let approved = s.get_approved("01ARZ").await.unwrap().unwrap();
-        assert_eq!(approved.pubkey, PUBA);
+        let enrolled = s.get_enrolled("01ARZ").await.unwrap().unwrap();
+        assert_eq!(enrolled.pubkey, PUBA);
     }
 
     #[tokio::test]
@@ -1558,7 +1558,7 @@ mod tests {
         s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
             .await
             .unwrap();
-        assert!(s.get_approved("01ARZ").await.unwrap().is_some());
+        assert!(s.get_enrolled("01ARZ").await.unwrap().is_some());
         assert!(
             s.get_pending("01ARZ").await.unwrap().is_none(),
             "pending deleted at approval"
@@ -1567,7 +1567,7 @@ mod tests {
         s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
             .await
             .unwrap();
-        assert!(s.get_approved("01ARZ").await.unwrap().is_some());
+        assert!(s.get_enrolled("01ARZ").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1581,7 +1581,7 @@ mod tests {
             .await
             .unwrap();
         assert!(s.revoke("01ARZ").await.unwrap());
-        assert!(s.get_approved("01ARZ").await.unwrap().is_none());
+        assert!(s.get_enrolled("01ARZ").await.unwrap().is_none());
         assert!(
             !s.revoke("01ARZ").await.unwrap(),
             "second revoke is a no-op"
@@ -1596,7 +1596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_drops_old_pending_only_never_approved() {
+    async fn gc_drops_old_pending_only_never_enrolled() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
         s.record_pending("old-pending", PUBA, &b, "usr_op", "ip", 0)
@@ -1615,8 +1615,8 @@ mod tests {
         assert_eq!(dropped, 1, "only the stale pending goes");
         assert!(s.get_pending("old-pending").await.unwrap().is_none());
         assert!(
-            s.get_approved("kept-approved").await.unwrap().is_some(),
-            "gc never touches the approved registry"
+            s.get_enrolled("kept-approved").await.unwrap().is_some(),
+            "gc never touches the enrolled registry"
         );
         assert!(s.get_pending("fresh").await.unwrap().is_some());
     }
@@ -1634,7 +1634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_unifies_pending_and_approved_with_state_column() {
+    async fn list_unifies_pending_and_enrolled_with_state_column() {
         let (_d, s) = store().await;
         let b = s.current_invite().await.unwrap();
         s.record_pending("subP", PUBA, &b, "usr_op", "ip", 1)
@@ -1650,7 +1650,7 @@ mod tests {
         let by_sub: std::collections::HashMap<_, _> =
             rows.iter().map(|r| (r.sub.as_str(), r.state)).collect();
         assert_eq!(by_sub.get("subP"), Some(&EnrollmentState::Pending));
-        assert_eq!(by_sub.get("subQ"), Some(&EnrollmentState::Approved));
+        assert_eq!(by_sub.get("subQ"), Some(&EnrollmentState::Enrolled));
         assert_eq!(rows.len(), 2);
     }
 
@@ -1697,13 +1697,13 @@ mod tests {
 
     // ---- Approval-MAC / keyring-rotation behaviour ----
 
-    /// Write a raw JSON body directly to `_mint/approved/<sub>` via the
+    /// Write a raw JSON body directly to `_mint/clients/enrolled/<sub>` via the
     /// backing object store. Simulates a bucket-level attacker that
     /// holds a `mint-rw` credential (PUT on `_mint/*`) but does not
     /// have the macaroon keyring on local disk — every test that asks
     /// "could this be forged?" exercises this path.
-    async fn raw_put_approved(store: &Store, sub: &str, body: &serde_json::Value) {
-        let key = Store::approved_key(sub);
+    async fn raw_put_enrolled(store: &Store, sub: &str, body: &serde_json::Value) {
+        let key = Store::enrolled_key(sub);
         let bytes = serde_json::to_vec(body).unwrap();
         store
             .objects
@@ -1717,12 +1717,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_record_round_trips_with_mac() {
+    async fn enrolled_record_round_trips_with_mac() {
         let (_d, s) = store().await;
         s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
             .await
             .unwrap();
-        let got = s.get_approved("01ARZ").await.unwrap().expect("present");
+        let got = s.get_enrolled("01ARZ").await.unwrap().expect("present");
         let kr = s.keyring().await;
         assert_eq!(got.kid, kr.current_kid());
         assert_eq!(got.mac.len(), 64, "32-byte mac as hex");
@@ -1733,7 +1733,7 @@ mod tests {
         let (_d, s) = store().await;
         // A bucket-level write of a record that omits the MAC entirely
         // (or, equivalently, supplies any random value) must not be
-        // honoured by `get_approved`.
+        // honoured by `get_enrolled`.
         let forged = serde_json::json!({
             "pubkey": PUBA,
             "approved_at": APPROVED_AT,
@@ -1742,9 +1742,9 @@ mod tests {
             "kid": 0,
             "mac": "00".repeat(32),
         });
-        raw_put_approved(&s, "01ARZ", &forged).await;
+        raw_put_enrolled(&s, "01ARZ", &forged).await;
         assert!(matches!(
-            s.get_approved("01ARZ").await,
+            s.get_enrolled("01ARZ").await,
             Err(StateError::Forged)
         ));
     }
@@ -1752,8 +1752,8 @@ mod tests {
     #[tokio::test]
     async fn record_pending_falls_through_on_corrupt_approved() {
         // A pre-#454 unsigned body (or any record that won't
-        // deserialise as the current `Approved` struct) is treated as
-        // "no approved record" for the fast-path check — the slow
+        // deserialise as the current `Enrolled` struct) is treated as
+        // "no enrolled record" for the fast-path check — the slow
         // path proceeds and writes a fresh pending. Previously this
         // returned Err(Corrupt) and surfaced as an opaque 401 with
         // a misleading `denied:conflict` audit tag, blocking
@@ -1766,7 +1766,7 @@ mod tests {
             "fingerprint_shown": fingerprint(PUBA),
             // No kid, no mac — pre-#454 shape.
         });
-        raw_put_approved(&s, "01ARZ", &legacy_unsigned).await;
+        raw_put_enrolled(&s, "01ARZ", &legacy_unsigned).await;
         let invite = s.current_invite().await.unwrap();
         let recorded = s
             .record_pending("01ARZ", PUBA, &invite, "usr_op", "ip", 1)
@@ -1781,7 +1781,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_pending_falls_through_on_forged_approved() {
-        // Same defence-in-depth as the Corrupt case: an approved
+        // Same defence-in-depth as the Corrupt case: an enrolled
         // record under a retired/unknown kid (or with a forged MAC)
         // should not block re-enrollment.
         let (_d, s) = store().await;
@@ -1793,7 +1793,7 @@ mod tests {
             "kid": 0,
             "mac": "00".repeat(32),
         });
-        raw_put_approved(&s, "01ARZ", &forged).await;
+        raw_put_enrolled(&s, "01ARZ", &forged).await;
         let invite = s.current_invite().await.unwrap();
         let recorded = s
             .record_pending("01ARZ", PUBA, &invite, "usr_op", "ip", 1)
@@ -1806,17 +1806,17 @@ mod tests {
     #[tokio::test]
     async fn record_copied_to_a_different_sub_fails_to_verify() {
         // The MAC binds `sub` into its input, so an attacker who copies
-        // a valid record verbatim from `_mint/approved/subA` to
-        // `_mint/approved/subB` cannot replay it under the new sub.
+        // a valid record verbatim from `_mint/clients/enrolled/subA` to
+        // `_mint/clients/enrolled/subB` cannot replay it under the new sub.
         let (_d, s) = store().await;
         s.approve("subA", PUBA, "usr_op", APPROVED_AT)
             .await
             .unwrap();
-        let real = s.get_approved("subA").await.unwrap().expect("present");
+        let real = s.get_enrolled("subA").await.unwrap().expect("present");
         let body = serde_json::to_value(&real).unwrap();
-        raw_put_approved(&s, "subB", &body).await;
+        raw_put_enrolled(&s, "subB", &body).await;
         assert!(matches!(
-            s.get_approved("subB").await,
+            s.get_enrolled("subB").await,
             Err(StateError::Forged)
         ));
     }
@@ -1839,7 +1839,7 @@ mod tests {
         kr.retire(&rk, 0).unwrap();
         s.set_keyring(kr).await;
         assert!(matches!(
-            s.get_approved("01ARZ").await,
+            s.get_enrolled("01ARZ").await,
             Err(StateError::Forged)
         ));
     }
@@ -1858,9 +1858,9 @@ mod tests {
         let rk = d.path().join("root_keys");
         kr.add_and_promote(&rk, None).unwrap();
         s.set_keyring(kr).await;
-        // get_approved still returns the original record — the new kid
+        // get_enrolled still returns the original record — the new kid
         // is current, but kid=0 is still in the ring for verification.
-        let got = s.get_approved("01ARZ").await.unwrap().expect("present");
+        let got = s.get_enrolled("01ARZ").await.unwrap().expect("present");
         assert_eq!(got.kid, 0, "record stays on its issuing kid");
     }
 
@@ -1887,12 +1887,12 @@ mod tests {
             .await
             .unwrap();
         s.set_keyring(ring_two_keys([1u8; 32], [2u8; 32])).await;
-        let migrated = s.migrate_approval_to_current_kid("01ARZ").await.unwrap();
+        let migrated = s.migrate_enrollment_to_current_kid("01ARZ").await.unwrap();
         assert!(migrated, "first call moves it forward");
-        let after = s.get_approved("01ARZ").await.unwrap().expect("present");
+        let after = s.get_enrolled("01ARZ").await.unwrap().expect("present");
         assert_eq!(after.kid, 1);
         assert_eq!(after.pubkey, PUBA, "body content unchanged");
-        let again = s.migrate_approval_to_current_kid("01ARZ").await.unwrap();
+        let again = s.migrate_enrollment_to_current_kid("01ARZ").await.unwrap();
         assert!(!again, "already at current kid → no-op");
     }
 
@@ -1909,15 +1909,15 @@ mod tests {
             "kid": 0,
             "mac": "00".repeat(32),
         });
-        raw_put_approved(&s, "01ARZ", &forged).await;
+        raw_put_enrolled(&s, "01ARZ", &forged).await;
         s.set_keyring(ring_two_keys([1u8; 32], [2u8; 32])).await;
-        let migrated = s.migrate_approval_to_current_kid("01ARZ").await.unwrap();
+        let migrated = s.migrate_enrollment_to_current_kid("01ARZ").await.unwrap();
         assert!(!migrated, "forged record is not re-MAC'd forward");
         // And the record still fails to verify under the new kid: the
         // MAC didn't change, and the new kid's key wouldn't match it
         // either.
         assert!(matches!(
-            s.get_approved("01ARZ").await,
+            s.get_enrolled("01ARZ").await,
             Err(StateError::Forged)
         ));
     }
@@ -1941,7 +1941,7 @@ mod tests {
             "kid": 0,
             "mac": "00".repeat(32),
         });
-        raw_put_approved(&s, "forged", &forged).await;
+        raw_put_enrolled(&s, "forged", &forged).await;
         let mut kr = (*s.keyring().await).clone();
         let rk = d.path().join("root_keys");
         kr.add_and_promote(&rk, None).unwrap();
@@ -1955,9 +1955,9 @@ mod tests {
         assert_eq!(report.rekeyed, 1, "real-old moved forward");
         assert_eq!(report.skipped, 1, "forged not laundered");
         assert_eq!(report.already_current, 1, "on-current untouched");
-        assert_eq!(s.get_approved("real-old").await.unwrap().unwrap().kid, 1);
+        assert_eq!(s.get_enrolled("real-old").await.unwrap().unwrap().kid, 1);
         assert!(matches!(
-            s.get_approved("forged").await,
+            s.get_enrolled("forged").await,
             Err(StateError::Forged)
         ));
     }
@@ -1991,10 +1991,10 @@ mod tests {
         let mut kr = (*s.keyring().await).clone();
         kr.retire(&rk, 1).unwrap();
         s.set_keyring(kr).await;
-        assert!(s.get_approved("under-0").await.unwrap().is_some());
-        assert!(s.get_approved("under-2").await.unwrap().is_some());
+        assert!(s.get_enrolled("under-0").await.unwrap().is_some());
+        assert!(s.get_enrolled("under-2").await.unwrap().is_some());
         assert!(matches!(
-            s.get_approved("under-1").await,
+            s.get_enrolled("under-1").await,
             Err(StateError::Forged)
         ));
     }
@@ -2003,7 +2003,7 @@ mod tests {
     async fn list_skips_forged_records_without_failing() {
         // `mint enroll list` must not crash because one record was
         // forged or under a retired kid; that record is silently
-        // dropped from the view (logged inside get_approved).
+        // dropped from the view (logged inside get_enrolled).
         let (_d, s) = store().await;
         s.approve("good", PUBA, "usr_op", APPROVED_AT)
             .await
@@ -2016,7 +2016,7 @@ mod tests {
             "kid": 0,
             "mac": "00".repeat(32),
         });
-        raw_put_approved(&s, "bad", &forged).await;
+        raw_put_enrolled(&s, "bad", &forged).await;
         let rows = s.list(0).await.unwrap();
         let subs: Vec<&str> = rows.iter().map(|r| r.sub.as_str()).collect();
         assert!(subs.contains(&"good"));

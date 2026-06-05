@@ -8,7 +8,7 @@
 //! - [`derive_r`] — `r = BLAKE3-derive-key("mint tpc r-key v1",
 //!   K_M || client_id || r_epoch)`. Deterministic in its inputs, so
 //!   mint can re-derive `r` on every exchange call without storing
-//!   per-client state. Bumping `r_epoch` (in `_mint/approved/<sub>`)
+//!   per-client state. Bumping `r_epoch` (in `_mint/clients/enrolled/<sub>`)
 //!   rolls `r` to a fresh value, invalidating every existing CID for
 //!   the client.
 //!
