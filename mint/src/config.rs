@@ -59,6 +59,11 @@ pub enum ConfigError {
     NonScalarEnv { key: String },
     #[error("role {role}: template references env.{key} but [env] has no such key")]
     UndefinedEnvKey { role: String, key: String },
+    #[error("role {role}: policy template is not valid JSON: {source}")]
+    PolicyNotJson {
+        role: String,
+        source: serde_json::Error,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,7 +241,7 @@ pub struct RawRole {
     pub min_ttl_seconds: u64,
     pub max_ttl_seconds: u64,
     pub default_ttl_seconds: u64,
-    /// Filename of the IAM-policy handlebars template (see
+    /// Filename of the IAM-policy JSON template (see
     /// [`crate::template`]), resolved against `roles_dir`. Optional;
     /// defaults to `<name>.json`. Whether explicit or derived it must
     /// be a single normal path component — validated by [`read_policy`]
@@ -356,7 +361,7 @@ pub struct Role {
     /// explicit `policy_file` was set. Retained for diagnostics
     /// (`mint role inspect`); the template itself is already resolved.
     pub policy_path: PathBuf,
-    /// The role's IAM-policy handlebars template, read from
+    /// The role's IAM-policy JSON template, read from
     /// [`policy_path`](Role::policy_path) at load.
     pub policy: String,
 }
@@ -434,7 +439,7 @@ impl Config {
         // (every `{{env.X}}` names a defined key) is deliberately **not**
         // run here — it gates seal authoring, not config load, so a
         // drifted local template never blocks a host from serving its
-        // already-sealed surface. See [`Config::validate_env_surface`].
+        // already-sealed surface. See [`Config::validate_policy_surface`].
         let mut env = BTreeMap::new();
         for (key, value) in raw.env {
             let scalar = env_scalar_to_string(&key, &value)?;
@@ -454,16 +459,33 @@ impl Config {
         })
     }
 
-    /// Check that every `{{env.X}}` a role template references names a key
-    /// present in `[env]`. This gates **seal authoring** (`POST
-    /// /v1/admin/seal`): a seal must not pin templates that reference
-    /// undefined env values. It is *not* run at config load — the request
-    /// path renders the sealed surface, decoupled from the live config, so
-    /// a drifted local template must never block a host from serving its
-    /// already-sealed roles. Render-time strict mode is the final backstop
-    /// if `[env]` is later mutated to drop a key a sealed template uses.
-    pub fn validate_env_surface(&self) -> Result<(), ConfigError> {
+    /// Gate **seal authoring** (`POST /v1/admin/seal`) on two template
+    /// invariants:
+    ///
+    /// 1. Every policy template parses as JSON. A `{{…}}` token may sit
+    ///    only inside a JSON string value; one that escaped (array, key,
+    ///    bare position) makes the template invalid JSON and is caught
+    ///    here, not at first render. The renderer relies on this — it
+    ///    substitutes into the parsed string leaves and re-serialises, so
+    ///    a valid-JSON template is the precondition for injection-proof
+    ///    rendering (`crate::template`).
+    /// 2. Every `{{env.X}}` a template references names a key present in
+    ///    `[env]` — a seal must not pin templates referencing undefined
+    ///    env values.
+    ///
+    /// Neither is run at config load: the request path renders the sealed
+    /// surface, decoupled from the live config, so a drifted local
+    /// template must never block a host from serving its already-sealed
+    /// roles. Render-time strict mode is the final backstop if `[env]` is
+    /// later mutated to drop a key a sealed template uses.
+    pub fn validate_policy_surface(&self) -> Result<(), ConfigError> {
         for role in self.roles.values() {
+            serde_json::from_str::<serde_json::Value>(&role.policy).map_err(|source| {
+                ConfigError::PolicyNotJson {
+                    role: role.name.clone(),
+                    source,
+                }
+            })?;
             for path in crate::template::template_surface(&role.policy).env {
                 if let Some(key) = path.strip_prefix("env.")
                     && !self.env.contains_key(key)
@@ -626,7 +648,7 @@ policy_file = "r.json"
         assert_eq!(c.store.bucket, "state-bucket");
         assert_eq!(c.env["bucket"], "data-bucket");
         // A template referencing a defined key satisfies the seal gate.
-        assert!(c.validate_env_surface().is_ok());
+        assert!(c.validate_policy_surface().is_ok());
     }
 
     #[test]
@@ -638,7 +660,7 @@ policy_file = "r.json"
         let cfg = parse_for_test(ENV_SAMPLE, &[("r.json", r#"{"r":"{{env.region}}"}"#)])
             .expect("load tolerates an undefined env-key reference");
         assert!(matches!(
-            cfg.validate_env_surface(),
+            cfg.validate_policy_surface(),
             Err(ConfigError::UndefinedEnvKey { key, .. }) if key == "region"
         ));
     }

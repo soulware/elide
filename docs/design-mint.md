@@ -1188,15 +1188,38 @@ the actual fix. The guarantee is name-level: a symlink *inside*
 custody, so its contents are the operator's own, not an external-input
 boundary. The role inventory — names and TTL bounds —
 stays visible at a glance in one `mint.toml`; only the multi-line
-handlebars-over-JSON template, which is awkward to lint and diff inside a
+JSON policy template, which is awkward to lint and diff inside a
 TOML triple-quoted string, moves to a per-role file. The policy is
 mandatory: a role whose template file is absent is a config error
 (`ReadPolicyFile`); there is no inline form.
 
 ### Templating
 
-The mint substitutes four classes of variable in the policy template at
-issuance time, each a plain handlebars data path with an explicit,
+A role's policy template is **JSON** carrying `{{ ns.key }}` scalar
+substitution tokens, each token sitting inside a JSON *string value*.
+Rendering parses the template as JSON, substitutes into the string
+leaves, and re-serialises. Mint runs no templating engine — the grammar
+is exactly `{{ namespace.key }}` scalar lookup, so a small scanner
+replaces the engine and its dependency.
+
+Two security properties fall out of that shape rather than from a bespoke
+check:
+
+- **Injection-proof.** A substituted value is placed into an
+  already-parsed JSON string and the document is re-serialised, so the
+  serialiser escapes any `"`/`\` the value contains — a value can never
+  break out of its slot, whatever its content (a value that itself
+  contains `{{…}}` is inert text, never re-scanned). The rendered output
+  is valid JSON by construction.
+- **Substitution is string-positioned, structurally.** A `{{…}}` token
+  anywhere but inside a string value — an array element, an object key, a
+  bare position — makes the template invalid JSON. That is rejected when
+  the template is parsed: at **seal authoring** (`POST /v1/admin/seal`,
+  alongside the env-key check) and again at render time. JSON validity
+  *is* the "this token sits in a safe position" assertion; there is no
+  separate positional check to forget.
+
+The mint substitutes four classes of variable, each with an explicit,
 distinct trust provenance:
 
 - `{{env.X}}` — values from the mint's `[env]` table, a flat set of
@@ -1204,10 +1227,9 @@ distinct trust provenance:
   path. Server-side, never caller-controlled — and **sealed**: at seal
   time the `[env]` values are materialised into the sealed surface
   (`sealed/env.json`, pinned by the seal's `env_blake3`), so the request
-  path renders the *sealed* env, never the live config. Values render as
-  data (a value containing `{{…}}` is inert text, never re-parsed), so
-  there is no template injection. Every `{{env.X}}` a template references
-  must name a key in `[env]`; this is enforced when a seal is authored
+  path renders the *sealed* env, never the live config. Every `{{env.X}}`
+  a template references must name a key in `[env]`; this is enforced when
+  a seal is authored
   (`POST /v1/admin/seal`) — a seal cannot pin templates referencing
   undefined env values — so the gap surfaces at publish time, not as a
   fail-closed render. It is deliberately *not* checked at config load:
@@ -1248,16 +1270,17 @@ this verify/clear path is the only thing that grants or denies. As
 **data** its MAC-verified value may also be substituted via
 `{{caveat.X}}` (above), read-only. The per-volume target, by contrast, is
 honest-but-unverified caller assertion and rides the body as `req.volume`,
-not a caveat. All four classes render strict — an absent key a template
-references fails the render closed, never a silent empty string.
+not a caveat. All four classes are strict — a token naming an absent key,
+a non-string `req` field, or anything that is not a `namespace.key`
+scalar path fails the render closed, never a silent empty string.
 
-The mint **does not** ship a general-purpose policy DSL. The
-role-facing template surface is scalar substitution: `{{env.*}}`,
-`{{mint.*}}`, `{{req.*}}`, and `{{caveat.*}}` plain paths. No role
-iterates a list — every role's policy is straight scalar substitution.
-Conditional blocks,
-arithmetic, value transformations, and dynamic resource construction
-beyond straight substitution are deliberately out of scope. Roles
+The mint **does not** ship a general-purpose policy DSL. The role-facing
+surface is scalar substitution of `{{env.*}}`, `{{mint.*}}`, `{{req.*}}`,
+and `{{caveat.*}}` tokens into the JSON string leaves. No role iterates a
+list — every role's policy is straight scalar substitution. List
+iteration, conditional blocks, arithmetic, value transformations, and
+dynamic resource construction beyond straight substitution are
+deliberately out of scope. Roles
 requiring more expressive policies should be split into multiple roles.
 
 ### Per-volume read credentials
