@@ -189,13 +189,15 @@ enum CredentialCmd {
 
 #[derive(Subcommand)]
 enum RoleCmd {
-    /// List configured roles: name, TTL bounds.
+    /// List roles: name, TTL bounds, and each role's state relative to
+    /// the served seal (served / drifted / unsealed).
     List {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
     },
-    /// Show one role: TTL bounds, policy source, and
-    /// the raw policy template + the substitution surface it references.
+    /// Show one role from the served seal: TTL bounds, policy source, the
+    /// served policy template + its substitution surface, and any drift of
+    /// the local config from the seal.
     Inspect {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
@@ -884,13 +886,56 @@ fn role_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("no roles configured");
         return Ok(());
     }
-    println!("{:<24} {:>7} {:>7} {:>7}", "NAME", "MIN", "DEF", "MAX");
+
+    // The served seal (if any) is authoritative; the STATE column reports
+    // each role's relationship to it, mirroring `mint role inspect`.
+    use mint::sealed_cache::CacheState;
+    let cache = mint::sealed_cache::load(&config.data_dir)?;
+    if let CacheState::Corrupt { reason } = &cache {
+        eprintln!("warning: sealed cache is corrupt and will not be served: {reason}");
+    }
+    let served = match &cache {
+        CacheState::Loaded {
+            seal, templates, ..
+        } => Some((seal, templates)),
+        _ => None,
+    };
+    // env/audience drift is deployment-wide: it marks every served role
+    // drifted, since it changes the resources each grant renders to.
+    let global_drift =
+        served.is_some_and(|(s, _)| !s.env_matches(&config.env) || s.audience != config.audience);
+
+    println!(
+        "{:<24} {:>7} {:>7} {:>7}  STATE",
+        "NAME", "MIN", "DEF", "MAX"
+    );
     // config.roles is a BTreeMap, so iteration is name-sorted.
     for r in config.roles.values() {
-        println!(
-            "{:<24} {:>7} {:>7} {:>7}",
-            r.name, r.min_ttl_seconds, r.default_ttl_seconds, r.max_ttl_seconds,
-        );
+        let row = served
+            .and_then(|(seal, templates)| {
+                let sealed = seal.roles.get(&r.name)?;
+                templates.get(&r.name)?;
+                let drifted = global_drift
+                    || sealed.min_ttl_seconds != r.min_ttl_seconds
+                    || sealed.default_ttl_seconds != r.default_ttl_seconds
+                    || sealed.max_ttl_seconds != r.max_ttl_seconds
+                    || sealed.policy_blake3 != mint::seal::hash_hex(r.policy.as_bytes());
+                let state = if drifted { "drifted" } else { "served" };
+                Some((
+                    sealed.min_ttl_seconds,
+                    sealed.default_ttl_seconds,
+                    sealed.max_ttl_seconds,
+                    state,
+                ))
+            })
+            .unwrap_or((
+                r.min_ttl_seconds,
+                r.default_ttl_seconds,
+                r.max_ttl_seconds,
+                "unsealed",
+            ));
+        let (min, def, max, state) = row;
+        println!("{:<24} {min:>7} {def:>7} {max:>7}  {state}", r.name);
     }
     Ok(())
 }
@@ -901,19 +946,96 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
         .roles
         .get(name)
         .ok_or_else(|| format!("no role {name} in config (see `mint role list`)"))?;
+
+    // Two surfaces hold a role: the live authoring template in roles_dir/
+    // (what the operator edits) and the sealed surface in <data_dir>/sealed/
+    // (what mint mints from — never the live config). Report the served
+    // surface as authoritative and flag where the live config has drifted.
+    let cache = mint::sealed_cache::load(&config.data_dir)?;
+
     eprintln!("role: {}", role.name);
-    eprintln!(
-        "  ttl_seconds:      min={} default={} max={}",
-        role.min_ttl_seconds, role.default_ttl_seconds, role.max_ttl_seconds
-    );
-    eprintln!("  audience:         {}", config.audience);
     eprintln!("  store.bucket:     {}", config.store.bucket);
     eprintln!("  policy source:    {}", role.policy_path.display());
 
-    // The policy is a request-parameterised template: there is no
-    // single concrete grant to print, so show the substitution surface
-    // (by trust provenance) + the raw template, not a rendering.
-    let surface = mint::template::template_surface(&role.policy);
+    use mint::sealed_cache::CacheState;
+    match cache {
+        CacheState::Loaded {
+            seal, templates, ..
+        } => match (seal.roles.get(name), templates.get(name)) {
+            (Some(sealed), Some(sealed_policy)) => {
+                eprintln!("  surface:          served (sealed at {})", seal.sealed_at);
+
+                // Sealed value is authoritative; show the live value only
+                // where the config has drifted from it.
+                let drift = |s: u64, l: u64| {
+                    if s == l {
+                        String::new()
+                    } else {
+                        format!(" (local={l})")
+                    }
+                };
+                eprintln!(
+                    "  ttl_seconds:      min={}{} default={}{} max={}{}",
+                    sealed.min_ttl_seconds,
+                    drift(sealed.min_ttl_seconds, role.min_ttl_seconds),
+                    sealed.default_ttl_seconds,
+                    drift(sealed.default_ttl_seconds, role.default_ttl_seconds),
+                    sealed.max_ttl_seconds,
+                    drift(sealed.max_ttl_seconds, role.max_ttl_seconds),
+                );
+                if seal.audience == config.audience {
+                    eprintln!("  audience:         {}", seal.audience);
+                } else {
+                    eprintln!(
+                        "  audience:         {} (local={})",
+                        seal.audience, config.audience
+                    );
+                }
+                // env is deployment-wide; drift changes the resources every
+                // {{env.X}} in this template renders to.
+                if !seal.env_matches(&config.env) {
+                    eprintln!("  \u{26a0} local [env] has drifted from the seal");
+                }
+
+                // Surface + template come from the sealed bytes.
+                print_policy_surface(sealed_policy);
+                let local_blake3 = mint::seal::hash_hex(role.policy.as_bytes());
+                if local_blake3 != sealed.policy_blake3 {
+                    eprintln!("  \u{26a0} local roles_dir/ has drifted from the seal:");
+                    eprintln!("      sealed policy_blake3: {}", sealed.policy_blake3);
+                    eprintln!("      local  policy_blake3: {local_blake3}");
+                    eprintln!("      (run `mint seal` to publish the local template)");
+                }
+                eprintln!("  policy template (served):");
+                println!("{sealed_policy}");
+            }
+            // In the config but not the seal: added since the last seal,
+            // so it cannot be minted yet.
+            _ => print_unsealed_role(
+                role,
+                "role absent from the served seal; will not be minted until `mint seal`",
+            ),
+        },
+        CacheState::Absent => print_unsealed_role(
+            role,
+            "no sealed cache on this host; the local template is not served",
+        ),
+        CacheState::Corrupt { reason } => {
+            eprintln!(
+                "  surface:          CORRUPT \u{2014} sealed cache will not be served: {reason}"
+            );
+            print_unsealed_role(role, "showing local authoring template");
+        }
+    }
+    Ok(())
+}
+
+/// The substitution surface of a policy template, grouped by trust
+/// provenance. A role policy is a request-parameterised template — there
+/// is no single concrete grant to print — so this shows where each
+/// substituted value comes from, not a rendering.
+fn print_policy_surface(template: &str) {
+    let surface = mint::template::template_surface(template);
     eprintln!("  policy references:");
     for (label, vals) in [
         ("caveat (MAC-bound)", &surface.caveats),
@@ -925,7 +1047,17 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
             eprintln!("    {label}: {}", vals.join(", "));
         }
     }
-    eprintln!("  policy template:");
+}
+
+/// No sealed surface backs this role — print the live authoring template,
+/// labelled so it is never mistaken for what mint serves.
+fn print_unsealed_role(role: &mint::config::Role, why: &str) {
+    eprintln!("  surface:          NOT SEALED \u{2014} {why}");
+    eprintln!(
+        "  ttl_seconds:      min={} default={} max={}  (local, unsealed)",
+        role.min_ttl_seconds, role.default_ttl_seconds, role.max_ttl_seconds
+    );
+    print_policy_surface(&role.policy);
+    eprintln!("  policy template (local draft):");
     println!("{}", role.policy);
-    Ok(())
 }
