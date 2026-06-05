@@ -173,7 +173,7 @@ Each mint instance is configured with:
    plus optional `endpoint` and `region` for the S3 client mint builds
    to reach it. Operational transport only; **never** a template surface.
 6. **Template values** (`[env]`) — a flat table of operator-defined
-   scalar entries, surfaced to role policy templates as `{{env.X}}`
+   scalar entries, surfaced to role policy templates as `{{env "X"}}`
    (§ *Templating*): the bucket name(s) roles grant on, prefixes, region
    strings. The only server-side substitution source a role policy reads.
    Nested tables or arrays under `[env]` are a config error; the store
@@ -1163,13 +1163,13 @@ all of them.
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each req.ancestors}},
-      "arn:aws:s3:::{{env.bucket}}/by_id/{{this}}/*"
+      "arn:aws:s3:::{{env "bucket"}}/by_id/{{caveat "elide:Volume"}}/*"
+      {{#each (req "ancestors")}},
+      "arn:aws:s3:::{{env "bucket"}}/by_id/{{this}}/*"
       {{/each}}
     ],
     "Condition": {
-      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+      "DateLessThan": {"aws:CurrentTime": "{{system "expiry_iso8601"}}"}
     }
   }]
 }
@@ -1200,61 +1200,83 @@ mandatory: a role whose template file is absent is a config error
 ### Templating
 
 The mint substitutes four classes of variable in the policy template at
-issuance time, each with an explicit, distinct trust provenance:
+issuance time, each reached through a built-in **lookup helper** that
+takes the key as a string argument, each with an explicit, distinct
+trust provenance. A template author learns one rule — `{{namespace
+"key"}}` to substitute a value, `{{#each (namespace "key")}}` to iterate
+a list — and the namespace word names the provenance:
 
-- `{{env.X}}` — values from the mint's `[env]` table, a flat set of
-  operator-defined scalars (bucket name(s), prefixes, region), as a plain
-  path. Server-side, never caller-controlled — and **sealed**: at seal
-  time the `[env]` values are materialised into the sealed surface
+- `{{env "X"}}` — value `X` from the mint's `[env]` table, a flat set of
+  operator-defined scalars (bucket name(s), prefixes, region).
+  Server-side, never caller-controlled, and **sealed**: at seal time the
+  `[env]` values are materialised into the sealed surface
   (`sealed/env.json`, pinned by the seal's `env_blake3`), so the request
   path renders the *sealed* env, never the live config. Values render as
   data (a value containing `{{…}}` is inert text, never re-parsed), so
-  there is no template injection. Every `{{env.X}}` a template references
-  must name a key in `[env]`; this is enforced when a seal is authored
+  there is no template injection. Every `{{env "X"}}` a template
+  references must name a key in `[env]`; enforced when a seal is authored
   (`POST /v1/admin/seal`) — a seal cannot pin templates referencing
   undefined env values — so the gap surfaces at publish time, not as a
-  fail-closed render. It is deliberately *not* checked at config load:
-  serving is decoupled from the live config, so a drifted local template
-  never blocks a host from serving its already-sealed roles.
+  fail-closed render. Deliberately *not* checked at config load: serving
+  is decoupled from the live config, so a drifted local template never
+  blocks a host from serving its already-sealed roles.
 - `{{caveat "X"}}` — the verified macaroon's caveat named `X` (MAC-bound,
-  rooted in the mint's macaroon root), resolved through a built-in
-  `caveat` lookup helper that takes the caveat name as a string argument.
-  All caveats are scalar and render directly (`{{caveat "elide:Volume"}}`).
-  The helper form (not a `{{caveat.X}}` path) is required because
-  namespaced caveat names contain `:`, which is not a legal template path
-  segment; it also keeps the caveat surface to a single named lookup
-  rather than arbitrary data-graph traversal.
-- `{{req.X}}` — fields from the PoP-verified request body (bound to
-  `coordinator.key`, this macaroon's tail, and this moment — §
-  *Authentication*). Available **only** after the PoP signature is
-  verified. Scalars render directly; arrays iterate as
-  `{{#each req.ancestors}}…{{/each}}`. This is the channel for
-  honest-but-unverified scoping data the coordinator computes (e.g. the
-  ancestor lineage): mint transmits it into the policy, the PoP
+  rooted in the mint's macaroon root). All caveats are scalar and render
+  directly. The key is the full namespaced caveat name
+  (`{{caveat "elide:Volume"}}`); its `:` rides in as a string argument,
+  so the namespacing convention is preserved with no issuer-side rename.
+- `{{req "X"}}` — the **top-level** field `X` of the PoP-verified request
+  body (bound to `coordinator.key`, this macaroon's tail, and this
+  moment — § *Authentication*); available **only** after the PoP
+  signature is verified. `req` exposes top-level named fields only: there
+  is no nested traversal — `{{req "a.b"}}` is a single key named `a.b`,
+  not a walk into a sub-object. Scalar fields render directly; array
+  fields iterate as `{{#each (req "ancestors")}}…{{/each}}`. This is the
+  channel for honest-but-unverified scoping data the coordinator computes
+  (e.g. the ancestor lineage): mint transmits it into the policy, the PoP
   authenticates *who* asserted it, mint never validates the value.
-- `{{system.X}}` — values computed by the mint at request time, as a
-  plain path. v1 set: `system.expiry_iso8601` (the issued credential's
-  expiry, derived from the requested or default TTL).
+- `{{system "X"}}` — value `X` computed by the mint at request time. v1
+  set: `system "expiry_iso8601"` (the issued credential's expiry, derived
+  from the requested or default TTL).
 
-The `caveat` helper resolves names against the chain under AND
-semantics: a scalar caveat repeated across attenuations must agree on a
-single value; two disagreeing occurrences are an unsatisfiable
-restriction the holder constructed and resolve to a hard failure —
-**never** silently to "absent" (that would let a holder, who can append
-caveats with only the trailing MAC, neutralise a binding caveat by
-appending a contradictory copy). A reference to a caveat the macaroon
-does not carry, or one that is unsatisfiable, is a hard render failure:
-the request is refused, never minted with a missing or downgraded
-substitution. `{{req.X}}` is likewise strict — an absent field a
-template references fails the render closed.
+All four helpers are **strict / fail-closed**. The `caveat` helper
+resolves names against the chain under AND semantics: a scalar caveat
+repeated across attenuations must agree on a single value; two
+disagreeing occurrences are an unsatisfiable restriction the holder
+constructed and resolve to a hard failure — **never** silently to
+"absent" (that would let a holder, who can append caveats with only the
+trailing MAC, neutralise a binding caveat by appending a contradictory
+copy). A reference to a caveat the macaroon does not carry, or one that
+is unsatisfiable, is a hard render failure. `{{env "X"}}`, `{{req "X"}}`,
+and `{{system "X"}}` are likewise strict: a key the helper cannot
+resolve fails the render closed, and an unregistered namespace
+(`{{tenant "X"}}`) is a helper-not-found error.
 
 The mint **does not** ship a general-purpose policy DSL. The entire
-template surface is `{{env.*}}` / `{{system.*}}` plain paths, the
-`caveat` scalar lookup helper, `{{req.*}}` fields, and `{{#each}}`
-over a `req.*` array. Conditional blocks, arithmetic, value
-transformations, and dynamic resource construction beyond straight
-substitution are deliberately out of scope. Roles requiring more
+template surface is the four lookup helpers and `{{#each (req "X")}}`
+over a `req` array. No namespace is exposed as a raw context-data object,
+so arbitrary data-graph traversal does not exist *by construction* —
+there is nothing for conditional blocks, nested-path walks, or
+`{{#each}}` over a non-`req` namespace to operate on. Conditionals,
+arithmetic, value transformations, and dynamic resource construction
+beyond straight substitution are out of scope. Roles requiring more
 expressive policies should be split into multiple roles.
+
+A role template reads:
+
+```handlebars
+"Resource": [
+  "arn:aws:s3:::{{env "bucket"}}/by_id/{{caveat "elide:Volume"}}/*"
+  {{#each (req "ancestors")}},
+  "arn:aws:s3:::{{env "bucket"}}/by_id/{{this}}/*"
+  {{/each}}
+],
+"Condition": {"DateLessThan": {"aws:CurrentTime": "{{system "expiry_iso8601"}}"}}
+```
+
+Because `{{env "bucket"}}` is a helper call, not a path, it resolves
+identically in any block scope — no `{{../env.bucket}}` scope-walk is
+needed inside `{{#each}}`.
 
 ### Required caveats
 
@@ -1442,13 +1464,13 @@ definition below):
 Non-caveat template inputs (the other three substitution classes,
 listed here so the issuer's surface is unambiguous):
 
-- `{{env.X}}` — server-side config; Elide uses `env.bucket`. Never
-  caller-controlled.
-- `{{req.X}}` — PoP-verified request body; Elide uses
-  `req.ancestors` (the `volume-ro` ancestor lineage). Vouched for
+- `{{env "X"}}` — server-side config; Elide uses `{{env "bucket"}}`.
+  Never caller-controlled.
+- `{{req "X"}}` — PoP-verified request body; Elide uses
+  `{{req "ancestors"}}` (the `volume-ro` ancestor lineage). Vouched for
   by `coordinator.key`, never validated by mint.
-- `{{system.X}}` — mint-computed at issuance; Elide uses
-  `system.expiry_iso8601`.
+- `{{system "X"}}` — mint-computed at issuance; Elide uses
+  `{{system "expiry_iso8601"}}`.
 
 Notes:
 
@@ -1546,7 +1568,7 @@ prefix.
   the window; WAL absorbs a brief refresh stall), and 24h bounds the
   write/delete revocation window on a single volume.
 - **Policy:** `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
-  `arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*`,
+  `arn:aws:s3:::{{env "bucket"}}/by_id/{{caveat "elide:Volume"}}/*`,
   plus the volume's two exact `meta/{{caveat "elide:Volume"}}.provenance`
   and `meta/{{caveat "elide:Volume"}}.pub` objects (the drain uploads
   them; force-release reads `volume.pub`). Single volume only.
@@ -1572,13 +1594,13 @@ partitioning:
 - **Policy:** a multi-statement document, each statement preserving
   the invariant its prefix carries:
   - `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
-    `arn:aws:s3:::{{env.bucket}}/names/*`.
+    `arn:aws:s3:::{{env "bucket"}}/names/*`.
   - `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-    `arn:aws:s3:::{{env.bucket}}/events/*`. **`events/` append-only**
+    `arn:aws:s3:::{{env "bucket"}}/events/*`. **`events/` append-only**
     is enforced here — no statement, in any role, grants delete on
     `events/`.
   - `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-    `arn:aws:s3:::{{env.bucket}}/coordinators/{{caveat "sub"}}/*`
+    `arn:aws:s3:::{{env "bucket"}}/coordinators/{{caveat "sub"}}/*`
     — own-prefix only, via `sub` templating. **`coordinators/`
     immutability** is enforced here; a leaked key can rewrite only
     *this* coordinator's identity, never impersonate another, and
@@ -1685,10 +1707,10 @@ endpoint resolution, event-log and peer-discovery reads.
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{env.bucket}}/names/*",
-      "arn:aws:s3:::{{env.bucket}}/coordinators/*",
-      "arn:aws:s3:::{{env.bucket}}/events/*",
-      "arn:aws:s3:::{{env.bucket}}/meta/*"
+      "arn:aws:s3:::{{env "bucket"}}/names/*",
+      "arn:aws:s3:::{{env "bucket"}}/coordinators/*",
+      "arn:aws:s3:::{{env "bucket"}}/events/*",
+      "arn:aws:s3:::{{env "bucket"}}/meta/*"
     ]
   }]
 }
@@ -2064,7 +2086,7 @@ and the fake-minter `assume-role` are hermetic and run anywhere; the
 real-Tigris `assume-role` end-to-end is VM-only.
 
 **Demo role config** is a minimal `read` / `write` pair over a single
-`{{req.prefix}}` (shipped as `examples/mint-demo.toml`) — distinct from
+`{{req "prefix"}}` (shipped as `examples/mint-demo.toml`) — distinct from
 the full Elide role inventory below. Both are plain key-bound roles;
 neither credential carries a TPC. The operator-authorisation loop is
 exercised at **enrollment**, not at `assume-role`: the config colocates
