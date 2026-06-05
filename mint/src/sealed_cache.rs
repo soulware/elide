@@ -92,7 +92,7 @@ pub fn policies_from_config(config: &Config) -> TemplateSet {
 #[derive(Debug, Clone)]
 pub struct ServedSurface {
     /// The canonical seal — its `audience` and `roles` (each a
-    /// [`SealedRole`]: required caveats, TTL bounds) are the
+    /// [`SealedRole`]: TTL bounds) are the
     /// authority surface; the policy *bytes* live in `templates`.
     pub seal: Seal,
     /// Verified policy templates, role → bytes.
@@ -406,14 +406,12 @@ bucket = "demo-bucket"
 bucket = "demo-bucket"
 [[role]]
 name = "volume-ro"
-required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 3600
 policy_file = "volume-ro.json"
 [[role]]
 name = "volume-rw"
-required_caveats = ["sub", "elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 3600

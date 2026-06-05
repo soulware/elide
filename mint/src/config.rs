@@ -233,8 +233,6 @@ fn env_scalar_to_string(key: &str, value: &toml::Value) -> Result<String, Config
 #[derive(Debug, Deserialize)]
 pub struct RawRole {
     pub name: String,
-    #[serde(default)]
-    pub required_caveats: Vec<String>,
     pub min_ttl_seconds: u64,
     pub max_ttl_seconds: u64,
     pub default_ttl_seconds: u64,
@@ -350,7 +348,6 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Role {
     pub name: String,
-    pub required_caveats: Vec<String>,
     pub min_ttl_seconds: u64,
     pub max_ttl_seconds: u64,
     pub default_ttl_seconds: u64,
@@ -407,7 +404,6 @@ impl Config {
             };
             let role = Role {
                 name: r.name.clone(),
-                required_caveats: r.required_caveats,
                 min_ttl_seconds: r.min_ttl_seconds,
                 max_ttl_seconds: r.max_ttl_seconds,
                 default_ttl_seconds: r.default_ttl_seconds,
@@ -591,7 +587,6 @@ bucket = "demo-bucket"
 
 [[role]]
 name = "volume-ro"
-required_caveats = ["elide:Volume", "Audience", "NotAfter"]
 min_ttl_seconds = 60
 max_ttl_seconds = 2592000
 default_ttl_seconds = 2592000
@@ -616,7 +611,6 @@ bucket = "state-bucket"
 bucket = "data-bucket"
 [[role]]
 name = "r"
-required_caveats = []
 min_ttl_seconds = 60
 max_ttl_seconds = 100
 default_ttl_seconds = 100

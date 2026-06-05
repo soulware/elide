@@ -15,8 +15,7 @@ running daemon, a *dormant-until-sealed* startup state, and a local
 restart safely during a fleet-wide template update before the re-seal.
 There is no pending file: `mint seal` is an authenticated client call,
 and the request path reads the *sealed* role surface (audience,
-`required_caveats`, TTL bounds, policy bytes) — never the live
-config.
+TTL bounds, policy bytes) — never the live config.
 
 ## Why
 
@@ -31,11 +30,13 @@ credential authorises:
 A tampered template trivially widens that surface — change `/by_id/`
 to `/`, or drop the resource constraint entirely, and the role goes
 from one-volume-read to bucket-wide-read with no other signal.
-Role-block fields in `mint.toml` (`required_caveats`,
-`min_ttl_seconds`) have the same property: drop `elide:Volume` from
-`required_caveats` and `volume-ro` becomes effectively bucket-wide.
-Every such field has to be inside the seal, not just the
-policy template.
+Role-block fields in `mint.toml` have the same property: bump
+`max_ttl_seconds` and `volume-ro` credentials outlive their intended
+window. Every such field has to be inside the seal, not just the
+policy template. (Caveat presence is no longer one of these fields —
+`sub`/`aud`/`exp` are hard-coded, and a template-referenced caveat like
+`elide:Volume` is protected by the sealed template hash: widening
+`/by_id/` to `/` changes the template bytes the seal pins.)
 
 Filesystem write to `roles_dir/` or `mint.toml` is the attacker's
 prerequisite. That's a *different* trust pipeline from the keyring in
@@ -194,7 +195,6 @@ _mint/templates/seal.json
   "audience":   "mint",
   "roles": {
     "volume-ro": {
-      "required_caveats":   ["elide:Volume", "aud", "exp"],
       "min_ttl_seconds":    60,
       "max_ttl_seconds":    2592000,
       "default_ttl_seconds": 2592000,
@@ -215,7 +215,7 @@ Fields:
   `aud=mint` are part of the policy surface and must agree across
   the fleet.
 - **`roles`** — every field of every `[[role]]` block that bears on
-  what mint will render or grant: `required_caveats` and the TTL bounds. The one
+  what mint will render or grant: the TTL bounds. The one
   role-block field *not* sealed is `policy_file`: it is replaced by a
   `policy_blake3` content hash, because what matters is the bytes the
   file currently contains, not where the operator put them. The hash is
@@ -346,8 +346,8 @@ errors (keyring unreadable, bucket unreachable, config unparseable)
 hard-fail startup.
 
 The dormant diff in (3) names the specific divergence — *"role
-volume-ro: required_caveats sealed as [elide:Volume, aud, exp], local
-has [aud, exp]; deliver the sealed templates to this host or re-seal."*
+volume-ro: policy_blake3 sealed as <hash>, local file hashes to <hash>;
+deliver the sealed templates to this host or re-seal."*
 The cache is immutable for the process lifetime; the request path reads
 it without locking and consults nothing on disk.
 

@@ -3,9 +3,8 @@
 //! time (`docs/design-mint-template-seal.md`).
 //!
 //! The seal MACs the substrate that drives `/v1/assume-role`'s policy
-//! output: each role's TTL bounds, required-caveat set, TPC-issuance
-//! flag, and the BLAKE3 hash of its policy template's content. A
-//! bucket-credential
+//! output: each role's TTL bounds and the BLAKE3 hash of its policy
+//! template's content. A bucket-credential
 //! holder cannot forge a seal — only a process holding the macaroon
 //! keyring can produce a valid MAC, the same trust anchor that signs
 //! `_mint/approved/<sub>` (PR #454).
@@ -40,8 +39,8 @@ use crate::sealed_cache::{SealState, ServedSurface};
 const SEAL_DOMAIN: &[u8] = b"mint-templates-seal-v1";
 
 /// Sealed view of one role: every field of the `[[role]]` block that
-/// bears on what mint will render or grant — TTL bounds, required-caveat
-/// set, and the policy template's content hash. The only role-block
+/// bears on what mint will render or grant — TTL bounds and the policy
+/// template's content hash. The only role-block
 /// field deliberately left unsealed is `policy_file` (the filename):
 /// what matters is the bytes it currently contains — hashed into
 /// `policy_blake3` — not where the operator put them.
@@ -61,7 +60,6 @@ pub struct SealedRole {
     pub min_ttl_seconds: u64,
     /// BLAKE3 of the role's policy template file content, hex-encoded.
     pub policy_blake3: String,
-    pub required_caveats: Vec<String>,
 }
 
 /// The complete seal: every role, plus the audience. MAC'd under one
@@ -121,7 +119,6 @@ impl Seal {
             // how an authority-bearing field silently escapes the seal.
             let crate::config::Role {
                 name: _,
-                required_caveats,
                 min_ttl_seconds,
                 max_ttl_seconds,
                 default_ttl_seconds,
@@ -135,7 +132,6 @@ impl Seal {
                     max_ttl_seconds: *max_ttl_seconds,
                     min_ttl_seconds: *min_ttl_seconds,
                     policy_blake3: hash_hex(policy.as_bytes()),
-                    required_caveats: required_caveats.clone(),
                 },
             );
         }
@@ -171,8 +167,8 @@ impl Seal {
     }
 
     /// Two seals are *semantically* equal when they pin the same
-    /// intent — audience + per-role required_caveats, TTL bounds, and
-    /// policy hash. `sealed_at`, `kid`, and `mac` are explicitly
+    /// intent — audience + per-role TTL bounds and policy hash.
+    /// `sealed_at`, `kid`, and `mac` are explicitly
     /// ignored so two hosts signing identical templates produce
     /// reconciliation-equal seals.
     pub fn semantically_equal(&self, other: &Seal) -> bool {
@@ -228,12 +224,6 @@ impl Seal {
                 diffs.push(format!("role {name}: not in seal"));
                 continue;
             };
-            if sealed.required_caveats != role.required_caveats {
-                diffs.push(format!(
-                    "role {name}: required_caveats sealed as {:?}, local has {:?}",
-                    sealed.required_caveats, role.required_caveats
-                ));
-            }
             if sealed.min_ttl_seconds != role.min_ttl_seconds
                 || sealed.max_ttl_seconds != role.max_ttl_seconds
                 || sealed.default_ttl_seconds != role.default_ttl_seconds
@@ -456,7 +446,6 @@ bucket = "demo-bucket"
 
 [[role]]
 name = "volume-ro"
-required_caveats = ["elide:Volume", "Audience", "NotAfter"]
 min_ttl_seconds = 60
 max_ttl_seconds = 2592000
 default_ttl_seconds = 2592000
@@ -554,14 +543,10 @@ policy_file = "volume-ro.json"
 
     #[test]
     fn verify_fails_with_tampered_role() {
-        // Tampering with required_caveats invalidates the MAC.
+        // Tampering with a sealed role field invalidates the MAC.
         let kr = Keyring::single([7u8; 32]);
         let mut seal = Seal::build_from_config(&config(), &kr, "t");
-        seal.roles
-            .get_mut("volume-ro")
-            .unwrap()
-            .required_caveats
-            .clear();
+        seal.roles.get_mut("volume-ro").unwrap().max_ttl_seconds += 1;
         assert!(matches!(seal.verify(&kr), Err(SealError::BadMac)));
     }
 

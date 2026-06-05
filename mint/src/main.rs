@@ -189,12 +189,12 @@ enum CredentialCmd {
 
 #[derive(Subcommand)]
 enum RoleCmd {
-    /// List configured roles: name, required caveats, TTL bounds.
+    /// List configured roles: name, TTL bounds.
     List {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
     },
-    /// Show one role: TTL bounds, required caveats, policy source, and
+    /// Show one role: TTL bounds, policy source, and
     /// the raw policy template + the substitution surface it references.
     Inspect {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
@@ -847,23 +847,12 @@ fn role_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("no roles configured");
         return Ok(());
     }
-    println!(
-        "{:<24} {:>7} {:>7} {:>7}  REQUIRED-CAVEATS",
-        "NAME", "MIN", "DEF", "MAX"
-    );
+    println!("{:<24} {:>7} {:>7} {:>7}", "NAME", "MIN", "DEF", "MAX");
     // config.roles is a BTreeMap, so iteration is name-sorted.
     for r in config.roles.values() {
         println!(
-            "{:<24} {:>7} {:>7} {:>7}  {}",
-            r.name,
-            r.min_ttl_seconds,
-            r.default_ttl_seconds,
-            r.max_ttl_seconds,
-            if r.required_caveats.is_empty() {
-                "(none)".to_string()
-            } else {
-                r.required_caveats.join(", ")
-            }
+            "{:<24} {:>7} {:>7} {:>7}",
+            r.name, r.min_ttl_seconds, r.default_ttl_seconds, r.max_ttl_seconds,
         );
     }
     Ok(())
@@ -879,14 +868,6 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
     eprintln!(
         "  ttl_seconds:      min={} default={} max={}",
         role.min_ttl_seconds, role.default_ttl_seconds, role.max_ttl_seconds
-    );
-    eprintln!(
-        "  required_caveats: {}",
-        if role.required_caveats.is_empty() {
-            "(none)".to_string()
-        } else {
-            role.required_caveats.join(", ")
-        }
     );
     eprintln!("  audience:         {}", config.audience);
     eprintln!("  store.bucket:     {}", config.store.bucket);

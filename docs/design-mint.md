@@ -1008,7 +1008,6 @@ in its own file under `roles_dir`, named `<name>.json` by default:
 ```toml
 [[role]]
 name = "volume-ro"
-required_caveats = ["elide:Volume"]
 min_ttl_seconds = 60
 max_ttl_seconds = 604800     # 7 days
 default_ttl_seconds = 86400  # 1 day
@@ -1057,7 +1056,7 @@ explicit `policy_file` (`BadPolicyFileName`), pointing the operator at
 the actual fix. The guarantee is name-level: a symlink *inside*
 `roles_dir` is still followed, but `roles_dir` shares `mint.toml`'s
 custody, so its contents are the operator's own, not an external-input
-boundary. The role inventory — names, required caveats, TTL bounds —
+boundary. The role inventory — names and TTL bounds —
 stays visible at a glance in one `mint.toml`; only the multi-line
 handlebars-over-JSON template, which is awkward to lint and diff inside a
 TOML triple-quoted string, moves to a per-role file. The policy is
@@ -1125,10 +1124,16 @@ expressive policies should be split into multiple roles.
 
 ### Required caveats
 
-`required_caveats` declares which caveats the macaroon **must** carry for the
-role to be assumed. If the macaroon lacks any required caveat, the request
-fails before policy rendering. This catches malformed or wrong-audience
-macaroons cleanly.
+Every assume-role credential must carry `sub` (principal), `aud`
+(audience), and `exp` (expiry). This set is **hard-coded and identical
+for every role** — not a per-role config knob — and is checked for
+presence before any role-specific gate, so a credential missing one is
+denied before policy rendering. `aud` and `exp` additionally have their
+*values* checked (audience equality and the TTL clamp below); `sub` is
+presence-only — its value is MAC-authentic and its holder is proven by
+the `cnf`+PoP gate (§ *Authentication*). Caveats a role's policy
+substitutes (e.g. `elide:Volume`) need no separate declaration: the
+template renderer fails closed on an absent caveat it references.
 
 ### TTL bounds
 
@@ -1270,9 +1275,11 @@ chain — see *Request body*.
 ### Caveat field inventory (Elide)
 
 The complete caveat vocabulary the Elide roles draw on. A caveat serves
-one or both of two purposes: it **gates** authorization (listed in a
-role's `required_caveats`) and/or it **feeds** the policy template
-(`{{caveat "X"}}` substitution). Some only gate.
+one or both of two purposes: it **gates** authorization (the hard-coded
+universal set `sub`/`aud`/`exp`, plus the `op`/`invite`/`role` gates) and/or
+it **feeds** the policy template (`{{caveat "X"}}` substitution). A caveat
+the template references is enforced by the renderer failing closed on its
+absence; only `sub`/`aud`/`exp` have a dedicated presence gate.
 
 | Caveat | Type | Scalar/List | Issuer | Purpose |
 |---|---|---|---|---|
@@ -1281,7 +1288,7 @@ role's `required_caveats`) and/or it **feeds** the policy template
 | `invite` | string | scalar | mint, on first start / rotate | Gate only — invite macaroon must carry the current value. |
 | `exp` | uint64 (unix s) | scalar | issuer | Gate — caps granted TTL (`min(req, role.max, exp−now)`); multiple narrow to the minimum. |
 | `role` | string | scalar | mint, at the enrollment exchange | Gate **and** selects the role policy — the single role this credential carries; always present, and the request's asserted `req.role` must equal it. |
-| `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on all `coord-*`; defines the credential macaroon. Templated as `{{caveat "sub"}}` in `coord-rw`'s own-identity statement (`coordinators/{{caveat "sub"}}/*`). |
+| `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on every role (universally required, presence-only); defines the credential macaroon. Templated as `{{caveat "sub"}}` in `coord-rw`'s own-identity statement (`coordinators/{{caveat "sub"}}/*`). |
 | `cnf` | string (`ed25519:<pub>`, scalar-encoded) | scalar | coordinator-self-asserted alongside `sub` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ BLAKE3(body)` (freshness `ts` rides in the body), verified against this key. Makes the credential key-bound (not a bearer) and authenticates the request body. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 
@@ -1871,7 +1878,7 @@ mint enroll list                   # sub, state (pending|approved), cnf fingerpr
                                    #   peer ip (pending only), age / approved_at
 mint enroll approve <sub>          # approve a pending record
 mint enroll revoke <sub>           # delete an approved/<sub> entry (forces fresh approval on re-enroll)
-mint role list                     # configured roles: name, required caveats, TTL bounds
+mint role list                     # configured roles: name, TTL bounds
 mint role inspect <name>           # one role: bounds, policy source, raw template + ref surface
 ```
 
@@ -2163,8 +2170,8 @@ around:
 - **List-roles authorisation discovery.** Beyond a flat `ListRoles`,
   callers may want "which roles can this specific macaroon assume." The
   macaroon's caveats determine eligibility; computing the answer requires
-  walking each role's required-caveats list. Cheap to compute, useful for
-  UX in the web console.
+  checking the universal `sub`/`aud`/`exp` set plus the caveats each role's
+  template references. Cheap to compute, useful for UX in the web console.
 
 ## References
 
