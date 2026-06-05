@@ -271,14 +271,21 @@ _mint/clients/pending/<sub>.json — one per in-flight enrollment; small set,
                                            first_seen, peer_ip}
 _mint/clients/enrolled/<sub>     — long-lived; one per ever-approved sub
                                    body = {pub, approved_by, approved_at,
-                                           fingerprint_shown, kid, mac}
+                                           fingerprint_shown, kid,
+                                           rev_epoch, mac}
+_mint/clients/revoked/<sub>      — revocation tombstone (sub revoked,
+                                   awaiting re-approval); carries the
+                                   high-water rev_epoch so approve resumes
+                                   the counter
+                                   body = {rev_epoch, revoked_by,
+                                           revoked_at, kid, mac}
 ```
 
 Every `_mint/clients/enrolled/<sub>` body is MAC'd by the keyring generation
 that issued it: `mac = blake3_keyed(keyring[kid], "mint-approved-v1"
 || len(sub) || sub || len(pub) || pub || len(approved_by) ||
 approved_by || len(approved_at) || approved_at ||
-len(fingerprint_shown) || fingerprint_shown)`. The
+len(fingerprint_shown) || fingerprint_shown || rev_epoch)`. The
 `sub` is in the MAC input (not just the object key) so a record
 cannot be copied to a different `<sub>` and still verify. A holder
 of a `mint-rw` bucket credential can `PutObject` to
@@ -613,15 +620,103 @@ Freshness is a `ts` field **inside the body** (unix seconds, ±skew
 window) — already covered by `BLAKE3(request-body)`, so no separate
 signed term and no header. The persisted file alone is therefore inert:
 the only secret is the identity key the coordinator already protects
-(name-claims, provenance, peer-fetch). For verification, mint keeps
-no per-coordinator state — the `(sub, cnf)` pairing rides every token
-and is checked against the macaroon root each call.
-For enrollment workflow only, mint does maintain a long-lived
-registry of approved coordinators (`_mint/clients/enrolled/<sub>`,
-§ *Enrollment* / *Mint state in the store bucket*) so a previously
-approved key can re-enroll without operator intervention; this
-registry is consulted only during enrollment and is never on the
-`assume-role` verification path.
+(name-claims, provenance, peer-fetch). The `(sub, cnf, role)` binding
+rides every token and is checked against the macaroon root each call,
+so verification carries no per-coordinator state of its own — with one
+deliberate exception: `assume-role` reads the enrolled record's
+**revocation epoch** to make a credential revocable (§ *Revocation*).
+That same long-lived registry of approved coordinators
+(`_mint/clients/enrolled/<sub>`, § *Enrollment* / *Mint state in the
+store bucket*) also lets a previously approved key re-enroll without
+operator intervention.
+
+### Revocation
+
+`mint enroll revoke <sub>` de-authorizes a coordinator and kills every
+credential it holds. Revocation gates two things — **issuance** of new
+credentials and **verification** of existing ones — because either
+alone leaks: a held ticket or the re-enrollment fast path would re-mint
+around an `assume-role`-only check.
+
+**Issuance gate (structural).** The enrolled record's *presence* is what
+authorizes a coordinator to obtain credentials — `/v1/enroll`'s
+re-enrollment fast path and `/v1/enroll-exchange` both require
+`_mint/clients/enrolled/<sub>` present with a matching `cnf`. Deleting
+the record drops the coordinator to the slow path: it cannot exchange
+again, and a held ticket exchanges against nothing, until an operator
+re-approves.
+
+**Verification gate (the epoch).** Each credential is stamped at the
+exchange (§ *Enrollment* (3)) with the enrolled record's current
+`rev_epoch` as a first-party `epoch=<n>` caveat, beside `sub`/`cnf`/
+`role`. `assume-role` clears it against `_mint/clients/enrolled/<sub>`:
+the record must be present and MAC-valid, its `cnf` must match the
+credential's, and its `rev_epoch` must equal the credential's `epoch`.
+This gate exists for the one job presence cannot do — keep credentials
+minted before a revocation dead even after the *same* key is re-approved.
+
+**Revoke.** `mint enroll revoke <sub>` deletes
+`_mint/clients/enrolled/<sub>` and writes a tombstone
+`_mint/clients/revoked/<sub>` carrying the **high-water `rev_epoch`** —
+the value the killed credentials were stamped with — plus `revoked_by` /
+`revoked_at`, MAC'd under the current kid. At once: every held credential
+fails `assume-role` (its enrolled record is gone — fail-safe deny), a
+held ticket fails `/v1/enroll-exchange` the same way, and the
+re-enrollment fast path falls back to the operator-gated slow path. The
+coordinator can mint nothing new and use nothing it holds.
+
+**Re-approval.** Epoch allocation lives here, at the moment a new
+generation is born. `mint enroll approve <sub>` sets the new enrolled
+record's `rev_epoch` by:
+
+- a `_mint/clients/revoked/<sub>` tombstone exists → tombstone's
+  `rev_epoch` **+ 1** (then delete the tombstone);
+- else an enrolled record is still present (key rotation / idempotent
+  re-approval) → keep its `rev_epoch`;
+- else (first-ever approval) → `0`.
+
+Because the counter only ever advances, credentials minted before the
+revocation carry a lower `epoch` and never clear again — even when the
+same key re-enrolls.
+
+**Latency.** Revoke stops *new* keypair minting immediately. Tigris
+keypairs already vended live until their `DateLessThan` expiry (mint
+does not recall IAM keys — § *Cleanup*), so live S3 access dies within
+one keypair TTL: **TTL is the maximum revocation latency**. Instant
+hard-kill (deleting the vended IAM keys) is possible but out of scope
+for now.
+
+**Properties.**
+
+- *Fail-safe:* every gate denies on an absent or unverifiable enrolled
+  record, so revocation is the *absence* of authority — not a flag a
+  verifier must read correctly to make it bite.
+- *Integrity, not freshness:* the MAC stops a `_mint/` writer forging a
+  record or a `rev_epoch`, but not *replaying* one — restoring a
+  previously-valid `enrolled/` record (or deleting the tombstone) can
+  revive old-epoch credentials or un-revoke a coordinator. This is a
+  residual of the `_mint/` trust class (which carries no signing
+  capability); a different-key re-enrollment stays safe via `cnf`.
+- *Verify ≠ clear:* the credential's MAC check stays pure and
+  cacheable; the presence/`cnf`/`epoch` comparison is a clearing
+  predicate against live state — cacheable only with bounded staleness,
+  which adds to (never replaces) the keypair-TTL latency.
+- *Still app-driven:* `assume-role` gains no operator gate; revocation
+  is an out-of-band operator action that changes stored state the gates
+  read, not a per-request discharge.
+
+**Evolution.** The replay residual exists only because the live
+revocation state sits in the shared bucket. To withstand a `_mint/`-level
+adversary, move `rev_epoch` and the revoked flag to the auth-service — the
+operator trust source — and have mint read them from a cached revocation
+feed at exchange and `assume-role` (the denylist-at-the-authority pattern
+in Fly.io's [*Operationalizing Macaroons*](https://fly.io/blog/operationalizing-macaroons/)).
+The bucket records become binding/audit only, so replaying them is inert.
+This design is forward-compatible: the credential already carries the
+`epoch` caveat and `assume-role` already does a freshness clear — only the
+*source* of the current value changes. The cost is a runtime
+mint↔auth-service dependency on `assume-role`, served from last-known feed
+state through an outage.
 
 ### Enrollment
 
@@ -2113,13 +2208,13 @@ prematurely.
     minimal self-hosted deployment is anchored by operator approval of a
     displayed fingerprint (§ *Enrollment*); the third-party caveats on
     the invite and the ticket are the enrolling- and exchanging-operator
-    gates layered on top. Open within this question: because credentials
-    do not expire, carry no TPC, and the enrolled registry is not on the
-    `assume-role` verification path, there is currently no mechanism to
-    de-authorize a coordinator whose credentials are already issued —
-    deleting the enrolled-registry entry only gates *future* enrollment
-    exchanges. Re-attestation of a live coordinator (e.g. a managed
-    customer who left) is unsettled.
+    gates layered on top. *Resolved:* per-coordinator de-authorization is
+    the revoke mechanism (§ *Revocation*) — `mint enroll revoke <sub>`
+    deletes the enrolled record (so the coordinator can mint nothing new
+    until re-approved), and the `epoch` carried on each credential keeps
+    already-issued credentials dead through any later re-approval. Bounded
+    by the keypair TTL. Re-attestation of a live coordinator (e.g. a
+    managed customer who left) is that revoke, then a deliberate approve.
 16. **PoP caveat wire detail.** `cnf` is decided (first-party
     holder-of-key; credential is key-bound, not a bearer; the signed
     payload is `BLAKE3(presented-macaroon-tail ‖ BLAKE3(request-body))`
