@@ -216,6 +216,7 @@ impl From<EnrollmentView> for EnrollmentRow {
             state: match v.state {
                 EnrollmentState::Pending => "pending".into(),
                 EnrollmentState::Enrolled => "enrolled".into(),
+                EnrollmentState::Revoked => "revoked".into(),
             },
             pubkey: v.pubkey,
             fingerprint: v.fingerprint,
