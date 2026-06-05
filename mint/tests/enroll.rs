@@ -412,7 +412,7 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
         .await
         .unwrap();
     assert_eq!(
-        store.get_approved(SUB).await.unwrap().unwrap().kid,
+        store.get_enrolled(SUB).await.unwrap().unwrap().kid,
         0,
         "approval starts under kid=0"
     );
@@ -429,7 +429,7 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
         .await;
     // The record is still trustable — kid=0 is still in the ring.
     assert_eq!(
-        store.get_approved(SUB).await.unwrap().unwrap().kid,
+        store.get_enrolled(SUB).await.unwrap().unwrap().kid,
         0,
         "record stays on its issuing kid until migrated",
     );
@@ -445,7 +445,7 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        store.get_approved(SUB).await.unwrap().unwrap().kid,
+        store.get_enrolled(SUB).await.unwrap().unwrap().kid,
         1,
         "lazy migration drifted the record to the current kid",
     );
@@ -457,7 +457,7 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
     store
         .set_keyring(Keyring::from_parts(ring, 1).unwrap())
         .await;
-    assert!(store.get_approved(SUB).await.unwrap().is_some());
+    assert!(store.get_enrolled(SUB).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -520,23 +520,23 @@ async fn conflicting_key_for_same_sub_is_opaque_401() {
 #[tokio::test]
 async fn re_enroll_over_legacy_unsigned_approved_takes_slow_path() {
     // The fix for the post-#454 upgrade footgun: a pre-existing
-    // approved record from before the keyring + MAC landed cannot
-    // be deserialised by the current `Approved` struct (missing
+    // enrolled record from before the keyring + MAC landed cannot
+    // be deserialised by the current `Enrolled` struct (missing
     // kid + mac fields). Before this fix, `record_pending` propagated
     // `StateError::Corrupt` and the handler tagged it
     // `enroll:denied:conflict` — opaque 401 with a misleading audit
     // line, blocking re-enrollment behind a state only inspection of
     // the bucket could reveal.
     //
-    // After: a corrupt approved record is treated as "no approved
+    // After: a corrupt enrolled record is treated as "no approved
     // record" for the fast-path check, the slow path writes a fresh
     // pending, and the operator can re-approve normally.
     let (app, audit, store) = app_in_memory().await;
     let nonce = store.current_invite().await.unwrap();
 
-    // Inject a pre-#454-shaped record at `_mint/approved/<SUB>` —
+    // Inject a pre-#454-shaped record at `_mint/clients/enrolled/<SUB>` —
     // the body lacks `kid` and `mac`, so deserialising it as the
-    // current `Approved` struct fails.
+    // current `Enrolled` struct fails.
     let legacy = serde_json::json!({
         "pubkey": pop::cnf_value(&CLIENT_SEED),
         "approved_at": now_iso(),
@@ -546,7 +546,7 @@ async fn re_enroll_over_legacy_unsigned_approved_takes_slow_path() {
     store
         .objects()
         .put_opts(
-            &object_store::path::Path::from(format!("_mint/approved/{SUB}")),
+            &object_store::path::Path::from(format!("_mint/clients/enrolled/{SUB}")),
             object_store::PutPayload::from(axum::body::Bytes::from(body)),
             object_store::PutOptions::default(),
         )
@@ -751,7 +751,7 @@ async fn exchange_without_approval_returns_403_awaiting() {
     let (app, _a, _store, _dir) = app().await;
     // A perfectly well-formed ticket (minted from root) for a sub
     // that was never approved: the exchange-time check is
-    // `_mint/approved/<sub>` exists and its pub matches the cnf, so
+    // `_mint/clients/enrolled/<sub>` exists and its pub matches the cnf, so
     // an unrecorded sub is indistinguishable from "operator hasn't
     // approved yet" — both are the 403-awaited outcome.
     let inter = mint_credential_ticket(

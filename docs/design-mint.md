@@ -264,17 +264,17 @@ touches `s3:*`. Consequences:
   inside a single process.
 
 ```
-_mint/invite                    — single object; body = nonce (hex)
-_mint/pending/<sub>.json        — one per in-flight enrollment; small set,
-                                  GC'd on a bound ≥ the ticket exp;
-                                  body = {pub, invite, requested_by,
-                                          first_seen, peer_ip}
-_mint/approved/<sub>            — long-lived; one per ever-approved sub
-                                  body = {pub, approved_by, approved_at,
-                                          fingerprint_shown, kid, mac}
+_mint/invite                     — single object; body = nonce (hex)
+_mint/clients/pending/<sub>.json — one per in-flight enrollment; small set,
+                                   GC'd on a bound ≥ the ticket exp;
+                                   body = {pub, invite, requested_by,
+                                           first_seen, peer_ip}
+_mint/clients/enrolled/<sub>     — long-lived; one per ever-approved sub
+                                   body = {pub, approved_by, approved_at,
+                                           fingerprint_shown, kid, mac}
 ```
 
-Every `_mint/approved/<sub>` body is MAC'd by the keyring generation
+Every `_mint/clients/enrolled/<sub>` body is MAC'd by the keyring generation
 that issued it: `mac = blake3_keyed(keyring[kid], "mint-approved-v1"
 || len(sub) || sub || len(pub) || pub || len(approved_by) ||
 approved_by || len(approved_at) || approved_at ||
@@ -282,15 +282,15 @@ len(fingerprint_shown) || fingerprint_shown)`. The
 `sub` is in the MAC input (not just the object key) so a record
 cannot be copied to a different `<sub>` and still verify. A holder
 of a `mint-rw` bucket credential can `PutObject` to
-`_mint/approved/*` but cannot produce a valid MAC without the
-keyring on local disk; mint's `get_approved` verifies and treats a
+`_mint/clients/enrolled/*` but cannot produce a valid MAC without the
+keyring on local disk; mint's `get_enrolled` verifies and treats a
 mismatch as "not approved" (the HTTP layer returns the same opaque
 403 awaiting-approval signal so a client cannot distinguish forgery
 from absence). Forgeries are logged loudly server-side for the
 operator's forensic trail.
 
-The split is intentional: `pending/` is small and LIST-friendly
-(rotation and GC walk it); `approved/` is a growing per-coordinator
+The split is intentional: `clients/pending/` is small and LIST-friendly
+(rotation and GC walk it); `clients/enrolled/` is a growing per-coordinator
 registry queried only by key (HEAD/GET on `<sub>`), never listed on a
 hot path. Merging the two would force every exchange to GET a record
 just to read an approval bit, and every rotation to LIST a set whose
@@ -299,15 +299,15 @@ size is unbounded by design.
 Concurrency primitives (multi-instance mint is a goal — see *Admin
 credential custody — deployment shapes* below):
 
-- `record_pending`: `PUT _mint/pending/<sub>.json` with
+- `record_pending`: `PUT _mint/clients/pending/<sub>.json` with
   `If-None-Match: *`. On 412, GET the existing record and run the
   idempotency / `(sub, pub)` conflict check unchanged.
-- `approve`: `PUT _mint/approved/<sub>` carrying the body MAC under
-  the keyring's current kid, then `DELETE _mint/pending/<sub>.json`.
+- `approve`: `PUT _mint/clients/enrolled/<sub>` carrying the body MAC under
+  the keyring's current kid, then `DELETE _mint/clients/pending/<sub>.json`.
   Re-approval against a *different* pub is a key-rotation
   acknowledgment and overwrites the registry record (under the
   current kid).
-- `is_approved` (exchange path): `GET _mint/approved/<sub>` — one
+- `is_enrolled` (exchange path): `GET _mint/clients/enrolled/<sub>` — one
   round-trip; the body MAC is verified before any of its fields are
   trusted, then the record's `pub` must be the key the exchange request's
   PoP verifies against. A MAC failure (forged record, or record left over from a
@@ -320,11 +320,11 @@ credential custody — deployment shapes* below):
   record changed underfoot and the write is silently abandoned. The
   effect is that every active coordinator drifts its approval forward
   to the current kid on its next restart, without operator action.
-- `rotate_invite`: `PUT _mint/invite`, then `LIST _mint/pending/` and
+- `rotate_invite`: `PUT _mint/invite`, then `LIST _mint/clients/pending/` and
   `DELETE` every record whose `invite` field is not the new value.
-  `approved/` is not touched.
-- Pending GC: `LIST _mint/pending/`, drop entries past a bound on their
-  first-seen timestamp. `approved/` is never GC'd.
+  `clients/enrolled/` is not touched.
+- Pending GC: `LIST _mint/clients/pending/`, drop entries past a bound on their
+  first-seen timestamp. `clients/enrolled/` is never GC'd.
 
 Mint processes cache the invite locally with an ETag-conditional
 refresh (~30s): a background poll issues `GET _mint/invite` with
@@ -360,7 +360,7 @@ falls out of mint owning the records it issues: opportunistic
 re-MAC on natural touch, so approvals drift forward to the current
 kid as their coordinators restart.
 
-**Wire format.** Every macaroon and every `_mint/approved/<sub>`
+**Wire format.** Every macaroon and every `_mint/clients/enrolled/<sub>`
 record carries the kid that MAC'd it (a 2-byte BE prefix in the
 macaroon binary container; a `kid` JSON field on the approval).
 Verification picks the named kid out of the keyring and replays the
@@ -397,7 +397,7 @@ exist for the situations that need them:
    whose body carries `kid == X` — enumerable via a LIST + per-record
    peek before the operator pulls the trigger.
 4. **Sweep** (`Store::sweep_approvals_to_current_kid`). The
-   force-converge admin operation: re-MAC every `_mint/approved/<sub>`
+   force-converge admin operation: re-MAC every `_mint/clients/enrolled/<sub>`
    under the current kid in one pass, regardless of natural touch.
    Used only when an operator wants to retire an older kid without
    waiting for lazy migration to drain it (e.g. immediate compliance
@@ -617,7 +617,7 @@ the only secret is the identity key the coordinator already protects
 no per-coordinator state — the `(sub, cnf)` pairing rides every token
 and is checked against the macaroon root each call.
 For enrollment workflow only, mint does maintain a long-lived
-registry of approved coordinators (`_mint/approved/<sub>`,
+registry of approved coordinators (`_mint/clients/enrolled/<sub>`,
 § *Enrollment* / *Mint state in the store bucket*) so a previously
 approved key can re-enroll without operator intervention; this
 registry is consulted only during enrollment and is never on the
@@ -671,7 +671,7 @@ PoP over the body, operator discharge]`. Mint verifies the chain against
 its root (`op=enroll`, `invite`=current), the PoP against the appended
 `cnf`, and the discharge against the invite's third-party caveat —
 clearing its `Scope` to `mint:enroll`; it
-records a **pending enrollment** at `_mint/pending/<sub>.json` —
+records a **pending enrollment** at `_mint/clients/pending/<sub>.json` —
 `(sub, pub, invite, requested_by, first-seen ts, peer ip)`, where
 `requested_by` is the discharge's `Subject` — and returns a **credential
 ticket**: a macaroon minted fresh from root with `op=enroll-exchange`,
@@ -685,16 +685,16 @@ for the same `sub` with a different `pub` is a conflict that surfaces to
 the operator and never auto-resolves; a `pub` seen on a different `sub`
 is anomalous (a new key is a new principal) and surfaced.
 **Re-enrollment fast path.** Before writing the pending record, mint
-checks `_mint/approved/<sub>`: if it exists and its `pub` equals the
+checks `_mint/clients/enrolled/<sub>`: if it exists and its `pub` equals the
 presented `cnf`, no pending record is written — the returned ticket
 exchanges against the existing registry entry immediately, with no
-second approval (the exchange gate still applies). If `approved/<sub>`
+second approval (the exchange gate still applies). If `clients/enrolled/<sub>`
 exists with a *different* `pub`, a pending record is written as normal
 and surfaces to the operator as a key-rotation acknowledgment (approval
 there overwrites the registry record). The pending record's lifetime is
 the ticket's: it is GC'd on a bound ≥ the ticket `exp` if not approved
-by then, or deleted at approval time (step (2)). The approved entry at
-`_mint/approved/<sub>` is **not** transient — it persists for the life
+by then, or deleted at approval time (step (2)). The enrolled entry at
+`_mint/clients/enrolled/<sub>` is **not** transient — it persists for the life
 of the coordinator identity and powers the fast path.
 
 **(2) Operator approval — the approve gate.** `mint enroll approve
@@ -710,9 +710,9 @@ confirmation **is** the trust anchor binding `sub` to the rightful key;
 the operator discharge is what attributes the decision to a human.
 `--yes` skips the prompt for automation (the operator then asserts the
 out-of-band check happened). On confirmation mint writes
-`_mint/approved/<sub>` with `{pub, approved_by, approved_at,
+`_mint/clients/enrolled/<sub>` with `{pub, approved_by, approved_at,
 fingerprint_shown}` — `approved_by` is the admin call's discharge
-`Subject` — and deletes `_mint/pending/<sub>.json`. The recorded
+`Subject` — and deletes `_mint/clients/pending/<sub>.json`. The recorded
 approval is the operator-attested, audit-bearing artifact that later
 credential issuance consults; it is the durable successor to the
 in-flight pending record. Mint does not enforce `approved_by ≠
@@ -728,14 +728,14 @@ presents `[ticket, operator discharge]` with a `coordinator.key` PoP over
 the body `{ts, role}`, once per role it needs. Mint verifies the ticket
 chain (`op=enroll-exchange`, the short `exp`), the discharge against the
 ticket's TPC — clearing its `Scope` to `mint:exchange` — and the PoP
-against the ticket's `cnf`; requires `_mint/approved/<sub>` to exist with
+against the ticket's `cnf`; requires `_mint/clients/enrolled/<sub>` to exist with
 a `pub` equal to that `cnf`; and decides **is this `sub` permitted this
 `role`**. The decision has a
 floor and an upgrade: the **floor** (minimal self-hosted deployment) is
 that `role` names a role in the mint config with no per-`sub`
 restriction — role policies scope per coordinator by templating on
 `sub`; the **upgrade** is a per-`sub` permitted-role set recorded on the
-approved entry at approval time, so the approving operator decides not
+enrolled entry at approval time, so the approving operator decides not
 just *that* a coordinator may enroll but *what* it may assume. On
 success mint **re-mints from root** a credential (`op=assume-role`, the
 same `sub`/`cnf`, `aud=mint`, `role=<requested>`, no `exp`, **no
@@ -748,9 +748,9 @@ machine's credentials is itself an operator action.
 
 **Rotation.** `mint invite --rotate` draws a new random
 `invite`, persists it at `_mint/invite`, emits a fresh invite
-macaroon, then LISTs `_mint/pending/` and deletes every record whose
+macaroon, then LISTs `_mint/clients/pending/` and deletes every record whose
 `invite` field is not the new value. The
-`_mint/approved/<sub>` registry is **not** touched: an outstanding
+`_mint/clients/enrolled/<sub>` registry is **not** touched: an outstanding
 approval — and the credentials it backs — survive rotation, as do the
 re-enrollment fast paths of every previously approved coordinator.
 Restart preserves the nonce (it lives in the bucket); only explicit
@@ -885,7 +885,7 @@ operator's discharge in the `MintV1` bundle, the PoP in `X-Mint-Pop`,
 and `{ts, role}` in the body (the requested role rides the PoP-signed
 body, so it is authenticated and audited like any exercise field). Mint
 verifies the ticket chain, the discharge against the ticket's TPC, and
-the PoP against the ticket's `cnf`; requires `_mint/approved/<sub>` to
+the PoP against the ticket's `cnf`; requires `_mint/clients/enrolled/<sub>` to
 exist with a matching `pub`; and returns `200` with the role-stamped
 credential, `403` until that `sub` has been approved, or the same opaque
 `401` as `assume-role` on any failure (including a role this `sub` is not
@@ -1867,10 +1867,10 @@ mint serve <cfg> [bind]            # HTTP service
 mint login [--url <u>|--config <c>] [--subject <s>]  # auth session for the admin plane AND `mint client` (gates discharge issuance); remembers the transport
 mint logout                        # remove the session (keeps the remembered auth transport)
 mint invite [--rotate]             # print current invite macaroon / rotate the nonce
-mint enroll list                   # sub, state (pending|approved), cnf fingerprint,
+mint enroll list                   # sub, state (pending|enrolled), cnf fingerprint,
                                    #   peer ip (pending only), age / approved_at
 mint enroll approve <sub>          # approve a pending record
-mint enroll revoke <sub>           # delete an approved/<sub> entry (forces fresh approval on re-enroll)
+mint enroll revoke <sub>           # delete a clients/enrolled/<sub> entry (forces fresh approval on re-enroll)
 mint role list                     # configured roles: name, required caveats, TTL bounds
 mint role inspect <name>           # one role: bounds, policy source, raw template + ref surface
 ```
@@ -2069,7 +2069,7 @@ prematurely.
     `sub`/`cnf` at `POST /v1/enroll`, which records a pending record
     (`requested_by`) and returns a short-lived **ticket** carrying its
     own *ticket* TPC → the approving operator approves a displayed pubkey
-    fingerprint via the admin plane, recording `_mint/approved/<sub>`
+    fingerprint via the admin plane, recording `_mint/clients/enrolled/<sub>`
     (`approved_by`) → the exchanging operator discharges the ticket's
     TPC and the coordinator presents `[ticket, discharge]` + PoP at `POST
     /v1/enroll-exchange {ts, role}`, which re-mints a single-role
@@ -2079,11 +2079,11 @@ prematurely.
     `assume-role` is operator-free. Role authorization gates `(sub,
     role)` at exchange — floor is "role is in the mint config" (per-`sub`
     scoping lives in role policy templating on `sub`), upgrade is a
-    per-`sub` permitted-role set recorded on the approved entry at
+    per-`sub` permitted-role set recorded on the enrolled entry at
     approval time. `invite` is the rotation knob; `op` partitions the
     three macaroon-bearing endpoints.
     *Open within this question:* the exact wire shape of that recorded
-    permitted-role set is unsettled — a flat allowlist on the approved
+    permitted-role set is unsettled — a flat allowlist on the enrolled
     record is the leading candidate.
 14. **Root-key durability and rotation.** *Resolved:* mint persists a
     `(kid, key)` keyring at `<data_dir>/root_keys/` (one 64-hex file
@@ -2110,7 +2110,7 @@ prematurely.
     gates layered on top. Open within this question: because credentials
     do not expire and carry no TPC, periodic re-attestation of a
     coordinator (e.g. a managed customer who left) is enforced by
-    revoking the approved-registry entry or refusing re-enrollment —
+    revoking the enrolled-registry entry or refusing re-enrollment —
     which, is unsettled.
 16. **PoP caveat wire detail.** `cnf` is decided (first-party
     holder-of-key; credential is key-bound, not a bearer; the signed

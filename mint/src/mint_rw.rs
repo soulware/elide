@@ -46,7 +46,7 @@ pub const REFRESH_SAFETY_MARGIN_RATIO: f64 = 0.5;
 
 /// `mint-rw` policy: prefix-scoped S3 read/write/delete on `_mint/*`
 /// plus `ListBucket` for the rotation/GC walks
-/// (`_mint/pending/*` enumeration). The bare bucket appears as a
+/// (`_mint/clients/pending/*` enumeration). The bare bucket appears as a
 /// resource only for `s3:ListBucket`, which is the AWS-mandated shape.
 ///
 /// `ListBucket` is **not** further constrained by an `s3:prefix`
