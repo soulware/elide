@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn tampered_kid_fails_verify_even_if_key_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let mut kr = Keyring::open(&dir.path().join("rk"), None, None).unwrap();
+        let mut kr = Keyring::open(&dir.path().join("rk"), None).unwrap();
         kr.add_and_promote(&dir.path().join("rk"), None).unwrap();
         let m = mint(&kr, vec![Caveat::scalar("Audience", "mint")]);
         assert_eq!(m.kid(), 1);
@@ -665,7 +665,7 @@ mod tests {
     fn token_minted_under_old_kid_still_verifies_until_retired() {
         let dir = tempfile::tempdir().unwrap();
         let rk = dir.path().join("rk");
-        let mut kr = Keyring::open(&rk, None, None).unwrap();
+        let mut kr = Keyring::open(&rk, None).unwrap();
         let token_under_zero = mint(&kr, vec![Caveat::scalar("Audience", "mint")]);
         let new_kid = kr.add_and_promote(&rk, None).unwrap();
         assert_eq!(new_kid, 1);

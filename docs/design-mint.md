@@ -133,11 +133,11 @@ Each mint instance is configured with:
    `<data_dir>/root_keys/<NNNN>` (one 64-hex file per generation,
    mode 0600) with a small `<data_dir>/root_keys/current` text file
    naming the active kid — `ls` shows the rotation history without
-   any binary-only state. The historical singleton at
-   `<data_dir>/root_key` is migrated into `root_keys/0000` on first
-   start if present. First start with no legacy file generates a
-   CSPRNG `kid=0`; the caller can optionally seed an existing key
-   (the multi-host shape — see *Root-key rotation*).
+   any binary-only state. First start generates a CSPRNG `kid=0`
+   only in demo mode (`[demo_auth].enabled`); a production instance
+   must have `root_keys/` provisioned out-of-band — or be handed a key
+   to seed (the multi-host shape — see *Root-key rotation*) — and fails
+   closed otherwise.
    Verification accepts any kid still in the ring; minting always
    uses `current`. Rotation procedure lives in *Root-key rotation*
    below. The current **`invite`**

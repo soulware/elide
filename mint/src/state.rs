@@ -434,11 +434,9 @@ pub const INVITE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::fr
 
 impl Store {
     /// Local-filesystem backend rooted at `dir` — the dev / co-resident
-    /// shape. `dir/root_keys/` holds the keyring (migrated from
-    /// `dir/root_key` if the legacy singleton is present); everything
-    /// else lives under `dir/_mint/`, matching the bucket-side layout
-    /// key for key so an operator can `ls` either and see the same
-    /// structure.
+    /// shape. `dir/root_keys/` holds the keyring; everything else lives
+    /// under `dir/_mint/`, matching the bucket-side layout key for key so
+    /// an operator can `ls` either and see the same structure.
     pub async fn open_local(dir: impl Into<PathBuf>) -> io::Result<Store> {
         Self::open_local_with_initial_key(dir, None).await
     }
@@ -453,12 +451,8 @@ impl Store {
     ) -> io::Result<Store> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        let keyring = Keyring::open(
-            &dir.join("root_keys"),
-            Some(&dir.join("root_key")),
-            initial_key,
-        )
-        .map_err(io::Error::other)?;
+        let keyring =
+            Keyring::open(&dir.join("root_keys"), initial_key).map_err(io::Error::other)?;
         // LocalFileSystem rejects paths that don't exist; create the
         // _mint subtree so the first PUT lands. (PUTs auto-create
         // intermediate directories, but the prefix root must exist.)
@@ -472,31 +466,25 @@ impl Store {
     /// Bucket-backed store. `objects` is a [`ObjectStore`] whose root
     /// is the store bucket; the `_mint/` prefix is applied to every
     /// key. `keyring_dir` is the local directory the macaroon keyring
-    /// is loaded from / written to. `legacy_singleton` migrates an
-    /// older `<data_dir>/root_key` if present. `initial_key` seeds the
-    /// first-start case for multi-host deployments. `allow_generate`
-    /// permits minting a fresh keyring when none is provisioned (demo
-    /// mode only); a production instance with an empty `root_keys/` and
-    /// no supplied key fails closed rather than diverging from its peers.
+    /// is loaded from / written to. `initial_key` seeds the first-start
+    /// case for multi-host deployments. `allow_generate` permits minting
+    /// a fresh keyring when none is provisioned (demo mode only); a
+    /// production instance with an empty `root_keys/` and no supplied key
+    /// fails closed rather than diverging from its peers.
     pub async fn open_remote(
         objects: Arc<dyn ObjectStore>,
         keyring_dir: &Path,
-        legacy_singleton: Option<&Path>,
         initial_key: Option<[u8; 32]>,
         allow_generate: bool,
     ) -> io::Result<Store> {
-        if !allow_generate
-            && initial_key.is_none()
-            && !Keyring::is_provisioned(keyring_dir, legacy_singleton)
-        {
+        if !allow_generate && initial_key.is_none() && !Keyring::is_provisioned(keyring_dir) {
             return Err(io::Error::other(format!(
                 "macaroon keyring absent at {keyring_dir:?}; provision root_keys/ \
                  out-of-band (multi-host: replicate the same keyring to every \
                  instance) or enable [demo_auth] to generate one"
             )));
         }
-        let keyring =
-            Keyring::open(keyring_dir, legacy_singleton, initial_key).map_err(io::Error::other)?;
+        let keyring = Keyring::open(keyring_dir, initial_key).map_err(io::Error::other)?;
         let store = Store::with_object_store(keyring, objects);
         store.ensure_invite().await.map_err(io::Error::other)?;
         Ok(store)
@@ -1732,29 +1720,25 @@ mod tests {
     async fn open_remote_gates_keyring_generation_on_demo() {
         let d = tempfile::tempdir().unwrap();
         let kr = d.path().join("root_keys");
-        let legacy = d.path().join("root_key");
 
         // Production first start, empty keyring, no supplied key: fail
         // closed rather than mint a divergent master key.
-        let err = Store::open_remote(Arc::new(InMemory::new()), &kr, Some(&legacy), None, false)
+        let err = Store::open_remote(Arc::new(InMemory::new()), &kr, None, false)
             .await
             .map(drop)
             .expect_err("must refuse to generate outside demo");
-        assert!(
-            !Keyring::is_provisioned(&kr, Some(&legacy)),
-            "nothing written"
-        );
+        assert!(!Keyring::is_provisioned(&kr), "nothing written");
         assert_eq!(err.kind(), io::ErrorKind::Other);
 
         // Demo mode mints one.
-        Store::open_remote(Arc::new(InMemory::new()), &kr, Some(&legacy), None, true)
+        Store::open_remote(Arc::new(InMemory::new()), &kr, None, true)
             .await
             .expect("demo generates a keyring");
-        assert!(Keyring::is_provisioned(&kr, Some(&legacy)));
+        assert!(Keyring::is_provisioned(&kr));
 
         // Once provisioned, a production instance loads it with generation
         // still disallowed.
-        Store::open_remote(Arc::new(InMemory::new()), &kr, Some(&legacy), None, false)
+        Store::open_remote(Arc::new(InMemory::new()), &kr, None, false)
             .await
             .expect("a provisioned keyring loads with generation disallowed");
     }
@@ -1768,31 +1752,11 @@ mod tests {
         Store::open_remote(
             Arc::new(InMemory::new()),
             &d.path().join("root_keys"),
-            Some(&d.path().join("root_key")),
             Some([7u8; 32]),
             false,
         )
         .await
         .expect("supplied key provisions even outside demo");
-    }
-
-    #[tokio::test]
-    async fn legacy_root_key_file_migrated_into_keyring() {
-        let d = tempfile::tempdir().unwrap();
-        let hex: String = [7u8; 32].iter().map(|b| format!("{b:02x}")).collect();
-        std::fs::write(d.path().join("root_key"), hex).unwrap();
-        let store = Store::open_local(d.path()).await.unwrap();
-        let kr = store.keyring().await;
-        assert_eq!(kr.current_kid(), 0);
-        assert_eq!(kr.current_key(), &[7u8; 32]);
-        assert!(
-            d.path().join("root_keys").join("0000").exists(),
-            "migrated into the new layout"
-        );
-        assert!(
-            !d.path().join("root_key").exists(),
-            "legacy singleton removed"
-        );
     }
 
     #[tokio::test]
@@ -1807,9 +1771,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keyring_malformed_root_key_file_is_an_error() {
+    async fn keyring_malformed_key_file_is_an_error() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("root_key"), b"not hex").unwrap();
+        std::fs::create_dir_all(d.path().join("root_keys")).unwrap();
+        std::fs::write(d.path().join("root_keys").join("0000"), b"not hex").unwrap();
         assert!(Store::open_local(d.path()).await.is_err());
     }
 

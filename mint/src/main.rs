@@ -464,15 +464,8 @@ async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std:
     // out-of-band and fails closed if absent; only a demo instance mints
     // a fresh master key.
     let demo_enabled = cfg.demo_auth.as_ref().is_some_and(|d| d.enabled);
-    let legacy = cfg.data_dir.join("root_key");
-    let mut store = Store::open_remote(
-        s3,
-        &cfg.data_dir.join("root_keys"),
-        Some(&legacy),
-        None,
-        demo_enabled,
-    )
-    .await?;
+    let mut store =
+        Store::open_remote(s3, &cfg.data_dir.join("root_keys"), None, demo_enabled).await?;
     // K_M-A is needed wherever an auth integration is configured (TPC
     // verification and demo discharge issuance): a colocated demo auth
     // role generates it locally, otherwise `auth_location` signals that the

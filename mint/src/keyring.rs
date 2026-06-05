@@ -24,10 +24,6 @@
 //! <data_dir>/root_keys/current  "0001" + newline
 //! ```
 //!
-//! `<data_dir>/root_key` (the legacy single-key file) is migrated into
-//! `root_keys/0000` on first start if `root_keys/` is empty. New
-//! deployments skip that step and generate `0000` directly.
-//!
 //! **Multi-host minting.** Two mint instances sharing one `_mint/`
 //! prefix must agree on every `(kid, key)`. The keyring supports this
 //! by taking an optional caller-supplied key at the two points where
@@ -107,41 +103,26 @@ impl Keyring {
     }
 
     /// Whether a keyring is already provisioned at `dir` — at least one
-    /// generation file present, or a migratable legacy singleton. The
-    /// serve path consults this to refuse silent first-start generation
-    /// outside demo mode: a production instance with an empty `root_keys/`
-    /// is a mis-provisioned deployment, not a request to mint a fresh
-    /// master key.
-    pub fn is_provisioned(dir: &Path, legacy_singleton: Option<&Path>) -> bool {
-        if legacy_singleton.is_some_and(|p| p.exists()) {
-            return true;
-        }
+    /// generation file present. The serve path consults this to refuse
+    /// silent first-start generation outside demo mode: a production
+    /// instance with an empty `root_keys/` is a mis-provisioned
+    /// deployment, not a request to mint a fresh master key.
+    pub fn is_provisioned(dir: &Path) -> bool {
         read_all_keys(dir).is_ok_and(|keys| !keys.is_empty())
     }
 
     /// Load (or initialise) the on-disk keyring at `dir`.
     ///
-    /// - `legacy_singleton`: optional path to the historical
-    ///   `<data_dir>/root_key` file; migrated into `kid=0` when the
-    ///   keyring directory is otherwise empty.
-    /// - `initial_key`: optional caller-supplied initial key, used **only**
-    ///   when the directory is empty and no legacy file is present
-    ///   (the multi-host shape — operator provisions the same key on
-    ///   every instance). If `None`, a fresh random key is generated.
-    ///
-    /// If both `legacy_singleton` and `initial_key` are present, the
-    /// legacy file wins (an upgrade-in-place is unambiguous; a fresh
-    /// install plus a provisioned key is the multi-host shape).
-    pub fn open(
-        dir: &Path,
-        legacy_singleton: Option<&Path>,
-        initial_key: Option<[u8; 32]>,
-    ) -> Result<Self, KeyringError> {
+    /// `initial_key` is an optional caller-supplied initial key, used
+    /// **only** when the directory is empty (the multi-host shape —
+    /// operator provisions the same key on every instance). If `None`, a
+    /// fresh random key is generated.
+    pub fn open(dir: &Path, initial_key: Option<[u8; 32]>) -> Result<Self, KeyringError> {
         fs::create_dir_all(dir)?;
         let keys = read_all_keys(dir)?;
 
         if keys.is_empty() {
-            return Self::init_empty(dir, legacy_singleton, initial_key);
+            return Self::init_empty(dir, initial_key);
         }
 
         let current = match read_current_pointer(dir)? {
@@ -156,28 +137,12 @@ impl Keyring {
         Ok(Self { keys, current })
     }
 
-    fn init_empty(
-        dir: &Path,
-        legacy_singleton: Option<&Path>,
-        initial_key: Option<[u8; 32]>,
-    ) -> Result<Self, KeyringError> {
-        let initial = match legacy_singleton {
-            Some(p) if p.exists() => {
-                let text = fs::read_to_string(p)?;
-                let key = decode_hex32(text.trim())
-                    .ok_or_else(|| KeyringError::Malformed(p.to_owned()))?;
-                // Best-effort removal; on failure we still proceed with
-                // the keyring as the canonical source. The sibling 0000
-                // supersedes the singleton either way.
-                let _ = fs::remove_file(p);
-                key
-            }
-            _ => initial_key.unwrap_or_else(|| {
-                let mut k = [0u8; 32];
-                OsRng.fill_bytes(&mut k);
-                k
-            }),
-        };
+    fn init_empty(dir: &Path, initial_key: Option<[u8; 32]>) -> Result<Self, KeyringError> {
+        let initial = initial_key.unwrap_or_else(|| {
+            let mut k = [0u8; 32];
+            OsRng.fill_bytes(&mut k);
+            k
+        });
         write_key_file(&kid_path(dir, 0), &initial)?;
         write_current_pointer(dir, 0)?;
         let mut keys = BTreeMap::new();
@@ -378,7 +343,7 @@ mod tests {
     #[test]
     fn first_open_generates_kid_zero() {
         let (_d, dir) = dir();
-        let kr = Keyring::open(&dir, None, None).unwrap();
+        let kr = Keyring::open(&dir, None).unwrap();
         assert_eq!(kr.current_kid(), 0);
         assert_eq!(kr.len(), 1);
         assert_ne!(kr.current_key(), &[0u8; 32]);
@@ -393,7 +358,7 @@ mod tests {
     #[test]
     fn first_open_with_supplied_initial_key_adopts_it() {
         let (_d, dir) = dir();
-        let kr = Keyring::open(&dir, None, Some([7u8; 32])).unwrap();
+        let kr = Keyring::open(&dir, Some([7u8; 32])).unwrap();
         assert_eq!(kr.current_kid(), 0);
         assert_eq!(kr.current_key(), &[7u8; 32]);
     }
@@ -401,9 +366,9 @@ mod tests {
     #[test]
     fn supplied_initial_key_ignored_when_ring_already_populated() {
         let (_d, dir) = dir();
-        let kr = Keyring::open(&dir, None, None).unwrap();
+        let kr = Keyring::open(&dir, None).unwrap();
         let original = *kr.current_key();
-        let kr2 = Keyring::open(&dir, None, Some([9u8; 32])).unwrap();
+        let kr2 = Keyring::open(&dir, Some([9u8; 32])).unwrap();
         assert_eq!(
             kr2.current_key(),
             &original,
@@ -414,41 +379,15 @@ mod tests {
     #[test]
     fn reopen_preserves_keys_and_pointer() {
         let (_d, dir) = dir();
-        let k1 = *Keyring::open(&dir, None, None).unwrap().current_key();
-        let k2 = *Keyring::open(&dir, None, None).unwrap().current_key();
+        let k1 = *Keyring::open(&dir, None).unwrap().current_key();
+        let k2 = *Keyring::open(&dir, None).unwrap().current_key();
         assert_eq!(k1, k2, "restart preserves the key");
-    }
-
-    #[test]
-    fn legacy_singleton_migrated_into_kid_zero() {
-        let d = tempfile::tempdir().unwrap();
-        let legacy = d.path().join("root_key");
-        let hex: String = [7u8; 32].iter().map(|b| format!("{b:02x}")).collect();
-        fs::write(&legacy, &hex).unwrap();
-        let kr_dir = d.path().join("root_keys");
-        let kr = Keyring::open(&kr_dir, Some(&legacy), None).unwrap();
-        assert_eq!(kr.current_kid(), 0);
-        assert_eq!(kr.current_key(), &[7u8; 32]);
-        assert!(!legacy.exists(), "legacy file removed after migration");
-    }
-
-    #[test]
-    fn legacy_singleton_wins_over_supplied_initial_key() {
-        // Mixed signals on first start: an in-place upgrade is the
-        // unambiguous reading.
-        let d = tempfile::tempdir().unwrap();
-        let legacy = d.path().join("root_key");
-        let hex: String = [7u8; 32].iter().map(|b| format!("{b:02x}")).collect();
-        fs::write(&legacy, &hex).unwrap();
-        let kr_dir = d.path().join("root_keys");
-        let kr = Keyring::open(&kr_dir, Some(&legacy), Some([9u8; 32])).unwrap();
-        assert_eq!(kr.current_key(), &[7u8; 32]);
     }
 
     #[test]
     fn add_and_promote_advances_current() {
         let (_d, dir) = dir();
-        let mut kr = Keyring::open(&dir, None, None).unwrap();
+        let mut kr = Keyring::open(&dir, None).unwrap();
         let k0 = *kr.current_key();
         let new_kid = kr.add_and_promote(&dir, None).unwrap();
         assert_eq!(new_kid, 1);
@@ -465,12 +404,12 @@ mod tests {
         // The peer-host rotation: operator hands the new key bytes to
         // the second instance so both hosts converge on the same kid.
         let (_d, dir) = dir();
-        let mut kr = Keyring::open(&dir, None, None).unwrap();
+        let mut kr = Keyring::open(&dir, None).unwrap();
         let kid = kr.add_and_promote(&dir, Some([42u8; 32])).unwrap();
         assert_eq!(kid, 1);
         assert_eq!(kr.current_key(), &[42u8; 32]);
         // Reload to confirm it really hit disk.
-        let kr2 = Keyring::open(&dir, None, None).unwrap();
+        let kr2 = Keyring::open(&dir, None).unwrap();
         assert_eq!(kr2.current_key(), &[42u8; 32]);
         assert_eq!(kr2.current_kid(), 1);
     }
@@ -480,10 +419,10 @@ mod tests {
         // A peer that already wrote kid=1 with the same bytes is a
         // benign race, not an error.
         let (_d, dir) = dir();
-        let mut kr_a = Keyring::open(&dir, None, None).unwrap();
+        let mut kr_a = Keyring::open(&dir, None).unwrap();
         kr_a.add_and_promote(&dir, Some([42u8; 32])).unwrap();
         // Second mint instance over the same dir, same key → no-op.
-        let mut kr_b = Keyring::open(&dir, None, None).unwrap();
+        let mut kr_b = Keyring::open(&dir, None).unwrap();
         let kid = kr_b.add_and_promote(&dir, Some([42u8; 32])).unwrap();
         assert_eq!(kid, 2, "next kid after the existing one");
         // Now force the disagreement case by trying to re-add kid 2
@@ -492,7 +431,7 @@ mod tests {
         assert_eq!(kid3, 3);
         // Reopen and try to add a kid=3 with a different key — should
         // be rejected.
-        let mut kr_c = Keyring::open(&dir, None, None).unwrap();
+        let mut kr_c = Keyring::open(&dir, None).unwrap();
         // The next kid is 4; ask for 4 via add_and_promote with one
         // value, then a second add asking for 4 with a different value
         // would mismatch — but each add_and_promote advances. Instead
@@ -505,7 +444,7 @@ mod tests {
     #[test]
     fn retire_drops_old_kid_and_rejects_current() {
         let (_d, dir) = dir();
-        let mut kr = Keyring::open(&dir, None, None).unwrap();
+        let mut kr = Keyring::open(&dir, None).unwrap();
         kr.add_and_promote(&dir, None).unwrap();
         assert!(matches!(
             kr.retire(&dir, kr.current_kid()),
@@ -520,7 +459,7 @@ mod tests {
     #[test]
     fn pointer_at_retired_kid_falls_back_to_highest_extant() {
         let (_d, dir) = dir();
-        let mut kr = Keyring::open(&dir, None, None).unwrap();
+        let mut kr = Keyring::open(&dir, None).unwrap();
         kr.add_and_promote(&dir, None).unwrap();
         kr.add_and_promote(&dir, None).unwrap();
         // Simulate corruption: pointer claims a kid no longer in the
@@ -528,7 +467,7 @@ mod tests {
         // hadn't been advanced).
         fs::remove_file(kid_path(&dir, 2)).unwrap();
         // Drop in-memory state and reload from disk.
-        let kr2 = Keyring::open(&dir, None, None).unwrap();
+        let kr2 = Keyring::open(&dir, None).unwrap();
         assert_eq!(
             kr2.current_kid(),
             1,
@@ -539,12 +478,12 @@ mod tests {
     #[test]
     fn ignores_tmp_files_and_non_kid_entries() {
         let (_d, dir) = dir();
-        let kr = Keyring::open(&dir, None, None).unwrap();
+        let kr = Keyring::open(&dir, None).unwrap();
         // Leave a stale .tmp behind (simulating a crashed atomic write).
         fs::write(dir.join("0001.tmp"), "garbage").unwrap();
         // And a junk file with a non-numeric name.
         fs::write(dir.join("notes.md"), "hi").unwrap();
-        let kr2 = Keyring::open(&dir, None, None).unwrap();
+        let kr2 = Keyring::open(&dir, None).unwrap();
         assert_eq!(kr2.current_kid(), kr.current_kid());
         assert_eq!(kr2.len(), 1);
     }

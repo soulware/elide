@@ -84,10 +84,6 @@ async fn state_with_audit() -> (
     let buf = Arc::new(Mutex::new(Vec::new()));
     let minter = Arc::new(FakeMinter::new());
     let dir = tempfile::tempdir().expect("tempdir");
-    // Seed the known root key (hex) so Store::open_local loads it (vs
-    // generating one) and the macaroons minted with ROOT verify.
-    let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
     let cfg = config();
     let seal = Arc::new(arc_swap::ArcSwap::from_pointee(
         mint::sealed_cache::serving_from_config(&cfg),
@@ -95,7 +91,9 @@ async fn state_with_audit() -> (
     // assume-role clears the credential against a present enrolled
     // record (§ *Revocation*). Approve SUB at the implicit epoch 0 so a
     // credential minted at epoch 0 with this cnf clears.
-    let store = Store::open_local(dir.path()).await.expect("store");
+    let store = Store::open_local_with_initial_key(dir.path(), Some(ROOT))
+        .await
+        .expect("store");
     store
         .approve(
             SUB,
@@ -412,13 +410,15 @@ async fn dormant_closes_assume_role_and_readiness() {
     // A mint that came up without a verifiable seal closes the
     // role-rendering plane and reports not-ready, while liveness stays up.
     let dir = tempfile::tempdir().expect("tempdir");
-    let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
     let state = AppState {
         config: Arc::new(config()),
         minter: Arc::new(FakeMinter::new()),
         audit: Arc::new(AuditLog::new(Box::new(std::io::sink()))),
-        store: Arc::new(Store::open_local(dir.path()).await.expect("store")),
+        store: Arc::new(
+            Store::open_local_with_initial_key(dir.path(), Some(ROOT))
+                .await
+                .expect("store"),
+        ),
         seal: Arc::new(arc_swap::ArcSwap::from_pointee(
             mint::sealed_cache::SealState::Dormant,
         )),
