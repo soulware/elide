@@ -746,7 +746,11 @@ async fn enroll_list(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "{:<28} {:<9} {:<18} {:<16} {:>7} {}",
             r.sub,
             r.state,
-            r.fingerprint,
+            if r.fingerprint.is_empty() {
+                "-"
+            } else {
+                &r.fingerprint
+            },
             r.peer_ip.as_deref().unwrap_or("-"),
             r.age_seconds,
             if r.anomalous_pub { "ANOMALOUS-PUB" } else { "" }

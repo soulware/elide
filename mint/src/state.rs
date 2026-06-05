@@ -244,6 +244,7 @@ pub struct SweepReport {
 pub enum EnrollmentState {
     Pending,
     Enrolled,
+    Revoked,
 }
 
 /// One row of `mint enroll list` — the unified pending+enrolled view.
@@ -1497,8 +1498,10 @@ impl Store {
         Ok(())
     }
 
-    /// All enrollment rows — pending and enrolled — for
-    /// `mint enroll list`. State is a column, not a filter.
+    /// All enrollment rows — pending, enrolled, and revoked — for
+    /// `mint enroll list`. State is a column, not a filter. A `sub`
+    /// that has been revoked and is now re-pending appears as two rows;
+    /// that is the lifecycle, not a duplicate.
     pub async fn list(&self, now_unix: u64) -> Result<Vec<EnrollmentView>, StateError> {
         let pending_subs = self.pending_subs().await?;
         let mut pendings: Vec<(String, Pending)> = Vec::new();
@@ -1524,7 +1527,21 @@ impl Store {
             }
         }
 
-        let mut out = Vec::with_capacity(pendings.len() + enrolleds.len());
+        let revoked_subs = self.revoked_subs().await?;
+        let mut revokeds: Vec<(String, Revoked)> = Vec::new();
+        for sub in revoked_subs {
+            match self.get_revoked(&sub).await {
+                Ok(Some(r)) => revokeds.push((sub, r)),
+                Ok(None) => {}
+                // A forged tombstone is skipped for the same reason a
+                // forged enrolled record is — already logged, treat as
+                // absent rather than poisoning the whole view.
+                Err(StateError::Forged) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut out = Vec::with_capacity(pendings.len() + enrolleds.len() + revokeds.len());
         for (sub, p) in &pendings {
             let anomalous_pub = pendings
                 .iter()
@@ -1557,19 +1574,43 @@ impl Store {
                 anomalous_pub: false,
             });
         }
+        for (sub, r) in &revokeds {
+            // The tombstone carries no pubkey, so fingerprint/peer are
+            // absent; age runs from revoked_at, parsed like approved_at.
+            let age = chrono::DateTime::parse_from_rfc3339(&r.revoked_at)
+                .ok()
+                .map(|t| now_unix.saturating_sub(t.timestamp().max(0) as u64))
+                .unwrap_or(0);
+            out.push(EnrollmentView {
+                sub: sub.clone(),
+                state: EnrollmentState::Revoked,
+                pubkey: String::new(),
+                fingerprint: String::new(),
+                peer_ip: None,
+                age_seconds: age,
+                anomalous_pub: false,
+            });
+        }
         out.sort_by(|a, b| a.sub.cmp(&b.sub).then(a.state.cmp(&b.state)));
         Ok(out)
     }
 }
 
+impl EnrollmentState {
+    /// Sort rank for the `mint enroll list` view: pending first, then
+    /// enrolled, then revoked tombstones last.
+    fn rank(self) -> u8 {
+        match self {
+            EnrollmentState::Pending => 0,
+            EnrollmentState::Enrolled => 1,
+            EnrollmentState::Revoked => 2,
+        }
+    }
+}
+
 impl Ord for EnrollmentState {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use EnrollmentState::*;
-        match (self, other) {
-            (Pending, Pending) | (Enrolled, Enrolled) => std::cmp::Ordering::Equal,
-            (Pending, Enrolled) => std::cmp::Ordering::Less,
-            (Enrolled, Pending) => std::cmp::Ordering::Greater,
-        }
+        self.rank().cmp(&other.rank())
     }
 }
 impl PartialOrd for EnrollmentState {
@@ -1960,6 +2001,29 @@ mod tests {
         assert_eq!(by_sub.get("subP"), Some(&EnrollmentState::Pending));
         assert_eq!(by_sub.get("subQ"), Some(&EnrollmentState::Enrolled));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_shows_revoked_tombstone_as_revoked_row() {
+        let (_d, s) = store().await;
+        let b = s.current_invite().await.unwrap();
+        s.record_pending("subR", PUBA, &b, "usr_op", "ip", 1)
+            .await
+            .unwrap();
+        s.approve("subR", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        s.revoke("subR", "usr_op", APPROVED_AT).await.unwrap();
+        let rows = s.list(10).await.unwrap();
+        // The enrolled record is gone; the row that remains is the
+        // revoked tombstone, surfaced as state=revoked with no
+        // fingerprint/peer.
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.sub, "subR");
+        assert_eq!(r.state, EnrollmentState::Revoked);
+        assert!(r.fingerprint.is_empty());
+        assert!(r.peer_ip.is_none());
     }
 
     #[tokio::test]
