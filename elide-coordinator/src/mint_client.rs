@@ -59,7 +59,7 @@ fn retry_after_delay(retry_after_secs: Option<u64>) -> Duration {
 use elide_coordinator::config::MintConfig;
 use elide_coordinator::identity::CoordinatorIdentity;
 
-use crate::credential::{CredentialIssuer, Credentialer, IssuedCredentials};
+use crate::credential::{AuthorizedTarget, CredentialIssuer, Credentialer, IssuedCredentials};
 
 /// Wire prefix for a base64url-encoded mint macaroon — must match
 /// `mint::macaroon::WIRE_PREFIX`. `mnt1` = mint macaroon, wire
@@ -734,11 +734,13 @@ impl MintCredentialIssuer {
 
 #[async_trait]
 impl CredentialIssuer for MintCredentialIssuer {
-    async fn issue(&self, target: Ulid) -> io::Result<IssuedCredentials> {
+    async fn issue(&self, target: AuthorizedTarget) -> io::Result<IssuedCredentials> {
         // `target` is a single volume the requester is authorized to read
-        // (checked at the boundary); grant only its `by_id/<target>/*`
-        // prefix — no ancestor expansion.
-        self.credentialer.provision_volume_ro(target, &[]).await
+        // (the `AuthorizedTarget` proof); grant only its
+        // `by_id/<target>/*` prefix — no ancestor expansion.
+        self.credentialer
+            .provision_volume_ro(target.ulid(), &[])
+            .await
     }
 }
 
