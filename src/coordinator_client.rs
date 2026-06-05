@@ -295,10 +295,15 @@ impl Client {
     /// Coordinator re-checks SO_PEERCRED against the macaroon's `pid`
     /// caveat and the volume's recorded `volume.pid` before delegating
     /// to the configured `CredentialIssuer`.
-    pub fn macaroon_credentials(&self, macaroon: &str) -> io::Result<StoreCreds> {
+    pub fn macaroon_credentials(
+        &self,
+        macaroon: &str,
+        target: ulid::Ulid,
+    ) -> io::Result<StoreCreds> {
         let attenuated = attenuate_for_creds_request(macaroon, now_unix())?;
         self.call_typed(&Request::Credentials {
             macaroon: attenuated,
+            target,
         })?
         .map_err(io::Error::other)
     }

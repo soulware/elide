@@ -717,38 +717,28 @@ impl Credentialer for MintCredentialer {
     }
 }
 
-/// `CredentialIssuer` wrapper that resolves the volume's ancestor
-/// chain from local provenance and delegates to a [`Credentialer`].
+/// `CredentialIssuer` wrapper that delegates to a [`Credentialer`].
 /// Mirrors the in-process iam issuer so the inbound `credentials`
-/// handshake is identical regardless of backend.
+/// handshake is identical regardless of backend. Lineage authorization
+/// happens at the IPC boundary (`inbound::issue_credentials`), so this
+/// issuer provisions exactly the one authorized `target` prefix.
 pub struct MintCredentialIssuer {
     credentialer: Arc<dyn Credentialer>,
-    data_dir: PathBuf,
 }
 
 impl MintCredentialIssuer {
-    pub fn new(credentialer: Arc<dyn Credentialer>, data_dir: PathBuf) -> Self {
-        Self {
-            credentialer,
-            data_dir,
-        }
+    pub fn new(credentialer: Arc<dyn Credentialer>) -> Self {
+        Self { credentialer }
     }
 }
 
 #[async_trait]
 impl CredentialIssuer for MintCredentialIssuer {
-    async fn issue(
-        &self,
-        volume_id: elide_coordinator::macaroon::Verified<Ulid>,
-    ) -> io::Result<IssuedCredentials> {
-        let vol_ulid = volume_id.copy_inner();
-        let by_id_dir = self.data_dir.join("by_id");
-        let fork_dir = by_id_dir.join(vol_ulid.to_string());
-        let ancestors = elide_core::volume::lineage_ulids(&fork_dir, &by_id_dir)
-            .map_err(|e| io::Error::other(format!("loading ancestor chain: {e}")))?;
-        self.credentialer
-            .provision_volume_ro(vol_ulid, &ancestors)
-            .await
+    async fn issue(&self, target: Ulid) -> io::Result<IssuedCredentials> {
+        // `target` is a single volume the requester is authorized to read
+        // (checked at the boundary); grant only its `by_id/<target>/*`
+        // prefix — no ancestor expansion.
+        self.credentialer.provision_volume_ro(target, &[]).await
     }
 }
 
