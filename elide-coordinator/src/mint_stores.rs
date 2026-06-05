@@ -93,21 +93,6 @@ impl fmt::Display for RoleStore {
     }
 }
 
-/// Per-role `extra_body` fields surfaced through `assume-role`'s
-/// PoP-signed body. `volume-ro` is the one role whose policy template
-/// references `request.ancestors`; the key must be present even though
-/// the list is always empty, because handlebars strict mode treats a
-/// missing path as a render failure (whereas an empty `{{#each}}` block
-/// simply emits nothing — mint-side test
-/// `empty_request_ancestors_renders_self_only`).
-fn extra_body_for(role: &str) -> Vec<(&'static str, serde_json::Value)> {
-    if role == ROLE_VOLUME_RO {
-        vec![("ancestors", serde_json::json!([]))]
-    } else {
-        Vec::new()
-    }
-}
-
 impl RoleStore {
     fn new(
         endpoint: MintEndpoint,
@@ -186,9 +171,8 @@ impl RoleStore {
             Some(v) => vec![(CAVEAT_VOLUME, v.as_str())],
             None => Vec::new(),
         };
-        let extra_owned = extra_body_for(self.role);
         self.endpoint
-            .assume_role(self.role, self.ttl_secs, &narrowing, &extra_owned)
+            .assume_role(self.role, self.ttl_secs, &narrowing)
             .await
     }
 }
@@ -421,25 +405,6 @@ mod tests {
         let expiry: u64 = now + 1000;
         let refresh_at = now + expiry.saturating_sub(now) / 2;
         assert_eq!(refresh_at, now + 500);
-    }
-
-    #[test]
-    fn volume_ro_always_emits_ancestors_key_even_when_empty() {
-        // Regression: the volume-ro policy template references
-        // `request.ancestors`; handlebars strict mode rejects a missing
-        // path. The key must always be present even though it is now
-        // always an empty array.
-        let body = extra_body_for(ROLE_VOLUME_RO);
-        assert_eq!(body.len(), 1);
-        assert_eq!(body[0].0, "ancestors");
-        assert_eq!(body[0].1, serde_json::json!([] as [&str; 0]));
-    }
-
-    #[test]
-    fn non_volume_ro_roles_emit_no_extra_body() {
-        for role in [ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RW] {
-            assert!(extra_body_for(role).is_empty());
-        }
     }
 
     fn test_scoped_stores() -> MintScopedStores {

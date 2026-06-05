@@ -518,7 +518,6 @@ impl MintEndpoint {
         role: &str,
         ttl_secs: u64,
         narrowing: &[(&str, &str)],
-        extra_body: &[(&str, serde_json::Value)],
     ) -> io::Result<IssuedCredentials> {
         let cred_path = self.data_dir.join("credentials").join(role);
         let stored = std::fs::read_to_string(&cred_path).map_err(|e| {
@@ -556,9 +555,6 @@ impl MintEndpoint {
             obj.insert("ts".into(), now.into());
             obj.insert("role".into(), role.into());
             obj.insert("ttl_seconds".into(), ttl_secs.into());
-            for (k, v) in extra_body {
-                obj.insert((*k).to_owned(), v.clone());
-            }
             let body = serde_json::Value::Object(obj).to_string();
 
             let sig = BASE64.encode(self.identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
@@ -645,7 +641,7 @@ impl MintEndpoint {
         let mut attempt: u64 = 0;
         loop {
             attempt += 1;
-            match self.assume_role(role, ttl_secs, &[], &[]).await {
+            match self.assume_role(role, ttl_secs, &[]).await {
                 Ok(_) => {
                     if attempt > 1 {
                         tracing::info!("[coordinator] mint reachable after {attempt} attempts");
@@ -691,18 +687,12 @@ impl MintCredentialer {
 
 #[async_trait]
 impl Credentialer for MintCredentialer {
-    async fn provision_volume_ro(
-        &self,
-        vol_ulid: Ulid,
-        ancestors: &[Ulid],
-    ) -> io::Result<IssuedCredentials> {
-        let ancestor_strs: Vec<String> = ancestors.iter().map(Ulid::to_string).collect();
+    async fn provision_volume_ro(&self, vol_ulid: Ulid) -> io::Result<IssuedCredentials> {
         self.endpoint
             .assume_role(
                 ROLE_VOLUME_RO,
                 VOLUME_RO_TTL_SECS,
                 &[(CAVEAT_VOLUME, &vol_ulid.to_string())],
-                &[("ancestors", serde_json::json!(ancestor_strs))],
             )
             .await
     }
@@ -736,11 +726,9 @@ impl MintCredentialIssuer {
 impl CredentialIssuer for MintCredentialIssuer {
     async fn issue(&self, target: AuthorizedTarget) -> io::Result<IssuedCredentials> {
         // `target` is a single volume the requester is authorized to read
-        // (the `AuthorizedTarget` proof); grant only its
-        // `by_id/<target>/*` prefix — no ancestor expansion.
-        self.credentialer
-            .provision_volume_ro(target.ulid(), &[])
-            .await
+        // (the `AuthorizedTarget` proof); grant its `by_id/<target>/*`
+        // prefix.
+        self.credentialer.provision_volume_ro(target.ulid()).await
     }
 }
 
