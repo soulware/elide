@@ -460,6 +460,64 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         tigris_access_key_id: key,
     };
 
+    // --- Revocation gate (`docs/design-mint.md` § *Revocation*). The
+    // credential's (sub, cnf, epoch) must still match a present,
+    // MAC-valid enrolled record. Presence is the structural gate — a
+    // deleted record (revoked, awaiting re-approval) denies; the epoch
+    // keeps credentials minted before a revocation dead even after the
+    // same key re-enrolls. A cnf mismatch, a stale epoch, a missing
+    // epoch caveat, or a forged/corrupt record are all "revoked" →
+    // opaque 401. This is a clearing predicate against live state, not a
+    // MAC check, so it sits outside `verify_and_clear`. ---
+    let creds = EffectiveCaveats::new(&caveats);
+    let (cred_sub, cred_cnf, cred_epoch) = match (
+        creds.resolve(name::SUB),
+        creds.resolve(name::CNF),
+        creds.resolve(name::EPOCH),
+    ) {
+        (Resolved::Value(s), Resolved::Value(c), Resolved::Value(e)) => match e.parse::<u64>() {
+            Ok(epoch) => (s, c, epoch),
+            Err(_) => {
+                audit(entry("denied:revoked", "", None, None));
+                return unauthorized(&request_id);
+            }
+        },
+        _ => {
+            audit(entry("denied:revoked", "", None, None));
+            return unauthorized(&request_id);
+        }
+    };
+    match state.store.get_enrolled(&cred_sub).await {
+        Ok(Some(a)) if a.pubkey == cred_cnf && a.rev_epoch == cred_epoch => {}
+        Ok(_) | Err(StateError::Forged | StateError::Corrupt | StateError::BadSub) => {
+            audit(entry("denied:revoked", "", None, None));
+            return unauthorized(&request_id);
+        }
+        Err(StateError::Io(e)) => {
+            tracing::error!(error = %e, "read enrolled (revocation gate)");
+            audit(entry("denied:state_error", "", None, None));
+            return respond(
+                &request_id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "service unavailable"}),
+            );
+        }
+        Err(StateError::Store(msg)) => {
+            tracing::error!(error = %msg, "read enrolled (revocation gate, object store)");
+            audit(entry("denied:state_error", "", None, None));
+            return respond(
+                &request_id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "service unavailable"}),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, sub = %cred_sub, "unexpected state error in revocation gate");
+            audit(entry("denied:revoked", "", None, None));
+            return unauthorized(&request_id);
+        }
+    }
+
     // --- Request body (the exact bytes the PoP already covered). ---
     let Ok(req) = serde_json::from_slice::<AssumeRoleBody>(&body) else {
         audit(entry("denied:bad_request", "", None, None));
@@ -923,8 +981,10 @@ async fn enroll_exchange(
     // The enrolled-registry entry for this sub must exist and its
     // pinned pub must match the presented cnf — the operator approved
     // *this* (sub, pub) pair (`docs/design-mint.md` § *Enrollment* (3)).
-    match state.store.get_enrolled(&sub).await {
-        Ok(Some(a)) if a.pubkey == cnf => {}
+    // Its `rev_epoch` is stamped onto the minted credential so a later
+    // revoke can kill it (§ *Revocation*).
+    let rev_epoch = match state.store.get_enrolled(&sub).await {
+        Ok(Some(a)) if a.pubkey == cnf => a.rev_epoch,
         // The one non-401 authorization outcome: awaited, not a
         // failure. Includes both "never approved" and "approved
         // under a different pub" (pending key-rotation re-approval).
@@ -995,7 +1055,14 @@ async fn enroll_exchange(
     // `assume-role` (`docs/design-mint.md` § *Credential macaroon &
     // lifecycle*). Every role's credential is a uniform key-bound service
     // token.
-    let credential = issuance::mint_credential(&keyring, &state.config.audience, &sub, &cnf, &role);
+    let credential = issuance::mint_credential(
+        &keyring,
+        &state.config.audience,
+        &sub,
+        &cnf,
+        &role,
+        rev_epoch,
+    );
 
     // The enrolled-registry entry is not consumed: the ticket is
     // multi-use until its `exp` and the entry powers the re-enrollment

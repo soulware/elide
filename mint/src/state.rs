@@ -13,8 +13,12 @@
 //! _mint/invite                       current random nonce (one object)
 //! _mint/clients/pending/<sub>.json   transient (sub, pub, invite, first_seen, peer_ip);
 //!                                    GC'd at ticket-exp, deleted at approve()
-//! _mint/clients/enrolled/<sub>       long-lived {pub, approved_at, fingerprint_shown,
-//!                                    kid, mac}; powers the re-enrollment fast path
+//! _mint/clients/enrolled/<sub>       long-lived {pub, approved_by, approved_at,
+//!                                    fingerprint_shown, kid, rev_epoch, mac}; powers
+//!                                    the re-enrollment fast path
+//! _mint/clients/revoked/<sub>        revocation tombstone {rev_epoch, revoked_by,
+//!                                    revoked_at, kid, mac}; carries the high-water
+//!                                    rev_epoch so approve() resumes above it
 //! ```
 //!
 //! **Every enrolled-registry entry carries a MAC over its body keyed by
@@ -125,8 +129,42 @@ pub struct Enrolled {
     /// Keyring generation that MAC'd this record. Retired kids fail
     /// verification — that is the rotation invalidation step.
     pub kid: Kid,
+    /// Per-coordinator revocation epoch. Stamped onto every credential
+    /// minted for this `sub` at `enroll-exchange` and re-checked at
+    /// `assume-role`; a `revoke` bumps the high-water (via the
+    /// tombstone) so credentials minted before it never clear again,
+    /// even after the same key re-enrolls (`docs/design-mint.md` §
+    /// *Revocation*). Part of the body MAC.
+    pub rev_epoch: u64,
     /// BLAKE3-keyed MAC over the body, hex-encoded. See
     /// [`approval_mac`] for the exact input domain-separation.
+    pub mac: String,
+}
+
+/// One revocation tombstone (`_mint/clients/revoked/<sub>`). Written by
+/// [`Store::revoke`] when a coordinator is de-authorized; it carries the
+/// **high-water `rev_epoch`** — the value the killed credentials were
+/// stamped with — so a later [`Store::approve`] resumes the counter one
+/// above it and old credentials can never clear again. Deleted at
+/// re-approval (the moment a fresh generation is born).
+///
+/// MAC'd under the keyring generation that wrote it, the same way an
+/// [`Enrolled`] record is: a bucket-level writer cannot forge a
+/// tombstone with an attacker-chosen epoch without the keyring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revoked {
+    /// High-water revocation epoch — the epoch the now-dead credentials
+    /// carried. The next approval allocates `rev_epoch + 1`.
+    pub rev_epoch: u64,
+    /// The revoking operator's `Subject`, taken from the admin-plane
+    /// discharge at `mint enroll revoke`. Part of the body MAC.
+    pub revoked_by: String,
+    /// RFC 3339 timestamp the operator revoked the coordinator.
+    pub revoked_at: String,
+    /// Keyring generation that MAC'd this tombstone.
+    pub kid: Kid,
+    /// BLAKE3-keyed MAC over the body, hex-encoded. See
+    /// [`tombstone_mac`].
     pub mac: String,
 }
 
@@ -141,6 +179,20 @@ pub enum Recorded {
     /// written, and `/v1/enroll-exchange` will succeed immediately
     /// against the existing approval (fast path).
     AlreadyEnrolled,
+}
+
+/// What [`Store::revoke`] did, for the operator's confirmation message.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RevokeOutcome {
+    /// The high-water revocation epoch recorded in the tombstone — the
+    /// epoch the now-dead credentials carried. The next approval resumes
+    /// at `rev_epoch + 1`.
+    pub rev_epoch: u64,
+    /// True if a live enrolled record was present and deleted (the
+    /// common case). False if the `sub` was already revoked or never
+    /// enrolled — the tombstone is still written/kept either way, so
+    /// revocation is fail-safe and idempotent.
+    pub was_enrolled: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -173,7 +225,8 @@ impl From<OsError> for StateError {
     }
 }
 
-/// Outcome counts from a [`Store::sweep_approvals_to_current_kid`] run.
+/// Outcome counts from a [`Store::sweep_approvals_to_current_kid`] run,
+/// summed across enrolled records and revocation tombstones.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SweepReport {
     /// Records re-MAC'd from an older kid to the current kid.
@@ -243,10 +296,17 @@ pub fn fingerprint(pubkey_value: &str) -> String {
 /// approval MAC that doubles as a credential MAC or vice versa.
 const APPROVAL_DOMAIN: &[u8] = b"mint-approved-v1";
 
+/// Domain separator for revocation-tombstone MACs. Distinct from
+/// [`APPROVAL_DOMAIN`] so an enrolled record and a tombstone for the
+/// same `sub` can never be confused for one another under the same key.
+const REVOKED_DOMAIN: &[u8] = b"mint-revoked-v1";
+
 /// MAC over an approval record body. `sub` is included even though it
 /// is encoded in the object key, so a record cannot be copied to a
 /// different `<sub>` and still verify (cross-record substitution).
-/// Every variable-length field is length-prefixed to prevent
+/// `rev_epoch` is covered so a bucket writer cannot roll the epoch back
+/// to revive a revoked generation's credentials without breaking the
+/// MAC. Every variable-length field is length-prefixed to prevent
 /// canonicalization ambiguity.
 fn approval_mac(
     key: &[u8; 32],
@@ -255,6 +315,7 @@ fn approval_mac(
     approved_by: &str,
     approved_at: &str,
     fingerprint_shown: &str,
+    rev_epoch: u64,
 ) -> [u8; 32] {
     let mut msg = Vec::new();
     msg.extend_from_slice(APPROVAL_DOMAIN);
@@ -263,6 +324,26 @@ fn approval_mac(
     append_len_prefixed(&mut msg, approved_by.as_bytes());
     append_len_prefixed(&mut msg, approved_at.as_bytes());
     append_len_prefixed(&mut msg, fingerprint_shown.as_bytes());
+    msg.extend_from_slice(&rev_epoch.to_be_bytes());
+    *blake3::keyed_hash(key, &msg).as_bytes()
+}
+
+/// MAC over a revocation-tombstone body. `sub` is folded in (it is the
+/// object key) so a tombstone cannot be moved to a different `<sub>`,
+/// and `rev_epoch` is covered so the high-water mark cannot be tampered.
+fn tombstone_mac(
+    key: &[u8; 32],
+    sub: &str,
+    rev_epoch: u64,
+    revoked_by: &str,
+    revoked_at: &str,
+) -> [u8; 32] {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(REVOKED_DOMAIN);
+    append_len_prefixed(&mut msg, sub.as_bytes());
+    msg.extend_from_slice(&rev_epoch.to_be_bytes());
+    append_len_prefixed(&mut msg, revoked_by.as_bytes());
+    append_len_prefixed(&mut msg, revoked_at.as_bytes());
     *blake3::keyed_hash(key, &msg).as_bytes()
 }
 
@@ -543,11 +624,17 @@ impl Store {
     fn enrolled_key(sub: &str) -> OPath {
         OPath::from(format!("{STATE_PREFIX}/clients/enrolled/{sub}"))
     }
+    fn revoked_key(sub: &str) -> OPath {
+        OPath::from(format!("{STATE_PREFIX}/clients/revoked/{sub}"))
+    }
     fn pending_prefix() -> OPath {
         OPath::from(format!("{STATE_PREFIX}/clients/pending"))
     }
     fn enrolled_prefix() -> OPath {
         OPath::from(format!("{STATE_PREFIX}/clients/enrolled"))
+    }
+    fn revoked_prefix() -> OPath {
+        OPath::from(format!("{STATE_PREFIX}/clients/revoked"))
     }
     fn template_seal_key() -> OPath {
         OPath::from(format!("{STATE_PREFIX}/templates/seal.json"))
@@ -777,6 +864,30 @@ impl Store {
         if !safe_sub(sub) {
             return Err(StateError::BadSub);
         }
+        // Epoch allocation (`docs/design-mint.md` § *Revocation* —
+        // *Re-approval*). A tombstone means this `sub` was revoked:
+        // resume one above its high-water so credentials minted before
+        // the revocation never clear again. Otherwise keep an existing
+        // record's epoch (key rotation / idempotent re-approval), or
+        // start at 0. A forged/corrupt tombstone or enrolled record is
+        // the bucket-adversary residual (documented) — treat it as
+        // absent so a clean re-approval can proceed, matching
+        // get_enrolled's policy.
+        let tombstone = match self.get_revoked(sub).await {
+            Ok(t) => t,
+            Err(StateError::Forged | StateError::Corrupt) => None,
+            Err(e) => return Err(e),
+        };
+        let rev_epoch = if let Some(t) = &tombstone {
+            t.rev_epoch + 1
+        } else {
+            match self.get_enrolled(sub).await {
+                Ok(Some(existing)) => existing.rev_epoch,
+                Ok(None) | Err(StateError::Forged | StateError::Corrupt) => 0,
+                Err(e) => return Err(e),
+            }
+        };
+
         let fingerprint_shown = fingerprint(pubkey);
         let kr = self.keyring().await;
         let kid = kr.current_kid();
@@ -787,6 +898,7 @@ impl Store {
             approved_by,
             now_iso8601,
             &fingerprint_shown,
+            rev_epoch,
         );
         let rec = Enrolled {
             pubkey: pubkey.to_string(),
@@ -794,6 +906,7 @@ impl Store {
             approved_at: now_iso8601.to_string(),
             fingerprint_shown,
             kid,
+            rev_epoch,
             mac: hex32(&mac),
         };
         let bytes = serde_json::to_vec(&rec).map_err(|_| StateError::Corrupt)?;
@@ -804,6 +917,18 @@ impl Store {
                 PutOptions::default(),
             )
             .await?;
+        // The new generation supersedes the tombstone — drop it so the
+        // next approval reads "no tombstone" and the registry shows one
+        // row. Ordered after the enrolled PUT: a crash in between leaves
+        // the high-water recorded (re-approval re-derives the same
+        // epoch), never an enrolled record with the tombstone already
+        // gone.
+        if tombstone.is_some() {
+            match self.objects.delete(&Self::revoked_key(sub)).await {
+                Ok(()) | Err(OsError::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         // Best-effort: a missing pending record (already GC'd, or this
         // is a no-op re-approval) is not an error.
         match self.objects.delete(&Self::pending_key(sub)).await {
@@ -811,6 +936,76 @@ impl Store {
             Err(e) => return Err(e.into()),
         }
         Ok(())
+    }
+
+    /// Revoke a coordinator: write a tombstone at the high-water
+    /// `rev_epoch` and delete its enrolled record
+    /// (`docs/design-mint.md` § *Revocation*). After this every held
+    /// credential fails `assume-role` (its enrolled record is gone), a
+    /// held ticket fails `/v1/enroll-exchange` the same way, and the
+    /// re-enrollment fast path falls back to the operator-gated slow
+    /// path. Idempotent: re-revoking keeps the existing tombstone's
+    /// epoch.
+    ///
+    /// The high-water is `max` of the live enrolled record's epoch (the
+    /// value the now-dead credentials carry) and any prior tombstone's
+    /// epoch. The tombstone PUT is ordered **before** the enrolled
+    /// delete so a crash in between leaves the high-water recorded
+    /// (fail-safe), never an enrolled record gone with no tombstone to
+    /// resume from — which would let re-approval reuse an epoch and
+    /// revive dead credentials.
+    pub async fn revoke(
+        &self,
+        sub: &str,
+        revoked_by: &str,
+        now_iso8601: &str,
+    ) -> Result<RevokeOutcome, StateError> {
+        if !safe_sub(sub) {
+            return Err(StateError::BadSub);
+        }
+        let enrolled = match self.get_enrolled(sub).await {
+            Ok(e) => e,
+            Err(StateError::Forged | StateError::Corrupt) => None,
+            Err(e) => return Err(e),
+        };
+        let prior_tomb = match self.get_revoked(sub).await {
+            Ok(t) => t,
+            Err(StateError::Forged | StateError::Corrupt) => None,
+            Err(e) => return Err(e),
+        };
+        let was_enrolled = enrolled.is_some();
+        let rev_epoch = enrolled
+            .as_ref()
+            .map(|e| e.rev_epoch)
+            .unwrap_or(0)
+            .max(prior_tomb.as_ref().map(|t| t.rev_epoch).unwrap_or(0));
+
+        let kr = self.keyring().await;
+        let kid = kr.current_kid();
+        let mac = tombstone_mac(kr.current_key(), sub, rev_epoch, revoked_by, now_iso8601);
+        let rec = Revoked {
+            rev_epoch,
+            revoked_by: revoked_by.to_string(),
+            revoked_at: now_iso8601.to_string(),
+            kid,
+            mac: hex32(&mac),
+        };
+        let bytes = serde_json::to_vec(&rec).map_err(|_| StateError::Corrupt)?;
+        self.objects
+            .put_opts(
+                &Self::revoked_key(sub),
+                PutPayload::from(Bytes::from(bytes)),
+                PutOptions::default(),
+            )
+            .await?;
+        match self.objects.delete(&Self::enrolled_key(sub)).await {
+            Ok(()) | Err(OsError::NotFound { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(RevokeOutcome {
+            rev_epoch,
+            was_enrolled,
+        })
     }
 
     /// The pending record for `sub`, if any.
@@ -867,6 +1062,7 @@ impl Store {
             &rec.approved_by,
             &rec.approved_at,
             &rec.fingerprint_shown,
+            rec.rev_epoch,
         );
         let actual = unhex32(&rec.mac).ok_or(StateError::Corrupt)?;
         if !bool::from(expected.ct_eq(&actual)) {
@@ -875,6 +1071,47 @@ impl Store {
                 sub,
                 kid = rec.kid,
                 "enrolled record MAC mismatch; treating as forged"
+            );
+            return Err(StateError::Forged);
+        }
+        Ok(Some(rec))
+    }
+
+    /// The revocation tombstone for `sub`, if any, MAC-verified under the
+    /// keyring. Consulted at `approve` (to resume the epoch above the
+    /// high-water) and at `revoke` (to stay idempotent). A record under
+    /// a retired / unknown kid, a bucket-level forgery, or a partial
+    /// overwrite surface as [`StateError::Forged`]; an undeserialisable
+    /// body as [`StateError::Corrupt`] — the same policy and tolerant
+    /// treatment as [`Self::get_enrolled`].
+    pub async fn get_revoked(&self, sub: &str) -> Result<Option<Revoked>, StateError> {
+        if !safe_sub(sub) {
+            return Err(StateError::BadSub);
+        }
+        let bytes = match self.objects.get(&Self::revoked_key(sub)).await {
+            Ok(g) => g.bytes().await?,
+            Err(OsError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let rec: Revoked = serde_json::from_slice(&bytes).map_err(|_| StateError::Corrupt)?;
+        let kr = self.keyring().await;
+        let Some(key) = kr.get(rec.kid) else {
+            tracing::warn!(
+                target: "mint::state",
+                sub,
+                kid = rec.kid,
+                "tombstone claims a kid not in the keyring; treating as forged"
+            );
+            return Err(StateError::Forged);
+        };
+        let expected = tombstone_mac(key, sub, rec.rev_epoch, &rec.revoked_by, &rec.revoked_at);
+        let actual = unhex32(&rec.mac).ok_or(StateError::Corrupt)?;
+        if !bool::from(expected.ct_eq(&actual)) {
+            tracing::warn!(
+                target: "mint::state",
+                sub,
+                kid = rec.kid,
+                "tombstone MAC mismatch; treating as forged"
             );
             return Err(StateError::Forged);
         }
@@ -899,6 +1136,18 @@ impl Store {
         while let Some(item) = stream.next().await {
             let meta = item?;
             if let Some(sub) = sub_from_enrolled_key(meta.location.as_ref()) {
+                out.push(sub);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn revoked_subs(&self) -> Result<Vec<String>, StateError> {
+        let mut out = Vec::new();
+        let mut stream = self.objects.list(Some(&Self::revoked_prefix()));
+        while let Some(item) = stream.next().await {
+            let meta = item?;
+            if let Some(sub) = sub_from_revoked_key(meta.location.as_ref()) {
                 out.push(sub);
             }
         }
@@ -951,6 +1200,7 @@ impl Store {
             &rec.approved_by,
             &rec.approved_at,
             &rec.fingerprint_shown,
+            rec.rev_epoch,
         );
         let actual = match unhex32(&rec.mac) {
             Some(a) => a,
@@ -966,6 +1216,7 @@ impl Store {
             &rec.approved_by,
             &rec.approved_at,
             &rec.fingerprint_shown,
+            rec.rev_epoch,
         );
         let next = Enrolled {
             pubkey: rec.pubkey,
@@ -973,6 +1224,7 @@ impl Store {
             approved_at: rec.approved_at,
             fingerprint_shown: rec.fingerprint_shown,
             kid: kr.current_kid(),
+            rev_epoch: rec.rev_epoch,
             mac: hex32(&new_mac),
         };
         let body = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
@@ -1002,13 +1254,19 @@ impl Store {
         }
     }
 
-    /// Re-MAC every approval record under the keyring's current
-    /// generation (rotation step 2 — `docs/design-mint.md` §
-    /// *Root-key rotation*). Verifies each record under any kid still
-    /// in the ring before re-emitting it, so a forged or tampered
-    /// record is skipped (logged + reported in the return value),
-    /// never propagated under a new MAC. Returns the count of records
-    /// re-MAC'd and the count skipped.
+    /// Re-MAC every enrolled record **and every revocation tombstone**
+    /// under the keyring's current generation (rotation step 2 —
+    /// `docs/design-mint.md` § *Root-key rotation*). Verifies each
+    /// record under any kid still in the ring before re-emitting it, so
+    /// a forged or tampered record is skipped (logged + reported in the
+    /// return value), never propagated under a new MAC. Returns the
+    /// counts across both record types.
+    ///
+    /// Tombstones have no lazy-migration touch path of their own (they
+    /// are read only at `approve` / `revoke`), so this sweep is the only
+    /// way their high-water `rev_epoch` drifts forward before an old kid
+    /// is retired. Skipping them would let a kid retirement silently
+    /// drop the high-water and let re-approval revive dead credentials.
     ///
     /// Safe to run repeatedly — a record already at `current_kid`
     /// re-serialises to identical bytes. Intended to be invoked once
@@ -1055,6 +1313,7 @@ impl Store {
                 &rec.approved_by,
                 &rec.approved_at,
                 &rec.fingerprint_shown,
+                rec.rev_epoch,
             );
             let actual = match unhex32(&rec.mac) {
                 Some(a) => a,
@@ -1084,6 +1343,7 @@ impl Store {
                 &rec.approved_by,
                 &rec.approved_at,
                 &rec.fingerprint_shown,
+                rec.rev_epoch,
             );
             let next = Enrolled {
                 pubkey: rec.pubkey,
@@ -1091,12 +1351,89 @@ impl Store {
                 approved_at: rec.approved_at,
                 fingerprint_shown: rec.fingerprint_shown,
                 kid: new_kid,
+                rev_epoch: rec.rev_epoch,
                 mac: hex32(&new_mac),
             };
             let bytes = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
             self.objects
                 .put_opts(
                     &Self::enrolled_key(&sub),
+                    PutPayload::from(Bytes::from(bytes)),
+                    PutOptions::default(),
+                )
+                .await?;
+            report.rekeyed += 1;
+        }
+        for sub in self.revoked_subs().await? {
+            let bytes = match self.objects.get(&Self::revoked_key(&sub)).await {
+                Ok(g) => g.bytes().await?,
+                Err(OsError::NotFound { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let rec: Revoked = match serde_json::from_slice(&bytes) {
+                Ok(r) => r,
+                Err(_) => {
+                    report.skipped += 1;
+                    tracing::warn!(target: "mint::state", sub, "sweep: corrupt tombstone body");
+                    continue;
+                }
+            };
+            let Some(old_key) = kr.get(rec.kid) else {
+                report.skipped += 1;
+                tracing::warn!(
+                    target: "mint::state",
+                    sub,
+                    kid = rec.kid,
+                    "sweep: tombstone under unknown kid"
+                );
+                continue;
+            };
+            let expected = tombstone_mac(
+                old_key,
+                &sub,
+                rec.rev_epoch,
+                &rec.revoked_by,
+                &rec.revoked_at,
+            );
+            let actual = match unhex32(&rec.mac) {
+                Some(a) => a,
+                None => {
+                    report.skipped += 1;
+                    continue;
+                }
+            };
+            if !bool::from(expected.ct_eq(&actual)) {
+                report.skipped += 1;
+                tracing::warn!(
+                    target: "mint::state",
+                    sub,
+                    kid = rec.kid,
+                    "sweep: tombstone MAC mismatch; skipping"
+                );
+                continue;
+            }
+            if rec.kid == new_kid {
+                report.already_current += 1;
+                continue;
+            }
+            let new_mac = tombstone_mac(
+                new_key,
+                &sub,
+                rec.rev_epoch,
+                &rec.revoked_by,
+                &rec.revoked_at,
+            );
+            let next = Revoked {
+                rev_epoch: rec.rev_epoch,
+                revoked_by: rec.revoked_by,
+                revoked_at: rec.revoked_at,
+                kid: new_kid,
+                mac: hex32(&new_mac),
+            };
+            let bytes = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
+            self.objects
+                .put_opts(
+                    &Self::revoked_key(&sub),
                     PutPayload::from(Bytes::from(bytes)),
                     PutOptions::default(),
                 )
@@ -1249,6 +1586,13 @@ fn sub_from_pending_key(key: &str) -> Option<String> {
 
 fn sub_from_enrolled_key(key: &str) -> Option<String> {
     let prefix = format!("{STATE_PREFIX}/clients/enrolled/");
+    key.strip_prefix(&prefix)
+        .filter(|s| safe_sub(s))
+        .map(str::to_owned)
+}
+
+fn sub_from_revoked_key(key: &str) -> Option<String> {
+    let prefix = format!("{STATE_PREFIX}/clients/revoked/");
     key.strip_prefix(&prefix)
         .filter(|s| safe_sub(s))
         .map(str::to_owned)
@@ -1677,6 +2021,7 @@ mod tests {
             "approved_by": "usr_op",
             "fingerprint_shown": fingerprint(PUBA),
             "kid": 0,
+            "rev_epoch": 0,
             "mac": "00".repeat(32),
         });
         raw_put_enrolled(&s, "01ARZ", &forged).await;
@@ -1728,6 +2073,7 @@ mod tests {
             "approved_by": "usr_op",
             "fingerprint_shown": fingerprint(PUBA),
             "kid": 0,
+            "rev_epoch": 0,
             "mac": "00".repeat(32),
         });
         raw_put_enrolled(&s, "01ARZ", &forged).await;
@@ -1844,6 +2190,7 @@ mod tests {
             "approved_by": "usr_op",
             "fingerprint_shown": fingerprint(PUBA),
             "kid": 0,
+            "rev_epoch": 0,
             "mac": "00".repeat(32),
         });
         raw_put_enrolled(&s, "01ARZ", &forged).await;
@@ -1876,6 +2223,7 @@ mod tests {
             "approved_by": "usr_op",
             "fingerprint_shown": fingerprint(PUBB),
             "kid": 0,
+            "rev_epoch": 0,
             "mac": "00".repeat(32),
         });
         raw_put_enrolled(&s, "forged", &forged).await;
@@ -1951,6 +2299,7 @@ mod tests {
             "approved_by": "usr_op",
             "fingerprint_shown": fingerprint(PUBB),
             "kid": 0,
+            "rev_epoch": 0,
             "mac": "00".repeat(32),
         });
         raw_put_enrolled(&s, "bad", &forged).await;
@@ -1992,5 +2341,152 @@ mod tests {
         }
         assert_ne!(initial, new_nonce);
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fresh_approve_starts_at_epoch_zero() {
+        let (_d, s) = store().await;
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        let rec = s.get_enrolled("01ARZ").await.unwrap().expect("present");
+        assert_eq!(rec.rev_epoch, 0);
+    }
+
+    #[tokio::test]
+    async fn revoke_writes_tombstone_and_deletes_enrolled() {
+        let (_d, s) = store().await;
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        let out = s.revoke("01ARZ", "usr_rev", APPROVED_AT).await.unwrap();
+        assert!(out.was_enrolled);
+        assert_eq!(out.rev_epoch, 0, "high-water is the enrolled epoch");
+        assert!(
+            s.get_enrolled("01ARZ").await.unwrap().is_none(),
+            "enrolled record deleted"
+        );
+        let tomb = s.get_revoked("01ARZ").await.unwrap().expect("tombstone");
+        assert_eq!(tomb.rev_epoch, 0);
+        assert_eq!(tomb.revoked_by, "usr_rev");
+    }
+
+    #[tokio::test]
+    async fn re_approve_after_revoke_bumps_epoch_and_clears_tombstone() {
+        let (_d, s) = store().await;
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        s.revoke("01ARZ", "usr_rev", APPROVED_AT).await.unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        let rec = s.get_enrolled("01ARZ").await.unwrap().expect("present");
+        assert_eq!(
+            rec.rev_epoch, 1,
+            "resumes one above the tombstone high-water"
+        );
+        assert!(
+            s.get_revoked("01ARZ").await.unwrap().is_none(),
+            "tombstone deleted at re-approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_is_idempotent_and_epoch_advances_each_cycle() {
+        let (_d, s) = store().await;
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.revoke("01ARZ", "r", APPROVED_AT).await.unwrap().rev_epoch,
+            0
+        );
+        // Re-revoking an already-revoked sub keeps the high-water and
+        // reports no live record.
+        let again = s.revoke("01ARZ", "r", APPROVED_AT).await.unwrap();
+        assert_eq!(again.rev_epoch, 0);
+        assert!(!again.was_enrolled);
+        // Each approve/revoke cycle advances the high-water.
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.revoke("01ARZ", "r", APPROVED_AT).await.unwrap().rev_epoch,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_never_enrolled_writes_tombstone_at_zero() {
+        let (_d, s) = store().await;
+        let out = s.revoke("ghost", "usr_rev", APPROVED_AT).await.unwrap();
+        assert!(!out.was_enrolled);
+        assert_eq!(out.rev_epoch, 0);
+        assert!(s.get_revoked("ghost").await.unwrap().is_some());
+        // A later first approval still resumes above the tombstone.
+        s.approve("ghost", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        assert_eq!(s.get_enrolled("ghost").await.unwrap().unwrap().rev_epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn tombstone_copied_to_a_different_sub_fails_to_verify() {
+        // The tombstone MAC binds `sub`, so a verbatim copy to another
+        // sub cannot revive the high-water there (cross-record forgery).
+        let (_d, s) = store().await;
+        s.approve("subA", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        s.revoke("subA", "usr_rev", APPROVED_AT).await.unwrap();
+        let real = s.get_revoked("subA").await.unwrap().expect("present");
+        let body = serde_json::to_vec(&real).unwrap();
+        s.objects
+            .put_opts(
+                &Store::revoked_key("subB"),
+                PutPayload::from(Bytes::from(body)),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.get_revoked("subB").await,
+            Err(StateError::Forged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sweep_rekeys_tombstone_so_it_survives_retire() {
+        // A tombstone has no lazy-migration path; only the sweep moves it
+        // forward. After sweep + retire of the old kid the tombstone must
+        // still verify, or re-approval would lose the high-water and
+        // revive dead credentials.
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open_local(d.path()).await.unwrap();
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        s.revoke("01ARZ", "usr_rev", APPROVED_AT).await.unwrap();
+        let rk = d.path().join("root_keys");
+        let mut kr = (*s.keyring().await).clone();
+        kr.add_and_promote(&rk, None).unwrap();
+        s.set_keyring(kr).await;
+        let report = s.sweep_approvals_to_current_kid().await.unwrap();
+        assert_eq!(report.rekeyed, 1, "tombstone moved to current kid");
+        let mut kr = (*s.keyring().await).clone();
+        kr.retire(&rk, 0).unwrap();
+        s.set_keyring(kr).await;
+        let tomb = s
+            .get_revoked("01ARZ")
+            .await
+            .unwrap()
+            .expect("survives retire");
+        assert_eq!(tomb.kid, 1);
+        // Re-approval still resumes above the surviving high-water.
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        assert_eq!(s.get_enrolled("01ARZ").await.unwrap().unwrap().rev_epoch, 1);
     }
 }

@@ -313,7 +313,13 @@ credential custody — deployment shapes* below):
   the keyring's current kid, then `DELETE _mint/clients/pending/<sub>.json`.
   Re-approval against a *different* pub is a key-rotation
   acknowledgment and overwrites the registry record (under the
-  current kid).
+  current kid). The new record's `rev_epoch` is allocated from any
+  `clients/revoked/<sub>` tombstone (then the tombstone is deleted) —
+  see § *Revocation*.
+- `revoke`: `PUT _mint/clients/revoked/<sub>` (the tombstone, at the
+  high-water `rev_epoch`), then `DELETE _mint/clients/enrolled/<sub>` —
+  ordered so a crash leaves the high-water recorded, never an enrolled
+  record gone with no tombstone to resume from. See § *Revocation*.
 - `is_enrolled` (exchange path): `GET _mint/clients/enrolled/<sub>` — one
   round-trip; the body MAC is verified before any of its fields are
   trusted, then the record's `pub` must be the key the exchange request's
@@ -405,11 +411,16 @@ exist for the situations that need them:
    peek before the operator pulls the trigger.
 4. **Sweep** (`Store::sweep_approvals_to_current_kid`). The
    force-converge admin operation: re-MAC every `_mint/clients/enrolled/<sub>`
-   under the current kid in one pass, regardless of natural touch.
-   Used only when an operator wants to retire an older kid without
-   waiting for lazy migration to drain it (e.g. immediate compliance
-   action). Skips records that fail to verify under any kid in the
-   ring — forgeries are never laundered forward.
+   **and every `_mint/clients/revoked/<sub>` tombstone** under the
+   current kid in one pass, regardless of natural touch. Used only when
+   an operator wants to retire an older kid without waiting for lazy
+   migration to drain it (e.g. immediate compliance action). Tombstones
+   have no lazy-migration path of their own, so the sweep is the only
+   way their high-water `rev_epoch` survives a kid retirement — without
+   it, retiring a kid would silently drop the high-water and let
+   re-approval revive dead credentials. Skips records that fail to
+   verify under any kid in the ring — forgeries are never laundered
+   forward.
 
 **Compromise rotation.** If a kid is suspected compromised:
 `retire` it immediately. Records that lazy-migration has already
@@ -1972,6 +1983,7 @@ mint invite [--rotate]             # print current invite macaroon / rotate the 
 mint enroll list                   # sub, state (pending|enrolled), cnf fingerprint,
                                    #   peer ip (pending only), age / approved_at
 mint enroll approve <sub>          # approve a pending record
+mint enroll revoke <sub>           # revoke a coordinator: kill its credentials, drop to slow path
 mint role list                     # configured roles: name, TTL bounds
 mint role inspect <name>           # one role: bounds, policy source, raw template + ref surface
 ```

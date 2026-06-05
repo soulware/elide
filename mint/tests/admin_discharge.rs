@@ -54,6 +54,7 @@ const OP_INVITE_READ: &str = "admin:invite-read";
 const OP_INVITE_ROTATE: &str = "admin:invite-rotate";
 const OP_ENROLL_LIST: &str = "admin:enroll-list";
 const OP_ENROLL_APPROVE: &str = "admin:enroll-approve";
+const OP_ENROLL_REVOKE: &str = "admin:enroll-revoke";
 
 /// A valid ULID — `approve` requires a `safe_sub`.
 const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -294,6 +295,12 @@ async fn one_wide_discharge_satisfies_every_verb() {
             "/v1/admin/enroll/approve",
             serde_json::json!({ "ts": now(), "sub": SUB, "pubkey": pop::cnf_value(&[1u8; 32]) })
                 .to_string(),
+        ),
+        (
+            OP_ENROLL_REVOKE,
+            "POST",
+            "/v1/admin/enroll/revoke",
+            serde_json::json!({ "ts": now(), "sub": SUB }).to_string(),
         ),
     ];
 
