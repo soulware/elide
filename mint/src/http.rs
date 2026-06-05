@@ -630,7 +630,6 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
                 json!({
                     "access_key_id": kp.access_key_id,
                     "secret_access_key": kp.secret_access_key,
-                    "expiration": kp.expiration.to_rfc3339(),
                 }),
             )
         }
