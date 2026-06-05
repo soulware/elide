@@ -110,14 +110,9 @@ pub fn authorize_target(
 /// own coord-* roles are handled separately via `crate::mint_stores`.
 #[async_trait]
 pub trait Credentialer: Send + Sync {
-    /// Mint (or return cached) per-volume read-only credentials whose
-    /// policy grants `s3:GetObject` on `by_id/<vol_ulid>/*` plus every
-    /// ancestor prefix in `ancestors`.
-    async fn provision_volume_ro(
-        &self,
-        vol_ulid: Ulid,
-        ancestors: &[Ulid],
-    ) -> io::Result<IssuedCredentials>;
+    /// Mint (or return cached) read-only credentials whose policy grants
+    /// `s3:GetObject` on the single prefix `by_id/<vol_ulid>/*`.
+    async fn provision_volume_ro(&self, vol_ulid: Ulid) -> io::Result<IssuedCredentials>;
 
     /// Tear down a volume's RO key + policy. Best-effort: a remote
     /// implementation may log and proceed if individual IAM calls fail

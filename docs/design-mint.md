@@ -65,7 +65,7 @@ mint itself** — minted once at enrollment, then attenuated by
 the caller per request. The macaroon is a pure *capability* (which
 roles this key-bound principal may assume, until when); the per-request
 *exercise* parameters (role, TTL, and any role-specific scoping data
-such as the ancestor set) travel in the request **body**, which is
+such as a `req.prefix`) travel in the request **body**, which is
 covered by the caller's proof-of-possession signature (§ *Credential
 macaroon & lifecycle*). The caller calls `mint`'s HTTP API, presenting the
 (attenuated) macaroon, the PoP-signed body, and any discharge
@@ -654,7 +654,7 @@ the macaroon only when the request carries a fresh Ed25519 signature, by
 `coordinator.key`, over `BLAKE3(presented-macaroon-tail ‖
 BLAKE3(request-body))` — the tail binds the proof to this exact
 capability macaroon (role/`exp`/`elide:Volume`), the body hash to
-this exact request (role, TTL, scoping data such as the ancestor set).
+this exact request (role, TTL, scoping data such as `req.prefix`).
 Freshness is a `ts` field **inside the body** (unix seconds, ±skew
 window) — already covered by `BLAKE3(request-body)`, so no separate
 signed term and no header. The persisted file alone is therefore inert:
@@ -918,8 +918,8 @@ invite at `/v1/enroll`, the ticket at `/v1/enroll-exchange`, and the CLI
 service token at the admin verbs. `/v1/verify` returns the cleared
 bundle's caveats and minimum `NotAfter` so the caller can cache the
 verdict. `/v1/assume-role` runs the same verify+clear and then **assumes
-the role** — clears the role-specific narrowing caveats (`elide:Volume`,
-ancestors), renders the role policy, mints a Tigris keypair. `/v1/enroll`
+the role** — clears the role-specific narrowing caveats (`elide:Volume`),
+renders the role policy, mints a Tigris keypair. `/v1/enroll`
 and `/v1/enroll-exchange` are the one-time bootstrap: `/v1/enroll` admits
 a coordinator's operator-gated invite attenuation, records a pending
 enrollment, and returns a ticket; `/v1/enroll-exchange` takes that
@@ -938,8 +938,7 @@ Content-Type: application/json
 {
   "ts": 1747000000,
   "role": "volume-ro",
-  "ttl_seconds": 3600,
-  "ancestors": ["01ARZ...", "01BXY..."]
+  "ttl_seconds": 3600
 }
 ```
 
@@ -1111,12 +1110,11 @@ an absent `req.X` fails closed). Conventional fields:
 - `ttl_seconds` (optional): requested credential lifetime. Must be within
   the role's `min_ttl_seconds`..`max_ttl_seconds` and must not exceed the
   macaroon's `exp` caveat. Defaults to the role's `default_ttl_seconds`.
-- `ancestors` (role-specific): the ancestor vol-ulid set the
-  `volume-ro` policy expands into per-ancestor ARNs. It is **not** a
-  caveat: the coordinator computes the honest lineage from signed
-  provenance and asserts it here, authenticated by the PoP rather than
-  the MAC chain. Mint neither knows nor requires this field except
-  through the role template that names it.
+- `req.*` (role-specific): scalar scoping fields a role template names
+  (e.g. the demo roles' `req.prefix`). They are **not** caveats: the
+  caller computes them and asserts them here, authenticated by the PoP
+  rather than the MAC chain. Mint neither knows nor requires a field
+  except through the role template that names it.
 
 ### Response
 
@@ -1159,15 +1157,10 @@ all of them.
 {
   "Version": "2012-10-17",
   "Statement": [{
-    "Sid": "ReadVolumeAndAncestors",
+    "Sid": "ReadVolume",
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
-    "Resource": [
-      "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each req.ancestors}},
-      "arn:aws:s3:::{{env.bucket}}/by_id/{{this}}/*"
-      {{/each}}
-    ],
+    "Resource": "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*",
     "Condition": {
       "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
     }
@@ -1224,14 +1217,13 @@ issuance time, each with an explicit, distinct trust provenance:
   namespaced caveat names contain `:`, which is not a legal template path
   segment; it also keeps the caveat surface to a single named lookup
   rather than arbitrary data-graph traversal.
-- `{{req.X}}` — fields from the PoP-verified request body (bound to
+- `{{req.X}}` — scalar fields from the PoP-verified request body (bound to
   `coordinator.key`, this macaroon's tail, and this moment — §
   *Authentication*). Available **only** after the PoP signature is
-  verified. Scalars render directly; arrays iterate as
-  `{{#each req.ancestors}}…{{/each}}`. This is the channel for
-  honest-but-unverified scoping data the coordinator computes (e.g. the
-  ancestor lineage): mint transmits it into the policy, the PoP
-  authenticates *who* asserted it, mint never validates the value.
+  verified. They render directly (e.g. the demo roles' `{{req.prefix}}`).
+  This is the channel for honest-but-unverified scoping data the caller
+  computes: mint transmits it into the policy, the PoP authenticates *who*
+  asserted it, mint never validates the value.
 - `{{mint.X}}` — values computed by the mint at request time, as a
   plain path. v1 set: `mint.expiry` (the issued credential's expiry as an
   RFC 3339 / ISO 8601 instant — `now + min(requested TTL, role
@@ -1252,100 +1244,61 @@ the request is refused, never minted with a missing or downgraded
 substitution. `{{req.X}}` is likewise strict — an absent field a
 template references fails the render closed.
 
-The mint **does not** ship a general-purpose policy DSL. The entire
-template surface is `{{env.*}}` / `{{mint.*}}` plain paths, the
-`caveat` scalar lookup helper, `{{req.*}}` fields, and `{{#each}}`
-over a `req.*` array. Conditional blocks, arithmetic, value
+The mint **does not** ship a general-purpose policy DSL. The
+role-facing template surface is scalar substitution: `{{env.*}}` /
+`{{mint.*}}` plain paths, the `caveat` scalar lookup helper, and
+`{{req.*}}` scalar fields. No role iterates a list — every role's policy
+is straight scalar substitution. Conditional blocks, arithmetic, value
 transformations, and dynamic resource construction beyond straight
 substitution are deliberately out of scope. Roles requiring more
 expressive policies should be split into multiple roles.
 
-### Proposed: per-volume read credentials (retire the ancestor list)
+### Per-volume read credentials
 
-The `{{#each req.ancestors}}` expansion in `volume-ro` is the **only**
-list-shaped construct in any template. Every other substitution is a
-scalar. This proposal removes the ancestor list entirely: a `volume-ro`
-credential scopes to a **single** prefix, `by_id/<vol>/*`, and a reader
-that needs an ancestor's segments obtains a separate `volume-ro`
-credential for *that* ancestor. The expansion construct, the
-`req.ancestors` body field, and the lineage walk that builds it all go
-away.
+A `volume-ro` credential scopes to a **single** prefix, `by_id/<vol>/*`,
+and a reader that needs an ancestor's segments obtains a separate
+`volume-ro` credential for *that* ancestor. No template iterates a list:
+`volume-ro`'s policy is a single scalar resource
+(`by_id/{{caveat "elide:Volume"}}/*`) with no `req` reference, which
+keeps least-privilege tight — a leaked `volume-ro` credential grants one
+volume's prefix, not a whole lineage.
 
-**Why.** The expansion is templating's only departure from scalar
-substitution — retiring it collapses the template surface to plain-path
-scalars plus the `caveat` lookup, with no iteration construct at all. It
-also tightens least-privilege: a leaked `volume-ro` credential grants one
-volume's prefix, not the whole lineage. And it removes the only
-*list-shaped* honest-but-unverified input — the lineage the coordinator
-asserts in the PoP body — which is the single channel that motivated the
-JSON-injection hardening of the renderer.
-
-**Why it is mechanical, not architectural.** The read path is already
-keyed by owner. The demand-fetch interface
+The read path is keyed by owner. The demand-fetch interface
 (`elide_core::segment::SegmentFetcher`) takes `owner_vol_id` per call and
 issues exactly one GET against that owner's prefix; the coordinator's
-`ScopedStores` already vends a single-prefix `read_volume(vol)` used by
-every non-lineage read site. The ancestor-spanning credential survives in
-only three places, and the routing key to replace it exists at each:
+`ScopedStores` vends a single-prefix `read_volume(vol)`. The
+per-owner routing key is present at every read site:
 
 - **Volume serve-time demand-fetch (hot path).** The running volume's
-  `RemoteFetcher` (`elide-fetch`) holds one store built from one
-  chain-spanning credential, acquired lazily through the coordinator's
-  `Credentials` IPC. Under this proposal it holds a **per-owner credential
-  cache** (`owner_vol_id` → store), each entry acquired on first fetch
-  from that owner and idle-dropped independently; `fetch_extent` selects
-  the store by the `owner_vol_id` it already receives.
+  `RemoteFetcher` (`elide-fetch`) holds a **per-owner credential cache**
+  (`owner_vol_id` → store), each entry acquired on first fetch from that
+  owner through the coordinator's `Credentials` IPC and idle-dropped
+  independently; `fetch_extent` selects the store by the `owner_vol_id`
+  it already receives.
 - **Prefetch index fan-out** (`coordinator::prefetch`). Each fan-out task
-  already reads only its own fork's prefix; it takes
-  `read_volume(task_vol)` instead of one shared
-  `read_head_with_ancestors` store. The shared store was only connection
-  reuse.
+  reads only its own fork's prefix via `read_volume(task_vol)`.
 - **Filemap generation** (`generate_filemap`, offline
   `import --extents-from`). Its range fetcher reads fragment bodies that
   may live in any ancestor prefix; it routes per fragment through the same
   per-owner store selection.
 
-`read_head_with_ancestors` and the `ancestors` argument to
-`provision_volume_ro` are removed; the `Credentials` IPC and mint's
-`assume-role` body carry a single target volume. The mint side gets
-strictly simpler — `provision_volume_ro` no longer expands a list.
+The `Credentials` IPC and mint's `assume-role` body carry a single
+**target** volume, and mint issues a single-prefix credential for that one
+named volume.
 
-**Authorization.** Today the volume's macaroon binds it to its own
-`volume_ulid` (the `volume()` caveat) and never names a target: the
-coordinator derives the lineage and grants self+ancestors, so there is
-nothing to authorize — a volume can only ever obtain its own chain. Once
-the volume **names** the target owner, that property must be re-asserted
-explicitly: the coordinator authorizes each request against
-`target ∈ {self} ∪ lineage(self)`, where `self` is the macaroon-bound
-volume, and refuses otherwise. Without this check a volume could request a
-read credential for any volume. The lineage walk that builds today's grant
-is not deleted — it **relocates** from "construct the ancestor set" to
-"authorize the named target", staying coordinator-side; mint itself only
-ever issues a single-prefix credential for one named volume. Net authority
-is identical to today (read self + ancestors), issued one prefix at a time
-and re-authorized per prefix.
+**Authorization.** Because the request **names** the target owner, the
+coordinator authorizes each request at the IPC boundary against
+`target ∈ {requester} ∪ lineage(requester)`, re-deriving the requester's
+lineage from local provenance, and refuses otherwise. Without this check a
+volume could request a read credential for any volume. The lineage walk
+lives at this authorization boundary; mint itself only ever issues a
+single-prefix credential for one named volume. A volume that demand-pages
+across `K` ancestors holds up to `K` cached per-owner credentials, each
+acquired on first fetch and amortised over the credential TTL; a volume
+reading only its own data holds one.
 
-**Cost.** One credential acquisition per *distinct ancestor actually
-demand-fetched* (cached, idle-dropped), versus one chain-spanning
-acquisition today. A volume reading only its own data pays the same (one).
-A volume that demand-pages across `K` ancestors pays `K` cached
-acquisitions over its lifetime and holds `K` S3 clients rather than one
-(extra connection overhead, no per-read cost — `owner_vol_id` hits the
-local cache). For deep chains with widely-scattered reads this is more
-mint round-trips; they amortise over the credential TTL.
-
-**Scope.** This does not touch the scalar `req.*` channel: demo roles
-still use `{{req.prefix}}`, so the `req` namespace and the renderer's
-injection hardening remain. Only the *list* expansion is retired.
-`volume-ro`'s policy becomes a single scalar resource
-(`by_id/{{caveat "elide:Volume"}}/*`) with no `req` reference.
-
-**Migration.** A clean break (no compatibility path): re-author and
-re-seal the `volume-ro` template, drop `req.ancestors` from the
-`assume-role` body and the `Credentials` IPC, and ship the per-owner
-credential cache in the volume binary together — a volume built against
-the new scope must talk to a coordinator that issues single-prefix
-credentials.
+The scalar `req.*` channel is untouched: demo roles use `{{req.prefix}}`,
+so the `req` namespace and the renderer's injection hardening remain.
 
 ### Required caveats
 
@@ -1463,13 +1416,13 @@ coordinator ULID is simply the `sub` value.)
 
 There are no list-valued caveats. Every caveat is a scalar capability
 predicate that attenuates by AND (repeated occurrences must agree;
-`exp` narrows to the numeric minimum). The only list-shaped input
-a role ever needed — the ancestor set for `volume-ro` — is **not** a
-caveat: it rides the PoP-signed request body as `req.ancestors`
-(§ *Request body*, § *Templating*). This keeps the macaroon library to
-scalar caveats plus the holder-of-key extension; no list-valued caveat
-type, no intersection semantics, no chain whose effective value depends
-on occurrence order.
+`exp` narrows to the numeric minimum). No role takes a list-shaped input
+either: a `volume-ro` credential scopes to a single volume prefix, and a
+reader that needs an ancestor's segments makes a separate lineage-authorized
+credential request for that ancestor (§ *Per-volume read credentials*).
+This keeps the macaroon library to scalar caveats plus the holder-of-key
+extension; no list-valued caveat type, no intersection semantics, no chain
+whose effective value depends on occurrence order.
 
 ### Partitioning vs. narrowing caveats
 
@@ -1491,9 +1444,9 @@ Caveats split into two kinds by where their value originates:
   `elide:Volume` scopes a coordinator's own credential within authority
   it already holds.
 
-The honest-but-unverified lineage data (the ancestor set) is neither:
-it is not a capability the macaroon attests, it is a per-request
-assertion the coordinator computes from signed provenance and the PoP
+Honest-but-unverified scalar scoping data a role names (e.g. the demo
+roles' `req.prefix`) is neither: it is not a capability the macaroon
+attests, it is a per-request assertion the caller computes and the PoP
 authenticates. It therefore belongs in the signed body, not the caveat
 chain — see *Request body*.
 
@@ -1517,8 +1470,8 @@ absence; only `sub`/`aud`/`exp` have a dedicated presence gate.
 | `cnf` | string (`ed25519:<pub>`, scalar-encoded) | scalar | coordinator-self-asserted alongside `sub` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ BLAKE3(body)` (freshness `ts` rides in the body), verified against this key. Makes the credential key-bound (not a bearer) and authenticates the request body. |
 | `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 
-The ancestor set is **not** in this table — it is not a caveat. It is
-`req.ancestors` in the PoP-signed body (§ *Request body*).
+Scalar `req.*` scoping fields are **not** in this table — they are not
+caveats. They ride the PoP-signed body (§ *Request body*).
 
 Per-role gate matrix (template substitutions are listed in each role's
 definition below):
@@ -1535,18 +1488,17 @@ listed here so the issuer's surface is unambiguous):
 
 - `{{env.X}}` — server-side config; Elide uses `env.bucket`. Never
   caller-controlled.
-- `{{req.X}}` — PoP-verified request body; Elide uses
-  `req.ancestors` (the `volume-ro` ancestor lineage). Vouched for
-  by `coordinator.key`, never validated by mint.
+- `{{req.X}}` — PoP-verified scalar request body; the demo roles use
+  `req.prefix`. Vouched for by `coordinator.key`, never validated by mint.
 - `{{mint.X}}` — mint-computed at issuance; Elide uses `mint.expiry`.
 
 Notes:
 
 - **Every caveat is scalar.** The one macaroon-library extension this
   inventory requires is the first-party holder-of-key caveat for
-  `cnf` (#16). No list-valued caveat type is needed (#6
-  resolved): the only list-shaped input, the ancestor set, is
-  `req.ancestors` in the PoP-signed body, not a caveat.
+  `cnf` (#16). No list-valued caveat type is needed: no role takes a
+  list-shaped input — scalar `req.*` fields ride the PoP-signed body, not
+  the caveat chain.
 - **`sub` templates only in `coord-rw`'s own-identity statement**
   (`coordinators/{{caveat "sub"}}/*`, own-prefix write). Everywhere
   else `sub` is a gate only; the other statements use prefix
@@ -1570,7 +1522,7 @@ at enrollment (§ *Enrollment*), not at `assume-role`.
 | `coord-ro` | read-only `names/* coordinators/* events/* meta/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
 | `coord-rw` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`) | all coordinator-wide mutation paths |
 | `volume-rw` | per-volume `by_id/<vol>/*` read+write, plus that volume's `meta/<vol>.{provenance,pub}` (**Split B** — per-volume) | per-volume writes (snapshot publish, fork, force-release, drain, GC, reaper) |
-| `volume-ro` | per-volume lineage read, vended to the volume process | the coordinator (assumes), the volume (holds the keypair) |
+| `volume-ro` | per-volume `by_id/<vol>/*` read (one credential per volume prefix; ancestor reads use a separate per-ancestor `volume-ro` credential, authorized by lineage), vended to the volume process | the coordinator (assumes), the volume (holds the keypair) |
 
 **Why not the per-purpose split (Split A).** `design-iam-key-model.md`'s
 in-process model fragmented the writer into one role per top-level
@@ -1627,8 +1579,7 @@ Two consequences shape every TTL below:
 Per-volume `by_id/` writer. Assumed by the coordinator the first time it
 writes a given volume within a TTL window; the returned keypair is cached
 in memory keyed by vol_ulid and re-assumed on miss/expiry. Structurally
-identical to `volume-ro` but with write actions and a single (non-ancestor)
-prefix.
+identical to `volume-ro` but with write actions.
 
 - **Required caveats:** `sub`, `elide:Volume`, `aud=mint`,
   `exp`
@@ -1686,12 +1637,13 @@ authenticated separately, outside the coordinator runtime
 
 ### `volume-ro`
 
-Per-volume read of one volume's lineage. **Assumed by the coordinator**,
+Per-volume read of one volume's prefix. **Assumed by the coordinator**,
 not the volume: the coordinator attenuates its credential (`elide:Volume`,
-`exp`), puts the honest ancestor lineage in the request body as
-`req.ancestors`, calls `assume-role` with its `coordinator.key` PoP
-(which signs the body), and uses the resulting **Tigris keypair** for
-two read paths:
+`exp`) for the **target** volume, calls `assume-role` with its
+`coordinator.key` PoP, and uses the resulting **Tigris keypair** for two
+read paths. A reader that needs an ancestor's segments obtains a separate
+`volume-ro` credential for that ancestor — one credential per volume
+prefix, each authorized by lineage (§ *Per-volume read credentials*):
 
 1. **Volume process reads** — coordinator vends the keypair to the volume
    over the local handshake; the volume holds only that keypair, never
@@ -1701,17 +1653,14 @@ two read paths:
    peer's local bytes (`design-peer-segment-fetch.md`).
 2. **Coordinator-side ancestor `.idx` reads** — `prefetch_indexes`'s
    warm-start chain walk reads each ancestor's `by_id/<a>/*` index
-   bulk; the coordinator's own per-volume `volume-rw` is single-prefix,
-   so these cross-ancestor reads ride `volume-ro` with the appropriate
-   `req.ancestors` body. The provenance/pub skeleton reads that
-   *discover* the chain (`pull_readonly_op`, and the skeleton pulls
-   inside `prefetch_indexes`) are **not** `volume-ro` — they hit only
-   `meta/*` and ride the warm `coord-ro` credential, so chain
-   discovery costs no per-ancestor mint.
+   bulk; each ancestor read rides a separate per-ancestor `volume-ro`
+   credential (target = that ancestor, lineage-authorized). The
+   provenance/pub skeleton reads that *discover* the chain
+   (`pull_readonly_op`, and the skeleton pulls inside `prefetch_indexes`)
+   are **not** `volume-ro` — they hit only `meta/*` and ride the warm
+   `coord-ro` credential, so chain discovery costs no per-ancestor mint.
 
 - **Required caveats:** `elide:Volume`, `aud=mint`, `exp`
-- **Required body:** `req.ancestors` (PoP-signed; the role template
-  references it, so an absent value fails the render closed)
 - **TTL:** 1h. Both consumers tolerate it cleanly: non-lazy volume
   episodes complete in seconds; lazy volumes refresh proactively at
   half-life; coord-side prefetch completes in seconds. The tightest
@@ -1728,8 +1677,8 @@ two read paths:
     still-valid keypair off the hot path. Revocation window is the
     keypair `DateLessThan`, bounded by the minimal blast radius (read one
     volume's lineage).
-- **Policy:** the per-volume RO shape — exact ARN for self
-  (`{{caveat "elide:Volume"}}`) plus one per `req.ancestors` entry.
+- **Policy:** the per-volume RO shape — a single scalar resource, the
+  exact ARN for the target volume (`by_id/{{caveat "elide:Volume"}}/*`).
 
 ### Why Split B is viable now
 
@@ -1787,9 +1736,9 @@ endpoint resolution, event-log and peer-discovery reads.
 `meta/*` is every volume's `volume.provenance` / `volume.pub`
 (`formats.md` § *Volume provenance*). Granting it bucket-wide lets a
 coordinator walk any ancestor chain's provenance under this one warm
-credential — the per-ancestor `volume-ro` mint for chain discovery is
-gone. The flat `meta/` prefix exists so `meta/*` is a trailing
-wildcard (Tigris does not match `*` mid-resource).
+credential, so chain discovery costs no per-ancestor mint. The flat
+`meta/` prefix exists so `meta/*` is a trailing wildcard (Tigris does not
+match `*` mid-resource).
 
 **Invariant: `coord-ro` is read-only and `by_id/`-free.** This is what
 makes it safe to be the *only* credential held by the LAN/internet-
@@ -2229,15 +2178,16 @@ prematurely.
    conditional `names/<name>` read (fence coincident with the S3 CAS).
 5. **Mid-path wildcard verification.** Not on the v1 critical path:
    `volume-rw` uses a single-volume *trailing* wildcard
-   (`by_id/{{caveat "elide:Volume"}}/*`), `volume-ro` uses exact ancestor
-   ARNs, and `coord-ro` touches no `by_id/` at all — none need mid-path
-   `*`. It is only a constraint on a future role wanting
+   (`by_id/{{caveat "elide:Volume"}}/*`), `volume-ro` uses the same
+   single-volume trailing wildcard, and `coord-ro` touches no `by_id/` at
+   all — none need mid-path `*`. It is only a constraint on a future role wanting
    `by_id/*/<something>` shape. Empirical test still worth running once,
    but does not block the current inventory.
 6. **Caveat library schema — resolved.** No list-valued caveat is
-   needed. The only list-shaped input (the `volume-ro` ancestor set)
-   rides the PoP-signed request body as `req.ancestors`, not the
-   caveat chain. All caveats are scalar; the only macaroon-library
+   needed. No role takes a list-shaped input: a `volume-ro` credential
+   scopes to a single volume prefix, and ancestor reads use separate
+   lineage-authorized per-ancestor credentials. All caveats are scalar;
+   the only macaroon-library
    extension over `design-auth-model.md`'s scalar caveats is the
    holder-of-key caveat (#16). This also removes the occurrence-order
    /effective-vs-last hazard a list caveat would carry.
