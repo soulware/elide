@@ -128,13 +128,6 @@ pub async fn prefetch_indexes(
         .and_then(|p| p.parent())
         .unwrap_or(fork_dir);
     let by_id_dir = data_dir.join("by_id");
-    let own_ulid = Ulid::from_string(
-        fork_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow::anyhow!("fork_dir has no name: {}", fork_dir.display()))?,
-    )
-    .map_err(|e| anyhow::anyhow!("fork_dir name is not a ULID: {e}"))?;
 
     // Two-pass shape:
     //   Pass 1 (this scope): walk lineage chain + extent ancestors to
@@ -297,14 +290,14 @@ pub async fn prefetch_indexes(
     }
 
     // Pass 2: dispatch all `prefetch_fork` calls concurrently. Each
-    // task gets its own `PrefetchResult`; merge after. All tasks share
-    // one `volume-ro` store scoped to the head fork plus every
-    // discovered ancestor — the role's policy expands one read ARN per
-    // entry (`docs/design-mint.md` § `volume-ro`).
-    let store = stores.read_head_with_ancestors(&own_ulid, &ancestor_ulids);
+    // task gets its own `PrefetchResult`; merge after. Each reads only
+    // its own fork's `by_id/<vol>/*` prefix, so it takes a single-prefix
+    // `volume-ro` credential of its own rather than one credential
+    // spanning the whole ancestor chain (`docs/design-mint.md`
+    // § `volume-ro`).
     let peer_owned: Option<PeerFetchContext> = peer.cloned();
     let outcomes: Vec<PrefetchResult> = futures::stream::iter(tasks.into_iter().map(|task| {
-        let store = store.clone();
+        let store = stores.read_volume(&task.vol_ulid);
         let peer = peer_owned.clone();
         async move {
             let mut local = PrefetchResult::default();
@@ -1029,12 +1022,34 @@ mod tests {
         .await
         .unwrap();
 
-        // Run prefetch_indexes on the child fork.
-        let result = prefetch_indexes(&child_dir, &passthrough(&store), None)
-            .await
-            .unwrap();
+        // Run prefetch_indexes on the child fork through a recording
+        // store so the per-fork credential routing can be asserted.
+        let recording = crate::stores::RecordingStores::wrap(passthrough(&store));
+        let scoped: Arc<dyn crate::stores::ScopedStores> = recording.clone();
+        let result = prefetch_indexes(&child_dir, &scoped, None).await.unwrap();
         assert_eq!(result.fetched, 1, "should fetch one .idx");
         assert_eq!(result.failed, 0);
+
+        // Pass 2 reads each fork under its own single-prefix `volume-ro`
+        // credential (`read_volume`), one per fork, never a chain-spanning
+        // `read_head_with_ancestors` store.
+        let calls = recording.calls();
+        let child = Ulid::from_string(child_ulid).unwrap();
+        let parent = Ulid::from_string(parent_ulid).unwrap();
+        assert!(
+            calls.contains(&crate::stores::RoleCall::ReadVolume(child)),
+            "head fork must read under read_volume(child); got {calls:?}"
+        );
+        assert!(
+            calls.contains(&crate::stores::RoleCall::ReadVolume(parent)),
+            "ancestor must read under read_volume(parent); got {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, crate::stores::RoleCall::ReadHeadWithAncestors(_, _))),
+            "prefetch must not mint a chain-spanning credential; got {calls:?}"
+        );
 
         // Verify the .idx file was written into parent's index/ dir.
         let idx_path = parent_dir.join("index").join(format!("{seg_ulid}.idx"));
