@@ -1260,6 +1260,93 @@ transformations, and dynamic resource construction beyond straight
 substitution are deliberately out of scope. Roles requiring more
 expressive policies should be split into multiple roles.
 
+### Proposed: per-volume read credentials (retire the ancestor list)
+
+The `{{#each req.ancestors}}` expansion in `volume-ro` is the **only**
+list-shaped construct in any template. Every other substitution is a
+scalar. This proposal removes the ancestor list entirely: a `volume-ro`
+credential scopes to a **single** prefix, `by_id/<vol>/*`, and a reader
+that needs an ancestor's segments obtains a separate `volume-ro`
+credential for *that* ancestor. The expansion construct, the
+`req.ancestors` body field, and the lineage walk that builds it all go
+away.
+
+**Why.** The expansion is templating's only departure from scalar
+substitution — retiring it collapses the template surface to plain-path
+scalars plus the `caveat` lookup, with no iteration construct at all. It
+also tightens least-privilege: a leaked `volume-ro` credential grants one
+volume's prefix, not the whole lineage. And it removes the only
+*list-shaped* honest-but-unverified input — the lineage the coordinator
+asserts in the PoP body — which is the single channel that motivated the
+JSON-injection hardening of the renderer.
+
+**Why it is mechanical, not architectural.** The read path is already
+keyed by owner. The demand-fetch interface
+(`elide_core::segment::SegmentFetcher`) takes `owner_vol_id` per call and
+issues exactly one GET against that owner's prefix; the coordinator's
+`ScopedStores` already vends a single-prefix `read_volume(vol)` used by
+every non-lineage read site. The ancestor-spanning credential survives in
+only three places, and the routing key to replace it exists at each:
+
+- **Volume serve-time demand-fetch (hot path).** The running volume's
+  `RemoteFetcher` (`elide-fetch`) holds one store built from one
+  chain-spanning credential, acquired lazily through the coordinator's
+  `Credentials` IPC. Under this proposal it holds a **per-owner credential
+  cache** (`owner_vol_id` → store), each entry acquired on first fetch
+  from that owner and idle-dropped independently; `fetch_extent` selects
+  the store by the `owner_vol_id` it already receives.
+- **Prefetch index fan-out** (`coordinator::prefetch`). Each fan-out task
+  already reads only its own fork's prefix; it takes
+  `read_volume(task_vol)` instead of one shared
+  `read_head_with_ancestors` store. The shared store was only connection
+  reuse.
+- **Filemap generation** (`generate_filemap`, offline
+  `import --extents-from`). Its range fetcher reads fragment bodies that
+  may live in any ancestor prefix; it routes per fragment through the same
+  per-owner store selection.
+
+`read_head_with_ancestors` and the `ancestors` argument to
+`provision_volume_ro` are removed; the `Credentials` IPC and mint's
+`assume-role` body carry a single target volume. The mint side gets
+strictly simpler — `provision_volume_ro` no longer expands a list.
+
+**Authorization.** Today the volume's macaroon binds it to its own
+`volume_ulid` (the `volume()` caveat) and never names a target: the
+coordinator derives the lineage and grants self+ancestors, so there is
+nothing to authorize — a volume can only ever obtain its own chain. Once
+the volume **names** the target owner, that property must be re-asserted
+explicitly: the coordinator authorizes each request against
+`target ∈ {self} ∪ lineage(self)`, where `self` is the macaroon-bound
+volume, and refuses otherwise. Without this check a volume could request a
+read credential for any volume. The lineage walk that builds today's grant
+is not deleted — it **relocates** from "construct the ancestor set" to
+"authorize the named target", staying coordinator-side; mint itself only
+ever issues a single-prefix credential for one named volume. Net authority
+is identical to today (read self + ancestors), issued one prefix at a time
+and re-authorized per prefix.
+
+**Cost.** One credential acquisition per *distinct ancestor actually
+demand-fetched* (cached, idle-dropped), versus one chain-spanning
+acquisition today. A volume reading only its own data pays the same (one).
+A volume that demand-pages across `K` ancestors pays `K` cached
+acquisitions over its lifetime and holds `K` S3 clients rather than one
+(extra connection overhead, no per-read cost — `owner_vol_id` hits the
+local cache). For deep chains with widely-scattered reads this is more
+mint round-trips; they amortise over the credential TTL.
+
+**Scope.** This does not touch the scalar `req.*` channel: demo roles
+still use `{{req.prefix}}`, so the `req` namespace and the renderer's
+injection hardening remain. Only the *list* expansion is retired.
+`volume-ro`'s policy becomes a single scalar resource
+(`by_id/{{caveat "elide:Volume"}}/*`) with no `req` reference.
+
+**Migration.** A clean break (no compatibility path): re-author and
+re-seal the `volume-ro` template, drop `req.ancestors` from the
+`assume-role` body and the `Credentials` IPC, and ship the per-owner
+credential cache in the volume binary together — a volume built against
+the new scope must talk to a coordinator that issues single-prefix
+credentials.
+
 ### Required caveats
 
 Every assume-role credential must carry `sub` (principal), `aud`
