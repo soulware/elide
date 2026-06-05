@@ -585,8 +585,8 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     let policy = match render_policy(
         policy_template,
         surface.env(),
-        &caveats,
         &request_json,
+        &caveats,
         &expiry_iso,
         &granted.role_name,
     ) {

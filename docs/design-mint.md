@@ -102,8 +102,9 @@ coordinator's root" step.
 
 The caller (e.g. a coordinator) is therefore **neither a macaroon issuer
 nor a root holder**. It holds a macaroon and may only *attenuate* it
-(append narrowing caveats — `exp`, a specific `elide:Volume`),
-which needs the trailing MAC, never the root. A compromised caller can
+(append a narrowing `exp`), which needs the trailing MAC, never the root.
+The per-volume target it scopes to rides the PoP-signed request body as
+`req.volume`, not the caveat chain. A compromised caller can
 only narrow authority it was already granted; it cannot forge authority
 for another coordinator or volume.
 
@@ -633,9 +634,9 @@ mode 0600), so `ls credentials/` shows exactly which roles are held.
 Each is persisted in `data_dir`
 alongside the identity key, loaded on every start, reused across
 restarts. Per request and per managed
-volume the coordinator appends narrowing caveats (`elide:Volume`, a
-tighter `exp`) before calling `assume-role`; the stored macaroon is
-never sent unattenuated. **A credential does not expire**: once
+volume the coordinator appends a narrowing `exp` and names the target
+volume in the request body (`req.volume`) before calling `assume-role`;
+the stored macaroon is never sent unattenuated. **A credential does not expire**: once
 PoP-bound a file-only leak is inert (the thief lacks `coordinator.key`)
 and a key compromise renews regardless, so there is no re-issuance
 cadence. The identity key is not rotated: a new key is a new
@@ -653,8 +654,8 @@ The credential is **bound to the coordinator's Ed25519 identity** by the
 the macaroon only when the request carries a fresh Ed25519 signature, by
 `coordinator.key`, over `BLAKE3(presented-macaroon-tail ‖
 BLAKE3(request-body))` — the tail binds the proof to this exact
-capability macaroon (role/`exp`/`elide:Volume`), the body hash to
-this exact request (role, TTL, scoping data such as `req.prefix`).
+capability macaroon (role/`exp`), the body hash to this exact request
+(role, TTL, scoping data such as `req.volume`).
 Freshness is a `ts` field **inside the body** (unix seconds, ±skew
 window) — already covered by `BLAKE3(request-body)`, so no separate
 signed term and no header. The persisted file alone is therefore inert:
@@ -895,8 +896,9 @@ Refresh cadences, distinct, in increasing trust cost:
 - **Tigris keypair** — re-call `assume-role` with the held macaroon
   (*Open questions* #8).
 - **Volume Tigris keypair** — the coordinator takes its `volume-ro`
-  credential, appends `elide:Volume`/`exp`, calls `assume-role`, then
-  vends the resulting keypair to the volume over the local handshake. On demand per fetch
+  credential, appends `exp`, names the target volume in the request body
+  (`req.volume`), calls `assume-role`, then vends the resulting keypair
+  to the volume over the local handshake. On demand per fetch
   episode for non-lazy volumes; kept warm and refreshed proactively for
   lazy ones (the `volume-rw` cache pattern). The volume holds no
   macaroon; the keypair `DateLessThan` is the only lifetime here.
@@ -918,8 +920,8 @@ invite at `/v1/enroll`, the ticket at `/v1/enroll-exchange`, and the CLI
 service token at the admin verbs. `/v1/verify` returns the cleared
 bundle's caveats and minimum `NotAfter` so the caller can cache the
 verdict. `/v1/assume-role` runs the same verify+clear and then **assumes
-the role** — clears the role-specific narrowing caveats (`elide:Volume`),
-renders the role policy, mints a Tigris keypair. `/v1/enroll`
+the role** — renders the role policy from the PoP-signed body's scoping
+data (`req.volume`), mints a Tigris keypair. `/v1/enroll`
 and `/v1/enroll-exchange` are the one-time bootstrap: `/v1/enroll` admits
 a coordinator's operator-gated invite attenuation, records a pending
 enrollment, and returns a ticket; `/v1/enroll-exchange` takes that
@@ -983,8 +985,9 @@ Content-Type: application/json
 ```
 
 The bundle is the same shape exercised at `/v1/assume-role` — the same
-credential under the same per-request `exp`/`elide:Volume` attenuation
-(and, for an admin token, the same discharge). The two endpoints share
+credential under the same per-request `exp` attenuation, with the target
+volume carried in the body as `req.volume` (and, for an admin token, the
+same discharge). The two endpoints share
 the verify+clear core described above. The `op` caveat at both is
 `assume-role`: `op`
 names the authority a token carries, not the protocol verb. The
@@ -1160,7 +1163,7 @@ all of them.
     "Sid": "ReadVolume",
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
-    "Resource": "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*",
+    "Resource": "arn:aws:s3:::{{env.bucket}}/by_id/{{req.volume}}/*",
     "Condition": {
       "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
     }
@@ -1193,7 +1196,8 @@ mandatory: a role whose template file is absent is a config error
 ### Templating
 
 The mint substitutes four classes of variable in the policy template at
-issuance time, each with an explicit, distinct trust provenance:
+issuance time, each a plain handlebars data path with an explicit,
+distinct trust provenance:
 
 - `{{env.X}}` — values from the mint's `[env]` table, a flat set of
   operator-defined scalars (bucket name(s), prefixes, region), as a plain
@@ -1209,49 +1213,52 @@ issuance time, each with an explicit, distinct trust provenance:
   fail-closed render. It is deliberately *not* checked at config load:
   serving is decoupled from the live config, so a drifted local template
   never blocks a host from serving its already-sealed roles.
-- `{{caveat "X"}}` — the verified macaroon's caveat named `X` (MAC-bound,
-  rooted in the mint's macaroon root), resolved through a built-in
-  `caveat` lookup helper that takes the caveat name as a string argument.
-  All caveats are scalar and render directly (`{{caveat "elide:Volume"}}`).
-  The helper form (not a `{{caveat.X}}` path) is required because
-  namespaced caveat names contain `:`, which is not a legal template path
-  segment; it also keeps the caveat surface to a single named lookup
-  rather than arbitrary data-graph traversal.
 - `{{req.X}}` — scalar fields from the PoP-verified request body (bound to
   `coordinator.key`, this macaroon's tail, and this moment — §
   *Authentication*). Available **only** after the PoP signature is
-  verified. They render directly (e.g. the demo roles' `{{req.prefix}}`).
-  This is the channel for honest-but-unverified scoping data the caller
-  computes: mint transmits it into the policy, the PoP authenticates *who*
-  asserted it, mint never validates the value.
+  verified. They render directly. This is the channel for the
+  honest-but-unverified scoping data the caller computes — including the
+  per-volume target, which rides the body as `req.volume`
+  (`by_id/{{req.volume}}/*`). Mint transmits it into the policy, the PoP
+  authenticates *who* asserted it, mint never validates the value.
 - `{{mint.X}}` — values computed by the mint at request time, as a
   plain path. v1 set: `mint.expiry` (the issued credential's expiry as an
   RFC 3339 / ISO 8601 instant — `now + min(requested TTL, role
   `max_ttl_seconds`, macaroon `exp` − now)`). This is the mint's clamped
   output, not the macaroon's raw `exp` caveat: it can be strictly tighter
-  and never looser, so a template substitutes `mint.expiry` here, never
-  `{{caveat "exp"}}`.
+  and never looser, so a template substitutes `mint.expiry` here.
+- `{{caveat.X}}` — the **MAC-verified** value of the macaroon's caveat
+  named `X`, as a plain path. v1 exposes one: `caveat.sub`, the
+  enrolment-immutable principal, for `coord-rw`'s own-identity prefix
+  (`coordinators/{{caveat.sub}}/*`). The value is sourced from the
+  verified caveat chain — never echoed through the request body — so it
+  is rooted in the mint's macaroon root and cannot be forged by the
+  caller. A name with ≥2 disagreeing occurrences resolves *unsatisfiable*
+  and is **omitted** (never collapsed to one of the disagreeing values),
+  so a `{{caveat.X}}` over it fails the render closed under strict mode —
+  a holder cannot smuggle a forged value past the renderer with a
+  contradictory appended copy. Only caveat names that are legal path
+  segments are referenceable; `sub` is, colon-namespaced names (`elide:…`)
+  are not, and none of those is a substitution source.
 
-The `caveat` helper resolves names against the chain under AND
-semantics: a scalar caveat repeated across attenuations must agree on a
-single value; two disagreeing occurrences are an unsatisfiable
-restriction the holder constructed and resolve to a hard failure —
-**never** silently to "absent" (that would let a holder, who can append
-caveats with only the trailing MAC, neutralise a binding caveat by
-appending a contradictory copy). A reference to a caveat the macaroon
-does not carry, or one that is unsatisfiable, is a hard render failure:
-the request is refused, never minted with a missing or downgraded
-substitution. `{{req.X}}` is likewise strict — an absent field a
-template references fails the render closed.
+A macaroon caveat plays two distinct, never-conflated roles. As a
+**predicate** it is *checked* — the role gate clears it against the
+credential and live request context (§ *Macaroon caveat conventions*);
+this verify/clear path is the only thing that grants or denies. As
+**data** its MAC-verified value may also be substituted via
+`{{caveat.X}}` (above), read-only. The per-volume target, by contrast, is
+honest-but-unverified caller assertion and rides the body as `req.volume`,
+not a caveat. All four classes render strict — an absent key a template
+references fails the render closed, never a silent empty string.
 
 The mint **does not** ship a general-purpose policy DSL. The
-role-facing template surface is scalar substitution: `{{env.*}}` /
-`{{mint.*}}` plain paths, the `caveat` scalar lookup helper, and
-`{{req.*}}` scalar fields. No role iterates a list — every role's policy
-is straight scalar substitution. Conditional blocks, arithmetic, value
-transformations, and dynamic resource construction beyond straight
-substitution are deliberately out of scope. Roles requiring more
-expressive policies should be split into multiple roles.
+role-facing template surface is scalar substitution: `{{env.*}}`,
+`{{mint.*}}`, `{{req.*}}`, and `{{caveat.*}}` plain paths. No role
+iterates a list — every role's policy is straight scalar substitution.
+Conditional blocks,
+arithmetic, value transformations, and dynamic resource construction
+beyond straight substitution are deliberately out of scope. Roles
+requiring more expressive policies should be split into multiple roles.
 
 ### Per-volume read credentials
 
@@ -1259,9 +1266,9 @@ A `volume-ro` credential scopes to a **single** prefix, `by_id/<vol>/*`,
 and a reader that needs an ancestor's segments obtains a separate
 `volume-ro` credential for *that* ancestor. No template iterates a list:
 `volume-ro`'s policy is a single scalar resource
-(`by_id/{{caveat "elide:Volume"}}/*`) with no `req` reference, which
-keeps least-privilege tight — a leaked `volume-ro` credential grants one
-volume's prefix, not a whole lineage.
+(`by_id/{{req.volume}}/*`), the per-volume target carried in the
+PoP-signed request body, which keeps least-privilege tight — a leaked
+`volume-ro` credential grants one volume's prefix, not a whole lineage.
 
 The read path is keyed by owner. The demand-fetch interface
 (`elide_core::segment::SegmentFetcher`) takes `owner_vol_id` per call and
@@ -1297,7 +1304,7 @@ across `K` ancestors holds up to `K` cached per-owner credentials, each
 acquired on first fetch and amortised over the credential TTL; a volume
 reading only its own data holds one.
 
-The scalar `req.*` channel is untouched: demo roles use `{{req.prefix}}`,
+The scalar `req.*` channel is untouched: roles use `{{req.volume}}`,
 so the `req` namespace and the renderer's injection hardening remain.
 
 ### Required caveats
@@ -1308,10 +1315,12 @@ for every role** — not a per-role config knob — and is checked for
 presence before any role-specific gate, so a credential missing one is
 denied before policy rendering. `aud` and `exp` additionally have their
 *values* checked (audience equality and the TTL clamp below); `sub` is
-presence-only — its value is MAC-authentic and its holder is proven by
-the `cnf`+PoP gate (§ *Authentication*). Caveats a role's policy
-substitutes (e.g. `elide:Volume`) need no separate declaration: the
-template renderer fails closed on an absent caveat it references.
+presence-gated — its value is MAC-authentic and its holder is proven by
+the `cnf`+PoP gate (§ *Authentication*). That MAC-authentic `sub` value
+is also exposed to a policy as `{{caveat.sub}}` (`coord-rw`'s
+own-identity prefix); honest-but-unverified scoping data a role needs
+(the per-volume target) instead rides the PoP-signed body as `req.*`. The
+renderer fails closed on any absent field it references, of either class.
 
 ### TTL bounds
 
@@ -1359,10 +1368,12 @@ Borrowed (RFC 7519 / RFC 7800):
 - **`sub`** (string, scalar; RFC 7519). The opaque principal the
   credential is about and bound to. Mint treats it as opaque: it keys
   the pending table on it and the operator approves it. The Elide
-  instantiation puts a coordinator ULID here; a role policy may template
-  it (`{{caveat "sub"}}`). Coordinator-self-asserted in enrollment;
-  survives into a credential only via the re-mint-from-root after operator
-  approval.
+  instantiation puts a coordinator ULID here. The gate *checks* it for
+  presence; its MAC-verified value is also exposed to a policy as
+  `{{caveat.sub}}`, so a coordinator that needs its own ULID in an ARN
+  reads it there (`coord-rw`'s own-identity prefix) rather than asserting
+  it. Coordinator-self-asserted in enrollment; survives into a credential
+  only via the re-mint-from-root after operator approval.
 - **`cnf`** (string, scalar; RFC 7800). The holder-of-key the request
   must prove possession of — scalar-encoded (`ed25519:<pub>`), **not**
   the JWT `cnf` JSON object. Every `assume-role` (and enrollment)
@@ -1401,16 +1412,13 @@ Coined (mint-specific; no registered equivalent):
 The standard caveats above (`aud`/`exp`/`sub`/`cnf`/`op`/`role`/
 `invite`) are un-namespaced — they are the mint mechanism, common to
 every consumer. Consumer-specific caveats are conventionally prefixed to
-indicate their issuer or domain. Elide's is:
-
-- `elide:Volume`
-
-This avoids collisions between issuers. Role templates reference such
-caveats by their full namespaced name through the `caveat` helper:
-`{{caveat "elide:Volume"}}`. The string-argument form is what makes the
-`:` separator usable in a template at all. (`sub` is the principal even
-for Elide — there is no `elide:`-prefixed coordinator caveat; the
-coordinator ULID is simply the `sub` value.)
+indicate their issuer or domain, avoiding collisions between issuers.
+Caveats are *checked* predicates the role gate clears; a caveat's
+MAC-verified value may additionally be substituted into a policy as
+`{{caveat.X}}` (§ *Templating*). (`sub` is the principal even for Elide —
+there is no `elide:`-prefixed coordinator caveat; the coordinator ULID is
+simply the `sub` value, read by a policy as `caveat.sub` when a role
+needs it.)
 
 ### All caveats are scalar
 
@@ -1437,27 +1445,27 @@ Caveats split into two kinds by where their value originates:
   approval (see *Credential macaroon & lifecycle*). A caller never alters any of
   them — an appended contradictory copy is unsatisfiable and fails
   closed, never silently dropped.
-- **Narrowing** — `elide:Volume`, `exp`. Coordinator-appended,
-  restricting an existing grant to one volume / expiry for attribution
-  and per-credential blast-radius reduction. Volume ownership across
-  coordinators is established by the name-claim and body-token lineage;
-  `elide:Volume` scopes a coordinator's own credential within authority
-  it already holds.
+- **Narrowing** — `exp`. Coordinator-appended, restricting an existing
+  grant's expiry for per-credential blast-radius reduction.
 
-Honest-but-unverified scalar scoping data a role names (e.g. the demo
-roles' `req.prefix`) is neither: it is not a capability the macaroon
+Honest-but-unverified scalar scoping data a role names — the per-volume
+target `req.volume` — is neither: it is not a capability the macaroon
 attests, it is a per-request assertion the caller computes and the PoP
 authenticates. It therefore belongs in the signed body, not the caveat
-chain — see *Request body*.
+chain — see *Request body*. A coordinator's own ULID is **not** in this
+class: it is the MAC-verified `sub` caveat, read by a policy as
+`caveat.sub`, so it is unforgeable rather than self-asserted.
 
 ### Caveat field inventory (Elide)
 
-The complete caveat vocabulary the Elide roles draw on. A caveat serves
-one or both of two purposes: it **gates** authorization (the hard-coded
-universal set `sub`/`aud`/`exp`, plus the `op`/`invite`/`role` gates) and/or
-it **feeds** the policy template (`{{caveat "X"}}` substitution). A caveat
-the template references is enforced by the renderer failing closed on its
-absence; only `sub`/`aud`/`exp` have a dedicated presence gate.
+The complete caveat vocabulary the Elide roles draw on. Every caveat is a
+**checked predicate** the role gate clears; a caveat's MAC-verified value
+may additionally be substituted into a policy as `{{caveat.X}}` (only
+`caveat.sub` is, today). A caveat **gates** authorization: the hard-coded
+universal set `sub`/`aud`/`exp`, plus the `op`/`invite`/`role` gates.
+Honest-but-unverified scoping data a policy template needs (the target
+volume) rides the PoP-signed body as `req.*`; the coordinator's own ULID
+is the MAC-verified `caveat.sub`, not a body field.
 
 | Caveat | Type | Scalar/List | Issuer | Purpose |
 |---|---|---|---|---|
@@ -1466,31 +1474,35 @@ absence; only `sub`/`aud`/`exp` have a dedicated presence gate.
 | `invite` | string | scalar | mint, on first start / rotate | Gate only — invite macaroon must carry the current value. |
 | `exp` | uint64 (unix s) | scalar | issuer | Gate — caps granted TTL (`min(req, role.max, exp−now)`); multiple narrow to the minimum. |
 | `role` | string | scalar | mint, at the enrollment exchange | Gate **and** selects the role policy — the single role this credential carries; always present, and the request's asserted `req.role` must equal it. |
-| `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on every role (universally required, presence-only); defines the credential macaroon. Templated as `{{caveat "sub"}}` in `coord-rw`'s own-identity statement (`coordinators/{{caveat "sub"}}/*`). |
+| `sub` | string (opaque; Elide: coord-ulid) | scalar | coordinator-self-asserted in enrollment; survives into a credential only via re-mint-from-root after operator approval | Gate on every role (universally required, presence-only); defines the credential macaroon. Its MAC-verified value is also read by a policy as `caveat.sub` (`coord-rw`'s own-identity statement, `coordinators/{{caveat.sub}}/*`). |
 | `cnf` | string (`ed25519:<pub>`, scalar-encoded) | scalar | coordinator-self-asserted alongside `sub` | First-party proof-of-possession — every `assume-role` request must carry a fresh Ed25519 signature by `coordinator.key` over `tail ‖ BLAKE3(body)` (freshness `ts` rides in the body), verified against this key. Makes the credential key-bound (not a bearer) and authenticates the request body. |
-| `elide:Volume` | string (vol-ulid) | scalar | coordinator (narrowing) | Gate **and** template — `by_id/{{caveat "elide:Volume"}}/*`. |
 
-Scalar `req.*` scoping fields are **not** in this table — they are not
-caveats. They ride the PoP-signed body (§ *Request body*).
+The per-volume target is **not** a caveat: it rides the PoP-signed body
+as `req.volume`. Scalar `req.*` scoping fields are not in this table —
+they are not caveats (§ *Request body*).
 
 Per-role gate matrix (template substitutions are listed in each role's
 definition below):
 
-| Role | `aud` | `exp` | `sub` | `elide:Volume` |
-|---|---|---|---|---|
-| `volume-rw` | ● | ● | ● | ● |
-| `coord-rw` | ● | ● | ● | |
-| `coord-ro` | ● | ● | ● | |
-| `volume-ro` | ● | ● | | ● |
+| Role | `aud` | `exp` | `sub` |
+|---|---|---|---|
+| `volume-rw` | ● | ● | ● |
+| `coord-rw` | ● | ● | ● |
+| `coord-ro` | ● | ● | ● |
+| `volume-ro` | ● | ● | |
 
-Non-caveat template inputs (the other three substitution classes,
-listed here so the issuer's surface is unambiguous):
+The four substitution classes (listed here so the issuer's surface is
+unambiguous):
 
 - `{{env.X}}` — server-side config; Elide uses `env.bucket`. Never
   caller-controlled.
-- `{{req.X}}` — PoP-verified scalar request body; the demo roles use
-  `req.prefix`. Vouched for by `coordinator.key`, never validated by mint.
+- `{{req.X}}` — PoP-verified scalar request body; Elide roles use
+  `req.volume` (the per-volume target). Vouched for by `coordinator.key`,
+  never validated by mint.
 - `{{mint.X}}` — mint-computed at issuance; Elide uses `mint.expiry`.
+- `{{caveat.X}}` — MAC-verified caveat value; Elide uses `caveat.sub`
+  (a coordinator's own ULID, `coord-rw`'s own-identity prefix). Rooted in
+  the mint's macaroon root, not caller-asserted.
 
 Notes:
 
@@ -1499,11 +1511,12 @@ Notes:
   `cnf` (#16). No list-valued caveat type is needed: no role takes a
   list-shaped input — scalar `req.*` fields ride the PoP-signed body, not
   the caveat chain.
-- **`sub` templates only in `coord-rw`'s own-identity statement**
-  (`coordinators/{{caveat "sub"}}/*`, own-prefix write). Everywhere
-  else `sub` is a gate only; the other statements use prefix
-  wildcards (`names/*`, `events/*`) and `coord-ro` reads
-  `coordinators/*`.
+- **`coord-rw`'s own-identity statement uses `caveat.sub`**
+  (`coordinators/{{caveat.sub}}/*`, own-prefix write) — the coordinator's
+  MAC-verified ULID, sourced from the caveat chain, not the body, so it
+  cannot name another coordinator's prefix. Everywhere else `sub` is a
+  gate only; the other statements use prefix wildcards (`names/*`,
+  `events/*`) and `coord-ro` reads `coordinators/*`.
 - **`coord-ro` is the read-only baseline every coordinator holds**, and
   the only credential the LAN/internet-exposed peer-fetch verifier holds.
   Coordinator-wide read of `names/*` / `coordinators/*` / `events/*` /
@@ -1581,15 +1594,15 @@ writes a given volume within a TTL window; the returned keypair is cached
 in memory keyed by vol_ulid and re-assumed on miss/expiry. Structurally
 identical to `volume-ro` but with write actions.
 
-- **Required caveats:** `sub`, `elide:Volume`, `aud=mint`,
-  `exp`
+- **Required caveats:** `sub`, `aud=mint`, `exp`
+- **Request body:** `volume` (the target volume ULID, `req.volume`).
 - **TTL:** 24h default. Not on the hot write path (cache holds the key for
   the window; WAL absorbs a brief refresh stall), and 24h bounds the
   write/delete revocation window on a single volume.
 - **Policy:** `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
-  `arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*`,
-  plus the volume's two exact `meta/{{caveat "elide:Volume"}}.provenance`
-  and `meta/{{caveat "elide:Volume"}}.pub` objects (the drain uploads
+  `arn:aws:s3:::{{env.bucket}}/by_id/{{req.volume}}/*`,
+  plus the volume's two exact `meta/{{req.volume}}.provenance`
+  and `meta/{{req.volume}}.pub` objects (the drain uploads
   them; force-release reads `volume.pub`). Single volume only.
 
 GC and the reaper cross volume boundaries (read ancestor/input prefixes,
@@ -1608,6 +1621,8 @@ The IAM-layer invariants ride the policy *template*, not key
 partitioning:
 
 - **Required caveats:** `sub`, `aud=mint`, `exp`
+- **Caveat substitution:** `caveat.sub` (this coordinator's MAC-verified
+  ULID, for the own-prefix statement).
 - **TTL:** 1h. Control-plane, infrequent, refreshed on demand; the
   tightest coordinator TTL since it is the broadest write capability.
 - **Policy:** a multi-statement document, each statement preserving
@@ -1619,11 +1634,11 @@ partitioning:
     is enforced here — no statement, in any role, grants delete on
     `events/`.
   - `s3:GetObject`/`s3:PutObject` (**no** `s3:DeleteObject`) on
-    `arn:aws:s3:::{{env.bucket}}/coordinators/{{caveat "sub"}}/*`
-    — own-prefix only, via `sub` templating. **`coordinators/`
-    immutability** is enforced here; a leaked key can rewrite only
-    *this* coordinator's identity, never impersonate another, and
-    never delete.
+    `arn:aws:s3:::{{env.bucket}}/coordinators/{{caveat.sub}}/*`
+    — own-prefix only, the coordinator's MAC-verified ULID from the caveat
+    chain. **`coordinators/` immutability** is enforced here; a leaked key
+    can rewrite only *this* coordinator's identity, never impersonate
+    another, and never delete.
 
 No `s3:ListBucket` statement: every per-volume and control-plane
 LIST in the coordinator runtime has been replaced by a deterministic
@@ -1638,10 +1653,10 @@ authenticated separately, outside the coordinator runtime
 ### `volume-ro`
 
 Per-volume read of one volume's prefix. **Assumed by the coordinator**,
-not the volume: the coordinator attenuates its credential (`elide:Volume`,
-`exp`) for the **target** volume, calls `assume-role` with its
-`coordinator.key` PoP, and uses the resulting **Tigris keypair** for two
-read paths. A reader that needs an ancestor's segments obtains a separate
+not the volume: the coordinator attenuates its credential (`exp`), names
+the **target** volume in the request body (`volume`), calls `assume-role`
+with its `coordinator.key` PoP, and uses the resulting **Tigris keypair**
+for two read paths. A reader that needs an ancestor's segments obtains a separate
 `volume-ro` credential for that ancestor — one credential per volume
 prefix, each authorized by lineage (§ *Per-volume read credentials*):
 
@@ -1660,7 +1675,8 @@ prefix, each authorized by lineage (§ *Per-volume read credentials*):
    are **not** `volume-ro` — they hit only `meta/*` and ride the warm
    `coord-ro` credential, so chain discovery costs no per-ancestor mint.
 
-- **Required caveats:** `elide:Volume`, `aud=mint`, `exp`
+- **Required caveats:** `aud=mint`, `exp`
+- **Request body:** `volume` (the target volume ULID, `req.volume`).
 - **TTL:** 1h. Both consumers tolerate it cleanly: non-lazy volume
   episodes complete in seconds; lazy volumes refresh proactively at
   half-life; coord-side prefetch completes in seconds. The tightest
@@ -1678,7 +1694,7 @@ prefix, each authorized by lineage (§ *Per-volume read credentials*):
     keypair `DateLessThan`, bounded by the minimal blast radius (read one
     volume's lineage).
 - **Policy:** the per-volume RO shape — a single scalar resource, the
-  exact ARN for the target volume (`by_id/{{caveat "elide:Volume"}}/*`).
+  exact ARN for the target volume (`by_id/{{req.volume}}/*`).
 
 ### Why Split B is viable now
 
@@ -1686,16 +1702,16 @@ prefix, each authorized by lineage (§ *Per-volume read credentials*):
 rejected per-volume writer keys on two grounds. The mint redesign changes
 one of them:
 
-- *Confused-deputy enforcement is "modest"* — unchanged. `elide:Volume`
-  is a narrowing caveat (see *Partitioning vs. narrowing caveats*);
-  per-volume IAM remains a redundant belt over the name-claim lineage.
+- *Confused-deputy enforcement is "modest"* — unchanged. The per-volume
+  target is honest-but-unverified `req.volume` scoping data; per-volume
+  IAM remains a redundant belt over the name-claim lineage.
 - *Operational cost* (N persisted policies, `ListPolicies` reconciliation,
   orphan reaping, refresh churn) — **dissolved**. Mint keys are short-lived,
   vended on demand, never persisted, expired by `DateLessThan`. No
   reconciliation, no orphans.
 
 Per-volume **attribution** is obtained for free regardless of Split B —
-every `AssumeRole` already logs the `elide:Volume` caveat (§ *Audit log*).
+every `AssumeRole` already logs the request body's `volume` (§ *Audit log*).
 Split B's *additional* value over a coordinator-wide `volume-rw` is
 purely per-volume IAM *enforcement* (the "modest" confused-deputy catch).
 The remaining cost is `AssumeRole` call volume: ~one mint round-trip per
@@ -2178,7 +2194,7 @@ prematurely.
    conditional `names/<name>` read (fence coincident with the S3 CAS).
 5. **Mid-path wildcard verification.** Not on the v1 critical path:
    `volume-rw` uses a single-volume *trailing* wildcard
-   (`by_id/{{caveat "elide:Volume"}}/*`), `volume-ro` uses the same
+   (`by_id/{{req.volume}}/*`), `volume-ro` uses the same
    single-volume trailing wildcard, and `coord-ro` touches no `by_id/` at
    all — none need mid-path `*`. It is only a constraint on a future role wanting
    `by_id/*/<something>` shape. Empirical test still worth running once,

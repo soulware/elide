@@ -88,7 +88,6 @@ pub(crate) const COORD_ENROLL_ROLES: &[&str] =
     &[ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RW, ROLE_VOLUME_RO];
 
 const CAVEAT_EXP: &str = "exp";
-const CAVEAT_VOLUME: &str = "elide:Volume";
 
 /// Lifetime requested for a `volume-ro` credential. Set to 1h: the
 /// non-lazy fetch episode completes in seconds, and the lazy-volume
@@ -517,7 +516,7 @@ impl MintEndpoint {
         &self,
         role: &str,
         ttl_secs: u64,
-        narrowing: &[(&str, &str)],
+        volume: Option<Ulid>,
     ) -> io::Result<IssuedCredentials> {
         let cred_path = self.data_dir.join("credentials").join(role);
         let stored = std::fs::read_to_string(&cred_path).map_err(|e| {
@@ -541,20 +540,21 @@ impl MintEndpoint {
             let now = now_unix()?;
             let exp = now.saturating_add(ttl_secs);
             // The credential does not expire; the role gate requires
-            // `exp`. Bound it, then apply any role-specific narrowing.
+            // `exp`. Bound it via a caveat (the gate clears it).
             mac.attenuate(CAVEAT_EXP, &exp.to_string());
-            for (n, v) in narrowing {
-                mac.attenuate(n, v);
-            }
 
             // Build the exact body bytes once: they are both signed
             // (via BLAKE3(body)) and sent. Mint hashes the raw bytes
             // before parsing, so no canonicalization step may sit
-            // between.
+            // between. The per-volume target rides the PoP-signed body as
+            // `req.volume`; the policy template substitutes it.
             let mut obj = serde_json::Map::new();
             obj.insert("ts".into(), now.into());
             obj.insert("role".into(), role.into());
             obj.insert("ttl_seconds".into(), ttl_secs.into());
+            if let Some(v) = volume {
+                obj.insert("volume".into(), v.to_string().into());
+            }
             let body = serde_json::Value::Object(obj).to_string();
 
             let sig = BASE64.encode(self.identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
@@ -641,7 +641,7 @@ impl MintEndpoint {
         let mut attempt: u64 = 0;
         loop {
             attempt += 1;
-            match self.assume_role(role, ttl_secs, &[]).await {
+            match self.assume_role(role, ttl_secs, None).await {
                 Ok(_) => {
                     if attempt > 1 {
                         tracing::info!("[coordinator] mint reachable after {attempt} attempts");
@@ -689,11 +689,7 @@ impl MintCredentialer {
 impl Credentialer for MintCredentialer {
     async fn provision_volume_ro(&self, vol_ulid: Ulid) -> io::Result<IssuedCredentials> {
         self.endpoint
-            .assume_role(
-                ROLE_VOLUME_RO,
-                VOLUME_RO_TTL_SECS,
-                &[(CAVEAT_VOLUME, &vol_ulid.to_string())],
-            )
+            .assume_role(ROLE_VOLUME_RO, VOLUME_RO_TTL_SECS, Some(vol_ulid))
             .await
     }
 

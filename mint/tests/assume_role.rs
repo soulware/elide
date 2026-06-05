@@ -24,6 +24,9 @@ const ROOT: [u8; 32] = [42u8; 32];
 /// Stands in for the client's Ed25519 identity-key seed.
 const CLIENT_SEED: [u8; 32] = [7u8; 32];
 const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+/// The per-request target volume. It rides the PoP-signed body as
+/// `req.volume`; the policy template substitutes the string verbatim.
+const VOLUME: &str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
 
 fn config() -> Config {
     common::parse_config(TOML_TEMPLATE, &[("volume-ro.json", POLICY)])
@@ -50,10 +53,7 @@ const POLICY: &str = r#"
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each req.ancestors}},
-      "arn:aws:s3:::{{../env.bucket}}/by_id/{{this}}/*"
-      {{/each}}
+      "arn:aws:s3:::{{env.bucket}}/by_id/{{req.volume}}/*"
     ],
     "Condition": {"DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}}
   }]
@@ -118,7 +118,8 @@ fn far_future() -> u64 {
 }
 
 /// A held `volume-ro` credential (op=assume-role, aud, sub, cnf, role)
-/// attenuated per request with a tighter `exp` and an `elide:Volume`.
+/// attenuated per request with a tighter `exp`. The target volume is
+/// no longer a caveat — it rides the PoP-signed body as `req.volume`.
 fn request_macaroon() -> Macaroon {
     mint_credential(
         &Keyring::single(ROOT),
@@ -129,7 +130,6 @@ fn request_macaroon() -> Macaroon {
         0,
     )
     .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
-    .attenuate(Caveat::scalar("elide:Volume", "VOL1"))
 }
 
 fn signed_request(m: &Macaroon, inner_fields: &str) -> Request<Body> {
@@ -162,19 +162,44 @@ async fn happy_path_mints_scoped_keypair() {
 
     let req = signed_request(
         &m,
-        r#""role":"volume-ro","ttl_seconds":3600,"ancestors":["ANC1","ANC2"]"#,
+        &format!(r#""role":"volume-ro","ttl_seconds":3600,"volume":"{VOLUME}""#),
     );
     let (status, body) = body_string(app.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert!(body.contains("tid_fake_00000000"), "body: {body}");
 
+    // The rendered policy scopes to the body's `volume`, substituted
+    // verbatim into the by_id prefix.
     let calls = minter.calls();
     assert_eq!(calls.len(), 1);
-    assert!(calls[0].policy_json.contains("demo-bucket/by_id/VOL1/*"));
-    assert!(calls[0].policy_json.contains("by_id/ANC1/*"));
+    assert!(
+        calls[0]
+            .policy_json
+            .contains(&format!("demo-bucket/by_id/{VOLUME}/*")),
+        "policy: {}",
+        calls[0].policy_json
+    );
 
     let audit = String::from_utf8(audit_buf.lock().unwrap().clone()).unwrap();
     assert!(audit.contains("\"outcome\":\"granted\""), "audit: {audit}");
+}
+
+#[tokio::test]
+async fn missing_volume_in_body_fails_render_400() {
+    // A fully authorized request (gate passes) whose body omits the
+    // `volume` field the `volume-ro` policy substitutes as
+    // `{{req.volume}}`: strict-mode render fails closed, so no
+    // unscoped credential is ever minted. This pins the fail-closed
+    // property of the target now that it rides the body, not a caveat.
+    let (state, _, minter, _dir) = state_with_audit().await;
+    let app = router(state);
+    let m = request_macaroon();
+
+    let req = signed_request(&m, r#""role":"volume-ro","ttl_seconds":3600"#);
+    let (status, body) = body_string(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    // The render failed before the keypair step — nothing was minted.
+    assert!(minter.calls().is_empty(), "no keypair should be minted");
 }
 
 #[tokio::test]
@@ -188,7 +213,6 @@ async fn wrong_op_is_opaque_401() {
         vec![
             Caveat::scalar(name::OP, op::ENROLL),
             Caveat::scalar(name::AUD, "mint"),
-            Caveat::scalar("elide:Volume", "VOL1"),
             Caveat::scalar(name::EXP, far_future().to_string()),
             Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
         ],
@@ -212,7 +236,7 @@ async fn key_bound_without_pop_is_opaque_401() {
         .uri("/v1/assume-role")
         .header("authorization", format!("MintV1 {}", m.encode()))
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"role":"volume-ro","ancestors":[]}"#))
+        .body(Body::from(r#"{"role":"volume-ro"}"#))
         .unwrap();
     let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -224,7 +248,7 @@ async fn pop_over_a_different_body_is_401() {
     let app = router(state);
     let m = request_macaroon();
     let ts = chrono::Utc::now().timestamp() as u64;
-    let signed = format!(r#"{{"ts":{ts},"role":"volume-ro","ancestors":["ANC1"]}}"#);
+    let signed = format!(r#"{{"ts":{ts},"role":"volume-ro","volume":"{VOLUME}"}}"#);
     let sig = pop::client_signature(&CLIENT_SEED, m.tail(), signed.as_bytes());
     let req = Request::builder()
         .method("POST")
@@ -233,7 +257,7 @@ async fn pop_over_a_different_body_is_401() {
         .header("x-mint-pop", sig)
         .header("content-type", "application/json")
         .body(Body::from(format!(
-            r#"{{"ts":{ts},"role":"volume-ro","ancestors":["EVIL"]}}"#
+            r#"{{"ts":{ts},"role":"volume-ro","volume":"01JQBBBBBBBBBBBBBBBBBBBBBB"}}"#
         )))
         .unwrap();
     let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
@@ -250,7 +274,7 @@ async fn contradictory_cnf_fails_closed_not_bearer() {
         .uri("/v1/assume-role")
         .header("authorization", format!("MintV1 {}", m.encode()))
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"role":"volume-ro","ancestors":[]}"#))
+        .body(Body::from(r#"{"role":"volume-ro"}"#))
         .unwrap();
     let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -276,10 +300,11 @@ async fn bad_mac_is_opaque_401() {
 }
 
 #[tokio::test]
-async fn missing_required_caveat_is_400() {
-    // A cnf-bound, PoP-signed macaroon that clears the revocation gate
-    // (present enrolled record, matching cnf + epoch) but carries no
-    // elide:Volume → the role gate denies with 400.
+async fn missing_role_caveat_is_400() {
+    // A cnf-bound, PoP-signed macaroon that clears the MAC stage
+    // (aud/op/cnf/exp) and the revocation gate (present enrolled record,
+    // matching sub + cnf + epoch) but carries no `Role` caveat → the
+    // role gate denies with 400 before any policy render.
     let (state, _, _, _dir) = state_with_audit().await;
     let app = router(state);
     let m = mint(
@@ -288,13 +313,12 @@ async fn missing_required_caveat_is_400() {
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::SUB, SUB),
-            Caveat::scalar(name::ROLE, "volume-ro"),
             Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
             Caveat::scalar(name::EPOCH, "0"),
             Caveat::scalar(name::EXP, far_future().to_string()),
         ],
     );
-    let req = signed_request(&m, r#""role":"volume-ro""#);
+    let req = signed_request(&m, &format!(r#""role":"volume-ro","volume":"{VOLUME}""#));
     let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
@@ -324,7 +348,7 @@ async fn revoked_credential_is_401() {
 
     let req = signed_request(
         &m,
-        r#""role":"volume-ro","ttl_seconds":3600,"ancestors":[]"#,
+        &format!(r#""role":"volume-ro","ttl_seconds":3600,"volume":"{VOLUME}""#),
     );
     let (status, body) = body_string(app.clone().oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -336,7 +360,7 @@ async fn revoked_credential_is_401() {
 
     let req = signed_request(
         &m,
-        r#""role":"volume-ro","ttl_seconds":3600,"ancestors":[]"#,
+        &format!(r#""role":"volume-ro","ttl_seconds":3600,"volume":"{VOLUME}""#),
     );
     let (status, _) = body_string(app.oneshot(req).await.unwrap()).await;
     assert_eq!(
@@ -374,7 +398,7 @@ async fn re_approval_after_revoke_does_not_revive_old_credential() {
 
     let req = signed_request(
         &old,
-        r#""role":"volume-ro","ttl_seconds":3600,"ancestors":[]"#,
+        &format!(r#""role":"volume-ro","ttl_seconds":3600,"volume":"{VOLUME}""#),
     );
     let (status, _) = body_string(app.clone().oneshot(req).await.unwrap()).await;
     assert_eq!(
@@ -391,11 +415,10 @@ async fn re_approval_after_revoke_does_not_revive_old_credential() {
         "volume-ro",
         1,
     )
-    .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
-    .attenuate(Caveat::scalar("elide:Volume", "VOL1"));
+    .attenuate(Caveat::scalar(name::EXP, far_future().to_string()));
     let req = signed_request(
         &fresh,
-        r#""role":"volume-ro","ttl_seconds":3600,"ancestors":[]"#,
+        &format!(r#""role":"volume-ro","ttl_seconds":3600,"volume":"{VOLUME}""#),
     );
     let (status, body) = body_string(app.oneshot(req).await.unwrap()).await;
     assert_eq!(
