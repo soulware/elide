@@ -9,6 +9,7 @@
 use crate::caveat::{EffectiveCaveats, Resolved, name};
 use crate::sealed_cache::ServedSurface;
 
+const SUBJECT_CAVEAT: &str = name::SUB;
 const AUDIENCE_CAVEAT: &str = name::AUD;
 const NOT_AFTER_CAVEAT: &str = name::EXP;
 const ROLE_CAVEAT: &str = name::ROLE;
@@ -20,7 +21,7 @@ const ROLE_CAVEAT: &str = name::ROLE;
 /// per-role policy knob. `aud` and `exp` additionally have their *values*
 /// checked below; `sub` is presence-only (its value is MAC-authentic and
 /// its holder is proven by the `cnf`+PoP gate at the HTTP layer).
-const REQUIRED_CAVEATS: [&str; 3] = [name::SUB, AUDIENCE_CAVEAT, NOT_AFTER_CAVEAT];
+const REQUIRED_CAVEATS: [&str; 3] = [SUBJECT_CAVEAT, AUDIENCE_CAVEAT, NOT_AFTER_CAVEAT];
 
 /// Why an assume-role request was refused. Mapped to coarse HTTP
 /// statuses by the caller; never surfaced verbatim to the client.
