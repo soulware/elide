@@ -1701,7 +1701,7 @@ mod tests {
         )];
         write_segment(&path, &mut entries, signer).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let key = elide_coordinator::upload::segment_key(&vol_ulid.to_string(), seg_ulid);
+        let key = elide_coordinator::upload::segment_key(vol_ulid, seg_ulid);
         store.put(&key, PutPayload::from(bytes)).await.unwrap();
         seed_head_added(store, vol_ulid, &[seg_ulid]).await;
     }
@@ -1908,7 +1908,7 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         // Header is 100 bytes; first index entry starts at offset 100.
         bytes[104] ^= 0xff;
-        let bad_key = elide_coordinator::upload::segment_key(&dead_vol.to_string(), bad_id);
+        let bad_key = elide_coordinator::upload::segment_key(dead_vol, bad_id);
         store.put(&bad_key, PutPayload::from(bytes)).await.unwrap();
         // HEAD must list the tampered segment too — recovery enumerates
         // through HEAD and verifies each. Without this entry, the

@@ -34,7 +34,7 @@ pub enum TickOutcome {
 pub struct GcCycleOrchestrator {
     fork_dir: PathBuf,
     by_id_dir: PathBuf,
-    volume_id: String,
+    vol_ulid: Ulid,
     store: Arc<dyn ObjectStore>,
     /// Typed handle for the per-volume `by_id/<vol>/…` objects. Used
     /// for HEAD ops; raw `store` is still used for object classes the
@@ -64,7 +64,7 @@ pub struct GcCycleOrchestrator {
 impl GcCycleOrchestrator {
     pub fn new(
         fork_dir: PathBuf,
-        volume_id: String,
+        vol_ulid: Ulid,
         store: Arc<dyn ObjectStore>,
         gc_config: GcConfig,
         snapshot_locks: &SnapshotLockRegistry,
@@ -82,18 +82,11 @@ impl GcCycleOrchestrator {
         let last_reap = Instant::now()
             .checked_sub(gc_config.reaper_cadence())
             .unwrap_or_else(Instant::now);
-        // volume_id is the volume directory name, validated as a ULID by
-        // the caller (`derive_names` / `volume_ulid` in tasks.rs).
-        // Re-parsing here keeps the typed value local; an unparseable
-        // string would mean a programmer error upstream — parse with
-        // `expect` and explain it.
-        let volume_ulid = Ulid::from_string(&volume_id)
-            .expect("volume_id is a parsed ULID upstream (tasks.rs / derive_names)");
-        let volume_data = VolumeData::new(Arc::clone(&store), volume_ulid);
+        let volume_data = VolumeData::new(Arc::clone(&store), vol_ulid);
         Self {
             fork_dir,
             by_id_dir,
-            volume_id,
+            vol_ulid,
             store,
             volume_data,
             gc_config,
@@ -141,7 +134,7 @@ impl GcCycleOrchestrator {
         let _snap_guard = match snap_lock.try_lock() {
             Ok(g) => g,
             Err(_) => {
-                info!("[tick {}] skipped: snapshot lock held", self.volume_id);
+                info!("[tick {}] skipped: snapshot lock held", self.vol_ulid);
                 return TickOutcome::Continue;
             }
         };
@@ -201,14 +194,14 @@ impl GcCycleOrchestrator {
             return;
         }
 
-        let volume_id = &self.volume_id;
+        let vol_ulid = self.vol_ulid;
         control::promote_wal(&self.fork_dir).await;
 
         if let Some(s) = control::repack(&self.fork_dir).await
             && s.segments_compacted > 0
         {
             info!(
-                "[drain {volume_id}] repack: {} segment(s), ~{} bytes freed",
+                "[drain {vol_ulid}] repack: {} segment(s), ~{} bytes freed",
                 s.segments_compacted, s.bytes_freed
             );
         }
@@ -222,7 +215,7 @@ impl GcCycleOrchestrator {
             && s.runs_rewritten > 0
         {
             info!(
-                "[drain {volume_id}] reclaim: scanned={} runs={} bytes={} discarded={}",
+                "[drain {vol_ulid}] reclaim: scanned={} runs={} bytes={} discarded={}",
                 s.candidates_scanned, s.runs_rewritten, s.bytes_rewritten, s.discarded,
             );
         }
@@ -235,7 +228,7 @@ impl GcCycleOrchestrator {
             && s.entries_converted > 0
         {
             info!(
-                "[drain {volume_id}] delta_repack: {}/{} segment(s) rewritten, \
+                "[drain {vol_ulid}] delta_repack: {}/{} segment(s) rewritten, \
                  {} entries converted, {} → {} bytes",
                 s.segments_rewritten,
                 s.segments_scanned,
@@ -255,12 +248,12 @@ impl GcCycleOrchestrator {
         if !self.fork_dir.join("pending").exists() {
             return true;
         }
-        let volume_id = &self.volume_id;
-        match upload::drain_pending(&self.fork_dir, volume_id, &self.store).await {
+        let vol_ulid = self.vol_ulid;
+        match upload::drain_pending(&self.fork_dir, vol_ulid, &self.store).await {
             Ok(r) => {
                 if r.seen > 0 {
                     info!(
-                        "[drain {volume_id}] pending={} uploaded={} upload_failed={} promote_failed={}",
+                        "[drain {vol_ulid}] pending={} uploaded={} upload_failed={} promote_failed={}",
                         r.seen,
                         r.uploaded_ulids.len(),
                         r.upload_failed,
@@ -269,14 +262,14 @@ impl GcCycleOrchestrator {
                 }
                 if r.upload_failed > 0 {
                     error!(
-                        "[drain {volume_id}] {} segment(s) failed to upload to S3; \
+                        "[drain {vol_ulid}] {} segment(s) failed to upload to S3; \
                          skipping GC this tick to preserve ULID ordering invariant",
                         r.upload_failed
                     );
                 }
                 if r.promote_failed > 0 {
                     warn!(
-                        "[drain {volume_id}] {} segment(s) uploaded to S3 but volume \
+                        "[drain {vol_ulid}] {} segment(s) uploaded to S3 but volume \
                          promote IPC unavailable; skipping GC this tick to preserve \
                          ULID ordering invariant",
                         r.promote_failed
@@ -287,7 +280,7 @@ impl GcCycleOrchestrator {
             }
             Err(e) => {
                 error!(
-                    "[drain {volume_id}] drain error: {e:#}; \
+                    "[drain {vol_ulid}] drain error: {e:#}; \
                      skipping GC this tick to preserve ULID ordering invariant"
                 );
                 false
@@ -296,14 +289,11 @@ impl GcCycleOrchestrator {
     }
 
     async fn run_handoff_cleanup(&mut self) {
-        let volume_id = &self.volume_id;
-        match gc::apply_done_handoffs(&self.fork_dir, volume_id, &self.store).await {
+        let vol_ulid = self.vol_ulid;
+        match gc::apply_done_handoffs(&self.fork_dir, vol_ulid, &self.store).await {
             Ok(outcomes) => {
                 if !outcomes.is_empty() {
-                    info!(
-                        "[gc {volume_id}] completed {} GC handoff(s)",
-                        outcomes.len()
-                    );
+                    info!("[gc {vol_ulid}] completed {} GC handoff(s)", outcomes.len());
                 }
                 // Stamp `since` once for the whole tick. The reaper
                 // (folded into the tick loop in a follow-up PR) checks
@@ -317,7 +307,7 @@ impl GcCycleOrchestrator {
                     }
                 }
             }
-            Err(e) => error!("[gc {volume_id}] handoff cleanup error: {e:#}"),
+            Err(e) => error!("[gc {vol_ulid}] handoff cleanup error: {e:#}"),
         }
     }
 
@@ -343,7 +333,7 @@ impl GcCycleOrchestrator {
             Err(e) => {
                 warn!(
                     "[head {}] read failed: {e}; treating as empty",
-                    self.volume_id
+                    self.vol_ulid
                 );
                 segment_head::SegmentHead::empty(None)
             }
@@ -372,7 +362,7 @@ impl GcCycleOrchestrator {
             warn!(
                 "[head {}] put failed: {e}; \
                  self-heals on the next active tick",
-                self.volume_id
+                self.vol_ulid
             );
         }
     }
@@ -396,7 +386,7 @@ impl GcCycleOrchestrator {
                 warn!(
                     "[reap {}] retention_window {:?} out of chrono::Duration range: {e}; \
                      skipping reap pass",
-                    self.volume_id, self.gc_config.retention_window
+                    self.vol_ulid, self.gc_config.retention_window
                 );
                 return false;
             }
@@ -418,7 +408,7 @@ impl GcCycleOrchestrator {
         // low enough not to burst the bucket.
         use futures::stream::{self, StreamExt};
         const REAP_CONCURRENCY: usize = 16;
-        let volume_id = self.volume_id.as_str();
+        let vol_ulid = self.vol_ulid;
         let vd = self.volume_data.clone();
         stream::iter(to_reap.iter().copied())
             .for_each_concurrent(REAP_CONCURRENCY, |input| {
@@ -440,7 +430,7 @@ impl GcCycleOrchestrator {
                             // tick if it turns out the delete didn't
                             // land (benign).
                             warn!(
-                                "[reap {volume_id}] delete {}: {e}; will retry",
+                                "[reap {vol_ulid}] delete {}: {e}; will retry",
                                 segments.segment_key(input)
                             );
                         }
@@ -450,14 +440,14 @@ impl GcCycleOrchestrator {
             .await;
         head.apply_reap(&to_reap);
         info!(
-            "[reap {volume_id}] reaped {} input segment(s) past retention",
+            "[reap {vol_ulid}] reaped {} input segment(s) past retention",
             to_reap.len()
         );
         true
     }
 
     async fn run_gc_pass(&mut self) {
-        let volume_id = &self.volume_id;
+        let vol_ulid = self.vol_ulid;
         let max_buckets = self.gc_config.max_buckets_per_tick.max(1);
         let Some(bucket_ulids) = control::gc_checkpoint(&self.fork_dir, max_buckets).await else {
             return;
@@ -465,7 +455,7 @@ impl GcCycleOrchestrator {
 
         let handoffs_applied = control::apply_gc_handoffs(&self.fork_dir).await;
         if handoffs_applied > 0 {
-            info!("[gc {volume_id}] volume applied {handoffs_applied} GC handoff(s)");
+            info!("[gc {vol_ulid}] volume applied {handoffs_applied} GC handoff(s)");
         }
 
         let gc_result = {
@@ -495,7 +485,7 @@ impl GcCycleOrchestrator {
                     String::new()
                 };
                 info!(
-                    "[gc {volume_id}] compact: {buckets_emitted} bucket(s), \
+                    "[gc {vol_ulid}] compact: {buckets_emitted} bucket(s), \
                      {candidates} input(s) ({dead_cleaned} dead{cold_note}), \
                      ~{bytes_freed} bytes freed"
                 );
@@ -513,14 +503,14 @@ impl GcCycleOrchestrator {
                 // cover PendingHandoffs visibility.
                 if matches!(reason, gc::NoneReason::NoCandidates) && self.gc_was_active {
                     info!(
-                        "[gc {volume_id}] idle — {total_segments} segment(s), \
+                        "[gc {vol_ulid}] idle — {total_segments} segment(s), \
                          nothing eligible (threshold {:.2})",
                         self.gc_config.density_threshold
                     );
                     self.gc_was_active = false;
                 }
             }
-            Err(e) => error!("[gc {volume_id}] error: {e:#}"),
+            Err(e) => error!("[gc {vol_ulid}] error: {e:#}"),
         }
     }
 }
@@ -569,7 +559,7 @@ mod tests {
         let locks = crate::new_snapshot_lock_registry();
         let orch = GcCycleOrchestrator::new(
             fork_dir,
-            vol.to_string(),
+            vol,
             store,
             crate::config::GcConfig::default(),
             &locks,
@@ -683,9 +673,8 @@ mod tests {
 
         // Put the input segment objects in S3 (the reap step DELETEs by
         // key).
-        let vol_id_str = vol_ulid().to_string();
-        let expired_key = crate::upload::segment_key(&vol_id_str, input_expired);
-        let fresh_key = crate::upload::segment_key(&vol_id_str, input_fresh);
+        let expired_key = crate::upload::segment_key(vol_ulid(), input_expired);
+        let fresh_key = crate::upload::segment_key(vol_ulid(), input_fresh);
         store
             .put(&expired_key, bytes::Bytes::from_static(b"body").into())
             .await

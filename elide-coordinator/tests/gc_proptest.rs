@@ -376,7 +376,7 @@ proptest! {
                     // apply_done_handoffs skips the upload+promote branch.
                     let _ = rt.block_on(apply_done_handoffs(
                         fork_dir,
-                        "00000000000000000000000000",
+                        ulid::Ulid::nil(),
                         &store,
                                             ));
 
@@ -599,7 +599,7 @@ proptest! {
                     // Step 4: upload new segment to S3, delete old S3 objects.
                     let _ = rt.block_on(apply_done_handoffs(
                         fork_dir,
-                        "00000000000000000000000000",
+                        ulid::Ulid::nil(),
                         &store,
                                             ));
 
@@ -713,11 +713,7 @@ fn gc_oracle_repro_bug_h() {
     let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
     let _ = vol.apply_gc_handoffs();
     promote_gc_outputs(&mut vol, fork_dir);
-    let _ = rt.block_on(apply_done_handoffs(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
     // Read both LBAs to populate file cache with the pending/ segment.
     assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
     assert_eq!(&vol.read(6, 1).unwrap(), &data_235);
@@ -735,11 +731,7 @@ fn gc_oracle_repro_bug_h() {
     let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
     let _ = vol.apply_gc_handoffs();
     promote_gc_outputs(&mut vol, fork_dir);
-    let _ = rt.block_on(apply_done_handoffs(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
 
     // These reads triggered "failed to fill whole buffer" before the fix.
     assert_eq!(&vol.read(3, 1).unwrap(), &data_235);
@@ -800,11 +792,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     eprintln!("apply_1 applied={applied_1}");
     eprintln!("gc/ after apply_1: [{}]", list_dir(&gc_dir).join(", "));
     promote_gc_outputs(&mut vol, fork_dir);
-    let _ = rt.block_on(apply_done_handoffs(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
     eprintln!(
         "index/ after sweep 1: [{}]",
         list_dir(&index_dir).join(", ")
@@ -833,11 +821,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     eprintln!("apply_2 applied={applied_2}");
     eprintln!("gc/ after apply_2: [{}]", list_dir(&gc_dir).join(", "));
     promote_gc_outputs(&mut vol, fork_dir);
-    let _ = rt.block_on(apply_done_handoffs(
-        fork_dir,
-        "00000000000000000000000000",
-        &store,
-    ));
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
     let final_idx = list_dir(&index_dir);
     eprintln!("index/ final: [{}]", final_idx.join(", "));
 

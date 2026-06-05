@@ -571,7 +571,7 @@ mod tests {
         // Match production: HEAD-driven recovery resolves the segment
         // key from the ULID via `upload::segment_key`, which date-shards
         // by the ULID's embedded timestamp.
-        crate::upload::segment_key(&vol_ulid.to_string(), seg_ulid)
+        crate::upload::segment_key(vol_ulid, seg_ulid)
     }
 
     /// Seed HEAD with the given segment ULIDs in `Added`. HEAD-driven

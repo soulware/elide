@@ -610,7 +610,7 @@ async fn force_snapshot_now_op(
         elide_core::signing::VOLUME_PUB_FILE,
     )
     .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
-    elide_coordinator::prefetch::pull_indexes_for_head(store, &ancestor_dir, &volume_id, &vk, None)
+    elide_coordinator::prefetch::pull_indexes_for_head(store, &ancestor_dir, vol_ulid, &vk, None)
         .await
         .map_err(|e| IpcError::store(format!("pulling indexes for head: {e:#}")))?;
 
@@ -645,8 +645,6 @@ async fn force_snapshot_now_op(
     // HEAD). A pin missing here means a concurrent owner GC raced us
     // and either superseded it or the reaper tombstoned it between
     // Step 1's hydration and this verification.
-    let vol_ulid =
-        Ulid::from_string(&volume_id).map_err(|e| IpcError::internal(format!("vol ulid: {e}")))?;
     let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     let live = elide_coordinator::segment_head::resolve_live_segments(&vd, &vk)
         .await

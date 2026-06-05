@@ -252,7 +252,7 @@ async fn run_orchestrator(
     let n_idx = elide_coordinator::prefetch::pull_indexes_for_snapshot(
         &store,
         &fork_dir,
-        &vol_ulid.to_string(),
+        vol_ulid,
         basis_snapshot,
         &verifying_key,
     )

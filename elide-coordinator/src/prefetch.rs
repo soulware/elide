@@ -159,7 +159,7 @@ pub async fn prefetch_indexes(
         .with_context(|| format!("loading volume.pub from {}", fork_dir.display()))?;
     tasks.push(PrefetchTask {
         dir: fork_dir.to_path_buf(),
-        volume_id: current_volume_id,
+        vol_ulid: current_volume_id,
         branch_ulid: None,
         vk: own_vk,
         // Head fork has no branch_ulid → no manifest is read for it
@@ -197,7 +197,7 @@ pub async fn prefetch_indexes(
                 parent.volume_ulid
             );
             let parent_store = stores.base_object_store();
-            pull_volume_skeleton(&parent_store, data_dir, &parent.volume_ulid, peer)
+            pull_volume_skeleton(&parent_store, data_dir, parent_ulid, peer)
                 .await
                 .with_context(|| format!("pulling ancestor {}", parent.volume_ulid))?
         };
@@ -225,7 +225,7 @@ pub async fn prefetch_indexes(
         };
         tasks.push(PrefetchTask {
             dir: parent_dir.clone(),
-            volume_id: parent.volume_ulid.clone(),
+            vol_ulid: parent_ulid,
             branch_ulid: Some(parent.snapshot_ulid.clone()),
             vk: parent_vk,
             manifest_vk: parent_manifest_vk,
@@ -266,13 +266,16 @@ pub async fn prefetch_indexes(
                         ancestor.dir.display()
                     )
                 })?;
-            info!("[prefetch] pulling extent-source skeleton: {ulid_str}");
+            let ancestor_ulid = Ulid::from_string(ulid_str).map_err(|e| {
+                anyhow::anyhow!("extent ancestor dir name '{ulid_str}' not a ULID: {e}")
+            })?;
+            info!("[prefetch] pulling extent-source skeleton: {ancestor_ulid}");
             let ancestor_store = stores.base_object_store();
-            pull_volume_skeleton(&ancestor_store, data_dir, ulid_str, peer)
+            pull_volume_skeleton(&ancestor_store, data_dir, ancestor_ulid, peer)
                 .await
-                .with_context(|| format!("pulling extent-source {ulid_str}"))?
+                .with_context(|| format!("pulling extent-source {ancestor_ulid}"))?
         };
-        let volume_id = derive_names(&ancestor_dir)
+        let ancestor_ulid = derive_names(&ancestor_dir)
             .with_context(|| format!("resolving volume id for {}", ancestor_dir.display()))?;
         let ancestor_vk = signing::load_verifying_key(&ancestor_dir, signing::VOLUME_PUB_FILE)
             .with_context(|| format!("loading volume.pub from {}", ancestor_dir.display()))?;
@@ -281,15 +284,12 @@ pub async fn prefetch_indexes(
         // the requesting child's provenance, so no
         // `manifest_pubkey` override applies). Manifest verify and
         // segment verify both use the ancestor's own volume.pub.
-        let ancestor_ulid = Ulid::from_string(&volume_id).map_err(|e| {
-            anyhow::anyhow!("extent ancestor volume_id '{volume_id}' not a ULID: {e}")
-        })?;
         if !ancestor_ulids.contains(&ancestor_ulid) {
             ancestor_ulids.push(ancestor_ulid);
         }
         tasks.push(PrefetchTask {
             dir: ancestor_dir,
-            volume_id,
+            vol_ulid: ancestor_ulid,
             branch_ulid: ancestor.branch_ulid,
             vk: ancestor_vk,
             manifest_vk: ancestor_vk,
@@ -311,7 +311,7 @@ pub async fn prefetch_indexes(
             prefetch_fork(
                 &store,
                 &task.dir,
-                &task.volume_id,
+                task.vol_ulid,
                 task.branch_ulid.as_deref(),
                 &task.vk,
                 &task.manifest_vk,
@@ -354,7 +354,7 @@ pub async fn prefetch_indexes(
 /// and we propagate it here so the manifest verify uses the right key.
 struct PrefetchTask {
     dir: PathBuf,
-    volume_id: String,
+    vol_ulid: Ulid,
     branch_ulid: Option<String>,
     vk: VerifyingKey,
     manifest_vk: VerifyingKey,
@@ -364,7 +364,7 @@ struct PrefetchTask {
 async fn prefetch_fork(
     store: &Arc<dyn ObjectStore>,
     fork_dir: &Path,
-    volume_id: &str,
+    vol_ulid: Ulid,
     branch_ulid: Option<&str>,
     verifying_key: &VerifyingKey,
     manifest_verifying_key: &VerifyingKey,
@@ -377,7 +377,7 @@ async fn prefetch_fork(
     // snapshot in S3 (LIST snapshots/) so we can identify *its*
     // manifest. Either way the manifest must land on disk before we can
     // compute the .idx fetch set.
-    prefetch_snapshots(store, fork_dir, volume_id, branch_ulid, peer, result).await?;
+    prefetch_snapshots(store, fork_dir, vol_ulid, branch_ulid, peer, result).await?;
 
     // Resolve the manifest anchor for this fork:
     //   - Ancestor fork: the branch point recorded in the requesting
@@ -400,8 +400,6 @@ async fn prefetch_fork(
         None => Vec::new(),
     };
 
-    let vol_ulid = Ulid::from_string(volume_id)
-        .map_err(|e| anyhow::anyhow!("invalid volume_id {volume_id}: {e}"))?;
     let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     fetch_idx_set(&vd, fork_dir, verifying_key, peer, to_fetch, result).await;
     Ok(())
@@ -428,18 +426,16 @@ async fn prefetch_fork(
 pub async fn pull_indexes_for_head(
     store: &Arc<dyn ObjectStore>,
     fork_dir: &Path,
-    volume_id: &str,
+    vol_ulid: Ulid,
     verifying_key: &VerifyingKey,
     peer: Option<&PeerFetchContext>,
 ) -> Result<PrefetchResult> {
     let mut result = PrefetchResult::default();
 
-    let vol_ulid = Ulid::from_string(volume_id)
-        .map_err(|e| anyhow::anyhow!("invalid volume_id {volume_id}: {e}"))?;
     let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     let live = crate::segment_head::resolve_live_segments(&vd, verifying_key)
         .await
-        .with_context(|| format!("resolving live segments for {volume_id}"))?;
+        .with_context(|| format!("resolving live segments for {vol_ulid}"))?;
 
     let to_fetch: Vec<(String, Ulid)> = live
         .into_iter()
@@ -616,7 +612,7 @@ async fn fetch_idx_set(
 pub async fn pull_indexes_for_snapshot(
     store: &Arc<dyn ObjectStore>,
     fork_dir: &Path,
-    volume_id: &str,
+    vol_ulid: Ulid,
     snap_ulid: Ulid,
     verifying_key: &VerifyingKey,
 ) -> Result<usize> {
@@ -624,8 +620,6 @@ pub async fn pull_indexes_for_snapshot(
     let to_fetch =
         manifest_driven_fetch_set(fork_dir, &snap_ulid.to_string(), verifying_key, &mut result)?;
     let n = to_fetch.len();
-    let vol_ulid = Ulid::from_string(volume_id)
-        .map_err(|e| anyhow::anyhow!("invalid volume_id {volume_id}: {e}"))?;
     let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     fetch_idx_set(&vd, fork_dir, verifying_key, None, to_fetch, &mut result).await;
     Ok(n)
@@ -807,7 +801,7 @@ async fn fetch_idx(
 async fn prefetch_snapshots(
     store: &Arc<dyn ObjectStore>,
     fork_dir: &Path,
-    volume_id: &str,
+    vol_ulid: Ulid,
     branch_ulid: Option<&str>,
     peer: Option<&PeerFetchContext>,
     result: &mut PrefetchResult,
@@ -820,8 +814,7 @@ async fn prefetch_snapshots(
     // peer answers; on a peer miss we fall back to a single S3 GET
     // per missed artifact (also no LIST).
     if let (Some(branch), Some(peer_ctx)) = (branch_ulid, peer)
-        && let (Ok(vol_ulid), Ok(snap_ulid)) =
-            (Ulid::from_string(volume_id), Ulid::from_string(branch))
+        && let Ok(snap_ulid) = Ulid::from_string(branch)
     {
         return prefetch_branch_snapshot_artifacts(
             store, &snap_dir, vol_ulid, snap_ulid, peer_ctx, result,
@@ -836,9 +829,7 @@ async fn prefetch_snapshots(
     // are not a writable head's basis (ancestors resolve via signed
     // provenance) and stop-snapshots never flow into prefetch, per
     // `docs/list-elimination-plan.md` § *Identity axes*.
-    let vol_ulid_parsed =
-        Ulid::from_string(volume_id).with_context(|| format!("parsing volume_id {volume_id}"))?;
-    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid_parsed);
+    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     let snapshots = vd.snapshots();
     let basis = match branch_ulid {
         Some(b) => Ulid::from_string(b).with_context(|| format!("parsing branch ulid {b}"))?,
@@ -1017,7 +1008,8 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = crate::upload::segment_key(parent_ulid, seg_ulid.parse().unwrap());
+        let key =
+            crate::upload::segment_key(parent_ulid.parse().unwrap(), seg_ulid.parse().unwrap());
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // Upload the parent's signed snapshot manifest at the branch
@@ -1128,7 +1120,8 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = crate::upload::segment_key(parent_ulid, seg_ulid.parse().unwrap());
+        let key =
+            crate::upload::segment_key(parent_ulid.parse().unwrap(), seg_ulid.parse().unwrap());
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // Parent's signed manifest at the branch point — required by
@@ -1252,7 +1245,8 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let seg_key = crate::upload::segment_key(parent_ulid, seg_ulid.parse().unwrap());
+        let seg_key =
+            crate::upload::segment_key(parent_ulid.parse().unwrap(), seg_ulid.parse().unwrap());
         store.put(&seg_key, seg_bytes.into()).await.unwrap();
 
         // Synthesised manifest signed under the *recovering coord*
@@ -1335,7 +1329,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = crate::upload::segment_key(root_ulid, seg_ulid.parse().unwrap());
+        let key = crate::upload::segment_key(root_ulid.parse().unwrap(), seg_ulid.parse().unwrap());
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         // Publish a snapshot manifest at a snap ULID > seg ULID, signed
@@ -1421,7 +1415,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         let seg_bytes = std::fs::read(&staging).unwrap();
-        let key = crate::upload::segment_key(root_ulid, seg_ulid.parse().unwrap());
+        let key = crate::upload::segment_key(root_ulid.parse().unwrap(), seg_ulid.parse().unwrap());
         store.put(&key, seg_bytes.into()).await.unwrap();
 
         let result = prefetch_indexes(&root_dir, &passthrough(&store), None)
@@ -1481,14 +1475,20 @@ mod tests {
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
         store
             .put(
-                &crate::upload::segment_key(root_ulid_str, old_ulid_str.parse().unwrap()),
+                &crate::upload::segment_key(
+                    root_ulid_str.parse().unwrap(),
+                    old_ulid_str.parse().unwrap(),
+                ),
                 old_bytes.into(),
             )
             .await
             .unwrap();
         store
             .put(
-                &crate::upload::segment_key(root_ulid_str, new_ulid_str.parse().unwrap()),
+                &crate::upload::segment_key(
+                    root_ulid_str.parse().unwrap(),
+                    new_ulid_str.parse().unwrap(),
+                ),
                 new_bytes.into(),
             )
             .await
@@ -1512,7 +1512,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = pull_indexes_for_head(&store, &root_dir, root_ulid_str, &vk, None)
+        let result = pull_indexes_for_head(&store, &root_dir, root_ulid, &vk, None)
             .await
             .unwrap();
         assert_eq!(result.fetched, 1, "only the GC output should be fetched");

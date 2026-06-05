@@ -63,16 +63,13 @@ use crate::prefetch::PeerFetchContext;
 pub async fn pull_volume_skeleton(
     store: &Arc<dyn ObjectStore>,
     data_dir: &Path,
-    volume_id: &str,
+    vol_ulid: Ulid,
     peer: Option<&PeerFetchContext>,
 ) -> Result<PathBuf> {
-    let vol_dir = data_dir.join("by_id").join(volume_id);
+    let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
     if vol_dir.exists() {
         return Ok(vol_dir);
     }
-
-    let vol_ulid = Ulid::from_string(volume_id)
-        .with_context(|| format!("parsing volume_id {volume_id} as ULID"))?;
 
     // Two independent GETs — fire concurrently so per-ancestor pull
     // latency is bounded by the slowest, not the sum. Each side tries
@@ -80,19 +77,11 @@ pub async fn pull_volume_skeleton(
     let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
     let provenance_key = StorePath::from(elide_core::store_keys::meta_provenance_key(vol_ulid));
     let (pub_bytes, provenance_bytes) = tokio::try_join!(
-        fetch_skeleton_file(
-            store,
-            &pub_key,
-            SkeletonFile::VolumePub,
-            volume_id,
-            vol_ulid,
-            peer,
-        ),
+        fetch_skeleton_file(store, &pub_key, SkeletonFile::VolumePub, vol_ulid, peer,),
         fetch_skeleton_file(
             store,
             &provenance_key,
             SkeletonFile::VolumeProvenance,
-            volume_id,
             vol_ulid,
             peer,
         ),
@@ -100,16 +89,16 @@ pub async fn pull_volume_skeleton(
 
     std::fs::create_dir_all(&vol_dir).with_context(|| format!("creating {}", vol_dir.display()))?;
     std::fs::write(vol_dir.join("volume.readonly"), "")
-        .with_context(|| format!("writing volume.readonly for {volume_id}"))?;
+        .with_context(|| format!("writing volume.readonly for {vol_ulid}"))?;
     std::fs::write(vol_dir.join("volume.pub"), &pub_bytes)
-        .with_context(|| format!("writing volume.pub for {volume_id}"))?;
+        .with_context(|| format!("writing volume.pub for {vol_ulid}"))?;
     std::fs::write(
         vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE),
         &provenance_bytes,
     )
-    .with_context(|| format!("writing volume.provenance for {volume_id}"))?;
+    .with_context(|| format!("writing volume.provenance for {vol_ulid}"))?;
     std::fs::create_dir_all(vol_dir.join("index"))
-        .with_context(|| format!("creating index/ for {volume_id}"))?;
+        .with_context(|| format!("creating index/ for {vol_ulid}"))?;
 
     // These bytes came *from* S3 — record matching upload sentinels
     // so the per-volume drain loop's first pass over
@@ -117,14 +106,14 @@ pub async fn pull_volume_skeleton(
     // Failures here only mean the daemon will re-upload the (byte-
     // identical) files on the next tick; no correctness impact.
     if let Err(e) = crate::upload::mark_already_uploaded(&vol_dir, "volume.pub", &pub_bytes) {
-        tracing::warn!("[pull {volume_id}] writing volume.pub upload sentinel: {e}");
+        tracing::warn!("[pull {vol_ulid}] writing volume.pub upload sentinel: {e}");
     }
     if let Err(e) = crate::upload::mark_already_uploaded(
         &vol_dir,
         elide_core::signing::VOLUME_PROVENANCE_FILE,
         &provenance_bytes,
     ) {
-        tracing::warn!("[pull {volume_id}] writing volume.provenance upload sentinel: {e}");
+        tracing::warn!("[pull {vol_ulid}] writing volume.provenance upload sentinel: {e}");
     }
 
     Ok(vol_dir)
@@ -151,21 +140,16 @@ async fn fetch_skeleton_file(
     store: &Arc<dyn ObjectStore>,
     key: &StorePath,
     kind: SkeletonFile,
-    volume_id: &str,
     vol_ulid: Ulid,
     peer: Option<&PeerFetchContext>,
 ) -> Result<Bytes> {
     if let Some(peer_ctx) = peer
         && let Some(bytes) = peer_fetch_skeleton(peer_ctx, kind, vol_ulid).await
     {
-        info!(
-            "[pull] fetched {} from peer for {}",
-            kind.label(),
-            volume_id
-        );
+        info!("[pull] fetched {} from peer for {}", kind.label(), vol_ulid);
         return Ok(bytes);
     }
-    fetch_bytes(store, key, kind.label(), volume_id).await
+    fetch_bytes(store, key, kind.label(), vol_ulid).await
 }
 
 async fn peer_fetch_skeleton(
@@ -198,15 +182,15 @@ async fn fetch_bytes(
     store: &Arc<dyn ObjectStore>,
     key: &StorePath,
     what: &str,
-    volume_id: &str,
+    vol_ulid: Ulid,
 ) -> Result<bytes::Bytes> {
     let resp = store
         .get(key)
         .await
-        .with_context(|| format!("downloading {what} for {volume_id}"))?;
+        .with_context(|| format!("downloading {what} for {vol_ulid}"))?;
     resp.bytes()
         .await
-        .with_context(|| format!("reading {what} for {volume_id}"))
+        .with_context(|| format!("reading {what} for {vol_ulid}"))
 }
 
 #[cfg(test)]
@@ -238,7 +222,6 @@ mod tests {
     async fn skeleton_pull_falls_back_to_s3_with_no_peer() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let vol_ulid = Ulid::new();
-        let vol_id = vol_ulid.to_string();
 
         let pub_bytes = b"pub-bytes\n";
         let prov_bytes = b"prov-bytes\n";
@@ -258,7 +241,7 @@ mod tests {
             .unwrap();
 
         let tmp = TempDir::new().unwrap();
-        let vol_dir = pull_volume_skeleton(&store, tmp.path(), &vol_id, None)
+        let vol_dir = pull_volume_skeleton(&store, tmp.path(), vol_ulid, None)
             .await
             .unwrap();
 
@@ -284,7 +267,6 @@ mod tests {
     async fn skeleton_pull_with_unreachable_peer_falls_back_to_s3() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let vol_ulid = Ulid::new();
-        let vol_id = vol_ulid.to_string();
         let pub_bytes = b"x";
         let prov_bytes = b"y";
         store
@@ -314,7 +296,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().unwrap();
-        let vol_dir = pull_volume_skeleton(&store, tmp.path(), &vol_id, Some(&peer))
+        let vol_dir = pull_volume_skeleton(&store, tmp.path(), vol_ulid, Some(&peer))
             .await
             .unwrap();
 

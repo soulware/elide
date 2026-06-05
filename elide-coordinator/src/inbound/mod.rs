@@ -832,15 +832,13 @@ pub(crate) async fn snapshot_volume_kind(
         )));
     }
 
-    let volume_id = elide_coordinator::upload::derive_names(&fork_dir)
-        .map_err(|e| IpcError::internal(format!("deriving volume id: {e}")))?;
     // Every store op below writes under `by_id/<vol>/` (segment drain,
     // GC handoff apply, snapshot manifest publish). That prefix is
     // owned by `volume-rw`; `coord-rw` is `names/*` + `events/*`
     // + `coordinators/<sub>/*` only and would 403 on the snapshot PUT.
     // Mirrors the same fix in `release_volume_op` (commit 4e6950f).
-    let vol_ulid = ulid::Ulid::from_string(&volume_id)
-        .map_err(|e| IpcError::internal(format!("vol dir name not a valid ULID: {e}")))?;
+    let vol_ulid = elide_coordinator::upload::derive_names(&fork_dir)
+        .map_err(|e| IpcError::internal(format!("deriving volume id: {e}")))?;
     let store = core.stores.volume_rw(&vol_ulid);
 
     let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir);
@@ -852,7 +850,7 @@ pub(crate) async fn snapshot_volume_kind(
         ));
     }
 
-    match elide_coordinator::upload::drain_pending(&fork_dir, &volume_id, &store).await {
+    match elide_coordinator::upload::drain_pending(&fork_dir, vol_ulid, &store).await {
         Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
             return Err(IpcError::store(format!(
                 "drain reported {} S3-upload failure(s), {} volume-promote failure(s)",
@@ -869,7 +867,7 @@ pub(crate) async fn snapshot_volume_kind(
     // the manifest's segment_ulids) and HEAD is truncated to empty
     // post-seal, so the orchestrator doesn't need them — drop on the
     // floor here. See `docs/design-segment-index.md` *Truncation*.
-    elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, &store)
+    elide_coordinator::gc::apply_done_handoffs(&fork_dir, vol_ulid, &store)
         .await
         .map_err(|e| IpcError::store(format!("draining gc handoffs: {e:#}")))?;
 
@@ -896,7 +894,7 @@ pub(crate) async fn snapshot_volume_kind(
             elide_core::signing::SnapshotKind::Stop => "stop-snapshot",
         };
         info!(
-            "[stop-snapshot {volume_id}] skipping: {label} {snap_ulid} \
+            "[stop-snapshot {vol_ulid}] skipping: {label} {snap_ulid} \
              already covers current state"
         );
         return Ok(SnapshotReply { snap_ulid });
@@ -916,7 +914,7 @@ pub(crate) async fn snapshot_volume_kind(
         )));
     }
 
-    elide_coordinator::upload::upload_snapshot_metadata(&fork_dir, &volume_id, &store)
+    elide_coordinator::upload::upload_snapshot_metadata(&fork_dir, vol_ulid, &store)
         .await
         .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
 
@@ -924,7 +922,7 @@ pub(crate) async fn snapshot_volume_kind(
         elide_core::signing::SnapshotKind::User => "snapshot",
         elide_core::signing::SnapshotKind::Stop => "stop-snapshot",
     };
-    info!("[{label} {volume_id}] committed {snap_ulid}");
+    info!("[{label} {vol_ulid}] committed {snap_ulid}");
     Ok(SnapshotReply { snap_ulid })
 }
 
@@ -1908,7 +1906,7 @@ pub(crate) async fn pull_readonly_op(
     // ancestor skeleton via `pull_volume_skeleton`. The two GETs run
     // in parallel so per-ancestor latency is bounded by the slowest
     // leg rather than the sum; peer-first when a context is supplied.
-    elide_coordinator::pull::pull_volume_skeleton(store, data_dir, &volume_id, peer)
+    elide_coordinator::pull::pull_volume_skeleton(store, data_dir, vol_ulid, peer)
         .await
         .map_err(|e| IpcError::store(format!("pulling skeleton for {volume_id}: {e}")))?;
     let fetch_elapsed = pull_started.elapsed();
