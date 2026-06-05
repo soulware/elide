@@ -57,11 +57,11 @@ async fn full_flow_over_unix_socket() {
     // Server state with a seeded root key so client-side invite
     // macaroons minted from ROOT verify.
     let srv_dir = tempfile::tempdir().expect("srv tempdir");
-    let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(srv_dir.path().join("root_key"), root_hex).expect("seed root_key");
     let k_m_a_hex: String = K_M_A.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(srv_dir.path().join(K_M_A_FILE), k_m_a_hex).expect("seed k_m_a");
-    let mut store_inner = Store::open_local(srv_dir.path()).await.expect("store");
+    let mut store_inner = Store::open_local_with_initial_key(srv_dir.path(), Some(ROOT))
+        .await
+        .expect("store");
     // Colocated demo auth: K_M-A keys the gate TPCs, K_session the
     // operator login the client performs before enrolling.
     store_inner

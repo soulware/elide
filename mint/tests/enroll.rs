@@ -108,13 +108,13 @@ async fn app() -> (
 ) {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let dir = tempfile::tempdir().expect("tempdir");
-    // Seed the known root key (hex) so Store::open_local loads it (vs
-    // generating one) and the macaroons minted with ROOT verify.
-    let root_hex: String = ROOT.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(dir.path().join("root_key"), root_hex).expect("seed root_key");
+    // Seed the keyring's kid=0 with the known ROOT so the macaroons
+    // minted with ROOT verify.
     let k_m_a_hex: String = K_M_A.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join(K_M_A_FILE), k_m_a_hex).expect("seed k_m_a");
-    let mut store_inner = Store::open_local(dir.path()).await.expect("store");
+    let mut store_inner = Store::open_local_with_initial_key(dir.path(), Some(ROOT))
+        .await
+        .expect("store");
     store_inner
         .init_k_m_a(dir.path(), true)
         .expect("init k_m_a");

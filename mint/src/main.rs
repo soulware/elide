@@ -459,15 +459,18 @@ async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std:
     )
     .await?;
     std::fs::create_dir_all(&cfg.data_dir)?;
-    let legacy = cfg.data_dir.join("root_key");
+    // Auto-generation of secret material is gated on demo mode. A
+    // production instance must have its keyring (and K_M-A) provisioned
+    // out-of-band and fails closed if absent; only a demo instance mints
+    // a fresh master key.
+    let demo_enabled = cfg.demo_auth.as_ref().is_some_and(|d| d.enabled);
     let mut store =
-        Store::open_remote(s3, &cfg.data_dir.join("root_keys"), Some(&legacy), None).await?;
+        Store::open_remote(s3, &cfg.data_dir.join("root_keys"), None, demo_enabled).await?;
     // K_M-A is needed wherever an auth integration is configured (TPC
     // verification and demo discharge issuance): a colocated demo auth
     // role generates it locally, otherwise `auth_location` signals that the
     // auth-service binary provisioned it. K_session is purely the demo
     // auth role's session root — generated only under `[demo_auth]`.
-    let demo_enabled = cfg.demo_auth.as_ref().is_some_and(|d| d.enabled);
     if demo_enabled || cfg.auth_location.is_some() {
         store.init_k_m_a(&cfg.data_dir, demo_enabled)?;
         if demo_enabled {
