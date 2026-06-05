@@ -443,7 +443,7 @@ issued against — the mint software is identical.
 
 Mint's admin endpoints — `POST /v1/admin/invite`,
 `POST /v1/admin/invite/rotate`, `POST /v1/admin/enrollments`,
-`POST /v1/admin/enroll/approve`, `POST /v1/admin/enroll/revoke` — are
+`POST /v1/admin/enroll/approve` — are
 the operator's surface for managing invites and approving coordinator
 enrollments. Every endpoint is a `POST` (even the reads), because the
 proof-of-possession signs over the request body and every call carries
@@ -1877,7 +1877,6 @@ mint invite [--rotate]             # print current invite macaroon / rotate the 
 mint enroll list                   # sub, state (pending|enrolled), cnf fingerprint,
                                    #   peer ip (pending only), age / approved_at
 mint enroll approve <sub>          # approve a pending record
-mint enroll revoke <sub>           # delete a clients/enrolled/<sub> entry (forces fresh approval on re-enroll)
 mint role list                     # configured roles: name, TTL bounds
 mint role inspect <name>           # one role: bounds, policy source, raw template + ref surface
 ```
@@ -1905,7 +1904,7 @@ exchange <role>` (once per role) → `client assume-role`, printing the
 returned Tigris keypair.
 
 **Operator auth.** The operator commands (`invite`, `enroll
-list/approve/revoke`) hit discharge-gated admin endpoints
+list/approve`) hit discharge-gated admin endpoints
 (§ *Operator authorization*). `mint serve` writes the **admin-service** and
 its machine key (`<data_dir>/admin-service` + `admin-service.key`, mode 0600)
 whenever either is absent; the operator runs `mint login` once to obtain a session,
@@ -2115,10 +2114,12 @@ prematurely.
     displayed fingerprint (§ *Enrollment*); the third-party caveats on
     the invite and the ticket are the enrolling- and exchanging-operator
     gates layered on top. Open within this question: because credentials
-    do not expire and carry no TPC, periodic re-attestation of a
-    coordinator (e.g. a managed customer who left) is enforced by
-    revoking the enrolled-registry entry or refusing re-enrollment —
-    which, is unsettled.
+    do not expire, carry no TPC, and the enrolled registry is not on the
+    `assume-role` verification path, there is currently no mechanism to
+    de-authorize a coordinator whose credentials are already issued —
+    deleting the enrolled-registry entry only gates *future* enrollment
+    exchanges. Re-attestation of a live coordinator (e.g. a managed
+    customer who left) is unsettled.
 16. **PoP caveat wire detail.** `cnf` is decided (first-party
     holder-of-key; credential is key-bound, not a bearer; the signed
     payload is `BLAKE3(presented-macaroon-tail ‖ BLAKE3(request-body))`

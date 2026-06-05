@@ -223,13 +223,6 @@ enum EnrollCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Revoke an enrolled-client registry entry.
-    Revoke {
-        #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
-        config: PathBuf,
-        /// The opaque principal id whose registry entry to delete.
-        sub: String,
-    },
 }
 
 #[tokio::main]
@@ -254,7 +247,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Enroll { cmd } => match cmd {
             EnrollCmd::List { config } => enroll_list(&config).await,
             EnrollCmd::Approve { config, sub, yes } => enroll_approve(&config, &sub, yes).await,
-            EnrollCmd::Revoke { config, sub } => enroll_revoke(&config, &sub).await,
         },
         Command::Seal { config } => seal(&config).await,
         Command::Role { cmd } => match cmd {
@@ -801,21 +793,6 @@ async fn enroll_approve(
         resp.approved_at
     );
     Ok(())
-}
-
-async fn enroll_revoke(config: &Path, sub: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let config = load(config)?;
-    let (op, discharge) = operator_session(&config).await?;
-    let req = mint::admin::RevokeRequest {
-        sub: sub.to_owned(),
-    };
-    let resp = mint::admin::revoke_enrollment(admin_target(&config), &op, &discharge, &req).await?;
-    if resp.revoked {
-        eprintln!("revoked enrollment for {sub}; next enroll requires fresh approval");
-        Ok(())
-    } else {
-        Err(format!("no enrolled entry for sub {sub}").into())
-    }
 }
 
 /// `mint seal` — author and publish the template seal by calling the
