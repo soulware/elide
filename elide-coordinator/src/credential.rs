@@ -13,11 +13,15 @@
 // § "Coordinator identity".
 
 use std::io;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use tracing::warn;
 use ulid::Ulid;
+
+use elide_coordinator::ipc::IpcError;
+use elide_coordinator::macaroon::Verified;
 
 /// Credentials issued to a volume in response to an authenticated
 /// `credentials` request.
@@ -37,19 +41,63 @@ pub struct IssuedCredentials {
 /// vend a credential scoped to one volume's `by_id/<target>/*` read
 /// prefix; `target` is the single volume to grant on.
 ///
-/// `target` is a bare `Ulid`, not a [`Verified<Ulid>`]: it is **not** the
-/// macaroon-bound requester but a (possibly ancestor) volume the requester
-/// asked to read. The caller — [`crate::inbound`]'s `issue_credentials` —
-/// is the sole call site and authorizes `target` against the requester's
-/// lineage (`target ∈ {requester} ∪ lineage(requester)`) before calling.
-/// This is a documented precondition rather than a type-level guarantee.
+/// `target` is an [`AuthorizedTarget`], whose only constructor is
+/// [`authorize_target`]. Holding one is a type-level proof that the
+/// requested target passed the lineage check, so `issue` cannot be
+/// reached for an unauthorized prefix.
 ///
 /// `issue` is async because the mint-backed impl calls out to the
 /// external mint service to vend per-volume keys. The shared-key
 /// passthrough impl returns immediately from cache.
 #[async_trait]
 pub trait CredentialIssuer: Send + Sync {
-    async fn issue(&self, target: Ulid) -> io::Result<IssuedCredentials>;
+    async fn issue(&self, target: AuthorizedTarget) -> io::Result<IssuedCredentials>;
+}
+
+/// A volume ULID the requester is authorized to read — itself or one of
+/// its ancestors. The only constructor is [`authorize_target`], so a
+/// value of this type *is* the proof that the lineage check passed;
+/// possessing one is what permits [`CredentialIssuer::issue`] to grant
+/// the `by_id/<target>/*` prefix.
+///
+/// Parallel to [`Verified<Ulid>`] and composes with it — a `Verified`
+/// requester is required to produce an `AuthorizedTarget`. The two attest
+/// different facts: `Verified<Ulid>` that the *caller* is macaroon-
+/// authenticated; `AuthorizedTarget` that the *target* is within the
+/// caller's lineage.
+pub struct AuthorizedTarget(Ulid);
+
+impl AuthorizedTarget {
+    /// The authorized volume ULID.
+    pub fn ulid(&self) -> Ulid {
+        self.0
+    }
+}
+
+/// Authorize `target` against the `requester`'s lineage and, on success,
+/// return the [`AuthorizedTarget`] proof. A volume may obtain read
+/// credentials only for itself or one of its ancestors; the lineage is
+/// re-derived from local provenance and anything outside it is refused.
+/// This is the sole constructor of [`AuthorizedTarget`], so the check can
+/// neither be skipped nor duplicated.
+pub fn authorize_target(
+    requester: &Verified<Ulid>,
+    target: Ulid,
+    data_dir: &Path,
+) -> Result<AuthorizedTarget, IpcError> {
+    let requester = requester.copy_inner();
+    if target != requester {
+        let by_id_dir = data_dir.join("by_id");
+        let fork_dir = by_id_dir.join(requester.to_string());
+        let lineage = elide_core::volume::lineage_ulids(&fork_dir, &by_id_dir)
+            .map_err(|e| IpcError::internal(format!("loading requester lineage: {e}")))?;
+        if !lineage.contains(&target) {
+            return Err(IpcError::forbidden(
+                "target is neither the requesting volume nor one of its ancestors",
+            ));
+        }
+    }
+    Ok(AuthorizedTarget(target))
 }
 
 /// Lower-layer abstraction over whatever component actually vends
@@ -106,7 +154,7 @@ impl SharedKeyPassthrough {
 
 #[async_trait]
 impl CredentialIssuer for SharedKeyPassthrough {
-    async fn issue(&self, _target: Ulid) -> io::Result<IssuedCredentials> {
+    async fn issue(&self, _target: AuthorizedTarget) -> io::Result<IssuedCredentials> {
         if let Some(c) = self.cached.get() {
             return Ok(c.clone());
         }

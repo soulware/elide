@@ -2229,28 +2229,15 @@ async fn issue_credentials(
         authenticate_volume_macaroon(macaroon_str, data_dir, peer_pid, macaroon_root).await?;
     let requester = verified.copy_inner();
 
-    // Authorize the requested target. The macaroon authenticates the
-    // requester; `target` is the single `by_id/<target>/*` prefix it
-    // wants to read. A volume may obtain read credentials only for
-    // itself or one of its ancestors — so we re-derive the requester's
-    // lineage from local provenance and refuse anything outside it. This
-    // is the same authority the coordinator granted implicitly when it
-    // built the ancestor set itself; naming the target just makes the
-    // check explicit (`docs/design-mint.md` § per-volume read creds).
-    if target != requester {
-        let by_id_dir = data_dir.join("by_id");
-        let fork_dir = by_id_dir.join(requester.to_string());
-        let lineage = elide_core::volume::lineage_ulids(&fork_dir, &by_id_dir)
-            .map_err(|e| IpcError::internal(format!("loading requester lineage: {e}")))?;
-        if !lineage.contains(&target) {
-            return Err(IpcError::forbidden(
-                "target is neither the requesting volume nor one of its ancestors",
-            ));
-        }
-    }
+    // Authorize the requested target against the requester's lineage. The
+    // macaroon authenticates the requester; `target` is the single
+    // `by_id/<target>/*` prefix it wants to read. The resulting
+    // `AuthorizedTarget` is a proof the check passed — `issue` cannot be
+    // reached without one (`docs/design-mint.md` § per-volume read creds).
+    let authorized = crate::credential::authorize_target(&verified, target, data_dir)?;
 
     let creds = issuer
-        .issue(target)
+        .issue(authorized)
         .await
         .map_err(|e| IpcError::internal(format!("issue: {e}")))?;
     info!(
@@ -2489,7 +2476,10 @@ mod tests {
     struct FixedIssuer;
     #[async_trait::async_trait]
     impl CredentialIssuer for FixedIssuer {
-        async fn issue(&self, _target: ulid::Ulid) -> std::io::Result<IssuedCredentials> {
+        async fn issue(
+            &self,
+            _target: crate::credential::AuthorizedTarget,
+        ) -> std::io::Result<IssuedCredentials> {
             Ok(IssuedCredentials {
                 access_key_id: "AK".into(),
                 secret_access_key: "SK".into(),
