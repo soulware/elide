@@ -13,6 +13,7 @@
 // exits, idle elapses TTL and creds are dropped; subsequent demand
 // fetches re-acquire transparently.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,24 +43,30 @@ pub trait CredsIssuer: Send + Sync {
     fn reissue(&self) -> io::Result<S3Credentials>;
 }
 
-/// `CredsIssuer` backed by the coordinator's `Credentials` IPC.
-/// Holds the macaroon obtained at registration time and re-authenticates
-/// on every call.
+/// `CredsIssuer` backed by the coordinator's `Credentials` IPC, scoped
+/// to one owner volume's `by_id/<owner>/*` read prefix. Holds the
+/// macaroon obtained at registration time and re-authenticates on every
+/// call; `owner` is the `target` the coordinator authorizes and grants.
 pub struct CoordinatorIssuer {
     socket: PathBuf,
     macaroon: String,
+    owner: ulid::Ulid,
 }
 
 impl CoordinatorIssuer {
-    pub fn new(socket: PathBuf, macaroon: String) -> Self {
-        Self { socket, macaroon }
+    pub fn new(socket: PathBuf, macaroon: String, owner: ulid::Ulid) -> Self {
+        Self {
+            socket,
+            macaroon,
+            owner,
+        }
     }
 }
 
 impl CredsIssuer for CoordinatorIssuer {
     fn reissue(&self) -> io::Result<S3Credentials> {
         let client = coordinator_client::Client::new(&self.socket);
-        let reply = client.macaroon_credentials(&self.macaroon)?;
+        let reply = client.macaroon_credentials(&self.macaroon, self.owner)?;
         Ok(S3Credentials {
             access_key_id: reply.access_key_id,
             secret_access_key: reply.secret_access_key,
@@ -144,6 +151,88 @@ impl RangeFetcher for LazyCredsFetcher {
         let f = self.acquire()?;
         f.get_range(key, start, end_exclusive)
     }
+}
+
+/// `RangeFetcher` that routes each key to a per-owner [`LazyCredsFetcher`].
+///
+/// Every fetch key is `by_id/<owner>/…`, so the owner volume is read
+/// straight from the key and used to select (or lazily build) a
+/// credential scoped to exactly that volume's prefix. Each owner gets
+/// its own coordinator-vended credential (requested with `target = owner`,
+/// which the coordinator authorizes against the requester's lineage) and
+/// its own idle-drop timer — so a volume holds read credentials only for
+/// the ancestors it actually pages in, one prefix each.
+pub struct PerOwnerCredsFetcher {
+    bucket: String,
+    endpoint: Option<String>,
+    region: Option<String>,
+    socket: PathBuf,
+    macaroon: String,
+    ttl: Duration,
+    owners: RwLock<HashMap<ulid::Ulid, Arc<LazyCredsFetcher>>>,
+}
+
+impl PerOwnerCredsFetcher {
+    pub fn new(
+        bucket: String,
+        endpoint: Option<String>,
+        region: Option<String>,
+        socket: PathBuf,
+        macaroon: String,
+        ttl: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            bucket,
+            endpoint,
+            region,
+            socket,
+            macaroon,
+            ttl,
+            owners: RwLock::new(HashMap::new()),
+        })
+    }
+
+    /// Get (or lazily build) the credential fetcher for `owner`.
+    fn fetcher_for(&self, owner: ulid::Ulid) -> Arc<LazyCredsFetcher> {
+        if let Some(f) = self.owners.read().expect("per-owner read lock").get(&owner) {
+            return Arc::clone(f);
+        }
+        let mut guard = self.owners.write().expect("per-owner write lock");
+        if let Some(f) = guard.get(&owner) {
+            return Arc::clone(f);
+        }
+        let issuer = Arc::new(CoordinatorIssuer::new(
+            self.socket.clone(),
+            self.macaroon.clone(),
+            owner,
+        ));
+        let lazy = LazyCredsFetcher::new(
+            self.bucket.clone(),
+            self.endpoint.clone(),
+            self.region.clone(),
+            issuer,
+            self.ttl,
+        );
+        guard.insert(owner, Arc::clone(&lazy));
+        lazy
+    }
+}
+
+impl RangeFetcher for PerOwnerCredsFetcher {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+        let owner = owner_from_key(key)?;
+        self.fetcher_for(owner).get_range(key, start, end_exclusive)
+    }
+}
+
+/// Parse the owning volume ULID from a `by_id/<owner>/…` object key.
+fn owner_from_key(key: &str) -> io::Result<ulid::Ulid> {
+    let owner = key
+        .strip_prefix("by_id/")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or_else(|| io::Error::other(format!("fetch key is not under by_id/: {key}")))?;
+    ulid::Ulid::from_string(owner)
+        .map_err(|e| io::Error::other(format!("fetch key owner '{owner}' is not a ULID: {e}")))
 }
 
 /// Spawn a background thread that drops the cached fetcher when the
@@ -312,6 +401,22 @@ mod tests {
     /// the latter would issue a real S3 request against an unreachable
     /// bucket. The two paths share the same caching primitives, so this
     /// covers them both.
+    #[test]
+    fn owner_from_key_parses_by_id_prefix() {
+        // The owner is the second path segment of a `by_id/<owner>/…`
+        // fetch key — this is the routing key for per-owner credentials.
+        let owner = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let key = format!("by_id/{owner}/segments/20260101/01JQBBBBBBBBBBBBBBBBBBBBBB");
+        assert_eq!(
+            super::owner_from_key(&key).unwrap(),
+            ulid::Ulid::from_string(owner).unwrap()
+        );
+        // Not under by_id/, or a non-ULID owner → hard error (never a
+        // silent mis-route to the wrong credential).
+        assert!(super::owner_from_key("snapshots/foo").is_err());
+        assert!(super::owner_from_key("by_id/not-a-ulid/segments/x").is_err());
+    }
+
     #[test]
     fn cold_start_then_acquire_then_idle_drop() {
         let issuer = StubIssuer::new();

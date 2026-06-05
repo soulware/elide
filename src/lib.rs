@@ -189,23 +189,21 @@ fn build_s3_store(
         io::Error::other("fetch.toml: one of 'bucket' or 'local_path' is required")
     })?;
     if let Some(reissue) = reissue {
-        // Coordinator-vended path: cold-start the lazy wrapper. The
-        // first demand fetch (if any) will issue a `Credentials` IPC
-        // and build the inner `S3RangeFetcher`. Volumes whose warm
-        // plan is empty and whose reads are all cached never trigger
-        // an issuance.
-        let issuer = Arc::new(creds_fetcher::CoordinatorIssuer::new(
-            reissue.coordinator_socket,
-            reissue.macaroon,
-        ));
-        let lazy = creds_fetcher::LazyCredsFetcher::new(
+        // Coordinator-vended path: route each fetch to a per-owner
+        // credential keyed on the `by_id/<owner>/…` in the object key.
+        // The first demand fetch for a given owner issues a `Credentials`
+        // IPC (with `target = owner`) and builds that owner's inner
+        // `S3RangeFetcher`; volumes whose warm plan is empty and whose
+        // reads are all cached never trigger an issuance.
+        let per_owner = creds_fetcher::PerOwnerCredsFetcher::new(
             bucket,
             config.endpoint.clone(),
             config.region.clone(),
-            issuer,
+            reissue.coordinator_socket,
+            reissue.macaroon,
             creds_fetcher::DEFAULT_CREDS_IDLE_TTL,
         );
-        return Ok(lazy);
+        return Ok(per_owner);
     }
     // Standalone fallback: hold creds for the life of the process —
     // there is no IPC path to ask for fresh ones.

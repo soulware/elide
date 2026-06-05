@@ -481,9 +481,10 @@ async fn dispatch_json(
             let env: Envelope<RegisterReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::Credentials { macaroon } => {
+        Request::Credentials { macaroon, target } => {
             let result = issue_credentials(
                 &macaroon,
+                target,
                 &ctx.data_dir,
                 peer_pid,
                 ctx.identity.macaroon_root(),
@@ -2218,6 +2219,7 @@ fn resolve_volume_name(
 
 async fn issue_credentials(
     macaroon_str: &str,
+    target: ulid::Ulid,
     data_dir: &Path,
     peer_pid: Option<i32>,
     macaroon_root: &[u8; 32],
@@ -2225,14 +2227,36 @@ async fn issue_credentials(
 ) -> Result<StoreCredsReply, IpcError> {
     let (m, verified) =
         authenticate_volume_macaroon(macaroon_str, data_dir, peer_pid, macaroon_root).await?;
-    let volume_ulid_str = verified.copy_inner().to_string();
+    let requester = verified.copy_inner();
+
+    // Authorize the requested target. The macaroon authenticates the
+    // requester; `target` is the single `by_id/<target>/*` prefix it
+    // wants to read. A volume may obtain read credentials only for
+    // itself or one of its ancestors — so we re-derive the requester's
+    // lineage from local provenance and refuse anything outside it. This
+    // is the same authority the coordinator granted implicitly when it
+    // built the ancestor set itself; naming the target just makes the
+    // check explicit (`docs/design-mint.md` § per-volume read creds).
+    if target != requester {
+        let by_id_dir = data_dir.join("by_id");
+        let fork_dir = by_id_dir.join(requester.to_string());
+        let lineage = elide_core::volume::lineage_ulids(&fork_dir, &by_id_dir)
+            .map_err(|e| IpcError::internal(format!("loading requester lineage: {e}")))?;
+        if !lineage.contains(&target) {
+            return Err(IpcError::forbidden(
+                "target is neither the requesting volume nor one of its ancestors",
+            ));
+        }
+    }
+
     let creds = issuer
-        .issue(verified)
+        .issue(target)
         .await
         .map_err(|e| IpcError::internal(format!("issue: {e}")))?;
     info!(
         target: "creds::issuance",
-        volume_ulid = %volume_ulid_str,
+        requester = %requester,
+        target = %target,
         peer_pid,
         macaroon_nonce = %m.nonce_hex(),
         macaroon_not_after = ?m.narrowest_not_after(),
@@ -2465,10 +2489,7 @@ mod tests {
     struct FixedIssuer;
     #[async_trait::async_trait]
     impl CredentialIssuer for FixedIssuer {
-        async fn issue(
-            &self,
-            _vol: macaroon::Verified<ulid::Ulid>,
-        ) -> std::io::Result<IssuedCredentials> {
+        async fn issue(&self, _target: ulid::Ulid) -> std::io::Result<IssuedCredentials> {
             Ok(IssuedCredentials {
                 access_key_id: "AK".into(),
                 secret_access_key: "SK".into(),
@@ -2551,6 +2572,7 @@ mod tests {
         let issuer = FixedIssuer;
         let creds = issue_credentials(
             &mint_reply.macaroon,
+            ulid_from(ulid_str),
             tmp.path(),
             Some(my_pid),
             &key(),
@@ -2575,6 +2597,7 @@ mod tests {
         let issuer = FixedIssuer;
         let err = issue_credentials(
             &mint_reply.macaroon,
+            ulid_from(ulid_str),
             tmp.path(),
             Some(my_pid),
             &other,
@@ -2598,6 +2621,7 @@ mod tests {
         // Present a different peer pid than the macaroon was minted for.
         let err = issue_credentials(
             &mint_reply.macaroon,
+            ulid_from(ulid_str),
             tmp.path(),
             Some(my_pid + 1),
             &key(),
@@ -2637,9 +2661,16 @@ mod tests {
         // key — verify must fail.
         let forged = macaroon::mint(&[0u8; 32], caveats);
         let issuer = FixedIssuer;
-        let err = issue_credentials(&forged.encode(), tmp.path(), Some(my_pid), &key(), &issuer)
-            .await
-            .expect_err("tampered caveat should fail");
+        let err = issue_credentials(
+            &forged.encode(),
+            ulid_from(ulid_str),
+            tmp.path(),
+            Some(my_pid),
+            &key(),
+            &issuer,
+        )
+        .await
+        .expect_err("tampered caveat should fail");
         assert_eq!(err.kind, IpcErrorKind::Forbidden);
         assert!(err.message.contains("invalid macaroon"), "{err}");
     }
@@ -2660,11 +2691,95 @@ mod tests {
             ],
         );
         let issuer = FixedIssuer;
-        let err = issue_credentials(&m.encode(), tmp.path(), Some(my_pid), &key(), &issuer)
-            .await
-            .expect_err("expired macaroon should fail");
+        let err = issue_credentials(
+            &m.encode(),
+            ulid_from(ulid_str),
+            tmp.path(),
+            Some(my_pid),
+            &key(),
+            &issuer,
+        )
+        .await
+        .expect_err("expired macaroon should fail");
         assert_eq!(err.kind, IpcErrorKind::Forbidden);
         assert!(err.message.contains("expired"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn credentials_target_unrelated_volume_is_forbidden() {
+        // The macaroon authenticates the requester; `target` is the
+        // prefix it wants to read. A volume with no lineage may obtain
+        // creds only for itself — any other target is refused, so a
+        // volume cannot mint another volume's read credential.
+        let tmp = TempDir::new().unwrap();
+        let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let my_pid = std::process::id() as i32;
+        setup_volume(tmp.path(), ulid_str, my_pid);
+        let mint_reply = register_volume(ulid_from(ulid_str), tmp.path(), Some(my_pid), &key())
+            .expect("register should succeed");
+        let issuer = FixedIssuer;
+        let unrelated = ulid_from("01JQZZZZZZZZZZZZZZZZZZZZZZ");
+        let err = issue_credentials(
+            &mint_reply.macaroon,
+            unrelated,
+            tmp.path(),
+            Some(my_pid),
+            &key(),
+            &issuer,
+        )
+        .await
+        .expect_err("unrelated target must be forbidden");
+        assert_eq!(err.kind, IpcErrorKind::Forbidden);
+        assert!(err.message.contains("ancestor"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn credentials_target_ancestor_is_allowed() {
+        // A volume whose signed provenance names a parent may obtain
+        // read creds for that ancestor's prefix.
+        let tmp = TempDir::new().unwrap();
+        let ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let parent_str = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        let my_pid = std::process::id() as i32;
+        setup_volume(tmp.path(), ulid_str, my_pid);
+        // Sign self's provenance with a parent ref so lineage resolves.
+        let self_dir = tmp.path().join("by_id").join(ulid_str);
+        let self_key = elide_core::signing::generate_keypair(
+            &self_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        elide_core::signing::write_provenance(
+            &self_dir,
+            &self_key,
+            elide_core::signing::VOLUME_PROVENANCE_FILE,
+            &elide_core::signing::ProvenanceLineage {
+                parent: Some(elide_core::signing::ParentRef {
+                    volume_ulid: parent_str.to_owned(),
+                    snapshot_ulid: "01JQCCCCCCCCCCCCCCCCCCCCCC".to_owned(),
+                    pubkey: self_key.verifying_key().to_bytes(),
+                    manifest_pubkey: None,
+                }),
+                extent_index: Vec::new(),
+                oci_source: None,
+            },
+        )
+        .unwrap();
+        let mint_reply = register_volume(ulid_from(ulid_str), tmp.path(), Some(my_pid), &key())
+            .expect("register should succeed");
+        let issuer = FixedIssuer;
+        let creds = issue_credentials(
+            &mint_reply.macaroon,
+            ulid_from(parent_str),
+            tmp.path(),
+            Some(my_pid),
+            &key(),
+            &issuer,
+        )
+        .await
+        .expect("ancestor target must be allowed");
+        assert_eq!(creds.access_key_id, "AK");
     }
 
     #[test]

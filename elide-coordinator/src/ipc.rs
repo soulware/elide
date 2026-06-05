@@ -249,11 +249,13 @@ pub enum Request {
     /// returned macaroon carries `Scope::FetchWorker` so it can't be
     /// confused with a credentials-scoped daemon macaroon.
     RegisterFetchWorker { volume_ulid: Ulid },
-    /// Macaroon-authenticated short-lived credential issuance.
-    /// Verifies the MAC, re-checks SO_PEERCRED matches the macaroon's
-    /// `pid` caveat, then delegates to the configured
-    /// `CredentialIssuer`.
-    Credentials { macaroon: String },
+    /// Macaroon-authenticated short-lived credential issuance for a
+    /// single volume's `by_id/<target>/*` read prefix. Verifies the MAC,
+    /// re-checks SO_PEERCRED matches the macaroon's `pid` caveat,
+    /// authorizes `target` against the requester's lineage (a volume may
+    /// only obtain read credentials for itself or one of its ancestors),
+    /// then delegates to the configured `CredentialIssuer`.
+    Credentials { macaroon: String, target: Ulid },
     /// Mint a coordinator-signed `PeerFetchToken` claimer credential
     /// for the requesting volume daemon. Authenticated exactly like
     /// `Credentials` (MAC verify, volume caveat, SO_PEERCRED / pid

@@ -189,7 +189,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     ));
                 set_credential_issuer(crate::mint_client::MintCredentialIssuer::new(
                     credentialer.clone(),
-                    config.data_dir.clone(),
                 ));
                 info!(
                     "[coordinator] credential issuer: external mint service ({})",
