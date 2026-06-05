@@ -67,14 +67,12 @@ bucket = "mint-demo"
 
 [[role]]
 name = "read"
-required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 
 [[role]]
 name = "write"
-required_caveats = ["sub", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300

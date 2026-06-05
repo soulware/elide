@@ -26,7 +26,6 @@ bucket = "demo-bucket"
 
 [[role]]
 name = "volume-ro"
-required_caveats = ["elide:Volume", "Audience", "NotAfter"]
 min_ttl_seconds = 60
 max_ttl_seconds = 2592000
 default_ttl_seconds = 2592000

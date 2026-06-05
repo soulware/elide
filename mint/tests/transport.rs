@@ -36,7 +36,6 @@ bucket = "demo-bucket"
 enabled = true
 [[role]]
 name = "volume-rw"
-required_caveats = ["aud"]
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900

@@ -37,7 +37,6 @@ bucket = "demo-bucket"
 bucket = "demo-bucket"
 [[role]]
 name = "volume-ro"
-required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 2592000
 default_ttl_seconds = 2592000

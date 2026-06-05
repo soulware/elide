@@ -9,9 +9,19 @@
 use crate::caveat::{EffectiveCaveats, Resolved, name};
 use crate::sealed_cache::ServedSurface;
 
+const SUBJECT_CAVEAT: &str = name::SUB;
 const AUDIENCE_CAVEAT: &str = name::AUD;
 const NOT_AFTER_CAVEAT: &str = name::EXP;
 const ROLE_CAVEAT: &str = name::ROLE;
+
+/// Caveats every assume-role credential must carry, enforced for
+/// presence only and identically for every role — `sub` (principal),
+/// `aud` (audience), `exp` (expiry). Hard-coded, not role-configurable:
+/// these are universal invariants of a mint-issued credential, not a
+/// per-role policy knob. `aud` and `exp` additionally have their *values*
+/// checked below; `sub` is presence-only (its value is MAC-authentic and
+/// its holder is proven by the `cnf`+PoP gate at the HTTP layer).
+const REQUIRED_CAVEATS: [&str; 3] = [SUBJECT_CAVEAT, AUDIENCE_CAVEAT, NOT_AFTER_CAVEAT];
 
 /// Why an assume-role request was refused. Mapped to coarse HTTP
 /// statuses by the caller; never surfaced verbatim to the client.
@@ -23,7 +33,7 @@ pub enum Denied {
     WrongAudience,
     /// A `Role` caveat is present and does not permit this role.
     RoleNotPermitted,
-    /// A caveat named in the role's `required_caveats` is absent.
+    /// A universally-required caveat ([`REQUIRED_CAVEATS`]) is absent.
     MissingRequiredCaveat(String),
     /// A required caveat is present but its occurrences contradict
     /// (unsatisfiable) — fail closed, never treat as absent.
@@ -44,9 +54,10 @@ pub struct Granted {
 }
 
 /// Evaluate an assume-role request against the **sealed** surface, not
-/// the live config: `required_caveats`, the TTL bounds, and the audience
-/// are the values the operator sealed, so a drifted `roles_dir/` or
-/// `mint.toml` cannot widen them at render time.
+/// the live config: the TTL bounds and the audience are the values the
+/// operator sealed, so a drifted `roles_dir/` or `mint.toml` cannot widen
+/// them at render time. Caveat presence ([`REQUIRED_CAVEATS`]) is a fixed
+/// invariant, not part of the sealed surface.
 ///
 /// `requested_ttl` is the caller's `ttl_seconds` body field (already
 /// defaulted to the role's `default_ttl_seconds` by the caller if the
@@ -61,6 +72,21 @@ pub fn authorize(
     let role = surface.role(requested_role).ok_or(Denied::UnknownRole)?;
 
     let eff = EffectiveCaveats::new(caveats);
+
+    // Required caveats: every credential must carry `sub`/`aud`/`exp`,
+    // present *and* satisfiable. An unsatisfiable required caveat is a
+    // distinct denial, never collapsed to "missing". This is the
+    // hard-coded universal gate; `aud` and `exp` have their values
+    // checked below, `sub` is presence-only.
+    for req in REQUIRED_CAVEATS {
+        match eff.resolve(req) {
+            Resolved::Value(_) => {}
+            Resolved::Absent => return Err(Denied::MissingRequiredCaveat(req.to_string())),
+            Resolved::Unsatisfiable => {
+                return Err(Denied::UnsatisfiableCaveat(req.to_string()));
+            }
+        }
+    }
 
     // Audience: cross-service replay defence. Must resolve to a single
     // value equal to the sealed name; absent or unsatisfiable both fail
@@ -81,19 +107,6 @@ pub fn authorize(
         Resolved::Value(s) if s == requested_role => {}
         Resolved::Value(_) | Resolved::Absent | Resolved::Unsatisfiable => {
             return Err(Denied::RoleNotPermitted);
-        }
-    }
-
-    // Required caveats: must be present *and* satisfiable. An
-    // unsatisfiable required caveat is a distinct denial, never
-    // collapsed to "missing".
-    for req in &role.required_caveats {
-        match eff.resolve(req) {
-            Resolved::Value(_) => {}
-            Resolved::Absent => return Err(Denied::MissingRequiredCaveat(req.clone())),
-            Resolved::Unsatisfiable => {
-                return Err(Denied::UnsatisfiableCaveat(req.clone()));
-            }
         }
     }
 
@@ -131,7 +144,6 @@ audience = "mint"
 bucket = "b"
 [[role]]
 name = "volume-ro"
-required_caveats = ["elide:Volume", "aud", "exp"]
 min_ttl_seconds = 60
 max_ttl_seconds = 1000
 default_ttl_seconds = 800
@@ -144,11 +156,14 @@ policy_file = "volume-ro.json"
     }
 
     fn good_caveats(not_after: u64) -> Vec<Caveat> {
+        // `aud` and `role` stay at indices 0 and 1 — some tests mutate
+        // them positionally.
         vec![
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::ROLE, "volume-ro"),
             Caveat::scalar("elide:Volume", "01ARZ"),
             Caveat::scalar(name::EXP, not_after.to_string()),
+            Caveat::scalar(name::SUB, "alice"),
         ]
     }
 
@@ -183,14 +198,17 @@ policy_file = "volume-ro.json"
 
     #[test]
     fn missing_required_caveat_denied() {
+        // `sub` is universally required (presence-only); a credential
+        // lacking it is denied before any role-specific check.
         let cv = vec![
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::ROLE, "volume-ro"),
+            Caveat::scalar("elide:Volume", "01ARZ"),
             Caveat::scalar(name::EXP, "1000000"),
         ];
         assert_eq!(
             authorize(&surface(), &cv, "volume-ro", 800, 1000),
-            Err(Denied::MissingRequiredCaveat("elide:Volume".into()))
+            Err(Denied::MissingRequiredCaveat("sub".into()))
         );
     }
 
@@ -233,6 +251,7 @@ policy_file = "volume-ro.json"
     #[test]
     fn absent_role_caveat_denied_no_omnibus() {
         let cv = vec![
+            Caveat::scalar(name::SUB, "alice"),
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar("elide:Volume", "01ARZ"),
             Caveat::scalar(name::EXP, "1000000"),
