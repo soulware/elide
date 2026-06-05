@@ -1045,7 +1045,7 @@ fn print_policy_surface(template: &str) {
         ("caveat (MAC-bound)", &surface.caveats),
         ("req (PoP-bound)", &surface.req),
         ("env (config)", &surface.env),
-        ("system (mint-computed)", &surface.system),
+        ("mint (mint-computed)", &surface.mint),
     ] {
         if !vals.is_empty() {
             eprintln!("    {label}: {}", vals.join(", "));

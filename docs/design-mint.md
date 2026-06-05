@@ -1169,7 +1169,7 @@ all of them.
       {{/each}}
     ],
     "Condition": {
-      "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+      "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
     }
   }]
 }
@@ -1232,9 +1232,13 @@ issuance time, each with an explicit, distinct trust provenance:
   honest-but-unverified scoping data the coordinator computes (e.g. the
   ancestor lineage): mint transmits it into the policy, the PoP
   authenticates *who* asserted it, mint never validates the value.
-- `{{system.X}}` — values computed by the mint at request time, as a
-  plain path. v1 set: `system.expiry_iso8601` (the issued credential's
-  expiry, derived from the requested or default TTL).
+- `{{mint.X}}` — values computed by the mint at request time, as a
+  plain path. v1 set: `mint.expiry` (the issued credential's expiry as an
+  RFC 3339 / ISO 8601 instant — `now + min(requested TTL, role
+  `max_ttl_seconds`, macaroon `exp` − now)`). This is the mint's clamped
+  output, not the macaroon's raw `exp` caveat: it can be strictly tighter
+  and never looser, so a template substitutes `mint.expiry` here, never
+  `{{caveat "exp"}}`.
 
 The `caveat` helper resolves names against the chain under AND
 semantics: a scalar caveat repeated across attenuations must agree on a
@@ -1249,7 +1253,7 @@ substitution. `{{req.X}}` is likewise strict — an absent field a
 template references fails the render closed.
 
 The mint **does not** ship a general-purpose policy DSL. The entire
-template surface is `{{env.*}}` / `{{system.*}}` plain paths, the
+template surface is `{{env.*}}` / `{{mint.*}}` plain paths, the
 `caveat` scalar lookup helper, `{{req.*}}` fields, and `{{#each}}`
 over a `req.*` array. Conditional blocks, arithmetic, value
 transformations, and dynamic resource construction beyond straight
@@ -1447,8 +1451,7 @@ listed here so the issuer's surface is unambiguous):
 - `{{req.X}}` — PoP-verified request body; Elide uses
   `req.ancestors` (the `volume-ro` ancestor lineage). Vouched for
   by `coordinator.key`, never validated by mint.
-- `{{system.X}}` — mint-computed at issuance; Elide uses
-  `system.expiry_iso8601`.
+- `{{mint.X}}` — mint-computed at issuance; Elide uses `mint.expiry`.
 
 Notes:
 

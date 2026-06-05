@@ -67,7 +67,7 @@ const POLICY: &str = r#"
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"],
-    "Condition": {"DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}}
+    "Condition": {"DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}}
   }]
 }
 "#;

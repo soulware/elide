@@ -7,7 +7,7 @@
       "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
       "Resource": ["arn:aws:s3:::{{env.bucket}}/names/*"],
       "Condition": {
-        "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+        "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
       }
     },
     {
@@ -16,7 +16,7 @@
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": ["arn:aws:s3:::{{env.bucket}}/events/*"],
       "Condition": {
-        "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+        "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
       }
     },
     {
@@ -25,7 +25,7 @@
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": ["arn:aws:s3:::{{env.bucket}}/coordinators/{{caveat "sub"}}/*"],
       "Condition": {
-        "DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}
+        "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
       }
     }
   ]

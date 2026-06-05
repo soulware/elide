@@ -55,7 +55,7 @@ const POLICY: &str = r#"
       "arn:aws:s3:::{{../env.bucket}}/by_id/{{this}}/*"
       {{/each}}
     ],
-    "Condition": {"DateLessThan": {"aws:CurrentTime": "{{system.expiry_iso8601}}"}}
+    "Condition": {"DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}}
   }]
 }
 "#;
