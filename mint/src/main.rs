@@ -207,7 +207,7 @@ enum RoleCmd {
 
 #[derive(Subcommand)]
 enum EnrollCmd {
-    /// List enrollments — pending and approved — with state as a column.
+    /// List enrollments — pending and enrolled — with state as a column.
     List {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
@@ -223,7 +223,7 @@ enum EnrollCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Revoke an approved-client registry entry.
+    /// Revoke an enrolled-client registry entry.
     Revoke {
         #[arg(long, env = "MINT_CONFIG", default_value = "mint.toml")]
         config: PathBuf,
@@ -811,10 +811,10 @@ async fn enroll_revoke(config: &Path, sub: &str) -> Result<(), Box<dyn std::erro
     };
     let resp = mint::admin::revoke_enrollment(admin_target(&config), &op, &discharge, &req).await?;
     if resp.revoked {
-        eprintln!("revoked approved/{sub}; next enroll requires fresh approval");
+        eprintln!("revoked enrollment for {sub}; next enroll requires fresh approval");
         Ok(())
     } else {
-        Err(format!("no approved entry for sub {sub}").into())
+        Err(format!("no enrolled entry for sub {sub}").into())
     }
 }
 

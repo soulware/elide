@@ -55,8 +55,8 @@ enrollments; outstanding primaries are unaffected.
 - `issuance` — `mint_invite` / `mint_intermediate` / `mint_primary`
   (each a fresh chain from root) + `bound_identity`.
 - `state` — persisted invite nonce + transient pending table, a
-  directory of files (`invite`, `pending/<sub>.json`,
-  `approved/<sub>`) so the lifecycle is `ls`-inspectable. Idempotent
+  directory of files (`invite`, `clients/pending/<sub>.json`,
+  `clients/enrolled/<sub>`) so the lifecycle is `ls`-inspectable. Idempotent
   same-`(sub,pub)`, conflict on a different key, GC of stale unapproved,
   consume-on-exchange.
 - `config` — TOML: audience, `data_dir`, `roles_dir`, tenant, role

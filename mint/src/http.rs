@@ -784,19 +784,19 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         &org_id,
         location,
     );
-    // Fast path (an existing `approved/<sub>` matches the presented
+    // Fast path (an existing `clients/enrolled/<sub>` matches the presented
     // `cnf`) means /v1/enroll-exchange will succeed immediately on the
     // returned ticket without any operator action; the slow path
     // requires `mint enroll approve <sub>` to fire first.
     //
     // Lazy migration: every client restart pings /v1/enroll, so
-    // this is the natural place to drift `_mint/approved/<sub>`
+    // this is the natural place to drift `_mint/clients/enrolled/<sub>`
     // forward to the keyring's current kid (`docs/design-mint.md` §
     // *Root-key rotation*). Best-effort and untimed; failures are
-    // logged, never blocking — the MAC check in `get_approved` is
+    // logged, never blocking — the MAC check in `get_enrolled` is
     // what makes correctness load-bearing, not this write.
-    if matches!(recorded, Recorded::AlreadyApproved) {
-        match state.store.migrate_approval_to_current_kid(&sub).await {
+    if matches!(recorded, Recorded::AlreadyEnrolled) {
+        match state.store.migrate_enrollment_to_current_kid(&sub).await {
             Ok(true) => tracing::info!(
                 target: "mint::http",
                 sub = %sub,
@@ -814,7 +814,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     }
     audit(
         match recorded {
-            Recorded::AlreadyApproved => "fast_path",
+            Recorded::AlreadyEnrolled => "fast_path",
             Recorded::Created | Recorded::Idempotent => "pending",
         },
         &caveats,
@@ -920,10 +920,10 @@ async fn enroll_exchange(
         }
     };
 
-    // The approved-registry entry for this sub must exist and its
+    // The enrolled-registry entry for this sub must exist and its
     // pinned pub must match the presented cnf — the operator approved
     // *this* (sub, pub) pair (`docs/design-mint.md` § *Enrollment* (3)).
-    match state.store.get_approved(&sub).await {
+    match state.store.get_enrolled(&sub).await {
         Ok(Some(a)) if a.pubkey == cnf => {}
         // The one non-401 authorization outcome: awaited, not a
         // failure. Includes both "never approved" and "approved
@@ -931,7 +931,7 @@ async fn enroll_exchange(
         // A `Forged` record (bucket-level tamper, or a record left
         // behind by a retired kid) is folded in here too: the client
         // gets no signal that distinguishes it from a missing record,
-        // while the audit tag and `Store::get_approved`'s warn-log
+        // while the audit tag and `Store::get_enrolled`'s warn-log
         // give operators a forensic trail.
         // `Corrupt` joins `Forged` here for the same reason:
         // operationally it means "no record we can trust" — a
@@ -947,7 +947,7 @@ async fn enroll_exchange(
             );
         }
         Err(StateError::Io(e)) => {
-            tracing::error!(error = %e, "read approved");
+            tracing::error!(error = %e, "read enrolled");
             return respond(
                 &request_id,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -955,7 +955,7 @@ async fn enroll_exchange(
             );
         }
         Err(StateError::Store(msg)) => {
-            tracing::error!(error = %msg, "read approved (object store)");
+            tracing::error!(error = %msg, "read enrolled (object store)");
             return respond(
                 &request_id,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -967,10 +967,10 @@ async fn enroll_exchange(
             return unauthorized(&request_id);
         }
         Err(e) => {
-            // Conflict shouldn't reach `get_approved` (it's a
+            // Conflict shouldn't reach `get_enrolled` (it's a
             // pending-side error); reaching this arm is the
             // unforeseen-state case. Log loudly, opaque 401 to client.
-            tracing::warn!(error = %e, sub = %sub, "unexpected state error during get_approved");
+            tracing::warn!(error = %e, sub = %sub, "unexpected state error during get_enrolled");
             audit("denied:state_error", &caveats);
             return unauthorized(&request_id);
         }
@@ -997,7 +997,7 @@ async fn enroll_exchange(
     // token.
     let credential = issuance::mint_credential(&keyring, &state.config.audience, &sub, &cnf, &role);
 
-    // The approved-registry entry is not consumed: the ticket is
+    // The enrolled-registry entry is not consumed: the ticket is
     // multi-use until its `exp` and the entry powers the re-enrollment
     // fast path beyond that.
     audit("granted", &caveats);

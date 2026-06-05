@@ -7,7 +7,7 @@
 //! template's content. A bucket-credential
 //! holder cannot forge a seal — only a process holding the macaroon
 //! keyring can produce a valid MAC, the same trust anchor that signs
-//! `_mint/approved/<sub>` (PR #454).
+//! `_mint/clients/enrolled/<sub>` (PR #454).
 //!
 //! Authoring is an authenticated call to a running daemon:
 //! `POST /v1/admin/seal` ([`crate::admin`]) hashes the daemon's own

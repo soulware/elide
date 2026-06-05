@@ -82,7 +82,7 @@ A **seal** is a small signed object in the tenant bucket that pins:
   roles.
 
 The seal is MAC'd under the macaroon keyring's current kid — the
-same trust anchor that signs `_mint/approved/<sub>` (PR #454). A
+same trust anchor that signs `_mint/clients/enrolled/<sub>` (PR #454). A
 bucket-only attacker can't produce a valid seal; only a process
 holding the keyring can. Template *bytes* never enter the bucket —
 they are distributed to every host out-of-band by the same

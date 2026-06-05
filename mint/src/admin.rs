@@ -200,7 +200,7 @@ async fn build_invite(state: &AppState) -> Result<InviteResponse, Response> {
 #[derive(Serialize, Deserialize)]
 pub struct EnrollmentRow {
     pub sub: String,
-    /// `"pending"` or `"approved"`.
+    /// `"pending"` or `"enrolled"`.
     pub state: String,
     pub pubkey: String,
     pub fingerprint: String,
@@ -215,7 +215,7 @@ impl From<EnrollmentView> for EnrollmentRow {
             sub: v.sub,
             state: match v.state {
                 EnrollmentState::Pending => "pending".into(),
-                EnrollmentState::Approved => "approved".into(),
+                EnrollmentState::Enrolled => "enrolled".into(),
             },
             pubkey: v.pubkey,
             fingerprint: v.fingerprint,
