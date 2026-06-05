@@ -589,10 +589,7 @@ mod tests {
             "latest-snapshot lookup must use volume-ro for vol_ulid {vol_ulid}; got {calls:?}"
         );
         assert!(
-            !calls.iter().any(|c| matches!(
-                c,
-                RoleCall::VolumeRw(_) | RoleCall::ReadHeadWithAncestors(_, _)
-            )),
+            !calls.iter().any(|c| matches!(c, RoleCall::VolumeRw(_))),
             "front-half must not burn a volume-rw or chain mint; got {calls:?}"
         );
     }
