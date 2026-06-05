@@ -66,7 +66,7 @@ const POLICY: &str = r#"
   "Statement": [{
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
-    "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"],
+    "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{req.volume}}/*"],
     "Condition": {"DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}}
   }]
 }
@@ -332,16 +332,15 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // (5) attenuate the credential and assume a role with it
-    let req = credential
-        .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
-        .attenuate(Caveat::scalar("elide:Volume", "VOL1"));
+    // (5) attenuate the credential and assume a role with it. The target
+    // volume rides the PoP-signed body as `req.volume`, not a caveat.
+    let req = credential.attenuate(Caveat::scalar(name::EXP, far_future().to_string()));
     let (status, body) = parts(
         app.oneshot(signed(
             "/v1/assume-role",
             &req,
             &CLIENT_SEED,
-            r#","role":"volume-ro","ttl_seconds":3600"#,
+            r#","role":"volume-ro","ttl_seconds":3600,"volume":"01JQAAAAAAAAAAAAAAAAAAAAAA""#,
         ))
         .await
         .unwrap(),

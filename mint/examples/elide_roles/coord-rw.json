@@ -23,7 +23,7 @@
       "Sid": "OwnIdentityImmutable",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": ["arn:aws:s3:::{{env.bucket}}/coordinators/{{caveat "sub"}}/*"],
+      "Resource": ["arn:aws:s3:::{{env.bucket}}/coordinators/{{caveat.sub}}/*"],
       "Condition": {
         "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
       }

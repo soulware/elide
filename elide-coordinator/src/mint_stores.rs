@@ -41,8 +41,6 @@ use crate::mint_client::{
     MintEndpoint, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO, ROLE_VOLUME_RW, VOLUME_RO_TTL_SECS,
 };
 
-const CAVEAT_VOLUME: &str = "elide:Volume";
-
 /// Documented coord-* TTLs (`docs/design-mint.md` § *Elide as
 /// customer*): coordinator-wide control plane 1h, per-volume data 24h.
 const COORD_CONTROL_TTL_SECS: u64 = 60 * 60;
@@ -166,13 +164,10 @@ impl RoleStore {
     }
 
     async fn assume(&self) -> std::io::Result<crate::credential::IssuedCredentials> {
-        let vol = self.vol_ulid.map(|v| v.to_string());
-        let narrowing: Vec<(&str, &str)> = match &vol {
-            Some(v) => vec![(CAVEAT_VOLUME, v.as_str())],
-            None => Vec::new(),
-        };
+        // The per-volume target (`volume-ro` / `volume-rw`) rides the
+        // assume-role body as `req.volume`; coord-wide roles pass `None`.
         self.endpoint
-            .assume_role(self.role, self.ttl_secs, &narrowing)
+            .assume_role(self.role, self.ttl_secs, self.vol_ulid)
             .await
     }
 }

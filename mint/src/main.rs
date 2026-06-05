@@ -1042,10 +1042,10 @@ fn print_policy_surface(template: &str) {
     let surface = mint::template::template_surface(template);
     eprintln!("  policy references:");
     for (label, vals) in [
-        ("caveat (MAC-bound)", &surface.caveats),
         ("req (PoP-bound)", &surface.req),
         ("env (config)", &surface.env),
         ("mint (mint-computed)", &surface.mint),
+        ("caveat (MAC-verified)", &surface.caveat),
     ] {
         if !vals.is_empty() {
             eprintln!("    {label}: {}", vals.join(", "));

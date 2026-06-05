@@ -1,37 +1,28 @@
 //! Policy-template rendering (`docs/design-mint.md` § *Templating*).
 //!
-//! Three substitution classes are exposed to a role's policy template:
+//! Four substitution classes are exposed to a role's policy template,
+//! each a plain handlebars data path:
 //!
-//! - `{{env.X}}`               — server-side config (the `[env]` table).
-//! - `{{caveat "elide:X"}}`    — verified-macaroon caveat, looked up
-//!   through a registered `caveat` helper. Scalars render directly;
-//!   list caveats iterate as `{{#each (caveat "elide:X")}}`.
-//! - `{{mint.X}}`              — mint-computed (`mint.expiry`).
+//! - `{{env.X}}`     — server-side config (the `[env]` table).
+//! - `{{req.X}}`     — PoP-verified request-body fields, the channel the
+//!   coordinator uses to convey scoping data such as the target volume
+//!   (`req.volume`).
+//! - `{{mint.X}}`    — mint-computed (`mint.expiry`).
+//! - `{{caveat.X}}`  — MAC-verified caveat values from the presented
+//!   macaroon, e.g. `caveat.sub` (the enrolment-immutable principal). The
+//!   value is sourced from the verified chain, never echoed through the
+//!   request body, so it cannot be forged: a contradictory occurrence
+//!   resolves [`Resolved::Unsatisfiable`] and is *omitted*, and a
+//!   reference to an absent caveat fails the render closed (strict mode).
 //!
-//! Caveats are reached through the `caveat` *helper* — not a
-//! `{{caveat.X}}` data path — for two reasons:
-//!
-//! 1. The design doc namespaces caveats with `:` (`elide:Volume`),
-//!    which is not a legal handlebars path segment. The helper takes
-//!    the name as a string argument, so the doc's `:` convention is
-//!    preserved unchanged (no issuer-side rename).
-//! 2. It tightens the "mint ships no policy DSL" property: the only
-//!    template surface is `{{env.*}}` / `{{mint.*}}` plain paths,
-//!    one `caveat` lookup helper, and the built-in `{{#each}}`. There
-//!    is no arbitrary data-graph traversal.
-//!
-//! The helper resolves names against the **effective** caveat set
-//! ([`crate::caveat::EffectiveCaveats::effective`]) — list caveats are
-//! intersected, scalars must agree — so the minted policy reflects
-//! exactly the authority the gate evaluated, never a broader
-//! last-occurrence view.
+//! The surface is exactly these plain scalar paths — mint ships no
+//! policy DSL, and there is no arbitrary data-graph traversal. Each
+//! class has a distinct, explicit trust provenance: `env.*` config,
+//! `req.*` PoP-bound, `mint.*` mint-computed, `caveat.*` MAC-verified.
 
 use std::collections::BTreeMap;
 
-use handlebars::{
-    Context, Handlebars, Helper, HelperDef, RenderContext, RenderError, RenderErrorReason,
-    ScopedJson,
-};
+use handlebars::Handlebars;
 use serde_json::{Map, Value};
 
 use crate::caveat::{Caveat, EffectiveCaveats, Resolved};
@@ -46,51 +37,6 @@ pub enum TemplateError {
     NotJson(serde_json::Error),
 }
 
-/// The `caveat` scalar lookup helper. Holds the resolved-caveat map;
-/// `{{caveat "name"}}` resolves against it. A name that is absent **or
-/// unsatisfiable** is a hard render error (fail closed): a role
-/// template referencing a caveat the macaroon doesn't carry — or whose
-/// occurrences contradict — must never mint an unscoped or downgraded
-/// credential. All caveats are scalar; there is no `{{#each}}` over a
-/// caveat (ancestor-style lists are PoP-signed `req.*` data).
-struct CaveatHelper {
-    resolved: BTreeMap<String, String>,
-}
-
-impl HelperDef for CaveatHelper {
-    fn call_inner<'reg: 'rc, 'rc>(
-        &self,
-        h: &Helper<'rc>,
-        _: &'reg Handlebars<'reg>,
-        _: &'rc Context,
-        _: &mut RenderContext<'reg, 'rc>,
-    ) -> Result<ScopedJson<'rc>, RenderError> {
-        let name = h
-            .param(0)
-            .and_then(|p| p.value().as_str())
-            .ok_or(RenderErrorReason::ParamNotFoundForIndex("caveat", 0))?;
-        let value = self.resolved.get(name).ok_or_else(|| {
-            RenderErrorReason::Other(format!("caveat not present or unsatisfiable: {name}"))
-        })?;
-        Ok(ScopedJson::Derived(Value::String(value.clone())))
-    }
-}
-
-/// Build the resolved-caveat map: one entry per distinct caveat name
-/// whose chain occurrences resolve to a single agreed value. `Absent`
-/// and `Unsatisfiable` names are omitted, so a template referencing
-/// either fails the render closed.
-fn resolved_map(caveats: &[Caveat]) -> BTreeMap<String, String> {
-    let eff = EffectiveCaveats::new(caveats);
-    let mut map = BTreeMap::new();
-    for name in eff.names() {
-        if let Resolved::Value(v) = eff.resolve(name) {
-            map.insert(name.to_string(), v);
-        }
-    }
-    map
-}
-
 /// Render `policy_template` into a concrete IAM policy JSON string.
 ///
 /// `request` is the **PoP-verified** request body (its provenance is
@@ -98,14 +44,22 @@ fn resolved_map(caveats: &[Caveat]) -> BTreeMap<String, String> {
 /// see [`crate::pop`]); it is exposed as the `req.*` namespace.
 /// The caller must verify the PoP signature *before* passing the
 /// body here.
+///
+/// `caveats` is the **MAC-verified** caveat chain (the aggregated set
+/// `verify_and_clear` returns); it is exposed as the `caveat.*`
+/// namespace. Only caveats that resolve to a single [`Resolved::Value`]
+/// are exposed — a contradictory (`Unsatisfiable`) occurrence is
+/// omitted, so a holder cannot smuggle a forged value past the renderer
+/// by appending a contradictory copy under the trailing MAC.
+///
 /// Each substitution class has a distinct, explicit trust provenance:
-/// `caveat.*` MAC-bound, `req.*` PoP-bound, `env.*` config,
-/// `mint.*` mint-computed.
+/// `req.*` PoP-bound, `env.*` config, `mint.*` mint-computed,
+/// `caveat.*` MAC-verified.
 pub fn render_policy(
     policy_template: &str,
     env: &BTreeMap<String, String>,
-    caveats: &[Caveat],
     request: &Value,
+    caveats: &[Caveat],
     expiry: &str,
     role: &str,
 ) -> Result<String, TemplateError> {
@@ -114,12 +68,6 @@ pub fn render_policy(
     reg.register_escape_fn(handlebars::no_escape);
     // A missing variable is a misconfigured role, not an empty string.
     reg.set_strict_mode(true);
-    reg.register_helper(
-        "caveat",
-        Box::new(CaveatHelper {
-            resolved: resolved_map(caveats),
-        }),
-    );
 
     let mut env_map = Map::new();
     for (k, v) in env {
@@ -129,10 +77,24 @@ pub fn render_policy(
     let mut mint_map = Map::new();
     mint_map.insert("expiry".into(), Value::String(expiry.to_string()));
 
+    // Verified caveats, by name. Resolution is the same scalar-AND the
+    // gate uses: an `Unsatisfiable` name is dropped, never exposed — a
+    // `{{caveat.X}}` over it then fails the render closed under strict
+    // mode rather than silently substituting one of the disagreeing
+    // occurrences.
+    let eff = EffectiveCaveats::new(caveats);
+    let mut caveat_map = Map::new();
+    for name in eff.names() {
+        if let Resolved::Value(v) = eff.resolve(name) {
+            caveat_map.insert(name.to_string(), Value::String(v));
+        }
+    }
+
     let mut data = Map::new();
     data.insert("env".into(), Value::Object(env_map));
     data.insert("mint".into(), Value::Object(mint_map));
     data.insert("req".into(), request.clone());
+    data.insert("caveat".into(), Value::Object(caveat_map));
 
     // Register under the role name so handlebars error messages name
     // the role ("...rendering \"read\"...") instead of the opaque
@@ -144,24 +106,23 @@ pub fn render_policy(
 }
 
 /// The substitution surface a policy template references, grouped by
-/// trust provenance (`docs/design-mint.md` § *Templating*): `caveats`
-/// MAC-bound, `req` PoP-bound, `env` config, `mint`
-/// mint-computed. Each list is sorted and de-duplicated.
+/// trust provenance (`docs/design-mint.md` § *Templating*): `req`
+/// PoP-bound, `env` config, `mint` mint-computed, `caveat` MAC-verified.
+/// Each list is sorted and de-duplicated.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TemplateSurface {
-    pub caveats: Vec<String>,
     pub env: Vec<String>,
     pub mint: Vec<String>,
     pub req: Vec<String>,
+    pub caveat: Vec<String>,
 }
 
 /// Extract the [`TemplateSurface`] of a policy template by scanning the
-/// four documented token shapes — `{{caveat "name"}}`, `{{env.*}}`,
-/// `{{mint.*}}`, `{{req.*}}` (with optional `../`/`./` scope
-/// prefixes and `(…)` subexpression wrapping). Lets `mint role inspect`
-/// state what a role's policy depends on without rendering it:
-/// rendering needs a live verified request and fails closed on any
-/// absent caveat, so there is no static "what this grants" to show.
+/// four documented token shapes — `{{env.*}}`, `{{mint.*}}`, `{{req.*}}`,
+/// `{{caveat.*}}` (with optional `../`/`./` scope prefixes). Lets `mint
+/// role inspect` state what a role's policy depends on without rendering
+/// it: rendering needs a live verified request body, so there is no
+/// static "what this grants" to show.
 pub fn template_surface(template: &str) -> TemplateSurface {
     let mut s = TemplateSurface::default();
     let mut i = 0;
@@ -179,20 +140,7 @@ pub fn template_surface(template: &str) -> TemplateSurface {
         if inner.starts_with('/') || inner.starts_with('!') || inner.starts_with('>') {
             continue; // block close, comment, partial — no data refs
         }
-        let mut tokens = inner.split_whitespace().peekable();
-        while let Some(tok) = tokens.next() {
-            // `caveat "name"` / `(caveat "name")` — the name is the
-            // next token, quote- and paren-stripped (caveat names carry
-            // `:`, so only trim wrapping punctuation).
-            if tok.trim_start_matches('(') == "caveat" {
-                if let Some(arg) = tokens.peek() {
-                    let name = arg.trim_matches(|c: char| matches!(c, '(' | ')' | '"' | '\''));
-                    if !name.is_empty() {
-                        s.caveats.push(name.to_string());
-                    }
-                }
-                continue;
-            }
+        for tok in inner.split_whitespace() {
             // A plain path: strip a leading `(`, any number of `../`
             // and a `./` scope prefix, and a trailing `)`.
             let mut p = tok.trim_start_matches('(').trim_end_matches(')');
@@ -206,6 +154,8 @@ pub fn template_surface(template: &str) -> TemplateSurface {
                 Some(&mut s.mint)
             } else if p == "req" || p.starts_with("req.") {
                 Some(&mut s.req)
+            } else if p == "caveat" || p.starts_with("caveat.") {
+                Some(&mut s.caveat)
             } else {
                 None
             };
@@ -214,7 +164,7 @@ pub fn template_surface(template: &str) -> TemplateSurface {
             }
         }
     }
-    for v in [&mut s.caveats, &mut s.env, &mut s.mint, &mut s.req] {
+    for v in [&mut s.env, &mut s.mint, &mut s.req, &mut s.caveat] {
         v.sort();
         v.dedup();
     }
@@ -234,62 +184,82 @@ mod tests {
   "Statement": [{
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
-    "Resource": [
-      "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat "elide:Volume"}}/*"
-      {{#each req.ancestors}},
-      "arn:aws:s3:::{{../env.bucket}}/by_id/{{this}}/*"
-      {{/each}}
-    ],
+    "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{req.volume}}/*"],
     "Condition": {"DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}}
   }]
 }"#;
 
-    fn req(ancestors: &[&str]) -> Value {
-        serde_json::json!({ "ancestors": ancestors })
+    fn req(volume: &str) -> Value {
+        serde_json::json!({ "volume": volume })
+    }
+
+    fn cv(pairs: &[(&str, &str)]) -> Vec<Caveat> {
+        pairs.iter().map(|(n, v)| Caveat::scalar(*n, *v)).collect()
     }
 
     #[test]
-    fn renders_scalar_caveat_signed_request_list_and_mint() {
-        let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
+    fn renders_env_req_scalar_and_mint() {
         let out = render_policy(
             TPL,
             &env(),
-            &caveats,
-            &req(&["ANC1", "ANC2"]),
+            &req("VOL1"),
+            &[],
             "2026-05-15T14:30:00Z",
             "volume-ro",
         )
         .unwrap();
         assert!(out.contains("demo/by_id/VOL1/*"));
-        assert!(out.contains("by_id/ANC1/*"));
-        assert!(out.contains("by_id/ANC2/*"));
         assert!(out.contains("2026-05-15T14:30:00Z"));
         serde_json::from_str::<Value>(&out).expect("valid json");
     }
 
     #[test]
-    fn empty_request_ancestors_renders_self_only() {
-        // Maximal narrowing — zero ancestors is a coherent grant, not
-        // an error: the {{#each}} simply emits nothing.
-        let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
-        let out = render_policy(TPL, &env(), &caveats, &req(&[]), "t", "volume-ro").unwrap();
-        assert!(out.contains("by_id/VOL1/*"));
-        assert!(!out.contains("by_id//*"));
-        serde_json::from_str::<Value>(&out).expect("valid json");
+    fn caveat_sub_comes_from_the_chain_not_the_body() {
+        // `{{caveat.sub}}` substitutes the MAC-verified principal —
+        // sourced from the caveat chain, never the request body. A body
+        // field also named `sub` lands in the `req` namespace and must
+        // not bleed into `caveat.*`: a forged body value cannot displace
+        // the MAC-bound one.
+        const TPL_SUB: &str = r#"{"Resource":["arn:aws:s3:::b/coordinators/{{caveat.sub}}/*"]}"#;
+        let out = render_policy(
+            TPL_SUB,
+            &env(),
+            &serde_json::json!({ "sub": "FORGED" }),
+            &cv(&[("sub", "COORD1"), ("aud", "mint")]),
+            "t",
+            "coord-rw",
+        )
+        .unwrap();
+        assert!(out.contains("coordinators/COORD1/*"), "got: {out}");
+        assert!(
+            !out.contains("FORGED"),
+            "body sub bled into caveat.sub: {out}"
+        );
     }
 
     #[test]
-    fn unknown_caveat_is_error() {
-        let err = render_policy(r#"{{caveat "nope"}}"#, &env(), &[], &req(&[]), "x", "r");
+    fn unsatisfiable_caveat_is_omitted_and_fails_closed() {
+        // Two disagreeing `sub` occurrences resolve Unsatisfiable; the
+        // renderer omits the name rather than picking one, so a
+        // `{{caveat.sub}}` over it fails the render closed (strict mode)
+        // — no forged value can ride a contradictory appended copy.
+        const TPL_SUB: &str = r#"{"Resource":["{{caveat.sub}}"]}"#;
+        let err = render_policy(
+            TPL_SUB,
+            &env(),
+            &serde_json::json!({}),
+            &cv(&[("sub", "REAL"), ("sub", "FORGED")]),
+            "t",
+            "coord-rw",
+        );
         assert!(matches!(err, Err(TemplateError::Render(_))));
     }
 
     #[test]
     fn missing_request_field_fails_closed() {
-        // Strict mode: a template referencing req.ancestors when
-        // the signed body omitted it must fail the render, not mint.
-        let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
-        let err = render_policy(TPL, &env(), &caveats, &serde_json::json!({}), "t", "r");
+        // Strict mode: a template referencing req.volume when the signed
+        // body omitted it must fail the render, not mint.
+        let err = render_policy(TPL, &env(), &serde_json::json!({}), &[], "t", "r");
         assert!(matches!(err, Err(TemplateError::Render(_))));
     }
 
@@ -300,8 +270,8 @@ mod tests {
         let err = render_policy(
             "{{req.prefix}}",
             &env(),
-            &[],
             &serde_json::json!({}),
+            &[],
             "t",
             "read",
         )
@@ -318,50 +288,23 @@ mod tests {
     }
 
     #[test]
-    fn contradictory_scalar_caveat_fails_closed() {
-        // Two disagreeing scalar occurrences ⇒ Unsatisfiable ⇒ omitted
-        // from the resolved map ⇒ template referencing it errors
-        // rather than minting a downgraded credential.
-        let caveats = vec![
-            Caveat::scalar("elide:Volume", "VOL1"),
-            Caveat::scalar("elide:Volume", "VOL2"),
-        ];
-        let err = render_policy(
-            r#"{{caveat "elide:Volume"}}"#,
-            &env(),
-            &caveats,
-            &req(&[]),
-            "x",
-            "r",
-        );
-        assert!(matches!(err, Err(TemplateError::Render(_))));
-    }
-
-    #[test]
-    fn surface_groups_refs_by_provenance_through_scopes_and_subexprs() {
-        // TPL exercises every shape: a scalar caveat, a `../`-scoped
-        // env ref inside an #each block, a req.* block path, and
-        // a mint.* ref. `{{this}}` and the `each` helper are not data
-        // refs and must not leak in.
+    fn surface_groups_refs_by_provenance() {
+        // TPL references one of each request-side namespace: `env.bucket`,
+        // `req.volume`, `mint.expiry`.
         let s = template_surface(TPL);
-        assert_eq!(s.caveats, vec!["elide:Volume"]);
-        assert_eq!(s.env, vec!["env.bucket"]); // ../ scope folded
+        assert_eq!(s.env, vec!["env.bucket"]);
         assert_eq!(s.mint, vec!["mint.expiry"]);
-        assert_eq!(s.req, vec!["req.ancestors"]);
+        assert_eq!(s.req, vec!["req.volume"]);
+        assert!(s.caveat.is_empty());
 
-        // Subexpression form `{{#each (caveat "elide:X")}}` and a bare
-        // namespace token both resolve; duplicates collapse.
-        let s = template_surface(
-            r#"{{caveat "a"}} {{caveat "a"}} {{#each (caveat "b")}}{{env}}{{/each}}"#,
-        );
-        assert_eq!(s.caveats, vec!["a", "b"]);
-        assert_eq!(s.env, vec!["env"]);
-        assert!(s.mint.is_empty() && s.req.is_empty());
+        // The MAC-verified namespace is scanned too.
+        let cav = template_surface("{{caveat.sub}}");
+        assert_eq!(cav.caveat, vec!["caveat.sub"]);
 
-        // Comments/partials contribute nothing.
-        assert_eq!(
-            template_surface("{{! caveat \"x\" }}{{> partial}}"),
-            TemplateSurface::default()
-        );
+        // `../` scope prefixes fold to the base namespace; comments and
+        // partials contribute nothing.
+        let scoped = template_surface("{{../env.region}} {{! a comment }}{{> partial}}");
+        assert_eq!(scoped.env, vec!["env.region"]);
+        assert!(scoped.mint.is_empty() && scoped.req.is_empty() && scoped.caveat.is_empty());
     }
 }
