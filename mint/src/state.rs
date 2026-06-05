@@ -474,13 +474,27 @@ impl Store {
     /// key. `keyring_dir` is the local directory the macaroon keyring
     /// is loaded from / written to. `legacy_singleton` migrates an
     /// older `<data_dir>/root_key` if present. `initial_key` seeds the
-    /// first-start case for multi-host deployments.
+    /// first-start case for multi-host deployments. `allow_generate`
+    /// permits minting a fresh keyring when none is provisioned (demo
+    /// mode only); a production instance with an empty `root_keys/` and
+    /// no supplied key fails closed rather than diverging from its peers.
     pub async fn open_remote(
         objects: Arc<dyn ObjectStore>,
         keyring_dir: &Path,
         legacy_singleton: Option<&Path>,
         initial_key: Option<[u8; 32]>,
+        allow_generate: bool,
     ) -> io::Result<Store> {
+        if !allow_generate
+            && initial_key.is_none()
+            && !Keyring::is_provisioned(keyring_dir, legacy_singleton)
+        {
+            return Err(io::Error::other(format!(
+                "macaroon keyring absent at {keyring_dir:?}; provision root_keys/ \
+                 out-of-band (multi-host: replicate the same keyring to every \
+                 instance) or enable [demo_auth] to generate one"
+            )));
+        }
         let keyring =
             Keyring::open(keyring_dir, legacy_singleton, initial_key).map_err(io::Error::other)?;
         let store = Store::with_object_store(keyring, objects);
@@ -1712,6 +1726,54 @@ mod tests {
         );
         let text = std::fs::read_to_string(&f).unwrap();
         assert_eq!(text.trim().len(), 64, "stored as 64 hex chars");
+    }
+
+    #[tokio::test]
+    async fn open_remote_gates_keyring_generation_on_demo() {
+        let d = tempfile::tempdir().unwrap();
+        let kr = d.path().join("root_keys");
+        let legacy = d.path().join("root_key");
+
+        // Production first start, empty keyring, no supplied key: fail
+        // closed rather than mint a divergent master key.
+        let err = Store::open_remote(Arc::new(InMemory::new()), &kr, Some(&legacy), None, false)
+            .await
+            .map(drop)
+            .expect_err("must refuse to generate outside demo");
+        assert!(
+            !Keyring::is_provisioned(&kr, Some(&legacy)),
+            "nothing written"
+        );
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+
+        // Demo mode mints one.
+        Store::open_remote(Arc::new(InMemory::new()), &kr, Some(&legacy), None, true)
+            .await
+            .expect("demo generates a keyring");
+        assert!(Keyring::is_provisioned(&kr, Some(&legacy)));
+
+        // Once provisioned, a production instance loads it with generation
+        // still disallowed.
+        Store::open_remote(Arc::new(InMemory::new()), &kr, Some(&legacy), None, false)
+            .await
+            .expect("a provisioned keyring loads with generation disallowed");
+    }
+
+    #[tokio::test]
+    async fn open_remote_accepts_supplied_key_without_demo() {
+        // A caller-supplied key is itself a provisioning act — the
+        // multi-host first-start shape — so it is allowed even with
+        // generation disallowed.
+        let d = tempfile::tempdir().unwrap();
+        Store::open_remote(
+            Arc::new(InMemory::new()),
+            &d.path().join("root_keys"),
+            Some(&d.path().join("root_key")),
+            Some([7u8; 32]),
+            false,
+        )
+        .await
+        .expect("supplied key provisions even outside demo");
     }
 
     #[tokio::test]

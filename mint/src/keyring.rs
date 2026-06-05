@@ -106,6 +106,19 @@ impl Keyring {
         Ok(Self { keys, current })
     }
 
+    /// Whether a keyring is already provisioned at `dir` — at least one
+    /// generation file present, or a migratable legacy singleton. The
+    /// serve path consults this to refuse silent first-start generation
+    /// outside demo mode: a production instance with an empty `root_keys/`
+    /// is a mis-provisioned deployment, not a request to mint a fresh
+    /// master key.
+    pub fn is_provisioned(dir: &Path, legacy_singleton: Option<&Path>) -> bool {
+        if legacy_singleton.is_some_and(|p| p.exists()) {
+            return true;
+        }
+        read_all_keys(dir).is_ok_and(|keys| !keys.is_empty())
+    }
+
     /// Load (or initialise) the on-disk keyring at `dir`.
     ///
     /// - `legacy_singleton`: optional path to the historical
