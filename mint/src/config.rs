@@ -59,6 +59,12 @@ pub enum ConfigError {
     NonScalarEnv { key: String },
     #[error("role {role}: template references env.{key} but [env] has no such key")]
     UndefinedEnvKey { role: String, key: String },
+    #[error("role {role}: {source}")]
+    UnsafeTemplate {
+        role: String,
+        #[source]
+        source: crate::template::TemplateError,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,16 +460,31 @@ impl Config {
         })
     }
 
-    /// Check that every `{{env.X}}` a role template references names a key
-    /// present in `[env]`. This gates **seal authoring** (`POST
-    /// /v1/admin/seal`): a seal must not pin templates that reference
-    /// undefined env values. It is *not* run at config load — the request
-    /// path renders the sealed surface, decoupled from the live config, so
-    /// a drifted local template must never block a host from serving its
-    /// already-sealed roles. Render-time strict mode is the final backstop
-    /// if `[env]` is later mutated to drop a key a sealed template uses.
+    /// Gate **seal authoring** (`POST /v1/admin/seal`) on two template
+    /// properties, so an unservable role surfaces at publish time rather
+    /// than as a per-request fail-closed render:
+    ///
+    /// 1. Every `{{env.X}}` a role template references names a key present
+    ///    in `[env]` — a seal must not pin templates referencing undefined
+    ///    env values.
+    /// 2. The template is safe to render under JSON-string escaping —
+    ///    every value substitution is string-positioned and no raw stache
+    ///    appears ([`crate::template::validate_substitutions`]), so a
+    ///    caller-influenced value can never restructure the policy.
+    ///
+    /// Neither is run at config load — the request path renders the sealed
+    /// surface, decoupled from the live config, so a drifted local template
+    /// must never block a host from serving its already-sealed roles.
+    /// Render-time strict mode and the same substitution gate are the final
+    /// backstops if `[env]` is later mutated or a template slips through.
     pub fn validate_env_surface(&self) -> Result<(), ConfigError> {
         for role in self.roles.values() {
+            crate::template::validate_substitutions(&role.policy).map_err(|source| {
+                ConfigError::UnsafeTemplate {
+                    role: role.name.clone(),
+                    source,
+                }
+            })?;
             for path in crate::template::template_surface(&role.policy).env {
                 if let Some(key) = path.strip_prefix("env.")
                     && !self.env.contains_key(key)
@@ -640,6 +661,19 @@ policy_file = "r.json"
         assert!(matches!(
             cfg.validate_env_surface(),
             Err(ConfigError::UndefinedEnvKey { key, .. }) if key == "region"
+        ));
+    }
+
+    #[test]
+    fn unsafe_template_passes_load_but_fails_seal_validation() {
+        // A value substitution placed outside a JSON string can't be made
+        // safe by escaping, so the seal gate rejects it — but config load
+        // still tolerates it (serving renders the sealed surface).
+        let cfg = parse_for_test(ENV_SAMPLE, &[("r.json", r#"{"ttl": {{env.bucket}}}"#)])
+            .expect("load tolerates a non-string-positioned reference");
+        assert!(matches!(
+            cfg.validate_env_surface(),
+            Err(ConfigError::UnsafeTemplate { role, .. }) if role == "r"
         ));
     }
 

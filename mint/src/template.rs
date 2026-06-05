@@ -44,6 +44,10 @@ pub enum TemplateError {
     Compile(#[from] handlebars::TemplateError),
     #[error("rendered policy is not valid JSON: {0}")]
     NotJson(serde_json::Error),
+    #[error("substitution `{0}` is not inside a JSON string literal")]
+    NonStringSubstitution(String),
+    #[error("raw (unescaped) substitution `{0}` is not allowed")]
+    RawSubstitution(String),
 }
 
 /// The `caveat` scalar lookup helper. Holds the resolved-caveat map;
@@ -91,6 +95,96 @@ fn resolved_map(caveats: &[Caveat]) -> BTreeMap<String, String> {
     map
 }
 
+/// Escape `s` for embedding inside a JSON string literal. Substituted
+/// values are caller-influenced (`req.*` is honest-but-unverified, an
+/// appended `caveat` is holder-chosen), so without escaping a value
+/// carrying `"`/`\` could close its string and restructure the policy
+/// while staying valid JSON — escalating a scoped credential to a
+/// broader grant. serde_json's encoder produces a fully-escaped quoted
+/// string; the template already supplies the surrounding quotes, so the
+/// outer pair is dropped. This is the handlebars escape function, so it
+/// applies uniformly to every `{{…}}` value (`env`, `caveat`, `req`,
+/// `mint`). It is a no-op on injection-free values.
+fn escape_json_string(s: &str) -> String {
+    match serde_json::to_string(s) {
+        // Quotes are single ASCII bytes, so [1..len-1] is on char
+        // boundaries.
+        Ok(quoted) if quoted.len() >= 2 => quoted[1..quoted.len() - 1].to_string(),
+        // Serialising a `&str` is infallible; an empty render (`""`) on
+        // the impossible error path fails safe — never a breakout.
+        _ => String::new(),
+    }
+}
+
+/// Verify the template is safe to render under [`escape_json_string`]:
+/// every **value-emitting** `{{…}}` must sit inside a JSON string
+/// literal, and no raw (`{{{…}}}` / `{{& …}}`) substitution may appear.
+///
+/// The escape only neutralises breakout for a value placed *inside* a
+/// string — it escapes `"`/`\`/control chars, not the structural
+/// `,{}[]`. A value hole in a bare JSON position, or a raw stache that
+/// bypasses the escape, could still restructure the policy, so both are
+/// rejected before any rendering. Section/block tokens (`{{#each}}`,
+/// `{{/each}}`, inverted `{{^}}`, `{{else}}`, comments, partials) emit
+/// no value of their own and may sit anywhere — only value expressions
+/// are constrained, which is what lets `{{#each req.ancestors}}` wrap a
+/// string-positioned `{{this}}`.
+pub(crate) fn validate_substitutions(template: &str) -> Result<(), TemplateError> {
+    let b = template.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false; // prev byte was a backslash inside a string
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'{' && i + 1 < b.len() && b[i + 1] == b'{' {
+            let triple = i + 2 < b.len() && b[i + 2] == b'{';
+            let close_pat = if triple { "}}}" } else { "}}" };
+            let open = i + 2;
+            let Some(rel) = template[open..].find(close_pat) else {
+                break; // unterminated — handlebars compile will report it
+            };
+            let end = open + rel;
+            let inner = template[open..end]
+                .trim_matches(|c: char| c.is_whitespace() || matches!(c, '{' | '}' | '~'));
+            let amp = inner.starts_with('&');
+            let token = inner.trim_start_matches('&').trim_start();
+            // Section/block/comment/partial tokens emit no value.
+            let is_control = token.is_empty()
+                || token.starts_with('#')
+                || token.starts_with('/')
+                || token.starts_with('^')
+                || token.starts_with('!')
+                || token.starts_with('>')
+                || token == "else";
+            if !is_control {
+                if triple || amp {
+                    return Err(TemplateError::RawSubstitution(token.to_string()));
+                }
+                if !in_string {
+                    return Err(TemplateError::NonStringSubstitution(token.to_string()));
+                }
+            }
+            i = end + close_pat.len();
+            continue;
+        }
+        // Plain JSON text — track string state. `{{…}}` spans are skipped
+        // above, so quotes inside helper arguments never toggle it.
+        let c = b[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+        } else if c == b'"' {
+            in_string = true;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Render `policy_template` into a concrete IAM policy JSON string.
 ///
 /// `request` is the **PoP-verified** request body (its provenance is
@@ -109,9 +203,16 @@ pub fn render_policy(
     expiry: &str,
     role: &str,
 ) -> Result<String, TemplateError> {
+    // Reject any value hole outside a JSON string, or any raw stache,
+    // before rendering — those are the shapes the escape below cannot
+    // make safe.
+    validate_substitutions(policy_template)?;
+
     let mut reg = Handlebars::new();
-    // Policies are JSON, not HTML — disable entity escaping.
-    reg.register_escape_fn(handlebars::no_escape);
+    // Policies are JSON: escape substituted values for a JSON *string*
+    // context (not HTML), so a caller-influenced value can never break
+    // out of its string and restructure the policy.
+    reg.register_escape_fn(escape_json_string);
     // A missing variable is a misconfigured role, not an empty string.
     reg.set_strict_mode(true);
     reg.register_helper(
@@ -280,7 +381,14 @@ mod tests {
 
     #[test]
     fn unknown_caveat_is_error() {
-        let err = render_policy(r#"{{caveat "nope"}}"#, &env(), &[], &req(&[]), "x", "r");
+        let err = render_policy(
+            r#"{"r": "{{caveat "nope"}}"}"#,
+            &env(),
+            &[],
+            &req(&[]),
+            "x",
+            "r",
+        );
         assert!(matches!(err, Err(TemplateError::Render(_))));
     }
 
@@ -298,7 +406,7 @@ mod tests {
         // Operator-facing: the handlebars message must point at the
         // role, not the opaque "Unnamed template".
         let err = render_policy(
-            "{{req.prefix}}",
+            r#"{"r": "{{req.prefix}}"}"#,
             &env(),
             &[],
             &serde_json::json!({}),
@@ -327,7 +435,7 @@ mod tests {
             Caveat::scalar("elide:Volume", "VOL2"),
         ];
         let err = render_policy(
-            r#"{{caveat "elide:Volume"}}"#,
+            r#"{"r": "{{caveat "elide:Volume"}}"}"#,
             &env(),
             &caveats,
             &req(&[]),
@@ -363,5 +471,95 @@ mod tests {
             template_surface("{{! caveat \"x\" }}{{> partial}}"),
             TemplateSurface::default()
         );
+    }
+
+    #[test]
+    fn req_value_breakout_attempt_is_escaped_not_structural() {
+        // A malicious ancestor tries to close the Resource-array string,
+        // close the array, and inject a second "Resource" key granting
+        // `*`. With JSON-string escaping the `"`/`\` are inert, so it
+        // stays a single (ugly) string element — no duplicate key, no
+        // escalation.
+        let evil = r#"*"],"Resource":["arn:aws:s3:::*"#;
+        let caveats = vec![Caveat::scalar("elide:Volume", "VOL1")];
+        let out = render_policy(
+            TPL,
+            &env(),
+            &caveats,
+            &req(&[evil]),
+            "2026-05-15T14:30:00Z",
+            "volume-ro",
+        )
+        .expect("escaped value renders to valid JSON");
+        let v: Value = serde_json::from_str(&out).expect("valid json");
+        let res = v["Statement"][0]["Resource"]
+            .as_array()
+            .expect("Resource is an array");
+        // Exactly the two intended entries — the scoped volume and the
+        // single ancestor element (carrying the injection inertly).
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0], "arn:aws:s3:::demo/by_id/VOL1/*");
+        let injected = res[1].as_str().expect("ancestor renders as a string");
+        assert!(injected.starts_with("arn:aws:s3:::demo/by_id/"));
+        assert!(injected.ends_with("/*"));
+        // The breakout payload survives only as inert string content.
+        assert!(injected.contains(r#""],"Resource""#));
+    }
+
+    #[test]
+    fn malicious_caveat_value_is_escaped() {
+        // A holder-appended caveat the issuer never bound carries an
+        // injection payload; escaping keeps it inside its string.
+        let caveats = vec![Caveat::scalar("elide:Volume", r#"x","Resource":"*"#)];
+        let out = render_policy(
+            r#"{"Resource": "by_id/{{caveat "elide:Volume"}}/*"}"#,
+            &env(),
+            &caveats,
+            &req(&[]),
+            "t",
+            "r",
+        )
+        .expect("escaped value renders to valid JSON");
+        let v: Value = serde_json::from_str(&out).expect("valid json");
+        // One Resource key, value carries the payload as inert text.
+        assert_eq!(
+            v["Resource"],
+            serde_json::json!(r#"by_id/x","Resource":"*/*"#)
+        );
+    }
+
+    #[test]
+    fn non_string_positioned_substitution_is_rejected() {
+        // A value hole outside a JSON string — escaping `"`/`\` cannot
+        // stop `,{}` breakout there, so the template is refused.
+        let err = render_policy(
+            r#"{"ttl": {{req.n}}}"#,
+            &env(),
+            &[],
+            &serde_json::json!({"n": 5}),
+            "t",
+            "r",
+        );
+        assert!(matches!(err, Err(TemplateError::NonStringSubstitution(_))));
+    }
+
+    #[test]
+    fn raw_stache_is_rejected() {
+        // Triple-stache and `{{&}}` bypass the escape fn entirely.
+        for tpl in [r#"{"r": "{{{req.x}}}"}"#, r#"{"r": "{{& req.x}}"}"#] {
+            let err = render_policy(tpl, &env(), &[], &serde_json::json!({"x": "v"}), "t", "r");
+            assert!(
+                matches!(err, Err(TemplateError::RawSubstitution(_))),
+                "expected RawSubstitution for {tpl}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_block_tokens_are_not_value_substitutions() {
+        // The `{{#each}}`/`{{/each}}` tokens sit outside strings (between
+        // array elements) yet the template validates: only the
+        // string-positioned `{{this}}` inside is a value substitution.
+        assert!(validate_substitutions(TPL).is_ok());
     }
 }
