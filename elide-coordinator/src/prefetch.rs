@@ -1031,8 +1031,7 @@ mod tests {
         assert_eq!(result.failed, 0);
 
         // Pass 2 reads each fork under its own single-prefix `volume-ro`
-        // credential (`read_volume`), one per fork, never a chain-spanning
-        // `read_head_with_ancestors` store.
+        // credential (`read_volume`), one per fork.
         let calls = recording.calls();
         let child = Ulid::from_string(child_ulid).unwrap();
         let parent = Ulid::from_string(parent_ulid).unwrap();
@@ -1043,12 +1042,6 @@ mod tests {
         assert!(
             calls.contains(&crate::stores::RoleCall::ReadVolume(parent)),
             "ancestor must read under read_volume(parent); got {calls:?}"
-        );
-        assert!(
-            !calls
-                .iter()
-                .any(|c| matches!(c, crate::stores::RoleCall::ReadHeadWithAncestors(_, _))),
-            "prefetch must not mint a chain-spanning credential; got {calls:?}"
         );
 
         // Verify the .idx file was written into parent's index/ dir.

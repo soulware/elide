@@ -122,17 +122,6 @@ pub trait ScopedStores: Send + Sync {
     /// not at the call site.
     fn read_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore>;
 
-    /// `volume-ro` scoped to a head fork plus its full ancestor chain.
-    /// Read-only under `by_id/<vol_ulid>/*` plus one
-    /// `by_id/<ancestor>/*` per entry in `ancestors`
-    /// (`docs/design-mint.md` § `volume-ro`). Used by the
-    /// head-prefetch fan-out (`prefetch::prefetch_indexes` pass 2),
-    /// which dispatches per-fork reads against a single shared
-    /// credential. `ancestors` is the chain derived from the head's
-    /// own provenance; for a given vol_ulid it is deterministic.
-    fn read_head_with_ancestors(&self, vol_ulid: &Ulid, ancestors: &[Ulid])
-    -> Arc<dyn ObjectStore>;
-
     /// The `coord-ro` store as a plain [`ObjectStore`]. Reads the
     /// coordinator-wide control-plane prefixes plus `meta/*` (every
     /// volume's `volume.provenance` / `volume.pub`); the read-only
@@ -233,14 +222,6 @@ impl ScopedStores for PassthroughStores {
         Arc::clone(&self.inner)
     }
 
-    fn read_head_with_ancestors(
-        &self,
-        _vol_ulid: &Ulid,
-        _ancestors: &[Ulid],
-    ) -> Arc<dyn ObjectStore> {
-        Arc::clone(&self.inner)
-    }
-
     fn base_object_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.inner)
     }
@@ -256,7 +237,6 @@ pub enum RoleCall {
     Writer,
     VolumeRw(Ulid),
     ReadVolume(Ulid),
-    ReadHeadWithAncestors(Ulid, Vec<Ulid>),
     BaseObjectStore,
 }
 
@@ -321,17 +301,6 @@ impl ScopedStores for RecordingStores {
     fn read_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
         self.record(RoleCall::ReadVolume(*vol_ulid));
         self.inner.read_volume(vol_ulid)
-    }
-    fn read_head_with_ancestors(
-        &self,
-        vol_ulid: &Ulid,
-        ancestors: &[Ulid],
-    ) -> Arc<dyn ObjectStore> {
-        self.record(RoleCall::ReadHeadWithAncestors(
-            *vol_ulid,
-            ancestors.to_vec(),
-        ));
-        self.inner.read_head_with_ancestors(vol_ulid, ancestors)
     }
     fn base_object_store(&self) -> Arc<dyn ObjectStore> {
         self.record(RoleCall::BaseObjectStore);

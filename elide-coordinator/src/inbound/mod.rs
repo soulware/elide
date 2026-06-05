@@ -1013,37 +1013,6 @@ async fn generate_filemap_op(
     let fork_dir = std::fs::canonicalize(&link)
         .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
 
-    // Mint a `volume-ro` view scoped to the leaf + its ancestor chain
-    // so the range fetcher inside `generate_snapshot_filemap` can read
-    // segment bodies under any of those prefixes. Each ancestor's
-    // ULID comes from a chain walk: every ancestor has its own
-    // `volume.provenance` planted by `pull_skeleton_chain`, so walking
-    // `parent → parent → …` from local disk reconstructs the full
-    // list without an S3 round-trip.
-    let vol_ulid = fork_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|s| ulid::Ulid::from_string(s).ok())
-        .ok_or_else(|| IpcError::internal(format!("vol dir name not a ULID: {vol_name}")))?;
-    let by_id_dir = data_dir.join("by_id");
-    let mut ancestors: Vec<ulid::Ulid> = Vec::new();
-    let mut cursor_dir = fork_dir.clone();
-    while let Ok(lineage) = elide_core::signing::read_lineage_verifying_signature(
-        &cursor_dir,
-        elide_core::signing::VOLUME_PUB_FILE,
-        elide_core::signing::VOLUME_PROVENANCE_FILE,
-    ) {
-        let Some(p) = lineage.parent else { break };
-        let parent_ulid = ulid::Ulid::from_string(&p.volume_ulid)
-            .map_err(|e| IpcError::internal(format!("ancestor ULID {:?}: {e}", p.volume_ulid)))?;
-        ancestors.push(parent_ulid);
-        cursor_dir = by_id_dir.join(&p.volume_ulid);
-        if !cursor_dir.exists() {
-            break;
-        }
-    }
-    let store = stores.read_head_with_ancestors(&vol_ulid, &ancestors);
-
     let snap_ulid = match snap_arg {
         Some(u) => u,
         None => match elide_core::volume::latest_snapshot(&fork_dir) {
@@ -1074,7 +1043,7 @@ async fn generate_filemap_op(
     }
 
     let started = std::time::Instant::now();
-    generate_snapshot_filemap(&fork_dir, snap_ulid, store.clone())
+    generate_snapshot_filemap(&fork_dir, snap_ulid, Arc::clone(stores))
         .await
         .map_err(|e| {
             IpcError::internal(format!("filemap generation failed for {snap_ulid}: {e:#}"))
@@ -1098,11 +1067,15 @@ async fn generate_filemap_op(
 async fn generate_snapshot_filemap(
     fork_dir: &Path,
     snap_ulid: ulid::Ulid,
-    store: Arc<dyn ObjectStore>,
+    stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> std::io::Result<()> {
     let fork_dir = fork_dir.to_owned();
+    // Reads route per owning volume — each segment body lives under the
+    // leaf's prefix or an ancestor's, and the owner is taken from the
+    // `by_id/<owner>/…` key, so each gets its own single-prefix
+    // `volume-ro` store.
     let range_fetcher: Arc<dyn elide_fetch::RangeFetcher> =
-        Arc::new(elide_coordinator::range_fetcher::ObjectStoreRangeFetcher::new(store));
+        Arc::new(elide_coordinator::range_fetcher::PerOwnerObjectStoreFetcher::new(stores));
     tokio::task::spawn_blocking(move || {
         let range_fetcher_for_factory = range_fetcher.clone();
         let mk_fetcher: Box<elide_core::block_reader::FetcherFactory<'_>> =
@@ -3240,18 +3213,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_filemap_routes_through_read_head_with_ancestors() {
-        // `generate_filemap_op` demand-fetches segment bodies under
-        // `by_id/<leaf>/segments/` and ancestor prefixes. The right
-        // role is `volume-ro` scoped to the leaf + ancestor chain
-        // (`read_head_with_ancestors`), never `coord-rw`.
+    async fn generate_filemap_routes_through_read_volume() {
+        // `generate_filemap_op` demand-fetches segment bodies per owner:
+        // each `by_id/<owner>/…` key is read under that owner's
+        // single-prefix `volume-ro` credential (`read_volume`), never a
+        // `writer` or `volume-rw` mint. The per-owner read store is built
+        // lazily inside the range fetcher when a body is actually
+        // fetched, so any role mint this op makes must be a `read_volume`.
+        // (End-to-end per-owner `read_volume` routing through the same
+        // fetcher is exercised by
+        // `prefetch::tests::prefetch_indexes_downloads_ancestor_idx`.)
         use elide_coordinator::stores::{
             PassthroughStores, RecordingStores, RoleCall, ScopedStores,
         };
 
         let tmp = TempDir::new().unwrap();
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
-        let vol_ulid = ulid::Ulid::from_string(vol_ulid_str).unwrap();
         let vol_dir = tmp.path().join("by_id").join(vol_ulid_str);
         std::fs::create_dir_all(&vol_dir).unwrap();
         let by_name = tmp.path().join("by_name");
@@ -3262,15 +3239,12 @@ mod tests {
         let recording = RecordingStores::wrap(inner);
         let stores: Arc<dyn ScopedStores> = recording.clone();
 
-        // The op errors with NotFound (no snapshot manifest on disk)
-        // AFTER the chain walk + store mint. The spy captures the
-        // role selection; no provenance file means ancestors == [].
         let _ = generate_filemap_op("vol", None, tmp.path(), &stores).await;
 
-        assert_eq!(
-            recording.calls(),
-            vec![RoleCall::ReadHeadWithAncestors(vol_ulid, vec![])],
-            "generate-filemap must route through read_head_with_ancestors (volume-ro)"
+        let calls = recording.calls();
+        assert!(
+            calls.iter().all(|c| matches!(c, RoleCall::ReadVolume(_))),
+            "generate-filemap may only mint per-owner read_volume credentials; got {calls:?}"
         );
     }
 
@@ -3331,10 +3305,7 @@ mod tests {
         // event_journal which ride coord-ro via the facade.
         for call in &calls {
             assert!(
-                !matches!(
-                    call,
-                    RoleCall::ReadVolume(_) | RoleCall::ReadHeadWithAncestors(_, _)
-                ),
+                !matches!(call, RoleCall::ReadVolume(_)),
                 "create must not mint per-vol read credentials; saw {call:?} in {calls:?}"
             );
         }

@@ -2403,10 +2403,7 @@ mod tests {
         // volume-rw not the read-only sibling).
         for call in &calls {
             assert!(
-                !matches!(
-                    call,
-                    RoleCall::ReadVolume(_) | RoleCall::ReadHeadWithAncestors(_, _)
-                ),
+                !matches!(call, RoleCall::ReadVolume(_)),
                 "force-release must not mint volume-ro; saw {call:?} in {calls:?}"
             );
         }

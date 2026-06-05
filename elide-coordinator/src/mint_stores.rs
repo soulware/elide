@@ -74,9 +74,6 @@ pub struct RoleStore {
     /// narrowing caveat + audit value. `None` for the coordinator-wide
     /// roles.
     vol_ulid: Option<Ulid>,
-    /// `volume-ro`-only: the PoP-signed ancestor list the role template
-    /// expands into per-ancestor read ARNs. Empty for every other role.
-    ancestors: Vec<Ulid>,
     cached: Mutex<Option<Cached>>,
 }
 
@@ -98,15 +95,14 @@ impl fmt::Display for RoleStore {
 
 /// Per-role `extra_body` fields surfaced through `assume-role`'s
 /// PoP-signed body. `volume-ro` is the one role whose policy template
-/// references `request.ancestors`; the key must be present even when
-/// the list is empty, because handlebars strict mode treats a missing
-/// path as a render failure (whereas an empty `{{#each}}` block simply
-/// emits nothing — mint-side test
+/// references `request.ancestors`; the key must be present even though
+/// the list is always empty, because handlebars strict mode treats a
+/// missing path as a render failure (whereas an empty `{{#each}}` block
+/// simply emits nothing — mint-side test
 /// `empty_request_ancestors_renders_self_only`).
-fn extra_body_for(role: &str, ancestors: &[Ulid]) -> Vec<(&'static str, serde_json::Value)> {
+fn extra_body_for(role: &str) -> Vec<(&'static str, serde_json::Value)> {
     if role == ROLE_VOLUME_RO {
-        let ancestor_strs: Vec<String> = ancestors.iter().map(Ulid::to_string).collect();
-        vec![("ancestors", serde_json::json!(ancestor_strs))]
+        vec![("ancestors", serde_json::json!([]))]
     } else {
         Vec::new()
     }
@@ -120,24 +116,12 @@ impl RoleStore {
         ttl_secs: u64,
         vol_ulid: Option<Ulid>,
     ) -> Self {
-        Self::with_ancestors(endpoint, store_cfg, role, ttl_secs, vol_ulid, Vec::new())
-    }
-
-    fn with_ancestors(
-        endpoint: MintEndpoint,
-        store_cfg: StoreSection,
-        role: &'static str,
-        ttl_secs: u64,
-        vol_ulid: Option<Ulid>,
-        ancestors: Vec<Ulid>,
-    ) -> Self {
         Self {
             endpoint,
             store_cfg,
             role,
             ttl_secs,
             vol_ulid,
-            ancestors,
             cached: Mutex::new(None),
         }
     }
@@ -202,7 +186,7 @@ impl RoleStore {
             Some(v) => vec![(CAVEAT_VOLUME, v.as_str())],
             None => Vec::new(),
         };
-        let extra_owned = extra_body_for(self.role, &self.ancestors);
+        let extra_owned = extra_body_for(self.role);
         self.endpoint
             .assume_role(self.role, self.ttl_secs, &narrowing, &extra_owned)
             .await
@@ -296,14 +280,6 @@ pub struct MintScopedStores {
     /// Populated by `read_volume`; each entry's mint policy grants
     /// `by_id/<vol_ulid>/*` only.
     read_volume: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
-    /// `volume-ro` facades for head-prefetch reads, keyed by the head
-    /// `vol_ulid`. The ancestor chain is deterministic from the head's
-    /// provenance, so the first call's chain wins; subsequent calls for
-    /// the same head reuse the facade. Kept separate from `read_volume`
-    /// so a previously-cached narrow facade can't satisfy a later wide
-    /// request (and vice versa, the wide facade is more permissive than
-    /// any future narrow request needs).
-    read_head: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
 }
 
 impl MintScopedStores {
@@ -335,7 +311,6 @@ impl MintScopedStores {
             store_cfg,
             data: Mutex::new(HashMap::new()),
             read_volume: Mutex::new(HashMap::new()),
-            read_head: Mutex::new(HashMap::new()),
         }
     }
 
@@ -427,33 +402,6 @@ impl ScopedStores for MintScopedStores {
         }
         rs as Arc<dyn ObjectStore>
     }
-
-    fn read_head_with_ancestors(
-        &self,
-        vol_ulid: &Ulid,
-        ancestors: &[Ulid],
-    ) -> Arc<dyn ObjectStore> {
-        // Cached by vol_ulid. The ancestor chain is deterministic from
-        // the head's own provenance, so a second call for the same head
-        // hits the cache regardless of the literal ancestor argument.
-        if let Ok(map) = self.read_head.try_lock()
-            && let Some(rs) = map.get(vol_ulid)
-        {
-            return Arc::clone(rs) as Arc<dyn ObjectStore>;
-        }
-        let rs = Arc::new(RoleStore::with_ancestors(
-            self.endpoint.clone(),
-            self.store_cfg.clone(),
-            ROLE_VOLUME_RO,
-            VOLUME_RO_TTL_SECS,
-            Some(*vol_ulid),
-            ancestors.to_vec(),
-        ));
-        if let Ok(mut map) = self.read_head.try_lock() {
-            map.insert(*vol_ulid, Arc::clone(&rs));
-        }
-        rs as Arc<dyn ObjectStore>
-    }
 }
 
 #[cfg(test)]
@@ -479,26 +427,18 @@ mod tests {
     fn volume_ro_always_emits_ancestors_key_even_when_empty() {
         // Regression: the volume-ro policy template references
         // `request.ancestors`; handlebars strict mode rejects a missing
-        // path. The chain-walk skeleton path mints with `&[]`, so the
-        // empty case must still emit the key.
-        let body = extra_body_for(ROLE_VOLUME_RO, &[]);
+        // path. The key must always be present even though it is now
+        // always an empty array.
+        let body = extra_body_for(ROLE_VOLUME_RO);
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].0, "ancestors");
         assert_eq!(body[0].1, serde_json::json!([] as [&str; 0]));
     }
 
     #[test]
-    fn volume_ro_serialises_ancestor_chain_as_string_array() {
-        let a = Ulid::new();
-        let b = Ulid::new();
-        let body = extra_body_for(ROLE_VOLUME_RO, &[a, b]);
-        assert_eq!(body[0].1, serde_json::json!([a.to_string(), b.to_string()]));
-    }
-
-    #[test]
     fn non_volume_ro_roles_emit_no_extra_body() {
         for role in [ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RW] {
-            assert!(extra_body_for(role, &[Ulid::new()]).is_empty());
+            assert!(extra_body_for(role).is_empty());
         }
     }
 
@@ -544,37 +484,6 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&s_parent, &s_other),
             "different vol_ulids must not share a facade"
-        );
-    }
-
-    #[test]
-    fn read_head_cache_reuses_facade_for_same_head() {
-        let stores = test_scoped_stores();
-        let v = Ulid::new();
-        let a = Ulid::new();
-        let s1 = stores.read_head_with_ancestors(&v, &[a]);
-        let s2 = stores.read_head_with_ancestors(&v, &[a]);
-        assert!(
-            Arc::ptr_eq(&s1, &s2),
-            "second head-prefetch call for the same head must hit the cache"
-        );
-    }
-
-    #[test]
-    fn read_volume_and_read_head_use_independent_caches() {
-        // The same vol_ulid called via the two methods must produce
-        // distinct facades — the narrow one (read_volume) and the wide
-        // one (read_head_with_ancestors) carry different mint policies,
-        // and the wide-then-narrow / narrow-then-wide ordering must
-        // not contaminate either cache.
-        let stores = test_scoped_stores();
-        let v = Ulid::new();
-        let a = Ulid::new();
-        let narrow = stores.read_volume(&v);
-        let wide = stores.read_head_with_ancestors(&v, &[a]);
-        assert!(
-            !Arc::ptr_eq(&narrow, &wide),
-            "single-volume and head-with-ancestors facades must be independent"
         );
     }
 }
