@@ -813,20 +813,6 @@ impl Store {
         Ok(())
     }
 
-    /// Remove an enrolled-registry entry. After this call, the next
-    /// `/v1/enroll` for `<sub>` falls back to the slow path
-    /// (operator-gated approval). Returns `true` if a record existed.
-    pub async fn revoke(&self, sub: &str) -> Result<bool, StateError> {
-        if !safe_sub(sub) {
-            return Err(StateError::BadSub);
-        }
-        match self.objects.delete(&Self::enrolled_key(sub)).await {
-            Ok(()) => Ok(true),
-            Err(OsError::NotFound { .. }) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// The pending record for `sub`, if any.
     pub async fn get_pending(&self, sub: &str) -> Result<Option<Pending>, StateError> {
         if !safe_sub(sub) {
@@ -926,7 +912,7 @@ impl Store {
     /// current kid on its next restart, without any global sweep.
     ///
     /// Best-effort by design: a missing record, a kid mismatch already
-    /// at current, a 412 (concurrent rotation / revoke racing us), or
+    /// at current, a 412 (concurrent rotation / re-approval racing us), or
     /// a body that no longer verifies are all silent no-ops returning
     /// `Ok(false)`. `Ok(true)` means a migration write actually
     /// happened. The caller never branches on the return value beyond
@@ -1002,7 +988,7 @@ impl Store {
             Ok(_) => Ok(true),
             // 412 (Precondition) means the record changed under us —
             // most commonly a peer mint just migrated it (idempotent
-            // race), or the operator revoked. Either way: don't retry,
+            // race), or a re-approval landed. Either way: don't retry,
             // don't error.
             Err(OsError::Precondition { .. }) => Ok(false),
             // `LocalFileSystem` returns `NotImplemented` for
@@ -1544,31 +1530,6 @@ mod tests {
             .await
             .unwrap();
         assert!(s.get_enrolled("01ARZ").await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn revoke_removes_registry_entry() {
-        let (_d, s) = store().await;
-        let b = s.current_invite().await.unwrap();
-        s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 1)
-            .await
-            .unwrap();
-        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
-            .await
-            .unwrap();
-        assert!(s.revoke("01ARZ").await.unwrap());
-        assert!(s.get_enrolled("01ARZ").await.unwrap().is_none());
-        assert!(
-            !s.revoke("01ARZ").await.unwrap(),
-            "second revoke is a no-op"
-        );
-        // Next enroll falls back to the slow path.
-        assert_eq!(
-            s.record_pending("01ARZ", PUBA, &b, "usr_op", "ip", 3)
-                .await
-                .unwrap(),
-            Recorded::Created
-        );
     }
 
     #[tokio::test]
