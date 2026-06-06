@@ -44,6 +44,8 @@ min_ttl_seconds = 60
 max_ttl_seconds = 2592000
 default_ttl_seconds = 2592000
 policy_file = "volume-ro.json"
+[role.template]
+req = ["volume"]
 "#;
 
 const POLICY: &str = r#"
@@ -185,21 +187,27 @@ async fn happy_path_mints_scoped_keypair() {
 }
 
 #[tokio::test]
-async fn missing_volume_in_body_fails_render_400() {
+async fn missing_declared_req_field_is_rejected_before_render() {
     // A fully authorized request (gate passes) whose body omits the
-    // `volume` field the `volume-ro` policy substitutes as
-    // `{{req.volume}}`: strict-mode render fails closed, so no
-    // unscoped credential is ever minted. This pins the fail-closed
-    // property of the target now that it rides the body, not a caveat.
-    let (state, _, minter, _dir) = state_with_audit().await;
+    // `volume` field `volume-ro` declares in its sealed `req` contract.
+    // The request-time contract check rejects it with a clean 400 before
+    // render — no unscoped credential is ever minted. This pins the
+    // fail-closed property of the target now that it rides the body.
+    let (state, audit_buf, minter, _dir) = state_with_audit().await;
     let app = router(state);
     let m = request_macaroon();
 
     let req = signed_request(&m, r#""role":"volume-ro","ttl_seconds":3600"#);
     let (status, body) = body_string(app.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-    // The render failed before the keypair step — nothing was minted.
+    // Nothing was minted, and the contract check (not render) is what
+    // fired — the request never reached the renderer.
     assert!(minter.calls().is_empty(), "no keypair should be minted");
+    let audit = String::from_utf8(audit_buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        audit.contains("\"outcome\":\"denied:missing_req_field\""),
+        "audit: {audit}"
+    );
 }
 
 #[tokio::test]

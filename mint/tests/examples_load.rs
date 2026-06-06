@@ -24,6 +24,8 @@ fn pin_cwd() {
 fn mint_demo_config_loads() {
     pin_cwd();
     let cfg = Config::load(&example("mint-demo.toml")).expect("mint-demo.toml");
+    cfg.validate_policy_surface()
+        .expect("demo templates satisfy the seal-authoring surface checks");
     // The demo colocates the auth role so the operator admin plane
     // (login / invite / enroll) has a discharge issuer and a admin-service.
     let demo = cfg.demo_auth.expect("[demo_auth] present");
@@ -39,6 +41,8 @@ fn mint_demo_config_loads() {
 fn mint_elide_config_loads() {
     pin_cwd();
     let cfg = Config::load(&example("mint-elide.toml")).expect("mint-elide.toml");
+    cfg.validate_policy_surface()
+        .expect("elide templates satisfy the seal-authoring surface checks");
     // The Elide inventory needs `auth_location`: enrollment is
     // operator-gated (the invite + ticket carry the enroll/exchange
     // gates, keyed by K_M-A).

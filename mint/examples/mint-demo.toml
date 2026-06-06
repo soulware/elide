@@ -65,14 +65,25 @@ bucket = "mint-demo"
 [env]
 bucket = "mint-demo"
 
+# The `[role.template]` subtable declares the `{{req.X}}` body fields each
+# template substitutes — its request contract, checked against the template at
+# seal and enforced before render. Both demo roles scope to a caller-supplied
+# `{{req.prefix}}`.
+
 [[role]]
 name = "read"
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 
+[role.template]
+req = ["prefix"]
+
 [[role]]
 name = "write"
 min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300
+
+[role.template]
+req = ["prefix"]
