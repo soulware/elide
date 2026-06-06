@@ -282,6 +282,14 @@ impl RangeFetcher for S3RangeFetcher {
                 io::ErrorKind::NotFound,
                 format!("{key} not found"),
             )),
+            // Auth rejection — the access key was refused or its policy's
+            // expiry window has passed. Surfaced as PermissionDenied so the
+            // credential-caching layer can distinguish "creds went stale,
+            // reissue and retry" from a genuine fetch failure.
+            n @ (401 | 403) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("s3 get_range {key}: status {n}"),
+            )),
             n => Err(io::Error::other(format!("s3 get_range {key}: status {n}"))),
         }
     }
