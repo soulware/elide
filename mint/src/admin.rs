@@ -374,7 +374,7 @@ async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: By
     // values — refuse to publish one (the host keeps serving whatever it
     // serves now). Not enforced at config load: serving is decoupled from
     // the live config, so this is the right gate.
-    if let Err(e) = state.config.validate_env_surface() {
+    if let Err(e) = state.config.validate_policy_surface() {
         return unprocessable(&e.to_string());
     }
 
