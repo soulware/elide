@@ -36,6 +36,41 @@ coord B (config item #2 in `design-mint.md` § *Mint configuration*),
 embeds a static TPC, verifies the discharge against that key, clears it,
 and reads the attested `req.volume` from the discharge's caveat.
 
+### TPC structure and timing — reuses `mint/src/tpc.rs`
+
+The TPC is the existing `Caveat::ThirdParty { location, vid, cid }`
+(`mint/src/caveat.rs`), built by the existing `tpc.rs` primitives — only
+the shared key and the message change. A hidden value `r` (the caveat /
+discharge root key) anchors it:
+
+- **`r = BLAKE3_derive_key("mint tpc r-key v1", K_M ‖ client_id ‖
+  r_epoch)`** — deterministic, so mint keeps no per-client state.
+- **`vid = AES-GCM-SIV(Tₙ₋₁, r)`** — `r` sealed under the chain tag at
+  the TPC's position; the *verifier* (mint) recovers `r` by walking the
+  chain and decrypting.
+- **`cid = AES-GCM-SIV(K_M-B, r ‖ message)`** — `r` plus the message,
+  sealed under the key shared with coord B; the *authority* (coord B)
+  recovers `r` + message by decrypting. For volume attestation the
+  message is `lp(client_id) ‖ mode`, `mode ∈ {rw-self, ro-ancestor}` —
+  **the volume is deliberately absent**, keeping mint volume-agnostic;
+  the volume is named only in the live discharge request and stamped into
+  the discharge's `req.volume`.
+
+`r` is recoverable by mint (via `vid`) and coord B (via `cid`), but **not
+by the holder** — coord A has neither `K_M-B` nor the intermediate chain
+tag, so it is a pure courier that can neither read nor forge `cid`/`vid`
+nor mint a discharge.
+
+The TPC is appended **at credential issuance** via `tpc::build_caveat`
+→ `Macaroon::attenuate`, reading the credential's `tail` as `Tₙ₋₁`. It is
+**static for the credential's life**; the holder only appends a narrowing
+`exp`. Discharges are fetched **fresh per request** (per volume /
+ancestor), minted by coord B under `r` with the reserved `DISCHARGE_KID`
+sentinel, carrying `req.volume = target` + `exp`. At verify, mint
+dispatches on kid (keyring → primary under `K_M`; `DISCHARGE_KID` →
+discharge under `r`); the discharge binds to this primary because the
+same `r` is encrypted in this chain's `vid`.
+
 ### Why a coordinator, not mint itself
 
 mint must stay volume-agnostic. The verification logic — `volume.pub`
@@ -86,8 +121,9 @@ problem never arises, and mint stays volume-agnostic.
 1. coord A holds `volume.key` for the live volume vol_Y it owns.
 2. mint issues a `volume-rw` primary carrying a static TPC to coord B.
 3. coord A → coord B `POST /v1/discharge`: `req:{volume: vol_Y}` plus a
-   signature over the caveat challenge (the TPC caveat-key nonce, so it
-   is bound to *this* discharge and not replayable) using `volume.key`.
+   `volume.key` signature bound to this credential's TPC (over
+   `blake3(cid)`; see *Possession-proof binding*), so it is not
+   replayable against another credential.
 4. coord B fetches `meta/vol_Y.pub`, verifies the possession
    proof, confirms currency (`names/<name> → vol_Y`), and discharges,
    stamping attested `req:{volume: vol_Y}`.
@@ -166,7 +202,7 @@ no separate proof to coord B: live-key possession + `names/<name> → vol_Y`
 The discharge request carries an Ed25519 **possession proof** signed by
 `owned`'s `volume.key`, proving coord A holds the live volume's key
 without revealing it. It is distinct from the macaroon's caveat-key
-(`ck`) mechanism: `ck` binds the *discharge to the primary*; the
+(`r`) mechanism: `r` binds the *discharge to the primary*; the
 possession proof binds *coord A to the volume*.
 
 **Signed payload** — domain-separated, NUL-joined canonical string
@@ -187,8 +223,9 @@ mint — the same CID-wrapping construction as the auth-service TPC's
 
 **coord B verification — fail-closed, in order:**
 
-1. **Recover `cid`.** AEAD-decrypt under `K_M-B` → `(ck, mode)`, with
-   `mode ∈ {rw-self, ro-ancestor}` baked in by mint at primary issuance
+1. **Recover `cid`.** AEAD-decrypt under `K_M-B` → `(r, message)` with
+   `message = lp(client_id) ‖ mode`, `mode ∈ {rw-self, ro-ancestor}`
+   baked in by mint at primary issuance
    (mint knows the role; coord B never trusts the primary, which it
    cannot MAC).
 2. **Freshness.** `|now − ts| ≤ skew` (≈30 s) and `(owned, nonce)`
@@ -202,8 +239,8 @@ mint — the same CID-wrapping construction as the auth-service TPC's
    currency design's concern, not the binding's.
 5. **Mode.** `rw-self` ⟹ `target == owned`; `ro-ancestor` ⟹ `target ∈
    {owned} ∪ ancestors(owned)` via the shared signed-provenance walk.
-6. **Discharge.** Mint a macaroon rooted at `ck` carrying attested
-   `req.volume = target`, `exp ≤ now + discharge_ttl`.
+6. **Discharge.** Mint a macaroon rooted at `r` (kid `DISCHARGE_KID`)
+   carrying attested `req.volume = target`, `exp ≤ now + discharge_ttl`.
 
 **What each field binds:**
 
@@ -221,8 +258,8 @@ mint — the same CID-wrapping construction as the auth-service TPC's
 
 **Why a stolen proof is inert.** The binding chain is
 `proof → cid → primary → cnf → coord A`: the proof roots a discharge at
-`ck`, which verifies only against the one primary whose TPC embedded that
-`ck`, which is itself `cnf`-bound to coord A's `coordinator.key`. So a
+`r`, which verifies only against the one primary whose TPC embedded that
+`r` (via `vid`), itself `cnf`-bound to coord A's `coordinator.key`. So a
 replayed proof — or a stolen discharge — yields a credential usable only
 by coord A. Freshness and the seen-cache are hardening on top of this
 (they stop coord B being a free discharge oracle), not the sole defence.
@@ -261,7 +298,7 @@ scoping and are unaffected:
 
 Because attested-`req` is the *only* `req` source, the provenance trap is
 closed by construction: it is sourced solely from a verified discharge
-(rooted at the TPC caveat key, attributable to coord B), never from a
+(rooted at the TPC root key `r`, attributable to coord B), never from a
 first-party caveat a caller could append. The `volume-rw`/`volume-ro` ARN
 renders from the discharge's attested volume.
 
