@@ -1,0 +1,372 @@
+# Volume-ownership attestation for mint tokens
+
+**Status: Exploration.** Captures the design discussion so far. Several
+points are still open — see *Open questions*. Builds on `design-mint.md`
+(token issuance, `req`/`caveat` namespaces, third-party caveats) and
+`design-portable-live-volume.md` (per-volume signing keys, signed
+provenance, the `names/<name>` claim).
+
+## The gap this closes
+
+Today a role's per-volume scoping field rides the PoP-signed request
+**body** as `req.volume`, classed as *honest-but-unverified*
+(`design-mint.md` § *Request body*). For `volume-rw` the policy ARN is
+`by_id/{{req.volume}}/*` and `req.volume` is self-asserted: a compromised
+or malicious coordinator can request RW credentials scoped to **any**
+volume's prefix. Per-volume read credentials self-assert the same way.
+The only thing standing between coordinators on that path is per-segment
+signing catching bad *data* on read — which is integrity, not access
+control.
+
+The goal is to make `req.volume` **attested** rather than self-asserted,
+without teaching mint anything about volumes.
+
+## The mechanism: a third-party caveat discharged by a co-located coordinator
+
+mint embeds a third-party caveat (TPC) in the credential: "valid only if
+discharged by the *attestation coordinator*, attesting the volume named
+in the discharge." The attestation coordinator (referred to below as
+**coord B**) is the discharge authority; the requesting coordinator
+(**coord A**) fetches a discharge and presents it alongside its primary.
+
+This is the canonical macaroon composition — symmetric TPC + discharge,
+the same shape as the operator-authorisation chain in
+`design-auth-service.md`. mint shares one symmetric discharge key with
+coord B (config item #2 in `design-mint.md` § *Mint configuration*),
+embeds a static TPC, verifies the discharge against that key, clears it,
+and reads the attested `req.volume` from the discharge's caveat.
+
+### Why a coordinator, not mint itself
+
+mint must stay volume-agnostic. The verification logic — `volume.pub`
+locations, lineage walks, claim-record currency — is volume-domain code
+that belongs in the coordinator. Folding it into mint would be cheaper
+(no second process, no discharge round-trip) but would puncture the
+"mint knows nothing about volumes" invariant.
+
+When coord B is co-located *and* co-operated with mint, the TPC is not
+buying a real trust boundary (same host, same operator, same blast
+radius). What it buys is:
+
+- **a code seam** — mint never links volume-domain logic; its
+  volume-agnostic invariant survives intact; and
+- **a future-movable authority** — the attestation coordinator can later
+  be split off, replicated, or replaced without touching mint's wire
+  contract.
+
+The round-trip is paid for *architectural cleanliness*, not isolation,
+as long as the two sit together.
+
+## The enabling fact: ownership and lineage are provable from public signed state
+
+A naive reading worries that a TPC fixes its third party at embed time,
+while volume ownership varies per volume — so mint would have to learn
+the topology to name the right discharger. That worry dissolves because
+**coord B needs no privileged knowledge**:
+
+- **Ownership** is provable against `meta/<vol>.pub` — the Ed25519 public
+  key uploaded to S3 under the flat `meta/` prefix (segment bodies, by
+  contrast, live under `by_id/<vol>/`). The private `volume.key` never
+  leaves the owning coordinator. Possession of the key *is* ownership.
+- **Lineage** is provable from `meta/<vol>.provenance`, signed by each
+  volume's own key, naming `parent:` (fork chain) and `extent_index:`
+  (dedup sources).
+- **Currency** is provable from the `names/<name>` claim record — the
+  single shared mutable surface, signed in the event log — which
+  resolves a name to the live episode's `by_id` ULID.
+
+All three are world-readable and signed. So coord B is a **pure function
+over public signed state plus a possession proof**: it holds no secret,
+can vouch for *any* volume, and can therefore be a **single fixed
+authority** named statically in the TPC. The per-volume-owner-resolution
+problem never arises, and mint stays volume-agnostic.
+
+## Flow: single volume (RW)
+
+1. coord A holds `volume.key` for the live volume vol_Y it owns.
+2. mint issues a `volume-rw` primary carrying a static TPC to coord B.
+3. coord A → coord B `POST /v1/discharge`: `req:{volume: vol_Y}` plus a
+   signature over the caveat challenge (the TPC caveat-key nonce, so it
+   is bound to *this* discharge and not replayable) using `volume.key`.
+4. coord B fetches `meta/vol_Y.pub`, verifies the possession
+   proof, confirms currency (`names/<name> → vol_Y`), and discharges,
+   stamping attested `req:{volume: vol_Y}`.
+5. coord A presents primary + discharge to `assume-role`. mint verifies
+   both chains, clears the TPC, and renders `by_id/{{req.volume}}/*` from
+   the **attested** volume.
+
+The duties split cleanly: **coord B attests the *volume* (possession);
+mint binds the *principal* (via `cnf`/PoP).** Neither learns the other's
+job.
+
+## Generalised predicate: the ancestor chain
+
+A reader needs `volume-ro` for **each** volume in vol_Y's read set —
+`walk_ancestors(vol_Y) ∪ walk_extent_ancestors(vol_Y)` (fork chain feeds
+the LBA map; `extent_index` sources feed dedup; both must be readable).
+Per-ancestor credentials are already the accepted shape (Tigris has no
+mid-resource wildcard).
+
+coord A anchors **once** at the live volume and derives the whole set
+from the signed lineage. coord B evaluates:
+
+- **self (RW):** possession(vol_Y) ∧ currency(vol_Y)
+  → attest `req.volume = vol_Y`
+- **ancestor (RO), per vol_X:** possession(vol_Y) ∧ currency(vol_Y) ∧
+  `vol_X ∈ ancestors(vol_Y)` (signed-provenance walk, bounded by
+  `MAX_EXTENT_INDEX_SOURCES`) → attest `req.volume = vol_X`
+
+The possession proof anchors entitlement; the lineage walk authorises
+each specific RO target. The entire authorization graph reduces to *one
+possession proof of one live volume key plus the public signed lineage*.
+
+### Credential model: role == keypair, acquired lazily per ancestor
+
+`assume-role` returns a **single keypair** — a role is a keypair, per
+Tigris. `volume-ro` keeps the merged per-ancestor shape
+(`design-mint.md` § *Per-volume read credentials*): one single-prefix
+keypair per ancestor, **acquired lazily on first demand-fetch from that
+owner**, not a single keypair whose policy spans the chain. This is not
+an artefact of "no list caveats" — it mirrors the read path, which is
+lazy and per-owner (`SegmentFetcher` takes `owner_vol_id`; `RemoteFetcher`
+caches per owner, each entry acquired on first fetch). Elide reads are
+sparse — a boot touches ~6% of an image — so provisioning the whole chain
+eagerly grants access to ancestor prefixes that are never read, and
+coarsens least-privilege (a leaked cred would span a lineage, not one
+prefix).
+
+Attestation layers onto this without disturbing it. Today the *requesting
+coordinator* already authorises `target ∈ {requester} ∪ lineage(requester)`
+at its IPC boundary, re-deriving lineage locally, and mint trusts the
+body assertion. The attestation design **moves that same check to coord
+B** so mint can verify it rather than trust the requester — each lazy
+first-touch acquisition simply gains a discharge step; the keypair stays
+single-prefix and the read path is unchanged.
+
+A single keypair whose policy spans the chain (one keypair, N
+statements, assembled in mint code from N scalar renders — never template
+iteration) only wins for *dense* full-chain reads (`materialize`, GC
+repack, offline filemap). It is **orthogonal** to attestation — an
+eager-vs-lazy tradeoff in its own right — and is not adopted here; see
+*Open questions*.
+
+### Currency unifies the liveness question
+
+Possession of `volume.key` proves "operator of episode vol_Y"; the
+`names/<name> → vol_Y` check upgrades that to "*current* owner". A
+released or stale episode (whose key coord A still holds locally) fails
+the currency check because the claim now points elsewhere. So currency is
+one predicate, checked once at the anchor, covering RW-on-self and
+RO-on-ancestors alike — and it means coord A's coordinator identity needs
+no separate proof to coord B: live-key possession + `names/<name> → vol_Y`
+*is* the ownership statement. mint still binds the principal via `cnf`.
+
+## Possession-proof binding
+
+The discharge request carries an Ed25519 **possession proof** signed by
+`owned`'s `volume.key`, proving coord A holds the live volume's key
+without revealing it. It is distinct from the macaroon's caveat-key
+(`ck`) mechanism: `ck` binds the *discharge to the primary*; the
+possession proof binds *coord A to the volume*.
+
+**Signed payload** — domain-separated, NUL-joined canonical string
+fields, following the `<domain>\0<field>…` convention already used by
+`RECOVERY_SIGNING_DOMAIN` in `signing.rs`:
+
+```
+"elide-volume-possession-v1" \0 owned_ulid \0 target_ulid \0
+  blake3_hex(cid) \0 ts \0 nonce_hex
+proof = Ed25519_sign(volume.key[owned], payload)
+```
+
+**Request** (`POST /v1/discharge` to coord B):
+`{ cid, name, owned, target, ts, nonce, proof }`. `cid` is opaque to
+coord A; coord B decrypts it under the symmetric `K_M-B` it shares with
+mint — the same CID-wrapping construction as the auth-service TPC's
+`K_M-A`. `name` is carried for the currency lookup.
+
+**coord B verification — fail-closed, in order:**
+
+1. **Recover `cid`.** AEAD-decrypt under `K_M-B` → `(ck, mode)`, with
+   `mode ∈ {rw-self, ro-ancestor}` baked in by mint at primary issuance
+   (mint knows the role; coord B never trusts the primary, which it
+   cannot MAC).
+2. **Freshness.** `|now − ts| ≤ skew` (≈30 s) and `(owned, nonce)`
+   unseen; insert into a seen-cache bounded by `2 × skew`.
+3. **Possession.** Recompute the payload, fetch `meta/owned.pub`,
+   `verify(payload, proof)`. Proves possession of `owned`'s key.
+4. **Currency.** `names/<name>` resolves to `owned` as the live episode
+   (a wrong `name` simply fails to resolve to `owned`). Applies to
+   `owned` only; ancestors are frozen. Resolution reuses the claim-record
+   model; its edge cases (e.g. an unnamed scratch volume) are the
+   currency design's concern, not the binding's.
+5. **Mode.** `rw-self` ⟹ `target == owned`; `ro-ancestor` ⟹ `target ∈
+   {owned} ∪ ancestors(owned)` via the shared signed-provenance walk.
+6. **Discharge.** Mint a macaroon rooted at `ck` carrying attested
+   `req.volume = target`, `exp ≤ now + discharge_ttl`.
+
+**What each field binds:**
+
+- **domain tag** — cross-protocol separation: a possession proof can
+  never validate as a provenance / snapshot-manifest / segment signature,
+  or vice versa — the discipline already applied to recovery manifests.
+- **`blake3(cid)`** — ties the proof to *this* TPC instance. A captured
+  proof cannot be lifted onto coord C's discharge request: coord C's
+  primary carries a different `cid`, so the recomputed payload differs and
+  the signature fails. This is the load-bearing anti-transfer binding.
+- **`owned` / `target`** — fix which key signs and which prefix is
+  vouched, so a proof cannot be retargeted across volumes.
+- **`ts` / `nonce`** — bounded-window anti-replay, mirroring the `cnf`
+  PoP's `ts` freshness; the seen-cache makes it single-use in the window.
+
+**Why a stolen proof is inert.** The binding chain is
+`proof → cid → primary → cnf → coord A`: the proof roots a discharge at
+`ck`, which verifies only against the one primary whose TPC embedded that
+`ck`, which is itself `cnf`-bound to coord A's `coordinator.key`. So a
+replayed proof — or a stolen discharge — yields a credential usable only
+by coord A. Freshness and the seen-cache are hardening on top of this
+(they stop coord B being a free discharge oracle), not the sole defence.
+
+## Self-asserted scoping is retired entirely
+
+Rather than keep a self-asserted body-`req` channel alongside the
+attested one, self-asserted **scoping** is removed: every value
+substituted into a policy comes from a MAC-verified source. This
+supersedes `design-mint.md` § *Request body*'s "honest-but-unverified
+`req.volume`" class.
+
+The resulting invariant: **every `{{...}}` template value is
+MAC-verified** — `{{caveat.sub}}` from the primary, `{{req.*}}` from the
+discharge, `{{env.*}}`/`{{mint.*}}` server-side. There is no
+self-asserted scoping path a caller can choose; a discharge is therefore
+**mandatory on every `assume-role`**, including self-volume RW. This is
+the *no optional path for a correctness property* rule applied: access
+scoping has exactly one source, the attested one. (The round-trip is
+cheap because coord B is co-located with mint, and lazy because it rides
+the per-ancestor first-touch acquisition.)
+
+This retires only template-substituted **scoping**. Two things are not
+scoping and are unaffected:
+
+- **`req.role` / `req.ttl` are request *parameters*.** They state what
+  the caller is asking for — `role` is gated against the `role` caveat,
+  `ttl` capped by `min(exp, role.max, …)`. There is no external truth for
+  a third party to attest, and neither is ever `{{...}}`-substituted.
+  They remain request inputs.
+- **Demo `req.prefix` loses its self-asserted source.** The
+  demo/mint-as-auth roles substitute a self-asserted `req.prefix`; with
+  self-asserted scoping gone, the demo prefix moves to server-side
+  `env.*` (simplest, given demo-only-forever) or is discharged by the
+  demo authority. Noted so it is reworked, not silently broken.
+
+Because attested-`req` is the *only* `req` source, the provenance trap is
+closed by construction: it is sourced solely from a verified discharge
+(rooted at the TPC caveat key, attributable to coord B), never from a
+first-party caveat a caller could append. The `volume-rw`/`volume-ro` ARN
+renders from the discharge's attested volume.
+
+## The attestation coordinator is a true (limited) coord instance
+
+coord B is not a thin bespoke verifier — it is a real coordinator,
+co-located with mint and designated as mint's discharge authority. It may
+own no volumes of its own; its job is to discharge. Being a coordinator,
+it already has everything the discharge predicate needs: S3 read,
+provenance-signature verification, claim-record resolution, and — the
+load-bearing part — the **same `walk_ancestors` / `walk_extent_ancestors`
+code** the read path uses.
+
+That shared code path settles the `rebuild-is-invariant` concern *by
+construction*: coord B's lineage and currency determination is
+byte-identical to what the read path computes, so **vouchable ≡
+readable** — a volume coord B refuses to vouch for is one the read path
+could not have served, and vice versa. There is no second
+re-implementation of the walk to drift out of sync.
+
+coord B enrolls like any coordinator and **additionally enrolls as a
+discharge authority**, establishing the symmetric `K_M-B` with mint the
+same way the auth service establishes `K_M-A` (`design-mint.md` §
+*Mint configuration*, item #2; the TPC-CID wrapping key). The volume
+roles' TPC names coord B; operator-authorisation TPCs continue to name
+the auth service — a primary may carry both, discharged independently.
+
+## S3 access: the verifier holds `coord-ro`, nothing more
+
+Every read the discharge predicate makes maps onto an existing `coord-ro`
+grant (`design-mint.md` § *`coord-ro`*: `GetObject` on `names/*`,
+`coordinators/*`, `events/*`, `meta/*`):
+
+| check | object | `coord-ro` prefix |
+|---|---|---|
+| possession | `meta/<owned>.pub` | `meta/*` |
+| lineage walk | `meta/<vol>.provenance` (owned + each ancestor) | `meta/*` |
+| currency | `names/<name>` | `names/*` |
+
+The verifier needs **zero `by_id/` access** — it reads only public signed
+metadata, never segment bodies. That is exactly `coord-ro`'s load-bearing
+**`by_id/`-free invariant**, which the doc already designed so `coord-ro`
+can be the *only* credential an internet/LAN-exposed verifier holds: a
+compromise of the exposed discharge endpoint can neither mutate state nor
+read bulk data. So coord B reuses `coord-ro` unchanged — **no new role**.
+
+This is not a coincidence of grants. The peer-fetch verifier
+(`design-peer-segment-fetch.md`) is the structural twin: on `coord-ro`
+alone it already does the near-identical trio — an ETag-conditional
+`names/<name>` fence (our *currency*), a `coordinators/<B>/coordinator.pub`
+requester check, and a signed-`volume.provenance` lineage walk (our
+*lineage*). The attestation verifier is the same animal pointed at a
+different question.
+
+No bootstrap loop: `coord-ro` is gated by `caveat.sub`, not by a volume
+attestation, so coord B obtains it through ordinary `assume-role` without
+needing a discharge from itself. Only `volume-rw` / `volume-ro` carry the
+volume TPC.
+
+## Trust properties
+
+- **Secrecy of coord B is irrelevant.** It verifies public-key crypto and
+  holds no secret. A malicious coord A cannot trick it into vouching for a
+  volume whose key coord A does not hold. The only assumption is that
+  coord B runs the honest check.
+- **Graceful degradation.** In a single-coord deployment where coord A is
+  its own attestation authority, the model is still sound (coord A can
+  only prove possession of volumes it holds keys for) and simply adds
+  nothing where there was nothing to protect. The security becomes
+  load-bearing only in multi-coord — exactly where it is needed.
+- **No new trusted state.** coord B reads and verifies the same signed
+  surfaces (`volume.pub`, `volume.provenance`, `names/<name>`) the
+  coordinators already treat as authoritative.
+
+## Decided
+
+- **`role == keypair`.** `assume-role` returns one keypair; no batch
+  `assume-role`.
+- **`volume-ro` stays lazy per-ancestor**, single-prefix keypair acquired
+  on first demand-fetch — *not* one keypair spanning the chain. A
+  chain-spanning keypair (multi-statement policy assembled in mint code)
+  is orthogonal to attestation and only helps dense full-chain reads; not
+  adopted (see *Credential model*).
+- **Self-asserted scoping is retired.** Every template value is
+  MAC-verified; a discharge is mandatory on every `assume-role`. `req.role`
+  / `req.ttl` remain request parameters; demo `req.prefix` relocates to
+  `env.*` (see *Self-asserted scoping is retired entirely*).
+- **Possession-proof binding** is fixed (see that section): domain-tagged
+  Ed25519 over `owned ‖ target ‖ blake3(cid) ‖ ts ‖ nonce`, `blake3(cid)`
+  the anti-transfer binding.
+- **coord B is a true (limited) coord instance**, sharing the read path's
+  `walk_*` code so vouchable ≡ readable by construction; it enrolls as a
+  discharge authority establishing `K_M-B` per the auth service's `K_M-A`
+  pattern (see *The attestation coordinator…*).
+- **The verifier reuses `coord-ro` unchanged** — its possession / lineage
+  / currency reads are all `meta/*` + `names/*`, with no `by_id/` access,
+  matching `coord-ro`'s `by_id/`-free exposed-verifier invariant. No new
+  role; no bootstrap loop (`coord-ro` is `caveat.sub`-gated, not
+  volume-attested).
+
+## Open questions
+
+1. **Map-valued vs scalar attested caveat.** With scoping attested-only
+   and one volume per role (RW: the live volume; RO: one ancestor per
+   keypair), a single scalar attested caveat suffices today. A map
+   (`req.*`, room for more keys) would revise the "all caveats are scalar"
+   invariant in `design-mint.md`; defer until a second attested field
+   actually appears, unless there is a reason to generalise now.
