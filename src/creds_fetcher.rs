@@ -1,12 +1,18 @@
 // Lazy-credential `RangeFetcher` wrapper.
 //
-// Holds an `S3RangeFetcher` built from a current set of S3 credentials
-// alongside the inputs needed to re-acquire them via the coordinator's
-// macaroon-authenticated `Credentials` IPC. A background timer thread
-// drops the cached fetcher (and the credentials baked into it) after
-// the volume goes idle for `ttl`. The next `get_range` call rebuilds
-// the fetcher under a write lock — concurrent waiters single-flight
-// on the rebuild and share the result.
+// Holds a credentialed inner `RangeFetcher` built from a current set of
+// S3 credentials alongside the inputs needed to re-acquire them via the
+// coordinator's macaroon-authenticated `Credentials` IPC. A background
+// timer thread drops the cached fetcher (and the credentials baked into
+// it) after the volume goes idle for `ttl`. The next `get_range` call
+// rebuilds the fetcher under a write lock — concurrent waiters
+// single-flight on the rebuild and share the result.
+//
+// Idle is not the only invalidation: credentials carry a policy expiry
+// that can elapse while the volume is still busy, ahead of the idle
+// timer. A `get_range` rejected with `PermissionDenied` reissues once
+// and retries, so a continuously-active volume recovers without a fatal
+// fetch failure.
 //
 // Trigger model is uniform: warm-stage activity keeps `last_use`
 // fresh, so creds stay alive for the duration of warm; once warm
@@ -75,14 +81,20 @@ impl CredsIssuer for CoordinatorIssuer {
     }
 }
 
-/// `RangeFetcher` that caches an `S3RangeFetcher` and drops it after
-/// `ttl` of idleness, re-acquiring on the next request.
+/// Builds a live `RangeFetcher` from a freshly-issued credential set.
+/// In production this is an `S3RangeFetcher` bound to the bucket; the
+/// seam lets tests inject a fetcher that simulates credential rejection
+/// without touching S3.
+type FetcherBuilder = Box<dyn Fn(S3Credentials) -> io::Result<Arc<dyn RangeFetcher>> + Send + Sync>;
+
+/// `RangeFetcher` that caches a credentialed inner fetcher and drops it
+/// after `ttl` of idleness, re-acquiring on the next request. A request
+/// rejected with `PermissionDenied` (creds expired mid-use, before the
+/// idle timer dropped them) forces a single reissue-and-retry.
 pub struct LazyCredsFetcher {
-    bucket: String,
-    endpoint: Option<String>,
-    region: Option<String>,
     issuer: Arc<dyn CredsIssuer>,
-    inner: RwLock<Option<Arc<S3RangeFetcher>>>,
+    build: FetcherBuilder,
+    inner: RwLock<Option<Arc<dyn RangeFetcher>>>,
     last_use_unix: AtomicU64,
     ttl: Duration,
 }
@@ -99,11 +111,21 @@ impl LazyCredsFetcher {
         issuer: Arc<dyn CredsIssuer>,
         ttl: Duration,
     ) -> Arc<Self> {
+        let build: FetcherBuilder = Box::new(move |creds| {
+            let f = S3RangeFetcher::new(&bucket, endpoint.as_deref(), region.as_deref(), creds)?;
+            Ok(Arc::new(f) as Arc<dyn RangeFetcher>)
+        });
+        Self::with_builder(issuer, ttl, build)
+    }
+
+    fn with_builder(
+        issuer: Arc<dyn CredsIssuer>,
+        ttl: Duration,
+        build: FetcherBuilder,
+    ) -> Arc<Self> {
         let me = Arc::new(Self {
-            bucket,
-            endpoint,
-            region,
             issuer,
+            build,
             inner: RwLock::new(None),
             last_use_unix: AtomicU64::new(now_unix()),
             ttl,
@@ -121,10 +143,16 @@ impl LazyCredsFetcher {
         now_unix().saturating_sub(last)
     }
 
-    /// Acquire (or reuse) a live `S3RangeFetcher`. Single-flight under
-    /// the write lock — concurrent waiters during a rebuild see the
-    /// freshly-built fetcher when they take the lock.
-    fn acquire(&self) -> io::Result<Arc<S3RangeFetcher>> {
+    /// Reissue credentials and build a fresh inner fetcher from them.
+    fn build_fresh(&self) -> io::Result<Arc<dyn RangeFetcher>> {
+        let creds = self.issuer.reissue()?;
+        (self.build)(creds)
+    }
+
+    /// Acquire (or reuse) a live fetcher. Single-flight under the write
+    /// lock — concurrent waiters during a rebuild see the freshly-built
+    /// fetcher when they take the lock.
+    fn acquire(&self) -> io::Result<Arc<dyn RangeFetcher>> {
         if let Some(f) = self.inner.read().expect("creds-fetcher read lock").as_ref() {
             return Ok(Arc::clone(f));
         }
@@ -132,15 +160,29 @@ impl LazyCredsFetcher {
         if let Some(f) = guard.as_ref() {
             return Ok(Arc::clone(f));
         }
-        let creds = self.issuer.reissue()?;
-        let new = Arc::new(S3RangeFetcher::new(
-            &self.bucket,
-            self.endpoint.as_deref(),
-            self.region.as_deref(),
-            creds,
-        )?);
+        let new = self.build_fresh()?;
         *guard = Some(Arc::clone(&new));
         info!("[creds] re-acquired S3 credentials after idle drop");
+        Ok(new)
+    }
+
+    /// Reissue after `failed`'s credentials were rejected by S3.
+    /// Single-flight against `failed`: if another thread already swapped
+    /// in a fresh fetcher, reuse theirs rather than reissuing again —
+    /// concurrent denials hit the coordinator at most once.
+    fn reissue_after_denial(
+        &self,
+        failed: &Arc<dyn RangeFetcher>,
+    ) -> io::Result<Arc<dyn RangeFetcher>> {
+        let mut guard = self.inner.write().expect("creds-fetcher write lock");
+        if let Some(f) = guard.as_ref()
+            && !Arc::ptr_eq(f, failed)
+        {
+            return Ok(Arc::clone(f));
+        }
+        let new = self.build_fresh()?;
+        *guard = Some(Arc::clone(&new));
+        info!("[creds] reissued S3 credentials after access denial");
         Ok(new)
     }
 }
@@ -149,7 +191,17 @@ impl RangeFetcher for LazyCredsFetcher {
     fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
         self.touch();
         let f = self.acquire()?;
-        f.get_range(key, start, end_exclusive)
+        match f.get_range(key, start, end_exclusive) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                // Cached creds were rejected — expired mid-use ahead of the
+                // idle timer. Reissue once and retry; a second denial is a
+                // genuine authz failure and propagates as fatal.
+                warn!("[creds] S3 denied cached creds for {key}, reissuing: {e}");
+                let fresh = self.reissue_after_denial(&f)?;
+                fresh.get_range(key, start, end_exclusive)
+            }
+            other => other,
+        }
     }
 }
 
@@ -484,5 +536,90 @@ mod tests {
         let _fetcher = build_fetcher(Arc::clone(&issuer), Duration::from_secs(2));
         thread::sleep(Duration::from_secs(3));
         assert_eq!(issuer.count(), 0);
+    }
+
+    /// Inner fetcher stub: returns `PermissionDenied` while `fail` is
+    /// set, otherwise a fixed body. Counts the get_range calls so a test
+    /// can see both the failed attempt and the successful retry.
+    struct DenyingFetcher {
+        fail: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RangeFetcher for DenyingFetcher {
+        fn get_range(&self, _key: &str, _start: u64, _end: u64) -> io::Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "stale creds",
+                ))
+            } else {
+                Ok(vec![1, 2, 3, 4])
+            }
+        }
+    }
+
+    #[test]
+    fn permission_denied_reissues_and_retries() {
+        // First-built inner rejects (creds expired mid-use); the reissued
+        // inner succeeds. One get_range call retried transparently.
+        let issuer = StubIssuer::new();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let build: FetcherBuilder = {
+            let builds = Arc::clone(&builds);
+            let get_calls = Arc::clone(&get_calls);
+            Box::new(move |_creds| {
+                let n = builds.fetch_add(1, Ordering::Relaxed);
+                Ok(Arc::new(DenyingFetcher {
+                    fail: n == 0,
+                    calls: Arc::clone(&get_calls),
+                }) as Arc<dyn RangeFetcher>)
+            })
+        };
+        let fetcher = LazyCredsFetcher::with_builder(
+            Arc::clone(&issuer) as Arc<dyn CredsIssuer>,
+            Duration::from_secs(60),
+            build,
+        );
+
+        let out = fetcher
+            .get_range("by_id/x/seg", 0, 4)
+            .expect("retry succeeds with reissued creds");
+        assert_eq!(out, vec![1, 2, 3, 4]);
+        // Acquired once, reissued once after the denial.
+        assert_eq!(issuer.count(), 2);
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        // Failed attempt + successful retry.
+        assert_eq!(get_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn persistent_denial_fails_after_single_retry() {
+        // Every inner rejects: the retry must not loop — exactly one
+        // reissue, then the PermissionDenied propagates as fatal.
+        let issuer = StubIssuer::new();
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let build: FetcherBuilder = {
+            let get_calls = Arc::clone(&get_calls);
+            Box::new(move |_creds| {
+                Ok(Arc::new(DenyingFetcher {
+                    fail: true,
+                    calls: Arc::clone(&get_calls),
+                }) as Arc<dyn RangeFetcher>)
+            })
+        };
+        let fetcher = LazyCredsFetcher::with_builder(
+            Arc::clone(&issuer) as Arc<dyn CredsIssuer>,
+            Duration::from_secs(60),
+            build,
+        );
+
+        let err = fetcher.get_range("by_id/x/seg", 0, 4).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        // Initial acquire + exactly one reissue (no unbounded retry loop).
+        assert_eq!(issuer.count(), 2);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 2);
     }
 }
