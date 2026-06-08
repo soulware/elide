@@ -18,8 +18,11 @@ The only thing standing between coordinators on that path is per-segment
 signing catching bad *data* on read — which is integrity, not access
 control.
 
-The goal is to make `req.volume` **attested** rather than self-asserted,
-without teaching mint anything about volumes.
+The goal is to make the per-volume scoping value **attested** rather than
+self-asserted — it moves out of the self-asserted body and into a new
+MAC-verified template namespace, `attested.volume` (§ *Every template
+value is MAC-verified or server-side*) — without teaching mint anything
+about volumes. The self-asserted `req.*` namespace is removed entirely.
 
 ## The mechanism: a third-party caveat discharged by a co-located coordinator
 
@@ -34,7 +37,7 @@ the same shape as the operator-authorisation chain in
 `design-auth-service.md`. mint shares one symmetric discharge key with
 coord B (config item #2 in `design-mint.md` § *Mint configuration*),
 embeds a static TPC, verifies the discharge against that key, clears it,
-and reads the attested `req.volume` from the discharge's caveat.
+and reads `attested.volume` from the discharge's caveat.
 
 ### TPC structure and timing — reuses `mint/src/tpc.rs`
 
@@ -60,7 +63,7 @@ discharge root key) anchors it:
   MAC the primary, so the role it discharges for must be sealed by mint
   here rather than asserted by coord A. **The volume is deliberately
   absent**, keeping mint volume-agnostic; it is named only in the live
-  discharge request and stamped into the discharge's `req.volume`.
+  discharge request and stamped into the discharge's `attested.volume`.
 
 `r` is recoverable by mint (via `vid`) and coord B (via `cid`), but **not
 by the holder** — coord A has neither `K_M-B` nor the intermediate chain
@@ -71,7 +74,7 @@ The TPC is appended **at credential issuance** via `tpc::build_caveat`
 → `Macaroon::attenuate`, reading the credential's `tail` as `Tₙ₋₁`. It is
 **static for the credential's life**; the holder only appends a narrowing
 `exp`. A discharge is minted by coord B under `r` with the reserved
-`DISCHARGE_KID` sentinel, carrying attested `req.volume = target` + `exp`,
+`DISCHARGE_KID` sentinel, carrying attested `attested.volume = target` + `exp`,
 and binds to this primary because the same `r` is encrypted in this
 chain's `vid` (and to coord A, since that primary is `cnf`-bound). At
 verify, mint dispatches on kid (keyring → primary under `K_M`;
@@ -141,10 +144,10 @@ problem never arises, and mint stays volume-agnostic.
    replayable against another credential.
 4. coord B fetches `meta/vol_Y.pub`, verifies the possession
    proof, confirms liveness (`names/<name> → vol_Y`), and discharges,
-   stamping attested `req:{volume: vol_Y}`.
+   stamping attested `attested.volume = vol_Y`.
 5. coord A presents primary + discharge to `assume-role`. mint verifies
-   both chains, clears the TPC, and renders `by_id/{{req.volume}}/*` from
-   the **attested** volume.
+   both chains, clears the TPC, and renders `by_id/{{attested.volume}}/*`
+   from the **attested** volume.
 
 The duties split cleanly: **coord B attests the *volume* (possession);
 mint binds the *principal* (via `cnf`/PoP).** Neither learns the other's
@@ -162,10 +165,10 @@ coord A anchors **once** at the live volume and derives the whole set
 from the signed lineage. coord B evaluates:
 
 - **self (RW):** possession(vol_Y) ∧ liveness(vol_Y)
-  → attest `req.volume = vol_Y`
+  → attest `attested.volume = vol_Y`
 - **ancestor (RO), per vol_X:** possession(vol_Y) ∧ liveness(vol_Y) ∧
   `vol_X ∈ ancestors(vol_Y)` (signed-provenance walk, bounded by
-  `MAX_EXTENT_INDEX_SOURCES`) → attest `req.volume = vol_X`
+  `MAX_EXTENT_INDEX_SOURCES`) → attest `attested.volume = vol_X`
 
 The possession proof anchors entitlement; the lineage walk authorises
 each specific RO target. The entire authorization graph reduces to *one
@@ -276,7 +279,7 @@ mint — the same CID-wrapping construction as the auth-service TPC's
 5. **Mode.** `rw-self` ⟹ `target == owned`; `ro-ancestor` ⟹ `target ∈
    {owned} ∪ ancestors(owned)` via the shared signed-provenance walk.
 6. **Discharge.** Mint a macaroon rooted at `r` (kid `DISCHARGE_KID`)
-   carrying attested `req.volume = target`, `exp ≤ now + discharge_ttl`.
+   carrying attested `attested.volume = target`, `exp ≤ now + discharge_ttl`.
 
 **What each field binds:**
 
@@ -300,43 +303,97 @@ replayed proof — or a stolen discharge — yields a credential usable only
 by coord A. Freshness and the seen-cache are hardening on top of this
 (they stop coord B being a free discharge oracle), not the sole defence.
 
-## Self-asserted scoping is retired entirely
+## Every template value is MAC-verified or server-side
 
-Rather than keep a self-asserted body-`req` channel alongside the
-attested one, self-asserted **scoping** is removed: every value
-substituted into a policy comes from a MAC-verified source. This
-supersedes `design-mint.md` § *Request body*'s "honest-but-unverified
-`req.volume`" class.
+The self-asserted `req.*` namespace is **removed from the template
+language** entirely, not kept alongside the attested one. Its only
+template-substituted member was the scoping value (`req.volume`), and
+that becomes `attested.volume`; its other members were never substituted
+(see below). This supersedes `design-mint.md` § *Request body*'s
+"honest-but-unverified `req.volume`" class.
 
-The resulting invariant: **every `{{...}}` template value is
-MAC-verified** — `{{caveat.sub}}` from the primary, `{{req.*}}` from the
-discharge, `{{env.*}}`/`{{mint.*}}` server-side. There is no
-self-asserted scoping path a caller can choose; a discharge is therefore
-**mandatory on every `assume-role`**, including self-volume RW. This is
-the *no optional path for a correctness property* rule applied: access
-scoping has exactly one source, the attested one. (The round-trip is
-cheap because coord B is co-located with mint, and lazy because it rides
-the per-ancestor first-touch acquisition.)
+The resulting invariant — **every `{{…}}` template value is MAC-verified
+or server-side, none self-asserted**:
 
-This retires only template-substituted **scoping**. Two things are not
-scoping and are unaffected:
+| namespace | source | trust |
+|---|---|---|
+| `caveat.*` | first-party caveats on the primary | MAC under `K_M` |
+| `attested.*` | the discharge's attested caveat | MAC under `r`, attributable to coord B |
+| `env.*` | operator `[env]` config | server-side |
+| `mint.*` | mint-internal (`MINT_KEYS`) | server-side |
 
-- **`req.role` / `req.ttl` are request *parameters*.** They state what
-  the caller is asking for — `role` is gated against the `role` caveat,
-  `ttl` capped by `min(exp, role.max, …)`. There is no external truth for
-  a third party to attest, and neither is ever `{{...}}`-substituted.
-  They remain request inputs.
-- **Demo `req.prefix` loses its self-asserted source.** The
-  demo/mint-as-auth roles substitute a self-asserted `req.prefix`; with
-  self-asserted scoping gone, the demo prefix moves to server-side
-  `env.*` (simplest, given demo-only-forever) or is discharged by the
-  demo authority. Noted so it is reworked, not silently broken.
+There is no self-asserted substitution path a caller can choose, so this
+is the *no optional path for a correctness property* rule at full
+strength: scoping has exactly one source class, and it is not the caller.
+A discharge is **required wherever a role's sealed policy references
+`attested.*`** — i.e. for `volume-rw`/`volume-ro`, by construction, since
+their ARN renders from `attested.volume`. Whether a discharge is needed
+is a static property of the sealed template, not a per-request choice, so
+the verifier stays unconditional. (The round-trip is cheap because coord
+B is co-located with mint, and lazy because it rides the per-ancestor
+first-touch acquisition.)
 
-Because attested-`req` is the *only* `req` source, the provenance trap is
-closed by construction: it is sourced solely from a verified discharge
-(rooted at the TPC root key `r`, attributable to coord B), never from a
-first-party caveat a caller could append. The `volume-rw`/`volume-ro` ARN
-renders from the discharge's attested volume.
+Two former `req.*` fields are **not** template values and survive the
+removal unchanged as plain request *parameters*:
+
+- **`role` / `ttl`** state what the caller is asking for — `role` is
+  gated against the `role` caveat, `ttl` capped by `min(exp, role.max,
+  …)`. Neither is ever `{{…}}`-substituted, so neither needs a template
+  namespace; they remain request inputs.
+- **Demo `prefix`** — the demo/mint-as-auth roles substituted a
+  self-asserted `req.prefix`; it relocates to server-side `env.*`
+  (simplest, given demo-only-forever). Noted so it is reworked, not
+  silently broken.
+
+Because `attested.*` is the only volume-scoping source, the provenance
+trap is closed by construction: the scoping volume comes solely from a
+verified discharge (rooted at `r`, attributable to coord B), never from a
+first-party caveat a caller could append.
+
+### Every substitution is declared per role and sealed
+
+The per-role `[role.template]` contract (`design-mint.md`; the
+`req`/`caveat` declared-key contract) extends to cover **all four**
+template namespaces, so every `{{…}}` a role's policy can substitute is
+explicitly listed in config and MAC'd into the seal — no implicit surface
+remains:
+
+```toml
+[env]                       # global; all operator-defined values
+bucket = "elide-demo"
+
+[[role]]
+name = "volume-rw"
+[role.template]
+caveat   = ["sub"]          # MAC under K_M, from the primary
+attested = ["volume"]       # MAC under r, from the discharge
+env      = ["bucket"]       # ⊆ the global [env] table
+mint     = []               # ⊆ the closed MINT_KEYS server set
+```
+
+Seal authoring (`validate_policy_surface`) enforces two checks per
+namespace, both already applied to `req`/`caveat` and now to all four:
+
+1. **declared ⊆ authoritative** — each declared key exists in its
+   authority: `env` keys in the global `[env]` table, `mint` keys in
+   `MINT_KEYS`, `attested` keys in the protocol's attestable set (today
+   `{volume}`), `caveat` names in the issuable set.
+2. **used ⊆ declared** — every `{{ns.X}}` token in the policy template is
+   in that role's declared list for `ns`, exact match (catches a
+   `{{env.buckt}}` typo or a dropped binding).
+
+For `env` the chain is therefore **used ⊆ declared ⊆ `[env]`**: the
+global table may hold values many roles never see, and each role narrows
+to the subset its template actually substitutes. The contract is sealed
+into `SealedRole` and MAC'd, so request-time enforcement runs against the
+authored requirement, not a drifted local config.
+
+> **Delta to `design-mint.md`** (apply when this is implemented): extend
+> the `[role.template]` contract from `{req, caveat}` to
+> `{caveat, attested, env, mint}`, dropping `req`; widen
+> `validate_policy_surface` to run *declared ⊆ authoritative* + *used ⊆
+> declared* for `env`/`mint`/`attested` (it already does for the others);
+> relocate the demo `prefix` to `[env]`.
 
 ## The attestation coordinator is a true (limited) coord instance
 
@@ -418,10 +475,14 @@ volume TPC.
   chain-spanning keypair (multi-statement policy assembled in mint code)
   is orthogonal to attestation and only helps dense full-chain reads; not
   adopted (see *Credential model*).
-- **Self-asserted scoping is retired.** Every template value is
-  MAC-verified; a discharge is mandatory on every `assume-role`. `req.role`
-  / `req.ttl` remain request parameters; demo `req.prefix` relocates to
-  `env.*` (see *Self-asserted scoping is retired entirely*).
+- **Self-asserted `req.*` is removed from the template language.** Every
+  `{{…}}` value is MAC-verified (`caveat.*`/`attested.*`) or server-side
+  (`env.*`/`mint.*`); a discharge is required wherever a sealed policy
+  references `attested.*` (so `volume-rw`/`volume-ro`, by construction).
+  `role` / `ttl` remain request parameters; demo `prefix` relocates to
+  `env.*`. All four template namespaces are declared per role in
+  `[role.template]` and sealed (see *Every template value is MAC-verified
+  or server-side*).
 - **Possession-proof binding** is fixed (see that section): domain-tagged
   Ed25519 over `owned ‖ target ‖ blake3(cid) ‖ ts ‖ nonce`, `blake3(cid)`
   the anti-transfer binding.
@@ -439,7 +500,7 @@ volume TPC.
 
 1. **Map-valued vs scalar attested caveat.** With scoping attested-only
    and one volume per role (RW: the live volume; RO: one ancestor per
-   keypair), a single scalar attested caveat suffices today. A map
-   (`req.*`, room for more keys) would revise the "all caveats are scalar"
-   invariant in `design-mint.md`; defer until a second attested field
-   actually appears, unless there is a reason to generalise now.
+   keypair), a single scalar `attested.volume` suffices today. A map
+   (`attested.*`, room for more keys) would revise the "all caveats are
+   scalar" invariant in `design-mint.md`; defer until a second attested
+   field actually appears, unless there is a reason to generalise now.
