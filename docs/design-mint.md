@@ -1562,21 +1562,23 @@ set before clearing. (The PoP/`cnf` check already works this way — it is
 evaluated against the primary's caveats and tail alone, never the
 bundle.) Two kinds of caveat, two clearing rules:
 
-- **Predicate caveats** — `aud`, `op`, `invite`, `Scope`. Answer "is
-  *this* macaroon valid for *this* request?" and are cleared against the
-  **request context** (the audience, the endpoint's authority, the
-  current nonce, the dispatched verb). They never need to be compared
-  *to each other* across macaroons — they meet only at the shared request
-  value. A discharge that carries `op=admin:invite-read` is gated by its
-  own `op` clearing against the request's verb, exactly as the primary's
-  `op` is; no cross-macaroon reconciliation.
+- **Predicate caveats** — `aud`, `op`, `invite`. Answer "is *this*
+  macaroon valid for *this* request?" and are cleared against the
+  **request context** (the audience, the authority/verb, the current
+  nonce). They never need to be compared *to each other* across
+  macaroons — they meet only at the shared request value. The discharge
+  attests its gate with `op` too (e.g. `op=admin:invite-read`), cleared
+  against the dispatched verb exactly as the primary's `op` is — no
+  cross-macaroon reconciliation. (`op` is the scalar operation predicate
+  on both primary and discharge; `Scope` survives only as the *granted
+  set* on a session, a membership shape `op` can't express.)
 - **Attestation caveats** — `sub`, `cnf`, and the auth discharge's
   `OrgId`/`ClientId`. Identities a macaroon *carries*, consumed
   downstream, **never cleared against a request value and never merged
-  across macaroons**. The primary's `sub` (the cnf-bound coordinator) and
-  a discharge's `sub` (the authenticated human the auth service attests)
-  are two different facts in two different contexts; each is read where
-  it belongs and they never collide.
+  across macaroons**. The primary's `sub` (the cnf-bound coordinator — a
+  service identity) and the discharge's `sub` (the authenticated human the
+  auth service attests) are two different facts in two different contexts;
+  each is read where it belongs and they never collide.
 
 `exp` is the **sole caveat combined across the bundle**: the effective
 deadline is the minimum over every macaroon's `exp`, because "valid
@@ -1588,12 +1590,14 @@ value is *unsatisfiable*, never silently dropped — § *All caveats are
 scalar*) is **per-macaroon**: a single chain that contradicts itself
 fails closed. Two macaroons bearing the same caveat name with different
 values is *not* a contradiction — it is two attestations in two
-contexts, which is precisely why `sub` can name the machine on the
-primary and the human on the discharge without conflict.
+contexts, which is precisely why `sub` names the coordinator service
+identity on the primary and the authenticated human on the discharge
+without conflict.
 
-This retires the flattened-union clear and, with it, the discharge's
-separate `Subject` coinage: the authenticated principal is `sub` in the
-discharge's context. It also subsumes the volume-attestation
+This retires the flattened-union clear; with the discharge cleared in its
+own context its principal is simply `sub`, superseding the `Subject`
+coinage that existed only to dodge the union collision. It also subsumes
+the volume-attestation
 `attested.*` fencing question (`design-mint-volume-attestation.md`): a
 discharge can no longer inject a control or `caveat.*` name into the
 primary's cleared identity, because the two namespaces are never merged —
@@ -1605,8 +1609,8 @@ an independent predicate, no agreement or hidden state between them. We
 extend it in exactly one place: because mint templates a MAC-verified
 caveat value into a policy (`caveat.sub`), clearing must track each
 caveat's source macaroon — a step an in-process authorizer that never
-reads a caveat as data does not need. (Fly's typed-caveat enum would make
-the `sub`/`Subject` homograph impossible by construction; mint stays
+reads a caveat as data does not need. (Fly's typed-caveat enum would keep
+the two `sub`s from ever being confused by construction; mint stays
 string-named for the vocabulary-agnostic property and relies on
 per-context clearing instead.)
 
@@ -1616,10 +1620,11 @@ per-context clearing instead.)
 > an `aggregated` union; `ClearedBundle` exposes the primary's and the
 > discharges' cleared caveats by source, not one flat list (the role gate
 > reads the primary's, the operator gates read the discharge's). Rename
-> the auth discharge's `Subject` caveat to `sub`
-> (`design-auth-service.md`; `mint/src/auth.rs`), and register `OrgId` /
-> `ClientId` as named constants alongside it. Retire the
-> `Subject`→`Principal` rename — it is no longer needed.
+> the auth discharge's `Subject` caveat to `sub` and its `Scope` caveat to
+> `op` (`design-auth-service.md`; `mint/src/auth.rs`) — the session keeps
+> `Scope` as its granted set — and register `OrgId` / `ClientId` as named
+> constants. Retire the `Subject`→`Principal` rename — it is no longer
+> needed.
 
 ### Caveat field inventory (Elide)
 
