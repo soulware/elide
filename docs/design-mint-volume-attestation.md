@@ -70,12 +70,21 @@ nor mint a discharge.
 The TPC is appended **at credential issuance** via `tpc::build_caveat`
 → `Macaroon::attenuate`, reading the credential's `tail` as `Tₙ₋₁`. It is
 **static for the credential's life**; the holder only appends a narrowing
-`exp`. Discharges are fetched **fresh per request** (per volume /
-ancestor), minted by coord B under `r` with the reserved `DISCHARGE_KID`
-sentinel, carrying `req.volume = target` + `exp`. At verify, mint
-dispatches on kid (keyring → primary under `K_M`; `DISCHARGE_KID` →
-discharge under `r`); the discharge binds to this primary because the
-same `r` is encrypted in this chain's `vid`.
+`exp`. A discharge is minted by coord B under `r` with the reserved
+`DISCHARGE_KID` sentinel, carrying attested `req.volume = target` + `exp`,
+and binds to this primary because the same `r` is encrypted in this
+chain's `vid` (and to coord A, since that primary is `cnf`-bound). At
+verify, mint dispatches on kid (keyring → primary under `K_M`;
+`DISCHARGE_KID` → discharge under `r`).
+
+A discharge is thus a self-contained bounded macaroon, not a bearer
+token — **safe to cache**. coord A re-presents one across every
+`assume-role` within its `exp`, including the repeated calls that refresh
+an expired Tigris keypair; mint re-verifies the MAC and re-clears `exp`
+per request (verify ≠ clear). coord B is consulted only to **mint** a
+discharge — on first-touch for a target and again on expiry — never on
+every keypair refresh. How long that `exp` is, and so how often coord B
+re-attests, is set per mode in *Currency*.
 
 ### Why a coordinator, not mint itself
 
@@ -202,6 +211,27 @@ one predicate, checked once at the anchor, covering RW-on-self and
 RO-on-ancestors alike — and it means coord A's coordinator identity needs
 no separate proof to coord B: live-key possession + `names/<name> → vol_Y`
 *is* the ownership statement. mint still binds the principal via `cnf`.
+
+Because a discharge can be cached (see *TPC structure*), its `exp` is the
+**currency-staleness bound** — the window in which a cached discharge
+keeps vouching after the underlying currency has moved. The two modes sit
+at opposite ends:
+
+- **RW-self** is currency-sensitive: a force-release or handoff revokes
+  ownership, so a stale RW discharge would keep minting writer keypairs
+  for a deposed owner. `discharge_ttl` here should be short — on the order
+  of the Tigris keypair lifetime (**start at ~5 min**) — so re-attestation
+  rides roughly the same cadence as keypair refresh and the staleness
+  window stays small.
+- **RO-ancestor** is immune: ancestors are frozen, currency never moves,
+  so the discharge cannot go stale. `discharge_ttl` can be long — bounded
+  only by the primary's own `exp` (**start at ~1 h**) — and coord B drops
+  off the path entirely after first-touch.
+
+These are starting points, not fixed constants. `skew` (≈30 s, the
+possession-proof freshness in *Possession-proof binding*) is a separate,
+tighter clock — it bounds replay of a single proof, not the discharge
+lifetime — and is unrelated to `discharge_ttl`.
 
 ## Possession-proof binding
 
