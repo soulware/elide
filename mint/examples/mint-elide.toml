@@ -40,17 +40,28 @@ bucket = "elide-demo"
 [env]
 bucket = "elide-demo"
 
+# The `[role.template]` subtable declares the role's substitution contract:
+# the `{{req.X}}` body fields and `{{caveat.X}}` MAC-verified names its policy
+# template uses. Seal authoring rejects a template whose tokens don't match
+# these exactly, and the request path enforces them before render.
+
 [[role]]
 name = "volume-ro"
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
 
+[role.template]
+req = ["volume"]
+
 [[role]]
 name = "volume-rw"
 min_ttl_seconds = 60
 max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
+
+[role.template]
+req = ["volume"]
 
 [[role]]
 name = "coord-ro"
@@ -63,3 +74,6 @@ name = "coord-rw"
 min_ttl_seconds = 60
 max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
+
+[role.template]
+caveat = ["sub"]

@@ -1003,6 +1003,16 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
 
                 // Surface + template come from the sealed bytes.
                 print_policy_surface(sealed_policy);
+                // The request contract (`[role.template]`) is sealed too;
+                // flag a local declaration that has drifted from it.
+                if sealed.req != role.req || sealed.caveat != role.caveat {
+                    eprintln!("  \u{26a0} local [role.template] has drifted from the seal:");
+                    eprintln!(
+                        "      sealed: req={:?} caveat={:?}",
+                        sealed.req, sealed.caveat
+                    );
+                    eprintln!("      local:  req={:?} caveat={:?}", role.req, role.caveat);
+                }
                 let local_blake3 = mint::seal::hash_hex(role.policy.as_bytes());
                 if local_blake3 != sealed.policy_blake3 {
                     eprintln!("  \u{26a0} local roles_dir/ has drifted from the seal:");

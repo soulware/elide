@@ -580,6 +580,52 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         );
     };
 
+    // The role's sealed request contract: every declared `req` field must
+    // be a string in the PoP-verified body, every declared `caveat` name
+    // must resolve to a single value in the MAC-verified chain. Enforced
+    // here, against the attested contract, before render — a missing input
+    // is a client fault (clean 400) rather than a render-time 500. Render's
+    // strict mode is the backstop. authorize() proved the role is in the
+    // surface, so an absent SealedRole is the same internal inconsistency
+    // the missing-policy branch above guards.
+    let eff = EffectiveCaveats::new(&caveats);
+    if let Some(sealed_role) = surface.role(&granted.role_name) {
+        for field in &sealed_role.req {
+            if request_json
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            {
+                audit(entry(
+                    "denied:missing_req_field",
+                    &granted.role_name,
+                    None,
+                    None,
+                ));
+                return respond(
+                    &request_id,
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "bad request"}),
+                );
+            }
+        }
+        for name in &sealed_role.caveat {
+            if !matches!(eff.resolve(name), Resolved::Value(_)) {
+                audit(entry(
+                    "denied:missing_caveat",
+                    &granted.role_name,
+                    None,
+                    None,
+                ));
+                return respond(
+                    &request_id,
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "bad request"}),
+                );
+            }
+        }
+    }
+
     let expiry = now + chrono::Duration::seconds(granted.ttl_seconds as i64);
     let expiry_iso = expiry.to_rfc3339();
     let policy = match render_policy(
@@ -602,7 +648,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         }
     };
 
-    let scope = match EffectiveCaveats::new(&caveats).resolve("elide:Volume") {
+    let scope = match eff.resolve("elide:Volume") {
         Resolved::Value(v) => Some(v),
         Resolved::Absent | Resolved::Unsatisfiable => None,
     };

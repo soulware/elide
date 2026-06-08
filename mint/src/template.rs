@@ -73,6 +73,14 @@ enum Resolution {
     Malformed,
 }
 
+/// The complete set of `mint.*` keys the renderer computes — currently
+/// just the credential's expiry. The seal-time surface check
+/// ([`crate::config::Config::validate_policy_surface`]) rejects a template
+/// referencing any `mint.X` outside this set, so an unknown mint key fails
+/// at publish, not at first render. Keep in sync with the `mint` arm of
+/// [`render_policy`]'s resolver, which is the matching value source.
+pub const MINT_KEYS: &[&str] = &["expiry"];
+
 /// Parse a token's trimmed interior into `(namespace, key)`, or `None` if
 /// it is not a well-formed `namespace.key` scalar path — an unknown
 /// namespace, a missing or empty key, or embedded whitespace (which

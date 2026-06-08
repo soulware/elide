@@ -1147,6 +1147,9 @@ min_ttl_seconds = 60
 max_ttl_seconds = 604800     # 7 days
 default_ttl_seconds = 86400  # 1 day
 # template: <roles_dir>/volume-ro.json (the default; no policy_file needed)
+
+[role.template]
+req = ["volume"]             # the policy substitutes {{req.volume}}
 ```
 
 Credentials carry no third-party caveat: operator authority is exercised
@@ -1256,7 +1259,10 @@ distinct trust provenance:
   RFC 3339 / ISO 8601 instant — `now + min(requested TTL, role
   `max_ttl_seconds`, macaroon `exp` − now)`). This is the mint's clamped
   output, not the macaroon's raw `exp` caveat: it can be strictly tighter
-  and never looser, so a template substitutes `mint.expiry` here.
+  and never looser, so a template substitutes `mint.expiry` here. The
+  `mint.*` namespace is closed to this server-computed set; seal authoring
+  rejects a template referencing any other `mint.X`, so an unknown key
+  fails at publish, not at render.
 - `{{caveat.X}}` — the **MAC-verified** value of the macaroon's caveat
   named `X`, as a plain path. v1 exposes one: `caveat.sub`, the
   enrolment-immutable principal, for `coord-rw`'s own-identity prefix
@@ -1281,6 +1287,60 @@ honest-but-unverified caller assertion and rides the body as `req.volume`,
 not a caveat. All four classes are strict — a token naming an absent key,
 a non-string `req` field, or anything that is not a `namespace.key`
 scalar path fails the render closed, never a silent empty string.
+
+#### Declared request contract
+
+The two **request-supplied** namespaces — `req.*` (PoP-signed body fields)
+and `caveat.*` (MAC-verified caveat names) — are declared per role in a
+`[role.template]` subtable, the role's *request contract*:
+
+```toml
+[[role]]
+name = "coord-rw"
+# … TTL bounds, policy_file …
+
+[role.template]
+caveat = ["sub"]      # the template binds {{caveat.sub}}
+```
+
+```toml
+[[role]]
+name = "volume-ro"
+# …
+
+[role.template]
+req = ["volume"]      # the template substitutes {{req.volume}}
+```
+
+The contract is the authoritative set for those two namespaces, validated
+in three places so the same declaration is checked at authoring,
+attestation, and request time:
+
+- **Seal authoring** (`POST /v1/admin/seal`) cross-checks each template's
+  actual `{{req.X}}` / `{{caveat.X}}` tokens against the declaration —
+  **exact match**, absent subtable = the empty set. A typo (`{{req.volm}}`
+  against a declared `volume`) or a dropped binding (a `coord-rw` template
+  that forgets `{{caveat.sub}}` and so would mis-scope to
+  `coordinators/*/*`) fails at publish instead of silently mis-scoping a
+  live credential. This is the same move as sourcing the principal from
+  `caveat.sub` rather than a body field: it takes a security binding off
+  "the author remembered to" and puts it on "the system enforces."
+- **Sealing.** The declared contract is part of the attested surface — it
+  is sealed alongside the policy hash and TTL bounds (`SealedRole`) and
+  MAC'd into the seal. A host enforces the contract that was *authored*,
+  never a drifted local one; `mint role inspect` flags a local
+  `[role.template]` that no longer matches the seal.
+- **Request time.** Before render, the request path enforces the sealed
+  contract against the live request: every declared `req` field must be a
+  string in the PoP-verified body, every declared `caveat` name must
+  resolve to a single value in the MAC-verified chain. A missing input is
+  a clean `400` (a client fault) rather than a render-time failure.
+  Render-time strict mode remains the backstop.
+
+This completes a symmetric picture: every namespace's surface is validated
+at seal against an authoritative set — `env.*` against `[env]`, `mint.*`
+against the closed server set, and `req.*` / `caveat.*` against the
+declared contract.
 
 The mint **does not** ship a general-purpose policy DSL. The role-facing
 surface is scalar substitution of `{{env.*}}`, `{{mint.*}}`, `{{req.*}}`,

@@ -55,11 +55,20 @@ const SEAL_DOMAIN: &[u8] = b"mint-templates-seal-v1";
 /// intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedRole {
+    /// The MAC-verified `caveat.*` names the role's template substitutes —
+    /// its declared caveat contract (`docs/design-mint.md` § *Templating*).
+    /// Sealing it pins the binding: a host enforces exactly the caveat
+    /// requirement that was authored, never a drifted local one.
+    pub caveat: Vec<String>,
     pub default_ttl_seconds: u64,
     pub max_ttl_seconds: u64,
     pub min_ttl_seconds: u64,
     /// BLAKE3 of the role's policy template file content, hex-encoded.
     pub policy_blake3: String,
+    /// The `req.*` body fields the role's template substitutes — its
+    /// declared request contract. Sealed alongside [`caveat`](Self::caveat)
+    /// and enforced at request time before render.
+    pub req: Vec<String>,
 }
 
 /// The complete seal: every role, plus the audience. MAC'd under one
@@ -124,14 +133,18 @@ impl Seal {
                 default_ttl_seconds,
                 policy_path: _, // location, not authority — bytes hashed below
                 policy,
+                req,
+                caveat,
             } = role;
             roles.insert(
                 name.clone(),
                 SealedRole {
+                    caveat: caveat.clone(),
                     default_ttl_seconds: *default_ttl_seconds,
                     max_ttl_seconds: *max_ttl_seconds,
                     min_ttl_seconds: *min_ttl_seconds,
                     policy_blake3: hash_hex(policy.as_bytes()),
+                    req: req.clone(),
                 },
             );
         }
@@ -243,6 +256,18 @@ impl Seal {
                 diffs.push(format!(
                     "role {name}: policy_blake3 sealed as {}, local file hashes to {}",
                     sealed.policy_blake3, local_hash,
+                ));
+            }
+            if sealed.req != role.req {
+                diffs.push(format!(
+                    "role {name}: req contract sealed as {:?}, local config has {:?}",
+                    sealed.req, role.req,
+                ));
+            }
+            if sealed.caveat != role.caveat {
+                diffs.push(format!(
+                    "role {name}: caveat contract sealed as {:?}, local config has {:?}",
+                    sealed.caveat, role.caveat,
                 ));
             }
         }
@@ -624,6 +649,49 @@ policy_file = "volume-ro.json"
         let diffs = seal.diff_against_config(&cfg2);
         assert_eq!(diffs.len(), 1);
         assert!(diffs[0].contains("policy_blake3"), "diff: {:?}", diffs);
+    }
+
+    const CONTRACT_TOML: &str = r#"
+audience = "mint"
+[store]
+bucket = "demo-bucket"
+[[role]]
+name = "coord-rw"
+min_ttl_seconds = 60
+max_ttl_seconds = 3600
+default_ttl_seconds = 3600
+policy_file = "coord-rw.json"
+[role.template]
+caveat = ["sub"]
+"#;
+
+    #[test]
+    fn req_caveat_contract_is_sealed_and_drift_is_diffed() {
+        // The declared contract is part of the attested surface: it MACs
+        // into the seal and a host that drifts its local declaration is
+        // flagged, so request-time enforcement runs against the sealed
+        // requirement, not a mutable local one.
+        let kr = Keyring::single([7u8; 32]);
+        let cfg = parse_for_test(
+            CONTRACT_TOML,
+            &[("coord-rw.json", r#"{"r":"c/{{caveat.sub}}/*"}"#)],
+        )
+        .expect("parse");
+        let seal = Seal::build_from_config(&cfg, &kr, "t");
+        assert_eq!(seal.roles["coord-rw"].caveat, vec!["sub".to_string()]);
+        assert!(seal.roles["coord-rw"].req.is_empty());
+        assert!(seal.diff_against_config(&cfg).is_empty());
+
+        // Drop the declaration locally: same templates, different contract
+        // → the seal no longer matches the config.
+        let drifted = parse_for_test(
+            &CONTRACT_TOML.replace("caveat = [\"sub\"]\n", ""),
+            &[("coord-rw.json", r#"{"r":"c/{{caveat.sub}}/*"}"#)],
+        )
+        .expect("parse");
+        let diffs = seal.diff_against_config(&drifted);
+        assert_eq!(diffs.len(), 1, "diffs: {diffs:?}");
+        assert!(diffs[0].contains("caveat contract"), "diff: {:?}", diffs);
     }
 
     #[test]
