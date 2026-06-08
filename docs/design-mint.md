@@ -1567,11 +1567,13 @@ bundle.) Two kinds of caveat, two clearing rules:
   **request context** (the audience, the authority/verb, the current
   nonce). They never need to be compared *to each other* across
   macaroons — they meet only at the shared request value. The discharge
-  attests its gate with `op` too (e.g. `op=admin:invite-read`), cleared
-  against the dispatched verb exactly as the primary's `op` is — no
-  cross-macaroon reconciliation. (`op` is the scalar operation predicate
-  on both primary and discharge; `Scope` survives only as the *granted
-  set* on a session, a membership shape `op` can't express.)
+  carries `aud=mint` and attests its gate with `op` (e.g.
+  `op=admin:invite-read`), each cleared against the request exactly as the
+  primary's are — so the discharge declares its own audience rather than
+  inheriting it only transitively through `r`, and no caveat is
+  reconciled across macaroons. (`op` is the scalar operation predicate on
+  both primary and discharge; `Scope` survives only as the *granted set*
+  on a session, a membership shape `op` can't express.)
 - **Attestation caveats** — `sub`, `cnf`, and the auth discharge's
   `OrgId`/`ClientId`. Identities a macaroon *carries*, consumed
   downstream, **never cleared against a request value and never merged
@@ -1621,10 +1623,10 @@ per-context clearing instead.)
 > discharges' cleared caveats by source, not one flat list (the role gate
 > reads the primary's, the operator gates read the discharge's). Rename
 > the auth discharge's `Subject` caveat to `sub` and its `Scope` caveat to
-> `op` (`design-auth-service.md`; `mint/src/auth.rs`) — the session keeps
-> `Scope` as its granted set — and register `OrgId` / `ClientId` as named
-> constants. Retire the `Subject`→`Principal` rename — it is no longer
-> needed.
+> `op`, and stamp `aud=mint` on it (`design-auth-service.md`;
+> `mint/src/auth.rs`) — the session keeps `Scope` as its granted set — and
+> register `OrgId` / `ClientId` as named constants. Retire the
+> `Subject`→`Principal` rename — it is no longer needed.
 
 ### Caveat field inventory (Elide)
 
