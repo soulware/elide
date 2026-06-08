@@ -23,6 +23,7 @@ mod common;
 
 const ROOT: [u8; 32] = [42u8; 32];
 const K_M_A: [u8; 32] = [13u8; 32];
+const K_M_B: [u8; 32] = [21u8; 32];
 const CLIENT_SEED: [u8; 32] = [7u8; 32];
 const CLIENT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const ORG_ID: &str = "demo";
@@ -120,6 +121,50 @@ fn build_discharge(r: [u8; 32]) -> Macaroon {
             Caveat::scalar("Subject", "usr_demo"),
             Caveat::scalar(name::EXP, "2099999999"),
         ],
+    )
+}
+
+/// A primary carrying the **attested** TPC (the volume-attestation
+/// variant), built via the public issuance APIs. Same universal caveats
+/// as [`build_primary`]; the TPC's CID is sealed under `K_M-B` and
+/// carries an opaque `mode`.
+fn build_attested_primary(mode: &str) -> Macaroon {
+    let ring = Keyring::single(ROOT);
+    let cred = macaroon::mint(
+        &ring,
+        vec![
+            Caveat::scalar(name::OP, op::ASSUME_ROLE),
+            Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::SUB, CLIENT_ID),
+            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(name::ROLE, "volume-ro"),
+        ],
+    );
+    let r = tpc::derive_r(&ROOT, CLIENT_ID, 0);
+    let tpc_cv =
+        tpc::build_caveat_attested(cred.tail(), &r, &K_M_B, CLIENT_ID, ORG_ID, mode, AUTH_URL);
+    cred.attenuate(tpc_cv)
+}
+
+/// Mint a discharge the way the attestation coordinator would: recover
+/// `r` from the attested TPC's CID under `K_M-B` (coord B has no `K_M`,
+/// so it cannot re-derive `r` — it must decrypt the CID), then mint
+/// rooted at that `r`. Proves the verifier's VID-side `r` and coord B's
+/// CID-side `r` agree end-to-end through the HTTP handler.
+fn coord_b_discharge(primary: &Macaroon) -> Macaroon {
+    let cid = primary
+        .caveats()
+        .iter()
+        .find_map(|c| match c {
+            Caveat::ThirdParty { cid, .. } => Some(cid.clone()),
+            _ => None,
+        })
+        .expect("attested TPC present");
+    let pt = tpc::decrypt_cid_attested(&K_M_B, &cid).expect("recover r from attested cid");
+    macaroon::mint_under_key(
+        &pt.r,
+        DISCHARGE_KID,
+        vec![Caveat::scalar(name::EXP, "2099999999")],
     )
 }
 
@@ -247,6 +292,36 @@ async fn verifies_tpc_free_chain_with_no_discharges() {
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["valid"], serde_json::Value::Bool(true), "body: {body}");
+}
+
+#[tokio::test]
+async fn verifies_attested_primary_and_coord_b_discharge() {
+    // The volume-attestation TPC rides the same generic discharge walk
+    // as the auth TPC: mint recovers `r` from the TPC's VID, coord B
+    // recovered the same `r` from the CID under K_M-B, and the discharge
+    // minted under it verifies. mint needs no K_M-B to verify (VID is
+    // key-agnostic) — the store here holds only K_M-A.
+    let (app, _dir) = app().await;
+    let primary = build_attested_primary("ro-ancestor");
+    let discharge = coord_b_discharge(&primary);
+
+    let (status, body) = verify_request(app, &primary.encode(), &[&discharge.encode()]).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["valid"], serde_json::Value::Bool(true), "body: {body}");
+}
+
+#[tokio::test]
+async fn rejects_attested_primary_when_discharge_missing() {
+    // The load-bearing invariant: a credential carrying the attested TPC
+    // is inert without a discharge — it cannot clear at assume-role.
+    let (app, _dir) = app().await;
+    let primary = build_attested_primary("rw-self");
+
+    let (_status, body) = verify_request(app, &primary.encode(), &[]).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["valid"], serde_json::Value::Bool(false));
+    assert_eq!(v["reason"], "tpc_undischarged");
 }
 
 #[tokio::test]
