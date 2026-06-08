@@ -56,8 +56,9 @@ pub mod name {
     /// cleared by the gate that consumes the discharge
     /// (`docs/design-auth-service.md` § *Scope tier*). Carried as a
     /// granted set on a session (membership-checked at issuance) and as a
-    /// single value on a discharge (scalar-cleared at the gate).
-    pub const SCOPE: &str = "Scope";
+    /// single value on a discharge (scalar-cleared at the gate). Coined,
+    /// so lowercase like the other coined names (`op`/`role`/`invite`).
+    pub const SCOPE: &str = "scope";
 }
 
 /// `Scope` caveat values — the authority classes auth grants and each

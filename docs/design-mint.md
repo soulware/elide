@@ -570,7 +570,7 @@ CLI fetches a **discharge** for the service token's third-party caveat
 from `POST <auth>/v1/discharge` at scope `mint:admin` (gated by the
 session, which must carry that scope; recovering the discharge key from
 the caveat's `CID` under `K_M-A`). The discharge carries `Subject`,
-`Scope=mint:admin`, and a short `exp` and **no** `op`, so one fetch
+`scope=mint:admin`, and a short `exp` and **no** `op`, so one fetch
 satisfies every verb (the verb binds via the per-call attenuation).
 
 The discharge **route** is the *path* of the service token's own TPC
@@ -805,7 +805,7 @@ and `cnf=ed25519:<own pub>` and presents `[invite ⊕ sub/cnf, coordinator
 PoP over the body, operator discharge]`. Mint verifies the chain against
 its root (`op=enroll`, `invite`=current), the PoP against the appended
 `cnf`, and the discharge against the invite's third-party caveat —
-clearing its `Scope` to `mint:enroll`; it
+clearing its `scope` to `mint:enroll`; it
 records a **pending enrollment** at `_mint/clients/pending/<sub>.json` —
 `(sub, pub, invite, requested_by, first-seen ts, peer ip)`, where
 `requested_by` is the discharge's `Subject` — and returns a **credential
@@ -862,7 +862,7 @@ human) fetches a discharge for the ticket's third-party caveat at scope
 presents `[ticket, operator discharge]` with a `coordinator.key` PoP over
 the body `{ts, role}`, once per role it needs. Mint verifies the ticket
 chain (`op=enroll-exchange`, the short `exp`), the discharge against the
-ticket's TPC — clearing its `Scope` to `mint:exchange` — and the PoP
+ticket's TPC — clearing its `scope` to `mint:exchange` — and the PoP
 against the ticket's `cnf`; requires `_mint/clients/enrolled/<sub>` to exist with
 a `pub` equal to that `cnf`; and decides **is this `sub` permitted this
 `role`**. The decision has a
@@ -1550,7 +1550,7 @@ class: it is the MAC-verified `sub` caveat, read by a policy as
 
 ### Clearing context: per-macaroon, not a flattened union
 
-**Proposed.** A bundle is a primary plus its discharges. Each is a
+A bundle is a primary plus its discharges. Each is a
 distinct macaroon, MAC'd under a distinct key (`K_M` for the primary,
 the recovered `r` for a discharge), bound to the others *structurally* —
 the discharge's caveat key `r` is recovered from the primary's `VID`, so
@@ -1562,18 +1562,18 @@ set before clearing. (The PoP/`cnf` check already works this way — it is
 evaluated against the primary's caveats and tail alone, never the
 bundle.) Two kinds of caveat, two clearing rules:
 
-- **Predicate caveats** — `aud`, `op`, `invite`. Answer "is *this*
-  macaroon valid for *this* request?" and are cleared against the
+- **Predicate caveats** — `aud`, `op`, `invite`, `scope`. Answer "is
+  *this* macaroon valid for *this* request?" and are cleared against the
   **request context** (the audience, the authority/verb, the current
-  nonce). They never need to be compared *to each other* across
-  macaroons — they meet only at the shared request value. The discharge
-  carries `aud=mint` and attests its gate with `op` (e.g.
-  `op=admin:invite-read`), each cleared against the request exactly as the
-  primary's are — so the discharge declares its own audience rather than
-  inheriting it only transitively through `r`, and no caveat is
-  reconciled across macaroons. (`op` is the scalar operation predicate on
-  both primary and discharge; `Scope` survives only as the *granted set*
-  on a session, a membership shape `op` can't express.)
+  nonce, the gate's tier). They never need to be compared *to each other*
+  across macaroons — they meet only at the shared request value. The
+  primary carries `aud` and `op` (its audience and verb). The discharge
+  carries `aud=mint` — cleared per-macaroon, so it declares its own
+  audience rather than inheriting it only transitively through `r` — and
+  `scope` (its authority tier), cleared at the gate against
+  `mint:enroll`/`mint:exchange`/`mint:admin`; it deliberately carries no
+  `op`, so one discharge satisfies every verb of its tier. No predicate is
+  reconciled across macaroons.
 - **Attestation caveats** — `sub` and `cnf`. Identities a macaroon
   *carries*, consumed downstream, **never cleared against a request value
   and never merged across macaroons**. The primary's `sub` (the cnf-bound
@@ -1624,24 +1624,23 @@ the two `sub`s from ever being confused by construction; mint stays
 string-named for the vocabulary-agnostic property and relies on
 per-context clearing instead.)
 
-> **Delta when implemented.** Restructure the verify+clear core
-> (`mint/src/http.rs::verify_and_clear`) to clear `aud`/`op`/`exp`
-> per-macaroon against the request context rather than `resolve`-ing over
-> an `aggregated` union; `ClearedBundle` exposes the primary's and the
-> discharges' cleared caveats by source, not one flat list (the role gate
-> reads the primary's, the operator gates read the discharge's). Rename
-> the auth discharge's `Subject` caveat to `sub` and its `Scope` caveat to
-> `op`, and stamp `aud=mint` on it (`design-auth-service.md`;
-> `mint/src/auth.rs`) — the session keeps `Scope` as its granted set.
-> Route the audit-identity read (`admin.rs`, `http.rs` — `approved_by` /
-> `revoked_by` / `requested_by`) to the discharge's context rather than
-> `resolve`-ing `Subject` over `aggregated_caveats`. Drop the `OrgId` /
-> `ClientId` caveats — never read; `client_id` / `org_id` stay as TPC CID
-> plaintext (`r` derivation; org check at issuance). Correct
-> `design-auth-service.md`, which says org-scoping is "enforced by
-> construction (mandatory `OrgId` caveat)": it is enforced at discharge
-> issuance via the CID, not a caveat. Retire the `Subject`→`Principal`
-> rename — it is no longer needed.
+The verify+clear core (`mint/src/http.rs::verify_and_clear`) clears
+`aud`/`op`/`exp` per-macaroon against the request context; `ClearedBundle`
+exposes the primary and the discharge caveats **by source**, never one
+flat list — the role gate reads the primary's, the operator gates read
+the discharge's `scope` tier and `sub` audit identity. The auth discharge
+carries `aud`, `sub` (was `Subject`), `scope`, `exp`; `OrgId`/`ClientId`
+are dropped (never read — `client_id` derives `r`, `org_id` is checked at
+issuance, both as TPC CID plaintext, so org-scoping is enforced via the
+CID, not a caveat). The `Subject`→`Principal` rename is retired — no
+longer needed.
+
+`scope` (the coarse authority *tier*) and `op` (the fine *verb*) are
+deliberately distinct predicates: a discharge carries no `op` precisely so
+one discharge drives every verb of its tier, and folding the two would
+break that. The tier therefore stays its own caveat — named `scope`
+(lowercase, like the other coined names `op`/`role`/`invite`), not the
+capitalised `Scope` it once was.
 
 ### Caveat field inventory (Elide)
 

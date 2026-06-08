@@ -13,7 +13,7 @@
 //! `/v1/discharge` request must carry `Authorization: Bearer
 //! <session>` — a session macaroon minted by `POST /v1/login` under
 //! `K_session`. The demo accepts any subject at login (no password);
-//! the session is the *gate* on discharge issuance, and its `Subject`
+//! the session is the *gate* on discharge issuance, and its `sub`
 //! is what each discharge attests. Production auth-service authenticates
 //! login for real and issues sessions over its own wire; the gate shape
 //! is the same.
@@ -40,11 +40,13 @@
 //! `K_M-A` ([`tpc::decrypt_cid`]) to recover `(r, client_id, org_id)` —
 //! no `K_M`, no per-client state — and reject if `org_id` is not the org
 //! this role serves. Mint a macaroon at `kid = DISCHARGE_KID`, chain
-//! MAC'd under that `r`, caveats `Subject` (the session subject),
-//! `OrgId`, `ClientId`, `Scope` (the requested class, cleared by the
-//! gate), `exp`. No `op`: per-op narrowing is the caller's
-//! attenuation onto the primary (the PoP'd anchor), so one discharge
-//! satisfies every op that primary is attenuated for. Mint's verifier
+//! MAC'd under that `r`, caveats `aud`, `sub` (the session subject — the
+//! authenticated human, in the discharge's own context), `Scope` (the
+//! requested class, cleared by the gate), `exp`. `org_id`/`client_id` are
+//! not stamped as caveats — nothing reads them; the org is checked here
+//! and `client_id` only derives `r`. No `op`: per-op narrowing is the
+//! caller's attenuation onto the primary (the PoP'd anchor), so one
+//! discharge satisfies every op that primary is attenuated for. Mint's verifier
 //! recovers the same `r` from the primary's `vid`
 //! ([`tpc::decrypt_vid`]) — the two recover identical keys by
 //! construction.
@@ -116,7 +118,7 @@ pub(crate) struct DischargeRequest {
     pub(crate) scope: String,
 }
 
-/// A verified session's claims: the `Subject` the discharge attests and
+/// A verified session's claims: the `sub` the discharge attests and
 /// the granted `Scope` set the issuance check is made against.
 pub struct SessionClaims {
     pub subject: String,
@@ -142,7 +144,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Mint a demo session macaroon under `K_session`: caveats
-/// `op=session`, `Subject=<subject>`, the granted `Scope` set, and
+/// `op=session`, `sub=<subject>`, the granted `Scope` set, and
 /// `exp=now+7d`. A fresh chain (not an attenuation), keyed by
 /// `K_session`, so it is structurally distinct from every mint-issued
 /// macaroon and verifiable only by this role. The demo grants **every**
@@ -156,7 +158,7 @@ fn mint_session(k_session: &[u8; 32], subject: &str, now_unix: u64) -> Macaroon 
         SESSION_KID,
         vec![
             Caveat::scalar(name::OP, op::SESSION),
-            Caveat::scalar("Subject", subject),
+            Caveat::scalar(name::SUB, subject),
             Caveat::scalar(name::SCOPE, scope::MINT_ENROLL),
             Caveat::scalar(name::SCOPE, scope::MINT_EXCHANGE),
             Caveat::scalar(name::SCOPE, scope::MINT_ADMIN),
@@ -167,7 +169,7 @@ fn mint_session(k_session: &[u8; 32], subject: &str, now_unix: u64) -> Macaroon 
 
 /// Verify a session presented in `Authorization: Bearer <session>`:
 /// chain MAC under `K_session`, `op=session`, and a non-expired
-/// `exp`. Returns the session's `Subject` and granted `Scope` set
+/// `exp`. Returns the session's `sub` and granted `Scope` set
 /// on success. Every failure is the opaque `()` the caller maps to
 /// `401`.
 #[allow(clippy::result_unit_err)]
@@ -202,7 +204,7 @@ pub fn verify_session(
             _ => None,
         })
         .collect();
-    match eff.resolve("Subject") {
+    match eff.resolve(name::SUB) {
         Resolved::Value(subject) => Ok(SessionClaims { subject, scopes }),
         _ => Err(()),
     }
@@ -234,7 +236,7 @@ async fn issue_session(State(state): State<AppState>, body: Bytes) -> Response {
 }
 
 /// `POST /v1/discharge` — session-gated wide discharge for a credential's
-/// third-party caveat. The session's `Subject` is what the discharge
+/// third-party caveat. The session's `sub` is what the discharge
 /// attests; the `cid` recovers `(r, client_id, org_id)` under `K_M-A`,
 /// cross-checked against the org this role serves.
 async fn issue_discharge(
@@ -286,9 +288,15 @@ async fn issue_discharge(
         &pt.r,
         DISCHARGE_KID,
         vec![
-            Caveat::scalar("Subject", &claims.subject),
-            Caveat::scalar("OrgId", pt.org_id),
-            Caveat::scalar("ClientId", pt.client_id),
+            // The discharge declares its own audience and clears it
+            // per-macaroon at the bundle, like the primary.
+            Caveat::scalar(name::AUD, &state.config.audience),
+            // The authenticated human the discharge attests — `sub` in the
+            // discharge's own context, never reconciled with the primary's
+            // `sub` (the machine). `org_id`/`client_id` from the CID are
+            // not re-stamped as caveats: nothing reads them, the org is
+            // already checked above, and `client_id` only derives `r`.
+            Caveat::scalar(name::SUB, &claims.subject),
             Caveat::scalar(name::SCOPE, &req.scope),
             Caveat::scalar(name::EXP, exp.to_string()),
         ],
@@ -357,7 +365,7 @@ mod tests {
             SESSION_KID,
             vec![
                 Caveat::scalar(name::OP, "not-session"),
-                Caveat::scalar("Subject", "alice"),
+                Caveat::scalar(name::SUB, "alice"),
             ],
         );
         assert!(verify_session(&[21u8; 32], &bearer(&m), 1_000).is_err());

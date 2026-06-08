@@ -157,16 +157,17 @@ fn gate_scope(m: &Macaroon) -> Option<&'static str> {
 
 /// Mint the operator discharge a gate clears, the way auth (or the
 /// colocated demo) would: recover `r` from the anchor's TPC `CID` under
-/// `K_M-A` and chain-MAC a discharge carrying `(Subject, OrgId, Scope,
-/// exp)` under it, at `DISCHARGE_KID`.
+/// `K_M-A` and chain-MAC a discharge carrying `(aud, sub, Scope, exp)`
+/// under it, at `DISCHARGE_KID`. `sub` is the authenticated human in the
+/// discharge's own context; `aud` clears per-macaroon like the primary's.
 fn gate_discharge(cid: &[u8], scope: &str) -> Macaroon {
     let pt = tpc::decrypt_cid(&K_M_A, cid).expect("cid decrypts under K_M-A");
     mint_under_key(
         &pt.r,
         DISCHARGE_KID,
         vec![
-            Caveat::scalar("Subject", "usr_test"),
-            Caveat::scalar("OrgId", pt.org_id),
+            Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::SUB, "usr_test"),
             Caveat::scalar(name::SCOPE, scope),
             Caveat::scalar(name::EXP, far_future().to_string()),
         ],
