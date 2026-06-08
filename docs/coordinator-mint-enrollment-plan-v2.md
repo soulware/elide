@@ -68,7 +68,7 @@ completed successfully.
   `coord-rw`, `volume-rw`, `volume-ro`) — bundle `[ticket, discharge]`,
   body `{ts, role}`, same PoP — and writes each re-minted credential to
   `credentials/<role>` (mode `0600`). One exchange-gate discharge covers
-  all four exchanges within its `NotAfter`; the approved record is not
+  all four exchanges within its `exp`; the approved record is not
   consumed per exchange.
 
 On success: four files under `credentials/`. Exit `0`.

@@ -51,7 +51,7 @@ authority rides two third-party caveats already present in the system:
 - **Admin-token TPC** — the third-party caveat on the mint admin service
   token. Discharged by an operator on each `/v1/admin/*` call.
 - **Discharge** — an auth-issued macaroon that satisfies one of those
-  TPCs. Attests `(Subject, OrgId, NotAfter)` — *who* authorised and for
+  TPCs. Attests `(Subject, OrgId, exp)` — *who* authorised and for
   *how long* — and is verified at mint, which holds the chain root.
 
 ## Principle
@@ -173,7 +173,7 @@ Slow cadence — once per org lifetime plus occasional rotation.
 
 1. Org admin signs up at the auth service's web UI (out of band).
 2. Org admin generates a one-shot mint-enrollment token in the auth
-   service UI: `OrgId=X, Purpose=MintEnroll, NotAfter=now+24h`.
+   service UI: `OrgId=X, Purpose=MintEnroll, exp=now+24h`.
 3. Mint admin runs `elide-mint setup --enrollment-token <token>`.
 4. Mint POSTs `<auth>/v1/mint/enroll` with the token.
 5. Auth verifies the token, records org X as activated, generates
@@ -233,7 +233,7 @@ credentials are inert service tokens it presents at `assume-role`.
 Same chained-keyed-BLAKE3 construction throughout.
 
 **1. Session.** Auth-issued, CLI-held. One per operator login, ~7d
-lifetime. Caveats `(Subject, OrgId, NotAfter)`. Chain-MAC'd under
+lifetime. Caveats `(Subject, OrgId, exp)`. Chain-MAC'd under
 `K_session`. Used only on the CLI ↔ auth channel; coord and mint never
 see it.
 
@@ -257,7 +257,7 @@ authorization*). Chain-MAC'd under `K_M`. The operator attenuates
 `op=admin:<verb>` per call; discharged on every `/v1/admin/*` call.
 
 **5. Discharge.** Auth-issued, CLI-held. Short-lived (~5 min). Caveats
-`(Subject, OrgId, Scope, NotAfter)` — the `Scope` first-party caveat
+`(Subject, OrgId, Scope, exp)` — the `Scope` first-party caveat
 names the authority class auth authorised (`mint:enroll`,
 `mint:exchange`, or `mint:admin`), and is what the gate clears against.
 Chain-MAC'd under the `r_tpc` recovered from the target `CID`; its nonce
@@ -296,7 +296,7 @@ When the enrolling operator brings a coordinator in:
    `K_M-A` → recovers `(r_inv, OrgId)`, cross-checks the decoded `OrgId`
    against the session's, requires `mint:enroll ∈ session.scopes`,
    and mints a discharge: caveats `(Subject, OrgId, Scope=mint:enroll,
-   NotAfter=now+5min)`, chain-MAC'd under `r_inv`, nonce = `CID`. A
+   exp=now+5min)`, chain-MAC'd under `r_inv`, nonce = `CID`. A
    session lacking the scope → `403`.
 3. The operator conveys the discharge to the coordinator (inert bytes).
    The coordinator presents `[invite ⊕ sub/cnf, coordinator PoP,
@@ -304,7 +304,7 @@ When the enrolling operator brings a coordinator in:
 4. Mint walks the invite's chain under `K_M`, recovers `r_inv` from the
    TPC's `VID` (or from the `CID` under `K_M-A`), verifies the
    discharge's MAC under `r_inv`, and clears its caveats (`OrgId`
-   matches, `Scope` is `mint:enroll`, `NotAfter` in the future). It
+   matches, `Scope` is `mint:enroll`, `exp` in the future). It
    records `requested_by = Subject` on the pending enrollment.
 
 One discharge serves any number of `/v1/enroll` calls in its window — it
@@ -317,7 +317,7 @@ When the exchanging operator brings an approved coordinator online:
 1. The CLI fetches a discharge against the **ticket's** `CID` (the
    coordinator's ticket carries it), `scope: "mint:exchange"` — auth
    recovers `r_xchg`, requires `mint:exchange ∈ session.scopes`, and
-   mints `(Subject, OrgId, Scope=mint:exchange, NotAfter)` with
+   mints `(Subject, OrgId, Scope=mint:exchange, exp)` with
    nonce = the ticket `CID`.
 2. The operator conveys the discharge to the coordinator. The
    coordinator presents `[ticket, discharge]` + PoP at
@@ -335,7 +335,7 @@ verb):
 
 1. The CLI fetches a discharge against the admin service token's `CID`,
    `scope: "mint:admin"` — auth recovers `r_adm`, requires `admin ∈
-   session.scopes`, mints `(Subject, OrgId, Scope=mint:admin, NotAfter)` with
+   session.scopes`, mints `(Subject, OrgId, Scope=mint:admin, exp)` with
    nonce = `CID`. One fetch covers every admin verb in the window; the
    verb is bound per call by the attenuation below, not by the discharge.
 2. The CLI attenuates `op=admin:<verb>` onto the service token, bundles
@@ -343,7 +343,7 @@ verb):
    machine key, and calls the admin endpoint.
 3. Mint walks the service token's chain under `K_M`, verifies the
    discharge under `r_adm`, clears `(Subject, OrgId, Scope=mint:admin,
-   NotAfter, op)` against the dispatched verb and the current time, and —
+   exp, op)` against the dispatched verb and the current time, and —
    for `enroll approve` — records `approved_by = Subject` on the approval
    entry.
 
@@ -371,7 +371,7 @@ What each party can do under compromise:
 
 - **Operator CLI rooted**: holds a session and any discharge it has
   fetched. Can replay a still-valid discharge within its short
-  `NotAfter`, bounded by the session's lifetime and auth's policy.
+  `exp`, bounded by the session's lifetime and auth's policy.
   Cannot synthesise a discharge for a TPC it has no session-authorised
   access to (needs `r_tpc`), and cannot mint an invite, service token,
   or credential (needs `K_M`). Its reach is exactly the operator
@@ -404,7 +404,7 @@ The design produces two correlated audit streams:
 
 The audit invariant: every operator-authorised action at mint must
 trace to a `/v1/discharge` issuance at auth within the discharge's
-`NotAfter` window. A mint-side verification with no matching auth
+`exp` window. A mint-side verification with no matching auth
 issuance (`absent issuance, present verify`) is the one unambiguous
 forgery signal — it indicates `K_M-A`/`K_M` leakage or an auth-issuance
 bypass.
@@ -463,7 +463,7 @@ specifics of any second issuer's wire protocol.
 whether `ELIDE_OPERATOR_API_KEY` is set; both end at the same
 artefact — a session macaroon stored once, per-user, in a file under
 `~/.elide/`. Structurally it's a macaroon under `K_session` with
-caveats `(Subject, OrgId, NotAfter=login_time+7d)`. The session is a
+caveats `(Subject, OrgId, exp=login_time+7d)`. The session is a
 CLI ↔ auth-service credential only — coord and mint never see it.
 
 The stored session is org-scoped (mandatory `OrgId` caveat) and
@@ -559,11 +559,11 @@ several admin verbs, without re-fetching. After expiry, the next call
 triggers a fresh fetch
 from auth.
 
-**Admin attenuations: per call, ~5s NotAfter.** Built by the admin CLI
+**Admin attenuations: per call, ~5s exp.** Built by the admin CLI
 before each `/v1/admin/*` call; not cached. Carries `op=admin:<verb>`
-and `NotAfter`.
+and `exp`.
 
-**Replay window.** Within the attenuation `NotAfter` a specific
+**Replay window.** Within the attenuation `exp` a specific
 attenuated discharge is theoretically replayable at the mint boundary.
 Admin verbs are idempotent (`enroll approve` of an already-approved sub
 is a no-op), so the short replay window grants no additional authority.
@@ -652,7 +652,7 @@ the service token, never on a credential.
 Trivial: only the auth service holds `K_session`. Rotation
 invalidates all existing sessions; operators re-run `login`. Grace
 window optional — auth can keep `K_session_old` to honour in-flight
-sessions until their `NotAfter` expiry, then drop it.
+sessions until their `exp` expiry, then drop it.
 
 ### Summary
 
@@ -705,7 +705,7 @@ The `cid` is the invite's, the ticket's, or the admin service token's
 `CID`; `scope` is the authority class requested (`mint:enroll`,
 `mint:exchange`, or `mint:admin`). Auth requires `scope ∈ session.scopes`
 and stamps it as a `Scope` caveat on the returned discharge, which is
-otherwise `(Subject, OrgId, NotAfter)`, chain-MAC'd under the `r_tpc`
+otherwise `(Subject, OrgId, exp)`, chain-MAC'd under the `r_tpc`
 recovered from `CID`, nonce = `CID`. `401` session expired, `403` session
 lacks the scope, `422` `CID` decode failure (signals `K_M-A` rotation).
 
@@ -871,7 +871,7 @@ granted at login, checked at issuance, cleared at verify:
 1. **Granted at login, carried on the session.** Login is the trust
    source for what a human may authorize, so the session carries its
    granted scope set as `Scope=<name>` caveats (multiple permitted),
-   alongside `(Subject, OrgId, NotAfter)`. Auth-side policy decides the
+   alongside `(Subject, OrgId, exp)`. Auth-side policy decides the
    grant; the demo grants all scopes to every subject — login stays
    wide-open, but the grant is *explicit* on the session.
 

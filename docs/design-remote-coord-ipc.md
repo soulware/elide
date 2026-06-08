@@ -69,7 +69,7 @@ in the auth design:
    local coord may itself be the owner, in which case this collapses
    to the existing local path.
 3. If remote: local coord attenuates its operator session down to
-   `(op=snapshot, vol=V, target=<coord>)` plus a short `NotAfter`,
+   `(op=snapshot, vol=V, target=<coord>)` plus a short `exp`,
    the same construction used for per-forward attenuation to mint.
 4. Local coord forwards `(attenuated bundle, op, args)` over the
    peer channel to the remote coord.
