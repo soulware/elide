@@ -135,14 +135,16 @@ async fn verify_discharge(
     // cannot drive an admin verb, even though the verb itself rides the
     // admin-service's per-call `op=admin:<verb>` attenuation.
     if !matches!(
-        EffectiveCaveats::new(&cleared.aggregated_caveats).resolve(name::SCOPE),
+        EffectiveCaveats::new(&cleared.discharge_caveats).resolve(name::SCOPE),
         Resolved::Value(v) if v == scope::MINT_ADMIN
     ) {
         return Err(unauthorized_response());
     }
-    // The operator's `Subject` from the discharge — the audit-bearing
-    // identity each admin verb records (e.g. `approved_by` on approve).
-    match EffectiveCaveats::new(&cleared.aggregated_caveats).resolve("Subject") {
+    // The operator's `sub` from the discharge — the audit-bearing identity
+    // each admin verb records (e.g. `approved_by` on approve). Read from
+    // the discharge's context, distinct from the admin-service primary's
+    // own `sub` (the machine identity).
+    match EffectiveCaveats::new(&cleared.discharge_caveats).resolve(name::SUB) {
         Resolved::Value(s) => Ok(s),
         _ => Err(unauthorized_response()),
     }
@@ -365,7 +367,7 @@ async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: By
         Ok(c) => c,
         Err(_) => return unauthorized_response(),
     };
-    let operator = match EffectiveCaveats::new(&cleared.aggregated_caveats).resolve(name::SUB) {
+    let operator = match EffectiveCaveats::new(&cleared.discharge_caveats).resolve(name::SUB) {
         Resolved::Value(s) => s.to_string(),
         Resolved::Absent | Resolved::Unsatisfiable => "unknown".to_string(),
     };

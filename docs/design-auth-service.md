@@ -51,8 +51,10 @@ authority rides two third-party caveats already present in the system:
 - **Admin-token TPC** — the third-party caveat on the mint admin service
   token. Discharged by an operator on each `/v1/admin/*` call.
 - **Discharge** — an auth-issued macaroon that satisfies one of those
-  TPCs. Attests `(Subject, OrgId, exp)` — *who* authorised and for
-  *how long* — and is verified at mint, which holds the chain root.
+  TPCs. Carries `(aud, sub, scope, exp)` — attesting *who* authorised
+  (`sub`), at what tier (`scope`), for *how long* (`exp`), scoped to mint
+  (`aud`) — and is verified at mint, which holds the chain root. The org
+  is bound in the TPC `CID` (`org_id`), checked at issuance, not a caveat.
 
 ## Principle
 
@@ -112,20 +114,21 @@ formulation](https://fly.io/blog/macaroons-escalated-quickly/):
   bytes, cacheable. Runs at the holder of the relevant key material —
   mint.
 - **Clearing** = caveat predicate evaluation against live request
-  context (the operator `Subject`, the admin verb, the current time).
+  context (the operator `sub`, the admin verb, the current time).
   Cannot be cached. Runs at mint, which has the request context at the
   point the discharge is presented.
 
 Auth participates in verification only at discharge-issuance time — it
-applies its policy ("may this Subject do this?") when it mints the
+applies its policy ("may this sub do this?") when it mints the
 discharge, and does not sit on any later path.
 
 ## Tenancy and enrollment
 
 The auth service is multi-tenant; coordinators and operators belong
 to organisations. **Org-scoping is the primary isolation boundary**
-and is enforced by construction (mandatory `OrgId` caveat), not by
-ACL.
+and is enforced by construction — the org rides each TPC's `CID`
+(`org_id`) and is checked when auth mints the discharge, before the
+discharge exists — not by an `OrgId` caveat mint clears, and not by ACL.
 
 - **Auth service is global** — one logical service across all orgs.
   Self-hosted deployments may run their own instance; the protocol
@@ -163,7 +166,7 @@ The keys established across the system are:
   The distinct keys give cryptographic separation between the gates (a
   discharge for one anchor is not MAC-valid against another); the
   *authorization* dimension — which operator may obtain which discharge —
-  rides a `Scope` caveat, not the key (§ *Discharge flows*, § *Scope
+  rides a `scope` caveat, not the key (§ *Discharge flows*, § *Scope
   tier*). Rotated by re-minting the anchor macaroon — a fresh invite, a
   fresh ticket, or `mint admin-service rotate`; see *Key rotation*.
 
@@ -233,7 +236,7 @@ credentials are inert service tokens it presents at `assume-role`.
 Same chained-keyed-BLAKE3 construction throughout.
 
 **1. Session.** Auth-issued, CLI-held. One per operator login, ~7d
-lifetime. Caveats `(Subject, OrgId, exp)`. Chain-MAC'd under
+lifetime. Caveats `(sub, exp)`. Chain-MAC'd under
 `K_session`. Used only on the CLI ↔ auth channel; coord and mint never
 see it.
 
@@ -257,7 +260,7 @@ authorization*). Chain-MAC'd under `K_M`. The operator attenuates
 `op=admin:<verb>` per call; discharged on every `/v1/admin/*` call.
 
 **5. Discharge.** Auth-issued, CLI-held. Short-lived (~5 min). Caveats
-`(Subject, OrgId, Scope, exp)` — the `Scope` first-party caveat
+`(aud, sub, scope, exp)` — the `scope` first-party caveat
 names the authority class auth authorised (`mint:enroll`,
 `mint:exchange`, or `mint:admin`), and is what the gate clears against.
 Chain-MAC'd under the `r_tpc` recovered from the target `CID`; its nonce
@@ -280,7 +283,7 @@ All three discharge consumers follow the same shape: the operator's CLI
 fetches a discharge from auth against a `CID`, **naming the scope it
 needs**, then presents it to mint alongside the macaroon it discharges.
 Auth issues only if the operator's session grants that scope, and stamps
-it as a `Scope` first-party caveat; mint clears that caveat against the
+it as a `scope` first-party caveat; mint clears that caveat against the
 scope the gate requires. Mint verifies inline. No coordinator sits on the
 verification path, and there is nothing to cache between calls.
 
@@ -295,7 +298,7 @@ When the enrolling operator brings a coordinator in:
 2. Auth verifies the session under `K_session`, AEAD-decrypts `CID` with
    `K_M-A` → recovers `(r_inv, OrgId)`, cross-checks the decoded `OrgId`
    against the session's, requires `mint:enroll ∈ session.scopes`,
-   and mints a discharge: caveats `(Subject, OrgId, Scope=mint:enroll,
+   and mints a discharge: caveats `(sub, scope=mint:enroll,
    exp=now+5min)`, chain-MAC'd under `r_inv`, nonce = `CID`. A
    session lacking the scope → `403`.
 3. The operator conveys the discharge to the coordinator (inert bytes).
@@ -303,9 +306,10 @@ When the enrolling operator brings a coordinator in:
    discharge]` at `/v1/enroll`.
 4. Mint walks the invite's chain under `K_M`, recovers `r_inv` from the
    TPC's `VID` (or from the `CID` under `K_M-A`), verifies the
-   discharge's MAC under `r_inv`, and clears its caveats (`OrgId`
-   matches, `Scope` is `mint:enroll`, `exp` in the future). It
-   records `requested_by = Subject` on the pending enrollment.
+   discharge's MAC under `r_inv`, and clears its caveats (`scope` is
+   `mint:enroll`, `exp` in the future; the org was already checked
+   against the `CID` when auth minted the discharge). It
+   records `requested_by = sub` on the pending enrollment.
 
 One discharge serves any number of `/v1/enroll` calls in its window — it
 is org-wide, not coord-bound.
@@ -317,13 +321,13 @@ When the exchanging operator brings an approved coordinator online:
 1. The CLI fetches a discharge against the **ticket's** `CID` (the
    coordinator's ticket carries it), `scope: "mint:exchange"` — auth
    recovers `r_xchg`, requires `mint:exchange ∈ session.scopes`, and
-   mints `(Subject, OrgId, Scope=mint:exchange, exp)` with
+   mints `(sub, scope=mint:exchange, exp)` with
    nonce = the ticket `CID`.
 2. The operator conveys the discharge to the coordinator. The
    coordinator presents `[ticket, discharge]` + PoP at
    `/v1/enroll-exchange`, once per role.
 3. Mint walks the ticket's chain under `K_M`, verifies the discharge
-   under `r_xchg`, clears its `Scope` against `mint:exchange`,
+   under `r_xchg`, clears its `scope` against `mint:exchange`,
    verifies the PoP against the ticket's `cnf`, requires
    `_mint/clients/enrolled/<sub>` to match, and mints the TPC-free role
    credential. One discharge covers every role exchanged in its window.
@@ -335,16 +339,16 @@ verb):
 
 1. The CLI fetches a discharge against the admin service token's `CID`,
    `scope: "mint:admin"` — auth recovers `r_adm`, requires `admin ∈
-   session.scopes`, mints `(Subject, OrgId, Scope=mint:admin, exp)` with
+   session.scopes`, mints `(sub, scope=mint:admin, exp)` with
    nonce = `CID`. One fetch covers every admin verb in the window; the
    verb is bound per call by the attenuation below, not by the discharge.
 2. The CLI attenuates `op=admin:<verb>` onto the service token, bundles
    `[service token, discharge]`, PoP-signs the attenuated tail with the
    machine key, and calls the admin endpoint.
 3. Mint walks the service token's chain under `K_M`, verifies the
-   discharge under `r_adm`, clears `(Subject, OrgId, Scope=mint:admin,
+   discharge under `r_adm`, clears `(sub, scope=mint:admin,
    exp, op)` against the dispatched verb and the current time, and —
-   for `enroll approve` — records `approved_by = Subject` on the approval
+   for `enroll approve` — records `approved_by = sub` on the approval
    entry.
 
 The admin service token, its machine key, and the `op=admin:<verb>`
@@ -393,13 +397,13 @@ coordinator holds none of these and is not on the discharge path at all.
 
 The design produces two correlated audit streams:
 
-- **Auth log**: every `/v1/discharge` issuance (Subject, target `CID`,
+- **Auth log**: every `/v1/discharge` issuance (sub, target `CID`,
   OrgId, expires_at).
 - **Mint log**: every discharge verified at the boundary — at
   `/v1/enroll` (the invite TPC, stamped `requested_by`), at
   `/v1/enroll-exchange` (the ticket TPC, stamped the exchanging
-  `Subject`), and at each `/v1/admin/*` call (the service-token TPC,
-  stamped the operator `Subject`, e.g. `approved_by` on `enroll
+  `sub`), and at each `/v1/admin/*` call (the service-token TPC,
+  stamped the operator `sub`, e.g. `approved_by` on `enroll
   approve`).
 
 The audit invariant: every operator-authorised action at mint must
@@ -463,7 +467,7 @@ specifics of any second issuer's wire protocol.
 whether `ELIDE_OPERATOR_API_KEY` is set; both end at the same
 artefact — a session macaroon stored once, per-user, in a file under
 `~/.elide/`. Structurally it's a macaroon under `K_session` with
-caveats `(Subject, OrgId, exp=login_time+7d)`. The session is a
+caveats `(sub, exp=login_time+7d)`. The session is a
 CLI ↔ auth-service credential only — coord and mint never see it.
 
 The stored session is org-scoped (mandatory `OrgId` caveat) and
@@ -507,15 +511,17 @@ distinguish automated from human actions.
 
 ## Identity and policy
 
-A discharge carries three claims:
+A discharge attests two claims; the org is bound separately:
 
-- **OrgId is mandatory and enforced.** Set by the auth service from
-  the org selected at login. Mint rejects any discharge whose `OrgId`
-  doesn't match its enrolled OrgId.
-- **Subject is mandatory and opaque.** A stable identifier (UUID,
+- **The org is mandatory and enforced — via the `CID`, not a caveat.**
+  It rides each TPC's `CID` (`org_id`), set by the auth service from the
+  org selected at login. Auth checks it before minting the discharge
+  (it must match the org the role serves), so a wrong-org discharge is
+  never issued — there is no `OrgId` caveat for mint to clear.
+- **`sub` is mandatory and opaque.** A stable identifier (UUID,
   OIDC `sub`, opaque token) chosen by the auth service. Not a
   username or email — those change. The auth service is responsible
-  for keeping `Subject` stable for a given human across renames and
+  for keeping `sub` stable for a given human across renames and
   IdP changes. It is what mint records as `requested_by` / `approved_by`.
 - **Scope is the authority class auth granted** — `mint:enroll`,
   `mint:exchange`, or `mint:admin`. Auth issues it only if the session
@@ -528,7 +534,7 @@ protocol caveats (see *Deferred* below). The admin plane binds the verb
 via the CLI's `op=admin:<verb>` attenuation, cleared at mint; the
 enroll-gate and exchange-gate discharges are org-wide
 (coord-specificity comes from the macaroon's `sub`/`cnf` + PoP). All
-access control — allow-listing, RBAC, which Subject may enroll,
+access control — allow-listing, RBAC, which sub may enroll,
 exchange, or administer — lives at the auth service and is exercised
 at `/v1/discharge` issuance time.
 
@@ -704,8 +710,8 @@ response: { "discharge": "<base64 macaroon>", "expires_at": "..." }
 The `cid` is the invite's, the ticket's, or the admin service token's
 `CID`; `scope` is the authority class requested (`mint:enroll`,
 `mint:exchange`, or `mint:admin`). Auth requires `scope ∈ session.scopes`
-and stamps it as a `Scope` caveat on the returned discharge, which is
-otherwise `(Subject, OrgId, exp)`, chain-MAC'd under the `r_tpc`
+and stamps it as a `scope` caveat on the returned discharge, which is
+otherwise `(sub, exp)`, chain-MAC'd under the `r_tpc`
 recovered from `CID`, nonce = `CID`. `401` session expired, `403` session
 lacks the scope, `422` `CID` decode failure (signals `K_M-A` rotation).
 
@@ -847,7 +853,7 @@ narrowing**, because there is no runtime operator authority over volumes
 to narrow — a coordinator's volume writes are app-driven service-token
 authority, not operator-gated.
 
-Finer auth-side policy on *which* admin verbs or enrollments a Subject
+Finer auth-side policy on *which* admin verbs or enrollments a sub
 may authorize is the Scope tier below; an even finer explicit
 `AllowedOps=[...]` list baked into the discharge at issuance is a purely
 additive extension on top of it (extra first-party caveats, one extra
@@ -858,7 +864,7 @@ admin delegation grows multi-team; not in the initial shape.
 
 The scope mechanism is **core** (§ *Discharge flows*): every session
 carries a granted scope set, every `/v1/discharge` names a scope auth
-checks against it, and every gate clears the discharge's `Scope` caveat.
+checks against it, and every gate clears the discharge's `scope` caveat.
 Three baseline scopes ship — `mint:enroll`, `mint:exchange`,
 `mint:admin` — one per gate. A *finer* vocabulary on the same mechanism is
 proposed below.
@@ -870,19 +876,19 @@ granted at login, checked at issuance, cleared at verify:
 
 1. **Granted at login, carried on the session.** Login is the trust
    source for what a human may authorize, so the session carries its
-   granted scope set as `Scope=<name>` caveats (multiple permitted),
-   alongside `(Subject, OrgId, exp)`. Auth-side policy decides the
+   granted scope set as `scope=<name>` caveats (multiple permitted),
+   alongside `(sub, exp)`. Auth-side policy decides the
    grant; the demo grants all scopes to every subject — login stays
    wide-open, but the grant is *explicit* on the session.
 
 2. **Checked at `/v1/discharge`.** The request names the scope it needs;
-   auth requires `requested ∈ session.Scope` and mints the discharge
-   carrying that one `Scope`. A session lacking it is refused (`403`) —
+   auth requires `requested ∈ session.scope` and mints the discharge
+   carrying that one `scope`. A session lacking it is refused (`403`) —
    the authorization decision `/v1/discharge` makes, distinct from the
    liveness gate.
 
 3. **Cleared at verify.** Each gate knows the scope it requires and
-   clears the discharge's `Scope` against it (`/v1/enroll` →
+   clears the discharge's `scope` against it (`/v1/enroll` →
    `mint:enroll`, `/v1/enroll-exchange` → `mint:exchange`,
    `/v1/admin/*` → `mint:admin`). A per-request predicate, never cached,
    joining the existing `aud`/`op`/`exp`/PoP clears.
@@ -893,7 +899,7 @@ The baseline `mint:admin` scope covers every `/v1/admin/*` verb, so "may
 approve enrollments but not seal" cannot yet be expressed. Splitting
 `mint:admin` into per-area scopes (e.g. `mint:admin:approve`,
 `mint:admin:seal`) — and deciding whether scopes are flat or
-hierarchical — is purely additive on the mechanism above: more `Scope`
+hierarchical — is purely additive on the mechanism above: more `scope`
 names, and a gate that requires the
 finer one. An even finer explicit `AllowedOps=[...]` list baked into the
 discharge at issuance composes on top (a specific list *within* a scope;

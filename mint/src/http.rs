@@ -199,14 +199,38 @@ pub fn pop_proof(headers: &HeaderMap) -> Result<Option<pop::Proof>, ()> {
     }
 }
 
-/// Output of [`verify_and_clear`]: the primary, the union of verified
-/// caveats across the bundle, and the bundle-wide minimum `exp`.
+/// Output of [`verify_and_clear`]: the primary and the verified
+/// discharge caveats kept **by source**, plus the bundle-wide minimum
+/// `exp`. Caveats are not flattened into one set: the primary's identity
+/// (`sub`/`cnf`/`role`/…) is read from [`Self::primary`]`.caveats()`, the
+/// discharge's attestations (its `sub` audit identity, `Scope` tier) from
+/// [`Self::discharge_caveats`]. Each clears in its own context, so a
+/// discharge caveat can never collide with or shadow a same-named primary
+/// caveat (`docs/design-mint.md` § *Clearing context*).
 pub struct ClearedBundle {
     pub primary: Macaroon,
-    pub aggregated_caveats: Vec<Caveat>,
+    /// Caveats from every verified discharge (concatenated in walk order).
+    /// Empty for a bare credential, which carries no third-party caveat.
+    pub discharge_caveats: Vec<Caveat>,
     /// Minimum `exp` across the primary and every verified discharge,
-    /// if any are present. `None` means the bundle carries no `exp`.
+    /// if any are present. `None` means the bundle carries no `exp`. This
+    /// is the sole value combined across macaroons — "valid until" is the
+    /// one monotonic property; everything else clears per-macaroon.
     pub expires_at: Option<u64>,
+}
+
+impl ClearedBundle {
+    /// All first-party caveats across the bundle (primary then
+    /// discharges) — for the `/v1/verify` echo and audit logging only,
+    /// never a clearing surface. Clearing is per-source.
+    pub fn all_caveats(&self) -> Vec<Caveat> {
+        self.primary
+            .caveats()
+            .iter()
+            .chain(self.discharge_caveats.iter())
+            .cloned()
+            .collect()
+    }
 }
 
 /// Why verify+clear refused a bundle. The HTTP layer translates each
@@ -259,10 +283,15 @@ impl VerifyClearError {
 /// cannot produce a discharge that verifies, and an attacker without
 /// `K_M` cannot produce a mint-issued primary that verifies.
 ///
-/// Returns the union of caveats across the bundle and the
-/// bundle-wide minimum `exp` — the verify endpoint returns
-/// these verbatim; assume-role hands the caveats to [`role::authorize`]
-/// for the role-specific gate.
+/// `aud`/`op` clear **per macaroon** against the request context, not
+/// over a flattened union: the primary must positively carry
+/// `aud == expected_aud` and `op == expected_op`; a discharge carries
+/// them only if it chooses to restrict, and then they must match — never
+/// reconciled against the primary. `exp` is the one value combined across
+/// the bundle (the minimum binds). Returns the primary and the discharge
+/// caveats by source — assume-role reads the primary's for
+/// [`role::authorize`]; the operator gates read the discharge's for the
+/// `Scope` tier and the `sub` audit identity.
 // Each input is independently meaningful at every call site (keyring +
 // K_M-A + body + expected caveats are all separate concerns). A
 // builder/struct wrapper would obscure that without removing any
@@ -280,13 +309,14 @@ pub fn verify_and_clear(
 ) -> Result<ClearedBundle, VerifyClearError> {
     let primary_key = resolve_primary_key(&bundle.primary, keyring, k_m_a)?;
 
-    let mut aggregated: Vec<Caveat> = Vec::new();
+    let mut discharge_caveats: Vec<Caveat> = Vec::new();
+    let mut min_exp: Option<u64> = None;
     let mut discharge_cursor = 0usize;
-    let mut work: std::collections::VecDeque<(Macaroon, [u8; 32])> =
+    let mut work: std::collections::VecDeque<(Macaroon, [u8; 32], bool)> =
         std::collections::VecDeque::new();
-    work.push_back((bundle.primary.clone(), primary_key));
+    work.push_back((bundle.primary.clone(), primary_key, true));
 
-    while let Some((mac, key)) = work.pop_front() {
+    while let Some((mac, key, is_primary)) = work.pop_front() {
         let sites = mac
             .verify_collecting_tpcs(&key)
             .ok_or(VerifyClearError::Auth("mac_mismatch"))?;
@@ -298,9 +328,42 @@ pub fn verify_and_clear(
                 .get(discharge_cursor)
                 .ok_or(VerifyClearError::Auth("tpc_undischarged"))?;
             discharge_cursor += 1;
-            work.push_back((discharge.clone(), r));
+            work.push_back((discharge.clone(), r, false));
         }
-        aggregated.extend(mac.caveats().iter().cloned());
+
+        // Per-macaroon clearing of the predicate caveats against the
+        // request context — never reconciled across macaroons. The
+        // primary must positively carry `aud`/`op`; a discharge restricts
+        // its own audience/operation only if it chooses to, and then it
+        // must match (a discharge can narrow, never contradict, the
+        // request it is presented for).
+        let eff = EffectiveCaveats::new(mac.caveats());
+        if is_primary {
+            if !matches!(eff.resolve(name::AUD), Resolved::Value(v) if v == expected_aud) {
+                return Err(VerifyClearError::AudClear);
+            }
+            if !matches!(eff.resolve(name::OP), Resolved::Value(v) if v == expected_op) {
+                return Err(VerifyClearError::OpClear);
+            }
+        } else {
+            match eff.resolve(name::AUD) {
+                Resolved::Value(v) if v == expected_aud => {}
+                Resolved::Absent => {}
+                _ => return Err(VerifyClearError::AudClear),
+            }
+            match eff.resolve(name::OP) {
+                Resolved::Value(v) if v == expected_op => {}
+                Resolved::Absent => {}
+                _ => return Err(VerifyClearError::OpClear),
+            }
+            discharge_caveats.extend(mac.caveats().iter().cloned());
+        }
+
+        // `exp` is the one value combined across the bundle: the minimum
+        // over every macaroon binds — the tightest attenuation wins.
+        if let Some(e) = eff.min_bound(name::EXP) {
+            min_exp = Some(min_exp.map_or(e, |m: u64| m.min(e)));
+        }
     }
     if discharge_cursor != bundle.discharges.len() {
         return Err(VerifyClearError::Auth("excess_discharges"));
@@ -320,19 +383,7 @@ pub fn verify_and_clear(
     )
     .map_err(|_| VerifyClearError::Pop)?;
 
-    let eff = EffectiveCaveats::new(&aggregated);
-    if !matches!(eff.resolve(name::AUD), Resolved::Value(v) if v == expected_aud) {
-        return Err(VerifyClearError::AudClear);
-    }
-    if !matches!(eff.resolve(name::OP), Resolved::Value(v) if v == expected_op) {
-        return Err(VerifyClearError::OpClear);
-    }
-    // `exp` is the sole deadline caveat: the issuer's lifetime on the
-    // primary, an authority's bound on a discharge, and any per-IPC /
-    // per-forward attenuation all append it, and the minimum across the
-    // whole bundle binds — the tightest attenuation wins.
-    let expires_at = eff.min_bound(name::EXP);
-    if let Some(deadline) = expires_at
+    if let Some(deadline) = min_exp
         && deadline <= now_unix
     {
         return Err(VerifyClearError::Expired);
@@ -340,8 +391,8 @@ pub fn verify_and_clear(
 
     Ok(ClearedBundle {
         primary: bundle.primary.clone(),
-        aggregated_caveats: aggregated,
-        expires_at,
+        discharge_caveats,
+        expires_at: min_exp,
     })
 }
 
@@ -443,7 +494,10 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
             return unauthorized(&request_id);
         }
     };
-    let caveats = cleared.aggregated_caveats;
+    // A credential carries no discharge, so the role gate and revocation
+    // gate read the primary's own caveats — the credential's identity and
+    // role — never a flattened bundle.
+    let caveats = cleared.primary.caveats().to_vec();
     let nonce_hex = cleared.primary.nonce_hex();
     let entry = |outcome: &str, role: &str, ttl: Option<u64>, key: Option<String>| AuditEntry {
         timestamp: now.to_rfc3339(),
@@ -761,12 +815,12 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
             return unauthorized(&request_id);
         }
     };
-    let caveats = cleared.aggregated_caveats;
+    let caveats = cleared.all_caveats();
 
     // The enroll gate clears the discharge's `Scope` against
     // `mint:enroll`: a session that only obtained an exchange- or
     // admin-scope discharge cannot open an enrollment.
-    if !scalar_is(&caveats, name::SCOPE, scope::MINT_ENROLL) {
+    if !scalar_is(&cleared.discharge_caveats, name::SCOPE, scope::MINT_ENROLL) {
         audit("denied:scope", &caveats);
         return unauthorized(&request_id);
     }
@@ -782,7 +836,9 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
             );
         }
     };
-    if !scalar_is(&caveats, name::INVITE, &current) {
+    // The `invite` nonce rides the primary (the client-attenuated invite),
+    // cleared in its own context.
+    if !scalar_is(cleared.primary.caveats(), name::INVITE, &current) {
         audit("denied:stale_invite", &caveats);
         return unauthorized(&request_id);
     }
@@ -796,9 +852,11 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     };
 
     // The enrolling operator's identity, from the enroll-gate discharge's
-    // `Subject` — recorded on the pending entry as `requested_by`. A
-    // discharge always carries it; absence is a malformed discharge.
-    let requested_by = match EffectiveCaveats::new(&caveats).resolve("Subject") {
+    // `sub` — recorded on the pending entry as `requested_by`. Read from
+    // the discharge's context, distinct from the primary's self-asserted
+    // `sub` (the enrolling coordinator). A discharge always carries it;
+    // absence is a malformed discharge.
+    let requested_by = match EffectiveCaveats::new(&cleared.discharge_caveats).resolve(name::SUB) {
         Resolved::Value(s) => s,
         _ => {
             audit("denied:identity", &caveats);
@@ -1003,11 +1061,15 @@ async fn enroll_exchange(
             return unauthorized(&request_id);
         }
     };
-    let caveats = cleared.aggregated_caveats;
+    let caveats = cleared.all_caveats();
 
     // The exchange gate clears the discharge's `Scope` against
     // `mint:exchange`.
-    if !scalar_is(&caveats, name::SCOPE, scope::MINT_EXCHANGE) {
+    if !scalar_is(
+        &cleared.discharge_caveats,
+        name::SCOPE,
+        scope::MINT_EXCHANGE,
+    ) {
         audit("denied:scope", &caveats);
         return unauthorized(&request_id);
     }
@@ -1167,11 +1229,11 @@ async fn discharge_verify(
         Err(e) => return verify_failure(&request_id, e.reason()),
     };
 
-    // Aggregated first-party caveats — mint is caveat-vocabulary-
-    // agnostic and hands the raw set back to the caller for live
+    // All first-party caveats across the bundle — mint is caveat-
+    // vocabulary-agnostic and hands the raw set back to the caller for live
     // context clearing (CoordId, Volume, op-attenuation, etc.).
     let aggregated: Vec<serde_json::Value> = cleared
-        .aggregated_caveats
+        .all_caveats()
         .iter()
         .filter_map(|c| match c {
             Caveat::FirstParty { name, value } => Some(json!({"name": name, "value": value})),
