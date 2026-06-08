@@ -508,14 +508,14 @@ volume TPC.
     authoritative* already rejects a declared `attested` key outside the
     set; the disjointness assertion additionally forbids the set from ever
     *containing* a reserved control name (`aud, exp, sub, cnf, op, role,
-    epoch, invite, NotAfter, Scope`). So `attested.sub` cannot exist —
+    epoch, invite, Scope`). So `attested.sub` cannot exist —
     coord B has no field named `sub` to emit — and the discharge's caveats
     are never flattened into `caveat.*`, so a discharge value can never
     shadow the primary's MAC-bound `caveat.sub`.
   - **The discharge's caveat vocabulary is closed per discharge type and
     fails closed.** mint dispatches discharge interpretation on the
     discharge type (kid / `location`). A *volume* discharge clears only
-    its own bound caveats (`exp` / `NotAfter`) and attests `{volume}`; a
+    its own bound caveat (`exp`) and attests `{volume}`; a
     caveat that is neither is **rejected**, not absorbed into the
     principal's control-clearing pass. So coord B — whose only job is to
     attest a volume — cannot reach the principal's control set, nor the
