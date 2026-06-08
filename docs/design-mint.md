@@ -1548,6 +1548,101 @@ chain — see *Request body*. A coordinator's own ULID is **not** in this
 class: it is the MAC-verified `sub` caveat, read by a policy as
 `caveat.sub`, so it is unforgeable rather than self-asserted.
 
+### Clearing context: per-macaroon, not a flattened union
+
+**Proposed.** A bundle is a primary plus its discharges. Each is a
+distinct macaroon, MAC'd under a distinct key (`K_M` for the primary,
+the recovered `r` for a discharge), bound to the others *structurally* —
+the discharge's caveat key `r` is recovered from the primary's `VID`, so
+the cryptographic binding is the chain, never agreement between two
+caveat *values*. A caveat is therefore a restriction on the **one
+macaroon it sits on**, cleared in that macaroon's context, and the
+verify+clear core must not merge the bundle's caveats into a single flat
+set before clearing. (The PoP/`cnf` check already works this way — it is
+evaluated against the primary's caveats and tail alone, never the
+bundle.) Two kinds of caveat, two clearing rules:
+
+- **Predicate caveats** — `aud`, `op`, `invite`. Answer "is *this*
+  macaroon valid for *this* request?" and are cleared against the
+  **request context** (the audience, the authority/verb, the current
+  nonce). They never need to be compared *to each other* across
+  macaroons — they meet only at the shared request value. The discharge
+  carries `aud=mint` and attests its gate with `op` (e.g.
+  `op=admin:invite-read`), each cleared against the request exactly as the
+  primary's are — so the discharge declares its own audience rather than
+  inheriting it only transitively through `r`, and no caveat is
+  reconciled across macaroons. (`op` is the scalar operation predicate on
+  both primary and discharge; `Scope` survives only as the *granted set*
+  on a session, a membership shape `op` can't express.)
+- **Attestation caveats** — `sub` and `cnf`. Identities a macaroon
+  *carries*, consumed downstream, **never cleared against a request value
+  and never merged across macaroons**. The primary's `sub` (the cnf-bound
+  coordinator — a service identity) and the discharge's `sub` (the
+  authenticated human the auth service attests, recorded as the audit
+  identity at the operator gates — `approved_by` / `revoked_by` /
+  `requested_by`) are two different facts in two different contexts; each
+  is read where it belongs and they never collide. This split is the
+  reason the rename and the de-flatten are inseparable: the discharge's
+  human identity is read today only because it is named `Subject`,
+  distinct from the primary's `sub`; renaming it to `sub` under the
+  flattened union would make `resolve("sub")` see two values and trip the
+  unsatisfiable check. `OrgId` / `ClientId` are **not** attestation
+  caveats — they are never read; `client_id` derives `r` and `org_id` is
+  checked at discharge issuance, both as TPC CID plaintext, not caveats.
+
+`exp` is the **sole caveat combined across the bundle**: the effective
+deadline is the minimum over every macaroon's `exp`, because "valid
+until" is the one property that is legitimately monotonic across the
+chain (§ *Standard caveats*). Everything else clears per-macaroon.
+
+The downgrade-footgun protection (a repeated caveat with a contradictory
+value is *unsatisfiable*, never silently dropped — § *All caveats are
+scalar*) is **per-macaroon**: a single chain that contradicts itself
+fails closed. Two macaroons bearing the same caveat name with different
+values is *not* a contradiction — it is two attestations in two
+contexts, which is precisely why `sub` names the coordinator service
+identity on the primary and the authenticated human on the discharge
+without conflict.
+
+This retires the flattened-union clear; with the discharge cleared in its
+own context its principal is simply `sub`, superseding the `Subject`
+coinage that existed only to dodge the union collision. It also subsumes
+the volume-attestation
+`attested.*` fencing question (`design-mint-volume-attestation.md`): a
+discharge can no longer inject a control or `caveat.*` name into the
+primary's cleared identity, because the two namespaces are never merged —
+the attestable set is simply what mint reads from the discharge's own
+context.
+
+This is the clearing model in Fly's `macaroon-thought.md` — every caveat
+an independent predicate, no agreement or hidden state between them. We
+extend it in exactly one place: because mint templates a MAC-verified
+caveat value into a policy (`caveat.sub`), clearing must track each
+caveat's source macaroon — a step an in-process authorizer that never
+reads a caveat as data does not need. (Fly's typed-caveat enum would keep
+the two `sub`s from ever being confused by construction; mint stays
+string-named for the vocabulary-agnostic property and relies on
+per-context clearing instead.)
+
+> **Delta when implemented.** Restructure the verify+clear core
+> (`mint/src/http.rs::verify_and_clear`) to clear `aud`/`op`/`exp`
+> per-macaroon against the request context rather than `resolve`-ing over
+> an `aggregated` union; `ClearedBundle` exposes the primary's and the
+> discharges' cleared caveats by source, not one flat list (the role gate
+> reads the primary's, the operator gates read the discharge's). Rename
+> the auth discharge's `Subject` caveat to `sub` and its `Scope` caveat to
+> `op`, and stamp `aud=mint` on it (`design-auth-service.md`;
+> `mint/src/auth.rs`) — the session keeps `Scope` as its granted set.
+> Route the audit-identity read (`admin.rs`, `http.rs` — `approved_by` /
+> `revoked_by` / `requested_by`) to the discharge's context rather than
+> `resolve`-ing `Subject` over `aggregated_caveats`. Drop the `OrgId` /
+> `ClientId` caveats — never read; `client_id` / `org_id` stay as TPC CID
+> plaintext (`r` derivation; org check at issuance). Correct
+> `design-auth-service.md`, which says org-scoping is "enforced by
+> construction (mandatory `OrgId` caveat)": it is enforced at discharge
+> issuance via the CID, not a caveat. Retire the `Subject`→`Principal`
+> rename — it is no longer needed.
+
 ### Caveat field inventory (Elide)
 
 The complete caveat vocabulary the Elide roles draw on. Every caveat is a
