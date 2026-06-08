@@ -84,12 +84,12 @@ an expired Tigris keypair; mint re-verifies the MAC and re-clears `exp`
 per request (verify ≠ clear). coord B is consulted only to **mint** a
 discharge — on first-touch for a target and again on expiry — never on
 every keypair refresh. How long that `exp` is, and so how often coord B
-re-attests, is set per mode in *Currency*.
+re-attests, is set per mode in *Liveness*.
 
 ### Why a coordinator, not mint itself
 
 mint must stay volume-agnostic. The verification logic — `volume.pub`
-locations, lineage walks, claim-record currency — is volume-domain code
+locations, lineage walks, claim-record liveness — is volume-domain code
 that belongs in the coordinator. Folding it into mint would be cheaper
 (no second process, no discharge round-trip) but would puncture the
 "mint knows nothing about volumes" invariant.
@@ -121,7 +121,7 @@ the topology to name the right discharger. That worry dissolves because
 - **Lineage** is provable from `meta/<vol>.provenance`, signed by each
   volume's own key, naming `parent:` (fork chain) and `extent_index:`
   (dedup sources).
-- **Currency** is provable from the `names/<name>` claim record — the
+- **Liveness** is provable from the `names/<name>` claim record — the
   single shared mutable surface, signed in the event log — which
   resolves a name to the live episode's `by_id` ULID.
 
@@ -140,7 +140,7 @@ problem never arises, and mint stays volume-agnostic.
    `blake3(cid)`; see *Possession-proof binding*), so it is not
    replayable against another credential.
 4. coord B fetches `meta/vol_Y.pub`, verifies the possession
-   proof, confirms currency (`names/<name> → vol_Y`), and discharges,
+   proof, confirms liveness (`names/<name> → vol_Y`), and discharges,
    stamping attested `req:{volume: vol_Y}`.
 5. coord A presents primary + discharge to `assume-role`. mint verifies
    both chains, clears the TPC, and renders `by_id/{{req.volume}}/*` from
@@ -161,9 +161,9 @@ mid-resource wildcard).
 coord A anchors **once** at the live volume and derives the whole set
 from the signed lineage. coord B evaluates:
 
-- **self (RW):** possession(vol_Y) ∧ currency(vol_Y)
+- **self (RW):** possession(vol_Y) ∧ liveness(vol_Y)
   → attest `req.volume = vol_Y`
-- **ancestor (RO), per vol_X:** possession(vol_Y) ∧ currency(vol_Y) ∧
+- **ancestor (RO), per vol_X:** possession(vol_Y) ∧ liveness(vol_Y) ∧
   `vol_X ∈ ancestors(vol_Y)` (signed-provenance walk, bounded by
   `MAX_EXTENT_INDEX_SOURCES`) → attest `req.volume = vol_X`
 
@@ -201,30 +201,30 @@ repack, offline filemap). It is **orthogonal** to attestation — an
 eager-vs-lazy tradeoff in its own right — and is not adopted here; see
 *Open questions*.
 
-### Currency unifies the liveness question
+### One liveness check unifies RW-self and RO-ancestor
 
 Possession of `volume.key` proves "operator of episode vol_Y"; the
 `names/<name> → vol_Y` check upgrades that to "*current* owner". A
 released or stale episode (whose key coord A still holds locally) fails
-the currency check because the claim now points elsewhere. So currency is
+the liveness check because the claim now points elsewhere. So liveness is
 one predicate, checked once at the anchor, covering RW-on-self and
 RO-on-ancestors alike — and it means coord A's coordinator identity needs
 no separate proof to coord B: live-key possession + `names/<name> → vol_Y`
 *is* the ownership statement. mint still binds the principal via `cnf`.
 
 Because a discharge can be cached (see *TPC structure*), its `exp` is the
-**currency-staleness bound** — the window in which a cached discharge
-keeps vouching after the underlying currency has moved. The two modes sit
+**liveness-staleness bound** — the window in which a cached discharge
+keeps vouching after the live owner has changed. The two modes sit
 at opposite ends:
 
-- **RW-self** is currency-sensitive: a force-release or handoff revokes
+- **RW-self** is liveness-sensitive: a force-release or handoff revokes
   ownership, so a stale RW discharge would keep minting writer keypairs
   for a deposed owner. `discharge_ttl` here should be short — on the order
   of the Tigris keypair lifetime (**start at ~5 min**) — so re-attestation
   rides roughly the same cadence as keypair refresh and the staleness
   window stays small.
-- **RO-ancestor** is immune: ancestors are frozen, currency never moves,
-  so the discharge cannot go stale. `discharge_ttl` can be long — bounded
+- **RO-ancestor** is immune: ancestors are frozen, the live owner never
+  changes, so the discharge cannot go stale. `discharge_ttl` can be long — bounded
   only by the primary's own `exp` (**start at ~1 h**) — and coord B drops
   off the path entirely after first-touch.
 
@@ -255,7 +255,7 @@ proof = Ed25519_sign(volume.key[owned], payload)
 `{ cid, name, owned, target, ts, nonce, proof }`. `cid` is opaque to
 coord A; coord B decrypts it under the symmetric `K_M-B` it shares with
 mint — the same CID-wrapping construction as the auth-service TPC's
-`K_M-A`. `name` is carried for the currency lookup.
+`K_M-A`. `name` is carried for the liveness lookup.
 
 **coord B verification — fail-closed, in order:**
 
@@ -268,11 +268,11 @@ mint — the same CID-wrapping construction as the auth-service TPC's
    unseen; insert into a seen-cache bounded by `2 × skew`.
 3. **Possession.** Recompute the payload, fetch `meta/owned.pub`,
    `verify(payload, proof)`. Proves possession of `owned`'s key.
-4. **Currency.** `names/<name>` resolves to `owned` as the live episode
+4. **Liveness.** `names/<name>` resolves to `owned` as the live episode
    (a wrong `name` simply fails to resolve to `owned`). Applies to
    `owned` only; ancestors are frozen. Resolution reuses the claim-record
    model; its edge cases (e.g. an unnamed scratch volume) are the
-   currency design's concern, not the binding's.
+   liveness design's concern, not the binding's.
 5. **Mode.** `rw-self` ⟹ `target == owned`; `ro-ancestor` ⟹ `target ∈
    {owned} ∪ ancestors(owned)` via the shared signed-provenance walk.
 6. **Discharge.** Mint a macaroon rooted at `r` (kid `DISCHARGE_KID`)
@@ -349,7 +349,7 @@ load-bearing part — the **same `walk_ancestors` / `walk_extent_ancestors`
 code** the read path uses.
 
 That shared code path settles the `rebuild-is-invariant` concern *by
-construction*: coord B's lineage and currency determination is
+construction*: coord B's lineage and liveness determination is
 byte-identical to what the read path computes, so **vouchable ≡
 readable** — a volume coord B refuses to vouch for is one the read path
 could not have served, and vice versa. There is no second
@@ -372,7 +372,7 @@ grant (`design-mint.md` § *`coord-ro`*: `GetObject` on `names/*`,
 |---|---|---|
 | possession | `meta/<owned>.pub` | `meta/*` |
 | lineage walk | `meta/<vol>.provenance` (owned + each ancestor) | `meta/*` |
-| currency | `names/<name>` | `names/*` |
+| liveness | `names/<name>` | `names/*` |
 
 The verifier needs **zero `by_id/` access** — it reads only public signed
 metadata, never segment bodies. That is exactly `coord-ro`'s load-bearing
@@ -384,7 +384,7 @@ read bulk data. So coord B reuses `coord-ro` unchanged — **no new role**.
 This is not a coincidence of grants. The peer-fetch verifier
 (`design-peer-segment-fetch.md`) is the structural twin: on `coord-ro`
 alone it already does the near-identical trio — an ETag-conditional
-`names/<name>` fence (our *currency*), a `coordinators/<B>/coordinator.pub`
+`names/<name>` fence (our *liveness*), a `coordinators/<B>/coordinator.pub`
 requester check, and a signed-`volume.provenance` lineage walk (our
 *lineage*). The attestation verifier is the same animal pointed at a
 different question.
@@ -430,7 +430,7 @@ volume TPC.
   discharge authority establishing `K_M-B` per the auth service's `K_M-A`
   pattern (see *The attestation coordinator…*).
 - **The verifier reuses `coord-ro` unchanged** — its possession / lineage
-  / currency reads are all `meta/*` + `names/*`, with no `by_id/` access,
+  / liveness reads are all `meta/*` + `names/*`, with no `by_id/` access,
   matching `coord-ro`'s `by_id/`-free exposed-verifier invariant. No new
   role; no bootstrap loop (`coord-ro` is `caveat.sub`-gated, not
   volume-attested).
