@@ -19,7 +19,7 @@ use mint::issuance::{mint_credential_ticket, mint_invite};
 use mint::keyring::Keyring;
 use mint::macaroon::{DISCHARGE_KID, Macaroon, mint_under_key};
 use mint::pop;
-use mint::state::{K_M_A_FILE, Store};
+use mint::state::{K_M_A_FILE, K_M_B_FILE, Store};
 use mint::tpc;
 use tower::ServiceExt;
 
@@ -30,16 +30,23 @@ const ROOT: [u8; 32] = [42u8; 32];
 /// handler can stamp the gate TPCs, and reused by [`signed`] to mint the
 /// operator discharge each gate clears.
 const K_M_A: [u8; 32] = [13u8; 32];
+/// The mint↔attestation-coordinator wrapping key. Pre-seeded so the
+/// exchange handler can stamp the volume role's attested TPC, and reused
+/// by [`signed`] to mint the attestation discharge it clears.
+const K_M_B: [u8; 32] = [21u8; 32];
 const CLIENT_SEED: [u8; 32] = [7u8; 32];
 const OTHER_SEED: [u8; 32] = [9u8; 32];
 const SUB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const ORG_ID: &str = "demo";
 /// Discharge location stamped into the invite/ticket gate TPCs.
 const AUTH_URL: &str = "https://auth.example/v1/discharge";
+/// The volume the attestation discharge attests for the `volume-ro` role.
+const VOLUME: &str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
 
 const TOML_TEMPLATE: &str = r#"
 audience = "mint"
 auth_location = "https://auth.example/v1/discharge"
+attestation_location = "https://coord-b.example/v1/discharge"
 [store]
 bucket = "demo-bucket"
 [env]
@@ -50,6 +57,10 @@ min_ttl_seconds = 60
 max_ttl_seconds = 2592000
 default_ttl_seconds = 2592000
 policy_file = "volume-ro.json"
+[role.template]
+attested = ["volume"]
+[role.attestation]
+mode = "ro-ancestor"
 [[role]]
 name = "volume-rw"
 min_ttl_seconds = 60
@@ -66,7 +77,7 @@ const POLICY: &str = r#"
   "Statement": [{
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
-    "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{req.volume}}/*"],
+    "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{attested.volume}}/*"],
     "Condition": {"DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}}
   }]
 }
@@ -112,12 +123,17 @@ async fn app() -> (
     // minted with ROOT verify.
     let k_m_a_hex: String = K_M_A.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.path().join(K_M_A_FILE), k_m_a_hex).expect("seed k_m_a");
+    let k_m_b_hex: String = K_M_B.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.path().join(K_M_B_FILE), k_m_b_hex).expect("seed k_m_b");
     let mut store_inner = Store::open_local_with_initial_key(dir.path(), Some(ROOT))
         .await
         .expect("store");
     store_inner
         .init_k_m_a(dir.path(), true)
         .expect("init k_m_a");
+    store_inner
+        .init_k_m_b(dir.path(), true)
+        .expect("init k_m_b");
     let store = Arc::new(store_inner);
     let cfg = config();
     let seal = Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -174,20 +190,41 @@ fn gate_discharge(cid: &[u8], scope: &str) -> Macaroon {
     )
 }
 
-/// Build a signed request, presenting the primary plus — for the enroll
-/// and exchange gates — a fresh operator discharge for each TPC the
-/// primary carries (the operator's half of the gate). The PoP signs the
-/// body under the *primary's* tail, as the client does.
+/// Mint the attestation discharge for the volume role's attested TPC the
+/// way coord B would: recover `r` from the CID under `K_M-B`, then mint a
+/// discharge rooted at it attesting `volume = VOLUME`.
+fn volume_discharge(cid: &[u8]) -> Macaroon {
+    let pt = tpc::decrypt_cid_attested(&K_M_B, cid).expect("cid decrypts under K_M-B");
+    mint_under_key(
+        &pt.r,
+        DISCHARGE_KID,
+        vec![
+            Caveat::scalar("volume", VOLUME),
+            Caveat::scalar(name::EXP, far_future().to_string()),
+        ],
+    )
+}
+
+/// Build a signed request, presenting the primary plus a fresh discharge
+/// for each TPC the primary carries — an operator discharge for the
+/// enroll/exchange gates, an attestation discharge for an assume-role
+/// credential's volume TPC. The PoP signs the body under the *primary's*
+/// tail, as the client does.
 fn signed(uri: &str, m: &Macaroon, seed: &[u8; 32], extra: &str) -> Request<Body> {
     let body = format!("{{\"ts\":{}{extra}}}", now());
     let sig = pop::client_signature(seed, m.tail(), body.as_bytes());
     let mut auth = format!("MintV1 {}", m.encode());
-    if let Some(scope) = gate_scope(m) {
-        for c in m.caveats() {
-            if let Caveat::ThirdParty { cid, .. } = c {
-                auth.push(',');
-                auth.push_str(&gate_discharge(cid, scope).encode());
-            }
+    for c in m.caveats() {
+        if let Caveat::ThirdParty { cid, .. } = c {
+            // An enroll/exchange anchor carries a gate TPC the operator
+            // discharges; an assume-role credential carries the volume
+            // role's attested TPC the attestation coordinator discharges.
+            let discharge = match gate_scope(m) {
+                Some(scope) => gate_discharge(cid, scope),
+                None => volume_discharge(cid),
+            };
+            auth.push(',');
+            auth.push_str(&discharge.encode());
         }
     }
     Request::builder()
@@ -333,15 +370,17 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // (5) attenuate the credential and assume a role with it. The target
-    // volume rides the PoP-signed body as `req.volume`, not a caveat.
+    // (5) attenuate the credential and assume a role with it. The
+    // credential carries the volume role's attested TPC (stamped at
+    // exchange); `signed` attaches the attestation discharge that vouches
+    // the target volume, which the policy renders as `{{attested.volume}}`.
     let req = credential.attenuate(Caveat::scalar(name::EXP, far_future().to_string()));
     let (status, body) = parts(
         app.oneshot(signed(
             "/v1/assume-role",
             &req,
             &CLIENT_SEED,
-            r#","role":"volume-ro","ttl_seconds":3600,"volume":"01JQAAAAAAAAAAAAAAAAAAAAAA""#,
+            r#","role":"volume-ro","ttl_seconds":3600"#,
         ))
         .await
         .unwrap(),
@@ -662,11 +701,35 @@ async fn gates_carry_tpc_but_credential_does_not() {
         "ticket carries the exchange-gate TPC"
     );
 
-    // approve, then exchange → a TPC-free credential.
+    // approve, then exchange. A non-attested role (`volume-rw` here
+    // declares no `[role.attestation]`) yields a TPC-free credential —
+    // operator authority lives at the gates, not at assume-role.
     store
         .approve(SUB, &pop::cnf_value(&CLIENT_SEED), "usr_op", &now_iso())
         .await
         .unwrap();
+    let (status, body) = parts(
+        app.clone()
+            .oneshot(signed(
+                "/v1/enroll-exchange",
+                &ticket,
+                &CLIENT_SEED,
+                r#","role":"volume-rw""#,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let credential = field(&body, "credential");
+    assert_eq!(
+        tpc_count(&credential),
+        0,
+        "non-attested role: credential carries no TPC"
+    );
+
+    // An attested role (`volume-ro`) instead yields a credential carrying
+    // exactly the volume attested TPC the attestation coordinator clears.
     let (status, body) = parts(
         app.oneshot(signed(
             "/v1/enroll-exchange",
@@ -679,8 +742,12 @@ async fn gates_carry_tpc_but_credential_does_not() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    let credential = field(&body, "credential");
-    assert_eq!(tpc_count(&credential), 0, "credential carries no TPC");
+    let attested_credential = field(&body, "credential");
+    assert_eq!(
+        tpc_count(&attested_credential),
+        1,
+        "attested role: credential carries the volume TPC"
+    );
 }
 
 /// Count third-party caveats on a macaroon.

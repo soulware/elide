@@ -415,8 +415,8 @@ fn parse_caveats(args: &[String]) -> Result<Vec<(String, String)>, ClientError> 
 /// `ts`/`role`/`ttl_seconds` (those are the conventional fields the
 /// client sets and signs; a value supplied for them in `--req` is
 /// overwritten, not trusted). Pure + ts-injected for testability. mint
-/// is body-field-agnostic — every other `req.*` field is opaque
-/// pass-through.
+/// no longer substitutes from the body (scoping is attested by a
+/// discharge), so any other field is opaque, PoP-covered, and unread.
 fn build_request_body(
     request_src: Option<&str>,
     role: &str,

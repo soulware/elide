@@ -569,7 +569,9 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         }
     }
 
-    // --- Request body (the exact bytes the PoP already covered). ---
+    // --- Request body (the exact bytes the PoP already covered). It
+    // carries only the request parameters `role`/`ttl_seconds`; no scoping
+    // value rides the body — scoping is attested by the discharge. ---
     let Ok(req) = serde_json::from_slice::<AssumeRoleBody>(&body) else {
         audit(entry("denied:bad_request", "", None, None));
         return respond(
@@ -578,8 +580,6 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
             json!({"error": "bad request"}),
         );
     };
-    let request_json: serde_json::Value =
-        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
 
     let requested_ttl = match req.ttl_seconds {
         Some(t) => t,
@@ -631,24 +631,21 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         );
     };
 
-    // The role's sealed request contract: every declared `req` field must
-    // be a string in the PoP-verified body, every declared `caveat` name
-    // must resolve to a single value in the MAC-verified chain. Enforced
-    // here, against the attested contract, before render — a missing input
-    // is a client fault (clean 400) rather than a render-time 500. Render's
+    // The role's sealed substitution contract: every declared `attested`
+    // name must resolve to a single value in the discharge context, every
+    // declared `caveat` name in the primary's MAC-verified chain. Enforced
+    // here, against the sealed contract, before render — a missing input is
+    // a client fault (clean 400) rather than a render-time 500. Render's
     // strict mode is the backstop. authorize() proved the role is in the
     // surface, so an absent SealedRole is the same internal inconsistency
     // the missing-policy branch above guards.
     let eff = EffectiveCaveats::new(&caveats);
+    let dis_eff = EffectiveCaveats::new(&cleared.discharge_caveats);
     if let Some(sealed_role) = surface.role(&granted.role_name) {
-        for field in &sealed_role.req {
-            if request_json
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .is_none()
-            {
+        for name in &sealed_role.attested {
+            if !matches!(dis_eff.resolve(name), Resolved::Value(_)) {
                 audit(entry(
-                    "denied:missing_req_field",
+                    "denied:missing_attested",
                     &granted.role_name,
                     None,
                     None,
@@ -682,7 +679,7 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     let policy = match render_policy(
         policy_template,
         surface.env(),
-        &request_json,
+        &cleared.discharge_caveats,
         &caveats,
         &expiry_iso,
         &granted.role_name,
@@ -699,7 +696,10 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         }
     };
 
-    let scope = match eff.resolve("elide:Volume") {
+    // The IAM policy name's scope segment reflects the attested volume —
+    // the authoritative scope for this credential — or `global` when the
+    // role attests none.
+    let scope = match dis_eff.resolve("volume") {
         Resolved::Value(v) => Some(v),
         Resolved::Absent | Resolved::Unsatisfiable => None,
     };

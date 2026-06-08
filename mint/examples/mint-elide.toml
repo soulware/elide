@@ -11,6 +11,13 @@ audience = "mint"
 # that service, not a colocated UDS.
 auth_location = "https://auth.elide.internal/v1/discharge"
 
+# Attestation integration (docs/design-mint-volume-attestation.md). The
+# discharge URL of the attestation coordinator that vouches a credential's
+# volume scope, keyed by K_M-B. Required because the volume roles below
+# declare [role.attestation]: their credentials carry an attested
+# third-party caveat this authority discharges at assume-role.
+attestation_location = "https://coord-b.elide.internal/v1/discharge"
+
 # data_dir / roles_dir: a relative value (including the defaults
 # mint_data / mint_roles) resolves against the working directory, not
 # this file's parent; an absolute path is used verbatim. roles_dir is
@@ -41,9 +48,12 @@ bucket = "elide-demo"
 bucket = "elide-demo"
 
 # The `[role.template]` subtable declares the role's substitution contract:
-# the `{{req.X}}` body fields and `{{caveat.X}}` MAC-verified names its policy
-# template uses. Seal authoring rejects a template whose tokens don't match
-# these exactly, and the request path enforces them before render.
+# the `{{attested.X}}` discharge-attested names and `{{caveat.X}}` MAC-verified
+# names its policy template uses. Seal authoring rejects a template whose
+# tokens don't match these exactly, and the request path enforces them before
+# render. The volume roles also declare `[role.attestation]`: their credential
+# carries an attested third-party caveat whose opaque `mode` tells the
+# attestation coordinator which ownership check to run.
 
 [[role]]
 name = "volume-ro"
@@ -52,7 +62,10 @@ max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
 
 [role.template]
-req = ["volume"]
+attested = ["volume"]
+
+[role.attestation]
+mode = "ro-ancestor"
 
 [[role]]
 name = "volume-rw"
@@ -61,7 +74,10 @@ max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
 
 [role.template]
-req = ["volume"]
+attested = ["volume"]
+
+[role.attestation]
+mode = "rw-self"
 
 [[role]]
 name = "coord-ro"
