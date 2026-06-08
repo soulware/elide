@@ -27,7 +27,11 @@ pub mod name {
     // Borrowed (RFC 7519 / RFC 7800).
     /// RFC 7519 audience — the service this macaroon is for.
     pub const AUD: &str = "aud";
-    /// RFC 7519 expiry, unix seconds; multiple narrow to the minimum.
+    /// RFC 7519 expiry, unix seconds; the sole deadline caveat. Multiple
+    /// occurrences narrow to the minimum, so every party binds time the
+    /// same way: the issuer's lifetime on a primary, an authority's bound
+    /// on a discharge, and a key-less holder's per-IPC / per-forward
+    /// attenuation all append `exp` and the tightest wins.
     pub const EXP: &str = "exp";
     /// RFC 7519 subject — the opaque principal the credential is bound
     /// to (typically a stable identifier of the client — e.g. a ULID).
@@ -48,11 +52,6 @@ pub mod name {
     pub const EPOCH: &str = "epoch";
     /// Carried only by the invite macaroon; the current nonce.
     pub const INVITE: &str = "invite";
-    /// Discharge / attenuation deadline, unix seconds; multiple narrow
-    /// to the minimum. Distinct from `exp`: borne by auth-issued
-    /// discharges and by per-IPC / per-forward chain attenuations,
-    /// where the holder bounds a bearer chain it cannot re-key.
-    pub const NOT_AFTER: &str = "NotAfter";
     /// Authority class a discharge attests, named at `/v1/discharge` and
     /// cleared by the gate that consumes the discharge
     /// (`docs/design-auth-service.md` § *Scope tier*). Carried as a
@@ -235,11 +234,12 @@ impl<'a> EffectiveCaveats<'a> {
         out
     }
 
-    /// Minimum `NotAfter` (unix seconds) across all `NotAfter` caveats,
-    /// or `None` if the macaroon carries no parseable `NotAfter`. This
-    /// is a numeric intersection (the minimum binds), distinct from the
+    /// Minimum value (unix seconds) across all caveats named `name`, or
+    /// `None` if the macaroon carries no parseable occurrence. The field
+    /// is read as a numeric narrowing bound — the minimum binds — which
+    /// is how the `exp` deadline is cleared, distinct from the
     /// scalar-agreement resolution of [`Self::resolve`].
-    pub fn not_after(&self, name: &str) -> Option<u64> {
+    pub fn min_bound(&self, name: &str) -> Option<u64> {
         self.caveats
             .iter()
             .filter_map(|c| match c {
@@ -291,12 +291,8 @@ mod tests {
     }
 
     #[test]
-    fn not_after_takes_the_minimum() {
-        let c = cv(&[
-            ("NotAfter", "5000"),
-            ("NotAfter", "3000"),
-            ("NotAfter", "9000"),
-        ]);
-        assert_eq!(EffectiveCaveats::new(&c).not_after("NotAfter"), Some(3000));
+    fn min_bound_takes_the_minimum() {
+        let c = cv(&[("exp", "5000"), ("exp", "3000"), ("exp", "9000")]);
+        assert_eq!(EffectiveCaveats::new(&c).min_bound("exp"), Some(3000));
     }
 }

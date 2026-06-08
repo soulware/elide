@@ -304,7 +304,7 @@ mod tests {
             ie.resolve(name::OP),
             Resolved::Value(op::ENROLL_EXCHANGE.into())
         );
-        assert_eq!(ie.not_after(name::EXP), Some(1_700_000_000));
+        assert_eq!(ie.min_bound(name::EXP), Some(1_700_000_000));
         // The exchange gate: the ticket carries its own TPC.
         assert_eq!(tpc_count(&ticket), 1);
 
@@ -321,7 +321,7 @@ mod tests {
         // The credential carries the revocation epoch it was minted at.
         assert_eq!(pe.resolve(name::EPOCH), Resolved::Value("7".into()));
         // The credential does not expire.
-        assert_eq!(pe.not_after(name::EXP), None);
+        assert_eq!(pe.min_bound(name::EXP), None);
         // A credential carries no third-party caveat — operator authority
         // lives entirely at the enroll/exchange gates, not at assume-role.
         assert_eq!(tpc_count(&cred), 0);

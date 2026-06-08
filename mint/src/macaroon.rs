@@ -454,7 +454,7 @@ mod tests {
             vec![
                 Caveat::scalar("Audience", "mint"),
                 Caveat::scalar("elide:Volume", "01ARZ"),
-                Caveat::scalar("NotAfter", "1700000000"),
+                Caveat::scalar("exp", "1700000000"),
             ],
         );
         let wire = m.encode();
@@ -471,7 +471,7 @@ mod tests {
             vec![
                 Caveat::scalar("Audience", "mint"),
                 Caveat::third_party("https://auth.example/", vec![1u8; 28], vec![2u8; 60]),
-                Caveat::scalar("NotAfter", "1700000000"),
+                Caveat::scalar("exp", "1700000000"),
             ],
         );
         let wire = m.encode();
@@ -535,7 +535,7 @@ mod tests {
             vec![
                 Caveat::scalar("Subject", "usr_abc"),
                 Caveat::scalar("CoordId", "01ARZ"),
-                Caveat::scalar("NotAfter", "1700000000"),
+                Caveat::scalar("exp", "1700000000"),
             ],
         );
         assert_eq!(m.kid(), DISCHARGE_KID);

@@ -200,7 +200,7 @@ pub fn pop_proof(headers: &HeaderMap) -> Result<Option<pop::Proof>, ()> {
 }
 
 /// Output of [`verify_and_clear`]: the primary, the union of verified
-/// caveats across the bundle, and the bundle-wide minimum `NotAfter`.
+/// caveats across the bundle, and the bundle-wide minimum `exp`.
 pub struct ClearedBundle {
     pub primary: Macaroon,
     pub aggregated_caveats: Vec<Caveat>,
@@ -260,7 +260,7 @@ impl VerifyClearError {
 /// `K_M` cannot produce a mint-issued primary that verifies.
 ///
 /// Returns the union of caveats across the bundle and the
-/// bundle-wide minimum `NotAfter` — the verify endpoint returns
+/// bundle-wide minimum `exp` — the verify endpoint returns
 /// these verbatim; assume-role hands the caveats to [`role::authorize`]
 /// for the role-specific gate.
 // Each input is independently meaningful at every call site (keyring +
@@ -310,7 +310,7 @@ pub fn verify_and_clear(
     // tail — the principal whose chain is being exercised. Discharges
     // carry their own `cnf` caveats but they are not request-time
     // PoP'd (the per-forward freshness is the primary's per-forward
-    // `NotAfter` attenuation).
+    // `exp` attenuation).
     pop::check(
         bundle.primary.caveats(),
         bundle.primary.tail(),
@@ -327,14 +327,11 @@ pub fn verify_and_clear(
     if !matches!(eff.resolve(name::OP), Resolved::Value(v) if v == expected_op) {
         return Err(VerifyClearError::OpClear);
     }
-    // Two deadline names bind: `exp` (the credential's own expiry) and
-    // `NotAfter` (borne by discharges and by per-IPC / per-forward
-    // attenuations). The minimum across both is the bundle's effective
-    // deadline — the tightest attenuation wins.
-    let expires_at = match (eff.not_after(name::EXP), eff.not_after(name::NOT_AFTER)) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    };
+    // `exp` is the sole deadline caveat: the issuer's lifetime on the
+    // primary, an authority's bound on a discharge, and any per-IPC /
+    // per-forward attenuation all append it, and the minimum across the
+    // whole bundle binds — the tightest attenuation wins.
+    let expires_at = eff.min_bound(name::EXP);
     if let Some(deadline) = expires_at
         && deadline <= now_unix
     {
@@ -735,7 +732,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     // discharge for the invite's enroll-gate TPC. `verify_and_clear`
     // walks the chain under `K_M`, recovers the TPC's `r` from its `VID`,
     // verifies the discharge, and clears `aud`/`op=enroll`/PoP/`exp`
-    // (the discharge's short `NotAfter` rides the deadline clear).
+    // (the discharge's short `exp` rides the deadline clear).
     let Some(bundle) = extract_bundle(&headers) else {
         audit("denied:unauthenticated", &[]);
         return unauthorized(&request_id);
@@ -977,7 +974,7 @@ async fn enroll_exchange(
     // discharge for the ticket's exchange-gate TPC. `verify_and_clear`
     // walks the chain under `K_M`, verifies the discharge against the
     // ticket's TPC, and clears `aud`/`op=enroll-exchange`/PoP and the
-    // deadline (the ticket's `exp` ∧ the discharge's `NotAfter`).
+    // deadline (the minimum `exp` across the ticket and the discharge).
     let Some(bundle) = extract_bundle(&headers) else {
         audit("denied:unauthenticated", &[]);
         return unauthorized(&request_id);
@@ -1137,7 +1134,7 @@ fn denied_tag(d: &Denied) -> &'static str {
 /// PoP freshness, signed under the primary's `cnf` over the request
 /// bytes. Runs the shared [`verify_and_clear`] core (chain MACs +
 /// `aud`/`op`/`cnf`+PoP/`exp` clears) and returns the verdict + the
-/// aggregated cleared caveats + the bundle-wide minimum `NotAfter`.
+/// aggregated cleared caveats + the bundle-wide minimum `exp`.
 /// The caller (coord) caches the verdict by the bundle's wire bytes
 /// for the lifetime of `expires_at`.
 async fn discharge_verify(

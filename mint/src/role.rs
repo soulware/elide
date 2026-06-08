@@ -11,7 +11,7 @@ use crate::sealed_cache::ServedSurface;
 
 const SUBJECT_CAVEAT: &str = name::SUB;
 const AUDIENCE_CAVEAT: &str = name::AUD;
-const NOT_AFTER_CAVEAT: &str = name::EXP;
+const EXP_CAVEAT: &str = name::EXP;
 const ROLE_CAVEAT: &str = name::ROLE;
 
 /// Caveats every assume-role credential must carry, enforced for
@@ -21,7 +21,7 @@ const ROLE_CAVEAT: &str = name::ROLE;
 /// per-role policy knob. `aud` and `exp` additionally have their *values*
 /// checked below; `sub` is presence-only (its value is MAC-authentic and
 /// its holder is proven by the `cnf`+PoP gate at the HTTP layer).
-const REQUIRED_CAVEATS: [&str; 3] = [SUBJECT_CAVEAT, AUDIENCE_CAVEAT, NOT_AFTER_CAVEAT];
+const REQUIRED_CAVEATS: [&str; 3] = [SUBJECT_CAVEAT, AUDIENCE_CAVEAT, EXP_CAVEAT];
 
 /// Why an assume-role request was refused. Mapped to coarse HTTP
 /// statuses by the caller; never surfaced verbatim to the client.
@@ -38,7 +38,7 @@ pub enum Denied {
     /// A required caveat is present but its occurrences contradict
     /// (unsatisfiable) — fail closed, never treat as absent.
     UnsatisfiableCaveat(String),
-    /// Macaroon carries no usable `NotAfter`, or it is already past.
+    /// Macaroon carries no usable `exp`, or it is already past.
     Expired,
     /// Requested TTL below the role's `min_ttl_seconds`.
     TtlTooShort,
@@ -110,9 +110,9 @@ pub fn authorize(
         }
     }
 
-    // TTL: granted = min(requested_or_default, role.max, NotAfter - now).
-    let not_after = eff.not_after(NOT_AFTER_CAVEAT).ok_or(Denied::Expired)?;
-    let remaining = not_after.checked_sub(now_unix).ok_or(Denied::Expired)?;
+    // TTL: granted = min(requested_or_default, role.max, exp - now).
+    let exp = eff.min_bound(EXP_CAVEAT).ok_or(Denied::Expired)?;
+    let remaining = exp.checked_sub(now_unix).ok_or(Denied::Expired)?;
     if remaining == 0 {
         return Err(Denied::Expired);
     }
@@ -155,14 +155,14 @@ policy_file = "volume-ro.json"
         ServedSurface::from_config(&cfg, &Keyring::single([7u8; 32]), "t")
     }
 
-    fn good_caveats(not_after: u64) -> Vec<Caveat> {
+    fn good_caveats(exp: u64) -> Vec<Caveat> {
         // `aud` and `role` stay at indices 0 and 1 — some tests mutate
         // them positionally.
         vec![
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::ROLE, "volume-ro"),
             Caveat::scalar("elide:Volume", "01ARZ"),
-            Caveat::scalar(name::EXP, not_after.to_string()),
+            Caveat::scalar(name::EXP, exp.to_string()),
             Caveat::scalar(name::SUB, "alice"),
         ]
     }
@@ -181,9 +181,9 @@ policy_file = "volume-ro.json"
     }
 
     #[test]
-    fn ttl_capped_by_not_after() {
+    fn ttl_capped_by_exp() {
         let g = authorize(&surface(), &good_caveats(1300), "volume-ro", 900, 1000).unwrap();
-        assert_eq!(g.ttl_seconds, 300); // not_after - now
+        assert_eq!(g.ttl_seconds, 300); // exp - now
     }
 
     #[test]
