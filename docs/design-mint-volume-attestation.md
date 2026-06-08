@@ -1,7 +1,7 @@
 # Volume-ownership attestation for mint tokens
 
-**Status: Exploration.** Captures the design discussion so far. Several
-points are still open — see *Open questions*. Builds on `design-mint.md`
+**Status: Exploration.** Captures the design discussion so far; the
+points raised have been resolved into *Decided*. Builds on `design-mint.md`
 (token issuance, `req`/`caveat` namespaces, third-party caveats) and
 `design-portable-live-volume.md` (per-volume signing keys, signed
 provenance, the `names/<name>` claim).
@@ -201,8 +201,8 @@ A single keypair whose policy spans the chain (one keypair, N
 statements, assembled in mint code from N scalar renders — never template
 iteration) only wins for *dense* full-chain reads (`materialize`, GC
 repack, offline filemap). It is **orthogonal** to attestation — an
-eager-vs-lazy tradeoff in its own right — and is not adopted here; see
-*Open questions*.
+eager-vs-lazy tradeoff in its own right — and is not adopted here (see
+*Decided*: `volume-ro` stays lazy per-ancestor).
 
 ### One liveness check unifies RW-self and RO-ancestor
 
@@ -495,12 +495,30 @@ volume TPC.
   matching `coord-ro`'s `by_id/`-free exposed-verifier invariant. No new
   role; no bootstrap loop (`coord-ro` is `caveat.sub`-gated, not
   volume-attested).
-
-## Open questions
-
-1. **Map-valued vs scalar attested caveat.** With scoping attested-only
-   and one volume per role (RW: the live volume; RO: one ancestor per
-   keypair), a single scalar `attested.volume` suffices today. A map
-   (`attested.*`, room for more keys) would revise the "all caveats are
-   scalar" invariant in `design-mint.md`; defer until a second attested
-   field actually appears, unless there is a reason to generalise now.
+- **`attested.*` is a closed, reserved-disjoint registry; the discharge
+  vocabulary is closed per type.** Attested growth is **named scalar
+  caveats, never a map** — multiple attested fields are multiple named
+  scalar caveats `(name, value)` (the existing caveat type), so the "all
+  caveats are scalar" invariant in `design-mint.md` is never revised. The
+  names are only safe if the space is fenced, by two invariants:
+  - **`ATTESTABLE ∩ RESERVED = ∅`** (asserted as a constant). `attested.*`
+    is the protocol's *attestable set* — today `{volume}` — and mint pulls
+    attested values **by name from that set**, never "whatever the
+    discharge carries". `validate_policy_surface`'s *declared ⊆
+    authoritative* already rejects a declared `attested` key outside the
+    set; the disjointness assertion additionally forbids the set from ever
+    *containing* a reserved control name (`aud, exp, sub, cnf, op, role,
+    epoch, invite, NotAfter, Scope`). So `attested.sub` cannot exist —
+    coord B has no field named `sub` to emit — and the discharge's caveats
+    are never flattened into `caveat.*`, so a discharge value can never
+    shadow the primary's MAC-bound `caveat.sub`.
+  - **The discharge's caveat vocabulary is closed per discharge type and
+    fails closed.** mint dispatches discharge interpretation on the
+    discharge type (kid / `location`). A *volume* discharge clears only
+    its own bound caveats (`exp` / `NotAfter`) and attests `{volume}`; a
+    caveat that is neither is **rejected**, not absorbed into the
+    principal's control-clearing pass. So coord B — whose only job is to
+    attest a volume — cannot reach the principal's control set, nor the
+    auth authority's vocabulary (a volume discharge carrying `Scope` is
+    invalid by vocabulary, just as an auth discharge carrying `volume`
+    would be). Each authority emits only its own type's names.
