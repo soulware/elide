@@ -1574,13 +1574,21 @@ bundle.) Two kinds of caveat, two clearing rules:
   reconciled across macaroons. (`op` is the scalar operation predicate on
   both primary and discharge; `Scope` survives only as the *granted set*
   on a session, a membership shape `op` can't express.)
-- **Attestation caveats** — `sub`, `cnf`, and the auth discharge's
-  `OrgId`/`ClientId`. Identities a macaroon *carries*, consumed
-  downstream, **never cleared against a request value and never merged
-  across macaroons**. The primary's `sub` (the cnf-bound coordinator — a
-  service identity) and the discharge's `sub` (the authenticated human the
-  auth service attests) are two different facts in two different contexts;
-  each is read where it belongs and they never collide.
+- **Attestation caveats** — `sub` and `cnf`. Identities a macaroon
+  *carries*, consumed downstream, **never cleared against a request value
+  and never merged across macaroons**. The primary's `sub` (the cnf-bound
+  coordinator — a service identity) and the discharge's `sub` (the
+  authenticated human the auth service attests, recorded as the audit
+  identity at the operator gates — `approved_by` / `revoked_by` /
+  `requested_by`) are two different facts in two different contexts; each
+  is read where it belongs and they never collide. This split is the
+  reason the rename and the de-flatten are inseparable: the discharge's
+  human identity is read today only because it is named `Subject`,
+  distinct from the primary's `sub`; renaming it to `sub` under the
+  flattened union would make `resolve("sub")` see two values and trip the
+  unsatisfiable check. `OrgId` / `ClientId` are **not** attestation
+  caveats — they are never read; `client_id` derives `r` and `org_id` is
+  checked at discharge issuance, both as TPC CID plaintext, not caveats.
 
 `exp` is the **sole caveat combined across the bundle**: the effective
 deadline is the minimum over every macaroon's `exp`, because "valid
@@ -1624,9 +1632,16 @@ per-context clearing instead.)
 > reads the primary's, the operator gates read the discharge's). Rename
 > the auth discharge's `Subject` caveat to `sub` and its `Scope` caveat to
 > `op`, and stamp `aud=mint` on it (`design-auth-service.md`;
-> `mint/src/auth.rs`) — the session keeps `Scope` as its granted set — and
-> register `OrgId` / `ClientId` as named constants. Retire the
-> `Subject`→`Principal` rename — it is no longer needed.
+> `mint/src/auth.rs`) — the session keeps `Scope` as its granted set.
+> Route the audit-identity read (`admin.rs`, `http.rs` — `approved_by` /
+> `revoked_by` / `requested_by`) to the discharge's context rather than
+> `resolve`-ing `Subject` over `aggregated_caveats`. Drop the `OrgId` /
+> `ClientId` caveats — never read; `client_id` / `org_id` stay as TPC CID
+> plaintext (`r` derivation; org check at issuance). Correct
+> `design-auth-service.md`, which says org-scoping is "enforced by
+> construction (mandatory `OrgId` caveat)": it is enforced at discharge
+> issuance via the CID, not a caveat. Retire the `Subject`→`Principal`
+> rename — it is no longer needed.
 
 ### Caveat field inventory (Elide)
 
