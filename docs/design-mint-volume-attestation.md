@@ -51,10 +51,16 @@ discharge root key) anchors it:
 - **`cid = AES-GCM-SIV(K_M-B, r ‖ message)`** — `r` plus the message,
   sealed under the key shared with coord B; the *authority* (coord B)
   recovers `r` + message by decrypting. For volume attestation the
-  message is `lp(client_id) ‖ mode`, `mode ∈ {rw-self, ro-ancestor}` —
-  **the volume is deliberately absent**, keeping mint volume-agnostic;
-  the volume is named only in the live discharge request and stamped into
-  the discharge's `req.volume`.
+  message is `lp(client_id) ‖ lp(org_id) ‖ mode`,
+  `mode ∈ {rw-self, ro-ancestor}` — extending the auth TPC's
+  `lp(client_id) ‖ lp(org_id)` with `mode`. `org_id` is retained for
+  parity with the auth TPC, so coord B can org-attribute the discharge
+  even though volume entitlement is anchored by the possession proof, not
+  the tenant claim. `mode` is the load-bearing addition: coord B cannot
+  MAC the primary, so the role it discharges for must be sealed by mint
+  here rather than asserted by coord A. **The volume is deliberately
+  absent**, keeping mint volume-agnostic; it is named only in the live
+  discharge request and stamped into the discharge's `req.volume`.
 
 `r` is recoverable by mint (via `vid`) and coord B (via `cid`), but **not
 by the holder** — coord A has neither `K_M-B` nor the intermediate chain
@@ -223,11 +229,11 @@ mint — the same CID-wrapping construction as the auth-service TPC's
 
 **coord B verification — fail-closed, in order:**
 
-1. **Recover `cid`.** AEAD-decrypt under `K_M-B` → `(r, message)` with
-   `message = lp(client_id) ‖ mode`, `mode ∈ {rw-self, ro-ancestor}`
-   baked in by mint at primary issuance
-   (mint knows the role; coord B never trusts the primary, which it
-   cannot MAC).
+1. **Recover `cid`.** AEAD-decrypt under `K_M-B` →
+   `(r, client_id, org_id, mode)` with `mode ∈ {rw-self, ro-ancestor}`
+   baked in by mint at primary issuance (mint knows the role; coord B
+   never trusts the primary, which it cannot MAC). `org_id` is available
+   for discharge attribution.
 2. **Freshness.** `|now − ts| ≤ skew` (≈30 s) and `(owned, nonce)`
    unseen; insert into a seen-cache bounded by `2 × skew`.
 3. **Possession.** Recompute the payload, fetch `meta/owned.pub`,
