@@ -1548,6 +1548,69 @@ chain — see *Request body*. A coordinator's own ULID is **not** in this
 class: it is the MAC-verified `sub` caveat, read by a policy as
 `caveat.sub`, so it is unforgeable rather than self-asserted.
 
+### Clearing context: per-macaroon, not a flattened union
+
+**Proposed.** A bundle is a primary plus its discharges. Each is a
+distinct macaroon, MAC'd under a distinct key (`K_M` for the primary,
+the recovered `r` for a discharge), bound to the others *structurally* —
+the discharge's caveat key `r` is recovered from the primary's `VID`, so
+the cryptographic binding is the chain, never agreement between two
+caveat *values*. A caveat is therefore a restriction on the **one
+macaroon it sits on**, cleared in that macaroon's context, and the
+verify+clear core must not merge the bundle's caveats into a single flat
+set before clearing. (The PoP/`cnf` check already works this way — it is
+evaluated against the primary's caveats and tail alone, never the
+bundle.) Two kinds of caveat, two clearing rules:
+
+- **Predicate caveats** — `aud`, `op`, `invite`, `Scope`. Answer "is
+  *this* macaroon valid for *this* request?" and are cleared against the
+  **request context** (the audience, the endpoint's authority, the
+  current nonce, the dispatched verb). They never need to be compared
+  *to each other* across macaroons — they meet only at the shared request
+  value. A discharge that carries `op=admin:invite-read` is gated by its
+  own `op` clearing against the request's verb, exactly as the primary's
+  `op` is; no cross-macaroon reconciliation.
+- **Attestation caveats** — `sub`, `cnf`, and the auth discharge's
+  `OrgId`/`ClientId`. Identities a macaroon *carries*, consumed
+  downstream, **never cleared against a request value and never merged
+  across macaroons**. The primary's `sub` (the cnf-bound coordinator) and
+  a discharge's `sub` (the authenticated human the auth service attests)
+  are two different facts in two different contexts; each is read where
+  it belongs and they never collide.
+
+`exp` is the **sole caveat combined across the bundle**: the effective
+deadline is the minimum over every macaroon's `exp`, because "valid
+until" is the one property that is legitimately monotonic across the
+chain (§ *Standard caveats*). Everything else clears per-macaroon.
+
+The downgrade-footgun protection (a repeated caveat with a contradictory
+value is *unsatisfiable*, never silently dropped — § *All caveats are
+scalar*) is **per-macaroon**: a single chain that contradicts itself
+fails closed. Two macaroons bearing the same caveat name with different
+values is *not* a contradiction — it is two attestations in two
+contexts, which is precisely why `sub` can name the machine on the
+primary and the human on the discharge without conflict.
+
+This retires the flattened-union clear and, with it, the discharge's
+separate `Subject` coinage: the authenticated principal is `sub` in the
+discharge's context. It also subsumes the volume-attestation
+`attested.*` fencing question (`design-mint-volume-attestation.md`): a
+discharge can no longer inject a control or `caveat.*` name into the
+primary's cleared identity, because the two namespaces are never merged —
+the attestable set is simply what mint reads from the discharge's own
+context.
+
+> **Delta when implemented.** Restructure the verify+clear core
+> (`mint/src/http.rs::verify_and_clear`) to clear `aud`/`op`/`exp`
+> per-macaroon against the request context rather than `resolve`-ing over
+> an `aggregated` union; `ClearedBundle` exposes the primary's and the
+> discharges' cleared caveats by source, not one flat list (the role gate
+> reads the primary's, the operator gates read the discharge's). Rename
+> the auth discharge's `Subject` caveat to `sub`
+> (`design-auth-service.md`; `mint/src/auth.rs`), and register `OrgId` /
+> `ClientId` as named constants alongside it. Retire the
+> `Subject`→`Principal` rename — it is no longer needed.
+
 ### Caveat field inventory (Elide)
 
 The complete caveat vocabulary the Elide roles draw on. Every caveat is a
