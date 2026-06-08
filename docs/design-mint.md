@@ -1600,6 +1600,16 @@ primary's cleared identity, because the two namespaces are never merged —
 the attestable set is simply what mint reads from the discharge's own
 context.
 
+This is the clearing model in Fly's `macaroon-thought.md` — every caveat
+an independent predicate, no agreement or hidden state between them. We
+extend it in exactly one place: because mint templates a MAC-verified
+caveat value into a policy (`caveat.sub`), clearing must track each
+caveat's source macaroon — a step an in-process authorizer that never
+reads a caveat as data does not need. (Fly's typed-caveat enum would make
+the `sub`/`Subject` homograph impossible by construction; mint stays
+string-named for the vocabulary-agnostic property and relies on
+per-context clearing instead.)
+
 > **Delta when implemented.** Restructure the verify+clear core
 > (`mint/src/http.rs::verify_and_clear`) to clear `aud`/`op`/`exp`
 > per-macaroon against the request context rather than `resolve`-ing over
