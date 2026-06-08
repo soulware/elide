@@ -183,7 +183,7 @@ discharge, attenuates per-IPC, retries the original request.
 `403 Forbidden` is distinct from `401 Unauthorized`: 401 means "the
 discharge needed refresh, here's how"; 403 means "the discharge was
 fresh and the caveat clearing failed against this request's context"
-(wrong Op, wrong Volume, expired NotAfter on the attenuation). 403
+(wrong Op, wrong Volume, expired exp on the attenuation). 403
 is terminal — the client should not retry with a fresh discharge,
 because that wasn't the problem.
 

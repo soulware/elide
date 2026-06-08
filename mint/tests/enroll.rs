@@ -158,7 +158,7 @@ fn gate_scope(m: &Macaroon) -> Option<&'static str> {
 /// Mint the operator discharge a gate clears, the way auth (or the
 /// colocated demo) would: recover `r` from the anchor's TPC `CID` under
 /// `K_M-A` and chain-MAC a discharge carrying `(Subject, OrgId, Scope,
-/// NotAfter)` under it, at `DISCHARGE_KID`.
+/// exp)` under it, at `DISCHARGE_KID`.
 fn gate_discharge(cid: &[u8], scope: &str) -> Macaroon {
     let pt = tpc::decrypt_cid(&K_M_A, cid).expect("cid decrypts under K_M-A");
     mint_under_key(
@@ -168,7 +168,7 @@ fn gate_discharge(cid: &[u8], scope: &str) -> Macaroon {
             Caveat::scalar("Subject", "usr_test"),
             Caveat::scalar("OrgId", pt.org_id),
             Caveat::scalar(name::SCOPE, scope),
-            Caveat::scalar(name::NOT_AFTER, far_future().to_string()),
+            Caveat::scalar(name::EXP, far_future().to_string()),
         ],
     )
 }
@@ -293,7 +293,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
         Resolved::Value(pop::cnf_value(&CLIENT_SEED))
     );
     assert_eq!(eff.resolve(name::ROLE), Resolved::Value("volume-ro".into()));
-    assert_eq!(eff.not_after(name::EXP), None, "credential does not expire");
+    assert_eq!(eff.min_bound(name::EXP), None, "credential does not expire");
 
     // ticket is multi-use: the SAME ticket, same approval, exchanged
     // again for a different role yields a second single-role credential

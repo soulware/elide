@@ -118,7 +118,7 @@ fn build_discharge(r: [u8; 32]) -> Macaroon {
         DISCHARGE_KID,
         vec![
             Caveat::scalar("Subject", "usr_demo"),
-            Caveat::scalar("NotAfter", "2099999999"),
+            Caveat::scalar(name::EXP, "2099999999"),
         ],
     )
 }

@@ -570,7 +570,7 @@ CLI fetches a **discharge** for the service token's third-party caveat
 from `POST <auth>/v1/discharge` at scope `mint:admin` (gated by the
 session, which must carry that scope; recovering the discharge key from
 the caveat's `CID` under `K_M-A`). The discharge carries `Subject`,
-`Scope=mint:admin`, and a short `NotAfter` and **no** `op`, so one fetch
+`Scope=mint:admin`, and a short `exp` and **no** `op`, so one fetch
 satisfies every verb (the verb binds via the per-call attenuation).
 
 The discharge **route** is the *path* of the service token's own TPC
@@ -594,7 +594,7 @@ tokens remain verifiable until a revocation mechanism lands (see
 regardless.
 
 **Lifetime.** Effectively the deployment's. Per-call freshness is
-supplied by the discharge's short `NotAfter` and the per-request PoP, so
+supplied by the discharge's short `exp` and the per-request PoP, so
 a long-lived service token does not weaken any property the per-call
 check enforces.
 
@@ -913,12 +913,13 @@ Four endpoints. `/v1/assume-role` and `/v1/verify` share a single
 **verify+clear** core: walk the presented macaroon's chain MAC,
 recursively verify any discharges by recovering `r` from each TPC's
 `VID` to fixpoint, then clear the standard first-party caveats (`aud`,
-`op=assume-role`, `cnf`+PoP, `exp`/per-forward `NotAfter`). A credential
+`op=assume-role`, `cnf`+PoP, `exp` — including any per-forward `exp`
+attenuation). A credential
 carries no third-party caveat, so the discharge step is a no-op on the
 `assume-role` path; it does real work at the three operator gates — the
 invite at `/v1/enroll`, the ticket at `/v1/enroll-exchange`, and the CLI
 service token at the admin verbs. `/v1/verify` returns the cleared
-bundle's caveats and minimum `NotAfter` so the caller can cache the
+bundle's caveats and minimum `exp` so the caller can cache the
 verdict. `/v1/assume-role` runs the same verify+clear and then **assumes
 the role** — renders the role policy from the PoP-signed body's scoping
 data (`req.volume`), mints a Tigris keypair. `/v1/enroll`

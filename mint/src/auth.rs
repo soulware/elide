@@ -42,7 +42,7 @@
 //! this role serves. Mint a macaroon at `kid = DISCHARGE_KID`, chain
 //! MAC'd under that `r`, caveats `Subject` (the session subject),
 //! `OrgId`, `ClientId`, `Scope` (the requested class, cleared by the
-//! gate), `NotAfter`. No `op`: per-op narrowing is the caller's
+//! gate), `exp`. No `op`: per-op narrowing is the caller's
 //! attenuation onto the primary (the PoP'd anchor), so one discharge
 //! satisfies every op that primary is attenuated for. Mint's verifier
 //! recovers the same `r` from the primary's `vid`
@@ -143,14 +143,14 @@ pub fn router(state: AppState) -> Router {
 
 /// Mint a demo session macaroon under `K_session`: caveats
 /// `op=session`, `Subject=<subject>`, the granted `Scope` set, and
-/// `NotAfter=now+7d`. A fresh chain (not an attenuation), keyed by
+/// `exp=now+7d`. A fresh chain (not an attenuation), keyed by
 /// `K_session`, so it is structurally distinct from every mint-issued
 /// macaroon and verifiable only by this role. The demo grants **every**
 /// scope to every subject — login stays wide-open, but the grant is
 /// explicit on the session (`docs/design-auth-service.md` § *Scope
 /// tier*); production auth-service decides the grant per its own policy.
 fn mint_session(k_session: &[u8; 32], subject: &str, now_unix: u64) -> Macaroon {
-    let not_after = now_unix + SESSION_EXP_SECONDS;
+    let exp = now_unix + SESSION_EXP_SECONDS;
     mint_under_key(
         k_session,
         SESSION_KID,
@@ -160,14 +160,14 @@ fn mint_session(k_session: &[u8; 32], subject: &str, now_unix: u64) -> Macaroon 
             Caveat::scalar(name::SCOPE, scope::MINT_ENROLL),
             Caveat::scalar(name::SCOPE, scope::MINT_EXCHANGE),
             Caveat::scalar(name::SCOPE, scope::MINT_ADMIN),
-            Caveat::scalar(name::NOT_AFTER, not_after.to_string()),
+            Caveat::scalar(name::EXP, exp.to_string()),
         ],
     )
 }
 
 /// Verify a session presented in `Authorization: Bearer <session>`:
 /// chain MAC under `K_session`, `op=session`, and a non-expired
-/// `NotAfter`. Returns the session's `Subject` and granted `Scope` set
+/// `exp`. Returns the session's `Subject` and granted `Scope` set
 /// on success. Every failure is the opaque `()` the caller maps to
 /// `401`.
 #[allow(clippy::result_unit_err)]
@@ -189,8 +189,8 @@ pub fn verify_session(
     if !matches!(eff.resolve(name::OP), Resolved::Value(v) if v == op::SESSION) {
         return Err(());
     }
-    if let Some(not_after) = eff.not_after(name::NOT_AFTER)
-        && not_after <= now_unix
+    if let Some(exp) = eff.min_bound(name::EXP)
+        && exp <= now_unix
     {
         return Err(());
     }
@@ -281,7 +281,7 @@ async fn issue_discharge(
         return error(StatusCode::FORBIDDEN, "org mismatch");
     }
 
-    let not_after = now_unix + DISCHARGE_EXP_SECONDS;
+    let exp = now_unix + DISCHARGE_EXP_SECONDS;
     let discharge = mint_under_key(
         &pt.r,
         DISCHARGE_KID,
@@ -290,7 +290,7 @@ async fn issue_discharge(
             Caveat::scalar("OrgId", pt.org_id),
             Caveat::scalar("ClientId", pt.client_id),
             Caveat::scalar(name::SCOPE, &req.scope),
-            Caveat::scalar(name::NOT_AFTER, not_after.to_string()),
+            Caveat::scalar(name::EXP, exp.to_string()),
         ],
     );
 
@@ -400,7 +400,7 @@ mod tests {
                 Caveat::scalar(name::AUD, "mint"),
                 Caveat::scalar(name::OP, "admin:invite-read"),
                 Caveat::scalar(name::CNF, "ed25519:AAAA"),
-                Caveat::scalar(name::NOT_AFTER, "1700000000"),
+                Caveat::scalar(name::EXP, "1700000000"),
             ],
         );
         let wire = discharge.encode();
