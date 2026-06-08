@@ -479,6 +479,13 @@ async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std:
             store.init_k_session(&cfg.data_dir)?;
         }
     }
+    // K_M-B is needed only when a role carries an attested third-party
+    // caveat to stamp. A colocated coordinator playing the attestation
+    // role generates it locally under demo; otherwise the attestation
+    // coordinator provisioned it out-of-band.
+    if cfg.roles.values().any(|r| r.attestation_mode.is_some()) {
+        store.init_k_m_b(&cfg.data_dir, demo_enabled)?;
+    }
     Ok((
         store,
         TigrisHandles {

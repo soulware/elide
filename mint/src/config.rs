@@ -57,6 +57,11 @@ pub enum ConfigError {
     },
     #[error("[env] key {key:?} is not a scalar (string, integer, float, or boolean)")]
     NonScalarEnv { key: String },
+    #[error(
+        "role {role}: declares [role.attestation] but no attestation_location \
+         is configured to discharge it"
+    )]
+    AttestationWithoutLocation { role: String },
     #[error("role {role}: template references env.{key} but [env] has no such key")]
     UndefinedEnvKey { role: String, key: String },
     #[error("role {role}: policy template is not valid JSON: {source}")]
@@ -169,6 +174,14 @@ pub struct RawConfig {
     /// colocated demo, the remembered `auth-transport` otherwise).
     #[serde(default)]
     pub auth_location: Option<String>,
+    /// The discharge URL stamped into the attested third-party caveat
+    /// of every role that declares `[role.attestation]` — where the
+    /// holder fetches the attestation discharge. A single fixed
+    /// authority (the attestation coordinator) for the deployment;
+    /// absent means no role may declare attestation. The transport it is
+    /// dialed over is resolved separately, like `auth_location`.
+    #[serde(default)]
+    pub attestation_location: Option<String>,
     #[serde(rename = "role", default)]
     pub roles: Vec<RawRole>,
 }
@@ -299,6 +312,22 @@ pub struct RawRole {
     /// template consumes. Absent = the empty contract.
     #[serde(default)]
     pub template: RawTemplate,
+    /// The `[role.attestation]` subtable. Present ⟹ a credential for
+    /// this role carries an attested third-party caveat that the
+    /// attestation authority (`attestation_location`) must discharge.
+    /// Absent ⟹ no attested caveat (the uniform key-bound credential).
+    #[serde(default)]
+    pub attestation: Option<RawAttestation>,
+}
+
+/// The `[role.attestation]` subtable: a role's attested-caveat contract.
+#[derive(Debug, Deserialize)]
+pub struct RawAttestation {
+    /// Opaque context sealed verbatim into the attested caveat's CID and
+    /// interpreted by the attestation authority alone. mint never
+    /// inspects it — it carries whatever the authority's vocabulary
+    /// needs (e.g. `rw-self` / `ro-ancestor` for volume attestation).
+    pub mode: String,
 }
 
 /// The `[role.template]` subtable: the request-supplied namespaces a role's
@@ -416,6 +445,10 @@ pub struct Config {
     /// without a demo auth role) cannot stamp those gates, so enrollment
     /// and the admin plane fail closed.
     pub auth_location: Option<String>,
+    /// The discharge URL for the attested third-party caveat — `None`
+    /// if the config omits `attestation_location`. A role that declares
+    /// `[role.attestation]` without it is rejected at load.
+    pub attestation_location: Option<String>,
     pub roles: BTreeMap<String, Role>,
 }
 
@@ -440,6 +473,12 @@ pub struct Role {
     /// ([`Config::validate_policy_surface`]) and enforced at request time.
     pub req: Vec<String>,
     pub caveat: Vec<String>,
+    /// The role's opaque attestation `mode`, from `[role.attestation]` —
+    /// `None` when the role declares no attestation. When `Some`, mint
+    /// stamps an attested third-party caveat onto the credential at
+    /// issuance, carrying this string verbatim for the attestation
+    /// authority (`docs/design-mint-volume-attestation.md`).
+    pub attestation_mode: Option<String>,
 }
 
 impl Config {
@@ -483,6 +522,12 @@ impl Config {
                 Some(ref f) => read_policy(&roles_dir, &r.name, f, true)?,
                 None => read_policy(&roles_dir, &r.name, &format!("{}.json", r.name), false)?,
             };
+            // A role that asks for an attested caveat needs an authority
+            // to discharge it; minting an undischargeable credential
+            // would be a silent dead-credential trap, so reject at load.
+            if r.attestation.is_some() && raw.attestation_location.is_none() {
+                return Err(ConfigError::AttestationWithoutLocation { role: r.name });
+            }
             let role = Role {
                 name: r.name.clone(),
                 min_ttl_seconds: r.min_ttl_seconds,
@@ -492,6 +537,7 @@ impl Config {
                 policy,
                 req: canonical_field_set(r.template.req),
                 caveat: canonical_field_set(r.template.caveat),
+                attestation_mode: r.attestation.map(|a| a.mode),
             };
             if roles.insert(r.name.clone(), role).is_some() {
                 return Err(ConfigError::DuplicateRole(r.name));
@@ -533,6 +579,7 @@ impl Config {
             admin: AdminCredential::from_env(),
             demo_auth,
             auth_location: raw.auth_location,
+            attestation_location: raw.attestation_location,
             roles,
         })
     }
@@ -747,6 +794,61 @@ policy_file = "volume-ro.json"
         assert_eq!(c.audience, "mint");
         assert_eq!(c.store.bucket, "demo-bucket");
         assert_eq!(c.roles["volume-ro"].policy, "{}");
+    }
+
+    const ATTESTATION_SAMPLE: &str = r#"
+audience = "mint"
+attestation_location = "https://coord-b.example/v1/discharge"
+[store]
+bucket = "demo-bucket"
+[[role]]
+name = "volume-rw"
+min_ttl_seconds = 60
+max_ttl_seconds = 100
+default_ttl_seconds = 100
+policy_file = "volume-rw.json"
+[role.attestation]
+mode = "rw-self"
+[[role]]
+name = "coord-base"
+min_ttl_seconds = 60
+max_ttl_seconds = 100
+default_ttl_seconds = 100
+policy_file = "coord-base.json"
+"#;
+
+    #[test]
+    fn attestation_mode_and_location_resolve_per_role() {
+        let c = parse_for_test(
+            ATTESTATION_SAMPLE,
+            &[("volume-rw.json", "{}"), ("coord-base.json", "{}")],
+        )
+        .expect("parse");
+        assert_eq!(
+            c.attestation_location.as_deref(),
+            Some("https://coord-b.example/v1/discharge")
+        );
+        // The declaring role carries its opaque mode; a role with no
+        // [role.attestation] carries none.
+        assert_eq!(
+            c.roles["volume-rw"].attestation_mode.as_deref(),
+            Some("rw-self")
+        );
+        assert_eq!(c.roles["coord-base"].attestation_mode, None);
+    }
+
+    #[test]
+    fn attestation_role_without_location_is_rejected_at_load() {
+        // A role asking for a discharge mint cannot stamp (no authority
+        // location) would mint a dead credential; load fails closed.
+        let toml = ATTESTATION_SAMPLE.replace(
+            "attestation_location = \"https://coord-b.example/v1/discharge\"\n",
+            "",
+        );
+        assert!(matches!(
+            parse_for_test(&toml, &[("volume-rw.json", "{}"), ("coord-base.json", "{}")]),
+            Err(ConfigError::AttestationWithoutLocation { role }) if role == "volume-rw"
+        ));
     }
 
     /// `[env]` block — env-table parsing, the scalar guard (load-time),

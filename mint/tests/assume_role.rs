@@ -130,6 +130,7 @@ fn request_macaroon() -> Macaroon {
         &pop::cnf_value(&CLIENT_SEED),
         "volume-ro",
         0,
+        None,
     )
     .attenuate(Caveat::scalar(name::EXP, far_future().to_string()))
 }
@@ -422,6 +423,7 @@ async fn re_approval_after_revoke_does_not_revive_old_credential() {
         &pop::cnf_value(&CLIENT_SEED),
         "volume-ro",
         1,
+        None,
     )
     .attenuate(Caveat::scalar(name::EXP, far_future().to_string()));
     let req = signed_request(

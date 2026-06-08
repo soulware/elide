@@ -1154,11 +1154,45 @@ async fn enroll_exchange(
         }
     };
 
-    // A credential carries no third-party caveat — operator authority is
-    // exercised at the enroll/exchange gates above, never at
-    // `assume-role` (`docs/design-mint.md` § *Credential macaroon &
-    // lifecycle*). Every role's credential is a uniform key-bound service
-    // token.
+    // Operator authority is exercised at the enroll/exchange gates above,
+    // never at `assume-role`. A role that declares `[role.attestation]`
+    // (`docs/design-mint-volume-attestation.md`) additionally carries a
+    // static attested third-party caveat the attestation authority
+    // discharges at `assume-role`; every other role's credential is the
+    // uniform key-bound service token with no third-party caveat.
+    let attested = match state
+        .config
+        .roles
+        .get(&role)
+        .and_then(|r| r.attestation_mode.as_deref())
+    {
+        None => None,
+        Some(mode) => {
+            // Config load rejects an attestation role without a location,
+            // and bootstrap loads K_M-B whenever such a role exists, so a
+            // gap here is an internal invariant breach, not a client
+            // fault — fail closed rather than mint an undischargeable
+            // credential.
+            let (Some(k_m_b), Some(location)) = (
+                state.store.k_m_b(),
+                state.config.attestation_location.as_deref(),
+            ) else {
+                tracing::error!(role = %role, "attestation role missing K_M-B or attestation_location");
+                audit("denied:state_error", &caveats);
+                return respond(
+                    &request_id,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"error": "service unavailable"}),
+                );
+            };
+            Some(issuance::AttestedTpc {
+                k_m_b,
+                org_id: state.store.org_id().unwrap_or("demo"),
+                mode,
+                location,
+            })
+        }
+    };
     let credential = issuance::mint_credential(
         &keyring,
         &state.config.audience,
@@ -1166,6 +1200,7 @@ async fn enroll_exchange(
         &cnf,
         &role,
         rev_epoch,
+        attested,
     );
 
     // The enrolled-registry entry is not consumed: the ticket is
