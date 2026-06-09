@@ -691,3 +691,169 @@ mod tests {
         }
     }
 }
+
+/// Property-based tests for the chained-MAC construction. The example
+/// tests above pin specific chains; these assert the chain invariants —
+/// verify round-trip, wire round-trip, additive attenuation, and
+/// tamper/key/kid binding — over arbitrary keys, kids, nonces, and
+/// chains that interleave first- and third-party caveats. Most properties
+/// mint through [`mint_under_key_with_nonce`] so the nonce is generated
+/// (deterministic and shrinkable) rather than drawn from `OsRng`.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    fn key() -> impl Strategy<Value = [u8; 32]> {
+        proptest::array::uniform32(any::<u8>())
+    }
+
+    fn nonce() -> impl Strategy<Value = [u8; NONCE_LEN]> {
+        proptest::array::uniform16(any::<u8>())
+    }
+
+    /// A chain step: mostly first-party scalars, occasionally a
+    /// third-party caveat, so generated chains interleave both kinds.
+    fn any_caveat() -> impl Strategy<Value = Caveat> {
+        prop_oneof![
+            3 => (".{0,12}", ".{0,12}").prop_map(|(n, v)| Caveat::scalar(n, v)),
+            1 => ("[a-z:/.]{0,16}", vec(any::<u8>(), 0..40), vec(any::<u8>(), 0..40))
+                .prop_map(|(loc, vid, cid)| Caveat::third_party(loc, vid, cid)),
+        ]
+    }
+
+    fn chain() -> impl Strategy<Value = Vec<Caveat>> {
+        vec(any_caveat(), 0..10)
+    }
+
+    proptest! {
+        /// Minting through the keyring and verifying against it round-trips;
+        /// a keyring holding any other key rejects.
+        #[test]
+        fn mint_via_keyring_round_trips(k in key(), other in key(), caveats in chain()) {
+            let kr = Keyring::single(k);
+            let m = mint(&kr, caveats);
+            prop_assert!(m.verify(&kr));
+            if k != other {
+                prop_assert!(!m.verify(&Keyring::single(other)));
+            }
+        }
+
+        /// A macaroon verifies under the key it was minted with and under
+        /// no other key — for any kid, nonce, and chain.
+        #[test]
+        fn verifies_under_its_key_and_not_others(
+            k in key(), other in key(), kid in any::<Kid>(), nonce in nonce(), caveats in chain(),
+        ) {
+            let m = mint_under_key_with_nonce(&k, kid, nonce, caveats);
+            prop_assert!(m.verify_under_key(&k));
+            if k != other {
+                prop_assert!(!m.verify_under_key(&other));
+            }
+        }
+
+        /// The wire form round-trips: decode∘encode is the identity, and
+        /// the decoded macaroon still verifies.
+        #[test]
+        fn encode_decode_round_trips(
+            k in key(), kid in any::<Kid>(), nonce in nonce(), caveats in chain(),
+        ) {
+            let m = mint_under_key_with_nonce(&k, kid, nonce, caveats);
+            let back = Macaroon::decode(&m.encode()).expect("decode its own encoding");
+            prop_assert_eq!(&m, &back);
+            prop_assert!(back.verify_under_key(&k));
+        }
+
+        /// Attenuation *is* chain extension: minting `base` then appending
+        /// `extra` one at a time yields a macaroon byte-identical to minting
+        /// `base ++ extra` directly (same kid/nonce). So attenuation only
+        /// ever appends — it can never alter an existing caveat or the seed.
+        #[test]
+        fn attenuation_equals_minting_the_concatenation(
+            k in key(), kid in any::<Kid>(), nonce in nonce(),
+            base in chain(), extra in vec(any_caveat(), 0..6),
+        ) {
+            let mut attenuated = mint_under_key_with_nonce(&k, kid, nonce, base.clone());
+            for c in &extra {
+                attenuated = attenuated.attenuate(c.clone());
+            }
+            let mut all = base;
+            all.extend(extra);
+            let direct = mint_under_key_with_nonce(&k, kid, nonce, all);
+            prop_assert_eq!(&attenuated, &direct);
+            prop_assert!(attenuated.verify_under_key(&k));
+        }
+
+        /// Appending any caveat changes the trailing MAC — the PoP anchor
+        /// moves, so a proof over the old tail won't bind the new macaroon.
+        #[test]
+        fn appending_a_caveat_changes_the_tail(
+            k in key(), kid in any::<Kid>(), nonce in nonce(), base in chain(), c in any_caveat(),
+        ) {
+            let m = mint_under_key_with_nonce(&k, kid, nonce, base);
+            let before = *m.tail();
+            let after = m.attenuate(c);
+            prop_assert_ne!(&before, after.tail());
+        }
+
+        /// Replacing any caveat with a different one breaks verification —
+        /// the holder cannot rewrite a caveat under the trailing MAC.
+        #[test]
+        fn tampering_a_caveat_fails_verify(
+            k in key(), kid in any::<Kid>(), nonce in nonce(),
+            caveats in vec(any_caveat(), 1..10), idx in any::<usize>(), replacement in any_caveat(),
+        ) {
+            let i = idx % caveats.len();
+            prop_assume!(caveats[i] != replacement);
+            let mut forged = mint_under_key_with_nonce(&k, kid, nonce, caveats);
+            forged.caveats[i] = replacement;
+            prop_assert!(!forged.verify_under_key(&k));
+        }
+
+        /// The kid is bound into the chain seed: changing it after minting
+        /// breaks verification even under the correct key.
+        #[test]
+        fn changing_kid_fails_verify(
+            k in key(), kid in any::<Kid>(), other_kid in any::<Kid>(),
+            nonce in nonce(), caveats in chain(),
+        ) {
+            prop_assume!(kid != other_kid);
+            let mut m = mint_under_key_with_nonce(&k, kid, nonce, caveats);
+            m.kid = other_kid;
+            prop_assert!(!m.verify_under_key(&k));
+        }
+
+        /// Any single-bit flip in the MAC fails verification.
+        #[test]
+        fn flipping_the_mac_fails_verify(
+            k in key(), kid in any::<Kid>(), nonce in nonce(), caveats in chain(),
+            byte in 0usize..32, bit in 0u8..8,
+        ) {
+            let mut m = mint_under_key_with_nonce(&k, kid, nonce, caveats);
+            m.mac[byte] ^= 1 << bit;
+            prop_assert!(!m.verify_under_key(&k));
+        }
+
+        /// `verify_collecting_tpcs` agrees with `verify` and surfaces every
+        /// third-party caveat, in chain order — for any chain.
+        #[test]
+        fn collecting_tpcs_matches_verify_and_lists_tpcs_in_order(
+            k in key(), kid in any::<Kid>(), nonce in nonce(), caveats in chain(),
+        ) {
+            let m = mint_under_key_with_nonce(&k, kid, nonce, caveats.clone());
+            let sites = m.verify_collecting_tpcs(&k).expect("minted under k must verify");
+            let tpc_locations: Vec<&str> = caveats
+                .iter()
+                .filter_map(|c| match c {
+                    Caveat::ThirdParty { location, .. } => Some(location.as_str()),
+                    _ => None,
+                })
+                .collect();
+            prop_assert_eq!(sites.len(), tpc_locations.len());
+            for (site, loc) in sites.iter().zip(&tpc_locations) {
+                prop_assert_eq!(site.location, *loc);
+            }
+        }
+    }
+}
