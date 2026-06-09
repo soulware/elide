@@ -261,6 +261,87 @@ possession-proof freshness in *Possession-proof binding*) is a separate,
 tighter clock — it bounds replay of a single proof, not the discharge
 lifetime — and is unrelated to `discharge_ttl`.
 
+## coord A acquisition: anchoring every read on a live local key
+
+The discharge predicate checks `liveness(owned)` and possession of
+`owned`'s `volume.key`, so **coord A can only obtain a discharge for a
+read it anchors on a live volume whose key it holds.** This is the
+acquisition-side invariant: *every `volume-ro` read routes through an
+`owned` anchor that is live (`names/<name> → owned`) and locally keyed.*
+The role enforces it unconditionally — once `volume-ro` carries an
+`ro-ancestor` TPC, every `assume-role` requires a discharge — so a read
+that cannot produce an anchor must not sit on the `volume-ro` path.
+
+### Threading the `owned` anchor
+
+`volume-ro` is acquired at two seams, both of which already know the
+anchor:
+
+- **The volume process's demand-fetch** (IPC `provision_volume_ro`): the
+  requester *is* `owned`. `authorize_target` already validates `target ∈
+  {requester} ∪ lineage(requester)`; it carries `requester` through as the
+  anchor.
+- **Coordinator-internal dense reads** (`ScopedStores::read_volume`): the
+  call site holds the live leaf being operated on. `read_volume(owned,
+  target)` threads it; the per-`(owned, target)` `volume-ro` facade fetches
+  an `ro-ancestor` discharge before `assume-role` (parallel to how
+  `volume-rw` fetches `rw-self`).
+
+### Setup reads: claim-first ordering
+
+Most reads anchor trivially — demand-fetch and prefetch run on a live
+leaf. The exception is *volume setup* (fork, claim, start), which reads an
+ancestor's data while the new leaf is still being established. The rule is
+**claim-first**: publish the new fork's `volume.provenance` and rebind
+`names/<name>` to it *before* any `by_id` read, so `owned = new_fork` is
+live and every subsequent read anchors on it. `claim` already orders
+`mark_claimed` ahead of its chain reads; `fork` adopts the same shape.
+
+### The provisional provenance must be recovery-correct — so its trust-anchors come from control-plane state
+
+claim-first has a sharp constraint: the provisional `volume.provenance`
+published before `mark_claimed` must be **complete and correct**. The
+partial-fork crash-recovery walk (`skip_empty_intermediates`) reads it
+back and trusts `parent.snapshot_ulid` (the basis) and
+`parent.manifest_pubkey` (the recovery-handoff signer); placeholders are
+unsafe. So those two trust-anchors must be available *without a `by_id`
+read* at fork-create time — i.e. from control-plane (`coord-ro`) state:
+
+- **Basis snapshot ULID.** *Proposed:* the owner appends a
+  `SnapshotPublished` event to the append-only `events/<name>` journal on
+  each publish. A fork resolves the source name (`coord-ro`) and reads the
+  basis from `events/<name>` (HEAD or the latest `SnapshotPublished`),
+  replacing the `by_id/<source>/snapshots/LATEST` read. The journal is
+  append-only, so this adds no CAS contention to the publish path — it sits
+  at the publish cadence naturally, and the event log is already the
+  canonical record of "what happened ever" per the event-log design.
+  Eventual consistency is fine: a fork basing on a slightly older published
+  snapshot just demand-fetches a little more later. (claim already has its
+  basis control-plane — the `handoff_snapshot` on the Released record.)
+- **Recovery-handoff signer.** *Proposed:* a force-release that synthesises
+  a recovery handoff records the synthesising coordinator's pubkey on the
+  `names/<name>` Released record alongside `handoff_snapshot`. `claim`'s
+  `early_rebind` reads it from the record instead of fetching the handoff
+  manifest from `by_id`. Normal (volume-signed) handoffs record nothing and
+  `manifest_pubkey` stays `None`.
+
+With both anchors sourced control-plane, fork and claim build the new
+fork's provisional provenance from `coord-ro` + `meta/` (`coord-base`)
+reads only, rebind the name, and then anchor every `by_id` read — basis
+manifest verify, idx pulls, body warm, ancestor data — on the now-live
+fork.
+
+### Foreign reads have no anchor — `volume fetch` is removed
+
+`volume fetch` pulled a *foreign* volume's bytes without taking ownership:
+a `by_id` read of a volume this host holds no key for, with no lineage
+relationship to prove. It cannot anchor an `ro-ancestor` discharge and so
+cannot sit on the attested `volume-ro` role. It is removed; the
+warm-then-takeover workflow is reconstructable as `fork --from` (which
+warms the owner-keyed `by_id/<source>/cache/` as a side effect of its
+reads, since the body cache is keyed by the owning volume) followed by
+`claim`.
+
 ## Possession-proof binding
 
 The discharge request carries an Ed25519 **possession proof** signed by
