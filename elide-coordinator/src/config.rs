@@ -104,9 +104,10 @@ pub struct CoordinatorConfig {
     pub mint: Option<MintConfig>,
 
     /// Volume-attestation discharge authority (coord B). Optional; absence
-    /// means this coordinator is not mint's discharge authority and the
-    /// peer-fetch `POST /v1/discharge` route fails closed. Only effective
-    /// when `peer_fetch.port` is set, since the route is served there.
+    /// means this coordinator is not mint's discharge authority. When
+    /// present with a `listen` address, serves `POST /v1/discharge` on its
+    /// own listener — independent of `[peer_fetch]`, so a pure verifier
+    /// enables only this (and may keep it off the network on a UDS).
     #[serde(default)]
     pub attestation: Option<AttestationConfig>,
 }
@@ -672,48 +673,78 @@ impl MintConfig {
     }
 }
 
-/// Peer-fetch configuration. v1 is opt-in: setting `port` enables the
+/// A server listen address: a TCP socket or a Unix-domain socket,
+/// discriminated by an optional `unix:` scheme prefix — the same
+/// convention as `[mint] url`. `unix:<path>` selects a UDS; anything else
+/// parses as a `<host>:<port>` TCP socket address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ListenAddr {
+    Tcp(std::net::SocketAddr),
+    Uds(PathBuf),
+}
+
+/// Parse a scheme-discriminated listen string into a [`ListenAddr`].
+pub fn parse_listen(s: &str) -> Result<ListenAddr> {
+    let s = s.trim();
+    if let Some(path) = s.strip_prefix("unix:") {
+        return Ok(ListenAddr::Uds(PathBuf::from(path)));
+    }
+    let addr = s
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("listen {s:?} must be `<host>:<port>` or `unix:<path>`"))?;
+    Ok(ListenAddr::Tcp(addr))
+}
+
+/// Peer-fetch configuration. v1 is opt-in: setting `listen` enables the
 /// HTTP server and the `coordinators/<id>/peer-endpoint.toml`
 /// advertisement. Leaving it unset keeps peer fetch fully disabled.
 #[derive(Deserialize, Default, Clone)]
 pub struct PeerFetchConfig {
-    /// TCP port for the peer-fetch HTTP server. Absent → peer fetch
-    /// disabled (no server bound, no advertised endpoint, prefetch
-    /// path skips the peer tier).
+    /// TCP listen address `<host>:<port>` for the peer-fetch HTTP server.
+    /// Absent → peer fetch disabled (no server bound, no advertised
+    /// endpoint, prefetch path skips the peer tier). Must be a TCP
+    /// address: the endpoint is advertised to remote coordinators, so a
+    /// `unix:` value is rejected.
     #[serde(default)]
-    pub port: Option<u16>,
-
-    /// Address the HTTP server binds on. Default: `0.0.0.0`. Only
-    /// relevant when `port` is set.
-    #[serde(default)]
-    pub bind: Option<String>,
+    pub listen: Option<String>,
 
     /// Hostname or IP advertised in `peer-endpoint.toml` for other
     /// coordinators to dial. Default: the result of `gethostname()`,
     /// which is correct on LANs with mDNS or DNS resolution. Set
     /// explicitly when the host's name is not routable from peer
     /// coordinators (e.g. when running behind a NAT or a load
-    /// balancer). Only relevant when `port` is set.
+    /// balancer). Only relevant when `listen` is set.
     #[serde(default)]
     pub host: Option<String>,
 }
 
 impl PeerFetchConfig {
-    /// Bind address, defaulting to `0.0.0.0`.
-    pub fn bind_addr(&self) -> &str {
-        self.bind.as_deref().unwrap_or("0.0.0.0")
+    /// Parse `listen` into its TCP socket address, or `None` when peer
+    /// fetch is disabled. Errors if set but not a `<host>:<port>` TCP
+    /// address — peer fetch must be TCP because it is advertised.
+    pub fn tcp_listen(&self) -> Result<Option<std::net::SocketAddr>> {
+        match &self.listen {
+            None => Ok(None),
+            Some(s) => match parse_listen(s)? {
+                ListenAddr::Tcp(addr) => Ok(Some(addr)),
+                ListenAddr::Uds(_) => bail!(
+                    "[peer_fetch] listen must be `<host>:<port>`: the peer-fetch endpoint is \
+                     advertised to remote coordinators and cannot be a unix socket"
+                ),
+            },
+        }
     }
 
-    /// Advertised host. Falls back to the cached coordinator hostname
-    /// if `host` is unset; if `gethostname()` also failed, falls back
-    /// to the bind address (which works for `127.0.0.1` localhost-only
-    /// setups but won't be routable across hosts — operators should
-    /// set `host` explicitly in that case).
-    pub fn advertised_host(&self, fallback_hostname: Option<&str>) -> String {
+    /// Advertised host. Falls back to the cached coordinator hostname if
+    /// `host` is unset; if `gethostname()` also failed, falls back to the
+    /// bind IP (which works for `127.0.0.1` localhost-only setups but
+    /// won't be routable across hosts — operators should set `host`
+    /// explicitly in that case).
+    pub fn advertised_host(&self, fallback_hostname: Option<&str>, bind_ip: &str) -> String {
         self.host
             .clone()
             .or_else(|| fallback_hostname.map(str::to_owned))
-            .unwrap_or_else(|| self.bind_addr().to_owned())
+            .unwrap_or_else(|| bind_ip.to_owned())
     }
 }
 
@@ -724,9 +755,23 @@ pub struct AttestationConfig {
     /// the symmetric `K_M-B` mint shares with this authority. In the
     /// co-located demo this is the same file mint generates.
     pub discharge_key_file: PathBuf,
+
+    /// Listen address for `POST /v1/discharge`: `<host>:<port>` (TCP) or
+    /// `unix:<path>` (UDS — keeps the discharge endpoint off the network,
+    /// reachable only by a co-located coord A). Absent → the authority is
+    /// configured but not served. Independent of `[peer_fetch]`: a pure
+    /// verifier sets only this.
+    #[serde(default)]
+    pub listen: Option<String>,
 }
 
 impl AttestationConfig {
+    /// Parse `listen` into a [`ListenAddr`], or `None` when the authority
+    /// is configured but not to be served.
+    pub fn listen_addr(&self) -> Result<Option<ListenAddr>> {
+        self.listen.as_deref().map(parse_listen).transpose()
+    }
+
     /// Load and parse the shared `K_M-B` discharge key.
     pub fn load_discharge_key(&self) -> Result<[u8; 32]> {
         let text = std::fs::read_to_string(&self.discharge_key_file)
@@ -836,29 +881,46 @@ mod tests {
     #[test]
     fn peer_fetch_defaults_off() {
         let cfg = CoordinatorConfig::default();
-        assert!(cfg.peer_fetch.port.is_none());
-        assert!(cfg.peer_fetch.bind.is_none());
+        assert!(cfg.peer_fetch.listen.is_none());
         assert!(cfg.peer_fetch.host.is_none());
+        assert!(cfg.peer_fetch.tcp_listen().unwrap().is_none());
     }
 
     #[test]
     fn peer_fetch_section_parses() {
         let toml_str = r#"
             [peer_fetch]
-            port = 8443
-            bind = "127.0.0.1"
+            listen = "127.0.0.1:8443"
             host = "host.example.com"
         "#;
         let cfg: CoordinatorConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.peer_fetch.port, Some(8443));
-        assert_eq!(cfg.peer_fetch.bind.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            cfg.peer_fetch.tcp_listen().unwrap().unwrap(),
+            "127.0.0.1:8443".parse().unwrap()
+        );
         assert_eq!(cfg.peer_fetch.host.as_deref(), Some("host.example.com"));
     }
 
     #[test]
-    fn peer_fetch_bind_addr_defaults_to_all_interfaces() {
-        let cfg = PeerFetchConfig::default();
-        assert_eq!(cfg.bind_addr(), "0.0.0.0");
+    fn peer_fetch_listen_rejects_unix_socket() {
+        let cfg = PeerFetchConfig {
+            listen: Some("unix:/run/elide/peer.sock".to_owned()),
+            ..PeerFetchConfig::default()
+        };
+        assert!(cfg.tcp_listen().is_err());
+    }
+
+    #[test]
+    fn attestation_listen_parses_tcp_and_uds() {
+        assert_eq!(
+            parse_listen("0.0.0.0:8086").unwrap(),
+            ListenAddr::Tcp("0.0.0.0:8086".parse().unwrap())
+        );
+        assert_eq!(
+            parse_listen("unix:/run/elide/discharge.sock").unwrap(),
+            ListenAddr::Uds(PathBuf::from("/run/elide/discharge.sock"))
+        );
+        assert!(parse_listen("not-an-address").is_err());
     }
 
     #[test]
@@ -868,18 +930,21 @@ mod tests {
             ..PeerFetchConfig::default()
         };
         assert_eq!(
-            with_explicit.advertised_host(Some("ignored.example")),
+            with_explicit.advertised_host(Some("ignored.example"), "0.0.0.0"),
             "explicit.example"
         );
 
         let no_explicit = PeerFetchConfig::default();
         assert_eq!(
-            no_explicit.advertised_host(Some("host.from.gethostname")),
+            no_explicit.advertised_host(Some("host.from.gethostname"), "0.0.0.0"),
             "host.from.gethostname"
         );
 
         let no_explicit_no_hostname = PeerFetchConfig::default();
-        assert_eq!(no_explicit_no_hostname.advertised_host(None), "0.0.0.0");
+        assert_eq!(
+            no_explicit_no_hostname.advertised_host(None, "0.0.0.0"),
+            "0.0.0.0"
+        );
     }
 
     #[test]

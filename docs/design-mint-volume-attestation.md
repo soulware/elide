@@ -500,6 +500,49 @@ attestation, so coord B obtains it through ordinary `assume-role` without
 needing a discharge from itself. Only `volume-rw` / `volume-ro` carry the
 volume TPC.
 
+### A separate crate and listener from peer fetch
+
+Peer fetch and the discharge authority are different capabilities with
+different exposure profiles. Segment fetch reads local `by_id/` bodies and
+is **advertised to remote peers** (`coordinators/<id>/peer-endpoint.toml`),
+so it needs a network-reachable address. Discharge reads only public signed
+metadata under `coord-ro`, holds no `by_id/`, and is **not advertised** —
+coord A learns where to POST from the `attestation_location` mint sealed
+into the caveat — so it can live entirely off the network on a UDS.
+
+So coord B is the **`elide-attestation` crate**, not a route bolted onto
+the peer-fetch server: the discharge handler, the discharge-mint crypto,
+and the signed-lineage walk over `meta/*` (`walk_lineage_set`). The
+peer-fetch crate keeps only its fork-only auth walk and the segment GET
+routes. The trust-critical per-link step stays single-sourced in
+`elide-core` (`verify_lineage_with_key` + `parse_lineage_pair`); each crate
+is a thin async driver over it, differing only by prefix (`by_id/` vs
+`meta/`) and whether `extent_index` sources are unioned.
+
+They run as **two separate, non-overlapping modes** — a coordinator runs as
+a peer-fetch server, a discharge verifier, both, or neither — each its own
+optional listener. **Each takes its own scheme-discriminated `listen`**
+(`unix:<path>` | `<host>:<port>`, the `[mint] url` convention); presence of
+`listen` enables that mode, binding a dedicated listener that serves only
+that mode's routes.
+
+```toml
+[peer_fetch]
+listen = "0.0.0.0:8086"                      # TCP — advertised to remote peers
+
+[attestation]
+listen = "unix:/run/elide/discharge.sock"    # UDS — discharge stays off the network
+discharge_key_file = "…"                     # K_M-B
+```
+
+This lets a verifier run discharge-only and enables the hardened shape:
+discharge served only to a co-located coord A over UDS while peer-fetch is
+the sole network surface. Two couplings remain: peer-fetch's advertised
+host must stay network-reachable (its `listen` is TCP-only — a `unix:`
+value is rejected), and the discharge `listen` must equal the
+`attestation_location` mint sealed (coord A's client already dials `unix:`
+discharge URLs via its UDS leg, so no client change).
+
 ## coord B mints the discharge: crossing the mint/coordinator boundary
 
 coord B lives in the coordinator — served on the `elide-peer-fetch` axum

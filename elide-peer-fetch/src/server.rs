@@ -43,7 +43,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use tokio::net::TcpListener;
 use tracing::info;
 use ulid::Ulid;
@@ -197,15 +197,15 @@ impl ResourceKind {
     }
 }
 
-/// Server context shared across handlers — cheap to clone.
+/// Server context for the peer-fetch (segment-serving) routes — cheap to
+/// clone. The discharge authority (coord B) is a separate mode in the
+/// `elide-attestation` crate with its own state and listener; it is not
+/// carried here (`docs/design-mint-volume-attestation.md` § *Proposed:
+/// per-endpoint transport*).
 #[derive(Clone)]
 pub struct ServerContext {
     pub auth: AuthState,
     pub data_dir: Arc<PathBuf>,
-    /// Discharge-authority state (coord B). `Some` only on a coordinator
-    /// enrolled as mint's volume-attestation discharge authority; `None`
-    /// makes `POST /v1/discharge` fail closed with `404`.
-    pub discharge: Option<crate::discharge::DischargeState>,
 }
 
 impl ServerContext {
@@ -213,34 +213,24 @@ impl ServerContext {
         Self {
             auth,
             data_dir: Arc::new(data_dir),
-            discharge: None,
         }
-    }
-
-    /// Enable the `POST /v1/discharge` endpoint with the given authority
-    /// state. Builder so the common (non-authority) path stays a plain
-    /// [`Self::new`].
-    pub fn with_discharge(mut self, discharge: crate::discharge::DischargeState) -> Self {
-        self.discharge = Some(discharge);
-        self
     }
 }
 
-/// Build the axum [`Router`] for this server. Exposed so tests can
-/// drive it with `axum::serve` against a local listener.
-pub fn router(ctx: ServerContext) -> Router {
+/// Build the [`Router`] for the peer-fetch segment routes (`GET
+/// /v1/<vol_id>/<file>`). The discharge route is mounted separately by the
+/// `elide-attestation` crate on its own listener.
+pub fn peer_fetch_router(ctx: ServerContext) -> Router {
     Router::new()
         .route("/v1/{vol_id}/{filename}", get(handle_segment))
-        .route("/v1/discharge", post(crate::discharge::handle_discharge))
         .with_state(ctx)
 }
 
-/// Bind a TCP listener at `addr` and serve the peer-fetch routes.
-/// Returns once the server stops (e.g. on signal handling at the
-/// caller).
-pub async fn serve(addr: std::net::SocketAddr, ctx: ServerContext) -> std::io::Result<()> {
+/// Bind a TCP listener at `addr` and serve `router`. Returns once the
+/// server stops (e.g. on signal handling at the caller).
+pub async fn serve_tcp(addr: std::net::SocketAddr, router: Router) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, router(ctx))
+    axum::serve(listener, router)
         .await
         .map_err(std::io::Error::other)
 }
@@ -700,7 +690,7 @@ mod tests {
             .unwrap();
 
         let ctx = ServerContext::new(auth, data_dir.path().to_owned());
-        let router = router(ctx);
+        let router = peer_fetch_router(ctx);
 
         Fixture {
             router,

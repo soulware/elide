@@ -37,7 +37,6 @@
 pub mod ancestry;
 pub mod auth;
 pub mod client;
-pub mod discharge;
 pub mod endpoint;
 pub mod hint;
 pub mod range_fetcher;
