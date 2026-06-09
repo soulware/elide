@@ -102,6 +102,13 @@ pub struct CoordinatorConfig {
     /// (`docs/design-mint.md` § "Coordinator configuration").
     #[serde(default)]
     pub mint: Option<MintConfig>,
+
+    /// Volume-attestation discharge authority (coord B). Optional; absence
+    /// means this coordinator is not mint's discharge authority and the
+    /// peer-fetch `POST /v1/discharge` route fails closed. Only effective
+    /// when `peer_fetch.port` is set, since the route is served there.
+    #[serde(default)]
+    pub attestation: Option<AttestationConfig>,
 }
 
 impl CoordinatorConfig {
@@ -610,6 +617,7 @@ impl Default for CoordinatorConfig {
             gc: GcConfig::default(),
             peer_fetch: PeerFetchConfig::default(),
             mint: None,
+            attestation: None,
         }
     }
 }
@@ -706,6 +714,31 @@ impl PeerFetchConfig {
             .clone()
             .or_else(|| fallback_hostname.map(str::to_owned))
             .unwrap_or_else(|| self.bind_addr().to_owned())
+    }
+}
+
+/// Volume-attestation discharge-authority configuration (coord B).
+#[derive(Clone, Deserialize)]
+pub struct AttestationConfig {
+    /// Path to the `attestation-shared.key` file (64 hex chars = 32 bytes):
+    /// the symmetric `K_M-B` mint shares with this authority. In the
+    /// co-located demo this is the same file mint generates.
+    pub discharge_key_file: PathBuf,
+}
+
+impl AttestationConfig {
+    /// Load and parse the shared `K_M-B` discharge key.
+    pub fn load_discharge_key(&self) -> Result<[u8; 32]> {
+        let text = std::fs::read_to_string(&self.discharge_key_file)
+            .with_context(|| format!("read discharge key {:?}", self.discharge_key_file))?;
+        let bytes = elide_core::signing::decode_hex(text.trim())
+            .with_context(|| format!("decode discharge key {:?}", self.discharge_key_file))?;
+        bytes.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "discharge key {:?} must be 32 bytes (64 hex chars)",
+                self.discharge_key_file
+            )
+        })
     }
 }
 

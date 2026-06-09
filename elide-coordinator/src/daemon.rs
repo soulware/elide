@@ -163,8 +163,24 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         );
         let auth =
             elide_peer_fetch::auth::AuthState::new(stores.base_object_store(), lineage_store);
-        let ctx = elide_peer_fetch::server::ServerContext::new(auth, data_dir.as_ref().clone());
+        let mut ctx = elide_peer_fetch::server::ServerContext::new(auth, data_dir.as_ref().clone());
+        // coord B: enable POST /v1/discharge when configured as mint's
+        // volume-attestation discharge authority. The predicate reads
+        // meta/*.pub + names/* through the same coord-ro store.
+        if let Some(att) = &config.attestation {
+            let k_m_b = att.load_discharge_key()?;
+            let discharge =
+                elide_peer_fetch::discharge::DischargeState::new(k_m_b, stores.base_object_store());
+            ctx = ctx.with_discharge(discharge);
+            info!("[coordinator] volume-attestation discharge authority enabled (coord B)");
+        }
         peer_fetch_server = Some((addr, ctx));
+    }
+    if config.attestation.is_some() && config.peer_fetch.port.is_none() {
+        warn!(
+            "[coordinator] [attestation] is configured but [peer_fetch].port is unset; the \
+             discharge authority is not served"
+        );
     }
     // Install the peer-fetch handle as a process-global so per-volume
     // tasks, the claim orchestrator, and the IPC `Register` handler
