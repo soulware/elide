@@ -646,6 +646,18 @@ pub struct MintConfig {
     /// 30s.
     #[serde(default = "default_mint_request_timeout", with = "humantime_serde")]
     pub request_timeout: Duration,
+
+    /// Discharge URL of the attestation coordinator (coord B) that
+    /// vouches volume ownership (`docs/design-mint-volume-attestation.md`).
+    /// When set, a primary credential carrying a third-party caveat at
+    /// this exact location is discharged before `assume-role`: the
+    /// coordinator proves possession of the volume's `volume.key` and
+    /// attaches the returned discharge to the bundle. Absent → no
+    /// discharge is fetched (the enrolled credentials carry no attestation
+    /// caveat). Must equal the `attestation_location` mint sealed into the
+    /// caveat.
+    #[serde(default)]
+    pub attestation_location: Option<String>,
 }
 
 fn default_mint_connect_timeout() -> Duration {
