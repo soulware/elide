@@ -135,6 +135,11 @@ impl Seal {
                 policy,
                 req,
                 caveat,
+                // Read from live config at exchange (like `auth_location`)
+                // and MAC'd into the credential at mint, so it cannot drift
+                // post-issuance. Folding it into the sealed `[role.template]`
+                // contract lands with the `attested.*` namespace.
+                attestation_mode: _,
             } = role;
             roles.insert(
                 name.clone(),

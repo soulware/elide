@@ -74,6 +74,14 @@ pub const STATE_PREFIX: &str = "_mint";
 /// `docs/design-auth-service.md` § *Keys*.
 pub const K_M_A_FILE: &str = "auth-shared.key";
 
+/// Filename for the on-disk K_M-B (the TPC-CID wrapping key shared with
+/// the attestation coordinator) under `<data_dir>/`. Same 64-hex-byte,
+/// mode-0600 shape and custody as [`K_M_A_FILE`]. Distinct from K_M-A
+/// even when one coordinator plays both the auth and attestation roles,
+/// so the two discharge vocabularies decrypt under different keys and
+/// cannot be confused (`docs/design-mint-volume-attestation.md`).
+pub const K_M_B_FILE: &str = "attestation-shared.key";
+
 /// Filename for the on-disk K_session (the login-session root) under
 /// `<data_dir>/`. Same 64-hex-byte, mode-0600 shape as [`K_M_A_FILE`].
 /// Auth-service-only in production (mint never holds it); generated
@@ -404,6 +412,13 @@ pub struct Store {
     /// `/v1/mint/enroll` (separate PR). Immutable for the lifetime
     /// of the process — rotation lands on a new Store via restart.
     k_m_a: Option<Arc<[u8; 32]>>,
+    /// The attestation-coordinator wrapping key. `None` for a mint with
+    /// no attestation roles. In demo mode mint generates K_M-B itself at
+    /// first start; in prod the attestation coordinator provisions it
+    /// via enrollment (separate PR). Immutable for the lifetime of the
+    /// process. Kept distinct from [`k_m_a`](Store::k_m_a) so attested
+    /// and auth discharges never share a CID-wrapping key.
+    k_m_b: Option<Arc<[u8; 32]>>,
     /// The session-signing root for the colocated demo auth role
     /// (`docs/design-auth-service.md` § *Login flow*). `None` outside
     /// demo mode — mint proper never signs or verifies sessions; they
@@ -503,6 +518,7 @@ impl Store {
         Store {
             keyring: Arc::new(RwLock::new(Arc::new(keyring))),
             k_m_a: None,
+            k_m_b: None,
             k_session: None,
             org_id: None,
             objects,
@@ -557,6 +573,42 @@ impl Store {
     /// configurations without `[auth]`).
     pub fn k_m_a(&self) -> Option<&[u8; 32]> {
         self.k_m_a.as_deref()
+    }
+
+    /// Load or — when `demo_enabled` is true and the file is absent —
+    /// generate the K_M-B wrapping key under `<dir>/k_m_b`. Mirrors
+    /// [`init_k_m_a`](Store::init_k_m_a): called from the bootstrap path
+    /// only when the config declares at least one attestation role. Same
+    /// on-disk shape and custody (64 ASCII hex, mode 0600). Unlike
+    /// K_M-A it does not assign `org_id` — the org is already settled by
+    /// `init_k_m_a` (the attestation coordinator serves the same org).
+    pub fn init_k_m_b(&mut self, dir: &Path, demo_enabled: bool) -> io::Result<()> {
+        let path = dir.join(K_M_B_FILE);
+        let bytes = match std::fs::read_to_string(&path) {
+            Ok(s) => unhex32(s.trim())
+                .ok_or_else(|| io::Error::other(format!("{path:?}: not 64 hex bytes")))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if !demo_enabled {
+                    return Err(io::Error::other(format!(
+                        "K_M-B absent at {path:?}; mint requires attestation-coordinator \
+                         enrollment or [demo_auth] enabled = true"
+                    )));
+                }
+                let mut fresh = [0u8; 32];
+                rand_core::OsRng.fill_bytes(&mut fresh);
+                write_key_file(&path, &hex32(&fresh))?;
+                fresh
+            }
+            Err(e) => return Err(e),
+        };
+        self.k_m_b = Some(Arc::new(bytes));
+        Ok(())
+    }
+
+    /// `Some` when [`init_k_m_b`](Store::init_k_m_b) has loaded or
+    /// generated the key; `None` for a mint with no attestation roles.
+    pub fn k_m_b(&self) -> Option<&[u8; 32]> {
+        self.k_m_b.as_deref()
     }
 
     /// Load or generate the demo session-signing key under
@@ -1698,6 +1750,34 @@ mod tests {
         let mut s = Store::open_local(d.path()).await.unwrap();
         let err = s.init_k_m_a(d.path(), false).expect_err("must refuse");
         assert!(format!("{err}").contains("K_M-A"));
+    }
+
+    #[tokio::test]
+    async fn k_m_b_generated_under_demo_reloaded_and_distinct_from_k_m_a() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open_local(d.path()).await.unwrap();
+        assert!(s.k_m_b().is_none(), "absent until init");
+        s.init_k_m_a(d.path(), true).expect("init k_m_a");
+        s.init_k_m_b(d.path(), true).expect("init k_m_b");
+        let k_m_a = *s.k_m_a().expect("k_m_a present");
+        let k_m_b = *s.k_m_b().expect("k_m_b present");
+        // Distinct keys, distinct files — never the same bytes even when
+        // one coordinator plays both authorities.
+        assert_ne!(k_m_a, k_m_b);
+        let meta = std::fs::metadata(d.path().join(K_M_B_FILE)).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        // Restart loads the same K_M-B bytes.
+        let mut s2 = Store::open_local(d.path()).await.unwrap();
+        s2.init_k_m_b(d.path(), true).expect("init");
+        assert_eq!(k_m_b, *s2.k_m_b().expect("present"));
+    }
+
+    #[tokio::test]
+    async fn k_m_b_absent_without_demo_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open_local(d.path()).await.unwrap();
+        let err = s.init_k_m_b(d.path(), false).expect_err("must refuse");
+        assert!(format!("{err}").contains("K_M-B"));
     }
 
     #[tokio::test]

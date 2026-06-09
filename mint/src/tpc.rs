@@ -3,7 +3,7 @@
 //! credentials (`docs/design-auth-service.md` § *Keys*, § *Coord ↔
 //! mint enrollment*).
 //!
-//! Three operations:
+//! The operations:
 //!
 //! - [`derive_r`] — `r = BLAKE3-derive-key("mint tpc r-key v1",
 //!   K_M || client_id || r_epoch)`. Deterministic in its inputs, so
@@ -26,6 +26,13 @@
 //!   CID is identical across credentials a client carries that share
 //!   `r` — that's the property that lets one discharge satisfy
 //!   several of the client's credentials at once.
+//!
+//! - [`encrypt_cid_attested`] — the same layout plus one trailing
+//!   length-prefixed `mode` string, sealed under a second authority key
+//!   (`K_M-B`). `mode` is opaque to mint: it is carried verbatim from a
+//!   role's config to the discharging authority, which alone interprets
+//!   it. mint never inspects it, keeping mint agnostic to the
+//!   authority's vocabulary.
 //!
 //! **Nonce reuse safety.** AES-GCM-SIV is misuse-resistant by
 //! construction: nonce reuse with the same key is safe (the
@@ -101,6 +108,56 @@ pub fn build_caveat(
         location: location.into(),
         vid: encrypt_vid(tail, r),
         cid: encrypt_cid(k_m_a, r, client_id, org_id),
+    }
+}
+
+/// Encrypt `r ‖ lp(client_id) ‖ lp(org_id) ‖ lp(mode)` under `K_M-B` to
+/// produce an **attested** TPC's `CID` — the auth CID layout
+/// ([`encrypt_cid`]) extended with one role-supplied opaque string,
+/// sealed under the key mint shares with the discharging authority
+/// (coord B). `mode` is **opaque to mint**: it is transported verbatim
+/// from the role's config to the authority, which alone assigns it
+/// meaning. mint never inspects or validates it, so mint stays agnostic
+/// to the authority's vocabulary
+/// (`docs/design-mint-volume-attestation.md` § *TPC structure*).
+pub fn encrypt_cid_attested(
+    k_m_b: &[u8; 32],
+    r: &[u8; 32],
+    client_id: &str,
+    org_id: &str,
+    mode: &str,
+) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(32 + 12 + client_id.len() + org_id.len() + mode.len());
+    plaintext.extend_from_slice(r);
+    plaintext.extend_from_slice(&(client_id.len() as u32).to_be_bytes());
+    plaintext.extend_from_slice(client_id.as_bytes());
+    plaintext.extend_from_slice(&(org_id.len() as u32).to_be_bytes());
+    plaintext.extend_from_slice(org_id.as_bytes());
+    plaintext.extend_from_slice(&(mode.len() as u32).to_be_bytes());
+    plaintext.extend_from_slice(mode.as_bytes());
+    aead_encrypt(k_m_b, &plaintext)
+}
+
+/// Build an attested `Caveat::ThirdParty` to append at credential
+/// issuance, naming the discharging authority at `location`. `tail` is
+/// the chain tag at the appending position; `r` is recovered by mint via
+/// `VID` ([`encrypt_vid`]) and by the authority via `CID`
+/// ([`encrypt_cid_attested`]), but never by the holder. Mirrors
+/// [`build_caveat`] for the auth TPC, plus the opaque `mode`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_caveat_attested(
+    tail: &[u8; 32],
+    r: &[u8; 32],
+    k_m_b: &[u8; 32],
+    client_id: &str,
+    org_id: &str,
+    mode: &str,
+    location: impl Into<String>,
+) -> Caveat {
+    Caveat::ThirdParty {
+        location: location.into(),
+        vid: encrypt_vid(tail, r),
+        cid: encrypt_cid_attested(k_m_b, r, client_id, org_id, mode),
     }
 }
 
@@ -195,6 +252,51 @@ pub fn decrypt_vid(t_n_minus_1: &[u8; 32], vid: &[u8]) -> Result<[u8; 32], TpcEr
 pub fn decrypt_cid(k_m_a: &[u8; 32], cid: &[u8]) -> Result<CidPlaintext, TpcError> {
     let plaintext = aead_decrypt(k_m_a, cid)?;
     parse_cid_plaintext(&plaintext)
+}
+
+/// The plaintext bound into an attested CID by [`encrypt_cid_attested`],
+/// recovered by [`decrypt_cid_attested`]. Extends [`CidPlaintext`] with
+/// the opaque `mode` string mint transported at issuance — meaningful
+/// only to the discharging authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestedCidPlaintext {
+    pub r: [u8; 32],
+    pub client_id: String,
+    pub org_id: String,
+    pub mode: String,
+}
+
+/// Decrypt an **attested** `CID` under `K_M-B` to recover
+/// `(r, client_id, org_id, mode)`. The path the discharging authority
+/// takes to obtain the discharge-MAC key `r`, the bound identity
+/// strings, and the opaque `mode` it interprets. Mirrors [`decrypt_cid`]
+/// for the auth TPC.
+pub fn decrypt_cid_attested(
+    k_m_b: &[u8; 32],
+    cid: &[u8],
+) -> Result<AttestedCidPlaintext, TpcError> {
+    let plaintext = aead_decrypt(k_m_b, cid)?;
+    parse_attested_cid_plaintext(&plaintext)
+}
+
+fn parse_attested_cid_plaintext(buf: &[u8]) -> Result<AttestedCidPlaintext, TpcError> {
+    if buf.len() < 32 {
+        return Err(TpcError::Truncated);
+    }
+    let r: [u8; 32] = buf[..32].try_into().expect("32-byte slice");
+    let mut pos = 32;
+    let client_id = read_length_prefixed_str(buf, &mut pos)?;
+    let org_id = read_length_prefixed_str(buf, &mut pos)?;
+    let mode = read_length_prefixed_str(buf, &mut pos)?;
+    if pos != buf.len() {
+        return Err(TpcError::Trailing);
+    }
+    Ok(AttestedCidPlaintext {
+        r,
+        client_id,
+        org_id,
+        mode,
+    })
 }
 
 fn parse_cid_plaintext(buf: &[u8]) -> Result<CidPlaintext, TpcError> {
@@ -390,6 +492,94 @@ mod tests {
         assert_eq!(location_path("https://auth.example"), None);
         // Not a URI.
         assert_eq!(location_path(""), None);
+    }
+
+    #[test]
+    fn attested_cid_round_trips_to_bound_identity_and_mode() {
+        let k_m_b = [2u8; 32];
+        let r = [7u8; 32];
+        // mint treats `mode` as opaque; exercise arbitrary strings.
+        for mode in ["rw-self", "ro-ancestor", ""] {
+            let cid = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", mode);
+            let pt = decrypt_cid_attested(&k_m_b, &cid).expect("decrypt");
+            assert_eq!(pt.r, r);
+            assert_eq!(pt.client_id, "01ARZ");
+            assert_eq!(pt.org_id, "org_demo");
+            assert_eq!(pt.mode, mode);
+        }
+    }
+
+    #[test]
+    fn attested_cid_changes_with_mode() {
+        let k_m_b = [2u8; 32];
+        let r = [7u8; 32];
+        let rw = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "rw-self");
+        let ro = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "ro-ancestor");
+        assert_ne!(rw, ro, "mode must affect the ciphertext");
+    }
+
+    #[test]
+    fn attested_cid_is_deterministic_across_calls() {
+        let k_m_b = [2u8; 32];
+        let r = [7u8; 32];
+        let a = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "ro-ancestor");
+        let b = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "ro-ancestor");
+        assert_eq!(a, b, "same inputs must produce the same attested CID");
+    }
+
+    #[test]
+    fn attested_cid_mode_length_prevents_boundary_collision() {
+        // (org="cd", mode="ef") vs (org="cdef", mode="") must not collide —
+        // the mode's length prefix is what separates them.
+        let k_m_b = [2u8; 32];
+        let r = [7u8; 32];
+        let a = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "cd", "ef");
+        let b = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "cdef", "");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn attested_cid_decrypt_fails_under_wrong_k_m_b() {
+        let k_m_b = [2u8; 32];
+        let r = [7u8; 32];
+        let cid = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "rw-self");
+        let mut wrong = k_m_b;
+        wrong[0] ^= 0x40;
+        assert_eq!(decrypt_cid_attested(&wrong, &cid), Err(TpcError::Aead));
+    }
+
+    #[test]
+    fn auth_cid_does_not_parse_as_an_attested_cid() {
+        // Layout separation: an auth CID (no trailing mode field) decrypted
+        // with the attested parser under the same key is truncated — there
+        // is no length-prefixed mode to read. The two CID layouts do not
+        // alias.
+        let key = [3u8; 32];
+        let r = [7u8; 32];
+        let auth = encrypt_cid(&key, &r, "01ARZ", "org_demo");
+        assert_eq!(decrypt_cid_attested(&key, &auth), Err(TpcError::Truncated));
+    }
+
+    #[test]
+    fn attested_cid_does_not_parse_as_an_auth_cid() {
+        // The reverse: an attested CID carries a trailing mode field the
+        // auth parser reads as trailing bytes, never silently dropped.
+        let key = [3u8; 32];
+        let r = [7u8; 32];
+        let attested = encrypt_cid_attested(&key, &r, "01ARZ", "org_demo", "rw-self");
+        assert_eq!(decrypt_cid(&key, &attested), Err(TpcError::Trailing));
+    }
+
+    #[test]
+    fn attested_cid_and_vid_agree_on_r() {
+        let k_m_b = [2u8; 32];
+        let r = derive_r(&[1u8; 32], "01ARZ", 0);
+        let tail = [11u8; 32];
+        let vid = encrypt_vid(&tail, &r);
+        let cid = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "ro-ancestor");
+        let via_vid = decrypt_vid(&tail, &vid).expect("vid");
+        let via_cid = decrypt_cid_attested(&k_m_b, &cid).expect("cid").r;
+        assert_eq!(via_vid, via_cid);
     }
 
     #[test]

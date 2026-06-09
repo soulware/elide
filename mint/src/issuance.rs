@@ -130,6 +130,19 @@ pub fn mint_credential_ticket(
     base.attenuate(tpc)
 }
 
+/// The attested third-party caveat to stamp onto a credential whose role
+/// declares `[role.attestation]` (`docs/design-mint-volume-attestation.md`).
+/// `mode` is opaque to mint, carried verbatim into the CID for the
+/// discharging authority at `location`; the CID is sealed under `K_M-B`
+/// and `r` derives from the credential's own `sub`, so the discharge
+/// binds to this coordinator.
+pub struct AttestedTpc<'a> {
+    pub k_m_b: &'a [u8; 32],
+    pub org_id: &'a str,
+    pub mode: &'a str,
+    pub location: &'a str,
+}
+
 /// The non-expiring credential, re-minted from root at a successful
 /// exchange: `op=assume-role`, `aud`, the same `sub`/`cnf`, the
 /// `role` it was authorized for, the enrolled record's `rev_epoch` as
@@ -143,6 +156,11 @@ pub fn mint_credential_ticket(
 /// the credential against (`docs/design-mint.md` § *Revocation*): a
 /// revoke bumps the enrolled record's epoch, so a credential minted
 /// before it carries a now-stale value and can never clear again.
+///
+/// `attested` is `Some` exactly for a role declaring `[role.attestation]`:
+/// the credential then carries a static attested third-party caveat that
+/// the attestation authority discharges at `assume-role`. Most roles pass
+/// `None` and get the uniform key-bound credential.
 pub fn mint_credential(
     keyring: &Keyring,
     audience: &str,
@@ -150,8 +168,9 @@ pub fn mint_credential(
     cnf: &str,
     role: &str,
     rev_epoch: u64,
+    attested: Option<AttestedTpc<'_>>,
 ) -> Macaroon {
-    macaroon::mint(
+    let base = macaroon::mint(
         keyring,
         vec![
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
@@ -161,7 +180,26 @@ pub fn mint_credential(
             Caveat::scalar(name::ROLE, role),
             Caveat::scalar(name::EPOCH, rev_epoch.to_string()),
         ],
-    )
+    );
+    match attested {
+        None => base,
+        Some(a) => {
+            // `r` derives from the credential's own `sub`, so the TPC is
+            // per-coordinator; the holder cannot recover it (it has
+            // neither `K_M-B` nor the chain tag at the TPC position).
+            let r = crate::tpc::derive_r(keyring.current_key(), sub, ANCHOR_R_EPOCH);
+            let tpc = crate::tpc::build_caveat_attested(
+                base.tail(),
+                &r,
+                a.k_m_b,
+                sub,
+                a.org_id,
+                a.mode,
+                a.location,
+            );
+            base.attenuate(tpc)
+        }
+    }
 }
 
 /// Fixed `client_id` bound into the admin service token's third-party
@@ -308,7 +346,7 @@ mod tests {
         // The exchange gate: the ticket carries its own TPC.
         assert_eq!(tpc_count(&ticket), 1);
 
-        let cred = mint_credential(&kr, "mint", SUB, &cnf(), "volume-ro", 7);
+        let cred = mint_credential(&kr, "mint", SUB, &cnf(), "volume-ro", 7, None);
         assert!(cred.verify(&kr));
         let pe = EffectiveCaveats::new(cred.caveats());
         assert_eq!(
@@ -327,6 +365,56 @@ mod tests {
         assert_eq!(tpc_count(&cred), 0);
         // Fresh chain, not an attenuation of the credential ticket.
         assert_ne!(cred.nonce(), ticket.nonce());
+    }
+
+    #[test]
+    fn attested_role_credential_carries_a_discharging_tpc() {
+        const K_M_B: [u8; 32] = [9u8; 32];
+        const ATT_LOCATION: &str = "https://coord-b.example/v1/discharge";
+        let kr = ring();
+        let cred = mint_credential(
+            &kr,
+            "mint",
+            SUB,
+            &cnf(),
+            "volume-ro",
+            7,
+            Some(AttestedTpc {
+                k_m_b: &K_M_B,
+                org_id: "org_demo",
+                mode: "ro-ancestor",
+                location: ATT_LOCATION,
+            }),
+        );
+        assert!(cred.verify(&kr));
+        // Identity caveats are exactly the plain credential's.
+        let pe = EffectiveCaveats::new(cred.caveats());
+        assert_eq!(pe.resolve(name::ROLE), Resolved::Value("volume-ro".into()));
+        assert_eq!(pe.resolve(name::SUB), Resolved::Value(SUB.into()));
+        // Plus exactly one third-party caveat, naming the authority.
+        assert_eq!(tpc_count(&cred), 1);
+        let (location, cid) = cred
+            .caveats()
+            .iter()
+            .find_map(|c| match c {
+                Caveat::ThirdParty { location, cid, .. } => {
+                    Some((location.as_str(), cid.as_slice()))
+                }
+                _ => None,
+            })
+            .expect("a third-party caveat");
+        assert_eq!(location, ATT_LOCATION);
+        // The CID seals (sub, org, mode) under K_M-B. `mode` round-trips
+        // verbatim — mint transported it without interpretation.
+        let pt = crate::tpc::decrypt_cid_attested(&K_M_B, cid).expect("decrypt cid");
+        assert_eq!(pt.client_id, SUB);
+        assert_eq!(pt.org_id, "org_demo");
+        assert_eq!(pt.mode, "ro-ancestor");
+        // `r` is per-coordinator — derived from the credential's own `sub`.
+        assert_eq!(
+            pt.r,
+            crate::tpc::derive_r(kr.current_key(), SUB, ANCHOR_R_EPOCH)
+        );
     }
 
     #[test]
