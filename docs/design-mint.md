@@ -2106,6 +2106,9 @@ even when both listeners exist on the server side).
 # enable mint
 [mint]
 url = "unix:mint/mint_data/mint.sock"   # or "https://mint.host:8085"
+# attestation discharge authority (coord B), when this deployment uses
+# volume-ownership attestation (docs/design-mint-volume-attestation.md):
+attestation_location = "https://coord-b.host:8086/v1/discharge"
 ```
 
 `url` is scheme-discriminated by mint's shared transport layer:
@@ -2122,6 +2125,15 @@ enrollment (§ *Enrollment*), not by config; and `aud=mint` is fixed
 inside the macaroon. Only the endpoint — and optionally
 `connect_timeout` / `request_timeout` (humantime, mirroring
 `[store]`) — is configurable.
+
+`attestation_location` is set when credentials carry an attestation
+third-party caveat (`docs/design-mint-volume-attestation.md`). It must
+equal the discharge URL mint sealed into the caveat; before
+`assume-role`, the coordinator discharges a credential carrying a
+third-party caveat at this exact location by proving possession of the
+volume's `volume.key` (a `rw-self` discharge for `volume-rw`) and
+attaches the returned discharge to the bundle. Absent → no discharge is
+fetched.
 
 The coordinator credential plane has exactly two states: `[mint]`
 present (per-volume scoping via the role inventory below), or absent
