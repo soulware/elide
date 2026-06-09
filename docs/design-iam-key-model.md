@@ -150,18 +150,6 @@ S3 — if a segment isn't in the local cache, peer-fetch reports "not
 here" and the requester falls back to its own S3 path. Granting S3
 segment-body access would defeat the cache-tier model.
 
-### 5. Ephemeral fetch keys (transient)
-
-Minted by the admin key at the start of `elide volume fetch`, deleted
-when the fetch worker exits or when `DateLessThan` expires. Scope
-mirrors the per-volume RO key (target volume + ancestors). Used by
-both the coordinator front-half and the spawned `elide fetch-volume`
-worker. Name resolution and any `coordinators/` reads needed for
-ancestor verification go through the **writer key**, not the fetch
-key — keeping the fetch key purely for `by_id/` data so the spawned
-worker has no path to the names index or coordinator identity
-records.
-
 ## Admin key containment
 
 The admin key is org-global root (see § "Admin key" — *Tigris admin
@@ -489,13 +477,6 @@ No `s3:ListBucket`. Volume processes fetch by ULID via the snapshot
 manifest; they never enumerate. No write actions. Optional
 hardening: add an `IpAddress` condition pinning the host's egress IP.
 
-### Ephemeral fetch key
-
-Same shape as per-volume RO, with a shorter `DateLessThan` (e.g.
-fetch-start + 24h). The coordinator front-half uses the **writer
-key** for `names/<name>` resolution and any `coordinators/*`
-verification reads, so the fetch key remains purely volume-data.
-
 ## GC / ancestor pruning
 
 When a child's ancestor is fully consumed by GC into the child, the
@@ -506,17 +487,16 @@ small amount of policy size and nothing else.
 ## Operational notes
 
 - **Tigris quota.** Tigris does not document a per-organization
-  access-key cap. With per-volume + per-fetch keys, a coordinator
-  with N volumes and F active fetches uses 3 + N + F keys (admin +
-  writer + peer-fetch + N volume + F fetch). Verify before relying
-  on per-volume keys at scales of thousands of concurrent volumes
-  per coordinator.
+  access-key cap. With per-volume keys, a coordinator with N volumes
+  uses 3 + N keys (admin + writer + peer-fetch + N volume). Verify
+  before relying on per-volume keys at scales of thousands of
+  concurrent volumes per coordinator.
 - **Optional `IpAddress` condition.** Tigris IAM supports
   `IpAddress` and `NotIpAddress` in policy conditions
   ([Tigris IAM policy support][tigris-iam-policies]; the same page
   confirms `DateLessThan` + `aws:CurrentTime`, the expiry mechanism
   every short-lived key here relies on). Binding
-  worker-class keys (RO, fetch, peer-fetch) to the host's egress IP
+  worker-class keys (RO, peer-fetch) to the host's egress IP
   gives defense-in-depth — a leaked key cannot be used off-host —
   but is brittle (NAT, IP changes, multi-homed). Off by default;
   available as a hardening option for deployments with stable
@@ -531,33 +511,6 @@ small amount of policy size and nothing else.
   not match `*` mid-resource (verified empirically), which is why
   `volume.pub` / `volume.provenance` live under the flat `meta/`
   prefix rather than nested in `by_id/<ulid>/`.
-
-## Volume fetch
-
-`elide volume fetch <name>` resolves a remote volume name, pulls the
-ancestor chain, downloads the manifest and per-segment idx files,
-and spawns `elide fetch-volume` to body-warm the cache. Two actors
-read S3.
-
-The split:
-
-- **Coordinator front-half** uses the **writer key** for name
-  resolution (`names/<name>`) and any coordinator-pub reads
-  (`coordinators/<id>/coordinator.pub`) needed for ancestor
-  verification.
-- **Ephemeral fetch key** is minted at `start_fetch`, scoped to
-  `[target, ancestors…]` on `by_id/`, with `DateLessThan` set to
-  fetch-start + a generous bound (e.g. 24 h) as a safety net for
-  orphaned keys. The coordinator front-half uses it for manifest
-  and idx fetches; the spawned `elide-fetch-volume` worker
-  authenticates via the macaroon handshake (same path as a volume
-  process) and receives the same key as its credentials. On worker
-  exit, the coordinator deletes the policy and key.
-
-If `volume fetch` is followed by `volume claim`, the claim flow
-mints the volume's durable per-volume RO key. The fetch key and the
-post-claim RO key are **separate**; the fetch key does not become
-the claim key.
 
 ## Open questions
 

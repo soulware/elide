@@ -603,18 +603,14 @@ fn cleanup_stale_lock_in(dir: &Path) {
 /// to exit. Used for clean coordinator shutdown in foreground mode and
 /// for the `--stop-volumes` daemon-shutdown path. Volume daemons are
 /// session-leaders and only signalled here on explicit operator
-/// request; import and fetch workers share the coordinator's session
-/// and are signalled unconditionally so the coordinator does not leak
+/// request; import workers share the coordinator's session and are
+/// signalled unconditionally so the coordinator does not leak
 /// admin-task processes.
 pub fn terminate_fork_processes(fork_dir: &Path) -> Vec<u32> {
     let mut pids = Vec::new();
     let label = fork_dir.display();
 
-    for (filename, role) in [
-        (PID_FILE, "volume"),
-        (IMPORT_PID_FILE, "import"),
-        (elide_coordinator::volume_state::FETCH_PID_FILE, "fetch"),
-    ] {
+    for (filename, role) in [(PID_FILE, "volume"), (IMPORT_PID_FILE, "import")] {
         if let Ok(text) = std::fs::read_to_string(fork_dir.join(filename))
             && let Ok(pid) = text.trim().parse::<u32>()
             && is_alive(pid)
@@ -628,15 +624,10 @@ pub fn terminate_fork_processes(fork_dir: &Path) -> Vec<u32> {
     pids
 }
 
-/// Send SIGTERM to the volume, import, and fetch processes in
-/// `vol_dir`, then wait briefly for them to exit. Used by the `delete`
-/// operation.
+/// Send SIGTERM to the volume and import processes in `vol_dir`, then
+/// wait briefly for them to exit. Used by the `delete` operation.
 pub fn kill_all_for_volume(vol_dir: &Path) {
-    for (filename, role) in [
-        (PID_FILE, "volume"),
-        (IMPORT_PID_FILE, "import"),
-        (elide_coordinator::volume_state::FETCH_PID_FILE, "fetch"),
-    ] {
+    for (filename, role) in [(PID_FILE, "volume"), (IMPORT_PID_FILE, "import")] {
         if let Ok(text) = std::fs::read_to_string(vol_dir.join(filename))
             && let Ok(pid) = text.trim().parse::<u32>()
             && is_alive(pid)

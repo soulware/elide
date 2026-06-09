@@ -313,13 +313,12 @@ async fn claim_volume_bucket_op(
             //       reconcile is a no-op on the local side; just
             //       flip the bucket to Stopped.
             //
-            //   (b) Fetched copy of our own lineage (no
+            //   (b) Readonly copy of our own lineage (no
             //       `volume.key`, but a key shadow exists):
             //       reconcile restores the key and strips the
-            //       fetched/readonly markers, then the bucket
-            //       flip proceeds.
+            //       readonly marker, then the bucket flip proceeds.
             //
-            //   (c) Fetched copy of a foreign lineage (no
+            //   (c) Readonly copy of a foreign lineage (no
             //       `volume.key`, no shadow): reconcile refuses
             //       with `NoKeyShadow` and we surface a hint to
             //       fork via `volume create --from`.
@@ -333,7 +332,7 @@ async fn claim_volume_bucket_op(
             {
                 return Err(match e {
                     ReconcileError::NoKeyShadow => IpcError::conflict(format!(
-                        "volume '{volume_name}' is a fetched (readonly) copy with no \
+                        "volume '{volume_name}' is a readonly copy with no \
                          local signing key. To use it as a writable fork run: \
                          elide volume create --from {volume_name} <new-name>"
                     )),
@@ -421,9 +420,8 @@ async fn claim_volume_bucket_op(
             // Idempotent: we already own this name in the bucket.
             // Reconcile the local fork to the canonical Stopped+
             // writable shape so a subsequent `volume start` works
-            // immediately. Handles the case where the local fork
-            // was stamped by an earlier `volume fetch`: `volume.key`
-            // missing, `volume.readonly` + `volume.fetched` present.
+            // immediately. Handles the readonly-local case: `volume.key`
+            // missing, `volume.readonly` present.
             //
             // If no local fork exists at all (e.g. post-stop+remove,
             // breadcrumb retained), `claim` doesn't hydrate — the
@@ -453,7 +451,7 @@ async fn claim_volume_bucket_op(
                     Ok(ClaimReply::Reclaimed)
                 }
                 Err(ReconcileError::NoKeyShadow) => Err(IpcError::conflict(format!(
-                    "volume '{volume_name}' is a fetched (readonly) copy with no \
+                    "volume '{volume_name}' is a readonly copy with no \
                      local signing key. To use it as a writable fork run: \
                      elide volume create --from {volume_name} <new-name>"
                 ))),

@@ -492,7 +492,7 @@ pub(crate) async fn release_volume_op(
     // operator can't easily recover from.
     match &shape {
         VolumeLifecycle::StoppedManual => {}
-        VolumeLifecycle::ReadonlyImported | VolumeLifecycle::Fetched { .. } => {
+        VolumeLifecycle::ReadonlyImported => {
             return Err(IpcError::conflict("volume is readonly; nothing to release"));
         }
         VolumeLifecycle::Released { .. } => {
@@ -1358,12 +1358,6 @@ pub(crate) async fn start_volume_op(
                 "volume '{volume_name}' is readonly (imported base); nothing to start"
             )));
         }
-        VolumeLifecycle::Fetched { .. } => {
-            return Err(IpcError::conflict(format!(
-                "volume '{volume_name}' is a fetched readonly copy; \
-                 use `volume claim {volume_name}` to take ownership first"
-            )));
-        }
         VolumeLifecycle::Absent => {
             return Err(IpcError::internal(format!(
                 "hydrate {volume_name}: classified Absent after successful hydrate"
@@ -2094,7 +2088,6 @@ mod tests {
             data_dir: Arc::new(data_dir.path().to_path_buf()),
             registry: crate::import::new_registry(),
             fork_registry: crate::fork::new_registry(),
-            fetch_registry: crate::fetch::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             snapshot_locks: SnapshotLockRegistry::default(),
@@ -2168,7 +2161,6 @@ mod tests {
             data_dir: Arc::new(data_dir.path().to_path_buf()),
             registry: crate::import::new_registry(),
             fork_registry: crate::fork::new_registry(),
-            fetch_registry: crate::fetch::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             snapshot_locks: SnapshotLockRegistry::default(),
@@ -2228,7 +2220,6 @@ mod tests {
             data_dir: Arc::new(data_dir.path().to_path_buf()),
             registry: crate::import::new_registry(),
             fork_registry: crate::fork::new_registry(),
-            fetch_registry: crate::fetch::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             snapshot_locks: SnapshotLockRegistry::default(),
@@ -2332,7 +2323,6 @@ mod tests {
             data_dir: Arc::new(data_dir.path().to_path_buf()),
             registry: crate::import::new_registry(),
             fork_registry: crate::fork::new_registry(),
-            fetch_registry: crate::fetch::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             snapshot_locks: SnapshotLockRegistry::default(),

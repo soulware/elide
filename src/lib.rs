@@ -6,7 +6,6 @@ pub mod control;
 pub mod coordinator_client;
 pub mod creds_fetcher;
 pub mod extents;
-pub mod fetch_volume;
 pub mod inspect;
 pub mod inspect_files;
 pub mod serve;
