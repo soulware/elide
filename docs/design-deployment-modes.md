@@ -4,7 +4,7 @@
 
 ## Problem
 
-The coordinator today launches every long-running child (volume daemon, import worker, fetch worker) the same way: `Command::spawn` with `setsid`, plus a per-fork pidfile and an in-process supervisor loop. That model is uniform but blurs an important distinction:
+The coordinator today launches every long-running child (volume daemon, import worker) the same way: `Command::spawn` with `setsid`, plus a per-fork pidfile and an in-process supervisor loop. That model is uniform but blurs an important distinction:
 
 - A **volume daemon** has live consumers (a VM via ublk) and must outlive a coordinator restart — bouncing the coordinator (rolling upgrade, panic, `systemctl restart`) must not drag the data plane with it.
 - An **import worker** and a **fetch worker** are admin batch jobs with no live consumers. They are restartable and idempotent; tying their lifetime to the coordinator is the natural fit.

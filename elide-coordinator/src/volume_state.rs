@@ -45,28 +45,6 @@ pub const RELEASED_FILE: &str = "volume.released";
 /// aligned with the other `volume.<state>` lifecycle markers.
 pub const IMPORTING_FILE: &str = "volume.importing";
 
-/// Per-fetch-worker pidfile. Written by the fetch orchestrator
-/// before it spawns `elide fetch-volume`, removed when the worker
-/// exits. Used by `Request::RegisterFetchWorker` to PID-bind the
-/// macaroon — same model as `volume.pid` for the volume daemon, but
-/// a distinct file so the lifecycle classifier doesn't see the
-/// fetch worker's PID and mis-classify the volume as `Running`.
-pub const FETCH_PID_FILE: &str = "fetch.pid";
-
-/// Fetched marker. Written by the coordinator after a `volume fetch`
-/// run completes successfully. Indicates this host holds a local copy
-/// of a foreign volume that has *not* been claimed locally — the
-/// owner's bucket-side state machine is untouched. Body is a small
-/// TOML record (`basis_snapshot`, `owner_coordinator_id`,
-/// `fetched_at`); see [`FetchedRecord`].
-///
-/// Lifetime: from worker exit on a successful fetch until either
-///   - `volume remove` (manual cleanup), or
-///   - `volume claim` of the foreign name (the local copy transitions
-///     to a readonly ancestor of the freshly-minted claim fork; the
-///     marker is cleared by the claim path).
-pub const FETCHED_FILE: &str = "volume.fetched";
-
 /// Read/write mode for a volume. Readonly is set on imported OCI
 /// volumes; everything else is read/write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,23 +80,20 @@ impl std::fmt::Display for VolumeMode {
 /// for display.
 ///
 /// Order of precedence in [`Self::from_dir`]:
-///   1. `volume.fetched`  → `Fetched { basis_snapshot }`
-///   2. `volume.released` → `Released { handoff_snapshot }`
-///   3. `volume.readonly` → `ReadonlyImported`
-///   4. `volume.stopped`  → `StoppedManual`
-///   5. `volume.importing`→ `Importing { import_ulid }`
-///   6. `volume.pid` names a live process → `Running { pid }`
-///   7. otherwise → `Stopped`
+///   1. `volume.released` → `Released { handoff_snapshot }`
+///   2. `volume.readonly` → `ReadonlyImported`
+///   3. `volume.stopped`  → `StoppedManual`
+///   4. `volume.importing`→ `Importing { import_ulid }`
+///   5. `volume.pid` names a live process → `Running { pid }`
+///   6. otherwise → `Stopped`
 ///
 /// `Absent` is produced only by [`Self::resolve`] — it represents
 /// "the `by_name/<name>` symlink canonicalised to NotFound", which
 /// `from_dir` (which takes an existing directory) cannot express.
 ///
-/// `Fetched` and `ReadonlyImported` are the two readonly-flavoured
-/// variants; verbs that need a signing key refuse on either via
-/// [`Self::is_readonly_local`]. `Fetched` carries a basis snapshot
-/// (foreign-cached); `ReadonlyImported` does not (OCI base or
-/// readonly skeleton).
+/// `ReadonlyImported` is the readonly-flavoured variant; verbs that
+/// need a signing key refuse on it via [`Self::is_readonly_local`]
+/// (OCI base or readonly skeleton).
 ///
 /// `Released` is a sticky terminal local marker. The bucket's
 /// `names/<name>` record is authoritative for claim state; the local
@@ -144,13 +119,8 @@ pub enum VolumeLifecycle {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         handoff_snapshot: Option<Ulid>,
     },
-    /// `volume.fetched` marker is present; this host holds a foreign
-    /// volume's bytes against the named basis snapshot but has not
-    /// claimed the name.
-    Fetched { basis_snapshot: Ulid },
-    /// `volume.readonly` is present without `volume.fetched` — an
-    /// imported OCI base, or a readonly skeleton pulled by ancestor
-    /// chain-walk. No basis snapshot is associated.
+    /// `volume.readonly` is present — an imported OCI base, or a
+    /// readonly skeleton pulled by ancestor chain-walk.
     ReadonlyImported,
     /// `volume.stopped` marker is present; supervisor will not relaunch.
     StoppedManual,
@@ -162,20 +132,14 @@ impl VolumeLifecycle {
     /// Derive lifecycle from the on-disk markers in `vol_dir`.
     ///
     /// Reads up to five small files; fast enough to call per-volume
-    /// in the CLI's list path. Unparseable ULID bodies (in
-    /// `volume.fetched`, `volume.released`) cause the variant to
-    /// fall through to the next-precedence classification rather
-    /// than surfacing an error — the classifier never blocks a
-    /// recovery verb.
+    /// in the CLI's list path. An unparseable ULID body in
+    /// `volume.released` causes the variant to fall through to the
+    /// next-precedence classification rather than surfacing an error
+    /// — the classifier never blocks a recovery verb.
     ///
     /// Never returns [`Self::Absent`] — that variant is the
     /// `resolve()`-only signal that no fork exists at all.
     pub fn from_dir(vol_dir: &Path) -> Self {
-        if let Some(record) = FetchedRecord::read(vol_dir)
-            && let Ok(basis_snapshot) = Ulid::from_string(&record.basis_snapshot)
-        {
-            return Self::Fetched { basis_snapshot };
-        }
         let released = vol_dir.join(RELEASED_FILE);
         if released.exists() {
             let handoff_snapshot = std::fs::read_to_string(&released)
@@ -232,7 +196,6 @@ impl VolumeLifecycle {
             Self::Running { .. } => "running",
             Self::Importing { .. } => "importing",
             Self::Released { .. } => "released",
-            Self::Fetched { .. } => "fetched",
             Self::ReadonlyImported => "readonly",
             Self::StoppedManual => "stopped (manual)",
             Self::Stopped => "stopped",
@@ -241,8 +204,8 @@ impl VolumeLifecycle {
 
     /// Body string for the `volume_status` IPC reply (without the
     /// leading `"ok "`). Identical to [`Self::label`] except
-    /// `Importing`, `Released`, and `Fetched` append their
-    /// associated ULIDs so clients can correlate with bucket state.
+    /// `Importing` and `Released` append their associated ULIDs so
+    /// clients can correlate with bucket state.
     pub fn wire_body(&self) -> String {
         match self {
             Self::Importing { import_ulid } if !import_ulid.is_empty() => {
@@ -251,7 +214,6 @@ impl VolumeLifecycle {
             Self::Released {
                 handoff_snapshot: Some(u),
             } => format!("released {u}"),
-            Self::Fetched { basis_snapshot } => format!("fetched {basis_snapshot}"),
             other => other.label().to_owned(),
         }
     }
@@ -270,74 +232,15 @@ impl VolumeLifecycle {
     }
 
     /// True when the local fork's on-disk markers say "no signing
-    /// key available" — `volume.readonly` or `volume.fetched`.
-    /// Verbs that need to sign segments refuse on this.
+    /// key available" — `volume.readonly`. Verbs that need to sign
+    /// segments refuse on this.
     pub fn is_readonly_local(&self) -> bool {
-        matches!(self, Self::ReadonlyImported | Self::Fetched { .. })
+        matches!(self, Self::ReadonlyImported)
     }
 
     /// True only for the `resolve()`-only `Absent` variant.
     pub fn is_absent(&self) -> bool {
         matches!(self, Self::Absent)
-    }
-}
-
-/// Contents of a `volume.fetched` marker. Written by the coordinator
-/// after a successful `volume fetch` worker exit; cleared by either
-/// `volume remove` or the claim path's transition into ancestor-of-
-/// fork shape.
-///
-/// Format on disk is TOML so the file is inspectable with `cat`:
-///
-/// ```toml
-/// basis_snapshot = "01J7…"
-/// owner_coordinator_id = "01J7…"
-/// fetched_at = "2026-05-09T14:23:51Z"
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FetchedRecord {
-    /// Owner-signed snapshot ULID this fetch was warmed against.
-    pub basis_snapshot: String,
-    /// Coordinator id that signed `basis_snapshot`'s manifest at the
-    /// time of fetch — pulled from the manifest's recovery metadata if
-    /// the basis is a synthesised handoff snapshot, otherwise empty.
-    /// Advisory; the volume's own `volume.pub` is the verifying key
-    /// for ordinary basis snapshots.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub owner_coordinator_id: String,
-    /// Wall-clock time the fetch worker exited cleanly (RFC3339).
-    pub fetched_at: String,
-}
-
-impl FetchedRecord {
-    /// Read and parse `<vol_dir>/volume.fetched`. Returns `None` if the
-    /// marker is absent or unparseable; treat unparseable as absent so
-    /// a hand-edited file doesn't pin the volume to a broken state.
-    pub fn read(vol_dir: &Path) -> Option<Self> {
-        let content = std::fs::read_to_string(vol_dir.join(FETCHED_FILE)).ok()?;
-        toml::from_str::<Self>(&content).ok()
-    }
-
-    /// Write `<vol_dir>/volume.fetched` atomically. The marker is small
-    /// (sub-1 KiB) so we don't bother with a tmp+rename dance —
-    /// presence is what matters for the lifecycle classifier; the body
-    /// is advisory.
-    pub fn write(&self, vol_dir: &Path) -> std::io::Result<()> {
-        let s = toml::to_string(self)
-            .map_err(|e| std::io::Error::other(format!("serialise volume.fetched: {e}")))?;
-        std::fs::write(vol_dir.join(FETCHED_FILE), s)
-    }
-}
-
-/// Remove `volume.fetched` if present; missing-file is not an error.
-/// Called by the claim path after the foreign by_id directory becomes
-/// a readonly ancestor of a freshly-minted owned fork, and by
-/// `volume remove`.
-pub fn clear_fetched_marker(vol_dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(vol_dir.join(FETCHED_FILE)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
     }
 }
 
@@ -366,10 +269,10 @@ pub fn clear_released_marker(vol_dir: &Path) -> std::io::Result<()> {
 pub enum ReconcileOutcome {
     /// Local fork was already in the canonical Stopped+writable shape;
     /// nothing was changed. Returned when `volume.key` was present,
-    /// no transient markers (`volume.fetched`/`volume.readonly`) were
-    /// stamped, and `volume.stopped` already existed.
+    /// `volume.readonly` was not stamped, and `volume.stopped` already
+    /// existed.
     AlreadyStopped,
-    /// At least one of `volume.key`, the transient markers, or
+    /// At least one of `volume.key`, the transient readonly marker, or
     /// `volume.stopped` had to be written/removed to reach the
     /// canonical shape.
     Reconciled,
@@ -398,7 +301,7 @@ impl std::fmt::Display for ReconcileError {
         match self {
             Self::NoKeyShadow => write!(
                 f,
-                "no key shadow available; foreign fetched fork cannot be made \
+                "no key shadow available; foreign readonly fork cannot be made \
                  writable in place"
             ),
             Self::Io(e) => write!(f, "i/o error during reconcile: {e}"),
@@ -426,7 +329,6 @@ impl From<std::io::Error> for ReconcileError {
 ///   - `volume.key` present (restored from `data_dir/keys/<vol_ulid>.key`
 ///     when absent).
 ///   - `volume.readonly` absent.
-///   - `volume.fetched` absent.
 ///   - `volume.stopped` present.
 ///   - No live daemon (no `volume.pid` with an alive pid).
 ///
@@ -434,11 +336,8 @@ impl From<std::io::Error> for ReconcileError {
 ///   - `volume claim` against a `Live`/`Stopped` record owned by us
 ///     (idempotent "I already own this; just make sure local is
 ///     consistent").
-///   - `volume fetch` against a record owned by us (final stage:
-///     drop the foreign-fetched markers in favour of the writable
-///     Stopped shape).
 ///   - `volume claim` against a `Released` record where the local
-///     fork is a fetched copy of our own lineage (the case fixed in
+///     fork is a readonly copy of our own lineage (the case fixed in
 ///     the original key-shadow rollout).
 pub fn reconcile_owned_local_to_stopped(
     fork_dir: &Path,
@@ -466,13 +365,11 @@ pub fn reconcile_owned_local_to_stopped(
         changed = true;
     }
 
-    // (2) Strip transient markers.
-    for marker in ["volume.readonly", FETCHED_FILE] {
-        match std::fs::remove_file(fork_dir.join(marker)) {
-            Ok(()) => changed = true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(ReconcileError::Io(e)),
-        }
+    // (2) Strip the transient readonly marker.
+    match std::fs::remove_file(fork_dir.join("volume.readonly")) {
+        Ok(()) => changed = true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ReconcileError::Io(e)),
     }
 
     // (3) Ensure volume.stopped is present.
@@ -548,64 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn fetched_marker_classifies_as_fetched() {
-        let d = TempDir::new().unwrap();
-        let rec = FetchedRecord {
-            basis_snapshot: "01J0000000000000000000000V".to_owned(),
-            owner_coordinator_id: "01J7".to_owned(),
-            fetched_at: "2026-05-09T14:23:51Z".to_owned(),
-        };
-        rec.write(d.path()).unwrap();
-        match VolumeLifecycle::from_dir(d.path()) {
-            VolumeLifecycle::Fetched { basis_snapshot } => {
-                assert_eq!(basis_snapshot.to_string(), "01J0000000000000000000000V");
-            }
-            other => panic!("expected Fetched, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn fetched_marker_takes_precedence_over_other_markers() {
-        let d = TempDir::new().unwrap();
-        let basis = ulid::Ulid::new();
-        FetchedRecord {
-            basis_snapshot: basis.to_string(),
-            owner_coordinator_id: String::new(),
-            fetched_at: "2026-05-09T14:23:51Z".to_owned(),
-        }
-        .write(d.path())
-        .unwrap();
-        std::fs::write(d.path().join(STOPPED_FILE), "").unwrap();
-        std::fs::write(d.path().join(IMPORTING_FILE), "01J7").unwrap();
-        std::fs::write(d.path().join(PID_FILE), std::process::id().to_string()).unwrap();
-        match VolumeLifecycle::from_dir(d.path()) {
-            VolumeLifecycle::Fetched { basis_snapshot } => {
-                assert_eq!(basis_snapshot, basis);
-            }
-            other => panic!("expected Fetched, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn fetched_marker_with_unparseable_basis_falls_through() {
-        // basis_snapshot is not a valid ULID — classifier falls
-        // through to the next precedence rule rather than producing
-        // a malformed Fetched variant.
-        let d = TempDir::new().unwrap();
-        FetchedRecord {
-            basis_snapshot: "not-a-ulid".to_owned(),
-            owner_coordinator_id: String::new(),
-            fetched_at: "2026-05-09T14:23:51Z".to_owned(),
-        }
-        .write(d.path())
-        .unwrap();
-        assert_eq!(
-            VolumeLifecycle::from_dir(d.path()),
-            VolumeLifecycle::Stopped
-        );
-    }
-
-    #[test]
     fn readonly_marker_classifies_as_readonly_imported() {
         let d = TempDir::new().unwrap();
         std::fs::write(d.path().join("volume.readonly"), "").unwrap();
@@ -624,34 +463,6 @@ mod tests {
         assert_eq!(
             VolumeLifecycle::from_dir(d.path()),
             VolumeLifecycle::ReadonlyImported
-        );
-    }
-
-    #[test]
-    fn fetched_record_round_trip_through_disk() {
-        let d = TempDir::new().unwrap();
-        let original = FetchedRecord {
-            basis_snapshot: "01J0000000000000000000000V".to_owned(),
-            owner_coordinator_id: "01J7000000000000000000000W".to_owned(),
-            fetched_at: "2026-05-09T14:23:51Z".to_owned(),
-        };
-        original.write(d.path()).unwrap();
-        let parsed = FetchedRecord::read(d.path()).unwrap();
-        assert_eq!(parsed, original);
-        clear_fetched_marker(d.path()).unwrap();
-        assert!(FetchedRecord::read(d.path()).is_none());
-        // Idempotent when already cleared.
-        clear_fetched_marker(d.path()).unwrap();
-    }
-
-    #[test]
-    fn fetched_marker_garbage_body_treated_as_absent() {
-        let d = TempDir::new().unwrap();
-        std::fs::write(d.path().join(FETCHED_FILE), "not toml at all =").unwrap();
-        // Unparseable -> classifier falls through to next-precedence rule.
-        assert_eq!(
-            VolumeLifecycle::from_dir(d.path()),
-            VolumeLifecycle::Stopped
         );
     }
 
@@ -772,13 +583,6 @@ mod tests {
             .label(),
             "released"
         );
-        assert_eq!(
-            VolumeLifecycle::Fetched {
-                basis_snapshot: snap
-            }
-            .label(),
-            "fetched"
-        );
     }
 
     #[test]
@@ -820,13 +624,6 @@ mod tests {
             }
             .wire_body(),
             "released"
-        );
-        assert_eq!(
-            VolumeLifecycle::Fetched {
-                basis_snapshot: snap
-            }
-            .wire_body(),
-            format!("fetched {snap}")
         );
     }
 
@@ -880,16 +677,9 @@ mod tests {
 
     #[test]
     fn helpers_match_variants() {
-        let snap = ulid::Ulid::new();
         assert!(VolumeLifecycle::Running { pid: 1 }.is_running());
         assert!(!VolumeLifecycle::Stopped.is_running());
         assert!(VolumeLifecycle::ReadonlyImported.is_readonly_local());
-        assert!(
-            VolumeLifecycle::Fetched {
-                basis_snapshot: snap
-            }
-            .is_readonly_local()
-        );
         assert!(!VolumeLifecycle::Stopped.is_readonly_local());
         assert!(VolumeLifecycle::Absent.is_absent());
         assert!(!VolumeLifecycle::Stopped.is_absent());
@@ -939,9 +729,8 @@ mod tests {
     #[test]
     fn reconcile_restores_key_from_shadow_and_strips_markers() {
         let (_tmp, data_dir, vol_dir, vol_ulid) = reconcile_scaffolding(true);
-        // Fetched shape: readonly + fetched markers, no key, no stopped.
+        // Readonly shape: readonly marker, no key, no stopped.
         std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
-        std::fs::write(vol_dir.join(FETCHED_FILE), "{}").unwrap();
         let out = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid).unwrap();
         assert_eq!(out, ReconcileOutcome::Reconciled);
         assert!(
@@ -953,10 +742,6 @@ mod tests {
             "readonly marker must be stripped"
         );
         assert!(
-            !vol_dir.join(FETCHED_FILE).exists(),
-            "fetched marker must be stripped"
-        );
-        assert!(
             vol_dir.join(STOPPED_FILE).exists(),
             "stopped marker must be written"
         );
@@ -966,13 +751,11 @@ mod tests {
     fn reconcile_refuses_when_no_key_and_no_shadow() {
         let (_tmp, data_dir, vol_dir, vol_ulid) = reconcile_scaffolding(false);
         std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
-        std::fs::write(vol_dir.join(FETCHED_FILE), "{}").unwrap();
         let err = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid)
-            .expect_err("foreign fetched fork must refuse");
+            .expect_err("foreign readonly fork must refuse");
         assert!(matches!(err, ReconcileError::NoKeyShadow));
         // No destructive side-effects on refusal.
         assert!(vol_dir.join("volume.readonly").exists());
-        assert!(vol_dir.join(FETCHED_FILE).exists());
     }
 
     #[test]
