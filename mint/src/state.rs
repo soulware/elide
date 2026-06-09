@@ -2660,4 +2660,88 @@ mod tests {
             .unwrap();
         assert_eq!(s.get_enrolled("01ARZ").await.unwrap().unwrap().rev_epoch, 1);
     }
+
+    #[tokio::test]
+    async fn rotation_in_order_preserves_every_enrolled_client() {
+        // The documented rotation choreography end-to-end:
+        //   add(new) → sweep → retire(old)
+        // run in that order must leave every previously-enrolled client
+        // still recognised, migrated onto the new generation. The
+        // per-step pieces are pinned individually elsewhere; this asserts
+        // the composed ordering — the safety the choreography exists for —
+        // for enrolled records (the tombstone equivalent is
+        // `sweep_rekeys_tombstone_so_it_survives_retire`).
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open_local(d.path()).await.unwrap();
+        let rk = d.path().join("root_keys");
+
+        // Two clients enrolled under kid 0.
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+        s.approve("01BXY", PUBB, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+
+        // Step 1 — add the new generation. Additive: kid 0 stays in the
+        // ring, so both records still verify on their issuing kid.
+        let mut kr = (*s.keyring().await).clone();
+        kr.add_and_promote(&rk, None).unwrap();
+        s.set_keyring(kr).await;
+        assert_eq!(s.get_enrolled("01ARZ").await.unwrap().unwrap().kid, 0);
+        assert_eq!(s.get_enrolled("01BXY").await.unwrap().unwrap().kid, 0);
+
+        // Step 2 — sweep: re-MAC every enrolled record under the new
+        // current generation before anything is retired.
+        let report = s.sweep_approvals_to_current_kid().await.unwrap();
+        assert_eq!(report.rekeyed, 2, "both records moved to the new kid");
+        assert_eq!(report.skipped, 0);
+
+        // Step 3 — retire the old kid. Because the sweep ran first, both
+        // clients survive, now anchored on kid 1.
+        let mut kr = (*s.keyring().await).clone();
+        kr.retire(&rk, 0).unwrap();
+        s.set_keyring(kr).await;
+        assert_eq!(s.get_enrolled("01ARZ").await.unwrap().unwrap().kid, 1);
+        assert_eq!(s.get_enrolled("01BXY").await.unwrap().unwrap().kid, 1);
+    }
+
+    #[tokio::test]
+    async fn retiring_before_the_sweep_orphans_clients_irrecoverably() {
+        // The ordering is load-bearing. Retiring the old kid before the
+        // sweep re-MACs records still on it strands those clients
+        // (get_enrolled treats them as forged) — and the orphaning is
+        // irreversible: a post-hoc sweep cannot rescue a record whose kid
+        // already left the ring, because it can no longer be verified as
+        // authentic, so the sweep skips it rather than laundering it
+        // forward. This is precisely the failure add → sweep → retire
+        // exists to prevent.
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open_local(d.path()).await.unwrap();
+        let rk = d.path().join("root_keys");
+
+        s.approve("01ARZ", PUBA, "usr_op", APPROVED_AT)
+            .await
+            .unwrap();
+
+        // Rotate and retire kid 0 with no sweep in between.
+        let mut kr = (*s.keyring().await).clone();
+        kr.add_and_promote(&rk, None).unwrap();
+        kr.retire(&rk, 0).unwrap();
+        s.set_keyring(kr).await;
+        assert!(matches!(
+            s.get_enrolled("01ARZ").await,
+            Err(StateError::Forged)
+        ));
+
+        // The sweep cannot undo it: the record's kid is gone from the
+        // ring, so it is unverifiable and skipped, not re-keyed.
+        let report = s.sweep_approvals_to_current_kid().await.unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.rekeyed, 0);
+        assert!(matches!(
+            s.get_enrolled("01ARZ").await,
+            Err(StateError::Forged)
+        ));
+    }
 }
