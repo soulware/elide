@@ -23,36 +23,31 @@ pub fn resolve_ancestor_dir(by_id_dir: &Path, ulid: &str) -> PathBuf {
     by_id_dir.join(ulid)
 }
 
-/// Parse a `<source-ulid>/<snapshot-ulid>` lineage entry, validating
-/// both components as ULIDs to prevent path traversal. Returns the source ULID
-/// slice (borrowed from `entry`) and the owned snapshot ULID string.
-fn parse_lineage_entry<'a>(
-    entry: &'a str,
-    field: &str,
-    fork_dir: &Path,
-) -> io::Result<(&'a str, String)> {
-    let (source_ulid_str, snapshot_ulid_str) = entry.split_once('/').ok_or_else(|| {
-        io::Error::other(format!(
-            "malformed {field} entry in {}: {entry}",
-            fork_dir.display()
-        ))
-    })?;
-    if snapshot_ulid_str.contains('/') {
+/// Parse a `<source-ulid>/<snapshot-ulid>` lineage entry, validating both
+/// components as ULIDs (rejecting path traversal and non-ULID sources).
+/// Returns the parsed source and snapshot ULIDs.
+///
+/// This is the single validator for an `extent_index` entry: the local
+/// read-path walk ([`walk_extent_ancestors`]) and coord B's signed-lineage
+/// walk (`elide-peer-fetch`) both parse entries through it, so the
+/// traversal-rejection rules cannot drift between vouching and reading.
+pub fn parse_lineage_pair(entry: &str) -> io::Result<(Ulid, Ulid)> {
+    let (source_str, snapshot_str) = entry
+        .split_once('/')
+        .ok_or_else(|| io::Error::other(format!("malformed lineage entry: {entry}")))?;
+    if snapshot_str.contains('/') {
         return Err(io::Error::other(format!(
-            "malformed {field} entry in {}: {entry} has more than one '/' separator",
-            fork_dir.display()
+            "malformed lineage entry: {entry} has more than one '/' separator"
         )));
     }
-    let snapshot_ulid = Ulid::from_string(snapshot_ulid_str)
-        .map_err(|e| io::Error::other(format!("bad snapshot ULID in {field}: {e}")))?
-        .to_string();
-    Ulid::from_string(source_ulid_str).map_err(|_| {
+    let source = Ulid::from_string(source_str).map_err(|_| {
         io::Error::other(format!(
-            "malformed {field} entry in {}: source '{source_ulid_str}' is not a valid ULID",
-            fork_dir.display(),
+            "malformed lineage entry: source '{source_str}' is not a valid ULID"
         ))
     })?;
-    Ok((source_ulid_str, snapshot_ulid))
+    let snapshot = Ulid::from_string(snapshot_str)
+        .map_err(|e| io::Error::other(format!("bad snapshot ULID in lineage entry: {e}")))?;
+    Ok((source, snapshot))
 }
 
 /// A volume with no `volume.provenance` is treated as root (empty chain).
@@ -217,9 +212,9 @@ pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Ve
     while let Some(dir) = cursor {
         let lineage = load_lineage_or_empty(&dir)?;
         for entry in &lineage.extent_index {
-            let (source_ulid_str, snapshot_ulid) =
-                parse_lineage_entry(entry, "extent_index", &dir)?;
-            let source_dir = resolve_ancestor_dir(by_id_dir, source_ulid_str);
+            let (source, snapshot) = parse_lineage_pair(entry)?;
+            let snapshot_ulid = snapshot.to_string();
+            let source_dir = resolve_ancestor_dir(by_id_dir, &source.to_string());
             match layers.iter_mut().find(|l| l.dir == source_dir) {
                 Some(existing) => {
                     if existing

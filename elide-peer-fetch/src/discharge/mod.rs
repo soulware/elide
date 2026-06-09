@@ -8,10 +8,15 @@
 //! public signed state, and minting a discharge that attests the scoped
 //! volume.
 //!
-//! This slice implements the **`rw-self`** mode: the requester proves
-//! possession of a live volume's key and is vouched for *that same* volume.
-//! The `ro-ancestor` mode (which needs the signed-lineage walk) is rejected
-//! as unimplemented rather than silently mishandled.
+//! Two modes are served, distinguished by the opaque `mode` mint sealed
+//! into the CID:
+//!
+//! - **`rw-self`** — the requester proves possession of a live volume's key
+//!   and is vouched for *that same* volume.
+//! - **`ro-ancestor`** — the requester proves possession of a live volume
+//!   and is vouched for any volume in that volume's read set (the
+//!   fork-parent chain plus every `extent_index` source named along it),
+//!   established by a signed-lineage walk over coord-ro `meta/*`.
 
 pub mod crypto;
 
@@ -40,12 +45,26 @@ const DEFAULT_SKEW_SECS: u64 = 30;
 /// bound and is kept short — roughly the Tigris keypair lifetime
 /// (`docs/design-mint-volume-attestation.md` § *One liveness check*).
 const RW_SELF_DISCHARGE_TTL_SECS: u64 = 300;
+/// `ro-ancestor` discharge lifetime, seconds. The read cred is gated on the
+/// owned volume staying the live claimant (`names/<name>`); the same
+/// liveness-staleness bound applies as `rw-self`, so the TTL matches.
+const RO_ANCESTOR_DISCHARGE_TTL_SECS: u64 = 300;
 
 /// The opaque `mode` mint sealed into the attested TPC's CID for the
 /// `volume-rw` role. coord B — not mint — assigns it meaning.
 const MODE_RW_SELF: &str = "rw-self";
-/// The `volume-ro` mode, recognised but not yet served by this slice.
+/// The opaque `mode` for the `volume-ro` role.
 const MODE_RO_ANCESTOR: &str = "ro-ancestor";
+
+/// coord B's interpretation of the opaque CID `mode`: the relationship the
+/// vouched-for `target` must bear to the possession-proven `owned` volume.
+enum Mode {
+    /// `target == owned` — a write cred for the volume itself.
+    RwSelf,
+    /// `target` in `owned`'s read set — a read cred for an ancestor or
+    /// extent source.
+    RoAncestor,
+}
 
 /// `POST /v1/discharge` request. `cid`, `nonce`, and `proof` are hex; `cid`
 /// is opaque to the requester (coord A), decrypted here under `K_M-B`.
@@ -82,8 +101,6 @@ pub enum DischargeError {
     Malformed(&'static str),
     #[error("discharge denied")]
     Denied(&'static str),
-    #[error("unsupported attestation mode")]
-    UnsupportedMode,
     #[error("metadata backend: {0}")]
     Backend(std::io::Error),
 }
@@ -94,7 +111,6 @@ impl DischargeError {
             Self::Malformed(_) => StatusCode::BAD_REQUEST,
             // Every verification failure looks identical to a caller.
             Self::Denied(_) => StatusCode::FORBIDDEN,
-            Self::UnsupportedMode => StatusCode::NOT_IMPLEMENTED,
             Self::Backend(_) => StatusCode::BAD_GATEWAY,
         }
     }
@@ -182,17 +198,21 @@ impl DischargeState {
         }
         self.check_and_record_nonce(&req.owned, &req.nonce, now)?;
 
-        // 3. Mode. rw-self ⟹ target == owned; ro-ancestor is recognised but
-        //    not served by this slice; anything else is unknown.
-        match recovered.mode.as_str() {
+        // 3. Recognise the mode. rw-self's `target == owned` is cheap and
+        //    checked here, before any S3 read; ro-ancestor's read-set
+        //    membership needs the lineage walk and is deferred to step 6.
+        //    An unknown mode is denied (not distinguishable from any other
+        //    failure to a caller).
+        let mode = match recovered.mode.as_str() {
             MODE_RW_SELF => {
                 if target != owned {
                     return Err(DischargeError::Denied("target != owned"));
                 }
+                Mode::RwSelf
             }
-            MODE_RO_ANCESTOR => return Err(DischargeError::UnsupportedMode),
+            MODE_RO_ANCESTOR => Mode::RoAncestor,
             _ => return Err(DischargeError::Denied("unknown mode")),
-        }
+        };
 
         // 4. Possession: the proof must verify under `owned`'s public key.
         let owned_pub = self.fetch_volume_pub(&owned).await?;
@@ -201,14 +221,36 @@ impl DischargeState {
         )
         .map_err(|_| DischargeError::Denied("possession"))?;
 
-        // 5. Liveness: `names/<name>` must resolve to `owned`, Live.
+        // 5. Liveness: `names/<name>` must resolve to `owned`, Live. This is
+        //    the single currency check for both modes — an ro-ancestor cred
+        //    is valid only while `owned` remains the live claimant.
         let record = self.fetch_name_record(&req.name).await?;
         if record.vol_ulid != owned || record.state != NameState::Live {
             return Err(DischargeError::Denied("liveness"));
         }
 
-        // 6. Mint the discharge attesting `volume = target`.
-        let exp = now + RW_SELF_DISCHARGE_TTL_SECS;
+        // 6. ro-ancestor: `target` must lie in `owned`'s read set — the
+        //    fork-parent chain plus every extent_index source named along
+        //    it, walked over signed `meta/*` and anchored at the same
+        //    `owned_pub` the possession proof verified against. A walk
+        //    failure (missing/unverifiable lineage) is a denial: by here
+        //    `owned`'s pub and name record already fetched, so S3 is live.
+        let ttl = match mode {
+            Mode::RwSelf => RW_SELF_DISCHARGE_TTL_SECS,
+            Mode::RoAncestor => {
+                let read_set =
+                    crate::ancestry::walk_lineage_set(self.inner.store.as_ref(), owned, owned_pub)
+                        .await
+                        .map_err(|_| DischargeError::Denied("lineage"))?;
+                if !read_set.contains(&target) {
+                    return Err(DischargeError::Denied("target not in read set"));
+                }
+                RO_ANCESTOR_DISCHARGE_TTL_SECS
+            }
+        };
+
+        // 7. Mint the discharge attesting `volume = target`.
+        let exp = now + ttl;
         let exp_s = exp.to_string();
         let target_s = target.to_string();
         Ok(crypto::mint_discharge(
@@ -475,6 +517,189 @@ mod tests {
         req.target = "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
         assert!(matches!(
             f.state.discharge(req).await,
+            Err(DischargeError::Denied(_))
+        ));
+    }
+
+    // --- ro-ancestor mode ---
+
+    use ed25519_dalek::SigningKey;
+    use elide_core::segment::SegmentSigner;
+    use elide_core::signing::{
+        ParentRef, ProvenanceLineage, VOLUME_PROVENANCE_FILE, signer_from_bytes, write_provenance,
+    };
+    use elide_core::store_keys::meta_provenance_key;
+    use rand_core::OsRng;
+    use tempfile::TempDir;
+
+    /// Sign a `volume.provenance` for `ulid` with `key` and publish it (plus
+    /// `volume.pub`) to the canonical `meta/*` keys. Uses elide-core's writer
+    /// via a tempdir so the on-disk format is byte-identical to production.
+    async fn publish_meta(
+        store: &dyn ObjectStore,
+        ulid: Ulid,
+        key: &SigningKey,
+        parent: Option<ParentRef>,
+        extent_index: Vec<String>,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let lineage = ProvenanceLineage {
+            parent,
+            extent_index,
+            oci_source: None,
+        };
+        write_provenance(tmp.path(), key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
+        let prov = std::fs::read(tmp.path().join(VOLUME_PROVENANCE_FILE)).unwrap();
+        put_object(store, &meta_provenance_key(ulid), prov)
+            .await
+            .unwrap();
+        put_object(
+            store,
+            &meta_pub_key(ulid),
+            encode_hex(key.verifying_key().as_bytes()).into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// owned ← parent (fork), owned names `extent` as a dedup/delta source.
+    /// All published to a fresh coord-ro store, owned the Live claimant of
+    /// `name`. The CID carries `mode = "ro-ancestor"`; possession proofs are
+    /// minted on demand per target via [`RoCtx::request_for`].
+    struct RoCtx {
+        state: DischargeState,
+        owned: Ulid,
+        parent: Ulid,
+        extent: Ulid,
+        owned_signer: Arc<dyn SegmentSigner>,
+        cid: Vec<u8>,
+        name: String,
+    }
+
+    impl RoCtx {
+        fn request_for(&self, target: Ulid) -> DischargeRequest {
+            let ts = now_unix();
+            // Vary the nonce by target so reuse across targets in one test
+            // doesn't trip the single-use cache.
+            let nonce = target.to_bytes();
+            let proof = sign_volume_possession(
+                self.owned_signer.as_ref(),
+                &self.owned,
+                &target,
+                &self.cid,
+                ts,
+                &nonce,
+            );
+            DischargeRequest {
+                cid: encode_hex(&self.cid),
+                name: self.name.clone(),
+                owned: self.owned.to_string(),
+                target: target.to_string(),
+                ts,
+                nonce: encode_hex(&nonce),
+                proof: encode_hex(&proof),
+            }
+        }
+    }
+
+    async fn ro_ancestor_ctx() -> RoCtx {
+        let v = vectors();
+        let k_m_b: [u8; 32] = elide_core::signing::decode_hex(v["k_m_b"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let r: [u8; 32] = elide_core::signing::decode_hex(v["r"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let cid = crypto::encrypt_cid_attested(&k_m_b, &r, "client", "org", MODE_RO_ANCESTOR);
+
+        let owned_sk = SigningKey::generate(&mut OsRng);
+        let parent_sk = SigningKey::generate(&mut OsRng);
+        let owned = Ulid::new();
+        let parent = Ulid::new();
+        let extent = Ulid::new();
+        let name = "ro-vol".to_string();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // owned forks `parent` and names `extent` as an extent source.
+        publish_meta(
+            store.as_ref(),
+            owned,
+            &owned_sk,
+            Some(ParentRef {
+                volume_ulid: parent.to_string(),
+                snapshot_ulid: Ulid::new().to_string(),
+                pubkey: parent_sk.verifying_key().to_bytes(),
+                manifest_pubkey: None,
+            }),
+            vec![format!("{extent}/{}", Ulid::new())],
+        )
+        .await;
+        // parent is a root volume; the extent source is a leaf the walk
+        // records by ULID without expanding, so it needs no provenance.
+        publish_meta(store.as_ref(), parent, &parent_sk, None, Vec::new()).await;
+
+        let record = NameRecord::live_minimal(owned, 4 * 1024 * 1024 * 1024);
+        put_object(
+            store.as_ref(),
+            &format!("names/{name}"),
+            record.to_toml().unwrap().into_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let owned_signer = signer_from_bytes(&owned_sk.to_bytes()).unwrap().0;
+        RoCtx {
+            state: DischargeState::new(k_m_b, store),
+            owned,
+            parent,
+            extent,
+            owned_signer,
+            cid,
+            name,
+        }
+    }
+
+    #[tokio::test]
+    async fn ro_ancestor_discharges_a_fork_parent() {
+        let ctx = ro_ancestor_ctx().await;
+        let wire = ctx
+            .state
+            .discharge(ctx.request_for(ctx.parent))
+            .await
+            .expect("fork parent is in the read set");
+        assert!(wire.starts_with("mnt1_"));
+    }
+
+    #[tokio::test]
+    async fn ro_ancestor_discharges_an_extent_source() {
+        let ctx = ro_ancestor_ctx().await;
+        let wire = ctx
+            .state
+            .discharge(ctx.request_for(ctx.extent))
+            .await
+            .expect("extent source is in the read set");
+        assert!(wire.starts_with("mnt1_"));
+    }
+
+    #[tokio::test]
+    async fn ro_ancestor_discharges_the_owned_volume_itself() {
+        let ctx = ro_ancestor_ctx().await;
+        let wire = ctx
+            .state
+            .discharge(ctx.request_for(ctx.owned))
+            .await
+            .expect("owned is its own read set member");
+        assert!(wire.starts_with("mnt1_"));
+    }
+
+    #[tokio::test]
+    async fn ro_ancestor_rejects_target_outside_the_read_set() {
+        let ctx = ro_ancestor_ctx().await;
+        let stranger = Ulid::new();
+        assert!(matches!(
+            ctx.state.discharge(ctx.request_for(stranger)).await,
             Err(DischargeError::Denied(_))
         ));
     }

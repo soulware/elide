@@ -19,8 +19,11 @@
 //! mint implementation in both test suites; see the test below and
 //! `mint/tests/discharge_vectors.rs`.
 //!
-//! coord B never *encrypts* a CID (mint does) and never *verifies* a
-//! discharge (mint does), so only the decrypt and mint halves appear here.
+//! coord B never *encrypts* a CID in production (mint does) and never
+//! *verifies* a discharge (mint does). A test-only [`encrypt_cid_attested`]
+//! is the exact inverse of the decrypt half, used to construct
+//! discharge-predicate fixtures for `mode`s the shared vector omits; it is
+//! pinned to the canonical layout by round-tripping the fixture CID.
 
 use aes_gcm_siv::aead::{Aead, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Key, Nonce};
@@ -105,6 +108,32 @@ fn parse_attested_cid(buf: &[u8]) -> Result<AttestedCid, CryptoError> {
         org_id,
         mode,
     })
+}
+
+/// Test-only inverse of [`decrypt_cid_attested`]: seal
+/// `r ‖ lp(client_id) ‖ lp(org_id) ‖ lp(mode)` under `K_M-B`. Production
+/// never seals CIDs — mint does — so this exists only to construct fixtures
+/// for `mode`s the shared vector does not carry. Its layout is pinned to the
+/// canonical one by `encrypt_reproduces_fixture_cid` below.
+#[cfg(test)]
+pub(crate) fn encrypt_cid_attested(
+    k_m_b: &[u8; 32],
+    r: &[u8; 32],
+    client_id: &str,
+    org_id: &str,
+    mode: &str,
+) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(32 + client_id.len() + org_id.len() + mode.len() + 12);
+    plaintext.extend_from_slice(r);
+    for s in [client_id, org_id, mode] {
+        let len: u32 = s.len().try_into().expect("field fits u32");
+        plaintext.extend_from_slice(&len.to_be_bytes());
+        plaintext.extend_from_slice(s.as_bytes());
+    }
+    let cipher = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(k_m_b));
+    cipher
+        .encrypt(Nonce::from_slice(&FIXED_AEAD_NONCE), plaintext.as_slice())
+        .expect("aes-gcm-siv encrypt is infallible for this payload size")
 }
 
 fn read_length_prefixed_str(buf: &[u8], pos: &mut usize) -> Result<String, CryptoError> {
@@ -249,6 +278,37 @@ mod tests {
         let exp = v["exp"].as_str().unwrap();
         let wire = mint_discharge_with_nonce(&r, &nonce, &[("volume", volume), ("exp", exp)]);
         assert_eq!(wire, v["discharge_wire"].as_str().unwrap());
+    }
+
+    #[test]
+    fn encrypt_reproduces_fixture_cid() {
+        // AES-GCM-SIV with the fixed nonce is deterministic, so the test-only
+        // sealer must reproduce mint's canonical CID byte-for-byte — pinning
+        // its layout to the same vector the decrypt half is pinned to.
+        let v = vectors();
+        let k_m_b = hex32(&v, "k_m_b");
+        let r = hex32(&v, "r");
+        let cid = encrypt_cid_attested(
+            &k_m_b,
+            &r,
+            v["client_id"].as_str().unwrap(),
+            v["org_id"].as_str().unwrap(),
+            v["mode"].as_str().unwrap(),
+        );
+        assert_eq!(cid, decode_hex(v["cid"].as_str().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn encrypt_decrypt_round_trips_an_arbitrary_mode() {
+        let v = vectors();
+        let k_m_b = hex32(&v, "k_m_b");
+        let r = hex32(&v, "r");
+        let cid = encrypt_cid_attested(&k_m_b, &r, "client-x", "org-y", "ro-ancestor");
+        let pt = decrypt_cid_attested(&k_m_b, &cid).expect("decrypt");
+        assert_eq!(pt.r, r);
+        assert_eq!(pt.client_id, "client-x");
+        assert_eq!(pt.org_id, "org-y");
+        assert_eq!(pt.mode, "ro-ancestor");
     }
 
     #[test]

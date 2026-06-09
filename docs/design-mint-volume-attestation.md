@@ -428,7 +428,7 @@ own no volumes of its own; its job is to discharge. Being a coordinator,
 it already has everything the discharge predicate needs: S3 read,
 provenance-signature verification, and claim-record resolution.
 
-### The lineage walk is one shared per-link step, two fetch drivers
+### The lineage walk shares its per-link step; the driver loops differ by source
 
 The read path and coord B walk the **same signed lineage** from different
 sources. The read path reads a volume's *local* copies
@@ -436,28 +436,30 @@ sources. The read path reads a volume's *local* copies
 coord B reads the *S3* copies (`meta/<vol>.{provenance,pub}` — § *S3
 access*) **asynchronously**, holding no local volume. A single async
 function cannot serve both without forcing the synchronous open path onto
-a runtime, and two independent walks would be exactly the drift the
-`rebuild-is-invariant` rule forbids.
+a runtime.
 
-The resolution single-sources the **trust-critical per-link step** —
-parse a `volume.provenance`, verify it under the pubkey the *child*
-committed (the root verified under its own `volume.pub`), extract
-`parent` and `extent_index`, detect cycles — as one pure function in
-`elide-core`, parameterised by a `ProvenanceSource` yielding
-`(provenance_bytes, volume.pub)` for a ULID. Two thin driver loops call
-it: a synchronous local-file source (the read path's
-`walk_ancestors`/`walk_extent_ancestors`) and an asynchronous
-`meta/`-prefix object-store source (coord B). The peer-fetch ancestry
-walk (`elide-peer-fetch/src/ancestry.rs`) folds in as a third caller —
-its standalone copy retires, running the shared step with a fork-only
-driver (it deliberately omits `extent_index`; scope is a driver choice,
-not a separate walk).
+The **trust-critical per-link step is single-sourced** in `elide-core`:
+the signature verify (`signing::verify_lineage_with_key` — parse a
+`volume.provenance`, check it under the pubkey the *child* committed, the
+root under its own `volume.pub`) and the `extent_index`-entry parser
+(`volume::parse_lineage_pair` — validate both ULIDs, reject traversal).
+Every walk bottoms out in these, so the definition of a valid link cannot
+drift between vouching and reading.
 
-This makes **vouchable ≡ readable** literal rather than asserted: the
-definition of a valid ancestor and the computed ancestor set come from
-one body of code, so a volume coord B refuses to vouch for is one the
-read path could not have served, and vice versa. Only the ~10-line fetch
-loop differs by source, and it carries no trust logic to drift.
+The driver loops — fetch a volume's bytes, follow `parent`, accumulate the
+set, detect cycles — differ by source and live with their consumer:
+
+- the read path's synchronous local-file `walk_ancestors` /
+  `walk_extent_ancestors` (`elide-core`);
+- coord B's asynchronous `meta/`-prefix walk (`elide-peer-fetch`), which
+  the peer-fetch fork-only ancestry walk now shares: a `meta`/`by_id`
+  layout switch and an `include_extents` flag select fork-only (peer
+  auth) versus fork ∪ extent (attestation).
+
+**vouchable ≡ readable** is pinned by an equivalence test: coord B's
+`walk_lineage_set(owned)` must equal the read path's `lineage_ulids(owned)`
+plus `owned` itself over the same lineage. A change that made coord B
+vouch for more or less than a reader can reach fails it.
 
 coord B enrolls like any coordinator and **additionally enrolls as a
 discharge authority**, establishing the symmetric `K_M-B` with mint the
@@ -569,8 +571,7 @@ allows it; pin with vectors only where it does not.
 - **Possession-proof binding** is fixed (see that section): domain-tagged
   Ed25519 over `owned ‖ target ‖ blake3(cid) ‖ ts ‖ nonce`, `blake3(cid)`
   the anti-transfer binding.
-- **coord B is a true (limited) coord instance**, sharing the read path's
-  `walk_*` code so vouchable ≡ readable by construction; it enrolls as a
+- **coord B is a true (limited) coord instance**; it enrolls as a
   discharge authority establishing `K_M-B` per the auth service's `K_M-A`
   pattern (see *The attestation coordinator…*).
 - **The verifier reuses `coord-ro` unchanged** — its possession / lineage
@@ -578,13 +579,14 @@ allows it; pin with vectors only where it does not.
   matching `coord-ro`'s `by_id/`-free exposed-verifier invariant. No new
   role; no bootstrap loop (`coord-ro` is `caveat.sub`-gated, not
   volume-attested).
-- **The lineage walk is single-sourced across the read path and coord B.**
-  One trust-critical per-link step in `elide-core` (parse + verify under
-  the child-committed pubkey + extract `parent`/`extent_index` +
-  cycle-check), parameterised by a `ProvenanceSource`; a sync local-file
-  driver (read path) and an async `meta/`-object-store driver (coord B)
-  share it, and peer-fetch's standalone ancestry walk folds in (fork-only
-  driver). Makes `vouchable ≡ readable` literal. The read set is exactly
+- **The lineage walk's trust-critical per-link step is single-sourced** in
+  `elide-core` (the signature verify `verify_lineage_with_key` and the
+  `extent_index`-entry parser `parse_lineage_pair`); the driver loops
+  differ by source — the read path's sync local-file walks, and coord B's
+  async `meta/` walk, which peer-fetch's fork-only ancestry walk shares via
+  a layout switch and an `include_extents` flag. `vouchable ≡ readable` is
+  pinned by an equivalence test (coord B's `walk_lineage_set(owned)` ==
+  `lineage_ulids(owned)` ∪ `{owned}`). The read set is exactly
   `walk_ancestors ∪ walk_extent_ancestors`, complete by construction
   because write-time dedup is gated on the extent index rebuilt from
   precisely that union (see *The read set is exactly fork ∪ extent_index*).

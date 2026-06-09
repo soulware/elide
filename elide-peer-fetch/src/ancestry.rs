@@ -1,66 +1,138 @@
-//! ObjectStore-backed ancestry walker for the peer-fetch auth pipeline.
+//! ObjectStore-backed ancestry walkers.
 //!
-//! Given a starting `vol_ulid`, walks the signed `volume.provenance`
-//! parent chain and returns the set of fork ULIDs that make up the
-//! volume's ancestry (including the starting volume itself).
+//! Two consumers, one shared per-step verify and one shared driver:
 //!
-//! The store is supplied by the caller. The peer-fetch auth pipeline
-//! passes a `LocalFileSystem` rooted at the coordinator's `data_dir`,
-//! so the walk reads the peer's *own local* `by_id/<vol>/volume.
-//! {provenance,pub}` — the copies it holds for every fork it serves.
-//! Lineage is therefore established with no S3 read and no credential
-//! (docs/design-peer-segment-fetch.md § Peer verification, check 4). A
-//! fork the peer does not serve has no local provenance: the walk
-//! returns a `NotFound` error and the caller fails closed (declines;
-//! the requester falls back to S3).
+//! - [`walk_ancestry`] — the peer-fetch auth pipeline. Fork-parent chain
+//!   only, read from the peer's *own local* `by_id/<vol>/volume.
+//!   {provenance,pub}` (a `LocalFileSystem` rooted at the coordinator's
+//!   `data_dir` — no S3 read, no credential; see
+//!   docs/design-peer-segment-fetch.md § Peer verification, check 4). A
+//!   fork the peer does not serve has no local provenance: the walk
+//!   returns `NotFound` and the caller fails closed (declines; the
+//!   requester falls back to S3). `extent_index` sources are *excluded* —
+//!   peer-fetch authorisation matches what the S3 IAM layer enforces (the
+//!   volume's own prefix and its fork-parent prefixes), a dedup-source
+//!   relationship is not a "may read those segments" relationship.
 //!
-//! Trust shape mirrors the local-filesystem walker in
-//! `elide-core::signing` and the read-path walker in
-//! `elide-coordinator::prefetch`:
+//! - [`walk_lineage_set`] — coord B's volume-attestation discharge
+//!   (docs/design-mint-volume-attestation.md). Fork-parent chain **plus**
+//!   every `extent_index` source named along it, read from the canonical
+//!   signed `meta/<ulid>.{provenance,pub}` over coord-ro S3. This is the
+//!   exact set whose `by_id/<ulid>/` prefixes a reader operating as the
+//!   owned volume may visit (dedup canonicals and delta bases live in
+//!   extent sources), so it equals `elide_core::volume::lineage_ulids`
+//!   plus the owned volume itself.
 //!
-//! - The starting volume's `volume.provenance` is verified against
-//!   `volume.pub` in its own `by_id/<vol_ulid>/` prefix.
-//! - Each ancestor step is verified against the `parent_pubkey`
-//!   embedded in the *child's* signed provenance — never against the
-//!   `volume.pub` sitting in the ancestor's prefix. This is the same
-//!   trust anchoring used at volume open time.
+//! Trust shape (both walks):
 //!
-//! The walk follows the fork-parent chain only. `extent_index`
-//! ancestors do not contribute to peer-fetch ancestry: they're a
-//! dedup-source relationship, not a "this volume can read those
-//! segments" relationship. Peer-fetch authorisation matches what the
-//! S3 IAM layer will eventually enforce — the volume's own prefix and
-//! its fork-parent prefixes — so the walk is fork-only.
+//! - The starting volume's `volume.provenance` is verified against its
+//!   trust-anchor pubkey: for [`walk_ancestry`] the `volume.pub` in its
+//!   own prefix; for [`walk_lineage_set`] the key the caller supplies —
+//!   coord B passes the key it already verified the possession proof
+//!   against, so the walk is anchored at the same identity it attested.
+//! - Each ancestor step is verified against the `parent_pubkey` embedded
+//!   in the *child's* signed provenance — never against whatever
+//!   `volume.pub` sits in the ancestor's prefix. This is the same trust
+//!   anchoring used at volume open time.
 
 use std::collections::HashSet;
 use std::io;
 
 use ed25519_dalek::VerifyingKey;
 use elide_core::signing::{VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, verify_lineage_with_key};
+use elide_core::store_keys::{meta_provenance_key, meta_pub_key};
 use object_store::Error as ObjectStoreError;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use ulid::Ulid;
 
-/// Walk the fork-parent ancestry of `starting_vol_ulid` against
-/// `store`. Returns the set of fork ULIDs in the ancestry, including
-/// `starting_vol_ulid` itself.
+/// Where a walk reads `volume.{provenance,pub}` from. `ById` is the peer's
+/// local copies under `by_id/<ulid>/`; `Meta` is the canonical signed copy
+/// at the flat `meta/<ulid>.{provenance,pub}` keys that coord-ro grants.
+#[derive(Clone, Copy)]
+enum Layout {
+    ById,
+    Meta,
+}
+
+impl Layout {
+    fn pub_key(self, vol: &Ulid) -> StorePath {
+        match self {
+            Layout::ById => StorePath::from(format!("by_id/{vol}/{VOLUME_PUB_FILE}")),
+            Layout::Meta => StorePath::from(meta_pub_key(*vol)),
+        }
+    }
+
+    fn provenance_key(self, vol: &Ulid) -> StorePath {
+        match self {
+            Layout::ById => StorePath::from(format!("by_id/{vol}/{VOLUME_PROVENANCE_FILE}")),
+            Layout::Meta => StorePath::from(meta_provenance_key(*vol)),
+        }
+    }
+}
+
+/// Walk the fork-parent ancestry of `starting_vol_ulid` against the peer's
+/// local `by_id/` copies. Returns the set of fork ULIDs in the ancestry,
+/// including `starting_vol_ulid` itself. Fork-only; see module docs.
 ///
-/// Each step is signature-verified — failures bubble up as
-/// `io::Error`, so callers can map them to 401/403 responses.
+/// Each step is signature-verified — failures bubble up as `io::Error`, so
+/// callers can map them to 401/403 responses.
 pub async fn walk_ancestry(
     store: &dyn ObjectStore,
     starting_vol_ulid: Ulid,
 ) -> io::Result<HashSet<Ulid>> {
-    let mut set = HashSet::new();
-    set.insert(starting_vol_ulid);
-
     // Trust anchor for the starting volume: its own local `volume.pub`.
-    let mut current_ulid = starting_vol_ulid;
-    let mut current_vk = load_volume_pub(store, &current_ulid).await?;
+    let start_vk = load_volume_pub(store, &starting_vol_ulid, Layout::ById).await?;
+    walk(store, starting_vol_ulid, start_vk, Layout::ById, false).await
+}
+
+/// Walk the fork-parent chain of `owned` over coord-ro `meta/*`, unioning
+/// every `extent_index` source named along it, anchored at `owned_vk` (the
+/// key coord B verified the possession proof against). Returns the full set
+/// of volume ULIDs whose `by_id/` prefixes a reader operating as `owned`
+/// may visit, including `owned` itself. See module docs.
+pub async fn walk_lineage_set(
+    store: &dyn ObjectStore,
+    owned: Ulid,
+    owned_vk: VerifyingKey,
+) -> io::Result<HashSet<Ulid>> {
+    walk(store, owned, owned_vk, Layout::Meta, true).await
+}
+
+/// Shared driver. Follows the fork-parent chain from `start` (anchored at
+/// `start_vk`, then each child-committed parent pubkey), inserting every
+/// fork ULID. When `include_extents`, also inserts each `extent_index`
+/// source named in the provenance at every step — those sources are leaves
+/// (the `extent_index` is already flat at attach time, so their own lineage
+/// is not expanded).
+async fn walk(
+    store: &dyn ObjectStore,
+    start: Ulid,
+    start_vk: VerifyingKey,
+    layout: Layout,
+    include_extents: bool,
+) -> io::Result<HashSet<Ulid>> {
+    let mut set = HashSet::new();
+    set.insert(start);
+
+    let mut current_ulid = start;
+    let mut current_vk = start_vk;
 
     loop {
-        let lineage = load_provenance(store, &current_ulid, &current_vk).await?;
+        let lineage = load_provenance(store, &current_ulid, &current_vk, layout).await?;
+
+        if include_extents {
+            for entry in &lineage.extent_index {
+                let (source, _snapshot) =
+                    elide_core::volume::parse_lineage_pair(entry).map_err(|e| {
+                        io::Error::other(format!(
+                            "provenance for {current_ulid}: bad extent_index entry: {e}"
+                        ))
+                    })?;
+                set.insert(source);
+            }
+        }
+
         let Some(parent) = lineage.parent else {
             break;
         };
@@ -95,8 +167,12 @@ pub async fn walk_ancestry(
     Ok(set)
 }
 
-async fn load_volume_pub(store: &dyn ObjectStore, vol_ulid: &Ulid) -> io::Result<VerifyingKey> {
-    let key = StorePath::from(format!("by_id/{vol_ulid}/{VOLUME_PUB_FILE}"));
+async fn load_volume_pub(
+    store: &dyn ObjectStore,
+    vol_ulid: &Ulid,
+    layout: Layout,
+) -> io::Result<VerifyingKey> {
+    let key = layout.pub_key(vol_ulid);
     let body = store
         .get(&key)
         .await
@@ -152,8 +228,9 @@ async fn load_provenance(
     store: &dyn ObjectStore,
     vol_ulid: &Ulid,
     verifying_key: &VerifyingKey,
+    layout: Layout,
 ) -> io::Result<elide_core::signing::ProvenanceLineage> {
-    let key = StorePath::from(format!("by_id/{vol_ulid}/{VOLUME_PROVENANCE_FILE}"));
+    let key = layout.provenance_key(vol_ulid);
     let body = store
         .get(&key)
         .await
@@ -237,6 +314,100 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// Write `volume.{provenance,pub}` for `ulid` both to a local
+    /// `by_id/<ulid>/` dir (what the sync read-path walk reads) and to
+    /// `meta/<ulid>.{provenance,pub}` on the store (what coord B reads),
+    /// from one key — so the two walks see byte-identical lineage.
+    async fn publish_both(
+        by_id: &std::path::Path,
+        store: &dyn ObjectStore,
+        ulid: Ulid,
+        key: &SigningKey,
+        parent: Option<ParentRef>,
+        extent_index: Vec<String>,
+    ) {
+        let dir = by_id.join(ulid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(VOLUME_PUB_FILE), pub_hex(key)).unwrap();
+        let lineage = ProvenanceLineage {
+            parent,
+            extent_index,
+            oci_source: None,
+        };
+        write_provenance(&dir, key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
+
+        let prov = std::fs::read(dir.join(VOLUME_PROVENANCE_FILE)).unwrap();
+        let pubb = std::fs::read(dir.join(VOLUME_PUB_FILE)).unwrap();
+        store
+            .put(
+                &StorePath::from(meta_provenance_key(ulid)),
+                Bytes::from(prov).into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &StorePath::from(meta_pub_key(ulid)),
+                Bytes::from(pubb).into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The load-bearing "vouchable ≡ readable" pin: coord B's signed-lineage
+    /// walk over `meta/*` returns exactly the read path's
+    /// `lineage_ulids` (fork chain ∪ extent sources) plus the owned volume
+    /// itself. If a future change makes coord B vouch for more or less than
+    /// a reader can reach, this fails.
+    #[tokio::test]
+    async fn walk_lineage_set_equals_read_path_plus_owned() {
+        let by_id = TempDir::new().unwrap();
+        let store = store();
+
+        let owned_key = SigningKey::generate(&mut OsRng);
+        let parent_key = SigningKey::generate(&mut OsRng);
+        let owned = Ulid::new();
+        let parent = Ulid::new();
+        let extent = Ulid::new();
+
+        publish_both(
+            by_id.path(),
+            store.as_ref(),
+            owned,
+            &owned_key,
+            Some(ParentRef {
+                volume_ulid: parent.to_string(),
+                snapshot_ulid: Ulid::new().to_string(),
+                pubkey: parent_key.verifying_key().to_bytes(),
+                manifest_pubkey: None,
+            }),
+            vec![format!("{extent}/{}", Ulid::new())],
+        )
+        .await;
+        publish_both(
+            by_id.path(),
+            store.as_ref(),
+            parent,
+            &parent_key,
+            None,
+            Vec::new(),
+        )
+        .await;
+
+        let owned_dir = by_id.path().join(owned.to_string());
+        let mut expected: HashSet<Ulid> =
+            elide_core::volume::lineage_ulids(&owned_dir, by_id.path())
+                .unwrap()
+                .into_iter()
+                .collect();
+        expected.insert(owned);
+
+        let got = walk_lineage_set(store.as_ref(), owned, owned_key.verifying_key())
+            .await
+            .unwrap();
+        assert_eq!(got, expected, "coord B must vouch exactly the read set");
     }
 
     #[tokio::test]
