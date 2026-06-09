@@ -27,6 +27,7 @@ http-body-util = "0.1"
 clap         = { version = "4", features = ["derive"] }
 elide-core   = { path = "../elide-core" }
 lz4_flex     = "0.11"
+elide-attestation = { path = "../elide-attestation" }
 elide-fetch  = { path = "../elide-fetch" }
 elide-peer-fetch = { path = "../elide-peer-fetch" }
 futures      = "0.3"

@@ -26,7 +26,7 @@ use elide_core::segment::{
 use elide_core::signing::{ProvenanceLineage, write_provenance};
 use elide_fetch::RangeFetcher;
 use elide_peer_fetch::auth::AuthState;
-use elide_peer_fetch::server::{ServerContext, router};
+use elide_peer_fetch::server::{ServerContext, peer_fetch_router};
 use elide_peer_fetch::{
     BodyFetchClient, ClaimerTokenProvider, PeerEndpoint, PeerFetchToken, PeerRangeFetcher,
 };
@@ -173,7 +173,7 @@ async fn spawn_peer(store: Arc<dyn ObjectStore>, data_dir: TempDir) -> TestPeer 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_addr = listener.local_addr().unwrap();
     let ctx = ServerContext::new(auth, data_dir.path().to_owned());
-    let app = router(ctx);
+    let app = peer_fetch_router(ctx);
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });

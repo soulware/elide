@@ -1206,6 +1206,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "elide-attestation"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm-siv",
+ "axum",
+ "base64",
+ "blake3",
+ "bytes",
+ "ed25519-dalek",
+ "elide-core",
+ "object_store",
+ "rand_core 0.6.4",
+ "rmp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "elide-coordinator"
 version = "0.1.0"
 dependencies = [
@@ -1217,6 +1240,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "elide-attestation",
  "elide-coordinator",
  "elide-core",
  "elide-fetch",
@@ -1318,7 +1342,6 @@ dependencies = [
 name = "elide-peer-fetch"
 version = "0.1.0"
 dependencies = [
- "aes-gcm-siv",
  "async-trait",
  "axum",
  "base64",
@@ -1331,7 +1354,6 @@ dependencies = [
  "object_store",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
- "rmp",
  "serde",
  "serde_json",
  "tempfile",

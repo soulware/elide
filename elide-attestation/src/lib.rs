@@ -1,12 +1,11 @@
-//! The attestation-coordinator (coord B) discharge endpoint.
+//! coord B — mint's volume-attestation discharge authority.
 //!
-//! coord B is mint's volume-attestation discharge authority
-//! (`docs/design-mint-volume-attestation.md`). It serves `POST /v1/discharge`
-//! on this peer-fetch server — the structural twin that already holds
-//! `coord-ro` and verifies signed metadata — recovering `r` from an attested
-//! TPC's CID, verifying a possession proof of the volume's signing key over
-//! public signed state, and minting a discharge that attests the scoped
-//! volume.
+//! A standalone crate (`docs/design-mint-volume-attestation.md`): the
+//! coordinator runs it as a `POST /v1/discharge` listener, separate from
+//! peer fetch. It recovers `r` from an attested TPC's CID, verifies a
+//! possession proof of the volume's signing key over public signed state
+//! (`coord-ro` only — `meta/*` + `names/*`, never `by_id/` bodies), and
+//! mints a discharge that attests the scoped volume.
 //!
 //! Two modes are served, distinguished by the opaque `mode` mint sealed
 //! into the CID:
@@ -19,6 +18,8 @@
 //!   established by a signed-lineage walk over coord-ro `meta/*`.
 
 pub mod crypto;
+pub mod lineage;
+pub mod serve;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -134,10 +135,9 @@ impl IntoResponse for DischargeError {
 /// stays bounded by `2 × skew`.
 type SeenCache = HashMap<(String, String), u64>;
 
-/// coord B's discharge-authority state, threaded onto the peer-fetch
-/// [`crate::server::ServerContext`]. Present only on a coordinator enrolled
-/// as a discharge authority (holds `K_M-B`); absent otherwise, so the
-/// route fails closed with `404`.
+/// coord B's discharge-authority state — the axum state for the
+/// `POST /v1/discharge` router ([`discharge_router`]). Holds the symmetric
+/// `K_M-B` and a `coord-ro` store.
 #[derive(Clone)]
 pub struct DischargeState {
     inner: Arc<DischargeInner>,
@@ -241,7 +241,7 @@ impl DischargeState {
             Mode::RwSelf => RW_SELF_DISCHARGE_TTL_SECS,
             Mode::RoAncestor => {
                 let read_set =
-                    crate::ancestry::walk_lineage_set(self.inner.store.as_ref(), owned, owned_pub)
+                    crate::lineage::walk_lineage_set(self.inner.store.as_ref(), owned, owned_pub)
                         .await
                         .map_err(|_| DischargeError::Denied("lineage"))?;
                 if !read_set.contains(&target) {
@@ -310,15 +310,22 @@ impl DischargeState {
     }
 }
 
-/// Axum handler for `POST /v1/discharge`. Fails closed with `404` when this
-/// coordinator is not a discharge authority.
+/// Build the [`axum::Router`] for the discharge route (`POST
+/// /v1/discharge`), served on its own listener — independent of the
+/// peer-fetch segment routes (`docs/design-mint-volume-attestation.md`
+/// § *Proposed: per-endpoint transport*).
+pub fn discharge_router(state: DischargeState) -> axum::Router {
+    axum::Router::new()
+        .route("/v1/discharge", axum::routing::post(handle_discharge))
+        .with_state(state)
+}
+
+/// Axum handler for `POST /v1/discharge`. The route exists only when the
+/// authority is configured, so there is no not-enabled case to gate here.
 pub async fn handle_discharge(
-    State(ctx): State<crate::server::ServerContext>,
+    State(state): State<DischargeState>,
     Json(req): Json<DischargeRequest>,
 ) -> Response {
-    let Some(state) = ctx.discharge.as_ref() else {
-        return (StatusCode::NOT_FOUND, "discharge authority not enabled").into_response();
-    };
     match state.discharge(req).await {
         Ok(discharge) => Json(DischargeResponse { discharge }).into_response(),
         Err(e) => {

@@ -313,7 +313,7 @@ mod tests {
     use super::*;
     use crate::auth::AuthState;
     use crate::client::ClaimerTokenProvider;
-    use crate::server::{ServerContext, router};
+    use crate::server::{ServerContext, peer_fetch_router};
     use crate::token::PeerFetchToken;
     use bytes::Bytes;
     use ed25519_dalek::{Signer, SigningKey};
@@ -557,7 +557,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
         let ctx = ServerContext::new(auth, data_dir.path().to_owned());
-        let app = router(ctx);
+        let app = peer_fetch_router(ctx);
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
