@@ -297,3 +297,202 @@ mod tests {
         assert_eq!(EffectiveCaveats::new(&c).min_bound("exp"), Some(3000));
     }
 }
+
+/// Property-based tests for caveat resolution. The example tests above
+/// pin specific scenarios; these assert the same invariants hold for
+/// *every* chain a holder could assemble. The chain alphabet is small
+/// on purpose — a handful of names and values — so agreement,
+/// disagreement, and absence all occur densely rather than every
+/// generated caveat being unique.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    /// The names queried by every property. `resolve` is checked against
+    /// each, so absent and present cases are both exercised per run.
+    const NAMES: &[&str] = &["a", "b", "c", "exp", "sub"];
+
+    fn fp_name() -> impl Strategy<Value = String> {
+        prop_oneof![Just("a"), Just("b"), Just("c"), Just("exp"), Just("sub"),]
+            .prop_map(String::from)
+    }
+
+    /// Small token values plus a numeric range — the tokens drive
+    /// agreement/disagreement, the numbers exercise `min_bound`.
+    fn fp_value() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("x".to_string()),
+            Just("y".to_string()),
+            Just("z".to_string()),
+            (0u64..10_000).prop_map(|n| n.to_string()),
+        ]
+    }
+
+    /// A chain step: mostly first-party scalars, occasionally a
+    /// third-party caveat (which name-based resolution must ignore).
+    fn any_caveat() -> impl Strategy<Value = Caveat> {
+        prop_oneof![
+            9 => (fp_name(), fp_value()).prop_map(|(n, v)| Caveat::scalar(n, v)),
+            1 => (vec(any::<u8>(), 0..6), vec(any::<u8>(), 0..6))
+                .prop_map(|(vid, cid)| Caveat::third_party("auth", vid, cid)),
+        ]
+    }
+
+    fn chain() -> impl Strategy<Value = Vec<Caveat>> {
+        vec(any_caveat(), 0..16)
+    }
+
+    /// First-party values for `name`, in chain order — the raw material
+    /// every oracle below recomputes from.
+    fn fp_values<'a>(chain: &'a [Caveat], name: &str) -> Vec<&'a str> {
+        chain
+            .iter()
+            .filter_map(|c| match c {
+                Caveat::FirstParty { name: n, value } if n == name => Some(value.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Independent oracle for `resolve`, formulated by distinct-value
+    /// *cardinality* rather than the implementation's sequential
+    /// all-equal scan — so agreement of the two is a real cross-check.
+    fn oracle_resolve(chain: &[Caveat], name: &str) -> Resolved {
+        let distinct: BTreeSet<&str> = fp_values(chain, name).into_iter().collect();
+        match distinct.len() {
+            0 => Resolved::Absent,
+            1 => Resolved::Value(distinct.into_iter().next().unwrap_or_default().to_string()),
+            _ => Resolved::Unsatisfiable,
+        }
+    }
+
+    proptest! {
+        /// `resolve` agrees with the cardinality oracle for every name.
+        #[test]
+        fn resolve_matches_oracle(chain in chain()) {
+            let eff = EffectiveCaveats::new(&chain);
+            for &name in NAMES {
+                prop_assert_eq!(eff.resolve(name), oracle_resolve(&chain, name));
+            }
+        }
+
+        /// The tri-state characterisation — and the downgrade footgun it
+        /// guards: disagreement resolves `Unsatisfiable`, never `Absent`.
+        /// Absent ⟺ no occurrence; Value(v) ⟺ exactly one distinct value;
+        /// Unsatisfiable ⟺ ≥2 distinct values.
+        #[test]
+        fn resolve_tristate_characterisation(chain in chain()) {
+            let eff = EffectiveCaveats::new(&chain);
+            for &name in NAMES {
+                let distinct: BTreeSet<&str> = fp_values(&chain, name).into_iter().collect();
+                match eff.resolve(name) {
+                    Resolved::Absent => prop_assert!(distinct.is_empty()),
+                    Resolved::Value(v) => {
+                        prop_assert_eq!(distinct.len(), 1);
+                        prop_assert_eq!(Some(v.as_str()), distinct.into_iter().next());
+                    }
+                    Resolved::Unsatisfiable => prop_assert!(distinct.len() >= 2),
+                }
+            }
+        }
+
+        /// Attenuation only narrows. Appending one more occurrence of a
+        /// name — the only move a key-less holder has via the trailing
+        /// MAC — can keep `Value` (agreeing copy) or collapse it to
+        /// `Unsatisfiable` (contradicting copy), but never re-widens.
+        #[test]
+        fn appending_only_narrows(
+            chain in vec(any_caveat(), 0..12),
+            name in fp_name(),
+            extra in fp_value(),
+        ) {
+            let before = EffectiveCaveats::new(&chain).resolve(&name);
+            let mut narrowed = chain.clone();
+            narrowed.push(Caveat::scalar(name.clone(), extra.clone()));
+            let after = EffectiveCaveats::new(&narrowed).resolve(&name);
+            match before {
+                Resolved::Absent => prop_assert_eq!(after, Resolved::Value(extra)),
+                Resolved::Value(v) => {
+                    if v == extra {
+                        prop_assert_eq!(after, Resolved::Value(v));
+                    } else {
+                        prop_assert_eq!(after, Resolved::Unsatisfiable);
+                    }
+                }
+                Resolved::Unsatisfiable => prop_assert_eq!(after, Resolved::Unsatisfiable),
+            }
+        }
+
+        /// `min_bound` is the minimum over parseable-u64 occurrences,
+        /// silently skipping non-numeric values, `None` if none parse.
+        #[test]
+        fn min_bound_matches_oracle(chain in chain()) {
+            let eff = EffectiveCaveats::new(&chain);
+            for &name in NAMES {
+                let oracle = fp_values(&chain, name)
+                    .into_iter()
+                    .filter_map(|v| v.parse::<u64>().ok())
+                    .min();
+                prop_assert_eq!(eff.min_bound(name), oracle);
+            }
+        }
+
+        /// `contains` is exact membership — orthogonal to `resolve`'s
+        /// agreement check. A name resolving `Unsatisfiable` can still
+        /// `contain` each of its disagreeing values.
+        #[test]
+        fn contains_is_membership(chain in chain()) {
+            let eff = EffectiveCaveats::new(&chain);
+            for &name in NAMES {
+                for value in ["x", "y", "z", "42", "absent"] {
+                    let expected = fp_values(&chain, name).contains(&value);
+                    prop_assert_eq!(eff.contains(name, value), expected);
+                }
+            }
+        }
+
+        /// Third-party caveats are inert to name-based resolution:
+        /// scattering arbitrary TPCs through a chain changes nothing
+        /// `resolve`, `min_bound`, or `names` reports.
+        #[test]
+        fn third_party_caveats_are_inert(
+            pairs in vec((fp_name(), fp_value()), 0..12),
+            tpcs in vec((vec(any::<u8>(), 0..6), vec(any::<u8>(), 0..6)), 0..4),
+        ) {
+            let only_fp: Vec<Caveat> =
+                pairs.iter().map(|(n, v)| Caveat::scalar(n.clone(), v.clone())).collect();
+            let mut mixed = only_fp.clone();
+            for (i, (vid, cid)) in tpcs.into_iter().enumerate() {
+                let pos = (i * 2 + 1).min(mixed.len());
+                mixed.insert(pos, Caveat::third_party("auth", vid, cid));
+            }
+            let plain = EffectiveCaveats::new(&only_fp);
+            let with_tpcs = EffectiveCaveats::new(&mixed);
+            for &name in NAMES {
+                prop_assert_eq!(plain.resolve(name), with_tpcs.resolve(name));
+                prop_assert_eq!(plain.min_bound(name), with_tpcs.min_bound(name));
+            }
+            prop_assert_eq!(plain.names(), with_tpcs.names());
+        }
+
+        /// `names` lists distinct first-party names in first-occurrence
+        /// order, with third-party caveats excluded.
+        #[test]
+        fn names_are_distinct_first_occurrence(chain in chain()) {
+            let names = EffectiveCaveats::new(&chain).names();
+
+            let mut expected = Vec::new();
+            let mut seen = BTreeSet::new();
+            for c in &chain {
+                if let Some(n) = c.first_party_name()
+                    && seen.insert(n)
+                {
+                    expected.push(n);
+                }
+            }
+            prop_assert_eq!(names, expected);
+        }
+    }
+}
