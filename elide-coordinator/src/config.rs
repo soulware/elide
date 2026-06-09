@@ -471,9 +471,9 @@ pub struct GcConfig {
 
     /// Retention window for GC input segments. After a successful GC
     /// handoff, inputs are not deleted from S3 immediately; the
-    /// coordinator writes a retention marker at
-    /// `by_id/<vol>/retention/<gc_output_ulid>` and the reaper deletes
-    /// the inputs once this window has elapsed. Accepts humantime-style
+    /// handoff records them as `superseded` entries in
+    /// `by_id/<vol>/HEAD` and the tick loop's reap step deletes them
+    /// once this window has elapsed. Accepts humantime-style
     /// strings like `"24h"`, `"30s"`, `"5m"`. Default: `10m`.
     #[serde(default = "default_retention_window", with = "humantime_serde")]
     pub retention_window: Duration,

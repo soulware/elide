@@ -19,7 +19,9 @@ retention-related subsystem implications below have been invalidated:
   — same unbounded-growth property.
 
 Consequence: retention cannot be delegated to Tigris. Elide owns
-retention via application-managed retention markers (see
+retention via the application-managed retention window — HEAD
+supersession entries reaped by the owner's tick loop (see
+`design-segment-index.md`; window semantics in
 `design-replica-model.md`). That decision removes the load-bearing
 Tigris-native primitive for the *Snapshots*, *GC / retention*, and
 *Disaster recovery* subsystems below. Those subsections are
@@ -119,8 +121,8 @@ through before picking.
 **Status: invalidated by 2026-04-24 update.** Both mappings below
 assume Tigris bucket snapshots are a bounded primitive; they aren't.
 Elide snapshots remain application-level manifest pointers as they are
-today, and retention is handled by retention markers rather than
-by delegating to a native snapshot primitive.
+today, and retention is handled by the HEAD-carried retention window
+rather than by delegating to a native snapshot primitive.
 
 Today an Elide snapshot is a `<vol_ulid, snap_ulid>` manifest pointer.
 The manifest bookkeeping exists to give volume-level atomicity on top
@@ -174,8 +176,8 @@ within segments. They are orthogonal and complementary. Dedup stays.
 **Status: retention half invalidated by 2026-04-24 update.** The
 "delegate retention to Tigris lifecycle + snapshot pinning" idea
 depends on native snapshots being bounded — they aren't. Retention
-stays in Elide via retention markers. Compaction was always
-going to stay in Elide and is unaffected.
+stays in Elide via the HEAD-carried retention window. Compaction was
+always going to stay in Elide and is unaffected.
 
 Today the coordinator runs per-segment liveness analysis across
 volumes, compacts partially-live segments, deletes unreferenced

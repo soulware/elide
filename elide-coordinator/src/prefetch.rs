@@ -27,10 +27,10 @@
 //        b. Range-GET [0..body_section_start] — header + index + inline
 //        c. Write atomically to <fork_dir>/index/<ulid>.idx
 //
-// `prefetch_indexes` therefore performs no `LIST segments/` and no
-// `LIST retention/`. Operator-initiated capture of pre-snapshot bucket
-// state (e.g. `force_snapshot_now`) goes through `pull_indexes_for_head`
-// instead, which retains the LIST + retention-marker filter.
+// `prefetch_indexes` therefore performs no bucket LISTs.
+// Operator-initiated capture of pre-snapshot bucket state
+// (e.g. `force_snapshot_now`) goes through `pull_indexes_for_head`
+// instead, which resolves the live set from HEAD.
 //
 // After this runs, Volume::open will find the .idx files, rebuild_segments and
 // extentindex::rebuild will both scan index/*.idx, and the volume opens

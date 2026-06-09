@@ -42,7 +42,7 @@ the surface reduction). `writer` and `volume_rw` keep the full
 - **No domain vocabulary.** A call site speaks `put_opts` / `get_opts`
   / `delete` / `list_with_delimiter` / `put_multipart` even when its
   operation is specific ("put this segment body", "head this
-  manifest", "delete the superseded retention marker", "advance the
+  manifest", "reap this superseded segment", "advance the
   per-vol HEAD object"). The abstraction layer the coordinator owns
   ends at the credential boundary; the *operation* layer is foreign.
 - **Key layout lives in `format!` calls scattered across the
@@ -125,12 +125,12 @@ self-publish is writer).
 Each handle is the *full* operation surface for that object class —
 it does **not** further fan out into sub-handles per verb. The cut is
 deliberately at the noun, not at the verb: a call site that publishes
-a snapshot also writes a HEAD and may delete a superseded retention
-marker, and we want those to land on one handle, not three.
+a snapshot also writes a HEAD, and we want those to land on one
+handle, not two.
 
 `VolumeData` returns sub-accessors *only* where the object class has
 internal structure with its own invariants — currently just
-`segments()`, `snapshots()`, `retention()`, `head()`. These are
+`segments()`, `snapshots()`, `head()`. These are
 non-`async` accessors on the same handle, not separate `Arc`s; they
 exist so callers state which sub-object they are touching.
 
@@ -138,7 +138,6 @@ exist so callers state which sub-object they are touching.
 trait VolumeData {
     fn segments(&self)  -> SegmentsView<'_>;
     fn snapshots(&self) -> SnapshotsView<'_>;
-    fn retention(&self) -> RetentionView<'_>;
     fn head(&self)      -> HeadView<'_>;
     fn metadata(&self)  -> MetadataView<'_>;   // volume.pub, volume.provenance
 }
@@ -241,13 +240,10 @@ computed inside the handle from the `Ulid` timestamp.
 | Read LATEST pointer | `GET snapshots/LATEST` | `read_latest() -> Option<LatestPointer>` |
 | CAS LATEST pointer | conditional `PUT` | `advance_latest(prev, new) -> Result<LatestPointer, LatestConflict>` |
 
-### `VolumeData::retention()` (`volume-rw`, `by_id/<vol>/retention/`)
-
-| Op | Today | Domain shape |
-|---|---|---|
-| Record supersession | `put_opts` | `record_supersession(inputs, output, ts)` |
-| Read supersessions | `GET by_id/<vol>/HEAD` | enumerated from the per-vol HEAD; no separate retention read op |
-| Delete (reaper) | `delete` | `delete_supersession(ulid)` |
+Supersession state has no view of its own: it lives in the per-vol
+HEAD (`superseded` / `tombstoned` sections), recorded and read through
+`head()`, with the reap step deleting segment objects through
+`segments()`.
 
 ### `VolumeData::head()` (`volume-rw`, `by_id/<vol>/HEAD`)
 
@@ -413,9 +409,7 @@ value. The migration is per-object:
 
 6. `VolumeData::segments()` — the bulk of the `upload.rs`,
    `prefetch.rs`, `gc_cycle.rs`, `inbound/lifecycle.rs` churn.
-7. `VolumeData::retention()` — small; can land with `segments()` or
-   later.
-8. `OwnIdentity` and `ControlPlaneReader` — finish, then delete
+7. `OwnIdentity` and `ControlPlaneReader` — finish, then delete
    `ScopedStores` and the `Arc<dyn ObjectStore>` accessors.
 
 Each step leaves the tree green and reduces the
