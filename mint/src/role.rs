@@ -263,3 +263,155 @@ policy_file = "volume-ro.json"
         );
     }
 }
+
+/// Property-based tests for the TTL clamp (the `min(requested, role.max,
+/// exp - now)` at the end of [`authorize`]). The example tests above pin
+/// the two clamp directions (capped by role max, capped by expiry); these
+/// assert the arithmetic invariants hold across every bound ordering.
+///
+/// Caveats are kept well-formed so every case reaches the TTL block — the
+/// caveat gate itself is covered by the example tests and by the
+/// `caveat::proptests` suite. With the gate passed, the only reachable
+/// outcomes are `Expired`, `TtlTooShort`, and `Ok(clamp)`.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::caveat::Caveat;
+    use crate::keyring::Keyring;
+    use proptest::prelude::*;
+
+    /// A served surface with one role carrying the given TTL bounds. Built
+    /// through the real config path so only surfaces the validator admits
+    /// (`0 < min ≤ default ≤ max`) are ever produced.
+    fn surface_with(min: u64, max: u64, default: u64) -> ServedSurface {
+        let toml = format!(
+            r#"
+audience = "mint"
+[store]
+bucket = "b"
+[[role]]
+name = "volume-ro"
+min_ttl_seconds = {min}
+max_ttl_seconds = {max}
+default_ttl_seconds = {default}
+policy_file = "volume-ro.json"
+"#
+        );
+        let cfg = crate::config::parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("cfg");
+        ServedSurface::from_config(&cfg, &Keyring::single([7u8; 32]), "t")
+    }
+
+    /// Well-formed caveats that pass every gate before the TTL block, with
+    /// the expiry left free so cases can be expired or live.
+    fn good_caveats(exp: u64) -> Vec<Caveat> {
+        vec![
+            Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::ROLE, "volume-ro"),
+            Caveat::scalar(name::EXP, exp.to_string()),
+            Caveat::scalar(name::SUB, "alice"),
+        ]
+    }
+
+    /// `(min, max)` with `1 ≤ min ≤ max` — the validator's admissible range.
+    fn ttl_minmax() -> impl Strategy<Value = (u64, u64)> {
+        (1u64..1000, 0u64..5000).prop_map(|(min, extra)| (min, min + extra))
+    }
+
+    fn granted(role_name: &str, ttl: u64) -> Granted {
+        Granted {
+            role_name: role_name.to_string(),
+            ttl_seconds: ttl,
+        }
+    }
+
+    proptest! {
+        /// The reachable-outcome trichotomy at the TTL stage. `Expired`
+        /// takes precedence over `TtlTooShort` (it's checked first), so:
+        /// expired ⟺ `exp ≤ now`; otherwise too-short ⟺ `requested < min`;
+        /// otherwise granted exactly the tightest of the three bounds.
+        #[test]
+        fn ttl_outcome_trichotomy(
+            (min, max) in ttl_minmax(),
+            requested in 0u64..6000,
+            exp in 0u64..2_000_000,
+            now in 0u64..1_000_000,
+        ) {
+            let result = authorize(&surface_with(min, max, min), &good_caveats(exp), "volume-ro", requested, now);
+            if exp <= now {
+                prop_assert_eq!(result, Err(Denied::Expired));
+            } else if requested < min {
+                prop_assert_eq!(result, Err(Denied::TtlTooShort));
+            } else {
+                let remaining = exp - now;
+                let tightest = [requested, max, remaining].into_iter().min().expect("nonempty");
+                prop_assert_eq!(result, Ok(granted("volume-ro", tightest)));
+            }
+        }
+
+        /// The clamp never widens past any input bound — in particular not
+        /// past the sealed `role.max`, so a drifted config cannot grant a
+        /// longer-lived credential than the operator sealed. When a grant
+        /// is issued it equals the tightest bound and is always ≥ 1.
+        #[test]
+        fn granted_never_exceeds_any_bound(
+            (min, max) in ttl_minmax(),
+            requested in 0u64..6000,
+            exp in 0u64..2_000_000,
+            now in 0u64..1_000_000,
+        ) {
+            if let Ok(g) = authorize(&surface_with(min, max, min), &good_caveats(exp), "volume-ro", requested, now) {
+                let remaining = exp - now;
+                prop_assert!(g.ttl_seconds <= requested);
+                prop_assert!(g.ttl_seconds <= max);
+                prop_assert!(g.ttl_seconds <= remaining);
+                prop_assert!(g.ttl_seconds >= 1);
+                let tightest = [requested, max, remaining].into_iter().min().expect("nonempty");
+                prop_assert_eq!(g.ttl_seconds, tightest);
+            }
+        }
+
+        /// Monotone in the requested TTL: asking for more never grants
+        /// less, and if a larger request is rejected as too-short then the
+        /// smaller one is too. Everything else held fixed.
+        #[test]
+        fn granted_monotonic_in_requested(
+            (min, max) in ttl_minmax(),
+            r_a in 0u64..6000,
+            r_b in 0u64..6000,
+            exp in 0u64..2_000_000,
+            now in 0u64..1_000_000,
+        ) {
+            let (r_lo, r_hi) = (r_a.min(r_b), r_a.max(r_b));
+            let surface = surface_with(min, max, min);
+            let cv = good_caveats(exp);
+            let lo = authorize(&surface, &cv, "volume-ro", r_lo, now);
+            let hi = authorize(&surface, &cv, "volume-ro", r_hi, now);
+            if let (Ok(a), Ok(b)) = (&lo, &hi) {
+                prop_assert!(a.ttl_seconds <= b.ttl_seconds);
+            }
+            if hi == Err(Denied::TtlTooShort) {
+                prop_assert_eq!(lo, Err(Denied::TtlTooShort));
+            }
+        }
+
+        /// `authorize` ignores `default_ttl_seconds`: the caller has
+        /// already substituted it for an absent request field, so the
+        /// granted TTL depends only on `(requested, max, exp - now)`.
+        /// Two surfaces differing solely in their default decide alike.
+        #[test]
+        fn default_ttl_does_not_affect_authorize(
+            (min, max) in ttl_minmax(),
+            d_a in 0u64..5000,
+            d_b in 0u64..5000,
+            requested in 0u64..6000,
+            exp in 0u64..2_000_000,
+            now in 0u64..1_000_000,
+        ) {
+            let clamp = |d: u64| min + d % (max - min + 1); // into [min, max]
+            let cv = good_caveats(exp);
+            let with_a = authorize(&surface_with(min, max, clamp(d_a)), &cv, "volume-ro", requested, now);
+            let with_b = authorize(&surface_with(min, max, clamp(d_b)), &cv, "volume-ro", requested, now);
+            prop_assert_eq!(with_a, with_b);
+        }
+    }
+}
