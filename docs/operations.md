@@ -114,7 +114,7 @@ elide volume start --claim <name>         # claim + start in one verb
 
 `claim` always leaves the volume `Stopped`; use `volume start` to bring up the daemon, or compose with `volume start --claim`.
 
-For `Live`/`Stopped` records held by another coordinator, run `volume claim --force <name>` (synthesises a handoff snapshot internally, equivalent to `volume release --force` then `volume claim`) — see [Disaster recovery](#disaster-recovery).
+For `Live`/`Stopped` records held by another coordinator, run `volume claim --force <name>` (force-CASes the stale record straight to a fresh fork based on the record's latest published snapshot, then re-owns the post-snapshot tail) — see [Disaster recovery](#disaster-recovery).
 
 ## Post-import workflows
 
@@ -125,7 +125,7 @@ An imported volume is readonly. Two ways to handle writes (not mutually exclusiv
 
 ## Disaster recovery
 
-- **Disk loss on a live volume.** Recoverable: everything in fully-uploaded segments. Lost: `pending/` and the in-memory WAL tail. Recover from another host with two steps: `volume release --force <name>` (declares the dead host's coordinator unreachable, synthesises a handoff snapshot from the dead fork's S3-visible segments, and flips `names/<name>` to `Released`), then `volume claim <name>` (CAS-protected — pulls the dead fork's chain, mints a fresh local fork, atomically rebinds the name). Finally `volume start <name>` brings up the daemon. The recovered fork is fresh and writable. The two steps are intentional: `release --force` is the unconditional override that declares a peer dead, and `claim` is always CAS-protected so concurrent recoveries can't both win.
+- **Disk loss on a live volume.** Recoverable: everything in fully-uploaded segments. Lost: `pending/` and the in-memory WAL tail. Recover from another host with `volume claim --force <name>`: mints a fresh local fork based on the stale record's latest published snapshot, force-CASes `names/<name>` straight to it — conditioned on the record it read, so concurrent recoveries can't both win — and re-owns the dead fork's post-snapshot tail under the new fork's prefix. Finally `volume start <name>` brings up the daemon. The recovered fork is fresh and writable.
 - **Lost private key.** S3 data remains readable (signatures verified with `volume.pub` in S3), but new writes are impossible. If snapshots exist, branch from the latest via `volume create --from <src>`. Snapshot markers are intentionally unsigned empty files, so an emergency branch point can be created by uploading an empty file to `by_id/<vol>/snapshots/<ulid>` with a ULID ≥ the latest segment.
 - **Unresponsive or dead upstream, need current state past the latest snapshot.** Today: `volume create --from <src> --force-snapshot` uploads a forker-attested "now" marker and branches from it. Proposed replacement: `volume materialize <new-name> --from <vol_ulid>` copies the upstream's current state into a self-contained new volume, pending TTL resolution — see [design-replica-model.md](design-replica-model.md).
 - **Local `cache/` deletion.** Automatic recovery — `Volume::open` rebuilds from `index/*.idx` and reads demand-fetch bodies.

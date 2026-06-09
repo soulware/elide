@@ -270,6 +270,6 @@ The point of shipping `.idx` + `.prefetch` first is to learn whether the mechani
 - **Peer hit rate** for `.idx` and `.prefetch` for handoff specifically — is it reliably high when the predecessor coordinator is alive and reachable?
 - **Warming-hint quality.** Does the peer-fetched `.prefetch` materially reduce time-to-warm vs. demand-only? If yes, peer body fetch (cutting the S3 hop entirely) is the obvious next step. If no, body fetch is a poor bet regardless.
 - **Latency improvement** for cold-claim prefetch — measurable reduction in time-to-first-read after `volume claim`.
-- **Operational behaviour** through real `release` / `claim` / `release --force` sequences — does the auth fence hold cleanly under `--force`? Are there discovery races that surfaced?
+- **Operational behaviour** through real `release` / `claim` / `claim --force` sequences — does the auth fence hold cleanly under `--force`? Are there discovery races that surfaced?
 
 If those are weak, peer body fetch likely isn't worth it. If they're strong, the body-fetch design (sketched in `design-peer-segment-fetch.md`) becomes the natural extension.

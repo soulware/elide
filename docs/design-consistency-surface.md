@@ -56,7 +56,7 @@ That single primitive carries:
 
 - Name uniqueness (no two coordinators believe they own the same name).
 - Ownership transfer (`stopped → released → live` chain).
-- The explicit-skip semantics of `volume release --force`.
+- The override semantics of `volume claim --force`.
 
 Lose linearizability on `names/<name>` and you can construct a
 two-coordinator split-brain over a single volume identity, which the
