@@ -45,10 +45,12 @@ const DEFAULT_SKEW_SECS: u64 = 30;
 /// bound and is kept short — roughly the Tigris keypair lifetime
 /// (`docs/design-mint-volume-attestation.md` § *One liveness check*).
 const RW_SELF_DISCHARGE_TTL_SECS: u64 = 300;
-/// `ro-ancestor` discharge lifetime, seconds. The read cred is gated on the
-/// owned volume staying the live claimant (`names/<name>`); the same
-/// liveness-staleness bound applies as `rw-self`, so the TTL matches.
-const RO_ANCESTOR_DISCHARGE_TTL_SECS: u64 = 300;
+/// `ro-ancestor` discharge lifetime, seconds. Ancestors are frozen and the
+/// live owner of an ancestor episode never changes, so this discharge
+/// cannot go stale the way `rw-self` can — coord B drops off the path after
+/// first-touch. The lifetime is bounded only by the primary's own `exp`
+/// (`docs/design-mint-volume-attestation.md` § *One liveness check*).
+const RO_ANCESTOR_DISCHARGE_TTL_SECS: u64 = 3600;
 
 /// The opaque `mode` mint sealed into the attested TPC's CID for the
 /// `volume-rw` role. coord B — not mint — assigns it meaning.
