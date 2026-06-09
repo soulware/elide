@@ -302,22 +302,28 @@ live and every subsequent read anchors on it. `claim` already orders
 claim-first has a sharp constraint: the provisional `volume.provenance`
 published before `mark_claimed` must be **complete and correct**. The
 partial-fork crash-recovery walk (`skip_empty_intermediates`) reads it
-back and trusts `parent.snapshot_ulid` (the basis) and
-`parent.manifest_pubkey` (the recovery-handoff signer); placeholders are
-unsafe. So those two trust-anchors must be available *without a `by_id`
-read* at fork-create time — i.e. from control-plane (`coord-ro`) state:
+back and trusts the `ParentRef`'s `snapshot_ulid` (the basis), `pubkey`
+(the parent's identity key), and `manifest_pubkey` (the recovery-handoff
+signer); placeholders are unsafe. So all three trust-anchors must be
+available *without a `by_id` read* at fork-create time — i.e. from
+control-plane (`coord-ro`) state:
 
-- **Basis snapshot ULID.** *Proposed:* the owner appends a
-  `SnapshotPublished` event to the append-only `events/<name>` journal on
-  each publish. A fork resolves the source name (`coord-ro`) and reads the
-  basis from `events/<name>` (HEAD or the latest `SnapshotPublished`),
-  replacing the `by_id/<source>/snapshots/LATEST` read. The journal is
-  append-only, so this adds no CAS contention to the publish path — it sits
-  at the publish cadence naturally, and the event log is already the
-  canonical record of "what happened ever" per the event-log design.
-  Eventual consistency is fine: a fork basing on a slightly older published
-  snapshot just demand-fetches a little more later. (claim already has its
-  basis control-plane — the `handoff_snapshot` on the Released record.)
+- **Basis snapshot ULID.** *Proposed:* a `latest_snapshot` field on the
+  `names/<name>` record — a bare snapshot ULID pairing with the record's
+  `vol_ulid`, the same convention as `handoff_snapshot`. The owner's
+  publish path CASes it after each `User` manifest upload (single
+  writer, best-effort, self-heals on the next publish — the same
+  discipline as the `by_id` LATEST bump it mirrors); import completion
+  writes it once on `Readonly` records, so `create --from
+  <imported-name>` resolves in one GET. Fork reads `(vol_ulid,
+  latest_snapshot)` from one record, atomically consistent under the
+  record CAS — a rebind can never leave the basis pointing at a previous
+  binding's volume. Eventual consistency is fine: a fork basing on a
+  slightly older published snapshot just demand-fetches a little more
+  later. (claim already has its basis control-plane — the
+  `handoff_snapshot` on the Released record.)
+- **Parent identity key.** Read from `meta/<parent>.pub` (`coord-base`),
+  the same S3 copy coord B's lineage walk verifies against.
 - **Recovery-handoff signer.** *Proposed:* a force-release that synthesises
   a recovery handoff records the synthesising coordinator's pubkey on the
   `names/<name>` Released record alongside `handoff_snapshot`. `claim`'s
@@ -325,11 +331,35 @@ read* at fork-create time — i.e. from control-plane (`coord-ro`) state:
   manifest from `by_id`. Normal (volume-signed) handoffs record nothing and
   `manifest_pubkey` stays `None`.
 
-With both anchors sourced control-plane, fork and claim build the new
+`latest_snapshot` and the recovery-signer pubkey are both `NameRecord`
+schema additions and land together in a single version bump
+(`name_record.rs` rejects unknown versions; schema changes are
+fresh-bucket-only).
+
+With the anchors sourced control-plane, fork and claim build the new
 fork's provisional provenance from `coord-ro` + `meta/` (`coord-base`)
 reads only, rebind the name, and then anchor every `by_id` read — basis
 manifest verify, idx pulls, body warm, ancestor data — on the now-live
 fork.
+
+`by_id/<vol>/snapshots/LATEST` remains the data-plane liveness anchor:
+the LATEST → manifest → HEAD resolution used by GC verification,
+recovery enumeration, and remote-start hydration, written by the owner
+under per-volume credential scoping and — unlike the name record —
+surviving rebinds, so ancestry walks can still resolve a released
+ancestor's snapshots. Every reader of that protocol is owner-anchored;
+strangers discover a basis through the name record.
+
+### Basis resolution per `--from` form
+
+- `--from <vol_ulid>/<snap_ulid>` and `--from <name>/<snap_ulid>` carry
+  the basis explicitly. Name resolution is one `names/<name>` GET; no
+  basis lookup at all.
+- `--from <name>` takes the record's `latest_snapshot` as the basis,
+  pinned into the fork's provenance at create time.
+- Bare `--from <vol_ulid>` has no record to consult — the name record is
+  the discovery surface; raw ULIDs are for explicit pins — and requires
+  the pinned form.
 
 ### Foreign reads have no anchor — `volume fetch` is removed
 
