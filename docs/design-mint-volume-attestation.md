@@ -174,6 +174,31 @@ The possession proof anchors entitlement; the lineage walk authorises
 each specific RO target. The entire authorization graph reduces to *one
 possession proof of one live volume key plus the public signed lineage*.
 
+### The read set is exactly fork ∪ extent_index — complete by construction
+
+`ancestors(owned)` in the predicate is `walk_ancestors(owned) ∪
+walk_extent_ancestors(owned)`: the fork chain (inherited LBA-map blocks)
+plus the extent-index sources (blocks the volume `DedupRef`'d at write
+time, whose canonical bodies can live in another volume's `by_id/`
+prefix). This union is not a heuristic — it is provably the *complete*
+set of prefixes a reader can touch. Write-time dedup emits a `DedupRef`
+only when the block's hash already resolves in the in-memory extent
+index, and that index is rebuilt at open *solely* from `walk_ancestors ∪
+walk_extent_ancestors` (`elide-core/src/volume/open_state.rs`); every
+`new_dedup_ref` call site is gated on `extent_index.lookup(hash)`. There
+is no out-of-band dedup against volumes outside the recorded lineage, so
+a read can never resolve to a prefix outside this union. coord A
+therefore never legitimately needs a prefix coord B would refuse, and
+coord B never vouches for one a read could not reach.
+
+> **Delta to `architecture.md`** (apply with this work): tighten the
+> cross-volume-dedup prose (§ *Cross-volume dedup*, ~line 938). Dedup
+> matches only the in-memory extent index — i.e. `fork ∪ extent_index`;
+> the "all volumes under a common root" pool is the *import-time*
+> candidate set for `--extents-from`, and anything actually deduped
+> against is recorded in `extent_index`. State it so no out-of-band
+> write-time dedup path is implied.
+
 ### Credential model: role == keypair, acquired lazily per ancestor
 
 `assume-role` returns a **single keypair** — a role is a keypair, per
@@ -401,16 +426,38 @@ coord B is not a thin bespoke verifier — it is a real coordinator,
 co-located with mint and designated as mint's discharge authority. It may
 own no volumes of its own; its job is to discharge. Being a coordinator,
 it already has everything the discharge predicate needs: S3 read,
-provenance-signature verification, claim-record resolution, and — the
-load-bearing part — the **same `walk_ancestors` / `walk_extent_ancestors`
-code** the read path uses.
+provenance-signature verification, and claim-record resolution.
 
-That shared code path settles the `rebuild-is-invariant` concern *by
-construction*: coord B's lineage and liveness determination is
-byte-identical to what the read path computes, so **vouchable ≡
-readable** — a volume coord B refuses to vouch for is one the read path
-could not have served, and vice versa. There is no second
-re-implementation of the walk to drift out of sync.
+### The lineage walk is one shared per-link step, two fetch drivers
+
+The read path and coord B walk the **same signed lineage** from different
+sources. The read path reads a volume's *local* copies
+(`by_id/<vol>/volume.{provenance,pub}`) **synchronously** at volume open;
+coord B reads the *S3* copies (`meta/<vol>.{provenance,pub}` — § *S3
+access*) **asynchronously**, holding no local volume. A single async
+function cannot serve both without forcing the synchronous open path onto
+a runtime, and two independent walks would be exactly the drift the
+`rebuild-is-invariant` rule forbids.
+
+The resolution single-sources the **trust-critical per-link step** —
+parse a `volume.provenance`, verify it under the pubkey the *child*
+committed (the root verified under its own `volume.pub`), extract
+`parent` and `extent_index`, detect cycles — as one pure function in
+`elide-core`, parameterised by a `ProvenanceSource` yielding
+`(provenance_bytes, volume.pub)` for a ULID. Two thin driver loops call
+it: a synchronous local-file source (the read path's
+`walk_ancestors`/`walk_extent_ancestors`) and an asynchronous
+`meta/`-prefix object-store source (coord B). The peer-fetch ancestry
+walk (`elide-peer-fetch/src/ancestry.rs`) folds in as a third caller —
+its standalone copy retires, running the shared step with a fork-only
+driver (it deliberately omits `extent_index`; scope is a driver choice,
+not a separate walk).
+
+This makes **vouchable ≡ readable** literal rather than asserted: the
+definition of a valid ancestor and the computed ancestor set come from
+one body of code, so a volume coord B refuses to vouch for is one the
+read path could not have served, and vice versa. Only the ~10-line fetch
+loop differs by source, and it carries no trust logic to drift.
 
 coord B enrolls like any coordinator and **additionally enrolls as a
 discharge authority**, establishing the symmetric `K_M-B` with mint the
@@ -450,6 +497,42 @@ No bootstrap loop: `coord-ro` is gated by `caveat.sub`, not by a volume
 attestation, so coord B obtains it through ordinary `assume-role` without
 needing a discharge from itself. Only `volume-rw` / `volume-ro` carry the
 volume TPC.
+
+## coord B mints the discharge: crossing the mint/coordinator boundary
+
+coord B lives in the coordinator — served on the `elide-peer-fetch` axum
+endpoint, the structural twin (§ *S3 access*) — not in `mint`. But
+minting a discharge *is* mint's macaroon crypto: recover `r` by
+AEAD-decrypting the TPC `cid` under `K_M-B` (`decrypt_cid_attested`),
+then mint a macaroon rooted at `r` with kid `DISCHARGE_KID` carrying
+`attested.volume = target` + `exp` (`mint_under_key`, `Macaroon::encode`).
+All of it lives in `mint/`, a **deliberately standalone workspace**
+(`exclude = ["mint"]` in the root `Cargo.toml`: mint must build, test,
+and lint independently of elide).
+
+The decision is to **reimplement these primitives in the coordinator
+against the spec**, not to depend on `mint`. This extends the precedent
+in `elide-coordinator/src/mint_client.rs`, which already reimplements the
+macaroon *wire format* rather than importing it, and it keeps mint's
+standalone-OSS build boundary intact — a path dependency from
+elide-coordinator would couple mint's build to the elide workspace, which
+the documented rationale rules out.
+
+The cost is two implementations of a security primitive — the
+keyed-BLAKE3 chain and the AES-GCM-SIV CID seal — which can drift. The
+mitigation is **mandatory cross-implementation test vectors**: committed
+known-answer fixtures (`(K_M-B, cid) → (r, client_id, org_id, mode)` and
+`(r, caveats) → encoded discharge bytes`) exercised by *both* the mint
+and coordinator suites, so any divergence in either direction fails CI.
+This is load-bearing, not a nicety: with the canonical implementation in
+a crate the coordinator cannot link, the vectors are the only thing
+binding the two MACs to one answer.
+
+The asymmetry with the lineage walk is deliberate. The walk is
+single-sourced because `elide-core` is already a shared dependency — no
+crate boundary forces a copy. The discharge crypto is reimplemented
+because `mint` is unlinkable by design. Share code where the crate graph
+allows it; pin with vectors only where it does not.
 
 ## Trust properties
 
@@ -495,6 +578,22 @@ volume TPC.
   matching `coord-ro`'s `by_id/`-free exposed-verifier invariant. No new
   role; no bootstrap loop (`coord-ro` is `caveat.sub`-gated, not
   volume-attested).
+- **The lineage walk is single-sourced across the read path and coord B.**
+  One trust-critical per-link step in `elide-core` (parse + verify under
+  the child-committed pubkey + extract `parent`/`extent_index` +
+  cycle-check), parameterised by a `ProvenanceSource`; a sync local-file
+  driver (read path) and an async `meta/`-object-store driver (coord B)
+  share it, and peer-fetch's standalone ancestry walk folds in (fork-only
+  driver). Makes `vouchable ≡ readable` literal. The read set is exactly
+  `walk_ancestors ∪ walk_extent_ancestors`, complete by construction
+  because write-time dedup is gated on the extent index rebuilt from
+  precisely that union (see *The read set is exactly fork ∪ extent_index*).
+- **coord B reimplements mint's discharge-mint crypto against the spec**,
+  guarded by cross-implementation test vectors run in both suites — rather
+  than depending on `mint` (which must build standalone) or duplicating it
+  silently. Mirrors `mint_client.rs`'s wire-format reimplementation; the
+  vectors are mandatory because the canonical MAC lives in an unlinkable
+  crate (see *coord B mints the discharge*).
 - **`attested.*` is a closed, reserved-disjoint registry; the discharge
   vocabulary is closed per type.** Attested growth is **named scalar
   caveats, never a map** — multiple attested fields are multiple named
