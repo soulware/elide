@@ -401,8 +401,8 @@ them is harmless. The one live race — the zombie compacting tail
 segments mid-copy — is retryable (re-resolve from HEAD; GC outputs
 carry the live bytes) and bounded by the `rw-self` liveness
 re-attestation window: the zombie's discharges stop renewing the moment
-the record is rebound. `design-force-release-fencing.md` needs its
-mechanism and walkthroughs updated to this shape.
+the record is rebound. `design-force-release-fencing.md` § *The tail
+race* carries the mechanism and walkthroughs.
 
 An operator who wants to free a dead name without hosting its volume
 runs `claim --force` followed by a normal `release`; the resulting
