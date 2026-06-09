@@ -65,10 +65,10 @@ pub struct SealedRole {
     pub min_ttl_seconds: u64,
     /// BLAKE3 of the role's policy template file content, hex-encoded.
     pub policy_blake3: String,
-    /// The `req.*` body fields the role's template substitutes — its
-    /// declared request contract. Sealed alongside [`caveat`](Self::caveat)
-    /// and enforced at request time before render.
-    pub req: Vec<String>,
+    /// The `attested.*` names the role's template substitutes — its
+    /// declared attestation contract. Sealed alongside
+    /// [`caveat`](Self::caveat) and enforced at request time before render.
+    pub attested: Vec<String>,
 }
 
 /// The complete seal: every role, plus the audience. MAC'd under one
@@ -133,12 +133,12 @@ impl Seal {
                 default_ttl_seconds,
                 policy_path: _, // location, not authority — bytes hashed below
                 policy,
-                req,
+                attested,
                 caveat,
                 // Read from live config at exchange (like `auth_location`)
                 // and MAC'd into the credential at mint, so it cannot drift
-                // post-issuance. Folding it into the sealed `[role.template]`
-                // contract lands with the `attested.*` namespace.
+                // post-issuance — the opaque TPC `mode`, distinct from the
+                // sealed `attested` contract below (the declared keys).
                 attestation_mode: _,
             } = role;
             roles.insert(
@@ -149,7 +149,7 @@ impl Seal {
                     max_ttl_seconds: *max_ttl_seconds,
                     min_ttl_seconds: *min_ttl_seconds,
                     policy_blake3: hash_hex(policy.as_bytes()),
-                    req: req.clone(),
+                    attested: attested.clone(),
                 },
             );
         }
@@ -263,10 +263,10 @@ impl Seal {
                     sealed.policy_blake3, local_hash,
                 ));
             }
-            if sealed.req != role.req {
+            if sealed.attested != role.attested {
                 diffs.push(format!(
-                    "role {name}: req contract sealed as {:?}, local config has {:?}",
-                    sealed.req, role.req,
+                    "role {name}: attested contract sealed as {:?}, local config has {:?}",
+                    sealed.attested, role.attested,
                 ));
             }
             if sealed.caveat != role.caveat {
@@ -684,7 +684,7 @@ caveat = ["sub"]
         .expect("parse");
         let seal = Seal::build_from_config(&cfg, &kr, "t");
         assert_eq!(seal.roles["coord-rw"].caveat, vec!["sub".to_string()]);
-        assert!(seal.roles["coord-rw"].req.is_empty());
+        assert!(seal.roles["coord-rw"].attested.is_empty());
         assert!(seal.diff_against_config(&cfg).is_empty());
 
         // Drop the declaration locally: same templates, different contract

@@ -77,14 +77,19 @@ pub enum ConfigError {
     )]
     UnknownMintKey { role: String, key: String },
     #[error(
-        "role {role}: declared req fields {declared:?} do not match the \
-         template's {{{{req.X}}}} tokens {used:?}"
+        "role {role}: declared attested names {declared:?} do not match the \
+         template's {{{{attested.X}}}} tokens {used:?}"
     )]
-    ReqContractMismatch {
+    AttestedContractMismatch {
         role: String,
         declared: Vec<String>,
         used: Vec<String>,
     },
+    #[error(
+        "role {role}: declared attested name {key:?} is not in the attestable \
+         registry"
+    )]
+    UnknownAttestedKey { role: String, key: String },
     #[error(
         "role {role}: declared caveat names {declared:?} do not match the \
          template's {{{{caveat.X}}}} tokens {used:?}"
@@ -96,7 +101,7 @@ pub enum ConfigError {
     },
 }
 
-/// Normalise a declared field set (`req`/`caveat`) to a canonical sorted,
+/// Normalise a declared field set (`attested`/`caveat`) to a canonical sorted,
 /// de-duplicated form so the sealed contract is independent of authoring
 /// order and the seal-time exact-match is a plain `Vec` equality against
 /// the equally-canonical [`crate::template::template_surface`] output.
@@ -106,7 +111,7 @@ fn canonical_field_set(mut fields: Vec<String>) -> Vec<String> {
     fields
 }
 
-/// Strip a namespace prefix (`req.`/`caveat.`) off each
+/// Strip a namespace prefix (`attested.`/`caveat.`) off each
 /// [`crate::template::template_surface`] entry, yielding the bare keys to
 /// compare against a role's declared contract. The surface is already
 /// sorted+deduped, so the result is too.
@@ -308,7 +313,7 @@ pub struct RawRole {
     #[serde(default)]
     pub policy_file: Option<String>,
     /// The role's substitution contract — the `[role.template]` subtable
-    /// declaring which `req.*` and `caveat.*` namespaces the policy
+    /// declaring which `attested.*` and `caveat.*` namespaces the policy
     /// template consumes. Absent = the empty contract.
     #[serde(default)]
     pub template: RawTemplate,
@@ -330,18 +335,19 @@ pub struct RawAttestation {
     pub mode: String,
 }
 
-/// The `[role.template]` subtable: the request-supplied namespaces a role's
-/// policy template substitutes (`docs/design-mint.md` § *Templating*).
-/// Declared here, cross-checked at seal authoring against the template's
-/// actual `{{req.X}}` / `{{caveat.X}}` tokens (exact match), sealed into
+/// The `[role.template]` subtable: the namespaces a role's policy template
+/// substitutes (`docs/design-mint.md` § *Templating*). Declared here,
+/// cross-checked at seal authoring against the template's actual
+/// `{{attested.X}}` / `{{caveat.X}}` tokens (exact match), sealed into
 /// [`crate::seal::SealedRole`], and enforced at request time before render.
 #[derive(Debug, Default, Deserialize)]
 pub struct RawTemplate {
-    /// The `req.*` body fields the template substitutes — its request
-    /// contract. Absent = the empty set (the template must reference no
-    /// `req.*`).
+    /// The `attested.*` names the template substitutes — the keys it
+    /// expects a discharge to attest. Each must be in the closed
+    /// [`crate::template::ATTESTABLE`] registry. Absent = the empty set
+    /// (the template must reference no `attested.*`).
     #[serde(default)]
-    pub req: Vec<String>,
+    pub attested: Vec<String>,
     /// The `caveat.*` MAC-verified names the template binds (e.g. `sub`).
     /// Absent = the empty set.
     #[serde(default)]
@@ -466,12 +472,12 @@ pub struct Role {
     /// The role's IAM-policy JSON template, read from
     /// [`policy_path`](Role::policy_path) at load.
     pub policy: String,
-    /// The role's declared request contract: the `req.*` body fields and
+    /// The role's declared substitution contract: the `attested.*` and
     /// `caveat.*` names its template substitutes. Sorted and de-duplicated
     /// at load so the sealed form is canonical regardless of authoring
     /// order. Cross-checked against the template at seal authoring
     /// ([`Config::validate_policy_surface`]) and enforced at request time.
-    pub req: Vec<String>,
+    pub attested: Vec<String>,
     pub caveat: Vec<String>,
     /// The role's opaque attestation `mode`, from `[role.attestation]` —
     /// `None` when the role declares no attestation. When `Some`, mint
@@ -535,7 +541,7 @@ impl Config {
                 default_ttl_seconds: r.default_ttl_seconds,
                 policy_path,
                 policy,
-                req: canonical_field_set(r.template.req),
+                attested: canonical_field_set(r.template.attested),
                 caveat: canonical_field_set(r.template.caveat),
                 attestation_mode: r.attestation.map(|a| a.mode),
             };
@@ -600,12 +606,14 @@ impl Config {
     ///    An engine-ism (`{{#each}}`), a namespace-less or empty token, or
     ///    an unterminated `{{` would fail the render closed; the lint
     ///    surfaces it at publish instead.
-    /// 3. Every `{{env.X}}` names a key present in `[env]`, and every
-    ///    `{{mint.X}}` names a [`crate::template::MINT_KEYS`] value — the
-    ///    two server-computed namespaces, each closed to a known set.
-    /// 4. The template's `{{req.X}}` and `{{caveat.X}}` tokens match the
-    ///    role's declared `req`/`caveat` contract exactly. A typo
-    ///    (`{{req.volm}}` vs declared `volume`) or a dropped binding
+    /// 3. Every `{{env.X}}` names a key present in `[env]`, every
+    ///    `{{mint.X}}` names a [`crate::template::MINT_KEYS`] value, and
+    ///    every declared `{{attested.X}}` names a key in
+    ///    [`crate::template::ATTESTABLE`] — the closed-to-a-known-set
+    ///    namespaces.
+    /// 4. The template's `{{attested.X}}` and `{{caveat.X}}` tokens match
+    ///    the role's declared `attested`/`caveat` contract exactly. A typo
+    ///    (`{{attested.volm}}` vs declared `volume`) or a dropped binding
     ///    (a `coord-rw` template forgetting `{{caveat.sub}}`) fails at
     ///    publish instead of silently mis-scoping a live credential. The
     ///    declared set is what gets sealed and enforced at request time.
@@ -650,15 +658,26 @@ impl Config {
                     });
                 }
             }
+            // Every declared attested name must be in the closed attestable
+            // registry — `declared ⊆ authoritative`, the same shape as the
+            // `env`/`mint` checks above.
+            for key in &role.attested {
+                if !crate::template::ATTESTABLE.contains(&key.as_str()) {
+                    return Err(ConfigError::UnknownAttestedKey {
+                        role: role.name.clone(),
+                        key: key.clone(),
+                    });
+                }
+            }
             // `template_surface` returns each bucket sorted+deduped, and
             // the declared sets are canonicalised the same way at load, so
             // the contract check is a plain Vec equality of the bare keys.
-            let used_req = strip_ns(&surface.req, "req.");
-            if used_req != role.req {
-                return Err(ConfigError::ReqContractMismatch {
+            let used_attested = strip_ns(&surface.attested, "attested.");
+            if used_attested != role.attested {
+                return Err(ConfigError::AttestedContractMismatch {
                     role: role.name.clone(),
-                    declared: role.req.clone(),
-                    used: used_req,
+                    declared: role.attested.clone(),
+                    used: used_attested,
                 });
             }
             let used_caveat = strip_ns(&surface.caveat, "caveat.");
@@ -910,7 +929,7 @@ policy_file = "r.json"
     fn non_json_template_passes_load_but_fails_seal_validation() {
         // A token that escaped its string slot makes the template invalid
         // JSON; the seal gate rejects it before it can ever be rendered.
-        let cfg = parse_for_test(ENV_SAMPLE, &[("r.json", r#"{"r":[{{req.volume}}]}"#)])
+        let cfg = parse_for_test(ENV_SAMPLE, &[("r.json", r#"{"r":[{{attested.volume}}]}"#)])
             .expect("load tolerates a non-JSON template");
         assert!(matches!(
             cfg.validate_policy_surface(),
@@ -948,47 +967,62 @@ policy_file = "r.json"
     fn declared_contract_matching_template_passes_seal() {
         let cfg = parse_for_test(
             &contract_toml(
-                r#"req = ["volume"]
+                r#"attested = ["volume"]
 caveat = ["sub"]"#,
             ),
-            &[("r.json", r#"{"r":"{{req.volume}}/{{caveat.sub}}"}"#)],
+            &[("r.json", r#"{"r":"{{attested.volume}}/{{caveat.sub}}"}"#)],
         )
         .expect("parse");
         assert!(cfg.validate_policy_surface().is_ok());
         // The declaration is canonicalised (sorted+deduped) at load.
-        assert_eq!(cfg.roles["r"].req, vec!["volume".to_string()]);
+        assert_eq!(cfg.roles["r"].attested, vec!["volume".to_string()]);
         assert_eq!(cfg.roles["r"].caveat, vec!["sub".to_string()]);
     }
 
     #[test]
-    fn req_token_typo_fails_seal_against_declaration() {
-        // The declared field is `volume`; the template typos it as `volm`.
+    fn attested_token_typo_fails_seal_against_declaration() {
+        // The declared name is `volume`; the template typos it as `volm`.
         // Caught at publish, not at the first request's render-time 500.
         let cfg = parse_for_test(
-            &contract_toml(r#"req = ["volume"]"#),
-            &[("r.json", r#"{"r":"{{req.volm}}"}"#)],
+            &contract_toml(r#"attested = ["volume"]"#),
+            &[("r.json", r#"{"r":"{{attested.volm}}"}"#)],
         )
         .expect("load tolerates a contract mismatch");
         assert!(matches!(
             cfg.validate_policy_surface(),
-            Err(ConfigError::ReqContractMismatch { declared, used, .. })
+            Err(ConfigError::AttestedContractMismatch { declared, used, .. })
                 if declared == ["volume"] && used == ["volm"]
         ));
     }
 
     #[test]
-    fn undeclared_req_token_fails_seal() {
-        // A template that substitutes a `req` field the role never declared
-        // is rejected — the declaration is the authoritative set.
+    fn undeclared_attested_token_fails_seal() {
+        // A template that substitutes an `attested` name the role never
+        // declared is rejected — the declaration is the authoritative set.
         let cfg = parse_for_test(
             &contract_toml(""),
-            &[("r.json", r#"{"r":"{{req.volume}}"}"#)],
+            &[("r.json", r#"{"r":"{{attested.volume}}"}"#)],
         )
         .expect("load tolerates a contract mismatch");
         assert!(matches!(
             cfg.validate_policy_surface(),
-            Err(ConfigError::ReqContractMismatch { declared, used, .. })
+            Err(ConfigError::AttestedContractMismatch { declared, used, .. })
                 if declared.is_empty() && used == ["volume"]
+        ));
+    }
+
+    #[test]
+    fn declared_attested_name_outside_registry_fails_seal() {
+        // `declared ⊆ authoritative`: a declared attested name not in the
+        // closed ATTESTABLE registry is rejected at publish.
+        let cfg = parse_for_test(
+            &contract_toml(r#"attested = ["region"]"#),
+            &[("r.json", r#"{"r":"{{attested.region}}"}"#)],
+        )
+        .expect("load tolerates a contract that fails the surface check");
+        assert!(matches!(
+            cfg.validate_policy_surface(),
+            Err(ConfigError::UnknownAttestedKey { key, .. }) if key == "region"
         ));
     }
 

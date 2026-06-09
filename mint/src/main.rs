@@ -158,9 +158,10 @@ enum ClientCmd {
         /// Defaults to `credentials/<role>`.
         #[arg(long = "in")]
         in_file: Option<String>,
-        /// PoP-signed request body as an inline JSON object. Opaque
-        /// pass-through into `req.*` — `ts`/`role`/`ttl_seconds` are
-        /// client-owned and ignored here.
+        /// PoP-signed request body as an inline JSON object. `ts`/`role`/
+        /// `ttl_seconds` are client-owned; any other field is opaque and
+        /// PoP-covered but not read by mint (scoping is attested by a
+        /// discharge, not the body).
         #[arg(long, value_name = "JSON")]
         req: Option<String>,
         /// Narrowing caveat to attenuate the credential with (repeatable).
@@ -1012,13 +1013,16 @@ fn role_inspect(config: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
                 print_policy_surface(sealed_policy);
                 // The request contract (`[role.template]`) is sealed too;
                 // flag a local declaration that has drifted from it.
-                if sealed.req != role.req || sealed.caveat != role.caveat {
+                if sealed.attested != role.attested || sealed.caveat != role.caveat {
                     eprintln!("  \u{26a0} local [role.template] has drifted from the seal:");
                     eprintln!(
-                        "      sealed: req={:?} caveat={:?}",
-                        sealed.req, sealed.caveat
+                        "      sealed: attested={:?} caveat={:?}",
+                        sealed.attested, sealed.caveat
                     );
-                    eprintln!("      local:  req={:?} caveat={:?}", role.req, role.caveat);
+                    eprintln!(
+                        "      local:  attested={:?} caveat={:?}",
+                        role.attested, role.caveat
+                    );
                 }
                 let local_blake3 = mint::seal::hash_hex(role.policy.as_bytes());
                 if local_blake3 != sealed.policy_blake3 {
@@ -1059,7 +1063,7 @@ fn print_policy_surface(template: &str) {
     let surface = mint::template::template_surface(template);
     eprintln!("  policy references:");
     for (label, vals) in [
-        ("req (PoP-bound)", &surface.req),
+        ("attested (discharge-MAC'd)", &surface.attested),
         ("env (config)", &surface.env),
         ("mint (mint-computed)", &surface.mint),
         ("caveat (MAC-verified)", &surface.caveat),

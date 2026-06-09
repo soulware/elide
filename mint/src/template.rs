@@ -2,13 +2,17 @@
 //!
 //! A role's policy template is **JSON** carrying `{{ ns.key }}` scalar
 //! substitution tokens, each token sitting inside a JSON *string value*.
-//! Four namespaces, each a flat scalar lookup:
+//! Four namespaces, each a flat scalar lookup — **every one MAC-verified
+//! or server-side, none self-asserted** (`docs/design-mint-volume-attestation.md`
+//! § *Every template value is MAC-verified or server-side*):
 //!
-//! - `{{env.X}}`    — sealed server-side config (the `[env]` table).
-//! - `{{req.X}}`    — PoP-verified request-body string fields (e.g.
-//!   `req.volume`).
-//! - `{{mint.X}}`   — mint-computed (`mint.expiry`).
-//! - `{{caveat.X}}` — MAC-verified caveat values (e.g. `caveat.sub`).
+//! - `{{env.X}}`      — sealed server-side config (the `[env]` table).
+//! - `{{attested.X}}` — values attested by a discharge authority, carried
+//!   on the discharge and MAC'd under its `r` (e.g. `attested.volume`).
+//!   Restricted to the closed [`ATTESTABLE`] registry.
+//! - `{{mint.X}}`     — mint-computed (`mint.expiry`).
+//! - `{{caveat.X}}`   — MAC-verified caveat values on the primary (e.g.
+//!   `caveat.sub`).
 //!
 //! Rendering parses the template as JSON, substitutes into the string
 //! leaves, and re-serialises. Two security properties fall out of that
@@ -95,8 +99,18 @@ fn classify_token(inner: &str) -> Option<(&str, &str)> {
     if key.is_empty() {
         return None;
     }
-    matches!(ns, "env" | "mint" | "req" | "caveat").then_some((ns, key))
+    matches!(ns, "env" | "mint" | "attested" | "caveat").then_some((ns, key))
 }
+
+/// The closed set of attestable names — the only keys `{{attested.X}}`
+/// may reference and the only names mint reads off a discharge's attested
+/// context. mint pulls attested values **by name from this set**, never
+/// "whatever the discharge carries", so a discharge can fill only the
+/// protocol's attestable slots. Disjoint from the reserved control caveat
+/// names by construction (asserted in tests), so `attested.*` can never
+/// shadow a primary's MAC-bound control caveat
+/// (`docs/design-mint-volume-attestation.md` § *Decided*).
+pub const ATTESTABLE: &[&str] = &["volume"];
 
 /// Render `policy_template` into a concrete IAM policy JSON string.
 ///
@@ -104,25 +118,28 @@ fn classify_token(inner: &str) -> Option<(&str, &str)> {
 /// leaves; the result is re-serialised, so it is valid JSON by
 /// construction and no value can break out of its string slot.
 ///
-/// `request` is the **PoP-verified** request body (its provenance is the
-/// client's identity key, bound to this macaroon and moment — see
-/// [`crate::pop`]); its top-level string fields are the `req.*` namespace.
-/// The caller must verify the PoP signature *before* passing the body.
+/// `discharge_caveats` are the **MAC-verified** caveats from the bundle's
+/// discharges (the `discharge_caveats` set `verify_and_clear` returns,
+/// each MAC'd under its discharge's `r` and attributable to the issuing
+/// authority); they are the `attested.*` namespace. Only the names in the
+/// closed [`ATTESTABLE`] registry are exposed — a discharge cannot fill an
+/// arbitrary or reserved slot, and the attested context is never flattened
+/// into `caveat.*`, so a discharge value can never shadow the primary's
+/// MAC-bound `caveat.*`.
 ///
-/// `caveats` is the **MAC-verified** caveat chain (the aggregated set
-/// `verify_and_clear` returns); it is the `caveat.*` namespace. Only
-/// caveats that resolve to a single [`Resolved::Value`] are exposed — a
-/// contradictory (`Unsatisfiable`) occurrence is omitted, so a holder
-/// cannot smuggle a forged value past the renderer by appending a
-/// contradictory copy under the trailing MAC.
+/// `caveats` is the **MAC-verified** caveat chain of the primary; it is
+/// the `caveat.*` namespace. Only caveats that resolve to a single
+/// [`Resolved::Value`] are exposed — a contradictory (`Unsatisfiable`)
+/// occurrence is omitted, so a holder cannot smuggle a forged value past
+/// the renderer by appending a contradictory copy under the trailing MAC.
 ///
-/// Each class has a distinct, explicit trust provenance: `req.*`
-/// PoP-bound, `env.*` config, `mint.*` mint-computed, `caveat.*`
-/// MAC-verified.
+/// Each class has a distinct, explicit trust provenance, **none
+/// self-asserted**: `attested.*` discharge-MAC'd, `env.*` config,
+/// `mint.*` mint-computed, `caveat.*` primary-MAC'd.
 pub fn render_policy(
     policy_template: &str,
     env: &BTreeMap<String, String>,
-    request: &Value,
+    discharge_caveats: &[Caveat],
     caveats: &[Caveat],
     expiry: &str,
     role: &str,
@@ -145,6 +162,18 @@ pub fn render_policy(
         }
     }
 
+    // Attested values, pulled **by name from the closed registry** out of
+    // the discharge context — never "whatever the discharge carries". A
+    // discharge caveat outside [`ATTESTABLE`] (or a reserved name) is not
+    // exposed here, so it cannot reach a policy slot.
+    let dis = EffectiveCaveats::new(discharge_caveats);
+    let mut attested_map: BTreeMap<&str, String> = BTreeMap::new();
+    for &name in ATTESTABLE {
+        if let Resolved::Value(v) = dis.resolve(name) {
+            attested_map.insert(name, v);
+        }
+    }
+
     let resolve = |inner: &str| -> Resolution {
         let Some((ns, key)) = classify_token(inner) else {
             return Resolution::Malformed;
@@ -153,9 +182,7 @@ pub fn render_policy(
             "env" => env.get(key).cloned(),
             "mint" => (key == "expiry").then(|| expiry.to_string()),
             "caveat" => caveat_map.get(key).cloned(),
-            // Only top-level string fields are substitutable; a non-string
-            // (or absent) `req` field fails closed.
-            "req" => request.get(key).and_then(Value::as_str).map(str::to_string),
+            "attested" => attested_map.get(key).cloned(),
             // `classify_token` already rejected unknown namespaces.
             _ => return Resolution::Malformed,
         };
@@ -245,14 +272,14 @@ fn substitute_string(
 }
 
 /// The substitution surface a policy template references, grouped by
-/// trust provenance (`docs/design-mint.md` § *Templating*): `req`
-/// PoP-bound, `env` config, `mint` mint-computed, `caveat` MAC-verified.
-/// Each list is sorted and de-duplicated.
+/// trust provenance (`docs/design-mint.md` § *Templating*): `attested`
+/// discharge-MAC'd, `env` config, `mint` mint-computed, `caveat`
+/// primary-MAC'd. Each list is sorted and de-duplicated.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TemplateSurface {
     pub env: Vec<String>,
     pub mint: Vec<String>,
-    pub req: Vec<String>,
+    pub attested: Vec<String>,
     pub caveat: Vec<String>,
 }
 
@@ -276,14 +303,14 @@ pub fn template_surface(template: &str) -> TemplateSurface {
             let bucket = match ns {
                 "env" => &mut s.env,
                 "mint" => &mut s.mint,
-                "req" => &mut s.req,
+                "attested" => &mut s.attested,
                 "caveat" => &mut s.caveat,
                 _ => continue,
             };
             bucket.push(inner.to_string());
         }
     }
-    for v in [&mut s.env, &mut s.mint, &mut s.req, &mut s.caveat] {
+    for v in [&mut s.env, &mut s.mint, &mut s.attested, &mut s.caveat] {
         v.sort();
         v.dedup();
     }
@@ -350,13 +377,15 @@ mod tests {
   "Statement": [{
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
-    "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{req.volume}}/*"],
+    "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{attested.volume}}/*"],
     "Condition": {"DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}}
   }]
 }"#;
 
-    fn req(volume: &str) -> Value {
-        serde_json::json!({ "volume": volume })
+    /// Discharge caveats carrying an attested `volume`, as the attestation
+    /// authority would stamp them.
+    fn dis(volume: &str) -> Vec<Caveat> {
+        vec![Caveat::scalar("volume", volume)]
     }
 
     fn cv(pairs: &[(&str, &str)]) -> Vec<Caveat> {
@@ -364,11 +393,36 @@ mod tests {
     }
 
     #[test]
-    fn renders_env_req_scalar_and_mint() {
+    fn attestable_is_disjoint_from_reserved_control_names() {
+        // The fencing invariant: no attestable name is also a reserved
+        // control caveat, so `attested.X` can never name (and thus never
+        // shadow) a primary's MAC-bound control caveat.
+        use crate::caveat::name;
+        let reserved = [
+            name::AUD,
+            name::EXP,
+            name::SUB,
+            name::CNF,
+            name::OP,
+            name::ROLE,
+            name::EPOCH,
+            name::INVITE,
+            name::SCOPE,
+        ];
+        for a in ATTESTABLE {
+            assert!(
+                !reserved.contains(a),
+                "attestable name {a:?} collides with a reserved control caveat"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_env_attested_scalar_and_mint() {
         let out = render_policy(
             TPL,
             &env(),
-            &req("VOL1"),
+            &dis("VOL1"),
             &[],
             "2026-05-15T14:30:00Z",
             "volume-ro",
@@ -380,17 +434,17 @@ mod tests {
     }
 
     #[test]
-    fn caveat_sub_comes_from_the_chain_not_the_body() {
+    fn caveat_sub_comes_from_the_primary_not_the_discharge() {
         // `{{caveat.sub}}` substitutes the MAC-verified principal —
-        // sourced from the caveat chain, never the request body. A body
-        // field also named `sub` lands in the `req` namespace and must
-        // not bleed into `caveat.*`: a forged body value cannot displace
-        // the MAC-bound one.
+        // sourced from the primary's caveat chain, never the discharge.
+        // A discharge caveat also named `sub` must not bleed into
+        // `caveat.*` (the attested context is never flattened in), and in
+        // any case `sub` is not in ATTESTABLE so it is never exposed.
         const TPL_SUB: &str = r#"{"Resource":["arn:aws:s3:::b/coordinators/{{caveat.sub}}/*"]}"#;
         let out = render_policy(
             TPL_SUB,
             &env(),
-            &serde_json::json!({ "sub": "FORGED" }),
+            &cv(&[("sub", "FORGED")]),
             &cv(&[("sub", "COORD1"), ("aud", "mint")]),
             "t",
             "coord-rw",
@@ -399,7 +453,7 @@ mod tests {
         assert!(out.contains("coordinators/COORD1/*"), "got: {out}");
         assert!(
             !out.contains("FORGED"),
-            "body sub bled into caveat.sub: {out}"
+            "discharge sub bled into caveat.sub: {out}"
         );
     }
 
@@ -413,7 +467,7 @@ mod tests {
         let err = render_policy(
             TPL_SUB,
             &env(),
-            &serde_json::json!({}),
+            &[],
             &cv(&[("sub", "REAL"), ("sub", "FORGED")]),
             "t",
             "coord-rw",
@@ -425,10 +479,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_request_field_fails_closed() {
-        // A template referencing req.volume when the signed body omitted
-        // it must fail the render, not mint an unscoped credential.
-        let err = render_policy(TPL, &env(), &serde_json::json!({}), &[], "t", "r");
+    fn missing_attested_field_fails_closed() {
+        // A template referencing attested.volume with no discharge
+        // carrying it must fail the render, not mint an unscoped
+        // credential.
+        let err = render_policy(TPL, &env(), &[], &[], "t", "r");
         assert!(
             matches!(err, Err(TemplateError::UnknownField { .. })),
             "{err:?}"
@@ -436,14 +491,15 @@ mod tests {
     }
 
     #[test]
-    fn non_string_request_field_fails_closed() {
-        // Scalars-only: a `req` field that exists but isn't a JSON string
-        // is not substitutable.
-        const TPL_V: &str = r#"{"Resource":["{{req.volume}}"]}"#;
+    fn attested_name_outside_registry_fails_closed() {
+        // A discharge caveat whose name is not in ATTESTABLE is never
+        // exposed, so a policy referencing it fails closed — a discharge
+        // cannot fill an arbitrary slot.
+        const TPL_R: &str = r#"{"Resource":["{{attested.region}}"]}"#;
         let err = render_policy(
-            TPL_V,
+            TPL_R,
             &env(),
-            &serde_json::json!({ "volume": 7 }),
+            &cv(&[("region", "eu-west")]),
             &[],
             "t",
             "volume-ro",
@@ -459,8 +515,8 @@ mod tests {
         // The structural injection defense: a token in array position is
         // not valid JSON, so the template is rejected — there is no
         // unsafe non-string substitution position to reach.
-        const TPL_BAD: &str = r#"{"Resource":[{{req.volume}}]}"#;
-        let err = render_policy(TPL_BAD, &env(), &req("V"), &[], "t", "volume-ro");
+        const TPL_BAD: &str = r#"{"Resource":[{{attested.volume}}]}"#;
+        let err = render_policy(TPL_BAD, &env(), &dis("V"), &[], "t", "volume-ro");
         assert!(matches!(err, Err(TemplateError::NotJson { .. })), "{err:?}");
     }
 
@@ -469,17 +525,9 @@ mod tests {
         // A value full of JSON metacharacters is escaped into its string
         // slot, never parsed as policy structure.
         const TPL_R: &str =
-            r#"{"Statement":[{"Effect":"Allow","Resource":["arn:{{req.volume}}"]}]}"#;
+            r#"{"Statement":[{"Effect":"Allow","Resource":["arn:{{attested.volume}}"]}]}"#;
         let evil = r#"x","Effect":"Deny"},{"Resource":"*"#;
-        let out = render_policy(
-            TPL_R,
-            &env(),
-            &serde_json::json!({ "volume": evil }),
-            &[],
-            "t",
-            "volume-ro",
-        )
-        .unwrap();
+        let out = render_policy(TPL_R, &env(), &dis(evil), &[], "t", "volume-ro").unwrap();
         let v: Value = serde_json::from_str(&out).expect("output is valid json");
         let stmts = v["Statement"].as_array().expect("statement array");
         assert_eq!(stmts.len(), 1, "value injected a statement: {out}");
@@ -496,7 +544,7 @@ mod tests {
         // A leftover handlebars-ism and a namespace-less token are both
         // rejected, not rendered as empty.
         for bad in [r#"{"x":"{{#each items}}"}"#, r#"{"x":"{{volume}}"}"#] {
-            let err = render_policy(bad, &env(), &req("V"), &[], "t", "r");
+            let err = render_policy(bad, &env(), &dis("V"), &[], "t", "r");
             assert!(
                 matches!(err, Err(TemplateError::MalformedToken { .. })),
                 "{bad}: {err:?}"
@@ -508,14 +556,14 @@ mod tests {
     fn render_error_names_the_role() {
         // Operator-facing: the error must point at the role.
         let err = render_policy(
-            r#"{"x":"{{req.prefix}}"}"#,
+            r#"{"x":"{{attested.volume}}"}"#,
             &env(),
-            &serde_json::json!({}),
+            &[],
             &[],
             "t",
             "read",
         )
-        .expect_err("missing req.prefix must fail closed");
+        .expect_err("missing attested.volume must fail closed");
         assert!(
             err.to_string().contains("\"read\""),
             "message should name the role: {err}"
@@ -529,10 +577,10 @@ mod tests {
         // not, because absence is a render-time data concern, not a
         // template defect.
         let doc = serde_json::json!({
-            "ok": "arn:{{env.bucket}}/{{req.volume}}",
+            "ok": "arn:{{env.bucket}}/{{attested.volume}}",
             "engineism": "{{#each items}}",
             "no_namespace": "{{volume}}",
-            "absent_but_well_formed": "{{req.nonesuch}}",
+            "absent_but_well_formed": "{{attested.nonesuch}}",
             "nested": ["{{caveat.sub}}", "{{ bad token }}"],
         });
         let bad = malformed_tokens(&doc);
@@ -541,8 +589,8 @@ mod tests {
         assert!(bad.contains(&"{{ bad token }}".to_string()), "{bad:?}");
         assert!(
             !bad.iter().any(|t| t.contains("env.bucket")
-                || t.contains("req.volume")
-                || t.contains("req.nonesuch")
+                || t.contains("attested.volume")
+                || t.contains("attested.nonesuch")
                 || t.contains("caveat.sub")),
             "well-formed token reported as malformed: {bad:?}"
         );
@@ -550,20 +598,23 @@ mod tests {
 
     #[test]
     fn malformed_tokens_flags_unterminated() {
-        let doc = serde_json::json!({ "x": "arn:{{req.volume" });
-        assert_eq!(malformed_tokens(&doc), vec!["{{req.volume".to_string()]);
+        let doc = serde_json::json!({ "x": "arn:{{attested.volume" });
+        assert_eq!(
+            malformed_tokens(&doc),
+            vec!["{{attested.volume".to_string()]
+        );
     }
 
     #[test]
     fn surface_groups_refs_by_provenance() {
-        // TPL references one of each request-side namespace.
+        // TPL references one of each non-primary namespace.
         let s = template_surface(TPL);
         assert_eq!(s.env, vec!["env.bucket"]);
         assert_eq!(s.mint, vec!["mint.expiry"]);
-        assert_eq!(s.req, vec!["req.volume"]);
+        assert_eq!(s.attested, vec!["attested.volume"]);
         assert!(s.caveat.is_empty());
 
-        // The MAC-verified namespace is scanned too.
+        // The primary MAC-verified namespace is scanned too.
         let cav = template_surface("{{caveat.sub}}");
         assert_eq!(cav.caveat, vec!["caveat.sub"]);
 
@@ -573,7 +624,7 @@ mod tests {
         assert!(
             noise.env.is_empty()
                 && noise.mint.is_empty()
-                && noise.req.is_empty()
+                && noise.attested.is_empty()
                 && noise.caveat.is_empty()
         );
     }
