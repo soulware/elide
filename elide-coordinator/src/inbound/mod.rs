@@ -27,6 +27,10 @@ mod lifecycle;
 pub(crate) use lifecycle::{
     FastPathDisposition, local_daemon_running, promote_stop_snapshot, release_fast_path_handoff,
 };
+// Reached by `claim.rs`'s crash-recovery test (#428), which drives the
+// real force-release op against a partial-fork shape.
+#[cfg(test)]
+pub(crate) use lifecycle::force_release_volume_op;
 
 // Shared test fixtures used by both `mod.rs::tests` and
 // `lifecycle.rs::tests`. Keeping them at the module level (rather
