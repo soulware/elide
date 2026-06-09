@@ -5,17 +5,22 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+aes-gcm-siv   = "0.11"
 async-trait   = "0.1"
 axum          = "0.8"
 base64        = "0.22"
+blake3        = "1"
 bytes         = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 elide-core    = { path = "../elide-core" }
 elide-fetch   = { path = "../elide-fetch" }
 http          = "1"
 object_store  = "0.11"
+rand_core     = { version = "0.6", features = ["getrandom"] }
 reqwest       = { version = "0.12", default-features = false, features = ["http2"] }
+rmp           = "0.8"
 serde         = { version = "1", features = ["derive"] }
+thiserror     = "1"
 tokio         = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "fs", "io-util"] }
 toml          = { version = "0.8", default-features = false, features = ["parse", "display"] }
 tower         = "0.5"
@@ -23,7 +28,6 @@ tracing       = "0.1"
 ulid          = "1"
 
 [dev-dependencies]
-blake3    = "1"
-rand_core = { version = "0.6", features = ["getrandom"] }
-tempfile  = "3"
-tokio     = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+serde_json = "1"
+tempfile   = "3"
+tokio      = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

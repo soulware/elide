@@ -43,7 +43,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use tokio::net::TcpListener;
 use tracing::info;
 use ulid::Ulid;
@@ -202,6 +202,10 @@ impl ResourceKind {
 pub struct ServerContext {
     pub auth: AuthState,
     pub data_dir: Arc<PathBuf>,
+    /// Discharge-authority state (coord B). `Some` only on a coordinator
+    /// enrolled as mint's volume-attestation discharge authority; `None`
+    /// makes `POST /v1/discharge` fail closed with `404`.
+    pub discharge: Option<crate::discharge::DischargeState>,
 }
 
 impl ServerContext {
@@ -209,7 +213,16 @@ impl ServerContext {
         Self {
             auth,
             data_dir: Arc::new(data_dir),
+            discharge: None,
         }
+    }
+
+    /// Enable the `POST /v1/discharge` endpoint with the given authority
+    /// state. Builder so the common (non-authority) path stays a plain
+    /// [`Self::new`].
+    pub fn with_discharge(mut self, discharge: crate::discharge::DischargeState) -> Self {
+        self.discharge = Some(discharge);
+        self
     }
 }
 
@@ -218,6 +231,7 @@ impl ServerContext {
 pub fn router(ctx: ServerContext) -> Router {
     Router::new()
         .route("/v1/{vol_id}/{filename}", get(handle_segment))
+        .route("/v1/discharge", post(crate::discharge::handle_discharge))
         .with_state(ctx)
 }
 

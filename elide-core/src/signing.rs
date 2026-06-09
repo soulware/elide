@@ -410,6 +410,86 @@ pub fn verify_lineage_with_key(
     Ok(lineage)
 }
 
+/// Domain-separation prefix for the volume-possession proof
+/// (`docs/design-mint-volume-attestation.md` § *Possession-proof
+/// binding*). A coordinator proves it holds a live volume's `volume.key`
+/// — without revealing it — by signing this payload; the attestation
+/// coordinator (coord B) verifies it against the volume's public
+/// `meta/<owned>.pub`. Bumping the suffix invalidates every prior proof.
+const VOLUME_POSSESSION_DOMAIN: &str = "elide-volume-possession-v1";
+
+/// The signed payload of a volume-possession proof: domain-separated,
+/// NUL-joined `owned ‖ target ‖ blake3_hex(cid) ‖ ts ‖ nonce_hex`. Built in
+/// one place so the signer (coord A) and verifier (coord B) cannot drift.
+///
+/// Hashing the attested TPC's `cid` binds the proof to *this* TPC instance,
+/// so a captured proof cannot be lifted onto another credential's discharge
+/// request (the anti-transfer binding); `ts` and `nonce` bound replay.
+pub fn volume_possession_signing_input(
+    owned: &ulid::Ulid,
+    target: &ulid::Ulid,
+    cid: &[u8],
+    ts: u64,
+    nonce: &[u8],
+) -> Vec<u8> {
+    let owned_s = owned.to_string();
+    let target_s = target.to_string();
+    let ts_s = ts.to_string();
+    let cid_hash_hex = encode_hex(blake3::hash(cid).as_bytes());
+    let nonce_hex = encode_hex(nonce);
+    let fields: [&str; 6] = [
+        VOLUME_POSSESSION_DOMAIN,
+        &owned_s,
+        &target_s,
+        &cid_hash_hex,
+        &ts_s,
+        &nonce_hex,
+    ];
+    let mut msg = Vec::new();
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            msg.push(0u8);
+        }
+        msg.extend_from_slice(f.as_bytes());
+    }
+    msg
+}
+
+/// Sign a volume-possession proof with `owned`'s `volume.key` — the
+/// requesting coordinator (coord A) side.
+pub fn sign_volume_possession(
+    signer: &dyn SegmentSigner,
+    owned: &ulid::Ulid,
+    target: &ulid::Ulid,
+    cid: &[u8],
+    ts: u64,
+    nonce: &[u8],
+) -> [u8; 64] {
+    signer.sign(&volume_possession_signing_input(
+        owned, target, cid, ts, nonce,
+    ))
+}
+
+/// Verify a volume-possession proof against `owned`'s public key — the
+/// attestation coordinator (coord B) side. coord B fetches `meta/<owned>.pub`,
+/// recomputes the payload, and checks the signature. Errors (mapped to a
+/// denial by the caller) on any mismatch.
+pub fn verify_volume_possession(
+    owned_pub: &VerifyingKey,
+    owned: &ulid::Ulid,
+    target: &ulid::Ulid,
+    cid: &[u8],
+    ts: u64,
+    nonce: &[u8],
+    proof: &[u8; 64],
+) -> io::Result<()> {
+    let signature = Signature::from_bytes(proof);
+    let msg = volume_possession_signing_input(owned, target, cid, ts, nonce);
+    owned_pub
+        .verify(&msg, &signature)
+        .map_err(|_| io::Error::other("volume-possession proof signature invalid"))
+}
+
 // --- internal helpers ---
 
 fn sign_provenance(key: &SigningKey, lineage: &ProvenanceLineage) -> [u8; 64] {
@@ -1202,6 +1282,50 @@ mod tests {
 
     fn make_ulid(s: &str) -> Ulid {
         Ulid::from_string(s).unwrap()
+    }
+
+    #[test]
+    fn volume_possession_round_trips_and_binds_every_field() {
+        let (signer, vk) = generate_ephemeral_signer();
+        let owned = make_ulid("01BX5ZZKBKACTAV9WEVGEMMVRZ");
+        let target = owned;
+        let cid = b"attested-tpc-cid-bytes";
+        let ts = 1_700_000_000u64;
+        let nonce = [0x11u8; 16];
+        let proof = sign_volume_possession(signer.as_ref(), &owned, &target, cid, ts, &nonce);
+
+        // Honest proof verifies.
+        assert!(verify_volume_possession(&vk, &owned, &target, cid, ts, &nonce, &proof).is_ok());
+
+        // A different signing key fails.
+        let (_, other_vk) = generate_ephemeral_signer();
+        assert!(
+            verify_volume_possession(&other_vk, &owned, &target, cid, ts, &nonce, &proof).is_err()
+        );
+
+        // Each bound field, perturbed, fails — the proof is not transferable.
+        let other = make_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(
+            verify_volume_possession(&vk, &other, &target, cid, ts, &nonce, &proof).is_err(),
+            "owned must bind"
+        );
+        assert!(
+            verify_volume_possession(&vk, &owned, &other, cid, ts, &nonce, &proof).is_err(),
+            "target must bind"
+        );
+        assert!(
+            verify_volume_possession(&vk, &owned, &target, b"other-cid", ts, &nonce, &proof)
+                .is_err(),
+            "cid must bind (anti-transfer)"
+        );
+        assert!(
+            verify_volume_possession(&vk, &owned, &target, cid, ts + 1, &nonce, &proof).is_err(),
+            "ts must bind"
+        );
+        assert!(
+            verify_volume_possession(&vk, &owned, &target, cid, ts, &[0x22u8; 16], &proof).is_err(),
+            "nonce must bind"
+        );
     }
 
     fn signer_from(key: SigningKey) -> Ed25519Signer {
