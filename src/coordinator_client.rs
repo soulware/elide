@@ -757,14 +757,21 @@ impl Client {
         let mut new_vol_ulid: Option<ulid::Ulid> = None;
         loop {
             buf.clear();
-            let n = reader.read_line(&mut buf)?;
+            let n = match reader.read_line(&mut buf) {
+                Ok(n) => n,
+                Err(e) => return finalize_or_err(new_vol_ulid, out, e),
+            };
             if n == 0 {
-                return Err(io::Error::other(
-                    "claim stream closed before terminal event",
-                ));
+                let err = io::Error::other("claim stream closed before terminal event");
+                return finalize_or_err(new_vol_ulid, out, err);
             }
-            let env: Envelope<ClaimAttachEvent> = serde_json::from_str(buf.trim())
-                .map_err(|e| io::Error::other(format!("parse claim event: {e}")))?;
+            let env: Envelope<ClaimAttachEvent> = match serde_json::from_str(buf.trim()) {
+                Ok(env) => env,
+                Err(e) => {
+                    let err = io::Error::other(format!("parse claim event: {e}"));
+                    return finalize_or_err(new_vol_ulid, out, err);
+                }
+            };
             match env.into_result() {
                 Ok(event) => {
                     if let Some(line) = render_claim_event(&event) {
@@ -779,6 +786,9 @@ impl Client {
                         });
                     }
                 }
+                // Server-declared failure: the orchestrator's `Failed` state,
+                // which (by the durability invariant above) means it never
+                // reached `finalize`. Authoritative — always propagate.
                 Err(e) => return Err(io::Error::other(e)),
             }
         }
@@ -886,6 +896,35 @@ impl Client {
                 Err(e) => return Err(io::Error::other(e)),
             }
         }
+    }
+}
+
+/// Resolve a claim attach-stream interruption against the durability
+/// boundary.
+///
+/// A fork is durable once `ForkCreated` has been observed: the orchestrator
+/// appends that event at the tail of its `finalize` stage, after every
+/// directory and marker the daemon needs, and only the infallible prefetch
+/// stage runs after it. So a transport break *past* that point (coordinator
+/// restart, dropped socket) left a usable volume behind — surface the
+/// interruption on `out` but report the fork ULID as success. A break
+/// *before* it (`new_vol_ulid` is `None`) is a genuine failure: propagate
+/// `err`.
+fn finalize_or_err(
+    new_vol_ulid: Option<ulid::Ulid>,
+    out: &mut dyn Write,
+    err: io::Error,
+) -> io::Result<ulid::Ulid> {
+    match new_vol_ulid {
+        Some(u) => {
+            let _ = writeln!(
+                out,
+                "[claim] attach stream interrupted after fork finalized \
+                 ({err}); prefetch continues in background"
+            );
+            Ok(u)
+        }
+        None => Err(err),
     }
 }
 
@@ -1316,5 +1355,98 @@ mod tests {
         };
         let err = macaroon::check_caveats(&parsed, &ctx).unwrap_err();
         assert_eq!(err, "macaroon expired");
+    }
+
+    const TEST_FORK_ULID: &str = "01J0000000000000000000000W";
+
+    fn ok_event(json: &str) -> String {
+        format!(r#"{{"outcome":"ok","data":{json}}}"#)
+    }
+
+    fn fork_created_event() -> String {
+        ok_event(&format!(
+            r#"{{"kind":"fork-created","new_vol_ulid":"{TEST_FORK_ULID}"}}"#
+        ))
+    }
+
+    /// `finalize_or_err`: once `ForkCreated` has been seen (`Some`), a
+    /// transport error becomes success and the interruption is noted on
+    /// `out`.
+    #[test]
+    fn finalize_or_err_reports_success_after_fork_created() {
+        let ulid = ulid::Ulid::from_string(TEST_FORK_ULID).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let r = finalize_or_err(Some(ulid), &mut out, io::Error::other("socket dropped"));
+        assert_eq!(r.unwrap(), ulid);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("interrupted after fork finalized"), "{s}");
+        assert!(s.contains("socket dropped"), "{s}");
+    }
+
+    /// `finalize_or_err`: with no fork yet (`None`), the error propagates
+    /// untouched and nothing is written to `out`.
+    #[test]
+    fn finalize_or_err_propagates_before_fork_created() {
+        let mut out: Vec<u8> = Vec::new();
+        let err = finalize_or_err(None, &mut out, io::Error::other("pull failed"))
+            .expect_err("pre-finalize break must propagate");
+        assert!(err.to_string().contains("pull failed"), "{err}");
+        assert!(out.is_empty(), "no note before the fork is durable");
+    }
+
+    /// claim attach: the stream emits `ForkCreated` then closes without a
+    /// terminal `Done` (coordinator restart mid-prefetch). Because the fork
+    /// was finalized, the client reports success with the fork ULID.
+    #[test]
+    fn claim_attach_treats_post_finalize_eof_as_success() {
+        let (_guard, sock) = temp_socket();
+        let server = spawn_streaming_server(sock.clone(), vec![fork_created_event()]);
+        let mut out: Vec<u8> = Vec::new();
+        let ulid = Client::new(&sock)
+            .claim_attach_by_name("vol", &mut out)
+            .expect("post-finalize interruption must succeed");
+        server.join().unwrap();
+        assert_eq!(ulid.to_string(), TEST_FORK_ULID);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("interrupted after fork finalized"), "{s}");
+    }
+
+    /// claim attach: a `Failed` orchestrator (err envelope) before any
+    /// `ForkCreated` propagates as an error — the fork is not usable, and no
+    /// success note is emitted.
+    #[test]
+    fn claim_attach_propagates_pre_finalize_failure() {
+        let (_guard, sock) = temp_socket();
+        let replies = vec![
+            ok_event(r#"{"kind":"pulling-ancestor","vol_ulid":"01JQAAAAAAAAAAAAAAAAAAAAAA"}"#),
+            r#"{"outcome":"err","error":{"kind":"internal","message":"pulling skeleton: boom"}}"#
+                .to_string(),
+        ];
+        let server = spawn_streaming_server(sock.clone(), replies);
+        let mut out: Vec<u8> = Vec::new();
+        let err = Client::new(&sock)
+            .claim_attach_by_name("vol", &mut out)
+            .expect_err("pre-finalize failure must propagate");
+        server.join().unwrap();
+        assert!(err.to_string().contains("boom"), "{err}");
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("interrupted after fork finalized"), "{s}");
+    }
+
+    /// claim attach: the happy path — `ForkCreated` then `Done` — returns
+    /// the ULID with no interruption note.
+    #[test]
+    fn claim_attach_clean_done_returns_fork_ulid() {
+        let (_guard, sock) = temp_socket();
+        let replies = vec![fork_created_event(), ok_event(r#"{"kind":"done"}"#)];
+        let server = spawn_streaming_server(sock.clone(), replies);
+        let mut out: Vec<u8> = Vec::new();
+        let ulid = Client::new(&sock)
+            .claim_attach_by_name("vol", &mut out)
+            .expect("clean done must succeed");
+        server.join().unwrap();
+        assert_eq!(ulid.to_string(), TEST_FORK_ULID);
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("interrupted"), "{s}");
     }
 }

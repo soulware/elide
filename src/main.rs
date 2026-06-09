@@ -2090,20 +2090,13 @@ fn run_claim(name: &str, coord: &coordinator_client::Client) -> std::io::Result<
             eprintln!("[claim] claiming '{name}' from {released_vol_ulid}");
             install_prefetch_ctrlc_handler(name, "[claim]");
             let mut stderr = std::io::stderr();
-            // Don't fail the claim if the attach stream errors out at
-            // the prefetch step — the bucket-side claim and local fork
-            // are durable by the time we get here, mirroring the prior
-            // CLI behaviour. Pre-prefetch errors do still surface.
-            match coord.claim_attach_by_name(name, &mut stderr) {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    eprintln!(
-                        "[claim] attach stream ended with error ({e}); \
-                         coordinator continues in background"
-                    );
-                    Ok(())
-                }
-            }
+            // An error here means the orchestrator failed before `finalize`:
+            // the bucket points at us but the local fork is incomplete, so
+            // the volume can't start. Propagate it so the claim exits non-
+            // zero. A stream that breaks *after* the fork was finalized
+            // (e.g. during prefetch warm-up) is already reported as success
+            // by `claim_attach_by_name`.
+            coord.claim_attach_by_name(name, &mut stderr).map(|_| ())
         }
     }
 }
