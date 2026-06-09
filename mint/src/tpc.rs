@@ -597,3 +597,151 @@ mod tests {
         assert_eq!(via_vid, via_cid);
     }
 }
+
+/// Property-based tests for the TPC crypto primitives. The example tests
+/// above pin specific keys, fields, and tamper sites; these assert the
+/// round-trip, injectivity, key-binding, tamper-detection, and
+/// layout-separation invariants over arbitrary keys and arbitrary
+/// (possibly empty, multi-byte, or token-looking) identity strings —
+/// fuzzing the length-prefix parser at every boundary the examples
+/// reach by hand. `client_id`/`org_id`/`mode` are arbitrary `String`s
+/// because mint treats them as opaque byte-fields, not validated input.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn key() -> impl Strategy<Value = [u8; 32]> {
+        proptest::array::uniform32(any::<u8>())
+    }
+
+    proptest! {
+        /// `r` derivation is a deterministic, input-sensitive KDF: equal
+        /// inputs give the same `r`; any differing input gives a different
+        /// one (collision probability ~2⁻²⁵⁶).
+        #[test]
+        fn derive_r_is_deterministic_and_sensitive(
+            k1 in key(), c1 in any::<String>(), e1 in any::<u32>(),
+            k2 in key(), c2 in any::<String>(), e2 in any::<u32>(),
+        ) {
+            prop_assert_eq!(derive_r(&k1, &c1, e1), derive_r(&k1, &c1, e1));
+            if (k1, &c1, e1) != (k2, &c2, e2) {
+                prop_assert_ne!(derive_r(&k1, &c1, e1), derive_r(&k2, &c2, e2));
+            }
+        }
+
+        /// VID round-trips under its chain tag.
+        #[test]
+        fn vid_round_trips(tag in key(), r in key()) {
+            let vid = encrypt_vid(&tag, &r);
+            prop_assert_eq!(decrypt_vid(&tag, &vid), Ok(r));
+        }
+
+        /// CID round-trips to its bound identity for any fields, including
+        /// empty and multi-byte strings — the length-prefix parser
+        /// recovers the exact bytes.
+        #[test]
+        fn cid_round_trips(key in key(), r in key(), client in any::<String>(), org in any::<String>()) {
+            let cid = encrypt_cid(&key, &r, &client, &org);
+            prop_assert_eq!(
+                decrypt_cid(&key, &cid),
+                Ok(CidPlaintext { r, client_id: client, org_id: org })
+            );
+        }
+
+        /// Attested CID round-trips to its bound identity and opaque mode.
+        #[test]
+        fn attested_cid_round_trips(
+            key in key(), r in key(),
+            client in any::<String>(), org in any::<String>(), mode in any::<String>(),
+        ) {
+            let cid = encrypt_cid_attested(&key, &r, &client, &org, &mode);
+            prop_assert_eq!(
+                decrypt_cid_attested(&key, &cid),
+                Ok(AttestedCidPlaintext { r, client_id: client, org_id: org, mode })
+            );
+        }
+
+        /// CID is injective in its identity fields: with key and `r` held
+        /// fixed, two CIDs are byte-equal iff their `(client, org)` pairs
+        /// are equal. The forward direction is determinism; the reverse is
+        /// the length-prefix anti-collision guarantee, over all string
+        /// pairs (not just the `("ab","cd")` vs `("abcd","")` example).
+        #[test]
+        fn cid_is_injective_in_its_fields(
+            key in key(), r in key(),
+            c1 in any::<String>(), o1 in any::<String>(),
+            c2 in any::<String>(), o2 in any::<String>(),
+        ) {
+            let a = encrypt_cid(&key, &r, &c1, &o1);
+            let b = encrypt_cid(&key, &r, &c2, &o2);
+            prop_assert_eq!(a == b, (&c1, &o1) == (&c2, &o2));
+        }
+
+        /// Attested CID is injective in `(client, org, mode)` — the mode's
+        /// own length prefix keeps `(org="cd", mode="ef")` distinct from
+        /// `(org="cdef", mode="")` for all strings.
+        #[test]
+        fn attested_cid_is_injective_in_its_fields(
+            key in key(), r in key(),
+            c1 in any::<String>(), o1 in any::<String>(), m1 in any::<String>(),
+            c2 in any::<String>(), o2 in any::<String>(), m2 in any::<String>(),
+        ) {
+            let a = encrypt_cid_attested(&key, &r, &c1, &o1, &m1);
+            let b = encrypt_cid_attested(&key, &r, &c2, &o2, &m2);
+            prop_assert_eq!(a == b, (&c1, &o1, &m1) == (&c2, &o2, &m2));
+        }
+
+        /// Decryption under any key other than the encrypting one fails the
+        /// AEAD tag check — the key binding holds for arbitrary keys, not
+        /// just a single flipped bit.
+        #[test]
+        fn cid_decrypt_under_wrong_key_fails(
+            k1 in key(), k2 in key(), r in key(),
+            client in any::<String>(), org in any::<String>(),
+        ) {
+            prop_assume!(k1 != k2);
+            let cid = encrypt_cid(&k1, &r, &client, &org);
+            prop_assert_eq!(decrypt_cid(&k2, &cid), Err(TpcError::Aead));
+        }
+
+        /// Any single-bit tamper anywhere in a VID is caught by the AEAD
+        /// tag — decryption fails rather than returning a corrupted `r`.
+        #[test]
+        fn tampered_vid_fails(tag in key(), r in key(), idx in any::<usize>(), bit in 0u8..8) {
+            let mut vid = encrypt_vid(&tag, &r);
+            let i = idx % vid.len();
+            vid[i] ^= 1 << bit;
+            prop_assert_eq!(decrypt_vid(&tag, &vid), Err(TpcError::Aead));
+        }
+
+        /// The auth and attested CID layouts never alias: an auth CID
+        /// (no mode field) read by the attested parser is `Truncated`,
+        /// and an attested CID read by the auth parser has `Trailing`
+        /// bytes — for any fields, under the same key.
+        #[test]
+        fn cid_layouts_do_not_alias(
+            key in key(), r in key(),
+            client in any::<String>(), org in any::<String>(), mode in any::<String>(),
+        ) {
+            let auth = encrypt_cid(&key, &r, &client, &org);
+            let attested = encrypt_cid_attested(&key, &r, &client, &org, &mode);
+            prop_assert_eq!(decrypt_cid_attested(&key, &auth), Err(TpcError::Truncated));
+            prop_assert_eq!(decrypt_cid(&key, &attested), Err(TpcError::Trailing));
+        }
+
+        /// The dual recovery paths agree: `r` recovered by walking the
+        /// chain (VID) equals `r` recovered by decrypting CID under K_M-A,
+        /// for arbitrary keys, tags, and fields.
+        #[test]
+        fn vid_and_cid_recover_the_same_r(
+            k_m_a in key(), tag in key(), r in key(),
+            client in any::<String>(), org in any::<String>(),
+        ) {
+            let via_vid = decrypt_vid(&tag, &encrypt_vid(&tag, &r));
+            let via_cid = decrypt_cid(&k_m_a, &encrypt_cid(&k_m_a, &r, &client, &org)).map(|pt| pt.r);
+            prop_assert_eq!(via_vid, Ok(r));
+            prop_assert_eq!(via_cid, Ok(r));
+        }
+    }
+}

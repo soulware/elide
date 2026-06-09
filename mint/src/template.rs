@@ -629,3 +629,126 @@ mod tests {
         );
     }
 }
+
+/// Property-based tests for the renderer's injection-proofness. The
+/// example tests above pin one hand-built malicious value; these assert
+/// the guarantee over *every* value a namespace source could carry: a
+/// substituted value always lands intact in its string slot, never alters
+/// the document's structure, and is never re-scanned as a second template.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn env_one(key: &str, val: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([(key.to_string(), val.to_string())])
+    }
+
+    fn dis(volume: &str) -> Vec<Caveat> {
+        vec![Caveat::scalar("volume", volume)]
+    }
+
+    /// An adversarial value: a run of fragments biased towards the
+    /// characters and substrings that could break a naïve string-splice
+    /// renderer — JSON metacharacters, control bytes, token-looking
+    /// `{{…}}` text, and arbitrary Unicode scalars.
+    fn evil_value() -> impl Strategy<Value = String> {
+        let fragment = prop_oneof![
+            Just("\"".to_string()),
+            Just("\\".to_string()),
+            Just("{".to_string()),
+            Just("}".to_string()),
+            Just("[".to_string()),
+            Just("]".to_string()),
+            Just(",".to_string()),
+            Just(":".to_string()),
+            Just("\n".to_string()),
+            Just("\u{0}".to_string()),
+            Just("{{env.bucket}}".to_string()),
+            Just("{{attested.volume}}".to_string()),
+            "[a-z0-9/_-]{0,5}".prop_map(String::from),
+            any::<char>().prop_map(|c| c.to_string()),
+        ];
+        proptest::collection::vec(fragment, 0..12).prop_map(|frags| frags.concat())
+    }
+
+    proptest! {
+        /// Whatever a substituted value contains, the output is valid JSON
+        /// and the value reappears byte-for-byte in its slot — serde
+        /// escapes it into the string on the way out.
+        #[test]
+        fn value_lands_intact_and_output_is_valid_json(value in evil_value()) {
+            const TPL: &str = r#"{"Resource":["arn:aws:s3:::{{attested.volume}}/*"]}"#;
+            let out = render_policy(TPL, &env_one("bucket", "demo"), &dis(&value), &[], "t", "r")
+                .expect("render must succeed for a well-formed, present token");
+            let v: Value = serde_json::from_str(&out).expect("output is valid json");
+            let expected = format!("arn:aws:s3:::{value}/*");
+            prop_assert_eq!(v["Resource"][0].as_str(), Some(expected.as_str()));
+        }
+
+        /// A value can never inject structure: regardless of content, the
+        /// rendered document has the same shape as a benign render — one
+        /// statement, `Effect: Allow`, a single `Resource` element — with
+        /// the value confined to that one leaf.
+        #[test]
+        fn value_cannot_alter_structure(value in evil_value()) {
+            const TPL: &str =
+                r#"{"Statement":[{"Effect":"Allow","Resource":["arn:{{attested.volume}}"]}]}"#;
+            let out = render_policy(TPL, &env_one("bucket", "demo"), &dis(&value), &[], "t", "r")
+                .expect("render ok");
+            let v: Value = serde_json::from_str(&out).expect("valid json");
+            let stmts = v["Statement"].as_array().expect("statement array");
+            prop_assert_eq!(stmts.len(), 1);
+            prop_assert_eq!(stmts[0]["Effect"].as_str(), Some("Allow"));
+            let res = stmts[0]["Resource"].as_array().expect("resource array");
+            prop_assert_eq!(res.len(), 1);
+            let expected = format!("arn:{value}");
+            prop_assert_eq!(res[0].as_str(), Some(expected.as_str()));
+        }
+
+        /// Three namespaces resolved in one render each land in their own
+        /// slot, intact and independent — no value bleeds across slots.
+        #[test]
+        fn every_namespace_value_lands_in_its_own_slot(
+            e in evil_value(),
+            a in evil_value(),
+            c in evil_value(),
+        ) {
+            const TPL: &str = r#"{"e":"{{env.x}}","a":"{{attested.volume}}","c":"{{caveat.sub}}"}"#;
+            let out = render_policy(
+                TPL,
+                &env_one("x", &e),
+                &dis(&a),
+                &[Caveat::scalar("sub", &c)],
+                "t",
+                "r",
+            )
+            .expect("render ok");
+            let v: Value = serde_json::from_str(&out).expect("valid json");
+            prop_assert_eq!(v["e"].as_str(), Some(e.as_str()));
+            prop_assert_eq!(v["a"].as_str(), Some(a.as_str()));
+            prop_assert_eq!(v["c"].as_str(), Some(c.as_str()));
+        }
+
+        /// A substituted value is emitted verbatim and never re-scanned: a
+        /// value that itself contains `{{env.bucket}}` stays literal text,
+        /// so the (differently-valued) real `env.bucket` never appears.
+        #[test]
+        fn substituted_values_are_not_rescanned(suffix in evil_value()) {
+            let value = format!("{{{{env.bucket}}}}{suffix}"); // literal "{{env.bucket}}" + suffix
+            const TPL: &str = r#"{"r":["{{attested.volume}}"]}"#;
+            let out = render_policy(
+                TPL,
+                &env_one("bucket", "SHOULD_NOT_APPEAR"),
+                &dis(&value),
+                &[],
+                "t",
+                "r",
+            )
+            .expect("render ok");
+            let v: Value = serde_json::from_str(&out).expect("valid json");
+            prop_assert_eq!(v["r"][0].as_str(), Some(value.as_str()));
+            prop_assert!(!out.contains("SHOULD_NOT_APPEAR"));
+        }
+    }
+}
