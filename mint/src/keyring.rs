@@ -497,3 +497,169 @@ mod tests {
         assert_eq!(kr.get(99), None);
     }
 }
+
+/// Property-based tests for the rotation state machine. The example tests
+/// above pin specific rotation sequences and torn-write scenarios; the
+/// first property here drives an *arbitrary* sequence of open/add/retire
+/// ops against a real on-disk keyring and a parallel model, asserting the
+/// ring invariants after every step. The rest assert the recovery
+/// behaviour under injected corruption (missing pointer, pointer at an
+/// absent kid, torn add) — they reach the module's private layout helpers,
+/// which is why they live inline rather than in a `tests/` file.
+///
+/// Each case does real filesystem I/O (a tempdir plus a file per
+/// generation), so the case count is capped below the proptest default.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    fn key() -> impl Strategy<Value = [u8; 32]> {
+        proptest::array::uniform32(any::<u8>())
+    }
+
+    fn root_keys_dir(tmp: &tempfile::TempDir) -> PathBuf {
+        tmp.path().join("root_keys")
+    }
+
+    /// One rotation operation. `Retire` carries a selector resolved at
+    /// apply time against the live kids, so it densely hits both the
+    /// refuse-current and the real-retire paths rather than almost always
+    /// naming an absent kid.
+    #[derive(Debug, Clone)]
+    enum Op {
+        Reopen,
+        Add([u8; 32]),
+        Retire(usize),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            2 => Just(Op::Reopen),
+            3 => key().prop_map(Op::Add),
+            2 => any::<usize>().prop_map(Op::Retire),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Any sequence of open/add/retire keeps the ring consistent with a
+        /// model that mirrors the contract: current is always the highest
+        /// kid and always resolves; add advances by exactly one; retire
+        /// removes only its (non-current) target; reopen preserves
+        /// everything. Key bytes are supplied so the model tracks them and
+        /// can assert each survives persistence.
+        #[test]
+        fn rotation_state_machine(ops in vec(op(), 0..16)) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let dir = root_keys_dir(&tmp);
+            let mut kr = Keyring::open(&dir, None).expect("initial open");
+
+            // Model: live kid → key bytes, plus the current kid. The
+            // initial generation's key is random, so capture it.
+            let mut model: BTreeMap<Kid, [u8; 32]> = BTreeMap::new();
+            model.insert(0, *kr.current_key());
+            let mut current: Kid = 0;
+
+            for op in ops {
+                match op {
+                    Op::Reopen => {
+                        kr = Keyring::open(&dir, None).expect("reopen");
+                    }
+                    Op::Add(k) => {
+                        let expected = current + 1;
+                        let got = kr.add_and_promote(&dir, Some(k)).expect("add_and_promote");
+                        prop_assert_eq!(got, expected);
+                        model.insert(expected, k);
+                        current = expected;
+                    }
+                    Op::Retire(sel) => {
+                        let live: Vec<Kid> = model.keys().copied().collect();
+                        let target = live[sel % live.len()];
+                        let res = kr.retire(&dir, target);
+                        if target == current {
+                            prop_assert!(matches!(res, Err(KeyringError::WouldRetireCurrent)));
+                        } else {
+                            prop_assert!(res.is_ok(), "retire of non-current failed: {res:?}");
+                            model.remove(&target);
+                        }
+                    }
+                }
+
+                // Invariants after every op.
+                prop_assert_eq!(kr.current_kid(), current);
+                prop_assert!(kr.get(current).is_some(), "current kid always resolves in the ring");
+                let live_real: BTreeSet<Kid> = kr.kids().collect();
+                let live_model: BTreeSet<Kid> = model.keys().copied().collect();
+                prop_assert_eq!(&live_real, &live_model);
+                prop_assert_eq!(kr.len(), model.len());
+                for (kid, expected) in &model {
+                    prop_assert_eq!(kr.get(*kid), Some(expected));
+                }
+            }
+        }
+
+        /// A missing pointer (torn retire that removed the pointer, or a
+        /// fresh sidecar mishap) reopens to the highest extant generation
+        /// with every key file still loaded.
+        #[test]
+        fn missing_pointer_falls_back_to_highest_kid(adds in vec(key(), 0..6)) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let dir = root_keys_dir(&tmp);
+            let mut kr = Keyring::open(&dir, None).expect("open");
+            for k in &adds {
+                kr.add_and_promote(&dir, Some(*k)).expect("add");
+            }
+            let highest = kr.current_kid();
+            let before_len = kr.len();
+
+            fs::remove_file(pointer_path(&dir)).expect("remove pointer");
+            let reopened = Keyring::open(&dir, None).expect("reopen");
+            prop_assert_eq!(reopened.current_kid(), highest);
+            prop_assert_eq!(reopened.len(), before_len);
+        }
+
+        /// A pointer naming a kid no longer on disk (a torn retire that
+        /// deleted the file before re-pointing) reopens to the highest
+        /// extant generation, not the dangling kid.
+        #[test]
+        fn pointer_at_absent_kid_falls_back_to_highest(adds in vec(key(), 0..6), bogus in any::<Kid>()) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let dir = root_keys_dir(&tmp);
+            let mut kr = Keyring::open(&dir, None).expect("open");
+            for k in &adds {
+                kr.add_and_promote(&dir, Some(*k)).expect("add");
+            }
+            let highest = kr.current_kid();
+            prop_assume!(kr.get(bogus).is_none());
+
+            write_current_pointer(&dir, bogus).expect("write dangling pointer");
+            let reopened = Keyring::open(&dir, None).expect("reopen");
+            prop_assert_eq!(reopened.current_kid(), highest);
+        }
+
+        /// A torn add — the next key file written, the pointer not yet
+        /// advanced — reopens without loss or corruption: the pointer still
+        /// names the old current (in the ring, so it stays current), and
+        /// the orphaned key is loadable rather than lost.
+        #[test]
+        fn torn_add_leaves_a_loadable_ring(adds in vec(key(), 0..5), orphan in key()) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let dir = root_keys_dir(&tmp);
+            let mut kr = Keyring::open(&dir, None).expect("open");
+            for k in &adds {
+                kr.add_and_promote(&dir, Some(*k)).expect("add");
+            }
+            let current_before = kr.current_kid();
+            let next = current_before + 1;
+
+            write_key_file(&kid_path(&dir, next), &orphan).expect("write orphan key file");
+            let reopened = Keyring::open(&dir, None).expect("reopen");
+            prop_assert_eq!(reopened.current_kid(), current_before);
+            prop_assert_eq!(reopened.get(next), Some(&orphan));
+        }
+    }
+}
