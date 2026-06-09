@@ -302,11 +302,10 @@ live and every subsequent read anchors on it. `claim` already orders
 claim-first has a sharp constraint: the provisional `volume.provenance`
 published before `mark_claimed` must be **complete and correct**. The
 partial-fork crash-recovery walk (`skip_empty_intermediates`) reads it
-back and trusts the `ParentRef`'s `snapshot_ulid` (the basis), `pubkey`
-(the parent's identity key), and `manifest_pubkey` (the recovery-handoff
-signer); placeholders are unsafe. So all three trust-anchors must be
-available *without a `by_id` read* at fork-create time — i.e. from
-control-plane (`coord-ro`) state:
+back and trusts the `ParentRef`'s `snapshot_ulid` (the basis) and
+`pubkey` (the parent's identity key); placeholders are unsafe. So both
+trust-anchors must be available *without a `by_id` read* at fork-create
+time — i.e. from control-plane (`coord-ro`) state:
 
 - **Basis snapshot ULID.** *Proposed:* a `latest_snapshot` field on the
   `names/<name>` record — a bare snapshot ULID pairing with the record's
@@ -324,15 +323,8 @@ control-plane (`coord-ro`) state:
   `handoff_snapshot` on the Released record.)
 - **Parent identity key.** Read from `meta/<parent>.pub` (`coord-base`),
   the same S3 copy coord B's lineage walk verifies against.
-- **Recovery-handoff signer.** *Proposed:* a force-release that synthesises
-  a recovery handoff records the synthesising coordinator's pubkey on the
-  `names/<name>` Released record alongside `handoff_snapshot`. `claim`'s
-  `early_rebind` reads it from the record instead of fetching the handoff
-  manifest from `by_id`. Normal (volume-signed) handoffs record nothing and
-  `manifest_pubkey` stays `None`.
 
-`latest_snapshot` and the recovery-signer pubkey are both `NameRecord`
-schema additions and land together in a single version bump
+`latest_snapshot` is a `NameRecord` schema addition
 (`name_record.rs` rejects unknown versions; schema changes are
 fresh-bucket-only).
 
@@ -360,6 +352,61 @@ strangers discover a basis through the name record.
 - Bare `--from <vol_ulid>` has no record to consult — the name record is
   the discovery surface; raw ULIDs are for explicit pins — and requires
   the pinned form.
+
+### Recovery is a claim: force-release becomes `claim --force`
+
+`release --force` was the one remaining foreign *write*: a coordinator
+that owns nothing synthesised a handoff manifest from a dead volume's
+published state and PUT it under `by_id/<dead>/snapshots/` — a write
+`rw-self` can never discharge, signed by a recovery key that
+`ParentRef.manifest_pubkey` then had to carry through every lineage
+walk. Every artefact that write produces exists only to serve the next
+owner, so the rework gives the operation to the next owner: recovery is
+`claim --force`, and ownership transfers *first*.
+
+1. **Rebind on the stale record's basis.** A stale `Live`/`Stopped`
+   record carries `latest_snapshot` — the dead volume's last
+   owner-published snapshot, volume-signed. That is a complete,
+   recovery-correct provisional basis: mint the fork, write the
+   provisional provenance with `ParentRef = (dead_vol,
+   latest_snapshot)`, and force-CAS `names/<name>` to the claimant. The
+   forced CAS is the fence point, exactly as in force-release today. (A
+   dead volume that never published a snapshot has no basis: the fork
+   is minted as a root and step 2 re-owns every live segment.)
+2. **Re-own the tail, anchored.** The segments the dead volume drained
+   after `latest_snapshot` (resolved from its HEAD) become the new
+   fork's first segments. The claimant is live and the dead volume is
+   its declared parent, so the reads ride `ro-ancestor`; the writes
+   land under the claimant's own prefix and ride `rw-self`. Per
+   segment: verify the parent's signature over the index, re-sign the
+   same index bytes with the fork's key — the segment signature covers
+   `BLAKE3(header || index_bytes)` only, body integrity being the
+   per-entry content hashes — and compose the new S3 object server-side
+   (`UploadPartCopy` for the body; Tigris supports it). Segment ULIDs
+   are retained so intra-tail delta/dedup references stay coherent; the
+   fork's first WAL ULID mints above the copied tail,
+   `max(inputs).increment()`-style.
+
+After this rework no synthesised manifest exists anywhere:
+`ParentRef.manifest_pubkey` and the recovery-signer machinery
+(`resolve_handoff_key_via_recovery`, the per-source attestation
+keypairs) retire. Every manifest is signed by its volume's own key, and
+every write in the system is `rw-self`.
+
+Fencing simplifies with it. The claimant's basis is an owner-published
+snapshot, so every segment it references is already at or below the
+dispossessed owner's GC floor; the tail ULIDs under the dead prefix are
+referenced by nobody once re-owned, so a zombie owner's GC compacting
+them is harmless. The one live race — the zombie compacting tail
+segments mid-copy — is retryable (re-resolve from HEAD; GC outputs
+carry the live bytes) and bounded by the `rw-self` liveness
+re-attestation window: the zombie's discharges stop renewing the moment
+the record is rebound. `design-force-release-fencing.md` needs its
+mechanism and walkthroughs updated to this shape.
+
+An operator who wants to free a dead name without hosting its volume
+runs `claim --force` followed by a normal `release`; the resulting
+Released record carries a real volume-signed handoff.
 
 ### Foreign reads have no anchor — `volume fetch` is removed
 
