@@ -323,3 +323,147 @@ mod tests {
         );
     }
 }
+
+/// Property-based tests for the holder-of-key gate. The example tests
+/// above pin one signer and a fixed tail/body; these assert the same
+/// accept/reject behaviour over arbitrary identity keys, macaroon tails,
+/// and request bodies — exercising the freshness window at its edges and
+/// the signature binding under arbitrary tamper.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn key() -> impl Strategy<Value = [u8; 32]> {
+        proptest::array::uniform32(any::<u8>())
+    }
+
+    /// A JSON-safe body tag — no `"` or `\`, so the assembled body stays
+    /// valid JSON while still varying the exact signed bytes.
+    fn tag() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[a-zA-Z0-9 ._-]{0,16}").expect("valid regex")
+    }
+
+    fn cnf_caveats(seed: &[u8; 32]) -> Vec<Caveat> {
+        vec![Caveat::scalar(CNF_CAVEAT, cnf_value(seed))]
+    }
+
+    fn body_with_ts(ts: u64, tag: &str) -> Vec<u8> {
+        format!(r#"{{"ts":{ts},"tag":"{tag}"}}"#).into_bytes()
+    }
+
+    fn proof_for(seed: &[u8; 32], tail: &[u8; 32], body: &[u8]) -> Proof {
+        Proof::from_b64(&client_signature(seed, tail, body)).expect("well-formed proof")
+    }
+
+    proptest! {
+        /// A `cnf` value minted from any seed is always a valid key.
+        #[test]
+        fn cnf_value_is_always_valid(seed in key()) {
+            prop_assert_eq!(validate_cnf(&cnf_value(&seed)), Ok(()));
+        }
+
+        /// A fresh signature over the exact tail and body, with an in-body
+        /// `ts` inside the skew window, verifies — for any key/tail/body.
+        #[test]
+        fn fresh_proof_within_skew_verifies(
+            seed in key(), tail in key(), tag in tag(),
+            now in SKEW_SECONDS..1_000_000u64, delta in 0..=SKEW_SECONDS, future in any::<bool>(),
+        ) {
+            let ts = if future { now + delta } else { now - delta };
+            let b = body_with_ts(ts, &tag);
+            let proof = proof_for(&seed, &tail, &b);
+            prop_assert_eq!(check(&cnf_caveats(&seed), &tail, &b, Some(proof), now), Ok(()));
+        }
+
+        /// The proof is bound to the macaroon tail: a signature minted for
+        /// one tail never verifies against a different one.
+        #[test]
+        fn proof_is_bound_to_the_tail(seed in key(), t1 in key(), t2 in key(), tag in tag()) {
+            prop_assume!(t1 != t2);
+            let b = body_with_ts(1000, &tag);
+            let proof = proof_for(&seed, &t1, &b);
+            prop_assert_eq!(
+                check(&cnf_caveats(&seed), &t2, &b, Some(proof), 1000),
+                Err(PopReject::BadSignature)
+            );
+        }
+
+        /// The proof is bound to the exact body: any single-bit tamper
+        /// anywhere in the body fails the signature (checked before `ts`
+        /// is even read).
+        #[test]
+        fn any_body_tamper_fails(
+            seed in key(), tail in key(), tag in tag(),
+            idx in any::<usize>(), bit in 0u8..8,
+        ) {
+            let b = body_with_ts(1000, &tag);
+            let proof = proof_for(&seed, &tail, &b);
+            let mut tampered = b.clone();
+            let i = idx % tampered.len();
+            tampered[i] ^= 1 << bit;
+            prop_assert_eq!(
+                check(&cnf_caveats(&seed), &tail, &tampered, Some(proof), 1000),
+                Err(PopReject::BadSignature)
+            );
+        }
+
+        /// A signature by any key other than the one sealed in `cnf` is
+        /// rejected.
+        #[test]
+        fn wrong_signing_key_fails(s1 in key(), s2 in key(), tail in key(), tag in tag()) {
+            prop_assume!(cnf_value(&s1) != cnf_value(&s2));
+            let b = body_with_ts(1000, &tag);
+            let proof = proof_for(&s2, &tail, &b);
+            prop_assert_eq!(
+                check(&cnf_caveats(&s1), &tail, &b, Some(proof), 1000),
+                Err(PopReject::BadSignature)
+            );
+        }
+
+        /// A correctly-signed proof whose in-body `ts` is outside the skew
+        /// window is `Stale` — freshness is enforced after the signature.
+        #[test]
+        fn outside_skew_is_stale(
+            seed in key(), tail in key(), tag in tag(),
+            now in 200_000..1_000_000u64, delta in (SKEW_SECONDS + 1)..100_000, future in any::<bool>(),
+        ) {
+            let ts = if future { now + delta } else { now - delta };
+            let b = body_with_ts(ts, &tag);
+            let proof = proof_for(&seed, &tail, &b);
+            prop_assert_eq!(
+                check(&cnf_caveats(&seed), &tail, &b, Some(proof), now),
+                Err(PopReject::Stale)
+            );
+        }
+
+        /// A key-bound credential with no proof header is `MissingProof`,
+        /// for any key.
+        #[test]
+        fn key_bound_without_proof_is_missing(seed in key(), tail in key(), tag in tag()) {
+            let b = body_with_ts(1000, &tag);
+            prop_assert_eq!(
+                check(&cnf_caveats(&seed), &tail, &b, None, 1000),
+                Err(PopReject::MissingProof)
+            );
+        }
+
+        /// The downgrade defence: two disagreeing `cnf` occurrences resolve
+        /// `Unsatisfiable` and fail closed before any proof is checked —
+        /// even a valid proof for one of them cannot open the gate.
+        #[test]
+        fn contradictory_cnf_fails_closed(s1 in key(), s2 in key(), tail in key(), tag in tag()) {
+            prop_assume!(cnf_value(&s1) != cnf_value(&s2));
+            let cv = vec![
+                Caveat::scalar(CNF_CAVEAT, cnf_value(&s1)),
+                Caveat::scalar(CNF_CAVEAT, cnf_value(&s2)),
+            ];
+            let b = body_with_ts(1000, &tag);
+            let proof = proof_for(&s1, &tail, &b);
+            prop_assert_eq!(
+                check(&cv, &tail, &b, Some(proof), 1000),
+                Err(PopReject::Unsatisfiable)
+            );
+        }
+    }
+}
