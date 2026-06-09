@@ -1023,11 +1023,11 @@ mod tests {
     #[tokio::test]
     async fn rw_self_discharge_request_is_accepted_by_coord_b() {
         use ed25519_dalek::SigningKey;
+        use elide_attestation::{DischargeRequest, DischargeState, put_object};
         use elide_core::config::VolumeConfig;
         use elide_core::name_record::NameRecord;
         use elide_core::signing::encode_hex;
         use elide_core::store_keys::meta_pub_key;
-        use elide_peer_fetch::discharge::{DischargeRequest, DischargeState, put_object};
         use object_store::ObjectStore;
         use object_store::memory::InMemory;
 
