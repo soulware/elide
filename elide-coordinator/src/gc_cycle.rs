@@ -425,6 +425,39 @@ impl GcCycleOrchestrator {
             return false;
         }
 
+        // Reap is the only destructive tick op: a `claim --force` on
+        // another host may be copying these very objects, so re-check
+        // `names/<name>` still binds this fork before DELETEing. Best
+        // effort (check-then-act, one-tick window) — the claimant's
+        // per-pass HEAD re-read remains the correctness backstop.
+        if let Some(name) = &self.volume_name {
+            match self.name_claims.read(name).await {
+                Ok(Some(rec)) if rec.vol_ulid == self.vol_ulid => {}
+                Ok(Some(rec)) => {
+                    error!(
+                        "[reap {}] names/{name} now binds {}; this fork has been \
+                         displaced — skipping reap",
+                        self.vol_ulid, rec.vol_ulid
+                    );
+                    return false;
+                }
+                Ok(None) => {
+                    error!(
+                        "[reap {}] names/{name} record is gone; skipping reap",
+                        self.vol_ulid
+                    );
+                    return false;
+                }
+                Err(e) => {
+                    warn!(
+                        "[reap {}] reading names/{name}: {e}; skipping reap",
+                        self.vol_ulid
+                    );
+                    return false;
+                }
+            }
+        }
+
         // Fan the DELETEs out concurrently so the per-vol tick isn't
         // blocked on N sequential round-trips when retention expires
         // for a large batch at once. Concurrency cap matches the
@@ -571,6 +604,13 @@ mod tests {
     }
 
     fn orchestrator(store: Arc<dyn ObjectStore>) -> (GcCycleOrchestrator, TempDir) {
+        orchestrator_named(store, None)
+    }
+
+    fn orchestrator_named(
+        store: Arc<dyn ObjectStore>,
+        volume_name: Option<&str>,
+    ) -> (GcCycleOrchestrator, TempDir) {
         let tmp = TempDir::new().unwrap();
         // Build `<tmp>/by_id/<vol>/` so by_id_dir resolves to a real
         // path; the orchestrator's tick logic exists() checks the fork
@@ -592,7 +632,7 @@ mod tests {
             crate::config::GcConfig::default(),
             &locks,
             claims,
-            None,
+            volume_name.map(String::from),
         );
         (orch, tmp)
     }
@@ -795,6 +835,114 @@ mod tests {
             b"sentinel",
             "publish must not PUT when no work was done"
         );
+    }
+
+    /// Seed an expired Superseded edge for `input` (object body
+    /// included) so the next reap pass would delete it.
+    async fn seed_expired_input(
+        store: &Arc<dyn ObjectStore>,
+        orch: &mut GcCycleOrchestrator,
+        input: Ulid,
+        output: Ulid,
+    ) -> object_store::path::Path {
+        orch.last_reap = std::time::Instant::now()
+            - orch.gc_config.reaper_cadence()
+            - std::time::Duration::from_secs(1);
+        let key = crate::upload::segment_key(vol_ulid(), input);
+        store
+            .put(&key, bytes::Bytes::from_static(b"body").into())
+            .await
+            .unwrap();
+        let mut head = segment_head::SegmentHead::empty(None);
+        head.added.insert(output);
+        let since = Utc::now()
+            - chrono::Duration::from_std(orch.gc_config.retention_window).unwrap()
+            - chrono::Duration::seconds(1);
+        head.superseded
+            .insert(input, Supersession { output, since });
+        put_head_via(store, &head).await;
+        key
+    }
+
+    #[tokio::test]
+    async fn reap_skipped_when_name_binds_another_fork() {
+        // names/<name> has been rebound to another fork (a forced
+        // claim displaced us). The ownership check must refuse the
+        // DELETE and leave HEAD untouched.
+        use crate::name_claims::NameClaims as _;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator_named(store.clone(), Some("vol"));
+        let mut m = UlidMint::new(Ulid::nil());
+        let input = m.next();
+        let output = m.next();
+        let usurper = m.next();
+
+        let claims =
+            crate::name_claims::BucketNameClaims::new(Arc::clone(&store), Arc::clone(&store));
+        claims
+            .mark_initial("vol", "other-coord", None, usurper, 1024)
+            .await
+            .unwrap();
+        let key = seed_expired_input(&store, &mut orch, input, output).await;
+
+        orch.publish_head_delta().await;
+
+        assert!(
+            store.head(&key).await.is_ok(),
+            "a displaced fork must not delete segment objects"
+        );
+        let head = read_head_via(&store).await;
+        assert!(head.superseded.contains_key(&input));
+        assert!(head.tombstoned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reap_proceeds_when_name_binds_this_fork() {
+        use crate::name_claims::NameClaims as _;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator_named(store.clone(), Some("vol"));
+        let mut m = UlidMint::new(Ulid::nil());
+        let input = m.next();
+        let output = m.next();
+
+        let claims =
+            crate::name_claims::BucketNameClaims::new(Arc::clone(&store), Arc::clone(&store));
+        claims
+            .mark_initial("vol", "this-coord", None, vol_ulid(), 1024)
+            .await
+            .unwrap();
+        let key = seed_expired_input(&store, &mut orch, input, output).await;
+
+        orch.publish_head_delta().await;
+
+        assert!(
+            matches!(
+                store.head(&key).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "owner-bound fork reaps normally"
+        );
+        let head = read_head_via(&store).await;
+        assert!(head.tombstoned.contains(&input));
+    }
+
+    #[tokio::test]
+    async fn reap_skipped_when_name_record_missing() {
+        // A named fork whose names/<name> record cannot be found must
+        // fail safe: no record means ownership cannot be confirmed.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator_named(store.clone(), Some("vol"));
+        let mut m = UlidMint::new(Ulid::nil());
+        let input = m.next();
+        let output = m.next();
+        let key = seed_expired_input(&store, &mut orch, input, output).await;
+
+        orch.publish_head_delta().await;
+
+        assert!(store.head(&key).await.is_ok());
+        let head = read_head_via(&store).await;
+        assert!(head.superseded.contains_key(&input));
+        assert!(head.tombstoned.is_empty());
     }
 
     #[tokio::test]
