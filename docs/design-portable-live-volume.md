@@ -452,8 +452,8 @@ Read `names/<name>` and act:
 - `state == "live"` or `"stopped"` (foreign-owned) → refuse, unless
   `--force` is passed. With `--force`, the verb force-CASes the
   stale record straight to a fresh fork based on the record's
-  `latest_snapshot` and re-owns the post-snapshot tail under the new
-  fork's prefix — see the dedicated section below.
+  `latest_snapshot` and re-owns the post-snapshot head delta under
+  the new fork's prefix — see the dedicated section below.
 - Anything else → refuse cleanly.
 
 The result of `volume claim` is always a `Stopped` volume bound to
@@ -471,7 +471,7 @@ process exit (graceful or crash) is something else entirely:
 | `volume release <name>` | flipped to `state=released`; `coordinator_id`, `claimed_at`, `hostname` cleared | drained, then discarded | yes — handoff snapshot | any coordinator may `volume claim` |
 | Coordinator graceful shutdown (SIGTERM, Ctrl-C) | unchanged | fsynced, retained on disk | no | this coordinator restarts, sees its own `coordinator_id`, replays WAL, resumes serving — `state` was never flipped to `stopped`, so volumes that were `live` come back `live` |
 | Coordinator crash (SIGKILL, hardware) | unchanged | retained, possibly with unsynced tail | no | same as graceful — restart replays WAL. Unsynced tail is lost (matches the existing crash-recovery contract) |
-| `volume claim --force` from elsewhere | force-CASed (conditioned on the observed stale record) straight to the claimant's fresh fork, `state=stopped` | abandoned (the dead coordinator's WAL is unreachable) | no — the claimant bases on the record's `latest_snapshot` and re-owns the post-snapshot tail under its own prefix *(Proposed)* | the forced claim *is* the recovery; any writes the old owner accepted but never promoted to S3 are lost |
+| `volume claim --force` from elsewhere | force-CASed (conditioned on the observed stale record) straight to the claimant's fresh fork, `state=stopped` | abandoned (the dead coordinator's WAL is unreachable) | no — the claimant bases on the record's `latest_snapshot` and re-owns the post-snapshot head delta under its own prefix *(Proposed)* | the forced claim *is* the recovery; any writes the old owner accepted but never promoted to S3 are lost |
 
 A coordinator that is coming back keeps its volumes, its WAL, and
 its `state=live` records. The only implicit transitions are
@@ -502,8 +502,9 @@ recovering coordinator B:
    concurrent forced claims arbitrate cleanly and the loser sees a
    clean error. The CAS is the fence point for the previous owner
    ([`design-force-release-fencing.md`](design-force-release-fencing.md)).
-3. Re-owns the post-snapshot tail: resolves the dead volume's HEAD,
-   verifies each tail segment's index against the dead fork's
+3. Re-owns the post-snapshot head delta: reads the dead volume's
+   HEAD once (the post-CAS cut defining the copy set), verifies each
+   segment's index against the dead fork's
    `volume.pub`, re-signs the same index bytes with the new fork's
    key, and composes the S3 objects server-side under the new fork's
    prefix. No drain happens (the dead owner's WAL is unreachable);
@@ -642,7 +643,7 @@ Portability is **orthogonal** to the replica model
 <vol_ulid>/<snap_ulid>` remains the way to *fork off* a logically
 independent volume (new name, new identity, divergence). `volume
 stop` + `volume start` is how to *relocate* a name (same name, fresh
-fork inheriting from the previous tail). A user who wants to diverge
+fork inheriting from the previous fork's state). A user who wants to diverge
 *and* relocate does each step explicitly.
 
 The two share the same on-disk fork machinery; only the lifecycle

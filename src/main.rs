@@ -461,10 +461,11 @@ enum VolumeCommand {
     /// by another coordinator. To recover a volume whose owner is
     /// unreachable (machine gone, key lost), run
     /// `volume claim --force <name>`: ownership transfers first via a
-    /// forced CAS on the record, then the dead fork's post-snapshot
-    /// tail is re-owned as the new fork's first segments. The forced
-    /// CAS is still conditioned on the record observed at start, so
-    /// concurrent forced claims arbitrate cleanly.
+    /// forced CAS on the record, then the dead fork's head delta
+    /// (live segments above its last snapshot) is re-owned as the new
+    /// fork's first segments. The forced CAS is still conditioned on
+    /// the record observed at start, so concurrent forced claims
+    /// arbitrate cleanly.
     Claim {
         /// Volume name
         name: String,

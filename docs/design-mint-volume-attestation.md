@@ -404,8 +404,9 @@ owner, so the rework gives the operation to the next owner: recovery is
    forced CAS is the fence point, exactly as in force-release today. (A
    dead volume that never published a snapshot has no basis: the fork
    is minted as a root and step 2 re-owns every live segment.)
-2. **Re-own the tail, anchored.** The segments the dead volume drained
-   after `latest_snapshot` (resolved from its HEAD) become the new
+2. **Re-own the head delta, anchored.** The live segments above
+   `latest_snapshot` — resolved from one post-CAS read of the dead
+   volume's HEAD, the cut that defines the claim set — become the new
    fork's first segments. The claimant is live and the dead volume is
    its declared parent, so the reads ride `ro-ancestor`; the writes
    land under the claimant's own prefix and ride `rw-self`. Per
@@ -414,8 +415,8 @@ owner, so the rework gives the operation to the next owner: recovery is
    `BLAKE3(header || index_bytes)` only, body integrity being the
    per-entry content hashes — and compose the new S3 object server-side
    (`UploadPartCopy` for the body; Tigris supports it). Segment ULIDs
-   are retained so intra-tail delta/dedup references stay coherent; the
-   fork's first WAL ULID mints above the copied tail,
+   are retained so intra-delta dedup references stay coherent; the
+   fork's first WAL ULID mints above the copied delta,
    `max(inputs).increment()`-style.
 
 After this rework no synthesised manifest exists anywhere:
@@ -426,14 +427,14 @@ every write in the system is `rw-self`.
 
 Fencing simplifies with it. The claimant's basis is an owner-published
 snapshot, so every segment it references is already at or below the
-dispossessed owner's GC floor; the tail ULIDs under the dead prefix are
-referenced by nobody once re-owned, so a zombie owner's GC compacting
-them is harmless. The one live race — the zombie compacting tail
-segments mid-copy — is retryable (re-resolve from HEAD; GC outputs
-carry the live bytes) and bounded by the `rw-self` liveness
+dispossessed owner's GC floor; the head-delta ULIDs under the dead
+prefix are referenced by nobody once re-owned, so a zombie owner's GC
+compacting them is harmless. The one live race — the zombie reaping a
+cut-set segment mid-copy — is held off by the retention window and the
+owner-side reap gate, and bounded by the `rw-self` liveness
 re-attestation window: the zombie's discharges stop renewing the moment
-the record is rebound. `design-force-release-fencing.md` § *The tail
-race* carries the mechanism and walkthroughs.
+the record is rebound. `design-force-release-fencing.md` § *The
+head-delta cut* carries the mechanism and walkthroughs.
 
 An operator who wants to free a dead name without hosting its volume
 runs `claim --force` followed by a normal `release`; the resulting

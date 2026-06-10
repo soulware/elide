@@ -6,10 +6,10 @@
 //! on `names/<name>` is the fence point; everything the claimant
 //! reads from the dead fork's prefix happens after it, anchored on
 //! the now-live new fork. The dead fork's prefix is never written:
-//! the post-snapshot tail is *re-owned* — each segment's index
-//! verified under the dead fork's key, re-signed with the new fork's
-//! key, and copied under the new fork's prefix with its ULID
-//! retained.
+//! the head delta (live segments above the basis manifest) is
+//! *re-owned* — each segment's index verified under the dead fork's
+//! key, re-signed with the new fork's key, and copied under the new
+//! fork's prefix with its ULID retained.
 //!
 //! Mirrors the structure of [`crate::claim`]: a [`ClaimJob`] in the
 //! shared registry, a staged orchestrator, progress via
@@ -19,7 +19,7 @@
 //! HEAD (written before any body copy) make the flow resumable. A
 //! re-run on the same host detects the partial fork and continues; a
 //! claimant on another host falls back to the `events/<name>`
-//! journal's prior bindings to source tail segments a crashed
+//! journal's prior bindings to source head-delta segments a crashed
 //! intermediate never finished copying.
 
 use std::collections::BTreeSet;
@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use ulid::Ulid;
 
 use crate::claim::{ClaimContext, ClaimJob, ClaimJobState};
@@ -43,16 +43,9 @@ use elide_core::signing::{
     generate_keypair, load_verifying_key, read_lineage_verifying_signature, write_provenance,
 };
 
-/// Cap on fence-race iterations in [`ForceClaimOrchestrator::re_own`]:
-/// each pass re-resolves the dead fork's HEAD and copies anything new.
-/// A not-yet-fenced zombie owner can grow HEAD for at most the
-/// credential-liveness window, so a handful of passes always
-/// converges; hitting the cap means something is actively writing and
-/// the claim aborts rather than chasing it.
-const REOWN_STABLE_PASSES: usize = 5;
-
-/// How many prior bindings of the name to consider when sourcing tail
-/// segments a crashed intermediate claimant never finished copying.
+/// How many prior bindings of the name to consider when sourcing
+/// head-delta segments a crashed intermediate claimant never finished
+/// copying.
 const JOURNAL_SOURCE_LIMIT: usize = 8;
 
 /// Synchronous entry point for `Request::ClaimStart { force: true }`.
@@ -180,7 +173,7 @@ struct ForceClaimOrchestrator {
     by_id_dir: PathBuf,
 
     // Stage outputs.
-    /// The dead fork whose tail is being re-owned. Fresh: the
+    /// The dead fork whose head delta is being re-owned. Fresh: the
     /// observed binding. Resume: the newest prior binding from the
     /// `events/<name>` journal.
     source_vol: Option<Ulid>,
@@ -349,7 +342,7 @@ impl ForceClaimOrchestrator {
         // the dead fork at that snapshot. Without one the dead fork
         // has no manifest to reference: the new fork takes over the
         // dead fork's own ParentRef and extent sources, and the dead
-        // fork's content arrives via the tail re-own instead.
+        // fork's content arrives via the head-delta re-own instead.
         let parent_pin = self
             .observed
             .record
@@ -445,16 +438,21 @@ impl ForceClaimOrchestrator {
         Ok(())
     }
 
-    /// Stage 4. Re-own the dead fork's post-basis tail.
+    /// Stage 4. Re-own the dead fork's head delta.
     ///
     /// Resolves the effective basis from the dead fork's data plane
-    /// (`snapshots/LATEST` → manifest), computes
-    /// `tail = live(manifest, HEAD) − manifest`, writes the new
-    /// fork's HEAD *first* (the durable intent a resumer reads), then
-    /// copies each segment: GET, verify under the source's key,
-    /// re-sign the header with the new fork's key, PUT under the new
-    /// prefix with the ULID retained. Iterates until the dead fork's
-    /// HEAD is stable across a pass (the fencing doc's tail race).
+    /// (`snapshots/LATEST` → manifest), then reads the dead fork's
+    /// HEAD **once**: the forced CAS is the cut, and this single read
+    /// defines the claim set — `delta = live(manifest, HEAD) −
+    /// manifest`. Anything the displaced owner publishes after the
+    /// cut is a post-displacement write and is excluded, the same
+    /// policy as its undrained WAL. Writes the new fork's HEAD
+    /// *first* (the durable intent a resumer reads), then copies each
+    /// segment: GET, verify under the source's key, re-sign the
+    /// header with the new fork's key, PUT under the new prefix with
+    /// the ULID retained. A final advisory re-read of the dead HEAD
+    /// detects an owner that was alive all along — logged loudly; the
+    /// claim proceeds, since the fence has already landed.
     async fn re_own(&mut self) -> Result<(), IpcError> {
         let source = self.source_vol.expect("resolve_source ran");
         let fork_vol = self.fork.as_ref().expect("rebind ran").vol_ulid;
@@ -498,62 +496,70 @@ impl ForceClaimOrchestrator {
         };
         self.basis = Some(basis);
 
-        // ULIDs handled this run. The new fork's HEAD is *intent*
-        // (written before the copies, for resumers), so it cannot
-        // serve as the done-set — per-object existence inside
-        // `re_own_segment` is what makes a resume skip work.
-        let fork_vd = self.ctx.core.stores.volume_data(&fork_vol);
-        let mut copied: BTreeSet<Ulid> = BTreeSet::new();
+        // The cut: one post-fence read of the dead fork's HEAD
+        // defines the claim set.
+        let source_head = source_vd
+            .head()
+            .read()
+            .await
+            .map_err(|e| IpcError::store(format!("reading HEAD for {source}: {e}")))?;
+        let head_delta: BTreeSet<Ulid> = live_set(&manifest_segments, &source_head)
+            .into_iter()
+            .filter(|u| !manifest_segments.contains(u))
+            .collect();
 
-        for pass in 0..REOWN_STABLE_PASSES {
-            let source_head = source_vd
-                .head()
-                .read()
-                .await
-                .map_err(|e| IpcError::store(format!("reading HEAD for {source}: {e}")))?;
-            let tail: BTreeSet<Ulid> = live_set(&manifest_segments, &source_head)
-                .into_iter()
-                .filter(|u| !manifest_segments.contains(u))
-                .collect();
-            let todo: Vec<Ulid> = tail.difference(&copied).copied().collect();
-            if todo.is_empty() {
-                break;
-            }
-            if pass == REOWN_STABLE_PASSES - 1 {
-                return Err(IpcError::conflict(format!(
-                    "tail of {source} kept growing across {REOWN_STABLE_PASSES} \
-                     passes — the displaced owner appears to be alive and \
-                     writing; aborting forced claim"
-                )));
-            }
-
+        if !head_delta.is_empty() {
             // Durable intent first: a resumer reads the new fork's
-            // HEAD to learn which ULIDs must exist under it.
+            // HEAD to learn which ULIDs must exist under it. It is
+            // written before the copies, so it cannot serve as the
+            // done-set — per-object existence inside `re_own_segment`
+            // is what makes a resume skip work.
+            let fork_vd = self.ctx.core.stores.volume_data(&fork_vol);
             let mut intent = SegmentHead::empty(basis);
-            intent.added = tail.union(&copied).copied().collect();
+            intent.added = head_delta.clone();
             fork_vd
                 .head()
                 .put(&intent)
                 .await
                 .map_err(|e| IpcError::store(format!("writing HEAD for {fork_vol}: {e}")))?;
 
-            for seg_ulid in todo {
-                self.re_own_segment(seg_ulid, source, &source_pubkey)
+            for seg_ulid in &head_delta {
+                self.re_own_segment(*seg_ulid, source, &source_pubkey)
                     .await?;
-                copied.insert(seg_ulid);
             }
         }
+
+        // Advisory liveness check: a dead owner's HEAD cannot move.
+        match source_vd.head().read().await {
+            Ok(h) if h != source_head => {
+                error!(
+                    "[force-claim {}] HEAD of {source} changed during the \
+                     claim — the displaced owner appears to be alive; its \
+                     post-displacement writes are lost",
+                    self.volume
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    "[force-claim {}] re-reading HEAD for {source}: {e}; \
+                     skipping liveness check",
+                    self.volume
+                );
+            }
+        }
+
         info!(
-            "[force-claim {}] re-owned {} tail segment(s) into {fork_vol} \
-             (basis {})",
+            "[force-claim {}] re-owned {} head-delta segment(s) into \
+             {fork_vol} (basis {})",
             self.volume,
-            copied.len(),
+            head_delta.len(),
             basis.map(|b| b.to_string()).as_deref().unwrap_or("<none>")
         );
         Ok(())
     }
 
-    /// Copy one tail segment under the new fork's prefix. Sources the
+    /// Copy one head-delta segment under the new fork's prefix. Sources the
     /// bytes from the dead fork, falling back to the name's prior
     /// bindings (journal) for chains of crashed claimants. Verifies
     /// under the source's key before re-signing — re-signing
@@ -579,13 +585,13 @@ impl ForceClaimOrchestrator {
         }
 
         let mut bytes = match self
-            .fetch_tail_segment(seg_ulid, primary_source, primary_pubkey)
+            .fetch_delta_segment(seg_ulid, primary_source, primary_pubkey)
             .await?
         {
             Some(b) => b,
             None => {
                 return Err(IpcError::not_found(format!(
-                    "tail segment {seg_ulid} not found under {primary_source} \
+                    "segment {seg_ulid} not found under {primary_source} \
                      or any prior binding of '{}' — originals may have been \
                      reaped; manual recovery required",
                     self.volume
@@ -610,12 +616,12 @@ impl ForceClaimOrchestrator {
         Ok(())
     }
 
-    /// Fetch + verify a tail segment's bytes from the dead fork, then
-    /// from each prior binding of the name (newest first). Each
-    /// candidate's bytes are verified under *that* volume's key (its
-    /// skeleton is pulled on demand, which verifies the key against
-    /// `meta/`).
-    async fn fetch_tail_segment(
+    /// Fetch + verify a head-delta segment's bytes from the dead
+    /// fork, then from each prior binding of the name (newest first).
+    /// Each candidate's bytes are verified under *that* volume's key
+    /// (its skeleton is pulled on demand, which verifies the key
+    /// against `meta/`).
+    async fn fetch_delta_segment(
         &self,
         seg_ulid: Ulid,
         primary_source: Ulid,
@@ -972,7 +978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_claim_reowns_post_snapshot_tail() {
+    async fn fresh_claim_reowns_post_snapshot_head_delta() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let mut mint = UlidMint::new(Ulid::nil());
         let s1 = mint.next();
@@ -990,7 +996,7 @@ mod tests {
             )
             .await;
         }
-        // Basis manifest covers s1; HEAD carries the post-basis tail.
+        // Basis manifest covers s1; HEAD carries the post-basis delta.
         let manifest =
             elide_core::signing::build_snapshot_manifest_bytes(dead.signer.as_ref(), &[s1], None);
         let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead.vol);
@@ -1026,14 +1032,14 @@ mod tests {
             Some(format!("{}/{basis}", dead.vol).as_str())
         );
 
-        // Tail re-owned under the new prefix, ULIDs retained; the
-        // basis-covered segment is not copied.
+        // Head delta re-owned under the new prefix, ULIDs retained;
+        // the basis-covered segment is not copied.
         assert_reowned(&store, data_dir.path(), fork, s2).await;
         assert_reowned(&store, data_dir.path(), fork, s3).await;
         let fork_vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), fork);
         assert!(fork_vd.segments().get_bytes(s1).await.is_err());
 
-        // New fork's HEAD: anchored at the basis, listing the tail.
+        // New fork's HEAD: anchored at the basis, listing the delta.
         let head = fork_vd.head().read().await.unwrap();
         assert_eq!(head.anchor, Some(basis));
         assert_eq!(head.added, [s2, s3].into_iter().collect());
