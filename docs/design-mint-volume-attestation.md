@@ -261,6 +261,195 @@ possession-proof freshness in *Possession-proof binding*) is a separate,
 tighter clock — it bounds replay of a single proof, not the discharge
 lifetime — and is unrelated to `discharge_ttl`.
 
+## coord A acquisition: anchoring every read on a live local key
+
+The discharge predicate checks `liveness(owned)` and possession of
+`owned`'s `volume.key`, so **coord A can only obtain a discharge for a
+read it anchors on a live volume whose key it holds.** This is the
+acquisition-side invariant: *every `volume-ro` read routes through an
+`owned` anchor that is live (`names/<name> → owned`) and locally keyed.*
+The role enforces it unconditionally — once `volume-ro` carries an
+`ro-ancestor` TPC, every `assume-role` requires a discharge — so a read
+that cannot produce an anchor must not sit on the `volume-ro` path.
+
+### Threading the `owned` anchor
+
+`volume-ro` is acquired at two seams, both of which already know the
+anchor:
+
+- **The volume process's demand-fetch** (IPC `provision_volume_ro`): the
+  requester *is* `owned`. `authorize_target` already validates `target ∈
+  {requester} ∪ lineage(requester)`; it carries `requester` through as the
+  anchor.
+- **Coordinator-internal dense reads** (`ScopedStores::read_volume`): the
+  call site holds the live leaf being operated on. `read_volume(owned,
+  target)` threads it; the per-`(owned, target)` `volume-ro` facade fetches
+  an `ro-ancestor` discharge before `assume-role` (parallel to how
+  `volume-rw` fetches `rw-self`).
+
+### Setup reads: claim-first ordering
+
+Most reads anchor trivially — demand-fetch and prefetch run on a live
+leaf. The exception is *volume setup* (fork, claim, start), which reads
+`by_id` data while the local leaf is still being established. fork and
+claim establish a *new* leaf, and the rule is **claim-first**: publish
+the new fork's `volume.provenance` and rebind `names/<name>` to it
+*before* any `by_id` read, so `owned = new_fork` is live and every
+subsequent read anchors on it. `claim` already orders `mark_claimed`
+ahead of its chain reads; `fork` adopts the same shape. start
+re-establishes an *existing* leaf and anchors on its surviving key
+(§ *`start` anchors on the key shadow*).
+
+### The provisional provenance must be recovery-correct — so its trust-anchors come from control-plane state
+
+claim-first has a sharp constraint: the provisional `volume.provenance`
+published before `mark_claimed` must be **complete and correct**. The
+partial-fork crash-recovery walk (`skip_empty_intermediates`) reads it
+back and trusts the `ParentRef`'s `snapshot_ulid` (the basis) and
+`pubkey` (the parent's identity key); placeholders are unsafe. So both
+trust-anchors must be available *without a `by_id` read* at fork-create
+time — i.e. from control-plane (`coord-ro`) state:
+
+- **Basis snapshot ULID.** *Proposed:* a `latest_snapshot` field on the
+  `names/<name>` record — a bare snapshot ULID pairing with the record's
+  `vol_ulid`, the same convention as `handoff_snapshot`. The owner's
+  publish path CASes it after each `User` manifest upload (single
+  writer, best-effort, self-heals on the next publish — the same
+  discipline as the `by_id` LATEST bump it mirrors); import completion
+  writes it once on `Readonly` records, so `create --from
+  <imported-name>` resolves in one GET. Fork reads `(vol_ulid,
+  latest_snapshot)` from one record, atomically consistent under the
+  record CAS — a rebind can never leave the basis pointing at a previous
+  binding's volume. Eventual consistency is fine: a fork basing on a
+  slightly older published snapshot just demand-fetches a little more
+  later. (claim already has its basis control-plane — the
+  `handoff_snapshot` on the Released record.)
+- **Parent identity key.** Read from `meta/<parent>.pub` (`coord-base`),
+  the same S3 copy coord B's lineage walk verifies against.
+
+`latest_snapshot` is a `NameRecord` schema addition
+(`name_record.rs` rejects unknown versions; schema changes are
+fresh-bucket-only).
+
+With the anchors sourced control-plane, fork and claim build the new
+fork's provisional provenance from `coord-ro` + `meta/` (`coord-base`)
+reads only, rebind the name, and then anchor every `by_id` read — basis
+manifest verify, idx pulls, body warm, ancestor data — on the now-live
+fork.
+
+`by_id/<vol>/snapshots/LATEST` remains the data-plane liveness anchor:
+the LATEST → manifest → HEAD resolution used by GC verification,
+recovery enumeration, and remote-start hydration, written by the owner
+under per-volume credential scoping and — unlike the name record —
+surviving rebinds, so ancestry walks can still resolve a released
+ancestor's snapshots. Every reader of that protocol is owner-anchored;
+strangers discover a basis through the name record.
+
+### Basis resolution per `--from` form
+
+- `--from <vol_ulid>/<snap_ulid>` and `--from <name>/<snap_ulid>` carry
+  the basis explicitly. Name resolution is one `names/<name>` GET; no
+  basis lookup at all.
+- `--from <name>` takes the record's `latest_snapshot` as the basis,
+  pinned into the fork's provenance at create time.
+- Bare `--from <vol_ulid>` has no record to consult — the name record is
+  the discovery surface; raw ULIDs are for explicit pins — and requires
+  the pinned form.
+
+### `start` anchors on the key shadow
+
+The third setup operation establishes no new leaf. Remote start
+(`start_remote.rs::hydrate_remote_owned`) runs when `names/<name>`
+points at a leaf this coordinator owns but `by_id/<leaf>/` is gone
+locally (the stop → remove → start round trip). Liveness already
+holds — the record still points at the leaf — so the anchor is the
+leaf itself, and the question is possession: the in-dir `volume.key`
+vanished with the directory. The surviving copy is the **key shadow**
+(`data_dir/keys/<vol_ulid>.key`, written when claim/fork mints the
+keypair), and it is start's possession proof:
+
+- **Shadow-first ordering.** The hydrate runs: skeleton chain off
+  `meta/*` (`coord-ro`, anchorless) → read the shadow → prove
+  possession with it → the `by_id` basis reads (`volume-ro` against
+  the leaf, and against the parent when the leaf never published a
+  snapshot). Today the shadow is consulted only after the basis
+  reads, to restore writability; the proof moves to the front. The
+  restore into the hydrated fork dir stays where it is.
+- **No shadow ⇒ start fails.** The current fallback — hydrate the
+  leaf readonly — retires: a keyless leaf proves nothing, so its
+  basis reads are unauthorisable regardless. A dead owner's volume
+  is recovered from another host via `claim --force`, which is a
+  claim, not a start.
+- **The shadow write becomes load-bearing.** claim/fork write it
+  warn-and-continue today (`claim.rs`); it promotes to hard-fail, so
+  owned-but-keyless cannot arise on a live host.
+
+### Recovery is a claim: force-release becomes `claim --force`
+
+`release --force` was the one remaining foreign *write*: a coordinator
+that owns nothing synthesised a handoff manifest from a dead volume's
+published state and PUT it under `by_id/<dead>/snapshots/` — a write
+`rw-self` can never discharge, signed by a recovery key that
+`ParentRef.manifest_pubkey` then had to carry through every lineage
+walk. Every artefact that write produces exists only to serve the next
+owner, so the rework gives the operation to the next owner: recovery is
+`claim --force`, and ownership transfers *first*.
+
+1. **Rebind on the stale record's basis.** A stale `Live`/`Stopped`
+   record carries `latest_snapshot` — the dead volume's last
+   owner-published snapshot, volume-signed. That is a complete,
+   recovery-correct provisional basis: mint the fork, write the
+   provisional provenance with `ParentRef = (dead_vol,
+   latest_snapshot)`, and force-CAS `names/<name>` to the claimant. The
+   forced CAS is the fence point, exactly as in force-release today. (A
+   dead volume that never published a snapshot has no basis: the fork
+   is minted as a root and step 2 re-owns every live segment.)
+2. **Re-own the tail, anchored.** The segments the dead volume drained
+   after `latest_snapshot` (resolved from its HEAD) become the new
+   fork's first segments. The claimant is live and the dead volume is
+   its declared parent, so the reads ride `ro-ancestor`; the writes
+   land under the claimant's own prefix and ride `rw-self`. Per
+   segment: verify the parent's signature over the index, re-sign the
+   same index bytes with the fork's key — the segment signature covers
+   `BLAKE3(header || index_bytes)` only, body integrity being the
+   per-entry content hashes — and compose the new S3 object server-side
+   (`UploadPartCopy` for the body; Tigris supports it). Segment ULIDs
+   are retained so intra-tail delta/dedup references stay coherent; the
+   fork's first WAL ULID mints above the copied tail,
+   `max(inputs).increment()`-style.
+
+After this rework no synthesised manifest exists anywhere:
+`ParentRef.manifest_pubkey` and the recovery-signer machinery
+(`resolve_handoff_key_via_recovery`, the per-source attestation
+keypairs) retire. Every manifest is signed by its volume's own key, and
+every write in the system is `rw-self`.
+
+Fencing simplifies with it. The claimant's basis is an owner-published
+snapshot, so every segment it references is already at or below the
+dispossessed owner's GC floor; the tail ULIDs under the dead prefix are
+referenced by nobody once re-owned, so a zombie owner's GC compacting
+them is harmless. The one live race — the zombie compacting tail
+segments mid-copy — is retryable (re-resolve from HEAD; GC outputs
+carry the live bytes) and bounded by the `rw-self` liveness
+re-attestation window: the zombie's discharges stop renewing the moment
+the record is rebound. `design-force-release-fencing.md` § *The tail
+race* carries the mechanism and walkthroughs.
+
+An operator who wants to free a dead name without hosting its volume
+runs `claim --force` followed by a normal `release`; the resulting
+Released record carries a real volume-signed handoff.
+
+### Foreign reads have no anchor — `volume fetch` is removed
+
+`volume fetch` pulled a *foreign* volume's bytes without taking ownership:
+a `by_id` read of a volume this host holds no key for, with no lineage
+relationship to prove. It cannot anchor an `ro-ancestor` discharge and so
+cannot sit on the attested `volume-ro` role. It is removed; the
+warm-then-takeover workflow is reconstructable as `fork --from` (which
+warms the owner-keyed `by_id/<source>/cache/` as a side effect of its
+reads, since the body cache is keyed by the owning volume) followed by
+`claim`.
+
 ## Possession-proof binding
 
 The discharge request carries an Ed25519 **possession proof** signed by

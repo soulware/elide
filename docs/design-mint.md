@@ -1957,7 +1957,7 @@ exposed-surface containment.
 
 The peer-fetch verifier needs no dedicated role and no `by_id/` access:
 it uses `coord-ro` for the gap-free fence (per-request ETag-
-conditional `names/<name>` read, coincident with the `release --force`
+conditional `names/<name>` read, coincident with the `claim --force`
 S3 CAS) and the requester-pubkey check (`coordinators/<B>/
 coordinator.pub`), and verifies lineage against the serving peer's
 **own local** signed `volume.provenance` chain — see

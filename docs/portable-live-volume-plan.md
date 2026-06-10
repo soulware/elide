@@ -14,14 +14,16 @@ Implements [`design-portable-live-volume.md`](design-portable-live-volume.md).
 
 **Decisions locked in 2026-04-28:**
 
-- **Force-release recovers to "now", not the last handoff snapshot.**
-  The recovering coordinator lists S3 segments under the dead fork's
-  prefix, verifies each segment's signature against the dead fork's
-  `volume.pub`, and synthesises a fresh handoff snapshot covering
-  the verified set. Data-loss boundary is "writes the dead owner
-  accepted but never promoted to S3" — same as the crash-recovery
-  contract. Works even if the dead owner never published a snapshot.
-  Closes Phase 3's prior open question on fallback semantics.
+- **Forced recovery recovers to "now", not the last snapshot.**
+  (Revised 2026-06-09 to the `claim --force` shape.) The claimant
+  bases on the dead volume's last owner-published snapshot and
+  re-owns the post-snapshot tail resolved from the dead volume's
+  HEAD, verifying each segment index against the dead fork's
+  `volume.pub` before re-signing it. Data-loss boundary is "writes
+  the dead owner accepted but never promoted to S3" — same as the
+  crash-recovery contract. Works even if the dead owner never
+  published a snapshot (the fork is minted as a root and re-owns
+  every live segment).
 - **Coordinator identity is an Ed25519 keypair.** `coordinator.key`
   / `coordinator.pub` (mirroring `volume.key` / `volume.pub`) are
   the sole on-disk identity artefacts. `coordinator_id` derives
@@ -29,7 +31,7 @@ Implements [`design-portable-live-volume.md`](design-portable-live-volume.md).
   MAC root derives from the private key in-memory at startup —
   there is no separate `coordinator.root_key` file. Existing
   deployments take a clean break: new keypair, new `coordinator_id`,
-  affected volumes recover via `volume release --force`.
+  affected volumes recover via `volume claim --force`.
 
 ## How it fits with existing `volume stop`/`volume start`
 
@@ -123,8 +125,8 @@ intents"):
 
 - `live` — held by `coordinator_id`, daemon serving.
 - `stopped` — held by `coordinator_id`, daemon down on this host.
-  Other coordinators cannot claim until the name is released
-  (`volume release --force` from another host).
+  Other coordinators cannot claim the name without
+  `volume claim --force`.
 - `released` — no current owner; any coordinator may
   `volume start --remote`. `coordinator_id`, `claimed_at`, and
   `hostname` are cleared on release.
@@ -171,8 +173,9 @@ plain-text records are not parseable and are not migrated.
 ### Phase 1.5 — Coordinator identity keypair
 
 Replace the symmetric `coordinator.root_key` foundation with an
-Ed25519 keypair held on the coordinator host. Required by Phase 3
-(synthesised handoff snapshots are signed by `coordinator.key`).
+Ed25519 keypair held on the coordinator host. Anchors coordinator
+identity and the macaroon MAC root; Phase 3's original
+synthesised-handoff signing (since retired) was its first consumer.
 Also retrofits Phase 0's `coordinator_id` derivation to derive from
 the public key.
 
@@ -238,7 +241,7 @@ on the bucket-capability probe from Phase 0 — see Phase 4.
 `volume start` is always safe: it never overrides another
 coordinator. Defaults to **local-only**; the bucket is only
 consulted when `--remote` is passed. The override path lives on
-`volume release --force` (Phase 3), not on `start`.
+`volume claim --force` (Phase 3), not on `start`.
 
 - [x] **Local-resume path** — `state == "stopped"` and
   `coordinator_id == self`. `lifecycle::mark_live` flips `state` back
@@ -321,26 +324,38 @@ works as today.
 
 ### Phase 3 — Force takeover and targeted handoff
 
-The override path is split into two normal verbs:
+Recovery from a dead owner is a single verb: `volume claim --force
+<name>` — ownership transfers first, then the claimant re-owns what
+it needs (see `design-mint-volume-attestation.md` § *Recovery is a
+claim* and `design-force-release-fencing.md`):
 
-1. `volume release --force <name>` — unconditionally flip foreign
-   `live`/`stopped` records to `released`. Synthesises a fresh
-   handoff snapshot covering all S3-visible signature-valid segments
-   under the dead fork's prefix, signed by the recovering
-   coordinator's `coordinator.key`. No drain (the dead owner's WAL
-   is unreachable).
-2. `volume start --remote <name>` — claim the now-released name
-   through the standard conditional-PUT path. Verifies the
-   synthesised handoff snapshot's signature against the recovering
-   coordinator's published pubkey before forking from it.
+1. Force-CAS `names/<name>` from the stale `live`/`stopped` record
+   straight to a fresh fork based on the record's `latest_snapshot`
+   (the dead volume's last owner-published snapshot). The forced CAS
+   is the fence point.
+2. Re-own the post-snapshot tail (resolved from the dead volume's
+   HEAD) as the new fork's first segments: verify each index under
+   the dead fork's `volume.pub`, re-sign the same index bytes with
+   the new fork's key, compose the S3 objects server-side. No
+   synthesised manifest, no write under the dead fork's prefix.
 
 This keeps `volume start` always-safe (never overrides another
 coordinator) and makes the dangerous step explicit and auditable.
+There is no post-release race window: the forced CAS binds the name
+directly to the claimant.
 
-`--to <coordinator_id>` adds a targeted-handoff variant that closes
-the post-release race window: instead of `released` (anyone may
-claim), the record goes to `reserved` (only the named coordinator
-may claim). Composes with `--force`.
+`--to <coordinator_id>` on `volume release` remains the graceful
+targeted handoff: the releasing owner drains, and the record goes to
+`reserved` (only the named coordinator may claim) instead of
+`released` (anyone may claim).
+
+The original recovery shape — `release --force` synthesising a
+coordinator-signed handoff manifest under the dead fork's prefix,
+verified on `start --remote` via `parent_manifest_pubkey` — landed as
+the items below and is what runs today. The `claim --force` rework
+retires it: the synthesised manifest was the one S3 write authored by
+a coordinator holding no key for the target prefix, which the
+attestation model's `rw-self` invariant cannot discharge.
 
 - [x] **`Reserved` state in `NameRecord`.** New variant in
   `NameState`; round-trip + lowercase wire tests landed.
@@ -462,17 +477,53 @@ may claim). Composes with `--force`.
   paths covered at the `recovery::resolve_handoff_verifier` layer;
   empty-segment-list recovery exercised in `recovery::tests` and
   the two-coordinator proptest.
-- [ ] **Process-level recovery test:** force-release after a real
-  simulated coordinator death (kill the writing process between
-  segment uploads and `names/<name>` rewrite, then
-  `release --force` + `start --remote` from a second coordinator).
-  Belongs alongside the kernel-lane CI tests; heavier than the
-  inbound-op coverage above.
+**Rework to `claim --force`:**
+
+- [ ] **`NameRecord` `latest_snapshot` field** (schema bump; written
+  by the owner's publish path and at import completion) — shared
+  with the fork-basis work in `design-mint-volume-attestation.md`.
+- [ ] **`claim --force`:** forced CAS on the stale record,
+  provisional provenance from `(vol_ulid, latest_snapshot)`, tail
+  re-own (index verify + re-sign, `UploadPartCopy` body
+  composition — probe Tigris's minimum part size first), first WAL
+  ULID minted above the copied tail. Never-snapshotted dead volume →
+  root fork, re-own every live segment.
+- [ ] **Retire the synthesis path:** `release --force` (CLI + IPC +
+  `force_release_volume_op` + `mark_released_force`),
+  `mint_and_publish_synthesised_snapshot`,
+  `resolve_handoff_verifier` / `resolve-handoff-key`, the manifest
+  recovery fields (`synthesised_from_recovery`,
+  `recovering_coordinator_id`, `recovered_at`, the
+  `"elide-snapshot-recovery-v1"` signing domain), and
+  `ParentRef.manifest_pubkey`. `release --force --to` goes with it;
+  `release --to` (graceful reservation) stays.
+- [ ] **Event vocabulary:** `force_released` in
+  `design-volume-event-log.md` is emitted by the retired verb; the
+  forced claim emits its own event (kind TBD in that doc).
+- [ ] **Process-level recovery test:** kill the writing coordinator
+  between segment uploads and any snapshot publish, then
+  `claim --force` from a second coordinator. Belongs alongside the
+  kernel-lane CI tests; heavier than the inbound-op coverage above.
+
+**Rework to `start --remote`** (same attestation contract,
+`design-mint-volume-attestation.md` § *`start` anchors on the key
+shadow*):
+
+- [ ] **Shadow-first hydrate:** `hydrate_remote_owned` proves
+  possession from `data_dir/keys/<vol_ulid>.key` before its `by_id`
+  basis reads; no shadow ⇒ start fails, and the keyless
+  readonly-resurrection fallback (`restore_key_from_shadow` returning
+  `false` → `mode=readonly`) retires.
+- [ ] **Shadow write hard-fails:** the claim/fork key-shadow write
+  promotes from warn-and-continue (`claim.rs`) to an error, so
+  owned-but-keyless cannot arise on a live host.
 
 **Phase exit criteria:** an operator can recover a name from a dead
-coordinator and the recovered fork includes every segment the dead
-owner successfully promoted to S3. The synthesised handoff snapshot
-is independently verifiable from bucket-public material.
+coordinator with one verb, and the recovered fork includes every
+segment the dead owner successfully promoted to S3 — the basis
+verified against the dead fork's own key, the tail re-signed under
+the new fork's key, with no coordinator-signed manifest artefacts in
+the bucket.
 
 ---
 
@@ -523,12 +574,12 @@ lookups go through `volume status --remote`.
 ### Phase 5 — Tests, docs, status
 
 - [ ] **End-to-end proptest.** Random sequences of {`create`,
-  `stop`, `start`, `release`, `release --force`, simulated crash}
+  `stop`, `start`, `release`, `claim --force`, simulated crash}
   across two simulated coordinators sharing a fake bucket; assert
   invariants (single live owner per name; chain validity; provenance
   signatures verify; no orphan ULIDs in `names/`).
 - [ ] **Real-bucket integration test.** Tigris-backed test exercising
-  stop-on-A, start-on-B, repeated migration, force-release recovery.
+  stop-on-A, start-on-B, repeated migration, forced-claim recovery.
   Probably gated by `ELIDE_S3_BUCKET` env var, similar to existing
   store tests.
 - [ ] **Documentation updates.**
@@ -536,7 +587,7 @@ lookups go through `volume status --remote`.
     section with the new authoritative-`names/` model.
   - `docs/operations.md`: add a "moving a volume between hosts"
     runbook (`stop` on A → `release` on A → `start --remote` on B;
-    `release --force` semantics for unreachable owners).
+    `claim --force` semantics for unreachable owners).
   - `docs/quickstart-tigris.md`: add a section showing two-host
     migration end to end.
   - `docs/status-2026-MM-DD.md`: a new status doc capturing the
@@ -575,8 +626,7 @@ the work fully closes:
    coordinator startup; readers fetch fresh on each verification.
    Decide whether claimants should cache pubs locally and how often
    they refresh. Not blocking — fresh-fetch on every verification
-   is correct and the cost is one small GET per `start --remote`
-   against a synthesised snapshot.
+   is correct and the cost is one small GET per verification.
 5. **~~ublk volume-open retry.~~ Done.** ublk goes through
    `crate::volume_open::open_volume_with_retry`. The helper does a
    synchronous coordinator handshake (`await-prefetch <vol_ulid>` IPC)

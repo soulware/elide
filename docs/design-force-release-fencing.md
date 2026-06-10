@@ -1,168 +1,134 @@
-# Force-release fencing
+# Forced-claim fencing
 
-**Status:** Proposed (2026-04-29). Companion to
-[`design-portable-live-volume.md`](design-portable-live-volume.md) §
-*`volume release --force`*. The recovery side of `--force` is already
-specified there; this doc covers the **previous owner** side: what
+**Status:** Proposed (2026-04-29; reworked 2026-06-09 to the
+`claim --force` shape — see
+[`design-mint-volume-attestation.md`](design-mint-volume-attestation.md)
+§ *Recovery is a claim*). Companion to
+[`design-portable-live-volume.md`](design-portable-live-volume.md).
+The claimant side of forced recovery is specified there and in the
+attestation doc; this doc covers the **previous owner** side: what
 must happen on coordinator A's host when A is alive and a peer has
-force-released A's volume out from under it.
+force-claimed A's volume out from under it.
 
 ## Problem
 
-`volume release --force` exists for the case "the previous owner is
-unreachable and not coming back." Coordinator B unconditionally
-rewrites `names/<name>` to `Released` after synthesising a handoff
-snapshot from segments observable in S3. A new claimant C forks
-from that synthesised snapshot.
+`volume claim --force` exists for the case "the previous owner is
+unreachable and not coming back." Coordinator B force-CASes
+`names/<name>` from A's stale `Live`/`Stopped` record to a fresh fork
+V2, bases V2 on the record's `latest_snapshot` S — A's last published
+user snapshot — and **re-owns the post-S tail** (the segments A
+drained after S, resolved from V1's HEAD) as V2's own first segments
+under V2's prefix.
 
 The verb's safety contract — "the dead owner's writes that never
 reached S3 are lost; nothing else" — assumes A is in fact dead. If A
 is **alive** when `--force` runs (a partition that resolves, or a
-mistakenly-issued `--force`), nothing in today's code stops A from
-continuing to mutate `by_id/<V1>/...` in S3. The dangerous mutations
-are not new writes (those become orphans, harmless), but **A's
-reaper deleting segments named in B's synthesised manifest**. Once a
-named segment is gone from S3, C's reads return 404.
+mistakenly-issued `--force`), A keeps mutating `by_id/<V1>/...` until
+fenced. The dangerous mutations are not new writes (those become
+orphans, harmless), but A's GC superseding and reaping segments B
+still needs: the basis set (forever) and the tail (during the
+re-own copy).
 
-## What "one owner" rests on, without `--force`
+## What the claim-first shape gives for free
 
-Today the "one mutating coordinator per S3 prefix" property is not
-enforced by `names/<name>` checks on A's data path. It holds **by
-construction**:
+**The basis pin needs no mechanism at all.** V2 and its descendants
+reference V1 ULIDs only at or below S — the set named by S's manifest
+and the chain beneath it. S is A's *own published snapshot*: its
+manifest is already in A's local `snapshots/`, so A's GC floor
+(`latest_snapshot(fork_dir)`) already freezes everything at or below
+it. The floor only ever advances, so the frozen set only grows —
+including under a zombie A that keeps publishing. There is nothing to
+pull, no reaper check to add, no new floor input: the basis is pinned
+by the same rule that protects every published snapshot from its own
+owner.
 
-1. **Directory locality.** `<data_dir>/by_id/<V1>/` exists on
-   exactly one host — the one that created or claimed it. Claims
-   from other coordinators mint a fresh `vol_ulid`, so V1 is only
-   mutated by A.
-2. **Local volume halt.** `volume release` requires
-   `volume.stopped` locally before the bucket flip. No new WAL, no
-   new pending segments after release.
-3. **Local snapshot floor.** A's GC respects
-   `latest_snapshot(fork_dir)` as a floor: segments with ULID below
-   it are not touched. The handoff snapshot in normal release is
-   exactly A's most recent local snapshot, so segments named in the
-   handoff are always at-or-below A's floor and pinned implicitly.
-4. **Disjoint write prefixes.** Claimants always mint a fresh
-   `vol_ulid`; their writes go to V2's prefix, never V1's.
+**The fence is the credential layer, not self-policing.** Every S3
+write A issues for V1 rides `rw-self` discharges whose liveness
+predicate is `names/<name> → V1`
+([`design-mint-volume-attestation.md`](design-mint-volume-attestation.md)
+§ *One liveness check unifies RW-self and RO-ancestor*). B's forced
+CAS makes that predicate false; A's discharge renewals fail from the
+CAS onward and A's outstanding credentials lapse within the
+liveness-staleness bound (the Tigris keypair lifetime, ~5 min). A
+zombie A loses the *capability* to mutate V1's prefix whether or not
+it ever observes the flip. This ties enablement together: the fence
+exists once `rw-self` enforcement is on, so `claim --force` sequences
+with attestation enablement.
 
-`--force` violates 2 and 3 when A is alive: A's volume is still
-running, and B's synthesised snapshot exists in S3 only — A's local
-floor is unaware of it.
+**A's name-record poll remains, for teardown rather than safety.** On
+observing `coordinator_id != self`, A halts the daemon and marks the
+fork reclaimed locally. This converts silent post-claim writes into
+prompt local errors; it is hygiene, not load-bearing.
 
-## The invariant `--force` must preserve
+## The tail race
 
-B's synthesised handoff manifest is a list of specific segment
-ULIDs. C's read path resolves those ULIDs by GET against
-`by_id/<V1>/segments/<ulid>`. **Every ULID named in the manifest
-must remain in S3 for as long as any descendant of V1's
-synthesised snap is alive.**
+The only transient exposure: B copies tail segments — above A's
+floor, exactly the segments A's GC preferentially compacts — while A
+may still hold live credentials inside the fence window.
 
-Set membership at the manifest level: whether a later GC output
-preserves the bytes is irrelevant, because C resolves by ULID, not
-by content. A doesn't know which ULIDs B chose, so A must stop
-reaping anything in V1's prefix once dispossessed.
+- **A supersedes a tail segment mid-copy.** The live bytes are
+  preserved in the GC output; HEAD's `superseded` entries record the
+  mapping. B re-resolves V1's HEAD and copies the output instead.
+- **A physically reaps an input** only after the retention window
+  elapses (HEAD `Superseded` entries are the timing carrier), which
+  adds slack on top of re-resolution.
+- **Convergence rule:** B iterates resolve-HEAD → copy-missing until
+  a re-read shows no change and every named segment exists under
+  V2's prefix. Termination is guaranteed: A's HEAD writes stop when
+  its credentials lapse, after which one further iteration
+  stabilises.
 
-## The mechanism
-
-The existing snapshot-floor rule already says exactly what we
-want: **a snapshot at ULID S means GC does not operate on segments
-with ULID < S.** B's synthesised snapshot has a freshly-minted ULID
-greater than every segment it names, so making A's local floor
-match B's snapshot pins B's entire set automatically.
-
-Three pieces:
-
-1. **A polls `names/<name>` for each owned volume per background
-   tick.** On observing `coordinator_id != self` (or
-   `state ∉ {Live, Stopped}`), A pulls the bucket's
-   `handoff_snapshot` for V1 into A's local `<fork_dir>/snapshots/`.
-   `latest_snapshot()` now returns S'; A's floor advances.
-2. **GC respects the floor (existing).** With S' at A's local
-   floor, every segment B named is below the floor, hence never
-   selected for compaction. A's GC continues to operate freely
-   *above* the floor — those segments are A's post-displacement
-   orphans, never referenced by C's manifest, harmless to compact.
-3. **Reaper respects the floor (new).** Before each
-   `store.delete(target)`, the reaper reads `latest_snapshot()` and
-   refuses to delete any segment with ULID below the floor. One
-   local fs read per delete; cheap.
-
-That's the whole mechanism. No `volume.retired` marker, no
-"handoff-vs-user-snapshot" distinction, no separate fencing flag,
-no per-op `names/<name>` reads.
-
-## Why this works
-
-- **A's pre-existing retention markers self-disarm.** Markers under
-  `by_id/<V1>/retention/` reference inputs from past GC compactions.
-  Once A pulls S' and the local floor advances, those inputs are
-  below the floor. The reaper's per-op floor check refuses to
-  process them. The markers remain in S3 until separately cleaned
-  up (orthogonal hygiene).
-- **A's post-displacement GC writes are scoped to orphans.** GC
-  operates above the floor. Anything A compacts above S' is by
-  definition not in B's manifest. Compacting orphans is harmless to
-  C; the resulting retention markers reference orphan inputs and
-  fire harmlessly when their deadlines elapse.
-- **The artefact is its own persistence.** If A crashes between
-  pulling S' and re-running, the snapshot is still on disk. On
-  restart, A's first GC/reaper invocation observes the new floor.
-  No separate fence flag to write or recover.
+B writes nothing under V1's prefix at any point — reads ride
+`ro-ancestor` against V2's declared parent, writes ride `rw-self`
+into V2.
 
 ## Failure-mode walkthroughs
 
-**A is partitioned from S3, B runs `--force`, A reconnects later.**
+**A is partitioned from S3, B runs `claim --force`, A reconnects
+later.**
 
-During partition: A's drain fails, segments accumulate locally. A's
-GC may compute plans but cannot publish retention markers. A's
-reaper cannot list S3. Zero mutations to V1's prefix.
-
-A reconnects: A's first tick polls `names/<V1>` and observes the
-flip. A pulls S' to local `snapshots/`. Floor advances to S'. A's
-GC and reaper, on the same tick, see the new floor and treat
-everything in B's pinned set as untouchable. No deletes are issued.
+During partition: A's drain fails, segments accumulate locally. Zero
+mutations to V1's prefix. A reconnects: its discharge renewal fails
+against the rebound record — A has no S3 write capability at all.
+Its next poll observes the flip and tears down locally. B's basis
+was never exposed (it sits under A's own floor regardless), and the
+tail copy ran against a frozen HEAD.
 
 **A is healthy and `--force` is mistakenly issued.**
 
-A's per-tick poll catches the flip on its next tick (≤ tick
-cadence, default ≤ 10s for GC). The reaper's per-op floor check
-absorbs anything mid-tick: any in-flight DELETE for an
-above-old-floor input is now below the new floor → refused.
+The exposure window is bounded by the credential fence (≤ the
+liveness-staleness bound) intersected with B's copy. Within it, A's
+GC may supersede or reap tail segments; B's copy retries through
+HEAD re-resolution and is further protected by the retention window
+on physical deletes. After the window, A is hard-fenced. A's
+accepted-but-undrained writes are lost — the verb's stated contract,
+unchanged. The basis set is never at risk: it is below A's floor.
 
 **Operator-initiated graceful retire (no claimant in mind yet).**
 
-A snapshots its current state (the "now" case), halts the volume,
-flips the name to Released. The fresh snapshot is the floor; GC and
-reaper continue to operate freely above it but never below. Any
-later claimant claims the released name and forks from this
-snapshot. Symmetric with the `--force` recovery flow.
+A normal `release`: A snapshots, halts, flips the name to `Released`
+with a volume-signed handoff. No forced CAS, no tail to re-own, no
+fence needed. A later claimant runs a normal `claim` from
+`handoff_snapshot`. The forced path is only for records whose owner
+cannot run that protocol.
 
 ## What's not addressed by this mechanism
 
-Three concerns remain orthogonal:
-
-- **Tightening `--force`'s precondition.** Refusing `--force` when
-  A's heartbeat is recent reduces the rate of stray triggers but is
+- **Tightening `--force`'s precondition.** Refusing `claim --force`
+  when A's heartbeat is recent reduces stray triggers but is
   independent of the fence. Belongs in
   [`design-portable-live-volume.md`](design-portable-live-volume.md).
-- **Cleanup of orphan state under V1.** Retention markers that
-  self-disarm, segments A wrote post-displacement, and the synthesised
-  snapshot manifest itself all accumulate under V1's prefix until a
-  "retire-`vol_ulid`" path runs once no living fork pins V1's snap.
-  Out of scope for this doc.
-- **Surfacing dispossession to A's app.** Today A's volume IPC
-  accepts writes regardless of name-record state. Plumbing the
-  poll's result through to the volume process would convert silent
-  post-`--force` writes into immediate errors. UX improvement, not
-  a correctness change.
+- **Cleanup of garbage under V1.** The tail originals (now duplicated
+  into V2), anything A wrote post-displacement, and V1's HEAD itself
+  accumulate under V1's prefix until a "retire-`vol_ulid`" path runs
+  once no living fork references V1. Out of scope for this doc.
 
 ## Open questions
 
-- **Poll cadence.** Default GC tick is 10s; the fence latency
-  matches that. Reaper cadence is `retention_window/10` (default
-  1 minute). Should both share a name-record poll, or do their own?
+- **Fence-window constant.** The bound is the `rw-self`
+  re-attestation cadence / Tigris keypair lifetime (attestation doc
+  § *Liveness*). Whether B should wait it out before its *final*
+  HEAD resolve, or rely purely on iterate-to-stable (assumed above),
+  is an implementation choice.
 - **Sign `names/<name>` records.** Defence in depth against
   non-coordinator bucket writers. Not load-bearing for the fence.
-- **Per-tick vs per-op poll.** Per-tick is sufficient given per-op
-  floor check in the reaper. Per-op `names/<name>` polling adds
-  cost without changing safety.
