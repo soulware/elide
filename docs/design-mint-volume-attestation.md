@@ -310,7 +310,7 @@ back and trusts the `ParentRef`'s `snapshot_ulid` (the basis) and
 trust-anchors must be available *without a `by_id` read* at fork-create
 time — i.e. from control-plane (`coord-ro`) state:
 
-- **Basis snapshot ULID.** *Proposed:* a `latest_snapshot` field on the
+- **Basis snapshot ULID.** A `latest_snapshot` field on the
   `names/<name>` record — a bare snapshot ULID pairing with the record's
   `vol_ulid`, the same convention as `handoff_snapshot`. The owner's
   publish path CASes it after each `User` manifest upload (single

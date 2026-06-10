@@ -187,6 +187,11 @@ pub struct DrainResult {
     /// perspective. The count of "uploaded this tick" is
     /// `uploaded_ulids.len()`.
     pub uploaded_ulids: Vec<Ulid>,
+    /// Highest `User` snapshot manifest newly uploaded this tick, if
+    /// any. The caller bumps `names/<name>.latest_snapshot` with it
+    /// (`NameClaims::record_latest_snapshot`) — the names write rides
+    /// `coord-rw`, which this volume-scoped drain does not hold.
+    pub published_user_snapshot: Option<Ulid>,
 }
 
 /// Return the volume ULID from a volume directory path.
@@ -234,7 +239,7 @@ pub async fn drain_pending(
 
     // Upload volume metadata before segments so that any host that
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
-    upload_volume_metadata(vol_dir, vol_ulid, store).await;
+    let published_user_snapshot = upload_volume_metadata(vol_dir, vol_ulid, store).await;
 
     // Upload + promote in ULID-ascending order so each promote moves
     // the lowest-ULID pending to committed, preserving
@@ -293,6 +298,7 @@ pub async fn drain_pending(
         upload_failed,
         promote_failed,
         uploaded_ulids,
+        published_user_snapshot,
     })
 }
 
@@ -307,7 +313,14 @@ pub async fn drain_pending(
 /// directory is inspectable with standard tools. The snapshot pair
 /// (marker + .manifest) is covered by a single empty sentinel at
 /// `uploaded/snapshots/<ulid>`.
-async fn upload_volume_metadata(vol_dir: &Path, vol_ulid: Ulid, store: &Arc<dyn ObjectStore>) {
+///
+/// Returns the highest `User` snapshot ULID newly uploaded, if any
+/// (see [`upload_snapshot_metadata`]).
+async fn upload_volume_metadata(
+    vol_dir: &Path,
+    vol_ulid: Ulid,
+    store: &Arc<dyn ObjectStore>,
+) -> Option<Ulid> {
     let pub_key_path = vol_dir.join("volume.pub");
     match std::fs::read(&pub_key_path) {
         Ok(bytes) => {
@@ -362,8 +375,12 @@ async fn upload_volume_metadata(vol_dir: &Path, vol_ulid: Ulid, store: &Arc<dyn 
         Err(e) => warn!("failed to read provenance: {e:#}"),
     }
 
-    if let Err(e) = upload_snapshot_metadata(vol_dir, vol_ulid, store).await {
-        warn!("snapshot upload failed: {e:#}");
+    match upload_snapshot_metadata(vol_dir, vol_ulid, store).await {
+        Ok(published) => published,
+        Err(e) => {
+            warn!("snapshot upload failed: {e:#}");
+            None
+        }
     }
 }
 
@@ -448,18 +465,22 @@ async fn upload_small_bytes(
 /// existence is the snapshot's existence. Each manifest's upload is
 /// gated on a sentinel at `uploaded/snapshots/<ulid>` so re-runs don't
 /// re-PUT.
+///
+/// Returns the highest `User` snapshot ULID newly uploaded by this
+/// call, for the caller's `names/<name>.latest_snapshot` bump.
 pub async fn upload_snapshot_metadata(
     vol_dir: &Path,
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
-) -> Result<()> {
+) -> Result<Option<Ulid>> {
     let snap_dir = vol_dir.join("snapshots");
     let entries = match std::fs::read_dir(&snap_dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
 
+    let mut published_user_snapshot: Option<Ulid> = None;
     for entry in entries {
         let entry = entry.context("reading snapshots dir entry")?;
         let file_name = entry.file_name();
@@ -513,6 +534,7 @@ pub async fn upload_snapshot_metadata(
                 // the `Stopped` event on the spine. A failure here must
                 // not fail the upload (self-heals on the next publish).
                 if kind == elide_core::signing::SnapshotKind::User {
+                    published_user_snapshot = published_user_snapshot.max(Some(snap_ulid));
                     if let Err(e) = snapshots.bump_latest_if_newer(snap_ulid).await {
                         warn!("[upload] bumping snapshots/LATEST for {snap_ulid}: {e}");
                     }
@@ -536,7 +558,7 @@ pub async fn upload_snapshot_metadata(
         }
     }
 
-    Ok(())
+    Ok(published_user_snapshot)
 }
 
 #[cfg(test)]

@@ -59,6 +59,14 @@ pub struct GcCycleOrchestrator {
     /// `docs/design-segment-index.md` (the GC output ULID is
     /// history-derived, not wall-clock).
     tick_superseded: Vec<(Ulid, Ulid, DateTime<Utc>)>,
+    /// `coord-rw` handle for the `names/<name>.latest_snapshot` bump
+    /// after a drain uploads a `User` manifest (the retry path for a
+    /// manifest whose inline snapshot-op upload failed, and the import
+    /// drain). The volume-rw `store` cannot write `names/*`.
+    name_claims: Arc<dyn crate::name_claims::NameClaims>,
+    /// Name bound to this fork, if it has one. Nameless forks (pulled
+    /// ancestors) have no `names/<name>` record to bump.
+    volume_name: Option<String>,
 }
 
 impl GcCycleOrchestrator {
@@ -68,6 +76,8 @@ impl GcCycleOrchestrator {
         store: Arc<dyn ObjectStore>,
         gc_config: GcConfig,
         snapshot_locks: &SnapshotLockRegistry,
+        name_claims: Arc<dyn crate::name_claims::NameClaims>,
+        volume_name: Option<String>,
     ) -> Self {
         let by_id_dir = fork_dir
             .parent()
@@ -96,6 +106,8 @@ impl GcCycleOrchestrator {
             last_reap,
             tick_added: Vec::new(),
             tick_superseded: Vec::new(),
+            name_claims,
+            volume_name,
         }
     }
 
@@ -273,6 +285,18 @@ impl GcCycleOrchestrator {
                          promote IPC unavailable; skipping GC this tick to preserve \
                          ULID ordering invariant",
                         r.promote_failed
+                    );
+                }
+                if let Some(snap) = r.published_user_snapshot
+                    && let Some(name) = &self.volume_name
+                    && let Err(e) = self
+                        .name_claims
+                        .record_latest_snapshot(name, vol_ulid, snap)
+                        .await
+                {
+                    warn!(
+                        "[drain {vol_ulid}] recording latest_snapshot {snap} \
+                         on names/{name}: {e}"
                     );
                 }
                 self.tick_added.extend(r.uploaded_ulids);
@@ -557,12 +581,18 @@ mod tests {
         let fork_dir = by_id.join(vol.to_string());
         std::fs::create_dir_all(&fork_dir).unwrap();
         let locks = crate::new_snapshot_lock_registry();
+        let claims = Arc::new(crate::name_claims::BucketNameClaims::new(
+            Arc::clone(&store),
+            Arc::clone(&store),
+        ));
         let orch = GcCycleOrchestrator::new(
             fork_dir,
             vol,
             store,
             crate::config::GcConfig::default(),
             &locks,
+            claims,
+            None,
         );
         (orch, tmp)
     }

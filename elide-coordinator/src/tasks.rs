@@ -288,6 +288,8 @@ pub async fn run_volume_tasks(
         data_store,
         gc_config,
         &snapshot_locks,
+        stores.name_claims(),
+        read_volume_name(&fork_dir),
     );
 
     let mut tick = tokio::time::interval(drain_interval);

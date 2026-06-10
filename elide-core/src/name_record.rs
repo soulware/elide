@@ -17,7 +17,7 @@
 //! ## Minimal writer output (`NameRecord::live_minimal(vol_ulid, size)`)
 //!
 //! ```toml
-//! version = 2
+//! version = 3
 //! vol_ulid = "01J0000000000000000000000V"
 //! size = 4294967296
 //! state = "live"
@@ -29,7 +29,7 @@
 //! ## Fully-populated record
 //!
 //! ```toml
-//! version = 2
+//! version = 3
 //! vol_ulid = "01J0000000000000000000000V"
 //! size = 4294967296
 //! coordinator_id = "01ABCDEFGHJKMNPQRSTVWXYZ23"
@@ -38,11 +38,12 @@
 //! claimed_at = "2026-04-27T12:34:56Z"
 //! hostname = "host-a"
 //! handoff_snapshot = "01HND0FF000000000000000000"
+//! latest_snapshot = "01LATEST000000000000000000"
 //! ```
 //!
 //! # Field semantics
 //!
-//! - `version` — schema version. Always `2` for this build. `from_toml`
+//! - `version` — schema version. Always `3` for this build. `from_toml`
 //!   rejects unknown values; schema changes are fresh-bucket-only.
 //! - `vol_ulid` — ULID of the fork currently bound to this name.
 //!   Crockford-Base32; round-trips through `ulid::Ulid` directly via
@@ -70,6 +71,14 @@
 //!   snapshot. Set when state transitions to `Released`; the next
 //!   coordinator claiming the name forks from
 //!   `<vol_ulid>/<handoff_snapshot>`.
+//! - `latest_snapshot` — ULID of the most recent `User` snapshot
+//!   manifest published under `by_id/<vol_ulid>/snapshots/`. Pairs
+//!   with the record's `vol_ulid` (same convention as
+//!   `handoff_snapshot`); the record CAS keeps the pair atomically
+//!   consistent across rebinds, so it is cleared by `mark_claimed`
+//!   (the new fork has published nothing yet). Bumped best-effort by
+//!   the owner's publish path after each `User` manifest upload;
+//!   written once at import completion on `Readonly` records.
 
 use std::fmt;
 
@@ -286,10 +295,20 @@ pub struct NameRecord {
     /// forks from `<vol_ulid>/<handoff_snapshot>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_snapshot: Option<Ulid>,
+
+    /// ULID of the most recent `User` snapshot manifest published
+    /// under `by_id/<vol_ulid>/snapshots/`. Pairs with the record's
+    /// `vol_ulid`; cleared on rebind (`mark_claimed`) so the pair
+    /// stays atomically consistent under the record CAS. Best-effort:
+    /// bumped by the owner's publish path after each `User` manifest
+    /// upload, self-heals on the next publish. Fork-from-name basis
+    /// resolution reads `(vol_ulid, latest_snapshot)` from one GET.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_snapshot: Option<Ulid>,
 }
 
 impl NameRecord {
-    pub const CURRENT_VERSION: u32 = 2;
+    pub const CURRENT_VERSION: u32 = 3;
 
     /// Create a record naming a single fork as live, with no
     /// coordinator-specific metadata. Useful for tests and any caller
@@ -305,6 +324,7 @@ impl NameRecord {
             claimed_at: None,
             hostname: None,
             handoff_snapshot: None,
+            latest_snapshot: None,
         }
     }
 
@@ -392,6 +412,7 @@ mod tests {
     #[test]
     fn round_trip_full() {
         let snap = Ulid::from_string("01J1111111111111111111111V").unwrap();
+        let latest = Ulid::from_string("01J2222222222222222222222V").unwrap();
         let r = NameRecord {
             version: NameRecord::CURRENT_VERSION,
             vol_ulid: sample_ulid(),
@@ -402,6 +423,7 @@ mod tests {
             claimed_at: Some("2026-04-27T12:34:56Z".to_string()),
             hostname: Some("host-a".to_string()),
             handoff_snapshot: Some(snap),
+            latest_snapshot: Some(latest),
         };
         let toml = r.to_toml().unwrap();
         let parsed = NameRecord::from_toml(&toml).unwrap();
@@ -412,6 +434,7 @@ mod tests {
         assert_eq!(parsed.claimed_at, r.claimed_at);
         assert_eq!(parsed.hostname, r.hostname);
         assert_eq!(parsed.handoff_snapshot, Some(snap));
+        assert_eq!(parsed.latest_snapshot, Some(latest));
     }
 
     #[test]
@@ -506,14 +529,21 @@ vol_ulid = "01J0000000000000000000000V"
     #[test]
     fn rejects_missing_required_fields() {
         // `vol_ulid` and `size` are required.
-        let toml = "version = 2\n";
+        let toml = "version = 3\n";
         assert!(NameRecord::from_toml(toml).is_err());
 
-        let toml = "version = 2\nvol_ulid = \"01J0000000000000000000000V\"\n";
+        let toml = "version = 3\nvol_ulid = \"01J0000000000000000000000V\"\n";
         assert!(
             NameRecord::from_toml(toml).is_err(),
             "missing size must fail to parse"
         );
+    }
+
+    #[test]
+    fn rejects_previous_schema_version() {
+        let toml = "version = 2\nvol_ulid = \"01J0000000000000000000000V\"\nsize = 4096\n";
+        let err = NameRecord::from_toml(toml).expect_err("v2 record must be rejected");
+        assert!(matches!(err, ParseNameRecordError::UnsupportedVersion(2)));
     }
 
     #[test]
