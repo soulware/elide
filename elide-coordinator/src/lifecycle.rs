@@ -215,6 +215,11 @@ pub async fn mark_released(
 
     record.state = NameState::Released;
     record.handoff_snapshot = Some(handoff_snapshot);
+    // The handoff is a published `User` manifest under the same
+    // vol_ulid — release paths that publish it directly (empty-handoff
+    // synthesis, stop-snapshot promotion) bypass the drain's bump, so
+    // fold it in here.
+    record.latest_snapshot = record.latest_snapshot.max(Some(handoff_snapshot));
     record.coordinator_id = None;
     record.claimed_at = None;
     record.hostname = None;
@@ -300,6 +305,9 @@ pub async fn mark_released_force(
         claimed_at: None,
         hostname: None,
         handoff_snapshot: Some(handoff_snapshot),
+        // Same vol_ulid, so the pairing stays valid; the synthesised
+        // handoff is itself a published `User` manifest, fold it in.
+        latest_snapshot: current.latest_snapshot.max(Some(handoff_snapshot)),
     };
 
     let displaced_coordinator_id = current.coordinator_id.clone();
@@ -502,6 +510,7 @@ pub async fn mark_initial(
         claimed_at: Some(chrono::Utc::now().to_rfc3339()),
         hostname: hostname.map(str::to_owned),
         handoff_snapshot: None,
+        latest_snapshot: None,
     };
 
     match name_store::create_name_record(store, name, &record).await {
@@ -540,11 +549,16 @@ pub async fn mark_initial(
 /// conditional create still gives uniqueness: two coordinators
 /// racing to import the same name resolve cleanly (one wins,
 /// the other gets `AlreadyExists`).
+///
+/// `latest_snapshot` is the import's `User` snapshot manifest,
+/// recorded so `create --from <imported-name>` resolves its basis
+/// from this record in one GET.
 pub async fn mark_initial_readonly(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     vol_ulid: Ulid,
     size: u64,
+    latest_snapshot: Option<Ulid>,
 ) -> Result<MarkInitialOutcome, LifecycleError> {
     if let Some((existing, _)) = name_store::read_name_record(store, name).await? {
         return Ok(MarkInitialOutcome::AlreadyExists {
@@ -564,6 +578,7 @@ pub async fn mark_initial_readonly(
         claimed_at: None,
         hostname: None,
         handoff_snapshot: None,
+        latest_snapshot,
     };
 
     match name_store::create_name_record(store, name, &record).await {
@@ -578,6 +593,61 @@ pub async fn mark_initial_readonly(
                 None => Err(LifecycleError::Store(NameStoreError::PreconditionFailed)),
             }
         }
+        Err(e) => Err(LifecycleError::Store(e)),
+    }
+}
+
+/// Outcome of a `record_latest_snapshot` call.
+#[derive(Debug)]
+pub enum RecordLatestSnapshotOutcome {
+    /// `latest_snapshot` was advanced to the offered ULID.
+    Recorded,
+    /// The record's `latest_snapshot` is already at or past the
+    /// offered ULID. No write.
+    AlreadyCurrent,
+    /// The record no longer points at `vol_ulid` — the name was
+    /// rebound since the manifest published. No write: the offered
+    /// snapshot belongs to a fork the name no longer names.
+    StaleBinding { bound_vol_ulid: Ulid },
+    /// `names/<name>` does not exist. No write.
+    Absent,
+    /// The conditional PUT lost a race with a concurrent record
+    /// mutation. No retry — the next publish self-heals.
+    Raced,
+}
+
+/// Best-effort bump of `latest_snapshot` on `names/<name>` after a
+/// `User` snapshot manifest upload. Mirrors the discipline of the
+/// `by_id/<vol>/snapshots/LATEST` bump
+/// ([`crate::volume_data::SnapshotsView::bump_latest_if_newer`]):
+/// monotonic, single logical writer (the publish path of the fork the
+/// record points at), self-healing on the next publish.
+///
+/// Guards on `record.vol_ulid == vol_ulid` rather than ownership so
+/// the same verb serves owned (`Live`/`Stopped`) and `Readonly`
+/// (import drain) records, and a rebound name is never stamped with a
+/// previous binding's snapshot.
+pub async fn record_latest_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    vol_ulid: Ulid,
+    snap_ulid: Ulid,
+) -> Result<RecordLatestSnapshotOutcome, LifecycleError> {
+    let Some((mut record, version)) = name_store::read_name_record(store, name).await? else {
+        return Ok(RecordLatestSnapshotOutcome::Absent);
+    };
+    if record.vol_ulid != vol_ulid {
+        return Ok(RecordLatestSnapshotOutcome::StaleBinding {
+            bound_vol_ulid: record.vol_ulid,
+        });
+    }
+    if record.latest_snapshot.is_some_and(|cur| cur >= snap_ulid) {
+        return Ok(RecordLatestSnapshotOutcome::AlreadyCurrent);
+    }
+    record.latest_snapshot = Some(snap_ulid);
+    match name_store::update_name_record(store, name, &record, version).await {
+        Ok(_) => Ok(RecordLatestSnapshotOutcome::Recorded),
+        Err(NameStoreError::PreconditionFailed) => Ok(RecordLatestSnapshotOutcome::Raced),
         Err(e) => Err(LifecycleError::Store(e)),
     }
 }
@@ -659,6 +729,9 @@ pub async fn mark_claimed(
         claimed_at: Some(chrono::Utc::now().to_rfc3339()),
         hostname: hostname.map(str::to_owned),
         handoff_snapshot: None,
+        // Rebind: the new fork has published nothing yet, and the old
+        // value paired with the previous vol_ulid.
+        latest_snapshot: None,
     };
 
     name_store::update_name_record(store, name, &new_record, version).await?;
@@ -1435,7 +1508,7 @@ mod tests {
     #[tokio::test]
     async fn mark_initial_readonly_claims_with_no_owner_identity() {
         let s = store();
-        let outcome = mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE)
+        let outcome = mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE, None)
             .await
             .unwrap();
         assert!(matches!(outcome, MarkInitialOutcome::Claimed));
@@ -1454,11 +1527,11 @@ mod tests {
     #[tokio::test]
     async fn mark_initial_readonly_refuses_when_name_already_exists() {
         let s = store();
-        mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE)
+        mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE, None)
             .await
             .unwrap();
 
-        let outcome = mark_initial_readonly(&s, "ubuntu24", snap(), SAMPLE_SIZE)
+        let outcome = mark_initial_readonly(&s, "ubuntu24", snap(), SAMPLE_SIZE, None)
             .await
             .unwrap();
         match outcome {
@@ -1483,7 +1556,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = mark_initial_readonly(&s, "name", snap(), SAMPLE_SIZE)
+        let outcome = mark_initial_readonly(&s, "name", snap(), SAMPLE_SIZE, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1495,12 +1568,201 @@ mod tests {
         ));
     }
 
+    // ── record_latest_snapshot ──────────────────────────────────────────
+
+    fn snap_hi() -> Ulid {
+        Ulid::from_string("01J3333333333333333333333V").unwrap()
+    }
+
+    #[tokio::test]
+    async fn record_latest_snapshot_records_and_round_trips() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        create_name_record(&s, "vol", &rec).await.unwrap();
+
+        let outcome = record_latest_snapshot(&s, "vol", sample_ulid(), snap())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RecordLatestSnapshotOutcome::Recorded));
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.latest_snapshot, Some(snap()));
+    }
+
+    #[tokio::test]
+    async fn record_latest_snapshot_is_monotonic() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        create_name_record(&s, "vol", &rec).await.unwrap();
+
+        record_latest_snapshot(&s, "vol", sample_ulid(), snap_hi())
+            .await
+            .unwrap();
+
+        // A lower ULID must not regress the field.
+        let outcome = record_latest_snapshot(&s, "vol", sample_ulid(), snap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            RecordLatestSnapshotOutcome::AlreadyCurrent
+        ));
+
+        // Same ULID is also a no-op.
+        let outcome = record_latest_snapshot(&s, "vol", sample_ulid(), snap_hi())
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            RecordLatestSnapshotOutcome::AlreadyCurrent
+        ));
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.latest_snapshot, Some(snap_hi()));
+    }
+
+    #[tokio::test]
+    async fn record_latest_snapshot_skips_rebound_record() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        create_name_record(&s, "vol", &rec).await.unwrap();
+
+        // Offer a snapshot for a fork the record no longer points at.
+        let other = Ulid::from_string("01J4444444444444444444444V").unwrap();
+        let outcome = record_latest_snapshot(&s, "vol", other, snap())
+            .await
+            .unwrap();
+        match outcome {
+            RecordLatestSnapshotOutcome::StaleBinding { bound_vol_ulid } => {
+                assert_eq!(bound_vol_ulid, sample_ulid());
+            }
+            _ => panic!("expected StaleBinding, got {outcome:?}"),
+        }
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got.latest_snapshot.is_none(), "record must not be touched");
+    }
+
+    #[tokio::test]
+    async fn record_latest_snapshot_absent_record() {
+        let s = store();
+        let outcome = record_latest_snapshot(&s, "missing", sample_ulid(), snap())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RecordLatestSnapshotOutcome::Absent));
+    }
+
+    #[tokio::test]
+    async fn record_latest_snapshot_serves_readonly_records() {
+        let s = store();
+        mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE, None)
+            .await
+            .unwrap();
+
+        let outcome = record_latest_snapshot(&s, "ubuntu24", sample_ulid(), snap())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RecordLatestSnapshotOutcome::Recorded));
+
+        let (got, _) = name_store::read_name_record(&s, "ubuntu24")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.latest_snapshot, Some(snap()));
+    }
+
+    #[tokio::test]
+    async fn mark_initial_readonly_records_import_snapshot() {
+        let s = store();
+        mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE, Some(snap()))
+            .await
+            .unwrap();
+
+        let (got, _) = name_store::read_name_record(&s, "ubuntu24")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.latest_snapshot, Some(snap()));
+    }
+
+    #[tokio::test]
+    async fn mark_claimed_clears_latest_snapshot() {
+        let s = store();
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        rec.state = NameState::Released;
+        rec.handoff_snapshot = Some(snap());
+        rec.latest_snapshot = Some(snap());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+
+        let new_fork = Ulid::from_string("01J5555555555555555555555V").unwrap();
+        mark_claimed(&s, "vol", &id_a(), None, new_fork, NameState::Live)
+            .await
+            .unwrap();
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.vol_ulid, new_fork);
+        assert!(
+            got.latest_snapshot.is_none(),
+            "rebind must clear the previous binding's snapshot pairing"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_released_folds_handoff_into_latest_snapshot() {
+        let s = store();
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        rec.latest_snapshot = Some(snap());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
+
+        mark_released(&s, "vol", &id_a(), snap_hi()).await.unwrap();
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.handoff_snapshot, Some(snap_hi()));
+        assert_eq!(
+            got.latest_snapshot,
+            Some(snap_hi()),
+            "handoff is a published User manifest under the same vol_ulid"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_released_force_folds_handoff_into_latest_snapshot() {
+        let s = store();
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        rec.latest_snapshot = Some(snap());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+
+        mark_released_force(&s, "vol", snap_hi()).await.unwrap();
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.latest_snapshot, Some(snap_hi()));
+    }
+
     // ── Lifecycle verbs refuse Readonly records ─────────────────────────
 
     #[tokio::test]
     async fn mark_stopped_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE)
+        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None)
             .await
             .unwrap();
 
@@ -1519,7 +1781,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE)
+        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None)
             .await
             .unwrap();
 
@@ -1538,7 +1800,7 @@ mod tests {
     #[tokio::test]
     async fn mark_live_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE)
+        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None)
             .await
             .unwrap();
 
@@ -1560,7 +1822,7 @@ mod tests {
         // path — readonly records are not part of the claim-from-released
         // flow.
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE)
+        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None)
             .await
             .unwrap();
 
@@ -1650,7 +1912,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_force_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE)
+        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None)
             .await
             .unwrap();
 

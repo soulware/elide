@@ -204,6 +204,7 @@ mod tests {
             claimed_at: None,
             hostname: None,
             handoff_snapshot: None,
+            latest_snapshot: None,
         }
     }
 

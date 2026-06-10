@@ -475,8 +475,27 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
             })();
             match claim_outcome {
                 Ok((size, _)) => {
+                    // The import's `User` snapshot manifest, recorded on
+                    // the record so `create --from <imported-name>`
+                    // resolves its basis in one GET.
+                    let latest_snapshot = match elide_core::volume::latest_snapshot(&async_vol_dir)
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                "[import {import_ulid_clone}] reading local \
+                                     latest snapshot: {e}"
+                            );
+                            None
+                        }
+                    };
                     match async_claims
-                        .mark_initial_readonly(&async_vol_name, vol_ulid_value, size)
+                        .mark_initial_readonly(
+                            &async_vol_name,
+                            vol_ulid_value,
+                            size,
+                            latest_snapshot,
+                        )
                         .await
                     {
                         Ok(MarkInitialOutcome::Claimed) => {

@@ -32,6 +32,7 @@ use elide_core::name_record::{NameRecord, NameState};
 use crate::lifecycle::{
     ForceReleaseOutcome, LifecycleError, MarkClaimedOutcome, MarkInitialOutcome, MarkLiveOutcome,
     MarkReclaimedLocalOutcome, MarkReleasedOutcome, MarkStoppedOutcome,
+    RecordLatestSnapshotOutcome,
 };
 use crate::name_store::{self, NameStoreError};
 
@@ -75,13 +76,25 @@ pub trait NameClaims: NameClaimsReader {
 
     /// Create-time claim of a fresh **readonly** name (no exclusive
     /// owner). Same conditional-create mechanics as
-    /// [`Self::mark_initial`]; record carries `state = Readonly`.
+    /// [`Self::mark_initial`]; record carries `state = Readonly` and
+    /// the import's `User` snapshot as `latest_snapshot`.
     async fn mark_initial_readonly(
         &self,
         name: &str,
         vol_ulid: Ulid,
         size: u64,
+        latest_snapshot: Option<Ulid>,
     ) -> Result<MarkInitialOutcome, LifecycleError>;
+
+    /// Best-effort monotonic bump of `latest_snapshot` after a `User`
+    /// snapshot manifest upload. Guarded on the record still pointing
+    /// at `vol_ulid`; mirrors the `by_id` `snapshots/LATEST` bump.
+    async fn record_latest_snapshot(
+        &self,
+        name: &str,
+        vol_ulid: Ulid,
+        snap_ulid: Ulid,
+    ) -> Result<RecordLatestSnapshotOutcome, LifecycleError>;
 
     /// Transition `Live` → `Stopped`, retaining ownership.
     async fn mark_stopped(
@@ -210,8 +223,19 @@ impl NameClaims for BucketNameClaims {
         name: &str,
         vol_ulid: Ulid,
         size: u64,
+        latest_snapshot: Option<Ulid>,
     ) -> Result<MarkInitialOutcome, LifecycleError> {
-        crate::lifecycle::mark_initial_readonly(&self.writer, name, vol_ulid, size).await
+        crate::lifecycle::mark_initial_readonly(&self.writer, name, vol_ulid, size, latest_snapshot)
+            .await
+    }
+
+    async fn record_latest_snapshot(
+        &self,
+        name: &str,
+        vol_ulid: Ulid,
+        snap_ulid: Ulid,
+    ) -> Result<RecordLatestSnapshotOutcome, LifecycleError> {
+        crate::lifecycle::record_latest_snapshot(&self.writer, name, vol_ulid, snap_ulid).await
     }
 
     async fn mark_stopped(

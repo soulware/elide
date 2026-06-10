@@ -820,16 +820,17 @@ pub(crate) async fn snapshot_volume_kind(
         ));
     }
 
-    match elide_coordinator::upload::drain_pending(&fork_dir, vol_ulid, &store).await {
-        Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
-            return Err(IpcError::store(format!(
-                "drain reported {} S3-upload failure(s), {} volume-promote failure(s)",
-                r.upload_failed, r.promote_failed
-            )));
-        }
-        Ok(_) => {}
-        Err(e) => return Err(IpcError::store(format!("drain: {e:#}"))),
-    }
+    let drained_user_snapshot =
+        match elide_coordinator::upload::drain_pending(&fork_dir, vol_ulid, &store).await {
+            Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
+                return Err(IpcError::store(format!(
+                    "drain reported {} S3-upload failure(s), {} volume-promote failure(s)",
+                    r.upload_failed, r.promote_failed
+                )));
+            }
+            Ok(r) => r.published_user_snapshot,
+            Err(e) => return Err(IpcError::store(format!("drain: {e:#}"))),
+        };
 
     let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
     // Outcomes from handoffs draining during a snapshot seal are folded
@@ -884,9 +885,24 @@ pub(crate) async fn snapshot_volume_kind(
         )));
     }
 
-    elide_coordinator::upload::upload_snapshot_metadata(&fork_dir, vol_ulid, &store)
-        .await
-        .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
+    let uploaded_user_snapshot =
+        elide_coordinator::upload::upload_snapshot_metadata(&fork_dir, vol_ulid, &store)
+            .await
+            .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
+
+    // Best-effort `names/<name>.latest_snapshot` bump (`coord-rw` —
+    // the volume-rw drain above cannot write it). Mirrors the
+    // `snapshots/LATEST` bump inside the upload: monotonic,
+    // self-heals on the next publish.
+    if let Some(snap) = drained_user_snapshot.max(uploaded_user_snapshot)
+        && let Err(e) = core
+            .stores
+            .name_claims()
+            .record_latest_snapshot(vol_name, vol_ulid, snap)
+            .await
+    {
+        warn!("[snapshot {vol_ulid}] recording latest_snapshot {snap} on names/{vol_name}: {e}");
+    }
 
     let label = match kind {
         elide_core::signing::SnapshotKind::User => "snapshot",

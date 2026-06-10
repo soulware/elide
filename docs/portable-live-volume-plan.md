@@ -479,9 +479,11 @@ attestation model's `rw-self` invariant cannot discharge.
   the two-coordinator proptest.
 **Rework to `claim --force`:**
 
-- [ ] **`NameRecord` `latest_snapshot` field** (schema bump; written
-  by the owner's publish path and at import completion) — shared
-  with the fork-basis work in `design-mint-volume-attestation.md`.
+- [x] **`NameRecord` `latest_snapshot` field** (schema v3 bump;
+  bumped via `record_latest_snapshot` from the snapshot op and the
+  drain tick, folded in from the handoff on release, written at
+  import completion) — shared with the fork-basis work in
+  `design-mint-volume-attestation.md`.
 - [ ] **`claim --force`:** forced CAS on the stale record,
   provisional provenance from `(vol_ulid, latest_snapshot)`, tail
   re-own (index verify + re-sign, `UploadPartCopy` body
