@@ -156,6 +156,10 @@ pub enum Lifecycle {
     ForceRelease,
     /// `volume claim` — flip `Released` → `Live`/`Stopped` under new ownership.
     Claim,
+    /// `volume claim --force` — forced CAS from a dead owner's
+    /// `Live`/`Stopped` record straight to a fresh fork under new
+    /// ownership.
+    ForceClaim,
 }
 
 impl Lifecycle {
@@ -167,6 +171,7 @@ impl Lifecycle {
             Self::Start => "start",
             Self::ForceRelease => "force-release",
             Self::Claim => "claim",
+            Self::ForceClaim => "force-claim",
         }
     }
 }
@@ -206,12 +211,12 @@ impl NameState {
     /// matrix is the single source of truth for which lifecycle verbs
     /// apply to which source states; callers must not re-derive it.
     ///
-    /// | from \ verb  | Stop       | Release    | Start      | ForceRelease | Claim   |
-    /// |--------------|------------|------------|------------|--------------|---------|
-    /// | Live         | Proceed    | Proceed    | Idempotent | Proceed      | Refuse  |
-    /// | Stopped      | Idempotent | Proceed    | Proceed    | Proceed      | Refuse  |
-    /// | Released     | Refuse     | Idempotent | Reroute    | Refuse       | Proceed |
-    /// | Readonly     | Refuse     | Refuse     | Refuse     | Refuse       | Refuse  |
+    /// | from \ verb  | Stop       | Release    | Start      | ForceRelease | Claim   | ForceClaim |
+    /// |--------------|------------|------------|------------|--------------|---------|------------|
+    /// | Live         | Proceed    | Proceed    | Idempotent | Proceed      | Refuse  | Proceed    |
+    /// | Stopped      | Idempotent | Proceed    | Proceed    | Proceed      | Refuse  | Proceed    |
+    /// | Released     | Refuse     | Idempotent | Reroute    | Refuse       | Proceed | Reroute    |
+    /// | Readonly     | Refuse     | Refuse     | Refuse     | Refuse       | Refuse  | Refuse     |
     pub fn check_transition(self, verb: Lifecycle) -> TransitionCheck {
         use Lifecycle as V;
         use NameState as S;
@@ -237,6 +242,11 @@ impl NameState {
             // Claim (only valid against a Released record)
             (S::Released, V::Claim) => Proceed,
             (S::Live | S::Stopped | S::Readonly, V::Claim) => Refuse,
+            // ForceClaim (override a dead owner; a Released record
+            // needs no force -- reroute to the normal claim)
+            (S::Live | S::Stopped, V::ForceClaim) => Proceed,
+            (S::Released, V::ForceClaim) => Reroute,
+            (S::Readonly, V::ForceClaim) => Refuse,
         }
     }
 }
@@ -486,6 +496,11 @@ mod tests {
             (S::Stopped, V::Claim, Refuse),
             (S::Released, V::Claim, Proceed),
             (S::Readonly, V::Claim, Refuse),
+            // ForceClaim
+            (S::Live, V::ForceClaim, Proceed),
+            (S::Stopped, V::ForceClaim, Proceed),
+            (S::Released, V::ForceClaim, Reroute),
+            (S::Readonly, V::ForceClaim, Refuse),
         ];
         for (from, verb, want) in cases {
             assert_eq!(
@@ -504,6 +519,7 @@ mod tests {
             Lifecycle::Start,
             Lifecycle::ForceRelease,
             Lifecycle::Claim,
+            Lifecycle::ForceClaim,
         ] {
             assert_eq!(format!("{v}"), v.as_str());
         }

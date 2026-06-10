@@ -498,8 +498,12 @@ async fn dispatch_json(
         Request::ForkAttach { new_name } => {
             stream_fork_by_name(&new_name, writer, &ctx.fork_registry).await;
         }
-        Request::ClaimStart { volume } => {
-            let result = crate::claim::start_claim(volume, ctx.for_claim()).await;
+        Request::ClaimStart { volume, force } => {
+            let result = if force {
+                crate::force_claim::start_force_claim(volume, ctx.for_claim()).await
+            } else {
+                crate::claim::start_claim(volume, ctx.for_claim()).await
+            };
             let env: Envelope<ClaimStartReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }

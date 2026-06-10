@@ -563,7 +563,10 @@ impl EventJournal for BucketEventJournal {
         sign_event(&mut event, identity);
 
         let new_head = prev_head.unwrap_or_default().pushed(event.clone());
-        let is_force = matches!(event.kind, EventKind::ForceReleased { .. });
+        let is_force = matches!(
+            event.kind,
+            EventKind::ForceReleased { .. } | EventKind::ForceClaimed { .. }
+        );
         write_head(self.writer.as_ref(), name, &new_head, expected, is_force).await?;
         append_record(self.writer.as_ref(), name, &event).await?;
         Ok(event)

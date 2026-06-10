@@ -30,9 +30,9 @@ use ulid::Ulid;
 use elide_core::name_record::{NameRecord, NameState};
 
 use crate::lifecycle::{
-    ForceReleaseOutcome, LifecycleError, MarkClaimedOutcome, MarkInitialOutcome, MarkLiveOutcome,
-    MarkReclaimedLocalOutcome, MarkReleasedOutcome, MarkStoppedOutcome,
-    RecordLatestSnapshotOutcome,
+    ForceReleaseOutcome, LifecycleError, MarkClaimedForceOutcome, MarkClaimedOutcome,
+    MarkInitialOutcome, MarkLiveOutcome, MarkReclaimedLocalOutcome, MarkReleasedOutcome,
+    MarkStoppedOutcome, RecordLatestSnapshotOutcome,
 };
 use crate::name_store::{self, NameStoreError};
 
@@ -130,6 +130,21 @@ pub trait NameClaims: NameClaimsReader {
         coord_id: &str,
         hostname: Option<&str>,
     ) -> Result<MarkLiveOutcome, LifecycleError>;
+
+    /// Forced rebind over a dead owner's `Live`/`Stopped` record —
+    /// `volume claim --force`'s fence point. Conditioned on the
+    /// version the caller observed when it took `parent_pin` and
+    /// `size` from the record; see
+    /// [`crate::lifecycle::mark_claimed_force`].
+    async fn mark_claimed_force(
+        &self,
+        name: &str,
+        coord_id: &str,
+        hostname: Option<&str>,
+        new_vol_ulid: Ulid,
+        parent_pin: Option<String>,
+        observed: &crate::lifecycle::ObservedRecord,
+    ) -> Result<MarkClaimedForceOutcome, LifecycleError>;
 
     /// Atomically claim a `Released` name and rebind it to
     /// `new_vol_ulid`. Conditional PUT under the ETag observed at
@@ -271,6 +286,27 @@ impl NameClaims for BucketNameClaims {
         hostname: Option<&str>,
     ) -> Result<MarkLiveOutcome, LifecycleError> {
         crate::lifecycle::mark_live(&self.writer, name, coord_id, hostname).await
+    }
+
+    async fn mark_claimed_force(
+        &self,
+        name: &str,
+        coord_id: &str,
+        hostname: Option<&str>,
+        new_vol_ulid: Ulid,
+        parent_pin: Option<String>,
+        observed: &crate::lifecycle::ObservedRecord,
+    ) -> Result<MarkClaimedForceOutcome, LifecycleError> {
+        crate::lifecycle::mark_claimed_force(
+            &self.writer,
+            name,
+            coord_id,
+            hostname,
+            new_vol_ulid,
+            parent_pin,
+            observed,
+        )
+        .await
     }
 
     async fn mark_claimed(

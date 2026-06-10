@@ -738,6 +738,78 @@ pub async fn mark_claimed(
     Ok(MarkClaimedOutcome::Claimed)
 }
 
+/// Outcome of a `mark_claimed_force` call.
+#[derive(Debug)]
+pub enum MarkClaimedForceOutcome {
+    /// The record was rewritten to the new fork under this
+    /// coordinator. Carries the displaced owner for the journal event.
+    Claimed {
+        displaced_coordinator_id: Option<String>,
+    },
+    /// The conditional PUT lost a race: the record changed between the
+    /// caller's observation and the rewrite. Either a concurrent
+    /// forced claim won, or the "dead" owner is alive and wrote.
+    /// Callers must re-observe before retrying — the basis they built
+    /// from the old observation is stale.
+    Raced,
+}
+
+/// The record a force-claim caller observed, paired with the version
+/// its conditional rewrite is conditioned on. Bundled so the
+/// (record, version) pair read together stays together.
+pub struct ObservedRecord {
+    pub record: elide_core::name_record::NameRecord,
+    pub version: object_store::UpdateVersion,
+}
+
+/// Forced rebind of `names/<name>` to `new_vol_ulid` over a dead
+/// owner's `Live`/`Stopped` record — the fence point of
+/// `volume claim --force` (`docs/design-force-release-fencing.md`).
+///
+/// "Force" skips the ownership refusal, **not** the precondition: the
+/// PUT is conditioned (`If-Match`) on `observed_version`, the version
+/// of the record the caller read when it took `parent_pin` and `size`
+/// from it. Concurrent forced claims therefore arbitrate cleanly —
+/// one wins, the rest get [`MarkClaimedForceOutcome::Raced`] — and a
+/// not-actually-dead owner whose write lands in between also forces a
+/// `Raced`. The caller validates the observed state
+/// (`check_transition(ForceClaim)`) before minting its fork; this
+/// function only performs the conditioned rewrite.
+pub async fn mark_claimed_force(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    coord_id: &str,
+    hostname: Option<&str>,
+    new_vol_ulid: Ulid,
+    parent_pin: Option<String>,
+    observed: &ObservedRecord,
+) -> Result<MarkClaimedForceOutcome, LifecycleError> {
+    let ObservedRecord { record, version } = observed;
+    let new_record = elide_core::name_record::NameRecord {
+        version: elide_core::name_record::NameRecord::CURRENT_VERSION,
+        vol_ulid: new_vol_ulid,
+        // Capacity carries forward — a forced claim is a continuation
+        // of the same volume identity, not a resize.
+        size: record.size,
+        coordinator_id: Some(coord_id.to_owned()),
+        state: NameState::Stopped,
+        parent: parent_pin,
+        claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+        hostname: hostname.map(str::to_owned),
+        handoff_snapshot: None,
+        // Rebind: pairs with the previous vol_ulid, cleared like
+        // `mark_claimed`.
+        latest_snapshot: None,
+    };
+    match name_store::update_name_record(store, name, &new_record, version.clone()).await {
+        Ok(_) => Ok(MarkClaimedForceOutcome::Claimed {
+            displaced_coordinator_id: record.coordinator_id.clone(),
+        }),
+        Err(NameStoreError::PreconditionFailed) => Ok(MarkClaimedForceOutcome::Raced),
+        Err(e) => Err(LifecycleError::Store(e)),
+    }
+}
+
 /// Reconcile the local park markers (`volume.stopped`,
 /// `volume.released`) against `names/<name>.state`. S3 is
 /// authoritative — local markers are a host-side cache used by the
@@ -1755,6 +1827,93 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.latest_snapshot, Some(snap_hi()));
+    }
+
+    // ── mark_claimed_force ──────────────────────────────────────────────
+
+    async fn observe(s: &Arc<dyn ObjectStore>, name: &str) -> ObservedRecord {
+        let (record, version) = name_store::read_name_record(s, name)
+            .await
+            .unwrap()
+            .unwrap();
+        ObservedRecord { record, version }
+    }
+
+    #[tokio::test]
+    async fn mark_claimed_force_rebinds_dead_owner_record() {
+        let s = store();
+        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        rec.coordinator_id = Some(id_b());
+        rec.latest_snapshot = Some(snap());
+        create_name_record(&s, "vol", &rec).await.unwrap();
+
+        let observed = observe(&s, "vol").await;
+        let new_fork = Ulid::from_string("01J5555555555555555555555V").unwrap();
+        let pin = format!("{}/{}", sample_ulid(), snap());
+        let outcome = mark_claimed_force(
+            &s,
+            "vol",
+            &id_a(),
+            Some("host-a"),
+            new_fork,
+            Some(pin.clone()),
+            &observed,
+        )
+        .await
+        .unwrap();
+        match outcome {
+            MarkClaimedForceOutcome::Claimed {
+                displaced_coordinator_id,
+            } => assert_eq!(displaced_coordinator_id.as_deref(), Some(id_b().as_str())),
+            other => panic!("expected Claimed, got {other:?}"),
+        }
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.vol_ulid, new_fork);
+        assert_eq!(got.state, NameState::Stopped);
+        assert_eq!(got.coordinator_id.as_deref(), Some(id_a().as_str()));
+        assert_eq!(got.parent.as_deref(), Some(pin.as_str()));
+        assert_eq!(got.size, SAMPLE_SIZE, "capacity carries forward");
+        assert!(got.handoff_snapshot.is_none());
+        assert!(
+            got.latest_snapshot.is_none(),
+            "rebind clears the previous binding's pairing"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_claimed_force_races_when_record_moved() {
+        let s = store();
+        let rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
+        create_name_record(&s, "vol", &rec).await.unwrap();
+
+        let observed = observe(&s, "vol").await;
+        // The record changes between observation and the forced CAS —
+        // e.g. a concurrent forced claim, or the owner is alive.
+        mark_stopped(&s, "vol", &id_b(), None).await.unwrap();
+
+        let outcome = mark_claimed_force(
+            &s,
+            "vol",
+            &id_a(),
+            None,
+            Ulid::from_string("01J5555555555555555555555V").unwrap(),
+            None,
+            &observed,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, MarkClaimedForceOutcome::Raced));
+
+        let (got, _) = name_store::read_name_record(&s, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.vol_ulid, sample_ulid(), "record untouched by the loser");
+        assert_eq!(got.coordinator_id.as_deref(), Some(id_b().as_str()));
     }
 
     // ── Lifecycle verbs refuse Readonly records ─────────────────────────

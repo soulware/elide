@@ -603,16 +603,32 @@ impl SegmentsView<'_> {
         seg_ulid: Ulid,
         path: &std::path::Path,
     ) -> Result<(), SegmentsError> {
-        const MAX_CONCURRENT_PARTS: usize = 2;
-
-        let key = self.segment_key(seg_ulid);
         let data = std::fs::read(path).map_err(|e| SegmentsError::ReadFile {
             path: path.to_path_buf(),
             source: e,
         })?;
-        let mut bytes = Bytes::from(data);
-        let part_size = crate::upload::part_size_bytes();
+        self.put_bytes(seg_ulid, Bytes::from(data)).await
+    }
 
+    /// GET the whole segment object. Used by forced-claim tail
+    /// re-own, which needs every byte (header + index to verify and
+    /// re-sign, body to copy verbatim). Callers verify under the
+    /// source volume's pubkey before reusing the bytes.
+    pub async fn get_bytes(&self, seg_ulid: Ulid) -> Result<Bytes, SegmentsError> {
+        let key = self.segment_key(seg_ulid);
+        let got = self.store.get(&key).await.map_err(SegmentsError::Get)?;
+        got.bytes().await.map_err(SegmentsError::Get)
+    }
+
+    /// Multipart PUT of a fully-formed in-memory segment object. Same
+    /// part discipline as [`Self::put_from_file`]; used by
+    /// forced-claim tail re-own, which composes the object in memory
+    /// (re-signed head + copied body).
+    pub async fn put_bytes(&self, seg_ulid: Ulid, mut bytes: Bytes) -> Result<(), SegmentsError> {
+        const MAX_CONCURRENT_PARTS: usize = 2;
+
+        let key = self.segment_key(seg_ulid);
+        let part_size = crate::upload::part_size_bytes();
         let upload = self
             .store
             .put_multipart(&key)

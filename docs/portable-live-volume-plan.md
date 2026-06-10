@@ -484,12 +484,23 @@ attestation model's `rw-self` invariant cannot discharge.
   drain tick, folded in from the handoff on release, written at
   import completion) — shared with the fork-basis work in
   `design-mint-volume-attestation.md`.
-- [ ] **`claim --force`:** forced CAS on the stale record,
-  provisional provenance from `(vol_ulid, latest_snapshot)`, tail
-  re-own (index verify + re-sign, `UploadPartCopy` body
-  composition — probe Tigris's minimum part size first), first WAL
-  ULID minted above the copied tail. Never-snapshotted dead volume →
-  root fork, re-own every live segment.
+- [x] **`claim --force`:** forced CAS on the stale record
+  (`If-Match` on the observed version — concurrent forced claims
+  arbitrate), provisional provenance from
+  `(vol_ulid, latest_snapshot)`, effective basis re-resolved from the
+  dead fork's `snapshots/LATEST`, tail re-own (index verify under the
+  dead key, re-sign with the fork key, client-side GET+PUT copy in
+  v1 — server-side `UploadPartCopy` composition is a follow-up
+  optimisation), iterate-to-stable against the dead fork's HEAD. The
+  WAL ULID floor needs no special handling: re-owned tail `.idx`
+  files enter `index/` via prefetch and the open-time
+  `UlidMint` floor sits above them. Never-snapshotted dead volume →
+  the new fork takes over the dead fork's own `ParentRef` + extent
+  sources and re-owns every live segment. Crash-resumable: the new
+  fork's HEAD is written as durable intent before any copy; same-host
+  re-runs resume the partial fork, cross-host claimants source
+  missing tail segments from the name's prior bindings in
+  `events/<name>`.
 - [ ] **Retire the synthesis path:** `release --force` (CLI + IPC +
   `force_release_volume_op` + `mark_released_force`),
   `mint_and_publish_synthesised_snapshot`,
@@ -499,9 +510,10 @@ attestation model's `rw-self` invariant cannot discharge.
   `"elide-snapshot-recovery-v1"` signing domain), and
   `ParentRef.manifest_pubkey`. `release --force --to` goes with it;
   `release --to` (graceful reservation) stays.
-- [ ] **Event vocabulary:** `force_released` in
-  `design-volume-event-log.md` is emitted by the retired verb; the
-  forced claim emits its own event (kind TBD in that doc).
+- [x] **Event vocabulary:** the forced claim emits `force_claimed`
+  (carries `displaced_coordinator_id`; doubles as the crash-resume
+  source index). `force_released` retires with its verb in the
+  synthesis-path retirement below.
 - [ ] **Process-level recovery test:** kill the writing coordinator
   between segment uploads and any snapshot publish, then
   `claim --force` from a second coordinator. Belongs alongside the
