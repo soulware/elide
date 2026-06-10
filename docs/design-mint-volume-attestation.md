@@ -290,12 +290,15 @@ anchor:
 ### Setup reads: claim-first ordering
 
 Most reads anchor trivially — demand-fetch and prefetch run on a live
-leaf. The exception is *volume setup* (fork, claim, start), which reads an
-ancestor's data while the new leaf is still being established. The rule is
-**claim-first**: publish the new fork's `volume.provenance` and rebind
-`names/<name>` to it *before* any `by_id` read, so `owned = new_fork` is
-live and every subsequent read anchors on it. `claim` already orders
-`mark_claimed` ahead of its chain reads; `fork` adopts the same shape.
+leaf. The exception is *volume setup* (fork, claim, start), which reads
+`by_id` data while the local leaf is still being established. fork and
+claim establish a *new* leaf, and the rule is **claim-first**: publish
+the new fork's `volume.provenance` and rebind `names/<name>` to it
+*before* any `by_id` read, so `owned = new_fork` is live and every
+subsequent read anchors on it. `claim` already orders `mark_claimed`
+ahead of its chain reads; `fork` adopts the same shape. start
+re-establishes an *existing* leaf and anchors on its surviving key
+(§ *`start` anchors on the key shadow*).
 
 ### The provisional provenance must be recovery-correct — so its trust-anchors come from control-plane state
 
@@ -352,6 +355,34 @@ strangers discover a basis through the name record.
 - Bare `--from <vol_ulid>` has no record to consult — the name record is
   the discovery surface; raw ULIDs are for explicit pins — and requires
   the pinned form.
+
+### `start` anchors on the key shadow
+
+The third setup operation establishes no new leaf. Remote start
+(`start_remote.rs::hydrate_remote_owned`) runs when `names/<name>`
+points at a leaf this coordinator owns but `by_id/<leaf>/` is gone
+locally (the stop → remove → start round trip). Liveness already
+holds — the record still points at the leaf — so the anchor is the
+leaf itself, and the question is possession: the in-dir `volume.key`
+vanished with the directory. The surviving copy is the **key shadow**
+(`data_dir/keys/<vol_ulid>.key`, written when claim/fork mints the
+keypair), and it is start's possession proof:
+
+- **Shadow-first ordering.** The hydrate runs: skeleton chain off
+  `meta/*` (`coord-ro`, anchorless) → read the shadow → prove
+  possession with it → the `by_id` basis reads (`volume-ro` against
+  the leaf, and against the parent when the leaf never published a
+  snapshot). Today the shadow is consulted only after the basis
+  reads, to restore writability; the proof moves to the front. The
+  restore into the hydrated fork dir stays where it is.
+- **No shadow ⇒ start fails.** The current fallback — hydrate the
+  leaf readonly — retires: a keyless leaf proves nothing, so its
+  basis reads are unauthorisable regardless. A dead owner's volume
+  is recovered from another host via `claim --force`, which is a
+  claim, not a start.
+- **The shadow write becomes load-bearing.** claim/fork write it
+  warn-and-continue today (`claim.rs`); it promotes to hard-fail, so
+  owned-but-keyless cannot arise on a live host.
 
 ### Recovery is a claim: force-release becomes `claim --force`
 

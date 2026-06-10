@@ -505,6 +505,19 @@ attestation model's `rw-self` invariant cannot discharge.
   `claim --force` from a second coordinator. Belongs alongside the
   kernel-lane CI tests; heavier than the inbound-op coverage above.
 
+**Rework to `start --remote`** (same attestation contract,
+`design-mint-volume-attestation.md` § *`start` anchors on the key
+shadow*):
+
+- [ ] **Shadow-first hydrate:** `hydrate_remote_owned` proves
+  possession from `data_dir/keys/<vol_ulid>.key` before its `by_id`
+  basis reads; no shadow ⇒ start fails, and the keyless
+  readonly-resurrection fallback (`restore_key_from_shadow` returning
+  `false` → `mode=readonly`) retires.
+- [ ] **Shadow write hard-fails:** the claim/fork key-shadow write
+  promotes from warn-and-continue (`claim.rs`) to an error, so
+  owned-but-keyless cannot arise on a live host.
+
 **Phase exit criteria:** an operator can recover a name from a dead
 coordinator with one verb, and the recovered fork includes every
 segment the dead owner successfully promoted to S3 — the basis
