@@ -1224,4 +1224,54 @@ mod tests {
             .expect_err("rebound record must not supply a basis");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
     }
+    #[tokio::test]
+    async fn setup_stages_are_control_plane_only() {
+        // Claim-first ordering: stages 1-3 (resolve-source, pull-chain,
+        // resolve-snapshot) run before the new fork exists, so they may
+        // touch only control-plane state -- names/<name> + meta/* on
+        // coord-ro. The first by_id credential is minted post-rebind
+        // (prefetch, anchored on the new fork).
+        use elide_coordinator::stores::{RecordingStores, RoleCall};
+
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let source = Ulid::new();
+        upload_root_skeleton(&mem, source).await;
+        let mut rec = NameRecord::live_minimal(source, 4096);
+        rec.state = NameState::Readonly;
+        rec.latest_snapshot = Some(snap());
+        put_name_record(&mem, "base", &rec).await;
+
+        let coord_dir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+        let recording = RecordingStores::wrap(Arc::new(PassthroughStores::new(mem)));
+        let ctx = ForkContext {
+            core: CoordinatorCore {
+                data_dir: Arc::new(data_dir.path().to_path_buf()),
+                stores: recording.clone(),
+                identity,
+            },
+            fork_registry: new_registry(),
+            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            snapshot_locks: elide_coordinator::new_snapshot_lock_registry(),
+        };
+        let mut orch = orchestrator(
+            ctx,
+            ForkSource::Name {
+                name: "base".to_owned(),
+            },
+        );
+        orch.resolve_source().await.unwrap();
+        orch.pull_chain().await.unwrap();
+        orch.resolve_snapshot().await.unwrap();
+
+        let calls = recording.calls();
+        assert!(!calls.is_empty(), "expected role acquisitions");
+        for call in &calls {
+            assert!(
+                matches!(call, RoleCall::BaseObjectStore),
+                "fork setup stages must ride coord-ro only; saw {call:?} in {calls:?}"
+            );
+        }
+    }
 }

@@ -515,7 +515,6 @@ pub(crate) struct ClaimOrchestrator {
     // Stage outputs.
     new_fork: Option<NewForkSkeleton>,
     peer_ctx: Option<PeerFetchContext>,
-    parent_key_hex: Option<String>,
     effective: Option<EffectiveAncestor>,
 }
 
@@ -539,7 +538,6 @@ impl ClaimOrchestrator {
             pulled_guard,
             new_fork: None,
             peer_ctx: None,
-            parent_key_hex: None,
             effective: None,
         }
     }
@@ -623,40 +621,33 @@ impl ClaimOrchestrator {
         // shape. `finalize` overwrites this with the effective `ParentRef`
         // once `effective` is resolved.
         //
-        // The two trust anchors of the `ParentRef` are read from S3 (the
-        // released volume's published `volume.pub`, and the signer of its
-        // handoff manifest), so no local skeleton pull is required yet.
-        let released_vd = self.ctx.core.stores.volume_data(&self.released_vol_ulid);
-        let parent_pubkey = released_vd.metadata().read_pubkey().await.map_err(|e| {
+        // Claim-first ordering (`design-mint-volume-attestation.md`
+        // § *Setup reads*): everything before `mark_claimed` below is
+        // control-plane only. Both provisional trust anchors come from
+        // there — the basis (`handoff_snap`) from the Released record,
+        // the parent identity key from `meta/<released>.pub` on
+        // `coord-ro`. `manifest_pubkey` is left `None`: resolving it
+        // needs a `by_id` manifest read, which stage 4
+        // (`resolve_handoff_key`) performs after the rebind. The
+        // partial fork is invisible to the daemon until `finalize`,
+        // and the crash-recovery walk re-resolves recovery signers
+        // from the manifest's in-band metadata, so nothing reads the
+        // provisional `None`.
+        let base_ro = self.ctx.core.stores.base_object_store();
+        let released_meta =
+            elide_coordinator::volume_data::VolumeData::new(base_ro, self.released_vol_ulid);
+        let parent_pubkey = released_meta.metadata().read_pubkey().await.map_err(|e| {
             IpcError::store(format!(
-                "reading volume.pub for released {}: {e}",
+                "reading meta/{}.pub for released volume: {e}",
                 self.released_vol_ulid
             ))
         })?;
-        let released_ro = self.ctx.core.stores.read_volume(&self.released_vol_ulid);
-        let base_ro = self.ctx.core.stores.base_object_store();
-        let parent_manifest_pubkey = match resolve_handoff_key_via_recovery(
-            self.released_vol_ulid,
-            self.handoff_snap,
-            &released_ro,
-            &base_ro,
-        )
-        .await?
-        {
-            ResolveHandoffKeyReply::Normal => None,
-            ResolveHandoffKeyReply::Recovery {
-                manifest_pubkey_hex,
-            } => Some(
-                decode_hex32(&manifest_pubkey_hex)
-                    .map_err(|e| IpcError::internal(format!("bad parent-key: {e}")))?,
-            ),
-        };
         let provisional_lineage = ProvenanceLineage {
             parent: Some(ParentRef {
                 volume_ulid: self.released_vol_ulid.to_string(),
                 snapshot_ulid: self.handoff_snap.to_string(),
                 pubkey: parent_pubkey.to_bytes(),
-                manifest_pubkey: parent_manifest_pubkey,
+                manifest_pubkey: None,
             }),
             extent_index: Vec::new(),
             oci_source: None,
@@ -857,12 +848,6 @@ impl ClaimOrchestrator {
             self.volume,
             handoff_started.elapsed()
         );
-        self.parent_key_hex = match &key {
-            ResolveHandoffKeyReply::Normal => None,
-            ResolveHandoffKeyReply::Recovery {
-                manifest_pubkey_hex,
-            } => Some(manifest_pubkey_hex.clone()),
-        };
         self.job
             .append(ClaimAttachEvent::HandoffKeyResolved { key });
         Ok(())
@@ -882,7 +867,6 @@ impl ClaimOrchestrator {
             &self.volume,
             self.released_vol_ulid,
             self.handoff_snap,
-            self.parent_key_hex.take(),
             &self.ctx.core.data_dir,
             &self.ctx.core.stores,
             self.peer_ctx.as_ref(),
@@ -1115,7 +1099,6 @@ pub(crate) async fn skip_empty_intermediates_impl(
     volume: &str,
     released_vol_ulid: Ulid,
     handoff_snap: Ulid,
-    initial_parent_key_hex: Option<String>,
     data_dir: &std::path::Path,
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
     peer: Option<&PeerFetchContext>,
@@ -1131,7 +1114,9 @@ pub(crate) async fn skip_empty_intermediates_impl(
 
     let mut effective_vol = released_vol_ulid;
     let mut effective_snap = handoff_snap;
-    let mut effective_parent_key_hex = initial_parent_key_hex;
+    // Assigned on every loop iteration (from the fetched manifest's
+    // verifier) before any break can reach the return.
+    let mut effective_parent_key_hex: Option<String>;
 
     loop {
         let dir = volume::resolve_ancestor_dir(&by_id_dir, &effective_vol.to_string());
@@ -1151,7 +1136,7 @@ pub(crate) async fn skip_empty_intermediates_impl(
         // Pure-read manifest fetch — `volume-ro` is the right scope.
         let store = stores.read_volume(&effective_vol);
         let base_ro = stores.base_object_store();
-        let (manifest, _verifier) = elide_coordinator::recovery::fetch_verified_handoff_manifest(
+        let (manifest, verifier) = elide_coordinator::recovery::fetch_verified_handoff_manifest(
             &store,
             &base_ro,
             effective_vol,
@@ -1165,6 +1150,19 @@ pub(crate) async fn skip_empty_intermediates_impl(
                 "fetching handoff manifest {effective_vol}/{effective_snap}: {e}"
             ))
         })?;
+
+        // The key the new fork must record for this handoff comes from
+        // the verifier that just checked it — `None` for a
+        // volume-signed manifest, the recovering coordinator's pub for
+        // a synthesised one. Derived per link from the manifest's
+        // in-band recovery metadata, never inherited from a child's
+        // provenance copy (the provisional ParentRef defers it).
+        effective_parent_key_hex = match &verifier {
+            elide_coordinator::recovery::HandoffVerifier::Normal => None,
+            elide_coordinator::recovery::HandoffVerifier::Synthesised {
+                manifest_pubkey, ..
+            } => Some(encode_hex(&manifest_pubkey.to_bytes())),
+        };
 
         let Some(parent) = lineage.parent else {
             // Root volume. The function's contract is "deepest non-empty
@@ -1222,7 +1220,6 @@ pub(crate) async fn skip_empty_intermediates_impl(
 
         effective_vol = parent_vol_ulid;
         effective_snap = parent_snap_ulid;
-        effective_parent_key_hex = parent.manifest_pubkey.map(|k| encode_hex(&k));
     }
 
     Ok((effective_vol, effective_snap, effective_parent_key_hex))
@@ -1331,7 +1328,6 @@ mod tests {
             "vol",
             f1.vol,
             f1.snap,
-            None,
             data_dir,
             &stores,
             None,
@@ -1372,7 +1368,6 @@ mod tests {
             "vol",
             f2.vol,
             f2.snap,
-            None,
             data_dir,
             &stores,
             None,
@@ -1410,7 +1405,6 @@ mod tests {
             "vol",
             f1.vol,
             f1.snap,
-            None,
             data_dir,
             &stores,
             None,
@@ -1455,7 +1449,6 @@ mod tests {
             "vol",
             corrupt_vol,
             snap,
-            None,
             data_dir,
             &stores,
             None,
@@ -1589,7 +1582,6 @@ mod tests {
             "vol",
             partial_vol,
             empty_snap,
-            None,
             data_dir,
             &stores,
             None,
@@ -1605,12 +1597,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_fork_recovery_carries_recovery_handoff_manifest_pubkey() {
+    async fn partial_fork_recovery_resolves_recovery_signer_post_rebind() {
         // #428 variant. The released volume's handoff is a *recovery*
-        // (coordinator-signed) manifest, not a normal volume-signed one —
-        // the case where a `None` manifest_pubkey guess would be wrong.
-        // `early_rebind` must record the signing coordinator's pubkey in the
-        // provisional ParentRef, and recovery must carry it through.
+        // (coordinator-signed) manifest, not a normal volume-signed one.
+        // Claim-first keeps `early_rebind` control-plane-only, so the
+        // provisional ParentRef defers `manifest_pubkey` (`None`); the
+        // crash-recovery walk must still resolve the signing
+        // coordinator's pubkey from the manifest's in-band recovery
+        // metadata and carry it through to the new fork.
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1682,8 +1676,10 @@ mod tests {
         let partial_vol = orch.new_fork.as_ref().unwrap().vol_ulid;
         drop(orch);
 
-        // Variant assertion: the provisional ParentRef records coord-A's
-        // pubkey as the manifest_pubkey — the Recovery branch, not None.
+        // The provisional ParentRef defers the manifest_pubkey: resolving
+        // it needs a `by_id` manifest read, which claim-first pushes past
+        // the rebind (stage 4). The walk below proves the deferral is
+        // safe for the crash window.
         let partial_dir = data_dir.join("by_id").join(partial_vol.to_string());
         let lineage = elide_core::signing::read_lineage_verifying_signature(
             &partial_dir,
@@ -1693,11 +1689,7 @@ mod tests {
         .unwrap();
         let parent = lineage.parent.expect("ParentRef present");
         assert_eq!(parent.volume_ulid, vol_x.to_string());
-        assert_eq!(
-            parent.manifest_pubkey,
-            Some(coord_a.verifying_key().to_bytes()),
-            "the recovery handoff signer must be recorded as the manifest_pubkey"
-        );
+        assert!(parent.manifest_pubkey.is_none(), "resolved post-rebind");
 
         // The recovery cycle resolves back to vol_x and carries coord-A's
         // key through to the new fork.
@@ -1721,7 +1713,6 @@ mod tests {
             "vol",
             partial_vol,
             empty_snap,
-            None,
             data_dir,
             &stores,
             None,
@@ -1759,7 +1750,6 @@ mod tests {
             "vol",
             r.vol,
             r.snap,
-            None,
             data_dir,
             &stores,
             None,
@@ -1793,7 +1783,6 @@ mod tests {
             "vol",
             r.vol,
             r.snap,
-            None,
             data_dir,
             &stores,
             None,
@@ -1838,7 +1827,6 @@ mod tests {
             "vol",
             f2.vol,
             f2.snap,
-            None,
             data_dir,
             &stores,
             None,
@@ -1861,10 +1849,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_pubkey_override_flows_through_when_skipping() {
-        // F1's parent ref carries a manifest_pubkey override (recovery
-        // snapshot at the grandparent). When we skip F1 (empty), the override
-        // must be propagated as the new fork's parent_key_hex.
+    async fn child_provenance_manifest_pubkey_claim_is_ignored() {
+        // F1's parent ref carries a manifest_pubkey claim for R's
+        // handoff that R's actual manifest does not bear out (it is
+        // volume-signed). The walk derives the key from the verifier
+        // of each manifest it fetches — never from a child's
+        // provenance copy — so the fabricated claim must not surface
+        // as the new fork's parent_key_hex.
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1912,7 +1903,6 @@ mod tests {
             "vol",
             f1.vol,
             f1.snap,
-            None,
             data_dir,
             &stores,
             None,
@@ -1922,9 +1912,11 @@ mod tests {
         .unwrap();
         assert_eq!(vol, r.vol);
         assert_eq!(snap, r.snap);
-        assert_eq!(
-            key_hex.as_deref(),
-            Some(encode_hex(&override_pubkey_bytes).as_str())
+        assert!(
+            key_hex.is_none(),
+            "R's manifest is volume-signed; the fabricated provenance \
+             claim {} must not flow through",
+            encode_hex(&override_pubkey_bytes)
         );
     }
 
@@ -1993,5 +1985,99 @@ mod tests {
                  saw {call:?} in {calls:?}"
             );
         }
+    }
+    #[tokio::test]
+    async fn early_rebind_is_control_plane_only() {
+        // Claim-first ordering: everything `early_rebind` does before
+        // `mark_claimed` must be control-plane (`coord-ro` / `coord-rw`)
+        // plus the new fork's own uploads. In particular the released
+        // volume's identity key comes from `meta/<released>.pub`, never
+        // a `by_id/<released>/` read — no volume-ro/volume-rw credential
+        // may be minted for the released (foreign) volume.
+        use elide_coordinator::stores::{RecordingStores, RoleCall};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut mint = UlidMint::new(Ulid::nil());
+        let handoff = mint.next();
+        let released = mint.next();
+
+        // Released volume's identity key, published at meta/<released>.pub.
+        let released_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pub_hex = encode_hex(&released_key.verifying_key().to_bytes());
+        store
+            .put(
+                &object_store::path::Path::from(elide_core::store_keys::meta_pub_key(released)),
+                object_store::PutPayload::from(format!("{pub_hex}\n").into_bytes()),
+            )
+            .await
+            .unwrap();
+
+        // names/vol: Released with a handoff pin, claimable.
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(released, 1 << 30);
+        rec.state = elide_core::name_record::NameState::Released;
+        rec.coordinator_id = None;
+        rec.handoff_snapshot = Some(handoff);
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(coord_dir.path())
+                .unwrap(),
+        );
+        let recording = RecordingStores::wrap(passthrough(Arc::clone(&store)));
+        let ctx = ClaimContext {
+            core: crate::inbound::CoordinatorCore {
+                data_dir: Arc::new(data_dir.to_path_buf()),
+                stores: recording.clone(),
+                identity,
+            },
+            claim_registry: new_registry(),
+            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+        };
+        let mut orch =
+            ClaimOrchestrator::new(ClaimJob::new(), "vol".to_owned(), released, handoff, ctx);
+        orch.early_rebind().await.expect("early rebind succeeds");
+
+        // No by_id credential for the released volume; no volume-ro at all.
+        let calls = recording.calls();
+        for call in &calls {
+            assert!(
+                !matches!(call, RoleCall::ReadVolume(_)),
+                "early_rebind must not mint volume-ro; saw {call:?} in {calls:?}"
+            );
+            assert!(
+                !matches!(call, RoleCall::VolumeRw(v) if *v == released),
+                "early_rebind must not mint volume-rw for the released \
+                 volume; saw {call:?} in {calls:?}"
+            );
+        }
+
+        // The name is rebound to the new fork...
+        let (rebound, _) = elide_coordinator::name_store::read_name_record(&store, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(rebound.vol_ulid, released);
+        assert_eq!(rebound.state, elide_core::name_record::NameState::Stopped);
+
+        // ...and the provisional provenance carries the control-plane
+        // anchors: parent pubkey from meta/, manifest_pubkey deferred.
+        let new_dir = data_dir.join("by_id").join(rebound.vol_ulid.to_string());
+        let lineage = elide_core::signing::read_lineage_verifying_signature(
+            &new_dir,
+            VOLUME_PUB_FILE,
+            VOLUME_PROVENANCE_FILE,
+        )
+        .unwrap();
+        let parent = lineage.parent.expect("provisional parent ref");
+        assert_eq!(parent.volume_ulid, released.to_string());
+        assert_eq!(parent.snapshot_ulid, handoff.to_string());
+        assert_eq!(parent.pubkey, released_key.verifying_key().to_bytes());
+        assert!(parent.manifest_pubkey.is_none(), "resolved post-rebind");
     }
 }
