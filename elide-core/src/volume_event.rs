@@ -112,6 +112,16 @@ pub enum EventKind {
         handoff_snapshot: Ulid,
         displaced_coordinator_id: String,
     },
+    /// `names/<name>` was force-claimed: a coordinator displaced an
+    /// unreachable owner with a forced CAS straight to a fresh fork
+    /// (`volume claim --force`). The event's `vol_ulid` is the new
+    /// fork; `displaced_coordinator_id` is the dead owner recorded
+    /// just before the rewrite (`None` if the stale record carried no
+    /// owner identity).
+    ForceClaimed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        displaced_coordinator_id: Option<String>,
+    },
     /// This name was created as a fork of another name's snapshot.
     /// Emitted on the *new* name's log only; the source name's log
     /// is not updated (see `design-volume-event-log.md` open question
@@ -145,6 +155,7 @@ impl EventKind {
             Self::Claimed => "claimed",
             Self::Released { .. } => "released",
             Self::ForceReleased { .. } => "force_released",
+            Self::ForceClaimed { .. } => "force_claimed",
             Self::ForkedFrom { .. } => "forked_from",
             Self::RenamedTo { .. } => "renamed_to",
             Self::RenamedFrom { .. } => "renamed_from",
@@ -311,6 +322,15 @@ impl VolumeEvent {
                     displaced_coordinator_id,
                 );
             }
+            EventKind::ForceClaimed {
+                displaced_coordinator_id,
+            } => {
+                push_field(
+                    &mut buf,
+                    "displaced_coordinator_id",
+                    displaced_coordinator_id.as_deref().unwrap_or(""),
+                );
+            }
             EventKind::ForkedFrom {
                 source_name,
                 source_vol_ulid,
@@ -451,6 +471,12 @@ mod tests {
             EventKind::ForceReleased {
                 handoff_snapshot: snap_ulid(),
                 displaced_coordinator_id: "01OLDCOORDXXXXXXXXXXXXXXXX".to_string(),
+            },
+            EventKind::ForceClaimed {
+                displaced_coordinator_id: Some("01OLDCOORDXXXXXXXXXXXXXXXX".to_string()),
+            },
+            EventKind::ForceClaimed {
+                displaced_coordinator_id: None,
             },
             EventKind::ForkedFrom {
                 source_name: "parent".to_string(),

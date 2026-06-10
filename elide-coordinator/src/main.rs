@@ -13,6 +13,7 @@ mod claim;
 mod credential;
 mod daemon;
 mod enroll;
+mod force_claim;
 mod fork;
 mod import;
 mod inbound;

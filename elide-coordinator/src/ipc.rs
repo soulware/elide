@@ -283,7 +283,11 @@ pub enum Request {
     /// spawned; foreign-content claims return
     /// `Claiming { released_vol_ulid }` and the caller observes via
     /// [`Request::ClaimAttach`].
-    ClaimStart { volume: String },
+    ClaimStart {
+        volume: String,
+        #[serde(default)]
+        force: bool,
+    },
     /// Stream progress for an in-flight claim started via
     /// [`Request::ClaimStart`]. Addressed by the bucket-side name so
     /// the caller doesn't have to remember the freshly-minted fork

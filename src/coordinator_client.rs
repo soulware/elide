@@ -616,9 +616,10 @@ impl Client {
     /// a foreign-content claim is now running in the background — the
     /// caller subscribes via [`Client::claim_attach_by_name`] to stream
     /// progress and learn the freshly-minted fork ULID.
-    pub fn claim_start(&self, volume: &str) -> io::Result<ClaimStartReply> {
+    pub fn claim_start(&self, volume: &str, force: bool) -> io::Result<ClaimStartReply> {
         self.call_typed(&Request::ClaimStart {
             volume: volume.to_owned(),
+            force,
         })?
         .map_err(io::Error::other)
     }

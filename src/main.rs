@@ -458,15 +458,22 @@ enum VolumeCommand {
     /// released snapshot, and atomically rebinds `names/<name>`.
     ///
     /// Refuses if the bucket record is `Live` or `Stopped` and owned
-    /// by another coordinator. To override an unreachable owner,
-    /// run `volume release --force <name>` first (which declares the
-    /// previous owner dead and flips the record to `Released`), then
-    /// `volume claim <name>`. The two-step sequence is intentional:
-    /// `release --force` is the unconditional override, and `claim`
-    /// is always CAS-protected against concurrent claimants.
+    /// by another coordinator. To recover a volume whose owner is
+    /// unreachable (machine gone, key lost), run
+    /// `volume claim --force <name>`: ownership transfers first via a
+    /// forced CAS on the record, then the dead fork's post-snapshot
+    /// tail is re-owned as the new fork's first segments. The forced
+    /// CAS is still conditioned on the record observed at start, so
+    /// concurrent forced claims arbitrate cleanly.
     Claim {
         /// Volume name
         name: String,
+        /// Override an unreachable owner's `live`/`stopped` record.
+        /// Never run this against a healthy owner: its undrained
+        /// local writes are lost (drained state is recovered in
+        /// full).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Release a volume's name back to the pool. Drains the WAL, publishes
@@ -947,7 +954,7 @@ fn main() {
                 if claim {
                     // run_claim's foreign-claim path streams the prefetch
                     // already; no second await needed here.
-                    if let Err(e) = run_claim(&name, &coord) {
+                    if let Err(e) = run_claim(&name, false, &coord) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
@@ -985,12 +992,13 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Claim { name } => {
-                if let Err(e) = run_claim(&name, &coord) {
+            VolumeCommand::Claim { name, force } => {
+                if let Err(e) = run_claim(&name, force, &coord) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
-                println!("{name}: claimed");
+                let verb = if force { "force-claimed" } else { "claimed" };
+                println!("{name}: {verb}");
             }
 
             VolumeCommand::Release { name, force } => match coord.release_volume(&name, force) {
@@ -2043,9 +2051,9 @@ fn create_fork(
 ///     conditional PUT inside `rebind-name` resolves races; the local
 ///     fork is left in place as a usable orphan if another
 ///     coordinator wins.
-fn run_claim(name: &str, coord: &coordinator_client::Client) -> std::io::Result<()> {
+fn run_claim(name: &str, force: bool, coord: &coordinator_client::Client) -> std::io::Result<()> {
     use coordinator_client::ClaimStartReply;
-    match coord.claim_start(name)? {
+    match coord.claim_start(name, force)? {
         ClaimStartReply::Reclaimed => Ok(()),
         ClaimStartReply::Claiming { released_vol_ulid } => {
             eprintln!("[claim] claiming '{name}' from {released_vol_ulid}");
@@ -2264,6 +2272,12 @@ fn print_volume_events(reply: &coordinator_client::VolumeEventsReply) {
             } => {
                 format!(" handoff={handoff_snapshot} displaced={displaced_coordinator_id}")
             }
+            EventKind::ForceClaimed {
+                displaced_coordinator_id,
+            } => match displaced_coordinator_id {
+                Some(d) => format!(" displaced={d}"),
+                None => String::new(),
+            },
             EventKind::ForkedFrom {
                 source_name,
                 source_vol_ulid,

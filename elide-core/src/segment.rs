@@ -1084,6 +1084,45 @@ pub fn verify_segment_bytes(
         })
 }
 
+/// Re-sign a segment's header in place with `signer`, returning the
+/// number of bytes covered by `[0, body_section_start)` (header +
+/// index section + inline section).
+///
+/// Used by forced-claim tail re-own: the claimant copies a dead
+/// fork's segment under its own prefix, where it must verify under
+/// the claimant's `volume.pub`. The signature covers only
+/// `BLAKE3(header[0..36] || index_bytes)`; header fields, index, and
+/// body bytes are byte-identical before and after. Callers must have
+/// verified the original signature ([`verify_segment_bytes`]) first —
+/// re-signing unverified bytes would launder them under the new key.
+pub fn resign_segment_head(bytes: &mut [u8], signer: &dyn SegmentSigner) -> io::Result<u64> {
+    if bytes.len() < HEADER_LEN as usize {
+        return Err(io::Error::other(format!(
+            "segment too short to re-sign ({} bytes)",
+            bytes.len()
+        )));
+    }
+    let h = SegmentHeader::read_from_bytes(&bytes[..HEADER_LEN as usize])
+        .map_err(|_| io::Error::other("segment header size mismatch"))?;
+    if h.magic != *MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
+    }
+    let index_length = h.index_length.get() as usize;
+    let index_end = HEADER_LEN as usize + index_length;
+    if bytes.len() < index_end {
+        return Err(io::Error::other(
+            "segment truncated before end of index section",
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes[..HEADER_SIGNED_PREFIX]);
+    hasher.update(&bytes[HEADER_LEN as usize..index_end]);
+    let hash = hasher.finalize();
+    let signature = signer.sign(hash.as_bytes());
+    bytes[HEADER_SIGNED_PREFIX..HEADER_LEN as usize].copy_from_slice(&signature);
+    Ok(HEADER_LEN + index_length as u64 + h.inline_length.get() as u64)
+}
+
 /// Return `body_section_start` for a cached `.idx` file.
 ///
 /// A `.idx` file contains exactly `[0, body_section_start)` of the full
@@ -3716,5 +3755,47 @@ mod tests {
         // Arbitrary bytes that do not hash to `fake_hash` — should still pass.
         assert!(verify_body_hash(&deduping, &[]).is_ok());
         assert!(verify_body_hash(&zero, &[]).is_ok());
+    }
+    #[test]
+    fn resign_segment_head_swaps_key_and_preserves_bytes() {
+        let path = temp_path(".seg");
+        let (signer_a, vk_a) = test_signer();
+        let (signer_b, vk_b) = test_signer();
+        let body = vec![0xABu8; INLINE_THRESHOLD + 100];
+        let hash = blake3::hash(&body);
+        let mut entries = vec![SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            body,
+        )];
+        write_segment(&path, &mut entries, signer_a.as_ref()).unwrap();
+        let original = fs::read(&path).unwrap();
+        verify_segment_bytes(&original, "seg", &vk_a).unwrap();
+
+        let mut resigned = original.clone();
+        let body_start = resign_segment_head(&mut resigned, signer_b.as_ref()).unwrap();
+
+        // Verifies under B, no longer under A.
+        verify_segment_bytes(&resigned, "seg", &vk_b).unwrap();
+        verify_segment_bytes(&resigned, "seg", &vk_a).expect_err("old key must no longer verify");
+
+        // Only the signature bytes changed; header prefix, index, and
+        // body are byte-identical.
+        assert_eq!(
+            &resigned[..HEADER_SIGNED_PREFIX],
+            &original[..HEADER_SIGNED_PREFIX]
+        );
+        assert_eq!(
+            &resigned[HEADER_LEN as usize..],
+            &original[HEADER_LEN as usize..]
+        );
+        assert_ne!(
+            &resigned[HEADER_SIGNED_PREFIX..HEADER_LEN as usize],
+            &original[HEADER_SIGNED_PREFIX..HEADER_LEN as usize]
+        );
+        assert!(body_start >= HEADER_LEN);
+        let _ = fs::remove_file(&path);
     }
 }
