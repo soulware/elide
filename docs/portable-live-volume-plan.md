@@ -17,8 +17,8 @@ Implements [`design-portable-live-volume.md`](design-portable-live-volume.md).
 - **Forced recovery recovers to "now", not the last snapshot.**
   (Revised 2026-06-09 to the `claim --force` shape.) The claimant
   bases on the dead volume's last owner-published snapshot and
-  re-owns the post-snapshot tail resolved from the dead volume's
-  HEAD, verifying each segment index against the dead fork's
+  re-owns the post-snapshot head delta resolved from the dead
+  volume's HEAD, verifying each segment index against the dead fork's
   `volume.pub` before re-signing it. Data-loss boundary is "writes
   the dead owner accepted but never promoted to S3" — same as the
   crash-recovery contract. Works even if the dead owner never
@@ -333,8 +333,9 @@ claim* and `design-force-release-fencing.md`):
    straight to a fresh fork based on the record's `latest_snapshot`
    (the dead volume's last owner-published snapshot). The forced CAS
    is the fence point.
-2. Re-own the post-snapshot tail (resolved from the dead volume's
-   HEAD) as the new fork's first segments: verify each index under
+2. Re-own the post-snapshot head delta (resolved from one post-CAS
+   read of the dead volume's HEAD — the cut that defines the claim
+   set) as the new fork's first segments: verify each index under
    the dead fork's `volume.pub`, re-sign the same index bytes with
    the new fork's key, compose the S3 objects server-side. No
    synthesised manifest, no write under the dead fork's prefix.
@@ -488,18 +489,21 @@ attestation model's `rw-self` invariant cannot discharge.
   (`If-Match` on the observed version — concurrent forced claims
   arbitrate), provisional provenance from
   `(vol_ulid, latest_snapshot)`, effective basis re-resolved from the
-  dead fork's `snapshots/LATEST`, tail re-own (index verify under the
-  dead key, re-sign with the fork key, client-side GET+PUT copy in
-  v1 — server-side `UploadPartCopy` composition is a follow-up
-  optimisation), iterate-to-stable against the dead fork's HEAD. The
-  WAL ULID floor needs no special handling: re-owned tail `.idx`
+  dead fork's `snapshots/LATEST`, head-delta re-own (index verify
+  under the dead key, re-sign with the fork key, client-side GET+PUT
+  copy in v1 — server-side `UploadPartCopy` composition is a
+  follow-up optimisation). One post-CAS read of the dead fork's HEAD
+  is the cut defining the copy set; post-cut writes by a zombie
+  owner are lost by policy, and a post-copy advisory HEAD re-read
+  reports an owner that was alive all along. The WAL ULID floor
+  needs no special handling: re-owned head-delta `.idx`
   files enter `index/` via prefetch and the open-time
   `UlidMint` floor sits above them. Never-snapshotted dead volume →
   the new fork takes over the dead fork's own `ParentRef` + extent
   sources and re-owns every live segment. Crash-resumable: the new
   fork's HEAD is written as durable intent before any copy; same-host
   re-runs resume the partial fork, cross-host claimants source
-  missing tail segments from the name's prior bindings in
+  missing head-delta segments from the name's prior bindings in
   `events/<name>`.
 - [ ] **Retire the synthesis path:** `release --force` (CLI + IPC +
   `force_release_volume_op` + `mark_released_force`),
@@ -535,7 +539,8 @@ shadow*):
 **Phase exit criteria:** an operator can recover a name from a dead
 coordinator with one verb, and the recovered fork includes every
 segment the dead owner successfully promoted to S3 — the basis
-verified against the dead fork's own key, the tail re-signed under
+verified against the dead fork's own key, the head delta re-signed
+under
 the new fork's key, with no coordinator-signed manifest artefacts in
 the bucket.
 
@@ -624,7 +629,7 @@ the work fully closes:
 1. **Garbage collection across migration-driven fork chains.** The
    existing GC and dedup paths handle ancestry; whether they handle
    the *traffic pattern* of frequent migrations (long thin chains
-   with small per-fork tails) is worth a focused look. Probably a
+   with small per-fork head deltas) is worth a focused look. Probably a
    real exercise in Phase 5 testing.
 2. **`volume materialize` ergonomics for chain compaction.** Already
    exists (`design-replica-model.md`) but is "deferred". Frequent
