@@ -62,8 +62,10 @@ that cannot skew for it:
   Written GET-max-PUT (no CAS — single-writer per vol) in
   `upload_snapshot_manifests` immediately after the manifest PUT,
   **under `volume-rw` only — no cross-role write, no event**. Migrates
-  `fetch.rs:325`, `fork.rs:561`, `prefetch.rs:947`,
-  `start_remote.rs:147`, `lifecycle.rs:777`. Here a stale/lost pointer
+  `fetch.rs:325`, `prefetch.rs:947`, `start_remote.rs:147`,
+  `lifecycle.rs:777`; fork's basis discovery reads the `names/<name>`
+  record's `latest_snapshot` instead (owner-anchored vs discovery —
+  `design-mint-volume-attestation.md`). Here a stale/lost pointer
   is genuinely benign and self-heals on the next publish: these
   consumers fetch a basis and then catch up via segments, so an old
   basis only costs extra GETs, never data. A pointer is the right tool

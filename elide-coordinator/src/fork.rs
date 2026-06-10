@@ -32,7 +32,6 @@ use crate::inbound::{
 };
 use elide_coordinator::ipc::{
     ForceSnapshotNowReply, ForkAttachEvent, ForkCreateReply, ForkSource, ForkStartReply, IpcError,
-    LatestSnapshotReply, ResolveNameReply,
 };
 use elide_coordinator::register_prefetch_or_get;
 use elide_coordinator::volume_state::{IMPORTING_FILE, STOPPED_FILE};
@@ -166,12 +165,15 @@ pub(crate) fn start_fork(
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 
-/// Source resolved in stage 1. `name` is `Some` only for `Name` sources;
-/// `snap_hint` is `Some` only for `Pinned` sources.
+/// Source resolved in stage 1. `name` is `Some` for name-addressed
+/// sources (`Name` / `PinnedName`); `snap_hint` is `Some` for the
+/// pinned forms; `record_latest` carries the `names/<name>` record's
+/// `latest_snapshot` when the name was resolved through the bucket.
 struct ResolvedSource {
     vol_ulid: Ulid,
     name: Option<String>,
     snap_hint: Option<Ulid>,
+    record_latest: Option<Ulid>,
 }
 
 /// Drive one fork job to completion.
@@ -238,9 +240,10 @@ impl ForkOrchestrator {
     }
 
     /// Stage 1. Resolve `from` to `(source_vol_ulid, source_name,
-    /// snap_hint)`. For `Name` sources, look up the local symlink first
-    /// and fall back to `resolve_name_op` (LIST `names/<name>` in the
-    /// bucket).
+    /// snap_hint, record_latest)`. Name-addressed sources look up the
+    /// local symlink first and fall back to `names/<name>` in the
+    /// bucket (`coord-ro`), capturing the record's `latest_snapshot`
+    /// alongside the binding.
     async fn resolve_source(&mut self) -> Result<(), IpcError> {
         let resolved = match &self.from {
             ForkSource::Pinned {
@@ -250,47 +253,66 @@ impl ForkOrchestrator {
                 vol_ulid: *vol_ulid,
                 name: None,
                 snap_hint: Some(*snap_ulid),
+                record_latest: None,
             },
-            ForkSource::BareUlid { vol_ulid } => ResolvedSource {
-                vol_ulid: *vol_ulid,
-                name: None,
-                snap_hint: None,
-            },
+            ForkSource::PinnedName { name, snap_ulid } => {
+                let snap_ulid = *snap_ulid;
+                let name = name.clone();
+                let (vol_ulid, record_latest) = self.resolve_by_name(&name).await?;
+                ResolvedSource {
+                    vol_ulid,
+                    name: Some(name),
+                    snap_hint: Some(snap_ulid),
+                    record_latest,
+                }
+            }
             ForkSource::Name { name } => {
-                let local = self.ctx.core.data_dir.join("by_name").join(name);
-                if local.exists() {
-                    let canon = std::fs::canonicalize(&local).map_err(|e| {
-                        IpcError::internal(format!("canonicalize by_name/{name}: {e}"))
-                    })?;
-                    let ulid_str = canon
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .ok_or_else(|| IpcError::internal("by_name link has non-utf8 target"))?;
-                    let vol_ulid = Ulid::from_string(ulid_str).map_err(|e| {
-                        IpcError::internal(format!(
-                            "by_name/{name} target {ulid_str:?} not a ULID: {e}"
-                        ))
-                    })?;
-                    ResolvedSource {
-                        vol_ulid,
-                        name: Some(name.clone()),
-                        snap_hint: None,
-                    }
-                } else {
-                    self.job
-                        .append(ForkAttachEvent::ResolvingName { name: name.clone() });
-                    let claims = self.ctx.core.stores.name_claims_ro();
-                    let reply = resolve_name_op(name, claims.as_ref()).await?;
-                    ResolvedSource {
-                        vol_ulid: reply.vol_ulid,
-                        name: Some(name.clone()),
-                        snap_hint: None,
-                    }
+                let name = name.clone();
+                let (vol_ulid, record_latest) = self.resolve_by_name(&name).await?;
+                ResolvedSource {
+                    vol_ulid,
+                    name: Some(name),
+                    snap_hint: None,
+                    record_latest,
                 }
             }
         };
         self.source = Some(resolved);
         Ok(())
+    }
+
+    /// Resolve a name-addressed source: `by_name/<name>` locally
+    /// first, else the `names/<name>` record in the bucket. Returns
+    /// the bound `vol_ulid` plus the record's `latest_snapshot` when
+    /// the bucket record was consulted.
+    async fn resolve_by_name(&self, name: &str) -> Result<(Ulid, Option<Ulid>), IpcError> {
+        validate_volume_name(name).map_err(IpcError::bad_request)?;
+        let local = self.ctx.core.data_dir.join("by_name").join(name);
+        if local.exists() {
+            let canon = std::fs::canonicalize(&local)
+                .map_err(|e| IpcError::internal(format!("canonicalize by_name/{name}: {e}")))?;
+            let ulid_str = canon
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| IpcError::internal("by_name link has non-utf8 target"))?;
+            let vol_ulid = Ulid::from_string(ulid_str).map_err(|e| {
+                IpcError::internal(format!(
+                    "by_name/{name} target {ulid_str:?} not a ULID: {e}"
+                ))
+            })?;
+            return Ok((vol_ulid, None));
+        }
+        self.job.append(ForkAttachEvent::ResolvingName {
+            name: name.to_owned(),
+        });
+        let claims = self.ctx.core.stores.name_claims_ro();
+        match claims.read(name).await {
+            Ok(Some(rec)) => Ok((rec.vol_ulid, rec.latest_snapshot)),
+            Ok(None) => Err(IpcError::not_found(format!(
+                "volume '{name}' not found in store"
+            ))),
+            Err(e) => Err(IpcError::store(format!("reading names/{name}: {e}"))),
+        }
     }
 
     /// Stage 2. Walk the ancestor chain, pulling each missing entry.
@@ -339,13 +361,13 @@ impl ForkOrchestrator {
     /// Stage 3. Decide which snapshot the fork pins to.
     ///
     /// Resolution order:
-    ///   - `Pinned` source: use the explicit `snap_hint`.
+    ///   - Pinned source (`Pinned` / `PinnedName`): use the explicit
+    ///     `snap_hint`.
     ///   - Readonly source + `force_snapshot`: synthesise an attested
     ///     "now" snapshot via [`force_snapshot_now_op`] and record the
     ///     attestation pubkey as `parent_key_hex`.
     ///   - Readonly source: use the latest local snapshot, falling back
-    ///     to [`latest_snapshot_op`] (the per-vol `snapshots/LATEST`
-    ///     pointer in S3).
+    ///     to the `names/<name>` record's `latest_snapshot`.
     ///   - Writable source: take an implicit snapshot. If the source
     ///     daemon is stopped, transparently bring it up in
     ///     transport-suppressed mode for the drain, then halt and
@@ -387,17 +409,35 @@ impl ForkOrchestrator {
             {
                 snap
             } else {
-                // Pure-read latest-snapshot pointer lookup — `volume-ro`.
-                let store = self.ctx.core.stores.read_volume(&source_vol_ulid);
-                match latest_snapshot_op(source_vol_ulid, &store)
-                    .await?
-                    .snapshot_ulid
-                {
+                // Basis discovery through the `names/<name>` record
+                // (`coord-ro`). `by_id/<vol>/snapshots/LATEST` is
+                // owner-anchored; strangers discover a basis via the
+                // record's `latest_snapshot`
+                // (`design-mint-volume-attestation.md` § *Basis
+                // resolution per `--from` form*). Guarded on the record
+                // still binding this vol_ulid so a rebound name never
+                // supplies a previous binding's snapshot.
+                let record_latest = if source.record_latest.is_some() {
+                    source.record_latest
+                } else if let Some(name) = &source.name {
+                    let claims = self.ctx.core.stores.name_claims_ro();
+                    match claims.read(name).await {
+                        Ok(Some(rec)) if rec.vol_ulid == source_vol_ulid => rec.latest_snapshot,
+                        Ok(_) => None,
+                        Err(e) => {
+                            return Err(IpcError::store(format!("reading names/{name}: {e}")));
+                        }
+                    }
+                } else {
+                    None
+                };
+                match record_latest {
                     Some(snap) => snap,
                     None => {
                         return Err(IpcError::not_found(format!(
-                            "source volume {source_ulid_str} has no snapshots; pass \
-                             force_snapshot=true to upload a new 'now' marker"
+                            "source volume {source_ulid_str} has no published snapshot \
+                             recorded; pin one explicitly with \
+                             --from {source_ulid_str}/<snap_ulid>"
                         )));
                     }
                 }
@@ -480,12 +520,12 @@ impl ForkOrchestrator {
 
     /// Stage 4. Mint the fork.
     ///
-    /// For a `Name` source the orchestrator already knows the user-facing
-    /// name; pass it as `source_name_hint` so a pulled source (whose
-    /// `volume.toml` lacks `name`) still produces a `ForkedFrom` journal
-    /// event instead of falling back to `Created`. ULID-only sources
-    /// (`BareUlid` / `Pinned`) have no orchestrator-known name and rely
-    /// on `src_cfg.name`.
+    /// For a name-addressed source the orchestrator already knows the
+    /// user-facing name; pass it as `source_name_hint` so a pulled
+    /// source (whose `volume.toml` lacks `name`) still produces a
+    /// `ForkedFrom` journal event instead of falling back to `Created`.
+    /// `Pinned` sources have no orchestrator-known name and rely on
+    /// `src_cfg.name`.
     async fn mint_fork(&mut self) -> Result<(), IpcError> {
         let source = self
             .source
@@ -532,48 +572,6 @@ impl ForkOrchestrator {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Resolve `names/<name>` in the bucket and return the bound `vol_ulid`.
-/// Errors NotFound when the name has no S3 record.
-async fn resolve_name_op(
-    name: &str,
-    claims: &dyn elide_coordinator::name_claims::NameClaimsReader,
-) -> Result<ResolveNameReply, IpcError> {
-    validate_volume_name(name).map_err(IpcError::bad_request)?;
-    match claims.read(name).await {
-        Ok(Some(rec)) => Ok(ResolveNameReply {
-            vol_ulid: rec.vol_ulid,
-        }),
-        Ok(None) => Err(IpcError::not_found(format!(
-            "volume '{name}' not found in store"
-        ))),
-        Err(e) => Err(IpcError::store(format!("reading names/{name}: {e}"))),
-    }
-}
-
-/// GET the per-vol latest stable (`User`) snapshot pointer. Stop
-/// snapshots are ephemeral checkpoints owned by the stop/start
-/// lifecycle and must not be picked up as a fork basis, so only the
-/// `User` pointer is consulted. Replaces the former
-/// `by_id/<vol>/snapshots/` LIST (`docs/list-elimination-plan.md`
-/// § *Identity axes*).
-async fn latest_snapshot_op(
-    vol_ulid: Ulid,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<LatestSnapshotReply, IpcError> {
-    let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
-    let snapshot_ulid = vd
-        .snapshots()
-        .read_latest()
-        .await
-        .map(|opt| opt.map(|(u, _)| u))
-        .map_err(|e| {
-            IpcError::store(format!(
-                "reading latest-snapshot pointer for {vol_ulid}: {e}"
-            ))
-        })?;
-    Ok(LatestSnapshotReply { snapshot_ulid })
-}
 
 /// Synthesize a "now" snapshot for a readonly source volume.
 ///
@@ -1030,4 +1028,200 @@ async fn fork_create_op(
     Ok(ForkCreateReply {
         new_vol_ulid: new_vol_ulid_value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use elide_coordinator::identity::CoordinatorIdentity;
+    use elide_coordinator::ipc::IpcErrorKind;
+    use elide_coordinator::stores::{PassthroughStores, ScopedStores};
+    use elide_core::name_record::{NameRecord, NameState};
+    use elide_core::signing::{ProvenanceLineage, VOLUME_PROVENANCE_FILE, write_provenance};
+    use object_store::PutPayload;
+    use object_store::path::Path as StorePath;
+    use rand_core::OsRng;
+    use tempfile::TempDir;
+
+    /// Upload a root-shape `volume.pub` + `volume.provenance` for
+    /// `vol_ulid` so `pull_chain` can pull + verify the skeleton.
+    async fn upload_root_skeleton(store: &Arc<dyn ObjectStore>, vol_ulid: Ulid) {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let vk = signing_key.verifying_key();
+
+        let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
+        let pub_hex: String = vk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        store
+            .put(
+                &pub_key,
+                PutPayload::from(format!("{pub_hex}\n").into_bytes()),
+            )
+            .await
+            .unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        write_provenance(
+            tmp.path(),
+            &signing_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
+        let body = std::fs::read(tmp.path().join(VOLUME_PROVENANCE_FILE)).unwrap();
+        let prov_key = StorePath::from(elide_core::store_keys::meta_provenance_key(vol_ulid));
+        store.put(&prov_key, PutPayload::from(body)).await.unwrap();
+    }
+
+    async fn put_name_record(store: &Arc<dyn ObjectStore>, name: &str, rec: &NameRecord) {
+        let key = StorePath::from(format!("names/{name}"));
+        let body = rec.to_toml().unwrap();
+        store
+            .put(&key, PutPayload::from(body.into_bytes()))
+            .await
+            .unwrap();
+    }
+
+    fn fixture(store: Arc<dyn ObjectStore>) -> (ForkContext, TempDir) {
+        let coord_dir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+        let stores: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(store));
+        let ctx = ForkContext {
+            core: CoordinatorCore {
+                data_dir: Arc::new(data_dir.path().to_path_buf()),
+                stores,
+                identity,
+            },
+            fork_registry: new_registry(),
+            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            snapshot_locks: elide_coordinator::new_snapshot_lock_registry(),
+        };
+        (ctx, data_dir)
+    }
+
+    fn orchestrator(ctx: ForkContext, from: ForkSource) -> ForkOrchestrator {
+        ForkOrchestrator::new(
+            ForkJob::new(),
+            "child".to_owned(),
+            from,
+            false,
+            Vec::new(),
+            ctx,
+        )
+    }
+
+    fn snap() -> Ulid {
+        Ulid::from_string("01J1111111111111111111111V").unwrap()
+    }
+
+    #[tokio::test]
+    async fn remote_name_basis_comes_from_record_latest_snapshot() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let source = Ulid::new();
+        upload_root_skeleton(&mem, source).await;
+        let mut rec = NameRecord::live_minimal(source, 4096);
+        rec.state = NameState::Readonly;
+        rec.latest_snapshot = Some(snap());
+        put_name_record(&mem, "base", &rec).await;
+
+        let (ctx, _data_dir) = fixture(Arc::clone(&mem));
+        let mut orch = orchestrator(
+            ctx,
+            ForkSource::Name {
+                name: "base".to_owned(),
+            },
+        );
+        orch.resolve_source().await.unwrap();
+        orch.pull_chain().await.unwrap();
+        orch.resolve_snapshot().await.unwrap();
+        assert_eq!(orch.snap_ulid, Some(snap()));
+    }
+
+    #[tokio::test]
+    async fn remote_name_without_recorded_snapshot_refuses() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let source = Ulid::new();
+        upload_root_skeleton(&mem, source).await;
+        let mut rec = NameRecord::live_minimal(source, 4096);
+        rec.state = NameState::Readonly;
+        put_name_record(&mem, "base", &rec).await;
+
+        let (ctx, _data_dir) = fixture(Arc::clone(&mem));
+        let mut orch = orchestrator(
+            ctx,
+            ForkSource::Name {
+                name: "base".to_owned(),
+            },
+        );
+        orch.resolve_source().await.unwrap();
+        orch.pull_chain().await.unwrap();
+        let err = orch
+            .resolve_snapshot()
+            .await
+            .expect_err("no basis anywhere must refuse");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+        assert!(err.message.contains("no published snapshot"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pinned_name_uses_explicit_snapshot() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let source = Ulid::new();
+        upload_root_skeleton(&mem, source).await;
+        let mut rec = NameRecord::live_minimal(source, 4096);
+        rec.state = NameState::Readonly;
+        rec.latest_snapshot = Some(snap());
+        put_name_record(&mem, "base", &rec).await;
+
+        let pinned = Ulid::from_string("01J2222222222222222222222V").unwrap();
+        let (ctx, _data_dir) = fixture(Arc::clone(&mem));
+        let mut orch = orchestrator(
+            ctx,
+            ForkSource::PinnedName {
+                name: "base".to_owned(),
+                snap_ulid: pinned,
+            },
+        );
+        orch.resolve_source().await.unwrap();
+        orch.pull_chain().await.unwrap();
+        orch.resolve_snapshot().await.unwrap();
+        assert_eq!(orch.snap_ulid, Some(pinned), "pin wins over record latest");
+    }
+
+    #[tokio::test]
+    async fn rebound_record_never_supplies_basis_for_local_name() {
+        // Local symlink binds the name to fork A (readonly, no local
+        // manifest); the bucket record has been rebound to fork B with
+        // a latest_snapshot. The fallback must not pair B's snapshot
+        // with A.
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let local_vol = Ulid::new();
+        let (ctx, data_dir) = fixture(Arc::clone(&mem));
+
+        let vol_dir = data_dir.path().join("by_id").join(local_vol.to_string());
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
+        let by_name = data_dir.path().join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        std::os::unix::fs::symlink(&vol_dir, by_name.join("base")).unwrap();
+
+        let mut rec = NameRecord::live_minimal(Ulid::new(), 4096);
+        rec.latest_snapshot = Some(snap());
+        put_name_record(&mem, "base", &rec).await;
+
+        let mut orch = orchestrator(
+            ctx,
+            ForkSource::Name {
+                name: "base".to_owned(),
+            },
+        );
+        orch.resolve_source().await.unwrap();
+        orch.pull_chain().await.unwrap();
+        let err = orch
+            .resolve_snapshot()
+            .await
+            .expect_err("rebound record must not supply a basis");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+    }
 }

@@ -304,19 +304,23 @@ pub enum Request {
     },
 }
 
-/// Source spec for [`Request::ForkStart`]. Mirrors the CLI's
-/// `FromSpec`: a name to resolve, a writable volume by ULID (which
-/// implies an implicit snapshot before forking), or an explicit
-/// `(vol_ulid, snap_ulid)` pin.
+/// Source spec for [`Request::ForkStart`]. Mirrors the CLI's `--from`
+/// forms: a name to resolve, a name pinned to a specific snapshot, or
+/// an explicit `(vol_ulid, snap_ulid)` pin. A bare ULID is not a
+/// source — the name record is the discovery surface; raw ULIDs
+/// always carry an explicit snapshot pin.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ForkSource {
     /// Source addressed by name. Coordinator tries `by_name/<name>`
-    /// locally first, then `names/<name>` in the store.
+    /// locally first, then `names/<name>` in the store. The basis is
+    /// the source's current state: an implicit snapshot for a local
+    /// writable source, otherwise the record's `latest_snapshot`.
     Name { name: String },
-    /// Writable source addressed by ULID. Coordinator takes an
-    /// implicit snapshot of the running daemon before forking.
-    BareUlid { vol_ulid: Ulid },
+    /// Source addressed by name, pinned to a specific snapshot:
+    /// `--from <name>/<snap_ulid>`. Name resolution as for [`Self::Name`];
+    /// the snapshot is taken as-given.
+    PinnedName { name: String, snap_ulid: Ulid },
     /// Pinned source: a specific `(vol_ulid, snap_ulid)` pair.
     /// Coordinator pulls the chain if missing and verifies the
     /// snapshot exists in the store.
@@ -405,23 +409,6 @@ pub struct UpdateReply {
 pub struct PullReadonlyReply {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parent: Option<Ulid>,
-}
-
-/// Internal return type for `resolve_name_op`, called from the fork
-/// orchestrator's name-source resolution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResolveNameReply {
-    pub vol_ulid: Ulid,
-}
-
-/// Internal return type for `latest_snapshot_op`, used by the fork
-/// orchestrator to pick a snapshot when the source is readonly and
-/// no local snapshot is recorded. `snapshot_ulid` is `None` when the
-/// volume has no snapshots in the store.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LatestSnapshotReply {
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub snapshot_ulid: Option<Ulid>,
 }
 
 /// Reply for [`Request::ImportStart`]. The import runs detached; the
@@ -769,6 +756,16 @@ mod tests {
         };
         let s = serde_json::to_string(&by_name).unwrap();
         assert_eq!(s, r#"{"kind":"name","name":"demo"}"#);
+
+        let pinned_name = ForkSource::PinnedName {
+            name: "demo".to_owned(),
+            snap_ulid: Ulid::nil(),
+        };
+        let s = serde_json::to_string(&pinned_name).unwrap();
+        assert_eq!(
+            s,
+            r#"{"kind":"pinned-name","name":"demo","snap_ulid":"00000000000000000000000000"}"#
+        );
     }
 
     #[test]
