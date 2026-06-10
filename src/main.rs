@@ -277,15 +277,18 @@ enum VolumeCommand {
     ///
     /// With `--from`, creates a writable replica branched from an existing
     /// volume.  `--from` accepts three forms:
-    ///   - `<name>` — branches from the volume's latest snapshot
-    ///   - `<vol_ulid>` — bare ULID, branches from latest snapshot
-    ///   - `<vol_ulid>/<snap_ulid>` — pins to a specific snapshot
+    ///   - `<name>` — branches from the volume's latest published snapshot
+    ///   - `<name>/<snap_ulid>` — pins to a specific snapshot by name
+    ///   - `<vol_ulid>/<snap_ulid>` — pins to a specific snapshot by ULID
+    ///
+    /// A bare `<vol_ulid>` is rejected: raw ULIDs always carry an
+    /// explicit snapshot pin; the name is the discovery surface.
     ///
     /// If the source is not found locally, the volume and its ancestor
     /// chain are auto-pulled from the remote store.
     ///
-    /// ULID-wins: if the `--from` value parses as a valid ULID it is always
-    /// treated as a volume ID, never as a volume name.
+    /// ULID-wins: if the part before `/` parses as a valid ULID it is
+    /// always treated as a volume ID, never as a volume name.
     ///
     /// Without `--from`, creates a fresh empty volume and `--size` is
     /// required.
@@ -296,8 +299,8 @@ enum VolumeCommand {
         /// conflicts with `--from` (size is inherited from the source).
         #[arg(long, conflicts_with = "from")]
         size: Option<String>,
-        /// Fork from an existing volume: `<name>`, `<vol_ulid>`, or
-        /// `<vol_ulid>/<snap_ulid>`
+        /// Fork from an existing volume: `<name>`, `<name>/<snap_ulid>`,
+        /// or `<vol_ulid>/<snap_ulid>`
         #[arg(long)]
         from: Option<String>,
         /// Serve this volume over ublk on first start. The kernel
@@ -1931,23 +1934,67 @@ fn encode_transport_flags(ublk: bool, no_ublk: bool) -> Vec<String> {
     out
 }
 
-/// Create a new volume forked from a source.
+/// Parse a `--from` value into the `ForkSource` the coordinator's
+/// `fork-start` IPC takes.
 ///
-/// `from` is one of:
+/// Accepted forms:
 ///   - `<vol_ulid>/<snap_ulid>` — explicit pin to a specific snapshot
-///   - `<vol_ulid>` — bare ULID, resolved by ID (snapshot chosen automatically)
+///   - `<name>/<snap_ulid>` — explicit pin, source addressed by name
 ///   - `<name>` — volume name, resolved locally then by remote store
 ///
-/// All three forms try local first, then fall back to the remote store
-/// (auto-pulling the volume and its ancestor chain).
+/// A bare `<vol_ulid>` is rejected: raw ULIDs always carry an explicit
+/// snapshot pin; the name is the discovery surface.
 ///
-/// ULID-wins rule: if `from` (or the part before `/`) parses as a valid ULID
-/// it is always treated as one, never looked up as a volume name. This
+/// ULID-wins rule: if the part before `/` parses as a valid ULID it is
+/// always treated as one, never looked up as a volume name. This
 /// prevents ambiguity when a volume is named with a ULID string.
+fn parse_fork_source(
+    from: &str,
+    force_snapshot: bool,
+) -> std::io::Result<coordinator_client::ForkSource> {
+    if let Some((vol, snap)) = from.split_once('/') {
+        let snap_ulid = ulid::Ulid::from_string(snap)
+            .map_err(|e| std::io::Error::other(format!("invalid snapshot ULID in --from: {e}")))?;
+        if force_snapshot {
+            return Err(std::io::Error::other(
+                "--force-snapshot conflicts with an explicit snapshot pin in --from",
+            ));
+        }
+        if let Ok(vol_ulid) = ulid::Ulid::from_string(vol) {
+            Ok(coordinator_client::ForkSource::Pinned {
+                vol_ulid,
+                snap_ulid,
+            })
+        } else {
+            validate_volume_name(vol)?;
+            Ok(coordinator_client::ForkSource::PinnedName {
+                name: vol.to_owned(),
+                snap_ulid,
+            })
+        }
+    } else if ulid::Ulid::from_string(from).is_ok() {
+        Err(std::io::Error::other(format!(
+            "--from {from}: a bare volume ULID needs an explicit snapshot pin \
+             (--from {from}/<snap_ulid>); use the volume's name to fork from \
+             its latest published snapshot"
+        )))
+    } else {
+        Ok(coordinator_client::ForkSource::Name {
+            name: from.to_owned(),
+        })
+    }
+}
+
+/// Create a new volume forked from a source.
 ///
-/// For writable volumes, an implicit snapshot is taken first. For readonly
-/// volumes (pulled or already local), the latest snapshot is discovered from
-/// the remote store. For explicit pins the caller already chose a snapshot.
+/// `from` is parsed by [`parse_fork_source`]. The source is tried local
+/// first, then the remote store (auto-pulling the volume and its
+/// ancestor chain).
+///
+/// For writable volumes, an implicit snapshot is taken first. For
+/// readonly volumes (pulled or already local), the latest snapshot is
+/// discovered from the local manifests then the `names/<name>` record.
+/// For explicit pins the caller already chose a snapshot.
 ///
 /// `force_snapshot` (readonly sources only): upload a new "now" snapshot
 /// marker to the remote store and branch from it. Needed when the source
@@ -1972,29 +2019,7 @@ fn create_fork(
         )));
     }
 
-    // Parse `from` into one of three forms. Maps directly to the
-    // `ForkSource` enum the coordinator's `fork-start` IPC takes.
-    let source = if let Some((vol, snap)) = from.split_once('/') {
-        let vol_ulid = ulid::Ulid::from_string(vol)
-            .map_err(|e| std::io::Error::other(format!("invalid volume ULID in --from: {e}")))?;
-        let snap_ulid = ulid::Ulid::from_string(snap)
-            .map_err(|e| std::io::Error::other(format!("invalid snapshot ULID in --from: {e}")))?;
-        if force_snapshot {
-            return Err(std::io::Error::other(
-                "--force-snapshot conflicts with an explicit snapshot pin in --from <vol>/<snap>",
-            ));
-        }
-        coordinator_client::ForkSource::Pinned {
-            vol_ulid,
-            snap_ulid,
-        }
-    } else if let Ok(vol_ulid) = ulid::Ulid::from_string(from) {
-        coordinator_client::ForkSource::BareUlid { vol_ulid }
-    } else {
-        coordinator_client::ForkSource::Name {
-            name: from.to_owned(),
-        }
-    };
+    let source = parse_fork_source(from, force_snapshot)?;
 
     coord.fork_start(fork_name, source, force_snapshot, flags)?;
 
@@ -2326,6 +2351,65 @@ fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn parse_fork_source_pinned_ulid() {
+        let vol = ulid::Ulid::new();
+        let snap = ulid::Ulid::new();
+        let src = parse_fork_source(&format!("{vol}/{snap}"), false).unwrap();
+        assert_eq!(
+            src,
+            coordinator_client::ForkSource::Pinned {
+                vol_ulid: vol,
+                snap_ulid: snap
+            }
+        );
+    }
+
+    #[test]
+    fn parse_fork_source_pinned_name() {
+        let snap = ulid::Ulid::new();
+        let src = parse_fork_source(&format!("base/{snap}"), false).unwrap();
+        assert_eq!(
+            src,
+            coordinator_client::ForkSource::PinnedName {
+                name: "base".to_owned(),
+                snap_ulid: snap
+            }
+        );
+    }
+
+    #[test]
+    fn parse_fork_source_name() {
+        let src = parse_fork_source("base", false).unwrap();
+        assert_eq!(
+            src,
+            coordinator_client::ForkSource::Name {
+                name: "base".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_fork_source_rejects_bare_ulid() {
+        let vol = ulid::Ulid::new();
+        let err = parse_fork_source(&vol.to_string(), false).expect_err("bare ULID must refuse");
+        assert!(err.to_string().contains("snapshot pin"), "{err}");
+    }
+
+    #[test]
+    fn parse_fork_source_rejects_force_snapshot_with_pin() {
+        let snap = ulid::Ulid::new();
+        let err = parse_fork_source(&format!("base/{snap}"), true)
+            .expect_err("pin + force-snapshot must refuse");
+        assert!(err.to_string().contains("--force-snapshot"), "{err}");
+    }
+
+    #[test]
+    fn parse_fork_source_rejects_bad_snapshot_ulid() {
+        let err = parse_fork_source("base/notaulid", false).expect_err("bad snap must refuse");
+        assert!(err.to_string().contains("invalid snapshot ULID"), "{err}");
+    }
 
     /// Build a minimal `<data_dir>/by_id/<ulid>/` skeleton plus a
     /// `by_name/<name>` symlink. Returns the data dir and vol_dir for
