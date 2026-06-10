@@ -65,6 +65,11 @@ remaining work relative to the previous status.  Latest first.
 
 | Date | Document |
 |---|---|
+| 2026-06-10 | [docs/status-2026-06-10.md](docs/status-2026-06-10.md) |
+| 2026-06-02 | [docs/status-2026-06-02.md](docs/status-2026-06-02.md) |
+| 2026-05-26 | [docs/status-2026-05-26.md](docs/status-2026-05-26.md) |
+| 2026-05-19 | [docs/status-2026-05-19.md](docs/status-2026-05-19.md) |
+| 2026-05-10 | [docs/status-2026-05-10.md](docs/status-2026-05-10.md) |
 | 2026-04-27 | [docs/status-2026-04-27.md](docs/status-2026-04-27.md) |
 | 2026-04-20 | [docs/status-2026-04-20.md](docs/status-2026-04-20.md) |
 | 2026-04-09 | [docs/status-2026-04-09.md](docs/status-2026-04-09.md) |
