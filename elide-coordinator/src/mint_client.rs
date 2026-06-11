@@ -816,9 +816,13 @@ impl MintCredentialer {
 
 #[async_trait]
 impl Credentialer for MintCredentialer {
-    async fn provision_volume_ro(&self, vol_ulid: Ulid) -> io::Result<IssuedCredentials> {
+    async fn provision_volume_ro(
+        &self,
+        _owned: Ulid,
+        target: Ulid,
+    ) -> io::Result<IssuedCredentials> {
         self.endpoint
-            .assume_role(ROLE_VOLUME_RO, VOLUME_RO_TTL_SECS, Some(vol_ulid))
+            .assume_role(ROLE_VOLUME_RO, VOLUME_RO_TTL_SECS, Some(target))
             .await
     }
 
@@ -849,11 +853,13 @@ impl MintCredentialIssuer {
 
 #[async_trait]
 impl CredentialIssuer for MintCredentialIssuer {
-    async fn issue(&self, target: AuthorizedTarget) -> io::Result<IssuedCredentials> {
-        // `target` is a single volume the requester is authorized to read
-        // (the `AuthorizedTarget` proof); grant its `by_id/<target>/*`
-        // prefix.
-        self.credentialer.provision_volume_ro(target.ulid()).await
+    async fn issue(&self, authorized: AuthorizedTarget) -> io::Result<IssuedCredentials> {
+        // A single volume the requester is authorized to read (the
+        // `AuthorizedTarget` proof); grant its `by_id/<target>/*`
+        // prefix, anchored on the requester.
+        self.credentialer
+            .provision_volume_ro(authorized.owned(), authorized.target())
+            .await
     }
 }
 

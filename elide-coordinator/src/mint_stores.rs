@@ -255,10 +255,13 @@ pub struct MintScopedStores {
     endpoint: MintEndpoint,
     store_cfg: StoreSection,
     data: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
-    /// `volume-ro` facades for single-volume reads, keyed by `vol_ulid`.
-    /// Populated by `read_volume`; each entry's mint policy grants
-    /// `by_id/<vol_ulid>/*` only.
-    read_volume: Mutex<HashMap<Ulid, Arc<RoleStore>>>,
+    /// `volume-ro` facades for single-volume reads, keyed by
+    /// `(owned, target)`. Each entry's mint policy grants
+    /// `by_id/<target>/*` only; the `owned` half of the key is the
+    /// anchor whose key signs the `ro-ancestor` possession proof at
+    /// assume time, so facades with different anchors never share a
+    /// credential cache.
+    read_volume: Mutex<HashMap<(Ulid, Ulid), Arc<RoleStore>>>,
 }
 
 impl MintScopedStores {
@@ -357,15 +360,16 @@ impl ScopedStores for MintScopedStores {
         rs as Arc<dyn ObjectStore>
     }
 
-    fn read_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
-        // Cached by vol_ulid so successive reads of the same parent
-        // inside one claim/start collapse onto one mint round-trip —
-        // the role's 1h TTL covers a whole orchestrator pass.
-        // `try_lock` keeps the method sync; momentary contention falls
-        // back to constructing a fresh facade (its first op assumes
-        // lazily either way — no correctness impact).
+    fn read_volume(&self, owned: &Ulid, target: &Ulid) -> Arc<dyn ObjectStore> {
+        // Cached by (owned, target) so successive reads of the same
+        // parent inside one claim/start collapse onto one mint
+        // round-trip — the role's 1h TTL covers a whole orchestrator
+        // pass. `try_lock` keeps the method sync; momentary contention
+        // falls back to constructing a fresh facade (its first op
+        // assumes lazily either way — no correctness impact).
+        let key = (*owned, *target);
         if let Ok(map) = self.read_volume.try_lock()
-            && let Some(rs) = map.get(vol_ulid)
+            && let Some(rs) = map.get(&key)
         {
             return Arc::clone(rs) as Arc<dyn ObjectStore>;
         }
@@ -374,10 +378,10 @@ impl ScopedStores for MintScopedStores {
             self.store_cfg.clone(),
             ROLE_VOLUME_RO,
             VOLUME_RO_TTL_SECS,
-            Some(*vol_ulid),
+            Some(*target),
         ));
         if let Ok(mut map) = self.read_volume.try_lock() {
-            map.insert(*vol_ulid, Arc::clone(&rs));
+            map.insert(key, Arc::clone(&rs));
         }
         rs as Arc<dyn ObjectStore>
     }
@@ -426,25 +430,40 @@ mod tests {
     }
 
     #[test]
-    fn read_volume_cache_reuses_facade_for_same_vol_ulid() {
+    fn read_volume_cache_reuses_facade_for_same_owned_target_pair() {
         let stores = test_scoped_stores();
-        let v = Ulid::new();
-        let s1 = stores.read_volume(&v);
-        let s2 = stores.read_volume(&v);
+        let owned = Ulid::new();
+        let target = Ulid::new();
+        let s1 = stores.read_volume(&owned, &target);
+        let s2 = stores.read_volume(&owned, &target);
         assert!(
             Arc::ptr_eq(&s1, &s2),
-            "second read_volume call for the same vol_ulid must hit the cache"
+            "second read_volume call for the same (owned, target) must hit the cache"
         );
     }
 
     #[test]
-    fn read_volume_cache_separates_distinct_vol_ulids() {
+    fn read_volume_cache_separates_distinct_targets() {
         let stores = test_scoped_stores();
-        let s_parent = stores.read_volume(&Ulid::new());
-        let s_other = stores.read_volume(&Ulid::new());
+        let owned = Ulid::new();
+        let s_parent = stores.read_volume(&owned, &Ulid::new());
+        let s_other = stores.read_volume(&owned, &Ulid::new());
         assert!(
             !Arc::ptr_eq(&s_parent, &s_other),
-            "different vol_ulids must not share a facade"
+            "different targets must not share a facade"
+        );
+    }
+
+    #[test]
+    fn read_volume_cache_separates_distinct_owned_anchors() {
+        let stores = test_scoped_stores();
+        let target = Ulid::new();
+        let s_a = stores.read_volume(&Ulid::new(), &target);
+        let s_b = stores.read_volume(&Ulid::new(), &target);
+        assert!(
+            !Arc::ptr_eq(&s_a, &s_b),
+            "same target under different anchors must not share a facade \
+             (each anchor signs its own possession proof)"
         );
     }
 }

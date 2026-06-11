@@ -1029,12 +1029,23 @@ async fn generate_snapshot_filemap(
     stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> std::io::Result<()> {
     let fork_dir = fork_dir.to_owned();
+    let leaf_ulid = fork_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|s| ulid::Ulid::from_string(s).ok())
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "fork dir {} is not a by_id/<ulid> path",
+                fork_dir.display()
+            ))
+        })?;
     // Reads route per owning volume — each segment body lives under the
     // leaf's prefix or an ancestor's, and the owner is taken from the
     // `by_id/<owner>/…` key, so each gets its own single-prefix
-    // `volume-ro` store.
-    let range_fetcher: Arc<dyn elide_fetch::RangeFetcher> =
-        Arc::new(elide_coordinator::range_fetcher::PerOwnerObjectStoreFetcher::new(stores));
+    // `volume-ro` store anchored on the leaf.
+    let range_fetcher: Arc<dyn elide_fetch::RangeFetcher> = Arc::new(
+        elide_coordinator::range_fetcher::PerOwnerObjectStoreFetcher::new(stores, leaf_ulid),
+    );
     tokio::task::spawn_blocking(move || {
         let range_fetcher_for_factory = range_fetcher.clone();
         let mk_fetcher: Box<elide_core::block_reader::FetcherFactory<'_>> =
@@ -3032,7 +3043,9 @@ mod tests {
 
         let calls = recording.calls();
         assert!(
-            calls.iter().all(|c| matches!(c, RoleCall::ReadVolume(_))),
+            calls
+                .iter()
+                .all(|c| matches!(c, RoleCall::ReadVolume { .. })),
             "generate-filemap may only mint per-owner read_volume credentials; got {calls:?}"
         );
     }
@@ -3094,7 +3107,7 @@ mod tests {
         // event_journal which ride coord-ro via the facade.
         for call in &calls {
             assert!(
-                !matches!(call, RoleCall::ReadVolume(_)),
+                !matches!(call, RoleCall::ReadVolume { .. }),
                 "create must not mint per-vol read credentials; saw {call:?} in {calls:?}"
             );
         }

@@ -268,7 +268,7 @@ pub async fn prefetch_indexes(
     // § `volume-ro`).
     let peer_owned: Option<PeerFetchContext> = peer.cloned();
     let outcomes: Vec<PrefetchResult> = futures::stream::iter(tasks.into_iter().map(|task| {
-        let store = stores.read_volume(&task.vol_ulid);
+        let store = stores.read_volume(&current_volume_id, &task.vol_ulid);
         let peer = peer_owned.clone();
         async move {
             let mut local = PrefetchResult::default();
@@ -931,17 +931,24 @@ mod tests {
         assert_eq!(result.failed, 0);
 
         // Pass 2 reads each fork under its own single-prefix `volume-ro`
-        // credential (`read_volume`), one per fork.
+        // credential (`read_volume`), one per fork, every read anchored
+        // on the leaf being prefetched.
         let calls = recording.calls();
         let child = Ulid::from_string(child_ulid).unwrap();
         let parent = Ulid::from_string(parent_ulid).unwrap();
         assert!(
-            calls.contains(&crate::stores::RoleCall::ReadVolume(child)),
-            "head fork must read under read_volume(child); got {calls:?}"
+            calls.contains(&crate::stores::RoleCall::ReadVolume {
+                owned: child,
+                target: child
+            }),
+            "head fork must read under read_volume(child, child); got {calls:?}"
         );
         assert!(
-            calls.contains(&crate::stores::RoleCall::ReadVolume(parent)),
-            "ancestor must read under read_volume(parent); got {calls:?}"
+            calls.contains(&crate::stores::RoleCall::ReadVolume {
+                owned: child,
+                target: parent
+            }),
+            "ancestor must read under read_volume(child, parent); got {calls:?}"
         );
 
         // Verify the .idx file was written into parent's index/ dir.

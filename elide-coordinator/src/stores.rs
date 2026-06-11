@@ -115,12 +115,20 @@ pub trait ScopedStores: Send + Sync {
     fn volume_rw(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore>;
 
     /// `volume-ro` scoped to one volume's prefix only. Read-only
-    /// under `by_id/<vol_ulid>/*`. Used by single-volume read sites:
+    /// under `by_id/<target>/*`. Used by single-volume read sites:
     /// pulling an ancestor's skeleton, fetching a parent's handoff
     /// manifest, walking an extent-source ancestor. The returned
     /// store is `GetObject`-only — wrong-prefix writes fail at IAM,
     /// not at the call site.
-    fn read_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore>;
+    ///
+    /// `owned` is the read's anchor: the live, locally-keyed volume
+    /// the read is performed *for* — the leaf itself when reading its
+    /// own prefix, the leaf when reading an ancestor's. The facade is
+    /// per-`(owned, target)`; the anchor is what signs the
+    /// `ro-ancestor` possession proof when `volume-ro` acquisition
+    /// requires a discharge (`design-mint-volume-attestation.md`
+    /// § *Threading the `owned` anchor*).
+    fn read_volume(&self, owned: &Ulid, target: &Ulid) -> Arc<dyn ObjectStore>;
 
     /// The `coord-ro` store as a plain [`ObjectStore`]. Reads the
     /// coordinator-wide control-plane prefixes plus `meta/*` (every
@@ -218,7 +226,7 @@ impl ScopedStores for PassthroughStores {
         Arc::clone(&self.inner)
     }
 
-    fn read_volume(&self, _vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
+    fn read_volume(&self, _owned: &Ulid, _target: &Ulid) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.inner)
     }
 
@@ -236,7 +244,7 @@ pub enum RoleCall {
     BaseRo,
     Writer,
     VolumeRw(Ulid),
-    ReadVolume(Ulid),
+    ReadVolume { owned: Ulid, target: Ulid },
     BaseObjectStore,
 }
 
@@ -298,9 +306,12 @@ impl ScopedStores for RecordingStores {
         self.record(RoleCall::VolumeRw(*vol_ulid));
         self.inner.volume_rw(vol_ulid)
     }
-    fn read_volume(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore> {
-        self.record(RoleCall::ReadVolume(*vol_ulid));
-        self.inner.read_volume(vol_ulid)
+    fn read_volume(&self, owned: &Ulid, target: &Ulid) -> Arc<dyn ObjectStore> {
+        self.record(RoleCall::ReadVolume {
+            owned: *owned,
+            target: *target,
+        });
+        self.inner.read_volume(owned, target)
     }
     fn base_object_store(&self) -> Arc<dyn ObjectStore> {
         self.record(RoleCall::BaseObjectStore);

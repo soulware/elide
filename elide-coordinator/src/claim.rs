@@ -812,9 +812,14 @@ impl ClaimOrchestrator {
     /// Detect it and rewrite `effective` to point at the deepest non-empty
     /// ancestor.
     async fn skip_empty_intermediates(&mut self) -> Result<(), IpcError> {
+        // claim-first: `early_rebind` has already bound the name to the
+        // new fork, so it is the live `owned` anchor for every chain
+        // read below.
+        let owned = self.new_fork.as_ref().expect("early_rebind ran").vol_ulid;
         let (vol, snap) = skip_empty_intermediates_impl(
             &self.job,
             &self.volume,
+            owned,
             self.released_vol_ulid,
             self.handoff_snap,
             &self.ctx.core.data_dir,
@@ -1002,6 +1007,7 @@ impl ClaimOrchestrator {
 pub(crate) async fn skip_empty_intermediates_impl(
     job: &Arc<ClaimJob>,
     volume: &str,
+    owned: Ulid,
     released_vol_ulid: Ulid,
     handoff_snap: Ulid,
     data_dir: &std::path::Path,
@@ -1038,8 +1044,9 @@ pub(crate) async fn skip_empty_intermediates_impl(
             IpcError::internal(format!("loading volume.pub for {effective_vol}: {e}"))
         })?;
 
-        // Pure-read manifest fetch — `volume-ro` is the right scope.
-        let store = stores.read_volume(&effective_vol);
+        // Pure-read manifest fetch — `volume-ro` is the right scope,
+        // anchored on the freshly-bound new fork.
+        let store = stores.read_volume(&owned, &effective_vol);
         let manifest =
             fetch_handoff_manifest(&store, effective_vol, effective_snap, &fork_pubkey, peer)
                 .await?;
@@ -1255,6 +1262,7 @@ mod tests {
         let (vol, snap) = skip_empty_intermediates_impl(
             &job,
             "vol",
+            Ulid::new(),
             f1.vol,
             f1.snap,
             data_dir,
@@ -1294,6 +1302,7 @@ mod tests {
         let (vol, snap) = skip_empty_intermediates_impl(
             &job,
             "vol",
+            Ulid::new(),
             f2.vol,
             f2.snap,
             data_dir,
@@ -1331,6 +1340,7 @@ mod tests {
         let (vol, snap) = skip_empty_intermediates_impl(
             &job,
             "vol",
+            Ulid::new(),
             f1.vol,
             f1.snap,
             data_dir,
@@ -1375,6 +1385,7 @@ mod tests {
         let err = skip_empty_intermediates_impl(
             &job,
             "vol",
+            Ulid::new(),
             corrupt_vol,
             snap,
             data_dir,
@@ -1497,6 +1508,7 @@ mod tests {
         let (vol, snap) = skip_empty_intermediates_impl(
             &job,
             "vol",
+            Ulid::new(),
             r.vol,
             r.snap,
             data_dir,
@@ -1530,6 +1542,7 @@ mod tests {
         let err = skip_empty_intermediates_impl(
             &job,
             "vol",
+            Ulid::new(),
             r.vol,
             r.snap,
             data_dir,
@@ -1574,6 +1587,7 @@ mod tests {
         let err = skip_empty_intermediates_impl(
             &job,
             "vol",
+            Ulid::new(),
             f2.vol,
             f2.snap,
             data_dir,
@@ -1724,7 +1738,7 @@ mod tests {
         let calls = recording.calls();
         for call in &calls {
             assert!(
-                !matches!(call, RoleCall::ReadVolume(_)),
+                !matches!(call, RoleCall::ReadVolume { .. }),
                 "early_rebind must not mint volume-ro; saw {call:?} in {calls:?}"
             );
             assert!(

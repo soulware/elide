@@ -1365,8 +1365,11 @@ PoP-signed request body, which keeps least-privilege tight — a leaked
 The read path is keyed by owner. The demand-fetch interface
 (`elide_core::segment::SegmentFetcher`) takes `owner_vol_id` per call and
 issues exactly one GET against that owner's prefix; the coordinator's
-`ScopedStores` vends a single-prefix `read_volume(vol)`. The
-per-owner routing key is present at every read site:
+`ScopedStores` vends a single-prefix `read_volume(owned, target)` —
+`target` selects the prefix, `owned` is the live local leaf the read
+anchors on (`design-mint-volume-attestation.md` § *Threading the
+`owned` anchor*). The per-owner routing key is present at every read
+site:
 
 - **Volume serve-time demand-fetch (hot path).** The running volume's
   `RemoteFetcher` (`elide-fetch`) holds a **per-owner credential cache**
@@ -1375,7 +1378,7 @@ per-owner routing key is present at every read site:
   independently; `fetch_extent` selects the store by the `owner_vol_id`
   it already receives.
 - **Prefetch index fan-out** (`coordinator::prefetch`). Each fan-out task
-  reads only its own fork's prefix via `read_volume(task_vol)`.
+  reads only its own fork's prefix via `read_volume(leaf, task_vol)`.
 - **Filemap generation** (`generate_filemap`, offline
   `import --extents-from`). Its range fetcher reads fragment bodies that
   may live in any ancestor prefix; it routes per fragment through the same
