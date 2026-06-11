@@ -280,6 +280,15 @@ impl WireMacaroon {
         })
     }
 
+    /// Every third-party caveat as `(location, cid)` — what a gate
+    /// discharge fetch iterates (`crate::enroll`).
+    pub(crate) fn third_party_caveats(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.caveats.iter().filter_map(|c| match c {
+            Caveat::ThirdParty { location, cid, .. } => Some((location.as_str(), cid.as_slice())),
+            _ => None,
+        })
+    }
+
     pub(crate) fn encode(&self) -> String {
         let mut buf = Vec::new();
         rmp::encode::write_array_len(&mut buf, 4).expect("vec writer");
