@@ -254,9 +254,18 @@ fails the second. Every *bound* state is a live binding:
   claim's post-CAS chain reads, and stopped-volume verbs (filemap
   generation) all anchor before any daemon runs. The fence is about who
   holds the name, not whether a process is up.
+- **`Importing`** — an import in flight: the record binds the new
+  vol_ulid from import start, and the importer's on-disk key anchors
+  the drain's `rw-self` discharges for the whole construction window
+  (see *Import runs under an `Importing` record*).
 - **`Readonly`** — a readonly import is terminally bound: no lifecycle
-  verb accepts a `Readonly` record, so no displacement scenario exists,
-  and the importing host's retained key anchors the base's own reads.
+  verb accepts a `Readonly` record, so no displacement scenario exists.
+  In practice a `Readonly` record never anchors anything — the flip
+  that publishes it destroys the volume key (see *Import runs under an
+  `Importing` record*), so possession is unprovable. The predicate
+  accepts it anyway because excluding it would buy nothing: the
+  possession check already refuses, and `state ≠ Released` keeps the
+  predicate a single structural test.
 
 Liveness is one predicate, checked once at the anchor, covering
 RW-on-self and RO-on-ancestors alike — and it means coord A's
@@ -414,6 +423,100 @@ keypair), and it is start's possession proof:
 - **The shadow write is load-bearing.** Every keypair-mint site
   (create, fork, claim, `claim --force`) aborts if the shadow write
   fails, so owned-but-keyless cannot arise on a live host.
+
+### New-volume bootstrap: identity establishment is coordinator-plane
+
+A brand-new volume cannot attest its own first write. `volume-rw`'s
+policy covers `by_id/<vol>/*` plus the volume's two `meta/` trust
+anchors, and its `rw-self` discharge requires coord B to verify the
+possession proof against `meta/<vol>.pub` — fetched from S3. For the
+first-ever upload of that pub the dependency is circular: the upload
+needs the discharge, the discharge needs the uploaded object. No
+record ordering fixes this; the first write of a volume's trust
+anchors is structurally un-attestable *by the volume*.
+
+It is attestable by the **coordinator**: creating a volume's identity
+is a coordinator act. The `meta/<vol>.{pub,provenance}` uploads ride
+`coord-rw`, whose `sub`-gated policy already carries the strictly
+stronger `names/*` write (a rogue holder could rebind any name;
+creating identity objects adds no trust beyond that). `volume-rw`'s
+policy shrinks to `by_id/<vol>/*` only.
+
+The two anchors have different write disciplines. `volume.pub` is
+write-once: a conditional create (`If-None-Match: *`), so a race or
+replay cannot overwrite a published key, and crash-resume re-uploads
+treat `AlreadyExists` as success (the content is deterministic for a
+given keypair). `volume.provenance` has exactly one modeled rewrite:
+claim and `claim --force` publish a *provisional* lineage at rebind
+and rewrite it when the effective basis resolves (§ *The provisional
+provenance must be recovery-correct*), so its uploads are plain puts.
+Tigris IAM cannot *require* the create header (`DateLessThan` is its
+only condition operator), so the create-only discipline on the pub is
+client-side; against a malicious enrolled coordinator the bar is
+`coord-rw` itself, exactly as for `names/*`.
+
+A creation flow is then three ordered planes:
+
+1. **Identity** (`coord-rw`): upload `meta/<vol>.pub` +
+   `meta/<vol>.provenance`, create-only.
+2. **Record** (`coord-rw`): CAS-create `names/<name>` binding the new
+   vol_ulid — the claim-first fence.
+3. **Data** (`volume-rw` + `rw-self`): every `by_id/<vol>/` write,
+   fully attested — the record exists (liveness) and the pub is
+   fetchable (possession).
+
+Fork and claim already order record-before-data (claim-first); their
+only pre-record S3 writes were the meta uploads this section moves.
+Import needed more — its entire drain ran pre-record — and gets the
+next section.
+
+### Import runs under an `Importing` record
+
+Import's `names/<name>` record doubled as the completion gate: written
+once at worker exit, because `NameRecord.size` is only known
+post-extraction. That left every drain write unanchored. The record
+moves to import start, in a state that names the window:
+
+- **Start.** Spawn the worker; it writes `volume.pub`,
+  `volume.provenance` (extent sources signed in), and — new —
+  persists `volume.key` in the fork dir. The importing window *is*
+  the volume's rw phase, and it gets the standard rw key treatment:
+  the worker signs segments with the on-disk key, the coordinator
+  builds `rw-self` possession proofs from it, exactly like every
+  other volume. No key shadow is written (nothing will ever
+  resurrect; the flip destroys the key). The coordinator then runs
+  the bootstrap planes: identity uploads (`coord-rw`, create-only),
+  and CAS-create `names/<name>` with `state = Importing`, the new
+  vol_ulid, this coordinator, and `size = 0` — `Importing` is what
+  marks the size as not-yet-meaningful. `AlreadyExists` fails the
+  import *before* download and extraction: the cross-coordinator
+  uniqueness race is settled at start, not after both hosts have
+  done the work.
+- **During.** The serve-phase drain writes `by_id/<vol>/` under
+  `volume-rw` + `rw-self`; the `Importing` record is a bound state,
+  so the liveness predicate accepts it, and the on-disk key signs
+  the proofs. `record_latest_snapshot` bumps stay vol_ulid-guarded.
+  Every lifecycle verb (claim, force-claim, release, start, stop)
+  refuses an `Importing` record.
+- **Completion.** CAS-flip `Importing → Readonly` carrying the real
+  `size` and the import's `User` snapshot — and **destroy
+  `volume.key`**. Cryptographic immutability attaches at
+  publication: a `Readonly` record implies the key was destroyed at
+  the flip, so nobody — including the importer — can ever sign
+  another segment under the base. During the window the base is
+  extendable by its importer, the same trust as any unpublished rw
+  volume.
+- **Failure.** The post-wait failure path CAS-deletes the record
+  (ours and `Importing` only) alongside the local rollback; the
+  crashed-import rescan cleanup does the same. A dead *host* leaves
+  an `Importing` record visible and targetable — distinguishable
+  from a healthy base, unlike a part-written `Readonly` — for a
+  future cleanup verb.
+
+Cross-host `--extents-from` rides the start ordering: extent-source
+idx reads happen in the import block loop, before the serve phase, so
+an importer-anchored `ro-ancestor` read of a foreign source is
+possible only because the record exists from start.
 
 ### Recovery is a claim: force-release becomes `claim --force`
 
@@ -888,18 +991,3 @@ allows it; pin with vectors only where it does not.
     auth authority's vocabulary (a volume discharge carrying `Scope` is
     invalid by vocabulary, just as an auth discharge carrying `volume`
     would be). Each authority emits only its own type's names.
-
-## Open
-
-- **The import-drain window.** During import the volume's
-  `names/<name>` record does not exist — it is written once at
-  completion, when the size is known — so an `rw-self` discharge for
-  the import drain has nothing to verify against. Sealing `volume-rw`
-  with the attestation TPC needs this resolved (e.g. a record written
-  at import start) before import can run under it. The same fix is
-  what a cross-host `--extents-from` would ride if ever built: a
-  foreign source's skeleton pull is `coord-ro`, its snapshot pin comes
-  off the source's `Readonly` record, and its idx/filemap reads during
-  import are ordinary `ro-ancestor` reads — the source is in the
-  importer's provenance `extent_index`, so the importer anchors them
-  once it has a record to discharge against.
