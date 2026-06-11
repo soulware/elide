@@ -593,16 +593,16 @@ impl ClaimOrchestrator {
             .map_err(|e| IpcError::internal(format!("generating keypair: {e}")))?;
 
         // Shadow the freshly-minted key under
-        // `data_dir/keys/<vol_ulid>.key` so a future
-        // `stop`→`remove`→`start` round-trip on this host preserves
-        // writability — see `elide_coordinator::key_shadow`.
-        if let Err(e) = elide_coordinator::key_shadow::write(
+        // `data_dir/keys/<vol_ulid>.key`. The shadow is `start`'s
+        // possession proof after a `remove` — minting an owned volume
+        // without one would leave it unrestartable on this host, so
+        // the write is load-bearing.
+        elide_coordinator::key_shadow::write(
             &self.ctx.core.data_dir,
             new_vol_ulid,
             &signing_key.to_bytes(),
-        ) {
-            warn!("[claim {new_vol_ulid_str}] writing key shadow failed: {e}");
-        }
+        )
+        .map_err(|e| IpcError::internal(format!("writing key shadow: {e}")))?;
 
         // Sign a provisional `volume.provenance` whose `ParentRef` points at
         // the immediate released volume, alongside `volume.pub`. The

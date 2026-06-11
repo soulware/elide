@@ -369,20 +369,19 @@ vanished with the directory. The surviving copy is the **key shadow**
 keypair), and it is start's possession proof:
 
 - **Shadow-first ordering.** The hydrate runs: skeleton chain off
-  `meta/*` (`coord-ro`, anchorless) → read the shadow → prove
-  possession with it → the `by_id` basis reads (`volume-ro` against
-  the leaf, and against the parent when the leaf never published a
-  snapshot). Today the shadow is consulted only after the basis
-  reads, to restore writability; the proof moves to the front. The
-  restore into the hydrated fork dir stays where it is.
-- **No shadow ⇒ start fails.** The current fallback — hydrate the
-  leaf readonly — retires: a keyless leaf proves nothing, so its
-  basis reads are unauthorisable regardless. A dead owner's volume
-  is recovered from another host via `claim --force`, which is a
-  claim, not a start.
-- **The shadow write becomes load-bearing.** claim/fork write it
-  warn-and-continue today (`claim.rs`); it promotes to hard-fail, so
-  owned-but-keyless cannot arise on a live host.
+  `meta/*` (`coord-ro`, anchorless) → read the shadow and prove
+  possession with it (the shadow key must match the leaf's published
+  `volume.pub`) → the `by_id` basis reads (`volume-ro` against the
+  leaf, and against the parent when the leaf never published a
+  snapshot). The restore into the hydrated fork dir happens after the
+  basis reads, from the already-proven shadow bytes.
+- **No shadow ⇒ start fails.** There is no readonly fallback: a
+  keyless leaf proves nothing, so its basis reads are unauthorisable
+  regardless. A dead owner's volume is recovered from another host
+  via `claim --force`, which is a claim, not a start.
+- **The shadow write is load-bearing.** Every keypair-mint site
+  (create, fork, claim, `claim --force`) aborts if the shadow write
+  fails, so owned-but-keyless cannot arise on a live host.
 
 ### Recovery is a claim: force-release becomes `claim --force`
 

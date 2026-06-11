@@ -329,13 +329,12 @@ impl ForceClaimOrchestrator {
             .map_err(|e| IpcError::internal(format!("creating fork dir: {e}")))?;
         let signing_key = generate_keypair(&new_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
             .map_err(|e| IpcError::internal(format!("generating keypair: {e}")))?;
-        if let Err(e) = elide_coordinator::key_shadow::write(
+        elide_coordinator::key_shadow::write(
             &self.ctx.core.data_dir,
             new_vol_ulid,
             &signing_key.to_bytes(),
-        ) {
-            warn!("[force-claim {new_vol_ulid}] writing key shadow failed: {e}");
-        }
+        )
+        .map_err(|e| IpcError::internal(format!("writing key shadow: {e}")))?;
 
         // Provisional ParentRef, control-plane anchors only
         // (claim-first). With a basis hint the new fork is a child of
