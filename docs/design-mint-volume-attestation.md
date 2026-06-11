@@ -864,14 +864,20 @@ This lets a verifier run discharge-only and enables the hardened shape:
 discharge served only to a co-located coord A over UDS while peer-fetch is
 the sole network surface. Two couplings remain: peer-fetch's advertised
 host must stay network-reachable (its `listen` is TCP-only — a `unix:`
-value is rejected), and the discharge `listen` must equal the
-`attestation_location` mint sealed (coord A's client already dials `unix:`
-discharge URLs via its UDS leg, so no client change).
+value is rejected), and coord A must be able to reach the discharge
+`listen`. The sealed `attestation_location` is the authority's
+*identity* — a URL whose path is the discharge route — and is not
+required to be dialable: coord A dials it directly by default, and when
+coord B is off-network, coord A's `[mint] attestation_transport`
+(`unix:<path>` | `http(s)://host:port`) supplies the connection while
+the route still comes from the location's path. This is the same
+location/transport split the operator-gate discharges use (the sealed
+auth `location` vs the session's stored transport).
 
 ## coord B mints the discharge: crossing the mint/coordinator boundary
 
-coord B lives in the coordinator — served on the `elide-peer-fetch` axum
-endpoint, the structural twin (§ *S3 access*) — not in `mint`. But
+coord B lives in the coordinator tree — the `elide-attestation` crate,
+its own listener (§ *A separate crate and listener*) — not in `mint`. But
 minting a discharge *is* mint's macaroon crypto: recover `r` by
 AEAD-decrypting the TPC `cid` under `K_M-B` (`decrypt_cid_attested`),
 then mint a macaroon rooted at `r` with kid `DISCHARGE_KID` carrying

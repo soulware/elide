@@ -2123,6 +2123,10 @@ url = "unix:mint/mint_data/mint.sock"   # or "https://mint.host:8085"
 # attestation discharge authority (coord B), when this deployment uses
 # volume-ownership attestation (docs/design-mint-volume-attestation.md):
 attestation_location = "https://coord-b.host:8086/v1/discharge"
+# how to dial coord B when the location is not the connection (e.g. a
+# co-located coord B off the network on a UDS); the request path still
+# comes from attestation_location:
+# attestation_transport = "unix:/run/elide/discharge.sock"
 ```
 
 `url` is scheme-discriminated by mint's shared transport layer:
@@ -2142,12 +2146,14 @@ inside the macaroon. Only the endpoint — and optionally
 
 `attestation_location` is set when credentials carry an attestation
 third-party caveat (`docs/design-mint-volume-attestation.md`). It must
-equal the discharge URL mint sealed into the caveat; before
+equal the location mint sealed into the caveat — the authority's
+identity, a URL whose path is the discharge route; before
 `assume-role`, the coordinator discharges a credential carrying a
 third-party caveat at this exact location by proving possession of the
 volume's `volume.key` (a `rw-self` discharge for `volume-rw`) and
 attaches the returned discharge to the bundle. Absent → no discharge is
-fetched.
+fetched. The connection comes from `attestation_transport` when set
+(coord B off-network on a UDS), else the location is dialled directly.
 
 The coordinator credential plane has exactly two states: `[mint]`
 present (per-volume scoping via the role inventory below), or absent

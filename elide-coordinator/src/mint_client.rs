@@ -549,11 +549,35 @@ pub struct MintEndpoint {
     request_timeout: Duration,
     data_dir: PathBuf,
     identity: Arc<CoordinatorIdentity>,
-    /// coord B's discharge URL, when this deployment uses volume
+    /// coord B's discharge location, when this deployment uses volume
     /// attestation. A primary whose third-party caveat sits at this exact
     /// location is discharged before `assume-role`; see
-    /// [`MintEndpoint::fetch_rw_self_discharge`].
+    /// [`MintEndpoint::fetch_attestation_discharge`].
     attestation_location: Option<String>,
+    /// How to dial coord B when the location is not the connection
+    /// (`[mint] attestation_transport`); `None` dials the location.
+    attestation_transport: Option<String>,
+}
+
+/// Resolve where a discharge POST goes: the route is always the
+/// location's URL path (the location is the authority's *identity*);
+/// the connection is `transport` when given — coord B off-network on a
+/// UDS, or any dial target differing from the identity — else the
+/// location minus its path.
+fn discharge_dial<'a>(
+    location: &'a str,
+    transport: Option<&'a str>,
+) -> io::Result<(&'a str, &'a str)> {
+    let path = elide_coordinator::config::location_path(location).ok_or_else(|| {
+        io::Error::other(format!(
+            "attestation location carries no discharge route: {location}"
+        ))
+    })?;
+    let base = match transport {
+        Some(t) => t,
+        None => &location[..location.len() - path.len()],
+    };
+    Ok((base, path))
 }
 
 impl MintEndpoint {
@@ -565,6 +589,7 @@ impl MintEndpoint {
             data_dir,
             identity,
             attestation_location: cfg.attestation_location.clone(),
+            attestation_transport: cfg.attestation_transport.clone(),
         }
     }
 
@@ -602,13 +627,14 @@ impl MintEndpoint {
     ) -> io::Result<String> {
         let body = self.build_discharge_request(owned, target, cid)?;
 
-        // The discharge URL carries its own path, so the endpoint suffix is
-        // empty; auth/PoP headers are unused by coord B and sent empty.
+        // Route from the location, connection from the transport when
+        // set; auth/PoP headers are unused by coord B and sent empty.
+        let (base, path) = discharge_dial(location, self.attestation_transport.as_deref())?;
         let (status, text, _) = post(
-            location,
+            base,
             self.connect_timeout,
             self.request_timeout,
-            "",
+            path,
             "",
             "",
             body,
@@ -1027,6 +1053,28 @@ mod tests {
     }
 
     #[test]
+    fn discharge_dial_routes_from_the_location() {
+        // No transport: the location is the connection, split into the
+        // base post() re-joins with the path.
+        assert_eq!(
+            discharge_dial("https://coord-b.example/v1/discharge", None).unwrap(),
+            ("https://coord-b.example", "/v1/discharge")
+        );
+        // Transport set: the location is identity only; the connection
+        // is whatever the transport says — the off-network UDS shape.
+        assert_eq!(
+            discharge_dial(
+                "https://coord-b.example/v1/discharge",
+                Some("unix:/run/elide/coord-b.sock")
+            )
+            .unwrap(),
+            ("unix:/run/elide/coord-b.sock", "/v1/discharge")
+        );
+        // A routeless location cannot be dialled under any transport.
+        assert!(discharge_dial("https://coord-b.example", None).is_err());
+    }
+
+    #[test]
     fn retry_after_delay_clamps() {
         // Absent or zero header → fallback, not a tight loop.
         assert_eq!(retry_after_delay(None), RETRY_AFTER_FALLBACK);
@@ -1129,6 +1177,7 @@ mod tests {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
             attestation_location: Some("https://coord-b.example/v1/discharge".into()),
+            attestation_transport: None,
         };
         let endpoint = MintEndpoint::new(&cfg, data_dir.path().to_path_buf(), identity);
 
@@ -1214,6 +1263,7 @@ mod tests {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
             attestation_location: Some("https://coord-b.example/v1/discharge".into()),
+            attestation_transport: None,
         };
         let endpoint = MintEndpoint::new(&cfg, data_dir.path().to_path_buf(), identity);
 

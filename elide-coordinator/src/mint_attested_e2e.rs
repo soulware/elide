@@ -147,27 +147,23 @@ async fn attested_loop_over_shipped_templates() {
     std::fs::create_dir_all(&bucket_dir).expect("bucket dir");
     std::fs::create_dir_all(home.join(".config")).expect("home dir");
 
-    // coord B's listener binds first: its URL is the TPC location mint
-    // seals into every volume-role credential, so it must be known
-    // before the daemon reads its config.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind coord B");
-    let location = format!(
-        "http://{}/v1/discharge",
-        listener.local_addr().expect("coord B addr")
-    );
-
     // The mint config is the shipped elide inventory, patched for the
-    // test root. [demo_auth] is inserted because the operator gates
-    // (login / seal / invite / approve) need an issuer and production's
-    // is a separate auth-service binary.
+    // test root. The attestation location stays the shipped value — it
+    // is the authority's identity, never dialled; the connection is the
+    // coord B UDS below. [demo_auth] is inserted because the operator
+    // gates (login / seal / invite / approve) need an issuer and
+    // production's is a separate auth-service binary.
     let repo_mint = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mint");
     let shipped =
         std::fs::read_to_string(repo_mint.join("examples/mint-elide.toml")).expect("mint-elide");
     let mut cfg_doc: toml::Value = toml::from_str(&shipped).expect("parse mint-elide.toml");
+    let location = cfg_doc["attestation_location"]
+        .as_str()
+        .expect("shipped attestation_location")
+        .to_owned();
     let mint_sock = root_p.join("mint.sock");
     let auth_sock = root_p.join("auth.sock");
+    let coord_b_sock = root_p.join("coord-b.sock");
     {
         let tbl = cfg_doc.as_table_mut().expect("config table");
         let mut set = |k: &str, v: String| {
@@ -179,7 +175,6 @@ async fn attested_loop_over_shipped_templates() {
             repo_mint.join("examples/elide_roles").display().to_string(),
         );
         set("socket", mint_sock.display().to_string());
-        set("attestation_location", location.clone());
         let mut demo = toml::value::Table::new();
         demo.insert("enabled".into(), toml::Value::Boolean(true));
         demo.insert(
@@ -227,7 +222,9 @@ async fn attested_loop_over_shipped_templates() {
         .to_string();
 
     // coord B serves over the daemon's demo-generated K_M-B (the
-    // documented demo key-sharing shape) and the bucket the test seeds.
+    // documented demo key-sharing shape) and the bucket the test seeds,
+    // on a UDS — the co-located off-network shape. The sealed location
+    // is never dialled; the transport below supplies the connection.
     let k_m_b_hex = std::fs::read_to_string(root_p.join("mint_data/attestation-shared.key"))
         .expect("attestation-shared.key — the harness generates it when a role attests");
     let k_m_b: [u8; 32] = decode_hex(k_m_b_hex.trim())
@@ -237,11 +234,15 @@ async fn attested_loop_over_shipped_templates() {
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(&bucket_dir).expect("bucket store"));
     let coord_b = DischargeState::new(k_m_b, store.clone());
-    tokio::spawn(async move {
-        axum::serve(listener, discharge_router(coord_b))
-            .await
-            .expect("coord B serve");
-    });
+    {
+        let sock = coord_b_sock.clone();
+        tokio::spawn(async move {
+            elide_attestation::serve::serve_uds(sock, discharge_router(coord_b))
+                .await
+                .expect("coord B serve");
+        });
+    }
+    wait_for_socket(&coord_b_sock).await;
 
     // Enrollment: the real invite → approve → exchange flow. `run`
     // blocks on operator approval, so it runs as a task while the test
@@ -253,6 +254,7 @@ async fn attested_loop_over_shipped_templates() {
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(30),
         attestation_location: Some(location.clone()),
+        attestation_transport: Some(format!("unix:{}", coord_b_sock.display())),
     };
     // The operator session `mint login` wrote, read from the same store
     // the production command loads it from.
@@ -430,6 +432,7 @@ async fn attested_loop_over_shipped_templates() {
     // and mint refuses the volume role outright.
     let blind_cfg = MintConfig {
         attestation_location: None,
+        attestation_transport: None,
         ..mint_cfg.clone()
     };
     let blind = MintEndpoint::new(&blind_cfg, coord_dir.clone(), identity.clone());

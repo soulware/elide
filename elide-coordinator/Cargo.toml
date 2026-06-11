@@ -76,7 +76,6 @@ test-helpers = []
 
 [dev-dependencies]
 async-trait = "0.1"
-axum        = "0.8"
 blake3      = "1"
 proptest    = "1"
 tempfile    = "3"

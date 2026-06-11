@@ -149,19 +149,6 @@ pub fn load_operator_session() -> io::Result<OperatorSession> {
     })
 }
 
-/// The request path of a TPC `location` (a full URL, e.g.
-/// `https://auth.example/v1/discharge`). The host is not dialled — the
-/// session transport supplies the connection — so only the path is
-/// taken (`mint/src/tpc.rs::location_path` semantics).
-fn location_path(location: &str) -> Option<&str> {
-    let rest = location
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(location);
-    let path = &rest[rest.find('/')?..];
-    (path != "/").then_some(path)
-}
-
 /// Fetch the operator discharge for each third-party caveat on
 /// `anchor` (the invite's enroll gate, the ticket's exchange gate):
 /// POST the CID and the requested `scope` to the authority's discharge
@@ -176,7 +163,7 @@ async fn gate_discharges(
 ) -> io::Result<Vec<String>> {
     let mut discharges = Vec::new();
     for (location, cid) in anchor.third_party_caveats() {
-        let path = location_path(location).ok_or_else(|| {
+        let path = elide_coordinator::config::location_path(location).ok_or_else(|| {
             io::Error::other(format!("{scope} gate location carries no path: {location}"))
         })?;
         let body = format!(
