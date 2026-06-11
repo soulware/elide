@@ -653,10 +653,18 @@ impl ClaimOrchestrator {
         // invariant "names/<name> only points at vol_ulids with both
         // immutable trust artefacts in the bucket" is restored at
         // `mark_claimed` below.
-        let new_vd = self.ctx.core.stores.volume_data(&new_vol_ulid);
+        let meta_store = self.ctx.core.stores.writer();
         let (pub_result, prov_result) = tokio::join!(
-            elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, &new_vd),
-            elide_coordinator::upload::upload_volume_provenance_initial(&new_fork_dir, &new_vd),
+            elide_coordinator::upload::upload_volume_pub_initial(
+                &self.ctx.core.data_dir,
+                new_vol_ulid,
+                &meta_store
+            ),
+            elide_coordinator::upload::upload_volume_provenance_initial(
+                &self.ctx.core.data_dir,
+                new_vol_ulid,
+                &meta_store
+            ),
         );
         pub_result.map_err(|e| IpcError::store(format!("uploading volume.pub: {e:#}")))?;
         prov_result
@@ -917,10 +925,14 @@ impl ClaimOrchestrator {
         )
         .map_err(|e| IpcError::internal(format!("writing provenance: {e}")))?;
 
-        let prov_vd = self.ctx.core.stores.volume_data(&new_fork.vol_ulid);
-        elide_coordinator::upload::upload_volume_provenance_initial(&new_fork.dir, &prov_vd)
-            .await
-            .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
+        let meta_store = self.ctx.core.stores.writer();
+        elide_coordinator::upload::upload_volume_provenance_initial(
+            &self.ctx.core.data_dir,
+            new_fork.vol_ulid,
+            &meta_store,
+        )
+        .await
+        .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
 
         // wal/ and pending/ now — daemon discovery becomes interested only
         // after these exist, by which point the provenance is on S3 and the
@@ -1437,12 +1449,10 @@ mod tests {
         let snap_x = mint.next();
         let vol_x = mint.next();
         let fork_x = build_fork(data_dir, vol_x, snap_x, None);
-        let vx_dir = data_dir.join("by_id").join(vol_x.to_string());
-        let vx_vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), vol_x);
-        elide_coordinator::upload::upload_volume_pub_initial(&vx_dir, &vx_vd)
+        elide_coordinator::upload::upload_volume_pub_initial(data_dir, vol_x, &store)
             .await
             .unwrap();
-        elide_coordinator::upload::upload_volume_provenance_initial(&vx_dir, &vx_vd)
+        elide_coordinator::upload::upload_volume_provenance_initial(data_dir, vol_x, &store)
             .await
             .unwrap();
         upload_handoff_manifest(&store, &fork_x, &[seg_a]).await;
@@ -1745,7 +1755,9 @@ mod tests {
             ClaimOrchestrator::new(ClaimJob::new(), "vol".to_owned(), released, handoff, ctx);
         orch.early_rebind().await.expect("early rebind succeeds");
 
-        // No by_id credential for the released volume; no volume-ro at all.
+        // No volume-ro at all, and no volume-rw at all: the new fork's
+        // identity uploads ride coord-rw (Writer), so nothing in
+        // early_rebind needs a per-volume credential.
         let calls = recording.calls();
         for call in &calls {
             assert!(
@@ -1753,9 +1765,9 @@ mod tests {
                 "early_rebind must not mint volume-ro; saw {call:?} in {calls:?}"
             );
             assert!(
-                !matches!(call, RoleCall::VolumeRw(v) if *v == released),
-                "early_rebind must not mint volume-rw for the released \
-                 volume; saw {call:?} in {calls:?}"
+                !matches!(call, RoleCall::VolumeRw(_)),
+                "early_rebind must not mint volume-rw — identity uploads \
+                 are coordinator-plane; saw {call:?} in {calls:?}"
             );
         }
 

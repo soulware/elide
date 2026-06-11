@@ -364,10 +364,18 @@ impl ForceClaimOrchestrator {
         write_provenance(&new_dir, &signing_key, VOLUME_PROVENANCE_FILE, &provisional)
             .map_err(|e| IpcError::internal(format!("writing provisional provenance: {e}")))?;
 
-        let new_vd = self.ctx.core.stores.volume_data(&new_vol_ulid);
+        let meta_store = self.ctx.core.stores.writer();
         let (pub_result, prov_result) = tokio::join!(
-            elide_coordinator::upload::upload_volume_pub_initial(&new_dir, &new_vd),
-            elide_coordinator::upload::upload_volume_provenance_initial(&new_dir, &new_vd),
+            elide_coordinator::upload::upload_volume_pub_initial(
+                &self.ctx.core.data_dir,
+                new_vol_ulid,
+                &meta_store
+            ),
+            elide_coordinator::upload::upload_volume_provenance_initial(
+                &self.ctx.core.data_dir,
+                new_vol_ulid,
+                &meta_store
+            ),
         );
         pub_result.map_err(|e| IpcError::store(format!("uploading volume.pub: {e:#}")))?;
         prov_result
@@ -761,10 +769,14 @@ impl ForceClaimOrchestrator {
                     &lineage,
                 )
                 .map_err(|e| IpcError::internal(format!("writing provenance: {e}")))?;
-                let vd = self.ctx.core.stores.volume_data(&fork.vol_ulid);
-                elide_coordinator::upload::upload_volume_provenance_initial(&fork.dir, &vd)
-                    .await
-                    .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
+                let meta_store = self.ctx.core.stores.writer();
+                elide_coordinator::upload::upload_volume_provenance_initial(
+                    &self.ctx.core.data_dir,
+                    fork.vol_ulid,
+                    &meta_store,
+                )
+                .await
+                .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
             }
         }
 

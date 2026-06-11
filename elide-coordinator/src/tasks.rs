@@ -286,9 +286,9 @@ pub async fn run_volume_tasks(
         fork_dir.clone(),
         vol_ulid,
         data_store,
+        &stores,
         gc_config,
         &snapshot_locks,
-        stores.name_claims(),
         read_volume_name(&fork_dir),
     );
 

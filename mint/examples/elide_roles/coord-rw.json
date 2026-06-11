@@ -27,6 +27,15 @@
       "Condition": {
         "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
       }
+    },
+    {
+      "Sid": "MetaIdentityEstablishment",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": ["arn:aws:s3:::{{env.bucket}}/meta/*"],
+      "Condition": {
+        "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
+      }
     }
   ]
 }
