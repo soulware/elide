@@ -280,7 +280,6 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
         signer.as_ref(),
         &delta_ulid,
         &[delta_ulid],
-        None,
     )
     .unwrap();
 

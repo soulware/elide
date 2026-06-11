@@ -218,7 +218,7 @@ async fn run_reap(world: &mut World, head: &mut SegmentHead) -> bool {
 async fn run_seal(world: &mut World, head: &mut SegmentHead) -> bool {
     let snap = world.mint.next();
     let live: Vec<Ulid> = world.expected_live.iter().copied().collect();
-    let bytes = signing::build_snapshot_manifest_bytes(world.signer.as_ref(), &live, None);
+    let bytes = signing::build_snapshot_manifest_bytes(world.signer.as_ref(), &live);
     let vd = world_vd(world);
     vd.snapshots()
         .put_manifest(snap, Bytes::from(bytes))

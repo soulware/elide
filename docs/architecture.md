@@ -468,7 +468,6 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 | `elide volume info <name\|ulid>` | Segment counts, WAL size, snapshot history, ancestry chain |
 | `elide volume snapshot <name\|ulid>` | Write a snapshot marker file |
 | `elide volume create <name> --from <source>` | Create a new writable replica of an existing volume. `<source>` is one of: `<vol_ulid>/<snap_ulid>` or `<name>/<snap_ulid>` (explicit pin), or `<name>` (local or remote lookup; a remote basis comes from the `names/<name>` record's `latest_snapshot`). A bare `<vol_ulid>` is rejected — raw ULIDs always carry an explicit pin; the name is the discovery surface. Refuses if `<name>` already exists. Reads traverse the upstream's S3 prefix via the ancestor chain (cheap-reference shape). See [design-replica-model.md](design-replica-model.md) for the direction of travel |
-| `elide volume create <name> --from <source> --force-snapshot` | Same as above, but uploads a new forker-attested "now" marker when the source has no usable snapshot. Interim mechanism; will be replaced by `volume materialize` (pending) |
 | `elide volume create <name> --size N` | Create a new empty root volume (generates ULID dir, writes `volume.name`); rescan |
 | `elide volume status --remote <name>` | `GET names/<name>` against the store; print the authoritative record (state, vol_ulid, coordinator_id, hostname, claimed_at, parent, handoff_snapshot) plus this coordinator's eligibility |
 | `elide volume claim <name>` | Claim a `Released` name from the store: pull the released ancestor's chain, mint a fresh local fork, and conditionally rebind `names/<name>` to the new fork (state ends `Stopped`). Always CAS-protected. To override an unreachable owner of a `Live`/`Stopped` record, use `volume claim --force <name>` |
@@ -533,9 +532,9 @@ Wire format is identical to the volume control socket: NDJSON `Request` envelope
 | Group | Verbs |
 |---|---|
 | Status / discovery | `rescan`, `status`, `status-remote`, `volume-events` |
-| Lifecycle | `start`, `stop`, `release` (`{force?}`), `claim`, `rebind-name` |
+| Lifecycle | `start`, `stop`, `release`, `claim` (`{force?}`), `rebind-name` |
 | Creation / readonly | `create`, `update`, `pull-readonly`, `fork-create`, `import-start`, `import-status`, `import-attach` |
-| Maintenance | `snapshot`, `force-snapshot-now`, `evict`, `generate-filemap`, `await-prefetch`, `remove`, `resolve-handoff-key` |
+| Maintenance | `snapshot`, `evict`, `generate-filemap`, `await-prefetch`, `remove` |
 | Credentials | `get-store-config`, `get-store-creds`, `register`, `credentials` |
 
 Most verbs follow the standard one-request / one-reply model. `import-attach` is the streaming exception: the coordinator emits a sequence of `Envelope<ImportAttachEvent>` messages (one per output line) terminated by either `Done` or an `Err` envelope, then closes the connection. If the import has already finished, the buffered output is replayed before the terminal envelope.

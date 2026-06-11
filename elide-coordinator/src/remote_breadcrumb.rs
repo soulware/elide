@@ -7,7 +7,7 @@
 //! a `remote` row, so the user can see at a glance which of their
 //! volumes are no longer hydrated locally. Removed when the volume
 //! regains a local presence (claim, start --remote) or when ownership
-//! is given up (`release --force`).
+//! is given up (breadcrumb-only `release`).
 //!
 //! Best-effort: not authoritative. The bucket name record is always the
 //! source of truth; a stale or missing breadcrumb only affects what

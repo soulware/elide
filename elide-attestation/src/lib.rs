@@ -640,7 +640,6 @@ mod tests {
                 volume_ulid: parent.to_string(),
                 snapshot_ulid: Ulid::new().to_string(),
                 pubkey: parent_sk.verifying_key().to_bytes(),
-                manifest_pubkey: None,
             }),
             vec![format!("{extent}/{}", Ulid::new())],
         )

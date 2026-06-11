@@ -1,9 +1,9 @@
 // Two-coordinator state-machine proptest for the portable-live-volume
-// lifecycle. Drives `lifecycle::*` and `recovery::*` directly — the
-// building blocks the inbound ops compose — against a shared
-// `InMemory` bucket plus two `CoordinatorIdentity` instances.
+// lifecycle. Drives `lifecycle::*` directly — the building blocks the
+// inbound ops compose — against a shared `InMemory` bucket plus two
+// `CoordinatorIdentity` instances.
 //
-// Op alphabet: { Create, Release, ForceRelease, ClaimReleased, ReclaimLocal }.
+// Op alphabet: { Create, Release, ForceClaim, ClaimReleased, ReclaimLocal }.
 // `Stop` is omitted (it is a single state flip already exhaustively
 // covered by `lifecycle::tests`); `start --remote` is modelled as the
 // `ClaimReleased` op since its bucket-side effect is identical;
@@ -40,18 +40,16 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ed25519_dalek::VerifyingKey;
 use elide_coordinator::identity::CoordinatorIdentity;
-use elide_coordinator::identity::fetch_coordinator_pub;
 use elide_coordinator::lifecycle::{
-    self, ForceReleaseOutcome, MarkClaimedOutcome, MarkReclaimedLocalOutcome, MarkReleasedOutcome,
+    self, MarkClaimedForceOutcome, MarkClaimedOutcome, MarkReclaimedLocalOutcome,
+    MarkReleasedOutcome, ObservedRecord,
 };
 use elide_coordinator::name_store as ns;
-use elide_coordinator::recovery;
 use elide_coordinator::volume_data::VolumeData;
 use elide_core::name_record::NameState;
 use elide_core::segment::SegmentSigner;
 use elide_core::signing::{
-    build_snapshot_manifest_bytes, generate_ephemeral_signer, peek_snapshot_manifest_recovery,
-    read_snapshot_manifest_from_bytes,
+    build_snapshot_manifest_bytes, generate_ephemeral_signer, read_snapshot_manifest_from_bytes,
 };
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, PutPayload};
@@ -73,9 +71,13 @@ enum Op {
         name: u8,
         coord: u8,
     },
-    ForceRelease {
+    /// Forced rebind of a `Live`/`Stopped` record whose owner is
+    /// presumed dead. Drives `mark_claimed_force` — the fence CAS of
+    /// `volume claim --force`. The data-plane re-own is not modelled
+    /// (this model never writes segments).
+    ForceClaim {
         name: u8,
-        recovering: u8,
+        claimant: u8,
     },
     ClaimReleased {
         name: u8,
@@ -101,7 +103,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         (name.clone(), coord.clone()).prop_map(|(name, coord)| Op::Create { name, coord }),
         (name.clone(), coord.clone()).prop_map(|(name, coord)| Op::Release { name, coord }),
-        (name.clone(), rec).prop_map(|(name, recovering)| Op::ForceRelease { name, recovering }),
+        (name.clone(), rec).prop_map(|(name, claimant)| Op::ForceClaim { name, claimant }),
         (name.clone(), coord.clone()).prop_map(|(name, coord)| Op::ClaimReleased { name, coord }),
         (name, coord, any::<bool>()).prop_map(|(name, coord, as_live)| Op::ReclaimLocal {
             name,
@@ -137,8 +139,8 @@ impl World {
         for _ in 0..NUM_COORDS {
             let d = TempDir::new().unwrap();
             let id = CoordinatorIdentity::load_or_generate(d.path()).unwrap();
-            // Publish coordinator.pub so synthesised-handoff verification
-            // can resolve the recovering coordinator's pubkey.
+            // Publish coordinator.pub so event-journal signature
+            // verification can resolve each emitter's pubkey.
             id.publish_pub(store.as_ref()).await.unwrap();
             coords.push(id);
             dirs.push(d);
@@ -178,13 +180,10 @@ impl World {
     async fn publish_volume_snapshot(&self, vol_ulid: Ulid) -> Option<Ulid> {
         let signer = self.vol_signers.get(&vol_ulid)?;
         let snap_ulid = Ulid::new();
-        let bytes = build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
-        // Use try_publish_manifest (If-None-Match: *) so we don't
-        // accidentally overwrite an existing manifest minted by a
-        // parallel op.
+        let bytes = build_snapshot_manifest_bytes(signer.as_ref(), &[]);
         VolumeData::new(self.store.clone(), vol_ulid)
             .snapshots()
-            .try_publish_manifest(snap_ulid, Bytes::from(bytes))
+            .put_manifest(snap_ulid, Bytes::from(bytes))
             .await
             .ok()?;
         Some(snap_ulid)
@@ -223,52 +222,38 @@ impl World {
                     lifecycle::mark_released(&self.store, name_for(*name), &coord_id, snap).await;
             }
 
-            Op::ForceRelease { name, recovering } => {
-                // Read the current record to learn which dead fork to
-                // recover from. If the record is absent or already in
-                // a state force-release refuses, skip silently — the
-                // proptest must tolerate ordering noise.
-                let dead_vol = match ns::read_name_record(&self.store, name_for(*name)).await {
-                    Ok(Some((rec, _))) => match rec.state {
-                        NameState::Live | NameState::Stopped => rec.vol_ulid,
+            Op::ForceClaim { name, claimant } => {
+                // Observe the record; skip silently unless it is in a
+                // state the forced claim proceeds from — the proptest
+                // must tolerate ordering noise.
+                let observed = match ns::read_name_record(&self.store, name_for(*name)).await {
+                    Ok(Some((rec, version))) => match rec.state {
+                        NameState::Live | NameState::Stopped => ObservedRecord {
+                            record: rec,
+                            version,
+                        },
                         _ => return,
                     },
                     _ => return,
                 };
-                let identity = &self.coords[*recovering as usize];
-                // Need the dead pubkey + segments. There are no
-                // segments in this model (we never write data), so
-                // list_and_verify_segments returns an empty slice;
-                // the synthesised manifest covers nothing, which the
-                // recovery API explicitly allows.
-                let dead_vd = elide_coordinator::volume_data::VolumeData::new(
-                    std::sync::Arc::clone(&self.store),
-                    dead_vol,
-                );
-                let dead_pub = match dead_vd.metadata().read_pubkey().await {
-                    Ok(k) => k,
-                    Err(_) => return,
-                };
-                if recovery::list_and_verify_segments(&self.store, dead_vol, &dead_pub)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                let snap = match recovery::mint_and_publish_synthesised_snapshot(
+                let coord_id = self.coords[*claimant as usize]
+                    .coordinator_id_str()
+                    .to_owned();
+                let parent_pin = observed
+                    .record
+                    .latest_snapshot
+                    .map(|snap| format!("{}/{snap}", observed.record.vol_ulid));
+                let new_vol = self.mint_fork().await;
+                let _: Result<MarkClaimedForceOutcome, _> = lifecycle::mark_claimed_force(
                     &self.store,
-                    dead_vol,
-                    &[],
-                    identity,
-                    identity.coordinator_id_str(),
+                    name_for(*name),
+                    &coord_id,
+                    None,
+                    new_vol,
+                    parent_pin,
+                    &observed,
                 )
-                .await
-                {
-                    Ok(p) => p.snap_ulid,
-                    Err(_) => return,
-                };
-                let _: Result<ForceReleaseOutcome, _> =
-                    lifecycle::mark_released_force(&self.store, name_for(*name), snap).await;
+                .await;
             }
 
             Op::ClaimReleased { name, coord } => {
@@ -319,12 +304,8 @@ impl World {
     }
 
     /// Invariant 6 (strong form): every `handoff_snapshot` references
-    /// a manifest that exists in S3 *and* verifies under the right
-    /// pubkey. For ordinary handoff snapshots that key is the dead
-    /// fork's `volume.pub`; for synthesised handoff snapshots
-    /// (`recovery` block present) it's the recovering coordinator's
-    /// `coordinator.pub`, which the coordinator-pub fetcher itself
-    /// path-binds to its derived id.
+    /// a manifest that exists in S3 *and* verifies under the volume's
+    /// own `volume.pub`.
     async fn verify_handoff_manifest(&self, vol_ulid: Ulid, snap: Ulid, name: &str) {
         let body = VolumeData::new(self.store.clone(), vol_ulid)
             .snapshots()
@@ -332,44 +313,25 @@ impl World {
             .await
             .unwrap_or_else(|e| panic!("name '{name}' snapshot {snap} unreadable: {e}"));
 
-        let recovery = peek_snapshot_manifest_recovery(&body)
-            .unwrap_or_else(|e| panic!("name '{name}' snapshot {snap} unparseable: {e}"));
-
-        let vk: VerifyingKey = match recovery {
-            None => {
-                // Ordinary manifest: signed by the volume itself.
-                let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
-                let pub_body = self
-                    .store
-                    .get(&pub_key)
-                    .await
-                    .unwrap_or_else(|e| panic!("volume.pub for {vol_ulid} missing: {e}"))
-                    .bytes()
-                    .await
-                    .expect("volume.pub body");
-                let hex = std::str::from_utf8(&pub_body)
-                    .expect("volume.pub utf8")
-                    .trim();
-                let bytes = (0..hex.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
-                    .collect::<Vec<u8>>();
-                let arr: [u8; 32] = bytes.try_into().expect("32-byte pub");
-                VerifyingKey::from_bytes(&arr).expect("valid pub")
-            }
-            Some(r) => {
-                // Synthesised handoff: signed by the recovering coordinator.
-                fetch_coordinator_pub(self.store.as_ref(), &r.recovering_coordinator_id)
-                    .await
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "synthesised handoff for '{name}' references unknown \
-                             coordinator '{}': {e}",
-                            r.recovering_coordinator_id
-                        )
-                    })
-            }
-        };
+        // Every manifest is signed by the volume's own key.
+        let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
+        let pub_body = self
+            .store
+            .get(&pub_key)
+            .await
+            .unwrap_or_else(|e| panic!("volume.pub for {vol_ulid} missing: {e}"))
+            .bytes()
+            .await
+            .expect("volume.pub body");
+        let hex = std::str::from_utf8(&pub_body)
+            .expect("volume.pub utf8")
+            .trim();
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
+            .collect::<Vec<u8>>();
+        let arr: [u8; 32] = bytes.try_into().expect("32-byte pub");
+        let vk = VerifyingKey::from_bytes(&arr).expect("valid pub");
 
         read_snapshot_manifest_from_bytes(&body, &vk, &snap).unwrap_or_else(|e| {
             panic!(
@@ -452,7 +414,7 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// After any sequence of {Create, Release, ForceRelease,
+    /// After any sequence of {Create, Release, ForceClaim,
     /// ClaimReleased, ReclaimLocal} ops on a shared bucket between two coordinators,
     /// the bucket state remains internally consistent. Each individual
     /// op tolerates wrong-state errors silently — the proptest is

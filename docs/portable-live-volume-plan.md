@@ -305,12 +305,11 @@ consulted when `--remote` is passed. The override path lives on
   `name_store::` end-to-end against `InMemory`.
 - [x] **Two-coordinator state-machine proptest** at
   `elide-coordinator/tests/portable_proptest.rs`: random sequences
-  drawn from `{Create, Release, ReleaseTo, ForceRelease,
+  drawn from `{Create, Release, ReleaseTo, ForceClaim,
   ClaimReleased}` between two simulated coordinators sharing an
   `InMemory` bucket. 256 cases. Asserts six bucket-level invariants
-  including signature verification of every handoff snapshot
-  (volume.pub for normal manifests, recovering coordinator's
-  `coordinator.pub` for synthesised handoff snapshots).
+  including signature verification of every handoff snapshot under
+  the volume's own `volume.pub`.
 - [ ] **Real-bucket integration test** exercising stop-on-A →
   start-on-A (local resume) and release-on-A → start-on-B
   (cross-coordinator) against Tigris in CI. Phase 5.
@@ -505,15 +504,25 @@ attestation model's `rw-self` invariant cannot discharge.
   re-runs resume the partial fork, cross-host claimants source
   missing head-delta segments from the name's prior bindings in
   `events/<name>`.
-- [ ] **Retire the synthesis path:** `release --force` (CLI + IPC +
+- [x] **Retire the synthesis path:** `release --force` (CLI + IPC +
   `force_release_volume_op` + `mark_released_force`),
   `mint_and_publish_synthesised_snapshot`,
   `resolve_handoff_verifier` / `resolve-handoff-key`, the manifest
   recovery fields (`synthesised_from_recovery`,
   `recovering_coordinator_id`, `recovered_at`, the
   `"elide-snapshot-recovery-v1"` signing domain), and
-  `ParentRef.manifest_pubkey`. `release --force --to` goes with it;
-  `release --to` (graceful reservation) stays.
+  `ParentRef.manifest_pubkey`. `release --force --to` went with it;
+  `release --to` (graceful reservation) stays. The readonly-source
+  `create --from --force-snapshot` flow retired in the same pass —
+  it was the other manifest author signing under a key that is not
+  the volume's own (`force-snapshot.key`), which the attestation
+  model's `rw-self` invariant cannot discharge; a readonly source
+  with no snapshot is recovered with `claim --force` instead.
+  `Lifecycle::ForceRelease`, the `force_released` event kind,
+  `name_store::overwrite_name_record`, and the
+  HEAD-set helpers that served synthesis
+  (`resolve_live_segments`, `pull_indexes_for_head`) retired as
+  dead code in the same sweep.
 - [x] **Event vocabulary:** the forced claim emits `force_claimed`
   (carries `displaced_coordinator_id`; doubles as the crash-resume
   source index). `force_released` retires with its verb in the

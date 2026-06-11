@@ -23,19 +23,16 @@
 // All three sections are always present (empty when no entries) — a
 // canonical form so the rebuild's bytes match what an incremental writer
 // would produce. ULIDs are sorted lex within each section; `superseded`
-// is keyed by `input` (the segment being killed). `since` is RFC3339,
-// matching the manifest's `recovered_at`. No `sig:` — HEAD is derived,
-// unsigned state (every segment carries its own Ed25519 signature).
+// is keyed by `input` (the segment being killed). `since` is RFC3339.
+// No `sig:` — HEAD is derived, unsigned state (every segment carries
+// its own Ed25519 signature).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use elide_core::signing::VerifyingKey;
 use object_store::path::Path as StorePath;
 use ulid::Ulid;
-
-use crate::volume_data::VolumeData;
 
 /// The post-snapshot delta carried by `by_id/<vol>/HEAD`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -312,79 +309,6 @@ pub fn live_set(manifest_segments: &BTreeSet<Ulid>, head: &SegmentHead) -> BTree
         .collect()
 }
 
-/// Resolve the live segment set for `vol` from S3: read the latest
-/// manifest via `snapshots/LATEST` (P2 pointer), read HEAD, and apply
-/// the read-path formula (`docs/design-segment-index.md`).
-///
-/// At most three GETs: one for `snapshots/LATEST`, one for the
-/// manifest blob (skipped on a fresh volume with no `User` snapshot
-/// yet), one for HEAD. Bounded regardless of segment cardinality —
-/// this is the LIST-free replacement the design specifies.
-///
-/// Trust model: the manifest signature is verified (it is the trusted
-/// basis for the boundary); HEAD is unsigned enumeration; per-segment
-/// signatures are verified by callers at fetch time.
-///
-/// A missing manifest is treated as an empty set, not a failure: a
-/// fresh volume that has never sealed a snapshot has only HEAD's
-/// `Added` segments, and the formula reduces to those minus any
-/// `Superseded` / `Tombstoned` HEAD already accumulated.
-///
-/// Routed entirely through [`VolumeData`]'s typed views — `head()`
-/// for HEAD, `snapshots()` for `snapshots/LATEST` and the manifest.
-/// No `data_store()` escape hatch.
-pub async fn resolve_live_segments(
-    vd: &VolumeData,
-    manifest_verifying_key: &VerifyingKey,
-) -> Result<BTreeSet<Ulid>, ResolveError> {
-    let snapshots = vd.snapshots();
-    let head_view = vd.head();
-    // LATEST first — its result decides whether to fetch a manifest
-    // at all. The manifest body GET and the HEAD GET are independent
-    // once we know the snap ulid, so issue them concurrently and pay
-    // one round-trip instead of two.
-    let snap_ulid = match snapshots.read_latest().await {
-        Ok(opt) => opt.map(|(u, _)| u),
-        Err(e) => return Err(ResolveError::Latest(e.to_string())),
-    };
-    let manifest_segments = match snap_ulid {
-        Some(snap) => {
-            let manifest_fut = fetch_and_parse_manifest(&snapshots, snap, manifest_verifying_key);
-            let head_fut = head_view.read();
-            let (manifest_res, head_res) = futures::join!(manifest_fut, head_fut);
-            let head = head_res.map_err(|e| ResolveError::Head(e.to_string()))?;
-            let manifest = manifest_res?;
-            return Ok(live_set(&manifest, &head));
-        }
-        None => BTreeSet::new(),
-    };
-    let head = head_view
-        .read()
-        .await
-        .map_err(|e| ResolveError::Head(e.to_string()))?;
-    Ok(live_set(&manifest_segments, &head))
-}
-
-async fn fetch_and_parse_manifest(
-    snapshots: &crate::volume_data::SnapshotsView<'_>,
-    snap_ulid: Ulid,
-    manifest_verifying_key: &VerifyingKey,
-) -> Result<BTreeSet<Ulid>, ResolveError> {
-    // A LATEST pointer to a missing manifest is benign — the pointer
-    // is a perf hint, not a correctness datum. Self-heals on next
-    // publish; treat as no manifest.
-    match snapshots
-        .get_manifest(snap_ulid, manifest_verifying_key)
-        .await
-    {
-        Ok(manifest) => Ok(manifest.segment_ulids.into_iter().collect()),
-        Err(crate::volume_data::SnapshotsError::Get(object_store::Error::NotFound { .. })) => {
-            Ok(BTreeSet::new())
-        }
-        Err(e) => Err(ResolveError::Manifest(e.to_string())),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseHeadError {
     MissingSection { name: &'static str },
@@ -417,25 +341,6 @@ impl fmt::Display for ParseHeadError {
 }
 
 impl std::error::Error for ParseHeadError {}
-
-#[derive(Debug)]
-pub enum ResolveError {
-    Latest(String),
-    Manifest(String),
-    Head(String),
-}
-
-impl fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ResolveError::Latest(s) => write!(f, "reading snapshots/LATEST: {s}"),
-            ResolveError::Manifest(s) => write!(f, "reading manifest: {s}"),
-            ResolveError::Head(s) => write!(f, "reading HEAD: {s}"),
-        }
-    }
-}
-
-impl std::error::Error for ResolveError {}
 
 #[cfg(test)]
 mod tests {
@@ -660,141 +565,5 @@ mod tests {
         let h = SegmentHead::empty(Some(a));
         let parsed = parse(&render(&h)).unwrap();
         assert_eq!(parsed.anchor, Some(a));
-    }
-
-    // --- resolve_live_segments: manifest ∪ HEAD ---
-    //
-    // (HEAD read/put/delete round-trips live in `volume_data.rs` tests
-    // now that those operations belong to `VolumeData::head()`.)
-
-    use crate::volume_data::VolumeData;
-    use bytes::Bytes;
-    use object_store::ObjectStore;
-    use std::sync::Arc;
-
-    async fn seed_manifest(
-        vd: &VolumeData,
-        snap_ulid: Ulid,
-        segments: &[Ulid],
-        signer: &dyn elide_core::segment::SegmentSigner,
-    ) {
-        let bytes = elide_core::signing::build_snapshot_manifest_bytes(signer, segments, None);
-        vd.snapshots()
-            .put_manifest(snap_ulid, Bytes::from(bytes))
-            .await
-            .unwrap();
-        // Seed the LATEST pointer via the typed CAS.
-        vd.snapshots()
-            .advance_latest(None, snap_ulid)
-            .await
-            .unwrap();
-    }
-
-    fn vd_for(store: Arc<dyn ObjectStore>) -> VolumeData {
-        VolumeData::new(store, vol())
-    }
-
-    #[tokio::test]
-    async fn resolve_fresh_volume_returns_empty() {
-        // No LATEST, no HEAD ⇒ no live segments.
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let vd = vd_for(store);
-        let live = resolve_live_segments(&vd, &vk).await.unwrap();
-        assert!(live.is_empty());
-    }
-
-    #[tokio::test]
-    async fn resolve_manifest_only_returns_manifest_segments() {
-        // A sealed snapshot exists; HEAD is absent (cleared at seal).
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let mut m = mint();
-        let s1 = m.next();
-        let s2 = m.next();
-        let snap = m.next();
-        let vd = vd_for(store);
-        seed_manifest(&vd, snap, &[s1, s2], &*signer).await;
-
-        let live = resolve_live_segments(&vd, &vk).await.unwrap();
-        assert_eq!(live, [s1, s2].into_iter().collect());
-    }
-
-    #[tokio::test]
-    async fn resolve_head_only_returns_added_segments() {
-        // Fresh volume with no manifest but drains have happened —
-        // HEAD's `Added` set is the entire live set.
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let mut m = mint();
-        let a1 = m.next();
-        let a2 = m.next();
-        let mut head = SegmentHead::empty(None);
-        head.added.insert(a1);
-        head.added.insert(a2);
-        let vd = vd_for(Arc::clone(&store));
-        vd.head().put(&head).await.unwrap();
-
-        let live = resolve_live_segments(&vd, &vk).await.unwrap();
-        assert_eq!(live, [a1, a2].into_iter().collect());
-    }
-
-    #[tokio::test]
-    async fn resolve_manifest_plus_head_applies_full_formula() {
-        // Pre-snapshot segments in manifest; post-snapshot drain in
-        // Added; one pre-snapshot superseded after seal; one
-        // post-snapshot tombstoned by reaper.
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let mut m = mint();
-        let pre1 = m.next();
-        let pre2 = m.next(); // will be Superseded
-        let snap = m.next();
-        let post1 = m.next();
-        let post2 = m.next(); // will be Tombstoned
-        let out = m.next(); // GC output for pre2
-
-        let vd = vd_for(Arc::clone(&store));
-        seed_manifest(&vd, snap, &[pre1, pre2], &*signer).await;
-
-        let mut head = SegmentHead::empty(Some(snap));
-        head.added.insert(post1);
-        head.added.insert(post2);
-        head.added.insert(out);
-        head.superseded.insert(
-            pre2,
-            Supersession {
-                output: out,
-                since: Utc::now(),
-            },
-        );
-        head.tombstoned.insert(post2);
-        vd.head().put(&head).await.unwrap();
-
-        let live = resolve_live_segments(&vd, &vk).await.unwrap();
-        // pre1 survives; pre2 superseded; post1 added; post2 tombstoned; out added.
-        assert_eq!(live, [pre1, post1, out].into_iter().collect());
-    }
-
-    #[tokio::test]
-    async fn resolve_treats_dangling_latest_as_empty_manifest() {
-        // A LATEST pointer to a missing manifest is benign (perf hint,
-        // self-heals on next publish). The resolver must not fail and
-        // must fall back to HEAD-only.
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let mut m = mint();
-        let snap = m.next();
-        let a = m.next();
-        let vd = vd_for(Arc::clone(&store));
-        // Seed LATEST via the typed CAS, but skip the manifest body —
-        // the resolver must tolerate the dangling pointer.
-        vd.snapshots().advance_latest(None, snap).await.unwrap();
-        let mut head = SegmentHead::empty(None);
-        head.added.insert(a);
-        vd.head().put(&head).await.unwrap();
-
-        let live = resolve_live_segments(&vd, &vk).await.unwrap();
-        assert_eq!(live, [a].into_iter().collect());
     }
 }

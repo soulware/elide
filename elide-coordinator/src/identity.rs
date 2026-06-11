@@ -90,18 +90,6 @@ pub struct CoordinatorIdentity {
     hostname: Option<String>,
 }
 
-/// Treat the coordinator's identity keypair as a `SegmentSigner` so
-/// it can sign synthesised handoff snapshots produced by
-/// `volume release --force`. The signing input is identical to any
-/// other Ed25519 signature; the key is the coordinator's identity
-/// rather than a per-volume key.
-impl elide_core::segment::SegmentSigner for CoordinatorIdentity {
-    fn sign(&self, msg: &[u8]) -> [u8; 64] {
-        use ed25519_dalek::Signer;
-        self.signing_key.sign(msg).to_bytes()
-    }
-}
-
 /// Implements [`elide_peer_fetch::TokenSigner`] so the
 /// coordinator's identity can mint peer-fetch bearer tokens directly
 /// — no IPC to a separate signing service, no per-volume keys.
@@ -186,11 +174,10 @@ impl CoordinatorIdentity {
 
     /// Sign `msg` with the coordinator's Ed25519 signing key.
     /// Used for any artefact attributed to this coordinator's
-    /// identity — synthesised handoff snapshots (via the
-    /// `SegmentSigner` impl) and per-name event log entries (via
-    /// `event_journal::EventJournal::emit`). Domain separation between
-    /// these uses is enforced by the *callers' canonical-form
-    /// pre-images*, not by separate keys.
+    /// identity — per-name event log entries (via
+    /// `event_journal::EventJournal::emit`) and peer-fetch tokens.
+    /// Domain separation between these uses is enforced by the
+    /// *callers' canonical-form pre-images*, not by separate keys.
     pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
         use ed25519_dalek::Signer;
         self.signing_key.sign(msg).to_bytes()
@@ -257,10 +244,8 @@ impl CoordinatorIdentity {
 /// `coordinators/<coord_id>/coordinator.pub` and verify the binding:
 /// `coordinator_id` must derive from the fetched bytes.
 ///
-/// Used by claimants on `start --remote` to verify a synthesised
-/// handoff snapshot's signature against the recovering coordinator,
-/// and by [`crate::event_journal::EventJournal::list_and_verify`] to
-/// verify per-name event log signatures.
+/// Used by [`crate::event_journal::EventJournal::list_and_verify`]
+/// to verify per-name event log signatures.
 pub async fn fetch_coordinator_pub(
     store: &dyn ObjectStore,
     coord_id_str: &str,
@@ -559,7 +544,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let id = CoordinatorIdentity::load_or_generate(tmp.path()).unwrap();
-        let msg = b"synthesised handoff snapshot test";
+        let msg = b"coordinator identity signing test";
         let sig = Signature::from_bytes(&id.sign(msg));
         id.verifying_key()
             .verify(msg, &sig)

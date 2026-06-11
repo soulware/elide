@@ -126,7 +126,6 @@ fn delta_entry_end_to_end_decompression() {
         signer.as_ref(),
         &delta_seg_ulid,
         &[delta_seg_ulid],
-        None,
     )
     .unwrap();
 
@@ -239,7 +238,6 @@ fn delta_entry_roundtrip_from_drained_cache() {
         signer.as_ref(),
         &delta_seg_ulid,
         &[delta_seg_ulid],
-        None,
     )
     .unwrap();
 
@@ -340,7 +338,6 @@ fn delta_entry_demand_fetch_from_pull_host() {
         signer.as_ref(),
         &delta_seg_ulid,
         &[delta_seg_ulid],
-        None,
     )
     .unwrap();
 
@@ -484,7 +481,6 @@ fn block_reader_read_block_dispatches_to_delta() {
         signer.as_ref(),
         &delta_seg_ulid,
         &[delta_seg_ulid],
-        None,
     )
     .unwrap();
 
@@ -587,7 +583,6 @@ fn delta_read_populates_dmat_and_second_read_matches() {
         signer.as_ref(),
         &delta_seg_ulid,
         &[delta_seg_ulid],
-        None,
     )
     .unwrap();
 

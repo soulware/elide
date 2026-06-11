@@ -1720,7 +1720,7 @@ at enrollment (§ *Enrollment*), not at `assume-role`.
 |---|---|---|
 | `coord-ro` | read-only `names/* coordinators/* events/* meta/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
 | `coord-rw` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`) | all coordinator-wide mutation paths |
-| `volume-rw` | per-volume `by_id/<vol>/*` read+write, plus that volume's `meta/<vol>.{provenance,pub}` (**Split B** — per-volume) | per-volume writes (snapshot publish, fork, force-release, drain, GC, reaper) |
+| `volume-rw` | per-volume `by_id/<vol>/*` read+write, plus that volume's `meta/<vol>.{provenance,pub}` (**Split B** — per-volume) | per-volume writes (snapshot publish, fork, forced-claim re-own, drain, GC, reaper) |
 | `volume-ro` | per-volume `by_id/<vol>/*` read (one credential per volume prefix; ancestor reads use a separate per-ancestor `volume-ro` credential, authorized by lineage), vended to the volume process | the coordinator (assumes), the volume (holds the keypair) |
 
 **Why not the per-purpose split (Split A).** `design-iam-key-model.md`'s
@@ -1789,7 +1789,7 @@ identical to `volume-ro` but with write actions.
   `arn:aws:s3:::{{env.bucket}}/by_id/{{req.volume}}/*`,
   plus the volume's two exact `meta/{{req.volume}}.provenance`
   and `meta/{{req.volume}}.pub` objects (the drain uploads
-  them; force-release reads `volume.pub`). Single volume only.
+  them; the forced-claim re-own reads `volume.pub`). Single volume only.
 
 GC and the reaper cross volume boundaries (read ancestor/input prefixes,
 delete a consumed prefix). GC *input reads* compose by assuming `volume-ro`
@@ -1799,7 +1799,7 @@ covered by `volume-rw` on that volume.)
 
 ### `coord-rw`
 
-Coordinator-wide write authority: name claim / rename / force-release
+Coordinator-wide write authority: name claim / rename / forced claim
 / rollback (`names/`), event-journal appends and reads (`events/`),
 and this coordinator's own identity records
 (`coordinators/<sub>/`). One role, one credential, one keypair cache.
@@ -2166,7 +2166,7 @@ already wired).
 path uses `writer()` for its *entire* `names/`+`events/`+own-
 `coordinators/` interaction — including the reads that are part of a
 mutation (`coord-rw`'s policy holds `s3:GetObject` on those
-prefixes), so a name-claim/force-release CAS (`GET` ETag → conditional
+prefixes), so a name-claim/forced-claim CAS (`GET` ETag → conditional
 `PUT`) runs wholly on one credential and is never split. It uses
 `volume_rw(v)` for that volume's `by_id/`. Read-only paths and
 the exposed peer-fetch verifier use `base_ro()`. There is **no
@@ -2388,7 +2388,7 @@ prematurely.
    role; the verifier uses `coord-ro` (read-only `names/*` /
    `coordinators/*` / `events/*`). Lineage is verified by the serving
    peer against its own *local* signed `volume.provenance`, not via S3.
-   The force-release fence is gap-free via the per-request ETag-
+   The forced-claim fence is gap-free via the per-request ETag-
    conditional `names/<name>` read (fence coincident with the S3 CAS).
 5. **Mid-path wildcard verification.** Not on the v1 critical path:
    `volume-rw` uses a single-volume *trailing* wildcard

@@ -354,7 +354,6 @@ impl ForceClaimOrchestrator {
                     volume_ulid: source.to_string(),
                     snapshot_ulid: basis.to_string(),
                     pubkey: source_pubkey.to_bytes(),
-                    manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
                 oci_source: None,
@@ -730,7 +729,6 @@ impl ForceClaimOrchestrator {
                         volume_ulid: source.to_string(),
                         snapshot_ulid: effective_basis.to_string(),
                         pubkey: source_pubkey.to_bytes(),
-                        manifest_pubkey: None,
                     }),
                     extent_index: Vec::new(),
                     oci_source: None,
@@ -829,15 +827,19 @@ mod tests {
     /// Mint a keypair and publish the root-shape `meta/<vol>.{pub,
     /// provenance}` skeleton for it.
     async fn make_dead_volume(store: &Arc<dyn ObjectStore>, vol: Ulid) -> DeadVol {
+        make_dead_volume_with_lineage(store, vol, &ProvenanceLineage::default()).await
+    }
+
+    /// Like [`make_dead_volume`] but with a caller-supplied lineage
+    /// (e.g. a partial fork that carries a `ParentRef`).
+    async fn make_dead_volume_with_lineage(
+        store: &Arc<dyn ObjectStore>,
+        vol: Ulid,
+        lineage: &ProvenanceLineage,
+    ) -> DeadVol {
         let tmp = TempDir::new().unwrap();
         let key = generate_keypair(tmp.path(), VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
-        write_provenance(
-            tmp.path(),
-            &key,
-            VOLUME_PROVENANCE_FILE,
-            &ProvenanceLineage::default(),
-        )
-        .unwrap();
+        write_provenance(tmp.path(), &key, VOLUME_PROVENANCE_FILE, lineage).unwrap();
         let vk = key.verifying_key();
         let pub_key = StorePath::from(elide_core::store_keys::meta_pub_key(vol));
         let pub_body = format!("{}\n", encode_hex(&vk.to_bytes()));
@@ -998,7 +1000,7 @@ mod tests {
         }
         // Basis manifest covers s1; HEAD carries the post-basis delta.
         let manifest =
-            elide_core::signing::build_snapshot_manifest_bytes(dead.signer.as_ref(), &[s1], None);
+            elide_core::signing::build_snapshot_manifest_bytes(dead.signer.as_ref(), &[s1]);
         let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead.vol);
         vd.snapshots()
             .put_manifest(basis, bytes::Bytes::from(manifest))
@@ -1127,6 +1129,75 @@ mod tests {
             .unwrap();
         assert_eq!(head.anchor, None);
         assert_eq!(head.added, [s1, s2].into_iter().collect());
+    }
+
+    /// A claim that crashed after `early_rebind` leaves a partial fork
+    /// bound to the name: meta artifacts only, a `ParentRef` to the
+    /// real parent, no manifest, no HEAD. `claim --force` over it must
+    /// take over that `ParentRef` so the new fork rejoins the lineage
+    /// at the same branch point.
+    #[tokio::test]
+    async fn crashed_claim_fork_takeover_carries_parent_ref() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut mint = UlidMint::new(Ulid::nil());
+        let gsnap = mint.next();
+        let grandparent = make_dead_volume(&store, mint.next()).await;
+        // Grandparent's handoff manifest at the branch point — the
+        // chain pull and later hydration anchor on it.
+        let manifest =
+            elide_core::signing::build_snapshot_manifest_bytes(grandparent.signer.as_ref(), &[]);
+        elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), grandparent.vol)
+            .snapshots()
+            .put_manifest(gsnap, bytes::Bytes::from(manifest))
+            .await
+            .unwrap();
+
+        let partial = make_dead_volume_with_lineage(
+            &store,
+            mint.next(),
+            &ProvenanceLineage {
+                parent: Some(ParentRef {
+                    volume_ulid: grandparent.vol.to_string(),
+                    snapshot_ulid: gsnap.to_string(),
+                    pubkey: grandparent.vk.to_bytes(),
+                }),
+                extent_index: Vec::new(),
+                oci_source: None,
+            },
+        )
+        .await;
+
+        let mut rec = NameRecord::live_minimal(partial.vol, 1 << 30);
+        rec.coordinator_id = Some(dead_owner_id());
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let (ctx, data_dir) = fixture(Arc::clone(&store));
+        let fork = run_force_claim(&ctx, &store).await;
+
+        // The partial fork had no manifest: the new fork takes over
+        // its ParentRef, rejoining the lineage at the grandparent's
+        // branch point.
+        let lineage = read_lineage_verifying_signature(
+            &data_dir.path().join("by_id").join(fork.to_string()),
+            VOLUME_PUB_FILE,
+            VOLUME_PROVENANCE_FILE,
+        )
+        .unwrap();
+        let parent = lineage.parent.expect("takeover carries the ParentRef");
+        assert_eq!(parent.volume_ulid, grandparent.vol.to_string());
+        assert_eq!(parent.snapshot_ulid, gsnap.to_string());
+        assert_eq!(parent.pubkey, grandparent.vk.to_bytes());
+
+        // Record rebound to the new fork; no basis pin (the partial
+        // fork never published a snapshot).
+        let (rec, _) = elide_coordinator::name_store::read_name_record(&store, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.vol_ulid, fork);
+        assert!(rec.parent.is_none());
     }
 
     #[tokio::test]

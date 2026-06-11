@@ -37,7 +37,7 @@ scan; the substitutes below do not need the date partition.
 bijective for a live name but **not stable over time**:
 
 - **`names/<name>`** — stable ownership identity. Its lifecycle
-  (Created/Claimed/Released/ForceReleased/Renamed/ForkedFrom) is
+  (Created/Claimed/Released/ForceClaimed/Renamed/ForkedFrom) is
   intrinsically per-*name* — ownership CAS, cross-host handoff
   rendezvous, rename — and *cannot* move to per-vol: a claiming
   coordinator finds the volume **through the name**; it does not know
@@ -93,16 +93,18 @@ that cannot skew for it:
   fields are the inbound pin). Neither present ⇒ a root volume that
   never wrote ⇒ synthesise an empty owner-signed handoff. The general
   principle still holds — a snapshot is only a basis from a *terminal*
-  ownership-relinquishing fact (`Released`/`ForceReleased`/fork pin),
+  ownership-relinquishing fact (`Released`/forced-claim displacement/fork pin),
   never from non-terminal `Stopped`/`Claimed` (the volume can resume,
   and an append-only log can't say a stop wasn't resumed past) — so
   there is **no `Stopped` event and no event-format change**; the
   record fields *are* that terminal fact, materialised where the
   caller already reads it.
 - **Unclean recovery never reads a snapshot off the log at all.**
-  `release --force` of a crashed owner **always synthesises the basis
-  from the latest durable segments** and records *that* as
-  `ForceReleased{handoff_snapshot}`. The stop-snapshot fast-path
+  `claim --force` of a crashed owner bases the new fork on the
+  record's `latest_snapshot` (the dead volume's last owner-published
+  snapshot), re-owns the post-snapshot head delta from one post-CAS
+  HEAD read, and records the takeover as
+  `ForceClaimed{displaced_coordinator_id}`. The stop-snapshot fast-path
   (`recovery.rs:379/384`) is unsound under append-only events (a stale
   stop checkpoint whose volume resumed) and is **dropped**; recovery's
   segment enumeration is a P3 concern (the maintained segment index),
@@ -148,12 +150,12 @@ handoff/fork references the per-name event spine already carries.
   **Write order — HEAD *before* the record PUT.** `emit` reads HEAD
   (+etag), derives `prev = HEAD[0]`, writes the new entry onto HEAD
   (`If-Match` etag for a normal emit; *unconditional* for the
-  `release --force` emit), *then* PUTs the immutable record
+  `claim --force` emit), *then* PUTs the immutable record
   (`If-None-Match:*`). The `If-Match` is **not** a serializer with a
   retry loop — normal appends are already single-writer by
   `names/<name>` ownership (§ *Single-writer*), so a mismatch never
   means "lost a race": it means **this coordinator has been
-  displaced** (only `release --force` can change HEAD under a
+  displaced** (only `claim --force` can change HEAD under a
   still-alive owner) → **fail hard**, no retry, no merge. A crash
   between the HEAD write and the record PUT leaves HEAD naming an
   event whose body is absent: a reader GETs it, 404s, and **skips the
@@ -173,7 +175,7 @@ handoff/fork references the per-name event spine already carries.
   prev-walk / elevated LIST (the project invariant for derived state:
   the rebuild defines correctness).
 
-  **Single-writer by ownership; `release --force` is the only
+  **Single-writer by ownership; `claim --force` is the only
   exception.** The `names/<name>` conditional update is already the
   serialization point: an event is emitted *only after* a won
   ownership transition (`claim.rs:628` emits `Claimed` solely on the
@@ -184,23 +186,23 @@ handoff/fork references the per-name event spine already carries.
   in-process per-name lock so a coordinator's own concurrent tasks
   don't race (reuse the existing per-name lock registry if present).
 
-  The **sole** multi-writer case is `release --force` with a
+  The **sole** multi-writer case is `claim --force` with a
   still-alive displaced owner A. Authority/ordering rules:
 
-  - **Authority before journal.** The decisive act is the
-    *unconditional* `names/<name>` overwrite (Released, `handoff=Sh`,
-    `displaced=A`); the `ForceReleased` event is the journal entry
-    that *follows* it. Full order: synthesize+write `Sh` → unconditional
-    `names/<name>` overwrite → event append (HEAD then record). This
-    is unchanged behaviour — `finalize_force_release` already runs only
-    after the overwrite. Reversing it (journal before authority) lets
-    a crash leave the log asserting a `ForceReleased` the authority
-    never made *and* fence the legitimate owner with no transfer → a
-    self-inflicted **ownership vacuum**. Authority-first leaves only a
-    recoverable journal gap (best-effort contract).
-  - **The force-releaser B never fails.** Its `ForceReleased` HEAD
-    write is **unconditional** (mirroring the unconditional
-    `names/<name>` overwrite — force is the override at both layers).
+  - **Authority before journal.** The decisive act is the forced CAS
+    on `names/<name>` (conditioned on the record observed at start;
+    "force" skips the ownership refusal, not the precondition),
+    binding the name straight to the claimant's fresh fork; the
+    `ForceClaimed` event is the journal entry that *follows* it.
+    Reversing it (journal before authority) lets a crash leave the
+    log asserting a `ForceClaimed` the authority never made *and*
+    fence the legitimate owner with no transfer → a self-inflicted
+    **ownership vacuum**. Authority-first leaves only a recoverable
+    journal gap (best-effort contract).
+  - **The forced claimant B never fails on the journal.** Its
+    `ForceClaimed` HEAD write is **unconditional** (force is the
+    override at the journal layer; the authority layer stays
+    CAS-conditioned).
   - **The displaced A fails hard *on the name*, not its data.** A is
     fenced at the authoritative layer the instant the name overwrite
     lands (A's own `If-Match` name-ops fail). B's unconditional HEAD
@@ -208,11 +210,11 @@ handoff/fork references the per-name event spine already carries.
     fails — a *secondary* displacement detector → A stops touching
     `names/<name>`/`events/<name>/`. A's `by_id/<V_a>/` lineage is
     **untouched** and survives as an unnamed, recoverable fork
-    (claim-after-force forks a new `vol_ulid` from `Sh`; `V_a` is
+    (the forced claim binds the name to a fresh fork; `V_a` is
     never overwritten). "Fail hard" = lose the *name*, not the data.
 
   `events/<name>/` therefore stays a **single clean chain** (B's, post-
-  `ForceReleased`); A's post-displacement activity is a *different
+  `ForceClaimed`); A's post-displacement activity is a *different
   lineage*, not entries in this name's log. The log *records* the
   displacement (`displaced_coordinator_id`); it does not *resolve* the
   data-plane fork — that, and any **automatic fork-continuation** for
@@ -237,7 +239,7 @@ handoff/fork references the per-name event spine already carries.
    (`Created`/`Claimed`/`Released`/`Renamed`); replaces
    `latest_event_ulid`'s LIST.
 2. **Peer-discovery** — the decisive event
-   (`Released`/`ForceReleased`/`ForkedFrom`) is almost always within
+   (`Released`/`ForceClaimed`/`ForkedFrom`) is almost always within
    the last *N*, so it is **in the HEAD GET itself — zero extra
    hops**. Only a pathological tail (>*N* events since the last
    `Released`) falls back to the bounded `prev_event_ulid` walk.
@@ -321,11 +323,12 @@ GET or a known-key PUT/DELETE — no LIST.
 **Unclean variant.** If A instead crashed (never reaching step 2's
 `Released` — whether it had stopped-then-resumed or never stopped),
 the tail of `events/myvol/` is *not* a terminal event. B's
-`release --force` does **not** read any snapshot off the log: it
-synthesises the basis from A's latest durable segments and records
-that as `ForceReleased{handoff_snapshot}`. A recorded `Stopped` could
+`claim --force` does **not** read any snapshot off the log: the basis
+is the record's `latest_snapshot`, the head delta comes from one
+post-CAS read of A's HEAD, and the takeover is recorded as
+`ForceClaimed{displaced_coordinator_id}`. A recorded `Stopped` could
 not be trusted (A may have resumed past it), so no such event exists;
-the recovery basis is segment-derived (P3 segment index), never a
+the recovery basis is record- and HEAD-derived, never a
 pointer or a stale checkpoint.
 
 The invariant the example illustrates: **the name axis (event log)
@@ -349,9 +352,10 @@ it, not merely delete it:
   reconstructable from local volume state, and is overwritten by the
   next publish, so a lost/stale pointer self-heals — a perf event, not
   a correctness one. This holds *because* the one
-  correctness-sensitive case — the unclean-recovery basis — never
-  reads the pointer (or any snapshot off the log): `release --force`
-  synthesises from the latest durable segments (P3 segment index).
+  correctness-sensitive case — the unclean-recovery basis — degrades
+  safely: `claim --force` re-resolves the effective basis from the
+  dead fork's `snapshots/LATEST`, and a stale pointer only shrinks
+  the basis (more of the head delta is re-owned), never corrupts.
 - **The segment/retention index is authoritative for the runtime**;
   readers trust it. Divergence is bounded and one-directional by
   construction if the

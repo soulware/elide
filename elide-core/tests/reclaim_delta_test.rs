@@ -128,7 +128,6 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
         signer.as_ref(),
         &delta_ulid,
         &[delta_ulid],
-        None,
     )
     .unwrap();
 
@@ -359,7 +358,6 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
         signer.as_ref(),
         &delta50_ulid,
         &[delta50_ulid],
-        None,
     )
     .unwrap();
 
@@ -497,7 +495,6 @@ fn reclaim_emits_delta_when_h_is_snapshot_pinned() {
         signer.as_ref(),
         &parent_ulid,
         &[parent_ulid],
-        None,
     )
     .unwrap();
 
@@ -620,7 +617,6 @@ fn scanner_surfaces_bloated_delta_hash() {
         signer.as_ref(),
         &delta_ulid,
         &[delta_ulid],
-        None,
     )
     .unwrap();
 

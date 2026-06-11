@@ -140,7 +140,7 @@ pub enum EventError {
     ParseHead(toml::de::Error),
     /// The `If-Match` HEAD rewrite failed: `events/<name>/HEAD`
     /// changed under us. The only writer that can do that to a name
-    /// we own is a concurrent `release --force` — i.e. **this
+    /// we own is a concurrent `claim --force` — i.e. **this
     /// coordinator has been displaced**. Caller must fail hard, not
     /// retry (`docs/list-elimination-plan.md` § *Single-writer*).
     Displaced,
@@ -159,7 +159,7 @@ impl std::fmt::Display for EventError {
             Self::Displaced => write!(
                 f,
                 "event-log HEAD changed under us — this coordinator has been displaced \
-                 (concurrent release --force)"
+                 (concurrent claim --force)"
             ),
         }
     }
@@ -563,10 +563,7 @@ impl EventJournal for BucketEventJournal {
         sign_event(&mut event, identity);
 
         let new_head = prev_head.unwrap_or_default().pushed(event.clone());
-        let is_force = matches!(
-            event.kind,
-            EventKind::ForceReleased { .. } | EventKind::ForceClaimed { .. }
-        );
+        let is_force = matches!(event.kind, EventKind::ForceClaimed { .. });
         write_head(self.writer.as_ref(), name, &new_head, expected, is_force).await?;
         append_record(self.writer.as_ref(), name, &event).await?;
         Ok(event)
@@ -939,11 +936,10 @@ mod tests {
                                 j.emit(
                                     &id_b,
                                     name,
-                                    EventKind::ForceReleased {
-                                        handoff_snapshot: Ulid::nil(),
-                                        displaced_coordinator_id: id_a
-                                            .coordinator_id_str()
-                                            .to_owned(),
+                                    EventKind::ForceClaimed {
+                                        displaced_coordinator_id: Some(
+                                            id_a.coordinator_id_str().to_owned(),
+                                        ),
                                     },
                                     v,
                                 )

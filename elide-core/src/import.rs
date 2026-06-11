@@ -248,7 +248,7 @@ pub fn import_image(
     // Signed snapshot manifest at `snapshots/<snap_ulid>.manifest`. The
     // manifest's existence is the snapshot's existence — there's no
     // separate marker file.
-    crate::signing::write_snapshot_manifest(vol_dir, signer, &snap_ulid, &all_segment_ulids, None)?;
+    crate::signing::write_snapshot_manifest(vol_dir, signer, &snap_ulid, &all_segment_ulids)?;
 
     // Write the filemap alongside the manifest.
     filemap::write(&snapshots_dir, &snap_ulid_str, &filemap_rows)?;

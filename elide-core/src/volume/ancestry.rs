@@ -115,18 +115,7 @@ pub fn verify_ancestor_manifests(fork_dir: &Path, by_id_dir: &Path) -> io::Resul
                     current_parent.volume_ulid
                 ))
             })?;
-        // For forker-attested "now" pins the `.manifest` is signed by a
-        // different (ephemeral) key than the parent's identity. When set,
-        // use it for the manifest; fall back to the identity key otherwise.
-        let manifest_verifying = match current_parent.manifest_pubkey {
-            Some(bytes) => crate::signing::VerifyingKey::from_bytes(&bytes).map_err(|e| {
-                io::Error::other(format!(
-                    "invalid parent manifest pubkey in provenance for {}: {e}",
-                    current_parent.volume_ulid
-                ))
-            })?,
-            None => parent_verifying,
-        };
+        let manifest_verifying = parent_verifying;
 
         let snap_ulid = Ulid::from_string(&current_parent.snapshot_ulid).map_err(|e| {
             io::Error::other(format!("invalid snapshot ULID in provenance parent: {e}"))

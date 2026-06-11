@@ -308,13 +308,6 @@ enum VolumeCommand {
         /// across restarts (recorded in volume.toml).
         #[arg(long)]
         ublk: bool,
-        /// When forking: upload a new "now" snapshot marker to the remote
-        /// store and branch from it, instead of relying on an existing
-        /// snapshot. Required when the source has no snapshot (e.g.
-        /// recovering from a dead host). Conflicts with an explicit snapshot
-        /// pin in `--from <vol>/<snap>`.
-        #[arg(long, requires = "from")]
-        force_snapshot: bool,
     },
 
     /// Update configuration for a running volume
@@ -486,17 +479,6 @@ enum VolumeCommand {
     Release {
         /// Volume name
         name: String,
-        /// Override foreign ownership when the previous owner is
-        /// unreachable. The recovering coordinator synthesises a
-        /// handoff snapshot from S3-visible segments under the dead
-        /// fork's prefix, signs it with its own coordinator key, and
-        /// unconditionally rewrites `names/<name>`.
-        ///
-        /// Skips local drain (the dead owner's WAL is unreachable).
-        /// Data-loss boundary: writes the dead owner accepted but
-        /// never promoted to S3.
-        #[arg(long)]
-        force: bool,
     },
 }
 
@@ -653,7 +635,6 @@ fn main() {
                 size,
                 from,
                 ublk,
-                force_snapshot,
             } => {
                 if let Some(from) = &from {
                     if let Err(e) = validate_volume_name(&name) {
@@ -661,15 +642,8 @@ fn main() {
                         std::process::exit(1);
                     }
                     let flags = encode_transport_flags(ublk, false);
-                    if let Err(e) = create_fork(
-                        &data_dir,
-                        &name,
-                        from,
-                        &coord,
-                        &by_id_dir,
-                        &flags,
-                        force_snapshot,
-                    ) {
+                    if let Err(e) = create_fork(&data_dir, &name, from, &coord, &by_id_dir, &flags)
+                    {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
@@ -831,15 +805,8 @@ fn main() {
                         }
                         // Optionally create a fork immediately after import.
                         if let Some(fork_name) = import_args.fork
-                            && let Err(e) = create_fork(
-                                &data_dir,
-                                &fork_name,
-                                &name,
-                                &coord,
-                                &by_id_dir,
-                                &[],
-                                false,
-                            )
+                            && let Err(e) =
+                                create_fork(&data_dir, &fork_name, &name, &coord, &by_id_dir, &[])
                         {
                             eprintln!("error creating fork '{fork_name}': {e}");
                             std::process::exit(1);
@@ -895,8 +862,8 @@ fn main() {
                 // credentials in the CLI), no stop-snapshot publish
                 // (the daemon's the only signer). The bucket record is
                 // left as-is — typically `Live` — so cross-host
-                // recovery requires `volume release --force` from
-                // somewhere with credentials. This path exists for
+                // recovery requires `volume claim --force` from
+                // another host. This path exists for
                 // when the coordinator is down and the volume daemon
                 // needs to be halted urgently (e.g. a stuck drain, a
                 // host being torn down quickly).
@@ -918,7 +885,7 @@ fn main() {
                             eprintln!(
                                 "warning: coordinator unreachable — halted local daemon directly; \
                                  names/{name} in S3 is unchanged (likely still Live). Recover \
-                                 from another host via `volume release --force {name}` if needed."
+                                 from another host via `volume claim --force {name}` if needed."
                             );
                             println!("{name}: stopped (direct)");
                         }
@@ -934,7 +901,7 @@ fn main() {
                     std::process::exit(1);
                 }
                 if release {
-                    match coord.release_volume(&name, false) {
+                    match coord.release_volume(&name) {
                         Ok(reply) => {
                             println!(
                                 "{name}: released at handoff snapshot {}",
@@ -1002,17 +969,12 @@ fn main() {
                 println!("{name}: {verb}");
             }
 
-            VolumeCommand::Release { name, force } => match coord.release_volume(&name, force) {
+            VolumeCommand::Release { name } => match coord.release_volume(&name) {
                 Ok(reply) => {
-                    let kind = if force {
-                        format!(
-                            "force-released at synthesised handoff snapshot {}",
-                            reply.handoff_snapshot
-                        )
-                    } else {
-                        format!("released at handoff snapshot {}", reply.handoff_snapshot)
-                    };
-                    println!("{name}: {kind}");
+                    println!(
+                        "{name}: released at handoff snapshot {}",
+                        reply.handoff_snapshot
+                    );
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -1491,8 +1453,8 @@ fn coord_stop(
 /// CLI doesn't carry S3 credentials.
 ///
 /// On success the caller surfaces a warning explaining that
-/// `names/<name>` in S3 is now stale: cross-host recovery requires
-/// `volume release --force` from somewhere with credentials.
+/// `names/<name>` in S3 is now stale: cross-host recovery is
+/// `volume claim --force` from the host that wants the volume.
 fn volume_stop_force_direct(data_dir: &Path, name: &str) -> std::io::Result<()> {
     let link = data_dir.join("by_name").join(name);
     if !link.exists() {
@@ -1957,18 +1919,10 @@ fn encode_transport_flags(ublk: bool, no_ublk: bool) -> Vec<String> {
 /// ULID-wins rule: if the part before `/` parses as a valid ULID it is
 /// always treated as one, never looked up as a volume name. This
 /// prevents ambiguity when a volume is named with a ULID string.
-fn parse_fork_source(
-    from: &str,
-    force_snapshot: bool,
-) -> std::io::Result<coordinator_client::ForkSource> {
+fn parse_fork_source(from: &str) -> std::io::Result<coordinator_client::ForkSource> {
     if let Some((vol, snap)) = from.split_once('/') {
         let snap_ulid = ulid::Ulid::from_string(snap)
             .map_err(|e| std::io::Error::other(format!("invalid snapshot ULID in --from: {e}")))?;
-        if force_snapshot {
-            return Err(std::io::Error::other(
-                "--force-snapshot conflicts with an explicit snapshot pin in --from",
-            ));
-        }
         if let Ok(vol_ulid) = ulid::Ulid::from_string(vol) {
             Ok(coordinator_client::ForkSource::Pinned {
                 vol_ulid,
@@ -2004,11 +1958,6 @@ fn parse_fork_source(
 /// readonly volumes (pulled or already local), the latest snapshot is
 /// discovered from the local manifests then the `names/<name>` record.
 /// For explicit pins the caller already chose a snapshot.
-///
-/// `force_snapshot` (readonly sources only): upload a new "now" snapshot
-/// marker to the remote store and branch from it. Needed when the source
-/// has no existing snapshot. Conflicts with an explicit pin.
-#[allow(clippy::too_many_arguments)]
 fn create_fork(
     data_dir: &Path,
     fork_name: &str,
@@ -2016,7 +1965,6 @@ fn create_fork(
     coord: &coordinator_client::Client,
     by_id_dir: &Path,
     flags: &[String],
-    force_snapshot: bool,
 ) -> std::io::Result<()> {
     validate_volume_name(fork_name)?;
 
@@ -2028,9 +1976,9 @@ fn create_fork(
         )));
     }
 
-    let source = parse_fork_source(from, force_snapshot)?;
+    let source = parse_fork_source(from)?;
 
-    coord.fork_start(fork_name, source, force_snapshot, flags)?;
+    coord.fork_start(fork_name, source, flags)?;
 
     // Stream coordinator-side progress to stderr (chain pull, snapshot
     // decision, fork mint, prefetch warm-up). The terminal `Done`
@@ -2267,12 +2215,6 @@ fn print_volume_events(reply: &coordinator_client::VolumeEventsReply) {
             EventKind::Released { handoff_snapshot } => {
                 format!(" handoff={handoff_snapshot}")
             }
-            EventKind::ForceReleased {
-                handoff_snapshot,
-                displaced_coordinator_id,
-            } => {
-                format!(" handoff={handoff_snapshot} displaced={displaced_coordinator_id}")
-            }
             EventKind::ForceClaimed {
                 displaced_coordinator_id,
             } => match displaced_coordinator_id {
@@ -2371,7 +2313,7 @@ mod tests {
     fn parse_fork_source_pinned_ulid() {
         let vol = ulid::Ulid::new();
         let snap = ulid::Ulid::new();
-        let src = parse_fork_source(&format!("{vol}/{snap}"), false).unwrap();
+        let src = parse_fork_source(&format!("{vol}/{snap}")).unwrap();
         assert_eq!(
             src,
             coordinator_client::ForkSource::Pinned {
@@ -2384,7 +2326,7 @@ mod tests {
     #[test]
     fn parse_fork_source_pinned_name() {
         let snap = ulid::Ulid::new();
-        let src = parse_fork_source(&format!("base/{snap}"), false).unwrap();
+        let src = parse_fork_source(&format!("base/{snap}")).unwrap();
         assert_eq!(
             src,
             coordinator_client::ForkSource::PinnedName {
@@ -2396,7 +2338,7 @@ mod tests {
 
     #[test]
     fn parse_fork_source_name() {
-        let src = parse_fork_source("base", false).unwrap();
+        let src = parse_fork_source("base").unwrap();
         assert_eq!(
             src,
             coordinator_client::ForkSource::Name {
@@ -2408,21 +2350,13 @@ mod tests {
     #[test]
     fn parse_fork_source_rejects_bare_ulid() {
         let vol = ulid::Ulid::new();
-        let err = parse_fork_source(&vol.to_string(), false).expect_err("bare ULID must refuse");
+        let err = parse_fork_source(&vol.to_string()).expect_err("bare ULID must refuse");
         assert!(err.to_string().contains("snapshot pin"), "{err}");
     }
 
     #[test]
-    fn parse_fork_source_rejects_force_snapshot_with_pin() {
-        let snap = ulid::Ulid::new();
-        let err = parse_fork_source(&format!("base/{snap}"), true)
-            .expect_err("pin + force-snapshot must refuse");
-        assert!(err.to_string().contains("--force-snapshot"), "{err}");
-    }
-
-    #[test]
     fn parse_fork_source_rejects_bad_snapshot_ulid() {
-        let err = parse_fork_source("base/notaulid", false).expect_err("bad snap must refuse");
+        let err = parse_fork_source("base/notaulid").expect_err("bad snap must refuse");
         assert!(err.to_string().contains("invalid snapshot ULID"), "{err}");
     }
 

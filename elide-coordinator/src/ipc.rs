@@ -118,13 +118,8 @@ pub enum Request {
         force: bool,
     },
     /// Drain WAL → publish handoff snapshot → flip `names/<name>`
-    /// to Released. With `force = true`, override an unreachable
-    /// foreign owner (synthesises a handoff from S3-visible segments).
-    Release {
-        volume: String,
-        #[serde(default)]
-        force: bool,
-    },
+    /// to Released.
+    Release { volume: String },
     /// Local resume of a `Stopped` volume. Empty success reply.
     Start { volume: String },
 
@@ -254,16 +249,14 @@ pub enum Request {
     //   * `*Attach` streams progress events until terminal.
     /// Spawn a fork-from-source flow as a background job. The
     /// coordinator does the full orchestration internally: name
-    /// resolution, ancestor-chain pull, snapshot decision (latest,
-    /// implicit, or `force_snapshot`-attested), and the fork mint.
+    /// resolution, ancestor-chain pull, snapshot decision (latest or
+    /// implicit), and the fork mint.
     /// Returns immediately on registration; progress is streamed via
     /// [`Request::ForkAttach`]. The new fork's ULID arrives in the
     /// stream as [`ForkAttachEvent::ForkCreated`].
     ForkStart {
         new_name: String,
         from: ForkSource,
-        #[serde(default)]
-        force_snapshot: bool,
         #[serde(default)]
         flags: Vec<String>,
     },
@@ -453,16 +446,6 @@ pub struct SnapshotReply {
     pub snap_ulid: Ulid,
 }
 
-/// Internal return type for `force_snapshot_now_op`, used by the
-/// fork orchestrator's `--force-snapshot` branch. The attestation
-/// pubkey is hex-encoded so it can be propagated into the new fork's
-/// signed provenance without re-encoding.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ForceSnapshotNowReply {
-    pub snap_ulid: Ulid,
-    pub attestation_pubkey_hex: String,
-}
-
 /// Reply for [`Request::Evict`]. `evicted` counts segment bodies
 /// reclaimed from `cache/`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -537,21 +520,6 @@ pub struct RegisterReply {
     pub peer_endpoint: Option<PeerEndpoint>,
 }
 
-/// Internal return type for `resolve_handoff_key_op`, also embedded
-/// in [`ClaimAttachEvent::HandoffKeyResolved`] so subscribers can
-/// see which key the handoff snapshot is signed under. `Normal`
-/// means the manifest is signed by the source volume's own key (the
-/// source volume's `volume.pub` is the verifying key); `Recovery`
-/// means the manifest is a synthesised handoff snapshot signed by a
-/// recovering coordinator under an attestation key — the carried hex
-/// is the already-verified Ed25519 pubkey.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum ResolveHandoffKeyReply {
-    Normal,
-    Recovery { manifest_pubkey_hex: String },
-}
-
 /// Outcome of verifying a [`VolumeEvent::signature`] against the
 /// emitting coordinator's published `coordinator.pub`.
 ///
@@ -617,10 +585,6 @@ pub enum ForkAttachEvent {
     PullingAncestor { vol_ulid: Ulid },
     /// Took an implicit snapshot of a writable source before forking.
     SnapshotTaken { snap_ulid: Ulid },
-    /// Synthesised an attested "now" snapshot under
-    /// `--force-snapshot`. `pubkey_hex` is the ephemeral attestation
-    /// key the fork's provenance is signed under.
-    AttestedSnapshot { snap_ulid: Ulid, pubkey_hex: String },
     /// Source resolved; about to mint the fork.
     ForkingFrom {
         source_vol_ulid: Ulid,
@@ -657,15 +621,13 @@ pub enum ClaimStartReply {
 
 /// Streaming event for [`Request::ClaimAttach`]. Same envelope shape
 /// as [`ForkAttachEvent`]; named separately so the wire format stays
-/// self-documenting and so claim-only events (handoff-key resolution)
-/// don't pollute the fork enum.
+/// self-documenting and claim-only events don't pollute the fork
+/// enum.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ClaimAttachEvent {
     /// Pulling one ancestor in the released volume's chain.
     PullingAncestor { vol_ulid: Ulid },
-    /// Resolved which key the handoff snapshot is signed under.
-    HandoffKeyResolved { key: ResolveHandoffKeyReply },
     /// Fresh fork minted from the released volume's handoff snapshot.
     ForkCreated { new_vol_ulid: Ulid },
     /// Background prefetch of the ancestor index has started.
@@ -784,10 +746,6 @@ mod tests {
             ForkAttachEvent::SnapshotTaken {
                 snap_ulid: Ulid::nil(),
             },
-            ForkAttachEvent::AttestedSnapshot {
-                snap_ulid: Ulid::nil(),
-                pubkey_hex: "deadbeef".to_owned(),
-            },
             ForkAttachEvent::ForkingFrom {
                 source_vol_ulid: Ulid::nil(),
                 snap_ulid: Some(Ulid::nil()),
@@ -828,14 +786,6 @@ mod tests {
             ClaimAttachEvent::PullingAncestor {
                 vol_ulid: Ulid::nil(),
             },
-            ClaimAttachEvent::HandoffKeyResolved {
-                key: ResolveHandoffKeyReply::Normal,
-            },
-            ClaimAttachEvent::HandoffKeyResolved {
-                key: ResolveHandoffKeyReply::Recovery {
-                    manifest_pubkey_hex: "deadbeef".to_owned(),
-                },
-            },
             ClaimAttachEvent::ForkCreated {
                 new_vol_ulid: Ulid::nil(),
             },
@@ -857,7 +807,6 @@ mod tests {
             from: ForkSource::Name {
                 name: "parent".to_owned(),
             },
-            force_snapshot: true,
             flags: vec!["ublk".to_owned()],
         };
         let s = serde_json::to_string(&req).unwrap();

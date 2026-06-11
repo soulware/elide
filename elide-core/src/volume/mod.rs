@@ -62,7 +62,7 @@ pub use ancestry::{
 pub(crate) use compress::maybe_compress;
 #[cfg(test)]
 pub(in crate::volume) use compress::{MIN_COMPRESSION_RATIO_DEN, MIN_COMPRESSION_RATIO_NUM};
-pub use fork::{fork_volume, fork_volume_at, fork_volume_at_with_manifest_key};
+pub use fork::{fork_volume, fork_volume_at};
 use jobs::GcCheckpointUlids;
 pub use jobs::{
     GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult, PromoteJob, PromoteResult,
@@ -2312,7 +2312,6 @@ impl Volume {
             self.signer.as_ref(),
             &snap_ulid,
             &index_ulids,
-            None,
         )?;
         self.has_new_segments = false;
 

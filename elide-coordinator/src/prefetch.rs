@@ -28,9 +28,6 @@
 //        c. Write atomically to <fork_dir>/index/<ulid>.idx
 //
 // `prefetch_indexes` therefore performs no bucket LISTs.
-// Operator-initiated capture of pre-snapshot bucket state
-// (e.g. `force_snapshot_now`) goes through `pull_indexes_for_head`
-// instead, which resolves the live set from HEAD.
 //
 // After this runs, Volume::open will find the .idx files, rebuild_segments and
 // extentindex::rebuild will both scan index/*.idx, and the volume opens
@@ -155,10 +152,6 @@ pub async fn prefetch_indexes(
         vol_ulid: current_volume_id,
         branch_ulid: None,
         vk: own_vk,
-        // Head fork has no branch_ulid → no manifest is read for it
-        // here. If `latest_snapshot(fork_dir)` later resolves to one
-        // it was authored by *this* fork (own_vk).
-        manifest_vk: own_vk,
     });
 
     // Walk the fork parent chain using embedded pubkeys committed in
@@ -201,27 +194,11 @@ pub async fn prefetch_indexes(
                 parent.volume_ulid
             )
         })?;
-        // Synthesised handoff snapshots (force-released parents) are
-        // signed under the recovering coordinator's attestation key,
-        // not the parent's volume.pub. The child's signed provenance
-        // records that override in `ParentRef::manifest_pubkey`;
-        // honour it here so the manifest verify under
-        // `read_snapshot_manifest` uses the right key.
-        let parent_manifest_vk = match parent.manifest_pubkey {
-            Some(bytes) => VerifyingKey::from_bytes(&bytes).map_err(|e| {
-                anyhow::anyhow!(
-                    "invalid parent manifest_pubkey in provenance for {}: {e}",
-                    parent.volume_ulid
-                )
-            })?,
-            None => parent_vk,
-        };
         tasks.push(PrefetchTask {
             dir: parent_dir.clone(),
             vol_ulid: parent_ulid,
             branch_ulid: Some(parent.snapshot_ulid.clone()),
             vk: parent_vk,
-            manifest_vk: parent_manifest_vk,
         });
         trusted_dirs.push(parent_dir.clone());
         // Continue walking under the pubkey the child committed to.
@@ -272,11 +249,6 @@ pub async fn prefetch_indexes(
             .with_context(|| format!("resolving volume id for {}", ancestor_dir.display()))?;
         let ancestor_vk = signing::load_verifying_key(&ancestor_dir, signing::VOLUME_PUB_FILE)
             .with_context(|| format!("loading volume.pub from {}", ancestor_dir.display()))?;
-        // Extent-index ancestors don't reach the synthesised-handoff
-        // path (their branch ULID is recorded in extent index, not in
-        // the requesting child's provenance, so no
-        // `manifest_pubkey` override applies). Manifest verify and
-        // segment verify both use the ancestor's own volume.pub.
         if !ancestor_ulids.contains(&ancestor_ulid) {
             ancestor_ulids.push(ancestor_ulid);
         }
@@ -285,7 +257,6 @@ pub async fn prefetch_indexes(
             vol_ulid: ancestor_ulid,
             branch_ulid: ancestor.branch_ulid,
             vk: ancestor_vk,
-            manifest_vk: ancestor_vk,
         });
     }
 
@@ -307,7 +278,6 @@ pub async fn prefetch_indexes(
                 task.vol_ulid,
                 task.branch_ulid.as_deref(),
                 &task.vk,
-                &task.manifest_vk,
                 peer.as_ref(),
                 &mut local,
             )
@@ -335,22 +305,14 @@ pub async fn prefetch_indexes(
 /// One unit of prefetch work collected during the lineage walk and
 /// dispatched concurrently in Pass 2.
 ///
-/// `vk` verifies per-segment signatures on `.idx` bytes — those are
-/// always signed by the volume's own `volume.key` regardless of who
-/// authored the snapshot manifest.
-///
-/// `manifest_vk` verifies the snapshot manifest at `branch_ulid`. For
-/// normal handoffs this equals `vk`. For force-released volumes the
-/// manifest is *synthesised* by the recovering coordinator and signed
-/// under its attestation key — the requesting child records that
-/// override key in its own provenance via `ParentRef::manifest_pubkey`,
-/// and we propagate it here so the manifest verify uses the right key.
+/// `vk` verifies both per-segment signatures on `.idx` bytes and the
+/// snapshot manifest at `branch_ulid` — every artefact is signed by
+/// the volume's own `volume.key`.
 struct PrefetchTask {
     dir: PathBuf,
     vol_ulid: Ulid,
     branch_ulid: Option<String>,
     vk: VerifyingKey,
-    manifest_vk: VerifyingKey,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,7 +322,6 @@ async fn prefetch_fork(
     vol_ulid: Ulid,
     branch_ulid: Option<&str>,
     verifying_key: &VerifyingKey,
-    manifest_verifying_key: &VerifyingKey,
     peer: Option<&PeerFetchContext>,
     result: &mut PrefetchResult,
 ) -> Result<()> {
@@ -378,9 +339,7 @@ async fn prefetch_fork(
     //   - Writable head: the latest local snapshot, populated by the
     //     prefetch_snapshots call above. None means this is a fresh
     //     fork (or one that has never published a snapshot) — there's
-    //     nothing for warm-start to fetch. Operator-initiated capture
-    //     of pre-snapshot bucket state belongs in
-    //     [`pull_indexes_for_head`], not here.
+    //     nothing for warm-start to fetch.
     let anchor: Option<String> = match branch_ulid {
         Some(b) => Some(b.to_owned()),
         None => elide_core::volume::latest_snapshot(fork_dir)
@@ -389,62 +348,13 @@ async fn prefetch_fork(
     };
 
     let to_fetch: Vec<(String, Ulid)> = match anchor.as_deref() {
-        Some(snap) => manifest_driven_fetch_set(fork_dir, snap, manifest_verifying_key, result)?,
+        Some(snap) => manifest_driven_fetch_set(fork_dir, snap, verifying_key, result)?,
         None => Vec::new(),
     };
 
     let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     fetch_idx_set(&vd, fork_dir, verifying_key, peer, to_fetch, result).await;
     Ok(())
-}
-
-/// Pull every `.idx` currently *live* for this volume into
-/// `<fork_dir>/index/`. Live set = `manifest.segment_ulids ∪
-/// HEAD.added − HEAD.superseded.inputs − HEAD.tombstoned` per
-/// `docs/design-segment-index.md`. Used by operator IPCs that need
-/// the post-snapshot bucket state — notably `force_snapshot_now`,
-/// which synthesises a handoff manifest from whatever is currently
-/// live *including* segments past the latest snapshot.
-///
-/// `verifying_key` is the volume's `volume.pub`; per-segment
-/// signatures are checked at fetch time, same as the manifest path.
-/// The manifest's own Ed25519 signature is verified by
-/// `resolve_live_segments` (it is the trusted basis for the
-/// snapshot/HEAD boundary).
-///
-/// At most three GETs (`snapshots/LATEST` + manifest + HEAD) plus the
-/// per-`.idx` fetches; no LIST. The warm-start claim path uses
-/// [`prefetch_indexes`] instead, which anchors on a signed manifest
-/// only and skips HEAD.
-pub async fn pull_indexes_for_head(
-    store: &Arc<dyn ObjectStore>,
-    fork_dir: &Path,
-    vol_ulid: Ulid,
-    verifying_key: &VerifyingKey,
-    peer: Option<&PeerFetchContext>,
-) -> Result<PrefetchResult> {
-    let mut result = PrefetchResult::default();
-
-    let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
-    let live = crate::segment_head::resolve_live_segments(&vd, verifying_key)
-        .await
-        .with_context(|| format!("resolving live segments for {vol_ulid}"))?;
-
-    let to_fetch: Vec<(String, Ulid)> = live
-        .into_iter()
-        .filter_map(|ulid| {
-            let ulid_str = ulid.to_string();
-            let local_idx = fork_dir.join("index").join(format!("{ulid_str}.idx"));
-            if local_idx.exists() {
-                result.skipped += 1;
-                return None;
-            }
-            Some((ulid_str, ulid))
-        })
-        .collect();
-
-    fetch_idx_set(&vd, fork_dir, verifying_key, peer, to_fetch, &mut result).await;
-    Ok(result)
 }
 
 /// Drive the parallel `.idx` fetch for a pre-computed set of
@@ -573,24 +483,8 @@ async fn fetch_idx_set(
     }
 }
 
-/// Build the `.idx` fetch set for an ancestor fork from its signed
-/// snapshot manifest at `branch_ulid`.
-///
-/// `prefetch_snapshots` is expected to have already landed
-/// `<fork_dir>/snapshots/<branch_ulid>.manifest` on disk; this helper
-/// reads + verifies it under `manifest_verifying_key` and drops any
-/// segments already present in `index/`. Each remaining ULID is
-/// paired with its computed S3 key via [`crate::upload::segment_key`]
-/// — no bucket LIST is involved.
-///
-/// `manifest_verifying_key` may differ from the ancestor's own
-/// `volume.pub`: synthesised handoff manifests (force-released
-/// parents) are signed under the recovering coordinator's
-/// attestation key, recorded in the requesting child's provenance
-/// via `ParentRef::manifest_pubkey`.
 /// Public entry point for pulling every segment `.idx` referenced by
-/// a volume's basis snapshot manifest into `<fork_dir>/index/`. Used
-/// by the `volume fetch` orchestration to warm a foreign volume
+/// a volume's basis snapshot manifest into `<fork_dir>/index/`,
 /// without going through the full prefetch pipeline (which is
 /// peer-tier-aware and tied to the claim path).
 ///
@@ -618,19 +512,27 @@ pub async fn pull_indexes_for_snapshot(
     Ok(n)
 }
 
+/// Build the `.idx` fetch set for an ancestor fork from its signed
+/// snapshot manifest at `branch_ulid`.
+///
+/// `prefetch_snapshots` is expected to have already landed
+/// `<fork_dir>/snapshots/<branch_ulid>.manifest` on disk; this helper
+/// reads + verifies it under `verifying_key` and drops any segments
+/// already present in `index/`. Each remaining ULID is paired with
+/// its computed S3 key via [`crate::upload::segment_key`] — no bucket
+/// LIST is involved.
 fn manifest_driven_fetch_set(
     fork_dir: &Path,
     branch_ulid: &str,
-    manifest_verifying_key: &VerifyingKey,
+    verifying_key: &VerifyingKey,
     result: &mut PrefetchResult,
 ) -> Result<Vec<(String, Ulid)>> {
     let snap_ulid = Ulid::from_string(branch_ulid)
         .map_err(|e| anyhow::anyhow!("invalid branch ULID '{branch_ulid}': {e}"))?;
-    let manifest =
-        elide_core::signing::read_snapshot_manifest(fork_dir, manifest_verifying_key, &snap_ulid)
-            .with_context(|| {
+    let manifest = elide_core::signing::read_snapshot_manifest(fork_dir, verifying_key, &snap_ulid)
+        .with_context(|| {
             format!(
-                "reading snapshot manifest {branch_ulid} for {} (verifying under manifest pubkey)",
+                "reading snapshot manifest {branch_ulid} for {}",
                 fork_dir.display()
             )
         })?;
@@ -987,7 +889,6 @@ mod tests {
                     volume_ulid: parent_ulid.to_owned(),
                     snapshot_ulid: snap_ulid.to_owned(),
                     pubkey: parent_key.verifying_key().to_bytes(),
-                    manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
                 oci_source: None,
@@ -1011,7 +912,6 @@ mod tests {
         let manifest_bytes = build_snapshot_manifest_bytes(
             parent_signer.as_ref(),
             &[Ulid::from_string(seg_ulid).unwrap()],
-            None,
         );
         crate::volume_data::VolumeData::new(
             Arc::clone(&store),
@@ -1116,7 +1016,6 @@ mod tests {
                     volume_ulid: parent_ulid.to_owned(),
                     snapshot_ulid: snap_ulid.to_owned(),
                     pubkey: parent_key.verifying_key().to_bytes(),
-                    manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
                 oci_source: None,
@@ -1137,7 +1036,6 @@ mod tests {
         let manifest_bytes = build_snapshot_manifest_bytes(
             parent_signer.as_ref(),
             &[Ulid::from_string(seg_ulid).unwrap()],
-            None,
         );
         crate::volume_data::VolumeData::new(
             Arc::clone(&store),
@@ -1164,138 +1062,6 @@ mod tests {
                 .exists(),
             "child must not inherit parent's .idx"
         );
-    }
-
-    /// Synthesised handoff manifest: a force-released parent's
-    /// snapshot is signed under the recovering coordinator's
-    /// attestation key, **not** the parent's `volume.pub`. The
-    /// requesting child's provenance records the override via
-    /// `ParentRef::manifest_pubkey`. Prefetch must verify the parent's
-    /// manifest under that override pubkey, while still verifying the
-    /// segment `.idx` bytes under the parent's own volume key (those
-    /// were signed when the parent was alive).
-    ///
-    /// Regression: prior to this fix `prefetch` used a single
-    /// `verifying_key` for both manifest verify and segment verify,
-    /// so any claim from a force-release immediately failed
-    /// startup with `manifest signature invalid` and the volume
-    /// supervisor entered a respawn loop. Reproduced live by
-    /// `volume release --force` followed by `volume claim` + `start`.
-    #[tokio::test]
-    async fn prefetch_indexes_verifies_synthesised_handoff_manifest_under_override_key() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path();
-        let by_id = data_dir.join("by_id");
-
-        let parent_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
-        let child_ulid = "01JQBBBBBBBBBBBBBBBBBBBBBB";
-        let parent_dir = by_id.join(parent_ulid);
-        let child_dir = by_id.join(child_ulid);
-
-        std::fs::create_dir_all(parent_dir.join("snapshots")).unwrap();
-        std::fs::create_dir_all(child_dir.join("pending")).unwrap();
-
-        // Parent's own volume key signs its segments. Child has its
-        // own key. The "recovering coordinator" key is what signed
-        // the synthesised handoff manifest after the force-release.
-        let parent_key = generate_keypair(&parent_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
-        let child_key = generate_keypair(&child_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
-        let recovering_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-
-        write_provenance(
-            &parent_dir,
-            &parent_key,
-            VOLUME_PROVENANCE_FILE,
-            &ProvenanceLineage::default(),
-        )
-        .unwrap();
-
-        let data = vec![0xC1u8; 4096];
-        let hash = blake3::hash(&data);
-        let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let mut entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            data,
-        )];
-        // Segment is signed by the parent's own key (it was minted
-        // when the parent was still alive).
-        let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
-        let staging = tmp.path().join(seg_ulid);
-        write_segment(&staging, &mut entries, parent_signer.as_ref()).unwrap();
-
-        let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
-        std::fs::write(parent_dir.join("snapshots").join(snap_ulid), "").unwrap();
-
-        // Child's signed provenance overrides the manifest pubkey to
-        // the recovering coordinator's attestation key. The parent's
-        // own pubkey still authoritatively verifies its segments.
-        write_provenance(
-            &child_dir,
-            &child_key,
-            VOLUME_PROVENANCE_FILE,
-            &ProvenanceLineage {
-                parent: Some(elide_core::signing::ParentRef {
-                    volume_ulid: parent_ulid.to_owned(),
-                    snapshot_ulid: snap_ulid.to_owned(),
-                    pubkey: parent_key.verifying_key().to_bytes(),
-                    manifest_pubkey: Some(recovering_key.verifying_key().to_bytes()),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-            },
-        )
-        .unwrap();
-
-        let store_tmp = TempDir::new().unwrap();
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
-        let seg_bytes = std::fs::read(&staging).unwrap();
-        let seg_key =
-            crate::upload::segment_key(parent_ulid.parse().unwrap(), seg_ulid.parse().unwrap());
-        store.put(&seg_key, seg_bytes.into()).await.unwrap();
-
-        // Synthesised manifest signed under the *recovering coord*
-        // key, not the parent's. Without the override the verify
-        // step fails with `manifest signature invalid`.
-        struct AttestationSigner(ed25519_dalek::SigningKey);
-        impl elide_core::segment::SegmentSigner for AttestationSigner {
-            fn sign(&self, msg: &[u8]) -> [u8; 64] {
-                use ed25519_dalek::Signer;
-                self.0.sign(msg).to_bytes()
-            }
-        }
-        let attestation_signer = AttestationSigner(recovering_key.clone());
-        let manifest_bytes = build_snapshot_manifest_bytes(
-            &attestation_signer,
-            &[Ulid::from_string(seg_ulid).unwrap()],
-            None,
-        );
-        crate::volume_data::VolumeData::new(
-            Arc::clone(&store),
-            Ulid::from_string(parent_ulid).unwrap(),
-        )
-        .snapshots()
-        .put_manifest(snap_ulid.parse().unwrap(), manifest_bytes.into())
-        .await
-        .unwrap();
-
-        // Run prefetch on the child. Should succeed: manifest verifies
-        // under the override key, the .idx itself verifies under the
-        // parent's volume.pub.
-        let result = prefetch_indexes(&child_dir, &passthrough(&store), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            result.fetched, 1,
-            "synthesised handoff manifest must verify under override key"
-        );
-        assert_eq!(result.failed, 0);
-
-        let idx_path = parent_dir.join("index").join(format!("{seg_ulid}.idx"));
-        assert!(idx_path.exists(), ".idx fetched and written");
     }
 
     /// Root volume with a published manifest: warm-start `prefetch_indexes`
@@ -1344,11 +1110,8 @@ mod tests {
         // by the volume's own key. This is the manifest the warm-start
         // prefetch path will anchor on for the writable head.
         let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
-        let manifest_bytes = build_snapshot_manifest_bytes(
-            signer.as_ref(),
-            &[Ulid::from_string(seg_ulid).unwrap()],
-            None,
-        );
+        let manifest_bytes =
+            build_snapshot_manifest_bytes(signer.as_ref(), &[Ulid::from_string(seg_ulid).unwrap()]);
         crate::volume_data::VolumeData::new(
             Arc::clone(&store),
             Ulid::from_string(root_ulid).unwrap(),
@@ -1385,8 +1148,7 @@ mod tests {
 
     /// Fresh writable head with no published snapshot: warm-start
     /// `prefetch_indexes` is a no-op (manifest-anchored, nothing to
-    /// anchor on). Operator-initiated capture of pre-snapshot bucket
-    /// state belongs in [`pull_indexes_for_head`].
+    /// anchor on).
     #[tokio::test]
     async fn prefetch_indexes_is_noop_for_root_without_snapshot() {
         let tmp = TempDir::new().unwrap();
@@ -1439,109 +1201,6 @@ mod tests {
         );
     }
 
-    /// HEAD awareness: an input segment listed in HEAD's `Superseded`
-    /// map must be skipped during `pull_indexes_for_head`. The warm-
-    /// start `prefetch_indexes` path anchors on the manifest only and
-    /// never reads HEAD; the HEAD-aware path here is the one operator
-    /// IPCs use to capture post-snapshot bucket state.
-    #[tokio::test]
-    async fn pull_for_head_skips_segments_superseded_in_head() {
-        let tmp = TempDir::new().unwrap();
-        let by_id = tmp.path().join("by_id");
-        let root_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
-        let root_ulid = Ulid::from_string(root_ulid_str).unwrap();
-        let root_dir = by_id.join(root_ulid_str);
-        std::fs::create_dir_all(&root_dir).unwrap();
-
-        let _key = generate_keypair(&root_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
-        let vk = elide_core::signing::load_verifying_key(&root_dir, VOLUME_PUB_FILE).unwrap();
-
-        let old_ulid_str = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let new_ulid_str = "01BBBBBBBBBBBBBBBBBBBBBBBB";
-        let old_ulid = Ulid::from_string(old_ulid_str).unwrap();
-        let new_ulid = Ulid::from_string(new_ulid_str).unwrap();
-        let signer = load_signer(&root_dir, VOLUME_KEY_FILE).unwrap();
-
-        let write_seg = |ulid_str: &str, fill: u8| {
-            let data = vec![fill; 4096];
-            let mut entries = vec![SegmentEntry::new_data(
-                blake3::hash(&data),
-                0,
-                1,
-                SegmentFlags::empty(),
-                data,
-            )];
-            let staging = tmp.path().join(ulid_str);
-            write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
-            std::fs::read(&staging).unwrap()
-        };
-        let old_bytes = write_seg(old_ulid_str, 0x11);
-        let new_bytes = write_seg(new_ulid_str, 0x22);
-
-        let store_tmp = TempDir::new().unwrap();
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
-        store
-            .put(
-                &crate::upload::segment_key(
-                    root_ulid_str.parse().unwrap(),
-                    old_ulid_str.parse().unwrap(),
-                ),
-                old_bytes.into(),
-            )
-            .await
-            .unwrap();
-        store
-            .put(
-                &crate::upload::segment_key(
-                    root_ulid_str.parse().unwrap(),
-                    new_ulid_str.parse().unwrap(),
-                ),
-                new_bytes.into(),
-            )
-            .await
-            .unwrap();
-
-        // Seed HEAD: `new` added, `old` superseded by `new`. The
-        // resolver excludes `old` from the live set, so the pull only
-        // fetches `new`.
-        let mut head = crate::segment_head::SegmentHead::empty(None);
-        head.added.insert(new_ulid);
-        head.superseded.insert(
-            old_ulid,
-            crate::segment_head::Supersession {
-                output: new_ulid,
-                since: chrono::Utc::now(),
-            },
-        );
-        crate::volume_data::VolumeData::new(Arc::clone(&store), root_ulid)
-            .head()
-            .put(&head)
-            .await
-            .unwrap();
-
-        let result = pull_indexes_for_head(&store, &root_dir, root_ulid, &vk, None)
-            .await
-            .unwrap();
-        assert_eq!(result.fetched, 1, "only the GC output should be fetched");
-        assert_eq!(result.failed, 0);
-
-        assert!(
-            root_dir
-                .join("index")
-                .join(format!("{new_ulid_str}.idx"))
-                .exists(),
-            "GC output .idx must be fetched"
-        );
-        assert!(
-            !root_dir
-                .join("index")
-                .join(format!("{old_ulid_str}.idx"))
-                .exists(),
-            "superseded input .idx must NOT be fetched"
-        );
-    }
-
     #[tokio::test]
     async fn prefetch_downloads_snapshot_marker_but_skips_filemap() {
         let tmp = TempDir::new().unwrap();
@@ -1572,7 +1231,7 @@ mod tests {
         // .idx path will read+verify it under the volume's pubkey.
         let snap_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let signer = load_signer(&vol_dir, VOLUME_KEY_FILE).unwrap();
-        let manifest_bytes = build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
+        let manifest_bytes = build_snapshot_manifest_bytes(signer.as_ref(), &[]);
         let vd_seed = crate::volume_data::VolumeData::new(
             Arc::clone(&store),
             Ulid::from_string(vol_ulid).unwrap(),
@@ -1665,7 +1324,6 @@ mod tests {
                     volume_ulid: parent_ulid.to_owned(),
                     snapshot_ulid: branch.to_owned(),
                     pubkey: parent_key.verifying_key().to_bytes(),
-                    manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
                 oci_source: None,
@@ -1683,8 +1341,7 @@ mod tests {
         // manifest-driven .idx path will read+verify it; the other two
         // are junk to verify the branch filter doesn't pull them.
         let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
-        let branch_manifest_bytes =
-            build_snapshot_manifest_bytes(parent_signer.as_ref(), &[], None);
+        let branch_manifest_bytes = build_snapshot_manifest_bytes(parent_signer.as_ref(), &[]);
         let parent_vd = crate::volume_data::VolumeData::new(
             Arc::clone(&store),
             Ulid::from_string(parent_ulid).unwrap(),
@@ -1832,7 +1489,6 @@ mod tests {
                     volume_ulid: parent_ulid.to_owned(),
                     snapshot_ulid: branch.to_owned(),
                     pubkey: parent_key.verifying_key().to_bytes(),
-                    manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
                 oci_source: None,
@@ -1850,7 +1506,7 @@ mod tests {
         // record; the test also uploads a stale bare-ULID marker
         // below to confirm prefetch ignores pre-#215 bucket residue.
         let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
-        let manifest_bytes = build_snapshot_manifest_bytes(parent_signer.as_ref(), &[], None);
+        let manifest_bytes = build_snapshot_manifest_bytes(parent_signer.as_ref(), &[]);
         crate::volume_data::VolumeData::new(
             Arc::clone(&store),
             Ulid::from_string(parent_ulid).unwrap(),

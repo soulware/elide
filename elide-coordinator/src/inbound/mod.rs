@@ -30,8 +30,6 @@ pub(crate) use lifecycle::{
 // Reached by `claim.rs`'s crash-recovery test (#428), which drives the
 // real force-release op against a partial-fork shape.
 #[cfg(test)]
-pub(crate) use lifecycle::force_release_volume_op;
-
 // Shared test fixtures used by both `mod.rs::tests` and
 // `lifecycle.rs::tests`. Keeping them at the module level (rather
 // than inside one of the `tests` modules) lets the sibling test
@@ -104,12 +102,10 @@ pub struct IpcContext {
     pub prefetch_tracker: PrefetchTracker,
     pub readiness_tracker: ReadinessTracker,
     pub stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
-    /// The coordinator's identity bundle. Used as a `SegmentSigner`
-    /// when minting synthesised handoff snapshots during
-    /// `volume release --force`, and as the source of the coordinator
-    /// id (`identity.coordinator_id_str()`) and the 32-byte macaroon
-    /// MAC root (`identity.macaroon_root()`). Arc-shared so per-
-    /// connection clones stay cheap.
+    /// The coordinator's identity bundle: the source of the
+    /// coordinator id (`identity.coordinator_id_str()`) and the
+    /// 32-byte macaroon MAC root (`identity.macaroon_root()`).
+    /// Arc-shared so per-connection clones stay cheap.
     pub identity: Arc<elide_coordinator::identity::CoordinatorIdentity>,
     /// Credentialer, present only when the `[iam]` config section is set.
     /// Used by the volume-delete path to tear down the per-volume RO
@@ -301,30 +297,12 @@ async fn dispatch_json(
             let env: Envelope<()> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
-        Request::Release { volume, force } => {
-            // Mixed: per-volume snapshot publish + names/<volume> flip.
-            // Coordinator-wide today; future Tigris work splits this.
-            let result = if force {
-                // force-release straddles two role scopes: coord-rw
-                // for names/<name> + events/<name>/, and per-vol
-                // volume-rw for by_id/<dead_vol>/. Pass the
-                // `ScopedStores` so the op can pick the right
-                // credential for each step.
-                lifecycle::force_release_volume_op(
-                    &volume,
-                    &ctx.data_dir,
-                    &ctx.stores,
-                    &ctx.identity,
-                )
-                .await
-            } else {
-                // `release_volume_op` straddles two role scopes
-                // (coord-rw for names/<name> + per-vol volume-rw
-                // for by_id/<vol>/snapshots/). It picks the right
-                // credential for each step internally; just hand it
-                // the IpcContext.
-                lifecycle::release_volume_op(&volume, ctx).await
-            };
+        Request::Release { volume } => {
+            // `release_volume_op` straddles two role scopes (coord-rw
+            // for names/<name> + per-vol volume-rw for
+            // by_id/<vol>/snapshots/). It picks the right credential
+            // for each step internally; just hand it the IpcContext.
+            let result = lifecycle::release_volume_op(&volume, ctx).await;
             let env: Envelope<ReleaseReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -487,11 +465,9 @@ async fn dispatch_json(
         Request::ForkStart {
             new_name,
             from,
-            force_snapshot,
             flags,
         } => {
-            let result =
-                crate::fork::start_fork(new_name, from, force_snapshot, flags, ctx.for_fork());
+            let result = crate::fork::start_fork(new_name, from, flags, ctx.for_fork());
             let env: Envelope<ForkStartReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -942,15 +918,9 @@ fn covering_local_snapshot(
     None
 }
 
-/// Pick a snapshot ULID as the max ULID in `fork_dir/index/`.
-///
-/// Returns `None` when `index/` is empty or missing — the coordinator must
-/// never mint ULIDs, so an empty fork has no valid snapshot tag and the
-/// caller rejects the snapshot request.
 /// Pick the ULID to tag a snapshot with: the max segment ULID in
-/// `index/` if any are present, else a fresh `Ulid::new()`. Mirrors
-/// `force_snapshot_now_op` at `inbound.rs` (the ancestor-pin path),
-/// so empty volumes get a valid snapshot tag through both paths.
+/// `fork_dir/index/` if any are present, else a fresh `Ulid::new()`,
+/// so empty volumes still get a valid snapshot tag.
 fn pick_snapshot_ulid(fork_dir: &Path) -> std::io::Result<ulid::Ulid> {
     let index_dir = fork_dir.join("index");
     let mut latest: Option<ulid::Ulid> = None;
@@ -1358,19 +1328,16 @@ fn bound_ublk_id(vol_dir: &Path) -> Option<i32> {
 /// "Fully durable" means: no segments awaiting upload (`pending/` empty)
 /// and no unflushed WAL records (`wal/` empty). Both directories are
 /// populated by writes and emptied by the drain pipeline.
-/// Post-flip best-effort housekeeping shared by `volume release`,
-/// `volume release --force`, and the breadcrumb-only release path.
-/// Each successful bucket flip (`mark_released` / `mark_released_force`
-/// returning `Updated`) wants to do the same three things in the
-/// same order:
+/// Post-flip best-effort housekeeping shared by `volume release` and
+/// the breadcrumb-only release path. Each successful bucket flip
+/// (`mark_released` returning `Updated`) wants to do the same three
+/// things in the same order:
 ///
 ///   1. If we have a local fork: write `volume.released` so
 ///      `volume list` reflects the new state without a bucket
 ///      round-trip. Failure is logged but non-fatal — the bucket
 ///      record is authoritative.
-///   2. Emit a journal entry recording the transition. The event
-///      kind varies: `Released` for the normal verb,
-///      `ForceReleased` for the override path. Best-effort.
+///   2. Emit a journal entry recording the transition. Best-effort.
 ///   3. If a remote breadcrumb existed for this name, clear it.
 ///      Some paths don't have a breadcrumb to clear (the standard
 ///      local-fork release); a missing breadcrumb is a no-op.
@@ -1412,7 +1379,7 @@ async fn emit_release_aftermath(
 
 /// Guard run early in every `volume release` variant (local fork
 /// and breadcrumb-only): pass through on `OwnedByUs`; refuse on
-/// foreign-owned (point at `release --force`), already-released,
+/// foreign-owned (point at `claim --force`), already-released,
 /// or readonly records; surface the caller-supplied `absent_msg`
 /// as the `not_found` reason. The error strings are
 /// operator-facing and load-bearing for discoverability — keep
@@ -1427,7 +1394,7 @@ fn ensure_release_eligible(
         OwnershipPosition::OwnedByUs { .. } => Ok(()),
         OwnershipPosition::OwnedByOther { coord_id, .. } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is owned by coordinator {coord_id}; \
-             run `volume release --force` to override"
+             if that owner is dead, run `volume claim --force` to take over"
         ))),
         OwnershipPosition::Released { .. } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is already released"
@@ -1628,7 +1595,7 @@ async fn create_volume_op(
 
     // Phase 3: claim the name in S3. After this point the names/<name>
     // record exists in the bucket and references a vol_ulid whose
-    // volume.pub is already uploaded — recovery via `release --force`
+    // volume.pub is already uploaded — recovery via `claim --force`
     // is always possible from here on.
     use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome};
     match core
@@ -1818,19 +1785,6 @@ async fn update_volume_op(
 
 // ── Volume fork (create --from) plumbing ──────────────────────────────────────
 
-/// Decode a 64-character hex string into a 32-byte array (Ed25519 pubkey).
-pub(crate) fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
-    if s.len() != 64 {
-        return Err(format!("expected 64 hex chars, got {}", s.len()));
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|_| format!("invalid hex at byte {i}"))?;
-    }
-    Ok(out)
-}
-
 /// Pull one readonly ancestor from the store.
 ///
 /// Downloads `volume.pub` and `volume.provenance` and writes the ancestor
@@ -1877,8 +1831,8 @@ pub(crate) async fn pull_readonly_op(
     // is self-consistent (provenance signature checked against the
     // just-downloaded volume.pub) — peer-served forgery isn't caught here
     // and is the caller's responsibility to detect downstream (typically
-    // by failing to verify a real S3-rooted artifact, e.g. the released
-    // volume's handoff manifest in `resolve_handoff_key_op`). The
+    // by failing to verify a real S3-rooted artifact, e.g. the handoff
+    // manifest fetched in `skip_empty_intermediates`). The
     // [`PulledAncestorsGuard`] in `run_claim_job` cleans up on that
     // downstream failure.
     let verify_started = std::time::Instant::now();
@@ -2590,7 +2544,6 @@ mod tests {
                     volume_ulid: parent_str.to_owned(),
                     snapshot_ulid: "01JQCCCCCCCCCCCCCCCCCCCCCC".to_owned(),
                     pubkey: self_key.verifying_key().to_bytes(),
-                    manifest_pubkey: None,
                 }),
                 extent_index: Vec::new(),
                 oci_source: None,
@@ -2669,27 +2622,6 @@ mod tests {
         assert!(validate_volume_name("foo/bar").is_err());
         assert!(validate_volume_name("status").is_err());
         assert!(validate_volume_name("attach").is_err());
-    }
-
-    #[test]
-    fn decode_hex32_roundtrip() {
-        let bytes = [0xAB; 32];
-        let s: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(decode_hex32(&s).unwrap(), bytes);
-    }
-
-    #[test]
-    fn decode_hex32_wrong_length() {
-        assert!(decode_hex32("abcd").is_err());
-        assert!(decode_hex32(&"a".repeat(63)).is_err());
-        assert!(decode_hex32(&"a".repeat(65)).is_err());
-    }
-
-    #[test]
-    fn decode_hex32_invalid_chars() {
-        let mut s = "ab".repeat(32);
-        s.replace_range(2..4, "zz");
-        assert!(decode_hex32(&s).is_err());
     }
 
     // ── status-remote ─────────────────────────────────────────────────────

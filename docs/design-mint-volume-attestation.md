@@ -245,7 +245,7 @@ Because a discharge can be cached (see *TPC structure*), its `exp` is the
 keeps vouching after the live owner has changed. The two modes sit
 at opposite ends:
 
-- **RW-self** is liveness-sensitive: a force-release or handoff revokes
+- **RW-self** is liveness-sensitive: a forced claim or handoff revokes
   ownership, so a stale RW discharge would keep minting writer keypairs
   for a deposed owner. `discharge_ttl` here should be short — on the order
   of the Tigris keypair lifetime (**start at ~5 min**) — so re-attestation
@@ -401,9 +401,9 @@ owner, so the rework gives the operation to the next owner: recovery is
    recovery-correct provisional basis: mint the fork, write the
    provisional provenance with `ParentRef = (dead_vol,
    latest_snapshot)`, and force-CAS `names/<name>` to the claimant. The
-   forced CAS is the fence point, exactly as in force-release today. (A
-   dead volume that never published a snapshot has no basis: the fork
-   is minted as a root and step 2 re-owns every live segment.)
+   forced CAS is the fence point. (A dead volume that never published
+   a snapshot has no basis: the new fork takes over the dead fork's
+   own `ParentRef` and step 2 re-owns every live segment.)
 2. **Re-own the head delta, anchored.** The live segments above
    `latest_snapshot` — resolved from one post-CAS read of the dead
    volume's HEAD, the cut that defines the claim set — become the new

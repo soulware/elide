@@ -16,10 +16,10 @@
 //! introduces no new artifacts, and is best-effort by design (per
 //! `docs/design-peer-segment-fetch.md` § "Discovery").
 //!
-//! Importantly, `force_released` is **not** a valid handoff signal:
-//! the emitter of a `force_released` event is the *recovering*
+//! Importantly, `force_claimed` is **not** a valid handoff signal:
+//! the emitter of a `force_claimed` event is the *displacing*
 //! coordinator, not the coordinator that previously held the volume's
-//! cache warm. Attempting to peer-fetch from the recovering host
+//! cache warm. Attempting to peer-fetch from the displacing host
 //! gives nothing; the only sensible fallback in that case is direct
 //! S3, which is exactly what `None` selects.
 
@@ -170,7 +170,7 @@ pub async fn discover_peer_for_claim(
     // The typical tail after a fresh claim:
     //   - `[…, Released-by-A, Claimed-by-B]` → 2 events scanned
     //   - `[…, Released-by-A]` (still unclaimed) → 1 event
-    //   - `[…, ForceReleased]`/`Created`/etc. → 1 event
+    //   - `[…, ForceClaimed]`/`Created`/etc. → 1 event
     let mut keys: HashMap<String, VerifyingKey> = HashMap::new();
     let coord_id = match find_releaser(store, volume_name, &events, &mut keys).await {
         FindReleaserOutcome::Found(coord_id) => coord_id,
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_none_for_force_released() {
+    async fn returns_none_for_force_claimed() {
         let store = store().await;
         let (ident, _tmp) = make_coord(&store).await;
         let vol_ulid = Ulid::new();
@@ -408,15 +408,14 @@ mod tests {
             .emit(&ident, "vol", EventKind::Created, vol_ulid)
             .await
             .unwrap();
-        // ForceReleased — the emitter is the recovering coordinator,
+        // ForceClaimed — the emitter is the displacing coordinator,
         // not the previous owner; peer-fetch must fall back to S3.
         journal_for(&store)
             .emit(
                 &ident,
                 "vol",
-                EventKind::ForceReleased {
-                    handoff_snapshot: Ulid::new(),
-                    displaced_coordinator_id: "old-coord".to_owned(),
+                EventKind::ForceClaimed {
+                    displaced_coordinator_id: Some("old-coord".to_owned()),
                 },
                 vol_ulid,
             )
