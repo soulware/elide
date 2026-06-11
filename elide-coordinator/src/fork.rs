@@ -278,20 +278,12 @@ impl ForkOrchestrator {
     /// the bucket record was consulted.
     async fn resolve_by_name(&self, name: &str) -> Result<(Ulid, Option<Ulid>), IpcError> {
         validate_volume_name(name).map_err(IpcError::bad_request)?;
-        let local = self.ctx.core.data_dir.join("by_name").join(name);
-        if local.exists() {
-            let canon = std::fs::canonicalize(&local)
-                .map_err(|e| IpcError::internal(format!("canonicalize by_name/{name}: {e}")))?;
-            let ulid_str = canon
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| IpcError::internal("by_name link has non-utf8 target"))?;
-            let vol_ulid = Ulid::from_string(ulid_str).map_err(|e| {
-                IpcError::internal(format!(
-                    "by_name/{name} target {ulid_str:?} not a ULID: {e}"
-                ))
-            })?;
-            return Ok((vol_ulid, None));
+        match elide_coordinator::volume_state::resolve_volume_ulid(&self.ctx.core.data_dir, name) {
+            Ok(vol_ulid) => return Ok((vol_ulid, None)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(IpcError::internal(format!("resolving by_name/{name}: {e}")));
+            }
         }
         self.job.append(ForkAttachEvent::ResolvingName {
             name: name.to_owned(),

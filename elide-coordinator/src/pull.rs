@@ -66,7 +66,7 @@ pub async fn pull_volume_skeleton(
     vol_ulid: Ulid,
     peer: Option<&PeerFetchContext>,
 ) -> Result<PathBuf> {
-    let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
+    let vol_dir = crate::volume_state::fork_dir(data_dir, vol_ulid);
     if vol_dir.exists() {
         return Ok(vol_dir);
     }
