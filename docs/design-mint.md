@@ -1789,10 +1789,11 @@ identical to `volume-ro` but with write actions.
   the window; WAL absorbs a brief refresh stall), and 24h bounds the
   write/delete revocation window on a single volume.
 - **Policy:** `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on
-  `arn:aws:s3:::{{env.bucket}}/by_id/{{req.volume}}/*`,
-  plus the volume's two exact `meta/{{req.volume}}.provenance`
-  and `meta/{{req.volume}}.pub` objects (the drain uploads
-  them; the forced-claim re-own reads `volume.pub`). Single volume only.
+  `arn:aws:s3:::{{env.bucket}}/by_id/{{req.volume}}/*`. Single volume
+  only. The volume's `meta/` trust anchors are *not* here: they are
+  written once at creation on `coord-rw` (identity establishment — the
+  attestation doc § *New-volume bootstrap*; a volume cannot attest its
+  own first write) and read on `coord-ro`.
 
 GC and the reaper cross volume boundaries (read ancestor/input prefixes,
 delete a consumed prefix). GC *input reads* compose by assuming `volume-ro`
@@ -1804,10 +1805,10 @@ covered by `volume-rw` on that volume.)
 
 Coordinator-wide write authority: name claim / rename / forced claim
 / rollback (`names/`), event-journal appends and reads (`events/`),
-and this coordinator's own identity records
-(`coordinators/<sub>/`). One role, one credential, one keypair cache.
-The IAM-layer invariants ride the policy *template*, not key
-partitioning:
+this coordinator's own identity records (`coordinators/<sub>/`), and
+new-volume identity establishment (`meta/`). One role, one credential,
+one keypair cache. The IAM-layer invariants ride the policy
+*template*, not key partitioning:
 
 - **Required caveats:** `sub`, `aud=mint`, `exp`
 - **Caveat substitution:** `caveat.sub` (this coordinator's MAC-verified
@@ -1828,6 +1829,16 @@ partitioning:
     chain. **`coordinators/` immutability** is enforced here; a leaked key
     can rewrite only *this* coordinator's identity, never impersonate
     another, and never delete.
+  - `s3:PutObject` (**no** `s3:DeleteObject`) on
+    `arn:aws:s3:::{{env.bucket}}/meta/*` — new-volume identity
+    establishment (the attestation doc § *New-volume bootstrap*): the
+    initial `meta/<vol>.{pub,provenance}` uploads, sent as conditional
+    creates (`If-None-Match: *`) so published anchors are write-once at
+    the store layer. Tigris IAM cannot require the header, so the
+    create-only discipline is client-side; the trust bar against a
+    malicious holder is this role itself, which already carries the
+    strictly stronger `names/*` rebind. Reads of `meta/*` stay on
+    `coord-ro`.
 
 No `s3:ListBucket` statement: every per-volume and control-plane
 LIST in the coordinator runtime has been replaced by a deterministic
