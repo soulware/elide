@@ -891,19 +891,15 @@ allows it; pin with vectors only where it does not.
 
 ## Open
 
-- **Keyless readonly pulls.** A readonly base pulled to a host other
-  than its importer has no `volume.key` there — keys never leave the
-  importing host — so it cannot anchor a discharge at all, regardless
-  of record state. Fork-from-a-base is unaffected (claim-first ordering
-  means the new fork anchors the chain pull, and the base sits in its
-  read set); the exposure is the bare pre-seed verb
-  (`pull_readonly_op`'s prefetch fan-out, which anchors on the base
-  itself). Unresolved: rework the bare pull to require a local anchor,
-  retire it, or add a coordinator-identity-anchored mode for published
-  bases.
 - **The import-drain window.** During import the volume's
   `names/<name>` record does not exist — it is written once at
   completion, when the size is known — so an `rw-self` discharge for
   the import drain has nothing to verify against. Sealing `volume-rw`
   with the attestation TPC needs this resolved (e.g. a record written
-  at import start) before import can run under it.
+  at import start) before import can run under it. The same fix is
+  what a cross-host `--extents-from` would ride if ever built: a
+  foreign source's skeleton pull is `coord-ro`, its snapshot pin comes
+  off the source's `Readonly` record, and its idx/filemap reads during
+  import are ordinary `ro-ancestor` reads — the source is in the
+  importer's provenance `extent_index`, so the importer anchors them
+  once it has a record to discharge against.
