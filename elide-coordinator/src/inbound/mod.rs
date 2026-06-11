@@ -683,18 +683,17 @@ async fn evict_volume(
     data_dir: &Path,
     evict_registry: &EvictRegistry,
 ) -> Result<EvictReply, IpcError> {
-    // Resolve name → fork directory path using the same construction as
-    // daemon.rs (data_dir.join("by_id/<ulid>")), so the key matches the
-    // EvictRegistry entry.  canonicalize() returns an absolute path which
-    // would not match when data_dir is relative.
-    let link = data_dir.join("by_name").join(vol_name);
-    let target = std::fs::read_link(&link)
-        .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
-    // The symlink target is ../by_id/<ulid>; extract just the ULID component.
-    let ulid_component = target
-        .file_name()
-        .ok_or_else(|| IpcError::internal(format!("malformed volume symlink: {vol_name}")))?;
-    let fork_dir = data_dir.join("by_id").join(ulid_component);
+    let vol_ulid = elide_coordinator::volume_state::resolve_volume_ulid(data_dir, vol_name)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                IpcError::not_found(format!("volume not found: {vol_name}"))
+            }
+            _ => IpcError::internal(format!("resolving volume '{vol_name}': {e}")),
+        })?;
+    // The EvictRegistry key is built from `data_dir` (daemon.rs), so the
+    // fork dir must be reconstructed the same way — a canonicalised path
+    // would not match when `data_dir` is relative.
+    let fork_dir = elide_coordinator::volume_state::fork_dir(data_dir, vol_ulid);
 
     // Look up the fork's evict sender.
     let sender = evict_registry
@@ -968,9 +967,14 @@ async fn generate_filemap_op(
     data_dir: &Path,
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> Result<GenerateFilemapReply, IpcError> {
-    let link = data_dir.join("by_name").join(vol_name);
-    let fork_dir = std::fs::canonicalize(&link)
-        .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
+    let leaf_ulid = elide_coordinator::volume_state::resolve_volume_ulid(data_dir, vol_name)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                IpcError::not_found(format!("volume not found: {vol_name}"))
+            }
+            _ => IpcError::internal(format!("resolving volume '{vol_name}': {e}")),
+        })?;
+    let fork_dir = elide_coordinator::volume_state::fork_dir(data_dir, leaf_ulid);
 
     let snap_ulid = match snap_arg {
         Some(u) => u,
@@ -1002,7 +1006,7 @@ async fn generate_filemap_op(
     }
 
     let started = std::time::Instant::now();
-    generate_snapshot_filemap(&fork_dir, snap_ulid, Arc::clone(stores))
+    generate_snapshot_filemap(data_dir, leaf_ulid, snap_ulid, Arc::clone(stores))
         .await
         .map_err(|e| {
             IpcError::internal(format!("filemap generation failed for {snap_ulid}: {e:#}"))
@@ -1024,21 +1028,12 @@ async fn generate_filemap_op(
 /// closure (after the search-dir list is known) because each fetcher
 /// binds to a fork chain.
 async fn generate_snapshot_filemap(
-    fork_dir: &Path,
+    data_dir: &Path,
+    leaf_ulid: ulid::Ulid,
     snap_ulid: ulid::Ulid,
     stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> std::io::Result<()> {
-    let fork_dir = fork_dir.to_owned();
-    let leaf_ulid = fork_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|s| ulid::Ulid::from_string(s).ok())
-        .ok_or_else(|| {
-            std::io::Error::other(format!(
-                "fork dir {} is not a by_id/<ulid> path",
-                fork_dir.display()
-            ))
-        })?;
+    let fork_dir = elide_coordinator::volume_state::fork_dir(data_dir, leaf_ulid);
     // Reads route per owning volume — each segment body lives under the
     // leaf's prefix or an ancestor's, and the owner is taken from the
     // `by_id/<owner>/…` key, so each gets its own single-prefix
@@ -1155,7 +1150,7 @@ async fn remove_volume(
 ) -> Result<Option<ulid::Ulid>, IpcError> {
     use elide_coordinator::volume_state::VolumeLifecycle;
     let volume_ulid_str = volume_ulid.to_string();
-    let vol_dir_path = data_dir.join("by_id").join(&volume_ulid_str);
+    let vol_dir_path = elide_coordinator::volume_state::fork_dir(data_dir, volume_ulid);
     let (vol_dir, shape) = VolumeLifecycle::resolve(&vol_dir_path)
         .map_err(|e| IpcError::internal(format!("resolving by_id/{volume_ulid_str}: {e}")))?;
     let vol_dir = vol_dir
@@ -1540,7 +1535,7 @@ async fn create_volume_op(
 
     let vol_ulid = ulid::Ulid::new();
     let vol_ulid_str = vol_ulid.to_string();
-    let vol_dir = data_dir.join("by_id").join(&vol_ulid_str);
+    let vol_dir = elide_coordinator::volume_state::fork_dir(data_dir, vol_ulid);
 
     // Phase 1: create the local volume directory, signing key, and
     // signed empty-lineage `volume.provenance`. Both immutable trust
@@ -1819,7 +1814,7 @@ pub(crate) async fn pull_readonly_op(
     peer: Option<&elide_coordinator::prefetch::PeerFetchContext>,
 ) -> Result<PullReadonlyReply, IpcError> {
     let volume_id = vol_ulid.to_string();
-    let vol_dir = data_dir.join("by_id").join(&volume_id);
+    let vol_dir = elide_coordinator::volume_state::fork_dir(data_dir, vol_ulid);
     if vol_dir.exists() {
         return Err(IpcError::conflict(format!(
             "volume already present locally: {volume_id}"
@@ -1964,7 +1959,7 @@ fn register_volume(
     macaroon_root: &[u8; 32],
 ) -> Result<RegisterReply, IpcError> {
     let ulid_str = volume_ulid.to_string();
-    let vol_dir = data_dir.join("by_id").join(&ulid_str);
+    let vol_dir = elide_coordinator::volume_state::fork_dir(data_dir, volume_ulid);
     if !vol_dir.exists() {
         return Err(IpcError::not_found("unknown volume"));
     }
@@ -2003,7 +1998,7 @@ async fn resolve_peer_endpoint_for_volume(
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> Option<PeerEndpoint> {
     elide_coordinator::tasks::peer_fetch_handle()?;
-    let vol_dir = data_dir.join("by_id").join(volume_ulid.to_string());
+    let vol_dir = elide_coordinator::volume_state::fork_dir(data_dir, volume_ulid);
     let volume_name = elide_coordinator::tasks::read_volume_name(&vol_dir)?;
     // Cross-coordinator RO reads: events/<name>/HEAD + coordinators/<other>/* —
     // coord-ro scope. The read-only journal carries that.
@@ -2057,7 +2052,7 @@ async fn authenticate_volume_macaroon(
     .map_err(IpcError::forbidden)?;
     // Re-validate that volume.pid still matches — covers the case where the
     // original process has exited and the PID was reused.
-    let vol_dir = data_dir.join("by_id").join(volume_ulid.to_string());
+    let vol_dir = elide_coordinator::volume_state::fork_dir(data_dir, volume_ulid);
     check_peer_pid(&vol_dir, Some(peer_pid)).map_err(IpcError::forbidden)?;
     if !pid_is_alive(peer_pid as u32) {
         return Err(IpcError::forbidden("peer pid not alive"));

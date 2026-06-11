@@ -1278,7 +1278,7 @@ pub(crate) async fn notify_volume_ready_op(
     readiness_tracker: &elide_coordinator::ReadinessTracker,
 ) -> Result<(), IpcError> {
     let vol_ulid_str = vol_ulid.to_string();
-    let fork_dir = data_dir.join("by_id").join(&vol_ulid_str);
+    let fork_dir = elide_coordinator::volume_state::fork_dir(data_dir, vol_ulid);
     if !fork_dir.exists() {
         return Err(IpcError::not_found(format!(
             "fork dir for {vol_ulid_str} not present locally"

@@ -622,7 +622,7 @@ impl MintEndpoint {
     /// request/response contract with coord B is testable without a
     /// live server.
     fn build_discharge_request(&self, owned: Ulid, target: Ulid, cid: &[u8]) -> io::Result<String> {
-        let fork_dir = self.data_dir.join("by_id").join(owned.to_string());
+        let fork_dir = elide_coordinator::volume_state::fork_dir(&self.data_dir, owned);
         let name = elide_coordinator::tasks::read_volume_name(&fork_dir).ok_or_else(|| {
             io::Error::other(format!(
                 "cannot anchor on {owned}: no local volume name (not a live named volume)"

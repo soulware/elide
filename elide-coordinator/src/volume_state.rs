@@ -264,6 +264,30 @@ pub fn clear_released_marker(vol_dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The fork directory for `vol`: `data_dir/by_id/<vol>`.
+pub fn fork_dir(data_dir: &Path, vol: Ulid) -> PathBuf {
+    data_dir.join("by_id").join(vol.to_string())
+}
+
+/// Resolve `by_name/<name>` to the volume ULID it points at.
+///
+/// Canonicalises the symlink and parses the trailing path component
+/// through the ULID parser, so callers get a typed ID rather than a
+/// raw path. `NotFound` propagates with its kind intact so callers
+/// can distinguish "no such volume" from other I/O failures; a
+/// target that is not a `by_id/<ulid>` directory is `other`.
+pub fn resolve_volume_ulid(data_dir: &Path, name: &str) -> std::io::Result<Ulid> {
+    let link = data_dir.join("by_name").join(name);
+    let canon = std::fs::canonicalize(&link)?;
+    let stem = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::other(format!("by_name/{name} target is not utf-8")))?;
+    Ulid::from_string(stem).map_err(|e| {
+        std::io::Error::other(format!("by_name/{name} target {stem:?} is not a ULID: {e}"))
+    })
+}
+
 /// Outcome categories for [`reconcile_owned_local_to_stopped`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReconcileOutcome {

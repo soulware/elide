@@ -93,11 +93,8 @@ pub(crate) async fn start_force_claim(
     // CAS landed, re-own/finalize did not) — resume it.
     let ours =
         observed.record.coordinator_id.as_deref() == Some(ctx.core.identity.coordinator_id_str());
-    let bound_dir = ctx
-        .core
-        .data_dir
-        .join("by_id")
-        .join(observed.record.vol_ulid.to_string());
+    let bound_dir =
+        elide_coordinator::volume_state::fork_dir(&ctx.core.data_dir, observed.record.vol_ulid);
     let resume =
         ours && bound_dir.join(VOLUME_KEY_FILE).exists() && !bound_dir.join("wal").exists();
     if ours && !resume {

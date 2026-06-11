@@ -83,26 +83,11 @@ fn build_extent_index_entries(sources: &[String], data_dir: &Path) -> std::io::R
     let mut seen_ulids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for source_name in sources {
-        let by_name_link = data_dir.join("by_name").join(source_name);
-        let source_dir = std::fs::canonicalize(&by_name_link).map_err(|e| {
-            std::io::Error::other(format!(
-                "extents-from volume '{source_name}' not found at {}: {e}",
-                by_name_link.display()
-            ))
-        })?;
-        let source_ulid_str = source_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| {
-                std::io::Error::other(format!(
-                    "extents-from volume '{source_name}' resolves to a non-utf8 path"
-                ))
-            })?;
-        let source_ulid = Ulid::from_string(source_ulid_str).map_err(|e| {
-            std::io::Error::other(format!(
-                "extents-from volume '{source_name}' resolves to non-ulid dir name '{source_ulid_str}': {e}"
-            ))
-        })?;
+        let source_ulid =
+            elide_coordinator::volume_state::resolve_volume_ulid(data_dir, source_name).map_err(
+                |e| std::io::Error::other(format!("extents-from volume '{source_name}': {e}")),
+            )?;
+        let source_dir = elide_coordinator::volume_state::fork_dir(data_dir, source_ulid);
 
         // Inherit entries from the source's signed provenance. Signature
         // verification guards against a tampered source dragging malicious
@@ -143,7 +128,7 @@ fn build_extent_index_entries(sources: &[String], data_dir: &Path) -> std::io::R
                 "extents-from volume '{source_name}' has no snapshot; only imported/snapshotted volumes can contribute an extent index"
             ))
         })?;
-        if seen_ulids.insert(source_ulid_str.to_owned()) {
+        if seen_ulids.insert(source_ulid.to_string()) {
             explicit.push(format!("{source_ulid}/{snapshot}"));
         }
     }
@@ -300,7 +285,7 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
     // Generate a stable ULID for this volume (= S3 prefix).
     let vol_ulid_value = Ulid::new();
     let vol_ulid = vol_ulid_value.to_string();
-    let vol_dir = data_dir.join("by_id").join(&vol_ulid);
+    let vol_dir = elide_coordinator::volume_state::fork_dir(data_dir, vol_ulid_value);
 
     // The bucket-side `names/<name>` claim is *deferred* until after
     // import completes: `NameRecord` requires a real `size`, and the

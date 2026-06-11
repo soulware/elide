@@ -582,7 +582,8 @@ impl ClaimOrchestrator {
 
         let new_vol_ulid = Ulid::new();
         let new_vol_ulid_str = new_vol_ulid.to_string();
-        let new_fork_dir = self.ctx.core.data_dir.join("by_id").join(&new_vol_ulid_str);
+        let new_fork_dir =
+            elide_coordinator::volume_state::fork_dir(&self.ctx.core.data_dir, new_vol_ulid);
 
         // Bare dir + keypair only. No wal/, no pending/, no index/ — daemon
         // discovery requires one of those to consider a dir a volume, so this
