@@ -46,39 +46,6 @@ pub fn fork_volume_at(
     source_fork_dir: &Path,
     branch_ulid: Ulid,
 ) -> io::Result<()> {
-    fork_volume_at_inner(new_fork_dir, source_fork_dir, branch_ulid, None)
-}
-
-/// Like `fork_volume_at` but also records a `manifest_pubkey` override in
-/// the child's provenance. The parent's identity key (for verifying the
-/// ancestor's own `volume.provenance` and `.idx` signatures) is still
-/// loaded from the source's on-disk `volume.pub`; `manifest_pubkey` is
-/// used **only** for the pinned snapshot's `.manifest`.
-///
-/// Used by `volume create --from --force-snapshot` when the forker doesn't hold the
-/// source owner's private key and instead signs the synthetic manifest
-/// with an ephemeral key. That ephemeral pubkey goes here; the ancestor's
-/// own artefacts continue to verify under the owner's key.
-pub fn fork_volume_at_with_manifest_key(
-    new_fork_dir: &Path,
-    source_fork_dir: &Path,
-    branch_ulid: Ulid,
-    manifest_pubkey: crate::signing::VerifyingKey,
-) -> io::Result<()> {
-    fork_volume_at_inner(
-        new_fork_dir,
-        source_fork_dir,
-        branch_ulid,
-        Some(manifest_pubkey),
-    )
-}
-
-fn fork_volume_at_inner(
-    new_fork_dir: &Path,
-    source_fork_dir: &Path,
-    branch_ulid: Ulid,
-    manifest_pubkey: Option<crate::signing::VerifyingKey>,
-) -> io::Result<()> {
     if new_fork_dir.exists() {
         return Err(io::Error::other(format!(
             "fork directory '{}' already exists",
@@ -122,9 +89,7 @@ fn fork_volume_at_inner(
     // Embed the parent's identity pubkey (loaded from the source's on-disk
     // `volume.pub`) under the child's signature so the fork's open-time
     // ancestor walk has a trust anchor for the parent's own signed
-    // artefacts — see `ParentRef` in signing.rs. If a manifest_pubkey was
-    // supplied (force-snapshot path), also embed it as a narrow override
-    // for the pinned `.manifest` only.
+    // artefacts — see `ParentRef` in signing.rs.
     let parent_pubkey =
         crate::signing::load_verifying_key(&source_real, crate::signing::VOLUME_PUB_FILE)?;
     let lineage = crate::signing::ProvenanceLineage {
@@ -132,7 +97,6 @@ fn fork_volume_at_inner(
             volume_ulid: source_ulid.to_owned(),
             snapshot_ulid: branch_ulid.to_string(),
             pubkey: parent_pubkey.to_bytes(),
-            manifest_pubkey: manifest_pubkey.map(|k| k.to_bytes()),
         }),
         extent_index: Vec::new(),
         oci_source: None,

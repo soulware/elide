@@ -11,9 +11,9 @@
 //      of just retrying on the symptom (NotFound during open).
 //   2. Then retry briefly on missing-file errors during `Volume::open`
 //      itself. This is the second line of defence: covers untracked
-//      forks (no coordinator), `force-snapshot-now` style races, and
-//      filesystem-level latency between the prefetch finishing and the
-//      `.idx` becoming visible to a peer process.
+//      forks (no coordinator) and filesystem-level latency between the
+//      prefetch finishing and the `.idx` becoming visible to a peer
+//      process.
 
 use std::io;
 use std::path::Path;

@@ -41,7 +41,7 @@ pub struct ProvenanceLineage {
 }
 ```
 
-Signing-input encoding follows the same convention as `parent_manifest_pubkey`: stable line ordering, lines absent when the field is `None`, so a root-without-OCI-source signs to the same input it does today.
+Signing-input encoding follows the provenance file's existing convention for optional fields: stable line ordering, lines absent when the field is `None`, so a root-without-OCI-source signs to the same input it does today.
 
 ## Migration
 

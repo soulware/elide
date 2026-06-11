@@ -30,9 +30,9 @@ use ulid::Ulid;
 use elide_core::name_record::{NameRecord, NameState};
 
 use crate::lifecycle::{
-    ForceReleaseOutcome, LifecycleError, MarkClaimedForceOutcome, MarkClaimedOutcome,
-    MarkInitialOutcome, MarkLiveOutcome, MarkReclaimedLocalOutcome, MarkReleasedOutcome,
-    MarkStoppedOutcome, RecordLatestSnapshotOutcome,
+    LifecycleError, MarkClaimedForceOutcome, MarkClaimedOutcome, MarkInitialOutcome,
+    MarkLiveOutcome, MarkReclaimedLocalOutcome, MarkReleasedOutcome, MarkStoppedOutcome,
+    RecordLatestSnapshotOutcome,
 };
 use crate::name_store::{self, NameStoreError};
 
@@ -112,15 +112,6 @@ pub trait NameClaims: NameClaimsReader {
         coord_id: &str,
         handoff_snapshot: Ulid,
     ) -> Result<MarkReleasedOutcome, LifecycleError>;
-
-    /// **Unconditional** rewrite to `Released` for `volume release
-    /// --force`. No ownership check, no `If-Match` — overriding
-    /// foreign ownership is the verb's whole point.
-    async fn mark_released_force(
-        &self,
-        name: &str,
-        handoff_snapshot: Ulid,
-    ) -> Result<ForceReleaseOutcome, LifecycleError>;
 
     /// Transition `Stopped` → `Live` (local resume of a volume this
     /// coordinator already owns).
@@ -269,14 +260,6 @@ impl NameClaims for BucketNameClaims {
         handoff_snapshot: Ulid,
     ) -> Result<MarkReleasedOutcome, LifecycleError> {
         crate::lifecycle::mark_released(&self.writer, name, coord_id, handoff_snapshot).await
-    }
-
-    async fn mark_released_force(
-        &self,
-        name: &str,
-        handoff_snapshot: Ulid,
-    ) -> Result<ForceReleaseOutcome, LifecycleError> {
-        crate::lifecycle::mark_released_force(&self.writer, name, handoff_snapshot).await
     }
 
     async fn mark_live(
@@ -431,19 +414,5 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(outcome, MarkReclaimedLocalOutcome::Reclaimed));
-    }
-
-    #[tokio::test]
-    async fn mark_released_force_overrides_foreign_owner() {
-        let (_s, c) = claims();
-        c.mark_initial("vol", "coord-foreign", None, sample_ulid(), SAMPLE_SIZE)
-            .await
-            .unwrap();
-        let handoff = Ulid::new();
-        let outcome = c.mark_released_force("vol", handoff).await.unwrap();
-        assert!(matches!(outcome, ForceReleaseOutcome::Overwritten { .. }));
-        let rec = c.read("vol").await.unwrap().unwrap();
-        assert_eq!(rec.state, NameState::Released);
-        assert_eq!(rec.handoff_snapshot, Some(handoff));
     }
 }

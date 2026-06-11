@@ -10,9 +10,11 @@
   previously waited on TTL specifics for the object store; that gap is now
   resolved by the application-managed retention window (HEAD
   supersession — see *Retention mechanism* below), so
-  the blocker is implementation, not design. The existing `--force-snapshot`
-  flag on `create --from` stays in place as the interim mechanism for
-  branching past the most recent snapshot.
+  the blocker is implementation, not design. `--force-snapshot` is
+  retired (its forker-attested manifest violated the attestation
+  model's every-manifest-signed-by-its-own-volume contract); there is
+  currently no "branch from now" verb, and `materialize` is the
+  planned replacement.
 
 ## The framing
 
@@ -136,10 +138,10 @@ per-backend retention API, and lets us define the semantics precisely —
 what T is, when it starts, how restart works. See *Retention
 mechanism* below.
 
-`--force-snapshot` and its supporting machinery
-(`create_readonly_snapshot_now`, the attestation keypair, the
-`ParentRef.manifest_pubkey` field) stay in place until `materialize`
-lands; they're then retired.
+`--force-snapshot` and its supporting machinery (the attestation
+keypair, the `ParentRef.manifest_pubkey` field) are retired — removed
+with the synthesis-path retirement in the portable-live-volume work,
+ahead of `materialize` landing.
 
 ## Retention mechanism
 
@@ -361,9 +363,9 @@ Open questions:
 - `volume fork` is retired. It was already semantically identical to
   `volume create --from`, so this is a pure CLI cleanup.
 - `volume create` without `--from` stays as-is: a fresh empty volume.
-- `volume create --from <source>` continues to accept the same three forms
-  it accepts today — a volume name, a bare volume ULID, or an explicit
-  `<vol_ulid>/<snap_ulid>` pin — and `--force-snapshot` stays in place.
+- `volume create --from <source>` continues to accept a volume name or an
+  explicit `<vol_ulid>/<snap_ulid>` / `<name>/<snap_ulid>` pin (a bare
+  volume ULID is already rejected). `--force-snapshot` is retired.
 
 **Pending (blocked on `materialize`):**
 
@@ -372,9 +374,6 @@ Open questions:
   `materialize` because it removes the existing "branch from now" paths
   that `materialize` is the replacement for.
 - Introduce `volume materialize <new-name> --from <vol_ulid>`.
-- Remove `--force-snapshot` and its supporting machinery
-  (`create_readonly_snapshot_now`, `FORCE_SNAPSHOT_KEY_FILE`,
-  `ParentRef.manifest_pubkey`, `fork_volume_at_with_manifest_key`).
 
 ## Glossary changes
 

@@ -118,7 +118,7 @@ The point of shipping `.idx`-only first is to learn whether the peer tier is wor
 
 - **Hit rate** at the peer, both for handoff (one specific peer) and image-pull (any peer with the bytes). Below some threshold the entire mechanism isn't paying for itself.
 - **Latency improvement** vs direct S3 for the cold-start prefetch phase, where `.idx` fetch dominates wall-clock time.
-- **Operational cost.** Did discovery work? Did auth survive real claim/release/force-release sequences? Did fallback to S3 collapse cleanly on every error path?
+- **Operational cost.** Did discovery work? Did auth survive real claim/release/forced-claim sequences? Did fallback to S3 collapse cleanly on every error path?
 
 If those signals are weak, body fetch is unlikely to justify its complexity. If they're strong, body fetch is the natural extension and is sketched below.
 
@@ -151,7 +151,7 @@ If those signals are weak, body fetch is unlikely to justify its complexity. If 
 > Endpoint discovery extends to the volume process: the coordinator
 > hands off the per-volume `PeerFetchContext` it built at claim time
 > across the volume-start IPC so the volume's `RangeFetcher` can use
-> it. If discovery yielded no peer (`force_released`, unknown
+> it. If discovery yielded no peer (`force_claimed`, unknown
 > predecessor, unreachable), the volume runs peer-less, exactly like a
 > v1 read path runs S3-only.
 >
@@ -282,7 +282,7 @@ The body-fetch path is genuinely more complex than `.idx` (range arithmetic, par
 
 Per `docs/architecture.md` (§ S3 credential distribution via macaroons), each volume holds a short-lived read-only S3 credential scoped via IAM to its own S3 prefix and its ancestor prefixes. The peer **mirrors this scoping**: whatever a volume can read from S3, it can read from the peer; nothing more.
 
-The trust root is split. Token authenticity is the requester's Ed25519 signature, verified against the signer's published pubkey (`coordinators/<id>/coordinator.pub`, immutable). Current ownership is `names/<name>`, read ETag-conditionally so the auth fence stays coincident with the S3 CAS that defines the claimer (the gap-free force-release fence). Lineage is the signed `volume.provenance` chain the peer holds **locally** for every fork it serves — verified with no S3 read and no credential, and failing closed when absent (the requester then falls back to S3). No separate credential service or pre-shared coordinator secret is required.
+The trust root is split. Token authenticity is the requester's Ed25519 signature, verified against the signer's published pubkey (`coordinators/<id>/coordinator.pub`, immutable). Current ownership is `names/<name>`, read ETag-conditionally so the auth fence stays coincident with the S3 CAS that defines the claimer (the gap-free forced-claim fence). Lineage is the signed `volume.provenance` chain the peer holds **locally** for every fork it serves — verified with no S3 read and no credential, and failing closed when absent (the requester then falls back to S3). No separate credential service or pre-shared coordinator secret is required.
 
 ### Token shape
 
@@ -483,7 +483,7 @@ of the volume, a fact established by the `names/` CAS record and the
 signed `volume.provenance` lineage — not on a capability the serving
 peer delegated. The serving coordinator verifies that fact locally
 against state both peers already share, mint off the peer path: no
-shared secret, and revocation rides the same force-release CAS fence
+shared secret, and revocation rides the same forced-claim CAS fence
 (`design-mint.md` § *Trust model* / § *`coord-ro`*).
 
 The `PeerFetchToken` is already an instance of the holder-of-key
@@ -513,7 +513,7 @@ signed `volume.provenance` chain (it holds the chain for every fork it
 serves), not asserted by the requester — see *Peer verification* check
 4. Local verification fails closed: peer-fetch is optional, so a peer
 that cannot verify locally declines and the requester falls back to S3.
-The force-release fence stays gap-free via the one irreducibly-remote
+The forced-claim fence stays gap-free via the one irreducibly-remote
 check: the peer re-reads `names/<name>` ETag-conditionally per request,
 so the auth fence remains coincident with the S3 CAS.
 
@@ -540,11 +540,11 @@ The claim sequence:
 Peer-fetch then inspects the same event B already has:
 
 - If `kind == "released"` and the signature verifies against `coordinators/<event.coordinator_id>/coordinator.pub`: the prior owner is identified. Resolve their endpoint via `coordinators/<event.coordinator_id>/peer-endpoint.toml` (see below) and use as peer.
-- **Anything else** (`force_released`, missing event, signature failure, missing endpoint, unreachable peer, …): skip peer; fetch direct from S3.
+- **Anything else** (`force_claimed`, missing event, signature failure, missing endpoint, unreachable peer, …): skip peer; fetch direct from S3.
 
 The "anything-other-than-clean-released → S3" rule keeps the logic boring: one happy path, and every failure mode at every layer collapses to the same fallback.
 
-For `force_released` specifically, the event's emitter is the *recovering* coordinator (the one that ran `--force`), not the prior owner. The whole point of `--force` is "the prior owner is gone and not coming back" — so even though the event identifies a coordinator, that coordinator has no relationship to whichever host had the volume's cache warm. Direct S3 is the only sensible fallback.
+For `force_claimed` specifically, the event's emitter is the *displacing* coordinator (the one that ran `claim --force`), not the prior owner. The whole point of `--force` is "the prior owner is gone and not coming back" — so even though the event identifies a coordinator, that coordinator has no relationship to whichever host had the volume's cache warm. Direct S3 is the only sensible fallback.
 
 `prev_event_ulid` on each event chains backward through history; useful for verifying that no concurrent event was missed but not for *finding* the head of the log. Whatever mechanism the event-log design adopts for find-latest (LIST + sort by default, with `events/<name>/HEAD` pointer or inverted-ULID keys as future optimisations) is shared between claim and peer-fetch.
 

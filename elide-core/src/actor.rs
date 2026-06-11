@@ -2672,7 +2672,6 @@ pub(crate) fn execute_sign_snapshot_manifest(
             signer.as_ref(),
             &snap_ulid,
             &seg_ulids,
-            None,
         )?,
         crate::signing::SnapshotKind::Stop => crate::signing::write_stop_snapshot_manifest(
             &base_dir,

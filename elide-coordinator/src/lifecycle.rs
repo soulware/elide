@@ -26,8 +26,8 @@ use crate::volume_state::{RELEASED_FILE, STOPPED_FILE};
 pub enum LifecycleError {
     /// The store-level operation failed (transient I/O, parse error, etc.).
     Store(NameStoreError),
-    /// `names/<name>` is held by another coordinator. The caller may
-    /// retry after `volume release --force` (Phase 3).
+    /// `names/<name>` is held by another coordinator. If that owner
+    /// is dead, recover with `volume claim --force` on the new host.
     OwnershipConflict { held_by: String },
     /// `names/<name>` is in a state that does not permit this transition
     /// (e.g. trying to mark `stopped` something already `released`).
@@ -74,7 +74,7 @@ impl std::fmt::Display for LifecycleError {
             Self::Store(e) => write!(f, "{e}"),
             Self::OwnershipConflict { held_by } => write!(
                 f,
-                "name is held by another coordinator ({held_by}); run `volume release --force` to override"
+                "name is held by another coordinator ({held_by}); if that owner is dead, run `volume claim --force` to take over"
             ),
             Self::InvalidTransition { from, verb } => {
                 write!(f, "cannot {verb} a name in state {from:?}")
@@ -228,93 +228,6 @@ pub async fn mark_released(
     name_store::update_name_record(store, name, &record, version).await?;
     Ok(MarkReleasedOutcome::Updated {
         vol_ulid: released_vol_ulid,
-    })
-}
-
-/// Outcome of `mark_released_force`.
-#[derive(Debug)]
-pub enum ForceReleaseOutcome {
-    /// `names/<name>` was unconditionally rewritten to the new
-    /// state. Carries the dead fork's `vol_ulid` so callers can
-    /// surface it (e.g. for operator output) and the dead fork's
-    /// last known coordinator id (`None` if the prior record had
-    /// already been emptied of owner identity, e.g. an in-progress
-    /// release).
-    Overwritten {
-        dead_vol_ulid: Ulid,
-        displaced_coordinator_id: Option<String>,
-    },
-    /// `names/<name>` did not exist in the bucket. Force-release of a
-    /// non-existent name is meaningless — there is no dead fork to
-    /// recover from.
-    Absent,
-    /// `names/<name>` exists but is in a state where force-release
-    /// must refuse: `Released` or `Readonly`. Force is
-    /// the override path for an unreachable owner; it must not flip
-    /// states whose semantics make no sense for the verb.
-    InvalidState { observed: NameState },
-}
-
-/// **Unconditionally** rewrite `names/<name>` to `Released`,
-/// recording `handoff_snapshot` for the next claimant. Used by
-/// `volume release --force` when the previous owner is unreachable
-/// (machine gone, `coordinator.key` deleted, partition with no
-/// expected recovery).
-///
-/// No ownership check, no conditional PUT — overriding foreign
-/// ownership is the whole point of the verb. Callers must already
-/// have published the synthesised handoff snapshot at
-/// `by_id/<dead_vol_ulid>/snapshots/<handoff_snapshot>.manifest` via
-/// `recovery::mint_and_publish_synthesised_snapshot`. The dead
-/// fork's `vol_ulid` is preserved on the record so claimants know
-/// which prefix to fork from.
-///
-/// Refuses to operate on `Released` (already released — no-op) or
-/// `Readonly` (no exclusive owner to override).
-pub async fn mark_released_force(
-    store: &Arc<dyn ObjectStore>,
-    name: &str,
-    handoff_snapshot: Ulid,
-) -> Result<ForceReleaseOutcome, LifecycleError> {
-    let Some((current, _version)) = name_store::read_name_record(store, name).await? else {
-        return Ok(ForceReleaseOutcome::Absent);
-    };
-
-    match current.state.check_transition(Lifecycle::ForceRelease) {
-        TransitionCheck::Proceed => {}
-        TransitionCheck::Idempotent | TransitionCheck::Reroute | TransitionCheck::Refuse => {
-            return Ok(ForceReleaseOutcome::InvalidState {
-                observed: current.state,
-            });
-        }
-    }
-
-    let new = elide_core::name_record::NameRecord {
-        version: elide_core::name_record::NameRecord::CURRENT_VERSION,
-        // Same dead fork — the synthesised snapshot lives under this
-        // prefix, and the next claimant forks from it.
-        vol_ulid: current.vol_ulid,
-        // Capacity carries forward unchanged through release; the next
-        // claimant will fork at the same logical size.
-        size: current.size,
-        // Released → no current owner.
-        coordinator_id: None,
-        state: NameState::Released,
-        // Preserve provenance so the chain stays walkable.
-        parent: current.parent,
-        claimed_at: None,
-        hostname: None,
-        handoff_snapshot: Some(handoff_snapshot),
-        // Same vol_ulid, so the pairing stays valid; the synthesised
-        // handoff is itself a published `User` manifest, fold it in.
-        latest_snapshot: current.latest_snapshot.max(Some(handoff_snapshot)),
-    };
-
-    let displaced_coordinator_id = current.coordinator_id.clone();
-    name_store::overwrite_name_record(store, name, &new).await?;
-    Ok(ForceReleaseOutcome::Overwritten {
-        dead_vol_ulid: current.vol_ulid,
-        displaced_coordinator_id,
     })
 }
 
@@ -1813,22 +1726,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mark_released_force_folds_handoff_into_latest_snapshot() {
-        let s = store();
-        let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
-        rec.latest_snapshot = Some(snap());
-        create_name_record(&s, "vol", &rec).await.unwrap();
-
-        mark_released_force(&s, "vol", snap_hi()).await.unwrap();
-
-        let (got, _) = name_store::read_name_record(&s, "vol")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.latest_snapshot, Some(snap_hi()));
-    }
-
     // ── mark_claimed_force ──────────────────────────────────────────────
 
     async fn observe(s: &Arc<dyn ObjectStore>, name: &str) -> ObservedRecord {
@@ -1994,93 +1891,5 @@ mod tests {
                 observed: NameState::Readonly
             }
         ));
-    }
-
-    // ── mark_released_force ───────────────────────────────────────────
-
-    #[tokio::test]
-    async fn mark_released_force_returns_absent_when_record_missing() {
-        let s = store();
-        let outcome = mark_released_force(&s, "missing", snap()).await.unwrap();
-        assert!(matches!(outcome, ForceReleaseOutcome::Absent));
-    }
-
-    #[tokio::test]
-    async fn mark_released_force_overrides_foreign_owned_live_record() {
-        let s = store();
-        // A owns Live.
-        mark_initial(&s, "vol", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
-            .await
-            .unwrap();
-
-        // B force-releases without any ownership check.
-        let outcome = mark_released_force(&s, "vol", snap()).await.unwrap();
-        match outcome {
-            ForceReleaseOutcome::Overwritten {
-                dead_vol_ulid,
-                displaced_coordinator_id,
-            } => {
-                assert_eq!(dead_vol_ulid, sample_ulid());
-                assert_eq!(displaced_coordinator_id.as_deref(), Some(id_a().as_str()));
-            }
-            other => panic!("expected Overwritten, got {other:?}"),
-        }
-
-        let (got, _) = name_store::read_name_record(&s, "vol")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.state, NameState::Released);
-        assert_eq!(got.vol_ulid, sample_ulid(), "dead vol_ulid preserved");
-        assert_eq!(got.handoff_snapshot, Some(snap()));
-        // Released → no current owner.
-        assert!(got.coordinator_id.is_none());
-        assert!(got.claimed_at.is_none());
-        assert!(got.hostname.is_none());
-    }
-
-    #[tokio::test]
-    async fn mark_released_force_overrides_foreign_owned_stopped_record() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
-            .await
-            .unwrap();
-        mark_stopped(&s, "vol", &id_a(), None).await.unwrap();
-
-        let outcome = mark_released_force(&s, "vol", snap()).await.unwrap();
-        assert!(matches!(outcome, ForceReleaseOutcome::Overwritten { .. }));
-    }
-
-    #[tokio::test]
-    async fn mark_released_force_refuses_already_released_record() {
-        let s = store();
-        mark_initial(&s, "vol", &id_a(), None, sample_ulid(), SAMPLE_SIZE)
-            .await
-            .unwrap();
-        mark_released(&s, "vol", &id_a(), snap()).await.unwrap();
-
-        let outcome = mark_released_force(&s, "vol", snap()).await.unwrap();
-        match outcome {
-            ForceReleaseOutcome::InvalidState { observed } => {
-                assert_eq!(observed, NameState::Released);
-            }
-            other => panic!("expected InvalidState, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn mark_released_force_refuses_readonly_record() {
-        let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None)
-            .await
-            .unwrap();
-
-        let outcome = mark_released_force(&s, "vol", snap()).await.unwrap();
-        match outcome {
-            ForceReleaseOutcome::InvalidState { observed } => {
-                assert_eq!(observed, NameState::Readonly);
-            }
-            other => panic!("expected InvalidState, got {other:?}"),
-        }
     }
 }

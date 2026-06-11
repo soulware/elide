@@ -152,8 +152,6 @@ pub enum Lifecycle {
     Release,
     /// `volume start` (local resume) — flip `Stopped` → `Live`.
     Start,
-    /// `volume release --force` — unconditional flip to `Released`.
-    ForceRelease,
     /// `volume claim` — flip `Released` → `Live`/`Stopped` under new ownership.
     Claim,
     /// `volume claim --force` — forced CAS from a dead owner's
@@ -169,7 +167,6 @@ impl Lifecycle {
             Self::Stop => "stop",
             Self::Release => "release",
             Self::Start => "start",
-            Self::ForceRelease => "force-release",
             Self::Claim => "claim",
             Self::ForceClaim => "force-claim",
         }
@@ -211,12 +208,12 @@ impl NameState {
     /// matrix is the single source of truth for which lifecycle verbs
     /// apply to which source states; callers must not re-derive it.
     ///
-    /// | from \ verb  | Stop       | Release    | Start      | ForceRelease | Claim   | ForceClaim |
-    /// |--------------|------------|------------|------------|--------------|---------|------------|
-    /// | Live         | Proceed    | Proceed    | Idempotent | Proceed      | Refuse  | Proceed    |
-    /// | Stopped      | Idempotent | Proceed    | Proceed    | Proceed      | Refuse  | Proceed    |
-    /// | Released     | Refuse     | Idempotent | Reroute    | Refuse       | Proceed | Reroute    |
-    /// | Readonly     | Refuse     | Refuse     | Refuse     | Refuse       | Refuse  | Refuse     |
+    /// | from \ verb  | Stop       | Release    | Start      | Claim   | ForceClaim |
+    /// |--------------|------------|------------|------------|---------|------------|
+    /// | Live         | Proceed    | Proceed    | Idempotent | Refuse  | Proceed    |
+    /// | Stopped      | Idempotent | Proceed    | Proceed    | Refuse  | Proceed    |
+    /// | Released     | Refuse     | Idempotent | Reroute    | Proceed | Reroute    |
+    /// | Readonly     | Refuse     | Refuse     | Refuse     | Refuse  | Refuse     |
     pub fn check_transition(self, verb: Lifecycle) -> TransitionCheck {
         use Lifecycle as V;
         use NameState as S;
@@ -235,10 +232,6 @@ impl NameState {
             (S::Stopped, V::Start) => Proceed,
             (S::Released, V::Start) => Reroute,
             (S::Readonly, V::Start) => Refuse,
-            // ForceRelease (unconditional override; refuses targets that
-            // are already ownerless or have no owner to override)
-            (S::Live | S::Stopped, V::ForceRelease) => Proceed,
-            (S::Released | S::Readonly, V::ForceRelease) => Refuse,
             // Claim (only valid against a Released record)
             (S::Released, V::Claim) => Proceed,
             (S::Live | S::Stopped | S::Readonly, V::Claim) => Refuse,
@@ -486,11 +479,6 @@ mod tests {
             (S::Stopped, V::Start, Proceed),
             (S::Released, V::Start, Reroute),
             (S::Readonly, V::Start, Refuse),
-            // ForceRelease
-            (S::Live, V::ForceRelease, Proceed),
-            (S::Stopped, V::ForceRelease, Proceed),
-            (S::Released, V::ForceRelease, Refuse),
-            (S::Readonly, V::ForceRelease, Refuse),
             // Claim
             (S::Live, V::Claim, Refuse),
             (S::Stopped, V::Claim, Refuse),
@@ -517,7 +505,6 @@ mod tests {
             Lifecycle::Stop,
             Lifecycle::Release,
             Lifecycle::Start,
-            Lifecycle::ForceRelease,
             Lifecycle::Claim,
             Lifecycle::ForceClaim,
         ] {

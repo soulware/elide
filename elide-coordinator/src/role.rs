@@ -39,14 +39,13 @@
 //! | `Owner { Stopped }`     | `Owner { Live }`        | `start`                               |
 //! | `Owner { Live }`        | `Owner { Stopped }`     | `stop`                                |
 //! | `Owner { Stopped }`     | `Observer { Released }` | `release`                             |
-//! | `Owner { * }`           | `Observer { Released }` | `release --force` (self)              |
-//! | `Observer { Foreign }`  | `Observer { Released }` | `release --force` (other; the target  |
-//! |                         |                         | host's role transitions too)          |
+//! | `Observer { Foreign }`  | `Owner { Stopped }`     | `claim --force` (dead foreign owner;  |
+//! |                         |                         | the displaced host's role flips too)  |
 //!
 //! All transitions are verb-driven except one external interrupt:
-//! an external `release --force` from another coordinator flips us
-//! from `Owner` → `Observer { Released }` involuntarily —
-//! discovered lazily on the next bucket read.
+//! a `claim --force` from another coordinator flips us from `Owner`
+//! → `Observer { Foreign }` involuntarily — discovered lazily on the
+//! next bucket read.
 
 use ulid::Ulid;
 

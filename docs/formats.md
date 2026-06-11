@@ -418,7 +418,6 @@ Written at import, fork, and create time and uploaded with `volume.pub` so any h
 
 - `parent: <parent-ulid>/<snapshot-ulid>` — present on forks only.
 - `parent_pubkey: <hex>` — embedded parent verifying key, paired with `parent`.
-- `parent_manifest_pubkey: <hex>` — optional override for `.manifest` verification (force-snapshot path).
 - `extent_index:` — flat list of `<source-ulid>/<snapshot-ulid>` entries for hash-pool ancestors (delta compression).
 - `oci_image:` / `oci_digest:` / `oci_arch:` — present together iff this volume is an OCI-imported root. Forks of an imported volume don't inherit them.
 - `sig:` — 64-byte Ed25519 signature over the canonical signing input.

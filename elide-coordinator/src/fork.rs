@@ -27,11 +27,11 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::inbound::{
-    CoordinatorCore, await_prefetch_op, decode_hex32, parse_transport_flags, pull_readonly_op,
-    snapshot_volume, validate_volume_name,
+    CoordinatorCore, await_prefetch_op, parse_transport_flags, pull_readonly_op, snapshot_volume,
+    validate_volume_name,
 };
 use elide_coordinator::ipc::{
-    ForceSnapshotNowReply, ForkAttachEvent, ForkCreateReply, ForkSource, ForkStartReply, IpcError,
+    ForkAttachEvent, ForkCreateReply, ForkSource, ForkStartReply, IpcError,
 };
 use elide_coordinator::register_prefetch_or_get;
 use elide_coordinator::volume_state::{IMPORTING_FILE, STOPPED_FILE};
@@ -128,7 +128,6 @@ pub fn new_registry() -> ForkRegistry {
 pub(crate) fn start_fork(
     new_name: String,
     from: ForkSource,
-    force_snapshot: bool,
     flags: Vec<String>,
     ctx: ForkContext,
 ) -> Result<ForkStartReply, IpcError> {
@@ -150,7 +149,7 @@ pub(crate) fn start_fork(
     };
 
     tokio::spawn(async move {
-        let orch = ForkOrchestrator::new(job.clone(), new_name, from, force_snapshot, flags, ctx);
+        let orch = ForkOrchestrator::new(job.clone(), new_name, from, flags, ctx);
         match orch.run().await {
             Ok(()) => {
                 job.append(ForkAttachEvent::Done);
@@ -185,7 +184,6 @@ pub(crate) struct ForkOrchestrator {
     job: Arc<ForkJob>,
     new_name: String,
     from: ForkSource,
-    force_snapshot: bool,
     flags: Vec<String>,
     ctx: ForkContext,
     by_id_dir: PathBuf,
@@ -196,10 +194,6 @@ pub(crate) struct ForkOrchestrator {
     /// `Option` mirrors what [`fork_create_op`] accepts; in practice every
     /// success path sets `Some(_)`.
     snap_ulid: Option<Ulid>,
-    /// Hex ephemeral pubkey from `force-snapshot-now`, recorded in the
-    /// new fork's provenance for force-snapshot pins. Only set when the
-    /// readonly + force_snapshot branch fires.
-    parent_key_hex: Option<String>,
     /// Set by `mint_fork` so `surface_prefetch` knows which volume to
     /// await.
     new_vol_ulid: Option<Ulid>,
@@ -210,7 +204,6 @@ impl ForkOrchestrator {
         job: Arc<ForkJob>,
         new_name: String,
         from: ForkSource,
-        force_snapshot: bool,
         flags: Vec<String>,
         ctx: ForkContext,
     ) -> Self {
@@ -219,13 +212,11 @@ impl ForkOrchestrator {
             job,
             new_name,
             from,
-            force_snapshot,
             flags,
             ctx,
             by_id_dir,
             source: None,
             snap_ulid: None,
-            parent_key_hex: None,
             new_vol_ulid: None,
         }
     }
@@ -363,9 +354,6 @@ impl ForkOrchestrator {
     /// Resolution order:
     ///   - Pinned source (`Pinned` / `PinnedName`): use the explicit
     ///     `snap_hint`.
-    ///   - Readonly source + `force_snapshot`: synthesise an attested
-    ///     "now" snapshot via [`force_snapshot_now_op`] and record the
-    ///     attestation pubkey as `parent_key_hex`.
     ///   - Readonly source: use the latest local snapshot, falling back
     ///     to the `names/<name>` record's `latest_snapshot`.
     ///   - Writable source: take an implicit snapshot. If the source
@@ -390,21 +378,7 @@ impl ForkOrchestrator {
         }
 
         if source_dir.join("volume.readonly").exists() {
-            let snap_ulid = if self.force_snapshot {
-                // `force_snapshot_now_op` reads `by_id/<source>/segments/`
-                // and PUTs the new manifest under `by_id/<source>/snapshots/`,
-                // so it rides per-vol `volume-rw` for the source — not
-                // `coord-rw`, which has no `by_id/` access.
-                let store = self.ctx.core.stores.volume_rw(&source_vol_ulid);
-                let reply =
-                    force_snapshot_now_op(source_vol_ulid, &self.ctx.core.data_dir, &store).await?;
-                self.parent_key_hex = Some(reply.attestation_pubkey_hex.clone());
-                self.job.append(ForkAttachEvent::AttestedSnapshot {
-                    snap_ulid: reply.snap_ulid,
-                    pubkey_hex: reply.attestation_pubkey_hex,
-                });
-                reply.snap_ulid
-            } else if let Some(snap) = elide_core::volume::latest_snapshot(&source_dir)
+            let snap_ulid = if let Some(snap) = elide_core::volume::latest_snapshot(&source_dir)
                 .map_err(|e| IpcError::internal(format!("reading local snapshots: {e}")))?
             {
                 snap
@@ -544,7 +518,6 @@ impl ForkOrchestrator {
             &self.new_name,
             source_vol_ulid,
             snap_ulid,
-            self.parent_key_hex.as_deref(),
             &self.flags,
             source_name.as_deref(),
             &store,
@@ -573,149 +546,13 @@ impl ForkOrchestrator {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Synthesize a "now" snapshot for a readonly source volume.
-///
-/// Mirrors the CLI's `create_readonly_snapshot_now`: prefetches indexes,
-/// uploads the snapshot marker, verifies pinned segments are still in
-/// S3, and writes a signed manifest under an ephemeral key in the
-/// ancestor's directory. Returns `<snap_ulid> <ephemeral_pubkey_hex>`.
-async fn force_snapshot_now_op(
-    vol_ulid: Ulid,
-    data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
-) -> Result<ForceSnapshotNowReply, IpcError> {
-    let volume_id = vol_ulid.to_string();
-    let ancestor_dir = data_dir.join("by_id").join(&volume_id);
-    if !ancestor_dir.exists() {
-        return Err(IpcError::not_found(format!(
-            "volume not found locally: {volume_id}"
-        )));
-    }
-
-    // Step 1: pull every live .idx for this volume into local index/.
-    // `pull_indexes_for_head` resolves the live set from HEAD (not a
-    // snapshot manifest) — the whole point of `force_snapshot_now` is
-    // to capture *pre-snapshot* bucket state (segments published since
-    // the last manifest, or where no manifest exists yet), so anchoring
-    // on a manifest would defeat the operation.
-    //
-    // No peer-fetch tier on the IPC pull-readonly path: this code runs
-    // for ad-hoc readonly hydration (e.g. CLI inspect of a peer's
-    // snapshot), not for the per-volume claim flow that owns the
-    // peer-fetch context.
-    let vk = elide_core::signing::load_verifying_key(
-        &ancestor_dir,
-        elide_core::signing::VOLUME_PUB_FILE,
-    )
-    .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
-    elide_coordinator::prefetch::pull_indexes_for_head(store, &ancestor_dir, vol_ulid, &vk, None)
-        .await
-        .map_err(|e| IpcError::store(format!("pulling indexes for head: {e:#}")))?;
-
-    // Step 2: enumerate prefetched .idx files. Pin ULID = max(segments).
-    let index_dir = ancestor_dir.join("index");
-    let mut segments: Vec<Ulid> = Vec::new();
-    let mut max_seg: Option<Ulid> = None;
-    let entries = std::fs::read_dir(&index_dir)
-        .map_err(|e| IpcError::internal(format!("reading index dir: {e}")))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| IpcError::internal(format!("reading index entry: {e}")))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(stem) = name.strip_suffix(".idx") else {
-            continue;
-        };
-        if let Ok(u) = Ulid::from_string(stem) {
-            segments.push(u);
-            if max_seg.is_none_or(|m| u > m) {
-                max_seg = Some(u);
-            }
-        }
-    }
-    // `Ulid::default()` is the nil ULID, not a fresh one — explicitly mint.
-    #[allow(clippy::unwrap_or_default)]
-    let snap = max_seg.unwrap_or_else(Ulid::new);
-    let snap_str = snap.to_string();
-
-    // Step 3: verify pinned segments are still live before committing
-    // to a manifest. Re-read HEAD (one GET, plus LATEST + manifest
-    // GETs inside the resolver) and check pinned ⊆ live(manifest,
-    // HEAD). A pin missing here means a concurrent owner GC raced us
-    // and either superseded it or the reaper tombstoned it between
-    // Step 1's hydration and this verification.
-    let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
-    let live = elide_coordinator::segment_head::resolve_live_segments(&vd, &vk)
-        .await
-        .map_err(|e| IpcError::store(format!("resolving live segments for verification: {e}")))?;
-    let pinned: std::collections::BTreeSet<Ulid> = segments.iter().copied().collect();
-    let mut missing: Vec<Ulid> = pinned.difference(&live).copied().collect();
-    if !missing.is_empty() {
-        missing.sort();
-        let preview: Vec<String> = missing.iter().take(5).map(|u| u.to_string()).collect();
-        let extra = missing.len().saturating_sub(preview.len());
-        let suffix = if extra > 0 {
-            format!(" (+{extra} more)")
-        } else {
-            String::new()
-        };
-        return Err(IpcError::conflict(format!(
-            "force-snapshot aborted: {} of {} pinned segment(s) no longer present in S3 \
-             (owner GC raced us); missing: [{}]{}",
-            missing.len(),
-            pinned.len(),
-            preview.join(", "),
-            suffix,
-        )));
-    }
-
-    // Step 4: load-or-create the per-source attestation key.
-    let (signer, vk) = elide_core::signing::load_or_create_keypair(
-        &ancestor_dir,
-        elide_core::signing::FORCE_SNAPSHOT_KEY_FILE,
-        elide_core::signing::FORCE_SNAPSHOT_PUB_FILE,
-    )
-    .map_err(|e| IpcError::internal(format!("attestation keypair: {e}")))?;
-
-    // Step 5: sign + write manifest locally. The ancestor dir may have
-    // been freshly minted by `pull_volume_skeleton`, which only creates
-    // `index/` — `snapshots/` doesn't exist yet on a recovery path.
-    let snapshots_dir = ancestor_dir.join("snapshots");
-    std::fs::create_dir_all(&snapshots_dir)
-        .map_err(|e| IpcError::internal(format!("creating snapshots dir: {e}")))?;
-    elide_core::signing::write_snapshot_manifest(&ancestor_dir, &*signer, &snap, &segments, None)
-        .map_err(|e| IpcError::internal(format!("writing snapshot manifest: {e}")))?;
-
-    // Step 6: upload the manifest to S3. The manifest's S3 presence is
-    // the snapshot's S3 visibility — no separate marker.
-    let manifest_path = ancestor_dir
-        .join("snapshots")
-        .join(format!("{snap_str}.manifest"));
-    let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
-    vd.snapshots()
-        .put_manifest_from_file(snap, &manifest_path)
-        .await
-        .map_err(|e| IpcError::store(format!("uploading snapshot manifest: {e}")))?;
-
-    info!(
-        "[inbound] attested now-snapshot {snap_str} for {volume_id} ({} segments)",
-        segments.len()
-    );
-    let pubkey_hex: String = vk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    Ok(ForceSnapshotNowReply {
-        snap_ulid: snap,
-        attestation_pubkey_hex: pubkey_hex,
-    })
-}
-
 /// Fork an existing source volume into a new writable volume.
 ///
 /// Mirrors the CLI's `fork_volume_at*` + by_name symlink + volume.toml
 /// write. `source_vol_ulid` resolves to any volume in `by_id/<ulid>/` —
 /// writable, imported readonly base, or pulled ancestor. `snap` is
 /// optional: if omitted, falls back to `volume::fork_volume` (latest
-/// local snapshot). `parent_key_hex` is the hex ephemeral pubkey from
-/// `force-snapshot-now`, recorded in the new fork's provenance for
-/// force-snapshot pins. `source_name_hint` is the orchestrator-supplied
+/// local snapshot). `source_name_hint` is the orchestrator-supplied
 /// source name, used as a fallback when the source's on-disk
 /// `volume.toml` has no `name` field — typically because the source was
 /// pulled from S3 (`pull.rs` writes `name: None` for pulled ancestors).
@@ -727,7 +564,6 @@ async fn fork_create_op(
     new_name: &str,
     source_vol_ulid: Ulid,
     snap: Option<Ulid>,
-    parent_key_hex: Option<&str>,
     flags: &[String],
     source_name_hint: Option<&str>,
     store: &Arc<dyn ObjectStore>,
@@ -739,19 +575,6 @@ async fn fork_create_op(
     let coord_id = identity.coordinator_id_str();
     validate_volume_name(new_name).map_err(IpcError::bad_request)?;
     let source_ulid_str = source_vol_ulid.to_string();
-
-    let parent_key = match parent_key_hex {
-        Some(hex) => {
-            let arr = decode_hex32(hex)
-                .map_err(|e| IpcError::bad_request(format!("bad parent-key: {e}")))?;
-            Some(
-                elide_core::signing::VerifyingKey::from_bytes(&arr).map_err(|e| {
-                    IpcError::bad_request(format!("parent-key not a valid Ed25519 pubkey: {e}"))
-                })?,
-            )
-        }
-        None => None,
-    };
 
     let patch = parse_transport_flags(&flags.join(" ")).map_err(IpcError::bad_request)?;
     if patch.no_ublk {
@@ -803,15 +626,9 @@ async fn fork_create_op(
     // Phase 1: materialise the fork locally. This generates the new
     // fork's keypair on disk so we can upload `volume.pub` before
     // touching `names/<name>`.
-    let fork_result: std::io::Result<()> = match (snap, parent_key) {
-        (Some(snap), Some(vk)) => elide_core::volume::fork_volume_at_with_manifest_key(
-            &new_fork_dir,
-            &source_dir,
-            snap,
-            vk,
-        ),
-        (Some(snap), None) => elide_core::volume::fork_volume_at(&new_fork_dir, &source_dir, snap),
-        (None, _) => elide_core::volume::fork_volume(&new_fork_dir, &source_dir),
+    let fork_result: std::io::Result<()> = match snap {
+        Some(snap) => elide_core::volume::fork_volume_at(&new_fork_dir, &source_dir, snap),
+        None => elide_core::volume::fork_volume(&new_fork_dir, &source_dir),
     };
     if let Err(e) = fork_result {
         cleanup(&new_fork_dir, &symlink_path);
@@ -1101,14 +918,7 @@ mod tests {
     }
 
     fn orchestrator(ctx: ForkContext, from: ForkSource) -> ForkOrchestrator {
-        ForkOrchestrator::new(
-            ForkJob::new(),
-            "child".to_owned(),
-            from,
-            false,
-            Vec::new(),
-            ctx,
-        )
+        ForkOrchestrator::new(ForkJob::new(), "child".to_owned(), from, Vec::new(), ctx)
     }
 
     fn snap() -> Ulid {

@@ -31,7 +31,7 @@ use super::{
 /// True if `<data_dir>/by_name/<name>` resolves to a fork with a live
 /// volume daemon — i.e. this host is actively serving `<name>`.
 ///
-/// Used by recovery verbs (`release --force`, `claim`) to refuse when
+/// Used by recovery verbs (`claim`, `claim --force`) to refuse when
 /// the operator has typo'd a verb at their own running volume: those
 /// verbs are designed for unreachable peers and would otherwise leave
 /// on-disk state diverging from the bucket record. A `Released` or
@@ -182,225 +182,6 @@ pub(crate) async fn stop_volume_op(
             info!("[inbound] stopped volume {volume_name} (process was not running)");
             Ok(())
         }
-    }
-}
-
-/// `volume release --force`.
-///
-/// Override path for an unreachable previous owner: synthesise a
-/// fresh handoff snapshot from S3-visible segments under the dead
-/// fork's prefix, sign it with this coordinator's identity key, and
-/// unconditionally rewrite `names/<name>` to `Released`.
-///
-/// Does **not** require a local symlink, does **not** drain any WAL
-/// (the dead owner's WAL is unreachable), does **not** halt or touch
-/// any local volume daemon. The data-loss boundary is "writes the
-/// dead owner accepted but never promoted to S3" — same as the
-/// crash-recovery contract elsewhere.
-pub(crate) async fn force_release_volume_op(
-    volume_name: &str,
-    data_dir: &Path,
-    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-) -> Result<ReleaseReply, IpcError> {
-    use elide_coordinator::recovery;
-
-    // Refuse when the "dead peer" is actually this host's running
-    // daemon. force-release is for unreachable peers; against a local
-    // running fork it would leave on-disk state diverging from the
-    // bucket record. The operator wants `volume stop` first.
-    if local_daemon_running(data_dir, volume_name) {
-        return Err(IpcError::conflict(format!(
-            "volume '{volume_name}' is running on this host; \
-             stop it first with: elide volume stop {volume_name}"
-        )));
-    }
-
-    // Two credentials are involved. Operations on `names/<name>` and
-    // `events/<name>/` (the name-flip CAS, the journal entry, the
-    // initial record read) ride the coordinator-wide `coord-rw`
-    // credential. Operations on `by_id/<dead_vol>/` (volume.pub,
-    // LATEST, manifest, HEAD, segments, the synthesised manifest
-    // write) ride a per-volume `volume-rw` credential minted
-    // specifically for `dead_vol_ulid` — `coord-rw` has no
-    // access to `by_id/` at all (see `mint/examples/elide_roles/`).
-    // Both creds are mintable by this coordinator for any vol_ulid;
-    // there is no ownership check at mint time, by design for the
-    // recovery path.
-    let writer = stores.writer();
-
-    // Read the current record to learn which dead fork to recover from.
-    let dead_vol_ulid = {
-        use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
-        let (position, _) = fetch_position(&writer, volume_name, identity.coordinator_id_str())
-            .await
-            .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
-        match position {
-            OwnershipPosition::OwnedByUs { vol_ulid, .. }
-            | OwnershipPosition::OwnedByOther { vol_ulid, .. } => vol_ulid,
-            OwnershipPosition::Absent => {
-                return Err(IpcError::not_found(format!(
-                    "name '{volume_name}' has no S3 record"
-                )));
-            }
-            OwnershipPosition::Released { .. } | OwnershipPosition::Readonly { .. } => {
-                return Err(IpcError::conflict(format!(
-                    "names/{volume_name} is not in a Live or Stopped state; \
-                     force-release only overrides Live or Stopped records"
-                )));
-            }
-        }
-    };
-
-    // Mint the per-volume credential now that we know `dead_vol_ulid`.
-    // All by_id/<dead_vol>/* ops below ride this store.
-    let dead_store = stores.volume_rw(&dead_vol_ulid);
-    let dead_vd = stores.volume_data(&dead_vol_ulid);
-
-    // Recovery pipeline: fetch dead fork's pubkey, then synthesise a
-    // fresh handoff manifest from the dead fork's HEAD-enumerated
-    // live segment set.
-    //
-    // If `volume.pub` is absent the dead fork crashed during the
-    // create-time window before the coordinator published it. No
-    // segment could have been signed-and-verified under a missing key,
-    // so the dead fork is provably empty: publish an empty synthesised
-    // handoff and flip to Released.
-    let dead_pub = dead_vd
-        .metadata()
-        .read_pubkey_optional()
-        .await
-        .map_err(|e| {
-            IpcError::store(format!(
-                "fetching volume.pub for released fork {dead_vol_ulid}: {e}"
-            ))
-        })?;
-
-    let segment_ulids: Vec<ulid::Ulid> = match dead_pub {
-        Some(dead_pub) => {
-            let recovered =
-                recovery::list_and_verify_segments(&dead_store, dead_vol_ulid, &dead_pub)
-                    .await
-                    .map_err(|e| {
-                        IpcError::store(format!(
-                            "listing/verifying segments for released fork {dead_vol_ulid}: {e:#}"
-                        ))
-                    })?;
-            let ulids: Vec<ulid::Ulid> =
-                recovered.segments.iter().map(|s| s.segment_ulid).collect();
-            info!(
-                "[inbound] force-release {volume_name}: recovered {} segments \
-                 ({} dropped) from released fork {dead_vol_ulid}",
-                ulids.len(),
-                recovered.dropped,
-            );
-            ulids
-        }
-        None => {
-            info!(
-                "[inbound] force-release {volume_name}: released fork \
-                 {dead_vol_ulid} has no volume.pub in bucket — treating as \
-                 empty (create-time crash before pub upload)"
-            );
-            Vec::new()
-        }
-    };
-
-    let published = recovery::mint_and_publish_synthesised_snapshot(
-        &dead_store,
-        dead_vol_ulid,
-        &segment_ulids,
-        identity.as_ref(),
-        identity.coordinator_id_str(),
-    )
-    .await
-    .map_err(|e| IpcError::store(format!("publishing synthesised snapshot: {e}")))?;
-
-    // Unconditional flip of names/<name>.
-    let outcome = stores
-        .name_claims()
-        .mark_released_force(volume_name, published.snap_ulid)
-        .await;
-    let journal = stores.event_journal();
-    finalize_force_release(
-        volume_name,
-        data_dir,
-        journal.as_ref(),
-        identity,
-        published.snap_ulid,
-        outcome,
-    )
-    .await
-}
-
-/// Handle the outcome of `mark_released_force` plus the best-effort
-/// after-effects (local display marker, journal entry, breadcrumb
-/// cleanup). Factored out so both the auto-promotion fast path and
-/// the segment-list synthesis slow path in `force_release_volume_op`
-/// converge on identical operator-visible behaviour once the bucket
-/// flip outcome is known.
-async fn finalize_force_release(
-    volume_name: &str,
-    data_dir: &Path,
-    journal: &dyn elide_coordinator::event_journal::EventJournal,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    handoff_snapshot: ulid::Ulid,
-    outcome: Result<
-        elide_coordinator::lifecycle::ForceReleaseOutcome,
-        elide_coordinator::lifecycle::LifecycleError,
-    >,
-) -> Result<ReleaseReply, IpcError> {
-    use elide_coordinator::lifecycle::ForceReleaseOutcome;
-    match outcome {
-        Ok(ForceReleaseOutcome::Overwritten {
-            dead_vol_ulid: d,
-            displaced_coordinator_id,
-        }) => {
-            info!(
-                "[inbound] force-released volume {volume_name} (released fork {d}) at \
-                 handoff snapshot {handoff_snapshot}",
-            );
-            // force-release is also used to displace a *foreign*
-            // coordinator's record without any local fork — in that
-            // case the by_name symlink doesn't resolve and we
-            // silently skip the marker write.
-            let local_vol_dir =
-                std::fs::canonicalize(data_dir.join("by_name").join(volume_name)).ok();
-            emit_release_aftermath(
-                data_dir,
-                journal,
-                identity,
-                volume_name,
-                local_vol_dir.as_deref(),
-                handoff_snapshot,
-                d,
-                elide_core::volume_event::EventKind::ForceReleased {
-                    handoff_snapshot,
-                    displaced_coordinator_id: displaced_coordinator_id
-                        .unwrap_or_else(|| "<unknown>".to_string()),
-                },
-                true,
-                "force-release",
-            )
-            .await;
-            Ok(ReleaseReply { handoff_snapshot })
-        }
-        Ok(ForceReleaseOutcome::Absent) => {
-            // Race: record disappeared between our read and our write.
-            Err(IpcError::precondition_failed(format!(
-                "names/{volume_name} vanished between read and force-write"
-            )))
-        }
-        Ok(ForceReleaseOutcome::InvalidState { observed }) => {
-            // Race: state changed under us. The handoff snapshot is
-            // still published (harmless); operator can retry.
-            Err(IpcError::precondition_failed(format!(
-                "names/{volume_name} changed underneath us; now in state {observed:?}"
-            )))
-        }
-        Err(e) => Err(IpcError::store(format!(
-            "force-release flip failed (handoff snapshot {handoff_snapshot} already published): {e}"
-        ))),
     }
 }
 
@@ -660,14 +441,10 @@ pub(crate) async fn release_volume_op(
 /// Refuses if:
 ///   - The breadcrumb is absent (no record of ever owning this).
 ///   - The bucket record is missing or owned by another coordinator
-///     (the cross-host case — operator must `release --force` from
-///     a host that's actually the dead owner).
+///     (the cross-host case — recovery is `claim --force` from the
+///     host that wants the volume).
 ///   - The bucket record is already `Released` (idempotent failure
 ///     to give better operator feedback).
-///   - No snapshot exists under `by_id/<vol_ulid>/snapshots/` (the
-///     stop-snapshot was somehow lost; cross-host recovery via
-///     `release --force` is the only remaining path, and even that
-///     would synthesise).
 #[allow(clippy::too_many_arguments)]
 async fn release_breadcrumb_only(
     volume_name: &str,
@@ -828,7 +605,7 @@ fn reuse_handoff_snapshot(record: &elide_core::name_record::NameRecord) -> Optio
 /// Refuses if no key shadow exists. That would mean we own the
 /// bucket record but the host has no record of ever minting the
 /// volume — an inconsistency the operator should resolve via
-/// `release --force` from somewhere with credentials.
+/// `claim --force` from another host.
 ///
 /// The `snap_ulid` is freshly minted coordinator-side. This is one
 /// of the few legitimate coordinator-side ULID mints — there is no
@@ -845,15 +622,14 @@ async fn synthesise_empty_owner_handoff(
     let key_bytes = shadow.ok_or_else(|| {
         IpcError::not_found(format!(
             "name '{volume_name}' has no snapshot in the store and no key shadow \
-             locally — recover via `release --force` from another host"
+             locally — recover via `volume claim --force` from another host"
         ))
     })?;
     let (signer, _vk) = elide_core::signing::signer_from_bytes(&key_bytes)
         .map_err(|e| IpcError::internal(format!("loading shadow signer: {e}")))?;
 
     let snap_ulid = ulid::Ulid::new();
-    let manifest_bytes =
-        elide_core::signing::build_snapshot_manifest_bytes(signer.as_ref(), &[], None);
+    let manifest_bytes = elide_core::signing::build_snapshot_manifest_bytes(signer.as_ref(), &[]);
     vd.snapshots()
         .put_manifest(snap_ulid, bytes::Bytes::from(manifest_bytes.clone()))
         .await
@@ -1230,12 +1006,11 @@ fn latest_segment_ulid(index_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> 
 ///   - reclaims in place (own released fork still on disk) → `ok reclaimed`
 ///   - directs the CLI to orchestrate a foreign claim → `released <vol_ulid> <snap>`
 ///   - refuses if the record is `Live`/`Stopped` and owned by another
-///     coordinator. The operator must run `release --force` first to
-///     declare the previous owner dead and flip the record to
-///     `Released`. Splitting the verbs keeps the claim step
+///     coordinator. If that owner is dead, the operator runs
+///     `claim --force`, which displaces it under an `If-Match` fence
+///     on the fetched record. The plain claim step here stays
 ///     CAS-protected (via `mark_claimed`) so concurrent claimants
-///     are arbitrated by the conditional PUT, not by the unconditional
-///     overwrite that `release --force` performs.
+///     are arbitrated by the conditional PUT.
 ///
 /// The result always leaves the volume `Stopped` (no daemon launched).
 /// The CLI calls `start` afterwards if `volume start --claim` was the
@@ -1273,7 +1048,7 @@ pub(crate) async fn hydrate_or_route(
             coord_id: held_by, ..
         } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is held by coordinator {held_by}; \
-                 run `volume release --force` to override"
+                 if that owner is dead, run `volume claim --force` to take over"
         ))),
         OwnershipPosition::Released { .. } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is Released; \
@@ -1399,7 +1174,7 @@ pub(crate) async fn start_volume_op(
         Err(LifecycleError::OwnershipConflict { held_by }) => {
             return Err(IpcError::conflict(format!(
                 "name '{volume_name}' is owned by coordinator {held_by}; \
-                 run `volume release --force` to override"
+                 if that owner is dead, run `volume claim --force` to take over"
             )));
         }
         Err(LifecycleError::InvalidTransition { from, .. }) => {
@@ -1624,328 +1399,8 @@ mod tests {
         );
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // ── force_release_volume_op ───────────────────────────────────────────
-    //
-    // Verify the inbound op composes recovery + lifecycle + name_store
-    // correctly. The lower-level helpers each have unit coverage already;
-    // these tests exercise the IPC verb's end-to-end path: read current
-    // record → fetch dead pubkey → list+verify segments → publish
-    // synthesised snapshot → unconditionally rewrite names/<name>.
-
-    use elide_coordinator::identity::CoordinatorIdentity;
     use elide_coordinator::name_store as ns;
-    use elide_coordinator::stores::{PassthroughStores, ScopedStores};
     use elide_core::name_record::{NameRecord, NameState};
-    use elide_core::segment::{SegmentEntry, SegmentFlags, SegmentSigner, write_segment};
-    use elide_core::signing::generate_ephemeral_signer;
-    use object_store::PutPayload;
-    use object_store::path::Path as StorePath;
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    /// Wrap a single in-memory `ObjectStore` in `PassthroughStores`
-    /// so test callers can pass it as `&Arc<dyn ScopedStores>` to
-    /// `force_release_volume_op`. Both sides see the same bucket
-    /// bytes, matching the local-store / no-`[mint]` deployment
-    /// where every role resolves to the same underlying store.
-    fn scoped(store: &Arc<dyn ObjectStore>) -> Arc<dyn ScopedStores> {
-        Arc::new(PassthroughStores::new(Arc::clone(store)))
-    }
-
-    /// Upload a `volume.pub` for the dead fork at the canonical path.
-    async fn upload_dead_pub(
-        store: &Arc<dyn ObjectStore>,
-        vol_ulid: ulid::Ulid,
-        vk: &ed25519_dalek::VerifyingKey,
-    ) {
-        let key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
-        let body = format!("{}\n", hex(&vk.to_bytes()));
-        store
-            .put(&key, PutPayload::from(body.into_bytes()))
-            .await
-            .unwrap();
-    }
-
-    /// Build a single-entry signed segment via the canonical writer and
-    /// upload it under the production `upload::segment_key` (date-
-    /// sharded), then mark it `Added` in HEAD. HEAD-driven recovery
-    /// (`recovery::list_and_verify_segments`) reads HEAD to discover
-    /// segments and uses `upload::segment_key` to build the GET key,
-    /// so test fixtures must mirror both production conventions to
-    /// be reachable.
-    async fn upload_signed_segment(
-        store: &Arc<dyn ObjectStore>,
-        vol_ulid: ulid::Ulid,
-        seg_ulid: ulid::Ulid,
-        signer: &dyn SegmentSigner,
-        body: &[u8],
-    ) {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("seg");
-        let hash = blake3::hash(body);
-        let mut entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            body.to_vec(),
-        )];
-        write_segment(&path, &mut entries, signer).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        let key = elide_coordinator::upload::segment_key(vol_ulid, seg_ulid);
-        store.put(&key, PutPayload::from(bytes)).await.unwrap();
-        seed_head_added(store, vol_ulid, &[seg_ulid]).await;
-    }
-
-    /// Add `segs` to the volume's HEAD `Added` set, merging with any
-    /// existing entries. Test fixtures that publish segments to S3
-    /// directly need this so HEAD-driven enumeration (the recovery
-    /// path under test) finds them.
-    async fn seed_head_added(
-        store: &Arc<dyn ObjectStore>,
-        vol_ulid: ulid::Ulid,
-        segs: &[ulid::Ulid],
-    ) {
-        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
-        let mut head = vd.head().read().await.unwrap();
-        for s in segs {
-            head.added.insert(*s);
-        }
-        vd.head().put(&head).await.unwrap();
-    }
-
-    /// Fixture: a name in `Live` state pointing at a dead fork that has
-    /// `volume.pub` and one signed segment in S3, plus a fresh
-    /// `CoordinatorIdentity` for the recovering coordinator.
-    async fn force_release_fixture(
-        name: &str,
-    ) -> (
-        Arc<dyn ObjectStore>,
-        Arc<CoordinatorIdentity>,
-        ulid::Ulid,
-        ulid::Ulid,
-        TempDir,
-    ) {
-        let store: Arc<dyn ObjectStore> = mem_store();
-        let dead_vol = ulid::Ulid::new();
-        let seg_ulid = ulid::Ulid::new();
-
-        let (signer, vk) = generate_ephemeral_signer();
-        upload_dead_pub(&store, dead_vol, &vk).await;
-        upload_signed_segment(&store, dead_vol, seg_ulid, signer.as_ref(), b"data").await;
-
-        // names/<name> = Live, owned by some "previous" coordinator id.
-        let mut rec = NameRecord::live_minimal(dead_vol, SAMPLE_SIZE);
-        rec.coordinator_id = Some("dead-owner".into());
-        ns::create_name_record(&store, name, &rec).await.unwrap();
-
-        // Recovering coordinator's identity, rooted in a tempdir.
-        let coord_dir = TempDir::new().unwrap();
-        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
-
-        (store, identity, dead_vol, seg_ulid, coord_dir)
-    }
-
-    #[tokio::test]
-    async fn force_release_op_overwrites_live_to_released() {
-        let (store, identity, dead_vol, _seg, _td) = force_release_fixture("vol").await;
-
-        let reply = force_release_volume_op(
-            "vol",
-            TempDir::new().unwrap().path(),
-            &scoped(&store),
-            &identity,
-        )
-        .await
-        .expect("force-release should succeed");
-        let snap_ulid = reply.handoff_snapshot;
-
-        // names/<vol> is now Released, references the dead fork.
-        let (rec, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
-        assert_eq!(rec.state, NameState::Released);
-        assert_eq!(rec.vol_ulid, dead_vol);
-        assert_eq!(rec.handoff_snapshot, Some(snap_ulid));
-
-        // Synthesised manifest landed at the predicted snapshot key.
-        elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead_vol)
-            .snapshots()
-            .head_manifest(snap_ulid)
-            .await
-            .expect("head_manifest succeeds")
-            .expect("synthesised manifest present at predicted key");
-    }
-
-    #[tokio::test]
-    async fn force_release_op_refuses_already_released_record() {
-        let (store, identity, _dead, _seg, _td) = force_release_fixture("vol").await;
-
-        // Pre-flip names/<vol> to Released so the op refuses.
-        let (mut rec, v) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
-        rec.state = NameState::Released;
-        rec.coordinator_id = None;
-        ns::update_name_record(&store, "vol", &rec, v)
-            .await
-            .unwrap();
-
-        let err = force_release_volume_op(
-            "vol",
-            TempDir::new().unwrap().path(),
-            &scoped(&store),
-            &identity,
-        )
-        .await
-        .expect_err("already-released record must refuse");
-        assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::Conflict);
-        assert!(
-            err.message
-                .contains("force-release only overrides Live or Stopped"),
-            "{}",
-            err.message
-        );
-    }
-
-    #[tokio::test]
-    async fn force_release_op_refuses_absent_name() {
-        let store = mem_store();
-        let coord_dir = TempDir::new().unwrap();
-        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
-
-        let err = force_release_volume_op(
-            "ghost",
-            TempDir::new().unwrap().path(),
-            &scoped(&store),
-            &identity,
-        )
-        .await
-        .expect_err("ghost name must error");
-        assert_eq!(err.kind, elide_coordinator::ipc::IpcErrorKind::NotFound);
-        assert!(err.message.contains("no S3 record"), "{}", err.message);
-    }
-
-    #[tokio::test]
-    async fn force_release_op_recovers_when_dead_pub_missing() {
-        // Reproduces the create-time crash window: `names/<name>` was
-        // published to S3 but the coordinator died before
-        // `volume.pub` made it to the bucket. With no `volume.pub`
-        // there is no key to verify any segment under, so the dead
-        // fork is provably empty — force-release publishes an empty
-        // synthesised handoff and flips to Released.
-        let store: Arc<dyn ObjectStore> = mem_store();
-        let dead_vol = ulid::Ulid::new();
-        let mut rec = NameRecord::live_minimal(dead_vol, SAMPLE_SIZE);
-        rec.coordinator_id = Some("dead-owner".into());
-        ns::create_name_record(&store, "vol", &rec).await.unwrap();
-
-        let coord_dir = TempDir::new().unwrap();
-        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
-
-        let reply = force_release_volume_op(
-            "vol",
-            TempDir::new().unwrap().path(),
-            &scoped(&store),
-            &identity,
-        )
-        .await
-        .expect("force-release on missing-pub fork should succeed");
-        let snap_ulid = reply.handoff_snapshot;
-
-        let (rec, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
-        assert_eq!(rec.state, NameState::Released);
-        assert_eq!(rec.vol_ulid, dead_vol);
-        assert_eq!(rec.handoff_snapshot, Some(snap_ulid));
-
-        // The synthesised manifest covers no segments.
-        let manifest =
-            elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead_vol)
-                .snapshots()
-                .get_manifest_bytes(snap_ulid)
-                .await
-                .unwrap();
-        let recovery = elide_core::signing::peek_snapshot_manifest_recovery(&manifest)
-            .unwrap()
-            .expect("synthesised handoff must carry recovery metadata");
-        assert_eq!(
-            recovery.recovering_coordinator_id,
-            identity.coordinator_id_str()
-        );
-    }
-
-    #[tokio::test]
-    async fn force_release_op_drops_tampered_segment_but_succeeds() {
-        // A tampered segment must be dropped (signature failure) without
-        // failing the verb. The published snapshot covers only the
-        // verified segments; the operator can still recover the name.
-        let store: Arc<dyn ObjectStore> = mem_store();
-        let dead_vol = ulid::Ulid::new();
-        let (signer, vk) = generate_ephemeral_signer();
-        upload_dead_pub(&store, dead_vol, &vk).await;
-
-        // One good segment, one tampered.
-        let good_id = ulid::Ulid::new();
-        upload_signed_segment(&store, dead_vol, good_id, signer.as_ref(), b"good").await;
-        let bad_id = ulid::Ulid::new();
-        // Build a valid segment then flip a byte inside the index section.
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("seg");
-        let hash = blake3::hash(b"bad");
-        let mut entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            b"bad".to_vec(),
-        )];
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
-        let mut bytes = std::fs::read(&path).unwrap();
-        // Header is 100 bytes; first index entry starts at offset 100.
-        bytes[104] ^= 0xff;
-        let bad_key = elide_coordinator::upload::segment_key(dead_vol, bad_id);
-        store.put(&bad_key, PutPayload::from(bytes)).await.unwrap();
-        // HEAD must list the tampered segment too — recovery enumerates
-        // through HEAD and verifies each. Without this entry, the
-        // resolver wouldn't even attempt to fetch + verify `bad_id`,
-        // so the "tampered segment is dropped" assertion would pass
-        // vacuously.
-        seed_head_added(&store, dead_vol, &[bad_id]).await;
-
-        let mut rec = NameRecord::live_minimal(dead_vol, SAMPLE_SIZE);
-        rec.coordinator_id = Some("dead-owner".into());
-        ns::create_name_record(&store, "vol", &rec).await.unwrap();
-
-        let coord_dir = TempDir::new().unwrap();
-        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
-
-        let reply = force_release_volume_op(
-            "vol",
-            TempDir::new().unwrap().path(),
-            &scoped(&store),
-            &identity,
-        )
-        .await
-        .expect("force-release with one tampered segment must still succeed");
-        let snap_ulid = reply.handoff_snapshot;
-
-        // Verify the synthesised manifest contains exactly one segment ULID
-        // — the good one. Read the manifest body and look for both ids.
-        let manifest_body =
-            elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead_vol)
-                .snapshots()
-                .get_manifest_bytes(snap_ulid)
-                .await
-                .unwrap();
-        let body_str = std::str::from_utf8(&manifest_body).unwrap();
-        assert!(
-            body_str.contains(&good_id.to_string()),
-            "good segment present"
-        );
-        assert!(
-            !body_str.contains(&bad_id.to_string()),
-            "tampered segment must not appear in manifest"
-        );
-    }
 
     // ── release / stop preconditions ──────────────────────────────────────
     //
@@ -1994,7 +1449,7 @@ mod tests {
     fn local_daemon_running_treats_released_marker_as_not_running() {
         // Regression: previously the predicate checked only for the
         // absence of `volume.stopped`, so a parked-Released fork was
-        // misclassified as running and `claim` / `release --force`
+        // misclassified as running and `claim` / `claim --force`
         // wrongly refused. The supervisor parks on `volume.released`
         // too — these forks have no daemon.
         use elide_coordinator::volume_state::RELEASED_FILE;
@@ -2343,60 +1798,6 @@ mod tests {
             "release must route `by_id/<vol>/snapshots/` writes through \
              volume_rw({vol_ulid}); got {calls:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn force_release_routes_dead_fork_writes_through_volume_rw_and_names_through_writer() {
-        // `force_release_volume_op` is split across two credentials by
-        // design (see the comment at the top of the op):
-        //   - by_id/<dead_vol>/* (volume.pub read, segment list, the
-        //     synthesised manifest write) → per-vol volume-rw minted
-        //     for `dead_vol_ulid`
-        //   - names/<name> CAS + events/<name>/ entry → coord-rw
-        // A regression that routed the synthesised manifest write
-        // through `writer()` would silently 403 on Tigris (coord-rw
-        // has no by_id/ access). This test pins both halves.
-        use elide_coordinator::stores::{
-            PassthroughStores, RecordingStores, RoleCall, ScopedStores,
-        };
-
-        let (store, identity, dead_vol, _seg, _td) = force_release_fixture("vol").await;
-        let passthrough: Arc<dyn ScopedStores> =
-            Arc::new(PassthroughStores::new(Arc::clone(&store)));
-        let recording = RecordingStores::wrap(passthrough);
-
-        let _ = force_release_volume_op(
-            "vol",
-            TempDir::new().unwrap().path(),
-            &(recording.clone() as Arc<dyn ScopedStores>),
-            &identity,
-        )
-        .await
-        .expect("force-release should succeed in this fixture");
-
-        let calls = recording.calls();
-        // Per-vol writes (synthesised manifest, segment list reads) ride
-        // volume-rw for the dead fork's ULID, not some other vol.
-        assert!(
-            calls.contains(&RoleCall::VolumeRw(dead_vol)),
-            "force-release must route by_id/{dead_vol}/* through \
-             volume_rw({dead_vol}); got {calls:?}"
-        );
-        // Coord-writer covers names/<vol> + events/<vol>/.
-        assert!(
-            calls.contains(&RoleCall::Writer),
-            "force-release must mint coord-rw for names/<vol> CAS; \
-             got {calls:?}"
-        );
-        // No volume-ro: force-release reads + writes by_id/<dead_vol>/*
-        // in one credential (recovery path needs both, so it mints
-        // volume-rw not the read-only sibling).
-        for call in &calls {
-            assert!(
-                !matches!(call, RoleCall::ReadVolume(_)),
-                "force-release must not mint volume-ro; saw {call:?} in {calls:?}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -2852,7 +2253,7 @@ mod tests {
             "{}",
             err.message
         );
-        assert!(err.message.contains("release --force"), "{}", err.message);
+        assert!(err.message.contains("claim --force"), "{}", err.message);
     }
 
     #[tokio::test]

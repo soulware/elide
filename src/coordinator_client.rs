@@ -19,9 +19,9 @@ use serde::Deserialize;
 pub use elide_coordinator::ipc::{
     ClaimAttachEvent, ClaimStartReply, CreateReply, EvictReply, ForkAttachEvent, ForkSource,
     ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply,
-    IpcErrorKind, PeerClaimerTokenReply, RegisterReply, ReleaseReply, ResolveHandoffKeyReply,
-    SignatureStatus, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply,
-    StoreCredsReply, UpdateReply, VolumeEventEntry, VolumeEventsReply,
+    IpcErrorKind, PeerClaimerTokenReply, RegisterReply, ReleaseReply, SignatureStatus,
+    SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
+    VolumeEventEntry, VolumeEventsReply,
 };
 pub use elide_peer_fetch::PeerEndpoint;
 
@@ -587,15 +587,9 @@ impl Client {
     /// `state=released` with the snapshot ULID recorded so the next
     /// claimant can fork from it. Returns the handoff snapshot ULID on
     /// success.
-    ///
-    /// With `force`, skips ownership and drain — used when the previous
-    /// owner is unreachable. The recovering coordinator synthesises a
-    /// handoff snapshot from S3-visible segments and unconditionally
-    /// rewrites the record.
-    pub fn release_volume(&self, name: &str, force: bool) -> io::Result<ReleaseReply> {
+    pub fn release_volume(&self, name: &str) -> io::Result<ReleaseReply> {
         self.call_typed(&Request::Release {
             volume: name.to_owned(),
-            force,
         })?
         .map_err(io::Error::other)
     }
@@ -727,13 +721,11 @@ impl Client {
         &self,
         new_name: &str,
         from: ForkSource,
-        force_snapshot: bool,
         flags: &[String],
     ) -> io::Result<ForkStartReply> {
         self.call_typed(&Request::ForkStart {
             new_name: new_name.to_owned(),
             from,
-            force_snapshot,
             flags: flags.to_vec(),
         })?
         .map_err(io::Error::other)
@@ -827,17 +819,12 @@ fn render_claim_event(event: &ClaimAttachEvent) -> Option<String> {
         ClaimAttachEvent::PullingAncestor { vol_ulid } => {
             Some(format!("[claim] pulled {vol_ulid}"))
         }
-        ClaimAttachEvent::HandoffKeyResolved { key } => match key {
-            ResolveHandoffKeyReply::Normal => None,
-            ResolveHandoffKeyReply::Recovery { .. } => Some(
-                "[claim] handoff snapshot is synthesised — verifying under recovering coordinator's key"
-                    .to_owned(),
-            ),
-        },
         ClaimAttachEvent::ForkCreated { new_vol_ulid } => {
             Some(format!("[claim] fork created at {new_vol_ulid}"))
         }
-        ClaimAttachEvent::PrefetchStarted => Some("[claim] prefetching ancestor index...".to_owned()),
+        ClaimAttachEvent::PrefetchStarted => {
+            Some("[claim] prefetching ancestor index...".to_owned())
+        }
         ClaimAttachEvent::PrefetchDone => Some("[claim] ready".to_owned()),
         ClaimAttachEvent::Done => None,
     }
@@ -854,9 +841,6 @@ fn render_fork_event(event: &ForkAttachEvent) -> Option<String> {
         ForkAttachEvent::PullingAncestor { vol_ulid } => Some(format!("pulled {vol_ulid}")),
         ForkAttachEvent::SnapshotTaken { snap_ulid } => {
             Some(format!("took implicit snapshot {snap_ulid}"))
-        }
-        ForkAttachEvent::AttestedSnapshot { snap_ulid, .. } => {
-            Some(format!("attested now-snapshot {snap_ulid}"))
         }
         ForkAttachEvent::ForkingFrom {
             source_vol_ulid,

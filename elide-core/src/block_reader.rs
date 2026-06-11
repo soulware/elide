@@ -173,17 +173,7 @@ impl BlockReader {
                     parent.volume_ulid
                 ))
             })?;
-            // Forker-attested pins carry a separate manifest key; fall back
-            // to the identity key when absent.
-            let manifest_vk = match parent.manifest_pubkey {
-                Some(bytes) => VerifyingKey::from_bytes(&bytes).map_err(|e| {
-                    io::Error::other(format!(
-                        "invalid parent manifest pubkey in provenance for {}: {e}",
-                        parent.volume_ulid
-                    ))
-                })?,
-                None => parent_vk,
-            };
+            let manifest_vk = parent_vk;
             let parent_snap = ulid::Ulid::from_string(&parent.snapshot_ulid).map_err(|e| {
                 io::Error::other(format!(
                     "invalid snapshot ulid in provenance parent {}: {e}",

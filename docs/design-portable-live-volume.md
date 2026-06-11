@@ -506,15 +506,16 @@ recovering coordinator B:
    HEAD once (the post-CAS cut defining the copy set), verifies each
    segment's index against the dead fork's
    `volume.pub`, re-signs the same index bytes with the new fork's
-   key, and composes the S3 objects server-side under the new fork's
-   prefix. No drain happens (the dead owner's WAL is unreachable);
-   nothing is written under the dead fork's prefix.
+   key, and copies the segment objects under the new fork's prefix
+   (ULIDs retained). No drain happens (the dead owner's WAL is
+   unreachable); nothing is written under the dead fork's prefix.
 
 The data-loss boundary is "writes that were fsync'd locally on the
 dead owner but never made it to S3" — identical to the crash-
 recovery contract elsewhere. Works equally well when the dead owner
-never published a snapshot at all: the fork is minted as a root and
-step 3 re-owns every live segment.
+never published a snapshot at all: the new fork takes over the dead
+fork's own `ParentRef` (a root continuation stays a root) and step 3
+re-owns every live segment.
 
 Why a single verb (rather than an unconditional `release --force`
 followed by a normal `claim`)?

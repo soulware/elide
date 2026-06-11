@@ -378,18 +378,16 @@ value. The migration is per-object:
 4. `VolumeData::snapshots()` — manifest publish / fetch and the
    `snapshots/LATEST` pointer. *Landed in this PR (stacked on
    #414).* Verb shape:
-   - `put_manifest(snap, Bytes)` for in-memory builds (synthesised
-     handoffs, force-release empty manifest).
+   - `put_manifest(snap, Bytes)` for in-memory builds (owner-signed
+     empty handoffs, the forced-claim basis copy).
    - `put_manifest_from_file(snap, &Path)` for disk-to-S3 uploads
-     (regular drain seal path, force-snapshot-now). Reads the file
+     (regular drain seal path). Reads the file
      verbatim, ships the bytes, returns them so the caller can
      record an upload sentinel without re-reading. The same
      file-input shape is used by [`MetadataView`] for
      `volume.pub` / `volume.provenance` uploads: when the on-disk
      file *is* the canonical signed form, the view's role is
      "ship this file" — not "parse and re-serialise."
-   - `try_publish_manifest(snap, Bytes)` — `If-None-Match: *` for
-     the synthesised-handoff conditional create.
    - `get_manifest(snap, &VerifyingKey) -> SnapshotManifest` —
      fetch + parse + verify in one step; the typed boundary.
    - `get_manifest_bytes(snap) -> Bytes` — raw fetch for the

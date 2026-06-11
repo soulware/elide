@@ -224,12 +224,8 @@ async fn install_basis_under_parent(
         .map_err(|e| IpcError::internal(format!("malformed parent snapshot ULID: {e}")))?;
     let parent_dir = by_id_dir.join(&parent.volume_ulid);
 
-    // `manifest_pubkey` overrides the parent's own pubkey when the
-    // basis was synthesised by a recovering coordinator (force-release
-    // path). For normal handoffs they're the same.
-    let manifest_vk_bytes = parent.manifest_pubkey.unwrap_or(parent.pubkey);
-    let manifest_vk = VerifyingKey::from_bytes(&manifest_vk_bytes)
-        .map_err(|e| IpcError::internal(format!("invalid parent manifest pubkey: {e}")))?;
+    let manifest_vk = VerifyingKey::from_bytes(&parent.pubkey)
+        .map_err(|e| IpcError::internal(format!("invalid parent pubkey: {e}")))?;
 
     // Claim resolves the handoff via the promoted `<ulid>.manifest`
     // key (release promotes stop → user before flipping), so the

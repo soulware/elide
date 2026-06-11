@@ -10,7 +10,7 @@ authoritative state of a name lives in a single S3 object —
 That object captures **what is true now**, but throws away **how we
 got here**. The fork chain (`vol_ulid` ancestry) carries some of the
 history, but only for episodes that produced a new fork; it does not
-record stops/starts, force-releases, or renames, and it cannot be
+record stops/starts, forced claims, or renames, and it cannot be
 walked from the human-facing name without already knowing the current
 `vol_ulid`.
 
@@ -94,7 +94,7 @@ signature = "<ed25519-sig-over-canonical-form>"
   events but cannot forge them under another coordinator's
   identity. The in-message domain tag prevents signature
   substitution between events and other coordinator-signed
-  artefacts (e.g. synthesised handoff snapshots) without requiring
+  artefacts (e.g. peer-fetch tokens) without requiring
   a second key.
 - **`name`** duplicates the `<name>` segment of the on-disk key
   (`events/<name>/<event_ulid>`). The path is already
@@ -118,7 +118,7 @@ signature = "<ed25519-sig-over-canonical-form>"
   on this name's log". It is *not* a strict hash chain — concurrent
   writers may both name the same `prev_event_ulid` — but it lets a
   reader detect when an emitter was unaware of a concurrent event,
-  which is useful provenance for force-release and rename
+  which is useful provenance for forced-claim and rename
   reconciliation. Emitters source this value from in-memory state in
   the warm case ("the event I just emitted" or "the latest I observed
   while watching this name"); a LIST of `events/<name>/` is only
@@ -143,7 +143,6 @@ readable.
 | `created` | first creator | initial `names/<name>` write (writable or readonly) |
 | `claimed` | acquiring coordinator | after `released → stopped/live` CAS succeeds |
 | `released` | releasing coordinator | after `live/stopped → released` CAS succeeds |
-| `force_released` | recovering coordinator | after `release --force` rewrites the pointer (retires with the `claim --force` rework) |
 | `force_claimed` | claiming coordinator | after `claim --force`'s conditioned CAS displaces a dead owner; carries `displaced_coordinator_id`. Doubles as the crash-resume source index: a later claimant resolves the name's prior bindings from these entries (and the rest of the log) to re-own a head delta a crashed intermediate never finished copying |
 | `forked_from` | new fork's coordinator | when this name was created via `volume create --from` (emitted on the *new* name's log only — see open question 1) |
 | `renamed_to` | owner | terminal event when this name is renamed away (see Rename) |
@@ -156,7 +155,7 @@ events would multiply the log volume for no auditable signal that
 isn't already in the pointer.
 
 Snapshot publication is also absent. Handoff snapshots are embedded
-in `released` / `force_released` events; user snapshots are a
+in `released` events; user snapshots are a
 fork-local concern. If we later want a richer log, we add events;
 old readers that don't recognise a kind treat it as opaque.
 
@@ -220,11 +219,12 @@ source of truth for transitions. The log is **journal, not protocol**:
   purposes:
   1. **Operator display.** `elide name log <name>` renders the
      events for human review before action.
-  2. **Force-release context.** When B is recovering name from a
-     dead coordinator A, B may inspect the log to confirm A's last
-     observed `vol_ulid` matches what segment listing produces. A
-     mismatch is a warning, not a hard refusal — segments are the
-     authoritative material.
+  2. **Forced-claim context.** When B is recovering name from a
+     dead coordinator A, `claim --force` reads the name's prior
+     bindings from the log to resume a head delta a crashed
+     intermediate never finished copying — the only place the log
+     is consulted programmatically; the record's `latest_snapshot`
+     and the dead fork's HEAD remain the authoritative material.
 - The log is not a fencing token. It is not on the critical path of
   any transition. Removing it would not change the correctness of
   claim/release; it would only erase history.
@@ -278,9 +278,9 @@ shape but without the global-truth property.
    observer be able to emit events (e.g. a recovering coordinator
    logging "I observed the dead owner's last segments")? Or only
    the current pointer-holder? Restricting to the current holder is
-   simpler; allowing observers makes force-release and migration
+   simpler; allowing observers makes forced claims and migration
    more inspectable. Lean: holder only for the lifecycle events;
-   force-release and rename are special cases the doc already
+   forced claim and rename are special cases the doc already
    covers.
 3. **Surface in CLI.** `elide name log <name>` is the obvious read
    verb. Worth confirming whether this lives under a new `name`
@@ -304,7 +304,7 @@ shape but without the global-truth property.
 - **The fork chain already covers some of this.** For volumes that
   migrate via fork, `walk_ancestors` already produces a coordinator-
   by-coordinator history. The event log adds the *non-fork*
-  transitions (stops, starts, force-releases, renames), which is
+  transitions (stops, starts, forced claims, renames), which is
   real value, but it overlaps with what's already there. Worth
   confirming the event log's incremental information justifies the
   extra prefix.

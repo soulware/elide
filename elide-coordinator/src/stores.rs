@@ -109,9 +109,9 @@ pub trait ScopedStores: Send + Sync {
 
     /// `volume-rw`: read+write under `by_id/<vol_ulid>/`. The write
     /// credential for one volume's data — segment drain, GC, snapshot
-    /// publish — and the credential for mixed read+write paths (a
-    /// recovery flow that reads HEAD then publishes a synthesised
-    /// manifest). Pure-read sites use [`Self::read_volume`] instead.
+    /// publish — and the credential for mixed read+write paths (e.g.
+    /// the `claim --force` re-own, which reads HEAD then publishes).
+    /// Pure-read sites use [`Self::read_volume`] instead.
     fn volume_rw(&self, vol_ulid: &Ulid) -> Arc<dyn ObjectStore>;
 
     /// `volume-ro` scoped to one volume's prefix only. Read-only

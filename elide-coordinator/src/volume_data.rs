@@ -14,12 +14,10 @@
 //! * [`SnapshotsView`] — signed snapshot manifests under
 //!   `by_id/<vol>/snapshots/…` and the `snapshots/LATEST` pointer.
 //!   Includes a typed CAS (`advance_latest` / `LatestPointerToken`)
-//!   for the LATEST pointer; an `If-None-Match: *` verb
-//!   (`try_publish_manifest`) for the synthesised-handoff publish
-//!   path; and a typed `get_manifest(snap, vk) -> SnapshotManifest`
-//!   that parses and verifies in one step (with `get_manifest_bytes`
-//!   for the recovery flow that peeks the unauthenticated recovery
-//!   header before picking a verifying key).
+//!   for the LATEST pointer, and a typed
+//!   `get_manifest(snap, vk) -> SnapshotManifest` that parses and
+//!   verifies in one step (with `get_manifest_bytes` for callers
+//!   that verify the raw bytes themselves).
 //! * [`SegmentsView`] — segment bodies under
 //!   `by_id/<vol>/segments/<YYYYMMDD>/<ulid>`. Multipart PUT for
 //!   bodies (via `put_from_file`), range-GET for header+index
@@ -168,23 +166,6 @@ impl MetadataView<'_> {
         parse_hex_pubkey(hex)
     }
 
-    /// Like [`Self::read_pubkey`] but returns `Ok(None)` when the
-    /// object is absent. Used by `volume release --force` to recover
-    /// the create-time window where `names/<name>` was published
-    /// before `meta/<vol>.pub`.
-    pub async fn read_pubkey_optional(&self) -> Result<Option<VerifyingKey>, MetadataError> {
-        let key = pubkey_key(self.vol_ulid);
-        match self.store.get(&key).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.map_err(MetadataError::Get)?;
-                let hex = std::str::from_utf8(&bytes).map_err(MetadataError::PubkeyNotUtf8)?;
-                parse_hex_pubkey(hex).map(Some)
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(MetadataError::Get(e)),
-        }
-    }
-
     /// Upload `volume.pub` from a local file. Reads the file
     /// verbatim and PUTs the body to `meta/<vol>.pub`.
     ///
@@ -283,9 +264,9 @@ impl SnapshotsView<'_> {
     /// PUT a signed snapshot manifest at
     /// `by_id/<vol>/snapshots/<date>/<snap_ulid>.manifest`. Used by
     /// callers that already hold the canonical bytes in memory
-    /// (synthesised handoffs, the force-release empty manifest). The
-    /// (date, ulid) partitioning makes the key globally unique by
-    /// construction, so no CAS.
+    /// (owner-signed empty handoffs, the `claim --force` basis copy).
+    /// The (date, ulid) partitioning makes the key globally unique
+    /// by construction, so no CAS.
     pub async fn put_manifest(&self, snap_ulid: Ulid, bytes: Bytes) -> Result<(), SnapshotsError> {
         let key = manifest_key(self.vol_ulid, snap_ulid);
         crate::upload::put_with_content_type(self.store, &key, bytes, MIME_TEXT)
@@ -333,26 +314,6 @@ impl SnapshotsView<'_> {
         .await
     }
 
-    /// Conditional PUT with `If-None-Match: *`. The synthesised
-    /// handoff manifest published by `volume release --force` uses
-    /// this verb so concurrent recovering coordinators racing on the
-    /// same freshly-minted `snap_ulid` resolve cleanly — one wins,
-    /// the others get [`PublishManifestError::AlreadyExists`].
-    pub async fn try_publish_manifest(
-        &self,
-        snap_ulid: Ulid,
-        bytes: Bytes,
-    ) -> Result<(), PublishManifestError> {
-        let key = manifest_key(self.vol_ulid, snap_ulid);
-        match put_if_absent_with_type(self.store.as_ref(), &key, bytes, MIME_TEXT).await {
-            Ok(_) => Ok(()),
-            Err(ConditionalPutError::PreconditionFailed) => {
-                Err(PublishManifestError::AlreadyExists { key })
-            }
-            Err(ConditionalPutError::Other(e)) => Err(PublishManifestError::Other(e)),
-        }
-    }
-
     /// Build the canonical manifest key — used by callers that need
     /// to surface it (logging, error paths). Internal writes go
     /// through the typed verbs above.
@@ -373,12 +334,10 @@ impl SnapshotsView<'_> {
         got.bytes().await.map_err(SnapshotsError::Get)
     }
 
-    /// GET raw manifest bytes. Used by the recovery flow that peeks
-    /// the unauthenticated `recovery:` header
-    /// ([`signing::peek_snapshot_manifest_recovery`]) before picking
-    /// which verifying key to use. Pure-read sites that already know
-    /// which key to verify under should call [`Self::get_manifest`]
-    /// instead so verification happens at the boundary.
+    /// GET raw manifest bytes. For callers that re-serve or copy the
+    /// canonical bytes verbatim. Pure-read sites that know which key
+    /// to verify under should call [`Self::get_manifest`] instead so
+    /// verification happens at the boundary.
     pub async fn get_manifest_bytes(&self, snap_ulid: Ulid) -> Result<Bytes, SnapshotsError> {
         let key = manifest_key(self.vol_ulid, snap_ulid);
         let got = self.store.get(&key).await.map_err(SnapshotsError::Get)?;
@@ -412,11 +371,8 @@ impl SnapshotsView<'_> {
     }
 
     /// GET, parse, and verify the snapshot manifest under
-    /// `verifying_key`. One round-trip. Callers supply the key that
-    /// matches the trust path: the volume's own `volume.pub` for
-    /// ordinary handoff snapshots, or a recovering coordinator's
-    /// `coordinator.pub` for synthesised handoffs — see
-    /// `crate::recovery::HandoffVerifier`.
+    /// `verifying_key` — the volume's own `volume.pub`. One
+    /// round-trip.
     pub async fn get_manifest(
         &self,
         snap_ulid: Ulid,
@@ -817,36 +773,6 @@ impl std::error::Error for SnapshotsError {
     }
 }
 
-/// Errors from [`SnapshotsView::try_publish_manifest`].
-#[derive(Debug)]
-pub enum PublishManifestError {
-    /// A manifest already exists at this key — the conditional create
-    /// refused. Carries the key for diagnostics. Vanishingly
-    /// improbable unless two recovering coordinators both minted the
-    /// same `snap_ulid` (a millisecond-level ULID collision).
-    AlreadyExists { key: StorePath },
-    /// Underlying store error unrelated to the CAS condition.
-    Other(object_store::Error),
-}
-
-impl std::fmt::Display for PublishManifestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AlreadyExists { key } => write!(f, "manifest already exists at {key}"),
-            Self::Other(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for PublishManifestError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Other(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
 /// Errors from [`HeadView`] operations.
 #[derive(Debug)]
 pub enum HeadError {
@@ -1034,25 +960,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_pubkey_optional_absent_is_none() {
-        let (_s, vd) = vd();
-        let got = vd.metadata().read_pubkey_optional().await.unwrap();
-        assert!(got.is_none());
-    }
-
-    #[tokio::test]
-    async fn metadata_pubkey_optional_present_is_some() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (_s, vd) = vd();
-        let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let hex = elide_core::signing::encode_hex(&vk.to_bytes()) + "\n";
-        let path = seed_file(tmp.path(), "volume.pub", hex.as_bytes());
-        vd.metadata().write_pubkey_from_file(&path).await.unwrap();
-        let got = vd.metadata().read_pubkey_optional().await.unwrap();
-        assert_eq!(got.expect("present").to_bytes(), vk.to_bytes());
-    }
-
-    #[tokio::test]
     async fn metadata_provenance_from_file_round_trip_via_store() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, vd) = vd();
@@ -1084,7 +991,7 @@ mod tests {
 
     fn manifest_bytes(signer: &dyn elide_core::segment::SegmentSigner, segments: &[Ulid]) -> Bytes {
         Bytes::from(elide_core::signing::build_snapshot_manifest_bytes(
-            signer, segments, None,
+            signer, segments,
         ))
     }
 
@@ -1138,25 +1045,6 @@ mod tests {
             .unwrap();
         let got = vd.snapshots().get_manifest_bytes(snap).await.unwrap();
         assert_eq!(got, body);
-    }
-
-    #[tokio::test]
-    async fn snapshots_try_publish_manifest_rejects_second_publish() {
-        let (_s, vd) = vd();
-        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
-        let mut m = mint();
-        let snap = m.next();
-        let body = manifest_bytes(&*signer, &[]);
-        vd.snapshots()
-            .try_publish_manifest(snap, body.clone())
-            .await
-            .unwrap();
-        let err = vd
-            .snapshots()
-            .try_publish_manifest(snap, body)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, PublishManifestError::AlreadyExists { .. }));
     }
 
     #[tokio::test]

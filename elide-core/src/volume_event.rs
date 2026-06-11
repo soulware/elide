@@ -30,9 +30,8 @@
 //! bytes returned by [`VolumeEvent::signing_payload`]. The payload is
 //! domain-tagged (`b"elide volume-event v1\0"`) so a signature on an
 //! event cannot be confused with one on any other coordinator-signed
-//! artefact (e.g. synthesised handoff snapshots) — the pre-image
-//! domain differs even if a malicious bucket-writer reuses the bytes
-//! verbatim.
+//! artefact — the pre-image domain differs even if a malicious
+//! bucket-writer reuses the bytes verbatim.
 //!
 //! The canonical form is deliberately not `toml::to_string` of the
 //! struct: the `toml` crate's output ordering depends on serde
@@ -103,15 +102,6 @@ pub enum EventKind {
     /// emitter is the previous owner; `handoff_snapshot` is the
     /// snapshot the next claimant will fork from.
     Released { handoff_snapshot: Ulid },
-    /// `names/<name>` was force-released by a coordinator that did
-    /// not previously own it. `handoff_snapshot` is the synthesised
-    /// snapshot produced by the recovering coordinator.
-    /// `displaced_coordinator_id` is the previous owner identifier
-    /// recorded just before the unconditional rewrite.
-    ForceReleased {
-        handoff_snapshot: Ulid,
-        displaced_coordinator_id: String,
-    },
     /// `names/<name>` was force-claimed: a coordinator displaced an
     /// unreachable owner with a forced CAS straight to a fresh fork
     /// (`volume claim --force`). The event's `vol_ulid` is the new
@@ -154,7 +144,6 @@ impl EventKind {
             Self::Created => "created",
             Self::Claimed => "claimed",
             Self::Released { .. } => "released",
-            Self::ForceReleased { .. } => "force_released",
             Self::ForceClaimed { .. } => "force_claimed",
             Self::ForkedFrom { .. } => "forked_from",
             Self::RenamedTo { .. } => "renamed_to",
@@ -311,17 +300,6 @@ impl VolumeEvent {
             EventKind::Released { handoff_snapshot } => {
                 push_field(&mut buf, "handoff_snapshot", &handoff_snapshot.to_string());
             }
-            EventKind::ForceReleased {
-                handoff_snapshot,
-                displaced_coordinator_id,
-            } => {
-                push_field(&mut buf, "handoff_snapshot", &handoff_snapshot.to_string());
-                push_field(
-                    &mut buf,
-                    "displaced_coordinator_id",
-                    displaced_coordinator_id,
-                );
-            }
             EventKind::ForceClaimed {
                 displaced_coordinator_id,
             } => {
@@ -467,10 +445,6 @@ mod tests {
             EventKind::Claimed,
             EventKind::Released {
                 handoff_snapshot: snap_ulid(),
-            },
-            EventKind::ForceReleased {
-                handoff_snapshot: snap_ulid(),
-                displaced_coordinator_id: "01OLDCOORDXXXXXXXXXXXXXXXX".to_string(),
             },
             EventKind::ForceClaimed {
                 displaced_coordinator_id: Some("01OLDCOORDXXXXXXXXXXXXXXXX".to_string()),
@@ -681,13 +655,12 @@ mod tests {
 
     #[test]
     fn lowercase_kind_serialisation() {
-        let ev = sample_event(EventKind::ForceReleased {
-            handoff_snapshot: snap_ulid(),
-            displaced_coordinator_id: "01OLDCOORDXXXXXXXXXXXXXXXX".to_string(),
+        let ev = sample_event(EventKind::ForceClaimed {
+            displaced_coordinator_id: Some("01OLDCOORDXXXXXXXXXXXXXXXX".to_string()),
         });
         let toml = ev.to_toml().unwrap();
         assert!(
-            toml.contains("kind = \"force_released\""),
+            toml.contains("kind = \"force_claimed\""),
             "expected snake_case kind, got: {toml}"
         );
     }

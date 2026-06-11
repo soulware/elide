@@ -891,14 +891,8 @@ mod tests {
         let snap_ulid = Ulid::from_parts(1743120000000, 77);
         let snap_str = snap_ulid.to_string();
         let (signer, _vk) = generate_ephemeral_signer();
-        elide_core::signing::write_snapshot_manifest(
-            &vol_dir,
-            signer.as_ref(),
-            &snap_ulid,
-            &[],
-            None,
-        )
-        .unwrap();
+        elide_core::signing::write_snapshot_manifest(&vol_dir, signer.as_ref(), &snap_ulid, &[])
+            .unwrap();
         std::fs::write(
             snap_dir.join(format!("{snap_str}.filemap")),
             "# elide-filemap v1\n/etc/hosts\tabcd1234\t128\n",

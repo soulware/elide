@@ -29,12 +29,8 @@ use object_store::ObjectStore;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::inbound::{
-    CoordinatorCore, await_prefetch_op, decode_hex32, local_daemon_running, pull_readonly_op,
-};
-use elide_coordinator::ipc::{
-    ClaimAttachEvent, ClaimReply, ClaimStartReply, IpcError, ResolveHandoffKeyReply,
-};
+use crate::inbound::{CoordinatorCore, await_prefetch_op, local_daemon_running, pull_readonly_op};
+use elide_coordinator::ipc::{ClaimAttachEvent, ClaimReply, ClaimStartReply, IpcError};
 use elide_coordinator::prefetch::PeerFetchContext;
 use elide_coordinator::register_prefetch_or_get;
 use elide_coordinator::volume_state::STOPPED_FILE;
@@ -490,13 +486,10 @@ struct NewForkSkeleton {
 }
 
 /// The ancestor chosen as the new fork's parent after stage 4b
-/// (`skip_empty_intermediates`). `parent_key_hex` is `Some` only when the
-/// chosen ancestor's snapshot was a recovery snapshot — its
-/// `manifest_pubkey` override flows into the new fork's provenance.
+/// (`skip_empty_intermediates`).
 struct EffectiveAncestor {
     vol: Ulid,
     snap: Ulid,
-    parent_key_hex: Option<String>,
 }
 
 /// Drive one claim job to completion.
@@ -546,7 +539,6 @@ impl ClaimOrchestrator {
         self.early_rebind().await?;
         self.discover_peer().await;
         self.pull_chain().await?;
-        self.resolve_handoff_key().await?;
         self.skip_empty_intermediates().await?;
         // All signature checks against S3-rooted artifacts have passed.
         // Commit so the pulled skeletons survive the rest of this job.
@@ -573,11 +565,11 @@ impl ClaimOrchestrator {
     /// Crash semantics. If the coordinator dies between this returning and
     /// `finalize`'s rewrite, the bucket points at an empty fork whose
     /// provenance already names the released volume as its parent. It is
-    /// recoverable: `volume release --force` synthesises an empty handoff
-    /// over it, and the re-`claim` walks partial → released → data through
-    /// the normal empty-intermediate skip. (A root-shape `parent: None`
-    /// provenance would instead strand the released volume's data behind an
-    /// empty root that the non-empty-ancestor contract rejects.)
+    /// recoverable: `volume claim --force` over the partial fork takes over
+    /// that `ParentRef`, anchoring the new fork on the released volume's
+    /// data. (A root-shape `parent: None` provenance would instead strand
+    /// the released volume's data behind an empty root the takeover could
+    /// never reach.)
     async fn early_rebind(&mut self) -> Result<(), IpcError> {
         use elide_coordinator::lifecycle::{LifecycleError, MarkClaimedOutcome};
         use elide_core::name_record::NameState;
@@ -626,13 +618,7 @@ impl ClaimOrchestrator {
         // control-plane only. Both provisional trust anchors come from
         // there — the basis (`handoff_snap`) from the Released record,
         // the parent identity key from `meta/<released>.pub` on
-        // `coord-ro`. `manifest_pubkey` is left `None`: resolving it
-        // needs a `by_id` manifest read, which stage 4
-        // (`resolve_handoff_key`) performs after the rebind. The
-        // partial fork is invisible to the daemon until `finalize`,
-        // and the crash-recovery walk re-resolves recovery signers
-        // from the manifest's in-band metadata, so nothing reads the
-        // provisional `None`.
+        // `coord-ro`.
         let base_ro = self.ctx.core.stores.base_object_store();
         let released_meta =
             elide_coordinator::volume_data::VolumeData::new(base_ro, self.released_vol_ulid);
@@ -647,7 +633,6 @@ impl ClaimOrchestrator {
                 volume_ulid: self.released_vol_ulid.to_string(),
                 snapshot_ulid: self.handoff_snap.to_string(),
                 pubkey: parent_pubkey.to_bytes(),
-                manifest_pubkey: None,
             }),
             extent_index: Vec::new(),
             oci_source: None,
@@ -662,7 +647,7 @@ impl ClaimOrchestrator {
 
         // Upload volume.pub and volume.provenance to S3 in parallel so
         // peer-fetch ancestry walks (which read both) and future claimants
-        // doing `release --force` see a complete fork in the bucket. Both
+        // doing `claim --force` see a complete fork in the bucket. Both
         // are self-signed by the fresh keypair generated above. The
         // invariant "names/<name> only points at vol_ulids with both
         // immutable trust artefacts in the bucket" is restored at
@@ -818,41 +803,6 @@ impl ClaimOrchestrator {
         Ok(())
     }
 
-    /// Stage 4. Resolve the handoff key.
-    ///
-    /// Recovery snapshots are signed by an attestation key the fork's
-    /// provenance must record so its own signature verifies later. **This is
-    /// the first step that verifies a peer-served pubkey against an S3-rooted
-    /// artifact**: the released volume's signed handoff manifest comes from
-    /// the bucket and is checked against the just-pulled `volume.pub`. A
-    /// tampering peer is detected here; on `?` propagation `pulled_guard`
-    /// tears down the bogus skeletons before the error returns. (The partial
-    /// fork minted in stage 1 is left for `volume release --force` to clean
-    /// up; see [`Self::early_rebind`] for the recovery story.)
-    async fn resolve_handoff_key(&mut self) -> Result<(), IpcError> {
-        let handoff_started = std::time::Instant::now();
-        // Reads the handoff manifest under
-        // `by_id/<released>/snapshots/` — GET only, so `volume-ro` is
-        // the right scope.
-        let store = self.ctx.core.stores.read_volume(&self.released_vol_ulid);
-        let base_ro = self.ctx.core.stores.base_object_store();
-        let key = resolve_handoff_key_via_recovery(
-            self.released_vol_ulid,
-            self.handoff_snap,
-            &store,
-            &base_ro,
-        )
-        .await?;
-        info!(
-            "[claim {}] handoff key resolved in {:.2?}",
-            self.volume,
-            handoff_started.elapsed()
-        );
-        self.job
-            .append(ClaimAttachEvent::HandoffKeyResolved { key });
-        Ok(())
-    }
-
     /// Stage 4b. Skip empty intermediate forks.
     ///
     /// A fork that produced no writes between claim and release leaves a
@@ -862,7 +812,7 @@ impl ClaimOrchestrator {
     /// Detect it and rewrite `effective` to point at the deepest non-empty
     /// ancestor.
     async fn skip_empty_intermediates(&mut self) -> Result<(), IpcError> {
-        let (vol, snap, parent_key_hex) = skip_empty_intermediates_impl(
+        let (vol, snap) = skip_empty_intermediates_impl(
             &self.job,
             &self.volume,
             self.released_vol_ulid,
@@ -873,11 +823,7 @@ impl ClaimOrchestrator {
             &mut self.pulled_guard,
         )
         .await?;
-        self.effective = Some(EffectiveAncestor {
-            vol,
-            snap,
-            parent_key_hex,
-        });
+        self.effective = Some(EffectiveAncestor { vol, snap });
         Ok(())
     }
 
@@ -911,20 +857,11 @@ impl ClaimOrchestrator {
         let parent_pubkey = load_verifying_key(&parent_dir, VOLUME_PUB_FILE)
             .map_err(|e| IpcError::internal(format!("loading parent volume.pub: {e}")))?;
 
-        let manifest_pubkey = match effective.parent_key_hex.as_deref() {
-            Some(hex) => Some(
-                decode_hex32(hex)
-                    .map_err(|e| IpcError::internal(format!("bad parent-key: {e}")))?,
-            ),
-            None => None,
-        };
-
         let lineage = ProvenanceLineage {
             parent: Some(ParentRef {
                 volume_ulid: effective.vol.to_string(),
                 snapshot_ulid: effective.snap.to_string(),
                 pubkey: parent_pubkey.to_bytes(),
-                manifest_pubkey,
             }),
             extent_index: Vec::new(),
             oci_source: None,
@@ -1035,36 +972,6 @@ impl ClaimOrchestrator {
 
 // ── Private helpers ──────────────────────────────────────────────────────────
 
-/// Implementation of [`ResolveHandoffKey`]: maps a (vol, snap) onto either
-/// `Normal` or `Recovery { manifest_pubkey_hex }`, used by the orchestrator
-/// before forking from the released chain.
-async fn resolve_handoff_key_via_recovery(
-    vol_ulid: Ulid,
-    snap_ulid: Ulid,
-    data_store: &Arc<dyn ObjectStore>,
-    base_ro_store: &Arc<dyn ObjectStore>,
-) -> Result<ResolveHandoffKeyReply, IpcError> {
-    use elide_coordinator::recovery::{HandoffVerifier, resolve_handoff_verifier};
-
-    match resolve_handoff_verifier(data_store, base_ro_store, vol_ulid, snap_ulid).await {
-        Ok(HandoffVerifier::Normal) => Ok(ResolveHandoffKeyReply::Normal),
-        Ok(HandoffVerifier::Synthesised {
-            manifest_pubkey, ..
-        }) => {
-            let hex: String = manifest_pubkey
-                .as_ref()
-                .to_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            Ok(ResolveHandoffKeyReply::Recovery {
-                manifest_pubkey_hex: hex,
-            })
-        }
-        Err(e) => Err(IpcError::internal(format!("{e}"))),
-    }
-}
-
 /// Walk back through empty intermediate forks and return the deepest non-empty
 /// ancestor as the source the new fork should pin to.
 ///
@@ -1086,9 +993,7 @@ async fn resolve_handoff_key_via_recovery(
 /// present — chain-pull in stage 3 stops at the first existing dir, but the
 /// skip walk may need to reach further back.
 ///
-/// Returns `(source_vol_ulid, snapshot_ulid, parent_key_hex)`. `parent_key_hex`
-/// is the manifest_pubkey override carried in the chosen ancestor reference
-/// (Some only for ancestors whose snapshot was a recovery snapshot).
+/// Returns `(source_vol_ulid, snapshot_ulid)`.
 ///
 /// Kept as a free fn (rather than folded into the `&mut self` method above)
 /// so the existing test suite can drive it directly without needing to
@@ -1103,9 +1008,9 @@ pub(crate) async fn skip_empty_intermediates_impl(
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
     peer: Option<&PeerFetchContext>,
     guard: &mut PulledAncestorsGuard,
-) -> Result<(Ulid, Ulid, Option<String>), IpcError> {
+) -> Result<(Ulid, Ulid), IpcError> {
     use elide_core::signing::{
-        VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, encode_hex, load_verifying_key,
+        VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, load_verifying_key,
         read_lineage_verifying_signature,
     };
     use elide_core::volume;
@@ -1114,9 +1019,6 @@ pub(crate) async fn skip_empty_intermediates_impl(
 
     let mut effective_vol = released_vol_ulid;
     let mut effective_snap = handoff_snap;
-    // Assigned on every loop iteration (from the fetched manifest's
-    // verifier) before any break can reach the return.
-    let mut effective_parent_key_hex: Option<String>;
 
     loop {
         let dir = volume::resolve_ancestor_dir(&by_id_dir, &effective_vol.to_string());
@@ -1126,43 +1028,21 @@ pub(crate) async fn skip_empty_intermediates_impl(
                     IpcError::internal(format!("reading provenance for {effective_vol}: {e}"))
                 })?;
 
-        // Verify and read this fork's handoff manifest. The fallback pubkey
-        // for a non-recovery manifest is the fork's own `volume.pub` on disk;
-        // recovery manifests are auto-resolved by the helper.
-        let fallback_pubkey = load_verifying_key(&dir, VOLUME_PUB_FILE).map_err(|e| {
+        // Verify and read this fork's handoff manifest under the
+        // fork's own `volume.pub` from the just-pulled (and verified)
+        // skeleton. This is the first step that verifies a
+        // peer-served pubkey against an S3-rooted artifact: a
+        // tampering peer is detected here, and on `?` propagation the
+        // caller's guard tears down the bogus skeletons.
+        let fork_pubkey = load_verifying_key(&dir, VOLUME_PUB_FILE).map_err(|e| {
             IpcError::internal(format!("loading volume.pub for {effective_vol}: {e}"))
         })?;
 
         // Pure-read manifest fetch — `volume-ro` is the right scope.
         let store = stores.read_volume(&effective_vol);
-        let base_ro = stores.base_object_store();
-        let (manifest, verifier) = elide_coordinator::recovery::fetch_verified_handoff_manifest(
-            &store,
-            &base_ro,
-            effective_vol,
-            effective_snap,
-            &fallback_pubkey,
-            peer,
-        )
-        .await
-        .map_err(|e| {
-            IpcError::internal(format!(
-                "fetching handoff manifest {effective_vol}/{effective_snap}: {e}"
-            ))
-        })?;
-
-        // The key the new fork must record for this handoff comes from
-        // the verifier that just checked it — `None` for a
-        // volume-signed manifest, the recovering coordinator's pub for
-        // a synthesised one. Derived per link from the manifest's
-        // in-band recovery metadata, never inherited from a child's
-        // provenance copy (the provisional ParentRef defers it).
-        effective_parent_key_hex = match &verifier {
-            elide_coordinator::recovery::HandoffVerifier::Normal => None,
-            elide_coordinator::recovery::HandoffVerifier::Synthesised {
-                manifest_pubkey, ..
-            } => Some(encode_hex(&manifest_pubkey.to_bytes())),
-        };
+        let manifest =
+            fetch_handoff_manifest(&store, effective_vol, effective_snap, &fork_pubkey, peer)
+                .await?;
 
         let Some(parent) = lineage.parent else {
             // Root volume. The function's contract is "deepest non-empty
@@ -1222,7 +1102,57 @@ pub(crate) async fn skip_empty_intermediates_impl(
         effective_snap = parent_snap_ulid;
     }
 
-    Ok((effective_vol, effective_snap, effective_parent_key_hex))
+    Ok((effective_vol, effective_snap))
+}
+
+/// Fetch a handoff snapshot manifest — peer-fetch first when
+/// available, S3 otherwise — and verify it under the volume's own
+/// key. The signature is checked the same way regardless of which
+/// tier served the bytes, so a tampering peer surfaces as a
+/// verification error rather than a silent acceptance.
+async fn fetch_handoff_manifest(
+    data_store: &Arc<dyn ObjectStore>,
+    vol_ulid: Ulid,
+    snap_ulid: Ulid,
+    pubkey: &ed25519_dalek::VerifyingKey,
+    peer: Option<&PeerFetchContext>,
+) -> Result<elide_core::signing::SnapshotManifest, IpcError> {
+    let from_peer = match peer {
+        Some(peer_ctx) => {
+            peer_ctx
+                .client
+                .fetch_snapshot_manifest(
+                    &peer_ctx.endpoint,
+                    &peer_ctx.volume_name,
+                    vol_ulid,
+                    snap_ulid,
+                )
+                .await
+        }
+        None => None,
+    };
+    let bytes = match from_peer {
+        Some(b) => b,
+        None => {
+            let vd =
+                elide_coordinator::volume_data::VolumeData::new(Arc::clone(data_store), vol_ulid);
+            vd.snapshots()
+                .get_manifest_bytes(snap_ulid)
+                .await
+                .map_err(|e| {
+                    IpcError::store(format!(
+                        "fetching snapshot manifest for {vol_ulid}/{snap_ulid}: {e}"
+                    ))
+                })?
+        }
+    };
+    elide_core::signing::read_snapshot_manifest_from_bytes(&bytes, pubkey, &snap_ulid).map_err(
+        |e| {
+            IpcError::internal(format!(
+                "verifying snapshot manifest {vol_ulid}/{snap_ulid}: {e}"
+            ))
+        },
+    )
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1262,7 +1192,6 @@ mod tests {
                     volume_ulid: p.vol.to_string(),
                     snapshot_ulid: p.snap.to_string(),
                     pubkey: p.verifying_key.to_bytes(),
-                    manifest_pubkey: None,
                 }),
                 extent_index: vec![],
                 oci_source: None,
@@ -1286,7 +1215,7 @@ mod tests {
         fork: &Fork,
         segment_ulids: &[Ulid],
     ) {
-        let bytes = build_snapshot_manifest_bytes(fork.signer.as_ref(), segment_ulids, None);
+        let bytes = build_snapshot_manifest_bytes(fork.signer.as_ref(), segment_ulids);
         elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), fork.vol)
             .snapshots()
             .put_manifest(fork.snap, bytes::Bytes::from(bytes))
@@ -1323,7 +1252,7 @@ mod tests {
 
         let job = ClaimJob::new();
         let stores = passthrough(store);
-        let (vol, snap, key_hex) = skip_empty_intermediates_impl(
+        let (vol, snap) = skip_empty_intermediates_impl(
             &job,
             "vol",
             f1.vol,
@@ -1337,7 +1266,6 @@ mod tests {
         .unwrap();
         assert_eq!(vol, r.vol);
         assert_eq!(snap, r.snap);
-        assert!(key_hex.is_none());
     }
 
     #[tokio::test]
@@ -1363,7 +1291,7 @@ mod tests {
 
         let job = ClaimJob::new();
         let stores = passthrough(store);
-        let (vol, snap, _) = skip_empty_intermediates_impl(
+        let (vol, snap) = skip_empty_intermediates_impl(
             &job,
             "vol",
             f2.vol,
@@ -1400,7 +1328,7 @@ mod tests {
 
         let job = ClaimJob::new();
         let stores = passthrough(store);
-        let (vol, snap, _) = skip_empty_intermediates_impl(
+        let (vol, snap) = skip_empty_intermediates_impl(
             &job,
             "vol",
             f1.vol,
@@ -1464,18 +1392,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_fork_recovery_completes_via_provisional_parent() {
-        // #428 end-to-end crash recovery. Drive the real `early_rebind`
-        // (stage 1 of a claim), simulate a crash by *not* running
-        // `finalize`, then walk the documented recovery — `release --force`
-        // then `claim` — and assert it now closes the loop, resolving the
-        // re-claim back to the released volume's data.
+    async fn crashed_claim_leaves_non_root_provisional_provenance() {
+        // #428 crash window. Drive the real `early_rebind` (stage 1 of a
+        // claim) and simulate a crash by *not* running `finalize`.
         //
-        // The fix under test: `early_rebind` writes a provisional provenance
-        // whose `ParentRef` points at the released volume. A crash here
-        // leaves an *empty fork with a real parent*, not an empty root, so
-        // the re-claim's skip-empty walk reaches the data instead of
-        // erroring on the non-empty-ancestor contract.
+        // The invariant under test: `early_rebind` writes a provisional
+        // provenance whose `ParentRef` points at the released volume. A
+        // crash here leaves an *empty fork with a real parent*, not an
+        // empty root, so the documented recovery — `claim --force` over
+        // the partial fork, which takes over its `ParentRef` — lands on
+        // the released volume's data. The takeover itself is covered in
+        // `force_claim::tests`.
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1506,14 +1433,12 @@ mod tests {
             .await
             .unwrap();
 
-        // ── Recovering coordinator (coord-B). Publishes its pub so the
-        // synthesised recovery manifest it later signs is verifiable.
+        // ── Claiming coordinator.
         let coord_b_dir = TempDir::new().unwrap();
         let identity = Arc::new(
             elide_coordinator::identity::CoordinatorIdentity::load_or_generate(coord_b_dir.path())
                 .unwrap(),
         );
-        identity.publish_pub(store.as_ref()).await.unwrap();
         let stores = passthrough(Arc::clone(&store));
 
         // ── Stage 1 of the claim, for real. `early_rebind` mints the fork,
@@ -1551,182 +1476,6 @@ mod tests {
             .expect("provisional provenance must carry a ParentRef, not be root-shape");
         assert_eq!(parent.volume_ulid, vol_x.to_string());
         assert_eq!(parent.snapshot_ulid, snap_x.to_string());
-
-        // ── Recovery step 1: force-release (real op) over the partial fork.
-        // It has no segments of its own → empty synthesised handoff.
-        crate::inbound::force_release_volume_op(
-            "vol",
-            TempDir::new().unwrap().path(),
-            &stores,
-            &identity,
-        )
-        .await
-        .expect("force-release of the partial fork succeeds");
-
-        let (rec, _) = elide_coordinator::name_store::read_name_record(&store, "vol")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(rec.state, elide_core::name_record::NameState::Released);
-        assert_eq!(rec.vol_ulid, partial_vol);
-        let empty_snap = rec
-            .handoff_snapshot
-            .expect("force-release set the synthesised handoff snapshot");
-
-        // ── Recovery step 2: the re-claim walks the released shape. The
-        // partial fork is empty but has a parent, so skip-empty advances
-        // partial → vol_x and stops there with its data intact.
-        let job = ClaimJob::new();
-        let (vol, snap, _key) = skip_empty_intermediates_impl(
-            &job,
-            "vol",
-            partial_vol,
-            empty_snap,
-            data_dir,
-            &stores,
-            None,
-            &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
-        )
-        .await
-        .expect("recovery resolves through the empty partial fork to the data");
-        assert_eq!(
-            vol, vol_x,
-            "re-claim pins to the released volume, not the empty partial"
-        );
-        assert_eq!(snap, snap_x);
-    }
-
-    #[tokio::test]
-    async fn partial_fork_recovery_resolves_recovery_signer_post_rebind() {
-        // #428 variant. The released volume's handoff is a *recovery*
-        // (coordinator-signed) manifest, not a normal volume-signed one.
-        // Claim-first keeps `early_rebind` control-plane-only, so the
-        // provisional ParentRef defers `manifest_pubkey` (`None`); the
-        // crash-recovery walk must still resolve the signing
-        // coordinator's pubkey from the manifest's in-band recovery
-        // metadata and carry it through to the new fork.
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path();
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-        // Released volume vol_x (a root), published to S3.
-        let mut mint = UlidMint::new(Ulid::nil());
-        let seg_a = mint.next();
-        let vol_x = mint.next();
-        build_fork(data_dir, vol_x, mint.next(), None);
-        let vx_dir = data_dir.join("by_id").join(vol_x.to_string());
-        let vx_vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), vol_x);
-        elide_coordinator::upload::upload_volume_pub_initial(&vx_dir, &vx_vd)
-            .await
-            .unwrap();
-        elide_coordinator::upload::upload_volume_provenance_initial(&vx_dir, &vx_vd)
-            .await
-            .unwrap();
-
-        // vol_x's handoff is synthesised by a *different* coordinator
-        // (coord-A) — e.g. vol_x's previous owner was force-released. coord-A
-        // publishes its pub so the recovery manifest verifies.
-        let coord_a = Arc::new(
-            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(
-                TempDir::new().unwrap().path(),
-            )
-            .unwrap(),
-        );
-        coord_a.publish_pub(store.as_ref()).await.unwrap();
-        let published = elide_coordinator::recovery::mint_and_publish_synthesised_snapshot(
-            &store,
-            vol_x,
-            &[seg_a],
-            coord_a.as_ref(),
-            coord_a.coordinator_id_str(),
-        )
-        .await
-        .unwrap();
-        let snap_x = published.snap_ulid;
-
-        let mut rec = elide_core::name_record::NameRecord::live_minimal(vol_x, 4096);
-        rec.state = elide_core::name_record::NameState::Released;
-        rec.coordinator_id = None;
-        rec.handoff_snapshot = Some(snap_x);
-        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
-            .await
-            .unwrap();
-
-        // coord-B does the claim.
-        let coord_b = Arc::new(
-            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(
-                TempDir::new().unwrap().path(),
-            )
-            .unwrap(),
-        );
-        coord_b.publish_pub(store.as_ref()).await.unwrap();
-        let stores = passthrough(Arc::clone(&store));
-
-        let ctx = ClaimContext {
-            core: crate::inbound::CoordinatorCore {
-                data_dir: Arc::new(data_dir.to_path_buf()),
-                stores: Arc::clone(&stores),
-                identity: Arc::clone(&coord_b),
-            },
-            claim_registry: new_registry(),
-            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
-        };
-        let mut orch = ClaimOrchestrator::new(ClaimJob::new(), "vol".into(), vol_x, snap_x, ctx);
-        orch.early_rebind().await.expect("early_rebind succeeds");
-        let partial_vol = orch.new_fork.as_ref().unwrap().vol_ulid;
-        drop(orch);
-
-        // The provisional ParentRef defers the manifest_pubkey: resolving
-        // it needs a `by_id` manifest read, which claim-first pushes past
-        // the rebind (stage 4). The walk below proves the deferral is
-        // safe for the crash window.
-        let partial_dir = data_dir.join("by_id").join(partial_vol.to_string());
-        let lineage = elide_core::signing::read_lineage_verifying_signature(
-            &partial_dir,
-            VOLUME_PUB_FILE,
-            VOLUME_PROVENANCE_FILE,
-        )
-        .unwrap();
-        let parent = lineage.parent.expect("ParentRef present");
-        assert_eq!(parent.volume_ulid, vol_x.to_string());
-        assert!(parent.manifest_pubkey.is_none(), "resolved post-rebind");
-
-        // The recovery cycle resolves back to vol_x and carries coord-A's
-        // key through to the new fork.
-        crate::inbound::force_release_volume_op(
-            "vol",
-            TempDir::new().unwrap().path(),
-            &stores,
-            &coord_b,
-        )
-        .await
-        .expect("force-release of the partial fork succeeds");
-        let (rec, _) = elide_coordinator::name_store::read_name_record(&store, "vol")
-            .await
-            .unwrap()
-            .unwrap();
-        let empty_snap = rec.handoff_snapshot.unwrap();
-
-        let job = ClaimJob::new();
-        let (vol, snap, key_hex) = skip_empty_intermediates_impl(
-            &job,
-            "vol",
-            partial_vol,
-            empty_snap,
-            data_dir,
-            &stores,
-            None,
-            &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
-        )
-        .await
-        .expect("recovery resolves through the empty partial fork to vol_x");
-        assert_eq!(vol, vol_x);
-        assert_eq!(snap, snap_x);
-        assert_eq!(
-            key_hex,
-            Some(encode_hex(&coord_a.verifying_key().to_bytes())),
-            "the recovery manifest_pubkey flows through the skip to the new fork"
-        );
     }
 
     #[tokio::test]
@@ -1745,7 +1494,7 @@ mod tests {
 
         let job = ClaimJob::new();
         let stores = passthrough(store);
-        let (vol, snap, _) = skip_empty_intermediates_impl(
+        let (vol, snap) = skip_empty_intermediates_impl(
             &job,
             "vol",
             r.vol,
@@ -1845,78 +1594,6 @@ mod tests {
             err.message.contains(&r.vol.to_string()),
             "error should identify the empty root: {}",
             err.message
-        );
-    }
-
-    #[tokio::test]
-    async fn child_provenance_manifest_pubkey_claim_is_ignored() {
-        // F1's parent ref carries a manifest_pubkey claim for R's
-        // handoff that R's actual manifest does not bear out (it is
-        // volume-signed). The walk derives the key from the verifier
-        // of each manifest it fetches — never from a child's
-        // provenance copy — so the fabricated claim must not surface
-        // as the new fork's parent_key_hex.
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path();
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-        let mut mint = UlidMint::new(Ulid::nil());
-        let seg_a = mint.next();
-        let r_snap = mint.next();
-        let f1_snap = mint.next();
-
-        let r = build_fork(data_dir, mint.next(), r_snap, None);
-        let f1_vol = mint.next();
-
-        // Construct F1 manually so we can inject a manifest_pubkey override.
-        let f1_dir = data_dir.join("by_id").join(f1_vol.to_string());
-        std::fs::create_dir_all(&f1_dir).unwrap();
-        let override_pubkey_bytes = [0xCDu8; 32];
-        let lineage = ProvenanceLineage {
-            parent: Some(ParentRef {
-                volume_ulid: r.vol.to_string(),
-                snapshot_ulid: r.snap.to_string(),
-                pubkey: r.verifying_key.to_bytes(),
-                manifest_pubkey: Some(override_pubkey_bytes),
-            }),
-            extent_index: vec![],
-            oci_source: None,
-        };
-        let f1_signer =
-            setup_readonly_identity(&f1_dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE, &lineage)
-                .unwrap();
-        let f1_vk = load_verifying_key(&f1_dir, VOLUME_PUB_FILE).unwrap();
-        let f1 = Fork {
-            vol: f1_vol,
-            snap: f1_snap,
-            signer: f1_signer,
-            verifying_key: f1_vk,
-        };
-
-        upload_handoff_manifest(&store, &r, &[seg_a]).await;
-        upload_handoff_manifest(&store, &f1, &[seg_a]).await;
-
-        let job = ClaimJob::new();
-        let stores = passthrough(store);
-        let (vol, snap, key_hex) = skip_empty_intermediates_impl(
-            &job,
-            "vol",
-            f1.vol,
-            f1.snap,
-            data_dir,
-            &stores,
-            None,
-            &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
-        )
-        .await
-        .unwrap();
-        assert_eq!(vol, r.vol);
-        assert_eq!(snap, r.snap);
-        assert!(
-            key_hex.is_none(),
-            "R's manifest is volume-signed; the fabricated provenance \
-             claim {} must not flow through",
-            encode_hex(&override_pubkey_bytes)
         );
     }
 
@@ -2066,7 +1743,7 @@ mod tests {
         assert_eq!(rebound.state, elide_core::name_record::NameState::Stopped);
 
         // ...and the provisional provenance carries the control-plane
-        // anchors: parent pubkey from meta/, manifest_pubkey deferred.
+        // anchors: parent pubkey from meta/.
         let new_dir = data_dir.join("by_id").join(rebound.vol_ulid.to_string());
         let lineage = elide_core::signing::read_lineage_verifying_signature(
             &new_dir,
@@ -2078,6 +1755,5 @@ mod tests {
         assert_eq!(parent.volume_ulid, released.to_string());
         assert_eq!(parent.snapshot_ulid, handoff.to_string());
         assert_eq!(parent.pubkey, released_key.verifying_key().to_bytes());
-        assert!(parent.manifest_pubkey.is_none(), "resolved post-rebind");
     }
 }

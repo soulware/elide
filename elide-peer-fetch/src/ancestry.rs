@@ -271,7 +271,6 @@ mod tests {
                 volume_ulid: root_ulid.to_string(),
                 snapshot_ulid: Ulid::new().to_string(),
                 pubkey: root_key.verifying_key().to_bytes(),
-                manifest_pubkey: None,
             }),
         )
         .await;
@@ -283,7 +282,6 @@ mod tests {
                 volume_ulid: mid_ulid.to_string(),
                 snapshot_ulid: Ulid::new().to_string(),
                 pubkey: mid_key.verifying_key().to_bytes(),
-                manifest_pubkey: None,
             }),
         )
         .await;
@@ -334,7 +332,6 @@ mod tests {
                 volume_ulid: root_ulid.to_string(),
                 snapshot_ulid: Ulid::new().to_string(),
                 pubkey: imposter.verifying_key().to_bytes(),
-                manifest_pubkey: None,
             }),
         )
         .await;

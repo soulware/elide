@@ -271,14 +271,9 @@ owns in the current epoch.** The read happens only for
 segments/supersessions a *different or prior* coordinator produced
 that this host lacks locally:
 
-- **Force-release recovery** (`lifecycle.rs:301` →
-  `recovery::list_and_verify_segments`) — recovering a dead *other*
-  coordinator's volume; no local `index/` for it at all.
-- **`force_snapshot_now` on a readonly source** (`fork.rs:367` →
-  `force_snapshot_now_op`) — the source's local `index/` was hydrated
-  manifest-only by `prefetch_indexes`; its owner has HEAD, this
-  host does not. The pinned-snapshot fork branch beside it never reads
-  HEAD.
+- **Forced-claim re-own** (`force_claim.rs`) — taking over a dead
+  *other* coordinator's volume; the dead fork's HEAD is read once
+  (the post-CAS cut) to derive the head delta to re-own.
 - **Post-handoff reap** — a new owner's tick-loop reap step must
   reclaim inputs a *prior* owner superseded. Same-epoch the reap step
   needs no HEAD read (it just wrote HEAD itself this iteration);
@@ -418,18 +413,12 @@ Removing it from the runtime does not remove the need:
 
 ## Consumer migration
 
-| Site | Today | After |
+| Site | Before | Now |
 |---|---|---|
-| `prefetch.rs:442` (`pull_indexes_for_head`) | LIST `segments/` | manifest ∪ HEAD |
-| `prefetch.rs:643` (`list_supersessions`) | LIST `retention/` | `Superseded` entries in HEAD |
-| `fork.rs:670` | LIST `segments/` to verify pins present | manifest ∪ HEAD membership check |
-| `recovery.rs:165` (force-release synthesis) | LIST `segments/` to re-sign | manifest ∪ HEAD; synthesised manifest absorbs HEAD |
-| `reaper.rs:80` | LIST `retention/`, separate task | `Superseded` entries in HEAD; reap step folded into the per-volume tick loop |
+| `list_supersessions` | LIST `retention/` | `Superseded` entries in HEAD |
+| fork pin verification | LIST `segments/` to verify pins present | manifest ∪ HEAD membership check |
+| forced-claim re-own | LIST `segments/` to re-sign | live(manifest, HEAD) − manifest, from one post-CAS HEAD read |
+| reaper | LIST `retention/`, separate task | `Superseded` entries in HEAD; reap step folded into the per-volume tick loop |
 
-`pull_indexes_for_head` and `list_supersessions` collapse into one
-manifest-anchored HEAD GET; `force_snapshot_now`'s "synthesise from
-whatever is in S3 including segments past the latest snapshot" becomes
-"latest manifest ∪ HEAD", and the synthesised handoff manifest it
-writes absorbs HEAD by the same truncation rule as any seal. The
-coordinator-wide reaper task is removed; `reap_volume` becomes a
-gated step in `tasks.rs`'s per-volume loop.
+The coordinator-wide reaper task is removed; `reap_volume` is a gated
+step in `tasks.rs`'s per-volume loop.

@@ -134,7 +134,7 @@ This pass is the first place v1 actually warms body bytes from S3 *before* a gue
 - **Failure modes:**
   - A's peer-fetch port disabled → B falls back to S3 cleanly.
   - A's coord crashed (endpoint unreachable) → fallback.
-  - `force_released` instead of clean `released` → B skips peer, fetches from S3.
+  - `force_claimed` instead of clean `released` → B skips peer, fetches from S3.
   - Token replay outside `issued_at` window → 401.
   - Caller asserts a `volume_name` they don't currently claim → 401.
   - Caller requests `vol_id` outside the claimed volume's ancestry → 403.
@@ -211,7 +211,7 @@ context available to the volume process — handed across the
 volume-start IPC at the moment the daemon comes up — so the volume's
 `RangeFetcher` can issue peer requests against the right endpoint
 without re-discovering. If discovery yielded no peer
-(`force_released`, unknown predecessor, unreachable), the volume runs
+(`force_claimed`, unknown predecessor, unreachable), the volume runs
 peer-less, exactly like a v1 read path runs S3-only.
 
 ### Work items

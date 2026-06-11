@@ -79,7 +79,7 @@ fn write_snapshot_and_filemap(
     byte_count: u64,
 ) {
     let snap_str = snap_ulid.to_string();
-    elide_core::signing::write_snapshot_manifest(vol_dir, signer, &snap_ulid, &[], None).unwrap();
+    elide_core::signing::write_snapshot_manifest(vol_dir, signer, &snap_ulid, &[]).unwrap();
     let rows = vec![FilemapRow {
         path: path.to_owned(),
         file_offset: 0,
