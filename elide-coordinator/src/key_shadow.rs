@@ -1,13 +1,13 @@
-//! Local backup of a removed volume's Ed25519 signing key, so that a
-//! later `volume start` on this host can resurrect the volume as
-//! *writable* rather than degrading to a read-only hydration.
+//! Local backup of a volume's Ed25519 signing key. The shadow is
+//! `volume start`'s possession proof when hydrating a remote-owned
+//! volume whose local fork directory is gone: no shadow ⇒ start
+//! fails, and the key restored into the hydrated fork comes from it.
 //!
-//! Written by `volume remove` just before the fork directory is torn
-//! down, alongside the `data_dir/remote/<name>` breadcrumb. Read by
+//! Written whenever a keypair is minted (`volume create`, fork
+//! creation, `claim`, `claim --force`) — a write failure aborts the
+//! mint — and refreshed by `start`'s self-heal pass. Read by
 //! [`crate::start_remote::hydrate_remote_owned`] when it sees a
-//! retained name. Deleted by `volume start` once the volume is back
-//! Live (the local fork now owns the key again), or by `volume
-//! release` when ownership is given up.
+//! retained name.
 //!
 //! On-disk: `data_dir/keys/<vol_ulid>.key` containing 32 raw bytes
 //! (the same encoding `volume.key` uses inside a fork directory). The

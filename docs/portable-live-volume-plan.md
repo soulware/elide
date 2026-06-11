@@ -536,14 +536,17 @@ attestation model's `rw-self` invariant cannot discharge.
 `design-mint-volume-attestation.md` § *`start` anchors on the key
 shadow*):
 
-- [ ] **Shadow-first hydrate:** `hydrate_remote_owned` proves
-  possession from `data_dir/keys/<vol_ulid>.key` before its `by_id`
-  basis reads; no shadow ⇒ start fails, and the keyless
-  readonly-resurrection fallback (`restore_key_from_shadow` returning
-  `false` → `mode=readonly`) retires.
-- [ ] **Shadow write hard-fails:** the claim/fork key-shadow write
-  promotes from warn-and-continue (`claim.rs`) to an error, so
-  owned-but-keyless cannot arise on a live host.
+- [x] **Shadow-first hydrate:** `hydrate_remote_owned` proves
+  possession from `data_dir/keys/<vol_ulid>.key` — read after the
+  skeleton chain, checked against the leaf's published `volume.pub`,
+  before any `by_id` basis read. No shadow ⇒ start fails pointing at
+  `claim --force` from another host; the keyless
+  readonly-resurrection fallback retired.
+- [x] **Shadow write hard-fails:** every keypair-mint site (create,
+  fork, claim, `claim --force`) aborts if the key-shadow write fails,
+  so owned-but-keyless cannot arise on a live host. `start`'s
+  self-heal refresh stays best-effort (the in-dir `volume.key` still
+  exists there).
 
 **Phase exit criteria:** an operator can recover a name from a dead
 coordinator with one verb, and the recovered fork includes every

@@ -49,6 +49,14 @@ pub(crate) async fn hydrate_remote_owned(
     // reads `by_id/<leaf>/*` and rides `volume-ro`.
     pull_skeleton_chain(vol_ulid, &core.data_dir, &by_id_dir, &core.stores).await?;
 
+    // Possession proof (`design-mint-volume-attestation.md` § *`start`
+    // anchors on the key shadow*): the shadow is the surviving copy of
+    // the leaf's signing key, checked against the leaf's published
+    // `volume.pub` before any `by_id` basis read. No shadow ⇒ no
+    // proof ⇒ start fails.
+    let key_bytes =
+        read_shadow_proving_possession(volume_name, vol_ulid, &core.data_dir, &fork_dir)?;
+
     let leaf_store = core.stores.read_volume(&vol_ulid);
     let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &leaf_store).await? {
         Some((snap_ulid, kind)) => {
@@ -75,14 +83,7 @@ pub(crate) async fn hydrate_remote_owned(
     std::fs::write(fork_dir.join(STOPPED_FILE), "")
         .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
 
-    // Restore the signing key from the local shadow if one exists,
-    // and strip the `volume.readonly` marker that `pull_readonly_op`
-    // stamped onto the leaf during the skeleton chain pull. With the
-    // shadow restored, the resurrected volume is writable; without
-    // it, the leaf stays readonly because there is no key to sign
-    // future writes with.
-    let restored = restore_key_from_shadow(&core.data_dir, &fork_dir, vol_ulid)?;
-    let mode_label = if restored { "writable" } else { "readonly" };
+    restore_key_into_fork(&fork_dir, &key_bytes)?;
 
     plant_by_name_symlink(volume_name, vol_ulid, &core.data_dir)?;
 
@@ -92,30 +93,52 @@ pub(crate) async fn hydrate_remote_owned(
 
     info!(
         "[inbound] start {volume_name}: hydrated remote-owned volume \
-         (vol {vol_ulid}, basis {basis_snapshot}, mode={mode_label}, {:.2?})",
+         (vol {vol_ulid}, basis {basis_snapshot}, {:.2?})",
         started.elapsed()
     );
     Ok(())
 }
 
-/// If `data_dir/keys/<vol_ulid>.key` exists, copy it into
-/// `fork_dir/volume.key` and remove `fork_dir/volume.readonly` so the
-/// resurrected leaf is writable. Returns `true` when a shadow was
-/// found and applied, `false` when no shadow exists (leaf stays
-/// readonly — the only correct shape without a key).
-fn restore_key_from_shadow(
+/// Read `data_dir/keys/<vol_ulid>.key` and check it against the leaf's
+/// published `volume.pub` (planted in `fork_dir` by the skeleton
+/// pull). Missing shadow or key mismatch fails the start — a keyless
+/// leaf proves nothing, and recovery from elsewhere is a claim, not a
+/// start.
+fn read_shadow_proving_possession(
+    volume_name: &str,
+    vol_ulid: Ulid,
     data_dir: &Path,
     fork_dir: &Path,
-    vol_ulid: Ulid,
-) -> Result<bool, IpcError> {
-    let Some(key_bytes) = elide_coordinator::key_shadow::read(data_dir, vol_ulid)
+) -> Result<Vec<u8>, IpcError> {
+    let key_bytes = elide_coordinator::key_shadow::read(data_dir, vol_ulid)
         .map_err(|e| IpcError::internal(format!("reading key shadow: {e}")))?
-    else {
-        return Ok(false);
-    };
+        .ok_or_else(|| {
+            IpcError::not_found(format!(
+                "volume '{volume_name}' has no signing-key shadow on this host; \
+                 recover via `volume claim --force` from another host"
+            ))
+        })?;
+    let (_, shadow_vk) = elide_core::signing::signer_from_bytes(&key_bytes)
+        .map_err(|e| IpcError::internal(format!("loading shadow signer: {e}")))?;
+    let leaf_vk =
+        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+            .map_err(|e| IpcError::internal(format!("loading volume.pub: {e}")))?;
+    if shadow_vk != leaf_vk {
+        return Err(IpcError::internal(format!(
+            "key shadow for {vol_ulid} does not match the volume's published key; \
+             recover via `volume claim --force` from another host"
+        )));
+    }
+    Ok(key_bytes)
+}
+
+/// Copy the proven shadow key into `fork_dir/volume.key` and strip the
+/// `volume.readonly` marker that `pull_readonly_op` stamped onto the
+/// leaf during the skeleton pull — the hydrated leaf is writable.
+fn restore_key_into_fork(fork_dir: &Path, key_bytes: &[u8]) -> Result<(), IpcError> {
     elide_core::segment::write_file_atomic(
         &fork_dir.join(elide_core::signing::VOLUME_KEY_FILE),
-        &key_bytes,
+        key_bytes,
     )
     .map_err(|e| IpcError::internal(format!("restoring volume.key: {e}")))?;
     // Idempotent: missing-file is not an error.
@@ -126,7 +149,7 @@ fn restore_key_from_shadow(
             "stripping volume.readonly from hydrated leaf: {e}"
         )));
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Walk the parent chain rooted at `leaf_ulid`, calling [`pull_readonly_op`]
@@ -351,8 +374,9 @@ mod tests {
 
     /// Upload a root-shape `volume.pub` and `volume.provenance` for
     /// `vol_ulid` to the in-memory store so `pull_skeleton_chain` can
-    /// pull + verify them.
-    async fn upload_root_skeleton(store: &Arc<dyn ObjectStore>, vol_ulid: Ulid) {
+    /// pull + verify them. Returns the signing key so tests can plant
+    /// a matching key shadow.
+    async fn upload_root_skeleton(store: &Arc<dyn ObjectStore>, vol_ulid: Ulid) -> SigningKey {
         let signing_key = SigningKey::generate(&mut OsRng);
         let vk = signing_key.verifying_key();
 
@@ -370,6 +394,44 @@ mod tests {
         let body = std::fs::read(tmp.path().join(VOLUME_PROVENANCE_FILE)).unwrap();
         let prov_key = StorePath::from(elide_core::store_keys::meta_provenance_key(vol_ulid));
         store.put(&prov_key, PutPayload::from(body)).await.unwrap();
+        signing_key
+    }
+
+    struct HydrateFixture {
+        _coord_dir: TempDir,
+        _data_dir: TempDir,
+        core: crate::inbound::CoordinatorCore,
+        recording: Arc<RecordingStores>,
+        leaf: Ulid,
+        leaf_key: SigningKey,
+    }
+
+    async fn hydrate_fixture() -> HydrateFixture {
+        let coord_dir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
+
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let leaf = Ulid::new();
+        let leaf_key = upload_root_skeleton(&mem, leaf).await;
+
+        let passthrough: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(Arc::clone(&mem)));
+        let recording = RecordingStores::wrap(passthrough);
+        let stores: Arc<dyn ScopedStores> = recording.clone();
+
+        let core = crate::inbound::CoordinatorCore {
+            data_dir: Arc::new(data_dir.path().to_path_buf()),
+            stores,
+            identity,
+        };
+        HydrateFixture {
+            _coord_dir: coord_dir,
+            _data_dir: data_dir,
+            core,
+            recording,
+            leaf,
+            leaf_key,
+        }
     }
 
     #[tokio::test]
@@ -381,32 +443,18 @@ mod tests {
         //   - `by_id/<leaf>/snapshots/LATEST` (read_volume(leaf))
         // Coord-writer has no `by_id/` grant and `volume-rw` is the
         // write credential — neither belongs on this path.
-        let coord_dir = TempDir::new().unwrap();
-        let data_dir = TempDir::new().unwrap();
-        let identity = Arc::new(CoordinatorIdentity::load_or_generate(coord_dir.path()).unwrap());
-
-        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let leaf = Ulid::new();
-        upload_root_skeleton(&mem, leaf).await;
-
-        let passthrough: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(Arc::clone(&mem)));
-        let recording = RecordingStores::wrap(passthrough);
-        let stores: Arc<dyn ScopedStores> = recording.clone();
-
-        let core = crate::inbound::CoordinatorCore {
-            data_dir: Arc::new(data_dir.path().to_path_buf()),
-            stores,
-            identity,
-        };
+        let f = hydrate_fixture().await;
+        elide_coordinator::key_shadow::write(&f.core.data_dir, f.leaf, &f.leaf_key.to_bytes())
+            .unwrap();
 
         // Root leaf with no snapshot → `install_basis_under_parent`
         // errors with "no published snapshot". Routing decisions made
         // before that landed in the spy.
-        let _ = hydrate_remote_owned("vol", leaf, 1024 * 1024, &core).await;
+        let _ = hydrate_remote_owned("vol", f.leaf, 1024 * 1024, &f.core).await;
 
-        let calls = recording.calls();
+        let calls = f.recording.calls();
         assert!(
-            calls.contains(&RoleCall::ReadVolume(leaf)),
+            calls.contains(&RoleCall::ReadVolume(f.leaf)),
             "hydrate reads must use volume-ro per ULID; got {calls:?}"
         );
         assert!(
@@ -414,6 +462,50 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, RoleCall::VolumeRw(_) | RoleCall::Writer)),
             "hydrate is pure-read — no volume-rw or coord-rw mint; got {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_without_shadow_fails_before_basis_reads() {
+        let f = hydrate_fixture().await;
+
+        let err = hydrate_remote_owned("vol", f.leaf, 1024 * 1024, &f.core)
+            .await
+            .expect_err("keyless hydrate must fail");
+        assert!(
+            err.message.contains("claim --force"),
+            "error should route the operator to claim --force: {}",
+            err.message
+        );
+
+        // The possession proof precedes every `by_id` basis read: a
+        // keyless start mints no volume-ro credential.
+        let calls = f.recording.calls();
+        assert!(
+            !calls.contains(&RoleCall::ReadVolume(f.leaf)),
+            "no basis read may precede the possession proof; got {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_shadow_mismatching_published_key() {
+        let f = hydrate_fixture().await;
+        let foreign_key = SigningKey::generate(&mut OsRng);
+        elide_coordinator::key_shadow::write(&f.core.data_dir, f.leaf, &foreign_key.to_bytes())
+            .unwrap();
+
+        let err = hydrate_remote_owned("vol", f.leaf, 1024 * 1024, &f.core)
+            .await
+            .expect_err("mismatched shadow must fail");
+        assert!(
+            err.message.contains("does not match"),
+            "error should name the key mismatch: {}",
+            err.message
+        );
+        let calls = f.recording.calls();
+        assert!(
+            !calls.contains(&RoleCall::ReadVolume(f.leaf)),
+            "no basis read may precede the possession proof; got {calls:?}"
         );
     }
 }

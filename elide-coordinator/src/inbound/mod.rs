@@ -1,7 +1,7 @@
 // Coordinator inbound socket — top-level dispatch.
 //
 // Submodules:
-//   - `lifecycle`: start, stop, release, force-release, hydrate.
+//   - `lifecycle`: start, stop, release, hydrate.
 //
 // Listens on control.sock for commands from the elide CLI.
 // Protocol: one request line per connection, one response line, then close.
@@ -1553,10 +1553,9 @@ async fn create_volume_op(
             elide_core::signing::VOLUME_PUB_FILE,
         )?;
         // Shadow the signing key under `data_dir/keys/<vol_ulid>.key`
-        // immediately. The shadow is what lets a future
-        // `stop`→`remove`→`start` round-trip preserve writability
-        // (without it, hydrate-from-bucket can only ever produce a
-        // readonly view because the private key is never uploaded).
+        // immediately. The shadow is `start`'s possession proof after
+        // a `remove` — the private key is never uploaded, and a
+        // future `start` fails without it.
         elide_coordinator::key_shadow::write(data_dir, vol_ulid, &key.to_bytes())?;
         elide_core::signing::write_provenance(
             &vol_dir,
