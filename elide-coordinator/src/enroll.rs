@@ -1,11 +1,18 @@
 //! Coordinator-side mint enrollment
-//! (`docs/coordinator-mint-enrollment-plan.md`).
+//! (`docs/coordinator-mint-enrollment-plan-v2.md`).
 //!
 //! One blocking operator command: `POST /v1/enroll` (A), wait while the
 //! operator approves out of band (B), then exchange the ticket once per
 //! role (C), writing `<data_dir>/credentials/<role>`. The credential
 //! ticket lives in memory for the command's duration and never touches
 //! disk — `credentials/<role>` is the only durable enrollment artifact.
+//!
+//! A and C are operator-gated: the invite and the ticket each carry a
+//! third-party caveat keyed by the auth service, so the command fetches
+//! an operator discharge for each presentation (`mint:enroll` /
+//! `mint:exchange` scope) using the logged-in operator's session and
+//! bundles it after the primary. Discharges are short-lived and held
+//! only in memory; one exchange discharge covers every role in a pass.
 //!
 //! Because the command holds the invite macaroon for its whole
 //! duration it self-heals the ticket-expiry race: if the short-lived
@@ -23,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use tracing::{info, warn};
 
 use elide_coordinator::config::MintConfig;
@@ -34,6 +42,12 @@ use crate::mint_client::{
 
 const CAVEAT_SUB: &str = "sub";
 const CAVEAT_CNF: &str = "cnf";
+
+/// Operator-discharge scopes for the two coordinator-presented
+/// enrollment gates (`mint/src/caveat.rs::scope` — reimplemented
+/// constants, same deliberate duplication as the wire format).
+const SCOPE_ENROLL: &str = "mint:enroll";
+const SCOPE_EXCHANGE: &str = "mint:exchange";
 
 /// How often to re-attempt the exchange while awaiting operator
 /// approval. Foreground operator command — a short, predictable cadence
@@ -94,20 +108,116 @@ fn resolve_invite(src: &str) -> io::Result<String> {
     Ok(trimmed)
 }
 
-/// A — `POST /v1/enroll`. Attenuate the invite with `sub`/`cnf`, PoP
-/// over `{ts}`, return the credential-ticket macaroon string.
+/// The operator's auth-service session, as written by `mint login`:
+/// the session bearer that gates `/v1/discharge` plus the transport to
+/// dial the auth role with (`unix:<sock>` or `http(s)://host`). The
+/// session shape is the auth service's
+/// (`docs/design-auth-service.md` § *Login flow*), shared across its
+/// CLIs — one login serves the mint operator plane and this command.
+pub struct OperatorSession {
+    pub session: String,
+    pub transport: String,
+}
+
+/// Load the session from the per-user store `mint login` writes:
+/// `$XDG_CONFIG_HOME/mint`, else `$HOME/.config/mint` — the `session`
+/// and `auth-transport` files.
+pub fn load_operator_session() -> io::Result<OperatorSession> {
+    let dir = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(x) if !x.is_empty() => PathBuf::from(x).join("mint"),
+        _ => match std::env::var_os("HOME") {
+            Some(h) if !h.is_empty() => PathBuf::from(h).join(".config").join("mint"),
+            _ => {
+                return Err(io::Error::other(
+                    "no config home — set HOME or XDG_CONFIG_HOME",
+                ));
+            }
+        },
+    };
+    let read = |file: &str, missing: &str| -> io::Result<String> {
+        match std::fs::read_to_string(dir.join(file)) {
+            Ok(s) => Ok(s.trim().to_owned()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(io::Error::other(format!("{missing} (run `mint login`)")))
+            }
+            Err(e) => Err(e),
+        }
+    };
+    Ok(OperatorSession {
+        session: read("session", "not logged in")?,
+        transport: read("auth-transport", "no auth transport known")?,
+    })
+}
+
+/// Fetch the operator discharge for each third-party caveat on
+/// `anchor` (the invite's enroll gate, the ticket's exchange gate):
+/// POST the CID and the requested `scope` to the authority's discharge
+/// route under the session bearer. The authority issues only if the
+/// session grants `scope`; the returned discharges bundle after the
+/// primary.
+async fn gate_discharges(
+    cfg: &MintConfig,
+    session: &OperatorSession,
+    anchor: &WireMacaroon,
+    scope: &str,
+) -> io::Result<Vec<String>> {
+    let mut discharges = Vec::new();
+    for (location, cid) in anchor.third_party_caveats() {
+        let path = elide_coordinator::config::location_path(location).ok_or_else(|| {
+            io::Error::other(format!("{scope} gate location carries no path: {location}"))
+        })?;
+        let body = format!(
+            r#"{{"cid":"{}","scope":"{scope}"}}"#,
+            BASE64_URL.encode(cid)
+        );
+        let (status, text, _retry_after) = post(
+            &session.transport,
+            cfg.connect_timeout,
+            cfg.request_timeout,
+            path,
+            &format!("Bearer {}", session.session),
+            "",
+            body,
+        )
+        .await?;
+        if status != 200 {
+            let snippet: String = text.chars().take(200).collect();
+            return Err(io::Error::other(format!(
+                "auth discharge for the {scope} gate returned {status}: {snippet}"
+            )));
+        }
+        discharges.push(json_str_field(&text, "discharge")?);
+    }
+    Ok(discharges)
+}
+
+/// `MintV1 <primary>[,<discharge>…]` — the bundle wire mint parses.
+fn bundle_auth(primary: &WireMacaroon, discharges: &[String]) -> String {
+    let mut auth = format!("MintV1 {}", primary.encode());
+    for d in discharges {
+        auth.push(',');
+        auth.push_str(d);
+    }
+    auth
+}
+
+/// A — `POST /v1/enroll`. Attenuate the invite with `sub`/`cnf`,
+/// discharge its enroll gate, PoP over `{ts}`, return the
+/// credential-ticket macaroon string.
 async fn enroll_request(
     cfg: &MintConfig,
     identity: &CoordinatorIdentity,
     invite: &str,
+    session: &OperatorSession,
 ) -> io::Result<String> {
     let mut mac = WireMacaroon::decode(invite)?;
     mac.attenuate(CAVEAT_SUB, identity.coordinator_id_str());
     mac.attenuate(CAVEAT_CNF, &cnf_value(identity));
+    let discharges = gate_discharges(cfg, session, &mac, SCOPE_ENROLL).await?;
 
     let body = format!(r#"{{"ts":{}}}"#, now_unix()?);
     let sig = BASE64.encode(identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
-    let auth = format!("MintV1 {}", mac.encode());
+    let auth = bundle_auth(&mac, &discharges);
 
     let (status, text, _retry_after) = post(
         &cfg.url,
@@ -135,13 +245,15 @@ enum ExchangeOutcome {
 }
 
 /// C (one role) — `POST /v1/enroll-exchange`, body `{ts, role}`, PoP
-/// over it. `200` → the credential; `403` → not yet approved; `401` →
+/// over it, the pass's exchange-gate discharges bundled after the
+/// ticket. `200` → the credential; `403` → not yet approved; `401` →
 /// ticket expired (the single command re-enrolls); anything else fails.
 async fn exchange_request(
     cfg: &MintConfig,
     identity: &CoordinatorIdentity,
     ticket: &str,
     role: &str,
+    discharges: &[String],
 ) -> io::Result<ExchangeOutcome> {
     let mac = WireMacaroon::decode(ticket)?;
     let body = format!(
@@ -150,7 +262,7 @@ async fn exchange_request(
         serde_json::Value::from(role)
     );
     let sig = BASE64.encode(identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
-    let auth = format!("MintV1 {}", mac.encode());
+    let auth = bundle_auth(&mac, discharges);
 
     let (status, text, _retry_after) = post(
         &cfg.url,
@@ -233,6 +345,7 @@ pub async fn run(
     invite_src: &str,
     wait: Duration,
     force: bool,
+    session: &OperatorSession,
 ) -> io::Result<()> {
     let mut remaining: Vec<&str> = COORD_ENROLL_ROLES
         .iter()
@@ -252,7 +365,7 @@ pub async fn run(
     let sub = identity.coordinator_id_str();
     let cnf = cnf_value(identity);
 
-    let mut ticket = enroll_request(cfg, identity, &invite).await?;
+    let mut ticket = enroll_request(cfg, identity, &invite, session).await?;
     info!(
         "[enroll] enrolled sub={sub} cnf-fingerprint={} — now run `mint enroll approve {sub}` \
          on the mint host (match that fingerprint out of band first)",
@@ -270,12 +383,17 @@ pub async fn run(
         // its `exp`, so on AwaitingApproval there is no point trying the
         // other roles this pass.
         let mut awaiting = false;
+        // One exchange-gate discharge covers every role in the pass
+        // (the auth scope is per-operation, not per-role); fetched per
+        // pass so a long approval wait never presents a stale one.
+        let ticket_mac = WireMacaroon::decode(&ticket)?;
+        let discharges = gate_discharges(cfg, session, &ticket_mac, SCOPE_EXCHANGE).await?;
         // Always process from the front: Granted removes the head;
         // AwaitingApproval / TicketExpired break the pass.
         let idx = 0;
         while idx < remaining.len() {
             let role = remaining[idx];
-            match exchange_request(cfg, identity, &ticket, role).await? {
+            match exchange_request(cfg, identity, &ticket, role, &discharges).await? {
                 ExchangeOutcome::Granted(credential) => {
                     write_credential(data_dir, role, &credential)?;
                     info!("[enroll] {role}: credential written");
@@ -290,7 +408,7 @@ pub async fn run(
                         "[enroll] credential ticket expired before approval; re-enrolling — \
                          the operator must re-run `mint enroll approve {sub}`"
                     );
-                    ticket = enroll_request(cfg, identity, &invite).await?;
+                    ticket = enroll_request(cfg, identity, &invite, session).await?;
                     awaiting = true;
                     break;
                 }

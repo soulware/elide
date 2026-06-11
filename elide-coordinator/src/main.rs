@@ -17,6 +17,8 @@ mod force_claim;
 mod fork;
 mod import;
 mod inbound;
+#[cfg(test)]
+mod mint_attested_e2e;
 mod mint_client;
 mod mint_stores;
 mod pidfile;
@@ -286,6 +288,10 @@ async fn run() -> Result<()> {
                 &config.data_dir,
             )
             .with_context(|| "loading coordinator identity")?;
+            // The enroll/exchange gates are operator-discharged, so a
+            // logged-in operator session is a prerequisite.
+            let session = enroll::load_operator_session()
+                .with_context(|| "loading the operator session for the enrollment gates")?;
             enroll::run(
                 mint_cfg,
                 &identity,
@@ -293,6 +299,7 @@ async fn run() -> Result<()> {
                 &invite,
                 timeout,
                 force,
+                &session,
             )
             .await
             .map_err(anyhow::Error::from)

@@ -648,7 +648,7 @@ pub struct MintConfig {
     #[serde(default = "default_mint_request_timeout", with = "humantime_serde")]
     pub request_timeout: Duration,
 
-    /// Discharge URL of the attestation coordinator (coord B) that
+    /// Discharge location of the attestation coordinator (coord B) that
     /// vouches volume ownership (`docs/design-mint-volume-attestation.md`).
     /// When set, a primary credential carrying a third-party caveat at
     /// this exact location is discharged before `assume-role`: the
@@ -656,9 +656,20 @@ pub struct MintConfig {
     /// attaches the returned discharge to the bundle. Absent → no
     /// discharge is fetched (the enrolled credentials carry no attestation
     /// caveat). Must equal the `attestation_location` mint sealed into the
-    /// caveat.
+    /// caveat — the authority's *identity*, a URL whose path is the
+    /// discharge route. The connection comes from
+    /// [`attestation_transport`](Self::attestation_transport) when set,
+    /// else the location is dialled directly.
     #[serde(default)]
     pub attestation_location: Option<String>,
+
+    /// How to dial coord B when its location is not the connection:
+    /// `unix:<path>` (the co-located, off-network shape) or
+    /// `http(s)://host:port`. The request path still comes from
+    /// `attestation_location`. Absent → the location itself is dialled,
+    /// so it must then be a reachable `http(s)` URL.
+    #[serde(default)]
+    pub attestation_transport: Option<String>,
 }
 
 fn default_mint_connect_timeout() -> Duration {
@@ -668,19 +679,58 @@ fn default_mint_request_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+/// The request path of a discharge-authority location URL (e.g.
+/// `https://coord-b.example/v1/discharge` → `/v1/discharge`). The host
+/// part is an identity, not necessarily dialable — a separate transport
+/// may supply the connection — so only the path is taken. `None` when
+/// the location carries no route.
+pub fn location_path(location: &str) -> Option<&str> {
+    let rest = location
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(location);
+    let path = &rest[rest.find('/')?..];
+    (path != "/").then_some(path)
+}
+
+/// `unix:<path>` or `http(s)://…` — the scheme set every dial target in
+/// this config speaks (`docs/design-mint.md` § "Transport").
+fn valid_dial_scheme(s: &str) -> bool {
+    s.starts_with("unix:") || s.starts_with("http://") || s.starts_with("https://")
+}
+
 impl MintConfig {
-    /// Reject an endpoint whose scheme is neither `unix:` nor
-    /// `http(s)://`. Validated at issuer-build time so a typo fails at
-    /// startup rather than on the first `assume-role`.
+    /// Reject a dial target whose scheme is neither `unix:` nor
+    /// `http(s)://`, an attestation location with no discharge route,
+    /// and a transport with nothing to route. Validated at issuer-build
+    /// time so a typo fails at startup rather than on the first
+    /// `assume-role`.
     pub fn validate(&self) -> Result<()> {
-        let u = self.url.trim();
-        if u.starts_with("unix:") || u.starts_with("http://") || u.starts_with("https://") {
-            Ok(())
-        } else {
+        if !valid_dial_scheme(self.url.trim()) {
             bail!(
                 "[mint] url must be `unix:<path>` or `http(s)://host:port` (got {:?})",
                 self.url
-            )
+            );
+        }
+        if let Some(loc) = &self.attestation_location
+            && location_path(loc.trim()).is_none()
+        {
+            bail!(
+                "[mint] attestation_location must carry the discharge route as its \
+                 URL path (e.g. `https://coord-b/v1/discharge`), got {loc:?}"
+            );
+        }
+        match &self.attestation_transport {
+            Some(_) if self.attestation_location.is_none() => {
+                bail!("[mint] attestation_transport is set without attestation_location");
+            }
+            Some(t) if !valid_dial_scheme(t.trim()) => {
+                bail!(
+                    "[mint] attestation_transport must be `unix:<path>` or \
+                     `http(s)://host:port` (got {t:?})"
+                );
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -933,6 +983,61 @@ mod tests {
             ListenAddr::Uds(PathBuf::from("/run/elide/discharge.sock"))
         );
         assert!(parse_listen("not-an-address").is_err());
+    }
+
+    #[test]
+    fn location_path_takes_only_the_path() {
+        assert_eq!(
+            location_path("https://coord-b.example/v1/discharge"),
+            Some("/v1/discharge")
+        );
+        assert_eq!(
+            location_path("http://127.0.0.1:8086/v1/discharge"),
+            Some("/v1/discharge")
+        );
+        assert_eq!(location_path("https://coord-b.example"), None);
+        assert_eq!(location_path("https://coord-b.example/"), None);
+    }
+
+    #[test]
+    fn mint_validate_checks_the_attestation_pair() {
+        let base = MintConfig {
+            url: "unix:/run/elide/mint.sock".into(),
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            attestation_location: None,
+            attestation_transport: None,
+        };
+        assert!(base.validate().is_ok());
+
+        // A location must carry the discharge route.
+        let pathless = MintConfig {
+            attestation_location: Some("https://coord-b.example".into()),
+            ..base.clone()
+        };
+        assert!(pathless.validate().is_err());
+
+        // A transport needs a location to take the route from.
+        let dangling = MintConfig {
+            attestation_transport: Some("unix:/run/elide/coord-b.sock".into()),
+            ..base.clone()
+        };
+        assert!(dangling.validate().is_err());
+
+        // The co-located shape: logical location, UDS connection.
+        let uds = MintConfig {
+            attestation_location: Some("https://coord-b.example/v1/discharge".into()),
+            attestation_transport: Some("unix:/run/elide/coord-b.sock".into()),
+            ..base.clone()
+        };
+        assert!(uds.validate().is_ok());
+
+        let bad_scheme = MintConfig {
+            attestation_location: Some("https://coord-b.example/v1/discharge".into()),
+            attestation_transport: Some("coord-b.example:8086".into()),
+            ..base
+        };
+        assert!(bad_scheme.validate().is_err());
     }
 
     #[test]
