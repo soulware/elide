@@ -71,9 +71,11 @@ impl RangeFetcher for ObjectStoreRangeFetcher {
 /// single-prefix `volume-ro` store ([`ScopedStores::read_volume`]). Used
 /// by filemap generation, whose range fetcher reads segment bodies that
 /// may live under the leaf's prefix or any ancestor's — each owner gets
-/// its own credential, none spanning the chain.
+/// its own credential, none spanning the chain. Every read anchors on
+/// `owned`: the leaf the fetcher was built for.
 pub struct PerOwnerObjectStoreFetcher {
     stores: Arc<dyn ScopedStores>,
+    owned: Ulid,
     handle: tokio::runtime::Handle,
     cache: Mutex<HashMap<Ulid, Arc<ObjectStoreRangeFetcher>>>,
 }
@@ -82,9 +84,10 @@ impl PerOwnerObjectStoreFetcher {
     /// Capture the current runtime handle (call on the reactor) so the
     /// per-owner adapters can be built lazily inside `get_range`, which
     /// runs in a blocking worker.
-    pub fn new(stores: Arc<dyn ScopedStores>) -> Self {
+    pub fn new(stores: Arc<dyn ScopedStores>, owned: Ulid) -> Self {
         Self {
             stores,
+            owned,
             handle: tokio::runtime::Handle::current(),
             cache: Mutex::new(HashMap::new()),
         }
@@ -96,7 +99,7 @@ impl PerOwnerObjectStoreFetcher {
             return Arc::clone(f);
         }
         let f = Arc::new(ObjectStoreRangeFetcher::with_handle(
-            self.stores.read_volume(&owner),
+            self.stores.read_volume(&self.owned, &owner),
             self.handle.clone(),
         ));
         cache.insert(owner, Arc::clone(&f));

@@ -55,22 +55,37 @@ pub trait CredentialIssuer: Send + Sync {
 }
 
 /// A volume ULID the requester is authorized to read — itself or one of
-/// its ancestors. The only constructor is [`authorize_target`], so a
-/// value of this type *is* the proof that the lineage check passed;
-/// possessing one is what permits [`CredentialIssuer::issue`] to grant
-/// the `by_id/<target>/*` prefix.
+/// its ancestors — together with the requester it was authorized *for*.
+/// The only constructor is [`authorize_target`], so a value of this
+/// type *is* the proof that the lineage check passed; possessing one is
+/// what permits [`CredentialIssuer::issue`] to grant the
+/// `by_id/<target>/*` prefix.
+///
+/// The requester is carried as the read's `owned` anchor: the live,
+/// locally-keyed volume whose key signs the `ro-ancestor` possession
+/// proof when credential acquisition requires a discharge
+/// (`design-mint-volume-attestation.md` § *Threading the `owned`
+/// anchor*).
 ///
 /// Parallel to [`Verified`] and composes with it — a `Verified`
 /// requester is required to produce an `AuthorizedTarget`. The two attest
 /// different facts: `Verified` that the *caller* is macaroon-
 /// authenticated; `AuthorizedTarget` that the *target* is within the
 /// caller's lineage.
-pub struct AuthorizedTarget(Ulid);
+pub struct AuthorizedTarget {
+    owned: Ulid,
+    target: Ulid,
+}
 
 impl AuthorizedTarget {
-    /// The authorized volume ULID.
-    pub fn ulid(&self) -> Ulid {
-        self.0
+    /// The anchor: the requesting volume the lineage check ran against.
+    pub fn owned(&self) -> Ulid {
+        self.owned
+    }
+
+    /// The authorized volume ULID — the prefix to grant.
+    pub fn target(&self) -> Ulid {
+        self.target
     }
 }
 
@@ -97,7 +112,10 @@ pub fn authorize_target(
             ));
         }
     }
-    Ok(AuthorizedTarget(target))
+    Ok(AuthorizedTarget {
+        owned: requester,
+        target,
+    })
 }
 
 /// Lower-layer abstraction over whatever component actually vends
@@ -111,8 +129,12 @@ pub fn authorize_target(
 #[async_trait]
 pub trait Credentialer: Send + Sync {
     /// Mint (or return cached) read-only credentials whose policy grants
-    /// `s3:GetObject` on the single prefix `by_id/<vol_ulid>/*`.
-    async fn provision_volume_ro(&self, vol_ulid: Ulid) -> io::Result<IssuedCredentials>;
+    /// `s3:GetObject` on the single prefix `by_id/<target>/*`. `owned`
+    /// is the anchor the read was authorized for — the volume whose key
+    /// signs the `ro-ancestor` possession proof when acquisition
+    /// requires a discharge.
+    async fn provision_volume_ro(&self, owned: Ulid, target: Ulid)
+    -> io::Result<IssuedCredentials>;
 
     /// Tear down a volume's RO key + policy. Best-effort: a remote
     /// implementation may log and proceed if individual IAM calls fail

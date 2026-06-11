@@ -455,7 +455,7 @@ impl ForceClaimOrchestrator {
         let source = self.source_vol.expect("resolve_source ran");
         let fork_vol = self.fork.as_ref().expect("rebind ran").vol_ulid;
 
-        let source_ro = self.ctx.core.stores.read_volume(&source);
+        let source_ro = self.ctx.core.stores.read_volume(&fork_vol, &source);
         let source_vd =
             elide_coordinator::volume_data::VolumeData::new(Arc::clone(&source_ro), source);
         let source_dir =
@@ -571,7 +571,11 @@ impl ForceClaimOrchestrator {
         let fork = self.fork.as_ref().expect("rebind ran");
 
         // Resume skip: already copied by a previous run.
-        let fork_ro = self.ctx.core.stores.read_volume(&fork.vol_ulid);
+        let fork_ro = self
+            .ctx
+            .core
+            .stores
+            .read_volume(&fork.vol_ulid, &fork.vol_ulid);
         let fork_ro_vd = elide_coordinator::volume_data::VolumeData::new(fork_ro, fork.vol_ulid);
         if fork_ro_vd
             .segments()
@@ -626,7 +630,8 @@ impl ForceClaimOrchestrator {
         primary_pubkey: &VerifyingKey,
     ) -> Result<Option<Vec<u8>>, IpcError> {
         let seg_id = seg_ulid.to_string();
-        let primary_ro = self.ctx.core.stores.read_volume(&primary_source);
+        let owned = self.fork.as_ref().expect("rebind ran").vol_ulid;
+        let primary_ro = self.ctx.core.stores.read_volume(&owned, &primary_source);
         let primary_vd =
             elide_coordinator::volume_data::VolumeData::new(primary_ro, primary_source);
         match primary_vd.segments().get_bytes(seg_ulid).await {
@@ -667,7 +672,7 @@ impl ForceClaimOrchestrator {
             let Ok(vk) = load_verifying_key(&dir, VOLUME_PUB_FILE) else {
                 continue;
             };
-            let ro = self.ctx.core.stores.read_volume(&candidate);
+            let ro = self.ctx.core.stores.read_volume(&owned, &candidate);
             let vd = elide_coordinator::volume_data::VolumeData::new(ro, candidate);
             match vd.segments().get_bytes(seg_ulid).await {
                 Ok(b) => {

@@ -57,14 +57,15 @@ pub(crate) async fn hydrate_remote_owned(
     let key_bytes =
         read_shadow_proving_possession(volume_name, vol_ulid, &core.data_dir, &fork_dir)?;
 
-    let leaf_store = core.stores.read_volume(&vol_ulid);
+    let leaf_store = core.stores.read_volume(&vol_ulid, &vol_ulid);
     let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &leaf_store).await? {
         Some((snap_ulid, kind)) => {
             install_basis_under_leaf(vol_ulid, snap_ulid, kind, &fork_dir, &leaf_store).await?;
             snap_ulid
         }
         None => {
-            install_basis_under_parent(volume_name, &fork_dir, &by_id_dir, &core.stores).await?
+            install_basis_under_parent(volume_name, vol_ulid, &fork_dir, &by_id_dir, &core.stores)
+                .await?
         }
     };
 
@@ -225,6 +226,7 @@ async fn install_basis_under_leaf(
 /// ancestry to find them.
 async fn install_basis_under_parent(
     volume_name: &str,
+    leaf_ulid: Ulid,
     fork_dir: &Path,
     by_id_dir: &Path,
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
@@ -253,7 +255,7 @@ async fn install_basis_under_parent(
     // Claim resolves the handoff via the promoted `<ulid>.manifest`
     // key (release promotes stop → user before flipping), so the
     // parent's basis is always a User-kind manifest here.
-    let parent_store = stores.read_volume(&parent_vol);
+    let parent_store = stores.read_volume(&leaf_ulid, &parent_vol);
     fetch_and_verify_manifest(
         parent_vol,
         parent_snap,
@@ -454,8 +456,11 @@ mod tests {
 
         let calls = f.recording.calls();
         assert!(
-            calls.contains(&RoleCall::ReadVolume(f.leaf)),
-            "hydrate reads must use volume-ro per ULID; got {calls:?}"
+            calls.contains(&RoleCall::ReadVolume {
+                owned: f.leaf,
+                target: f.leaf
+            }),
+            "hydrate reads must use volume-ro anchored on the leaf; got {calls:?}"
         );
         assert!(
             !calls
@@ -482,7 +487,9 @@ mod tests {
         // keyless start mints no volume-ro credential.
         let calls = f.recording.calls();
         assert!(
-            !calls.contains(&RoleCall::ReadVolume(f.leaf)),
+            !calls
+                .iter()
+                .any(|c| matches!(c, RoleCall::ReadVolume { .. })),
             "no basis read may precede the possession proof; got {calls:?}"
         );
     }
@@ -504,7 +511,9 @@ mod tests {
         );
         let calls = f.recording.calls();
         assert!(
-            !calls.contains(&RoleCall::ReadVolume(f.leaf)),
+            !calls
+                .iter()
+                .any(|c| matches!(c, RoleCall::ReadVolume { .. })),
             "no basis read may precede the possession proof; got {calls:?}"
         );
     }
