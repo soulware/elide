@@ -38,7 +38,8 @@ use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::stores::{ReadOnlyAdapter, ReadStore, ScopedStores};
 
 use crate::mint_client::{
-    MintEndpoint, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO, ROLE_VOLUME_RW, VOLUME_RO_TTL_SECS,
+    AssumeTarget, MintEndpoint, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO, ROLE_VOLUME_RW,
+    VOLUME_RO_TTL_SECS,
 };
 
 /// Documented coord-* TTLs (`docs/design-mint.md` § *Elide as
@@ -68,20 +69,16 @@ pub struct RoleStore {
     store_cfg: StoreSection,
     role: &'static str,
     ttl_secs: u64,
-    /// `volume-rw` and `volume-ro` are per-volume; the `elide:Volume`
-    /// narrowing caveat + audit value. `None` for the coordinator-wide
-    /// roles.
-    vol_ulid: Option<Ulid>,
+    /// What each assume is for: the `req.volume` target for the
+    /// per-volume roles plus the attestation anchor (`Coord` for the
+    /// coordinator-wide roles).
+    target: AssumeTarget,
     cached: Mutex<Option<Cached>>,
 }
 
 impl fmt::Debug for RoleStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RoleStore({}", self.role)?;
-        if let Some(v) = &self.vol_ulid {
-            write!(f, " vol={v}")?;
-        }
-        write!(f, ")")
+        write!(f, "RoleStore({} {:?})", self.role, self.target)
     }
 }
 
@@ -97,14 +94,14 @@ impl RoleStore {
         store_cfg: StoreSection,
         role: &'static str,
         ttl_secs: u64,
-        vol_ulid: Option<Ulid>,
+        target: AssumeTarget,
     ) -> Self {
         Self {
             endpoint,
             store_cfg,
             role,
             ttl_secs,
-            vol_ulid,
+            target,
             cached: Mutex::new(None),
         }
     }
@@ -141,14 +138,8 @@ impl RoleStore {
             })?;
         let total_elapsed = mint_started.elapsed();
         info!(
-            "[mint] assume role={} vol={} assume={:.2?} total={:.2?} ttl={}s",
-            self.role,
-            self.vol_ulid
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            assume_elapsed,
-            total_elapsed,
-            self.ttl_secs,
+            "[mint] assume role={} target={:?} assume={:.2?} total={:.2?} ttl={}s",
+            self.role, self.target, assume_elapsed, total_elapsed, self.ttl_secs,
         );
 
         let now = now_unix();
@@ -164,10 +155,8 @@ impl RoleStore {
     }
 
     async fn assume(&self) -> std::io::Result<crate::credential::IssuedCredentials> {
-        // The per-volume target (`volume-ro` / `volume-rw`) rides the
-        // assume-role body as `req.volume`; coord-wide roles pass `None`.
         self.endpoint
-            .assume_role(self.role, self.ttl_secs, self.vol_ulid)
+            .assume_role(self.role, self.ttl_secs, self.target)
             .await
     }
 }
@@ -277,14 +266,14 @@ impl MintScopedStores {
             store_cfg.clone(),
             ROLE_COORD_RO,
             COORD_CONTROL_TTL_SECS,
-            None,
+            AssumeTarget::Coord,
         ));
         let writer = Arc::new(RoleStore::new(
             endpoint.clone(),
             store_cfg.clone(),
             ROLE_COORD_RW,
             COORD_CONTROL_TTL_SECS,
-            None,
+            AssumeTarget::Coord,
         ));
         Self {
             base,
@@ -352,7 +341,7 @@ impl ScopedStores for MintScopedStores {
             self.store_cfg.clone(),
             ROLE_VOLUME_RW,
             VOLUME_RW_TTL_SECS,
-            Some(*vol_ulid),
+            AssumeTarget::RwSelf(*vol_ulid),
         ));
         if let Ok(mut map) = self.data.try_lock() {
             map.insert(*vol_ulid, Arc::clone(&rs));
@@ -378,7 +367,10 @@ impl ScopedStores for MintScopedStores {
             self.store_cfg.clone(),
             ROLE_VOLUME_RO,
             VOLUME_RO_TTL_SECS,
-            Some(*target),
+            AssumeTarget::RoAncestor {
+                owned: *owned,
+                target: *target,
+            },
         ));
         if let Ok(mut map) = self.read_volume.try_lock() {
             map.insert(key, Arc::clone(&rs));
