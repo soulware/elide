@@ -36,6 +36,10 @@ pub struct GcCycleOrchestrator {
     by_id_dir: PathBuf,
     vol_ulid: Ulid,
     store: Arc<dyn ObjectStore>,
+    /// `coord-rw` store for the drain's `meta/<vol>.{pub,provenance}`
+    /// self-heal uploads — identity writes are coordinator-plane
+    /// (`design-mint-volume-attestation.md` § *New-volume bootstrap*).
+    meta_store: Arc<dyn ObjectStore>,
     /// Typed handle for the per-volume `by_id/<vol>/…` objects. Used
     /// for HEAD ops; raw `store` is still used for object classes the
     /// domain layer doesn't yet vend (segments, snapshot manifests).
@@ -74,11 +78,13 @@ impl GcCycleOrchestrator {
         fork_dir: PathBuf,
         vol_ulid: Ulid,
         store: Arc<dyn ObjectStore>,
+        stores: &Arc<dyn crate::stores::ScopedStores>,
         gc_config: GcConfig,
         snapshot_locks: &SnapshotLockRegistry,
-        name_claims: Arc<dyn crate::name_claims::NameClaims>,
         volume_name: Option<String>,
     ) -> Self {
+        let meta_store = stores.writer();
+        let name_claims = stores.name_claims();
         let by_id_dir = fork_dir
             .parent()
             .map(|p| p.to_path_buf())
@@ -98,6 +104,7 @@ impl GcCycleOrchestrator {
             by_id_dir,
             vol_ulid,
             store,
+            meta_store,
             volume_data,
             gc_config,
             snap_lock,
@@ -261,7 +268,7 @@ impl GcCycleOrchestrator {
             return true;
         }
         let vol_ulid = self.vol_ulid;
-        match upload::drain_pending(&self.fork_dir, vol_ulid, &self.store).await {
+        match upload::drain_pending(&self.fork_dir, vol_ulid, &self.store, &self.meta_store).await {
             Ok(r) => {
                 if r.seen > 0 {
                     info!(
@@ -621,17 +628,15 @@ mod tests {
         let fork_dir = by_id.join(vol.to_string());
         std::fs::create_dir_all(&fork_dir).unwrap();
         let locks = crate::new_snapshot_lock_registry();
-        let claims = Arc::new(crate::name_claims::BucketNameClaims::new(
-            Arc::clone(&store),
-            Arc::clone(&store),
-        ));
+        let stores: Arc<dyn crate::stores::ScopedStores> =
+            Arc::new(crate::stores::PassthroughStores::new(Arc::clone(&store)));
         let orch = GcCycleOrchestrator::new(
             fork_dir,
             vol,
             store,
+            &stores,
             crate::config::GcConfig::default(),
             &locks,
-            claims,
             volume_name.map(String::from),
         );
         (orch, tmp)

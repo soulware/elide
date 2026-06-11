@@ -799,8 +799,11 @@ pub(crate) async fn snapshot_volume_kind(
         ));
     }
 
+    let meta_store = core.stores.writer();
     let drained_user_snapshot =
-        match elide_coordinator::upload::drain_pending(&fork_dir, vol_ulid, &store).await {
+        match elide_coordinator::upload::drain_pending(&fork_dir, vol_ulid, &store, &meta_store)
+            .await
+        {
             Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
                 return Err(IpcError::store(format!(
                     "drain reported {} S3-upload failure(s), {} volume-promote failure(s)",
@@ -1583,14 +1586,16 @@ async fn create_volume_op(
     // `by_id/<vol_ulid>/{volume.pub, volume.provenance}` (no
     // names/<name> references them, so they're harmless and
     // GC-reclaimable).
-    let create_vd = core.stores.volume_data(&vol_ulid);
-    if let Err(e) = elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, &create_vd).await
+    let meta_store = core.stores.writer();
+    if let Err(e) =
+        elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, vol_ulid, &meta_store).await
     {
         cleanup_local();
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
     }
     if let Err(e) =
-        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, &create_vd).await
+        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, vol_ulid, &meta_store)
+            .await
     {
         cleanup_local();
         return Err(IpcError::store(format!(
@@ -3046,17 +3051,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_volume_op_routes_pub_provenance_through_volume_rw_and_name_through_writer() {
+    async fn create_volume_op_routes_everything_through_writer() {
         // `create_volume_op` runs three S3-touching phases (volume.pub
-        // upload, volume.provenance upload, names/<name> claim) and
-        // each must ride the matching role:
-        //   - by_id/<vol>/{volume.pub,.provenance} → per-vol volume-rw
-        //   - names/<name> CAS + events/<name>/    → coord-rw
-        // The role pick happens at the top of the op via
-        // `core.stores.volume_data(&vol)` and `core.stores.{name_claims,
-        // event_journal}()`. A regression that swapped writer↔volume-rw
-        // would silently 403 on Tigris (memo
-        // `project_coordinator_per_volume_scoping.md`).
+        // upload, volume.provenance upload, names/<name> claim) and all
+        // of them are coordinator-plane (coord-rw): identity
+        // establishment cannot ride volume-rw — a volume cannot attest
+        // its own first write (`design-mint-volume-attestation.md`
+        // § *New-volume bootstrap*) — and names/events always were
+        // coord-rw. No per-volume credential of either direction may
+        // be minted at create time.
         use elide_coordinator::stores::{
             PassthroughStores, RecordingStores, RoleCall, ScopedStores,
         };
@@ -3082,28 +3085,25 @@ mod tests {
         let vol_ulid = reply.vol_ulid;
 
         let calls = recording.calls();
-        // Per-volume writes (volume.pub, volume.provenance) must mint
-        // volume-rw for this fork's vol_ulid.
-        assert!(
-            calls.contains(&RoleCall::VolumeRw(vol_ulid)),
-            "create must route by_id/<vol>/{{volume.pub, volume.provenance}} \
-             through volume_rw({vol_ulid}); got {calls:?}"
-        );
-        // Coordinator-wide writes (names/<vol>, events/<vol>/) mint
-        // coord-rw plus coord-ro reads (the name_claims +
-        // event_journal facades wrap both).
+        // Coordinator-plane writes (meta identity, names/<vol>,
+        // events/<vol>/) mint coord-rw plus coord-ro reads (the
+        // name_claims + event_journal facades wrap both).
         assert!(
             calls.contains(&RoleCall::Writer),
-            "create must mint coord-rw for names/{{<name>, events}}; got {calls:?}"
+            "create must mint coord-rw for meta identity + names/events; got {calls:?}"
         );
-        // No read-only single-volume credential should appear: every
-        // create-time read is on local disk, and the only S3 reads
-        // are the conditional-PUT preflights inside name_claims/
-        // event_journal which ride coord-ro via the facade.
+        // No per-volume credential in either direction: create-time
+        // reads are local disk, and every S3 write is
+        // coordinator-plane.
         for call in &calls {
             assert!(
                 !matches!(call, RoleCall::ReadVolume { .. }),
                 "create must not mint per-vol read credentials; saw {call:?} in {calls:?}"
+            );
+            assert!(
+                !matches!(call, RoleCall::VolumeRw(_)),
+                "create must not mint volume-rw — identity uploads are \
+                 coordinator-plane; saw {call:?} (vol {vol_ulid}) in {calls:?}"
             );
         }
     }

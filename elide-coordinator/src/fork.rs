@@ -654,15 +654,23 @@ async fn fork_create_op(
     // artefacts are missing — which breaks both the normal claim path
     // and the peer-fetch auth pipeline (lineage walk 404s on
     // volume.provenance).
-    let new_vd = ctx.core.stores.volume_data(&new_vol_ulid_value);
-    if let Err(e) =
-        elide_coordinator::upload::upload_volume_pub_initial(&new_fork_dir, &new_vd).await
+    let meta_store = ctx.core.stores.writer();
+    if let Err(e) = elide_coordinator::upload::upload_volume_pub_initial(
+        &new_fork_dir,
+        new_vol_ulid_value,
+        &meta_store,
+    )
+    .await
     {
         cleanup(&new_fork_dir, &symlink_path);
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
     }
-    if let Err(e) =
-        elide_coordinator::upload::upload_volume_provenance_initial(&new_fork_dir, &new_vd).await
+    if let Err(e) = elide_coordinator::upload::upload_volume_provenance_initial(
+        &new_fork_dir,
+        new_vol_ulid_value,
+        &meta_store,
+    )
+    .await
     {
         cleanup(&new_fork_dir, &symlink_path);
         return Err(IpcError::store(format!(

@@ -784,6 +784,7 @@ fn drain_failure_skips_gc_and_data_survives() {
             fork_dir,
             ulid::Ulid::nil(),
             &fail_store,
+            &fail_store,
         ))
         .expect("drain_pending itself should not error");
     assert!(
@@ -818,6 +819,7 @@ fn drain_failure_skips_gc_and_data_survives() {
         .block_on(upload::drain_pending(
             fork_dir,
             ulid::Ulid::nil(),
+            &good_store,
             &good_store,
         ))
         .expect("drain should succeed with good store");

@@ -106,6 +106,31 @@ pub(crate) async fn put_with_content_type(
     }
 }
 
+/// PUT with `PutMode::Create` and `Content-Type` set. If the backing
+/// store returns `NotImplemented` for attribute options (as
+/// `LocalFileSystem` does), retry without attributes — the create mode
+/// itself is never dropped. `AlreadyExists` surfaces to the caller.
+async fn put_create_with_content_type(
+    store: &Arc<dyn ObjectStore>,
+    key: &StorePath,
+    payload: Bytes,
+    content_type: &'static str,
+) -> std::result::Result<(), object_store::Error> {
+    let mut opts = put_opts_with_type(content_type);
+    opts.mode = object_store::PutMode::Create;
+    match store.put_opts(key, payload.clone().into(), opts).await {
+        Ok(_) => Ok(()),
+        Err(object_store::Error::NotImplemented) => {
+            let opts = PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            };
+            store.put_opts(key, payload.into(), opts).await.map(|_| ())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Directory under each volume that holds upload-completion records — one
 /// file per S3 object we've confirmed uploaded. For small metadata the file
 /// holds a verbatim copy of the uploaded bytes, so `diff uploaded/<f>
@@ -234,12 +259,14 @@ pub async fn drain_pending(
     vol_dir: &Path,
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
+    meta_store: &Arc<dyn ObjectStore>,
 ) -> Result<DrainResult> {
     let pending_dir = vol_dir.join("pending");
 
     // Upload volume metadata before segments so that any host that
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
-    let published_user_snapshot = upload_volume_metadata(vol_dir, vol_ulid, store).await;
+    let published_user_snapshot =
+        upload_volume_metadata(vol_dir, vol_ulid, store, meta_store).await;
 
     // Upload + promote in ULID-ascending order so each promote moves
     // the lowest-ULID pending to committed, preserving
@@ -320,6 +347,7 @@ async fn upload_volume_metadata(
     vol_dir: &Path,
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
+    meta_store: &Arc<dyn ObjectStore>,
 ) -> Option<Ulid> {
     let pub_key_path = vol_dir.join("volume.pub");
     match std::fs::read(&pub_key_path) {
@@ -331,7 +359,7 @@ async fn upload_volume_metadata(
                     &StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid)),
                     "volume.pub",
                     MIME_TEXT,
-                    store,
+                    meta_store,
                 )
                 .await
                 {
@@ -358,7 +386,7 @@ async fn upload_volume_metadata(
                     &StorePath::from(elide_core::store_keys::meta_provenance_key(vol_ulid)),
                     elide_core::signing::VOLUME_PROVENANCE_FILE,
                     MIME_TEXT,
-                    store,
+                    meta_store,
                 )
                 .await
                 {
@@ -384,8 +412,13 @@ async fn upload_volume_metadata(
     }
 }
 
-/// Upload `<vol_dir>/volume.pub` via the volume's typed metadata
-/// handle and write the local upload sentinel.
+/// Upload `<vol_dir>/volume.pub` to `meta/<vol_ulid>.pub` on the
+/// coordinator-plane meta store and write the local upload sentinel.
+///
+/// Identity establishment rides `coord-rw`, never `volume-rw`: a
+/// volume cannot attest its own first write, because the `rw-self`
+/// possession check reads this very object
+/// (`design-mint-volume-attestation.md` § *New-volume bootstrap*).
 ///
 /// Used at create / fork time to establish the invariant
 /// "`names/<name>` only ever points at a `vol_ulid` whose `volume.pub` is
@@ -398,21 +431,32 @@ async fn upload_volume_metadata(
 /// pass observes a content-equal sentinel and skips the redundant PUT.
 pub async fn upload_volume_pub_initial(
     vol_dir: &Path,
-    vd: &crate::volume_data::VolumeData,
+    vol_ulid: Ulid,
+    meta_store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let pub_key_path = vol_dir.join("volume.pub");
-    vd.metadata()
-        .write_pubkey_from_file(&pub_key_path)
-        .await
-        .with_context(|| format!("uploading volume.pub for {}", vd.vol_ulid()))?;
+    let bytes = std::fs::read(&pub_key_path)
+        .with_context(|| format!("reading {}", pub_key_path.display()))?;
+    let key = StorePath::from(elide_core::store_keys::meta_pub_key(vol_ulid));
+    // Write-once: the pub is the volume's trust anchor and never
+    // changes. `AlreadyExists` is success — the content is
+    // deterministic for a given keypair, so a crash-resume re-upload
+    // finds the identical object.
+    match put_create_with_content_type(meta_store, &key, Bytes::from(bytes), MIME_TEXT).await {
+        Ok(()) | Err(object_store::Error::AlreadyExists { .. }) => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("uploading volume.pub to {key}"));
+        }
+    }
     let sentinel = upload_sentinel(vol_dir, "volume.pub");
     mark_uploaded_from_file(&sentinel, &pub_key_path)
         .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
     Ok(())
 }
 
-/// Upload `<vol_dir>/volume.provenance` via the volume's typed
-/// metadata handle and write the local upload sentinel.
+/// Upload `<vol_dir>/volume.provenance` to `meta/<vol_ulid>.provenance`
+/// on the coordinator-plane meta store and write the local upload
+/// sentinel.
 ///
 /// Sibling to [`upload_volume_pub_initial`]: extends the same
 /// "`names/<name>` only ever points at a `vol_ulid` whose immutable
@@ -424,19 +468,30 @@ pub async fn upload_volume_pub_initial(
 /// the daemon's later metadata-drain pass is one in which every such
 /// request 404s.
 ///
+/// Unlike the pub this is a plain put, not a conditional create: claim
+/// and `claim --force` rewrite the provisional lineage once, when the
+/// effective basis resolves.
+///
 /// Crash-safety story matches the `volume.pub` case: if the
 /// coordinator dies after this call but before `mark_initial` /
-/// `mark_claimed`, the orphan `by_id/<vol_ulid>/volume.provenance`
+/// `mark_claimed`, the orphan `meta/<vol_ulid>.provenance`
 /// has no `names/<name>` referrer and is reclaimed by future GC.
 pub async fn upload_volume_provenance_initial(
     vol_dir: &Path,
-    vd: &crate::volume_data::VolumeData,
+    vol_ulid: Ulid,
+    meta_store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
-    vd.metadata()
-        .write_provenance_from_file(&provenance_path)
-        .await
-        .with_context(|| format!("uploading volume.provenance for {}", vd.vol_ulid()))?;
+    let bytes = std::fs::read(&provenance_path)
+        .with_context(|| format!("reading {}", provenance_path.display()))?;
+    upload_small_bytes(
+        &bytes,
+        &StorePath::from(elide_core::store_keys::meta_provenance_key(vol_ulid)),
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+        MIME_TEXT,
+        meta_store,
+    )
+    .await?;
     let sentinel = upload_sentinel(vol_dir, elide_core::signing::VOLUME_PROVENANCE_FILE);
     mark_uploaded_from_file(&sentinel, &provenance_path)
         .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
@@ -709,7 +764,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+        let result = drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
             .await
             .unwrap();
 
@@ -761,7 +816,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+        let result = drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
             .await
             .unwrap();
         assert_eq!(result.uploaded_ulids.len(), 0);
@@ -804,7 +859,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
             .await
             .unwrap();
 
@@ -840,7 +895,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
             .await
             .unwrap();
 
@@ -853,7 +908,7 @@ mod tests {
         ));
         store.delete(&pub_key).await.unwrap();
 
-        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
             .await
             .unwrap();
 
@@ -861,7 +916,7 @@ mod tests {
 
         // Now change volume.pub content — re-drain must upload.
         std::fs::write(vol_dir.join("volume.pub"), b"rotated").unwrap();
-        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
             .await
             .unwrap();
         let got = store.get(&pub_key).await.expect("volume.pub re-uploaded");
@@ -903,7 +958,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store)
+        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
             .await
             .unwrap();
 

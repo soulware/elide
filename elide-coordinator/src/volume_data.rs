@@ -165,50 +165,6 @@ impl MetadataView<'_> {
         let hex = std::str::from_utf8(&bytes).map_err(MetadataError::PubkeyNotUtf8)?;
         parse_hex_pubkey(hex)
     }
-
-    /// Upload `volume.pub` from a local file. Reads the file
-    /// verbatim and PUTs the body to `meta/<vol>.pub`.
-    ///
-    /// The on-disk format is the canonical form (authored by
-    /// `signing::generate_keypair`): `lowercase-hex(pub) + "\n"`.
-    /// The view ships exactly those bytes — no parse, no
-    /// re-serialise.
-    pub async fn write_pubkey_from_file(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<(), MetadataError> {
-        upload_file_to_store(self.store, &pubkey_key(self.vol_ulid), path).await
-    }
-
-    /// Upload `volume.provenance` from a local file. Reads the file
-    /// verbatim and PUTs the body to `meta/<vol>.provenance`.
-    ///
-    /// The on-disk format is the canonical signed form authored by
-    /// [`signing::write_provenance`]; the view ships exactly those
-    /// bytes — the structured `ProvenanceLineage` is parsed by
-    /// downstream readers, never re-serialised here.
-    pub async fn write_provenance_from_file(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<(), MetadataError> {
-        upload_file_to_store(self.store, &provenance_key(self.vol_ulid), path).await
-    }
-}
-
-/// Read `path` and PUT its bytes to `key` under the metadata
-/// surface — used for `volume.pub` and `volume.provenance` uploads.
-async fn upload_file_to_store(
-    store: &Arc<dyn ObjectStore>,
-    key: &StorePath,
-    path: &std::path::Path,
-) -> Result<(), MetadataError> {
-    let bytes = std::fs::read(path).map_err(|e| MetadataError::ReadFile {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    crate::upload::put_with_content_type(store, key, Bytes::from(bytes), MIME_TEXT)
-        .await
-        .map_err(MetadataError::Put)
 }
 
 /// Sibling to [`upload_file_to_store`] for the snapshots surface —
@@ -850,10 +806,6 @@ fn pubkey_key(vol: Ulid) -> StorePath {
     StorePath::from(elide_core::store_keys::meta_pub_key(vol))
 }
 
-fn provenance_key(vol: Ulid) -> StorePath {
-    StorePath::from(elide_core::store_keys::meta_provenance_key(vol))
-}
-
 fn manifest_key(vol: Ulid, snap: Ulid) -> StorePath {
     let dt: chrono::DateTime<chrono::Utc> = snap.datetime().into();
     let date = dt.format("%Y%m%d").to_string();
@@ -938,53 +890,20 @@ mod tests {
         assert_eq!(vd.head().read().await.unwrap(), SegmentHead::empty(None));
     }
 
-    /// Seed a file with `bytes` inside `dir` named `name`, returning
-    /// the full path. The view's metadata writes consume on-disk
-    /// files; tests stage them in a tempdir.
-    fn seed_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, bytes).unwrap();
-        path
-    }
-
     #[tokio::test]
     async fn metadata_pubkey_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (_s, vd) = vd();
+        let (store, vd) = vd();
         let (_signer, vk) = elide_core::signing::generate_ephemeral_signer();
         let hex = elide_core::signing::encode_hex(&vk.to_bytes()) + "\n";
-        let path = seed_file(tmp.path(), "volume.pub", hex.as_bytes());
-        vd.metadata().write_pubkey_from_file(&path).await.unwrap();
-        let got = vd.metadata().read_pubkey().await.unwrap();
-        assert_eq!(got.to_bytes(), vk.to_bytes());
-    }
-
-    #[tokio::test]
-    async fn metadata_provenance_from_file_round_trip_via_store() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (store, vd) = vd();
-        let body = b"provenance body";
-        let path = seed_file(tmp.path(), "volume.provenance", body);
-        vd.metadata()
-            .write_provenance_from_file(&path)
+        store
+            .put(
+                &pubkey_key(vd.vol_ulid()),
+                bytes::Bytes::from(hex.into_bytes()).into(),
+            )
             .await
             .unwrap();
-        // S3 holds exactly what was on disk — the view ships the
-        // file verbatim, so a byte-equal comparison succeeds.
-        let from_store = store.get(&provenance_key(vd.vol_ulid())).await.unwrap();
-        assert_eq!(from_store.bytes().await.unwrap().as_ref(), body);
-    }
-
-    #[tokio::test]
-    async fn metadata_write_pubkey_reports_missing_file() {
-        let (_s, vd) = vd();
-        let bogus = std::path::Path::new("/does/not/exist/volume.pub");
-        let err = vd
-            .metadata()
-            .write_pubkey_from_file(bogus)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, MetadataError::ReadFile { .. }));
+        let got = vd.metadata().read_pubkey().await.unwrap();
+        assert_eq!(got.to_bytes(), vk.to_bytes());
     }
 
     // ── SnapshotsView ───────────────────────────────────────────────
