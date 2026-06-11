@@ -42,13 +42,13 @@ use elide_core::store_keys::meta_pub_key;
 /// proof; the seen-cache (below) makes it single-use within `2 × skew`.
 const DEFAULT_SKEW_SECS: u64 = 30;
 /// `rw-self` discharge lifetime, seconds. RW ownership is revocable
-/// (force-release/handoff), so the discharge is the liveness-staleness
+/// (forced claim/handoff), so the discharge is the liveness-staleness
 /// bound and is kept short — roughly the Tigris keypair lifetime
 /// (`docs/design-mint-volume-attestation.md` § *One liveness check*).
 const RW_SELF_DISCHARGE_TTL_SECS: u64 = 300;
 /// `ro-ancestor` discharge lifetime, seconds. Ancestors are frozen and the
-/// live owner of an ancestor episode never changes, so this discharge
-/// cannot go stale the way `rw-self` can — coord B drops off the path after
+/// binding of an ancestor episode never changes, so this discharge cannot
+/// go stale the way `rw-self` can — coord B drops off the path after
 /// first-touch. The lifetime is bounded only by the primary's own `exp`
 /// (`docs/design-mint-volume-attestation.md` § *One liveness check*).
 const RO_ANCESTOR_DISCHARGE_TTL_SECS: u64 = 3600;
@@ -77,7 +77,7 @@ pub struct DischargeRequest {
     pub cid: String,
     /// Volume name, for the liveness lookup (`names/<name>`).
     pub name: String,
-    /// ULID of the live volume coord A proves possession of.
+    /// ULID of the anchor volume coord A proves possession of.
     pub owned: String,
     /// ULID of the volume to vouch for. `== owned` in `rw-self`.
     pub target: String,
@@ -167,7 +167,7 @@ impl DischargeState {
         }
     }
 
-    /// Run the `rw-self` discharge predicate and mint the discharge.
+    /// Run the discharge predicate and mint the discharge.
     ///
     /// Order follows `docs/design-mint-volume-attestation.md` § *coord B
     /// verification*: recover the CID, check freshness + anti-replay, verify
@@ -223,11 +223,17 @@ impl DischargeState {
         )
         .map_err(|_| DischargeError::Denied("possession"))?;
 
-        // 5. Liveness: `names/<name>` must resolve to `owned`, Live. This is
-        //    the single currency check for both modes — an ro-ancestor cred
-        //    is valid only while `owned` remains the live claimant.
+        // 5. Liveness: `names/<name>` must currently bind `owned`. Live
+        //    is a property of the *binding*, not the record's `Live`
+        //    state or a running daemon — every bound state counts:
+        //    `Live`, `Stopped` (claim creates records Stopped; hydrate
+        //    and post-CAS reads anchor before the daemon runs), and
+        //    `Readonly` (terminally bound — no lifecycle verb can
+        //    displace it). What the check fences is a *displaced or
+        //    relinquished* episode: a forced claim rebinds `vol_ulid`
+        //    elsewhere, a release flips the state to `Released`.
         let record = self.fetch_name_record(&req.name).await?;
-        if record.vol_ulid != owned || record.state != NameState::Live {
+        if record.vol_ulid != owned || record.state == NameState::Released {
             return Err(DischargeError::Denied("liveness"));
         }
 
@@ -487,6 +493,52 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(matches!(
+            f.state.discharge(f.request()).await,
+            Err(DischargeError::Denied(_))
+        ));
+    }
+
+    /// Rewrite the fixture's name record with the given state, keeping
+    /// the `owned` binding.
+    async fn set_record_state(f: &Fixture, state: NameState) {
+        let mut record = NameRecord::live_minimal(f.owned, 4 * 1024 * 1024 * 1024);
+        record.state = state;
+        put_object(
+            f.state.inner.store.as_ref(),
+            &format!("names/{}", f.name),
+            record.to_toml().unwrap().into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn discharges_for_stopped_record() {
+        // Claim creates records in `Stopped`; hydrate and post-CAS reads
+        // anchor before the daemon runs. A bound-but-stopped episode is
+        // current.
+        let f = live_rw_self().await;
+        set_record_state(&f, NameState::Stopped).await;
+        f.state.discharge(f.request()).await.expect("discharge");
+    }
+
+    #[tokio::test]
+    async fn discharges_for_readonly_record() {
+        // A readonly import is terminally bound — no lifecycle verb can
+        // displace it — so it anchors its own reads (e.g. filemap
+        // generation for --extents-from seeding).
+        let f = live_rw_self().await;
+        set_record_state(&f, NameState::Readonly).await;
+        f.state.discharge(f.request()).await.expect("discharge");
+    }
+
+    #[tokio::test]
+    async fn rejects_released_record() {
+        // Released retains the old vol_ulid for handoff, so the state
+        // check is what fences a relinquished episode.
+        let f = live_rw_self().await;
+        set_record_state(&f, NameState::Released).await;
         assert!(matches!(
             f.state.discharge(f.request()).await,
             Err(DischargeError::Denied(_))

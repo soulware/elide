@@ -87,7 +87,7 @@ an expired Tigris keypair; mint re-verifies the MAC and re-clears `exp`
 per request (verify ≠ clear). coord B is consulted only to **mint** a
 discharge — on first-touch for a target and again on expiry — never on
 every keypair refresh. How long that `exp` is, and so how often coord B
-re-attests, is set per mode in *Liveness*.
+re-attests, is set per mode in *One liveness check*.
 
 ### Why a coordinator, not mint itself
 
@@ -126,7 +126,8 @@ the topology to name the right discharger. That worry dissolves because
   (dedup sources).
 - **Liveness** is provable from the `names/<name>` claim record — the
   single shared mutable surface, signed in the event log — which
-  resolves a name to the live episode's `by_id` ULID.
+  resolves a name to the current episode's `by_id` ULID. Liveness of
+  the *binding*, not of a daemon: see *One liveness check*.
 
 All three are world-readable and signed. So coord B is a **pure function
 over public signed state plus a possession proof**: it holds no secret,
@@ -161,7 +162,7 @@ the LBA map; `extent_index` sources feed dedup; both must be readable).
 Per-ancestor credentials are already the accepted shape (Tigris has no
 mid-resource wildcard).
 
-coord A anchors **once** at the live volume and derives the whole set
+coord A anchors **once** at the anchor volume and derives the whole set
 from the signed lineage. coord B evaluates:
 
 - **self (RW):** possession(vol_Y) ∧ liveness(vol_Y)
@@ -172,7 +173,8 @@ from the signed lineage. coord B evaluates:
 
 The possession proof anchors entitlement; the lineage walk authorises
 each specific RO target. The entire authorization graph reduces to *one
-possession proof of one live volume key plus the public signed lineage*.
+possession proof of one live-binding volume key plus the public signed
+lineage*.
 
 ### The read set is exactly fork ∪ extent_index — complete by construction
 
@@ -232,17 +234,39 @@ eager-vs-lazy tradeoff in its own right — and is not adopted here (see
 ### One liveness check unifies RW-self and RO-ancestor
 
 Possession of `volume.key` proves "operator of episode vol_Y"; the
-`names/<name> → vol_Y` check upgrades that to "*current* owner". A
-released or stale episode (whose key coord A still holds locally) fails
-the liveness check because the claim now points elsewhere. So liveness is
-one predicate, checked once at the anchor, covering RW-on-self and
-RO-on-ancestors alike — and it means coord A's coordinator identity needs
-no separate proof to coord B: live-key possession + `names/<name> → vol_Y`
-*is* the ownership statement. mint still binds the principal via `cnf`.
+`names/<name>` check upgrades that to "operator of the name's *current*
+episode". **Liveness is a property of the binding — not the record's
+`Live` state, and not a running daemon.** The predicate is:
+
+```
+record.vol_ulid == owned  ∧  record.state ≠ Released
+```
+
+What it fences is a *displaced or relinquished* episode — the two ways
+an episode whose key coord A still holds stops being current. A forced
+claim rebinds `vol_ulid` to the new fork, so a displaced anchor fails
+the first conjunct; a release flips the state to `Released` (the record
+retains the old `vol_ulid` only for handoff), so a relinquished anchor
+fails the second. Every *bound* state is a live binding:
+
+- **`Live`** — the daemon is running.
+- **`Stopped`** — claim creates records in `Stopped`, and hydrate,
+  claim's post-CAS chain reads, and stopped-volume verbs (filemap
+  generation) all anchor before any daemon runs. The fence is about who
+  holds the name, not whether a process is up.
+- **`Readonly`** — a readonly import is terminally bound: no lifecycle
+  verb accepts a `Readonly` record, so no displacement scenario exists,
+  and the importing host's retained key anchors the base's own reads.
+
+Liveness is one predicate, checked once at the anchor, covering
+RW-on-self and RO-on-ancestors alike — and it means coord A's
+coordinator identity needs no separate proof to coord B: key possession
++ a live `names/<name>` binding *is* the ownership statement. mint
+still binds the principal via `cnf`.
 
 Because a discharge can be cached (see *TPC structure*), its `exp` is the
 **liveness-staleness bound** — the window in which a cached discharge
-keeps vouching after the live owner has changed. The two modes sit
+keeps vouching after the binding has changed. The two modes sit
 at opposite ends:
 
 - **RW-self** is liveness-sensitive: a forced claim or handoff revokes
@@ -251,8 +275,8 @@ at opposite ends:
   of the Tigris keypair lifetime (**start at ~5 min**) — so re-attestation
   rides roughly the same cadence as keypair refresh and the staleness
   window stays small.
-- **RO-ancestor** is immune: ancestors are frozen, the live owner never
-  changes, so the discharge cannot go stale. `discharge_ttl` can be long — bounded
+- **RO-ancestor** is immune: ancestors are frozen, their bindings never
+  change, so the discharge cannot go stale. `discharge_ttl` can be long — bounded
   only by the primary's own `exp` (**start at ~1 h**) — and coord B drops
   off the path entirely after first-touch.
 
@@ -265,9 +289,10 @@ lifetime — and is unrelated to `discharge_ttl`.
 
 The discharge predicate checks `liveness(owned)` and possession of
 `owned`'s `volume.key`, so **coord A can only obtain a discharge for a
-read it anchors on a live volume whose key it holds.** This is the
-acquisition-side invariant: *every `volume-ro` read routes through an
-`owned` anchor that is live (`names/<name> → owned`) and locally keyed.*
+read it anchors on a live-binding volume whose key it holds.** This is
+the acquisition-side invariant: *every `volume-ro` read routes through an
+`owned` anchor whose binding is live (`names/<name> → owned`, state not
+`Released`) and that is locally keyed.*
 The role enforces it unconditionally — once `volume-ro` carries an
 `ro-ancestor` TPC, every `assume-role` requires a discharge — so a read
 that cannot produce an anchor must not sit on the `volume-ro` path.
@@ -369,7 +394,7 @@ The third setup operation establishes no new leaf. Remote start
 (`start_remote.rs::hydrate_remote_owned`) runs when `names/<name>`
 points at a leaf this coordinator owns but `by_id/<leaf>/` is gone
 locally (the stop → remove → start round trip). Liveness already
-holds — the record still points at the leaf — so the anchor is the
+holds — the record still binds the leaf — so the anchor is the
 leaf itself, and the question is possession: the in-dir `volume.key`
 vanished with the directory. The surviving copy is the **key shadow**
 (`data_dir/keys/<vol_ulid>.key`, written when claim/fork mints the
@@ -460,7 +485,7 @@ reads, since the body cache is keyed by the owning volume) followed by
 ## Possession-proof binding
 
 The discharge request carries an Ed25519 **possession proof** signed by
-`owned`'s `volume.key`, proving coord A holds the live volume's key
+`owned`'s `volume.key`, proving coord A holds the anchor volume's key
 without revealing it. It is distinct from the macaroon's caveat-key
 (`r`) mechanism: `r` binds the *discharge to the primary*; the
 possession proof binds *coord A to the volume*.
@@ -492,11 +517,12 @@ mint — the same CID-wrapping construction as the auth-service TPC's
    unseen; insert into a seen-cache bounded by `2 × skew`.
 3. **Possession.** Recompute the payload, fetch `meta/owned.pub`,
    `verify(payload, proof)`. Proves possession of `owned`'s key.
-4. **Liveness.** `names/<name>` resolves to `owned` as the live episode
-   (a wrong `name` simply fails to resolve to `owned`). Applies to
-   `owned` only; ancestors are frozen. Resolution reuses the claim-record
-   model; its edge cases (e.g. an unnamed scratch volume) are the
-   liveness design's concern, not the binding's.
+4. **Liveness.** `names/<name>` must currently bind `owned`:
+   `vol_ulid == owned ∧ state ≠ Released` (a wrong `name` simply fails
+   to resolve to `owned`; see *One liveness check* for the state set).
+   Applies to `owned` only; ancestors are frozen. Resolution reuses the
+   claim-record model; its edge cases (e.g. an unnamed scratch volume)
+   are the claim-record design's concern, not the binding's.
 5. **Mode.** `rw-self` ⟹ `target == owned`; `ro-ancestor` ⟹ `target ∈
    {owned} ∪ ancestors(owned)` via the shared signed-provenance walk.
 6. **Discharge.** Mint a macaroon rooted at `r` (kid `DISCHARGE_KID`)
@@ -865,11 +891,19 @@ allows it; pin with vectors only where it does not.
 
 ## Open
 
-- **Readonly anchors.** coord B's liveness check accepts only `Live`
-  records (`names/<name> → owned`). A local readonly import retains
-  its signing key — it signed its own segments — but its record state
-  is `Readonly`, so it can never anchor a discharge: once a deployment
-  seals `volume-ro` with the attestation TPC, a readonly volume's
-  demand-fetch has no path to a credential. Whether a `Readonly`
-  record binding `owned` should count as the live episode (and how
-  that composes with the single currency check) is unresolved.
+- **Keyless readonly pulls.** A readonly base pulled to a host other
+  than its importer has no `volume.key` there — keys never leave the
+  importing host — so it cannot anchor a discharge at all, regardless
+  of record state. Fork-from-a-base is unaffected (claim-first ordering
+  means the new fork anchors the chain pull, and the base sits in its
+  read set); the exposure is the bare pre-seed verb
+  (`pull_readonly_op`'s prefetch fan-out, which anchors on the base
+  itself). Unresolved: rework the bare pull to require a local anchor,
+  retire it, or add a coordinator-identity-anchored mode for published
+  bases.
+- **The import-drain window.** During import the volume's
+  `names/<name>` record does not exist — it is written once at
+  completion, when the size is known — so an `rw-self` discharge for
+  the import drain has nothing to verify against. Sealing `volume-rw`
+  with the attestation TPC needs this resolved (e.g. a record written
+  at import start) before import can run under it.
