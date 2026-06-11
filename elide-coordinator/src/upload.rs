@@ -412,7 +412,7 @@ async fn upload_volume_metadata(
     }
 }
 
-/// Upload `<vol_dir>/volume.pub` to `meta/<vol_ulid>.pub` on the
+/// Upload `by_id/<vol_ulid>/volume.pub` to `meta/<vol_ulid>.pub` on the
 /// coordinator-plane meta store and write the local upload sentinel.
 ///
 /// Identity establishment rides `coord-rw`, never `volume-rw`: a
@@ -430,10 +430,11 @@ async fn upload_volume_metadata(
 /// The sentinel write means the daemon's later `upload_volume_metadata`
 /// pass observes a content-equal sentinel and skips the redundant PUT.
 pub async fn upload_volume_pub_initial(
-    vol_dir: &Path,
+    data_dir: &Path,
     vol_ulid: Ulid,
     meta_store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
+    let vol_dir = crate::volume_state::fork_dir(data_dir, vol_ulid);
     let pub_key_path = vol_dir.join("volume.pub");
     let bytes = std::fs::read(&pub_key_path)
         .with_context(|| format!("reading {}", pub_key_path.display()))?;
@@ -448,15 +449,15 @@ pub async fn upload_volume_pub_initial(
             return Err(e).with_context(|| format!("uploading volume.pub to {key}"));
         }
     }
-    let sentinel = upload_sentinel(vol_dir, "volume.pub");
+    let sentinel = upload_sentinel(&vol_dir, "volume.pub");
     mark_uploaded_from_file(&sentinel, &pub_key_path)
         .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
     Ok(())
 }
 
-/// Upload `<vol_dir>/volume.provenance` to `meta/<vol_ulid>.provenance`
-/// on the coordinator-plane meta store and write the local upload
-/// sentinel.
+/// Upload `by_id/<vol_ulid>/volume.provenance` to
+/// `meta/<vol_ulid>.provenance` on the coordinator-plane meta store and
+/// write the local upload sentinel.
 ///
 /// Sibling to [`upload_volume_pub_initial`]: extends the same
 /// "`names/<name>` only ever points at a `vol_ulid` whose immutable
@@ -477,10 +478,11 @@ pub async fn upload_volume_pub_initial(
 /// `mark_claimed`, the orphan `meta/<vol_ulid>.provenance`
 /// has no `names/<name>` referrer and is reclaimed by future GC.
 pub async fn upload_volume_provenance_initial(
-    vol_dir: &Path,
+    data_dir: &Path,
     vol_ulid: Ulid,
     meta_store: &Arc<dyn ObjectStore>,
 ) -> Result<()> {
+    let vol_dir = crate::volume_state::fork_dir(data_dir, vol_ulid);
     let provenance_path = vol_dir.join(elide_core::signing::VOLUME_PROVENANCE_FILE);
     let bytes = std::fs::read(&provenance_path)
         .with_context(|| format!("reading {}", provenance_path.display()))?;
@@ -492,7 +494,7 @@ pub async fn upload_volume_provenance_initial(
         meta_store,
     )
     .await?;
-    let sentinel = upload_sentinel(vol_dir, elide_core::signing::VOLUME_PROVENANCE_FILE);
+    let sentinel = upload_sentinel(&vol_dir, elide_core::signing::VOLUME_PROVENANCE_FILE);
     mark_uploaded_from_file(&sentinel, &provenance_path)
         .with_context(|| format!("writing upload sentinel {}", sentinel.display()))?;
     Ok(())

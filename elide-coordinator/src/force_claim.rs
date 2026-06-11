@@ -367,12 +367,12 @@ impl ForceClaimOrchestrator {
         let meta_store = self.ctx.core.stores.writer();
         let (pub_result, prov_result) = tokio::join!(
             elide_coordinator::upload::upload_volume_pub_initial(
-                &new_dir,
+                &self.ctx.core.data_dir,
                 new_vol_ulid,
                 &meta_store
             ),
             elide_coordinator::upload::upload_volume_provenance_initial(
-                &new_dir,
+                &self.ctx.core.data_dir,
                 new_vol_ulid,
                 &meta_store
             ),
@@ -771,7 +771,7 @@ impl ForceClaimOrchestrator {
                 .map_err(|e| IpcError::internal(format!("writing provenance: {e}")))?;
                 let meta_store = self.ctx.core.stores.writer();
                 elide_coordinator::upload::upload_volume_provenance_initial(
-                    &fork.dir,
+                    &self.ctx.core.data_dir,
                     fork.vol_ulid,
                     &meta_store,
                 )

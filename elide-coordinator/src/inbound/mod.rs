@@ -1588,14 +1588,18 @@ async fn create_volume_op(
     // GC-reclaimable).
     let meta_store = core.stores.writer();
     if let Err(e) =
-        elide_coordinator::upload::upload_volume_pub_initial(&vol_dir, vol_ulid, &meta_store).await
+        elide_coordinator::upload::upload_volume_pub_initial(&core.data_dir, vol_ulid, &meta_store)
+            .await
     {
         cleanup_local();
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
     }
-    if let Err(e) =
-        elide_coordinator::upload::upload_volume_provenance_initial(&vol_dir, vol_ulid, &meta_store)
-            .await
+    if let Err(e) = elide_coordinator::upload::upload_volume_provenance_initial(
+        &core.data_dir,
+        vol_ulid,
+        &meta_store,
+    )
+    .await
     {
         cleanup_local();
         return Err(IpcError::store(format!(

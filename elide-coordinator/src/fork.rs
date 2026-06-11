@@ -656,7 +656,7 @@ async fn fork_create_op(
     // volume.provenance).
     let meta_store = ctx.core.stores.writer();
     if let Err(e) = elide_coordinator::upload::upload_volume_pub_initial(
-        &new_fork_dir,
+        &ctx.core.data_dir,
         new_vol_ulid_value,
         &meta_store,
     )
@@ -666,7 +666,7 @@ async fn fork_create_op(
         return Err(IpcError::store(format!("uploading volume.pub: {e:#}")));
     }
     if let Err(e) = elide_coordinator::upload::upload_volume_provenance_initial(
-        &new_fork_dir,
+        &ctx.core.data_dir,
         new_vol_ulid_value,
         &meta_store,
     )
