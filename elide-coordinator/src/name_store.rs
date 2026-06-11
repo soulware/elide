@@ -170,6 +170,27 @@ pub async fn update_name_record(
     Ok(put_result_to_version(r))
 }
 
+/// Delete `names/<name>`. Unconditional — the object-store layer has
+/// no conditional delete, so callers must establish single-writer
+/// ownership of the record before calling (the import-failure path:
+/// an `Importing` record is only ever written by its importing
+/// coordinator, every lifecycle verb refuses the state, and the
+/// caller re-reads to verify the binding immediately before this).
+pub async fn delete_name_record(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+) -> Result<(), NameStoreError> {
+    let key = name_key(name);
+    let started = std::time::Instant::now();
+    match store.delete(&key).await {
+        Ok(()) => {}
+        Err(object_store::Error::NotFound { .. }) => {}
+        Err(e) => return Err(NameStoreError::Store(e)),
+    }
+    debug!("[name_store] DELETE {key} ({:.2?})", started.elapsed());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

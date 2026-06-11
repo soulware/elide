@@ -524,6 +524,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discharges_for_importing_record() {
+        // The import drain anchors rw-self discharges on the
+        // `Importing` binding for the whole construction window.
+        let f = live_rw_self().await;
+        set_record_state(&f, NameState::Importing).await;
+        f.state.discharge(f.request()).await.expect("discharge");
+    }
+
+    #[tokio::test]
     async fn discharges_for_readonly_record() {
         // A readonly import is terminally bound — no lifecycle verb can
         // displace it — so it anchors its own reads (e.g. filemap

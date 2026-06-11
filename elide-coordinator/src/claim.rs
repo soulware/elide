@@ -471,6 +471,12 @@ async fn claim_volume_bucket_op(
             "name '{volume_name}' is readonly (immutable handle); \
              pull it with `volume pull` to serve locally"
         ))),
+        Role::Observer {
+            kind: ObserverKind::Importing { coord_id },
+        } => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is being imported on coordinator {coord_id}; \
+             nothing to claim"
+        ))),
     }
 }
 
@@ -1192,8 +1198,8 @@ mod tests {
     use super::*;
     use elide_coordinator::stores::PassthroughStores;
     use elide_core::signing::{
-        ParentRef, ProvenanceLineage, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
-        build_snapshot_manifest_bytes, encode_hex, load_verifying_key, setup_readonly_identity,
+        ParentRef, ProvenanceLineage, VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
+        build_snapshot_manifest_bytes, encode_hex, load_verifying_key, setup_import_identity,
     };
     use elide_core::ulid_mint::UlidMint;
     use object_store::{ObjectStore, memory::InMemory};
@@ -1228,9 +1234,14 @@ mod tests {
             },
         };
 
-        let signer =
-            setup_readonly_identity(&dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE, &lineage)
-                .unwrap();
+        let signer = setup_import_identity(
+            &dir,
+            VOLUME_KEY_FILE,
+            VOLUME_PUB_FILE,
+            VOLUME_PROVENANCE_FILE,
+            &lineage,
+        )
+        .unwrap();
         let verifying_key = load_verifying_key(&dir, VOLUME_PUB_FILE).unwrap();
         Fork {
             vol,

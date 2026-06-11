@@ -385,9 +385,10 @@ impl World {
                         "Released record must carry a handoff_snapshot"
                     );
                 }
-                NameState::Readonly => {
-                    // No coordinator-id constraints; readonly records
-                    // are produced by `mark_initial_readonly` only,
+                NameState::Readonly | NameState::Importing => {
+                    // No coordinator-id constraints; these states are
+                    // produced by the import flow only
+                    // (`mark_importing` / `mark_import_complete`),
                     // which our op alphabet doesn't drive.
                 }
             }

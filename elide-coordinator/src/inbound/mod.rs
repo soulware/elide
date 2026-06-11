@@ -1411,6 +1411,10 @@ fn ensure_release_eligible(
         OwnershipPosition::Readonly { .. } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is readonly; nothing to release"
         ))),
+        OwnershipPosition::Importing { coord_id, .. } => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is being imported on coordinator {coord_id}; \
+             nothing to release"
+        ))),
         OwnershipPosition::Absent => Err(IpcError::not_found(absent_msg)),
     }
 }

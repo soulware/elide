@@ -21,7 +21,6 @@ use tokio::io::AsyncBufReadExt;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use elide_coordinator::lifecycle::MarkInitialOutcome;
 use elide_coordinator::volume_state::{IMPORTING_FILE, PID_FILE};
 
 use crate::inbound::CoordinatorCore;
@@ -341,7 +340,7 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
         .stdout(Stdio::null());
 
     // Pass each resolved extent-source entry to elide-import. It will sign
-    // them into volume.provenance as part of setup_readonly_identity, and
+    // them into volume.provenance as part of setup_import_identity, and
     // walk provenance to rebuild the parent ExtentIndex for dedup during
     // the import block loop. No separate file is written — provenance is
     // the single signed source of truth for lineage.
@@ -385,13 +384,99 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
         .expect("import registry poisoned")
         .insert(import_ulid.clone(), job.clone());
 
-    // Watch for the import to enter the serve phase (control.sock appears) and
-    // trigger an immediate rescan so the coordinator starts draining without
-    // waiting up to supervisor.scan_interval.
+    // Identity gate + serve-phase watcher. The worker writes its
+    // identity files (volume.{key,pub,provenance}) right after
+    // resolving the image manifest — before the bulk download and
+    // extraction. The coordinator then runs the bootstrap planes
+    // (`design-mint-volume-attestation.md` § *Import runs under an
+    // `Importing` record*): identity uploads on coord-rw, then the
+    // `names/<name>` CAS-create as `Importing` — the uniqueness gate,
+    // settled before the heavy work; a lost race kills the worker.
+    // Every later drain write is then anchored: the record exists and
+    // the pub is fetchable. Afterwards the same task waits for
+    // control.sock and triggers the rescan that starts the serve-phase
+    // drain, so the drain never observes a record-less import.
     {
         let watch_dir = vol_dir.clone();
         let watch_lock = vol_dir.join(IMPORTING_FILE);
+        let gate_job = job.clone();
+        let gate_stores = ctx.core.stores.clone();
+        let gate_identity = identity.clone();
+        let gate_data_dir = data_dir.to_path_buf();
+        let gate_name = vol_name.to_owned();
         tokio::spawn(async move {
+            let identity_files = [
+                elide_core::signing::VOLUME_KEY_FILE,
+                elide_core::signing::VOLUME_PUB_FILE,
+                elide_core::signing::VOLUME_PROVENANCE_FILE,
+            ];
+            loop {
+                if identity_files.iter().all(|f| watch_dir.join(f).exists()) {
+                    break;
+                }
+                if !watch_lock.exists() {
+                    return; // worker exited before writing its identity
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
+            let meta_store = gate_stores.writer();
+            let uploads = async {
+                elide_coordinator::upload::upload_volume_pub_initial(
+                    &gate_data_dir,
+                    vol_ulid_value,
+                    &meta_store,
+                )
+                .await?;
+                elide_coordinator::upload::upload_volume_provenance_initial(
+                    &gate_data_dir,
+                    vol_ulid_value,
+                    &meta_store,
+                )
+                .await
+            };
+            if let Err(e) = uploads.await {
+                gate_job.append(format!("error: uploading volume identity: {e:#}"));
+                sigterm(pid);
+                return;
+            }
+
+            use elide_coordinator::lifecycle::MarkInitialOutcome;
+            match gate_stores
+                .name_claims()
+                .mark_importing(
+                    &gate_name,
+                    gate_identity.coordinator_id_str(),
+                    gate_identity.hostname(),
+                    vol_ulid_value,
+                )
+                .await
+            {
+                Ok(MarkInitialOutcome::Claimed) => {}
+                Ok(MarkInitialOutcome::AlreadyExists {
+                    existing_vol_ulid,
+                    existing_state,
+                    existing_owner,
+                }) => {
+                    let owner = existing_owner.as_deref().unwrap_or("<unowned>");
+                    gate_job.append(format!(
+                        "error: name '{gate_name}' already exists in bucket \
+                         (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
+                         owner={owner})"
+                    ));
+                    sigterm(pid);
+                    return;
+                }
+                Err(e) => {
+                    gate_job.append(format!("error: claiming name in bucket: {e}"));
+                    sigterm(pid);
+                    return;
+                }
+            }
+
+            // Serve phase: trigger an immediate rescan so the
+            // coordinator starts draining without waiting up to
+            // supervisor.scan_interval.
             loop {
                 if watch_dir.join("control.sock").exists() {
                     crate::rescan::trigger();
@@ -443,23 +528,20 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
             }
         };
 
-        // Post-success: claim the bucket-side `names/<name>` now that
-        // the import has computed a real `size` and written it to
-        // `volume.toml`. This is the bucket-uniqueness gate for
-        // imports — two coordinators racing on the same name both
-        // arrive here, the second sees `AlreadyExists`, and its
-        // local artefacts are rolled back like any other failure.
+        // Post-success: flip the `Importing` record to `Readonly` now
+        // that the import has computed a real `size` and written it
+        // to `volume.toml`, then destroy `volume.key` — publication is
+        // the moment cryptographic immutability attaches, and a
+        // `Readonly` record implies the key was destroyed at the flip.
         if !failed {
-            let claim_outcome = (|| -> Result<(u64, MarkInitialOutcome), String> {
+            let size_outcome = (|| -> Result<u64, String> {
                 let cfg = elide_core::config::VolumeConfig::read(&async_vol_dir)
                     .map_err(|e| format!("reading post-import volume.toml: {e}"))?;
-                let size = cfg
-                    .size
-                    .ok_or_else(|| "post-import volume.toml missing size".to_owned())?;
-                Ok((size, MarkInitialOutcome::Claimed))
+                cfg.size
+                    .ok_or_else(|| "post-import volume.toml missing size".to_owned())
             })();
-            match claim_outcome {
-                Ok((size, _)) => {
+            match size_outcome {
+                Ok(size) => {
                     // The import's `User` snapshot manifest, recorded on
                     // the record so `create --from <imported-name>`
                     // resolves its basis in one GET.
@@ -474,16 +556,28 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
                             None
                         }
                     };
+                    use elide_coordinator::lifecycle::ImportRecordOutcome;
                     match async_claims
-                        .mark_initial_readonly(
+                        .mark_import_complete(
                             &async_vol_name,
+                            async_identity.coordinator_id_str(),
                             vol_ulid_value,
                             size,
                             latest_snapshot,
                         )
                         .await
                     {
-                        Ok(MarkInitialOutcome::Claimed) => {
+                        Ok(ImportRecordOutcome::Done) => {
+                            let key_path = async_vol_dir.join(elide_core::signing::VOLUME_KEY_FILE);
+                            if let Err(e) = std::fs::remove_file(&key_path) {
+                                // The record is already Readonly; a stray
+                                // key violates "Readonly ⇒ key destroyed"
+                                // and must not pass silently.
+                                tracing::error!(
+                                    "[import {import_ulid_clone}] destroying {}: {e}",
+                                    key_path.display()
+                                );
+                            }
                             async_journal
                                 .emit_best_effort(
                                     async_identity.as_ref(),
@@ -493,23 +587,17 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
                                 )
                                 .await;
                         }
-                        Ok(MarkInitialOutcome::AlreadyExists {
-                            existing_vol_ulid,
-                            existing_state,
-                            existing_owner,
-                        }) => {
-                            let owner = existing_owner.as_deref().unwrap_or("<unowned>");
+                        Ok(ImportRecordOutcome::Lost { existing }) => {
                             let msg = format!(
-                                "name '{async_vol_name}' already exists in bucket \
-                                 (vol_ulid={existing_vol_ulid}, state={existing_state:?}, \
-                                 owner={owner})"
+                                "names/{async_vol_name} no longer holds this import's \
+                                 Importing binding (found {existing:?})"
                             );
                             warn!("[import {import_ulid_clone}] {msg}");
                             final_state = ImportState::Failed(msg);
                             failed = true;
                         }
                         Err(e) => {
-                            let msg = format!("claiming name in bucket: {e}");
+                            let msg = format!("publishing name in bucket: {e}");
                             warn!("[import {import_ulid_clone}] {msg}");
                             final_state = ImportState::Failed(msg);
                             failed = true;
@@ -526,10 +614,23 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
 
         if failed {
             // Remove the by_name symlink so the name is not reserved by a
-            // failed import (the vol_dir is left for post-mortem inspection).
-            // No bucket claim to release: it was either never made (early
-            // failure) or never landed (claim itself failed).
+            // failed import (the vol_dir is left for post-mortem inspection),
+            // and CAS-delete the bucket-side `Importing` record so the name
+            // is free again. `clear_importing` only removes our own
+            // `Importing` binding — a record that was never created, was
+            // already flipped, or belongs to someone else reports `Lost`
+            // and is left alone.
             let _ = std::fs::remove_file(&symlink_path);
+            if let Err(e) = async_claims
+                .clear_importing(
+                    &async_vol_name,
+                    async_identity.coordinator_id_str(),
+                    vol_ulid_value,
+                )
+                .await
+            {
+                warn!("[import {import_ulid_clone}] clearing Importing record: {e}");
+            }
         }
 
         job.finish(final_state);
@@ -544,23 +645,67 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
 ///
 /// A lock is stale if no live process matches `import.pid`. If a process is
 /// found alive, it is sent SIGTERM so the volume is in a clean state for retry.
-pub fn cleanup_stale_locks(data_dir: &Path) {
+pub fn cleanup_stale_locks(data_dir: &Path) -> Vec<PathBuf> {
     let by_id_dir = data_dir.join("by_id");
     let Ok(entries) = std::fs::read_dir(&by_id_dir) else {
-        return;
+        return Vec::new();
     };
+    let mut cleaned = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            cleanup_stale_lock_in(&path);
+        if path.is_dir() && cleanup_stale_lock_in(&path) {
+            cleaned.push(path);
+        }
+    }
+    cleaned
+}
+
+/// CAS-delete the `Importing` records of imports whose stale locks
+/// [`cleanup_stale_locks`] just cleared — the bucket half of the
+/// crashed-import cleanup. `clear_importing` only removes this
+/// coordinator's own `Importing` binding, so a record that completed
+/// (already `Readonly`), was never created, or belongs to another
+/// host is left alone.
+pub async fn clear_stale_import_records(
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
+    identity: &elide_coordinator::identity::CoordinatorIdentity,
+    cleaned_dirs: &[PathBuf],
+) {
+    for dir in cleaned_dirs {
+        let Some(vol_ulid) = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| ulid::Ulid::from_string(s).ok())
+        else {
+            continue;
+        };
+        let Some(name) = elide_coordinator::tasks::read_volume_name(dir) else {
+            continue;
+        };
+        match stores
+            .name_claims()
+            .clear_importing(&name, identity.coordinator_id_str(), vol_ulid)
+            .await
+        {
+            Ok(elide_coordinator::lifecycle::ImportRecordOutcome::Done) => {
+                warn!(
+                    "[import] removed stale Importing record names/{name} \
+                     (vol_ulid={vol_ulid})"
+                );
+            }
+            Ok(elide_coordinator::lifecycle::ImportRecordOutcome::Lost { .. }) => {}
+            Err(e) => {
+                warn!("[import] clearing stale Importing record names/{name}: {e}");
+            }
         }
     }
 }
 
-fn cleanup_stale_lock_in(dir: &Path) {
+/// Returns true when a stale lock was cleared in `dir`.
+fn cleanup_stale_lock_in(dir: &Path) -> bool {
     let lock_path = dir.join(IMPORTING_FILE);
     if !lock_path.exists() {
-        return;
+        return false;
     }
 
     let ulid = std::fs::read_to_string(&lock_path)
@@ -580,7 +725,7 @@ fn cleanup_stale_lock_in(dir: &Path) {
         // actively handling promote IPC from the coordinator.  Leave it running
         // — the coordinator will resume draining against it on the next tick.
         if dir.join("control.sock").exists() {
-            return;
+            return false;
         }
         // Process is alive but no control.sock: still in write phase when the
         // coordinator restarted.  Send SIGTERM so the volume is in a clean
@@ -598,6 +743,7 @@ fn cleanup_stale_lock_in(dir: &Path) {
     );
     let _ = std::fs::remove_file(&lock_path);
     let _ = std::fs::remove_file(dir.join(IMPORT_PID_FILE));
+    true
 }
 
 /// Send SIGTERM to the volume, import, and fetch worker processes in

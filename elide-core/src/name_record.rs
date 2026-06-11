@@ -56,10 +56,11 @@
 //!   via `blake3::derive_key("elide coordinator-id v1", &pub_bytes)`,
 //!   formatted as a 26-char Crockford-Base32 ULID-shape (see
 //!   `elide_coordinator::portable::format_coordinator_id`). Owner when
-//!   `state ∈ {Live, Stopped}`; cleared when
-//!   `state ∈ {Released, Readonly}`.
-//! - `state` — `"live"` | `"stopped"` | `"released"` | `"readonly"`
-//!   on the wire (lowercase). See § "Four states" in the design doc.
+//!   `state ∈ {Live, Stopped}`, the importer when `state == Importing`;
+//!   cleared when `state ∈ {Released, Readonly}`.
+//! - `state` — `"live"` | `"stopped"` | `"released"` | `"readonly"` |
+//!   `"importing"` on the wire (lowercase). See § "Five states" in the
+//!   design doc.
 //! - `parent` — `"<prev_vol_ulid>/<prev_snap_ulid>"`, the handoff
 //!   snapshot the current fork was minted from. Present on forks born
 //!   from a released ancestor; absent on root volumes.
@@ -98,7 +99,7 @@ pub fn current_hostname() -> Option<String> {
 
 /// Lifecycle state of a named volume.
 ///
-/// See the design doc § "Four states" for the operator model behind
+/// See the design doc § "Five states" for the operator model behind
 /// these values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -119,6 +120,15 @@ pub enum NameState {
     /// / `start`) all refuse this state. See design doc § "Readonly
     /// names".
     Readonly,
+    /// An import is constructing this volume on `coordinator_id`.
+    /// `size` is not yet meaningful (written as 0; the real size is
+    /// only known post-extraction). The importer's drain anchors
+    /// `rw-self` discharges on this binding; every lifecycle verb
+    /// refuses it. Flipped to `Readonly` at import completion,
+    /// CAS-deleted on import failure
+    /// (`design-mint-volume-attestation.md` § *Import runs under an
+    /// `Importing` record*).
+    Importing,
 }
 
 impl NameState {
@@ -131,6 +141,7 @@ impl NameState {
             Self::Stopped => "stopped",
             Self::Released => "released",
             Self::Readonly => "readonly",
+            Self::Importing => "importing",
         }
     }
 }
@@ -214,11 +225,16 @@ impl NameState {
     /// | Stopped      | Idempotent | Proceed    | Proceed    | Refuse  | Proceed    |
     /// | Released     | Refuse     | Idempotent | Reroute    | Proceed | Reroute    |
     /// | Readonly     | Refuse     | Refuse     | Refuse     | Refuse  | Refuse     |
+    /// | Importing    | Refuse     | Refuse     | Refuse     | Refuse  | Refuse     |
     pub fn check_transition(self, verb: Lifecycle) -> TransitionCheck {
         use Lifecycle as V;
         use NameState as S;
         use TransitionCheck::*;
         match (self, verb) {
+            // Importing: the importer's completion flip and failure
+            // delete are the only legal exits, and neither is a
+            // lifecycle verb.
+            (S::Importing, _) => Refuse,
             // Stop
             (S::Live, V::Stop) => Proceed,
             (S::Stopped, V::Stop) => Idempotent,
@@ -489,6 +505,13 @@ mod tests {
             (S::Stopped, V::ForceClaim, Proceed),
             (S::Released, V::ForceClaim, Reroute),
             (S::Readonly, V::ForceClaim, Refuse),
+            // Importing: every verb refuses; the importer's
+            // completion flip / failure delete are not verbs.
+            (S::Importing, V::Stop, Refuse),
+            (S::Importing, V::Release, Refuse),
+            (S::Importing, V::Start, Refuse),
+            (S::Importing, V::Claim, Refuse),
+            (S::Importing, V::ForceClaim, Refuse),
         ];
         for (from, verb, want) in cases {
             assert_eq!(

@@ -23,6 +23,10 @@ pub enum Eligibility {
     ReleasedClaimable,
     /// `state == Readonly`. No exclusive owner; anyone may pull and serve.
     Readonly,
+    /// `state == Importing`. An import is constructing the volume;
+    /// every lifecycle verb refuses it until the importer flips the
+    /// record to `Readonly` (or deletes it on failure).
+    Importing,
 }
 
 impl Eligibility {
@@ -35,6 +39,7 @@ impl Eligibility {
             },
             NameState::Released => Self::ReleasedClaimable,
             NameState::Readonly => Self::Readonly,
+            NameState::Importing => Self::Importing,
         }
     }
 
@@ -46,6 +51,7 @@ impl Eligibility {
             Self::Foreign => "foreign",
             Self::ReleasedClaimable => "released-claimable",
             Self::Readonly => "readonly",
+            Self::Importing => "importing",
         }
     }
 }

@@ -74,6 +74,10 @@ pub enum OwnershipPosition {
     /// and serve the same name concurrently. Lifecycle verbs
     /// refuse this state.
     Readonly { vol_ulid: Ulid },
+    /// An import is constructing this volume on `coord_id`. Every
+    /// lifecycle verb refuses it; the importer flips the record to
+    /// `Readonly` at completion or deletes it on failure.
+    Importing { vol_ulid: Ulid, coord_id: String },
 }
 
 /// Sub-state of `OwnedByUs` / `OwnedByOther`. Both variants retain
@@ -131,6 +135,13 @@ impl OwnershipPosition {
             NameState::Readonly => Self::Readonly {
                 vol_ulid: rec.vol_ulid,
             },
+            NameState::Importing => Self::Importing {
+                vol_ulid: rec.vol_ulid,
+                coord_id: rec
+                    .coordinator_id
+                    .clone()
+                    .unwrap_or_else(|| UNKNOWN_COORD_ID.to_owned()),
+            },
         }
     }
 
@@ -143,6 +154,7 @@ impl OwnershipPosition {
             Self::OwnedByOther { .. } => Some(Eligibility::Foreign),
             Self::Released { .. } => Some(Eligibility::ReleasedClaimable),
             Self::Readonly { .. } => Some(Eligibility::Readonly),
+            Self::Importing { .. } => Some(Eligibility::Importing),
         }
     }
 
@@ -153,7 +165,8 @@ impl OwnershipPosition {
             Self::OwnedByUs { vol_ulid, .. }
             | Self::OwnedByOther { vol_ulid, .. }
             | Self::Released { vol_ulid, .. }
-            | Self::Readonly { vol_ulid } => Some(*vol_ulid),
+            | Self::Readonly { vol_ulid }
+            | Self::Importing { vol_ulid, .. } => Some(*vol_ulid),
         }
     }
 
@@ -309,6 +322,27 @@ mod tests {
         assert_eq!(
             OwnershipPosition::classify(Some(&r), "me"),
             OwnershipPosition::Readonly { vol_ulid: vol }
+        );
+    }
+
+    #[test]
+    fn importing_classifies_as_importing_with_importer() {
+        let vol = Ulid::new();
+        let r = record(NameState::Importing, Some("them"), vol);
+        assert_eq!(
+            OwnershipPosition::classify(Some(&r), "me"),
+            OwnershipPosition::Importing {
+                vol_ulid: vol,
+                coord_id: "them".to_owned()
+            }
+        );
+        assert_eq!(
+            OwnershipPosition::Importing {
+                vol_ulid: vol,
+                coord_id: "them".to_owned()
+            }
+            .to_eligibility(),
+            Some(Eligibility::Importing)
         );
     }
 
