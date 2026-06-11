@@ -23,7 +23,7 @@
 //! intermediate never finished copying.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -306,6 +306,7 @@ impl ForceClaimOrchestrator {
                 "[force-claim {}] resuming partial fork {vol_ulid}",
                 self.volume
             );
+            self.write_volume_toml(&dir)?;
             self.fork = Some(ForkSkeleton {
                 vol_ulid,
                 dir,
@@ -428,12 +429,31 @@ impl ForceClaimOrchestrator {
             )
             .await;
 
+        // The new fork is the `owned` anchor for the re-own reads that
+        // follow; the discharge possession proof loads the anchor's
+        // name and key from its dir, so volume.toml lands before the
+        // first anchored read.
+        self.write_volume_toml(&new_dir)?;
         self.fork = Some(ForkSkeleton {
             vol_ulid: new_vol_ulid,
             dir: new_dir,
             signing_key,
         });
         Ok(())
+    }
+
+    /// Write the fork's `volume.toml` (name + size from the observed
+    /// record — a forced claim continues the same logical volume
+    /// identity).
+    fn write_volume_toml(&self, dir: &Path) -> Result<(), IpcError> {
+        elide_core::config::VolumeConfig {
+            name: Some(self.volume.clone()),
+            size: Some(self.observed.record.size),
+            ublk: None,
+            lazy: None,
+        }
+        .write(dir)
+        .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))
     }
 
     /// Stage 4. Re-own the dead fork's head delta.
@@ -755,14 +775,6 @@ impl ForceClaimOrchestrator {
             .map_err(|e| IpcError::internal(format!("creating wal/: {e}")))?;
         std::fs::create_dir_all(fork.dir.join("pending"))
             .map_err(|e| IpcError::internal(format!("creating pending/: {e}")))?;
-        elide_core::config::VolumeConfig {
-            name: Some(self.volume.clone()),
-            size: Some(self.observed.record.size),
-            ublk: None,
-            lazy: None,
-        }
-        .write(&fork.dir)
-        .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
 
         let by_name_dir = self.ctx.core.data_dir.join("by_name");
         let symlink_path = by_name_dir.join(&self.volume);

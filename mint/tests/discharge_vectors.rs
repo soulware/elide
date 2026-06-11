@@ -44,6 +44,7 @@ fn nonce() -> [u8; macaroon::NONCE_LEN] {
 const CLIENT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const ORG_ID: &str = "org_demo";
 const MODE: &str = "rw-self";
+const MODE_RO: &str = "ro-ancestor";
 const VOLUME: &str = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
 const EXP: &str = "2099999999";
 
@@ -53,6 +54,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn vectors_json() -> String {
     let cid = tpc::encrypt_cid_attested(&k_m_b(), &r(), CLIENT_ID, ORG_ID, MODE);
+    let cid_ro_ancestor = tpc::encrypt_cid_attested(&k_m_b(), &r(), CLIENT_ID, ORG_ID, MODE_RO);
     let wire = macaroon::mint_under_key_with_nonce(
         &r(),
         DISCHARGE_KID,
@@ -72,6 +74,7 @@ fn vectors_json() -> String {
             "  \"org_id\": \"{}\",\n",
             "  \"mode\": \"{}\",\n",
             "  \"cid\": \"{}\",\n",
+            "  \"cid_ro_ancestor\": \"{}\",\n",
             "  \"discharge_nonce\": \"{}\",\n",
             "  \"discharge_kid\": {},\n",
             "  \"volume\": \"{}\",\n",
@@ -85,6 +88,7 @@ fn vectors_json() -> String {
         ORG_ID,
         MODE,
         hex(&cid),
+        hex(&cid_ro_ancestor),
         hex(&nonce()),
         DISCHARGE_KID,
         VOLUME,

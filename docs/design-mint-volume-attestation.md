@@ -300,6 +300,13 @@ ahead of its chain reads; `fork` adopts the same shape. start
 re-establishes an *existing* leaf and anchors on its surviving key
 (§ *`start` anchors on the key shadow*).
 
+The anchor is also *materialised locally* before the first anchored
+read: the discharge request is built from the anchor's own fork dir —
+`volume.toml` carries the name coord B's liveness lookup resolves,
+`volume.key` signs the possession proof — so both land at rebind
+(claim, `claim --force`) or immediately after the shadow proof
+(start), ahead of any `by_id` read.
+
 ### The provisional provenance must be recovery-correct — so its trust-anchors come from control-plane state
 
 claim-first has a sharp constraint: the provisional `volume.provenance`
@@ -855,3 +862,14 @@ allows it; pin with vectors only where it does not.
     auth authority's vocabulary (a volume discharge carrying `Scope` is
     invalid by vocabulary, just as an auth discharge carrying `volume`
     would be). Each authority emits only its own type's names.
+
+## Open
+
+- **Readonly anchors.** coord B's liveness check accepts only `Live`
+  records (`names/<name> → owned`). A local readonly import retains
+  its signing key — it signed its own segments — but its record state
+  is `Readonly`, so it can never anchor a discharge: once a deployment
+  seals `volume-ro` with the attestation TPC, a readonly volume's
+  demand-fetch has no path to a credential. Whether a `Readonly`
+  record binding `owned` should count as the live episode (and how
+  that composes with the single currency check) is unresolved.

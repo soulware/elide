@@ -281,6 +281,28 @@ mod tests {
     }
 
     #[test]
+    fn ro_ancestor_fixture_cid_is_canonical() {
+        // `cid_ro_ancestor` differs from `cid` only in the baked mode
+        // string. Same key, `r`, and identities, so the deterministic
+        // sealer pins it the same way `encrypt_reproduces_fixture_cid`
+        // pins the rw-self CID.
+        let v = vectors();
+        let k_m_b = hex32(&v, "k_m_b");
+        let r = hex32(&v, "r");
+        let cid = encrypt_cid_attested(
+            &k_m_b,
+            &r,
+            v["client_id"].as_str().unwrap(),
+            v["org_id"].as_str().unwrap(),
+            "ro-ancestor",
+        );
+        assert_eq!(
+            elide_core::signing::encode_hex(&cid),
+            v["cid_ro_ancestor"].as_str().unwrap()
+        );
+    }
+
+    #[test]
     fn encrypt_reproduces_fixture_cid() {
         // AES-GCM-SIV with the fixed nonce is deterministic, so the test-only
         // sealer must reproduce mint's canonical CID byte-for-byte — pinning

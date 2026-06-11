@@ -57,6 +57,18 @@ pub(crate) async fn hydrate_remote_owned(
     let key_bytes =
         read_shadow_proving_possession(volume_name, vol_ulid, &core.data_dir, &fork_dir)?;
 
+    // Materialise the anchor before the basis reads: the leaf is the
+    // `owned` anchor for every read below, and the ro-ancestor
+    // discharge proof loads the anchor's name and key from its dir.
+    restore_key_into_fork(&fork_dir, &key_bytes)?;
+    elide_core::config::VolumeConfig {
+        name: Some(volume_name.to_owned()),
+        size: Some(size_bytes),
+        ..Default::default()
+    }
+    .write(&fork_dir)
+    .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
+
     let leaf_store = core.stores.read_volume(&vol_ulid, &vol_ulid);
     let basis_snapshot = match latest_snapshot_in_store(vol_ulid, &leaf_store).await? {
         Some((snap_ulid, kind)) => {
@@ -69,22 +81,12 @@ pub(crate) async fn hydrate_remote_owned(
         }
     };
 
-    elide_core::config::VolumeConfig {
-        name: Some(volume_name.to_owned()),
-        size: Some(size_bytes),
-        ..Default::default()
-    }
-    .write(&fork_dir)
-    .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
-
     std::fs::create_dir_all(fork_dir.join("wal"))
         .map_err(|e| IpcError::internal(format!("creating wal/: {e}")))?;
     std::fs::create_dir_all(fork_dir.join("pending"))
         .map_err(|e| IpcError::internal(format!("creating pending/: {e}")))?;
     std::fs::write(fork_dir.join(STOPPED_FILE), "")
         .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
-
-    restore_key_into_fork(&fork_dir, &key_bytes)?;
 
     plant_by_name_symlink(volume_name, vol_ulid, &core.data_dir)?;
 

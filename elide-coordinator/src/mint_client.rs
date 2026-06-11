@@ -90,6 +90,46 @@ pub(crate) const COORD_ENROLL_ROLES: &[&str] =
 
 const CAVEAT_EXP: &str = "exp";
 
+/// What an `assume-role` is for — the `req.volume` target plus the
+/// attestation anchor, made structural so the discharge decision is a
+/// property of the variant, not a role-string comparison at the call
+/// site.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AssumeTarget {
+    /// Coordinator-wide roles (`coord-ro` / `coord-rw`): no
+    /// `req.volume`, no attestation discharge.
+    Coord,
+    /// `volume-rw`: the volume is both the possession-proven anchor
+    /// and the vouched target (`rw-self`).
+    RwSelf(Ulid),
+    /// `volume-ro`: read `target`'s prefix, anchored on the live,
+    /// locally-keyed `owned` whose key signs the possession proof
+    /// (`ro-ancestor`; `target == owned` is the leaf reading its own
+    /// prefix).
+    RoAncestor { owned: Ulid, target: Ulid },
+}
+
+impl AssumeTarget {
+    /// The `req.volume` value for the assume-role body.
+    fn volume(&self) -> Option<Ulid> {
+        match self {
+            AssumeTarget::Coord => None,
+            AssumeTarget::RwSelf(v) => Some(*v),
+            AssumeTarget::RoAncestor { target, .. } => Some(*target),
+        }
+    }
+
+    /// The `(owned, target)` pair a discharge attests, when this
+    /// assume carries an attestation TPC.
+    fn attestation(&self) -> Option<(Ulid, Ulid)> {
+        match self {
+            AssumeTarget::Coord => None,
+            AssumeTarget::RwSelf(v) => Some((*v, *v)),
+            AssumeTarget::RoAncestor { owned, target } => Some((*owned, *target)),
+        }
+    }
+}
+
 /// Lifetime requested for a `volume-ro` credential. Set to 1h: the
 /// non-lazy fetch episode completes in seconds, and the lazy-volume
 /// cache refreshes proactively at half-life (`docs/design-mint.md`
@@ -532,22 +572,26 @@ impl MintEndpoint {
     /// performs its own per-IAM-call retry before surfacing 503, so
     /// reaching this loop already implies a sustained backend
     /// condition, not a one-shot burst.
-    /// Fetch a `rw-self` attestation discharge from coord B for `owned`.
+    /// Fetch an attestation discharge from coord B vouching `target`,
+    /// anchored on `owned`.
     ///
-    /// `owned` is both the possession-proven volume and the vouched target
-    /// (rw-self). Proves possession of `owned`'s `volume.key` over a fresh
+    /// Proves possession of `owned`'s `volume.key` over a fresh
     /// `(ts, nonce)` bound to the opaque `cid`, names the volume for coord
     /// B's liveness lookup (`read_volume_name` reads it from the volume's
     /// own dir), and returns the `mnt1_` discharge to attach to the
     /// `assume-role` bundle. coord B authenticates the request by the
-    /// possession proof in the body, not the mint PoP headers.
-    async fn fetch_rw_self_discharge(
+    /// possession proof in the body, not the mint PoP headers. Which
+    /// `(owned, target)` shapes coord B accepts is the CID's baked
+    /// `mode`: `rw-self` requires `target == owned`; `ro-ancestor`
+    /// requires `target` in `owned`'s read set.
+    async fn fetch_attestation_discharge(
         &self,
         owned: Ulid,
+        target: Ulid,
         cid: &[u8],
         location: &str,
     ) -> io::Result<String> {
-        let body = self.build_rw_self_discharge_request(owned, cid)?;
+        let body = self.build_discharge_request(owned, target, cid)?;
 
         // The discharge URL carries its own path, so the endpoint suffix is
         // empty; auth/PoP headers are unused by coord B and sent empty.
@@ -564,24 +608,24 @@ impl MintEndpoint {
         if status != 200 {
             let snippet: String = text.chars().take(200).collect();
             return Err(io::Error::other(format!(
-                "coord B discharge for {owned} returned {status}: {snippet}"
+                "coord B discharge for {target} (anchor {owned}) returned {status}: {snippet}"
             )));
         }
         json_str_field(&text, "discharge")
     }
 
-    /// Build coord B's `POST /v1/discharge` request body for a `rw-self`
-    /// attestation of `owned`: load the volume name and `volume.key`, sign
-    /// an Ed25519 possession proof over a fresh `(ts, nonce)` bound to
-    /// `cid`, and serialise the JSON coord B's `DischargeRequest` expects.
-    /// `owned` is both the possession-proven volume and the vouched target.
-    /// Separated from the POST so the request/response contract with coord B
-    /// is testable without a live server.
-    fn build_rw_self_discharge_request(&self, owned: Ulid, cid: &[u8]) -> io::Result<String> {
+    /// Build coord B's `POST /v1/discharge` request body attesting
+    /// `target` anchored on `owned`: load the anchor's volume name and
+    /// `volume.key`, sign an Ed25519 possession proof over a fresh
+    /// `(ts, nonce)` bound to `cid`, and serialise the JSON coord B's
+    /// `DischargeRequest` expects. Separated from the POST so the
+    /// request/response contract with coord B is testable without a
+    /// live server.
+    fn build_discharge_request(&self, owned: Ulid, target: Ulid, cid: &[u8]) -> io::Result<String> {
         let fork_dir = self.data_dir.join("by_id").join(owned.to_string());
         let name = elide_coordinator::tasks::read_volume_name(&fork_dir).ok_or_else(|| {
             io::Error::other(format!(
-                "cannot attest {owned}: no local volume name (not a live named volume)"
+                "cannot anchor on {owned}: no local volume name (not a live named volume)"
             ))
         })?;
         let signer =
@@ -593,7 +637,7 @@ impl MintEndpoint {
         let proof = elide_core::signing::sign_volume_possession(
             signer.as_ref(),
             &owned,
-            &owned,
+            &target,
             cid,
             ts,
             &nonce,
@@ -603,7 +647,7 @@ impl MintEndpoint {
         obj.insert("cid".into(), elide_core::signing::encode_hex(cid).into());
         obj.insert("name".into(), name.into());
         obj.insert("owned".into(), owned.to_string().into());
-        obj.insert("target".into(), owned.to_string().into());
+        obj.insert("target".into(), target.to_string().into());
         obj.insert("ts".into(), ts.into());
         obj.insert(
             "nonce".into(),
@@ -620,7 +664,7 @@ impl MintEndpoint {
         &self,
         role: &str,
         ttl_secs: u64,
-        volume: Option<Ulid>,
+        target: AssumeTarget,
     ) -> io::Result<IssuedCredentials> {
         let cred_path = self.data_dir.join("credentials").join(role);
         let stored = std::fs::read_to_string(&cred_path).map_err(|e| {
@@ -635,23 +679,25 @@ impl MintEndpoint {
 
         // If this credential carries an attestation third-party caveat at
         // the configured coord B location, discharge it once and attach the
-        // discharge to every attempt's bundle. rw-self: the `volume` is both
-        // the possession-proven owner and the vouched target. Only
-        // `volume-rw` is wired here; `volume-ro`'s ro-ancestor discharge
-        // needs the owned anchor threaded from the operation and lands
-        // separately.
-        let discharge = match (&self.attestation_location, volume) {
-            (Some(loc), Some(owned)) if role == ROLE_VOLUME_RW => {
+        // discharge to every attempt's bundle. The `(owned, target)` the
+        // discharge attests is a property of the assume's variant — rw-self
+        // for `volume-rw`, ro-ancestor for `volume-ro`.
+        let discharge = match (&self.attestation_location, target.attestation()) {
+            (Some(loc), Some((owned, tgt))) => {
                 let cid = WireMacaroon::decode(&stored)?
                     .third_party_cid_at(loc)
                     .map(<[u8]>::to_vec);
                 match cid {
-                    Some(cid) => Some(self.fetch_rw_self_discharge(owned, &cid, loc).await?),
+                    Some(cid) => Some(
+                        self.fetch_attestation_discharge(owned, tgt, &cid, loc)
+                            .await?,
+                    ),
                     None => None,
                 }
             }
             _ => None,
         };
+        let volume = target.volume();
 
         let mut attempt: u32 = 0;
         let (text, exp) = loop {
@@ -770,7 +816,7 @@ impl MintEndpoint {
         let mut attempt: u64 = 0;
         loop {
             attempt += 1;
-            match self.assume_role(role, ttl_secs, None).await {
+            match self.assume_role(role, ttl_secs, AssumeTarget::Coord).await {
                 Ok(_) => {
                     if attempt > 1 {
                         tracing::info!("[coordinator] mint reachable after {attempt} attempts");
@@ -818,11 +864,15 @@ impl MintCredentialer {
 impl Credentialer for MintCredentialer {
     async fn provision_volume_ro(
         &self,
-        _owned: Ulid,
+        owned: Ulid,
         target: Ulid,
     ) -> io::Result<IssuedCredentials> {
         self.endpoint
-            .assume_role(ROLE_VOLUME_RO, VOLUME_RO_TTL_SECS, Some(target))
+            .assume_role(
+                ROLE_VOLUME_RO,
+                VOLUME_RO_TTL_SECS,
+                AssumeTarget::RoAncestor { owned, target },
+            )
             .await
     }
 
@@ -1075,7 +1125,7 @@ mod tests {
 
         // coord A builds exactly the JSON it would POST.
         let body = endpoint
-            .build_rw_self_discharge_request(owned, &cid)
+            .build_discharge_request(owned, owned, &cid)
             .expect("build request");
         // Field-name / hex contract: coord A's body parses into coord B's
         // request struct with no remapping.
@@ -1104,6 +1154,132 @@ mod tests {
             .discharge(req)
             .await
             .expect("coord B accepts coord A's rw-self request");
+        assert!(wire.starts_with("mnt1_"), "discharge wire was {wire}");
+    }
+
+    #[tokio::test]
+    async fn ro_ancestor_discharge_request_is_accepted_by_coord_b() {
+        use ed25519_dalek::SigningKey;
+        use elide_attestation::{DischargeRequest, DischargeState, put_object};
+        use elide_core::config::VolumeConfig;
+        use elide_core::name_record::NameRecord;
+        use elide_core::signing::{
+            ParentRef, ProvenanceLineage, VOLUME_PROVENANCE_FILE, encode_hex, write_provenance,
+        };
+        use elide_core::store_keys::{meta_provenance_key, meta_pub_key};
+        use object_store::ObjectStore;
+        use object_store::memory::InMemory;
+
+        let v = discharge_vectors();
+        let k_m_b: [u8; 32] = elide_core::signing::decode_hex(v["k_m_b"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let cid = elide_core::signing::decode_hex(v["cid_ro_ancestor"].as_str().unwrap()).unwrap();
+
+        // --- coord A: own a live named fork of `parent`, key + name on disk.
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let owned = Ulid::new();
+        let parent = Ulid::new();
+        let owned_sk = SigningKey::generate(&mut OsRng);
+        let parent_sk = SigningKey::generate(&mut OsRng);
+        let fork_dir = data_dir.path().join("by_id").join(owned.to_string());
+        std::fs::create_dir_all(&fork_dir).unwrap();
+        std::fs::write(
+            fork_dir.join(elide_core::signing::VOLUME_KEY_FILE),
+            owned_sk.to_bytes(),
+        )
+        .unwrap();
+        VolumeConfig {
+            name: Some("ro-vol".into()),
+            ..Default::default()
+        }
+        .write(&fork_dir)
+        .unwrap();
+
+        let identity_dir = tempfile::TempDir::new().unwrap();
+        let identity =
+            Arc::new(CoordinatorIdentity::load_or_generate(identity_dir.path()).unwrap());
+        let cfg = MintConfig {
+            url: "unix:/tmp/unused.sock".into(),
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            attestation_location: Some("https://coord-b.example/v1/discharge".into()),
+        };
+        let endpoint = MintEndpoint::new(&cfg, data_dir.path().to_path_buf(), identity);
+
+        // coord A builds exactly the JSON it would POST: target = the
+        // fork's parent, anchored on owned.
+        let body = endpoint
+            .build_discharge_request(owned, parent, &cid)
+            .expect("build request");
+        let req: DischargeRequest = serde_json::from_str(&body).expect("contract: body shape");
+
+        // --- coord B: owned's signed lineage (parent ref) + both pubs +
+        // a Live name claim on a coord-ro store, so the read-set walk
+        // resolves `parent` from `meta/*`.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prov_dir = tempfile::TempDir::new().unwrap();
+        write_provenance(
+            prov_dir.path(),
+            &owned_sk,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage {
+                parent: Some(ParentRef {
+                    volume_ulid: parent.to_string(),
+                    snapshot_ulid: Ulid::new().to_string(),
+                    pubkey: parent_sk.verifying_key().to_bytes(),
+                }),
+                extent_index: Vec::new(),
+                oci_source: None,
+            },
+        )
+        .unwrap();
+        let prov = std::fs::read(prov_dir.path().join(VOLUME_PROVENANCE_FILE)).unwrap();
+        put_object(store.as_ref(), &meta_provenance_key(owned), prov)
+            .await
+            .unwrap();
+        put_object(
+            store.as_ref(),
+            &meta_pub_key(owned),
+            encode_hex(owned_sk.verifying_key().as_bytes()).into_bytes(),
+        )
+        .await
+        .unwrap();
+        let parent_prov_dir = tempfile::TempDir::new().unwrap();
+        write_provenance(
+            parent_prov_dir.path(),
+            &parent_sk,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::default(),
+        )
+        .unwrap();
+        let parent_prov =
+            std::fs::read(parent_prov_dir.path().join(VOLUME_PROVENANCE_FILE)).unwrap();
+        put_object(store.as_ref(), &meta_provenance_key(parent), parent_prov)
+            .await
+            .unwrap();
+        put_object(
+            store.as_ref(),
+            &meta_pub_key(parent),
+            encode_hex(parent_sk.verifying_key().as_bytes()).into_bytes(),
+        )
+        .await
+        .unwrap();
+        let record = NameRecord::live_minimal(owned, 4 * 1024 * 1024 * 1024);
+        put_object(
+            store.as_ref(),
+            "names/ro-vol",
+            record.to_toml().unwrap().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let state = DischargeState::new(k_m_b, store);
+
+        let wire = state
+            .discharge(req)
+            .await
+            .expect("coord B accepts coord A's ro-ancestor request");
         assert!(wire.starts_with("mnt1_"), "discharge wire was {wire}");
     }
 }

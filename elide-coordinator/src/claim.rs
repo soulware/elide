@@ -694,6 +694,43 @@ impl ClaimOrchestrator {
                         new_vol_ulid,
                     )
                     .await;
+                // Local volume.toml now, not in finalize: the new fork
+                // is the `owned` anchor for the chain reads that
+                // follow, and the discharge possession proof loads the
+                // anchor's name and key from this dir — both must be
+                // on disk before the first anchored read. Size from
+                // the just-claimed NameRecord (claim is a continuation
+                // of the same logical volume identity, not a resize).
+                let size = match self
+                    .ctx
+                    .core
+                    .stores
+                    .name_claims_ro()
+                    .read(&self.volume)
+                    .await
+                {
+                    Ok(Some(rec)) => rec.size,
+                    Ok(None) => {
+                        return Err(IpcError::not_found(format!(
+                            "names/{} disappeared after rebind",
+                            self.volume
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(IpcError::store(format!(
+                            "reading names/{}: {e}",
+                            self.volume
+                        )));
+                    }
+                };
+                elide_core::config::VolumeConfig {
+                    name: Some(self.volume.clone()),
+                    size: Some(size),
+                    ublk: None,
+                    lazy: None,
+                }
+                .write(&new_fork_dir)
+                .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
                 self.new_fork = Some(NewForkSkeleton {
                     vol_ulid: new_vol_ulid,
                     dir: new_fork_dir,
@@ -891,33 +928,6 @@ impl ClaimOrchestrator {
             .map_err(|e| IpcError::internal(format!("creating wal/: {e}")))?;
         std::fs::create_dir_all(new_fork.dir.join("pending"))
             .map_err(|e| IpcError::internal(format!("creating pending/: {e}")))?;
-
-        // Local volume.toml: size from the released NameRecord (claim is a
-        // continuation of the same logical volume identity, not a resize).
-        let claims = self.ctx.core.stores.name_claims_ro();
-        let size = match claims.read(&self.volume).await {
-            Ok(Some(rec)) => rec.size,
-            Ok(None) => {
-                return Err(IpcError::not_found(format!(
-                    "names/{} disappeared during finalize",
-                    self.volume
-                )));
-            }
-            Err(e) => {
-                return Err(IpcError::store(format!(
-                    "reading names/{}: {e}",
-                    self.volume
-                )));
-            }
-        };
-        elide_core::config::VolumeConfig {
-            name: Some(self.volume.clone()),
-            size: Some(size),
-            ublk: None,
-            lazy: None,
-        }
-        .write(&new_fork.dir)
-        .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
 
         // by_name symlink + volume.stopped marker.
         let by_name_dir = self.ctx.core.data_dir.join("by_name");

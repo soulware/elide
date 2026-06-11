@@ -5,6 +5,7 @@
   "org_id": "org_demo",
   "mode": "rw-self",
   "cid": "ca19db670c05bdd0bb10989f870fbb1016aea835875c9454b6c0fe9ed518ebe1a6418a48fca554f9844bfe8162db67230f3f9637cad4611bff407099a2f923cbe48d59a16cd3842f649c204d85a36ba818634820dab74daefea7d5bda529d599f3838864f1",
+  "cid_ro_ancestor": "88a973debf18060f6ebef84f6781f2df96a6192b78d9697f476ea29797e0587fc3970d9e93365e4fc42a23f2bdc4b6e670872fdc52650d5bdd6f0564e8c000d4db21f4b200cf0980d4c2ec271c3740ac57c9b0cc42c943a0be0abd30ef4231d943af22b23691f29efd",
   "discharge_nonce": "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
   "discharge_kid": 65535,
   "volume": "01BX5ZZKBKACTAV9WEVGEMMVRZ",
