@@ -1831,14 +1831,14 @@ one keypair cache. The IAM-layer invariants ride the policy
     another, and never delete.
   - `s3:PutObject` (**no** `s3:DeleteObject`) on
     `arn:aws:s3:::{{env.bucket}}/meta/*` — new-volume identity
-    establishment (the attestation doc § *New-volume bootstrap*): the
-    initial `meta/<vol>.{pub,provenance}` uploads, sent as conditional
-    creates (`If-None-Match: *`) so published anchors are write-once at
-    the store layer. Tigris IAM cannot require the header, so the
-    create-only discipline is client-side; the trust bar against a
-    malicious holder is this role itself, which already carries the
-    strictly stronger `names/*` rebind. Reads of `meta/*` stay on
-    `coord-ro`.
+    establishment (the attestation doc § *New-volume bootstrap*).
+    `volume.pub` uploads are conditional creates (`If-None-Match: *`,
+    write-once at the store layer); `volume.provenance` is a plain put
+    (claim flows rewrite the provisional lineage once, at basis
+    resolution). Tigris IAM cannot require the create header, so that
+    discipline is client-side; the trust bar against a malicious
+    holder is this role itself, which already carries the strictly
+    stronger `names/*` rebind. Reads of `meta/*` stay on `coord-ro`.
 
 No `s3:ListBucket` statement: every per-volume and control-plane
 LIST in the coordinator runtime has been replaced by a deterministic

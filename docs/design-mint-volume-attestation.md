@@ -436,17 +436,24 @@ record ordering fixes this; the first write of a volume's trust
 anchors is structurally un-attestable *by the volume*.
 
 It is attestable by the **coordinator**: creating a volume's identity
-is a coordinator act. The initial `meta/<vol>.{pub,provenance}`
-uploads ride `coord-rw`, whose `sub`-gated policy already carries the
-strictly stronger `names/*` write (a rogue holder could rebind any
-name; creating identity objects adds no trust beyond that). The
-uploads are conditional creates (`If-None-Match: *`), so the anchors
-are write-once at the store layer and a race or replay cannot
-overwrite a published identity. Tigris IAM cannot *require* the
-header (`DateLessThan` is its only condition operator), so write-once
-integrity holds against races and bugs; against a malicious enrolled
-coordinator the bar is `coord-rw` itself, exactly as for `names/*`.
-`volume-rw`'s policy shrinks to `by_id/<vol>/*` only.
+is a coordinator act. The `meta/<vol>.{pub,provenance}` uploads ride
+`coord-rw`, whose `sub`-gated policy already carries the strictly
+stronger `names/*` write (a rogue holder could rebind any name;
+creating identity objects adds no trust beyond that). `volume-rw`'s
+policy shrinks to `by_id/<vol>/*` only.
+
+The two anchors have different write disciplines. `volume.pub` is
+write-once: a conditional create (`If-None-Match: *`), so a race or
+replay cannot overwrite a published key, and crash-resume re-uploads
+treat `AlreadyExists` as success (the content is deterministic for a
+given keypair). `volume.provenance` has exactly one modeled rewrite:
+claim and `claim --force` publish a *provisional* lineage at rebind
+and rewrite it when the effective basis resolves (§ *The provisional
+provenance must be recovery-correct*), so its uploads are plain puts.
+Tigris IAM cannot *require* the create header (`DateLessThan` is its
+only condition operator), so the create-only discipline on the pub is
+client-side; against a malicious enrolled coordinator the bar is
+`coord-rw` itself, exactly as for `names/*`.
 
 A creation flow is then three ordered planes:
 
