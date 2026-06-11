@@ -127,11 +127,14 @@ fn run_from_file(
         extent_index: extent_sources,
         oci_source: None,
     };
-    // Readonly volumes must not have a private key on disk — use an ephemeral
-    // keypair that signs segments during import but is never persisted. The
-    // extent-source list is signed into volume.provenance at the same time.
-    let signer = elide_core::signing::setup_readonly_identity(
+    // The importing window is the volume's rw phase: volume.key is
+    // persisted so the worker signs segments and the coordinator signs
+    // rw-self possession proofs; the completion flip to Readonly
+    // destroys it. The extent-source list is signed into
+    // volume.provenance at the same time.
+    let signer = elide_core::signing::setup_import_identity(
         vol_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
         VOLUME_PUB_FILE,
         VOLUME_PROVENANCE_FILE,
         &lineage,
@@ -167,7 +170,7 @@ fn run_from_file(
 /// Build the parent `ExtentIndex` from the extent-source list in
 /// `volume.provenance`. The coordinator has already validated and
 /// persisted the list via `--extent-source` CLI args, which
-/// `setup_readonly_identity` signed into provenance. Walking provenance
+/// `setup_import_identity` signed into provenance. Walking provenance
 /// here is the single source of truth: if provenance is tampered with,
 /// `walk_extent_ancestors` will fail signature verification and the
 /// import aborts.
@@ -274,11 +277,14 @@ async fn run_oci(
             arch: target_arch.to_string(),
         }),
     };
-    // Readonly volumes must not have a private key on disk — use an ephemeral
-    // keypair that signs segments during import but is never persisted. The
-    // extent-source list is signed into volume.provenance at the same time.
-    let signer = elide_core::signing::setup_readonly_identity(
+    // The importing window is the volume's rw phase: volume.key is
+    // persisted so the worker signs segments and the coordinator signs
+    // rw-self possession proofs; the completion flip to Readonly
+    // destroys it. The extent-source list is signed into
+    // volume.provenance at the same time.
+    let signer = elide_core::signing::setup_import_identity(
         vol_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
         VOLUME_PUB_FILE,
         VOLUME_PROVENANCE_FILE,
         &lineage,

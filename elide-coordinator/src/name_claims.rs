@@ -30,9 +30,9 @@ use ulid::Ulid;
 use elide_core::name_record::{NameRecord, NameState};
 
 use crate::lifecycle::{
-    LifecycleError, MarkClaimedForceOutcome, MarkClaimedOutcome, MarkInitialOutcome,
-    MarkLiveOutcome, MarkReclaimedLocalOutcome, MarkReleasedOutcome, MarkStoppedOutcome,
-    RecordLatestSnapshotOutcome,
+    ImportRecordOutcome, LifecycleError, MarkClaimedForceOutcome, MarkClaimedOutcome,
+    MarkInitialOutcome, MarkLiveOutcome, MarkReclaimedLocalOutcome, MarkReleasedOutcome,
+    MarkStoppedOutcome, RecordLatestSnapshotOutcome,
 };
 use crate::name_store::{self, NameStoreError};
 
@@ -74,17 +74,37 @@ pub trait NameClaims: NameClaimsReader {
         size: u64,
     ) -> Result<MarkInitialOutcome, LifecycleError>;
 
-    /// Create-time claim of a fresh **readonly** name (no exclusive
-    /// owner). Same conditional-create mechanics as
-    /// [`Self::mark_initial`]; record carries `state = Readonly` and
-    /// the import's `User` snapshot as `latest_snapshot`.
-    async fn mark_initial_readonly(
+    /// Create-time claim of a fresh name at **import start**. Same
+    /// conditional-create mechanics as [`Self::mark_initial`]; the
+    /// record carries `state = Importing` and `size = 0` (unknown
+    /// until extraction). The import's uniqueness gate.
+    async fn mark_importing(
         &self,
         name: &str,
+        coord_id: &str,
+        hostname: Option<&str>,
+        vol_ulid: Ulid,
+    ) -> Result<MarkInitialOutcome, LifecycleError>;
+
+    /// Flip this import's `Importing` record to `Readonly` at
+    /// completion, carrying the real `size` and the import's `User`
+    /// snapshot as `latest_snapshot`.
+    async fn mark_import_complete(
+        &self,
+        name: &str,
+        coord_id: &str,
         vol_ulid: Ulid,
         size: u64,
         latest_snapshot: Option<Ulid>,
-    ) -> Result<MarkInitialOutcome, LifecycleError>;
+    ) -> Result<ImportRecordOutcome, LifecycleError>;
+
+    /// Delete this import's `Importing` record after a failed import.
+    async fn clear_importing(
+        &self,
+        name: &str,
+        coord_id: &str,
+        vol_ulid: Ulid,
+    ) -> Result<ImportRecordOutcome, LifecycleError>;
 
     /// Best-effort monotonic bump of `latest_snapshot` after a `User`
     /// snapshot manifest upload. Guarded on the record still pointing
@@ -224,15 +244,42 @@ impl NameClaims for BucketNameClaims {
         crate::lifecycle::mark_initial(&self.writer, name, coord_id, hostname, vol_ulid, size).await
     }
 
-    async fn mark_initial_readonly(
+    async fn mark_importing(
         &self,
         name: &str,
+        coord_id: &str,
+        hostname: Option<&str>,
+        vol_ulid: Ulid,
+    ) -> Result<MarkInitialOutcome, LifecycleError> {
+        crate::lifecycle::mark_importing(&self.writer, name, coord_id, hostname, vol_ulid).await
+    }
+
+    async fn mark_import_complete(
+        &self,
+        name: &str,
+        coord_id: &str,
         vol_ulid: Ulid,
         size: u64,
         latest_snapshot: Option<Ulid>,
-    ) -> Result<MarkInitialOutcome, LifecycleError> {
-        crate::lifecycle::mark_initial_readonly(&self.writer, name, vol_ulid, size, latest_snapshot)
-            .await
+    ) -> Result<ImportRecordOutcome, LifecycleError> {
+        crate::lifecycle::mark_import_complete(
+            &self.writer,
+            name,
+            coord_id,
+            vol_ulid,
+            size,
+            latest_snapshot,
+        )
+        .await
+    }
+
+    async fn clear_importing(
+        &self,
+        name: &str,
+        coord_id: &str,
+        vol_ulid: Ulid,
+    ) -> Result<ImportRecordOutcome, LifecycleError> {
+        crate::lifecycle::clear_importing(&self.writer, name, coord_id, vol_ulid).await
     }
 
     async fn record_latest_snapshot(

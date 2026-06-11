@@ -87,7 +87,7 @@ claimed_at = "<rfc3339>"
 hostname = "<owner-host-at-claim-time>"  # advisory only
 ```
 
-### Four states, two intents
+### Five states, two intents
 
 The lifecycle distinguishes:
 
@@ -102,7 +102,7 @@ The lifecycle distinguishes:
    coordinators may serve it concurrently with no coordination,
    because there is nothing to coordinate).
 
-Four states make these intents explicit:
+Five states make these intents explicit:
 
 | State | `coordinator_id` | `claimed_at` / `hostname` | Mutable? | Who can claim |
 |---|---|---|---|---|
@@ -110,18 +110,27 @@ Four states make these intents explicit:
 | `stopped` | current owner | populated | yes | this coordinator (local resume); others need `claim --force` |
 | `released` | empty | empty | yes (after claim) | any coordinator |
 | `readonly` | empty | empty | **no** | n/a (no daemon, multiple readers OK) |
+| `importing` | the importer | populated | by the importer only | n/a (every verb refuses) |
 
 Each state has a coherent field shape: `coordinator_id` consistently
 means "the coordinator this record is associated with" (current
-owner on live/stopped, no one on released/readonly); `claimed_at`
-and `hostname` consistently mean "when/where the *current* owner
-claimed" — populated only when there is a current owner.
+owner on live/stopped, the importer on importing, no one on
+released/readonly); `claimed_at` and `hostname` consistently mean
+"when/where the *current* owner claimed" — populated only when there
+is a current owner.
 
 The first three are the writable lifecycle. `readonly` is the
 published-handle case: the name is bound permanently to immutable
 content, no exclusive owner is needed, and lifecycle verbs
 (`stop` / `release` / `start` / `claim`) all refuse it cleanly. See §
-"Readonly names" below.
+"Readonly names" below. `importing` is the construction window that
+produces a `readonly` record: CAS-created at import start (the
+uniqueness gate, and the binding the import drain's `rw-self`
+discharges anchor on — `design-mint-volume-attestation.md` § *Import
+runs under an `Importing` record*), flipped to `readonly` with the
+real size and import snapshot at completion, CAS-deleted on failure.
+`size` is 0 while importing — the state marks the field
+not-yet-meaningful. Every lifecycle verb refuses it.
 
 Verbs and their state transitions:
 

@@ -271,22 +271,26 @@ pub struct ProvenanceLineage {
     pub oci_source: Option<OciSource>,
 }
 
-/// Set up a readonly volume's identity and return a signer for segment writing.
+/// Set up an importing volume's identity and return a signer for
+/// segment writing.
 ///
-/// Generates an ephemeral Ed25519 keypair, writes `volume.pub` and
-/// `volume.provenance` (with the given `lineage`), and returns the signer.
-/// The private key is never written to disk — readonly volumes (e.g. OCI
-/// imports) have no use for it after the one-time write. Segment
-/// verification at rebuild time uses the persisted `volume.pub`.
-pub fn setup_readonly_identity(
+/// Generates an Ed25519 keypair, writes `volume.key`, `volume.pub`, and
+/// `volume.provenance` (with the given `lineage`), and returns the
+/// signer. The importing window is the volume's rw phase, so the key is
+/// persisted like any other rw volume's: the worker signs segments with
+/// it and the coordinator signs `rw-self` possession proofs from it.
+/// The completion flip to `Readonly` destroys it — a `Readonly` record
+/// implies the key is gone, so the published base is cryptographically
+/// immutable (`design-mint-volume-attestation.md` § *Import runs under
+/// an `Importing` record*).
+pub fn setup_import_identity(
     dir: &Path,
+    key_file: &str,
     pub_file: &str,
     provenance_file: &str,
     lineage: &ProvenanceLineage,
 ) -> io::Result<Arc<dyn SegmentSigner>> {
-    let key = SigningKey::generate(&mut OsRng);
-    let pub_hex = encode_hex(&key.verifying_key().to_bytes()) + "\n";
-    crate::segment::write_file_atomic(&dir.join(pub_file), pub_hex.as_bytes())?;
+    let key = generate_keypair(dir, key_file, pub_file)?;
     write_provenance(dir, &key, provenance_file, lineage)?;
     Ok(Arc::new(Ed25519Signer { key }))
 }

@@ -21,7 +21,7 @@ use elide_core::segment::{
     write_segment,
 };
 use elide_core::signing::{
-    ProvenanceLineage, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, setup_readonly_identity,
+    ProvenanceLineage, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE, setup_import_identity,
 };
 use lz4_flex::compress_prepend_size;
 use tempfile::TempDir;
@@ -43,9 +43,14 @@ fn make_readonly_volume(
     }
     .write(&vol_dir)
     .unwrap();
-    let signer =
-        setup_readonly_identity(&vol_dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE, lineage)
-            .unwrap();
+    let signer = setup_import_identity(
+        &vol_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        VOLUME_PUB_FILE,
+        VOLUME_PROVENANCE_FILE,
+        lineage,
+    )
+    .unwrap();
     (vol_ulid, vol_dir, signer)
 }
 

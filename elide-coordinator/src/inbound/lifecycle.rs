@@ -1057,6 +1057,9 @@ pub(crate) async fn hydrate_or_route(
         OwnershipPosition::Readonly { .. } => Err(IpcError::conflict(format!(
             "name '{volume_name}' is readonly; cannot start"
         ))),
+        OwnershipPosition::Importing { coord_id, .. } => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is being imported on coordinator {coord_id}; cannot start"
+        ))),
     }
 }
 

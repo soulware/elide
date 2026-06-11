@@ -239,8 +239,13 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // exists, add missing symlinks for volumes that have a volume.name file.
     reconcile_by_name(&data_dir);
 
-    // Clean up any stale import locks left by a previous coordinator run.
-    import::cleanup_stale_locks(&config.data_dir);
+    // Clean up any stale import locks left by a previous coordinator
+    // run, then CAS-delete the bucket-side `Importing` records of the
+    // imports those locks belonged to.
+    let stale_import_dirs = import::cleanup_stale_locks(&config.data_dir);
+    if !stale_import_dirs.is_empty() {
+        import::clear_stale_import_records(&stores, &identity, &stale_import_dirs).await;
+    }
 
     // Reconcile ublk kernel devices against on-disk bindings. Under
     // shutdown-park, daemons leave devices QUIESCED for recovery; this

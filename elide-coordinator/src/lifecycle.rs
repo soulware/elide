@@ -448,30 +448,27 @@ pub async fn mark_initial(
     }
 }
 
-/// Atomically claim a fresh name in S3 for a **readonly** import.
+/// Atomically claim a fresh name in S3 at **import start**.
 ///
 /// Same conditional-create mechanics as `mark_initial` (one writer
 /// wins on `If-None-Match: *`), but the resulting record carries
-/// `state = Readonly` and *no* coordinator identity:
-/// `coordinator_id`, `claimed_at`, and `hostname` are all `None`,
-/// reflecting that imports have no exclusive owner. Multiple
-/// coordinators may pull and serve the same name concurrently
-/// (see design doc § "Readonly names").
+/// `state = Importing` and `size = 0` — the real size is only known
+/// post-extraction; the state is what marks the field
+/// not-yet-meaningful. The conditional create is the import's
+/// uniqueness gate, settled *before* download and extraction: two
+/// coordinators racing to import the same name resolve cleanly (one
+/// wins, the other gets `AlreadyExists` without doing the work).
 ///
-/// Takes no `root_key` — there is no owner to identify. The
-/// conditional create still gives uniqueness: two coordinators
-/// racing to import the same name resolve cleanly (one wins,
-/// the other gets `AlreadyExists`).
-///
-/// `latest_snapshot` is the import's `User` snapshot manifest,
-/// recorded so `create --from <imported-name>` resolves its basis
-/// from this record in one GET.
-pub async fn mark_initial_readonly(
+/// The record carries the importer's identity so the binding anchors
+/// the drain's `rw-self` discharges and a dead importer's record is
+/// attributable. [`mark_import_complete`] flips it to `Readonly`;
+/// [`clear_importing`] deletes it on failure.
+pub async fn mark_importing(
     store: &Arc<dyn ObjectStore>,
     name: &str,
+    coord_id: &str,
+    hostname: Option<&str>,
     vol_ulid: Ulid,
-    size: u64,
-    latest_snapshot: Option<Ulid>,
 ) -> Result<MarkInitialOutcome, LifecycleError> {
     if let Some((existing, _)) = name_store::read_name_record(store, name).await? {
         return Ok(MarkInitialOutcome::AlreadyExists {
@@ -484,14 +481,14 @@ pub async fn mark_initial_readonly(
     let record = elide_core::name_record::NameRecord {
         version: elide_core::name_record::NameRecord::CURRENT_VERSION,
         vol_ulid,
-        size,
-        coordinator_id: None,
-        state: NameState::Readonly,
+        size: 0,
+        coordinator_id: Some(coord_id.to_owned()),
+        state: NameState::Importing,
         parent: None,
-        claimed_at: None,
-        hostname: None,
+        claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+        hostname: hostname.map(str::to_owned),
         handoff_snapshot: None,
-        latest_snapshot,
+        latest_snapshot: None,
     };
 
     match name_store::create_name_record(store, name, &record).await {
@@ -508,6 +505,92 @@ pub async fn mark_initial_readonly(
         }
         Err(e) => Err(LifecycleError::Store(e)),
     }
+}
+
+/// Outcome of [`mark_import_complete`] and [`clear_importing`].
+#[derive(Debug)]
+pub enum ImportRecordOutcome {
+    /// The record was flipped to `Readonly` (complete) or deleted
+    /// (clear).
+    Done,
+    /// `names/<name>` no longer holds this import's `Importing`
+    /// binding — missing, rebound, or foreign. Nothing was written.
+    Lost { existing: Option<NameRecord> },
+}
+
+/// Flip this import's `Importing` record to `Readonly` at completion,
+/// carrying the real `size` and the import's `User` snapshot.
+///
+/// The resulting record matches the readonly shape: no coordinator
+/// identity (`coordinator_id`, `claimed_at`, and `hostname` cleared) —
+/// imports have no exclusive owner once published, and multiple
+/// coordinators may pull and serve the name concurrently.
+/// `latest_snapshot` is recorded so `create --from <imported-name>`
+/// resolves its basis from this record in one GET.
+///
+/// CAS'd on the version read here; the read verifies the record is
+/// still this import's `Importing` binding before writing.
+pub async fn mark_import_complete(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    coord_id: &str,
+    vol_ulid: Ulid,
+    size: u64,
+    latest_snapshot: Option<Ulid>,
+) -> Result<ImportRecordOutcome, LifecycleError> {
+    let Some((record, version)) = name_store::read_name_record(store, name).await? else {
+        return Ok(ImportRecordOutcome::Lost { existing: None });
+    };
+    if record.state != NameState::Importing
+        || record.vol_ulid != vol_ulid
+        || record.coordinator_id.as_deref() != Some(coord_id)
+    {
+        return Ok(ImportRecordOutcome::Lost {
+            existing: Some(record),
+        });
+    }
+
+    let record = elide_core::name_record::NameRecord {
+        version: elide_core::name_record::NameRecord::CURRENT_VERSION,
+        vol_ulid,
+        size,
+        coordinator_id: None,
+        state: NameState::Readonly,
+        parent: None,
+        claimed_at: None,
+        hostname: None,
+        handoff_snapshot: None,
+        latest_snapshot,
+    };
+    name_store::update_name_record(store, name, &record, version).await?;
+    Ok(ImportRecordOutcome::Done)
+}
+
+/// Delete this import's `Importing` record after a failed import.
+///
+/// The read-verify-delete is safe without a conditional delete because
+/// an `Importing` record has a single writer by construction: only the
+/// importing coordinator ever writes it, and every lifecycle verb
+/// refuses the state.
+pub async fn clear_importing(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    coord_id: &str,
+    vol_ulid: Ulid,
+) -> Result<ImportRecordOutcome, LifecycleError> {
+    let Some((record, _)) = name_store::read_name_record(store, name).await? else {
+        return Ok(ImportRecordOutcome::Lost { existing: None });
+    };
+    if record.state != NameState::Importing
+        || record.vol_ulid != vol_ulid
+        || record.coordinator_id.as_deref() != Some(coord_id)
+    {
+        return Ok(ImportRecordOutcome::Lost {
+            existing: Some(record),
+        });
+    }
+    name_store::delete_name_record(store, name).await?;
+    Ok(ImportRecordOutcome::Done)
 }
 
 /// Outcome of a `record_latest_snapshot` call.
@@ -804,7 +887,9 @@ pub async fn reconcile_marker(
             }
             ensure_absent(&stopped, "volume.stopped");
         }
-        NameState::Readonly => {}
+        // Neither state has an owner episode to reconcile markers
+        // against; the import path manages its own local markers.
+        NameState::Readonly | NameState::Importing => {}
     }
 }
 
@@ -1488,12 +1573,28 @@ mod tests {
         assert_eq!(got.state, NameState::Released);
     }
 
-    // ── mark_initial_readonly ───────────────────────────────────────────
+    // ── import record verbs ─────────────────────────────────────────────
+
+    /// Seed a published readonly import: `mark_importing` then
+    /// `mark_import_complete`, the same two-step path production takes.
+    async fn seed_readonly(
+        s: &Arc<dyn ObjectStore>,
+        name: &str,
+        vol: Ulid,
+        size: u64,
+        latest: Option<Ulid>,
+    ) {
+        mark_importing(s, name, &id_a(), None, vol).await.unwrap();
+        let outcome = mark_import_complete(s, name, &id_a(), vol, size, latest)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ImportRecordOutcome::Done));
+    }
 
     #[tokio::test]
-    async fn mark_initial_readonly_claims_with_no_owner_identity() {
+    async fn mark_importing_claims_with_importer_identity() {
         let s = store();
-        let outcome = mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE, None)
+        let outcome = mark_importing(&s, "ubuntu24", &id_a(), None, sample_ulid())
             .await
             .unwrap();
         assert!(matches!(outcome, MarkInitialOutcome::Claimed));
@@ -1503,20 +1604,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.vol_ulid, sample_ulid());
-        assert_eq!(got.state, NameState::Readonly);
-        assert!(got.coordinator_id.is_none(), "no exclusive owner");
-        assert!(got.claimed_at.is_none(), "no claim time recorded");
-        assert!(got.hostname.is_none(), "no hostname recorded");
+        assert_eq!(got.state, NameState::Importing);
+        assert_eq!(got.size, 0, "size unknown until extraction");
+        assert_eq!(
+            got.coordinator_id.as_deref(),
+            Some(id_a().as_str()),
+            "the importer is attributable"
+        );
     }
 
     #[tokio::test]
-    async fn mark_initial_readonly_refuses_when_name_already_exists() {
+    async fn mark_importing_refuses_when_name_already_exists() {
         let s = store();
-        mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE, None)
+        mark_importing(&s, "ubuntu24", &id_a(), None, sample_ulid())
             .await
             .unwrap();
 
-        let outcome = mark_initial_readonly(&s, "ubuntu24", snap(), SAMPLE_SIZE, None)
+        let outcome = mark_importing(&s, "ubuntu24", &id_b(), None, snap())
             .await
             .unwrap();
         match outcome {
@@ -1526,14 +1630,14 @@ mod tests {
                 ..
             } => {
                 assert_eq!(existing_vol_ulid, sample_ulid());
-                assert_eq!(existing_state, NameState::Readonly);
+                assert_eq!(existing_state, NameState::Importing);
             }
             _ => panic!("expected AlreadyExists, got {outcome:?}"),
         }
     }
 
     #[tokio::test]
-    async fn mark_initial_readonly_collides_with_writable_record() {
+    async fn mark_importing_collides_with_writable_record() {
         // First a writable claim, then an attempt to import the same
         // name → must be refused.
         let s = store();
@@ -1541,7 +1645,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = mark_initial_readonly(&s, "name", snap(), SAMPLE_SIZE, None)
+        let outcome = mark_importing(&s, "name", &id_b(), None, snap())
             .await
             .unwrap();
         assert!(matches!(
@@ -1551,6 +1655,114 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn mark_import_complete_flips_to_readonly_clearing_identity() {
+        let s = store();
+        mark_importing(&s, "ubuntu24", &id_a(), None, sample_ulid())
+            .await
+            .unwrap();
+
+        let outcome = mark_import_complete(
+            &s,
+            "ubuntu24",
+            &id_a(),
+            sample_ulid(),
+            SAMPLE_SIZE,
+            Some(snap()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ImportRecordOutcome::Done));
+
+        let (got, _) = name_store::read_name_record(&s, "ubuntu24")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.state, NameState::Readonly);
+        assert_eq!(got.size, SAMPLE_SIZE, "real size recorded at the flip");
+        assert_eq!(got.latest_snapshot, Some(snap()));
+        assert!(got.coordinator_id.is_none(), "no exclusive owner");
+        assert!(got.claimed_at.is_none(), "no claim time recorded");
+        assert!(got.hostname.is_none(), "no hostname recorded");
+    }
+
+    #[tokio::test]
+    async fn mark_import_complete_lost_when_binding_is_not_ours() {
+        let s = store();
+        mark_importing(&s, "ubuntu24", &id_a(), None, sample_ulid())
+            .await
+            .unwrap();
+
+        // Wrong coordinator, wrong volume, and missing record all
+        // report Lost without writing.
+        let foreign =
+            mark_import_complete(&s, "ubuntu24", &id_b(), sample_ulid(), SAMPLE_SIZE, None)
+                .await
+                .unwrap();
+        assert!(matches!(foreign, ImportRecordOutcome::Lost { .. }));
+        let wrong_vol = mark_import_complete(&s, "ubuntu24", &id_a(), snap(), SAMPLE_SIZE, None)
+            .await
+            .unwrap();
+        assert!(matches!(wrong_vol, ImportRecordOutcome::Lost { .. }));
+        let missing = mark_import_complete(&s, "ghost", &id_a(), sample_ulid(), SAMPLE_SIZE, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            missing,
+            ImportRecordOutcome::Lost { existing: None }
+        ));
+
+        let (got, _) = name_store::read_name_record(&s, "ubuntu24")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.state, NameState::Importing, "record untouched");
+    }
+
+    #[tokio::test]
+    async fn clear_importing_deletes_only_our_importing_record() {
+        let s = store();
+        mark_importing(&s, "ubuntu24", &id_a(), None, sample_ulid())
+            .await
+            .unwrap();
+
+        // Foreign coordinator and wrong volume are refused.
+        let foreign = clear_importing(&s, "ubuntu24", &id_b(), sample_ulid())
+            .await
+            .unwrap();
+        assert!(matches!(foreign, ImportRecordOutcome::Lost { .. }));
+        let wrong_vol = clear_importing(&s, "ubuntu24", &id_a(), snap())
+            .await
+            .unwrap();
+        assert!(matches!(wrong_vol, ImportRecordOutcome::Lost { .. }));
+        assert!(
+            name_store::read_name_record(&s, "ubuntu24")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // The importer deletes its own record.
+        let ours = clear_importing(&s, "ubuntu24", &id_a(), sample_ulid())
+            .await
+            .unwrap();
+        assert!(matches!(ours, ImportRecordOutcome::Done));
+        assert!(
+            name_store::read_name_record(&s, "ubuntu24")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A completed (Readonly) record is also refused — clear only
+        // ever removes an in-flight import's binding.
+        seed_readonly(&s, "published", sample_ulid(), SAMPLE_SIZE, None).await;
+        let readonly = clear_importing(&s, "published", &id_a(), sample_ulid())
+            .await
+            .unwrap();
+        assert!(matches!(readonly, ImportRecordOutcome::Lost { .. }));
     }
 
     // ── record_latest_snapshot ──────────────────────────────────────────
@@ -1649,28 +1861,12 @@ mod tests {
     #[tokio::test]
     async fn record_latest_snapshot_serves_readonly_records() {
         let s = store();
-        mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE, None)
-            .await
-            .unwrap();
+        seed_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE, None).await;
 
         let outcome = record_latest_snapshot(&s, "ubuntu24", sample_ulid(), snap())
             .await
             .unwrap();
         assert!(matches!(outcome, RecordLatestSnapshotOutcome::Recorded));
-
-        let (got, _) = name_store::read_name_record(&s, "ubuntu24")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.latest_snapshot, Some(snap()));
-    }
-
-    #[tokio::test]
-    async fn mark_initial_readonly_records_import_snapshot() {
-        let s = store();
-        mark_initial_readonly(&s, "ubuntu24", sample_ulid(), SAMPLE_SIZE, Some(snap()))
-            .await
-            .unwrap();
 
         let (got, _) = name_store::read_name_record(&s, "ubuntu24")
             .await
@@ -1818,9 +2014,7 @@ mod tests {
     #[tokio::test]
     async fn mark_stopped_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None)
-            .await
-            .unwrap();
+        seed_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None).await;
 
         let err = mark_stopped(&s, "vol", &id_a(), None)
             .await
@@ -1837,9 +2031,7 @@ mod tests {
     #[tokio::test]
     async fn mark_released_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None)
-            .await
-            .unwrap();
+        seed_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None).await;
 
         let err = mark_released(&s, "vol", &id_a(), snap())
             .await
@@ -1856,9 +2048,7 @@ mod tests {
     #[tokio::test]
     async fn mark_live_refuses_readonly_record() {
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None)
-            .await
-            .unwrap();
+        seed_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None).await;
 
         let err = mark_live(&s, "vol", &id_a(), None)
             .await
@@ -1878,9 +2068,7 @@ mod tests {
         // path — readonly records are not part of the claim-from-released
         // flow.
         let s = store();
-        mark_initial_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None)
-            .await
-            .unwrap();
+        seed_readonly(&s, "vol", sample_ulid(), SAMPLE_SIZE, None).await;
 
         let outcome = mark_claimed(&s, "vol", &id_a(), None, snap(), NameState::Live)
             .await

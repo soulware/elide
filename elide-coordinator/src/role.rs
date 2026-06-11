@@ -86,6 +86,10 @@ pub enum ObserverKind {
     /// owner; multiple coordinators may `pull` and serve the same
     /// name concurrently.
     Readonly,
+    /// An import is constructing the volume on `coord_id`. Every
+    /// verb refuses it until the importer flips the record to
+    /// `Readonly` (or deletes it on failure).
+    Importing { coord_id: String },
 }
 
 impl Role {
@@ -109,6 +113,11 @@ impl Role {
             },
             OwnershipPosition::Readonly { .. } => Self::Observer {
                 kind: ObserverKind::Readonly,
+            },
+            OwnershipPosition::Importing { coord_id, .. } => Self::Observer {
+                kind: ObserverKind::Importing {
+                    coord_id: coord_id.clone(),
+                },
             },
         }
     }
