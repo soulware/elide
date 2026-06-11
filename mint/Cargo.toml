@@ -12,6 +12,16 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Macaroon-authenticated scoped-credential vending for Tigris (prototype). Standalone-OSS-to-be; lives in the elide repo during the design phase."
 
+[features]
+# Builds the `mint-e2e` bin: the hermetic daemon harness (FakeMinter +
+# local store) that cross-workspace end-to-end tests spawn.
+e2e-harness = []
+
+[[bin]]
+name = "mint-e2e"
+path = "src/bin/mint_e2e.rs"
+required-features = ["e2e-harness"]
+
 [dependencies]
 # AES-GCM-SIV is misuse-resistant: nonce reuse with the same key is
 # safe by construction. We use it with a fixed nonce so the

@@ -112,7 +112,7 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --features e2e-harness -- -D warnings
 
       - name: cargo test
         run: cargo test --no-fail-fast

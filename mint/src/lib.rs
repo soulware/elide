@@ -30,6 +30,7 @@ pub mod pop;
 pub mod role;
 pub mod seal;
 pub mod sealed_cache;
+pub mod serve;
 pub mod session;
 pub mod state;
 pub mod template;

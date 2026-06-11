@@ -87,8 +87,10 @@ cargo build && cargo test
 clap CLI (`--config` defaults to `mint.toml`). Server + operator:
 
 ```sh
-mint serve   --config mint-demo.toml [--tigris]      # --tigris = real Tigris IAM; else fake minter
-mint invite    --config mint-demo.toml               # print the invite macaroon
+mint serve   --config mint-demo.toml                 # Tigris-backed; AWS_* admin creds in the environment
+mint login   --config mint-demo.toml                 # operator session at the (demo) auth role
+mint seal    --config mint-demo.toml                 # author + publish the template seal; serve is dormant until sealed
+mint invite  --config mint-demo.toml                 # print the invite macaroon
 mint enroll list    --config mint-demo.toml
 mint enroll approve --config mint-demo.toml <sub>    # shows the fingerprint, interactive y/N; --yes for automation
 ```
@@ -99,13 +101,16 @@ Client (the coordinator's half; identity under `./mint_client`):
 mint client fingerprint                                  # mints the identity on first use; operator compares this during `enroll approve`
 mint client enroll      --id <sub> <macaroon|file|->     # invite is the final positional arg
 mint client exchange                                     # exit 2 until approved, then saves the primary
-mint client assume-role --request '{"prefix":"demo/x"}' [--caveat N=V] <role>
-                                                         # request body is opaque pass-through
+mint client assume-role [--req '{...}'] [--caveat N=V] <role>
+                                                         # body fields beyond ts/role/ttl are opaque to mint
 ```
 
-Without `--tigris`, `serve` wires the deterministic fake minter (warns
-loudly) so the whole flow runs hermetically; `--tigris` calls real
-Tigris IAM and requires `AWS_*` admin creds.
+`serve` always runs against real Tigris IAM (or any S3-compatible
+backend speaking the IAM API). The hermetic shape is the `mint-e2e`
+harness bin — the same serve loop over the deterministic fake minter
+and a local-filesystem store — built with
+`cargo build --features e2e-harness --bin mint-e2e` and spawned by
+cross-workspace end-to-end tests.
 
 ## Out of scope
 
