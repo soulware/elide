@@ -968,9 +968,14 @@ async fn generate_filemap_op(
     data_dir: &Path,
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> Result<GenerateFilemapReply, IpcError> {
-    let link = data_dir.join("by_name").join(vol_name);
-    let fork_dir = std::fs::canonicalize(&link)
-        .map_err(|_| IpcError::not_found(format!("volume not found: {vol_name}")))?;
+    let leaf_ulid = elide_coordinator::volume_state::resolve_volume_ulid(data_dir, vol_name)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                IpcError::not_found(format!("volume not found: {vol_name}"))
+            }
+            _ => IpcError::internal(format!("resolving volume '{vol_name}': {e}")),
+        })?;
+    let fork_dir = elide_coordinator::volume_state::fork_dir(data_dir, leaf_ulid);
 
     let snap_ulid = match snap_arg {
         Some(u) => u,
@@ -1002,7 +1007,7 @@ async fn generate_filemap_op(
     }
 
     let started = std::time::Instant::now();
-    generate_snapshot_filemap(&fork_dir, snap_ulid, Arc::clone(stores))
+    generate_snapshot_filemap(data_dir, leaf_ulid, snap_ulid, Arc::clone(stores))
         .await
         .map_err(|e| {
             IpcError::internal(format!("filemap generation failed for {snap_ulid}: {e:#}"))
@@ -1024,21 +1029,12 @@ async fn generate_filemap_op(
 /// closure (after the search-dir list is known) because each fetcher
 /// binds to a fork chain.
 async fn generate_snapshot_filemap(
-    fork_dir: &Path,
+    data_dir: &Path,
+    leaf_ulid: ulid::Ulid,
     snap_ulid: ulid::Ulid,
     stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
 ) -> std::io::Result<()> {
-    let fork_dir = fork_dir.to_owned();
-    let leaf_ulid = fork_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|s| ulid::Ulid::from_string(s).ok())
-        .ok_or_else(|| {
-            std::io::Error::other(format!(
-                "fork dir {} is not a by_id/<ulid> path",
-                fork_dir.display()
-            ))
-        })?;
+    let fork_dir = elide_coordinator::volume_state::fork_dir(data_dir, leaf_ulid);
     // Reads route per owning volume — each segment body lives under the
     // leaf's prefix or an ancestor's, and the owner is taken from the
     // `by_id/<owner>/…` key, so each gets its own single-prefix
