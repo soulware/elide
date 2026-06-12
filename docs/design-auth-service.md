@@ -165,7 +165,8 @@ The keys established across the system are:
   nowhere outside its caveat — there is no derivation to replay — so a
   discharge is MAC-valid against exactly the caveat it was minted for.
   Auth uses `r_tpc` as the HMAC root when minting a discharge for that
-  caveat, and the discharge's nonce equals the `CID`. The
+  caveat; the discharge's nonce is random — its audit identity, while
+  the binding to the caveat is `r_tpc` itself. The
   *authorization* dimension — which operator may obtain which
   discharge — rides a `scope` caveat, not the key (§ *Discharge flows*,
   § *Scope tier*). Rotated by re-minting the anchor macaroon — a fresh
@@ -265,8 +266,8 @@ authorization*). Chain-MAC'd under `K_M`. The operator attenuates
 `(aud, sub, scope, exp)` — the `scope` first-party caveat
 names the authority class auth authorised (`mint:enroll`,
 `mint:exchange`, or `mint:admin`), and is what the gate clears against.
-Chain-MAC'd under the `r_tpc` recovered from the target `CID`; its nonce
-equals that `CID`. One discharge satisfies one TPC. The operator may
+Chain-MAC'd under the `r_tpc` recovered from the target `CID`, with a
+random nonce. One discharge satisfies one TPC. The operator may
 attenuate it before use (e.g. the admin CLI appends `op=admin:<verb>`).
 
 **Role credentials carry no TPC** and so are not discharge anchors —
@@ -301,7 +302,7 @@ When the enrolling operator brings a coordinator in:
    `K_M-A` → recovers `(r_inv, OrgId)`, cross-checks the decoded `OrgId`
    against the session's, requires `mint:enroll ∈ session.scopes`,
    and mints a discharge: caveats `(sub, scope=mint:enroll,
-   exp=now+5min)`, chain-MAC'd under `r_inv`, nonce = `CID`. A
+   exp=now+5min)`, chain-MAC'd under `r_inv`. A
    session lacking the scope → `403`.
 3. The operator conveys the discharge to the coordinator (inert bytes).
    The coordinator presents `[invite ⊕ sub/cnf, coordinator PoP,
@@ -323,8 +324,7 @@ When the exchanging operator brings an approved coordinator online:
 1. The CLI fetches a discharge against the **ticket's** `CID` (the
    coordinator's ticket carries it), `scope: "mint:exchange"` — auth
    recovers `r_xchg`, requires `mint:exchange ∈ session.scopes`, and
-   mints `(sub, scope=mint:exchange, exp)` with
-   nonce = the ticket `CID`.
+   mints `(sub, scope=mint:exchange, exp)`.
 2. The operator conveys the discharge to the coordinator. The
    coordinator presents `[ticket, discharge]` + PoP at
    `/v1/enroll-exchange`, once per role.
@@ -341,8 +341,8 @@ verb):
 
 1. The CLI fetches a discharge against the admin service token's `CID`,
    `scope: "mint:admin"` — auth recovers `r_adm`, requires `admin ∈
-   session.scopes`, mints `(sub, scope=mint:admin, exp)` with
-   nonce = `CID`. One fetch covers every admin verb in the window; the
+   session.scopes`, mints `(sub, scope=mint:admin, exp)`. One
+   fetch covers every admin verb in the window; the
    verb is bound per call by the attenuation below, not by the discharge.
 2. The CLI attenuates `op=admin:<verb>` onto the service token, bundles
    `[service token, discharge]`, PoP-signs the attenuated tail with the
@@ -453,9 +453,10 @@ Use cases this opens up:
   valid.
 
 The cryptography is just recursion of the basic TPC mechanism — no
-new primitives. The API shape (flat `discharges` list, matched by
-nonce) accommodates either extension without a wire change. The
-verifier's queue walk handles either without a routine change.
+new primitives. The API shape (flat `discharges` list, matched
+positionally to the chain's TPCs) accommodates either extension
+without a wire change. The verifier's queue walk handles either
+without a routine change.
 
 Out of scope for the initial implementation: caching shape for
 multi-discharge bundles (each discharge could in principle be
@@ -714,7 +715,7 @@ The `cid` is the invite's, the ticket's, or the admin service token's
 `mint:exchange`, or `mint:admin`). Auth requires `scope ∈ session.scopes`
 and stamps it as a `scope` caveat on the returned discharge, which is
 otherwise `(sub, exp)`, chain-MAC'd under the `r_tpc`
-recovered from `CID`, nonce = `CID`. `401` session expired, `403` session
+recovered from `CID`. `401` session expired, `403` session
 lacks the scope, `422` `CID` decode failure (signals `K_M-A` rotation).
 
 ### Auth service — mint-facing
