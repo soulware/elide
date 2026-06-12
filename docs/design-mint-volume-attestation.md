@@ -8,14 +8,14 @@ provenance, the `names/<name>` claim).
 
 ## The gap this closes
 
-Today a role's per-volume scoping field rides the PoP-signed request
-**body** as `req.volume`, classed as *honest-but-unverified*
-(`design-mint.md` § *Request body*). For `volume-rw` the policy ARN is
-`by_id/{{req.volume}}/*` and `req.volume` is self-asserted: a compromised
-or malicious coordinator can request RW credentials scoped to **any**
-volume's prefix. Per-volume read credentials self-assert the same way.
-The only thing standing between coordinators on that path is per-segment
-signing catching bad *data* on read — which is integrity, not access
+Before this work a role's per-volume scoping field rode the PoP-signed
+request **body** as `req.volume`, classed as *honest-but-unverified*.
+For `volume-rw` the policy ARN was
+`by_id/{{req.volume}}/*` with `req.volume` self-asserted: a compromised
+or malicious coordinator could request RW credentials scoped to **any**
+volume's prefix. Per-volume read credentials self-asserted the same way.
+The only thing standing between coordinators on that path was
+per-segment signing catching bad *data* on read — integrity, not access
 control.
 
 The goal is to make the per-volume scoping value **attested** rather than
@@ -662,8 +662,8 @@ The self-asserted `req.*` namespace is **removed from the template
 language** entirely, not kept alongside the attested one. Its only
 template-substituted member was the scoping value (`req.volume`), and
 that becomes `attested.volume`; its other members were never substituted
-(see below). This supersedes `design-mint.md` § *Request body*'s
-"honest-but-unverified `req.volume`" class.
+(see below). `design-mint.md` § *Templating* / § *Request body* carry
+the canonical statement.
 
 The resulting invariant — **every `{{…}}` template value is MAC-verified
 or server-side, none self-asserted**:
@@ -693,10 +693,8 @@ removal unchanged as plain request *parameters*:
   gated against the `role` caveat, `ttl` capped by `min(exp, role.max,
   …)`. Neither is ever `{{…}}`-substituted, so neither needs a template
   namespace; they remain request inputs.
-- **Demo `prefix`** — the demo/mint-as-auth roles substituted a
-  self-asserted `req.prefix`; it relocates to server-side `env.*`
-  (simplest, given demo-only-forever). Noted so it is reworked, not
-  silently broken.
+- **Demo `prefix`** — the demo roles scope to the server-side
+  `env.prefix` (simplest, given demo-only-forever).
 
 Because `attested.*` is the only volume-scoping source, the provenance
 trap is closed by construction: the scoping volume comes solely from a
@@ -705,11 +703,10 @@ first-party caveat a caller could append.
 
 ### Every substitution is declared per role and sealed
 
-The per-role `[role.template]` contract (`design-mint.md`; the
-`req`/`caveat` declared-key contract) extends to cover **all four**
-template namespaces, so every `{{…}}` a role's policy can substitute is
-explicitly listed in config and MAC'd into the seal — no implicit surface
-remains:
+The per-role `[role.template]` contract (`design-mint.md` § *Declared
+template contract*) covers the two request-coupled namespaces, so every
+discharge-attested or caveat-bound `{{…}}` a role's policy can
+substitute is explicitly listed in config and MAC'd into the seal:
 
 ```toml
 [env]                       # global; all operator-defined values
@@ -720,33 +717,23 @@ name = "volume-rw"
 [role.template]
 caveat   = ["sub"]          # MAC under K_M, from the primary
 attested = ["volume"]       # MAC under r, from the discharge
-env      = ["bucket"]       # ⊆ the global [env] table
-mint     = []               # ⊆ the closed MINT_KEYS server set
 ```
 
-Seal authoring (`validate_policy_surface`) enforces two checks per
-namespace, both already applied to `req`/`caveat` and now to all four:
+Seal authoring (`validate_policy_surface`) enforces, per namespace:
 
-1. **declared ⊆ authoritative** — each declared key exists in its
-   authority: `env` keys in the global `[env]` table, `mint` keys in
-   `MINT_KEYS`, `attested` keys in the protocol's attestable set (today
-   `{volume}`), `caveat` names in the issuable set.
-2. **used ⊆ declared** — every `{{ns.X}}` token in the policy template is
-   in that role's declared list for `ns`, exact match (catches a
-   `{{env.buckt}}` typo or a dropped binding).
+1. **The authority check** — each `env` token names a key in the global
+   `[env]` table, each `mint` token a `MINT_KEYS` value. For `attested`
+   the declaration *is* the authority — the names are the attestation
+   authority's vocabulary, opaque to mint like the `mode` — constrained
+   only to be **disjoint from the reserved control-caveat names**, so an
+   attested name can never shadow a primary's MAC-bound control caveat.
+2. **used ⊆ declared** — every `{{attested.X}}` / `{{caveat.X}}` token in
+   the policy template is in that role's declared list, exact match
+   (catches a typo or a dropped binding).
 
-For `env` the chain is therefore **used ⊆ declared ⊆ `[env]`**: the
-global table may hold values many roles never see, and each role narrows
-to the subset its template actually substitutes. The contract is sealed
+The contract is sealed
 into `SealedRole` and MAC'd, so request-time enforcement runs against the
 authored requirement, not a drifted local config.
-
-> **Delta to `design-mint.md`** (apply when this is implemented): extend
-> the `[role.template]` contract from `{req, caveat}` to
-> `{caveat, attested, env, mint}`, dropping `req`; widen
-> `validate_policy_surface` to run *declared ⊆ authoritative* + *used ⊆
-> declared* for `env`/`mint`/`attested` (it already does for the others);
-> relocate the demo `prefix` to `[env]`.
 
 ## The attestation coordinator is a true (limited) coord instance
 
@@ -941,10 +928,10 @@ allows it; pin with vectors only where it does not.
   `{{…}}` value is MAC-verified (`caveat.*`/`attested.*`) or server-side
   (`env.*`/`mint.*`); a discharge is required wherever a sealed policy
   references `attested.*` (so `volume-rw`/`volume-ro`, by construction).
-  `role` / `ttl` remain request parameters; demo `prefix` relocates to
-  `env.*`. All four template namespaces are declared per role in
-  `[role.template]` and sealed (see *Every template value is MAC-verified
-  or server-side*).
+  `role` / `ttl` remain request parameters; the demo roles scope to the
+  server-side `env.prefix`. The `attested`/`caveat` substitution surface
+  is declared per role in `[role.template]` and sealed (see *Every
+  substitution is declared per role and sealed*).
 - **Possession-proof binding** is fixed (see that section): domain-tagged
   Ed25519 over `owned ‖ target ‖ blake3(cid) ‖ ts ‖ nonce`, `blake3(cid)`
   the anti-transfer binding.
@@ -973,21 +960,22 @@ allows it; pin with vectors only where it does not.
   silently. Mirrors `mint_client.rs`'s wire-format reimplementation; the
   vectors are mandatory because the canonical MAC lives in an unlinkable
   crate (see *coord B mints the discharge*).
-- **`attested.*` is a closed, reserved-disjoint registry; the discharge
-  vocabulary is closed per type.** Attested growth is **named scalar
-  caveats, never a map** — multiple attested fields are multiple named
-  scalar caveats `(name, value)` (the existing caveat type), so the "all
-  caveats are scalar" invariant in `design-mint.md` is never revised. The
-  names are only safe if the space is fenced, by two invariants:
-  - **`ATTESTABLE ∩ RESERVED = ∅`** (asserted as a constant). `attested.*`
-    is the protocol's *attestable set* — today `{volume}` — and mint pulls
-    attested values **by name from that set**, never "whatever the
-    discharge carries". `validate_policy_surface`'s *declared ⊆
-    authoritative* already rejects a declared `attested` key outside the
-    set; the disjointness assertion additionally forbids the set from ever
-    *containing* a reserved control name (`aud, exp, sub, cnf, op, role,
-    epoch, invite, Scope`). So `attested.sub` cannot exist —
-    coord B has no field named `sub` to emit — and the discharge's caveats
+- **`attested.*` is the role's declared, reserved-disjoint contract; the
+  discharge vocabulary is closed per type.** Attested growth is **named
+  scalar caveats, never a map** — multiple attested fields are multiple
+  named scalar caveats `(name, value)` (the existing caveat type), so the
+  "all caveats are scalar" invariant in `design-mint.md` is never
+  revised. The names are only safe if the space is fenced, by two
+  invariants:
+  - **declared ∩ RESERVED = ∅** (enforced at seal authoring). A role's
+    declared `[role.template] attested` list is itself the registry —
+    mint hard-codes no attestable vocabulary, staying as agnostic to the
+    authority's names as it is to the `mode` — and mint pulls attested
+    values **by name from that sealed set**, never "whatever the
+    discharge carries". Seal authoring rejects a declared name that
+    collides with a reserved control name (`aud, exp, sub, cnf, op,
+    role, epoch, invite, scope`). So `attested.sub` cannot exist —
+    no sealed contract can name `sub` — and the discharge's caveats
     are never flattened into `caveat.*`, so a discharge value can never
     shadow the primary's MAC-bound `caveat.sub`.
   - **The discharge's caveat vocabulary is closed per discharge type and

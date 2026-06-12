@@ -52,8 +52,9 @@ pub trait KeypairMinter: Send + Sync {
 /// Build a mint-issued IAM policy name.
 ///
 /// Format: `mint_<role>_<scope>_<expiry>_<nonce>`
-/// - `role`: role slug (e.g. `volume-rw`, `volume-ro`).
-/// - `scope`: volume ULID for volume-scoped roles, `global` otherwise.
+/// - `role`: the role slug.
+/// - `scope`: the role's attested values joined by `-`, `global` for a
+///   role that attests none.
 /// - `expiry`: basic ISO 8601 UTC (`YYYYMMDDTHHMMSSZ`) of the policy's
 ///   `DateLessThan` — sorts lexically = chronologically in the Tigris
 ///   console.
@@ -61,7 +62,8 @@ pub trait KeypairMinter: Send + Sync {
 ///   uniqueness within a single (role, scope, second) bucket.
 ///
 /// All characters are in IAM's policy-name charset (`[\w+=,.@-]{1,128}`).
-/// `_` separates fields; `-` only appears inside the role slug.
+/// `_` separates fields; `-` only appears inside the role and scope
+/// segments.
 pub fn policy_name(role: &str, scope: Option<&str>, expiry: DateTime<Utc>) -> String {
     let scope = scope.unwrap_or("global");
     let expiry_compact = expiry.format("%Y%m%dT%H%M%SZ");

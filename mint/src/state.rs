@@ -75,11 +75,11 @@ pub const STATE_PREFIX: &str = "_mint";
 pub const K_M_A_FILE: &str = "auth-shared.key";
 
 /// Filename for the on-disk K_M-B (the TPC-CID wrapping key shared with
-/// the attestation coordinator) under `<data_dir>/`. Same 64-hex-byte,
+/// the attestation authority) under `<data_dir>/`. Same 64-hex-byte,
 /// mode-0600 shape and custody as [`K_M_A_FILE`]. Distinct from K_M-A
-/// even when one coordinator plays both the auth and attestation roles,
+/// even when one party plays both the auth and attestation roles,
 /// so the two discharge vocabularies decrypt under different keys and
-/// cannot be confused (`docs/design-mint-volume-attestation.md`).
+/// cannot be confused (`docs/design-mint.md` § *Attestation contract*).
 pub const K_M_B_FILE: &str = "attestation-shared.key";
 
 /// Filename for the on-disk K_session (the login-session root) under

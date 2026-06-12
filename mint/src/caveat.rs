@@ -4,10 +4,8 @@
 //! § *Macaroon caveat conventions*): it does not hard-code which
 //! first-party caveat names are meaningful. A first-party caveat is a
 //! `(name, value)` pair; **every first-party caveat is scalar**. There
-//! is no list-valued caveat type — the only list-shaped input a role
-//! ever needed (the `volume-ro` ancestor set) rides the PoP-signed
-//! request body as `req.ancestors`, not the caveat chain
-//! (design-mint.md § *All caveats are scalar*).
+//! is no list-valued caveat type (design-mint.md § *All caveats are
+//! scalar*).
 //!
 //! Third-party caveats carry `(location, VID, CID)` and discharge
 //! verification (`docs/design-auth-service.md`); they're not scalar
@@ -59,6 +57,12 @@ pub mod name {
     /// single value on a discharge (scalar-cleared at the gate). Coined,
     /// so lowercase like the other coined names (`op`/`role`/`invite`).
     pub const SCOPE: &str = "scope";
+
+    /// Every reserved control-caveat name. A role's declared `attested`
+    /// contract must be disjoint from this set (enforced at seal
+    /// authoring), so an attested name can never shadow a primary's
+    /// MAC-bound control caveat.
+    pub const RESERVED: &[&str] = &[AUD, EXP, SUB, CNF, OP, ROLE, EPOCH, INVITE, SCOPE];
 }
 
 /// `Scope` caveat values — the authority classes auth grants and each

@@ -401,7 +401,7 @@ pub async fn exchange(
 
 /// Parse `NAME=VALUE` narrowing-caveat args. mint is
 /// caveat-vocabulary-agnostic, so the client is too: no name is
-/// special-cased (`elide:Volume`, `exp`, anything).
+/// special-cased.
 fn parse_caveats(args: &[String]) -> Result<Vec<(String, String)>, ClientError> {
     args.iter()
         .map(|a| match a.split_once('=') {

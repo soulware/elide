@@ -159,7 +159,7 @@ enum ClientCmd {
         #[arg(long, value_name = "JSON")]
         req: Option<String>,
         /// Narrowing caveat to attenuate the credential with (repeatable).
-        /// Vocabulary-agnostic — e.g. `--caveat elide:Volume=01VOL`.
+        /// Vocabulary-agnostic — e.g. `--caveat exp=1750000000`.
         #[arg(long = "caveat", value_name = "NAME=VALUE")]
         caveat: Vec<String>,
         #[arg(long, default_value_t = 900)]

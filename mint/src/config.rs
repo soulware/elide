@@ -86,10 +86,10 @@ pub enum ConfigError {
         used: Vec<String>,
     },
     #[error(
-        "role {role}: declared attested name {key:?} is not in the attestable \
-         registry"
+        "role {role}: declared attested name {key:?} collides with a reserved \
+         control-caveat name"
     )]
-    UnknownAttestedKey { role: String, key: String },
+    ReservedAttestedKey { role: String, key: String },
     #[error(
         "role {role}: declared caveat names {declared:?} do not match the \
          template's {{{{caveat.X}}}} tokens {used:?}"
@@ -331,8 +331,7 @@ pub struct RawAttestation {
     /// Opaque context sealed verbatim into the attested caveat's CID and
     /// interpreted by the attestation authority alone. mint never
     /// inspects it — it carries whatever the authority's vocabulary
-    /// needs (e.g. `volume-rw` / `volume-ro` for volume attestation).
-    /// Defaults to the role name; set explicitly only when the
+    /// needs. Defaults to the role name; set explicitly only when the
     /// authority's mode name differs from the role name.
     #[serde(default)]
     pub mode: Option<String>,
@@ -346,8 +345,10 @@ pub struct RawAttestation {
 #[derive(Debug, Default, Deserialize)]
 pub struct RawTemplate {
     /// The `attested.*` names the template substitutes — the keys it
-    /// expects a discharge to attest. Each must be in the closed
-    /// [`crate::template::ATTESTABLE`] registry. Absent = the empty set
+    /// expects a discharge to attest. The declared set is itself the
+    /// authoritative registry for the role's `{{attested.X}}`; each name
+    /// must be disjoint from the reserved control-caveat names
+    /// ([`crate::caveat::name::RESERVED`]). Absent = the empty set
     /// (the template must reference no `attested.*`).
     #[serde(default)]
     pub attested: Vec<String>,
@@ -487,7 +488,7 @@ pub struct Role {
     /// attestation. When `Some`, mint stamps an attested third-party
     /// caveat onto the credential at issuance, carrying this string
     /// verbatim for the attestation authority
-    /// (`docs/design-mint-volume-attestation.md`).
+    /// (`docs/design-mint.md` § *Attestation contract*).
     pub attestation_mode: Option<String>,
 }
 
@@ -614,13 +615,13 @@ impl Config {
     ///    surfaces it at publish instead.
     /// 3. Every `{{env.X}}` names a key present in `[env]`, every
     ///    `{{mint.X}}` names a [`crate::template::MINT_KEYS`] value, and
-    ///    every declared `{{attested.X}}` names a key in
-    ///    [`crate::template::ATTESTABLE`] — the closed-to-a-known-set
-    ///    namespaces.
+    ///    no declared `attested` name collides with a reserved
+    ///    control-caveat name ([`crate::caveat::name::RESERVED`]) — the
+    ///    declared set is itself the authoritative `attested` registry.
     /// 4. The template's `{{attested.X}}` and `{{caveat.X}}` tokens match
     ///    the role's declared `attested`/`caveat` contract exactly. A typo
-    ///    (`{{attested.volm}}` vs declared `volume`) or a dropped binding
-    ///    (a `coord-rw` template forgetting `{{caveat.sub}}`) fails at
+    ///    (`{{caveat.sb}}` vs declared `sub`) or a dropped binding
+    ///    (a template forgetting `{{caveat.sub}}`) fails at
     ///    publish instead of silently mis-scoping a live credential. The
     ///    declared set is what gets sealed and enforced at request time.
     ///
@@ -664,12 +665,16 @@ impl Config {
                     });
                 }
             }
-            // Every declared attested name must be in the closed attestable
-            // registry — `declared ⊆ authoritative`, the same shape as the
-            // `env`/`mint` checks above.
+            // The declared `attested` set is itself the authoritative
+            // registry for `{{attested.X}}` — the names are the
+            // authority's vocabulary, opaque to mint like the attestation
+            // `mode`. What seal authoring enforces is the fencing
+            // invariant: no declared name may collide with a reserved
+            // control-caveat name, so `attested.X` can never shadow a
+            // primary's MAC-bound control caveat.
             for key in &role.attested {
-                if !crate::template::ATTESTABLE.contains(&key.as_str()) {
-                    return Err(ConfigError::UnknownAttestedKey {
+                if crate::caveat::name::RESERVED.contains(&key.as_str()) {
+                    return Err(ConfigError::ReservedAttestedKey {
                         role: role.name.clone(),
                         key: key.clone(),
                     });
@@ -1041,18 +1046,40 @@ caveat = ["sub"]"#,
     }
 
     #[test]
-    fn declared_attested_name_outside_registry_fails_seal() {
-        // `declared ⊆ authoritative`: a declared attested name not in the
-        // closed ATTESTABLE registry is rejected at publish.
+    fn reserved_attested_name_fails_seal() {
+        // The fencing invariant: a declared attested name that collides
+        // with a reserved control-caveat name is rejected at publish, so
+        // `attested.X` can never shadow a primary's MAC-bound control
+        // caveat. Every reserved name is rejected, not just `sub`.
+        for reserved in crate::caveat::name::RESERVED {
+            let policy = format!(r#"{{"r":"{{{{attested.{reserved}}}}}"}}"#);
+            let cfg = parse_for_test(
+                &contract_toml(&format!(r#"attested = ["{reserved}"]"#)),
+                &[("r.json", policy.as_str())],
+            )
+            .expect("load tolerates a contract that fails the surface check");
+            assert!(
+                matches!(
+                    cfg.validate_policy_surface(),
+                    Err(ConfigError::ReservedAttestedKey { key, .. }) if key == *reserved
+                ),
+                "reserved name {reserved:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_attested_names_are_the_registry() {
+        // The declared set is itself the authority: a non-reserved name
+        // unknown to any global registry seals fine when declaration and
+        // template agree.
         let cfg = parse_for_test(
             &contract_toml(r#"attested = ["region"]"#),
             &[("r.json", r#"{"r":"{{attested.region}}"}"#)],
         )
-        .expect("load tolerates a contract that fails the surface check");
-        assert!(matches!(
-            cfg.validate_policy_surface(),
-            Err(ConfigError::UnknownAttestedKey { key, .. }) if key == "region"
-        ));
+        .expect("cfg");
+        cfg.validate_policy_surface()
+            .expect("a declared, non-reserved attested name is valid");
     }
 
     #[test]
