@@ -95,7 +95,7 @@ async fn handle_invite(State(state): State<AppState>, headers: HeaderMap, body: 
 }
 
 /// Run verify+clear against the request bundle in
-/// `Authorization: MintV1 mnt1_<admin-service>,mnt1_<discharge>`. The
+/// `Authorization: MintV1 mnt2_<admin-service>,mnt2_<discharge>`. The
 /// admin-service primary must verify under `K_M`, its third-party caveat
 /// must be satisfied by the accompanying discharge (under the `r`
 /// recovered from the TPC's `VID`), the aggregated caveats must clear

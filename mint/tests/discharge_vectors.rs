@@ -18,7 +18,7 @@
 //! test with `MINT_EMIT_VECTORS=1`, which rewrites the fixture in place.
 
 use mint::caveat::{Caveat, name};
-use mint::macaroon::{self, DISCHARGE_KID};
+use mint::macaroon::{self, KeyRef};
 use mint::tpc;
 
 /// Canonical inputs. Chosen deterministic and non-trivial; the same `r`
@@ -57,7 +57,7 @@ fn vectors_json() -> String {
     let cid_volume_ro = tpc::encrypt_cid_attested(&k_m_b(), &r(), CLIENT_ID, ORG_ID, MODE_RO);
     let wire = macaroon::mint_under_key_with_nonce(
         &r(),
-        DISCHARGE_KID,
+        KeyRef::Discharge,
         nonce(),
         vec![
             Caveat::scalar("volume", VOLUME),
@@ -76,7 +76,6 @@ fn vectors_json() -> String {
             "  \"cid\": \"{}\",\n",
             "  \"cid_volume_ro\": \"{}\",\n",
             "  \"discharge_nonce\": \"{}\",\n",
-            "  \"discharge_kid\": {},\n",
             "  \"volume\": \"{}\",\n",
             "  \"exp\": \"{}\",\n",
             "  \"discharge_wire\": \"{}\"\n",
@@ -90,7 +89,6 @@ fn vectors_json() -> String {
         hex(&cid),
         hex(&cid_volume_ro),
         hex(&nonce()),
-        DISCHARGE_KID,
         VOLUME,
         EXP,
         wire,

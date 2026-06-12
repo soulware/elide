@@ -13,7 +13,7 @@ use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::issuance::{AttestedTpc, mint_credential};
 use mint::keyring::Keyring;
-use mint::macaroon::{DISCHARGE_KID, Macaroon, mint, mint_under_key};
+use mint::macaroon::{KeyRef, Macaroon, mint, mint_under_key};
 use mint::pop;
 use mint::state::Store;
 use mint::tpc;
@@ -166,7 +166,7 @@ fn discharge_for(primary: &Macaroon) -> Option<Macaroon> {
     let pt = tpc::decrypt_cid_attested(&K_M_B, &cid).expect("recover r from attested cid");
     Some(mint_under_key(
         &pt.r,
-        DISCHARGE_KID,
+        KeyRef::Discharge,
         vec![
             Caveat::scalar("volume", VOLUME),
             Caveat::scalar(name::EXP, far_future().to_string()),
@@ -263,7 +263,7 @@ async fn missing_attested_value_is_rejected_before_render() {
         .r;
     let bare_discharge = mint_under_key(
         &r,
-        DISCHARGE_KID,
+        KeyRef::Discharge,
         vec![Caveat::scalar(name::EXP, far_future().to_string())],
     );
 

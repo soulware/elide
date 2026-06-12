@@ -36,7 +36,7 @@ use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op, scope};
 use crate::config::Config;
 use crate::iam::{self, KeypairMinter};
 use crate::issuance;
-use crate::macaroon::Macaroon;
+use crate::macaroon::{KeyRef, Macaroon};
 use crate::pop;
 use crate::role::{self, Denied};
 use crate::sealed_cache::SealState;
@@ -137,7 +137,7 @@ fn not_sealed(request_id: &str) -> Response {
 }
 
 /// A `(primary, discharges)` bundle parsed from
-/// `Authorization: MintV1 mnt1_<b64url>[,mnt1_<b64url>...]`. Primary is
+/// `Authorization: MintV1 mnt2_<b64url>[,mnt2_<b64url>...]`. Primary is
 /// positionally first; discharges follow in the order they
 /// position-match the primary's TPCs. Used at the verify+clear
 /// endpoints.
@@ -149,7 +149,7 @@ pub struct Bundle {
 /// Parse `Authorization: MintV1 <m>[,<m>...]` into a bundle. Single
 /// macaroon → bundle with empty discharges. The scheme name is
 /// `MintV1` at every macaroon-bearing endpoint; the payload's
-/// per-macaroon `mnt1_` prefix keeps individual macaroons greppable
+/// per-macaroon `mnt2_` prefix keeps individual macaroons greppable
 /// in logs even when concatenated.
 pub fn extract_bundle(headers: &HeaderMap) -> Option<Bundle> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
@@ -267,12 +267,12 @@ impl VerifyClearError {
 /// (`/v1/assume-role`, `/v1/verify`) invoke this; assume-role layers
 /// role-specific clearing and IAM issuance on top of the result.
 ///
-/// The bundle's *primary* must be mint-issued: its `kid` names a
-/// generation in mint's keyring and the chain seed verifies under
-/// `K_M`. Discharges carry the reserved
-/// [`DISCHARGE_KID`](crate::macaroon::DISCHARGE_KID) — never a keyring
-/// generation — so a discharge presented as the primary fails as
-/// `unknown_kid`.
+/// The bundle's *primary* must be mint-issued: a [`KeyRef::Keyring`]
+/// macaroon whose kid names a generation in mint's keyring, the chain
+/// seed verifying under `K_M`. Each entry in the discharges array must
+/// carry [`KeyRef::Discharge`]. Both checks are structural — a
+/// discharge presented as the primary, or a credential smuggled in as
+/// a discharge, is rejected before any MAC work.
 ///
 /// `aud`/`op` clear **per macaroon** against the request context, not
 /// over a flattened union: the primary must positively carry
@@ -292,8 +292,11 @@ pub fn verify_and_clear(
     expected_aud: &str,
     expected_op: &str,
 ) -> Result<ClearedBundle, VerifyClearError> {
+    let KeyRef::Keyring(primary_kid) = bundle.primary.key_ref() else {
+        return Err(VerifyClearError::Auth("primary_not_credential"));
+    };
     let primary_key = keyring
-        .get(bundle.primary.kid())
+        .get(primary_kid)
         .copied()
         .ok_or(VerifyClearError::Auth("unknown_kid"))?;
 
@@ -315,6 +318,9 @@ pub fn verify_and_clear(
                 .discharges
                 .get(discharge_cursor)
                 .ok_or(VerifyClearError::Auth("tpc_undischarged"))?;
+            if discharge.key_ref() != KeyRef::Discharge {
+                return Err(VerifyClearError::Auth("not_a_discharge"));
+            }
             discharge_cursor += 1;
             work.push_back((discharge.clone(), r, false));
         }
@@ -1190,7 +1196,7 @@ fn denied_tag(d: &Denied) -> &'static str {
 }
 
 /// `POST /v1/verify`. The bundle (`primary` + any discharges) is in
-/// `Authorization: MintV1 mnt1_<…>,mnt1_<…>`; the body is `{ts}` only —
+/// `Authorization: MintV1 mnt2_<…>,mnt2_<…>`; the body is `{ts}` only —
 /// PoP freshness, signed under the primary's `cnf` over the request
 /// bytes. Runs the shared [`verify_and_clear`] core (chain MACs +
 /// `aud`/`op`/`cnf`+PoP/`exp` clears) and returns the verdict + the

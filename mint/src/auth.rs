@@ -22,16 +22,16 @@
 //!
 //! ```text
 //! request body:  { "subject": "<opaque>" }
-//! 200 OK:        { "session": "mnt1_<base64url>" }
+//! 200 OK:        { "session": "mnt2_<base64url>" }
 //! ```
 //!
 //! Wire (`POST /v1/discharge`):
 //!
 //! ```text
-//! Authorization: Bearer mnt1_<session>
+//! Authorization: Bearer mnt2_<session>
 //! request body:  { "cid": "<base64url of the anchor's TPC CID>",
 //!                  "scope": "mint:enroll" | "mint:exchange" | "mint:admin" }
-//! 200 OK:        { "discharge": "mnt1_<base64url>" }
+//! 200 OK:        { "discharge": "mnt2_<base64url>" }
 //! 403:           session valid but does not grant the requested scope
 //! ```
 //!
@@ -39,12 +39,12 @@
 //! authorization decision; `403` otherwise), then decrypt `cid` under
 //! `K_M-A` ([`tpc::decrypt_cid`]) to recover `(r, client_id, org_id)` —
 //! no `K_M`, no per-client state — and reject if `org_id` is not the org
-//! this role serves. Mint a macaroon at `kid = DISCHARGE_KID`, chain
-//! MAC'd under that `r`, caveats `aud`, `sub` (the session subject — the
+//! this role serves. Mint a discharge macaroon chain-MAC'd under that
+//! `r`, caveats `aud`, `sub` (the session subject — the
 //! authenticated human, in the discharge's own context), `Scope` (the
 //! requested class, cleared by the gate), `exp`. `org_id`/`client_id` are
-//! not stamped as caveats — nothing reads them; the org is checked here
-//! and `client_id` only derives `r`. No `op`: per-op narrowing is the
+//! not stamped as caveats — nothing reads them; the org is checked
+//! here. No `op`: per-op narrowing is the
 //! caller's attenuation onto the primary (the PoP'd anchor), so one
 //! discharge satisfies every op that primary is attenuated for. Mint's verifier
 //! recovers the same `r` from the primary's `vid`
@@ -70,7 +70,7 @@ use serde_json::json;
 
 use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op, scope};
 use crate::http::AppState;
-use crate::macaroon::{DISCHARGE_KID, Macaroon, SESSION_KID, mint_under_key};
+use crate::macaroon::{KeyRef, Macaroon, mint_under_key};
 use crate::tpc;
 
 /// Demo discharge lifetime. Long enough for a CLI command to round-trip
@@ -179,7 +179,7 @@ fn mint_session(k_session: &[u8; 32], subject: &str, now_unix: u64) -> Macaroon 
         GrantedScopes::canonical(&[scope::MINT_ENROLL, scope::MINT_EXCHANGE, scope::MINT_ADMIN]);
     mint_under_key(
         k_session,
-        SESSION_KID,
+        KeyRef::Session,
         vec![
             Caveat::scalar(name::OP, op::SESSION),
             Caveat::scalar(name::SUB, subject),
@@ -206,6 +206,9 @@ pub fn verify_session(
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or(())?;
     let mac = Macaroon::decode(token.trim()).map_err(|_| ())?;
+    if mac.key_ref() != KeyRef::Session {
+        return Err(());
+    }
     if !mac.verify_under_key(k_session) {
         return Err(());
     }
@@ -309,7 +312,7 @@ async fn issue_discharge(
     let exp = now_unix + DISCHARGE_EXP_SECONDS;
     let discharge = mint_under_key(
         &pt.r,
-        DISCHARGE_KID,
+        KeyRef::Discharge,
         vec![
             // The discharge declares its own audience and clears it
             // per-macaroon at the bundle, like the primary.
@@ -318,7 +321,7 @@ async fn issue_discharge(
             // discharge's own context, never reconciled with the primary's
             // `sub` (the machine). `org_id`/`client_id` from the CID are
             // not re-stamped as caveats: nothing reads them, the org is
-            // already checked above, and `client_id` only derives `r`.
+            // already checked above.
             Caveat::scalar(name::SUB, &claims.subject),
             Caveat::scalar(name::SCOPE, &req.scope),
             Caveat::scalar(name::EXP, exp.to_string()),
@@ -379,7 +382,7 @@ mod tests {
         // grants all three, leaving nothing to escalate to).
         let narrow = mint_under_key(
             &k,
-            crate::macaroon::SESSION_KID,
+            KeyRef::Session,
             vec![
                 Caveat::scalar(name::OP, op::SESSION),
                 Caveat::scalar(name::SUB, "alice"),
@@ -423,7 +426,7 @@ mod tests {
     fn non_session_op_rejected() {
         let m = mint_under_key(
             &[21u8; 32],
-            SESSION_KID,
+            KeyRef::Session,
             vec![
                 Caveat::scalar(name::OP, "not-session"),
                 Caveat::scalar(name::SUB, "alice"),

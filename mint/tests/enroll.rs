@@ -17,7 +17,7 @@ use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::issuance::{mint_credential_ticket, mint_invite};
 use mint::keyring::Keyring;
-use mint::macaroon::{DISCHARGE_KID, Macaroon, mint_under_key};
+use mint::macaroon::{KeyRef, Macaroon, mint_under_key};
 use mint::pop;
 use mint::state::{K_M_A_FILE, K_M_B_FILE, Store};
 use mint::tpc;
@@ -173,13 +173,13 @@ fn gate_scope(m: &Macaroon) -> Option<&'static str> {
 /// Mint the operator discharge a gate clears, the way auth (or the
 /// colocated demo) would: recover `r` from the anchor's TPC `CID` under
 /// `K_M-A` and chain-MAC a discharge carrying `(aud, sub, Scope, exp)`
-/// under it, at `DISCHARGE_KID`. `sub` is the authenticated human in the
+/// under it. `sub` is the authenticated human in the
 /// discharge's own context; `aud` clears per-macaroon like the primary's.
 fn gate_discharge(cid: &[u8], scope: &str) -> Macaroon {
     let pt = tpc::decrypt_cid(&K_M_A, cid).expect("cid decrypts under K_M-A");
     mint_under_key(
         &pt.r,
-        DISCHARGE_KID,
+        KeyRef::Discharge,
         vec![
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::SUB, "usr_test"),
@@ -196,7 +196,7 @@ fn volume_discharge(cid: &[u8]) -> Macaroon {
     let pt = tpc::decrypt_cid_attested(&K_M_B, cid).expect("cid decrypts under K_M-B");
     mint_under_key(
         &pt.r,
-        DISCHARGE_KID,
+        KeyRef::Discharge,
         vec![
             Caveat::scalar("volume", VOLUME),
             Caveat::scalar(name::EXP, far_future().to_string()),

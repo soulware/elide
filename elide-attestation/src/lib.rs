@@ -89,7 +89,7 @@ pub struct DischargeRequest {
     pub proof: String,
 }
 
-/// `POST /v1/discharge` response: the `mnt1_` discharge macaroon.
+/// `POST /v1/discharge` response: the `mnt2_` discharge macaroon.
 #[derive(Debug, Clone, Serialize)]
 pub struct DischargeResponse {
     pub discharge: String,
@@ -464,7 +464,7 @@ mod tests {
     async fn volume_rw_discharge_succeeds_and_returns_a_macaroon() {
         let f = live_volume_rw().await;
         let wire = f.state.discharge(f.request()).await.expect("discharge");
-        assert!(wire.starts_with("mnt1_"), "wire was {wire}");
+        assert!(wire.starts_with("mnt2_"), "wire was {wire}");
     }
 
     #[tokio::test]
@@ -738,7 +738,7 @@ mod tests {
             .discharge(ctx.request_for(ctx.parent))
             .await
             .expect("fork parent is in the read set");
-        assert!(wire.starts_with("mnt1_"));
+        assert!(wire.starts_with("mnt2_"));
     }
 
     #[tokio::test]
@@ -749,7 +749,7 @@ mod tests {
             .discharge(ctx.request_for(ctx.extent))
             .await
             .expect("extent source is in the read set");
-        assert!(wire.starts_with("mnt1_"));
+        assert!(wire.starts_with("mnt2_"));
     }
 
     #[tokio::test]
@@ -760,7 +760,7 @@ mod tests {
             .discharge(ctx.request_for(ctx.owned))
             .await
             .expect("owned is its own read set member");
-        assert!(wire.starts_with("mnt1_"));
+        assert!(wire.starts_with("mnt2_"));
     }
 
     #[tokio::test]

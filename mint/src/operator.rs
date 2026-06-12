@@ -265,7 +265,7 @@ mod tests {
         let op = Operator::load(dir.path()).unwrap();
         let discharge = crate::macaroon::mint_under_key(
             &[7u8; 32],
-            crate::macaroon::DISCHARGE_KID,
+            crate::macaroon::KeyRef::Discharge,
             vec![Caveat::scalar(name::SUB, "alice")],
         );
         let body = br#"{"ts":1700000000}"#;

@@ -63,9 +63,9 @@ use elide_coordinator::identity::CoordinatorIdentity;
 use crate::credential::{AuthorizedTarget, CredentialIssuer, Credentialer, IssuedCredentials};
 
 /// Wire prefix for a base64url-encoded mint macaroon — must match
-/// `mint::macaroon::WIRE_PREFIX`. `mnt1` = mint macaroon, wire
-/// generation 1.
-const WIRE_PREFIX: &str = "mnt1_";
+/// `mint::macaroon::WIRE_PREFIX`. `mnt2` = mint macaroon, wire
+/// generation 2.
+const WIRE_PREFIX: &str = "mnt2_";
 const NONCE_LEN: usize = 16;
 
 /// Per-step type tag in the canonical MsgPack encoding (first element
@@ -199,12 +199,14 @@ fn first_party(name: impl Into<String>, value: impl Into<String>) -> Caveat {
 
 /// A decoded mint macaroon. The coordinator only ever decodes one mint
 /// gave it, appends narrowing caveats, and re-encodes — it has no root
-/// key, so it neither mints nor verifies. The `kid` is preserved
-/// opaquely through the round-trip so re-encoded bytes match what mint
-/// will accept (kid is part of the MAC seed, not the wire-level chain
-/// extension — so attenuation doesn't touch it).
+/// key, so it neither mints nor verifies. The keyref (which key roots
+/// the chain — `[0, kid]` for a keyring credential, `[1]` for a
+/// discharge) is preserved opaquely through the round-trip so
+/// re-encoded bytes match what mint will accept (the keyref is part of
+/// the MAC seed, not the wire-level chain extension — so attenuation
+/// doesn't touch it).
 pub(crate) struct WireMacaroon {
-    kid: u16,
+    key_ref: Vec<u64>,
     nonce: [u8; NONCE_LEN],
     caveats: Vec<Caveat>,
     mac: [u8; 32],
@@ -215,7 +217,7 @@ impl WireMacaroon {
         let body = s
             .trim()
             .strip_prefix(WIRE_PREFIX)
-            .ok_or_else(|| io::Error::other("credential macaroon: missing mnt1_ prefix"))?;
+            .ok_or_else(|| io::Error::other("credential macaroon: missing mnt2_ prefix"))?;
         let buf = BASE64_URL
             .decode(body)
             .map_err(|_| io::Error::other("credential macaroon: base64url decode failed"))?;
@@ -226,11 +228,17 @@ impl WireMacaroon {
         if env_len != 4 {
             return Err(io::Error::other("credential macaroon: envelope shape"));
         }
-        let kid_u64: u64 = rmp::decode::read_int(&mut r)
+        let kr_len = rmp::decode::read_array_len(&mut r)
             .map_err(|_| io::Error::other("credential macaroon: truncated"))?;
-        let kid: u16 = kid_u64
-            .try_into()
-            .map_err(|_| io::Error::other("credential macaroon: kid overflow"))?;
+        if kr_len == 0 || kr_len > 8 {
+            return Err(io::Error::other("credential macaroon: keyref shape"));
+        }
+        let mut key_ref = Vec::with_capacity(kr_len as usize);
+        for _ in 0..kr_len {
+            let v: u64 = rmp::decode::read_int(&mut r)
+                .map_err(|_| io::Error::other("credential macaroon: truncated"))?;
+            key_ref.push(v);
+        }
         let nonce = read_bin_fixed::<NONCE_LEN>(&mut r)?;
         let mac = read_bin_fixed::<32>(&mut r)?;
         let count = rmp::decode::read_array_len(&mut r)
@@ -243,7 +251,7 @@ impl WireMacaroon {
             return Err(io::Error::other("credential macaroon: trailing bytes"));
         }
         Ok(Self {
-            kid,
+            key_ref,
             nonce,
             caveats,
             mac,
@@ -292,7 +300,15 @@ impl WireMacaroon {
     pub(crate) fn encode(&self) -> String {
         let mut buf = Vec::new();
         rmp::encode::write_array_len(&mut buf, 4).expect("vec writer");
-        rmp::encode::write_uint(&mut buf, self.kid as u64).expect("vec writer");
+        let kr_len: u32 = self
+            .key_ref
+            .len()
+            .try_into()
+            .expect("keyref length fits u32");
+        rmp::encode::write_array_len(&mut buf, kr_len).expect("vec writer");
+        for v in &self.key_ref {
+            rmp::encode::write_uint(&mut buf, *v).expect("vec writer");
+        }
         rmp::encode::write_bin(&mut buf, &self.nonce).expect("vec writer");
         rmp::encode::write_bin(&mut buf, &self.mac).expect("vec writer");
         let count: u32 = self
@@ -612,7 +628,7 @@ impl MintEndpoint {
     /// Proves possession of `owned`'s `volume.key` over a fresh
     /// `(ts, nonce)` bound to the opaque `cid`, names the volume for coord
     /// B's liveness lookup (`read_volume_name` reads it from the volume's
-    /// own dir), and returns the `mnt1_` discharge to attach to the
+    /// own dir), and returns the `mnt2_` discharge to attach to the
     /// `assume-role` bundle. coord B authenticates the request by the
     /// possession proof in the body, not the mint PoP headers. Which
     /// `(owned, target)` shapes coord B accepts is the CID's baked
@@ -954,8 +970,8 @@ mod tests {
     /// Build a wire macaroon the way `mint/src/macaroon.rs` does, so
     /// the coordinator's decode/attenuate/encode is checked against the
     /// real construction without depending on the mint crate. Mirrors
-    /// the v4 wire format: canonical MsgPack envelope, base64url-no-pad
-    /// encoded, `mnt1_` prefix.
+    /// the v5 wire format: canonical MsgPack envelope with a keyring
+    /// keyref, base64url-no-pad encoded, `mnt2_` prefix.
     fn mint_like(
         root: &[u8; 32],
         kid: u16,
@@ -963,10 +979,14 @@ mod tests {
         caveats: &[(&str, &str)],
     ) -> String {
         let cs: Vec<Caveat> = caveats.iter().map(|(n, v)| first_party(*n, *v)).collect();
-        const DOMAIN: &[u8] = b"mint-macaroon-v4";
+        const DOMAIN: &[u8] = b"mint-macaroon-v5";
+        let mut kr_bytes = Vec::new();
+        rmp::encode::write_array_len(&mut kr_bytes, 2).unwrap();
+        rmp::encode::write_uint(&mut kr_bytes, 0).unwrap();
+        rmp::encode::write_uint(&mut kr_bytes, kid as u64).unwrap();
         let mut seed_msg = Vec::new();
         seed_msg.extend_from_slice(DOMAIN);
-        seed_msg.extend_from_slice(&kid.to_be_bytes());
+        seed_msg.extend_from_slice(&kr_bytes);
         seed_msg.extend_from_slice(&nonce);
         let mut key = *blake3::keyed_hash(root, &seed_msg).as_bytes();
         for c in &cs {
@@ -974,7 +994,7 @@ mod tests {
         }
         let mut buf = Vec::new();
         rmp::encode::write_array_len(&mut buf, 4).unwrap();
-        rmp::encode::write_uint(&mut buf, kid as u64).unwrap();
+        buf.extend_from_slice(&kr_bytes);
         rmp::encode::write_bin(&mut buf, &nonce).unwrap();
         rmp::encode::write_bin(&mut buf, &key).unwrap();
         rmp::encode::write_array_len(&mut buf, cs.len() as u32).unwrap();
@@ -994,18 +1014,18 @@ mod tests {
         );
         let m = WireMacaroon::decode(&wire).expect("decode");
         assert_eq!(m.caveats.len(), 2);
-        assert_eq!(m.kid, 0);
+        assert_eq!(m.key_ref, vec![0, 0]);
         assert_eq!(m.encode(), wire);
     }
 
     #[test]
-    fn kid_is_preserved_through_roundtrip() {
+    fn key_ref_is_preserved_through_roundtrip() {
         // Coordinator never minted, never verifies, never rotates —
-        // its only obligation is to hand back the kid bytes it
-        // received so mint's verifier picks the same generation.
+        // its only obligation is to hand back the keyref bytes it
+        // received so mint's verifier picks the same key.
         let wire = mint_like(&[7u8; 32], 5, [3u8; NONCE_LEN], &[("aud", "mint")]);
         let m = WireMacaroon::decode(&wire).expect("decode");
-        assert_eq!(m.kid, 5);
+        assert_eq!(m.key_ref, vec![0, 5]);
         assert_eq!(m.encode(), wire);
     }
 
@@ -1093,7 +1113,7 @@ mod tests {
         // different authorities; coord A must pick the attestation one by
         // its location, not by position.
         let m = WireMacaroon {
-            kid: 0,
+            key_ref: vec![0, 0],
             nonce: [0u8; NONCE_LEN],
             mac: [0u8; 32],
             caveats: vec![
@@ -1211,7 +1231,7 @@ mod tests {
             .discharge(req)
             .await
             .expect("coord B accepts coord A's volume-rw request");
-        assert!(wire.starts_with("mnt1_"), "discharge wire was {wire}");
+        assert!(wire.starts_with("mnt2_"), "discharge wire was {wire}");
     }
 
     #[tokio::test]
@@ -1338,6 +1358,6 @@ mod tests {
             .discharge(req)
             .await
             .expect("coord B accepts coord A's volume-ro request");
-        assert!(wire.starts_with("mnt1_"), "discharge wire was {wire}");
+        assert!(wire.starts_with("mnt2_"), "discharge wire was {wire}");
     }
 }

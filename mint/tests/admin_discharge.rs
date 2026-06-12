@@ -25,7 +25,7 @@ use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::keyring::Keyring;
-use mint::macaroon::{DISCHARGE_KID, Macaroon, mint_under_key};
+use mint::macaroon::{KeyRef, Macaroon, mint_under_key};
 use mint::pop;
 use mint::state::Store;
 use tower::ServiceExt;
@@ -242,7 +242,7 @@ async fn happy_path_discharge_then_invite_read() {
     let (mint_router, auth_router, _dir) = app().await;
     let token = admin_service();
     let discharge = fetch_discharge(auth_router, &admin_service_cid(&token)).await;
-    assert_eq!(discharge.kid(), DISCHARGE_KID);
+    assert_eq!(discharge.key_ref(), KeyRef::Discharge);
 
     let body = format!(r#"{{"ts":{}}}"#, now());
     let req = admin_request(
@@ -477,7 +477,7 @@ async fn discharge_with_foreign_session_rejected() {
     let token = admin_service();
     let foreign = mint_under_key(
         &[0xAAu8; 32],
-        mint::macaroon::SESSION_KID,
+        mint::macaroon::KeyRef::Session,
         vec![
             Caveat::scalar(name::OP, mint::caveat::op::SESSION),
             Caveat::scalar(name::SUB, "intruder"),
@@ -550,7 +550,7 @@ async fn forged_discharge_under_wrong_r_rejected() {
     let token = admin_service();
     let forged = mint_under_key(
         &[0x11u8; 32],
-        DISCHARGE_KID,
+        KeyRef::Discharge,
         vec![
             Caveat::scalar(name::SUB, "operator-alice"),
             Caveat::scalar(name::EXP, (now() + 300).to_string()),

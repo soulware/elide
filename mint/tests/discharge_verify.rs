@@ -13,7 +13,7 @@ use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::keyring::Keyring;
-use mint::macaroon::{self, DISCHARGE_KID, Macaroon};
+use mint::macaroon::{self, KeyRef, Macaroon};
 use mint::pop;
 use mint::state::Store;
 use mint::tpc;
@@ -132,7 +132,7 @@ fn recover_r(primary: &Macaroon) -> [u8; 32] {
 fn build_discharge(r: [u8; 32]) -> Macaroon {
     macaroon::mint_under_key(
         &r,
-        DISCHARGE_KID,
+        KeyRef::Discharge,
         vec![
             Caveat::scalar("Subject", "usr_demo"),
             Caveat::scalar(name::EXP, "2099999999"),
@@ -177,7 +177,7 @@ fn coord_b_discharge(primary: &Macaroon) -> Macaroon {
     let pt = tpc::decrypt_cid_attested(&K_M_B, &cid).expect("recover r from attested cid");
     macaroon::mint_under_key(
         &pt.r,
-        DISCHARGE_KID,
+        KeyRef::Discharge,
         vec![Caveat::scalar(name::EXP, "2099999999")],
     )
 }
