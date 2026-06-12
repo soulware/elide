@@ -33,7 +33,6 @@
 use std::io;
 
 use rand_core::{OsRng, RngCore};
-use subtle::ConstantTimeEq;
 use ulid::Ulid;
 
 const MAGIC: &str = "v2";
@@ -80,7 +79,8 @@ pub enum Caveat {
 pub struct Macaroon {
     nonce: [u8; NONCE_LEN],
     caveats: Vec<Caveat>,
-    mac: [u8; 32],
+    // Held as blake3::Hash so tag comparison (`==`) is constant-time.
+    mac: blake3::Hash,
 }
 
 impl Macaroon {
@@ -148,7 +148,7 @@ impl Macaroon {
         format!(
             "{MAGIC}.{}.{}.{}",
             encode_hex(&self.nonce),
-            encode_hex(&self.mac),
+            self.mac.to_hex(),
             encode_hex(&blob),
         )
     }
@@ -173,7 +173,7 @@ impl Macaroon {
             .next()
             .ok_or_else(|| io::Error::other("malformed macaroon"))?;
         let nonce = decode_hex_fixed::<NONCE_LEN>(nonce_hex)?;
-        let mac = decode_hex_fixed::<32>(mac_hex)?;
+        let mac = blake3::Hash::from_bytes(decode_hex_fixed::<32>(mac_hex)?);
         let blob = decode_hex(cav_hex)?;
         let caveats = deserialize_caveats(&blob)?;
         Ok(Self {
@@ -203,17 +203,17 @@ pub fn mint(root_key: &[u8; 32], caveats: Vec<Caveat>) -> Macaroon {
 /// [`check_caveats`].
 pub fn verify(root_key: &[u8; 32], m: &Macaroon) -> bool {
     let expected = chain_mac(root_key, &m.nonce, &m.caveats);
-    expected.ct_eq(&m.mac).into()
+    expected == m.mac
 }
 
-fn chain_mac(root_key: &[u8; 32], nonce: &[u8; NONCE_LEN], caveats: &[Caveat]) -> [u8; 32] {
+fn chain_mac(root_key: &[u8; 32], nonce: &[u8; NONCE_LEN], caveats: &[Caveat]) -> blake3::Hash {
     let mut seed_msg = Vec::with_capacity(DOMAIN.len() + NONCE_LEN);
     seed_msg.extend_from_slice(DOMAIN);
     seed_msg.extend_from_slice(nonce);
-    let mut key = *blake3::keyed_hash(root_key, &seed_msg).as_bytes();
+    let mut key = blake3::keyed_hash(root_key, &seed_msg);
     for c in caveats {
         let step = serialize_one(c);
-        key = *blake3::keyed_hash(&key, &step).as_bytes();
+        key = blake3::keyed_hash(key.as_bytes(), &step);
     }
     key
 }
@@ -228,9 +228,9 @@ impl Macaroon {
     /// adding a caveat can only restrict the token's authority.
     pub fn attenuate(mut self, c: Caveat) -> Macaroon {
         let step = serialize_one(&c);
-        let new_mac = blake3::keyed_hash(&self.mac, &step);
+        let new_mac = blake3::keyed_hash(self.mac.as_bytes(), &step);
         self.caveats.push(c);
-        self.mac = *new_mac.as_bytes();
+        self.mac = new_mac;
         self
     }
 }

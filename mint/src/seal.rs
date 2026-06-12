@@ -26,7 +26,6 @@ use std::collections::BTreeMap;
 use std::io;
 
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 
 use crate::config::Config;
 use crate::keyring::{Keyring, Kid};
@@ -163,7 +162,7 @@ impl Seal {
             mac: String::new(),
         };
         let mac = seal.compute_mac(keyring.current_key());
-        seal.mac = hex32(&mac);
+        seal.mac = mac.to_hex().to_string();
         seal
     }
 
@@ -176,8 +175,8 @@ impl Seal {
             .get(self.kid)
             .ok_or(SealError::UnknownKid(self.kid))?;
         let expected = self.compute_mac(key);
-        let actual = unhex32(&self.mac).ok_or(SealError::BadMac)?;
-        if bool::from(expected.ct_eq(&actual)) {
+        let actual = blake3::Hash::from_hex(&self.mac).map_err(|_| SealError::BadMac)?;
+        if expected == actual {
             Ok(())
         } else {
             Err(SealError::BadMac)
@@ -199,7 +198,7 @@ impl Seal {
     /// serialised by `serde_json::to_vec` with `mac` cleared to the
     /// empty string — deterministic for the field set used (small
     /// object, no floats, BTreeMap ordering is stable).
-    fn compute_mac(&self, key: &[u8; 32]) -> [u8; 32] {
+    fn compute_mac(&self, key: &[u8; 32]) -> blake3::Hash {
         let canonical = Seal {
             audience: self.audience.clone(),
             roles: self.roles.clone(),
@@ -212,7 +211,7 @@ impl Seal {
         let mut msg = Vec::with_capacity(SEAL_DOMAIN.len() + body.len());
         msg.extend_from_slice(SEAL_DOMAIN);
         msg.extend_from_slice(&body);
-        *blake3::keyed_hash(key, &msg).as_bytes()
+        blake3::keyed_hash(key, &msg)
     }
 
     /// Verify the seal pins exactly the role surface `config` carries
@@ -297,8 +296,7 @@ impl Seal {
 /// `policy_blake3` in the seal, so the sealed cache must hash with this
 /// to compare cached bytes against the seal.
 pub fn hash_hex(bytes: &[u8]) -> String {
-    let h = blake3::hash(bytes);
-    hex32(h.as_bytes())
+    blake3::hash(bytes).to_hex().to_string()
 }
 
 /// Canonical serialisation of the `[env]` map — the bytes hashed into
@@ -308,21 +306,6 @@ pub fn hash_hex(bytes: &[u8]) -> String {
 pub(crate) fn canonical_env_bytes(env: &BTreeMap<String, String>) -> Vec<u8> {
     // A String→String map cannot fail to serialise.
     serde_json::to_vec_pretty(env).expect("serialise env map")
-}
-
-fn hex32(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
 }
 
 /// `mint serve` startup: resolve the template-seal state
@@ -598,7 +581,7 @@ policy_file = "volume-ro.json"
         // BadMac before UnknownKid: we want to confirm kid-lookup
         // fires first.
         let mac = seal.compute_mac(kr.current_key());
-        seal.mac = hex32(&mac);
+        seal.mac = mac.to_hex().to_string();
         assert!(matches!(seal.verify(&kr), Err(SealError::UnknownKid(99))));
     }
 
