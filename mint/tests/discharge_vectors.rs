@@ -41,6 +41,20 @@ fn nonce() -> [u8; macaroon::NONCE_LEN] {
     }
     n
 }
+fn cid_nonce() -> [u8; tpc::AEAD_NONCE_LEN] {
+    let mut n = [0u8; tpc::AEAD_NONCE_LEN];
+    for (i, b) in n.iter_mut().enumerate() {
+        *b = (0xa0 + i) as u8;
+    }
+    n
+}
+fn cid_nonce_ro() -> [u8; tpc::AEAD_NONCE_LEN] {
+    let mut n = [0u8; tpc::AEAD_NONCE_LEN];
+    for (i, b) in n.iter_mut().enumerate() {
+        *b = (0xb0 + i) as u8;
+    }
+    n
+}
 const CLIENT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const ORG_ID: &str = "org_demo";
 const MODE: &str = "volume-rw";
@@ -53,8 +67,16 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn vectors_json() -> String {
-    let cid = tpc::encrypt_cid_attested(&k_m_b(), &r(), CLIENT_ID, ORG_ID, MODE);
-    let cid_volume_ro = tpc::encrypt_cid_attested(&k_m_b(), &r(), CLIENT_ID, ORG_ID, MODE_RO);
+    let cid =
+        tpc::encrypt_cid_attested_with_nonce(&k_m_b(), &cid_nonce(), &r(), CLIENT_ID, ORG_ID, MODE);
+    let cid_volume_ro = tpc::encrypt_cid_attested_with_nonce(
+        &k_m_b(),
+        &cid_nonce_ro(),
+        &r(),
+        CLIENT_ID,
+        ORG_ID,
+        MODE_RO,
+    );
     let wire = macaroon::mint_under_key_with_nonce(
         &r(),
         KeyRef::Discharge,

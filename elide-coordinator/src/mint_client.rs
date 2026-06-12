@@ -971,7 +971,7 @@ mod tests {
     /// Build a wire macaroon the way `mint/src/macaroon.rs` does, so
     /// the coordinator's decode/attenuate/encode is checked against the
     /// real construction without depending on the mint crate. Mirrors
-    /// the v5 wire format: canonical MsgPack envelope with a keyring
+    /// the v6 wire format: canonical MsgPack envelope with a keyring
     /// keyref, base64url-no-pad encoded, `mnt2_` prefix.
     fn mint_like(
         root: &[u8; 32],
@@ -980,7 +980,7 @@ mod tests {
         caveats: &[(&str, &str)],
     ) -> String {
         let cs: Vec<Caveat> = caveats.iter().map(|(n, v)| first_party(*n, *v)).collect();
-        const DOMAIN: &[u8] = b"mint-macaroon-v5";
+        const DOMAIN: &[u8] = b"mint-macaroon-v6";
         let mut kr_bytes = Vec::new();
         rmp::encode::write_array_len(&mut kr_bytes, 2).unwrap();
         rmp::encode::write_uint(&mut kr_bytes, 0).unwrap();

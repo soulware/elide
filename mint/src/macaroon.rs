@@ -49,7 +49,7 @@ use crate::keyring::{Keyring, Kid};
 /// macaroon, wire generation 2".
 pub const WIRE_PREFIX: &str = "mnt2_";
 
-const DOMAIN: &[u8] = b"mint-macaroon-v5";
+const DOMAIN: &[u8] = b"mint-macaroon-v6";
 pub const NONCE_LEN: usize = 16;
 
 /// Per-step type tag in the canonical MsgPack encoding (first element

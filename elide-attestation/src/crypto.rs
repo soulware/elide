@@ -5,8 +5,9 @@
 //! `docs/design-mint-volume-attestation.md` § *coord B mints the
 //! discharge*). So the two primitives coord B needs are re-expressed here:
 //!
-//! - [`decrypt_cid_attested`] — AES-GCM-SIV(`K_M-B`) over an attested TPC's
-//!   CID, recovering `r ‖ lp(client_id) ‖ lp(org_id) ‖ lp(mode)`. The twin
+//! - [`decrypt_cid_attested`] — ChaCha20-Poly1305(`K_M-B`) over an attested
+//!   TPC's CID (`nonce ‖ ciphertext`, the nonce its leading 12 bytes),
+//!   recovering `r ‖ lp(client_id) ‖ lp(org_id) ‖ lp(mode)`. The twin
 //!   of mint's `tpc::decrypt_cid_attested`.
 //! - [`mint_discharge_with_nonce`] — a keyless chained-BLAKE3 macaroon
 //!   rooted at the recovered `r`, carrying the discharge keyref, its
@@ -25,17 +26,18 @@
 //! *verifies* a discharge (mint does). A test-only [`encrypt_cid_attested`]
 //! is the exact inverse of the decrypt half, used to construct
 //! discharge-predicate fixtures for `mode`s the shared vector omits; it is
-//! pinned to the canonical layout by round-tripping the fixture CID.
+//! pinned to the canonical layout by re-sealing the fixture CID under the
+//! fixture's own nonce.
 
-use aes_gcm_siv::aead::{Aead, KeyInit};
-use aes_gcm_siv::{Aes256GcmSiv, Key, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
 /// Wire prefix for a base64url-encoded mint macaroon (`mint::macaroon`).
 const WIRE_PREFIX: &str = "mnt2_";
 /// Chain-seed domain separator (`mint::macaroon::DOMAIN`).
-const DOMAIN: &[u8] = b"mint-macaroon-v5";
+const DOMAIN: &[u8] = b"mint-macaroon-v6";
 /// Macaroon nonce length (`mint::macaroon::NONCE_LEN`).
 const NONCE_LEN: usize = 16;
 /// Per-step type tag for a first-party caveat (`mint::macaroon`). coord B
@@ -46,9 +48,9 @@ const TYPE_FIRST_PARTY: u64 = 0;
 /// A discharge's keyref is the MsgPack array `[1]` — no kid; the chain is
 /// rooted at `r`, not at a keyring generation.
 const KEYREF_DISCHARGE: u64 = 1;
-/// Fixed all-zero AEAD nonce. AES-GCM-SIV is misuse-resistant, so a fixed
-/// nonce yields deterministic, collision-safe ciphertext (`mint::tpc`).
-const FIXED_AEAD_NONCE: [u8; 12] = [0u8; 12];
+/// AEAD nonce length (`mint::tpc::AEAD_NONCE_LEN`): every sealed CID
+/// carries its nonce as the leading bytes.
+const AEAD_NONCE_LEN: usize = 12;
 
 /// The plaintext recovered from an attested TPC's CID — mint's
 /// `tpc::AttestedCidPlaintext`. `r` is the discharge-MAC root key; `mode`
@@ -83,9 +85,12 @@ pub enum CryptoError {
 /// `(r, client_id, org_id, mode)`. coord B alone holds `K_M-B`; mint sealed
 /// the CID at credential issuance via `tpc::encrypt_cid_attested`.
 pub fn decrypt_cid_attested(k_m_b: &[u8; 32], cid: &[u8]) -> Result<AttestedCid, CryptoError> {
-    let cipher = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(k_m_b));
+    let (nonce, ciphertext) = cid
+        .split_at_checked(AEAD_NONCE_LEN)
+        .ok_or(CryptoError::Aead)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(k_m_b));
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(&FIXED_AEAD_NONCE), cid)
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
         .map_err(|_| CryptoError::Aead)?;
     parse_attested_cid(&plaintext)
 }
@@ -111,13 +116,15 @@ fn parse_attested_cid(buf: &[u8]) -> Result<AttestedCid, CryptoError> {
 }
 
 /// Test-only inverse of [`decrypt_cid_attested`]: seal
-/// `r ‖ lp(client_id) ‖ lp(org_id) ‖ lp(mode)` under `K_M-B`. Production
-/// never seals CIDs — mint does — so this exists only to construct fixtures
-/// for `mode`s the shared vector does not carry. Its layout is pinned to the
-/// canonical one by `encrypt_reproduces_fixture_cid` below.
+/// `r ‖ lp(client_id) ‖ lp(org_id) ‖ lp(mode)` under `K_M-B` with the
+/// caller's nonce prepended. Production never seals CIDs — mint does — so
+/// this exists only to construct fixtures for `mode`s the shared vector
+/// does not carry. Its layout is pinned to the canonical one by
+/// `encrypt_reproduces_fixture_cid` below.
 #[cfg(test)]
 pub(crate) fn encrypt_cid_attested(
     k_m_b: &[u8; 32],
+    nonce: &[u8; AEAD_NONCE_LEN],
     r: &[u8; 32],
     client_id: &str,
     org_id: &str,
@@ -130,10 +137,14 @@ pub(crate) fn encrypt_cid_attested(
         plaintext.extend_from_slice(&len.to_be_bytes());
         plaintext.extend_from_slice(s.as_bytes());
     }
-    let cipher = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(k_m_b));
-    cipher
-        .encrypt(Nonce::from_slice(&FIXED_AEAD_NONCE), plaintext.as_slice())
-        .expect("aes-gcm-siv encrypt is infallible for this payload size")
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(k_m_b));
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(nonce), plaintext.as_slice())
+        .expect("chacha20-poly1305 encrypt is infallible for this payload size");
+    let mut sealed = Vec::with_capacity(AEAD_NONCE_LEN + ciphertext.len());
+    sealed.extend_from_slice(nonce);
+    sealed.extend_from_slice(&ciphertext);
+    sealed
 }
 
 fn read_length_prefixed_str(buf: &[u8], pos: &mut usize) -> Result<String, CryptoError> {
@@ -293,44 +304,52 @@ mod tests {
         assert_eq!(wire, v["discharge_wire"].as_str().unwrap());
     }
 
+    /// The nonce a fixture CID was sealed under — its leading bytes.
+    /// Re-sealing under it must reproduce the fixture byte-for-byte.
+    fn fixture_nonce(cid: &[u8]) -> [u8; AEAD_NONCE_LEN] {
+        cid[..AEAD_NONCE_LEN].try_into().expect("nonce prefix")
+    }
+
     #[test]
     fn volume_ro_fixture_cid_is_canonical() {
         // `cid_volume_ro` differs from `cid` only in the baked mode
-        // string. Same key, `r`, and identities, so the deterministic
-        // sealer pins it the same way `encrypt_reproduces_fixture_cid`
-        // pins the volume-rw CID.
+        // string and its nonce. Re-sealing under the fixture's own nonce
+        // pins it the same way `encrypt_reproduces_fixture_cid` pins the
+        // volume-rw CID.
         let v = vectors();
         let k_m_b = hex32(&v, "k_m_b");
         let r = hex32(&v, "r");
+        let fixture = decode_hex(v["cid_volume_ro"].as_str().unwrap()).unwrap();
         let cid = encrypt_cid_attested(
             &k_m_b,
+            &fixture_nonce(&fixture),
             &r,
             v["client_id"].as_str().unwrap(),
             v["org_id"].as_str().unwrap(),
             "volume-ro",
         );
-        assert_eq!(
-            elide_core::signing::encode_hex(&cid),
-            v["cid_volume_ro"].as_str().unwrap()
-        );
+        assert_eq!(cid, fixture);
     }
 
     #[test]
     fn encrypt_reproduces_fixture_cid() {
-        // AES-GCM-SIV with the fixed nonce is deterministic, so the test-only
-        // sealer must reproduce mint's canonical CID byte-for-byte — pinning
+        // ChaCha20-Poly1305 is deterministic for a fixed nonce, so the
+        // test-only sealer re-sealing under the fixture CID's own nonce
+        // must reproduce mint's canonical CID byte-for-byte — pinning
         // its layout to the same vector the decrypt half is pinned to.
         let v = vectors();
         let k_m_b = hex32(&v, "k_m_b");
         let r = hex32(&v, "r");
+        let fixture = decode_hex(v["cid"].as_str().unwrap()).unwrap();
         let cid = encrypt_cid_attested(
             &k_m_b,
+            &fixture_nonce(&fixture),
             &r,
             v["client_id"].as_str().unwrap(),
             v["org_id"].as_str().unwrap(),
             v["mode"].as_str().unwrap(),
         );
-        assert_eq!(cid, decode_hex(v["cid"].as_str().unwrap()).unwrap());
+        assert_eq!(cid, fixture);
     }
 
     #[test]
@@ -338,7 +357,14 @@ mod tests {
         let v = vectors();
         let k_m_b = hex32(&v, "k_m_b");
         let r = hex32(&v, "r");
-        let cid = encrypt_cid_attested(&k_m_b, &r, "client-x", "org-y", "volume-ro");
+        let cid = encrypt_cid_attested(
+            &k_m_b,
+            &[7u8; AEAD_NONCE_LEN],
+            &r,
+            "client-x",
+            "org-y",
+            "volume-ro",
+        );
         let pt = decrypt_cid_attested(&k_m_b, &cid).expect("decrypt");
         assert_eq!(pt.r, r);
         assert_eq!(pt.client_id, "client-x");
