@@ -3,16 +3,16 @@
 //! A role's policy template is **JSON** carrying `{{ ns.key }}` scalar
 //! substitution tokens, each token sitting inside a JSON *string value*.
 //! Four namespaces, each a flat scalar lookup — **every one MAC-verified
-//! or server-side, none self-asserted** (`docs/design-mint.md`
-//! § *Templating*):
+//! or server-side** (`docs/design-mint.md` § *Templating*):
 //!
 //! - `{{env.X}}`      — sealed server-side config (the `[env]` table).
 //! - `{{attested.X}}` — values attested by a discharge authority, carried
 //!   on the discharge and MAC'd under its `r`. Restricted to the role's
 //!   declared, sealed `attested` contract.
 //! - `{{mint.X}}`     — mint-computed (`mint.expiry`).
-//! - `{{caveat.X}}`   — MAC-verified caveat values on the primary (e.g.
-//!   `caveat.sub`).
+//! - `{{caveat.X}}`   — MAC-verified caveat values on the primary;
+//!   issuer-stamped (e.g. `caveat.sub`) or holder-appended
+//!   (self-attested attenuation).
 //!
 //! Rendering parses the template as JSON, substitutes into the string
 //! leaves, and re-serialises. Two security properties fall out of that
@@ -49,8 +49,8 @@ pub enum TemplateError {
         source: serde_json::Error,
     },
     /// A `{{…}}` token names a field absent from the render data. Strict:
-    /// a missing `req`/`env`/`mint`/`caveat` value fails the render closed,
-    /// never a silent empty string.
+    /// a missing `env`/`mint`/`attested`/`caveat` value fails the render
+    /// closed, never a silent empty string.
     #[error("policy for role {role:?} references unknown field '{field}'")]
     UnknownField { role: String, field: String },
     /// A `{{…}}` token is not a `namespace.key` scalar path (an unknown
@@ -125,9 +125,9 @@ fn classify_token(inner: &str) -> Option<(&str, &str)> {
 /// occurrence is omitted, so a holder cannot smuggle a forged value past
 /// the renderer by appending a contradictory copy under the trailing MAC.
 ///
-/// Each class has a distinct, explicit trust provenance, **none
-/// self-asserted**: `attested.*` discharge-MAC'd, `env.*` config,
-/// `mint.*` mint-computed, `caveat.*` primary-MAC'd.
+/// Each class has a distinct, explicit trust provenance: `attested.*`
+/// discharge-MAC'd, `env.*` config, `mint.*` mint-computed, `caveat.*`
+/// primary-MAC'd (issuer-stamped or holder-appended).
 pub fn render_policy(
     policy_template: &str,
     env: &BTreeMap<String, String>,
@@ -431,6 +431,28 @@ mod tests {
             !out.contains("FORGED"),
             "discharge sub bled into caveat.sub: {out}"
         );
+    }
+
+    #[test]
+    fn holder_appended_caveat_renders() {
+        // The `caveat.*` namespace is name-agnostic: a holder-appended
+        // `NAME=VALUE` attenuation renders exactly like the
+        // issuer-stamped `sub` — self-attested by documented contract
+        // (`docs/design-mint.md` § *Templating*), bound by the role's
+        // declared `caveat` list.
+        const TPL_TEAM: &str =
+            r#"{"Resource":["arn:aws:s3:::b/{{caveat.sub}}/{{caveat.team}}/*"]}"#;
+        let out = render_policy(
+            TPL_TEAM,
+            &env(),
+            &[],
+            &[],
+            &cv(&[("sub", "COORD1"), ("team", "blue")]),
+            "t",
+            "scratch",
+        )
+        .unwrap();
+        assert!(out.contains("b/COORD1/blue/*"), "got: {out}");
     }
 
     #[test]

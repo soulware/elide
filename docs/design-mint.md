@@ -1307,19 +1307,35 @@ distinct trust provenance:
   `mint.*` namespace is closed to this server-computed set; seal authoring
   rejects a template referencing any other `mint.X`, so an unknown key
   fails at publish, not at render.
-- `{{caveat.X}}` — the **MAC-verified** value of the macaroon's caveat
-  named `X`, as a plain path. v1 exposes one: `caveat.sub`, the
-  enrolment-immutable principal, for `coord-rw`'s own-identity prefix
-  (`coordinators/{{caveat.sub}}/*`). The value is sourced from the
-  verified caveat chain — never echoed through the request body — so it
-  is rooted in the mint's macaroon root and cannot be forged by the
-  caller. A name with ≥2 disagreeing occurrences resolves *unsatisfiable*
-  and is **omitted** (never collapsed to one of the disagreeing values),
-  so a `{{caveat.X}}` over it fails the render closed under strict mode —
-  a holder cannot smuggle a forged value past the renderer with a
-  contradictory appended copy. Only caveat names that are legal path
-  segments are referenceable; `sub` is, colon-namespaced names (`elide:…`)
-  are not, and none of those is a substitution source.
+- `{{caveat.X}}` — the **MAC-verified** value of the primary's
+  first-party caveat named `X`, as a plain path. The value is sourced
+  from the verified caveat chain — never echoed through the request
+  body — so it rides the credential itself: visible at `/v1/verify` and
+  in audit, undetachable without breaking the MAC. Any name that
+  resolves to a single value is exposed; the names a role's template may
+  bind are its declared contract (below). Within the namespace,
+  provenance is **per name, by who appended it**:
+  - **Issuer-stamped** — names mint itself seals at issuance (e.g.
+    `sub`, the enrolment-immutable principal, `coord-rw`'s own-identity
+    prefix `coordinators/{{caveat.sub}}/*`). Vouched by the issuance
+    path (re-minted from root after operator approval) and
+    holder-tamper-proof: a name with ≥2 disagreeing occurrences
+    resolves *unsatisfiable* and is **omitted** (never collapsed to one
+    of the disagreeing values), so a `{{caveat.X}}` over it fails the
+    render closed — a holder cannot smuggle a forged value past the
+    renderer with a contradictory appended copy.
+  - **Holder-appended** — any `NAME=VALUE` the holder attenuates onto
+    the credential (attenuation is vocabulary-agnostic). **Self-
+    attested**: the MAC proves the *holder* bound this credential to
+    that value — a commitment, not a vouched fact. A role binds a
+    holder-appended name only where the holder is the legitimate
+    authority for the value: self-partitioning inside a grant the role
+    already confers (a scratch/job prefix under the holder's own
+    subtree), or audit-visible labels. Where a third party must vouch
+    the value, that is `attested.*`; where the issuer must pin it, it
+    is issuer-stamped. A template that *widens* authority from a
+    holder-appended name grants on the holder's say-so — the role
+    author's declaration (below) is the explicit acceptance of that.
 
 A macaroon caveat plays two distinct, never-conflated roles. As a
 **predicate** it is *checked* — the role gate clears it against the
@@ -1330,8 +1346,12 @@ this verify/clear path is the only thing that grants or denies. As
 naming an absent key or anything that is not a `namespace.key`
 scalar path fails the render closed, never a silent empty string. The
 result: **every `{{…}}` template value is MAC-verified or server-side,
-none self-asserted** — `attested.*` discharge-MAC'd, `caveat.*`
-primary-MAC'd, `env.*` sealed config, `mint.*` mint-computed.
+and its provenance is explicit and attributable** — `attested.*`
+discharge-MAC'd (authority-vouched), `caveat.*` primary-MAC'd
+(issuer-stamped, or holder-appended self-attestation the role
+explicitly binds), `env.*` sealed config, `mint.*` mint-computed.
+Nothing reaches a policy through a side channel the verifier and audit
+log cannot see.
 
 #### Declared template contract
 
@@ -1392,6 +1412,12 @@ This completes a symmetric picture: every namespace's surface is validated
 at seal against an authoritative set — `env.*` against `[env]`, `mint.*`
 against the closed server set, and `attested.*` / `caveat.*` against the
 declared contract.
+
+For a holder-appended `caveat` name, the declaration is also where the
+trust decision is made and made visible: by declaring it, the role's
+author accepts the holder's self-attestation for that value
+(§ *Templating*), and the seal MACs that acceptance — it cannot creep
+in through a template edit alone.
 
 The mint **does not** ship a general-purpose policy DSL. The role-facing
 surface is scalar substitution of `{{env.*}}`, `{{mint.*}}`,
@@ -1589,8 +1615,11 @@ Caveats split into two kinds by where their value originates:
   approval (see *Credential macaroon & lifecycle*). A caller never alters any of
   them — an appended contradictory copy is unsatisfiable and fails
   closed, never silently dropped.
-- **Narrowing** — `exp`. Coordinator-appended, restricting an existing
-  grant's expiry for per-credential blast-radius reduction.
+- **Narrowing** — `exp`, plus any holder-appended `NAME=VALUE` a role's
+  template binds as `{{caveat.X}}`. Holder-appended, restricting an
+  existing grant — `exp` its expiry, a bound name its scope within the
+  role's grant — for per-credential blast-radius reduction. The bound
+  value is self-attested (§ *Templating*).
 
 Scalar scoping data a role names — the per-volume target
 `attested.volume` — is neither: it is not a capability the primary
@@ -1738,9 +1767,11 @@ unambiguous):
   discharge's `r`; Elide roles use `attested.volume` (the per-volume
   target), attested by the attestation coordinator.
 - `{{mint.X}}` — mint-computed at issuance; Elide uses `mint.expiry`.
-- `{{caveat.X}}` — MAC-verified caveat value; Elide uses `caveat.sub`
-  (a coordinator's own ULID, `coord-rw`'s own-identity prefix). Rooted in
-  the mint's macaroon root, not caller-asserted.
+- `{{caveat.X}}` — MAC-verified caveat value, issuer-stamped or
+  holder-appended (§ *Templating*); Elide uses the issuer-stamped
+  `caveat.sub` (a coordinator's own ULID, `coord-rw`'s own-identity
+  prefix), rooted in the mint's macaroon root. No Elide role binds a
+  holder-appended name.
 
 Notes:
 
