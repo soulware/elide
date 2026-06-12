@@ -39,7 +39,6 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use rand_core::{OsRng, RngCore};
-use subtle::ConstantTimeEq;
 
 use crate::caveat::Caveat;
 use crate::keyring::{Keyring, Kid};
@@ -90,7 +89,8 @@ pub struct Macaroon {
     key_ref: KeyRef,
     nonce: [u8; NONCE_LEN],
     caveats: Vec<Caveat>,
-    mac: [u8; 32],
+    // Held as blake3::Hash so tag comparison (`==`) is constant-time.
+    mac: blake3::Hash,
 }
 
 /// A third-party caveat encountered while walking a macaroon's chain,
@@ -172,18 +172,18 @@ fn serialize_key_ref(key_ref: &KeyRef) -> Vec<u8> {
 /// Initial chain tag: keyed BLAKE3 over `DOMAIN || keyref || nonce`.
 /// The keyref is bound here so a key recovered for one kind — or one
 /// keyring generation — cannot be replayed under a different claim.
-fn seed_mac(key: &[u8; 32], key_ref: &KeyRef, nonce: &[u8; NONCE_LEN]) -> [u8; 32] {
+fn seed_mac(key: &[u8; 32], key_ref: &KeyRef, nonce: &[u8; NONCE_LEN]) -> blake3::Hash {
     let kr = serialize_key_ref(key_ref);
     let mut seed_msg = Vec::with_capacity(DOMAIN.len() + kr.len() + NONCE_LEN);
     seed_msg.extend_from_slice(DOMAIN);
     seed_msg.extend_from_slice(&kr);
     seed_msg.extend_from_slice(nonce);
-    *blake3::keyed_hash(key, &seed_msg).as_bytes()
+    blake3::keyed_hash(key, &seed_msg)
 }
 
 /// One step of the chain MAC: `BLAKE3-keyed(prev_mac, serialize_one(c))`.
-fn step_mac(prev: &[u8; 32], c: &Caveat) -> [u8; 32] {
-    *blake3::keyed_hash(prev, &serialize_one(c)).as_bytes()
+fn step_mac(prev: &blake3::Hash, c: &Caveat) -> blake3::Hash {
+    blake3::keyed_hash(prev.as_bytes(), &serialize_one(c))
 }
 
 /// Walk the chain end-to-end. Used by [`Macaroon::verify`] and by
@@ -193,7 +193,7 @@ fn chain_mac(
     key_ref: &KeyRef,
     nonce: &[u8; NONCE_LEN],
     caveats: &[Caveat],
-) -> [u8; 32] {
+) -> blake3::Hash {
     let mut mac = seed_mac(key, key_ref, nonce);
     for c in caveats {
         mac = step_mac(&mac, c);
@@ -274,7 +274,7 @@ impl Macaroon {
     /// tail binds the proof to *this* exact attenuated macaroon
     /// (`docs/design-mint.md` § *Credential macaroon & lifecycle*, [`crate::pop`]).
     pub fn tail(&self) -> &[u8; 32] {
-        &self.mac
+        self.mac.as_bytes()
     }
 
     /// Hex of the nonce — a stable per-token identity for the audit log.
@@ -286,7 +286,7 @@ impl Macaroon {
     /// Caveats are AND-evaluated, so this can only restrict authority.
     pub fn attenuate(mut self, c: Caveat) -> Macaroon {
         let step = serialize_one(&c);
-        self.mac = *blake3::keyed_hash(&self.mac, &step).as_bytes();
+        self.mac = blake3::keyed_hash(self.mac.as_bytes(), &step);
         self.caveats.push(c);
         self
     }
@@ -316,7 +316,7 @@ impl Macaroon {
     /// different kind cannot verify under the same key.
     pub fn verify_under_key(&self, key: &[u8; 32]) -> bool {
         let expected = chain_mac(key, &self.key_ref, &self.nonce, &self.caveats);
-        expected.ct_eq(&self.mac).into()
+        expected == self.mac
     }
 
     /// Verify the chain MAC under `key` and return the third-party
@@ -332,7 +332,7 @@ impl Macaroon {
         for c in &self.caveats {
             if let Caveat::ThirdParty { location, vid, cid } = c {
                 sites.push(TpcSite {
-                    t_n_minus_1: mac,
+                    t_n_minus_1: *mac.as_bytes(),
                     location,
                     vid,
                     cid,
@@ -340,11 +340,7 @@ impl Macaroon {
             }
             mac = step_mac(&mac, c);
         }
-        if bool::from(mac.ct_eq(&self.mac)) {
-            Some(sites)
-        } else {
-            None
-        }
+        if mac == self.mac { Some(sites) } else { None }
     }
 
     /// Serialize to the wire form: `mnt2_<base64url-no-pad>` of the
@@ -354,7 +350,7 @@ impl Macaroon {
         rmp::encode::write_array_len(&mut buf, 4).expect("vec writer");
         buf.extend_from_slice(&serialize_key_ref(&self.key_ref));
         rmp::encode::write_bin(&mut buf, &self.nonce).expect("vec writer");
-        rmp::encode::write_bin(&mut buf, &self.mac).expect("vec writer");
+        rmp::encode::write_bin(&mut buf, self.mac.as_bytes()).expect("vec writer");
         // Caveats array: the elements are the same canonical MsgPack
         // bytes used as MAC-chain inputs (`serialize_one`), so the
         // envelope embeds them by extending the buffer directly.
@@ -392,7 +388,7 @@ impl Macaroon {
         let key_ref = decode_key_ref(&mut r)?;
 
         let nonce = read_bin_fixed::<NONCE_LEN>(&mut r)?;
-        let mac = read_bin_fixed::<32>(&mut r)?;
+        let mac = blake3::Hash::from_bytes(read_bin_fixed::<32>(&mut r)?);
 
         let count = rmp::decode::read_array_len(&mut r).map_err(|_| DecodeError::Truncated)?;
         let mut caveats = Vec::with_capacity(count as usize);
@@ -904,7 +900,9 @@ mod proptests {
             byte in 0usize..32, bit in 0u8..8,
         ) {
             let mut m = mint_under_key_with_nonce(&k, kr, nonce, caveats);
-            m.mac[byte] ^= 1 << bit;
+            let mut flipped = *m.mac.as_bytes();
+            flipped[byte] ^= 1 << bit;
+            m.mac = blake3::Hash::from_bytes(flipped);
             prop_assert!(!m.verify_under_key(&k));
         }
 

@@ -1262,7 +1262,6 @@ dependencies = [
  "rmp",
  "serde",
  "serde_json",
- "subtle",
  "tempfile",
  "tokio",
  "toml",

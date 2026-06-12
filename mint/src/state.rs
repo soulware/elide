@@ -58,7 +58,6 @@ use object_store::{
 };
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 
 use crate::keyring::{Keyring, Kid};
@@ -325,7 +324,7 @@ fn approval_mac(
     approved_at: &str,
     fingerprint_shown: &str,
     rev_epoch: u64,
-) -> [u8; 32] {
+) -> blake3::Hash {
     let mut msg = Vec::new();
     msg.extend_from_slice(APPROVAL_DOMAIN);
     append_len_prefixed(&mut msg, sub.as_bytes());
@@ -334,7 +333,7 @@ fn approval_mac(
     append_len_prefixed(&mut msg, approved_at.as_bytes());
     append_len_prefixed(&mut msg, fingerprint_shown.as_bytes());
     msg.extend_from_slice(&rev_epoch.to_be_bytes());
-    *blake3::keyed_hash(key, &msg).as_bytes()
+    blake3::keyed_hash(key, &msg)
 }
 
 /// MAC over a revocation-tombstone body. `sub` is folded in (it is the
@@ -346,14 +345,14 @@ fn tombstone_mac(
     rev_epoch: u64,
     revoked_by: &str,
     revoked_at: &str,
-) -> [u8; 32] {
+) -> blake3::Hash {
     let mut msg = Vec::new();
     msg.extend_from_slice(REVOKED_DOMAIN);
     append_len_prefixed(&mut msg, sub.as_bytes());
     msg.extend_from_slice(&rev_epoch.to_be_bytes());
     append_len_prefixed(&mut msg, revoked_by.as_bytes());
     append_len_prefixed(&mut msg, revoked_at.as_bytes());
-    *blake3::keyed_hash(key, &msg).as_bytes()
+    blake3::keyed_hash(key, &msg)
 }
 
 fn append_len_prefixed(out: &mut Vec<u8>, field: &[u8]) {
@@ -963,7 +962,7 @@ impl Store {
             fingerprint_shown,
             kid,
             rev_epoch,
-            mac: hex32(&mac),
+            mac: mac.to_hex().to_string(),
         };
         let bytes = serde_json::to_vec(&rec).map_err(|_| StateError::Corrupt)?;
         self.objects
@@ -1044,7 +1043,7 @@ impl Store {
             revoked_by: revoked_by.to_string(),
             revoked_at: now_iso8601.to_string(),
             kid,
-            mac: hex32(&mac),
+            mac: mac.to_hex().to_string(),
         };
         let bytes = serde_json::to_vec(&rec).map_err(|_| StateError::Corrupt)?;
         self.objects
@@ -1120,8 +1119,8 @@ impl Store {
             &rec.fingerprint_shown,
             rec.rev_epoch,
         );
-        let actual = unhex32(&rec.mac).ok_or(StateError::Corrupt)?;
-        if !bool::from(expected.ct_eq(&actual)) {
+        let actual = blake3::Hash::from_hex(&rec.mac).map_err(|_| StateError::Corrupt)?;
+        if expected != actual {
             tracing::warn!(
                 target: "mint::state",
                 sub,
@@ -1161,8 +1160,8 @@ impl Store {
             return Err(StateError::Forged);
         };
         let expected = tombstone_mac(key, sub, rec.rev_epoch, &rec.revoked_by, &rec.revoked_at);
-        let actual = unhex32(&rec.mac).ok_or(StateError::Corrupt)?;
-        if !bool::from(expected.ct_eq(&actual)) {
+        let actual = blake3::Hash::from_hex(&rec.mac).map_err(|_| StateError::Corrupt)?;
+        if expected != actual {
             tracing::warn!(
                 target: "mint::state",
                 sub,
@@ -1258,11 +1257,11 @@ impl Store {
             &rec.fingerprint_shown,
             rec.rev_epoch,
         );
-        let actual = match unhex32(&rec.mac) {
-            Some(a) => a,
-            None => return Ok(false),
+        let actual = match blake3::Hash::from_hex(&rec.mac) {
+            Ok(a) => a,
+            Err(_) => return Ok(false),
         };
-        if !bool::from(expected_old.ct_eq(&actual)) {
+        if expected_old != actual {
             return Ok(false);
         }
         let new_mac = approval_mac(
@@ -1281,7 +1280,7 @@ impl Store {
             fingerprint_shown: rec.fingerprint_shown,
             kid: kr.current_kid(),
             rev_epoch: rec.rev_epoch,
-            mac: hex32(&new_mac),
+            mac: new_mac.to_hex().to_string(),
         };
         let body = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
         let opts = PutOptions::from(PutMode::Update(object_store::UpdateVersion {
@@ -1371,14 +1370,14 @@ impl Store {
                 &rec.fingerprint_shown,
                 rec.rev_epoch,
             );
-            let actual = match unhex32(&rec.mac) {
-                Some(a) => a,
-                None => {
+            let actual = match blake3::Hash::from_hex(&rec.mac) {
+                Ok(a) => a,
+                Err(_) => {
                     report.skipped += 1;
                     continue;
                 }
             };
-            if !bool::from(expected.ct_eq(&actual)) {
+            if expected != actual {
                 report.skipped += 1;
                 tracing::warn!(
                     target: "mint::state",
@@ -1408,7 +1407,7 @@ impl Store {
                 fingerprint_shown: rec.fingerprint_shown,
                 kid: new_kid,
                 rev_epoch: rec.rev_epoch,
-                mac: hex32(&new_mac),
+                mac: new_mac.to_hex().to_string(),
             };
             let bytes = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
             self.objects
@@ -1451,14 +1450,14 @@ impl Store {
                 &rec.revoked_by,
                 &rec.revoked_at,
             );
-            let actual = match unhex32(&rec.mac) {
-                Some(a) => a,
-                None => {
+            let actual = match blake3::Hash::from_hex(&rec.mac) {
+                Ok(a) => a,
+                Err(_) => {
                     report.skipped += 1;
                     continue;
                 }
             };
-            if !bool::from(expected.ct_eq(&actual)) {
+            if expected != actual {
                 report.skipped += 1;
                 tracing::warn!(
                     target: "mint::state",
@@ -1484,7 +1483,7 @@ impl Store {
                 revoked_by: rec.revoked_by,
                 revoked_at: rec.revoked_at,
                 kid: new_kid,
-                mac: hex32(&new_mac),
+                mac: new_mac.to_hex().to_string(),
             };
             let bytes = serde_json::to_vec(&next).map_err(|_| StateError::Corrupt)?;
             self.objects
