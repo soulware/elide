@@ -48,7 +48,7 @@ fn mint_demo_config_loads() {
     // template namespace.
     let mut names: Vec<&str> = cfg.roles.keys().map(String::as_str).collect();
     names.sort_unstable();
-    assert_eq!(names, ["attested-write", "home", "read", "write"]);
+    assert_eq!(names, ["attested-write", "caveat-write", "read", "write"]);
     assert!(
         cfg.roles["attested-write"].attestation_mode.is_some(),
         "attested-write carries the attested TPC"

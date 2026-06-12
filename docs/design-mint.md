@@ -2391,7 +2391,7 @@ the full Elide role inventory below:
 
 - `read` / `write` — plain key-bound roles over a single server-side
   `{{env.prefix}}`; `{{env.X}}` + `{{mint.expiry}}` only, no TPC.
-- `home` — scopes to the credential's MAC-verified principal
+- `caveat-write` — scopes to the credential's MAC-verified principal
   (`{{env.prefix}}/{{caveat.sub}}/*`), adding `{{caveat.X}}`.
 - `attested-write` — declares `[role.attestation]`, so its credential
   carries an attested TPC and its policy substitutes all four

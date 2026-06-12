@@ -1,7 +1,7 @@
 {
   "Version": "2012-10-17",
   "Statement": [{
-    "Sid": "DemoHome",
+    "Sid": "DemoCaveatWrite",
     "Effect": "Allow",
     "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
     "Resource": ["arn:aws:s3:::{{env.bucket}}/{{env.prefix}}/{{caveat.sub}}/*"],

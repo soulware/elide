@@ -2,7 +2,7 @@
 #
 # Four roles, together exercising every template namespace. `read` /
 # `write` grant over a single server-side {{env.prefix}} ({{env.X}} +
-# {{mint.expiry}} only); `home` scopes to the credential's MAC-verified
+# {{mint.expiry}} only); `caveat-write` scopes to the credential's MAC-verified
 # principal ({{caveat.sub}}); `attested-write` adds the attestation
 # loop — its credential carries an attested third-party caveat, so
 # assume-role is refused until the client fetches a discharge from the
@@ -90,7 +90,7 @@ prefix = "demo"
 # Every template value is MAC-verified or server-side — there is no
 # self-asserted request scoping. `read`/`write` reference only
 # `{{env.X}}` and `{{mint.expiry}}`, so they need no `[role.template]`
-# contract; `home` and `attested-write` declare theirs below.
+# contract; `caveat-write` and `attested-write` declare theirs below.
 
 [[role]]
 name = "read"
@@ -105,7 +105,7 @@ max_ttl_seconds = 900
 default_ttl_seconds = 300
 
 [[role]]
-name = "home"
+name = "caveat-write"
 min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300
