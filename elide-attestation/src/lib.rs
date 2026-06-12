@@ -686,7 +686,8 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let cid = crypto::encrypt_cid_attested(&k_m_b, &r, "client", "org", MODE_VOLUME_RO);
+        let cid =
+            crypto::encrypt_cid_attested(&k_m_b, &[9u8; 12], &r, "client", "org", MODE_VOLUME_RO);
 
         let owned_sk = SigningKey::generate(&mut OsRng);
         let parent_sk = SigningKey::generate(&mut OsRng);

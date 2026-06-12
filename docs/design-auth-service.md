@@ -173,18 +173,14 @@ The keys established across the system are:
   invite, a fresh ticket, or `mint admin-service rotate`; see *Key
   rotation*.
 
-**Proposed: the `AEAD(k, p)` seal** — here and in the sibling docs
+The **`AEAD(k, p)` seal** — here and in the sibling docs
 ([`design-mint.md`](design-mint.md),
 [`design-mint-volume-attestation.md`](design-mint-volume-attestation.md))
 — is ChaCha20-Poly1305 (RFC 8439). Each seal draws a fresh random
 12-byte nonce; the sealed bytes are `nonce ‖ ciphertext`, and unseal
 splits the leading 12 bytes back off. Nonce uniqueness under a reused
 key (`K_M-A`, `K_M-B`) is the construction's one requirement, and the
-per-seal random draw carries it. Adopting this construction is a full
-wire break, taken together with a chain-MAC domain bump
-(`mint-macaroon-v5` → `mint-macaroon-v6`) so every outstanding macaroon
-fails crisply at verification rather than TPC-bearing ones failing at
-unseal — rotate the invite, re-enroll, re-login; no compat path.
+per-seal random draw carries it.
 
 ### Mint ↔ auth enrollment
 

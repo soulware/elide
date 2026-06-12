@@ -23,13 +23,6 @@ path = "src/bin/mint_e2e.rs"
 required-features = ["e2e-harness"]
 
 [dependencies]
-# AES-GCM-SIV is misuse-resistant: nonce reuse with the same key is
-# safe by construction. We use it with a fixed nonce so the
-# (K_M-A, plaintext) → CID mapping is deterministic — two
-# operator-write credentials for the same coord must produce the
-# same CID for one discharge to satisfy both
-# (`docs/design-auth-service.md` § *Keys*).
-aes-gcm-siv          = "0.11"
 arc-swap             = "1"
 async-trait          = "0.1"
 aws-credential-types = "1"
@@ -38,6 +31,7 @@ axum                 = "0.8"
 base64               = "0.22"
 blake3               = "1"
 bytes                = "1"
+chacha20poly1305     = "0.10"
 chrono               = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap                 = { version = "4", features = ["derive", "env"] }
 ed25519-dalek        = "2"

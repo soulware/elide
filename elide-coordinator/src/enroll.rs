@@ -455,14 +455,14 @@ mod tests {
 
     #[test]
     fn resolve_invite_distinguishes_inline_file_and_garbage() {
-        // A real wire macaroon, built the way mint mints one. v5
+        // A real wire macaroon, built the way mint mints one. v6
         // format: canonical-MsgPack envelope with a keyring keyref,
         // base64url-no-pad, mnt2_ prefix (`mint/src/macaroon.rs`).
         use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
         let nonce = [5u8; 16];
         let root = [2u8; 32];
         let kid: u16 = 0;
-        const DOMAIN: &[u8] = b"mint-macaroon-v5";
+        const DOMAIN: &[u8] = b"mint-macaroon-v6";
         let mut kr_bytes = Vec::new();
         rmp::encode::write_array_len(&mut kr_bytes, 2).unwrap();
         rmp::encode::write_uint(&mut kr_bytes, 0).unwrap();

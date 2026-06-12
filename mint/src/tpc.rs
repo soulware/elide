@@ -11,16 +11,16 @@
 //!   drawn for, so a discharge is MAC-valid against exactly the
 //!   caveat it was minted to satisfy.
 //!
-//! - [`encrypt_vid`] — AES-GCM-SIV(T_{n-1}, plaintext = `r`) with
-//!   a fixed all-zero nonce. T_{n-1} is the chain tag at the TPC's
-//!   position, so VID is intrinsically per-chain (differs across
-//!   credentials with different first-party caveats); decryption is
-//!   what lets the verifier recover `r` from VID alone.
+//! - [`encrypt_vid`] — seal(T_{n-1}, plaintext = `r`). T_{n-1} is the
+//!   chain tag at the TPC's position, so VID is intrinsically
+//!   per-chain (differs across credentials with different first-party
+//!   caveats); decryption is what lets the verifier recover `r` from
+//!   VID alone.
 //!
-//! - [`encrypt_cid`] — AES-GCM-SIV(K_M-A, plaintext =
-//!   `r || lp(client_id) || lp(org_id)`) with the same fixed nonce.
-//!   Length-prefix every variable field so two different
-//!   `(client_id, org_id)` pairs can't produce the same plaintext.
+//! - [`encrypt_cid`] — seal(K_M-A, plaintext =
+//!   `r || lp(client_id) || lp(org_id)`). Length-prefix every variable
+//!   field so two different `(client_id, org_id)` pairs can't produce
+//!   the same plaintext.
 //!
 //! - [`encrypt_cid_attested`] — the same layout plus one trailing
 //!   length-prefixed `mode` string, sealed under a second authority key
@@ -29,22 +29,22 @@
 //!   it. mint never inspects it, keeping mint agnostic to the
 //!   authority's vocabulary.
 //!
-//! **Nonce reuse safety.** AES-GCM-SIV is misuse-resistant by
-//! construction: nonce reuse with the same key is safe (the
-//! ciphertext+tag are a deterministic function of the plaintext
-//! alone), and every plaintext sealed here embeds its own fresh `r`.
+//! The seal is ChaCha20-Poly1305 (RFC 8439): each call draws a fresh
+//! random 12-byte nonce and emits `nonce ‖ ciphertext`; decryption
+//! splits the leading [`AEAD_NONCE_LEN`] bytes back off
+//! (`docs/design-auth-service.md` § *Keys*).
 
-use aes_gcm_siv::{
-    Aes256GcmSiv, Key, Nonce,
+use chacha20poly1305::{
+    ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit},
 };
 use rand_core::{OsRng, RngCore};
 
 use crate::caveat::Caveat;
 
-/// Fixed all-zero nonce. AES-GCM-SIV's misuse-resistance is what makes
-/// this safe — see module docs.
-const FIXED_NONCE: [u8; 12] = [0u8; 12];
+/// AEAD nonce length: every sealed VID/CID carries its nonce as the
+/// leading bytes.
+pub const AEAD_NONCE_LEN: usize = 12;
 
 /// Draw a fresh discharge root key for one caveat.
 fn fresh_r() -> [u8; 32] {
@@ -76,13 +76,17 @@ pub fn encrypt_vid(t_n_minus_1: &[u8; 32], r: &[u8; 32]) -> Vec<u8> {
 /// `(client, org) = (("ab","cd"), ("abcd",""))` collisions; `r` is
 /// fixed-size so doesn't need prefixing.
 pub fn encrypt_cid(k_m_a: &[u8; 32], r: &[u8; 32], client_id: &str, org_id: &str) -> Vec<u8> {
+    aead_encrypt(k_m_a, &cid_plaintext(r, client_id, org_id))
+}
+
+fn cid_plaintext(r: &[u8; 32], client_id: &str, org_id: &str) -> Vec<u8> {
     let mut plaintext = Vec::with_capacity(32 + 8 + client_id.len() + org_id.len());
     plaintext.extend_from_slice(r);
     plaintext.extend_from_slice(&(client_id.len() as u32).to_be_bytes());
     plaintext.extend_from_slice(client_id.as_bytes());
     plaintext.extend_from_slice(&(org_id.len() as u32).to_be_bytes());
     plaintext.extend_from_slice(org_id.as_bytes());
-    aead_encrypt(k_m_a, &plaintext)
+    plaintext
 }
 
 /// Build the `Caveat::ThirdParty` to append at issuance, drawing a
@@ -123,6 +127,29 @@ pub fn encrypt_cid_attested(
     org_id: &str,
     mode: &str,
 ) -> Vec<u8> {
+    aead_encrypt(k_m_b, &attested_cid_plaintext(r, client_id, org_id, mode))
+}
+
+/// As [`encrypt_cid_attested`] but with a caller-supplied nonce, for
+/// callers that need deterministic sealed bytes (the
+/// cross-implementation test vectors). Mirrors
+/// [`mint_under_key_with_nonce`](crate::macaroon::mint_under_key_with_nonce).
+pub fn encrypt_cid_attested_with_nonce(
+    k_m_b: &[u8; 32],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    r: &[u8; 32],
+    client_id: &str,
+    org_id: &str,
+    mode: &str,
+) -> Vec<u8> {
+    aead_encrypt_with_nonce(
+        k_m_b,
+        nonce,
+        &attested_cid_plaintext(r, client_id, org_id, mode),
+    )
+}
+
+fn attested_cid_plaintext(r: &[u8; 32], client_id: &str, org_id: &str, mode: &str) -> Vec<u8> {
     let mut plaintext = Vec::with_capacity(32 + 12 + client_id.len() + org_id.len() + mode.len());
     plaintext.extend_from_slice(r);
     plaintext.extend_from_slice(&(client_id.len() as u32).to_be_bytes());
@@ -131,7 +158,7 @@ pub fn encrypt_cid_attested(
     plaintext.extend_from_slice(org_id.as_bytes());
     plaintext.extend_from_slice(&(mode.len() as u32).to_be_bytes());
     plaintext.extend_from_slice(mode.as_bytes());
-    aead_encrypt(k_m_b, &plaintext)
+    plaintext
 }
 
 /// Build an attested `Caveat::ThirdParty` to append at credential
@@ -172,20 +199,35 @@ pub fn location_path(location: &str) -> Option<String> {
 }
 
 fn aead_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
-    let cipher = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(key));
-    // AES-GCM-SIV's misuse-resistance makes the fixed-nonce + same-key
-    // + same-plaintext encryption deterministic; the only failure mode
-    // is an internal allocator panic, which `expect` surfaces clearly
-    // because it would only fire under OOM.
-    cipher
-        .encrypt(Nonce::from_slice(&FIXED_NONCE), plaintext)
-        .expect("AES-GCM-SIV encrypt: internal buffer growth")
+    let mut nonce = [0u8; AEAD_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    aead_encrypt_with_nonce(key, &nonce, plaintext)
 }
 
-fn aead_decrypt(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, TpcError> {
-    let cipher = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(key));
+fn aead_encrypt_with_nonce(
+    key: &[u8; 32],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    // The only failure mode is an internal allocator panic, which
+    // `expect` surfaces clearly because it would only fire under OOM.
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(nonce), plaintext)
+        .expect("ChaCha20-Poly1305 encrypt: internal buffer growth");
+    let mut sealed = Vec::with_capacity(AEAD_NONCE_LEN + ciphertext.len());
+    sealed.extend_from_slice(nonce);
+    sealed.extend_from_slice(&ciphertext);
+    sealed
+}
+
+fn aead_decrypt(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>, TpcError> {
+    let (nonce, ciphertext) = sealed
+        .split_at_checked(AEAD_NONCE_LEN)
+        .ok_or(TpcError::Aead)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     cipher
-        .decrypt(Nonce::from_slice(&FIXED_NONCE), ciphertext)
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
         .map_err(|_| TpcError::Aead)
 }
 
@@ -382,23 +424,23 @@ mod tests {
     }
 
     #[test]
-    fn cid_is_deterministic_across_calls() {
+    fn cid_seals_differ_per_call_but_agree_on_plaintext() {
         let k_m_a = [3u8; 32];
         let r = [7u8; 32];
         let a = encrypt_cid(&k_m_a, &r, "01ARZ", "org_demo");
         let b = encrypt_cid(&k_m_a, &r, "01ARZ", "org_demo");
-        assert_eq!(a, b, "same inputs must produce same CID");
+        assert_ne!(a, b, "each seal draws its own nonce");
+        assert_eq!(decrypt_cid(&k_m_a, &a), decrypt_cid(&k_m_a, &b));
     }
 
     #[test]
-    fn cid_changes_per_client_org_and_r() {
-        let k_m_a = [3u8; 32];
+    fn cid_plaintext_changes_per_client_org_and_r() {
         let r0 = [7u8; 32];
         let r1 = [8u8; 32];
-        let base = encrypt_cid(&k_m_a, &r0, "01ARZ", "org_demo");
-        assert_ne!(base, encrypt_cid(&k_m_a, &r0, "01BXY", "org_demo"));
-        assert_ne!(base, encrypt_cid(&k_m_a, &r0, "01ARZ", "org_other"));
-        assert_ne!(base, encrypt_cid(&k_m_a, &r1, "01ARZ", "org_demo"));
+        let base = cid_plaintext(&r0, "01ARZ", "org_demo");
+        assert_ne!(base, cid_plaintext(&r0, "01BXY", "org_demo"));
+        assert_ne!(base, cid_plaintext(&r0, "01ARZ", "org_other"));
+        assert_ne!(base, cid_plaintext(&r1, "01ARZ", "org_demo"));
     }
 
     #[test]
@@ -406,27 +448,21 @@ mod tests {
         // (client="ab", org="cd") vs (client="abcd", org="") must not
         // collide. Without length prefixing the two concatenations
         // would be identical (both end up `..abcd..`).
-        let k_m_a = [3u8; 32];
         let r = [7u8; 32];
-        let a = encrypt_cid(&k_m_a, &r, "ab", "cd");
-        let b = encrypt_cid(&k_m_a, &r, "abcd", "");
+        let a = cid_plaintext(&r, "ab", "cd");
+        let b = cid_plaintext(&r, "abcd", "");
         assert_ne!(a, b);
     }
 
     #[test]
-    fn vid_is_deterministic_for_fixed_chain_tag() {
+    fn vid_seals_differ_per_call_but_agree_on_r() {
         let t = [4u8; 32];
         let r = [5u8; 32];
-        assert_eq!(encrypt_vid(&t, &r), encrypt_vid(&t, &r));
-    }
-
-    #[test]
-    fn vid_differs_across_chain_tags() {
-        let r = [5u8; 32];
-        let t1 = [4u8; 32];
-        let mut t2 = [4u8; 32];
-        t2[0] ^= 0x01;
-        assert_ne!(encrypt_vid(&t1, &r), encrypt_vid(&t2, &r));
+        let a = encrypt_vid(&t, &r);
+        let b = encrypt_vid(&t, &r);
+        assert_ne!(a, b, "each seal draws its own nonce");
+        assert_eq!(decrypt_vid(&t, &a), Ok(r));
+        assert_eq!(decrypt_vid(&t, &b), Ok(r));
     }
 
     #[test]
@@ -449,8 +485,8 @@ mod tests {
 
     #[test]
     fn vid_decrypt_fails_on_tampered_ciphertext() {
-        // AES-GCM-SIV's authentication tag should detect a single
-        // bit-flip — that's the misuse-resistance property we lean on.
+        // The Poly1305 tag detects a single bit-flip anywhere in the
+        // sealed bytes, nonce prefix included.
         let t = [4u8; 32];
         let r = [5u8; 32];
         let mut vid = encrypt_vid(&t, &r);
@@ -524,32 +560,58 @@ mod tests {
     }
 
     #[test]
-    fn attested_cid_changes_with_mode() {
-        let k_m_b = [2u8; 32];
+    fn attested_cid_plaintext_changes_with_mode() {
         let r = [7u8; 32];
-        let rw = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-rw");
-        let ro = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-ro");
-        assert_ne!(rw, ro, "mode must affect the ciphertext");
+        let rw = attested_cid_plaintext(&r, "01ARZ", "org_demo", "volume-rw");
+        let ro = attested_cid_plaintext(&r, "01ARZ", "org_demo", "volume-ro");
+        assert_ne!(rw, ro, "mode must affect the plaintext");
     }
 
     #[test]
-    fn attested_cid_is_deterministic_across_calls() {
+    fn attested_cid_seals_differ_per_call_but_agree_on_plaintext() {
         let k_m_b = [2u8; 32];
         let r = [7u8; 32];
         let a = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-ro");
         let b = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-ro");
-        assert_eq!(a, b, "same inputs must produce the same attested CID");
+        assert_ne!(a, b, "each seal draws its own nonce");
+        assert_eq!(
+            decrypt_cid_attested(&k_m_b, &a),
+            decrypt_cid_attested(&k_m_b, &b)
+        );
+    }
+
+    #[test]
+    fn attested_cid_with_nonce_is_deterministic_and_nonce_prefixed() {
+        let k_m_b = [2u8; 32];
+        let r = [7u8; 32];
+        let n = [0xa0u8; AEAD_NONCE_LEN];
+        let a = encrypt_cid_attested_with_nonce(&k_m_b, &n, &r, "01ARZ", "org_demo", "volume-ro");
+        let b = encrypt_cid_attested_with_nonce(&k_m_b, &n, &r, "01ARZ", "org_demo", "volume-ro");
+        assert_eq!(a, b, "caller-supplied nonce pins the sealed bytes");
+        assert_eq!(&a[..AEAD_NONCE_LEN], &n);
+        let pt = decrypt_cid_attested(&k_m_b, &a).expect("decrypt");
+        assert_eq!(pt.r, r);
+        assert_eq!(pt.mode, "volume-ro");
     }
 
     #[test]
     fn attested_cid_mode_length_prevents_boundary_collision() {
         // (org="cd", mode="ef") vs (org="cdef", mode="") must not collide —
         // the mode's length prefix is what separates them.
-        let k_m_b = [2u8; 32];
         let r = [7u8; 32];
-        let a = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "cd", "ef");
-        let b = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "cdef", "");
+        let a = attested_cid_plaintext(&r, "01ARZ", "cd", "ef");
+        let b = attested_cid_plaintext(&r, "01ARZ", "cdef", "");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn decrypt_rejects_sealed_bytes_shorter_than_a_nonce() {
+        let k = [3u8; 32];
+        assert_eq!(
+            decrypt_cid(&k, &[0u8; AEAD_NONCE_LEN - 1]),
+            Err(TpcError::Aead)
+        );
+        assert_eq!(decrypt_vid(&k, b""), Err(TpcError::Aead));
     }
 
     #[test]
@@ -629,6 +691,10 @@ mod proptests {
         proptest::array::uniform32(any::<u8>())
     }
 
+    fn aead_nonce() -> impl Strategy<Value = [u8; AEAD_NONCE_LEN]> {
+        proptest::array::uniform12(any::<u8>())
+    }
+
     proptest! {
         /// VID round-trips under its chain tag.
         #[test]
@@ -662,19 +728,20 @@ mod proptests {
             );
         }
 
-        /// CID is injective in its identity fields: with key and `r` held
-        /// fixed, two CIDs are byte-equal iff their `(client, org)` pairs
-        /// are equal. The forward direction is determinism; the reverse is
-        /// the length-prefix anti-collision guarantee, over all string
-        /// pairs (not just the `("ab","cd")` vs `("abcd","")` example).
+        /// CID is injective in its identity fields: with key, nonce, and
+        /// `r` held fixed, two seals are byte-equal iff their
+        /// `(client, org)` pairs are equal. The forward direction is the
+        /// AEAD's determinism for a fixed nonce; the reverse is the
+        /// length-prefix anti-collision guarantee, over all string pairs
+        /// (not just the `("ab","cd")` vs `("abcd","")` example).
         #[test]
         fn cid_is_injective_in_its_fields(
-            key in key(), r in key(),
+            key in key(), n in aead_nonce(), r in key(),
             c1 in any::<String>(), o1 in any::<String>(),
             c2 in any::<String>(), o2 in any::<String>(),
         ) {
-            let a = encrypt_cid(&key, &r, &c1, &o1);
-            let b = encrypt_cid(&key, &r, &c2, &o2);
+            let a = aead_encrypt_with_nonce(&key, &n, &cid_plaintext(&r, &c1, &o1));
+            let b = aead_encrypt_with_nonce(&key, &n, &cid_plaintext(&r, &c2, &o2));
             prop_assert_eq!(a == b, (&c1, &o1) == (&c2, &o2));
         }
 
@@ -683,12 +750,12 @@ mod proptests {
         /// `(org="cdef", mode="")` for all strings.
         #[test]
         fn attested_cid_is_injective_in_its_fields(
-            key in key(), r in key(),
+            key in key(), n in aead_nonce(), r in key(),
             c1 in any::<String>(), o1 in any::<String>(), m1 in any::<String>(),
             c2 in any::<String>(), o2 in any::<String>(), m2 in any::<String>(),
         ) {
-            let a = encrypt_cid_attested(&key, &r, &c1, &o1, &m1);
-            let b = encrypt_cid_attested(&key, &r, &c2, &o2, &m2);
+            let a = encrypt_cid_attested_with_nonce(&key, &n, &r, &c1, &o1, &m1);
+            let b = encrypt_cid_attested_with_nonce(&key, &n, &r, &c2, &o2, &m2);
             prop_assert_eq!(a == b, (&c1, &o1, &m1) == (&c2, &o2, &m2));
         }
 
