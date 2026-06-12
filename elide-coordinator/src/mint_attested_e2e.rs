@@ -372,32 +372,32 @@ async fn attested_loop_over_shipped_templates() {
         .await
         .expect("coord-ro assumes without a discharge");
 
-    // rw-self: possession of owned's volume.key + binding liveness,
+    // volume-rw: possession of owned's volume.key + binding liveness,
     // vouched by coord B, rendered by mint as the by_id/<owned> scope.
     let rw = endpoint
-        .assume_role("volume-rw", 3600, AssumeTarget::RwSelf(owned))
+        .assume_role("volume-rw", 3600, AssumeTarget::VolumeRw(owned))
         .await
-        .expect("volume-rw rw-self round trip");
+        .expect("volume-rw round trip");
     assert!(!rw.access_key_id.is_empty(), "vended keypair");
 
-    // ro-ancestor: the fork's parent is in owned's read set; the leaf
+    // volume-ro: the fork's parent is in owned's read set; the leaf
     // reading its own prefix is the degenerate target == owned case.
     endpoint
         .assume_role(
             "volume-ro",
             3600,
-            AssumeTarget::RoAncestor {
+            AssumeTarget::VolumeRo {
                 owned,
                 target: parent,
             },
         )
         .await
-        .expect("volume-ro ro-ancestor round trip");
+        .expect("volume-ro round trip");
     endpoint
         .assume_role(
             "volume-ro",
             3600,
-            AssumeTarget::RoAncestor {
+            AssumeTarget::VolumeRo {
                 owned,
                 target: owned,
             },
@@ -412,7 +412,7 @@ async fn attested_loop_over_shipped_templates() {
         .assume_role(
             "volume-ro",
             3600,
-            AssumeTarget::RoAncestor {
+            AssumeTarget::VolumeRo {
                 owned,
                 target: stranger,
             },
@@ -437,7 +437,7 @@ async fn attested_loop_over_shipped_templates() {
     };
     let blind = MintEndpoint::new(&blind_cfg, coord_dir.clone(), identity.clone());
     let err = match blind
-        .assume_role("volume-rw", 3600, AssumeTarget::RwSelf(owned))
+        .assume_role("volume-rw", 3600, AssumeTarget::VolumeRw(owned))
         .await
     {
         Ok(_) => panic!("an undischarged attestation TPC must not vend"),

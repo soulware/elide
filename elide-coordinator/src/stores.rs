@@ -125,7 +125,7 @@ pub trait ScopedStores: Send + Sync {
     /// the read is performed *for* — the leaf itself when reading its
     /// own prefix, the leaf when reading an ancestor's. The facade is
     /// per-`(owned, target)`; the anchor is what signs the
-    /// `ro-ancestor` possession proof when `volume-ro` acquisition
+    /// possession proof when `volume-ro` acquisition
     /// requires a discharge (`design-mint-volume-attestation.md`
     /// § *Threading the `owned` anchor*).
     fn read_volume(&self, owned: &Ulid, target: &Ulid) -> Arc<dyn ObjectStore>;

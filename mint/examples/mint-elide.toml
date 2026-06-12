@@ -53,7 +53,8 @@ bucket = "elide-demo"
 # tokens don't match these exactly, and the request path enforces them before
 # render. The volume roles also declare `[role.attestation]`: their credential
 # carries an attested third-party caveat whose opaque `mode` tells the
-# attestation coordinator which ownership check to run.
+# attestation coordinator which ownership check to run. `mode` defaults to
+# the role name; set it only to use a distinct name for role vs mode.
 
 [[role]]
 name = "volume-ro"
@@ -65,7 +66,7 @@ default_ttl_seconds = 3600
 attested = ["volume"]
 
 [role.attestation]
-mode = "ro-ancestor"
+# mode = "volume-ro"
 
 [[role]]
 name = "volume-rw"
@@ -77,7 +78,7 @@ default_ttl_seconds = 86400
 attested = ["volume"]
 
 [role.attestation]
-mode = "rw-self"
+# mode = "volume-rw"
 
 [[role]]
 name = "coord-ro"

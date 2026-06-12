@@ -43,7 +43,7 @@ by the same rule that protects every published snapshot from its own
 owner.
 
 **The fence is the credential layer, not self-policing.** Every S3
-write A issues for V1 rides `rw-self` discharges whose liveness
+write A issues for V1 rides `volume-rw` discharges whose liveness
 predicate is `names/<name> → V1`
 ([`design-mint-volume-attestation.md`](design-mint-volume-attestation.md)
 § *One liveness check unifies RW-self and RO-ancestor*). B's forced
@@ -52,7 +52,7 @@ CAS onward and A's outstanding credentials lapse within the
 liveness-staleness bound (the Tigris keypair lifetime, ~5 min). A
 zombie A loses the *capability* to mutate V1's prefix whether or not
 it ever observes the flip. This ties enablement together: the fence
-exists once `rw-self` enforcement is on, so `claim --force` sequences
+exists once `volume-rw` enforcement is on, so `claim --force` sequences
 with attestation enablement.
 
 **A's name-record poll remains, for teardown rather than safety.** On
@@ -92,7 +92,7 @@ already landed and a completed consistent fork beats a parked
 partial one.
 
 B writes nothing under V1's prefix at any point — reads ride
-`ro-ancestor` against V2's declared parent, writes ride `rw-self`
+`volume-ro` against V2's declared parent, writes ride `volume-rw`
 into V2.
 
 ## Failure-mode walkthroughs
@@ -141,7 +141,7 @@ cannot run that protocol.
 
 ## Open questions
 
-- **Fence-window constant.** The bound is the `rw-self`
+- **Fence-window constant.** The bound is the `volume-rw`
   re-attestation cadence / Tigris keypair lifetime (attestation doc
   § *Liveness*). Whether B should delay its advisory HEAD re-read
   until the window has fully elapsed (a more reliable liveness

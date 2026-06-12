@@ -62,7 +62,7 @@ pub trait CredentialIssuer: Send + Sync {
 /// `by_id/<target>/*` prefix.
 ///
 /// The requester is carried as the read's `owned` anchor: the live,
-/// locally-keyed volume whose key signs the `ro-ancestor` possession
+/// locally-keyed volume whose key signs the `volume-ro` possession
 /// proof when credential acquisition requires a discharge
 /// (`design-mint-volume-attestation.md` § *Threading the `owned`
 /// anchor*).
@@ -131,7 +131,7 @@ pub trait Credentialer: Send + Sync {
     /// Mint (or return cached) read-only credentials whose policy grants
     /// `s3:GetObject` on the single prefix `by_id/<target>/*`. `owned`
     /// is the anchor the read was authorized for — the volume whose key
-    /// signs the `ro-ancestor` possession proof when acquisition
+    /// signs the `volume-ro` possession proof when acquisition
     /// requires a discharge.
     async fn provision_volume_ro(&self, owned: Ulid, target: Ulid)
     -> io::Result<IssuedCredentials>;

@@ -58,7 +58,7 @@ pub(crate) async fn hydrate_remote_owned(
         read_shadow_proving_possession(volume_name, vol_ulid, &core.data_dir, &fork_dir)?;
 
     // Materialise the anchor before the basis reads: the leaf is the
-    // `owned` anchor for every read below, and the ro-ancestor
+    // `owned` anchor for every read below, and the volume-ro
     // discharge proof loads the anchor's name and key from its dir.
     restore_key_into_fork(&fork_dir, &key_bytes)?;
     elide_core::config::VolumeConfig {

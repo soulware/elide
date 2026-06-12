@@ -499,7 +499,7 @@ mod tests {
         let k_m_b = [2u8; 32];
         let r = [7u8; 32];
         // mint treats `mode` as opaque; exercise arbitrary strings.
-        for mode in ["rw-self", "ro-ancestor", ""] {
+        for mode in ["volume-rw", "volume-ro", ""] {
             let cid = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", mode);
             let pt = decrypt_cid_attested(&k_m_b, &cid).expect("decrypt");
             assert_eq!(pt.r, r);
@@ -513,8 +513,8 @@ mod tests {
     fn attested_cid_changes_with_mode() {
         let k_m_b = [2u8; 32];
         let r = [7u8; 32];
-        let rw = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "rw-self");
-        let ro = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "ro-ancestor");
+        let rw = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-rw");
+        let ro = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-ro");
         assert_ne!(rw, ro, "mode must affect the ciphertext");
     }
 
@@ -522,8 +522,8 @@ mod tests {
     fn attested_cid_is_deterministic_across_calls() {
         let k_m_b = [2u8; 32];
         let r = [7u8; 32];
-        let a = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "ro-ancestor");
-        let b = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "ro-ancestor");
+        let a = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-ro");
+        let b = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-ro");
         assert_eq!(a, b, "same inputs must produce the same attested CID");
     }
 
@@ -542,7 +542,7 @@ mod tests {
     fn attested_cid_decrypt_fails_under_wrong_k_m_b() {
         let k_m_b = [2u8; 32];
         let r = [7u8; 32];
-        let cid = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "rw-self");
+        let cid = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-rw");
         let mut wrong = k_m_b;
         wrong[0] ^= 0x40;
         assert_eq!(decrypt_cid_attested(&wrong, &cid), Err(TpcError::Aead));
@@ -566,7 +566,7 @@ mod tests {
         // auth parser reads as trailing bytes, never silently dropped.
         let key = [3u8; 32];
         let r = [7u8; 32];
-        let attested = encrypt_cid_attested(&key, &r, "01ARZ", "org_demo", "rw-self");
+        let attested = encrypt_cid_attested(&key, &r, "01ARZ", "org_demo", "volume-rw");
         assert_eq!(decrypt_cid(&key, &attested), Err(TpcError::Trailing));
     }
 
@@ -576,7 +576,7 @@ mod tests {
         let r = derive_r(&[1u8; 32], "01ARZ", 0);
         let tail = [11u8; 32];
         let vid = encrypt_vid(&tail, &r);
-        let cid = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "ro-ancestor");
+        let cid = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-ro");
         let via_vid = decrypt_vid(&tail, &vid).expect("vid");
         let via_cid = decrypt_cid_attested(&k_m_b, &cid).expect("cid").r;
         assert_eq!(via_vid, via_cid);
