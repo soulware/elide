@@ -878,10 +878,15 @@ granted at login, checked at issuance, cleared at verify:
 
 1. **Granted at login, carried on the session.** Login is the trust
    source for what a human may authorize, so the session carries its
-   granted scope set as `scope=<name>` caveats (multiple permitted),
-   alongside `(sub, exp)`. Auth-side policy decides the
-   grant; the demo grants all scopes to every subject — login stays
-   wide-open, but the grant is *explicit* on the session.
+   granted scope set as a **single** canonical `scope` caveat — the
+   scope names sorted and space-joined into one value — alongside
+   `(sub, exp)`. One caveat, not one per scope: a holder cannot append a
+   `scope` caveat to widen the grant, because two `scope` caveats resolve
+   to `Unsatisfiable` (→ empty grant), the same append-only-narrows rule
+   that protects every scalar caveat (`docs/finding-membership-caveat-read.md`).
+   Auth-side policy decides the grant; the demo grants all scopes to every
+   subject — login stays wide-open, but the grant is *explicit* on the
+   session.
 
 2. **Checked at `/v1/discharge`.** The request names the scope it needs;
    auth requires `requested ∈ session.scope` and mints the discharge

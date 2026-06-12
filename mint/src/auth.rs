@@ -118,11 +118,46 @@ pub(crate) struct DischargeRequest {
     pub(crate) scope: String,
 }
 
+/// The set of scopes a session grants, parsed from the session's
+/// **single** canonical `scope` caveat. Carrying the grant as one
+/// scalar — not one caveat per scope — is what keeps it append-safe: a
+/// holder cannot append a `scope` caveat to add a scope, because two
+/// `scope` caveats resolve to `Unsatisfiable` (→ empty grant), exactly
+/// like every other scalar. The set is private so no caller can iterate
+/// it and ask a membership question over loose, separately-appendable
+/// values; the only question is [`grants`](Self::grants), answered
+/// against this one tamper-evident value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GrantedScopes(std::collections::BTreeSet<String>);
+
+impl GrantedScopes {
+    /// The canonical wire value for a set of scopes: sorted and
+    /// space-joined into one string. Scope tokens never contain
+    /// whitespace, so the separator is unambiguous. This is what
+    /// [`mint_session`] stamps as the lone `scope` caveat value.
+    pub fn canonical(scopes: &[&str]) -> String {
+        let set: std::collections::BTreeSet<&str> = scopes.iter().copied().collect();
+        set.into_iter().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Parse a resolved canonical `scope` value back into a set.
+    fn parse(value: &str) -> Self {
+        GrantedScopes(value.split_whitespace().map(str::to_owned).collect())
+    }
+
+    /// Whether `scope` is in the granted set. Membership over a value
+    /// recovered from a single caveat — not over an appendable list — so
+    /// it cannot be widened by a holder.
+    pub fn grants(&self, scope: &str) -> bool {
+        self.0.contains(scope)
+    }
+}
+
 /// A verified session's claims: the `sub` the discharge attests and
-/// the granted `Scope` set the issuance check is made against.
+/// the granted scopes the issuance check is made against.
 pub struct SessionClaims {
     pub subject: String,
-    pub scopes: Vec<String>,
+    pub scopes: GrantedScopes,
 }
 
 #[derive(Deserialize)]
@@ -144,24 +179,28 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Mint a demo session macaroon under `K_session`: caveats
-/// `op=session`, `sub=<subject>`, the granted `Scope` set, and
-/// `exp=now+7d`. A fresh chain (not an attenuation), keyed by
-/// `K_session`, so it is structurally distinct from every mint-issued
-/// macaroon and verifiable only by this role. The demo grants **every**
-/// scope to every subject — login stays wide-open, but the grant is
-/// explicit on the session (`docs/design-auth-service.md` § *Scope
-/// tier*); production auth-service decides the grant per its own policy.
+/// `op=session`, `sub=<subject>`, the granted scopes as one canonical
+/// `scope` caveat, and `exp=now+7d`. A fresh chain (not an attenuation),
+/// keyed by `K_session`, so it is structurally distinct from every
+/// mint-issued macaroon and verifiable only by this role. The granted
+/// scopes are a **single** scalar caveat ([`GrantedScopes::canonical`]),
+/// not one caveat each — appending a second `scope` caveat makes the set
+/// `Unsatisfiable` (→ empty grant), so a holder cannot widen the grant.
+/// The demo grants **every** scope to every subject — login stays
+/// wide-open, but the grant is explicit on the session
+/// (`docs/design-auth-service.md` § *Scope tier*); production
+/// auth-service decides the grant per its own policy.
 fn mint_session(k_session: &[u8; 32], subject: &str, now_unix: u64) -> Macaroon {
     let exp = now_unix + SESSION_EXP_SECONDS;
+    let scopes =
+        GrantedScopes::canonical(&[scope::MINT_ENROLL, scope::MINT_EXCHANGE, scope::MINT_ADMIN]);
     mint_under_key(
         k_session,
         SESSION_KID,
         vec![
             Caveat::scalar(name::OP, op::SESSION),
             Caveat::scalar(name::SUB, subject),
-            Caveat::scalar(name::SCOPE, scope::MINT_ENROLL),
-            Caveat::scalar(name::SCOPE, scope::MINT_EXCHANGE),
-            Caveat::scalar(name::SCOPE, scope::MINT_ADMIN),
+            Caveat::scalar(name::SCOPE, scopes),
             Caveat::scalar(name::EXP, exp.to_string()),
         ],
     )
@@ -196,14 +235,15 @@ pub fn verify_session(
     {
         return Err(());
     }
-    let scopes = mac
-        .caveats()
-        .iter()
-        .filter_map(|c| match c {
-            Caveat::FirstParty { name: n, value } if n == name::SCOPE => Some(value.clone()),
-            _ => None,
-        })
-        .collect();
+    // Scopes clear like every other scalar: the grant is a single
+    // canonical `scope` caveat, read through `resolve`. Absent → no
+    // grant; a second, disagreeing `scope` caveat → `Unsatisfiable` →
+    // no grant. A holder cannot append a `scope` caveat to widen the
+    // set — the same tri-state that protects `aud`/`role`/`exp`.
+    let scopes = match eff.resolve(name::SCOPE) {
+        Resolved::Value(v) => GrantedScopes::parse(&v),
+        Resolved::Absent | Resolved::Unsatisfiable => GrantedScopes::default(),
+    };
     match eff.resolve(name::SUB) {
         Resolved::Value(subject) => Ok(SessionClaims { subject, scopes }),
         _ => Err(()),
@@ -264,7 +304,7 @@ async fn issue_discharge(
     // The authorization decision `/v1/discharge` makes: the session must
     // grant the requested scope. Distinct from the liveness gate above —
     // a valid session that lacks the scope is `403`, not `401`.
-    if !claims.scopes.iter().any(|s| s == &req.scope) {
+    if !claims.scopes.grants(&req.scope) {
         return error(StatusCode::FORBIDDEN, "scope not granted");
     }
     let cid = match BASE64.decode(req.cid.trim()) {
@@ -335,15 +375,56 @@ mod tests {
         let claims = verify_session(&k, &bearer(&s), 1_000).expect("valid session");
         assert_eq!(claims.subject, "operator-alice");
         // The demo grants every scope.
-        assert!(claims.scopes.iter().any(|s| s == scope::MINT_ENROLL));
-        assert!(claims.scopes.iter().any(|s| s == scope::MINT_EXCHANGE));
-        assert!(claims.scopes.iter().any(|s| s == scope::MINT_ADMIN));
+        assert!(claims.scopes.grants(scope::MINT_ENROLL));
+        assert!(claims.scopes.grants(scope::MINT_EXCHANGE));
+        assert!(claims.scopes.grants(scope::MINT_ADMIN));
     }
 
     #[test]
     fn session_under_wrong_key_rejected() {
         let s = mint_session(&[21u8; 32], "alice", 1_000);
         assert!(verify_session(&[22u8; 32], &bearer(&s), 1_000).is_err());
+    }
+
+    /// A holder cannot widen their granted scopes by appending a `scope`
+    /// caveat. The session grant is a single canonical `scope` caveat;
+    /// appending a second one makes it `Unsatisfiable` → empty grant, so
+    /// every scope is denied — not just the one not originally granted.
+    /// This is the regression for the membership-read escalation
+    /// (`docs/finding-membership-caveat-read.md`).
+    #[test]
+    fn appended_scope_caveat_cannot_widen_the_grant() {
+        let k = [21u8; 32];
+        // A narrow session: enroll only (the production shape — the demo
+        // grants all three, leaving nothing to escalate to).
+        let narrow = mint_under_key(
+            &k,
+            crate::macaroon::SESSION_KID,
+            vec![
+                Caveat::scalar(name::OP, op::SESSION),
+                Caveat::scalar(name::SUB, "alice"),
+                Caveat::scalar(name::SCOPE, GrantedScopes::canonical(&[scope::MINT_ENROLL])),
+                Caveat::scalar(name::EXP, "2000"),
+            ],
+        );
+        // Sanity: the un-tampered narrow session grants exactly enroll.
+        let claims = verify_session(&k, &bearer(&narrow), 1_000).expect("valid");
+        assert!(claims.scopes.grants(scope::MINT_ENROLL));
+        assert!(!claims.scopes.grants(scope::MINT_ADMIN));
+
+        // The holder appends `scope=mint:admin` with only the trailing
+        // MAC — a legal chain extension, so the MAC still verifies.
+        let tampered = narrow.attenuate(Caveat::scalar(name::SCOPE, scope::MINT_ADMIN));
+        let claims = verify_session(&k, &bearer(&tampered), 1_000).expect("mac still valid");
+        // Two disagreeing `scope` caveats → Unsatisfiable → empty grant.
+        assert!(
+            !claims.scopes.grants(scope::MINT_ADMIN),
+            "must not gain admin"
+        );
+        assert!(
+            !claims.scopes.grants(scope::MINT_ENROLL),
+            "the grant collapses entirely — fail closed, never widen"
+        );
     }
 
     #[test]

@@ -214,17 +214,6 @@ impl<'a> EffectiveCaveats<'a> {
         }
     }
 
-    /// Whether any occurrence of `name` equals `value` — membership, not
-    /// the scalar-AND of [`Self::resolve`]. A caveat carrying a *set*
-    /// (the granted `Scope` list on a session) has multiple disagreeing
-    /// occurrences by design, so `resolve` would read it `Unsatisfiable`;
-    /// this asks the set-membership question instead.
-    pub fn contains(&self, name: &str, value: &str) -> bool {
-        self.caveats.iter().any(
-            |c| matches!(c, Caveat::FirstParty { name: n, value: v } if n == name && v == value),
-        )
-    }
-
     /// Distinct first-party caveat names in first-occurrence order.
     pub fn names(&self) -> Vec<&'a str> {
         let mut seen = BTreeSet::new();
@@ -440,20 +429,6 @@ mod proptests {
                     .filter_map(|v| v.parse::<u64>().ok())
                     .min();
                 prop_assert_eq!(eff.min_bound(name), oracle);
-            }
-        }
-
-        /// `contains` is exact membership — orthogonal to `resolve`'s
-        /// agreement check. A name resolving `Unsatisfiable` can still
-        /// `contain` each of its disagreeing values.
-        #[test]
-        fn contains_is_membership(chain in chain()) {
-            let eff = EffectiveCaveats::new(&chain);
-            for &name in NAMES {
-                for value in ["x", "y", "z", "42", "absent"] {
-                    let expected = fp_values(&chain, name).contains(&value);
-                    prop_assert_eq!(eff.contains(name, value), expected);
-                }
             }
         }
 
