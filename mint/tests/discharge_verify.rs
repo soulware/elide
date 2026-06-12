@@ -273,7 +273,10 @@ async fn verifies_two_tpcs_regardless_of_discharge_order() {
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::SUB, CLIENT_ID),
-            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(
+                name::CNF,
+                pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
+            ),
             Caveat::scalar(name::ROLE, "volume-rw"),
         ],
     );
