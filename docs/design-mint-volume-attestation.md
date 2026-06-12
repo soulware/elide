@@ -50,10 +50,11 @@ discharge root key) anchors it:
   nowhere outside the caveat (mint keeps no per-client state — `r`
   travels only inside `vid`/`cid`), so a discharge is MAC-valid
   against exactly the caveat it was minted for.
-- **`vid = AES-GCM-SIV(Tₙ₋₁, r)`** — `r` sealed under the chain tag at
+- **`vid = AEAD(Tₙ₋₁, r)`** — `r` sealed under the chain tag at
   the TPC's position; the *verifier* (mint) recovers `r` by walking the
-  chain and decrypting.
-- **`cid = AES-GCM-SIV(K_M-B, r ‖ message)`** — `r` plus the message,
+  chain and decrypting. The `AEAD` seal is the one defined in
+  [`design-auth-service.md`](design-auth-service.md) § *Keys*.
+- **`cid = AEAD(K_M-B, r ‖ message)`** — `r` plus the message,
   sealed under the key shared with coord B; the *authority* (coord B)
   recovers `r` + message by decrypting. For volume attestation the
   message is `lp(client_id) ‖ lp(org_id) ‖ mode`,
@@ -890,7 +891,7 @@ elide-coordinator would couple mint's build to the elide workspace, which
 the documented rationale rules out.
 
 The cost is two implementations of a security primitive — the
-keyed-BLAKE3 chain and the AES-GCM-SIV CID seal — which can drift. The
+keyed-BLAKE3 chain and the AEAD CID seal — which can drift. The
 mitigation is **mandatory cross-implementation test vectors**: committed
 known-answer fixtures (`(K_M-B, cid) → (r, client_id, org_id, mode)` and
 `(r, caveats) → encoded discharge bytes`) exercised by *both* the mint
