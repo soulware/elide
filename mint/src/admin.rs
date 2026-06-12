@@ -121,7 +121,6 @@ async fn verify_discharge(
     let cleared = verify_and_clear(
         &bundle,
         &keyring,
-        state.store.k_m_a(),
         proof,
         body,
         now_unix,
@@ -357,7 +356,6 @@ async fn handle_seal(State(state): State<AppState>, headers: HeaderMap, body: By
     let cleared = match verify_and_clear(
         &bundle,
         &keyring,
-        state.store.k_m_a(),
         proof,
         &body,
         now_unix,

@@ -1006,11 +1006,9 @@ vector stay.
 **`K_M-A` is unchanged.** A pairwise key between two sovereign roots is
 the TPC composing as designed: it buys mutual offline-ness (mint
 verifies auth discharges with no auth round-trip; auth issues with no
-mint round-trip), and the session-discharge path
-(`derive_discharge_r(K_M-A, nonce)`) is constitutively shared-key. The
-unwrap pattern earns its complexity only where one side stops being a
-single principal — which is exactly what HA replication does to
-coord B.
+mint round-trip). The unwrap pattern earns its complexity only where
+one side stops being a single principal — which is exactly what HA
+replication does to coord B.
 
 ## Proposed: HA — N instances, one location, no shared secret
 
