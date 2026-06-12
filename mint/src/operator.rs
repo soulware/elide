@@ -22,6 +22,7 @@ use std::path::Path;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use ed25519_dalek::SigningKey;
 
 use crate::caveat::{Caveat, name, scope};
 use crate::macaroon::Macaroon;
@@ -50,11 +51,11 @@ pub enum OperatorError {
 }
 
 /// The operator's admin-plane identity: the admin-service and the machine
-/// key seed it is PoP'd with. Loaded from `<data_dir>` on the host that
+/// key it is PoP'd with. Loaded from `<data_dir>` on the host that
 /// also runs `mint serve`.
 pub struct Operator {
     admin_service: Macaroon,
-    machine_seed: [u8; 32],
+    machine_key: SigningKey,
 }
 
 impl Operator {
@@ -80,7 +81,7 @@ impl Operator {
 
         Ok(Operator {
             admin_service,
-            machine_seed,
+            machine_key: SigningKey::from_bytes(&machine_seed),
         })
     }
 
@@ -161,7 +162,7 @@ impl Operator {
             .admin_service
             .clone()
             .attenuate(Caveat::scalar(name::OP, op_value));
-        let sig = pop::client_signature(&self.machine_seed, attenuated.tail(), body);
+        let sig = pop::client_signature(&self.machine_key, attenuated.tail(), body);
         let auth = format!("MintV1 {},{}", attenuated.encode(), discharge.encode());
         (auth, sig)
     }
@@ -200,7 +201,7 @@ mod tests {
     /// does, returning the minted token for cross-checking.
     fn seed_operator_files(dir: &Path) -> Macaroon {
         let kr = Keyring::single(ROOT);
-        let cnf = pop::cnf_value(&MACHINE_SEED);
+        let cnf = pop::cnf_value(&SigningKey::from_bytes(&MACHINE_SEED));
         let token = crate::issuance::mint_admin_service_token(
             &kr,
             &K_M_A,
@@ -280,7 +281,10 @@ mod tests {
             .and_then(|m| Macaroon::decode(m).ok())
             .expect("primary decodes");
         let proof = pop::Proof::from_b64(&sig).expect("proof");
-        let cnf = vec![Caveat::scalar(name::CNF, pop::cnf_value(&MACHINE_SEED))];
+        let cnf = vec![Caveat::scalar(
+            name::CNF,
+            pop::cnf_value(&SigningKey::from_bytes(&MACHINE_SEED)),
+        )];
         assert!(pop::check(&cnf, primary.tail(), body, Some(proof), 1700000000).is_ok());
     }
 

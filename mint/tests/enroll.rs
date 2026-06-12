@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use ed25519_dalek::SigningKey;
 use mint::audit::AuditLog;
 use mint::caveat::{Caveat, EffectiveCaveats, Resolved, name, op, scope};
 use mint::config::Config;
@@ -213,7 +214,7 @@ fn volume_discharge(cid: &[u8]) -> Macaroon {
 /// tail, as the client does.
 fn signed(uri: &str, m: &Macaroon, seed: &[u8; 32], extra: &str) -> Request<Body> {
     let body = format!("{{\"ts\":{}{extra}}}", now());
-    let sig = pop::client_signature(seed, m.tail(), body.as_bytes());
+    let sig = pop::client_signature(&SigningKey::from_bytes(seed), m.tail(), body.as_bytes());
     let mut auth = format!("MintV1 {}", m.encode());
     for c in m.caveats() {
         if let Caveat::ThirdParty { cid, .. } = c {
@@ -263,7 +264,10 @@ fn client_invite(nonce: &str, seed: &[u8; 32]) -> Macaroon {
         AUTH_URL,
     )
     .attenuate(Caveat::scalar(name::SUB, SUB))
-    .attenuate(Caveat::scalar(name::CNF, pop::cnf_value(seed)))
+    .attenuate(Caveat::scalar(
+        name::CNF,
+        pop::cnf_value(&SigningKey::from_bytes(seed)),
+    ))
 }
 
 #[tokio::test]
@@ -301,7 +305,12 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
 
     // (3) operator approves the displayed sub
     store
-        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), "usr_op", &now_iso())
+        .approve(
+            SUB,
+            &pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
+            "usr_op",
+            &now_iso(),
+        )
         .await
         .unwrap();
 
@@ -329,7 +338,7 @@ async fn full_flow_enroll_approve_exchange_then_assume_role() {
     assert_eq!(eff.resolve(name::SUB), Resolved::Value(SUB.into()));
     assert_eq!(
         eff.resolve(name::CNF),
-        Resolved::Value(pop::cnf_value(&CLIENT_SEED))
+        Resolved::Value(pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)))
     );
     assert_eq!(eff.resolve(name::ROLE), Resolved::Value("volume-ro".into()));
     assert_eq!(eff.min_bound(name::EXP), None, "credential does not expire");
@@ -446,7 +455,12 @@ async fn re_enroll_after_keyring_rotation_lazily_migrates_approval() {
     .await;
     assert_eq!(status, StatusCode::OK);
     store
-        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), "usr_op", &now_iso())
+        .approve(
+            SUB,
+            &pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
+            "usr_op",
+            &now_iso(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -576,7 +590,7 @@ async fn re_enroll_over_legacy_unsigned_approved_takes_slow_path() {
     // the body lacks `kid` and `mac`, so deserialising it as the
     // current `Enrolled` struct fails.
     let legacy = serde_json::json!({
-        "pubkey": pop::cnf_value(&CLIENT_SEED),
+        "pubkey": pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
         "approved_at": now_iso(),
         "fingerprint_shown": "deadbeef00112233",
     });
@@ -706,7 +720,12 @@ async fn gates_carry_tpc_but_credential_does_not() {
     // declares no `[role.attestation]`) yields a TPC-free credential —
     // operator authority lives at the gates, not at assume-role.
     store
-        .approve(SUB, &pop::cnf_value(&CLIENT_SEED), "usr_op", &now_iso())
+        .approve(
+            SUB,
+            &pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
+            "usr_op",
+            &now_iso(),
+        )
         .await
         .unwrap();
     let (status, body) = parts(
@@ -767,7 +786,11 @@ async fn enroll_without_operator_discharge_is_opaque_401() {
     let nonce = store.current_invite().await.unwrap();
     let cb = client_invite(&nonce, &CLIENT_SEED);
     let body = format!(r#"{{"ts":{}}}"#, now());
-    let sig = pop::client_signature(&CLIENT_SEED, cb.tail(), body.as_bytes());
+    let sig = pop::client_signature(
+        &SigningKey::from_bytes(&CLIENT_SEED),
+        cb.tail(),
+        body.as_bytes(),
+    );
     let req = Request::builder()
         .method("POST")
         .uri("/v1/enroll")
@@ -798,7 +821,11 @@ async fn enroll_with_wrong_scope_discharge_is_opaque_401() {
         .expect("invite carries a TPC");
     let wrong = gate_discharge(&cid, scope::MINT_EXCHANGE);
     let body = format!(r#"{{"ts":{}}}"#, now());
-    let sig = pop::client_signature(&CLIENT_SEED, cb.tail(), body.as_bytes());
+    let sig = pop::client_signature(
+        &SigningKey::from_bytes(&CLIENT_SEED),
+        cb.tail(),
+        body.as_bytes(),
+    );
     let auth = format!("MintV1 {},{}", cb.encode(), wrong.encode());
     let req = Request::builder()
         .method("POST")
@@ -825,7 +852,7 @@ async fn exchange_without_approval_returns_403_awaiting() {
         &K_M_A,
         "mint",
         SUB,
-        &pop::cnf_value(&CLIENT_SEED),
+        &pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
         now() + 600,
         ORG_ID,
         AUTH_URL,

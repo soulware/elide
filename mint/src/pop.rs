@@ -155,12 +155,12 @@ pub fn check(
     Ok(())
 }
 
-/// The `cnf` caveat value for an Ed25519 seed:
+/// The `cnf` caveat value for an Ed25519 identity key:
 /// `ed25519:<base64 pubkey>`. This is the reference for what the
-/// issuance path seals into the credential; the client's identity-key
-/// seed produces the value mint must verify against.
-pub fn cnf_value(seed: &[u8; 32]) -> String {
-    let vk = SigningKey::from_bytes(seed).verifying_key();
+/// issuance path seals into the credential; the client's identity
+/// key produces the value mint must verify against.
+pub fn cnf_value(sk: &SigningKey) -> String {
+    let vk = sk.verifying_key();
     format!("{ED25519_PREFIX}{}", BASE64.encode(vk.to_bytes()))
 }
 
@@ -177,13 +177,13 @@ pub fn validate_cnf(value: &str) -> Result<(), PopReject> {
 }
 
 /// Reference client signature: sign `digest(tail, body)` with the
-/// client's identity-key seed, returning the `X-Mint-Pop` header
+/// client's identity key, returning the `X-Mint-Pop` header
 /// value. The caller must have already embedded the freshness `ts`
 /// field in `body` (it is covered by the signature via
 /// `BLAKE3(body)`). This is exactly what a client does per
 /// `assume-role`; mint never calls it.
-pub fn client_signature(seed: &[u8; 32], tail: &[u8; 32], body: &[u8]) -> String {
-    let sig = SigningKey::from_bytes(seed).sign(&digest(tail, body));
+pub fn client_signature(sk: &SigningKey, tail: &[u8; 32], body: &[u8]) -> String {
+    let sig = sk.sign(&digest(tail, body));
     BASE64.encode(sig.to_bytes())
 }
 
@@ -191,9 +191,10 @@ pub fn client_signature(seed: &[u8; 32], tail: &[u8; 32], body: &[u8]) -> String
 mod tests {
     use super::*;
 
-    fn signer() -> ([u8; 32], String) {
-        let seed = [7u8; 32];
-        (seed, cnf_value(&seed))
+    fn signer() -> (SigningKey, String) {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let cnf = cnf_value(&sk);
+        (sk, cnf)
     }
 
     /// A request body carrying the freshness `ts` field plus optional
@@ -202,8 +203,8 @@ mod tests {
         format!("{{\"ts\":{ts}{extra}}}").into_bytes()
     }
 
-    fn proof_for(seed: &[u8; 32], tail: &[u8; 32], body: &[u8]) -> Proof {
-        Proof::from_b64(&client_signature(seed, tail, body)).expect("well-formed proof")
+    fn proof_for(sk: &SigningKey, tail: &[u8; 32], body: &[u8]) -> Proof {
+        Proof::from_b64(&client_signature(sk, tail, body)).expect("well-formed proof")
     }
 
     const TAIL: [u8; 32] = [9u8; 32];
@@ -300,7 +301,7 @@ mod tests {
         let (_, key) = signer();
         let cv = vec![Caveat::scalar(CNF_CAVEAT, key)];
         let b = body(1000, "");
-        let p = proof_for(&[3u8; 32], &TAIL, &b);
+        let p = proof_for(&SigningKey::from_bytes(&[3u8; 32]), &TAIL, &b);
         assert_eq!(
             check(&cv, &TAIL, &b, Some(p), 1000),
             Err(PopReject::BadSignature)
@@ -338,6 +339,12 @@ mod proptests {
         proptest::array::uniform32(any::<u8>())
     }
 
+    /// Drawn key material is a plain seed (shrinkable); the typed
+    /// signing key is built at the use site.
+    fn sk_from(seed: &[u8; 32]) -> SigningKey {
+        SigningKey::from_bytes(seed)
+    }
+
     /// A JSON-safe body tag — no `"` or `\`, so the assembled body stays
     /// valid JSON while still varying the exact signed bytes.
     fn tag() -> impl Strategy<Value = String> {
@@ -345,22 +352,22 @@ mod proptests {
     }
 
     fn cnf_caveats(seed: &[u8; 32]) -> Vec<Caveat> {
-        vec![Caveat::scalar(CNF_CAVEAT, cnf_value(seed))]
+        vec![Caveat::scalar(CNF_CAVEAT, cnf_value(&sk_from(seed)))]
     }
 
     fn body_with_ts(ts: u64, tag: &str) -> Vec<u8> {
         format!(r#"{{"ts":{ts},"tag":"{tag}"}}"#).into_bytes()
     }
 
-    fn proof_for(seed: &[u8; 32], tail: &[u8; 32], body: &[u8]) -> Proof {
-        Proof::from_b64(&client_signature(seed, tail, body)).expect("well-formed proof")
+    fn proof_for(sk: &SigningKey, tail: &[u8; 32], body: &[u8]) -> Proof {
+        Proof::from_b64(&client_signature(sk, tail, body)).expect("well-formed proof")
     }
 
     proptest! {
         /// A `cnf` value minted from any seed is always a valid key.
         #[test]
         fn cnf_value_is_always_valid(seed in key()) {
-            prop_assert_eq!(validate_cnf(&cnf_value(&seed)), Ok(()));
+            prop_assert_eq!(validate_cnf(&cnf_value(&sk_from(&seed))), Ok(()));
         }
 
         /// A fresh signature over the exact tail and body, with an in-body
@@ -372,7 +379,7 @@ mod proptests {
         ) {
             let ts = if future { now + delta } else { now - delta };
             let b = body_with_ts(ts, &tag);
-            let proof = proof_for(&seed, &tail, &b);
+            let proof = proof_for(&sk_from(&seed), &tail, &b);
             prop_assert_eq!(check(&cnf_caveats(&seed), &tail, &b, Some(proof), now), Ok(()));
         }
 
@@ -382,7 +389,7 @@ mod proptests {
         fn proof_is_bound_to_the_tail(seed in key(), t1 in key(), t2 in key(), tag in tag()) {
             prop_assume!(t1 != t2);
             let b = body_with_ts(1000, &tag);
-            let proof = proof_for(&seed, &t1, &b);
+            let proof = proof_for(&sk_from(&seed), &t1, &b);
             prop_assert_eq!(
                 check(&cnf_caveats(&seed), &t2, &b, Some(proof), 1000),
                 Err(PopReject::BadSignature)
@@ -398,7 +405,7 @@ mod proptests {
             idx in any::<usize>(), bit in 0u8..8,
         ) {
             let b = body_with_ts(1000, &tag);
-            let proof = proof_for(&seed, &tail, &b);
+            let proof = proof_for(&sk_from(&seed), &tail, &b);
             let mut tampered = b.clone();
             let i = idx % tampered.len();
             tampered[i] ^= 1 << bit;
@@ -412,9 +419,9 @@ mod proptests {
         /// rejected.
         #[test]
         fn wrong_signing_key_fails(s1 in key(), s2 in key(), tail in key(), tag in tag()) {
-            prop_assume!(cnf_value(&s1) != cnf_value(&s2));
+            prop_assume!(cnf_value(&sk_from(&s1)) != cnf_value(&sk_from(&s2)));
             let b = body_with_ts(1000, &tag);
-            let proof = proof_for(&s2, &tail, &b);
+            let proof = proof_for(&sk_from(&s2), &tail, &b);
             prop_assert_eq!(
                 check(&cnf_caveats(&s1), &tail, &b, Some(proof), 1000),
                 Err(PopReject::BadSignature)
@@ -430,7 +437,7 @@ mod proptests {
         ) {
             let ts = if future { now + delta } else { now - delta };
             let b = body_with_ts(ts, &tag);
-            let proof = proof_for(&seed, &tail, &b);
+            let proof = proof_for(&sk_from(&seed), &tail, &b);
             prop_assert_eq!(
                 check(&cnf_caveats(&seed), &tail, &b, Some(proof), now),
                 Err(PopReject::Stale)
@@ -453,13 +460,13 @@ mod proptests {
         /// even a valid proof for one of them cannot open the gate.
         #[test]
         fn contradictory_cnf_fails_closed(s1 in key(), s2 in key(), tail in key(), tag in tag()) {
-            prop_assume!(cnf_value(&s1) != cnf_value(&s2));
+            prop_assume!(cnf_value(&sk_from(&s1)) != cnf_value(&sk_from(&s2)));
             let cv = vec![
-                Caveat::scalar(CNF_CAVEAT, cnf_value(&s1)),
-                Caveat::scalar(CNF_CAVEAT, cnf_value(&s2)),
+                Caveat::scalar(CNF_CAVEAT, cnf_value(&sk_from(&s1))),
+                Caveat::scalar(CNF_CAVEAT, cnf_value(&sk_from(&s2))),
             ];
             let b = body_with_ts(1000, &tag);
-            let proof = proof_for(&s1, &tail, &b);
+            let proof = proof_for(&sk_from(&s1), &tail, &b);
             prop_assert_eq!(
                 check(&cv, &tail, &b, Some(proof), 1000),
                 Err(PopReject::Unsatisfiable)

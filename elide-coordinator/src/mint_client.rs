@@ -209,7 +209,8 @@ pub(crate) struct WireMacaroon {
     key_ref: Vec<u64>,
     nonce: [u8; NONCE_LEN],
     caveats: Vec<Caveat>,
-    mac: [u8; 32],
+    // Held as blake3::Hash so tag comparison (`==`) is constant-time.
+    mac: blake3::Hash,
 }
 
 impl WireMacaroon {
@@ -240,7 +241,7 @@ impl WireMacaroon {
             key_ref.push(v);
         }
         let nonce = read_bin_fixed::<NONCE_LEN>(&mut r)?;
-        let mac = read_bin_fixed::<32>(&mut r)?;
+        let mac = blake3::Hash::from_bytes(read_bin_fixed::<32>(&mut r)?);
         let count = rmp::decode::read_array_len(&mut r)
             .map_err(|_| io::Error::other("credential macaroon: truncated"))?;
         let mut caveats = Vec::with_capacity(count as usize);
@@ -267,12 +268,12 @@ impl WireMacaroon {
     pub(crate) fn attenuate(&mut self, name: &str, value: &str) {
         let c = first_party(name, value);
         let step = serialize_one(&c);
-        self.mac = *blake3::keyed_hash(&self.mac, &step).as_bytes();
+        self.mac = blake3::keyed_hash(self.mac.as_bytes(), &step);
         self.caveats.push(c);
     }
 
     pub(crate) fn tail(&self) -> &[u8; 32] {
-        &self.mac
+        self.mac.as_bytes()
     }
 
     /// The `cid` of the third-party caveat at `location`, if the macaroon
@@ -310,7 +311,7 @@ impl WireMacaroon {
             rmp::encode::write_uint(&mut buf, *v).expect("vec writer");
         }
         rmp::encode::write_bin(&mut buf, &self.nonce).expect("vec writer");
-        rmp::encode::write_bin(&mut buf, &self.mac).expect("vec writer");
+        rmp::encode::write_bin(&mut buf, self.mac.as_bytes()).expect("vec writer");
         let count: u32 = self
             .caveats
             .len()
@@ -988,15 +989,15 @@ mod tests {
         seed_msg.extend_from_slice(DOMAIN);
         seed_msg.extend_from_slice(&kr_bytes);
         seed_msg.extend_from_slice(&nonce);
-        let mut key = *blake3::keyed_hash(root, &seed_msg).as_bytes();
+        let mut key = blake3::keyed_hash(root, &seed_msg);
         for c in &cs {
-            key = *blake3::keyed_hash(&key, &serialize_one(c)).as_bytes();
+            key = blake3::keyed_hash(key.as_bytes(), &serialize_one(c));
         }
         let mut buf = Vec::new();
         rmp::encode::write_array_len(&mut buf, 4).unwrap();
         buf.extend_from_slice(&kr_bytes);
         rmp::encode::write_bin(&mut buf, &nonce).unwrap();
-        rmp::encode::write_bin(&mut buf, &key).unwrap();
+        rmp::encode::write_bin(&mut buf, key.as_bytes()).unwrap();
         rmp::encode::write_array_len(&mut buf, cs.len() as u32).unwrap();
         for c in &cs {
             buf.extend_from_slice(&serialize_one(c));
@@ -1115,7 +1116,7 @@ mod tests {
         let m = WireMacaroon {
             key_ref: vec![0, 0],
             nonce: [0u8; NONCE_LEN],
-            mac: [0u8; 32],
+            mac: blake3::Hash::from_bytes([0u8; 32]),
             caveats: vec![
                 first_party("aud", "mint"),
                 Caveat::ThirdParty {
