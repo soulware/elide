@@ -1,17 +1,15 @@
-//! Third-party caveat primitives: per-anchor `r` derivation and the
-//! AEAD-encrypted `(VID, CID)` payload mint stamps onto operator-write
-//! credentials (`docs/design-auth-service.md` § *Keys*, § *Coord ↔
-//! mint enrollment*).
+//! Third-party caveat primitives: the AEAD-encrypted `(VID, CID)`
+//! payload mint stamps onto TPC-bearing anchors and credentials
+//! (`docs/design-auth-service.md` § *Keys*, § *Coord ↔ mint
+//! enrollment*).
 //!
 //! The operations:
 //!
-//! - [`derive_r`] — `r = BLAKE3-derive-key("mint tpc r-key v1",
-//!   K_M || client_id || r_epoch)`. Deterministic in its inputs, so
-//!   mint re-derives `r` on every call without storing per-client
-//!   state. `r` rolls when `K_M` rotates or an anchor is re-minted
-//!   (`docs/design-auth-service.md` § *`r_tpc` rotation*); the
-//!   `r_epoch` input lets a caller force a roll independently, and
-//!   production anchors (invite, ticket, admin-service) pass `0`.
+//! - [`build_caveat`] / [`build_caveat_attested`] — draw a fresh
+//!   random `r` (the discharge root key) and seal it twice, below.
+//!   `r` is ephemeral: it exists nowhere outside the one caveat it is
+//!   drawn for, so a discharge is MAC-valid against exactly the
+//!   caveat it was minted to satisfy.
 //!
 //! - [`encrypt_vid`] — AES-GCM-SIV(T_{n-1}, plaintext = `r`) with
 //!   a fixed all-zero nonce. T_{n-1} is the chain tag at the TPC's
@@ -23,9 +21,6 @@
 //!   `r || lp(client_id) || lp(org_id)`) with the same fixed nonce.
 //!   Length-prefix every variable field so two different
 //!   `(client_id, org_id)` pairs can't produce the same plaintext.
-//!   CID is identical across credentials a client carries that share
-//!   `r` — that's the property that lets one discharge satisfy
-//!   several of the client's credentials at once.
 //!
 //! - [`encrypt_cid_attested`] — the same layout plus one trailing
 //!   length-prefixed `mode` string, sealed under a second authority key
@@ -37,36 +32,25 @@
 //! **Nonce reuse safety.** AES-GCM-SIV is misuse-resistant by
 //! construction: nonce reuse with the same key is safe (the
 //! ciphertext+tag are a deterministic function of the plaintext
-//! alone). We exploit that to make CID deterministic — same inputs
-//! yield byte-identical CID, the property that lets multiple
-//! credentials share one CID.
+//! alone), and every plaintext sealed here embeds its own fresh `r`.
 
 use aes_gcm_siv::{
     Aes256GcmSiv, Key, Nonce,
     aead::{Aead, KeyInit},
 };
+use rand_core::{OsRng, RngCore};
 
 use crate::caveat::Caveat;
-
-/// Domain-separation context for `r` derivation. Bumping this string
-/// rotates every `r` cluster-wide; the `r_epoch` argument is the
-/// per-`client_id` equivalent.
-const R_KDF_CONTEXT: &str = "mint tpc r-key v1";
 
 /// Fixed all-zero nonce. AES-GCM-SIV's misuse-resistance is what makes
 /// this safe — see module docs.
 const FIXED_NONCE: [u8; 12] = [0u8; 12];
 
-/// Per-client discharge-recovery key. The KDF is keyed by `K_M`
-/// directly via BLAKE3's `derive_key` (KMAC-shaped, domain-separated
-/// by the context string), so a leaked `r` doesn't reveal `K_M` or
-/// any sibling client's `r`.
-pub fn derive_r(k_m: &[u8; 32], client_id: &str, r_epoch: u32) -> [u8; 32] {
-    let mut key_material = Vec::with_capacity(32 + client_id.len() + 4);
-    key_material.extend_from_slice(k_m);
-    key_material.extend_from_slice(client_id.as_bytes());
-    key_material.extend_from_slice(&r_epoch.to_be_bytes());
-    blake3::derive_key(R_KDF_CONTEXT, &key_material)
+/// Draw a fresh discharge root key for one caveat.
+fn fresh_r() -> [u8; 32] {
+    let mut r = [0u8; 32];
+    OsRng.fill_bytes(&mut r);
+    r
 }
 
 /// Encrypt `r` under `T_{n-1}` to produce `VID`. T_{n-1} is the
@@ -90,24 +74,25 @@ pub fn encrypt_cid(k_m_a: &[u8; 32], r: &[u8; 32], client_id: &str, org_id: &str
     aead_encrypt(k_m_a, &plaintext)
 }
 
-/// Build the `Caveat::ThirdParty` to append at issuance. `tail` is
-/// the chain tag at the appending position — the issuer reads it off
-/// the credential's [`tail`](crate::macaroon::Macaroon::tail) before
-/// calling [`attenuate`](crate::macaroon::Macaroon::attenuate). Chain
+/// Build the `Caveat::ThirdParty` to append at issuance, drawing a
+/// fresh `r` for it. `tail` is the chain tag at the appending
+/// position — the issuer reads it off the credential's
+/// [`tail`](crate::macaroon::Macaroon::tail) before calling
+/// [`attenuate`](crate::macaroon::Macaroon::attenuate). Chain
 /// extension is keyless, so this composes correctly whether the TPC
 /// is the first thing past the chain seed or the Nth caveat.
 pub fn build_caveat(
     tail: &[u8; 32],
-    r: &[u8; 32],
     k_m_a: &[u8; 32],
     client_id: &str,
     org_id: &str,
     location: impl Into<String>,
 ) -> Caveat {
+    let r = fresh_r();
     Caveat::ThirdParty {
         location: location.into(),
-        vid: encrypt_vid(tail, r),
-        cid: encrypt_cid(k_m_a, r, client_id, org_id),
+        vid: encrypt_vid(tail, &r),
+        cid: encrypt_cid(k_m_a, &r, client_id, org_id),
     }
 }
 
@@ -139,25 +124,25 @@ pub fn encrypt_cid_attested(
 }
 
 /// Build an attested `Caveat::ThirdParty` to append at credential
-/// issuance, naming the discharging authority at `location`. `tail` is
-/// the chain tag at the appending position; `r` is recovered by mint via
-/// `VID` ([`encrypt_vid`]) and by the authority via `CID`
-/// ([`encrypt_cid_attested`]), but never by the holder. Mirrors
-/// [`build_caveat`] for the auth TPC, plus the opaque `mode`.
-#[allow(clippy::too_many_arguments)]
+/// issuance, naming the discharging authority at `location`, drawing a
+/// fresh `r` for it. `tail` is the chain tag at the appending position;
+/// `r` is recovered by mint via `VID` ([`encrypt_vid`]) and by the
+/// authority via `CID` ([`encrypt_cid_attested`]), but never by the
+/// holder. Mirrors [`build_caveat`] for the auth TPC, plus the opaque
+/// `mode`.
 pub fn build_caveat_attested(
     tail: &[u8; 32],
-    r: &[u8; 32],
     k_m_b: &[u8; 32],
     client_id: &str,
     org_id: &str,
     mode: &str,
     location: impl Into<String>,
 ) -> Caveat {
+    let r = fresh_r();
     Caveat::ThirdParty {
         location: location.into(),
-        vid: encrypt_vid(tail, r),
-        cid: encrypt_cid_attested(k_m_b, r, client_id, org_id, mode),
+        vid: encrypt_vid(tail, &r),
+        cid: encrypt_cid_attested(k_m_b, &r, client_id, org_id, mode),
     }
 }
 
@@ -338,33 +323,51 @@ fn read_length_prefixed_str(buf: &[u8], pos: &mut usize) -> Result<String, TpcEr
 mod tests {
     use super::*;
 
-    #[test]
-    fn r_is_deterministic() {
-        let k_m = [9u8; 32];
-        let r1 = derive_r(&k_m, "01ARZ", 0);
-        let r2 = derive_r(&k_m, "01ARZ", 0);
-        assert_eq!(r1, r2);
+    /// `(vid, cid)` of a built caveat, for comparing two builds.
+    fn caveat_payload(c: Caveat) -> (Vec<u8>, Vec<u8>) {
+        match c {
+            Caveat::ThirdParty { vid, cid, .. } => (vid, cid),
+            other => panic!("expected a third-party caveat, got {other:?}"),
+        }
     }
 
     #[test]
-    fn r_differs_per_client_and_per_epoch() {
-        let k_m = [9u8; 32];
-        let a = derive_r(&k_m, "01ARZ", 0);
-        let b = derive_r(&k_m, "01BXY", 0);
-        let c = derive_r(&k_m, "01ARZ", 1);
-        assert_ne!(a, b, "different client_id must produce different r");
-        assert_ne!(a, c, "different r_epoch must produce different r");
+    fn built_caveats_draw_fresh_r() {
+        // Identical inputs, two builds: every encrypted field differs,
+        // because each build seals its own ephemeral `r`. A discharge
+        // minted for one caveat is therefore inert against the other.
+        let tail = [11u8; 32];
+        let k = [3u8; 32];
+        let (vid1, cid1) =
+            caveat_payload(build_caveat(&tail, &k, "01ARZ", "org_demo", "https://a"));
+        let (vid2, cid2) =
+            caveat_payload(build_caveat(&tail, &k, "01ARZ", "org_demo", "https://a"));
+        assert_ne!(vid1, vid2);
+        assert_ne!(cid1, cid2);
     }
 
     #[test]
-    fn r_independent_of_unrelated_k_m_bits() {
-        // A leak of one client's r must not yield a sibling's r.
-        let k_m = [9u8; 32];
-        let mut other_k_m = k_m;
-        other_k_m[0] ^= 0x80;
-        let mine = derive_r(&k_m, "01ARZ", 0);
-        let theirs = derive_r(&other_k_m, "01ARZ", 0);
-        assert_ne!(mine, theirs);
+    fn built_attested_caveats_draw_fresh_r() {
+        let tail = [11u8; 32];
+        let k = [3u8; 32];
+        let (vid1, cid1) = caveat_payload(build_caveat_attested(
+            &tail,
+            &k,
+            "01ARZ",
+            "org_demo",
+            "volume-rw",
+            "https://a",
+        ));
+        let (vid2, cid2) = caveat_payload(build_caveat_attested(
+            &tail,
+            &k,
+            "01ARZ",
+            "org_demo",
+            "volume-rw",
+            "https://a",
+        ));
+        assert_ne!(vid1, vid2);
+        assert_ne!(cid1, cid2);
     }
 
     #[test]
@@ -573,7 +576,7 @@ mod tests {
     #[test]
     fn attested_cid_and_vid_agree_on_r() {
         let k_m_b = [2u8; 32];
-        let r = derive_r(&[1u8; 32], "01ARZ", 0);
+        let r = fresh_r();
         let tail = [11u8; 32];
         let vid = encrypt_vid(&tail, &r);
         let cid = encrypt_cid_attested(&k_m_b, &r, "01ARZ", "org_demo", "volume-ro");
@@ -588,7 +591,7 @@ mod tests {
         // recover `r` either by walking the chain (VID) or by
         // decrypting CID under K_M-A — both yield the same key.
         let k_m_a = [3u8; 32];
-        let r = derive_r(&[1u8; 32], "01ARZ", 0);
+        let r = fresh_r();
         let tail = [11u8; 32];
         let vid = encrypt_vid(&tail, &r);
         let cid = encrypt_cid(&k_m_a, &r, "01ARZ", "org_demo");
@@ -616,20 +619,6 @@ mod proptests {
     }
 
     proptest! {
-        /// `r` derivation is a deterministic, input-sensitive KDF: equal
-        /// inputs give the same `r`; any differing input gives a different
-        /// one (collision probability ~2⁻²⁵⁶).
-        #[test]
-        fn derive_r_is_deterministic_and_sensitive(
-            k1 in key(), c1 in any::<String>(), e1 in any::<u32>(),
-            k2 in key(), c2 in any::<String>(), e2 in any::<u32>(),
-        ) {
-            prop_assert_eq!(derive_r(&k1, &c1, e1), derive_r(&k1, &c1, e1));
-            if (k1, &c1, e1) != (k2, &c2, e2) {
-                prop_assert_ne!(derive_r(&k1, &c1, e1), derive_r(&k2, &c2, e2));
-            }
-        }
-
         /// VID round-trips under its chain tag.
         #[test]
         fn vid_round_trips(tag in key(), r in key()) {

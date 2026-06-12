@@ -46,8 +46,10 @@ The TPC is the existing `Caveat::ThirdParty { location, vid, cid }`
 the shared key and the message change. A hidden value `r` (the caveat /
 discharge root key) anchors it:
 
-- **`r = BLAKE3_derive_key("mint tpc r-key v1", K_M ‖ client_id ‖
-  r_epoch)`** — deterministic, so mint keeps no per-client state.
+- **`r` — fresh random, drawn per TPC at attachment.** It exists
+  nowhere outside the caveat (mint keeps no per-client state — `r`
+  travels only inside `vid`/`cid`), so a discharge is MAC-valid
+  against exactly the caveat it was minted for.
 - **`vid = AES-GCM-SIV(Tₙ₋₁, r)`** — `r` sealed under the chain tag at
   the TPC's position; the *verifier* (mint) recovers `r` by walking the
   chain and decrypting.

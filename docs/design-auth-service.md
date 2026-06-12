@@ -156,19 +156,21 @@ The keys established across the system are:
   Mint re-derives on demand to chain the four role credentials it issues
   for a coord. **Coord does not hold this key.** No role credential
   carries a third-party caveat.
-- `r_tpc` — a per-TPC discharge key, one per anchor: the invite
-  (`r_inv`), the credential ticket (`r_xchg`), and the admin service token
-  (`r_adm`), each a distinct per-org key. `CID = AEAD-encrypt(K_M-A,
-  r_tpc ‖ OrgId)`, so mint and auth both recover `r_tpc` from the `CID`;
-  mint can also recover it by walking the anchor macaroon's chain to the
-  TPC's `VID`. Auth uses `r_tpc` as the HMAC root when minting a
-  discharge for that caveat, and the discharge's nonce equals the `CID`.
-  The distinct keys give cryptographic separation between the gates (a
-  discharge for one anchor is not MAC-valid against another); the
-  *authorization* dimension — which operator may obtain which discharge —
-  rides a `scope` caveat, not the key (§ *Discharge flows*, § *Scope
-  tier*). Rotated by re-minting the anchor macaroon — a fresh invite, a
-  fresh ticket, or `mint admin-service rotate`; see *Key rotation*.
+- `r_tpc` — a per-TPC discharge key, drawn fresh (random) at the moment
+  the caveat is attached: the invite (`r_inv`), the credential ticket
+  (`r_xchg`), and the admin service token (`r_adm`) each seal their own.
+  `CID = AEAD-encrypt(K_M-A, r_tpc ‖ OrgId)`, so mint and auth both
+  recover `r_tpc` from the `CID`; mint can also recover it by walking
+  the anchor macaroon's chain to the TPC's `VID`. `r_tpc` exists
+  nowhere outside its caveat — there is no derivation to replay — so a
+  discharge is MAC-valid against exactly the caveat it was minted for.
+  Auth uses `r_tpc` as the HMAC root when minting a discharge for that
+  caveat, and the discharge's nonce equals the `CID`. The
+  *authorization* dimension — which operator may obtain which
+  discharge — rides a `scope` caveat, not the key (§ *Discharge flows*,
+  § *Scope tier*). Rotated by re-minting the anchor macaroon — a fresh
+  invite, a fresh ticket, or `mint admin-service rotate`; see *Key
+  rotation*.
 
 ### Mint ↔ auth enrollment
 

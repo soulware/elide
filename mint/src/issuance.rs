@@ -49,26 +49,16 @@ pub enum EnrollError {
 }
 
 /// Fixed `client_id` bound into the **invite's** third-party caveat (the
-/// enroll gate). The invite is shared org-wide, so its `r`-cluster is a
-/// single fixed scope — one org, one enroll gate — and its `CID` is the
-/// same for every enrolling coordinator, so one enroll-gate discharge can
-/// bring in any number of them (`docs/design-auth-service.md` § *Coord ↔
-/// mint enrollment*).
+/// enroll gate). The invite is one shared macaroon org-wide — one org,
+/// one enroll gate — so its single `CID` means one enroll-gate discharge
+/// can bring in any number of coordinators
+/// (`docs/design-auth-service.md` § *Coord ↔ mint enrollment*).
 pub const INVITE_CLIENT_ID: &str = "invite";
 
 /// Fixed `client_id` bound into the **credential ticket's** third-party
 /// caveat (the exchange gate). Distinct from [`INVITE_CLIENT_ID`] so the
-/// two gates derive distinct keys (`r_inv` ≠ `r_xchg`) — a discharge for
-/// one anchor is not MAC-valid against the other. Still org-wide (not
-/// per-coordinator): one exchange-gate discharge exchanges every role for
-/// every approved coordinator in its window.
+/// authority can tell from the `CID` alone which gate it is discharging.
 pub const TICKET_CLIENT_ID: &str = "ticket";
-
-/// The enroll-gate and exchange-gate `r` epochs. Fixed at 0; rotation
-/// re-mints the anchor (`mint invite --rotate` / a fresh ticket) and
-/// draws a fresh `r` from a fresh keyring generation, so no per-epoch
-/// bump is needed here.
-const ANCHOR_R_EPOCH: u32 = 0;
 
 /// The reusable invite macaroon: root attenuated with `op=enroll`,
 /// `aud`, the current `invite` nonce, **and the enroll-gate third-party
@@ -93,8 +83,7 @@ pub fn mint_invite(
             Caveat::scalar(name::INVITE, invite_nonce),
         ],
     );
-    let r = crate::tpc::derive_r(keyring.current_key(), INVITE_CLIENT_ID, ANCHOR_R_EPOCH);
-    let tpc = crate::tpc::build_caveat(base.tail(), &r, k_m_a, INVITE_CLIENT_ID, org_id, location);
+    let tpc = crate::tpc::build_caveat(base.tail(), k_m_a, INVITE_CLIENT_ID, org_id, location);
     base.attenuate(tpc)
 }
 
@@ -125,8 +114,7 @@ pub fn mint_credential_ticket(
             Caveat::scalar(name::EXP, exp_unix.to_string()),
         ],
     );
-    let r = crate::tpc::derive_r(keyring.current_key(), TICKET_CLIENT_ID, ANCHOR_R_EPOCH);
-    let tpc = crate::tpc::build_caveat(base.tail(), &r, k_m_a, TICKET_CLIENT_ID, org_id, location);
+    let tpc = crate::tpc::build_caveat(base.tail(), k_m_a, TICKET_CLIENT_ID, org_id, location);
     base.attenuate(tpc)
 }
 
@@ -135,8 +123,8 @@ pub fn mint_credential_ticket(
 /// contract*).
 /// `mode` is opaque to mint, carried verbatim into the CID for the
 /// discharging authority at `location`; the CID is sealed under `K_M-B`
-/// and `r` derives from the credential's own `sub`, so the discharge
-/// binds to this coordinator.
+/// with a fresh per-caveat `r`, so the discharge binds to this
+/// credential alone.
 pub struct AttestedTpc<'a> {
     pub k_m_b: &'a [u8; 32],
     pub org_id: &'a str,
@@ -185,13 +173,11 @@ pub fn mint_credential(
     match attested {
         None => base,
         Some(a) => {
-            // `r` derives from the credential's own `sub`, so the TPC is
-            // per-coordinator; the holder cannot recover it (it has
+            // `r` is fresh per caveat, so a discharge binds to this
+            // credential alone; the holder cannot recover it (it has
             // neither `K_M-B` nor the chain tag at the TPC position).
-            let r = crate::tpc::derive_r(keyring.current_key(), sub, ANCHOR_R_EPOCH);
             let tpc = crate::tpc::build_caveat_attested(
                 base.tail(),
-                &r,
                 a.k_m_b,
                 sub,
                 a.org_id,
@@ -205,14 +191,9 @@ pub fn mint_credential(
 
 /// Fixed `client_id` bound into the admin service token's third-party
 /// caveat. The admin-service is the deployment's admin-plane primary, not
-/// a per-operator credential, so its `r`-cluster is a single fixed
-/// scope — one deployment, one admin plane
+/// a per-operator credential — one deployment, one admin plane
 /// (`docs/design-mint.md` § *Admin service token*).
 pub const ADMIN_SERVICE_CLIENT_ID: &str = "admin-service";
-
-/// The admin-service's TPC `r` epoch. Fixed at 0; rotation (which would
-/// bump it to invalidate outstanding discharges) is deferred.
-const ADMIN_SERVICE_R_EPOCH: u32 = 0;
 
 /// Mint the **admin service token** — the deployment's admin-plane
 /// primary (`docs/design-mint.md` § *Admin service token*). A mint-issued
@@ -225,9 +206,9 @@ const ADMIN_SERVICE_R_EPOCH: u32 = 0;
 /// the attenuated tail), and per-call freshness rides on the discharge.
 /// The token is inert without a fresh discharge satisfying the TPC.
 ///
-/// `r` for the TPC is `derive_r(K_M, "admin-service", 0)`; the verifier
-/// recovers it from the TPC's `VID` (chain-tag-keyed), the auth service
-/// from the `CID` (`K_M-A`-keyed) — both yield this same `r`.
+/// The TPC's fresh `r` is recovered by the verifier from the `VID`
+/// (chain-tag-keyed) and by the auth service from the `CID`
+/// (`K_M-A`-keyed) — both yield the same `r`.
 pub fn mint_admin_service_token(
     keyring: &Keyring,
     k_m_a: &[u8; 32],
@@ -243,14 +224,8 @@ pub fn mint_admin_service_token(
             Caveat::scalar(name::CNF, cnf),
         ],
     );
-    let r = crate::tpc::derive_r(
-        keyring.current_key(),
-        ADMIN_SERVICE_CLIENT_ID,
-        ADMIN_SERVICE_R_EPOCH,
-    );
     let tpc = crate::tpc::build_caveat(
         base.tail(),
-        &r,
         k_m_a,
         ADMIN_SERVICE_CLIENT_ID,
         org_id,
@@ -411,11 +386,38 @@ mod tests {
         assert_eq!(pt.client_id, SUB);
         assert_eq!(pt.org_id, "org_demo");
         assert_eq!(pt.mode, "volume-ro");
-        // `r` is per-coordinator — derived from the credential's own `sub`.
-        assert_eq!(
-            pt.r,
-            crate::tpc::derive_r(kr.current_key(), SUB, ANCHOR_R_EPOCH)
-        );
+    }
+
+    #[test]
+    fn attested_tpcs_draw_fresh_r_per_credential() {
+        // Two credentials for the same sub — even the same role — seal
+        // distinct `r` values, so a discharge minted for one cannot
+        // satisfy the other's TPC.
+        const K_M_B: [u8; 32] = [9u8; 32];
+        const ATT_LOCATION: &str = "https://coord-b.example/v1/discharge";
+        let kr = ring();
+        let attested = || AttestedTpc {
+            k_m_b: &K_M_B,
+            org_id: "org_demo",
+            mode: "volume-ro",
+            location: ATT_LOCATION,
+        };
+        let mint_one =
+            || mint_credential(&kr, "mint", SUB, &cnf(), "volume-ro", 7, Some(attested()));
+        let r_of = |cred: &Macaroon| {
+            let cid = cred
+                .caveats()
+                .iter()
+                .find_map(|c| match c {
+                    Caveat::ThirdParty { cid, .. } => Some(cid.clone()),
+                    _ => None,
+                })
+                .expect("a third-party caveat");
+            crate::tpc::decrypt_cid_attested(&K_M_B, &cid)
+                .expect("decrypt cid")
+                .r
+        };
+        assert_ne!(r_of(&mint_one()), r_of(&mint_one()));
     }
 
     #[test]

@@ -93,7 +93,7 @@ async fn app() -> (axum::Router, tempfile::TempDir) {
 /// Build a TPC-bearing primary the way mint's issuance path would,
 /// using the public APIs. Includes the universal caveats verify+clear
 /// requires: `op=assume-role`, `aud`, `cnf` for the test client.
-fn build_primary(r_epoch: u32) -> Macaroon {
+fn build_primary() -> Macaroon {
     let ring = Keyring::single(ROOT);
     let cred = macaroon::mint(
         &ring,
@@ -105,9 +105,25 @@ fn build_primary(r_epoch: u32) -> Macaroon {
             Caveat::scalar(name::ROLE, "volume-rw"),
         ],
     );
-    let r = tpc::derive_r(&ROOT, CLIENT_ID, r_epoch);
-    let tpc_cv = tpc::build_caveat(cred.tail(), &r, &K_M_A, CLIENT_ID, ORG_ID, AUTH_URL);
+    let tpc_cv = tpc::build_caveat(cred.tail(), &K_M_A, CLIENT_ID, ORG_ID, AUTH_URL);
     cred.attenuate(tpc_cv)
+}
+
+/// Recover the auth TPC's `r` the way the auth service would: decrypt
+/// the CID under `K_M-A`. `r` is fresh per TPC, so it can only come
+/// from the primary itself.
+fn recover_r(primary: &Macaroon) -> [u8; 32] {
+    let cid = primary
+        .caveats()
+        .iter()
+        .find_map(|c| match c {
+            Caveat::ThirdParty { cid, .. } => Some(cid.clone()),
+            _ => None,
+        })
+        .expect("TPC present");
+    tpc::decrypt_cid(&K_M_A, &cid)
+        .expect("recover r from cid")
+        .r
 }
 
 /// Build a discharge the way mint-as-auth (or a separate auth
@@ -140,9 +156,7 @@ fn build_attested_primary(mode: &str) -> Macaroon {
             Caveat::scalar(name::ROLE, "volume-ro"),
         ],
     );
-    let r = tpc::derive_r(&ROOT, CLIENT_ID, 0);
-    let tpc_cv =
-        tpc::build_caveat_attested(cred.tail(), &r, &K_M_B, CLIENT_ID, ORG_ID, mode, AUTH_URL);
+    let tpc_cv = tpc::build_caveat_attested(cred.tail(), &K_M_B, CLIENT_ID, ORG_ID, mode, AUTH_URL);
     cred.attenuate(tpc_cv)
 }
 
@@ -214,9 +228,8 @@ async fn verify_request_pop_seed(
 #[tokio::test]
 async fn verifies_matching_primary_and_discharge() {
     let (app, _dir) = app().await;
-    let primary = build_primary(0);
-    let r = tpc::derive_r(&ROOT, CLIENT_ID, 0);
-    let discharge = build_discharge(r);
+    let primary = build_primary();
+    let discharge = build_discharge(recover_r(&primary));
 
     let (status, body) = verify_request(app, &primary.encode(), &[&discharge.encode()]).await;
     assert_eq!(status, StatusCode::OK);
@@ -233,12 +246,14 @@ async fn verifies_matching_primary_and_discharge() {
 }
 
 #[tokio::test]
-async fn rejects_discharge_under_wrong_r() {
-    // Discharge minted under a *different* r — wrong r_epoch.
+async fn rejects_discharge_transplanted_from_another_primary() {
+    // `r` is fresh per TPC: a discharge minted for one primary's caveat
+    // is not MAC-valid against another primary — same client, same
+    // role, same gate.
     let (app, _dir) = app().await;
-    let primary = build_primary(0); // primary uses r_epoch = 0
-    let wrong_r = tpc::derive_r(&ROOT, CLIENT_ID, 1);
-    let discharge = build_discharge(wrong_r);
+    let primary = build_primary();
+    let other = build_primary();
+    let discharge = build_discharge(recover_r(&other));
 
     let (_status, body) = verify_request(app, &primary.encode(), &[&discharge.encode()]).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -249,7 +264,7 @@ async fn rejects_discharge_under_wrong_r() {
 #[tokio::test]
 async fn rejects_when_discharge_missing() {
     let (app, _dir) = app().await;
-    let primary = build_primary(0);
+    let primary = build_primary();
 
     let (_status, body) = verify_request(app, &primary.encode(), &[]).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -260,9 +275,8 @@ async fn rejects_when_discharge_missing() {
 #[tokio::test]
 async fn rejects_excess_discharges() {
     let (app, _dir) = app().await;
-    let primary = build_primary(0);
-    let r = tpc::derive_r(&ROOT, CLIENT_ID, 0);
-    let discharge = build_discharge(r);
+    let primary = build_primary();
+    let discharge = build_discharge(recover_r(&primary));
     // Pass two discharges for a one-TPC primary.
     let d_enc = discharge.encode();
 
@@ -312,6 +326,24 @@ async fn verifies_attested_primary_and_coord_b_discharge() {
 }
 
 #[tokio::test]
+async fn rejects_attested_discharge_transplanted_across_modes() {
+    // The cross-mode transplant: the same coordinator holds a volume-ro
+    // and a volume-rw credential. A discharge coord B mints for the
+    // volume-ro caveat (whose predicate admits ancestors) must not
+    // MAC-verify against the volume-rw credential — fresh per-TPC `r`
+    // is what binds each discharge to the caveat it was minted for.
+    let (app, _dir) = app().await;
+    let primary_ro = build_attested_primary("volume-ro");
+    let primary_rw = build_attested_primary("volume-rw");
+    let discharge = coord_b_discharge(&primary_ro);
+
+    let (_status, body) = verify_request(app, &primary_rw.encode(), &[&discharge.encode()]).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["valid"], serde_json::Value::Bool(false), "body: {body}");
+    assert_eq!(v["reason"], "mac_mismatch");
+}
+
+#[tokio::test]
 async fn rejects_attested_primary_when_discharge_missing() {
     // The load-bearing invariant: a credential carrying the attested TPC
     // is inert without a discharge — it cannot clear at assume-role.
@@ -327,9 +359,8 @@ async fn rejects_attested_primary_when_discharge_missing() {
 #[tokio::test]
 async fn rejects_tampered_primary() {
     let (app, _dir) = app().await;
-    let primary = build_primary(0);
-    let r = tpc::derive_r(&ROOT, CLIENT_ID, 0);
-    let discharge = build_discharge(r);
+    let primary = build_primary();
+    let discharge = build_discharge(recover_r(&primary));
 
     // Tamper a byte in the wire-encoded primary without re-MACing.
     let bad_enc = {
