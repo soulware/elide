@@ -916,7 +916,15 @@ Four endpoints. `/v1/assume-role` and `/v1/verify` share a single
 recursively verify any discharges by recovering `r` from each TPC's
 `VID` to fixpoint, then clear the standard first-party caveats (`aud`,
 `op=assume-role`, `cnf`+PoP, `exp` — including any per-forward `exp`
-attenuation). The discharge step does real work at the three operator
+attenuation). Each TPC is paired with the discharge that **names its
+ticket**: a discharge stamps the ticket id (derived from the TPC's `CID`)
+into its nonce, and the verifier indexes the presented discharges by that
+id, so a discharge satisfies the one caveat it was minted for regardless
+of bundle order — a discharge that names no presented TPC, or two
+discharges naming the same ticket, is rejected. Identity pairing is the
+index; the `r`-under-`VID` MAC check is the authority, so a discharge can
+neither be transplanted onto another caveat nor satisfy the wrong one.
+The discharge step does real work at the three operator
 gates — the invite at `/v1/enroll`, the ticket at `/v1/enroll-exchange`,
 the CLI service token at the admin verbs — and at `assume-role` for a
 role with an attestation contract, whose credential carries the attested

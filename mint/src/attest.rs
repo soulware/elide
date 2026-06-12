@@ -53,7 +53,7 @@ use std::collections::BTreeMap;
 use crate::auth::verify_session;
 use crate::caveat::{Caveat, name};
 use crate::http::AppState;
-use crate::macaroon::{KeyRef, mint_under_key};
+use crate::macaroon::{KeyRef, mint_under_key_with_nonce};
 use crate::tpc;
 
 /// Demo attestation-discharge lifetime. Long enough for the client to
@@ -145,7 +145,11 @@ async fn issue_discharge(
         .map(|(n, v)| Caveat::scalar(n.as_str(), v.as_str()))
         .collect();
     caveats.push(Caveat::scalar(name::EXP, exp.to_string()));
-    let discharge = mint_under_key(&pt.r, KeyRef::Discharge, caveats);
+    // The discharge names the third-party caveat it answers by stamping
+    // the ticket id (derived from this CID) into its nonce — the verifier
+    // pairs discharges to TPCs by that id, never by presentation order.
+    let discharge =
+        mint_under_key_with_nonce(&pt.r, KeyRef::Discharge, tpc::ticket_id(&cid), caveats);
 
     (
         StatusCode::OK,

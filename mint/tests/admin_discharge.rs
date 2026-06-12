@@ -25,9 +25,10 @@ use mint::config::Config;
 use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::keyring::Keyring;
-use mint::macaroon::{KeyRef, Macaroon, mint_under_key};
+use mint::macaroon::{KeyRef, Macaroon, mint_under_key, mint_under_key_with_nonce};
 use mint::pop;
 use mint::state::Store;
+use mint::tpc;
 use tower::ServiceExt;
 
 mod common;
@@ -544,13 +545,23 @@ async fn pop_signed_by_wrong_key_rejected() {
 async fn forged_discharge_under_wrong_r_rejected() {
     // An attacker mints a discharge under a key of their own choosing
     // (they don't hold K_M-A, so they can't recover the admin-service's
-    // real `r`). verify_and_clear recovers `r` from the TPC's `VID` and
-    // the forged discharge fails its chain MAC under that `r`.
+    // real `r`). It names the right ticket, so it matches by identity —
+    // then verify_and_clear recovers `r` from the TPC's `VID` and the
+    // forged discharge fails its chain MAC under that `r`.
     let (mint_router, _auth_router, _dir) = app().await;
     let token = admin_service();
-    let forged = mint_under_key(
+    let cid = token
+        .caveats()
+        .iter()
+        .find_map(|c| match c {
+            Caveat::ThirdParty { cid, .. } => Some(cid.clone()),
+            _ => None,
+        })
+        .expect("admin-service TPC present");
+    let forged = mint_under_key_with_nonce(
         &[0x11u8; 32],
         KeyRef::Discharge,
+        tpc::ticket_id(&cid),
         vec![
             Caveat::scalar(name::SUB, "operator-alice"),
             Caveat::scalar(name::EXP, (now() + 300).to_string()),
