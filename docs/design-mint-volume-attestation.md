@@ -55,15 +55,18 @@ discharge root key) anchors it:
   sealed under the key shared with coord B; the *authority* (coord B)
   recovers `r` + message by decrypting. For volume attestation the
   message is `lp(client_id) ‖ lp(org_id) ‖ mode`,
-  `mode ∈ {rw-self, ro-ancestor}` — extending the auth TPC's
+  `mode ∈ {volume-rw, volume-ro}` — extending the auth TPC's
   `lp(client_id) ‖ lp(org_id)` with `mode`. `org_id` is retained for
   parity with the auth TPC, so coord B can org-attribute the discharge
   even though volume entitlement is anchored by the possession proof, not
   the tenant claim. `mode` is the load-bearing addition: coord B cannot
   MAC the primary, so the role it discharges for must be sealed by mint
-  here rather than asserted by coord A. **The volume is deliberately
-  absent**, keeping mint volume-agnostic; it is named only in the live
-  discharge request and stamped into the discharge's `attested.volume`.
+  here rather than asserted by coord A. The mode comes from the role's
+  `[role.attestation]` config table and defaults to the role name; an
+  explicit `mode` supports a role whose name differs from the
+  authority's vocabulary. **The volume is deliberately absent**, keeping
+  mint volume-agnostic; it is named only in the live discharge request
+  and stamped into the discharge's `attested.volume`.
 
 `r` is recoverable by mint (via `vid`) and coord B (via `cid`), but **not
 by the holder** — coord A has neither `K_M-B` nor the intermediate chain
@@ -256,7 +259,7 @@ fails the second. Every *bound* state is a live binding:
   holds the name, not whether a process is up.
 - **`Importing`** — an import in flight: the record binds the new
   vol_ulid from import start, and the importer's on-disk key anchors
-  the drain's `rw-self` discharges for the whole construction window
+  the drain's `volume-rw` discharges for the whole construction window
   (see *Import runs under an `Importing` record*).
 - **`Readonly`** — a readonly import is terminally bound: no lifecycle
   verb accepts a `Readonly` record, so no displacement scenario exists.
@@ -303,7 +306,7 @@ the acquisition-side invariant: *every `volume-ro` read routes through an
 `owned` anchor whose binding is live (`names/<name> → owned`, state not
 `Released`) and that is locally keyed.*
 The role enforces it unconditionally — once `volume-ro` carries an
-`ro-ancestor` TPC, every `assume-role` requires a discharge — so a read
+`volume-ro` TPC, every `assume-role` requires a discharge — so a read
 that cannot produce an anchor must not sit on the `volume-ro` path.
 
 ### Threading the `owned` anchor
@@ -318,8 +321,8 @@ anchor:
 - **Coordinator-internal dense reads** (`ScopedStores::read_volume`): the
   call site holds the live leaf being operated on. `read_volume(owned,
   target)` threads it; the per-`(owned, target)` `volume-ro` facade fetches
-  an `ro-ancestor` discharge before `assume-role` (parallel to how
-  `volume-rw` fetches `rw-self`).
+  an `volume-ro` discharge before `assume-role` (parallel to how
+  `volume-rw` fetches `volume-rw`).
 
 ### Setup reads: claim-first ordering
 
@@ -428,7 +431,7 @@ keypair), and it is start's possession proof:
 
 A brand-new volume cannot attest its own first write. `volume-rw`'s
 policy covers `by_id/<vol>/*` plus the volume's two `meta/` trust
-anchors, and its `rw-self` discharge requires coord B to verify the
+anchors, and its `volume-rw` discharge requires coord B to verify the
 possession proof against `meta/<vol>.pub` — fetched from S3. For the
 first-ever upload of that pub the dependency is circular: the upload
 needs the discharge, the discharge needs the uploaded object. No
@@ -461,7 +464,7 @@ A creation flow is then three ordered planes:
    `meta/<vol>.provenance`, create-only.
 2. **Record** (`coord-rw`): CAS-create `names/<name>` binding the new
    vol_ulid — the claim-first fence.
-3. **Data** (`volume-rw` + `rw-self`): every `by_id/<vol>/` write,
+3. **Data** (`volume-rw` + `volume-rw`): every `by_id/<vol>/` write,
    fully attested — the record exists (liveness) and the pub is
    fetchable (possession).
 
@@ -482,7 +485,7 @@ moves to import start, in a state that names the window:
   persists `volume.key` in the fork dir. The importing window *is*
   the volume's rw phase, and it gets the standard rw key treatment:
   the worker signs segments with the on-disk key, the coordinator
-  builds `rw-self` possession proofs from it, exactly like every
+  builds `volume-rw` possession proofs from it, exactly like every
   other volume. No key shadow is written (nothing will ever
   resurrect; the flip destroys the key). The coordinator then runs
   the bootstrap planes: identity uploads (`coord-rw`, create-only),
@@ -493,7 +496,7 @@ moves to import start, in a state that names the window:
   uniqueness race is settled at start, not after both hosts have
   done the work.
 - **During.** The serve-phase drain writes `by_id/<vol>/` under
-  `volume-rw` + `rw-self`; the `Importing` record is a bound state,
+  `volume-rw` + `volume-rw`; the `Importing` record is a bound state,
   so the liveness predicate accepts it, and the on-disk key signs
   the proofs. `record_latest_snapshot` bumps stay vol_ulid-guarded.
   Every lifecycle verb (claim, force-claim, release, start, stop)
@@ -515,7 +518,7 @@ moves to import start, in a state that names the window:
 
 Cross-host `--extents-from` rides the start ordering: extent-source
 idx reads happen in the import block loop, before the serve phase, so
-an importer-anchored `ro-ancestor` read of a foreign source is
+an importer-anchored `volume-ro` read of a foreign source is
 possible only because the record exists from start.
 
 ### Recovery is a claim: force-release becomes `claim --force`
@@ -523,7 +526,7 @@ possible only because the record exists from start.
 `release --force` was the one remaining foreign *write*: a coordinator
 that owns nothing synthesised a handoff manifest from a dead volume's
 published state and PUT it under `by_id/<dead>/snapshots/` — a write
-`rw-self` can never discharge, signed by a recovery key that
+`volume-rw` can never discharge, signed by a recovery key that
 `ParentRef.manifest_pubkey` then had to carry through every lineage
 walk. Every artefact that write produces exists only to serve the next
 owner, so the rework gives the operation to the next owner: recovery is
@@ -542,8 +545,8 @@ owner, so the rework gives the operation to the next owner: recovery is
    `latest_snapshot` — resolved from one post-CAS read of the dead
    volume's HEAD, the cut that defines the claim set — become the new
    fork's first segments. The claimant is live and the dead volume is
-   its declared parent, so the reads ride `ro-ancestor`; the writes
-   land under the claimant's own prefix and ride `rw-self`. Per
+   its declared parent, so the reads ride `volume-ro`; the writes
+   land under the claimant's own prefix and ride `volume-rw`. Per
    segment: verify the parent's signature over the index, re-sign the
    same index bytes with the fork's key — the segment signature covers
    `BLAKE3(header || index_bytes)` only, body integrity being the
@@ -557,7 +560,7 @@ After this rework no synthesised manifest exists anywhere:
 `ParentRef.manifest_pubkey` and the recovery-signer machinery
 (`resolve_handoff_key_via_recovery`, the per-source attestation
 keypairs) retire. Every manifest is signed by its volume's own key, and
-every write in the system is `rw-self`.
+every write in the system is `volume-rw`.
 
 Fencing simplifies with it. The claimant's basis is an owner-published
 snapshot, so every segment it references is already at or below the
@@ -565,7 +568,7 @@ dispossessed owner's GC floor; the head-delta ULIDs under the dead
 prefix are referenced by nobody once re-owned, so a zombie owner's GC
 compacting them is harmless. The one live race — the zombie reaping a
 cut-set segment mid-copy — is held off by the retention window and the
-owner-side reap gate, and bounded by the `rw-self` liveness
+owner-side reap gate, and bounded by the `volume-rw` liveness
 re-attestation window: the zombie's discharges stop renewing the moment
 the record is rebound. `design-force-release-fencing.md` § *The
 head-delta cut* carries the mechanism and walkthroughs.
@@ -578,7 +581,7 @@ Released record carries a real volume-signed handoff.
 
 `volume fetch` pulled a *foreign* volume's bytes without taking ownership:
 a `by_id` read of a volume this host holds no key for, with no lineage
-relationship to prove. It cannot anchor an `ro-ancestor` discharge and so
+relationship to prove. It cannot anchor an `volume-ro` discharge and so
 cannot sit on the attested `volume-ro` role. It is removed; the
 warm-then-takeover workflow is reconstructable as `fork --from` (which
 warms the owner-keyed `by_id/<source>/cache/` as a side effect of its
@@ -612,7 +615,7 @@ mint — the same CID-wrapping construction as the auth-service TPC's
 **coord B verification — fail-closed, in order:**
 
 1. **Recover `cid`.** AEAD-decrypt under `K_M-B` →
-   `(r, client_id, org_id, mode)` with `mode ∈ {rw-self, ro-ancestor}`
+   `(r, client_id, org_id, mode)` with `mode ∈ {volume-rw, volume-ro}`
    baked in by mint at primary issuance (mint knows the role; coord B
    never trusts the primary, which it cannot MAC). `org_id` is available
    for discharge attribution.
@@ -626,7 +629,7 @@ mint — the same CID-wrapping construction as the auth-service TPC's
    Applies to `owned` only; ancestors are frozen. Resolution reuses the
    claim-record model; its edge cases (e.g. an unnamed scratch volume)
    are the claim-record design's concern, not the binding's.
-5. **Mode.** `rw-self` ⟹ `target == owned`; `ro-ancestor` ⟹ `target ∈
+5. **Mode.** `volume-rw` ⟹ `target == owned`; `volume-ro` ⟹ `target ∈
    {owned} ∪ ancestors(owned)` via the shared signed-provenance walk.
 6. **Discharge.** Mint a macaroon rooted at `r` (kid `DISCHARGE_KID`)
    carrying attested `attested.volume = target`, `exp ≤ now + discharge_ttl`.

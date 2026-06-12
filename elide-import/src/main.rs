@@ -129,7 +129,7 @@ fn run_from_file(
     };
     // The importing window is the volume's rw phase: volume.key is
     // persisted so the worker signs segments and the coordinator signs
-    // rw-self possession proofs; the completion flip to Readonly
+    // volume-rw possession proofs; the completion flip to Readonly
     // destroys it. The extent-source list is signed into
     // volume.provenance at the same time.
     let signer = elide_core::signing::setup_import_identity(
@@ -279,7 +279,7 @@ async fn run_oci(
     };
     // The importing window is the volume's rw phase: volume.key is
     // persisted so the worker signs segments and the coordinator signs
-    // rw-self possession proofs; the completion flip to Readonly
+    // volume-rw possession proofs; the completion flip to Readonly
     // destroys it. The extent-source list is signed into
     // volume.provenance at the same time.
     let signer = elide_core::signing::setup_import_identity(

@@ -416,7 +416,7 @@ async fn upload_volume_metadata(
 /// coordinator-plane meta store and write the local upload sentinel.
 ///
 /// Identity establishment rides `coord-rw`, never `volume-rw`: a
-/// volume cannot attest its own first write, because the `rw-self`
+/// volume cannot attest its own first write, because the `volume-rw`
 /// possession check reads this very object
 /// (`design-mint-volume-attestation.md` § *New-volume bootstrap*).
 ///

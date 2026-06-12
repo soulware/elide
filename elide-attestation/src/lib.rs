@@ -10,9 +10,9 @@
 //! Two modes are served, distinguished by the opaque `mode` mint sealed
 //! into the CID:
 //!
-//! - **`rw-self`** — the requester proves possession of a live volume's key
+//! - **`volume-rw`** — the requester proves possession of a live volume's key
 //!   and is vouched for *that same* volume.
-//! - **`ro-ancestor`** — the requester proves possession of a live volume
+//! - **`volume-ro`** — the requester proves possession of a live volume
 //!   and is vouched for any volume in that volume's read set (the
 //!   fork-parent chain plus every `extent_index` source named along it),
 //!   established by a signed-lineage walk over coord-ro `meta/*`.
@@ -41,32 +41,32 @@ use elide_core::store_keys::meta_pub_key;
 /// Possession-proof freshness window, seconds. Bounds replay of a single
 /// proof; the seen-cache (below) makes it single-use within `2 × skew`.
 const DEFAULT_SKEW_SECS: u64 = 30;
-/// `rw-self` discharge lifetime, seconds. RW ownership is revocable
+/// `volume-rw` discharge lifetime, seconds. RW ownership is revocable
 /// (forced claim/handoff), so the discharge is the liveness-staleness
 /// bound and is kept short — roughly the Tigris keypair lifetime
 /// (`docs/design-mint-volume-attestation.md` § *One liveness check*).
-const RW_SELF_DISCHARGE_TTL_SECS: u64 = 300;
-/// `ro-ancestor` discharge lifetime, seconds. Ancestors are frozen and the
+const VOLUME_RW_DISCHARGE_TTL_SECS: u64 = 300;
+/// `volume-ro` discharge lifetime, seconds. Ancestors are frozen and the
 /// binding of an ancestor episode never changes, so this discharge cannot
-/// go stale the way `rw-self` can — coord B drops off the path after
+/// go stale the way `volume-rw` can — coord B drops off the path after
 /// first-touch. The lifetime is bounded only by the primary's own `exp`
 /// (`docs/design-mint-volume-attestation.md` § *One liveness check*).
-const RO_ANCESTOR_DISCHARGE_TTL_SECS: u64 = 3600;
+const VOLUME_RO_DISCHARGE_TTL_SECS: u64 = 3600;
 
 /// The opaque `mode` mint sealed into the attested TPC's CID for the
 /// `volume-rw` role. coord B — not mint — assigns it meaning.
-const MODE_RW_SELF: &str = "rw-self";
+const MODE_VOLUME_RW: &str = "volume-rw";
 /// The opaque `mode` for the `volume-ro` role.
-const MODE_RO_ANCESTOR: &str = "ro-ancestor";
+const MODE_VOLUME_RO: &str = "volume-ro";
 
 /// coord B's interpretation of the opaque CID `mode`: the relationship the
 /// vouched-for `target` must bear to the possession-proven `owned` volume.
 enum Mode {
     /// `target == owned` — a write cred for the volume itself.
-    RwSelf,
+    VolumeRw,
     /// `target` in `owned`'s read set — a read cred for an ancestor or
     /// extent source.
-    RoAncestor,
+    VolumeRo,
 }
 
 /// `POST /v1/discharge` request. `cid`, `nonce`, and `proof` are hex; `cid`
@@ -79,7 +79,7 @@ pub struct DischargeRequest {
     pub name: String,
     /// ULID of the anchor volume coord A proves possession of.
     pub owned: String,
-    /// ULID of the volume to vouch for. `== owned` in `rw-self`.
+    /// ULID of the volume to vouch for. `== owned` in `volume-rw`.
     pub target: String,
     /// Possession-proof timestamp, unix seconds.
     pub ts: u64,
@@ -200,19 +200,19 @@ impl DischargeState {
         }
         self.check_and_record_nonce(&req.owned, &req.nonce, now)?;
 
-        // 3. Recognise the mode. rw-self's `target == owned` is cheap and
-        //    checked here, before any S3 read; ro-ancestor's read-set
+        // 3. Recognise the mode. volume-rw's `target == owned` is cheap and
+        //    checked here, before any S3 read; volume-ro's read-set
         //    membership needs the lineage walk and is deferred to step 6.
         //    An unknown mode is denied (not distinguishable from any other
         //    failure to a caller).
         let mode = match recovered.mode.as_str() {
-            MODE_RW_SELF => {
+            MODE_VOLUME_RW => {
                 if target != owned {
                     return Err(DischargeError::Denied("target != owned"));
                 }
-                Mode::RwSelf
+                Mode::VolumeRw
             }
-            MODE_RO_ANCESTOR => Mode::RoAncestor,
+            MODE_VOLUME_RO => Mode::VolumeRo,
             _ => return Err(DischargeError::Denied("unknown mode")),
         };
 
@@ -237,15 +237,15 @@ impl DischargeState {
             return Err(DischargeError::Denied("liveness"));
         }
 
-        // 6. ro-ancestor: `target` must lie in `owned`'s read set — the
+        // 6. volume-ro: `target` must lie in `owned`'s read set — the
         //    fork-parent chain plus every extent_index source named along
         //    it, walked over signed `meta/*` and anchored at the same
         //    `owned_pub` the possession proof verified against. A walk
         //    failure (missing/unverifiable lineage) is a denial: by here
         //    `owned`'s pub and name record already fetched, so S3 is live.
         let ttl = match mode {
-            Mode::RwSelf => RW_SELF_DISCHARGE_TTL_SECS,
-            Mode::RoAncestor => {
+            Mode::VolumeRw => VOLUME_RW_DISCHARGE_TTL_SECS,
+            Mode::VolumeRo => {
                 let read_set =
                     crate::lineage::walk_lineage_set(self.inner.store.as_ref(), owned, owned_pub)
                         .await
@@ -253,7 +253,7 @@ impl DischargeState {
                 if !read_set.contains(&target) {
                     return Err(DischargeError::Denied("target not in read set"));
                 }
-                RO_ANCESTOR_DISCHARGE_TTL_SECS
+                VOLUME_RO_DISCHARGE_TTL_SECS
             }
         };
 
@@ -380,7 +380,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     /// The shared fixture's CID is sealed under a known `K_M-B` and carries
-    /// `mode = "rw-self"` — exactly the rw-self input, so the test needs no
+    /// `mode = "volume-rw"` — exactly the input this suite needs, so no
     /// CID re-encryption.
     fn vectors() -> serde_json::Value {
         let path = concat!(
@@ -402,8 +402,8 @@ mod tests {
 
     /// A coordinator that owns a live volume, with its pub key and a Live
     /// name record published to an in-memory coord-ro store, and a valid
-    /// rw-self possession proof over the fixture CID.
-    async fn live_rw_self() -> Fixture {
+    /// volume-rw possession proof over the fixture CID.
+    async fn live_volume_rw() -> Fixture {
         let v = vectors();
         let k_m_b: [u8; 32] = elide_core::signing::decode_hex(v["k_m_b"].as_str().unwrap())
             .unwrap()
@@ -461,15 +461,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rw_self_discharge_succeeds_and_returns_a_macaroon() {
-        let f = live_rw_self().await;
+    async fn volume_rw_discharge_succeeds_and_returns_a_macaroon() {
+        let f = live_volume_rw().await;
         let wire = f.state.discharge(f.request()).await.expect("discharge");
         assert!(wire.starts_with("mnt1_"), "wire was {wire}");
     }
 
     #[tokio::test]
     async fn rejects_tampered_possession_proof() {
-        let f = live_rw_self().await;
+        let f = live_volume_rw().await;
         let mut req = f.request();
         let mut proof = f.proof;
         proof[0] ^= 0x80;
@@ -482,7 +482,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_when_name_owner_differs() {
-        let f = live_rw_self().await;
+        let f = live_volume_rw().await;
         // Rebind the name to a different live volume.
         let other = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let record = NameRecord::live_minimal(other, 4 * 1024 * 1024 * 1024);
@@ -518,16 +518,16 @@ mod tests {
         // Claim creates records in `Stopped`; hydrate and post-CAS reads
         // anchor before the daemon runs. A bound-but-stopped episode is
         // current.
-        let f = live_rw_self().await;
+        let f = live_volume_rw().await;
         set_record_state(&f, NameState::Stopped).await;
         f.state.discharge(f.request()).await.expect("discharge");
     }
 
     #[tokio::test]
     async fn discharges_for_importing_record() {
-        // The import drain anchors rw-self discharges on the
+        // The import drain anchors volume-rw discharges on the
         // `Importing` binding for the whole construction window.
-        let f = live_rw_self().await;
+        let f = live_volume_rw().await;
         set_record_state(&f, NameState::Importing).await;
         f.state.discharge(f.request()).await.expect("discharge");
     }
@@ -537,7 +537,7 @@ mod tests {
         // A readonly import is terminally bound — no lifecycle verb can
         // displace it — so it anchors its own reads (e.g. filemap
         // generation for --extents-from seeding).
-        let f = live_rw_self().await;
+        let f = live_volume_rw().await;
         set_record_state(&f, NameState::Readonly).await;
         f.state.discharge(f.request()).await.expect("discharge");
     }
@@ -546,7 +546,7 @@ mod tests {
     async fn rejects_released_record() {
         // Released retains the old vol_ulid for handoff, so the state
         // check is what fences a relinquished episode.
-        let f = live_rw_self().await;
+        let f = live_volume_rw().await;
         set_record_state(&f, NameState::Released).await;
         assert!(matches!(
             f.state.discharge(f.request()).await,
@@ -556,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_stale_timestamp() {
-        let f = live_rw_self().await;
+        let f = live_volume_rw().await;
         let mut req = f.request();
         req.ts = f.ts.saturating_sub(DEFAULT_SKEW_SECS + 5);
         // The proof was signed over the original ts, but freshness fails
@@ -569,7 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_replayed_nonce() {
-        let f = live_rw_self().await;
+        let f = live_volume_rw().await;
         f.state.discharge(f.request()).await.expect("first ok");
         assert!(
             matches!(
@@ -581,8 +581,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_target_not_owned_in_rw_self() {
-        let f = live_rw_self().await;
+    async fn rejects_target_not_owned_in_volume_rw() {
+        let f = live_volume_rw().await;
         let mut req = f.request();
         req.target = "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
         assert!(matches!(
@@ -591,7 +591,7 @@ mod tests {
         ));
     }
 
-    // --- ro-ancestor mode ---
+    // --- volume-ro mode ---
 
     use ed25519_dalek::SigningKey;
     use elide_core::segment::SegmentSigner;
@@ -634,7 +634,7 @@ mod tests {
 
     /// owned ← parent (fork), owned names `extent` as a dedup/delta source.
     /// All published to a fresh coord-ro store, owned the Live claimant of
-    /// `name`. The CID carries `mode = "ro-ancestor"`; possession proofs are
+    /// `name`. The CID carries `mode = "volume-ro"`; possession proofs are
     /// minted on demand per target via [`RoCtx::request_for`].
     struct RoCtx {
         state: DischargeState,
@@ -672,7 +672,7 @@ mod tests {
         }
     }
 
-    async fn ro_ancestor_ctx() -> RoCtx {
+    async fn volume_ro_ctx() -> RoCtx {
         let v = vectors();
         let k_m_b: [u8; 32] = elide_core::signing::decode_hex(v["k_m_b"].as_str().unwrap())
             .unwrap()
@@ -682,7 +682,7 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let cid = crypto::encrypt_cid_attested(&k_m_b, &r, "client", "org", MODE_RO_ANCESTOR);
+        let cid = crypto::encrypt_cid_attested(&k_m_b, &r, "client", "org", MODE_VOLUME_RO);
 
         let owned_sk = SigningKey::generate(&mut OsRng);
         let parent_sk = SigningKey::generate(&mut OsRng);
@@ -731,8 +731,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ro_ancestor_discharges_a_fork_parent() {
-        let ctx = ro_ancestor_ctx().await;
+    async fn volume_ro_discharges_a_fork_parent() {
+        let ctx = volume_ro_ctx().await;
         let wire = ctx
             .state
             .discharge(ctx.request_for(ctx.parent))
@@ -742,8 +742,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ro_ancestor_discharges_an_extent_source() {
-        let ctx = ro_ancestor_ctx().await;
+    async fn volume_ro_discharges_an_extent_source() {
+        let ctx = volume_ro_ctx().await;
         let wire = ctx
             .state
             .discharge(ctx.request_for(ctx.extent))
@@ -753,8 +753,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ro_ancestor_discharges_the_owned_volume_itself() {
-        let ctx = ro_ancestor_ctx().await;
+    async fn volume_ro_discharges_the_owned_volume_itself() {
+        let ctx = volume_ro_ctx().await;
         let wire = ctx
             .state
             .discharge(ctx.request_for(ctx.owned))
@@ -764,8 +764,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ro_ancestor_rejects_target_outside_the_read_set() {
-        let ctx = ro_ancestor_ctx().await;
+    async fn volume_ro_rejects_target_outside_the_read_set() {
+        let ctx = volume_ro_ctx().await;
         let stranger = Ulid::new();
         assert!(matches!(
             ctx.state.discharge(ctx.request_for(stranger)).await,

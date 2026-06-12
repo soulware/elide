@@ -382,7 +382,7 @@ mod tests {
             Some(AttestedTpc {
                 k_m_b: &K_M_B,
                 org_id: "org_demo",
-                mode: "ro-ancestor",
+                mode: "volume-ro",
                 location: ATT_LOCATION,
             }),
         );
@@ -409,7 +409,7 @@ mod tests {
         let pt = crate::tpc::decrypt_cid_attested(&K_M_B, cid).expect("decrypt cid");
         assert_eq!(pt.client_id, SUB);
         assert_eq!(pt.org_id, "org_demo");
-        assert_eq!(pt.mode, "ro-ancestor");
+        assert_eq!(pt.mode, "volume-ro");
         // `r` is per-coordinator — derived from the credential's own `sub`.
         assert_eq!(
             pt.r,

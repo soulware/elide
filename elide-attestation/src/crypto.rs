@@ -281,11 +281,11 @@ mod tests {
     }
 
     #[test]
-    fn ro_ancestor_fixture_cid_is_canonical() {
-        // `cid_ro_ancestor` differs from `cid` only in the baked mode
+    fn volume_ro_fixture_cid_is_canonical() {
+        // `cid_volume_ro` differs from `cid` only in the baked mode
         // string. Same key, `r`, and identities, so the deterministic
         // sealer pins it the same way `encrypt_reproduces_fixture_cid`
-        // pins the rw-self CID.
+        // pins the volume-rw CID.
         let v = vectors();
         let k_m_b = hex32(&v, "k_m_b");
         let r = hex32(&v, "r");
@@ -294,11 +294,11 @@ mod tests {
             &r,
             v["client_id"].as_str().unwrap(),
             v["org_id"].as_str().unwrap(),
-            "ro-ancestor",
+            "volume-ro",
         );
         assert_eq!(
             elide_core::signing::encode_hex(&cid),
-            v["cid_ro_ancestor"].as_str().unwrap()
+            v["cid_volume_ro"].as_str().unwrap()
         );
     }
 
@@ -325,12 +325,12 @@ mod tests {
         let v = vectors();
         let k_m_b = hex32(&v, "k_m_b");
         let r = hex32(&v, "r");
-        let cid = encrypt_cid_attested(&k_m_b, &r, "client-x", "org-y", "ro-ancestor");
+        let cid = encrypt_cid_attested(&k_m_b, &r, "client-x", "org-y", "volume-ro");
         let pt = decrypt_cid_attested(&k_m_b, &cid).expect("decrypt");
         assert_eq!(pt.r, r);
         assert_eq!(pt.client_id, "client-x");
         assert_eq!(pt.org_id, "org-y");
-        assert_eq!(pt.mode, "ro-ancestor");
+        assert_eq!(pt.mode, "volume-ro");
     }
 
     #[test]

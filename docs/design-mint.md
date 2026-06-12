@@ -2150,7 +2150,7 @@ equal the location mint sealed into the caveat — the authority's
 identity, a URL whose path is the discharge route; before
 `assume-role`, the coordinator discharges a credential carrying a
 third-party caveat at this exact location by proving possession of the
-volume's `volume.key` (a `rw-self` discharge for `volume-rw`) and
+volume's `volume.key` (a `volume-rw` discharge for `volume-rw`) and
 attaches the returned discharge to the bundle. Absent → no discharge is
 fetched. The connection comes from `attestation_transport` when set
 (coord B off-network on a UDS), else the location is dialled directly.

@@ -355,7 +355,7 @@ verified on `start --remote` via `parent_manifest_pubkey` — landed as
 the items below and is what runs today. The `claim --force` rework
 retires it: the synthesised manifest was the one S3 write authored by
 a coordinator holding no key for the target prefix, which the
-attestation model's `rw-self` invariant cannot discharge.
+attestation model's `volume-rw` invariant cannot discharge.
 
 - [x] **`Reserved` state in `NameRecord`.** New variant in
   `NameState`; round-trip + lowercase wire tests landed.
@@ -516,7 +516,7 @@ attestation model's `rw-self` invariant cannot discharge.
   `create --from --force-snapshot` flow retired in the same pass —
   it was the other manifest author signing under a key that is not
   the volume's own (`force-snapshot.key`), which the attestation
-  model's `rw-self` invariant cannot discharge; a readonly source
+  model's `volume-rw` invariant cannot discharge; a readonly source
   with no snapshot is recovered with `claim --force` instead.
   `Lifecycle::ForceRelease`, the `force_released` event kind,
   `name_store::overwrite_name_record`, and the

@@ -460,7 +460,7 @@ pub async fn mark_initial(
 /// wins, the other gets `AlreadyExists` without doing the work).
 ///
 /// The record carries the importer's identity so the binding anchors
-/// the drain's `rw-self` discharges and a dead importer's record is
+/// the drain's `volume-rw` discharges and a dead importer's record is
 /// attributable. [`mark_import_complete`] flips it to `Readonly`;
 /// [`clear_importing`] deletes it on failure.
 pub async fn mark_importing(

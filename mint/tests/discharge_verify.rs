@@ -302,7 +302,7 @@ async fn verifies_attested_primary_and_coord_b_discharge() {
     // minted under it verifies. mint needs no K_M-B to verify (VID is
     // key-agnostic) — the store here holds only K_M-A.
     let (app, _dir) = app().await;
-    let primary = build_attested_primary("ro-ancestor");
+    let primary = build_attested_primary("volume-ro");
     let discharge = coord_b_discharge(&primary);
 
     let (status, body) = verify_request(app, &primary.encode(), &[&discharge.encode()]).await;
@@ -316,7 +316,7 @@ async fn rejects_attested_primary_when_discharge_missing() {
     // The load-bearing invariant: a credential carrying the attested TPC
     // is inert without a discharge — it cannot clear at assume-role.
     let (app, _dir) = app().await;
-    let primary = build_attested_primary("rw-self");
+    let primary = build_attested_primary("volume-rw");
 
     let (_status, body) = verify_request(app, &primary.encode(), &[]).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();

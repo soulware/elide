@@ -123,7 +123,7 @@ pub enum NameState {
     /// An import is constructing this volume on `coordinator_id`.
     /// `size` is not yet meaningful (written as 0; the real size is
     /// only known post-extraction). The importer's drain anchors
-    /// `rw-self` discharges on this binding; every lifecycle verb
+    /// `volume-rw` discharges on this binding; every lifecycle verb
     /// refuses it. Flipped to `Readonly` at import completion,
     /// CAS-deleted on import failure
     /// (`design-mint-volume-attestation.md` § *Import runs under an

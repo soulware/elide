@@ -331,8 +331,11 @@ pub struct RawAttestation {
     /// Opaque context sealed verbatim into the attested caveat's CID and
     /// interpreted by the attestation authority alone. mint never
     /// inspects it — it carries whatever the authority's vocabulary
-    /// needs (e.g. `rw-self` / `ro-ancestor` for volume attestation).
-    pub mode: String,
+    /// needs (e.g. `volume-rw` / `volume-ro` for volume attestation).
+    /// Defaults to the role name; set explicitly only when the
+    /// authority's mode name differs from the role name.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// The `[role.template]` subtable: the namespaces a role's policy template
@@ -479,11 +482,12 @@ pub struct Role {
     /// ([`Config::validate_policy_surface`]) and enforced at request time.
     pub attested: Vec<String>,
     pub caveat: Vec<String>,
-    /// The role's opaque attestation `mode`, from `[role.attestation]` —
-    /// `None` when the role declares no attestation. When `Some`, mint
-    /// stamps an attested third-party caveat onto the credential at
-    /// issuance, carrying this string verbatim for the attestation
-    /// authority (`docs/design-mint-volume-attestation.md`).
+    /// The role's opaque attestation `mode`, from `[role.attestation]`
+    /// (defaulting to the role name) — `None` when the role declares no
+    /// attestation. When `Some`, mint stamps an attested third-party
+    /// caveat onto the credential at issuance, carrying this string
+    /// verbatim for the attestation authority
+    /// (`docs/design-mint-volume-attestation.md`).
     pub attestation_mode: Option<String>,
 }
 
@@ -543,7 +547,9 @@ impl Config {
                 policy,
                 attested: canonical_field_set(r.template.attested),
                 caveat: canonical_field_set(r.template.caveat),
-                attestation_mode: r.attestation.map(|a| a.mode),
+                attestation_mode: r
+                    .attestation
+                    .map(|a| a.mode.unwrap_or_else(|| r.name.clone())),
             };
             if roles.insert(r.name.clone(), role).is_some() {
                 return Err(ConfigError::DuplicateRole(r.name));
@@ -827,7 +833,14 @@ max_ttl_seconds = 100
 default_ttl_seconds = 100
 policy_file = "volume-rw.json"
 [role.attestation]
-mode = "rw-self"
+[[role]]
+name = "volume-ro"
+min_ttl_seconds = 60
+max_ttl_seconds = 100
+default_ttl_seconds = 100
+policy_file = "volume-ro.json"
+[role.attestation]
+mode = "custom-ancestor"
 [[role]]
 name = "coord-base"
 min_ttl_seconds = 60
@@ -840,18 +853,27 @@ policy_file = "coord-base.json"
     fn attestation_mode_and_location_resolve_per_role() {
         let c = parse_for_test(
             ATTESTATION_SAMPLE,
-            &[("volume-rw.json", "{}"), ("coord-base.json", "{}")],
+            &[
+                ("volume-rw.json", "{}"),
+                ("volume-ro.json", "{}"),
+                ("coord-base.json", "{}"),
+            ],
         )
         .expect("parse");
         assert_eq!(
             c.attestation_location.as_deref(),
             Some("https://coord-b.example/v1/discharge")
         );
-        // The declaring role carries its opaque mode; a role with no
+        // A bare [role.attestation] defaults the mode to the role name;
+        // an explicit mode is carried verbatim; a role with no
         // [role.attestation] carries none.
         assert_eq!(
             c.roles["volume-rw"].attestation_mode.as_deref(),
-            Some("rw-self")
+            Some("volume-rw")
+        );
+        assert_eq!(
+            c.roles["volume-ro"].attestation_mode.as_deref(),
+            Some("custom-ancestor")
         );
         assert_eq!(c.roles["coord-base"].attestation_mode, None);
     }
@@ -865,7 +887,14 @@ policy_file = "coord-base.json"
             "",
         );
         assert!(matches!(
-            parse_for_test(&toml, &[("volume-rw.json", "{}"), ("coord-base.json", "{}")]),
+            parse_for_test(
+                &toml,
+                &[
+                    ("volume-rw.json", "{}"),
+                    ("volume-ro.json", "{}"),
+                    ("coord-base.json", "{}"),
+                ]
+            ),
             Err(ConfigError::AttestationWithoutLocation { role }) if role == "volume-rw"
         ));
     }

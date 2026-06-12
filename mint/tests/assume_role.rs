@@ -55,7 +55,6 @@ policy_file = "volume-ro.json"
 [role.template]
 attested = ["volume"]
 [role.attestation]
-mode = "ro-ancestor"
 "#;
 
 const POLICY: &str = r#"
@@ -148,7 +147,7 @@ fn request_macaroon_at_epoch(rev_epoch: u64) -> Macaroon {
         Some(AttestedTpc {
             k_m_b: &K_M_B,
             org_id: ORG_ID,
-            mode: "ro-ancestor",
+            mode: "volume-ro",
             location: ATTEST_LOCATION,
         }),
     )

@@ -100,13 +100,13 @@ pub(crate) enum AssumeTarget {
     /// `req.volume`, no attestation discharge.
     Coord,
     /// `volume-rw`: the volume is both the possession-proven anchor
-    /// and the vouched target (`rw-self`).
-    RwSelf(Ulid),
+    /// and the vouched target (`volume-rw`).
+    VolumeRw(Ulid),
     /// `volume-ro`: read `target`'s prefix, anchored on the live,
     /// locally-keyed `owned` whose key signs the possession proof
-    /// (`ro-ancestor`; `target == owned` is the leaf reading its own
+    /// (`volume-ro`; `target == owned` is the leaf reading its own
     /// prefix).
-    RoAncestor { owned: Ulid, target: Ulid },
+    VolumeRo { owned: Ulid, target: Ulid },
 }
 
 impl AssumeTarget {
@@ -114,8 +114,8 @@ impl AssumeTarget {
     fn volume(&self) -> Option<Ulid> {
         match self {
             AssumeTarget::Coord => None,
-            AssumeTarget::RwSelf(v) => Some(*v),
-            AssumeTarget::RoAncestor { target, .. } => Some(*target),
+            AssumeTarget::VolumeRw(v) => Some(*v),
+            AssumeTarget::VolumeRo { target, .. } => Some(*target),
         }
     }
 
@@ -124,8 +124,8 @@ impl AssumeTarget {
     fn attestation(&self) -> Option<(Ulid, Ulid)> {
         match self {
             AssumeTarget::Coord => None,
-            AssumeTarget::RwSelf(v) => Some((*v, *v)),
-            AssumeTarget::RoAncestor { owned, target } => Some((*owned, *target)),
+            AssumeTarget::VolumeRw(v) => Some((*v, *v)),
+            AssumeTarget::VolumeRo { owned, target } => Some((*owned, *target)),
         }
     }
 }
@@ -616,7 +616,7 @@ impl MintEndpoint {
     /// `assume-role` bundle. coord B authenticates the request by the
     /// possession proof in the body, not the mint PoP headers. Which
     /// `(owned, target)` shapes coord B accepts is the CID's baked
-    /// `mode`: `rw-self` requires `target == owned`; `ro-ancestor`
+    /// `mode`: `volume-rw` requires `target == owned`; `volume-ro`
     /// requires `target` in `owned`'s read set.
     async fn fetch_attestation_discharge(
         &self,
@@ -715,8 +715,7 @@ impl MintEndpoint {
         // If this credential carries an attestation third-party caveat at
         // the configured coord B location, discharge it once and attach the
         // discharge to every attempt's bundle. The `(owned, target)` the
-        // discharge attests is a property of the assume's variant — rw-self
-        // for `volume-rw`, ro-ancestor for `volume-ro`.
+        // discharge attests is a property of the assume's variant.
         let discharge = match (&self.attestation_location, target.attestation()) {
             (Some(loc), Some((owned, tgt))) => {
                 let cid = WireMacaroon::decode(&stored)?
@@ -906,7 +905,7 @@ impl Credentialer for MintCredentialer {
             .assume_role(
                 ROLE_VOLUME_RO,
                 VOLUME_RO_TTL_SECS,
-                AssumeTarget::RoAncestor { owned, target },
+                AssumeTarget::VolumeRo { owned, target },
             )
             .await
     }
@@ -1122,7 +1121,7 @@ mod tests {
         assert_eq!(m.third_party_cid_at("https://nowhere.example"), None);
     }
 
-    /// The shared cross-implementation fixture (canonical rw-self CID under
+    /// The shared cross-implementation fixture (canonical volume-rw CID under
     /// a known `K_M-B`), the same file `elide-peer-fetch`'s discharge tests
     /// pin against.
     fn discharge_vectors() -> serde_json::Value {
@@ -1134,7 +1133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rw_self_discharge_request_is_accepted_by_coord_b() {
+    async fn volume_rw_discharge_request_is_accepted_by_coord_b() {
         use ed25519_dalek::SigningKey;
         use elide_attestation::{DischargeRequest, DischargeState, put_object};
         use elide_core::config::VolumeConfig;
@@ -1211,12 +1210,12 @@ mod tests {
         let wire = state
             .discharge(req)
             .await
-            .expect("coord B accepts coord A's rw-self request");
+            .expect("coord B accepts coord A's volume-rw request");
         assert!(wire.starts_with("mnt1_"), "discharge wire was {wire}");
     }
 
     #[tokio::test]
-    async fn ro_ancestor_discharge_request_is_accepted_by_coord_b() {
+    async fn volume_ro_discharge_request_is_accepted_by_coord_b() {
         use ed25519_dalek::SigningKey;
         use elide_attestation::{DischargeRequest, DischargeState, put_object};
         use elide_core::config::VolumeConfig;
@@ -1233,7 +1232,7 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let cid = elide_core::signing::decode_hex(v["cid_ro_ancestor"].as_str().unwrap()).unwrap();
+        let cid = elide_core::signing::decode_hex(v["cid_volume_ro"].as_str().unwrap()).unwrap();
 
         // --- coord A: own a live named fork of `parent`, key + name on disk.
         let data_dir = tempfile::TempDir::new().unwrap();
@@ -1338,7 +1337,7 @@ mod tests {
         let wire = state
             .discharge(req)
             .await
-            .expect("coord B accepts coord A's ro-ancestor request");
+            .expect("coord B accepts coord A's volume-ro request");
         assert!(wire.starts_with("mnt1_"), "discharge wire was {wire}");
     }
 }

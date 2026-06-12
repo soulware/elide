@@ -14,8 +14,8 @@
 //! direction fails CI.
 //!
 //! The fixture lives at the repo root (`testdata/mint-discharge-vectors.json`)
-//! so both workspaces read the identical file. Regenerate by running with
-//! `MINT_EMIT_VECTORS=1` and pasting the printed JSON.
+//! so both workspaces read the identical file. Regenerate by running this
+//! test with `MINT_EMIT_VECTORS=1`, which rewrites the fixture in place.
 
 use mint::caveat::{Caveat, name};
 use mint::macaroon::{self, DISCHARGE_KID};
@@ -43,8 +43,8 @@ fn nonce() -> [u8; macaroon::NONCE_LEN] {
 }
 const CLIENT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const ORG_ID: &str = "org_demo";
-const MODE: &str = "rw-self";
-const MODE_RO: &str = "ro-ancestor";
+const MODE: &str = "volume-rw";
+const MODE_RO: &str = "volume-ro";
 const VOLUME: &str = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
 const EXP: &str = "2099999999";
 
@@ -54,7 +54,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn vectors_json() -> String {
     let cid = tpc::encrypt_cid_attested(&k_m_b(), &r(), CLIENT_ID, ORG_ID, MODE);
-    let cid_ro_ancestor = tpc::encrypt_cid_attested(&k_m_b(), &r(), CLIENT_ID, ORG_ID, MODE_RO);
+    let cid_volume_ro = tpc::encrypt_cid_attested(&k_m_b(), &r(), CLIENT_ID, ORG_ID, MODE_RO);
     let wire = macaroon::mint_under_key_with_nonce(
         &r(),
         DISCHARGE_KID,
@@ -74,7 +74,7 @@ fn vectors_json() -> String {
             "  \"org_id\": \"{}\",\n",
             "  \"mode\": \"{}\",\n",
             "  \"cid\": \"{}\",\n",
-            "  \"cid_ro_ancestor\": \"{}\",\n",
+            "  \"cid_volume_ro\": \"{}\",\n",
             "  \"discharge_nonce\": \"{}\",\n",
             "  \"discharge_kid\": {},\n",
             "  \"volume\": \"{}\",\n",
@@ -88,7 +88,7 @@ fn vectors_json() -> String {
         ORG_ID,
         MODE,
         hex(&cid),
-        hex(&cid_ro_ancestor),
+        hex(&cid_volume_ro),
         hex(&nonce()),
         DISCHARGE_KID,
         VOLUME,
@@ -100,15 +100,14 @@ fn vectors_json() -> String {
 #[test]
 fn mint_reproduces_committed_vectors() {
     let actual = vectors_json();
-    if std::env::var("MINT_EMIT_VECTORS").is_ok() {
-        // Bootstrap path: print so the fixture can be (re)written.
-        print!("{actual}");
-        return;
-    }
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../testdata/mint-discharge-vectors.json"
     );
+    if std::env::var("MINT_EMIT_VECTORS").is_ok() {
+        std::fs::write(path, &actual).unwrap_or_else(|e| panic!("write {path}: {e}"));
+        return;
+    }
     let committed = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {path}: {e} (run with MINT_EMIT_VECTORS=1 to bootstrap)"));
     assert_eq!(

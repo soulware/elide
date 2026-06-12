@@ -125,7 +125,7 @@ content, no exclusive owner is needed, and lifecycle verbs
 (`stop` / `release` / `start` / `claim`) all refuse it cleanly. See §
 "Readonly names" below. `importing` is the construction window that
 produces a `readonly` record: CAS-created at import start (the
-uniqueness gate, and the binding the import drain's `rw-self`
+uniqueness gate, and the binding the import drain's `volume-rw`
 discharges anchor on — `design-mint-volume-attestation.md` § *Import
 runs under an `Importing` record*), flipped to `readonly` with the
 real size and import snapshot at completion, CAS-deleted on failure.

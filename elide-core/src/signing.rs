@@ -278,7 +278,7 @@ pub struct ProvenanceLineage {
 /// `volume.provenance` (with the given `lineage`), and returns the
 /// signer. The importing window is the volume's rw phase, so the key is
 /// persisted like any other rw volume's: the worker signs segments with
-/// it and the coordinator signs `rw-self` possession proofs from it.
+/// it and the coordinator signs `volume-rw` possession proofs from it.
 /// The completion flip to `Readonly` destroys it — a `Readonly` record
 /// implies the key is gone, so the published base is cryptographically
 /// immutable (`design-mint-volume-attestation.md` § *Import runs under

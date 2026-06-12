@@ -60,7 +60,6 @@ policy_file = "volume-ro.json"
 [role.template]
 attested = ["volume"]
 [role.attestation]
-mode = "ro-ancestor"
 [[role]]
 name = "volume-rw"
 min_ttl_seconds = 60

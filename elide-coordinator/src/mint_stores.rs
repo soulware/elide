@@ -247,7 +247,7 @@ pub struct MintScopedStores {
     /// `volume-ro` facades for single-volume reads, keyed by
     /// `(owned, target)`. Each entry's mint policy grants
     /// `by_id/<target>/*` only; the `owned` half of the key is the
-    /// anchor whose key signs the `ro-ancestor` possession proof at
+    /// anchor whose key signs the `volume-ro` possession proof at
     /// assume time, so facades with different anchors never share a
     /// credential cache.
     read_volume: Mutex<HashMap<(Ulid, Ulid), Arc<RoleStore>>>,
@@ -341,7 +341,7 @@ impl ScopedStores for MintScopedStores {
             self.store_cfg.clone(),
             ROLE_VOLUME_RW,
             VOLUME_RW_TTL_SECS,
-            AssumeTarget::RwSelf(*vol_ulid),
+            AssumeTarget::VolumeRw(*vol_ulid),
         ));
         if let Ok(mut map) = self.data.try_lock() {
             map.insert(*vol_ulid, Arc::clone(&rs));
@@ -367,7 +367,7 @@ impl ScopedStores for MintScopedStores {
             self.store_cfg.clone(),
             ROLE_VOLUME_RO,
             VOLUME_RO_TTL_SECS,
-            AssumeTarget::RoAncestor {
+            AssumeTarget::VolumeRo {
                 owned: *owned,
                 target: *target,
             },
