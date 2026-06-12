@@ -14,6 +14,7 @@
 //! live account.
 
 pub mod admin;
+pub mod attest;
 pub mod audit;
 pub mod auth;
 pub mod caveat;

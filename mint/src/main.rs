@@ -162,6 +162,12 @@ enum ClientCmd {
         /// Vocabulary-agnostic — e.g. `--caveat exp=1750000000`.
         #[arg(long = "caveat", value_name = "NAME=VALUE")]
         caveat: Vec<String>,
+        /// Value for the attestation authority to attest (repeatable) —
+        /// the names the role's policy substitutes as `{{attested.X}}`.
+        /// Vocabulary-agnostic; required when the credential carries an
+        /// attested third-party caveat.
+        #[arg(long = "attest", value_name = "NAME=VALUE")]
+        attest: Vec<String>,
         #[arg(long, default_value_t = 900)]
         ttl: u64,
         /// Role name from the mint config.
@@ -315,6 +321,7 @@ async fn client_cmd(
             in_file,
             req,
             caveat,
+            attest,
             ttl,
             role,
         } => {
@@ -326,6 +333,7 @@ async fn client_cmd(
                 &role,
                 req.as_deref(),
                 &caveat,
+                &attest,
                 ttl,
                 &in_file,
             )
@@ -416,11 +424,14 @@ async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std:
             store.init_k_session(&cfg.data_dir)?;
         }
     }
-    // K_M-B is needed only when a role carries an attested third-party
-    // caveat to stamp. A colocated coordinator playing the attestation
-    // role generates it locally under demo; otherwise the attestation
-    // coordinator provisioned it out-of-band.
-    if cfg.roles.values().any(|r| r.attestation_mode.is_some()) {
+    // K_M-B is needed when a role carries an attested third-party caveat
+    // to stamp, or when mint colocates the demo attestation authority.
+    // Like the other secrets, demo mode generates it locally — for a
+    // co-located attestation coordinator (which reads the same file) or
+    // the demo authority alike; a production mint has it provisioned
+    // out-of-band by its attestation authority.
+    let attest_demo = cfg.demo_attestation.as_ref().is_some_and(|d| d.enabled);
+    if cfg.roles.values().any(|r| r.attestation_mode.is_some()) || attest_demo {
         store.init_k_m_b(&cfg.data_dir, demo_enabled)?;
     }
     Ok((
@@ -502,27 +513,40 @@ fn config_auth_transport(cfg: &Config) -> Result<String, Box<dyn std::error::Err
 /// `[demo_auth]` socket, else the transport remembered from a prior login.
 fn resolve_login_transport(
     url: Option<String>,
-    config: Option<PathBuf>,
+    config: Option<&Config>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(url) = url {
         return Ok(url);
     }
     if let Some(config) = config {
-        return config_auth_transport(&load(&config)?);
+        return config_auth_transport(config);
     }
     Ok(mint::session::load_transport()?)
 }
 
 /// `mint login` — authenticate at the auth role and persist the per-user
-/// session + transport that gate `/v1/discharge` for both planes.
+/// session + transport that gate `/v1/discharge` for both planes. A
+/// `--config` colocating the demo attestation authority also persists
+/// that authority's transport, so `assume-role` can fetch attestation
+/// discharges without further flags.
 async fn login(
     url: Option<String>,
     config: Option<PathBuf>,
     subject: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let transport = resolve_login_transport(url, config)?;
+    let cfg = config.as_deref().map(load).transpose()?;
+    let transport = resolve_login_transport(url, cfg.as_ref())?;
     let session = mint::session::login(&transport, subject).await?;
     mint::session::save(&session, &transport)?;
+    if let Some(attest_socket) = cfg
+        .as_ref()
+        .and_then(|c| c.demo_attestation.as_ref())
+        .and_then(|d| d.socket.as_ref())
+    {
+        let attest_transport = format!("unix:{}", attest_socket.display());
+        mint::session::save_attest_transport(&attest_transport)?;
+        eprintln!("attestation authority at {attest_transport} (transport saved)");
+    }
     eprintln!(
         "logged in as {subject} at {transport}; session saved to {}",
         mint::session::dir()?.display()

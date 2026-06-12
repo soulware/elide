@@ -58,6 +58,11 @@ pub enum ConfigError {
     #[error("[env] key {key:?} is not a scalar (string, integer, float, or boolean)")]
     NonScalarEnv { key: String },
     #[error(
+        "[demo_attestation] enabled = true requires [demo_auth] enabled = true \
+         (the issuer is gated on the demo login session)"
+    )]
+    DemoAttestationWithoutDemoAuth,
+    #[error(
         "role {role}: declares [role.attestation] but no attestation_location \
          is configured to discharge it"
     )]
@@ -169,6 +174,10 @@ pub struct RawConfig {
     /// single-host only; absent in production.
     #[serde(default)]
     pub demo_auth: Option<RawDemoAuth>,
+    /// Colocated demo attestation authority. Demo / single-host only;
+    /// absent in production.
+    #[serde(default)]
+    pub demo_attestation: Option<RawDemoAttestation>,
     /// The discharge URL stamped into the enroll-gate (invite),
     /// exchange-gate (ticket), and admin-gate (admin-service) third-party
     /// caveats — where a client/operator fetches the discharge. A mint
@@ -206,6 +215,26 @@ pub struct RawDemoAuth {
     /// UDS path the colocated auth role binds, and the transport the
     /// operator/client dial to reach it. Path-only (UDS-only). Defaults
     /// to `<data_dir>/auth.sock` when omitted; ignored when
+    /// `enabled = false`.
+    #[serde(default)]
+    pub socket: Option<String>,
+}
+
+/// `[demo_attestation]` block: whether mint colocates the attestation
+/// authority and the UDS it binds. Demo / single-host only; production
+/// runs a real attestation authority (for Elide, the attestation
+/// coordinator) that shares `K_M-B` with mint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawDemoAttestation {
+    /// When `true`, mint colocates the attestation authority and binds
+    /// its own UDS for `/v1/discharge`. Generates `K_M-B` on first
+    /// start. Requires `[demo_auth].enabled = true`: the issuer is gated
+    /// on the same login session the demo auth role mints.
+    #[serde(default)]
+    pub enabled: bool,
+    /// UDS path the colocated attestation authority binds, and the
+    /// transport the client dials to reach it. Path-only (UDS-only).
+    /// Defaults to `<data_dir>/attest.sock` when omitted; ignored when
     /// `enabled = false`.
     #[serde(default)]
     pub socket: Option<String>,
@@ -418,6 +447,17 @@ pub struct DemoAuth {
     pub socket: Option<PathBuf>,
 }
 
+/// Colocated demo attestation authority, post-validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DemoAttestation {
+    pub enabled: bool,
+    /// UDS the demo attestation authority binds, and the transport the
+    /// client dials to reach it. Resolved from
+    /// `[demo_attestation].socket` (explicit) or `<data_dir>/attest.sock`
+    /// (default). `None` when `enabled = false`.
+    pub socket: Option<PathBuf>,
+}
+
 /// Validated configuration, ready to serve.
 #[derive(Debug)]
 pub struct Config {
@@ -450,6 +490,9 @@ pub struct Config {
     /// Colocated demo auth role — `None` if the config omits
     /// `[demo_auth]`.
     pub demo_auth: Option<DemoAuth>,
+    /// Colocated demo attestation authority — `None` if the config omits
+    /// `[demo_attestation]`.
+    pub demo_attestation: Option<DemoAttestation>,
     /// The discharge URL stamped into the enroll/exchange/admin gates —
     /// `None` if the config omits `auth_location`. A mint without it (and
     /// without a demo auth role) cannot stamp those gates, so enrollment
@@ -572,6 +615,25 @@ impl Config {
                 socket,
             }
         });
+        let demo_attestation = raw.demo_attestation.map(|d| {
+            let socket = d.enabled.then(|| {
+                d.socket
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| data_dir.join("attest.sock"))
+            });
+            DemoAttestation {
+                enabled: d.enabled,
+                socket,
+            }
+        });
+        // The demo attestation authority gates issuance on the login
+        // session the demo auth role mints (verified under K_session),
+        // so it cannot exist without the colocated auth role.
+        if demo_attestation.as_ref().is_some_and(|d| d.enabled)
+            && !demo_auth.as_ref().is_some_and(|d| d.enabled)
+        {
+            return Err(ConfigError::DemoAttestationWithoutDemoAuth);
+        }
         // `[env]` values must be scalars; the env-key *surface* check
         // (every `{{env.X}}` names a defined key) is deliberately **not**
         // run here — it gates seal authoring, not config load, so a
@@ -591,6 +653,7 @@ impl Config {
             env,
             admin: AdminCredential::from_env(),
             demo_auth,
+            demo_attestation,
             auth_location: raw.auth_location,
             attestation_location: raw.attestation_location,
             roles,

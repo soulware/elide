@@ -30,24 +30,30 @@ const AUTH_URL: &str = "https://auth.example/v1/discharge";
 const TOML: &str = r#"
 audience = "mint"
 auth_location = "https://auth.example/v1/discharge"
+attestation_location = "https://attest.example/v1/discharge"
 [store]
 bucket = "demo-bucket"
 [demo_auth]
 enabled = true
+[demo_attestation]
+enabled = true
 [[role]]
-name = "volume-rw"
+name = "writer"
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
-policy_file = "volume-rw.json"
+policy_file = "writer.json"
+[role.template]
+attested = ["project"]
+[role.attestation]
 "#;
 
 fn config() -> Config {
     common::parse_config(
         TOML,
         &[(
-            "volume-rw.json",
-            r#"{"Version":"2012-10-17","Statement":[]}"#,
+            "writer.json",
+            r#"{"Version":"2012-10-17","Statement":[{"Resource":["arn:aws:s3:::demo-bucket/{{attested.project}}/*"]}]}"#,
         )],
     )
 }
@@ -70,6 +76,11 @@ async fn full_flow_over_unix_socket() {
     store_inner
         .init_k_session(srv_dir.path())
         .expect("init k_session");
+    // K_M-B keys the attested TPC the exchange stamps onto the `writer`
+    // credential, and the demo attestation authority's discharge route.
+    store_inner
+        .init_k_m_b(srv_dir.path(), true)
+        .expect("init k_m_b");
     let store = Arc::new(store_inner);
     let nonce = store.current_invite().await.expect("nonce");
     let cfg = config();
@@ -99,7 +110,13 @@ async fn full_flow_over_unix_socket() {
     let auth_sock = srv_dir.path().join("auth.sock");
     let auth_listener = tokio::net::UnixListener::bind(&auth_sock).expect("bind auth uds");
     std::fs::set_permissions(&auth_sock, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+    // The demo attestation authority on a third UDS: the client fetches
+    // the `writer` credential's attestation discharge here.
+    let attest_sock = srv_dir.path().join("attest.sock");
+    let attest_listener = tokio::net::UnixListener::bind(&attest_sock).expect("bind attest uds");
+    std::fs::set_permissions(&attest_sock, std::fs::Permissions::from_mode(0o666)).expect("chmod");
     let auth_state = state.clone();
+    let attest_state = state.clone();
     tokio::spawn(async move {
         axum::serve(listener, router(state)).await.expect("serve");
     });
@@ -107,6 +124,11 @@ async fn full_flow_over_unix_socket() {
         axum::serve(auth_listener, mint::auth::router(auth_state))
             .await
             .expect("serve auth");
+    });
+    tokio::spawn(async move {
+        axum::serve(attest_listener, mint::attest::router(attest_state))
+            .await
+            .expect("serve attest");
     });
 
     let url = format!("unix:{}", sock.display());
@@ -124,6 +146,10 @@ async fn full_flow_over_unix_socket() {
         .await
         .expect("shared login over uds");
     mint::session::save(&session, &auth_transport).expect("persist session");
+    // As `mint login --config` does when the config colocates the demo
+    // attestation authority.
+    mint::session::save_attest_transport(&format!("unix:{}", attest_sock.display()))
+        .expect("persist attest transport");
     let invite = mint_invite(
         &Keyring::single(ROOT),
         &K_M_A,
@@ -146,7 +172,7 @@ async fn full_flow_over_unix_socket() {
     .expect("enroll over uds");
 
     // exchange before approval: not a failure, just not yet approved.
-    let role = "volume-rw";
+    let role = "writer";
     let cred = mint::client::credential_path(role);
     assert!(
         !mint::client::exchange(
@@ -181,8 +207,11 @@ async fn full_flow_over_unix_socket() {
     );
 
     // assume-role returns the (fake) keypair JSON — the full chain
-    // verified and a scoped credential minted, all over the socket.
-    let kp = mint::client::assume_role(cdir.path(), &url, role, None, &[], 900, &cred)
+    // verified and a scoped credential minted, all over the sockets:
+    // the client detects the credential's attested TPC, fetches the
+    // discharge from the attest socket, and presents the bundle.
+    let attest = ["project=apollo".to_string()];
+    let kp = mint::client::assume_role(cdir.path(), &url, role, None, &[], &attest, 900, &cred)
         .await
         .expect("assume-role over uds");
     let v: serde_json::Value = serde_json::from_str(&kp).expect("keypair json");

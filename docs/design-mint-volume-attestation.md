@@ -675,9 +675,12 @@ or server-side, none self-asserted**:
 | `env.*` | operator `[env]` config | server-side |
 | `mint.*` | mint-internal (`MINT_KEYS`) | server-side |
 
-There is no self-asserted substitution path a caller can choose, so this
+A volume role's policy has no self-asserted substitution path, so this
 is the *no optional path for a correctness property* rule at full
-strength: scoping has exactly one source class, and it is not the caller.
+strength: volume scoping has exactly one source class, and it is not the
+caller. (The `caveat.*` namespace separately admits holder-appended,
+self-attested names where a role declares them — `design-mint.md`
+§ *Templating*; the volume roles declare none.)
 A discharge is **required wherever a role's sealed policy references
 `attested.*`** — i.e. for `volume-rw`/`volume-ro`, by construction, since
 their ARN renders from `attested.volume`. Whether a discharge is needed

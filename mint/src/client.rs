@@ -439,17 +439,22 @@ fn build_request_body(
 
 /// `mint client assume-role`: attenuate the held credential (the
 /// bounding `exp` from `ttl`, plus any caller-supplied narrowing
-/// caveats), exercise it. Returns the raw keypair JSON to print.
+/// caveats), fetch an attestation discharge if the credential carries
+/// an attested third-party caveat, exercise it. Returns the raw keypair
+/// JSON to print.
+#[allow(clippy::too_many_arguments)]
 pub async fn assume_role(
     dir: &Path,
     base_url: &str,
     role: &str,
     request_src: Option<&str>,
     caveats: &[String],
+    attest: &[String],
     ttl_seconds: u64,
     in_file: &str,
 ) -> Result<String, ClientError> {
     let caveats = parse_caveats(caveats)?;
+    let attest = parse_caveats(attest)?;
     let seed = load_seed(dir)?;
     let in_path = dir.join(in_file);
     let mut mac = Macaroon::decode(
@@ -478,18 +483,73 @@ pub async fn assume_role(
         caveats.len()
     );
 
-    // A credential carries no third-party caveat — operator authority was
-    // exercised at enrollment, not here — so `assume-role` presents a
-    // bare primary with no discharge (`docs/design-auth-service.md`
-    // § *No runtime discharge*).
+    // Operator authority was exercised at enrollment, not here. A role
+    // with an attestation contract carries a static attested third-party
+    // caveat (`docs/design-mint.md` § *Attestation contract*): fetch its
+    // discharge — attesting the `--attest` pairs — from the attestation
+    // authority and present it alongside; every other credential is a
+    // bare primary with no discharge.
+    let discharges = attest_discharges(&mac, &attest).await?;
     eprintln!("  → POST {base_url}/v1/assume-role");
     let body = build_request_body(request_src, role, ttl_seconds, now_unix())?;
-    let (status, text) = post_bundle(base_url, "/v1/assume-role", &mac, &[], &seed, body).await?;
+    let (status, text) =
+        post_bundle(base_url, "/v1/assume-role", &mac, &discharges, &seed, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }
     eprintln!("  ← 200 — mint verified the chain + PoP and minted a scoped Tigris keypair:");
     Ok(text)
+}
+
+/// Fetch an attestation discharge for each third-party caveat on the
+/// credential, attesting the caller's `--attest` pairs. The session
+/// comes from the shared per-user login; the transport is the
+/// attestation authority's, saved by `mint login --config` against a
+/// config that colocates it. A credential with no TPC yields an empty
+/// list without touching either.
+async fn attest_discharges(
+    credential: &Macaroon,
+    attest: &[(String, String)],
+) -> Result<Vec<Macaroon>, ClientError> {
+    let has_tpc = credential
+        .caveats()
+        .iter()
+        .any(|c| matches!(c, Caveat::ThirdParty { .. }));
+    if !has_tpc {
+        return Ok(Vec::new());
+    }
+    let session = crate::session::load_session()?;
+    let transport = crate::session::load_attest_transport()?;
+    let attested: std::collections::BTreeMap<String, String> = attest.iter().cloned().collect();
+    let mut discharges = Vec::new();
+    for c in credential.caveats() {
+        let Caveat::ThirdParty { location, cid, .. } = c else {
+            continue;
+        };
+        eprintln!(
+            "  credential carries an attested caveat → fetching discharge \
+             from {location} (via {transport})"
+        );
+        let body = serde_json::to_string(&crate::attest::AttestRequest {
+            cid: BASE64.encode(cid),
+            attested: attested.clone(),
+        })
+        .map_err(|_| ClientError::BadRequest("attest body"))?;
+        let headers = [
+            ("content-type", "application/json".into()),
+            ("authorization", format!("Bearer {session}")),
+        ];
+        let path = discharge_path(location)?;
+        let (status, text) = send(&transport, &path, &headers, body).await?;
+        if status != 200 {
+            return Err(ClientError::Server { status, body: text });
+        }
+        let discharge = json_field(&text, "discharge")?;
+        discharges
+            .push(Macaroon::decode(&discharge).map_err(|_| ClientError::BadFile("discharge"))?);
+        eprintln!("    ← discharge received");
+    }
+    Ok(discharges)
 }
 
 /// Fetch an operator discharge for each third-party caveat on `anchor`
