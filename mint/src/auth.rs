@@ -5,9 +5,9 @@
 //! run a standalone auth-service binary that issues discharges over
 //! its own wire and shares `K_M-A` with mint. Mint's
 //! [`verify_and_clear`](crate::http::verify_and_clear) verifies any
-//! discharge by recovering `r` from `K_M-A` regardless of where the
-//! discharge was minted, so this module can later move out of the mint
-//! binary without disturbing the verifier.
+//! discharge by recovering `r` from the anchor's `vid` regardless of
+//! where the discharge was minted, so this module can later move out
+//! of the mint binary without disturbing the verifier.
 //!
 //! Session gate (`docs/design-auth-service.md` § *Login flow*): every
 //! `/v1/discharge` request must carry `Authorization: Bearer
@@ -70,13 +70,8 @@ use serde_json::json;
 
 use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op, scope};
 use crate::http::AppState;
-use crate::macaroon::{DISCHARGE_KID, Macaroon, NONCE_LEN, SESSION_KID, mint_under_key};
+use crate::macaroon::{DISCHARGE_KID, Macaroon, SESSION_KID, mint_under_key};
 use crate::tpc;
-
-/// BLAKE3 derive-key context for the per-discharge MAC key. The
-/// context string is the domain separator — bumping it rotates every
-/// outstanding demo discharge.
-const R_KDF_CONTEXT: &str = "mint discharge r-key v1";
 
 /// Demo discharge lifetime. Long enough for a CLI command to round-trip
 /// from auth to mint, short enough that a leaked discharge has minimal
@@ -87,18 +82,6 @@ const DISCHARGE_EXP_SECONDS: u64 = 300;
 /// Demo session lifetime — `~7 days` per `docs/design-auth-service.md`
 /// § *Cadence*. The operator re-runs `mint login` when it lapses.
 const SESSION_EXP_SECONDS: u64 = 7 * 24 * 60 * 60;
-
-/// Derive the per-discharge MAC key from `K_M-A` and a discharge's
-/// nonce. The discharge-as-primary verification path
-/// ([`crate::http`] `resolve_primary_key`) recovers `r` this way for a
-/// standalone discharge; the CID-arm discharge below is keyed by the
-/// CID's `r` instead.
-pub fn derive_discharge_r(k_m_a: &[u8; 32], nonce: &[u8; NONCE_LEN]) -> [u8; 32] {
-    let mut km = Vec::with_capacity(32 + NONCE_LEN);
-    km.extend_from_slice(k_m_a);
-    km.extend_from_slice(nonce);
-    blake3::derive_key(R_KDF_CONTEXT, &km)
-}
 
 /// The `/v1/discharge` request body. Shared with the client side
 /// (`crate::operator`) so the bytes a caller serialises and the bytes
@@ -316,9 +299,6 @@ fn error(status: StatusCode, msg: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macaroon::mint_under_key_with_nonce;
-    use rand_core::{OsRng, RngCore};
-
     fn bearer(session: &Macaroon) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(
@@ -369,55 +349,5 @@ mod tests {
             ],
         );
         assert!(verify_session(&[21u8; 32], &bearer(&m), 1_000).is_err());
-    }
-
-    #[test]
-    fn r_is_deterministic_in_nonce_and_kma() {
-        let k = [3u8; 32];
-        let n = [7u8; NONCE_LEN];
-        assert_eq!(derive_discharge_r(&k, &n), derive_discharge_r(&k, &n));
-    }
-
-    #[test]
-    fn r_differs_per_nonce_and_per_kma() {
-        let k0 = [3u8; 32];
-        let mut k1 = k0;
-        k1[0] ^= 0x80;
-        let n0 = [7u8; NONCE_LEN];
-        let mut n1 = n0;
-        n1[0] ^= 0x01;
-        let base = derive_discharge_r(&k0, &n0);
-        assert_ne!(base, derive_discharge_r(&k1, &n0));
-        assert_ne!(base, derive_discharge_r(&k0, &n1));
-    }
-
-    #[test]
-    fn issued_discharge_round_trips_under_recovered_r() {
-        // The discharge-as-primary property the verifier's
-        // resolve_primary_key path relies on: recover `r` from
-        // (K_M-A, nonce) and confirm the chain MAC verifies.
-        let k_m_a = [3u8; 32];
-        let mut nonce = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
-        let r = derive_discharge_r(&k_m_a, &nonce);
-        let discharge = mint_under_key_with_nonce(
-            &r,
-            DISCHARGE_KID,
-            nonce,
-            vec![
-                Caveat::scalar(name::AUD, "mint"),
-                Caveat::scalar(name::OP, "admin:invite-read"),
-                Caveat::scalar(name::CNF, "ed25519:AAAA"),
-                Caveat::scalar(name::EXP, "1700000000"),
-            ],
-        );
-        let wire = discharge.encode();
-        let decoded = Macaroon::decode(&wire).expect("decode");
-        let recovered = derive_discharge_r(&k_m_a, decoded.nonce());
-        assert!(decoded.verify_under_key(&recovered));
-        let mut wrong = k_m_a;
-        wrong[31] ^= 0x01;
-        let bad = derive_discharge_r(&wrong, decoded.nonce());
-        assert!(!decoded.verify_under_key(&bad));
     }
 }

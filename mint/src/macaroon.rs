@@ -184,12 +184,9 @@ pub fn mint_under_key(key: &[u8; 32], kid: Kid, caveats: Vec<Caveat>) -> Macaroo
     mint_under_key_with_nonce(key, kid, nonce, caveats)
 }
 
-/// As [`mint_under_key`] but with a caller-supplied nonce. Used when
-/// the issuer needs to derive `key` *from* the nonce — the demo
-/// discharge path does this: it picks a fresh nonce, derives `r` via
-/// BLAKE3 keyed by `K_M-A` over the nonce, then MAC's the chain under
-/// `r`. The same derivation at the verifier recovers `r` from the
-/// nonce alone — no extra state to track.
+/// As [`mint_under_key`] but with a caller-supplied nonce, for callers
+/// that need a deterministic wire (cross-implementation test vectors,
+/// the chain-MAC proptests).
 pub fn mint_under_key_with_nonce(
     key: &[u8; 32],
     kid: Kid,
@@ -211,10 +208,9 @@ pub fn mint_under_key_with_nonce(
 /// chain seed, so issuer and verifier must agree on its value. We
 /// reserve `u16::MAX` so it cannot collide with any keyring generation;
 /// the keyring monotonically increments from 0 and would have to
-/// rotate 65 535 times to clash. `verify_and_clear`'s
-/// `resolve_primary_key` dispatches on this value: kid in the keyring
-/// → mint-issued primary verified under `K_M`; kid == `DISCHARGE_KID`
-/// → auth-issued discharge verified under `r` recovered from `K_M-A`.
+/// rotate 65 535 times to clash. Because it never indexes the keyring,
+/// a discharge presented as a bundle's *primary* fails verification as
+/// `unknown_kid` — only mint-issued macaroons anchor a bundle.
 pub const DISCHARGE_KID: Kid = Kid::MAX;
 
 /// `kid` sentinel for demo auth-role sessions. Like [`DISCHARGE_KID`]

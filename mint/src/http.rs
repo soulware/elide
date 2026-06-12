@@ -267,21 +267,12 @@ impl VerifyClearError {
 /// (`/v1/assume-role`, `/v1/verify`) invoke this; assume-role layers
 /// role-specific clearing and IAM issuance on top of the result.
 ///
-/// The bundle's *primary* may be either:
-///
-/// 1. **Mint-issued** — `kid` matches a generation in mint's keyring;
-///    the chain seed verifies under `K_M`. This is the long-lived
-///    credential path (coord-side `assume-role`, `enroll-exchange`).
-/// 2. **Auth-issued discharge** — `kid == DISCHARGE_KID`; the chain
-///    seed verifies under `r` derived from `(K_M-A, nonce)`. This is
-///    the per-action operator-authority path (`admin:*` endpoints under
-///    the consolidation, or any future verifier of standalone
-///    discharges).
-///
-/// The two paths use *different* key sources (`K_M` vs. `K_M-A`-derived
-/// `r`) — no code path conflates them; an attacker without `K_M-A`
-/// cannot produce a discharge that verifies, and an attacker without
-/// `K_M` cannot produce a mint-issued primary that verifies.
+/// The bundle's *primary* must be mint-issued: its `kid` names a
+/// generation in mint's keyring and the chain seed verifies under
+/// `K_M`. Discharges carry the reserved
+/// [`DISCHARGE_KID`](crate::macaroon::DISCHARGE_KID) — never a keyring
+/// generation — so a discharge presented as the primary fails as
+/// `unknown_kid`.
 ///
 /// `aud`/`op` clear **per macaroon** against the request context, not
 /// over a flattened union: the primary must positively carry
@@ -292,22 +283,19 @@ impl VerifyClearError {
 /// caveats by source — assume-role reads the primary's for
 /// [`role::authorize`]; the operator gates read the discharge's for the
 /// `Scope` tier and the `sub` audit identity.
-// Each input is independently meaningful at every call site (keyring +
-// K_M-A + body + expected caveats are all separate concerns). A
-// builder/struct wrapper would obscure that without removing any
-// coupling.
-#[allow(clippy::too_many_arguments)]
 pub fn verify_and_clear(
     bundle: &Bundle,
     keyring: &crate::keyring::Keyring,
-    k_m_a: Option<&[u8; 32]>,
     proof: Option<pop::Proof>,
     body: &[u8],
     now_unix: u64,
     expected_aud: &str,
     expected_op: &str,
 ) -> Result<ClearedBundle, VerifyClearError> {
-    let primary_key = resolve_primary_key(&bundle.primary, keyring, k_m_a)?;
+    let primary_key = keyring
+        .get(bundle.primary.kid())
+        .copied()
+        .ok_or(VerifyClearError::Auth("unknown_kid"))?;
 
     let mut discharge_caveats: Vec<Caveat> = Vec::new();
     let mut min_exp: Option<u64> = None;
@@ -396,41 +384,6 @@ pub fn verify_and_clear(
     })
 }
 
-/// Resolve the chain-MAC seed key for the bundle's primary. Two
-/// disjoint paths, distinguished structurally:
-///
-/// - **Mint-issued primary**: `primary.kid()` matches a generation in
-///   the keyring → seed key is `keyring.get(kid)`. The chain MAC then
-///   verifies under `K_M`.
-/// - **Auth-issued discharge**: `primary.kid() == DISCHARGE_KID` →
-///   seed key is `auth::derive_discharge_r(K_M-A, primary.nonce())`.
-///   The chain MAC then verifies under `r` recovered from `K_M-A`.
-///
-/// Anything else (unknown kid, or `DISCHARGE_KID` with no `K_M-A`
-/// available) is `Auth("unknown_kid")`. The two paths use *different*
-/// key sources by construction — there is no code path that admits
-/// one's bytes under the other's key.
-fn resolve_primary_key(
-    primary: &Macaroon,
-    keyring: &crate::keyring::Keyring,
-    k_m_a: Option<&[u8; 32]>,
-) -> Result<[u8; 32], VerifyClearError> {
-    // Dispatch on the kid sentinel first: discharges use the reserved
-    // `DISCHARGE_KID` and never appear in the keyring. Checking this
-    // before the keyring lookup keeps the two paths cleanly disjoint
-    // even if the keyring were ever extended past the sentinel.
-    if primary.kid() == crate::macaroon::DISCHARGE_KID {
-        let Some(k_m_a) = k_m_a else {
-            return Err(VerifyClearError::Auth("unknown_kid"));
-        };
-        return Ok(crate::auth::derive_discharge_r(k_m_a, primary.nonce()));
-    }
-    keyring
-        .get(primary.kid())
-        .copied()
-        .ok_or(VerifyClearError::Auth("unknown_kid"))
-}
-
 async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     let caller = peer_ip(&headers);
@@ -481,7 +434,6 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     let cleared = match verify_and_clear(
         &bundle,
         &keyring,
-        state.store.k_m_a(),
         proof,
         &body,
         now_unix,
@@ -814,7 +766,6 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     let cleared = match verify_and_clear(
         &bundle,
         &keyring,
-        state.store.k_m_a(),
         proof,
         &body,
         now_unix,
@@ -1060,7 +1011,6 @@ async fn enroll_exchange(
     let cleared = match verify_and_clear(
         &bundle,
         &keyring,
-        state.store.k_m_a(),
         proof,
         &body,
         now_unix,
@@ -1266,7 +1216,6 @@ async fn discharge_verify(
     let cleared = match verify_and_clear(
         &bundle,
         &keyring,
-        state.store.k_m_a(),
         proof,
         &body,
         now_unix,
