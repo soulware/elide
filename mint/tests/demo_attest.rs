@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use ed25519_dalek::SigningKey;
 use mint::audit::AuditLog;
 use mint::caveat::{Caveat, name};
 use mint::config::Config;
@@ -89,7 +90,7 @@ async fn demo_state() -> (AppState, Arc<FakeMinter>, [u8; 32], tempfile::TempDir
     store
         .approve(
             SUB,
-            &pop::cnf_value(&CLIENT_SEED),
+            &pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
             "usr_test",
             &chrono::Utc::now().to_rfc3339(),
         )
@@ -116,7 +117,7 @@ fn credential(k_m_b: &[u8; 32]) -> Macaroon {
         &Keyring::single(ROOT),
         "mint",
         SUB,
-        &pop::cnf_value(&CLIENT_SEED),
+        &pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
         "attested-write",
         0,
         Some(AttestedTpc {
@@ -210,7 +211,11 @@ async fn demo_attest_loop_renders_all_four_namespaces() {
     // assume-role with the bundle.
     let ts = chrono::Utc::now().timestamp() as u64;
     let body = format!("{{\"ts\":{ts},\"role\":\"attested-write\",\"ttl_seconds\":600}}");
-    let sig = pop::client_signature(&CLIENT_SEED, m.tail(), body.as_bytes());
+    let sig = pop::client_signature(
+        &SigningKey::from_bytes(&CLIENT_SEED),
+        m.tail(),
+        body.as_bytes(),
+    );
     let req = Request::builder()
         .method("POST")
         .uri("/v1/assume-role")
@@ -302,7 +307,11 @@ async fn assume_role_without_the_discharge_is_refused() {
     let m = credential(&k_m_b);
     let ts = chrono::Utc::now().timestamp() as u64;
     let body = format!("{{\"ts\":{ts},\"role\":\"attested-write\",\"ttl_seconds\":600}}");
-    let sig = pop::client_signature(&CLIENT_SEED, m.tail(), body.as_bytes());
+    let sig = pop::client_signature(
+        &SigningKey::from_bytes(&CLIENT_SEED),
+        m.tail(),
+        body.as_bytes(),
+    );
     let req = Request::builder()
         .method("POST")
         .uri("/v1/assume-role")

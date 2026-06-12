@@ -18,6 +18,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use ed25519_dalek::SigningKey;
 use mint::audit::AuditLog;
 use mint::auth;
 use mint::caveat::{Caveat, name};
@@ -158,7 +159,7 @@ fn now() -> u64 {
 /// the auth-location TPC. Keyed by the store's root (`kid=0`).
 fn admin_service() -> Macaroon {
     let kr = Keyring::single(ROOT);
-    let cnf = pop::cnf_value(&MACHINE_SEED);
+    let cnf = pop::cnf_value(&SigningKey::from_bytes(&MACHINE_SEED));
     mint::issuance::mint_admin_service_token(&kr, &K_M_A, "mint", &cnf, ORG, AUTH_LOCATION)
 }
 
@@ -225,7 +226,11 @@ fn admin_request(
     body: &str,
 ) -> Request<Body> {
     let attenuated = token.clone().attenuate(Caveat::scalar(name::OP, op_value));
-    let sig = pop::client_signature(&MACHINE_SEED, attenuated.tail(), body.as_bytes());
+    let sig = pop::client_signature(
+        &SigningKey::from_bytes(&MACHINE_SEED),
+        attenuated.tail(),
+        body.as_bytes(),
+    );
     let bundle = format!("MintV1 {},{}", attenuated.encode(), discharge.encode());
     Request::builder()
         .method(method)
@@ -293,7 +298,7 @@ async fn one_wide_discharge_satisfies_every_verb() {
             OP_ENROLL_APPROVE,
             "POST",
             "/v1/admin/enroll/approve",
-            serde_json::json!({ "ts": now(), "sub": SUB, "pubkey": pop::cnf_value(&[1u8; 32]) })
+            serde_json::json!({ "ts": now(), "sub": SUB, "pubkey": pop::cnf_value(&SigningKey::from_bytes(&[1u8; 32])) })
                 .to_string(),
         ),
         (
@@ -526,7 +531,11 @@ async fn pop_signed_by_wrong_key_rejected() {
     let discharge = fetch_discharge(auth_router, &admin_service_cid(&token)).await;
     let body = format!(r#"{{"ts":{}}}"#, now());
     let attenuated = token.attenuate(Caveat::scalar(name::OP, OP_INVITE_READ));
-    let sig = pop::client_signature(&[99u8; 32], attenuated.tail(), body.as_bytes());
+    let sig = pop::client_signature(
+        &SigningKey::from_bytes(&[99u8; 32]),
+        attenuated.tail(),
+        body.as_bytes(),
+    );
     let bundle = format!("MintV1 {},{}", attenuated.encode(), discharge.encode());
     let req = Request::builder()
         .method("POST")
@@ -577,7 +586,11 @@ async fn admin_service_without_discharge_rejected() {
     let token = admin_service();
     let body = format!(r#"{{"ts":{}}}"#, now());
     let attenuated = token.attenuate(Caveat::scalar(name::OP, OP_INVITE_READ));
-    let sig = pop::client_signature(&MACHINE_SEED, attenuated.tail(), body.as_bytes());
+    let sig = pop::client_signature(
+        &SigningKey::from_bytes(&MACHINE_SEED),
+        attenuated.tail(),
+        body.as_bytes(),
+    );
     let req = Request::builder()
         .method("POST")
         .uri("/v1/admin/invite")

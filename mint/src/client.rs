@@ -110,30 +110,30 @@ fn read_text(path: &Path, hint: &'static str) -> Result<String, ClientError> {
 }
 
 /// Mint a fresh Ed25519 identity into `dir`, persisting `client.key`
-/// (0600) + `client.pub`, and return the seed. The caller is the first
-/// operation that needs an identity — see [`load_seed`].
-fn generate_identity(dir: &Path) -> Result<[u8; 32], ClientError> {
+/// (0600) + `client.pub`, and return the key. The caller is the first
+/// operation that needs an identity — see [`load_key`].
+fn generate_identity(dir: &Path) -> Result<SigningKey, ClientError> {
     fs::create_dir_all(dir)?;
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
-    let vk = SigningKey::from_bytes(&seed).verifying_key();
+    let sk = SigningKey::from_bytes(&seed);
     write_0600(
         &dir.join(KEY_FILE),
         format!("{}\n", encode_hex(&seed)).as_bytes(),
     )?;
     fs::write(
         dir.join(PUB_FILE),
-        format!("{}\n", encode_hex(&vk.to_bytes())),
+        format!("{}\n", encode_hex(&sk.verifying_key().to_bytes())),
     )?;
-    Ok(seed)
+    Ok(sk)
 }
 
-/// Load this client's identity seed, minting one on first use. A key
+/// Load this client's identity key, minting one on first use. A key
 /// *is* an identity, so the first operation that needs one generates and
 /// persists it; every later call reuses the same `client.key`.
-fn load_seed(dir: &Path) -> Result<[u8; 32], ClientError> {
+fn load_key(dir: &Path) -> Result<SigningKey, ClientError> {
     match fs::read_to_string(dir.join(KEY_FILE)) {
-        Ok(raw) => decode_hex_32(&raw),
+        Ok(raw) => Ok(SigningKey::from_bytes(&decode_hex_32(&raw)?)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => generate_identity(dir),
         Err(e) => Err(ClientError::Io(e)),
     }
@@ -142,7 +142,7 @@ fn load_seed(dir: &Path) -> Result<[u8; 32], ClientError> {
 /// `(cnf, fingerprint)` for the identity in `dir` — what the operator
 /// compares out of band before `mint enroll approve`.
 pub fn identity(dir: &Path) -> Result<(String, String), ClientError> {
-    let cnf = pop::cnf_value(&load_seed(dir)?);
+    let cnf = pop::cnf_value(&load_key(dir)?);
     let fp = fingerprint(&cnf);
     Ok((cnf, fp))
 }
@@ -168,10 +168,10 @@ async fn post_bundle(
     endpoint: &str,
     primary: &Macaroon,
     discharges: &[Macaroon],
-    seed: &[u8; 32],
+    sk: &SigningKey,
     body: String,
 ) -> Result<(u16, String), ClientError> {
-    let sig = pop::client_signature(seed, primary.tail(), body.as_bytes());
+    let sig = pop::client_signature(sk, primary.tail(), body.as_bytes());
     let mut auth = format!("MintV1 {}", primary.encode());
     for d in discharges {
         auth.push(',');
@@ -297,8 +297,8 @@ pub async fn enroll(
     sub: &str,
     out: &str,
 ) -> Result<(), ClientError> {
-    let seed = load_seed(dir)?;
-    let cnf = pop::cnf_value(&seed);
+    let sk = load_key(dir)?;
+    let cnf = pop::cnf_value(&sk);
     let presented = parse_invite(invite_src)?
         .attenuate(Caveat::scalar(name::SUB, sub))
         .attenuate(Caveat::scalar(name::CNF, cnf.clone()));
@@ -315,7 +315,7 @@ pub async fn enroll(
     eprintln!("  → POST {base_url}/v1/enroll  (signed with your client key)");
     let body = format!(r#"{{"ts":{}}}"#, now_unix());
     let (status, text) =
-        post_bundle(base_url, "/v1/enroll", &presented, &discharges, &seed, body).await?;
+        post_bundle(base_url, "/v1/enroll", &presented, &discharges, &sk, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }
@@ -343,7 +343,7 @@ pub async fn exchange(
     role: &str,
     out: &str,
 ) -> Result<bool, ClientError> {
-    let seed = load_seed(dir)?;
+    let sk = load_key(dir)?;
     let in_path = dir.join(in_file);
     let ticket = Macaroon::decode(read_text(&in_path, "run `mint client enroll …` first")?.trim())
         .map_err(|_| ClientError::BadFile("credential ticket"))?;
@@ -369,7 +369,7 @@ pub async fn exchange(
         "/v1/enroll-exchange",
         &ticket,
         &discharges,
-        &seed,
+        &sk,
         body,
     )
     .await?;
@@ -455,7 +455,7 @@ pub async fn assume_role(
 ) -> Result<String, ClientError> {
     let caveats = parse_caveats(caveats)?;
     let attest = parse_caveats(attest)?;
-    let seed = load_seed(dir)?;
+    let sk = load_key(dir)?;
     let in_path = dir.join(in_file);
     let mut mac = Macaroon::decode(
         read_text(
@@ -493,7 +493,7 @@ pub async fn assume_role(
     eprintln!("  → POST {base_url}/v1/assume-role");
     let body = build_request_body(request_src, role, ttl_seconds, now_unix())?;
     let (status, text) =
-        post_bundle(base_url, "/v1/assume-role", &mac, &discharges, &seed, body).await?;
+        post_bundle(base_url, "/v1/assume-role", &mac, &discharges, &sk, body).await?;
     if status != 200 {
         return Err(ClientError::Server { status, body: text });
     }

@@ -52,7 +52,7 @@ async fn write_admin_service(cfg: &Config, store: &Store) -> io::Result<()> {
 
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
-    let cnf = crate::pop::cnf_value(&seed);
+    let cnf = crate::pop::cnf_value(&ed25519_dalek::SigningKey::from_bytes(&seed));
 
     let keyring = store.keyring().await;
     let mac = crate::issuance::mint_admin_service_token(

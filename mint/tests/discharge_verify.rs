@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use ed25519_dalek::SigningKey;
 use mint::audit::AuditLog;
 use mint::caveat::{Caveat, name, op};
 use mint::config::Config;
@@ -101,7 +102,10 @@ fn build_primary() -> Macaroon {
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::SUB, CLIENT_ID),
-            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(
+                name::CNF,
+                pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
+            ),
             Caveat::scalar(name::ROLE, "volume-rw"),
         ],
     );
@@ -152,7 +156,10 @@ fn build_attested_primary(mode: &str) -> Macaroon {
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::SUB, CLIENT_ID),
-            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(
+                name::CNF,
+                pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
+            ),
             Caveat::scalar(name::ROLE, "volume-ro"),
         ],
     );
@@ -202,7 +209,11 @@ async fn verify_request_pop_seed(
     let ts = chrono::Utc::now().timestamp() as u64;
     let body = format!("{{\"ts\":{ts}}}");
     let primary_mac = Macaroon::decode(primary).expect("decode primary for tail");
-    let sig = pop::client_signature(pop_seed, primary_mac.tail(), body.as_bytes());
+    let sig = pop::client_signature(
+        &SigningKey::from_bytes(pop_seed),
+        primary_mac.tail(),
+        body.as_bytes(),
+    );
     let mut auth = String::from("MintV1 ");
     auth.push_str(primary);
     for d in discharges {
@@ -298,7 +309,10 @@ async fn verifies_tpc_free_chain_with_no_discharges() {
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::SUB, CLIENT_ID),
-            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(
+                name::CNF,
+                pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
+            ),
             Caveat::scalar(name::ROLE, "volume-rw-background"),
         ],
     );

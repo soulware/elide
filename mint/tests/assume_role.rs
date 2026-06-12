@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use ed25519_dalek::SigningKey;
 use mint::audit::AuditLog;
 use mint::caveat::{Caveat, name, op};
 use mint::config::Config;
@@ -108,7 +109,7 @@ async fn state_with_audit() -> (
     store
         .approve(
             SUB,
-            &pop::cnf_value(&CLIENT_SEED),
+            &pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
             "usr_test",
             &chrono::Utc::now().to_rfc3339(),
         )
@@ -141,7 +142,7 @@ fn request_macaroon_at_epoch(rev_epoch: u64) -> Macaroon {
         &Keyring::single(ROOT),
         "mint",
         SUB,
-        &pop::cnf_value(&CLIENT_SEED),
+        &pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
         "volume-ro",
         rev_epoch,
         Some(AttestedTpc {
@@ -187,7 +188,11 @@ fn signed_request_with_discharge(
 ) -> Request<Body> {
     let ts = chrono::Utc::now().timestamp() as u64;
     let body = format!("{{\"ts\":{ts},{inner_fields}}}");
-    let sig = pop::client_signature(&CLIENT_SEED, m.tail(), body.as_bytes());
+    let sig = pop::client_signature(
+        &SigningKey::from_bytes(&CLIENT_SEED),
+        m.tail(),
+        body.as_bytes(),
+    );
     let mut auth = format!("MintV1 {}", m.encode());
     if let Some(d) = discharge {
         auth.push(',');
@@ -296,7 +301,10 @@ async fn wrong_op_is_opaque_401() {
             Caveat::scalar(name::OP, op::ENROLL),
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::EXP, far_future().to_string()),
-            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(
+                name::CNF,
+                pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
+            ),
         ],
     );
     let (status, _) = body_string(
@@ -331,7 +339,11 @@ async fn pop_over_a_different_body_is_401() {
     let m = request_macaroon();
     let ts = chrono::Utc::now().timestamp() as u64;
     let signed = format!(r#"{{"ts":{ts},"role":"volume-ro","volume":"{VOLUME}"}}"#);
-    let sig = pop::client_signature(&CLIENT_SEED, m.tail(), signed.as_bytes());
+    let sig = pop::client_signature(
+        &SigningKey::from_bytes(&CLIENT_SEED),
+        m.tail(),
+        signed.as_bytes(),
+    );
     let req = Request::builder()
         .method("POST")
         .uri("/v1/assume-role")
@@ -395,7 +407,10 @@ async fn missing_role_caveat_is_400() {
             Caveat::scalar(name::OP, op::ASSUME_ROLE),
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::SUB, SUB),
-            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(
+                name::CNF,
+                pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
+            ),
             Caveat::scalar(name::EPOCH, "0"),
             Caveat::scalar(name::EXP, far_future().to_string()),
         ],
@@ -471,7 +486,7 @@ async fn re_approval_after_revoke_does_not_revive_old_credential() {
     store
         .approve(
             SUB,
-            &pop::cnf_value(&CLIENT_SEED),
+            &pop::cnf_value(&SigningKey::from_bytes(&CLIENT_SEED)),
             "usr_test",
             &chrono::Utc::now().to_rfc3339(),
         )

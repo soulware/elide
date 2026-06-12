@@ -266,7 +266,7 @@ mod tests {
     }
 
     fn cnf() -> String {
-        pop::cnf_value(&[3u8; 32])
+        pop::cnf_value(&ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]))
     }
 
     const K_M_A: [u8; 32] = [42u8; 32];
