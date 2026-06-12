@@ -455,17 +455,21 @@ mod tests {
 
     #[test]
     fn resolve_invite_distinguishes_inline_file_and_garbage() {
-        // A real wire macaroon, built the way mint mints one. v4
-        // format: canonical-MsgPack envelope, base64url-no-pad, mnt1_
-        // prefix (`mint/src/macaroon.rs`).
+        // A real wire macaroon, built the way mint mints one. v5
+        // format: canonical-MsgPack envelope with a keyring keyref,
+        // base64url-no-pad, mnt2_ prefix (`mint/src/macaroon.rs`).
         use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
         let nonce = [5u8; 16];
         let root = [2u8; 32];
         let kid: u16 = 0;
-        const DOMAIN: &[u8] = b"mint-macaroon-v4";
+        const DOMAIN: &[u8] = b"mint-macaroon-v5";
+        let mut kr_bytes = Vec::new();
+        rmp::encode::write_array_len(&mut kr_bytes, 2).unwrap();
+        rmp::encode::write_uint(&mut kr_bytes, 0).unwrap();
+        rmp::encode::write_uint(&mut kr_bytes, kid as u64).unwrap();
         let mut seed = Vec::new();
         seed.extend_from_slice(DOMAIN);
-        seed.extend_from_slice(&kid.to_be_bytes());
+        seed.extend_from_slice(&kr_bytes);
         seed.extend_from_slice(&nonce);
         let mut key = *blake3::keyed_hash(&root, &seed).as_bytes();
         let mut ser = Vec::new();
@@ -476,12 +480,12 @@ mod tests {
         key = *blake3::keyed_hash(&key, &ser).as_bytes();
         let mut buf = Vec::new();
         rmp::encode::write_array_len(&mut buf, 4).unwrap();
-        rmp::encode::write_uint(&mut buf, kid as u64).unwrap();
+        buf.extend_from_slice(&kr_bytes);
         rmp::encode::write_bin(&mut buf, &nonce).unwrap();
         rmp::encode::write_bin(&mut buf, &key).unwrap();
         rmp::encode::write_array_len(&mut buf, 1).unwrap();
         buf.extend_from_slice(&ser);
-        let inline = format!("mnt1_{}", B64URL.encode(buf));
+        let inline = format!("mnt2_{}", B64URL.encode(buf));
 
         assert_eq!(resolve_invite(&inline).expect("inline"), inline);
 

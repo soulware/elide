@@ -169,7 +169,7 @@ mod tests {
     fn sample_session() -> String {
         crate::macaroon::mint_under_key(
             &[1u8; 32],
-            crate::macaroon::SESSION_KID,
+            crate::macaroon::KeyRef::Session,
             vec![crate::caveat::Caveat::scalar(
                 crate::caveat::name::SUB,
                 "alice",

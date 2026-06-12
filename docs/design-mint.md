@@ -937,7 +937,7 @@ already-approved coordinator.
 ```
 POST /v1/assume-role
 Host: <mint-instance>
-Authorization: MintV1 mnt1_<b64url-primary>[,mnt1_<b64url-discharge>...]
+Authorization: MintV1 mnt2_<b64url-primary>[,mnt2_<b64url-discharge>...]
 X-Mint-Pop: <base64 Ed25519 signature>
 Content-Type: application/json
 
@@ -966,7 +966,7 @@ Content-Type: application/json
 ```
 POST /v1/verify
 Host: <mint-instance>
-Authorization: MintV1 mnt1_<b64url-primary>[,mnt1_<b64url-discharge>...]
+Authorization: MintV1 mnt2_<b64url-primary>[,mnt2_<b64url-discharge>...]
 X-Mint-Pop: <base64 Ed25519 signature>
 Content-Type: application/json
 
@@ -1012,7 +1012,7 @@ POST /v1/enroll-exchange     # ticket + exchanging-operator discharge in MintV1 
 ```
 
 `/v1/enroll` carries the coordinator-attenuated invite in `Authorization:
-MintV1 mnt1_<b64url>` together with the enrolling operator's discharge
+MintV1 mnt2_<b64url>` together with the enrolling operator's discharge
 in the same bundle, the PoP in `X-Mint-Pop`, and `{ts}` in the body.
 Mint verifies the chain, the discharge against the invite's TPC, and the
 PoP; records a pending enrollment (or none, on the fast path) and

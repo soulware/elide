@@ -9,8 +9,9 @@
 //!   CID, recovering `r ‖ lp(client_id) ‖ lp(org_id) ‖ lp(mode)`. The twin
 //!   of mint's `tpc::decrypt_cid_attested`.
 //! - [`mint_discharge`] — a keyless chained-BLAKE3 macaroon rooted at the
-//!   recovered `r`, kid [`DISCHARGE_KID`], encoded to mint's `mnt1_` wire
-//!   form. The twin of mint's `macaroon::mint_under_key` + `encode`.
+//!   recovered `r`, carrying the discharge keyref, encoded to mint's
+//!   `mnt2_` wire form. The twin of mint's `macaroon::mint_under_key` +
+//!   `encode`.
 //!
 //! Only the *composition* is reimplemented — the AEAD, BLAKE3, and MsgPack
 //! primitives are the identical crates mint uses, so the drift surface is
@@ -32,20 +33,19 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use rand_core::{OsRng, RngCore};
 
 /// Wire prefix for a base64url-encoded mint macaroon (`mint::macaroon`).
-const WIRE_PREFIX: &str = "mnt1_";
+const WIRE_PREFIX: &str = "mnt2_";
 /// Chain-seed domain separator (`mint::macaroon::DOMAIN`).
-const DOMAIN: &[u8] = b"mint-macaroon-v4";
+const DOMAIN: &[u8] = b"mint-macaroon-v5";
 /// Macaroon nonce length (`mint::macaroon::NONCE_LEN`).
 const NONCE_LEN: usize = 16;
 /// Per-step type tag for a first-party caveat (`mint::macaroon`). coord B
 /// only ever mints first-party scalar caveats, so the third-party tag is
 /// not reimplemented.
 const TYPE_FIRST_PARTY: u64 = 0;
-/// `kid` sentinel for discharges (`mint::macaroon::DISCHARGE_KID`,
-/// `u16::MAX`). It does not index mint's keyring — the discharge is MAC'd
-/// under `r` — but it participates in the chain seed, so issuer and
-/// verifier must agree on it.
-const DISCHARGE_KID: u16 = u16::MAX;
+/// Wire tag of the discharge keyref (`mint::macaroon::KEYREF_DISCHARGE`).
+/// A discharge's keyref is the MsgPack array `[1]` — no kid; the chain is
+/// rooted at `r`, not at a keyring generation.
+const KEYREF_DISCHARGE: u64 = 1;
 /// Fixed all-zero AEAD nonce. AES-GCM-SIV is misuse-resistant, so a fixed
 /// nonce yields deterministic, collision-safe ciphertext (`mint::tpc`).
 const FIXED_AEAD_NONCE: [u8; 12] = [0u8; 12];
@@ -158,7 +158,7 @@ fn read_length_prefixed_str(buf: &[u8], pos: &mut usize) -> Result<String, Crypt
 }
 
 /// Mint a discharge macaroon rooted at `r` carrying `caveats` (scalar
-/// first-party `(name, value)` pairs), returning the `mnt1_` wire form mint
+/// first-party `(name, value)` pairs), returning the `mnt2_` wire form mint
 /// will verify under `r` and clear. A fresh random nonce is drawn per call.
 pub fn mint_discharge(r: &[u8; 32], caveats: &[(&str, &str)]) -> String {
     let mut nonce = [0u8; NONCE_LEN];
@@ -181,12 +181,23 @@ pub fn mint_discharge_with_nonce(
     encode(nonce, &mac, caveats)
 }
 
-/// Initial chain tag: keyed BLAKE3 over `DOMAIN ‖ kid_be ‖ nonce`
+/// Canonical MsgPack encoding of the discharge keyref
+/// (`mint::macaroon::serialize_key_ref`). Used both as the first envelope
+/// element and as the seed-MAC input.
+fn serialize_key_ref_discharge() -> Vec<u8> {
+    let mut out = Vec::new();
+    rmp::encode::write_array_len(&mut out, 1).expect("vec writer");
+    rmp::encode::write_uint(&mut out, KEYREF_DISCHARGE).expect("vec writer");
+    out
+}
+
+/// Initial chain tag: keyed BLAKE3 over `DOMAIN ‖ keyref ‖ nonce`
 /// (`mint::macaroon::seed_mac`).
 fn seed_mac(key: &[u8; 32], nonce: &[u8; NONCE_LEN]) -> [u8; 32] {
-    let mut msg = Vec::with_capacity(DOMAIN.len() + 2 + NONCE_LEN);
+    let kr = serialize_key_ref_discharge();
+    let mut msg = Vec::with_capacity(DOMAIN.len() + kr.len() + NONCE_LEN);
     msg.extend_from_slice(DOMAIN);
-    msg.extend_from_slice(&DISCHARGE_KID.to_be_bytes());
+    msg.extend_from_slice(&kr);
     msg.extend_from_slice(nonce);
     *blake3::keyed_hash(key, &msg).as_bytes()
 }
@@ -211,12 +222,12 @@ fn serialize_one(name: &str, value: &str) -> Vec<u8> {
     out
 }
 
-/// Serialize to `mnt1_<base64url-no-pad>` of the canonical-MsgPack envelope
-/// `[kid, nonce, mac, [caveats]]` (`mint::macaroon::encode`).
+/// Serialize to `mnt2_<base64url-no-pad>` of the canonical-MsgPack envelope
+/// `[keyref, nonce, mac, [caveats]]` (`mint::macaroon::encode`).
 fn encode(nonce: &[u8; NONCE_LEN], mac: &[u8; 32], caveats: &[(&str, &str)]) -> String {
     let mut buf = Vec::new();
     rmp::encode::write_array_len(&mut buf, 4).expect("vec writer");
-    rmp::encode::write_uint(&mut buf, DISCHARGE_KID as u64).expect("vec writer");
+    buf.extend_from_slice(&serialize_key_ref_discharge());
     rmp::encode::write_bin(&mut buf, nonce).expect("vec writer");
     rmp::encode::write_bin(&mut buf, mac).expect("vec writer");
     let count: u32 = caveats.len().try_into().expect("caveat count fits u32");

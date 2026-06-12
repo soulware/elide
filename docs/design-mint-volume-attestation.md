@@ -78,12 +78,12 @@ nor mint a discharge.
 The TPC is appended **at credential issuance** via `tpc::build_caveat`
 → `Macaroon::attenuate`, reading the credential's `tail` as `Tₙ₋₁`. It is
 **static for the credential's life**; the holder only appends a narrowing
-`exp`. A discharge is minted by coord B under `r` with the reserved
-`DISCHARGE_KID` sentinel, carrying attested `attested.volume = target` + `exp`,
+`exp`. A discharge is minted by coord B under `r` with the discharge
+keyref, carrying attested `attested.volume = target` + `exp`,
 and binds to this primary because the same `r` is encrypted in this
 chain's `vid` (and to coord A, since that primary is `cnf`-bound). At
-verify, mint dispatches on kid (keyring → primary under `K_M`;
-`DISCHARGE_KID` → discharge under `r`).
+verify, mint anchors the bundle on the primary's keyring keyref under
+`K_M` and verifies the discharge under the `r` recovered from the `vid`.
 
 A discharge is thus a self-contained bounded macaroon, not a bearer
 token — **safe to cache**. coord A re-presents one across every
@@ -633,8 +633,8 @@ mint — the same CID-wrapping construction as the auth-service TPC's
    are the claim-record design's concern, not the binding's.
 5. **Mode.** `volume-rw` ⟹ `target == owned`; `volume-ro` ⟹ `target ∈
    {owned} ∪ ancestors(owned)` via the shared signed-provenance walk.
-6. **Discharge.** Mint a macaroon rooted at `r` (kid `DISCHARGE_KID`)
-   carrying attested `attested.volume = target`, `exp ≤ now + discharge_ttl`.
+6. **Discharge.** Mint a discharge macaroon rooted at `r` carrying
+   attested `attested.volume = target`, `exp ≤ now + discharge_ttl`.
 
 **What each field binds:**
 
@@ -875,7 +875,7 @@ coord B lives in the coordinator tree — the `elide-attestation` crate,
 its own listener (§ *A separate crate and listener*) — not in `mint`. But
 minting a discharge *is* mint's macaroon crypto: recover `r` by
 AEAD-decrypting the TPC `cid` under `K_M-B` (`decrypt_cid_attested`),
-then mint a macaroon rooted at `r` with kid `DISCHARGE_KID` carrying
+then mint a discharge macaroon rooted at `r` carrying
 `attested.volume = target` + `exp` (`mint_under_key`, `Macaroon::encode`).
 All of it lives in `mint/`, a **deliberately standalone workspace**
 (`exclude = ["mint"]` in the root `Cargo.toml`: mint must build, test,

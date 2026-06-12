@@ -5,27 +5,29 @@
 //! first-party and third-party caveats:
 //!
 //! ```text
-//! mac_seed = blake3_keyed(keyring[kid], DOMAIN || kid_be || nonce)
+//! mac_seed = blake3_keyed(key, DOMAIN || serialize_key_ref(key_ref) || nonce)
 //! mac_i    = blake3_keyed(mac_{i-1}, serialize_one(c_i))
 //! ```
 //!
 //! Each step's key is the previous step's MAC, so any holder of the
 //! trailing MAC can append a caveat (the additive-restriction property)
-//! but cannot remove one. Verification picks the per-token `kid` out of
-//! the wire format, looks it up in the verifier's [`Keyring`], replays
-//! the chain, and constant-time-compares the final MAC. A kid that is
-//! not in the ring (retired, or never existed) fails verification with
-//! the same opacity as a bad MAC.
+//! but cannot remove one. Every macaroon declares which key roots its
+//! chain via a [`KeyRef`] bound into the seed: a credential names a
+//! [`Keyring`] generation, a discharge is rooted at its TPC's `r`, a
+//! session at `K_session`. Each verifier matches the variant it serves
+//! and replays the chain; because the keyref is under the MAC, the
+//! kinds are domain-separated cryptographically, not by convention.
 //!
 //! Wire format: canonical MsgPack envelope, base64url-no-pad encoded,
-//! prefixed with `mnt1_` for log greppability. Per
+//! prefixed with `mnt2_` for log greppability. Per
 //! `docs/design-mint.md` § *Authentication*, macaroons ship in
-//! `Authorization: MintV1 mnt1_<b64url>[,mnt1_<b64url>...]` (bundles at
+//! `Authorization: MintV1 mnt2_<b64url>[,mnt2_<b64url>...]` (bundles at
 //! the verify+clear endpoints) or as a lone `Authorization: MintV1
-//! mnt1_<b64url>` (single-credential enrollment endpoints).
+//! mnt2_<b64url>` (single-credential enrollment endpoints).
 //!
 //! ```text
-//! envelope             [kid (uint), nonce (bin), mac (bin), [caveats]]
+//! envelope             [keyref, nonce (bin), mac (bin), [caveats]]
+//! keyref               [0, kid (uint)] | [1] (discharge) | [2] (session)
 //! first-party caveat   [0, name (str), value (str)]
 //! third-party caveat   [1, location (str), vid (bin), cid (bin)]
 //! ```
@@ -44,11 +46,11 @@ use crate::keyring::{Keyring, Kid};
 
 /// Wire prefix for a base64url-encoded mint macaroon. Makes each
 /// macaroon individually greppable in logs even when concatenated
-/// into a bundle (`mnt1_AbCd...,mnt1_EfGh...`). `mnt1` = "mint
-/// macaroon, wire generation 1".
-pub const WIRE_PREFIX: &str = "mnt1_";
+/// into a bundle (`mnt2_AbCd...,mnt2_EfGh...`). `mnt2` = "mint
+/// macaroon, wire generation 2".
+pub const WIRE_PREFIX: &str = "mnt2_";
 
-const DOMAIN: &[u8] = b"mint-macaroon-v4";
+const DOMAIN: &[u8] = b"mint-macaroon-v5";
 pub const NONCE_LEN: usize = 16;
 
 /// Per-step type tag in the canonical MsgPack encoding (first element
@@ -58,9 +60,34 @@ pub const NONCE_LEN: usize = 16;
 const TYPE_FIRST_PARTY: u64 = 0;
 const TYPE_THIRD_PARTY: u64 = 1;
 
+/// Wire tag of a keyref — the first element of the keyref array in the
+/// envelope. Keyring = 0 (followed by the kid), discharge = 1,
+/// session = 2.
+const KEYREF_KEYRING: u64 = 0;
+const KEYREF_DISCHARGE: u64 = 1;
+const KEYREF_SESSION: u64 = 2;
+
+/// The key a macaroon's chain is rooted in. Bound into the chain seed
+/// and carried in the wire envelope, so the kinds are domain-separated
+/// under the MAC itself. Each verifier matches the variant it serves:
+/// `verify_and_clear` anchors a bundle on a [`KeyRef::Keyring`] primary
+/// only, the bundle walk accepts [`KeyRef::Discharge`] discharges only,
+/// and the auth role's session gate accepts [`KeyRef::Session`] only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRef {
+    /// A mint keyring generation — the only kind that can anchor a
+    /// bundle. The kid selects which generation to verify under.
+    Keyring(Kid),
+    /// A discharge, rooted at the `r` of the third-party caveat it
+    /// answers.
+    Discharge,
+    /// A demo auth-role session under `K_session`.
+    Session,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Macaroon {
-    kid: Kid,
+    key_ref: KeyRef,
     nonce: [u8; NONCE_LEN],
     caveats: Vec<Caveat>,
     mac: [u8; 32],
@@ -85,7 +112,7 @@ pub struct TpcSite<'a> {
 /// `docs/design-mint.md` § *Authentication*).
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
-    #[error("missing mnt1_ prefix")]
+    #[error("missing mnt2_ prefix")]
     BadPrefix,
     #[error("base64url decode failed")]
     Base64,
@@ -119,13 +146,37 @@ fn serialize_one(c: &Caveat) -> Vec<u8> {
     out
 }
 
-/// Initial chain tag: keyed BLAKE3 over `DOMAIN || kid || nonce`. The
-/// kid is bound here so a key recovered from one generation cannot be
-/// replayed under a different kid claim.
-fn seed_mac(key: &[u8; 32], kid: Kid, nonce: &[u8; NONCE_LEN]) -> [u8; 32] {
-    let mut seed_msg = Vec::with_capacity(DOMAIN.len() + 2 + NONCE_LEN);
+/// Canonical MsgPack encoding of a [`KeyRef`]. Used both as the wire
+/// representation (first envelope element) and as the seed-MAC input —
+/// see [`seed_mac`] — so a decoded macaroon re-MACs identically.
+fn serialize_key_ref(key_ref: &KeyRef) -> Vec<u8> {
+    let mut out = Vec::new();
+    match key_ref {
+        KeyRef::Keyring(kid) => {
+            rmp::encode::write_array_len(&mut out, 2).expect("vec writer");
+            rmp::encode::write_uint(&mut out, KEYREF_KEYRING).expect("vec writer");
+            rmp::encode::write_uint(&mut out, *kid as u64).expect("vec writer");
+        }
+        KeyRef::Discharge => {
+            rmp::encode::write_array_len(&mut out, 1).expect("vec writer");
+            rmp::encode::write_uint(&mut out, KEYREF_DISCHARGE).expect("vec writer");
+        }
+        KeyRef::Session => {
+            rmp::encode::write_array_len(&mut out, 1).expect("vec writer");
+            rmp::encode::write_uint(&mut out, KEYREF_SESSION).expect("vec writer");
+        }
+    }
+    out
+}
+
+/// Initial chain tag: keyed BLAKE3 over `DOMAIN || keyref || nonce`.
+/// The keyref is bound here so a key recovered for one kind — or one
+/// keyring generation — cannot be replayed under a different claim.
+fn seed_mac(key: &[u8; 32], key_ref: &KeyRef, nonce: &[u8; NONCE_LEN]) -> [u8; 32] {
+    let kr = serialize_key_ref(key_ref);
+    let mut seed_msg = Vec::with_capacity(DOMAIN.len() + kr.len() + NONCE_LEN);
     seed_msg.extend_from_slice(DOMAIN);
-    seed_msg.extend_from_slice(&kid.to_be_bytes());
+    seed_msg.extend_from_slice(&kr);
     seed_msg.extend_from_slice(nonce);
     *blake3::keyed_hash(key, &seed_msg).as_bytes()
 }
@@ -137,8 +188,13 @@ fn step_mac(prev: &[u8; 32], c: &Caveat) -> [u8; 32] {
 
 /// Walk the chain end-to-end. Used by [`Macaroon::verify`] and by
 /// [`mint`] when no TPC is being stamped.
-fn chain_mac(key: &[u8; 32], kid: Kid, nonce: &[u8; NONCE_LEN], caveats: &[Caveat]) -> [u8; 32] {
-    let mut mac = seed_mac(key, kid, nonce);
+fn chain_mac(
+    key: &[u8; 32],
+    key_ref: &KeyRef,
+    nonce: &[u8; NONCE_LEN],
+    caveats: &[Caveat],
+) -> [u8; 32] {
+    let mut mac = seed_mac(key, key_ref, nonce);
     for c in caveats {
         mac = step_mac(&mac, c);
     }
@@ -158,13 +214,13 @@ fn chain_mac(key: &[u8; 32], kid: Kid, nonce: &[u8; NONCE_LEN], caveats: &[Cavea
 /// `vid` reads the appended-to credential's [`tail`](Macaroon::tail)
 /// as `T_{n-1}`. [`crate::tpc`] holds the AEAD primitives.
 pub fn mint(keyring: &Keyring, caveats: Vec<Caveat>) -> Macaroon {
-    let kid = keyring.current_kid();
+    let key_ref = KeyRef::Keyring(keyring.current_kid());
     let key = keyring.current_key();
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
-    let mac = chain_mac(key, kid, &nonce, &caveats);
+    let mac = chain_mac(key, &key_ref, &nonce, &caveats);
     Macaroon {
-        kid,
+        key_ref,
         nonce,
         caveats,
         mac,
@@ -172,16 +228,14 @@ pub fn mint(keyring: &Keyring, caveats: Vec<Caveat>) -> Macaroon {
 }
 
 /// Mint a macaroon under a raw 32-byte key — the keyring-less twin
-/// of [`mint`], used when the issuer holds the key directly. Discharge
-/// macaroons go through this path: they're MAC'd under the per-client
-/// ephemeral `r`, not under any entry in mint's root keyring, so the
-/// issuer supplies `(key, kid)` directly. `kid` is a free label the
-/// verifier must agree on; auth and mint use [`DISCHARGE_KID`] by
-/// convention.
-pub fn mint_under_key(key: &[u8; 32], kid: Kid, caveats: Vec<Caveat>) -> Macaroon {
+/// of [`mint`], used when the issuer holds the key directly:
+/// discharges (MAC'd under the per-caveat ephemeral `r`,
+/// [`KeyRef::Discharge`]) and demo sessions (`K_session`,
+/// [`KeyRef::Session`]).
+pub fn mint_under_key(key: &[u8; 32], key_ref: KeyRef, caveats: Vec<Caveat>) -> Macaroon {
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
-    mint_under_key_with_nonce(key, kid, nonce, caveats)
+    mint_under_key_with_nonce(key, key_ref, nonce, caveats)
 }
 
 /// As [`mint_under_key`] but with a caller-supplied nonce, for callers
@@ -189,43 +243,22 @@ pub fn mint_under_key(key: &[u8; 32], kid: Kid, caveats: Vec<Caveat>) -> Macaroo
 /// the chain-MAC proptests).
 pub fn mint_under_key_with_nonce(
     key: &[u8; 32],
-    kid: Kid,
+    key_ref: KeyRef,
     nonce: [u8; NONCE_LEN],
     caveats: Vec<Caveat>,
 ) -> Macaroon {
-    let mac = chain_mac(key, kid, &nonce, &caveats);
+    let mac = chain_mac(key, &key_ref, &nonce, &caveats);
     Macaroon {
-        kid,
+        key_ref,
         nonce,
         caveats,
         mac,
     }
 }
 
-/// `kid` sentinel for discharges. The kid slot of a discharge's wire
-/// format doesn't index mint's root keyring — the discharge is MAC'd
-/// under the per-client ephemeral `r` — but it does participate in the
-/// chain seed, so issuer and verifier must agree on its value. We
-/// reserve `u16::MAX` so it cannot collide with any keyring generation;
-/// the keyring monotonically increments from 0 and would have to
-/// rotate 65 535 times to clash. Because it never indexes the keyring,
-/// a discharge presented as a bundle's *primary* fails verification as
-/// `unknown_kid` — only mint-issued macaroons anchor a bundle.
-pub const DISCHARGE_KID: Kid = Kid::MAX;
-
-/// `kid` sentinel for demo auth-role sessions. Like [`DISCHARGE_KID`]
-/// it does not index mint's root keyring — sessions are MAC'd under
-/// `K_session` — but it participates in the chain seed, so issuer and
-/// verifier (both the colocated demo auth role) must agree on it.
-/// Reserved one below `DISCHARGE_KID` for the same
-/// won't-collide-with-a-keyring-generation reason. Sessions never pass
-/// through `verify_and_clear`, so this value is purely the auth role's
-/// own self-consistency label.
-pub const SESSION_KID: Kid = Kid::MAX - 1;
-
 impl Macaroon {
-    pub fn kid(&self) -> Kid {
-        self.kid
+    pub fn key_ref(&self) -> KeyRef {
+        self.key_ref
     }
 
     pub fn caveats(&self) -> &[Caveat] {
@@ -258,13 +291,17 @@ impl Macaroon {
         self
     }
 
-    /// Constant-time MAC verification against `keyring`. The token's
-    /// embedded `kid` selects which generation to verify under; an
-    /// absent kid (retired or never existed) fails verification with
-    /// the same opacity as a bad MAC. Caveat-value checks (audience,
-    /// role, ttl) are the caller's job — see [`crate::role`].
+    /// Constant-time MAC verification against `keyring`. Only a
+    /// [`KeyRef::Keyring`] macaroon can verify here: its kid selects
+    /// which generation to verify under, and an absent kid (retired or
+    /// never existed) — or a non-keyring keyref — fails verification
+    /// with the same opacity as a bad MAC. Caveat-value checks
+    /// (audience, role, ttl) are the caller's job — see [`crate::role`].
     pub fn verify(&self, keyring: &Keyring) -> bool {
-        let Some(key) = keyring.get(self.kid) else {
+        let KeyRef::Keyring(kid) = self.key_ref else {
+            return false;
+        };
+        let Some(key) = keyring.get(kid) else {
             return false;
         };
         self.verify_under_key(key)
@@ -273,13 +310,12 @@ impl Macaroon {
     /// Constant-time MAC verification against a raw 32-byte key. The
     /// keyring-less twin of [`verify`](Self::verify), used when the
     /// verifier holds the key directly rather than via a generation
-    /// lookup — discharge macaroons, which are MAC'd under the
-    /// per-client ephemeral `r` rather than under any keyring entry,
-    /// verify through this path. The `kid` slot still participates in
-    /// the chain seed, so issuer and verifier must agree on whatever
-    /// label the issuer used.
+    /// lookup — discharges (under the per-caveat `r`) and sessions
+    /// (under `K_session`) verify through this path. The keyref still
+    /// participates in the chain seed, so a macaroon claiming a
+    /// different kind cannot verify under the same key.
     pub fn verify_under_key(&self, key: &[u8; 32]) -> bool {
-        let expected = chain_mac(key, self.kid, &self.nonce, &self.caveats);
+        let expected = chain_mac(key, &self.key_ref, &self.nonce, &self.caveats);
         expected.ct_eq(&self.mac).into()
     }
 
@@ -291,7 +327,7 @@ impl Macaroon {
     /// the chain order. Returns `None` if the MAC doesn't verify;
     /// returns an empty vec for a chain with no TPCs.
     pub fn verify_collecting_tpcs(&self, key: &[u8; 32]) -> Option<Vec<TpcSite<'_>>> {
-        let mut mac = seed_mac(key, self.kid, &self.nonce);
+        let mut mac = seed_mac(key, &self.key_ref, &self.nonce);
         let mut sites: Vec<TpcSite<'_>> = Vec::new();
         for c in &self.caveats {
             if let Caveat::ThirdParty { location, vid, cid } = c {
@@ -311,12 +347,12 @@ impl Macaroon {
         }
     }
 
-    /// Serialize to the wire form: `mnt1_<base64url-no-pad>` of the
+    /// Serialize to the wire form: `mnt2_<base64url-no-pad>` of the
     /// canonical-MsgPack envelope.
     pub fn encode(&self) -> String {
         let mut buf = Vec::new();
         rmp::encode::write_array_len(&mut buf, 4).expect("vec writer");
-        rmp::encode::write_uint(&mut buf, self.kid as u64).expect("vec writer");
+        buf.extend_from_slice(&serialize_key_ref(&self.key_ref));
         rmp::encode::write_bin(&mut buf, &self.nonce).expect("vec writer");
         rmp::encode::write_bin(&mut buf, &self.mac).expect("vec writer");
         // Caveats array: the elements are the same canonical MsgPack
@@ -353,8 +389,7 @@ impl Macaroon {
             return Err(DecodeError::BadCaveat);
         }
 
-        let kid_u64: u64 = rmp::decode::read_int(&mut r).map_err(|_| DecodeError::Truncated)?;
-        let kid: Kid = kid_u64.try_into().map_err(|_| DecodeError::BadCaveat)?;
+        let key_ref = decode_key_ref(&mut r)?;
 
         let nonce = read_bin_fixed::<NONCE_LEN>(&mut r)?;
         let mac = read_bin_fixed::<32>(&mut r)?;
@@ -370,11 +405,26 @@ impl Macaroon {
         }
 
         Ok(Macaroon {
-            kid,
+            key_ref,
             nonce,
             caveats,
             mac,
         })
+    }
+}
+
+fn decode_key_ref(r: &mut &[u8]) -> Result<KeyRef, DecodeError> {
+    let arr_len = rmp::decode::read_array_len(r).map_err(|_| DecodeError::Truncated)?;
+    let tag: u64 = rmp::decode::read_int(r).map_err(|_| DecodeError::Truncated)?;
+    match (tag, arr_len) {
+        (KEYREF_KEYRING, 2) => {
+            let kid_u64: u64 = rmp::decode::read_int(r).map_err(|_| DecodeError::Truncated)?;
+            let kid: Kid = kid_u64.try_into().map_err(|_| DecodeError::BadCaveat)?;
+            Ok(KeyRef::Keyring(kid))
+        }
+        (KEYREF_DISCHARGE, 1) => Ok(KeyRef::Discharge),
+        (KEYREF_SESSION, 1) => Ok(KeyRef::Session),
+        _ => Err(DecodeError::BadCaveat),
     }
 }
 
@@ -527,14 +577,14 @@ mod tests {
         let r = [9u8; 32];
         let m = mint_under_key(
             &r,
-            DISCHARGE_KID,
+            KeyRef::Discharge,
             vec![
                 Caveat::scalar("Subject", "usr_abc"),
                 Caveat::scalar("CoordId", "01ARZ"),
                 Caveat::scalar("exp", "1700000000"),
             ],
         );
-        assert_eq!(m.kid(), DISCHARGE_KID);
+        assert_eq!(m.key_ref(), KeyRef::Discharge);
         assert!(m.verify_under_key(&r));
     }
 
@@ -543,7 +593,7 @@ mod tests {
         let r = [9u8; 32];
         let m = mint_under_key(
             &r,
-            DISCHARGE_KID,
+            KeyRef::Discharge,
             vec![Caveat::scalar("Subject", "usr_abc")],
         );
         let mut wrong = r;
@@ -554,7 +604,11 @@ mod tests {
     #[test]
     fn verify_under_key_rejects_tampered_caveat() {
         let r = [9u8; 32];
-        let m = mint_under_key(&r, DISCHARGE_KID, vec![Caveat::scalar("CoordId", "01ARZ")]);
+        let m = mint_under_key(
+            &r,
+            KeyRef::Discharge,
+            vec![Caveat::scalar("CoordId", "01ARZ")],
+        );
         let mut forged = Macaroon::decode(&m.encode()).unwrap();
         forged.caveats[0] = Caveat::scalar("CoordId", "01EVIL");
         assert!(!forged.verify_under_key(&r));
@@ -606,20 +660,35 @@ mod tests {
     }
 
     #[test]
-    fn discharge_kid_sentinel_is_unreachable_via_keyring() {
-        // DISCHARGE_KID is reserved (Kid::MAX) so it never collides
-        // with a keyring generation. Verifying a discharge under
-        // `r` directly works (right key); verifying via the keyring
-        // fails because the keyring never holds an entry at this kid.
+    fn non_keyring_keyref_never_verifies_via_keyring() {
+        // Only a `KeyRef::Keyring` macaroon can verify against the
+        // keyring. A discharge verifies under `r` directly (right
+        // key); `verify(&keyring)` rejects it structurally, before
+        // any key lookup.
         let r = [0xff; 32];
         let m = mint_under_key(
             &r,
-            DISCHARGE_KID,
+            KeyRef::Discharge,
             vec![Caveat::scalar("Subject", "usr_abc")],
         );
         assert!(m.verify_under_key(&r));
         assert!(!m.verify(&ring()));
-        assert_eq!(DISCHARGE_KID, Kid::MAX);
+    }
+
+    #[test]
+    fn keyref_variants_are_domain_separated_under_one_key() {
+        // The keyref is bound into the chain seed: the same key, nonce,
+        // and caveats under different keyrefs yield different MACs, so
+        // one kind's macaroon can never verify as another's.
+        let k = [5u8; 32];
+        let n = [3u8; NONCE_LEN];
+        let caveats = vec![Caveat::scalar("sub", "alice")];
+        let discharge = mint_under_key_with_nonce(&k, KeyRef::Discharge, n, caveats.clone());
+        let session = mint_under_key_with_nonce(&k, KeyRef::Session, n, caveats.clone());
+        let keyring = mint_under_key_with_nonce(&k, KeyRef::Keyring(0), n, caveats);
+        assert_ne!(discharge.tail(), session.tail());
+        assert_ne!(discharge.tail(), keyring.tail());
+        assert_ne!(session.tail(), keyring.tail());
     }
 
     #[test]
@@ -644,16 +713,16 @@ mod tests {
         let mut kr = Keyring::open(&dir.path().join("rk"), None).unwrap();
         kr.add_and_promote(&dir.path().join("rk"), None).unwrap();
         let m = mint(&kr, vec![Caveat::scalar("Audience", "mint")]);
-        assert_eq!(m.kid(), 1);
+        assert_eq!(m.key_ref(), KeyRef::Keyring(1));
         let mut forged = Macaroon::decode(&m.encode()).unwrap();
-        forged.kid = 0;
+        forged.key_ref = KeyRef::Keyring(0);
         assert!(!forged.verify(&kr));
     }
 
     #[test]
     fn garbage_decode_is_error_not_panic() {
         assert!(Macaroon::decode("not-prefixed").is_err());
-        assert!(Macaroon::decode("mnt1_!!!").is_err());
+        assert!(Macaroon::decode("mnt2_!!!").is_err());
         assert!(Macaroon::decode(&format!("{WIRE_PREFIX}{}", BASE64.encode([0u8; 3]))).is_err());
     }
 
@@ -671,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_has_mnt1_prefix_and_is_base64url() {
+    fn wire_has_prefix_and_is_base64url() {
         // The wire must be base64url-no-pad (no `+`, `/`, `=` chars,
         // only A-Z a-z 0-9 - _) so it's safe to drop into URLs, log
         // lines, and comma-separated bundles without quoting hazards.
@@ -691,7 +760,7 @@ mod tests {
 /// Property-based tests for the chained-MAC construction. The example
 /// tests above pin specific chains; these assert the chain invariants —
 /// verify round-trip, wire round-trip, additive attenuation, and
-/// tamper/key/kid binding — over arbitrary keys, kids, nonces, and
+/// tamper/key/keyref binding — over arbitrary keys, keyrefs, nonces, and
 /// chains that interleave first- and third-party caveats. Most properties
 /// mint through [`mint_under_key_with_nonce`] so the nonce is generated
 /// (deterministic and shrinkable) rather than drawn from `OsRng`.
@@ -707,6 +776,14 @@ mod proptests {
 
     fn nonce() -> impl Strategy<Value = [u8; NONCE_LEN]> {
         proptest::array::uniform16(any::<u8>())
+    }
+
+    fn key_ref() -> impl Strategy<Value = KeyRef> {
+        prop_oneof![
+            any::<Kid>().prop_map(KeyRef::Keyring),
+            Just(KeyRef::Discharge),
+            Just(KeyRef::Session),
+        ]
     }
 
     /// A chain step: mostly first-party scalars, occasionally a
@@ -737,12 +814,12 @@ mod proptests {
         }
 
         /// A macaroon verifies under the key it was minted with and under
-        /// no other key — for any kid, nonce, and chain.
+        /// no other key — for any keyref, nonce, and chain.
         #[test]
         fn verifies_under_its_key_and_not_others(
-            k in key(), other in key(), kid in any::<Kid>(), nonce in nonce(), caveats in chain(),
+            k in key(), other in key(), kr in key_ref(), nonce in nonce(), caveats in chain(),
         ) {
-            let m = mint_under_key_with_nonce(&k, kid, nonce, caveats);
+            let m = mint_under_key_with_nonce(&k, kr, nonce, caveats);
             prop_assert!(m.verify_under_key(&k));
             if k != other {
                 prop_assert!(!m.verify_under_key(&other));
@@ -753,9 +830,9 @@ mod proptests {
         /// the decoded macaroon still verifies.
         #[test]
         fn encode_decode_round_trips(
-            k in key(), kid in any::<Kid>(), nonce in nonce(), caveats in chain(),
+            k in key(), kr in key_ref(), nonce in nonce(), caveats in chain(),
         ) {
-            let m = mint_under_key_with_nonce(&k, kid, nonce, caveats);
+            let m = mint_under_key_with_nonce(&k, kr, nonce, caveats);
             let back = Macaroon::decode(&m.encode()).expect("decode its own encoding");
             prop_assert_eq!(&m, &back);
             prop_assert!(back.verify_under_key(&k));
@@ -763,20 +840,20 @@ mod proptests {
 
         /// Attenuation *is* chain extension: minting `base` then appending
         /// `extra` one at a time yields a macaroon byte-identical to minting
-        /// `base ++ extra` directly (same kid/nonce). So attenuation only
+        /// `base ++ extra` directly (same keyref/nonce). So attenuation only
         /// ever appends — it can never alter an existing caveat or the seed.
         #[test]
         fn attenuation_equals_minting_the_concatenation(
-            k in key(), kid in any::<Kid>(), nonce in nonce(),
+            k in key(), kr in key_ref(), nonce in nonce(),
             base in chain(), extra in vec(any_caveat(), 0..6),
         ) {
-            let mut attenuated = mint_under_key_with_nonce(&k, kid, nonce, base.clone());
+            let mut attenuated = mint_under_key_with_nonce(&k, kr, nonce, base.clone());
             for c in &extra {
                 attenuated = attenuated.attenuate(c.clone());
             }
             let mut all = base;
             all.extend(extra);
-            let direct = mint_under_key_with_nonce(&k, kid, nonce, all);
+            let direct = mint_under_key_with_nonce(&k, kr, nonce, all);
             prop_assert_eq!(&attenuated, &direct);
             prop_assert!(attenuated.verify_under_key(&k));
         }
@@ -785,9 +862,9 @@ mod proptests {
         /// moves, so a proof over the old tail won't bind the new macaroon.
         #[test]
         fn appending_a_caveat_changes_the_tail(
-            k in key(), kid in any::<Kid>(), nonce in nonce(), base in chain(), c in any_caveat(),
+            k in key(), kr in key_ref(), nonce in nonce(), base in chain(), c in any_caveat(),
         ) {
-            let m = mint_under_key_with_nonce(&k, kid, nonce, base);
+            let m = mint_under_key_with_nonce(&k, kr, nonce, base);
             let before = *m.tail();
             let after = m.attenuate(c);
             prop_assert_ne!(&before, after.tail());
@@ -797,36 +874,36 @@ mod proptests {
         /// the holder cannot rewrite a caveat under the trailing MAC.
         #[test]
         fn tampering_a_caveat_fails_verify(
-            k in key(), kid in any::<Kid>(), nonce in nonce(),
+            k in key(), kr in key_ref(), nonce in nonce(),
             caveats in vec(any_caveat(), 1..10), idx in any::<usize>(), replacement in any_caveat(),
         ) {
             let i = idx % caveats.len();
             prop_assume!(caveats[i] != replacement);
-            let mut forged = mint_under_key_with_nonce(&k, kid, nonce, caveats);
+            let mut forged = mint_under_key_with_nonce(&k, kr, nonce, caveats);
             forged.caveats[i] = replacement;
             prop_assert!(!forged.verify_under_key(&k));
         }
 
-        /// The kid is bound into the chain seed: changing it after minting
-        /// breaks verification even under the correct key.
+        /// The keyref is bound into the chain seed: changing it after
+        /// minting breaks verification even under the correct key.
         #[test]
-        fn changing_kid_fails_verify(
-            k in key(), kid in any::<Kid>(), other_kid in any::<Kid>(),
+        fn changing_key_ref_fails_verify(
+            k in key(), kr in key_ref(), other_kr in key_ref(),
             nonce in nonce(), caveats in chain(),
         ) {
-            prop_assume!(kid != other_kid);
-            let mut m = mint_under_key_with_nonce(&k, kid, nonce, caveats);
-            m.kid = other_kid;
+            prop_assume!(kr != other_kr);
+            let mut m = mint_under_key_with_nonce(&k, kr, nonce, caveats);
+            m.key_ref = other_kr;
             prop_assert!(!m.verify_under_key(&k));
         }
 
         /// Any single-bit flip in the MAC fails verification.
         #[test]
         fn flipping_the_mac_fails_verify(
-            k in key(), kid in any::<Kid>(), nonce in nonce(), caveats in chain(),
+            k in key(), kr in key_ref(), nonce in nonce(), caveats in chain(),
             byte in 0usize..32, bit in 0u8..8,
         ) {
-            let mut m = mint_under_key_with_nonce(&k, kid, nonce, caveats);
+            let mut m = mint_under_key_with_nonce(&k, kr, nonce, caveats);
             m.mac[byte] ^= 1 << bit;
             prop_assert!(!m.verify_under_key(&k));
         }
@@ -835,9 +912,9 @@ mod proptests {
         /// third-party caveat, in chain order — for any chain.
         #[test]
         fn collecting_tpcs_matches_verify_and_lists_tpcs_in_order(
-            k in key(), kid in any::<Kid>(), nonce in nonce(), caveats in chain(),
+            k in key(), kr in key_ref(), nonce in nonce(), caveats in chain(),
         ) {
-            let m = mint_under_key_with_nonce(&k, kid, nonce, caveats.clone());
+            let m = mint_under_key_with_nonce(&k, kr, nonce, caveats.clone());
             let sites = m.verify_collecting_tpcs(&k).expect("minted under k must verify");
             let tpc_locations: Vec<&str> = caveats
                 .iter()

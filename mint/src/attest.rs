@@ -20,16 +20,16 @@
 //! Wire (`POST /v1/discharge`):
 //!
 //! ```text
-//! Authorization: Bearer mnt1_<session>
+//! Authorization: Bearer mnt2_<session>
 //! request body:  { "cid": "<base64url of the attested TPC CID>",
 //!                  "attested": { "<name>": "<value>", … } }
-//! 200 OK:        { "discharge": "mnt1_<base64url>" }
+//! 200 OK:        { "discharge": "mnt2_<base64url>" }
 //! ```
 //!
 //! Discharge construction: decrypt `cid` under `K_M-B`
 //! ([`tpc::decrypt_cid_attested`]) to recover `(r, client_id, org_id,
 //! mode)`, reject if `org_id` is not the org this role serves, then mint
-//! a macaroon at `kid = DISCHARGE_KID` chain-MAC'd under `r`, carrying
+//! a discharge macaroon chain-MAC'd under `r`, carrying
 //! each requested `(name, value)` as a scalar caveat plus `exp` — the
 //! same caveat shape the attestation coordinator emits. A requested name
 //! that collides with a reserved control-caveat name is rejected: each
@@ -53,7 +53,7 @@ use std::collections::BTreeMap;
 use crate::auth::verify_session;
 use crate::caveat::{Caveat, name};
 use crate::http::AppState;
-use crate::macaroon::{DISCHARGE_KID, mint_under_key};
+use crate::macaroon::{KeyRef, mint_under_key};
 use crate::tpc;
 
 /// Demo attestation-discharge lifetime. Long enough for the client to
@@ -145,7 +145,7 @@ async fn issue_discharge(
         .map(|(n, v)| Caveat::scalar(n.as_str(), v.as_str()))
         .collect();
     caveats.push(Caveat::scalar(name::EXP, exp.to_string()));
-    let discharge = mint_under_key(&pt.r, DISCHARGE_KID, caveats);
+    let discharge = mint_under_key(&pt.r, KeyRef::Discharge, caveats);
 
     (
         StatusCode::OK,
