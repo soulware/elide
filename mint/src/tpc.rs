@@ -53,6 +53,17 @@ fn fresh_r() -> [u8; 32] {
     r
 }
 
+/// The identity a discharge carries so the verifier pairs it with the
+/// third-party caveat it answers by name, not by presentation order.
+/// Derived from the CID (the encrypted ticket) and stamped into the
+/// discharge's nonce — the slot superfly names `Nonce.KID`. The nonce is
+/// part of the chain seed, so this identity is MAC-bound for free.
+pub fn ticket_id(cid: &[u8]) -> [u8; crate::macaroon::NONCE_LEN] {
+    let mut id = [0u8; crate::macaroon::NONCE_LEN];
+    id.copy_from_slice(&blake3::hash(cid).as_bytes()[..crate::macaroon::NONCE_LEN]);
+    id
+}
+
 /// Encrypt `r` under `T_{n-1}` to produce `VID`. T_{n-1} is the
 /// macaroon chain tag at the TPC's position; the verifier walks the
 /// chain to recover it.

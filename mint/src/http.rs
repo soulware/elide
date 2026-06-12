@@ -302,7 +302,20 @@ pub fn verify_and_clear(
 
     let mut discharge_caveats: Vec<Caveat> = Vec::new();
     let mut min_exp: Option<u64> = None;
-    let mut discharge_cursor = 0usize;
+
+    // Index discharges by the ticket id stamped in their nonce, so each
+    // third-party caveat is paired with its discharge by identity, never
+    // by presentation order. Two discharges claiming the same ticket is
+    // ambiguous and rejected.
+    let mut by_ticket: std::collections::HashMap<[u8; crate::macaroon::NONCE_LEN], usize> =
+        std::collections::HashMap::with_capacity(bundle.discharges.len());
+    for (i, d) in bundle.discharges.iter().enumerate() {
+        if by_ticket.insert(*d.nonce(), i).is_some() {
+            return Err(VerifyClearError::Auth("ambiguous_discharge"));
+        }
+    }
+    let mut consumed = vec![false; bundle.discharges.len()];
+
     let mut work: std::collections::VecDeque<(Macaroon, [u8; 32], bool)> =
         std::collections::VecDeque::new();
     work.push_back((bundle.primary.clone(), primary_key, true));
@@ -314,14 +327,20 @@ pub fn verify_and_clear(
         for site in sites {
             let r = crate::tpc::decrypt_vid(&site.t_n_minus_1, site.vid)
                 .map_err(|_| VerifyClearError::Auth("vid_decrypt"))?;
-            let discharge = bundle
-                .discharges
-                .get(discharge_cursor)
+            let idx = by_ticket
+                .get(&crate::tpc::ticket_id(site.cid))
+                .copied()
                 .ok_or(VerifyClearError::Auth("tpc_undischarged"))?;
+            let discharge = &bundle.discharges[idx];
             if discharge.key_ref() != KeyRef::Discharge {
                 return Err(VerifyClearError::Auth("not_a_discharge"));
             }
-            discharge_cursor += 1;
+            // Each discharge answers exactly one third-party caveat;
+            // re-presenting it for a second site is rejected.
+            if consumed[idx] {
+                return Err(VerifyClearError::Auth("discharge_reused"));
+            }
+            consumed[idx] = true;
             work.push_back((discharge.clone(), r, false));
         }
 
@@ -359,8 +378,8 @@ pub fn verify_and_clear(
             min_exp = Some(min_exp.map_or(e, |m: u64| m.min(e)));
         }
     }
-    if discharge_cursor != bundle.discharges.len() {
-        return Err(VerifyClearError::Auth("excess_discharges"));
+    if consumed.iter().any(|c| !c) {
+        return Err(VerifyClearError::Auth("unmatched_discharge"));
     }
 
     // PoP is checked against the primary's caveats with the primary's

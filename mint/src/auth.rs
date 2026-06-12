@@ -70,7 +70,7 @@ use serde_json::json;
 
 use crate::caveat::{Caveat, EffectiveCaveats, Resolved, name, op, scope};
 use crate::http::AppState;
-use crate::macaroon::{KeyRef, Macaroon, mint_under_key};
+use crate::macaroon::{KeyRef, Macaroon, mint_under_key, mint_under_key_with_nonce};
 use crate::tpc;
 
 /// Demo discharge lifetime. Long enough for a CLI command to round-trip
@@ -310,9 +310,13 @@ async fn issue_discharge(
     }
 
     let exp = now_unix + DISCHARGE_EXP_SECONDS;
-    let discharge = mint_under_key(
+    // The discharge names the third-party caveat it answers by stamping
+    // the ticket id (derived from this CID) into its nonce. The verifier
+    // pairs discharges to TPCs by that id, never by presentation order.
+    let discharge = mint_under_key_with_nonce(
         &pt.r,
         KeyRef::Discharge,
+        tpc::ticket_id(&cid),
         vec![
             // The discharge declares its own audience and clears it
             // per-macaroon at the bundle, like the primary.

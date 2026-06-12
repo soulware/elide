@@ -109,30 +109,32 @@ fn build_primary() -> Macaroon {
     cred.attenuate(tpc_cv)
 }
 
-/// Recover the auth TPC's `r` the way the auth service would: decrypt
-/// the CID under `K_M-A`. `r` is fresh per TPC, so it can only come
-/// from the primary itself.
-fn recover_r(primary: &Macaroon) -> [u8; 32] {
-    let cid = primary
+/// Extract the auth TPC's CID from a primary. `r` is fresh per TPC, so a
+/// discharge can only be built from the primary that carries the caveat.
+fn cid_of(primary: &Macaroon) -> Vec<u8> {
+    primary
         .caveats()
         .iter()
         .find_map(|c| match c {
             Caveat::ThirdParty { cid, .. } => Some(cid.clone()),
             _ => None,
         })
-        .expect("TPC present");
-    tpc::decrypt_cid(&K_M_A, &cid)
-        .expect("recover r from cid")
-        .r
+        .expect("TPC present")
 }
 
-/// Build a discharge the way mint-as-auth (or a separate auth
-/// service) would mint one — keyring-less mint under `r`. Verifier
-/// expects this exact construction.
-fn build_discharge(r: [u8; 32]) -> Macaroon {
-    macaroon::mint_under_key(
+/// Build a discharge the way mint-as-auth (or a separate auth service)
+/// would: decrypt the CID under `K_M-A` to recover `r`, and stamp the
+/// ticket id (derived from that CID) into the nonce so the verifier pairs
+/// it by identity, not position. Keyring-less mint under `r`.
+fn build_discharge(primary: &Macaroon) -> Macaroon {
+    let cid = cid_of(primary);
+    let r = tpc::decrypt_cid(&K_M_A, &cid)
+        .expect("recover r from cid")
+        .r;
+    macaroon::mint_under_key_with_nonce(
         &r,
         KeyRef::Discharge,
+        tpc::ticket_id(&cid),
         vec![
             Caveat::scalar("Subject", "usr_demo"),
             Caveat::scalar(name::EXP, "2099999999"),
@@ -175,9 +177,10 @@ fn coord_b_discharge(primary: &Macaroon) -> Macaroon {
         })
         .expect("attested TPC present");
     let pt = tpc::decrypt_cid_attested(&K_M_B, &cid).expect("recover r from attested cid");
-    macaroon::mint_under_key(
+    macaroon::mint_under_key_with_nonce(
         &pt.r,
         KeyRef::Discharge,
+        tpc::ticket_id(&cid),
         vec![Caveat::scalar(name::EXP, "2099999999")],
     )
 }
@@ -229,7 +232,7 @@ async fn verify_request_pop_seed(
 async fn verifies_matching_primary_and_discharge() {
     let (app, _dir) = app().await;
     let primary = build_primary();
-    let discharge = build_discharge(recover_r(&primary));
+    let discharge = build_discharge(&primary);
 
     let (status, body) = verify_request(app, &primary.encode(), &[&discharge.encode()]).await;
     assert_eq!(status, StatusCode::OK);
@@ -246,16 +249,92 @@ async fn verifies_matching_primary_and_discharge() {
 }
 
 #[tokio::test]
+async fn verifies_two_tpcs_regardless_of_discharge_order() {
+    // The headline of identity pairing: a primary carrying two
+    // third-party caveats verifies whether its discharges are presented
+    // in chain order or reversed. Each discharge names its own ticket, so
+    // the verifier matches by identity, not position.
+    let (app, _dir) = app().await;
+    let ring = Keyring::single(ROOT);
+    let cred = macaroon::mint(
+        &ring,
+        vec![
+            Caveat::scalar(name::OP, op::ASSUME_ROLE),
+            Caveat::scalar(name::AUD, "mint"),
+            Caveat::scalar(name::SUB, CLIENT_ID),
+            Caveat::scalar(name::CNF, pop::cnf_value(&CLIENT_SEED)),
+            Caveat::scalar(name::ROLE, "volume-rw"),
+        ],
+    );
+    let tpc1 = tpc::build_caveat(cred.tail(), &K_M_A, CLIENT_ID, ORG_ID, AUTH_URL);
+    let cred = cred.attenuate(tpc1);
+    let tpc2 = tpc::build_caveat(cred.tail(), &K_M_A, CLIENT_ID, ORG_ID, AUTH_URL);
+    let primary = cred.attenuate(tpc2);
+
+    let cids: Vec<Vec<u8>> = primary
+        .caveats()
+        .iter()
+        .filter_map(|c| match c {
+            Caveat::ThirdParty { cid, .. } => Some(cid.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cids.len(), 2);
+    let discharge_for = |cid: &[u8]| {
+        let r = tpc::decrypt_cid(&K_M_A, cid).expect("recover r").r;
+        macaroon::mint_under_key_with_nonce(
+            &r,
+            KeyRef::Discharge,
+            tpc::ticket_id(cid),
+            vec![Caveat::scalar(name::EXP, "2099999999")],
+        )
+        .encode()
+    };
+    let d0 = discharge_for(&cids[0]);
+    let d1 = discharge_for(&cids[1]);
+
+    // Reversed relative to chain order — still verifies.
+    let (status, body) = verify_request(app, &primary.encode(), &[&d1, &d0]).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["valid"], serde_json::Value::Bool(true), "body: {body}");
+}
+
+#[tokio::test]
 async fn rejects_discharge_transplanted_from_another_primary() {
-    // `r` is fresh per TPC: a discharge minted for one primary's caveat
-    // is not MAC-valid against another primary — same client, same
-    // role, same gate.
+    // A discharge minted for one primary's caveat names a different
+    // ticket (derived from that caveat's CID), so it does not match the
+    // other primary's TPC and is never even tried under its `r`. Identity
+    // pairing rejects the transplant before the MAC check.
     let (app, _dir) = app().await;
     let primary = build_primary();
     let other = build_primary();
-    let discharge = build_discharge(recover_r(&other));
+    let discharge = build_discharge(&other);
 
     let (_status, body) = verify_request(app, &primary.encode(), &[&discharge.encode()]).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["valid"], serde_json::Value::Bool(false), "body: {body}");
+    assert_eq!(v["reason"], "tpc_undischarged");
+}
+
+#[tokio::test]
+async fn rejects_discharge_with_matching_ticket_but_wrong_r() {
+    // Belt-and-suspenders: even a discharge that names the right ticket
+    // (so it wins the identity lookup) must still MAC-verify under the
+    // `r` recovered from that TPC's VID. Forge one with the primary's
+    // ticket id but a foreign `r` — it matches by identity, then fails
+    // the chain MAC.
+    let (app, _dir) = app().await;
+    let primary = build_primary();
+    let cid = cid_of(&primary);
+    let forged = macaroon::mint_under_key_with_nonce(
+        &[0x99u8; 32],
+        KeyRef::Discharge,
+        tpc::ticket_id(&cid),
+        vec![Caveat::scalar(name::EXP, "2099999999")],
+    );
+
+    let (_status, body) = verify_request(app, &primary.encode(), &[&forged.encode()]).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["valid"], serde_json::Value::Bool(false), "body: {body}");
     assert_eq!(v["reason"], "mac_mismatch");
@@ -273,17 +352,33 @@ async fn rejects_when_discharge_missing() {
 }
 
 #[tokio::test]
-async fn rejects_excess_discharges() {
+async fn rejects_duplicate_discharge() {
+    // Two discharges claiming the same ticket is ambiguous — the index is
+    // built before the walk and rejects the collision outright.
     let (app, _dir) = app().await;
     let primary = build_primary();
-    let discharge = build_discharge(recover_r(&primary));
-    // Pass two discharges for a one-TPC primary.
-    let d_enc = discharge.encode();
+    let d_enc = build_discharge(&primary).encode();
 
     let (_status, body) = verify_request(app, &primary.encode(), &[&d_enc, &d_enc]).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["valid"], serde_json::Value::Bool(false));
-    assert_eq!(v["reason"], "excess_discharges");
+    assert_eq!(v["reason"], "ambiguous_discharge");
+}
+
+#[tokio::test]
+async fn rejects_unmatched_discharge() {
+    // A discharge that no TPC names is left unconsumed and rejected — the
+    // bundle must carry exactly the discharges the chain calls for.
+    let (app, _dir) = app().await;
+    let primary = build_primary();
+    let good = build_discharge(&primary).encode();
+    // A discharge for an unrelated primary names a different ticket.
+    let extra = build_discharge(&build_primary()).encode();
+
+    let (_status, body) = verify_request(app, &primary.encode(), &[&good, &extra]).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["valid"], serde_json::Value::Bool(false));
+    assert_eq!(v["reason"], "unmatched_discharge");
 }
 
 #[tokio::test]
@@ -329,9 +424,9 @@ async fn verifies_attested_primary_and_coord_b_discharge() {
 async fn rejects_attested_discharge_transplanted_across_modes() {
     // The cross-mode transplant: the same coordinator holds a volume-ro
     // and a volume-rw credential. A discharge coord B mints for the
-    // volume-ro caveat (whose predicate admits ancestors) must not
-    // MAC-verify against the volume-rw credential — fresh per-TPC `r`
-    // is what binds each discharge to the caveat it was minted for.
+    // volume-ro caveat names that caveat's ticket (derived from its CID),
+    // so it does not match the volume-rw credential's TPC and is rejected
+    // at the identity lookup — before its fresh per-TPC `r` is ever tried.
     let (app, _dir) = app().await;
     let primary_ro = build_attested_primary("volume-ro");
     let primary_rw = build_attested_primary("volume-rw");
@@ -340,7 +435,7 @@ async fn rejects_attested_discharge_transplanted_across_modes() {
     let (_status, body) = verify_request(app, &primary_rw.encode(), &[&discharge.encode()]).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["valid"], serde_json::Value::Bool(false), "body: {body}");
-    assert_eq!(v["reason"], "mac_mismatch");
+    assert_eq!(v["reason"], "tpc_undischarged");
 }
 
 #[tokio::test]
@@ -360,7 +455,7 @@ async fn rejects_attested_primary_when_discharge_missing() {
 async fn rejects_tampered_primary() {
     let (app, _dir) = app().await;
     let primary = build_primary();
-    let discharge = build_discharge(recover_r(&primary));
+    let discharge = build_discharge(&primary);
 
     // Tamper a byte in the wire-encoded primary without re-MACing.
     let bad_enc = {

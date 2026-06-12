@@ -17,7 +17,7 @@ use mint::http::{AppState, router};
 use mint::iam::FakeMinter;
 use mint::issuance::{mint_credential_ticket, mint_invite};
 use mint::keyring::Keyring;
-use mint::macaroon::{KeyRef, Macaroon, mint_under_key};
+use mint::macaroon::{KeyRef, Macaroon, mint_under_key_with_nonce};
 use mint::pop;
 use mint::state::{K_M_A_FILE, K_M_B_FILE, Store};
 use mint::tpc;
@@ -177,9 +177,10 @@ fn gate_scope(m: &Macaroon) -> Option<&'static str> {
 /// discharge's own context; `aud` clears per-macaroon like the primary's.
 fn gate_discharge(cid: &[u8], scope: &str) -> Macaroon {
     let pt = tpc::decrypt_cid(&K_M_A, cid).expect("cid decrypts under K_M-A");
-    mint_under_key(
+    mint_under_key_with_nonce(
         &pt.r,
         KeyRef::Discharge,
+        tpc::ticket_id(cid),
         vec![
             Caveat::scalar(name::AUD, "mint"),
             Caveat::scalar(name::SUB, "usr_test"),
@@ -194,9 +195,10 @@ fn gate_discharge(cid: &[u8], scope: &str) -> Macaroon {
 /// discharge rooted at it attesting `volume = VOLUME`.
 fn volume_discharge(cid: &[u8]) -> Macaroon {
     let pt = tpc::decrypt_cid_attested(&K_M_B, cid).expect("cid decrypts under K_M-B");
-    mint_under_key(
+    mint_under_key_with_nonce(
         &pt.r,
         KeyRef::Discharge,
+        tpc::ticket_id(cid),
         vec![
             Caveat::scalar("volume", VOLUME),
             Caveat::scalar(name::EXP, far_future().to_string()),
