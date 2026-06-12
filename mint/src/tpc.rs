@@ -119,7 +119,7 @@ pub fn build_caveat(
 /// from the role's config to the authority, which alone assigns it
 /// meaning. mint never inspects or validates it, so mint stays agnostic
 /// to the authority's vocabulary
-/// (`docs/design-mint-volume-attestation.md` § *TPC structure*).
+/// (`docs/design-mint.md` § *Attestation contract*).
 pub fn encrypt_cid_attested(
     k_m_b: &[u8; 32],
     r: &[u8; 32],

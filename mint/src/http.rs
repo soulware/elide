@@ -641,7 +641,8 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
     // the missing-policy branch above guards.
     let eff = EffectiveCaveats::new(&caveats);
     let dis_eff = EffectiveCaveats::new(&cleared.discharge_caveats);
-    if let Some(sealed_role) = surface.role(&granted.role_name) {
+    let sealed_role = surface.role(&granted.role_name);
+    if let Some(sealed_role) = sealed_role {
         for name in &sealed_role.attested {
             if !matches!(dis_eff.resolve(name), Resolved::Value(_)) {
                 audit(entry(
@@ -674,11 +675,18 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         }
     }
 
+    // The role's sealed `attested` contract is the registry the renderer
+    // pulls discharge values from; a role missing from the sealed surface
+    // exposes nothing (and its `{{attested.X}}` then fails the render
+    // closed).
+    let declared_attested: &[String] = sealed_role.map(|r| r.attested.as_slice()).unwrap_or(&[]);
+
     let expiry = now + chrono::Duration::seconds(granted.ttl_seconds as i64);
     let expiry_iso = expiry.to_rfc3339();
     let policy = match render_policy(
         policy_template,
         surface.env(),
+        declared_attested,
         &cleared.discharge_caveats,
         &caveats,
         &expiry_iso,
@@ -696,13 +704,17 @@ async fn assume_role(State(state): State<AppState>, headers: HeaderMap, body: By
         }
     };
 
-    // The IAM policy name's scope segment reflects the attested volume —
-    // the authoritative scope for this credential — or `global` when the
-    // role attests none.
-    let scope = match dis_eff.resolve("volume") {
-        Resolved::Value(v) => Some(v),
-        Resolved::Absent | Resolved::Unsatisfiable => None,
-    };
+    // The IAM policy name's scope segment reflects the role's attested
+    // values — the authoritative scope for this credential — or `global`
+    // when the role attests none.
+    let scope_values: Vec<String> = declared_attested
+        .iter()
+        .filter_map(|name| match dis_eff.resolve(name) {
+            Resolved::Value(v) => Some(v),
+            Resolved::Absent | Resolved::Unsatisfiable => None,
+        })
+        .collect();
+    let scope = (!scope_values.is_empty()).then(|| scope_values.join("-"));
     let policy_name = iam::policy_name(&granted.role_name, scope.as_deref(), expiry);
 
     match state
@@ -1156,10 +1168,11 @@ async fn enroll_exchange(
 
     // Operator authority is exercised at the enroll/exchange gates above,
     // never at `assume-role`. A role that declares `[role.attestation]`
-    // (`docs/design-mint-volume-attestation.md`) additionally carries a
-    // static attested third-party caveat the attestation authority
-    // discharges at `assume-role`; every other role's credential is the
-    // uniform key-bound service token with no third-party caveat.
+    // (`docs/design-mint.md` § *Attestation contract*) additionally
+    // carries a static attested third-party caveat the attestation
+    // authority discharges at `assume-role`; every other role's
+    // credential is the uniform key-bound service token with no
+    // third-party caveat.
     let attested = match state
         .config
         .roles
@@ -1265,8 +1278,8 @@ async fn discharge_verify(
     };
 
     // All first-party caveats across the bundle — mint is caveat-
-    // vocabulary-agnostic and hands the raw set back to the caller for live
-    // context clearing (CoordId, Volume, op-attenuation, etc.).
+    // vocabulary-agnostic and hands the raw set back to the caller for
+    // live context clearing in the caller's own vocabulary.
     let aggregated: Vec<serde_json::Value> = cleared
         .all_caveats()
         .iter()

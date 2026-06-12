@@ -131,7 +131,8 @@ pub fn mint_credential_ticket(
 }
 
 /// The attested third-party caveat to stamp onto a credential whose role
-/// declares `[role.attestation]` (`docs/design-mint-volume-attestation.md`).
+/// declares `[role.attestation]` (`docs/design-mint.md` § *Attestation
+/// contract*).
 /// `mode` is opaque to mint, carried verbatim into the CID for the
 /// discharging authority at `location`; the CID is sealed under `K_M-B`
 /// and `r` derives from the credential's own `sub`, so the discharge

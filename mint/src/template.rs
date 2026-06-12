@@ -3,13 +3,13 @@
 //! A role's policy template is **JSON** carrying `{{ ns.key }}` scalar
 //! substitution tokens, each token sitting inside a JSON *string value*.
 //! Four namespaces, each a flat scalar lookup — **every one MAC-verified
-//! or server-side, none self-asserted** (`docs/design-mint-volume-attestation.md`
-//! § *Every template value is MAC-verified or server-side*):
+//! or server-side, none self-asserted** (`docs/design-mint.md`
+//! § *Templating*):
 //!
 //! - `{{env.X}}`      — sealed server-side config (the `[env]` table).
 //! - `{{attested.X}}` — values attested by a discharge authority, carried
-//!   on the discharge and MAC'd under its `r` (e.g. `attested.volume`).
-//!   Restricted to the closed [`ATTESTABLE`] registry.
+//!   on the discharge and MAC'd under its `r`. Restricted to the role's
+//!   declared, sealed `attested` contract.
 //! - `{{mint.X}}`     — mint-computed (`mint.expiry`).
 //! - `{{caveat.X}}`   — MAC-verified caveat values on the primary (e.g.
 //!   `caveat.sub`).
@@ -102,16 +102,6 @@ fn classify_token(inner: &str) -> Option<(&str, &str)> {
     matches!(ns, "env" | "mint" | "attested" | "caveat").then_some((ns, key))
 }
 
-/// The closed set of attestable names — the only keys `{{attested.X}}`
-/// may reference and the only names mint reads off a discharge's attested
-/// context. mint pulls attested values **by name from this set**, never
-/// "whatever the discharge carries", so a discharge can fill only the
-/// protocol's attestable slots. Disjoint from the reserved control caveat
-/// names by construction (asserted in tests), so `attested.*` can never
-/// shadow a primary's MAC-bound control caveat
-/// (`docs/design-mint-volume-attestation.md` § *Decided*).
-pub const ATTESTABLE: &[&str] = &["volume"];
-
 /// Render `policy_template` into a concrete IAM policy JSON string.
 ///
 /// The template is parsed as JSON; substitution happens only into string
@@ -121,11 +111,13 @@ pub const ATTESTABLE: &[&str] = &["volume"];
 /// `discharge_caveats` are the **MAC-verified** caveats from the bundle's
 /// discharges (the `discharge_caveats` set `verify_and_clear` returns,
 /// each MAC'd under its discharge's `r` and attributable to the issuing
-/// authority); they are the `attested.*` namespace. Only the names in the
-/// closed [`ATTESTABLE`] registry are exposed — a discharge cannot fill an
-/// arbitrary or reserved slot, and the attested context is never flattened
-/// into `caveat.*`, so a discharge value can never shadow the primary's
-/// MAC-bound `caveat.*`.
+/// authority); they are the `attested.*` namespace. Only the names in
+/// `attested_names` — the role's declared contract, sealed in
+/// [`crate::seal::SealedRole`] and disjoint from the reserved control
+/// names by seal-time validation — are exposed: a discharge cannot fill
+/// an arbitrary or reserved slot, and the attested context is never
+/// flattened into `caveat.*`, so a discharge value can never shadow the
+/// primary's MAC-bound `caveat.*`.
 ///
 /// `caveats` is the **MAC-verified** caveat chain of the primary; it is
 /// the `caveat.*` namespace. Only caveats that resolve to a single
@@ -139,6 +131,7 @@ pub const ATTESTABLE: &[&str] = &["volume"];
 pub fn render_policy(
     policy_template: &str,
     env: &BTreeMap<String, String>,
+    attested_names: &[String],
     discharge_caveats: &[Caveat],
     caveats: &[Caveat],
     expiry: &str,
@@ -162,15 +155,15 @@ pub fn render_policy(
         }
     }
 
-    // Attested values, pulled **by name from the closed registry** out of
-    // the discharge context — never "whatever the discharge carries". A
-    // discharge caveat outside [`ATTESTABLE`] (or a reserved name) is not
-    // exposed here, so it cannot reach a policy slot.
+    // Attested values, pulled **by name from the role's declared
+    // contract** out of the discharge context — never "whatever the
+    // discharge carries". A discharge caveat outside the declared set is
+    // not exposed here, so it cannot reach a policy slot.
     let dis = EffectiveCaveats::new(discharge_caveats);
     let mut attested_map: BTreeMap<&str, String> = BTreeMap::new();
-    for &name in ATTESTABLE {
+    for name in attested_names {
         if let Resolved::Value(v) = dis.resolve(name) {
-            attested_map.insert(name, v);
+            attested_map.insert(name.as_str(), v);
         }
     }
 
@@ -388,33 +381,13 @@ mod tests {
         vec![Caveat::scalar("volume", volume)]
     }
 
-    fn cv(pairs: &[(&str, &str)]) -> Vec<Caveat> {
-        pairs.iter().map(|(n, v)| Caveat::scalar(*n, *v)).collect()
+    /// The declared `attested` contract of TPL's role.
+    fn vol() -> Vec<String> {
+        vec!["volume".to_string()]
     }
 
-    #[test]
-    fn attestable_is_disjoint_from_reserved_control_names() {
-        // The fencing invariant: no attestable name is also a reserved
-        // control caveat, so `attested.X` can never name (and thus never
-        // shadow) a primary's MAC-bound control caveat.
-        use crate::caveat::name;
-        let reserved = [
-            name::AUD,
-            name::EXP,
-            name::SUB,
-            name::CNF,
-            name::OP,
-            name::ROLE,
-            name::EPOCH,
-            name::INVITE,
-            name::SCOPE,
-        ];
-        for a in ATTESTABLE {
-            assert!(
-                !reserved.contains(a),
-                "attestable name {a:?} collides with a reserved control caveat"
-            );
-        }
+    fn cv(pairs: &[(&str, &str)]) -> Vec<Caveat> {
+        pairs.iter().map(|(n, v)| Caveat::scalar(*n, *v)).collect()
     }
 
     #[test]
@@ -422,6 +395,7 @@ mod tests {
         let out = render_policy(
             TPL,
             &env(),
+            &vol(),
             &dis("VOL1"),
             &[],
             "2026-05-15T14:30:00Z",
@@ -439,11 +413,13 @@ mod tests {
         // sourced from the primary's caveat chain, never the discharge.
         // A discharge caveat also named `sub` must not bleed into
         // `caveat.*` (the attested context is never flattened in), and in
-        // any case `sub` is not in ATTESTABLE so it is never exposed.
+        // any case `sub` is reserved, so no declared contract can expose
+        // it.
         const TPL_SUB: &str = r#"{"Resource":["arn:aws:s3:::b/coordinators/{{caveat.sub}}/*"]}"#;
         let out = render_policy(
             TPL_SUB,
             &env(),
+            &[],
             &cv(&[("sub", "FORGED")]),
             &cv(&[("sub", "COORD1"), ("aud", "mint")]),
             "t",
@@ -468,6 +444,7 @@ mod tests {
             TPL_SUB,
             &env(),
             &[],
+            &[],
             &cv(&[("sub", "REAL"), ("sub", "FORGED")]),
             "t",
             "coord-rw",
@@ -483,7 +460,7 @@ mod tests {
         // A template referencing attested.volume with no discharge
         // carrying it must fail the render, not mint an unscoped
         // credential.
-        let err = render_policy(TPL, &env(), &[], &[], "t", "r");
+        let err = render_policy(TPL, &env(), &vol(), &[], &[], "t", "r");
         assert!(
             matches!(err, Err(TemplateError::UnknownField { .. })),
             "{err:?}"
@@ -491,14 +468,15 @@ mod tests {
     }
 
     #[test]
-    fn attested_name_outside_registry_fails_closed() {
-        // A discharge caveat whose name is not in ATTESTABLE is never
+    fn attested_name_outside_declared_contract_fails_closed() {
+        // A discharge caveat whose name the role did not declare is never
         // exposed, so a policy referencing it fails closed — a discharge
-        // cannot fill an arbitrary slot.
+        // cannot fill a slot the sealed contract doesn't name.
         const TPL_R: &str = r#"{"Resource":["{{attested.region}}"]}"#;
         let err = render_policy(
             TPL_R,
             &env(),
+            &vol(),
             &cv(&[("region", "eu-west")]),
             &[],
             "t",
@@ -516,7 +494,7 @@ mod tests {
         // not valid JSON, so the template is rejected — there is no
         // unsafe non-string substitution position to reach.
         const TPL_BAD: &str = r#"{"Resource":[{{attested.volume}}]}"#;
-        let err = render_policy(TPL_BAD, &env(), &dis("V"), &[], "t", "volume-ro");
+        let err = render_policy(TPL_BAD, &env(), &vol(), &dis("V"), &[], "t", "volume-ro");
         assert!(matches!(err, Err(TemplateError::NotJson { .. })), "{err:?}");
     }
 
@@ -527,7 +505,7 @@ mod tests {
         const TPL_R: &str =
             r#"{"Statement":[{"Effect":"Allow","Resource":["arn:{{attested.volume}}"]}]}"#;
         let evil = r#"x","Effect":"Deny"},{"Resource":"*"#;
-        let out = render_policy(TPL_R, &env(), &dis(evil), &[], "t", "volume-ro").unwrap();
+        let out = render_policy(TPL_R, &env(), &vol(), &dis(evil), &[], "t", "volume-ro").unwrap();
         let v: Value = serde_json::from_str(&out).expect("output is valid json");
         let stmts = v["Statement"].as_array().expect("statement array");
         assert_eq!(stmts.len(), 1, "value injected a statement: {out}");
@@ -544,7 +522,7 @@ mod tests {
         // A leftover handlebars-ism and a namespace-less token are both
         // rejected, not rendered as empty.
         for bad in [r#"{"x":"{{#each items}}"}"#, r#"{"x":"{{volume}}"}"#] {
-            let err = render_policy(bad, &env(), &dis("V"), &[], "t", "r");
+            let err = render_policy(bad, &env(), &vol(), &dis("V"), &[], "t", "r");
             assert!(
                 matches!(err, Err(TemplateError::MalformedToken { .. })),
                 "{bad}: {err:?}"
@@ -558,6 +536,7 @@ mod tests {
         let err = render_policy(
             r#"{"x":"{{attested.volume}}"}"#,
             &env(),
+            &vol(),
             &[],
             &[],
             "t",
@@ -648,6 +627,11 @@ mod proptests {
         vec![Caveat::scalar("volume", volume)]
     }
 
+    /// The declared `attested` contract of the proptest templates' role.
+    fn vol() -> Vec<String> {
+        vec!["volume".to_string()]
+    }
+
     /// An adversarial value: a run of fragments biased towards the
     /// characters and substrings that could break a naïve string-splice
     /// renderer — JSON metacharacters, control bytes, token-looking
@@ -679,7 +663,7 @@ mod proptests {
         #[test]
         fn value_lands_intact_and_output_is_valid_json(value in evil_value()) {
             const TPL: &str = r#"{"Resource":["arn:aws:s3:::{{attested.volume}}/*"]}"#;
-            let out = render_policy(TPL, &env_one("bucket", "demo"), &dis(&value), &[], "t", "r")
+            let out = render_policy(TPL, &env_one("bucket", "demo"), &vol(), &dis(&value), &[], "t", "r")
                 .expect("render must succeed for a well-formed, present token");
             let v: Value = serde_json::from_str(&out).expect("output is valid json");
             let expected = format!("arn:aws:s3:::{value}/*");
@@ -694,7 +678,7 @@ mod proptests {
         fn value_cannot_alter_structure(value in evil_value()) {
             const TPL: &str =
                 r#"{"Statement":[{"Effect":"Allow","Resource":["arn:{{attested.volume}}"]}]}"#;
-            let out = render_policy(TPL, &env_one("bucket", "demo"), &dis(&value), &[], "t", "r")
+            let out = render_policy(TPL, &env_one("bucket", "demo"), &vol(), &dis(&value), &[], "t", "r")
                 .expect("render ok");
             let v: Value = serde_json::from_str(&out).expect("valid json");
             let stmts = v["Statement"].as_array().expect("statement array");
@@ -718,6 +702,7 @@ mod proptests {
             let out = render_policy(
                 TPL,
                 &env_one("x", &e),
+                &vol(),
                 &dis(&a),
                 &[Caveat::scalar("sub", &c)],
                 "t",
@@ -740,6 +725,7 @@ mod proptests {
             let out = render_policy(
                 TPL,
                 &env_one("bucket", "SHOULD_NOT_APPEAR"),
+                &vol(),
                 &dis(&value),
                 &[],
                 "t",
