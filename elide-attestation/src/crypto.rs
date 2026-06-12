@@ -8,10 +8,11 @@
 //! - [`decrypt_cid_attested`] — AES-GCM-SIV(`K_M-B`) over an attested TPC's
 //!   CID, recovering `r ‖ lp(client_id) ‖ lp(org_id) ‖ lp(mode)`. The twin
 //!   of mint's `tpc::decrypt_cid_attested`.
-//! - [`mint_discharge`] — a keyless chained-BLAKE3 macaroon rooted at the
-//!   recovered `r`, carrying the discharge keyref, encoded to mint's
-//!   `mnt2_` wire form. The twin of mint's `macaroon::mint_under_key` +
-//!   `encode`.
+//! - [`mint_discharge_with_nonce`] — a keyless chained-BLAKE3 macaroon
+//!   rooted at the recovered `r`, carrying the discharge keyref, its
+//!   nonce holding the [`ticket_id`] so mint pairs it to the caveat it
+//!   answers, encoded to mint's `mnt2_` wire form. The twin of mint's
+//!   `macaroon::mint_under_key_with_nonce` + `encode`.
 //!
 //! Only the *composition* is reimplemented — the AEAD, BLAKE3, and MsgPack
 //! primitives are the identical crates mint uses, so the drift surface is
@@ -30,7 +31,6 @@ use aes_gcm_siv::aead::{Aead, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Key, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
-use rand_core::{OsRng, RngCore};
 
 /// Wire prefix for a base64url-encoded mint macaroon (`mint::macaroon`).
 const WIRE_PREFIX: &str = "mnt2_";
@@ -157,18 +157,20 @@ fn read_length_prefixed_str(buf: &[u8], pos: &mut usize) -> Result<String, Crypt
     Ok(s)
 }
 
-/// Mint a discharge macaroon rooted at `r` carrying `caveats` (scalar
-/// first-party `(name, value)` pairs), returning the `mnt2_` wire form mint
-/// will verify under `r` and clear. A fresh random nonce is drawn per call.
-pub fn mint_discharge(r: &[u8; 32], caveats: &[(&str, &str)]) -> String {
-    let mut nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
-    mint_discharge_with_nonce(r, &nonce, caveats)
+/// The ticket id a discharge stamps into its nonce so mint's verifier
+/// pairs it with the third-party caveat it answers by identity, not by
+/// bundle position: `blake3(CID)[..NONCE_LEN]` (`mint::tpc::ticket_id`).
+pub fn ticket_id(cid: &[u8]) -> [u8; NONCE_LEN] {
+    let mut id = [0u8; NONCE_LEN];
+    id.copy_from_slice(&blake3::hash(cid).as_bytes()[..NONCE_LEN]);
+    id
 }
 
-/// As [`mint_discharge`] but with a caller-supplied nonce — for the
-/// known-answer vector, whose wire form is deterministic only with the
-/// nonce pinned.
+/// Mint a discharge macaroon rooted at `r` carrying `caveats` (scalar
+/// first-party `(name, value)` pairs), with `nonce` carrying the ticket
+/// id ([`ticket_id`]) so mint's verifier pairs it with the third-party
+/// caveat it answers. Returns the `mnt2_` wire form mint verifies under
+/// `r` and clears.
 pub fn mint_discharge_with_nonce(
     r: &[u8; 32],
     nonce: &[u8; NONCE_LEN],

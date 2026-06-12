@@ -257,12 +257,16 @@ impl DischargeState {
             }
         };
 
-        // 7. Mint the discharge attesting `volume = target`.
+        // 7. Mint the discharge attesting `volume = target`, naming the
+        //    third-party caveat it answers by stamping the ticket id
+        //    (derived from this CID) into its nonce — mint's verifier
+        //    pairs discharges to TPCs by that id, never by bundle order.
         let exp = now + ttl;
         let exp_s = exp.to_string();
         let target_s = target.to_string();
-        Ok(crypto::mint_discharge(
+        Ok(crypto::mint_discharge_with_nonce(
             &recovered.r,
+            &crypto::ticket_id(&cid),
             &[("volume", &target_s), ("exp", &exp_s)],
         ))
     }
