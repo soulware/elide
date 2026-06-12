@@ -578,10 +578,11 @@ impl Store {
     /// Load or — when `demo_enabled` is true and the file is absent —
     /// generate the K_M-B wrapping key under `<dir>/k_m_b`. Mirrors
     /// [`init_k_m_a`](Store::init_k_m_a): called from the bootstrap path
-    /// only when the config declares at least one attestation role. Same
-    /// on-disk shape and custody (64 ASCII hex, mode 0600). Unlike
-    /// K_M-A it does not assign `org_id` — the org is already settled by
-    /// `init_k_m_a` (the attestation coordinator serves the same org).
+    /// when the config declares an attestation role or colocates the
+    /// demo attestation authority. Same on-disk shape and custody
+    /// (64 ASCII hex, mode 0600). Unlike K_M-A it does not assign
+    /// `org_id` — the org is already settled by `init_k_m_a` (the
+    /// attestation authority serves the same org).
     pub fn init_k_m_b(&mut self, dir: &Path, demo_enabled: bool) -> io::Result<()> {
         let path = dir.join(K_M_B_FILE);
         let bytes = match std::fs::read_to_string(&path) {
@@ -590,8 +591,8 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if !demo_enabled {
                     return Err(io::Error::other(format!(
-                        "K_M-B absent at {path:?}; mint requires attestation-coordinator \
-                         enrollment or [demo_auth] enabled = true"
+                        "K_M-B absent at {path:?}; mint requires attestation-authority \
+                         enrollment or [demo_attestation] enabled = true"
                     )));
                 }
                 let mut fresh = [0u8; 32];

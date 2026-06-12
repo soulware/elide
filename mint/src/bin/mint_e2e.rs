@@ -46,8 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store.init_k_session(&config.data_dir)?;
         }
     }
-    if config.roles.values().any(|r| r.attestation_mode.is_some()) {
-        store.init_k_m_b(&config.data_dir, demo_enabled)?;
+    let attest_demo = config.demo_attestation.as_ref().is_some_and(|d| d.enabled);
+    if config.roles.values().any(|r| r.attestation_mode.is_some()) || attest_demo {
+        store.init_k_m_b(&config.data_dir, attest_demo)?;
     }
 
     let minter: Arc<dyn KeypairMinter> = Arc::new(FakeMinter::new());

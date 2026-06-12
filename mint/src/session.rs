@@ -20,6 +20,7 @@ use crate::macaroon::Macaroon;
 
 const SESSION_FILE: &str = "session";
 const TRANSPORT_FILE: &str = "auth-transport";
+const ATTEST_TRANSPORT_FILE: &str = "attest-transport";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -33,6 +34,8 @@ pub enum SessionError {
     NotLoggedIn,
     #[error("no auth transport known — run `mint login --url <auth-url>`")]
     NoTransport,
+    #[error("no attestation transport known — run `mint login --config <mint.toml>`")]
+    NoAttestTransport,
     #[error("login failed ({status}): {body}")]
     Login { status: u16, body: String },
 }
@@ -88,6 +91,27 @@ pub fn load_transport() -> Result<String, SessionError> {
     match std::fs::read_to_string(&path) {
         Ok(t) => Ok(t.trim().to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(SessionError::NoTransport),
+        Err(e) => Err(SessionError::Io(e.to_string())),
+    }
+}
+
+/// Persist how to dial the attestation authority (`unix:<sock>` /
+/// `http(s)://host`), mode 0600. Written by `mint login --config` when
+/// the config colocates the demo attestation authority; durable like
+/// `auth-transport`.
+pub fn save_attest_transport(transport: &str) -> Result<(), SessionError> {
+    let d = dir()?;
+    std::fs::create_dir_all(&d).map_err(|e| SessionError::Io(e.to_string()))?;
+    write_0600(&d.join(ATTEST_TRANSPORT_FILE), transport.trim().as_bytes())
+}
+
+/// Load the saved attestation transport. Absent →
+/// [`SessionError::NoAttestTransport`].
+pub fn load_attest_transport() -> Result<String, SessionError> {
+    let path = dir()?.join(ATTEST_TRANSPORT_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(t) => Ok(t.trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(SessionError::NoAttestTransport),
         Err(e) => Err(SessionError::Io(e.to_string())),
     }
 }

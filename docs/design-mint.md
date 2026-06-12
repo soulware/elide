@@ -2385,16 +2385,39 @@ Consequence for CI: the `invite` / `enroll` / `enroll-exchange` legs
 and the fake-minter `assume-role` are hermetic and run anywhere; the
 real-Tigris `assume-role` end-to-end is VM-only.
 
-**Demo role config** is a minimal `read` / `write` pair over a single
-server-side `{{env.prefix}}` (shipped as `examples/mint-demo.toml`) — distinct from
-the full Elide role inventory below. Both are plain key-bound roles;
-neither credential carries a TPC. The operator-authorisation loop is
+**Demo role config** (shipped as `examples/mint-demo.toml`) is four
+roles that together exercise every template namespace — distinct from
+the full Elide role inventory below:
+
+- `read` / `write` — plain key-bound roles over a single server-side
+  `{{env.prefix}}`; `{{env.X}}` + `{{mint.expiry}}` only, no TPC.
+- `home` — scopes to the credential's MAC-verified principal
+  (`{{env.prefix}}/{{caveat.sub}}/*`), adding `{{caveat.X}}`.
+- `attested-write` — declares `[role.attestation]`, so its credential
+  carries an attested TPC and its policy substitutes all four
+  namespaces (`{{env.prefix}}/{{caveat.sub}}/{{attested.project}}/*`).
+
+The operator-authorisation loop is
 exercised at **enrollment**, not at `assume-role`: the config colocates
-the demo auth role (`[auth] demo_enabled`), so `client enroll` discharges
+the demo auth role (`[demo_auth]`), so `client enroll` discharges
 the invite's TPC (the enroll gate) and `client exchange` discharges the
 ticket's TPC (the exchange gate), each fetching a discharge from the auth
-socket and presenting the bundle. `assume-role` against either role then
-needs no discharge. This is the mint CLI proving the consumption side
+socket and presenting the bundle.
+
+The **attestation loop** is exercised at `assume-role`: the config also
+colocates a demo attestation authority (`[demo_attestation]`, its own
+UDS, `K_M-B` generated on first start). `client assume-role --attest
+project=<value>` detects the credential's attested TPC, POSTs its CID
+plus the requested `(name, value)` pairs to the attest socket under the
+login-session bearer, and presents the returned discharge in the
+bundle. The session is the demo issuer's *whole* predicate — it attests
+whatever the logged-in caller asks, refusing only reserved control
+names; a real authority (the attestation coordinator) runs a real
+ownership predicate and returns the same discharge shape. Like
+mint-as-auth, mint-as-verifier is demo-only forever: mint will never
+grow a real attestation predicate.
+
+This is the mint CLI proving the consumption side
 before any `elide-*` client.
 
 ### Audit log
