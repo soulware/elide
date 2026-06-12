@@ -903,6 +903,143 @@ crate boundary forces a copy. The discharge crypto is reimplemented
 because `mint` is unlinkable by design. Share code where the crate graph
 allows it; pin with vectors only where it does not.
 
+## Proposed: a standalone verifier process
+
+coord B's embedded form — `elide-coordinator serve` with an
+`[attestation]` section — brings up the whole coordinator (supervisor,
+GC, IPC socket, volume scan) to serve one POST route. The deployment
+shape for a multi-coord installation is a dedicated process:
+
+```
+elide-attestation serve \
+  --listen 0.0.0.0:8087 \                      # or unix:<path>
+  --mint-url https://mint.example \
+  --identity-dir /var/lib/elide-attestation \
+  --bucket elide --endpoint https://t3.storage.dev --region auto
+```
+
+**Flags only — no config file.** The process consumes three things: a
+listen address, a mint endpoint plus enrolled identity (the keypair and
+`credentials/coord-ro` under `--identity-dir`), and the store
+coordinates for its `coord-ro` reads (S3 keypairs arrive via
+`assume-role`, never via flags or env). None of the coordinator config
+applies — no `data_dir` of volumes, no supervisor, no `elide_bin` — so a
+config file would hold five scalars.
+
+The process is **an enrolled attestation instance** (§ *Proposed:
+attestation-kind enrollment*): it holds its own identity keypair,
+assumes `coord-ro` through ordinary `assume-role` with the same
+half-TTL refresh every coordinator uses, and serves `POST /v1/discharge`
+— nothing else. The embedded `[attestation]` mode remains for the
+co-located single-host shape; both drive the same `DischargeState`.
+
+## Proposed: attestation-kind enrollment
+
+Enrollment today grants every approved `sub` the full coordinator role
+set — the `Enrolled` record carries no role constraint, and
+`COORD_ENROLL_ROLES` is coordinator-side convention. The grant becomes
+explicit and typed:
+
+- The `Enrolled` record carries a **granted role set**, declared by the
+  enrollee at `/v1/enroll`, shown to the operator alongside the key
+  fingerprint at approval, and covered by the record's body MAC.
+  `enroll-exchange` refuses a role outside the grant.
+- A **coordinator enrollment** grants the four coordinator roles, as
+  today. An **attestation enrollment** grants `{coord-ro}` — and is the
+  gate for the CID-unwrap endpoint (§ *Proposed: `K_M-B` stays at
+  mint*).
+- Each attestation instance enrolls **as its own `sub`**. The
+  enrollment *is* the instance's key: individually granted,
+  individually audited (every unwrap and `assume-role` logs the `sub`),
+  individually revoked (`rev_epoch`).
+
+## Proposed: `K_M-B` stays at mint — instances unwrap the CID over the wire
+
+Today coord B holds `K_M-B` and decrypts the attested CID locally. HA
+replication would put that key on every instance: one fleet-shared
+secret whose theft is **offline** discharge-forgery for every
+outstanding attested credential, revocable only by re-keying the
+mint↔coord-B pair and re-minting every credential sealed under it.
+
+Instead, **the CID key never leaves mint**. A new endpoint
+
+```
+POST /v1/unwrap-cid        op=unwrap-cid
+{ "cid": "<hex>" }    →    { "r": "<hex>", "mode": "<string>" }
+```
+
+is PoP-signed by an attestation-enrolled `sub` (`X-Mint-Pop`, the
+`assume-role` transport) and returns the `(r, mode)` a local decrypt
+yields today. The instance caches `cid → (r, mode)`; the CID is stable
+for its credential's lifetime, so steady-state discharges hit the
+cache.
+
+**No new information flows.** The instance learns exactly what local
+decryption taught it; what changes is the gate — a fleet-shared key
+file becomes a per-request, per-`sub`-authenticated, audited, revocable
+call. Delivering `r` to the discharge authority is not a leak but the
+TPC contract itself: the CID *is* the caveat root key encrypted to the
+third party. And the key-distribution rule is intact — the prohibition
+is on giving keys to *verifiers* (who could then forge what they
+verify); coord B is the discharge *issuer*, and the discharge's
+verifier is mint, whose keys never move. The discharge MAC chain is
+unchanged: symmetric, rooted at `r`.
+
+**Capability under compromise.** A stolen `K_M-B` forges discharges for
+every credential, offline, silently, until fleet re-key. A compromised
+instance yields its cached per-credential `r` values (each dead at its
+credential's `exp`) plus an **online** oracle that logs every use at
+mint and dies the moment its one `sub` is revoked.
+
+**Availability.** Mint lands on the discharge path, but the verifier
+already depends on mint at the half-TTL timescale for its `coord-ro`
+refresh, and the unwrap cache covers already-seen credentials through
+a mint outage. The marginal coupling is one POST per *new* credential,
+against the 2–4 S3 GETs already in every discharge.
+
+**What it retires.** `discharge_key_file` and the out-of-band `K_M-B`
+distribution; the AEAD half of the cross-implementation crypto
+(`decrypt_cid_attested` and its vector) — one of the two vector-pinned
+reimplementations gone. The MAC-chain half (`mint_discharge`) and its
+vector stay.
+
+**`K_M-A` is unchanged.** A pairwise key between two sovereign roots is
+the TPC composing as designed: it buys mutual offline-ness (mint
+verifies auth discharges with no auth round-trip; auth issues with no
+mint round-trip), and the session-discharge path
+(`derive_discharge_r(K_M-A, nonce)`) is constitutively shared-key. The
+unwrap pattern earns its complexity only where one side stops being a
+single principal — which is exactly what HA replication does to
+coord B.
+
+## Proposed: HA — N instances, one location, no shared secret
+
+Multiple instances stand behind the one sealed `attestation_location`
+(the location names the *authority*; instances are interchangeable
+servers of it). Each instance's durable state is its identity directory
+— its own enrollment keypair and `cnf`-bound `credentials/coord-ro` —
+and nothing else: no `K_M-B`, no fleet secret, no disk state beyond
+identity.
+
+The discharge protocol is single-shot — one POST carrying
+`cid, ts, nonce, proof`, one response — so no load-balancer affinity is
+required. Every cache an instance holds is soft: `cid → r` re-fetches
+from mint, the `coord-ro` credential re-assumes, and a restart loses
+nothing durable.
+
+The one per-instance cache with protocol meaning is the possession-proof
+`seen` set: single-use of a proof is enforced per instance, so behind a
+balancer a captured proof is usable at most once per instance within
+the freshness window (±30 s skew). The exposure is bounded — a replay
+re-mints a discharge the prover was already entitled to — and the
+freshness window, not the cache, is the primary fence. Sticky routing
+on `owned` restores global single-use if a deployment wants it.
+
+Fleet operations are per-instance enrollment operations: scale-out is
+one enroll ceremony and the new instance immediately serves every
+outstanding credential (no recipient-set churn); decommission or
+compromise is one `revoke`, leaving the rest of the fleet untouched.
+
 ## Trust properties
 
 - **Secrecy of coord B is irrelevant.** It verifies public-key crypto and
