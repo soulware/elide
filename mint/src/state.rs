@@ -496,7 +496,7 @@ impl Store {
             return Err(io::Error::other(format!(
                 "macaroon keyring absent at {keyring_dir:?}; provision root_keys/ \
                  out-of-band (multi-host: replicate the same keyring to every \
-                 instance) or enable [demo_auth] to generate one"
+                 instance) or enable [auth.demo] to generate one"
             )));
         }
         let keyring = Keyring::open(keyring_dir, initial_key).map_err(io::Error::other)?;
@@ -547,7 +547,7 @@ impl Store {
                 if !demo_enabled {
                     return Err(io::Error::other(format!(
                         "K_M-A absent at {path:?}; mint requires auth-service \
-                         enrollment or [demo_auth] enabled = true"
+                         enrollment or [auth.demo] enabled = true"
                     )));
                 }
                 let mut fresh = [0u8; 32];
@@ -591,7 +591,7 @@ impl Store {
                 if !demo_enabled {
                     return Err(io::Error::other(format!(
                         "K_M-B absent at {path:?}; mint requires attestation-authority \
-                         enrollment or demo mode ([demo_auth] enabled = true)"
+                         enrollment or demo mode ([auth.demo] enabled = true)"
                     )));
                 }
                 let mut fresh = [0u8; 32];

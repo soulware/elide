@@ -42,9 +42,10 @@ fn config() -> Config {
 
 const TOML_TEMPLATE: &str = r#"
 audience = "mint"
-attestation_location = "https://coord-b.example/v1/discharge"
 [store]
 bucket = "demo-bucket"
+[attestation]
+location = "https://coord-b.example/v1/discharge"
 [env]
 bucket = "demo-bucket"
 [[role]]

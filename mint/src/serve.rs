@@ -1,7 +1,7 @@
 //! The serve loop shared by every mint daemon shape: admin-service
 //! provisioning, template-seal startup, the mint/admin router on the
 //! configured listener, and the colocated demo-auth / demo-attestation
-//! listeners when `[demo_auth]` / `[demo_attestation]` are enabled.
+//! listeners when `[auth.demo]` / `[attestation.demo]` are enabled.
 //!
 //! Callers construct the store and minter for their backend and hand
 //! them in: `mint serve` opens the Tigris-backed store with a real
@@ -140,11 +140,11 @@ pub async fn run(
     // operator surface, not an auth-role concern).
     let mint_app = crate::admin::mount(router(state.clone()), state.clone());
 
-    // The auth role lives on its own UDS when `[demo_auth].enabled =
+    // The auth role lives on its own UDS when `[auth.demo].enabled =
     // true`. mint-as-auth is structurally not mint: separate listener,
     // separate router, no shared HTTP path. Production deploys run a
     // standalone auth-service binary instead — mint never opens this
-    // socket without `[demo_auth]`. (`socket` is `Some` only when
+    // socket without `[auth.demo]`. (`socket` is `Some` only when
     // `enabled`, resolved in `Config::from_raw`.)
     let auth_socket = state
         .config
@@ -152,7 +152,7 @@ pub async fn run(
         .as_ref()
         .and_then(|d| d.socket.clone());
     // Same shape for the demo attestation authority: its own UDS, its
-    // own router, only under `[demo_attestation].enabled = true`.
+    // own router, only under `[attestation.demo].enabled = true`.
     let attest_socket = state
         .config
         .demo_attestation

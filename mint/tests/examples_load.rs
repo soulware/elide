@@ -28,7 +28,7 @@ fn mint_demo_config_loads() {
         .expect("demo templates satisfy the seal-authoring surface checks");
     // The demo colocates the auth role so the operator admin plane
     // (login / invite / enroll) has a discharge issuer and a admin-service.
-    let demo = cfg.demo_auth.expect("[demo_auth] present");
+    let demo = cfg.demo_auth.expect("[auth.demo] present");
     assert!(demo.enabled, "demo colocates the auth role");
     assert!(demo.socket.is_some(), "demo auth role binds a UDS");
     assert!(
@@ -37,7 +37,7 @@ fn mint_demo_config_loads() {
     );
     // …and the attestation authority, so `demo-attested` has a
     // discharge issuer for its attested TPC.
-    let attest = cfg.demo_attestation.expect("[demo_attestation] present");
+    let attest = cfg.demo_attestation.expect("[attestation.demo] present");
     assert!(attest.enabled, "demo colocates the attestation authority");
     assert!(attest.socket.is_some(), "demo attestation binds a UDS");
     assert!(

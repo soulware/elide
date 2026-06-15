@@ -33,9 +33,10 @@ const PROJECT: &str = "apollo";
 
 const TOML_TEMPLATE: &str = r#"
 audience = "mint"
-attestation_location = "https://attest.elide.internal/v1/discharge"
 [store]
 bucket = "mint-demo"
+[attestation]
+location = "https://attest.elide.internal/v1/discharge"
 [env]
 bucket = "mint-demo"
 prefix = "demo"
@@ -69,7 +70,7 @@ fn config() -> Config {
 }
 
 /// AppState with demo keys provisioned the way `mint serve` does under
-/// `[demo_auth]` + `[demo_attestation]`: K_M-A (settling org = "demo"),
+/// `[auth.demo]` + `[attestation.demo]`: K_M-A (settling org = "demo"),
 /// K_session (the login-session root), and K_M-B (the attestation
 /// wrapping key). Returns the generated K_M-B so the test can stamp the
 /// credential's attested TPC the way issuance does.

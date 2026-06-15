@@ -3,21 +3,6 @@
 
 audience = "mint"
 
-# Operator auth integration (docs/design-auth-service.md). Required: the
-# discharge URL (path included) for the enroll gate (invite), the exchange
-# gate (ticket), and the admin gate (cli-token), each keyed by K_M-A which
-# the auth integration provides. Production runs a separate auth-service
-# binary (no [demo_auth]); the operator admin plane authenticates against
-# that service, not a colocated UDS.
-auth_location = "https://auth.elide.internal/v1/discharge"
-
-# Attestation integration (docs/design-mint-volume-attestation.md). The
-# discharge URL of the attestation coordinator that vouches a credential's
-# volume scope, keyed by K_M-B. Required because the volume roles below
-# declare [role.attestation]: their credentials carry an attested
-# third-party caveat this authority discharges at assume-role.
-attestation_location = "https://coord-b.elide.internal/v1/discharge"
-
 # data_dir / roles_dir: a relative value (including the defaults
 # mint_data / mint_roles) resolves against the working directory, not
 # this file's parent; an absolute path is used verbatim. roles_dir is
@@ -35,6 +20,16 @@ roles_dir = "examples/elide_roles"
 socket = "mint_data/mint.sock"
 # For a TCP listener instead, replace the line above with:
 #   bind = "127.0.0.1:8085"
+
+[auth]
+# Discharge URL for the enroll/exchange/admin gates (separate
+# auth-service in production; no [auth.demo]). Required.
+location = "https://auth.elide.internal/v1/discharge"
+
+[attestation]
+# Discharge URL of the attestation coordinator. Required: the volume
+# roles below declare [role.attestation].
+location = "https://coord-b.elide.internal/v1/discharge"
 
 [store]
 bucket = "elide-demo"

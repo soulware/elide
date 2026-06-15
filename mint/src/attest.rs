@@ -2,7 +2,7 @@
 //!
 //! Structurally separate from the mint role, exactly like the demo auth
 //! role (`crate::auth`): its discharge route mounts on its own UDS only
-//! when `[demo_attestation].enabled = true`. Production deploys run a
+//! when `[attestation.demo].enabled = true`. Production deploys run a
 //! real attestation authority (for Elide, the attestation coordinator —
 //! `elide-attestation`) that shares `K_M-B` with mint and runs a real
 //! ownership predicate. Mint's verifier recovers `r` from the attested

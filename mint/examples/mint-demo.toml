@@ -17,23 +17,6 @@
 
 audience = "mint"
 
-# The full discharge URL (path included) stamped into the enroll gate
-# (invite), exchange gate (ticket), and admin gate (cli-token), all keyed
-# by K_M-A. The operator/client derives its discharge route from this
-# location's path and dials [demo_auth].socket as the transport. The host
-# is never resolved in the demo (the socket is the connection), so it
-# reads the same as production. Required for the enrollment and admin
-# planes; without it (and without [demo_auth].enabled) mint cannot stamp
-# the gates and /v1/enroll fails closed.
-auth_location = "https://auth.elide.internal/v1/discharge"
-
-# The discharge URL stamped into the attested third-party caveat of
-# every role declaring [role.attestation] (`demo-attested` below). The
-# path is the discharge route; the client dials
-# [demo_attestation].socket as the transport (saved by `mint login
-# --config`), so the host is never resolved in the demo.
-attestation_location = "https://attest.elide.internal/v1/discharge"
-
 # data_dir defaults to mint_data, roles_dir to mint_roles, each resolved
 # against the working directory (not this file's parent); an absolute
 # path is used verbatim. roles_dir is set so the demo runs from mint/:
@@ -49,26 +32,27 @@ socket = "mint_data/mint.sock"
 # For a TCP listener instead, replace the line above with:
 #   bind = "127.0.0.1:8085"
 
-# Colocate the auth role on its own UDS instead of a separate
-# auth-service binary (docs/design-auth-service.md). Demo / single-host
-# only; generates K_M-A and K_session on first start.
-[demo_auth]
+[auth]
+# Discharge URL for the enroll/exchange/admin gates. Required, or the
+# enrollment and admin planes are disabled.
+location = "https://auth.elide.internal/v1/discharge"
+
+# Colocate the auth role on a UDS instead of a separate auth-service.
+# Demo / single-host only; omit for production.
+[auth.demo]
 enabled = true
-# UDS the colocated auth role binds for /v1/login + /v1/discharge,
-# separate from mint.sock above, and the transport the operator/client
-# dial to reach it. Defaults to <data_dir>/auth.sock; ignored when
-# enabled = false.
+# Defaults to <data_dir>/auth.sock; ignored when enabled = false.
 socket = "mint_data/auth.sock"
 
-# Colocate the attestation authority on its own UDS instead of a real
-# attestation service. Demo / single-host only; requires [demo_auth]
-# (issuance is gated on its login session). Generates K_M-B on first
-# start.
-[demo_attestation]
+[attestation]
+# Discharge URL for the attested caveat of any [role.attestation] role.
+location = "https://attest.elide.internal/v1/discharge"
+
+# Colocate the attestation authority on a UDS. Demo / single-host only;
+# requires [auth.demo]. Omit for production.
+[attestation.demo]
 enabled = true
-# UDS the colocated attestation authority binds for /v1/discharge, and
-# the transport the client dials to reach it. Defaults to
-# <data_dir>/attest.sock; ignored when enabled = false.
+# Defaults to <data_dir>/attest.sock; ignored when enabled = false.
 socket = "mint_data/attest.sock"
 
 # Where mint keeps its own enrollment state (`_mint/*`). Operational

@@ -58,12 +58,12 @@ pub enum ConfigError {
     #[error("[env] key {key:?} is not a scalar (string, integer, float, or boolean)")]
     NonScalarEnv { key: String },
     #[error(
-        "[demo_attestation] enabled = true requires [demo_auth] enabled = true \
+        "[attestation.demo] enabled = true requires [auth.demo] enabled = true \
          (the issuer is gated on the demo login session)"
     )]
     DemoAttestationWithoutDemoAuth,
     #[error(
-        "role {role}: declares [role.attestation] but no attestation_location \
+        "role {role}: declares [role.attestation] but no [attestation].location \
          is configured to discharge it"
     )]
     AttestationWithoutLocation { role: String },
@@ -170,37 +170,57 @@ pub struct RawConfig {
     /// rejected at load. Empty when the config omits `[env]`.
     #[serde(default)]
     pub env: BTreeMap<String, toml::Value>,
-    /// Colocated demo auth role (`docs/design-auth-service.md`). Demo /
-    /// single-host only; absent in production.
+    /// The `[auth]` plane: the discharge `location` for the enroll /
+    /// exchange / admin gates, plus the optional `[auth.demo]` colocation
+    /// of the auth role. Absent ⟹ no auth plane.
     #[serde(default)]
-    pub demo_auth: Option<RawDemoAuth>,
-    /// Colocated demo attestation authority. Demo / single-host only;
-    /// absent in production.
+    pub auth: Option<RawAuth>,
+    /// The `[attestation]` plane: the discharge `location` for attested
+    /// third-party caveats, plus the optional `[attestation.demo]`
+    /// colocation of the attestation authority. Absent ⟹ no attestation.
     #[serde(default)]
-    pub demo_attestation: Option<RawDemoAttestation>,
-    /// The discharge URL stamped into the enroll-gate (invite),
-    /// exchange-gate (ticket), and admin-gate (admin-service) third-party
-    /// caveats — where a client/operator fetches the discharge. A mint
-    /// without `auth_location` (and without `[demo_auth].enabled`) cannot
-    /// stamp those caveats, so it has no enrollment plane — `/v1/enroll`
-    /// fails closed. The path is the discharge route; the transport it is
-    /// dialed over is resolved separately (`[demo_auth]` socket in the
-    /// colocated demo, the remembered `auth-transport` otherwise).
-    #[serde(default)]
-    pub auth_location: Option<String>,
-    /// The discharge URL stamped into the attested third-party caveat
-    /// of every role that declares `[role.attestation]` — where the
-    /// holder fetches the attestation discharge. A single fixed
-    /// authority (the attestation coordinator) for the deployment;
-    /// absent means no role may declare attestation. The transport it is
-    /// dialed over is resolved separately, like `auth_location`.
-    #[serde(default)]
-    pub attestation_location: Option<String>,
+    pub attestation: Option<RawAttestation>,
     #[serde(rename = "role", default)]
     pub roles: Vec<RawRole>,
 }
 
-/// `[demo_auth]` block: whether mint colocates the auth-service role and
+/// `[auth]` table: the auth plane. `location` is the discharge URL
+/// stamped into the enroll-gate (invite), exchange-gate (ticket), and
+/// admin-gate (admin-service) third-party caveats — where a
+/// client/operator fetches the discharge. A mint without it (and without
+/// `[auth.demo].enabled`) cannot stamp those caveats, so it has no
+/// enrollment plane — `/v1/enroll` fails closed. The path is the
+/// discharge route; the transport it is dialed over is resolved
+/// separately (`[auth.demo]` socket in the colocated demo, the remembered
+/// `auth-transport` otherwise).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawAuth {
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Colocated demo auth role (`docs/design-auth-service.md`). Demo /
+    /// single-host only; absent in production.
+    #[serde(default)]
+    pub demo: Option<RawDemoAuth>,
+}
+
+/// `[attestation]` table: the attestation plane. `location` is the
+/// discharge URL stamped into the attested third-party caveat of every
+/// role that declares `[role.attestation]` — where the holder fetches the
+/// attestation discharge. A single fixed authority (the attestation
+/// coordinator) for the deployment; absent means no role may declare
+/// attestation. The transport is resolved separately, like the auth
+/// location.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawAttestation {
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Colocated demo attestation authority. Demo / single-host only;
+    /// absent in production.
+    #[serde(default)]
+    pub demo: Option<RawDemoAttestation>,
+}
+
+/// `[auth.demo]` block: whether mint colocates the auth-service role and
 /// the UDS it binds. Demo / single-host only; production runs a separate
 /// auth-service binary.
 #[derive(Debug, Clone, Deserialize)]
@@ -220,7 +240,7 @@ pub struct RawDemoAuth {
     pub socket: Option<String>,
 }
 
-/// `[demo_attestation]` block: whether mint colocates the attestation
+/// `[attestation.demo]` block: whether mint colocates the attestation
 /// authority and the UDS it binds. Demo / single-host only; production
 /// runs a real attestation authority (for Elide, the attestation
 /// coordinator) that shares `K_M-B` with mint.
@@ -228,7 +248,7 @@ pub struct RawDemoAuth {
 pub struct RawDemoAttestation {
     /// When `true`, mint colocates the attestation authority and binds
     /// its own UDS for `/v1/discharge`. Generates `K_M-B` on first
-    /// start. Requires `[demo_auth].enabled = true`: the issuer is gated
+    /// start. Requires `[auth.demo].enabled = true`: the issuer is gated
     /// on the same login session the demo auth role mints.
     #[serde(default)]
     pub enabled: bool,
@@ -351,12 +371,12 @@ pub struct RawRole {
     /// attestation authority (`attestation_location`) must discharge.
     /// Absent ⟹ no attested caveat (the uniform key-bound credential).
     #[serde(default)]
-    pub attestation: Option<RawAttestation>,
+    pub attestation: Option<RawRoleAttestation>,
 }
 
 /// The `[role.attestation]` subtable: a role's attested-caveat contract.
 #[derive(Debug, Deserialize)]
-pub struct RawAttestation {
+pub struct RawRoleAttestation {
     /// Opaque context sealed verbatim into the attested caveat's CID and
     /// interpreted by the attestation authority alone. mint never
     /// inspects it — it carries whatever the authority's vocabulary
@@ -442,7 +462,7 @@ pub struct DemoAuth {
     pub enabled: bool,
     /// UDS the demo auth role binds, and the transport the
     /// operator/client dial to reach it. Resolved from
-    /// `[demo_auth].socket` (explicit) or `<data_dir>/auth.sock`
+    /// `[auth.demo].socket` (explicit) or `<data_dir>/auth.sock`
     /// (default). `None` when `enabled = false`.
     pub socket: Option<PathBuf>,
 }
@@ -453,7 +473,7 @@ pub struct DemoAttestation {
     pub enabled: bool,
     /// UDS the demo attestation authority binds, and the transport the
     /// client dials to reach it. Resolved from
-    /// `[demo_attestation].socket` (explicit) or `<data_dir>/attest.sock`
+    /// `[attestation.demo].socket` (explicit) or `<data_dir>/attest.sock`
     /// (default). `None` when `enabled = false`.
     pub socket: Option<PathBuf>,
 }
@@ -488,10 +508,10 @@ pub struct Config {
     /// leave it `None`.
     pub admin: Option<AdminCredential>,
     /// Colocated demo auth role — `None` if the config omits
-    /// `[demo_auth]`.
+    /// `[auth.demo]`.
     pub demo_auth: Option<DemoAuth>,
     /// Colocated demo attestation authority — `None` if the config omits
-    /// `[demo_attestation]`.
+    /// `[attestation.demo]`.
     pub demo_attestation: Option<DemoAttestation>,
     /// The discharge URL stamped into the enroll/exchange/admin gates —
     /// `None` if the config omits `auth_location`. A mint without it (and
@@ -561,6 +581,16 @@ impl Config {
             .roles_dir
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("mint_roles"));
+        // Flatten the two planes into their resolved scalar location +
+        // demo-colocation parts; everything downstream consumes those.
+        let (auth_location, demo_auth_raw) = match raw.auth {
+            Some(a) => (a.location, a.demo),
+            None => (None, None),
+        };
+        let (attestation_location, demo_attestation_raw) = match raw.attestation {
+            Some(a) => (a.location, a.demo),
+            None => (None, None),
+        };
         let mut roles = BTreeMap::new();
         for r in raw.roles {
             if r.min_ttl_seconds == 0
@@ -579,7 +609,7 @@ impl Config {
             // A role that asks for an attested caveat needs an authority
             // to discharge it; minting an undischargeable credential
             // would be a silent dead-credential trap, so reject at load.
-            if r.attestation.is_some() && raw.attestation_location.is_none() {
+            if r.attestation.is_some() && attestation_location.is_none() {
                 return Err(ConfigError::AttestationWithoutLocation { role: r.name });
             }
             let role = Role {
@@ -604,7 +634,7 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
         let listener = resolve_listener(raw.bind.as_deref(), raw.socket.as_deref(), &data_dir)?;
-        let demo_auth = raw.demo_auth.map(|d| {
+        let demo_auth = demo_auth_raw.map(|d| {
             let socket = d.enabled.then(|| {
                 d.socket
                     .map(PathBuf::from)
@@ -615,7 +645,7 @@ impl Config {
                 socket,
             }
         });
-        let demo_attestation = raw.demo_attestation.map(|d| {
+        let demo_attestation = demo_attestation_raw.map(|d| {
             let socket = d.enabled.then(|| {
                 d.socket
                     .map(PathBuf::from)
@@ -654,8 +684,8 @@ impl Config {
             admin: AdminCredential::from_env(),
             demo_auth,
             demo_attestation,
-            auth_location: raw.auth_location,
-            attestation_location: raw.attestation_location,
+            auth_location,
+            attestation_location,
             roles,
         })
     }
@@ -891,9 +921,10 @@ policy_file = "volume-ro.json"
 
     const ATTESTATION_SAMPLE: &str = r#"
 audience = "mint"
-attestation_location = "https://coord-b.example/v1/discharge"
 [store]
 bucket = "demo-bucket"
+[attestation]
+location = "https://coord-b.example/v1/discharge"
 [[role]]
 name = "volume-rw"
 min_ttl_seconds = 60
@@ -951,7 +982,7 @@ policy_file = "coord-base.json"
         // A role asking for a discharge mint cannot stamp (no authority
         // location) would mint a dead credential; load fails closed.
         let toml = ATTESTATION_SAMPLE.replace(
-            "attestation_location = \"https://coord-b.example/v1/discharge\"\n",
+            "[attestation]\nlocation = \"https://coord-b.example/v1/discharge\"\n",
             "",
         );
         assert!(matches!(
@@ -1230,7 +1261,7 @@ caveat = ["sub"]"#,
         ));
     }
 
-    /// Inject a config block (e.g. `[demo_auth]`) before the first
+    /// Inject a config block (e.g. `[auth.demo]`) before the first
     /// `[[role]]` in SAMPLE. Injecting at `[store]` would land
     /// `parse_for_test`'s `roles_dir = ...` line inside the injected
     /// table; injecting at `[[role]]` keeps every key in the right table.
@@ -1239,13 +1270,12 @@ caveat = ["sub"]"#,
     }
 
     #[test]
-    fn demo_auth_block_and_auth_location_are_parsed() {
-        // `auth_location` is a top-level scalar, so it must precede the
-        // first `[table]` header; `[demo_auth]` injects before `[[role]]`.
-        let toml = with_block(SAMPLE, "[demo_auth]\nenabled = true").replacen(
-            "audience = \"mint\"",
-            "audience = \"mint\"\nauth_location = \"https://auth.example/v1/discharge\"",
-            1,
+    fn auth_block_with_location_and_demo_is_parsed() {
+        // The whole `[auth]` plane is one table tree: `location` plus the
+        // `[auth.demo]` colocation subtable, injected before `[[role]]`.
+        let toml = with_block(
+            SAMPLE,
+            "[auth]\nlocation = \"https://auth.example/v1/discharge\"\n\n[auth.demo]\nenabled = true",
         );
         let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
         let demo = c.demo_auth.expect("demo_auth present");
@@ -1259,7 +1289,9 @@ caveat = ["sub"]"#,
 
     #[test]
     fn demo_auth_enabled_defaults_to_false() {
-        let toml = with_block(SAMPLE, "[demo_auth]\nsocket = \"x.sock\"");
+        // `[auth.demo]` alone implicitly creates the `[auth]` table with
+        // no location — demo colocation present, enabled defaulting false.
+        let toml = with_block(SAMPLE, "[auth.demo]\nsocket = \"x.sock\"");
         let c = parse_for_test(&toml, &[("volume-ro.json", "{}")]).expect("parse");
         let demo = c.demo_auth.expect("demo_auth present");
         assert!(!demo.enabled);
