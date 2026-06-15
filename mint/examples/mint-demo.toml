@@ -108,5 +108,8 @@ caveat = ["sub"]
 attested = ["project"]
 
 # Marks the role: its credential carries an attested third-party caveat
-# at attestation_location. mode defaults to the role name.
+# at attestation_location. The opaque `mode` is sealed into the caveat
+# for the attestation authority; it defaults to the role name, set it
+# only to use a distinct name for role vs mode.
 [role.attestation]
+# mode = "demo-attested"
