@@ -2424,17 +2424,18 @@ Consequence for CI: the `invite` / `enroll` / `enroll-exchange` legs
 and the fake-minter `assume-role` are hermetic and run anywhere; the
 real-Tigris `assume-role` end-to-end is VM-only.
 
-**Demo role config** (shipped as `examples/mint-demo.toml`) is four
+**Demo role config** (shipped as `examples/mint-demo.toml`) is two
 roles that together exercise every template namespace — distinct from
 the full Elide role inventory below:
 
-- `read` / `write` — plain key-bound roles over a single server-side
-  `{{env.prefix}}`; `{{env.X}}` + `{{mint.expiry}}` only, no TPC.
-- `caveat-write` — scopes to the credential's MAC-verified principal
-  (`{{env.prefix}}/{{caveat.sub}}/*`), adding `{{caveat.X}}`.
-- `attested-write` — declares `[role.attestation]`, so its credential
-  carries an attested TPC and its policy substitutes all four
-  namespaces (`{{env.prefix}}/{{caveat.sub}}/{{attested.project}}/*`).
+- `demo` — a plain key-bound role over a single server-side
+  `{{env.prefix}}`; `{{env.X}}` + `{{mint.expiry}}` only, no contract,
+  no TPC.
+- `demo-attested` — declares `[role.attestation]`, so its credential
+  carries an attested TPC and its policy substitutes the remaining two
+  namespaces over the plain ones
+  (`{{env.prefix}}/{{caveat.sub}}/{{attested.project}}/*`): `{{caveat.X}}`
+  (the credential's MAC-verified principal) and `{{attested.X}}`.
 
 The operator-authorisation loop is
 exercised at **enrollment**, not at `assume-role`: the config colocates

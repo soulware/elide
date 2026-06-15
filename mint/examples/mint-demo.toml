@@ -1,14 +1,13 @@
 # Minimal demo config (docs/design-mint.md § "Reference client & demo").
 #
-# Four roles, together exercising every template namespace. `read` /
-# `write` grant over a single server-side {{env.prefix}} ({{env.X}} +
-# {{mint.expiry}} only); `caveat-write` scopes to the credential's MAC-verified
-# principal ({{caveat.sub}}); `attested-write` adds the attestation
-# loop — its credential carries an attested third-party caveat, so
-# assume-role is refused until the client fetches a discharge from the
-# demo attestation authority attesting {{attested.project}}. Its
-# template substitutes all four namespaces. This is NOT the Elide role
-# inventory (see mint-elide.toml for that).
+# Two roles, together exercising every template namespace. `demo` is a
+# plain key-bound role over a single server-side {{env.prefix}} ({{env.X}}
+# + {{mint.expiry}} only, no contract, no TPC). `demo-attested` adds the
+# caveat and attestation namespaces: its policy substitutes {{caveat.sub}}
+# (MAC-verified) and {{attested.project}}, and its credential carries an
+# attested third-party caveat, so assume-role is refused until the client
+# fetches a discharge from the demo attestation authority. This is NOT the
+# Elide role inventory (see mint-elide.toml for that).
 # Each role's policy template lives under roles_dir (examples/demo_roles/).
 #
 # `mint serve` always talks to a real S3-compatible backend (Tigris,
@@ -29,7 +28,7 @@ audience = "mint"
 auth_location = "https://auth.elide.internal/v1/discharge"
 
 # The discharge URL stamped into the attested third-party caveat of
-# every role declaring [role.attestation] (`attested-write` below). The
+# every role declaring [role.attestation] (`demo-attested` below). The
 # path is the discharge route; the client dials
 # [demo_attestation].socket as the transport (saved by `mint login
 # --config`), so the host is never resolved in the demo.
@@ -40,8 +39,8 @@ attestation_location = "https://attest.elide.internal/v1/discharge"
 # path is used verbatim. roles_dir is set so the demo runs from mint/:
 roles_dir = "examples/demo_roles"
 # data_dir = "mint_data"
-# Each role's template defaults to <roles_dir>/<name>.json (read ->
-# examples/demo_roles/read.json); set policy_file only to override.
+# Each role's template defaults to <roles_dir>/<name>.json (demo ->
+# examples/demo_roles/demo.json); set policy_file only to override.
 
 # Listener transport (docs/design-mint.md § "Transport"). `bind` and
 # `socket` are mutually exclusive. The bundled single-host dev shape
@@ -88,33 +87,18 @@ bucket = "mint-demo"
 prefix = "demo"
 
 # Every template value is MAC-verified or server-side — there is no
-# self-asserted request scoping. `read`/`write` reference only
-# `{{env.X}}` and `{{mint.expiry}}`, so they need no `[role.template]`
-# contract; `caveat-write` and `attested-write` declare theirs below.
+# self-asserted request scoping. `demo` references only `{{env.X}}` and
+# `{{mint.expiry}}`, so it needs no `[role.template]` contract;
+# `demo-attested` declares its caveat/attested contract below.
 
 [[role]]
-name = "read"
+name = "demo"
 min_ttl_seconds = 60
 max_ttl_seconds = 3600
 default_ttl_seconds = 900
 
 [[role]]
-name = "write"
-min_ttl_seconds = 60
-max_ttl_seconds = 900
-default_ttl_seconds = 300
-
-[[role]]
-name = "caveat-write"
-min_ttl_seconds = 60
-max_ttl_seconds = 900
-default_ttl_seconds = 300
-
-[role.template]
-caveat = ["sub"]
-
-[[role]]
-name = "attested-write"
+name = "demo-attested"
 min_ttl_seconds = 60
 max_ttl_seconds = 900
 default_ttl_seconds = 300
@@ -124,5 +108,8 @@ caveat = ["sub"]
 attested = ["project"]
 
 # Marks the role: its credential carries an attested third-party caveat
-# at attestation_location. mode defaults to the role name.
+# at attestation_location. The opaque `mode` is sealed into the caveat
+# for the attestation authority; it defaults to the role name, set it
+# only to use a distinct name for role vs mode.
 [role.attestation]
+# mode = "demo-attested"
