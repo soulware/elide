@@ -35,7 +35,7 @@ fn mint_demo_config_loads() {
         cfg.auth_location.is_some(),
         "demo configures the admin-service location"
     );
-    // …and the attestation authority, so `attested-write` has a
+    // …and the attestation authority, so `demo-attested` has a
     // discharge issuer for its attested TPC.
     let attest = cfg.demo_attestation.expect("[demo_attestation] present");
     assert!(attest.enabled, "demo colocates the attestation authority");
@@ -44,14 +44,14 @@ fn mint_demo_config_loads() {
         cfg.attestation_location.is_some(),
         "the attested role requires attestation_location"
     );
-    // The four-role demo inventory, together substituting every
+    // The two-role demo inventory, together substituting every
     // template namespace.
     let mut names: Vec<&str> = cfg.roles.keys().map(String::as_str).collect();
     names.sort_unstable();
-    assert_eq!(names, ["attested-write", "caveat-write", "read", "write"]);
+    assert_eq!(names, ["demo", "demo-attested"]);
     assert!(
-        cfg.roles["attested-write"].attestation_mode.is_some(),
-        "attested-write carries the attested TPC"
+        cfg.roles["demo-attested"].attestation_mode.is_some(),
+        "demo-attested carries the attested TPC"
     );
 }
 
