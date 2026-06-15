@@ -417,7 +417,7 @@ async fn open_store(cfg: &Config) -> Result<(Store, TigrisHandles), Box<dyn std:
     // verification and demo discharge issuance): a colocated demo auth
     // role generates it locally, otherwise `auth_location` signals that the
     // auth-service binary provisioned it. K_session is purely the demo
-    // auth role's session root — generated only under `[demo_auth]`.
+    // auth role's session root — generated only under `[auth.demo]`.
     if demo_enabled || cfg.auth_location.is_some() {
         store.init_k_m_a(&cfg.data_dir, demo_enabled)?;
         if demo_enabled {
@@ -493,8 +493,8 @@ fn admin_target(cfg: &Config) -> mint::admin::AdminTarget<'_> {
 }
 
 /// Derive the auth transport from a mint config's colocated demo auth
-/// role: `unix:<[demo_auth].socket>`. Present only when
-/// `[demo_auth].enabled = true` — the only auth backend that exists
+/// role: `unix:<[auth.demo].socket>`. Present only when
+/// `[auth.demo].enabled = true` — the only auth backend that exists
 /// in-tree. Production runs a separate auth-service binary, reached via
 /// `mint login --url`.
 fn config_auth_transport(cfg: &Config) -> Result<String, Box<dyn std::error::Error>> {
@@ -504,13 +504,13 @@ fn config_auth_transport(cfg: &Config) -> Result<String, Box<dyn std::error::Err
         .and_then(|d| d.socket.clone())
         .ok_or(
             "config has no colocated demo auth role \
-             ([demo_auth].enabled = true); pass --url instead",
+             ([auth.demo].enabled = true); pass --url instead",
         )?;
     Ok(format!("unix:{}", socket.display()))
 }
 
 /// Resolve the auth transport for `mint login`: `--url`, else `--config`'s
-/// `[demo_auth]` socket, else the transport remembered from a prior login.
+/// `[auth.demo]` socket, else the transport remembered from a prior login.
 fn resolve_login_transport(
     url: Option<String>,
     config: Option<&Config>,

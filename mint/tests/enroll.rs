@@ -46,10 +46,12 @@ const VOLUME: &str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
 
 const TOML_TEMPLATE: &str = r#"
 audience = "mint"
-auth_location = "https://auth.example/v1/discharge"
-attestation_location = "https://coord-b.example/v1/discharge"
 [store]
 bucket = "demo-bucket"
+[auth]
+location = "https://auth.example/v1/discharge"
+[attestation]
+location = "https://coord-b.example/v1/discharge"
 [env]
 bucket = "demo-bucket"
 [[role]]
