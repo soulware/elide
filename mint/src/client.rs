@@ -62,6 +62,12 @@ pub enum ClientError {
     #[error("--caveat must be NAME=VALUE (got {0:?})")]
     BadCaveat(String),
     #[error(
+        "this credential carries an attested caveat — supply at least one \
+         `--attest NAME=VALUE` pair naming the value(s) the role requires \
+         (e.g. `--attest project=…`)"
+    )]
+    AttestRequired,
+    #[error(
         "exchange refused (401) — the credential ticket most likely expired \
          (it is short-lived). Re-run `mint client enroll …` for a fresh \
          one; your approval persists, so just `mint client exchange` again"
@@ -518,6 +524,13 @@ async fn attest_discharges(
     if !has_tpc {
         return Ok(Vec::new());
     }
+    // The authority refuses an empty attestation (`nothing to attest`);
+    // fail fast with the actionable flag rather than round-tripping to a
+    // 400. The client doesn't hold the role's contract, so it names the
+    // flag, not the specific values.
+    if attest.is_empty() {
+        return Err(ClientError::AttestRequired);
+    }
     let session = crate::session::load_session()?;
     let transport = crate::session::load_attest_transport()?;
     let attested: std::collections::BTreeMap<String, String> = attest.iter().cloned().collect();
@@ -810,6 +823,33 @@ mod tests {
                 Err(ClientError::BadCaveat(_))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn attest_discharges_guards_empty_attest_before_round_trip() {
+        // A credential carrying an attested TPC but no `--attest` pairs
+        // fails fast with the actionable flag — no session/transport load,
+        // no 400 round-trip to the authority.
+        let with_tpc = crate::macaroon::mint(
+            &crate::keyring::Keyring::single([7u8; 32]),
+            vec![Caveat::third_party(
+                "https://attest.example/v1/discharge",
+                vec![1u8; 28],
+                vec![2u8; 60],
+            )],
+        );
+        assert!(matches!(
+            attest_discharges(&with_tpc, &[]).await,
+            Err(ClientError::AttestRequired)
+        ));
+
+        // A credential with no TPC yields an empty list regardless of
+        // `--attest`, touching neither session nor transport.
+        let no_tpc = crate::macaroon::mint(
+            &crate::keyring::Keyring::single([7u8; 32]),
+            vec![Caveat::scalar(name::OP, "assume-role")],
+        );
+        assert!(attest_discharges(&no_tpc, &[]).await.unwrap().is_empty());
     }
 
     #[test]
