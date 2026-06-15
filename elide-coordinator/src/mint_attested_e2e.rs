@@ -166,16 +166,17 @@ async fn attested_loop_over_shipped_templates() {
     let coord_b_sock = root_p.join("coord-b.sock");
     {
         let tbl = cfg_doc.as_table_mut().expect("config table");
-        let mut set = |k: &str, v: String| {
-            tbl.insert(k.into(), toml::Value::String(v));
-        };
-        set("data_dir", root_p.join("mint_data").display().to_string());
-        set(
-            "roles_dir",
-            repo_mint.join("examples/elide_roles").display().to_string(),
-        );
-        set("socket", mint_sock.display().to_string());
-        drop(set);
+        {
+            let mut set = |k: &str, v: String| {
+                tbl.insert(k.into(), toml::Value::String(v));
+            };
+            set("data_dir", root_p.join("mint_data").display().to_string());
+            set(
+                "roles_dir",
+                repo_mint.join("examples/elide_roles").display().to_string(),
+            );
+            set("socket", mint_sock.display().to_string());
+        }
         // Colocate the demo auth role under the shipped [auth] table.
         let mut demo = toml::value::Table::new();
         demo.insert("enabled".into(), toml::Value::Boolean(true));
