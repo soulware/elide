@@ -54,8 +54,8 @@ bucket = "elide-demo"
 [[role]]
 name = "volume-ro"
 min_ttl_seconds = 60
-max_ttl_seconds = 3600         # 1h
-default_ttl_seconds = 3600
+max_ttl_seconds = 3600
+default_ttl_seconds = 3600     # 1h
 
 [role.template]
 attested = ["volume"]
@@ -66,8 +66,8 @@ attested = ["volume"]
 [[role]]
 name = "volume-rw"
 min_ttl_seconds = 60
-max_ttl_seconds = 86400        # 24h
-default_ttl_seconds = 86400
+max_ttl_seconds = 86400
+default_ttl_seconds = 86400    # 24h
 
 [role.template]
 attested = ["volume"]
@@ -78,14 +78,14 @@ attested = ["volume"]
 [[role]]
 name = "coord-ro"
 min_ttl_seconds = 60
-max_ttl_seconds = 3600         # 1h
-default_ttl_seconds = 3600
+max_ttl_seconds = 3600
+default_ttl_seconds = 3600     # 1h
 
 [[role]]
 name = "coord-rw"
 min_ttl_seconds = 60
-max_ttl_seconds = 3600         # 1h
-default_ttl_seconds = 3600
+max_ttl_seconds = 3600
+default_ttl_seconds = 3600     # 1h
 
 [role.template]
 caveat = ["sub"]
