@@ -150,16 +150,16 @@ async fn attested_loop_over_shipped_templates() {
     // The mint config is the shipped elide inventory, patched for the
     // test root. The attestation location stays the shipped value — it
     // is the authority's identity, never dialled; the connection is the
-    // coord B UDS below. [demo_auth] is inserted because the operator
+    // coord B UDS below. [auth.demo] is inserted because the operator
     // gates (login / seal / invite / approve) need an issuer and
     // production's is a separate auth-service binary.
     let repo_mint = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mint");
     let shipped =
         std::fs::read_to_string(repo_mint.join("examples/mint-elide.toml")).expect("mint-elide");
     let mut cfg_doc: toml::Value = toml::from_str(&shipped).expect("parse mint-elide.toml");
-    let location = cfg_doc["attestation_location"]
+    let location = cfg_doc["attestation"]["location"]
         .as_str()
-        .expect("shipped attestation_location")
+        .expect("shipped [attestation].location")
         .to_owned();
     let mint_sock = root_p.join("mint.sock");
     let auth_sock = root_p.join("auth.sock");
@@ -175,13 +175,18 @@ async fn attested_loop_over_shipped_templates() {
             repo_mint.join("examples/elide_roles").display().to_string(),
         );
         set("socket", mint_sock.display().to_string());
+        drop(set);
+        // Colocate the demo auth role under the shipped [auth] table.
         let mut demo = toml::value::Table::new();
         demo.insert("enabled".into(), toml::Value::Boolean(true));
         demo.insert(
             "socket".into(),
             toml::Value::String(auth_sock.display().to_string()),
         );
-        tbl.insert("demo_auth".into(), toml::Value::Table(demo));
+        tbl.get_mut("auth")
+            .and_then(toml::Value::as_table_mut)
+            .expect("[auth] table from shipped config")
+            .insert("demo".into(), toml::Value::Table(demo));
     }
     let cfg_path = root_p.join("mint.toml");
     std::fs::write(
