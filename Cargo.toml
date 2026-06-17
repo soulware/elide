@@ -1,10 +1,8 @@
 [workspace]
 members = [".", "elide-core", "elide-fetch", "elide-import", "elide-coordinator", "elide-peer-fetch", "elide-attestation"]
-# `mint` is its own workspace (mint/Cargo.toml has [workspace]): it is
-# Standalone-OSS-to-be and must build/test/lint independently of elide.
-# Excluded so `cargo … --workspace` from the root never touches it; it
-# has a dedicated CI lane. Build it with `cd mint && cargo …`.
-exclude = ["mint"]
+# `mint` was extracted to its own repo (github.com/soulware/mint). The
+# attested-loop e2e consumes its binaries cross-repo; see the attested-e2e
+# CI job and elide-coordinator/src/mint_attested_e2e.rs.
 resolver = "2"
 
 [package]
