@@ -1,0 +1,12 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "ReadVolume",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject"],
+    "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{attested.volume}}/*"],
+    "Condition": {
+      "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
+    }
+  }]
+}

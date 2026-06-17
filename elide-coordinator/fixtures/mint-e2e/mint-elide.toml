@@ -1,0 +1,91 @@
+# Example mint configuration — the Elide role inventory subset from
+# docs/design-mint.md § "Elide as customer: role inventory".
+
+audience = "mint"
+
+# data_dir / roles_dir: a relative value (including the defaults
+# mint_data / mint_roles) resolves against the working directory, not
+# this file's parent; an absolute path is used verbatim. roles_dir is
+# set here so the example runs from the mint/ crate directory:
+roles_dir = "examples/elide_roles"
+# data_dir = "mint_data"
+#
+# Each role's policy template is <roles_dir>/<name>.json by default
+# (so volume-ro -> examples/elide_roles/volume-ro.json); set an explicit
+# policy_file on a role only to override that name.
+
+# Listener transport (docs/design-mint.md § "Transport"). `bind` and
+# `socket` are mutually exclusive. The bundled single-host dev shape
+# (coordinator + mint co-resident) uses the UDS listener:
+socket = "mint_data/mint.sock"
+# For a TCP listener instead, replace the line above with:
+#   bind = "127.0.0.1:8085"
+
+[auth]
+# Discharge URL for the enroll/exchange/admin gates (separate
+# auth-service in production; no [auth.demo]). Required.
+location = "https://auth.elide.internal/v1/discharge"
+
+[attestation]
+# Discharge URL of the attestation coordinator. Required: the volume
+# roles below declare [role.attestation].
+location = "https://coord-b.elide.internal/v1/discharge"
+
+[store]
+bucket = "elide-demo"
+# endpoint = "https://t3.storage.dev"   # default; set for non-Tigris S3
+# region   = "us-east-1"                # default
+
+# Surfaced to role policy templates as `{{env.X}}` (flat scalars only).
+# The elide roles grant on `{{env.bucket}}`; here it is the same bucket
+# that holds `_mint/*`, but the two are configured independently.
+[env]
+bucket = "elide-demo"
+
+# The `[role.template]` subtable declares the role's substitution contract:
+# the `{{attested.X}}` discharge-attested names and `{{caveat.X}}` MAC-verified
+# names its policy template uses. Seal authoring rejects a template whose
+# tokens don't match these exactly, and the request path enforces them before
+# render. The volume roles also declare `[role.attestation]`: their credential
+# carries an attested third-party caveat whose opaque `mode` tells the
+# attestation coordinator which ownership check to run. `mode` defaults to
+# the role name; set it only to use a distinct name for role vs mode.
+
+[[role]]
+name = "volume-ro"
+min_ttl_seconds = 60
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
+
+[role.template]
+attested = ["volume"]
+
+[role.attestation]
+# mode = "volume-ro"
+
+[[role]]
+name = "volume-rw"
+min_ttl_seconds = 60
+max_ttl_seconds = 86400        # 24h
+default_ttl_seconds = 86400
+
+[role.template]
+attested = ["volume"]
+
+[role.attestation]
+# mode = "volume-rw"
+
+[[role]]
+name = "coord-ro"
+min_ttl_seconds = 60
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
+
+[[role]]
+name = "coord-rw"
+min_ttl_seconds = 60
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
+
+[role.template]
+caveat = ["sub"]
