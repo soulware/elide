@@ -17,10 +17,12 @@
 //!
 //! Only the *composition* is reimplemented — the AEAD, BLAKE3, and MsgPack
 //! primitives are the identical crates mint uses, so the drift surface is
-//! the layout, not the cryptography. A shared known-answer fixture
+//! the layout, not the cryptography. A known-answer fixture
 //! (`testdata/mint-discharge-vectors.json`) pins this against the canonical
-//! mint implementation in both test suites; see the test below and
-//! `mint/tests/discharge_vectors.rs`.
+//! mint implementation; see the test below. mint is the producer of that
+//! fixture (`tests/discharge_vectors.rs` in the soulware/mint repo); we
+//! vendor a copy here, and CI's attested-e2e job fails if it drifts from
+//! the pinned mint.
 //!
 //! coord B never *encrypts* a CID in production (mint does) and never
 //! *verifies* a discharge (mint does). A test-only [`encrypt_cid_attested`]
