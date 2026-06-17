@@ -88,12 +88,13 @@ jobs:
             --test gc_proptest \
             --test segment_head_proptest
 
-  # The attested-loop e2e composes both workspaces: a real mint daemon
-  # (the hermetic `mint-e2e` harness), the coord B discharge listener,
-  # and the coordinator's enrollment + assume-role client, over the
-  # shipped elide role templates. The test is #[ignore]d (it spawns the
-  # mint workspace's binaries and binds sockets), so it gets its own
-  # job that builds those binaries first.
+  # The attested-loop e2e composes two repos: a real mint daemon (the
+  # hermetic `mint-e2e` harness, from github.com/soulware/mint), the
+  # coord B discharge listener, and the coordinator's enrollment +
+  # assume-role client, over elide's own mint role templates (the
+  # fixtures under elide-coordinator/fixtures/mint-e2e/). The test is
+  # #[ignore]d (it spawns the mint binaries and binds sockets), so it
+  # gets its own job that checks out and builds mint first.
   attested-e2e:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -101,59 +102,44 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # mint is a separate (public) repo; only its binaries are consumed
+      # here. Pin `ref` to a tag/SHA to test against a known mint, not a
+      # moving main.
+      - name: checkout mint
+        uses: actions/checkout@v6
+        with:
+          repository: soulware/mint
+          ref: main
+          path: .mint-ci
+
+      # mint is the producer of the discharge known-answer vectors;
+      # elide vendors a copy (testdata/mint-discharge-vectors.json) that
+      # its coord-B reimplementation tests pin against. The two repos must
+      # agree on the wire format, so fail loudly if elide's copy has
+      # drifted from the pinned mint's — regenerate in mint
+      # (MINT_EMIT_VECTORS=1), copy it here, and re-verify the reimpl.
+      - name: discharge vectors in sync with mint
+        run: |
+          diff -u testdata/mint-discharge-vectors.json \
+                  .mint-ci/testdata/mint-discharge-vectors.json \
+            || { echo "::error::elide's discharge vectors have drifted from mint@main"; exit 1; }
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: attested-e2e
           workspaces: |
             .
-            mint
+            .mint-ci
 
       - name: build mint bins
-        working-directory: mint
+        working-directory: .mint-ci
         run: cargo build --bin mint --features e2e-harness --bin mint-e2e
 
       - name: attested-loop e2e
         env:
-          MINT_BIN: ${{ github.workspace }}/mint/target/debug/mint
-          MINT_E2E_BIN: ${{ github.workspace }}/mint/target/debug/mint-e2e
+          MINT_BIN: ${{ github.workspace }}/.mint-ci/target/debug/mint
+          MINT_E2E_BIN: ${{ github.workspace }}/.mint-ci/target/debug/mint-e2e
         run: |
           cargo test -p elide-coordinator --bin elide-coordinator -- \
             --ignored attested_loop
-
-  # `mint` is its own workspace (excluded from the root one), so the
-  # jobs above never touch it. This dedicated lane is its entire CI:
-  # fmt, clippy, and tests, all run from within mint/.
-  mint:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-
-    defaults:
-      run:
-        working-directory: mint
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: mint-build
-          workspaces: mint
-
-      - name: cargo fmt --check
-        run: cargo fmt --check
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets --features e2e-harness -- -D warnings
-
-      - name: cargo test
-        run: cargo test --no-fail-fast
-
-      - name: Upload proptest regressions
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: proptest-regressions
-          path: "**/proptest-regressions/**"
-          if-no-files-found: ignore

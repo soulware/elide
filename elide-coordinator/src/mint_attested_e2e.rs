@@ -1,16 +1,19 @@
-//! End-to-end proof of the attested credential loop over the **shipped**
-//! elide role inventory: a real mint daemon (the hermetic `mint-e2e`
-//! harness from the mint workspace), a real coord B discharge listener
-//! (`elide-attestation`), and this crate's own enrollment + assume-role
-//! client as coord A. The mint config is `mint/examples/mint-elide.toml`
-//! itself, patched only for paths, the attestation location, and the
-//! colocated demo auth role; the sealed templates are the shipped
-//! `mint/examples/elide_roles/*.json`.
+//! End-to-end proof of the attested credential loop over elide's own
+//! mint role inventory: a real mint daemon (the hermetic `mint-e2e`
+//! harness from the mint repo, github.com/soulware/mint), a real coord B
+//! discharge listener (`elide-attestation`), and this crate's own
+//! enrollment + assume-role client as coord A. The mint config and role
+//! templates are elide-owned fixtures under
+//! `elide-coordinator/fixtures/mint-e2e/` (mint is a separate repo; only
+//! its binaries are consumed, via MINT_BIN / MINT_E2E_BIN). The config is
+//! patched only for paths, the attestation location, and the colocated
+//! demo auth role.
 //!
-//! Ignored by default: it spawns the mint workspace's binaries and binds
-//! sockets. Build them first, then point the env vars at them:
+//! Ignored by default: it spawns the mint binaries and binds sockets.
+//! Check out and build mint, then point the env vars at it:
 //!
 //! ```sh
+//! git clone https://github.com/soulware/mint   # or use an existing checkout
 //! (cd mint && cargo build --bin mint --features e2e-harness --bin mint-e2e)
 //! MINT_BIN=mint/target/debug/mint MINT_E2E_BIN=mint/target/debug/mint-e2e \
 //!   cargo test -p elide-coordinator --bin elide-coordinator -- --ignored attested_loop
@@ -49,7 +52,8 @@ fn bin_from_env(var: &str) -> PathBuf {
     match std::env::var_os(var) {
         Some(p) => PathBuf::from(p),
         None => panic!(
-            "{var} not set; build the mint workspace bins first:\n  \
+            "{var} not set; check out and build the mint repo first:\n  \
+             git clone https://github.com/soulware/mint\n  \
              (cd mint && cargo build --bin mint --features e2e-harness --bin mint-e2e)\n\
              and point MINT_BIN / MINT_E2E_BIN at mint/target/debug/"
         ),
@@ -147,15 +151,17 @@ async fn attested_loop_over_shipped_templates() {
     std::fs::create_dir_all(&bucket_dir).expect("bucket dir");
     std::fs::create_dir_all(home.join(".config")).expect("home dir");
 
-    // The mint config is the shipped elide inventory, patched for the
-    // test root. The attestation location stays the shipped value — it
-    // is the authority's identity, never dialled; the connection is the
-    // coord B UDS below. [auth.demo] is inserted because the operator
-    // gates (login / seal / invite / approve) need an issuer and
-    // production's is a separate auth-service binary.
-    let repo_mint = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mint");
-    let shipped =
-        std::fs::read_to_string(repo_mint.join("examples/mint-elide.toml")).expect("mint-elide");
+    // The mint config is elide's own mint inventory, patched for the
+    // test root. mint is a separate repo now; elide owns the config and
+    // role templates it runs mint with — these fixtures live here, not
+    // in the mint checkout (only the binaries come from there, via
+    // MINT_BIN / MINT_E2E_BIN). The attestation location stays the
+    // fixture value — it is the authority's identity, never dialled; the
+    // connection is the coord B UDS below. [auth.demo] is inserted
+    // because the operator gates (login / seal / invite / approve) need
+    // an issuer and production's is a separate auth-service binary.
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mint-e2e");
+    let shipped = std::fs::read_to_string(fixtures.join("mint-elide.toml")).expect("mint-elide");
     let mut cfg_doc: toml::Value = toml::from_str(&shipped).expect("parse mint-elide.toml");
     let location = cfg_doc["attestation"]["location"]
         .as_str()
@@ -173,7 +179,7 @@ async fn attested_loop_over_shipped_templates() {
             set("data_dir", root_p.join("mint_data").display().to_string());
             set(
                 "roles_dir",
-                repo_mint.join("examples/elide_roles").display().to_string(),
+                fixtures.join("elide_roles").display().to_string(),
             );
             set("socket", mint_sock.display().to_string());
         }
