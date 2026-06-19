@@ -1,0 +1,101 @@
+# Elide's mint configuration: the role inventory the stock mint binary is
+# sealed with to serve an Elide deployment (`mint serve --config
+# mint-elide.toml`; see README.md). The [[role]] inventory and its
+# caveat/attestation contracts are fixed and version-locked to the
+# coordinator; the keys marked PER-DEPLOYMENT below are filled in per site.
+
+audience = "mint"
+
+# roles_dir / data_dir: a relative value resolves against mint's working
+# directory, not this file's parent; an absolute path is used verbatim.
+# `roles` is the policy-template directory shipped alongside this file.
+roles_dir = "roles"
+# data_dir = "mint_data"   # default; the keyring + sealed surface live here
+#
+# Each role's policy template is <roles_dir>/<name>.json by default
+# (volume-ro -> roles/volume-ro.json); set an explicit policy_file on a
+# role only to override that name.
+
+# PER-DEPLOYMENT. Listener transport; `bind` and `socket` are mutually
+# exclusive. UDS for the single-host shape (coordinator + mint co-resident),
+# a TCP `bind` for a standalone mint:
+socket = "mint_data/mint.sock"
+#   bind = "127.0.0.1:8085"
+
+[auth]
+# PER-DEPLOYMENT. Discharge URL for the enroll/exchange/admin gates — the
+# auth service's identity. Required.
+location = "https://auth.elide.internal/v1/discharge"
+
+[attestation]
+# PER-DEPLOYMENT. Discharge URL of the attestation coordinator (coord B).
+# Required: the volume roles below declare [role.attestation].
+location = "https://coord-b.elide.internal/v1/discharge"
+
+[store]
+# PER-DEPLOYMENT. The bucket mint administers (holds `_mint/*`).
+bucket = "elide"
+# endpoint = "https://t3.storage.dev"   # default; set for non-Tigris S3
+# region   = "us-east-1"                # default
+
+# PER-DEPLOYMENT. Surfaced to role policy templates as `{{env.X}}` (flat
+# scalars only). The roles grant on `{{env.bucket}}` — the bucket holding
+# Elide volume data, configured independently of [store].bucket above.
+[env]
+bucket = "elide"
+
+# The `[role.template]` subtable declares the role's caveat contract: the
+# full manifest of `{{caveat.X}}` names its policy template substitutes,
+# whatever their provenance. Seal authoring rejects a template whose
+# `{{caveat.X}}` tokens don't match this set exactly. The volume roles also
+# declare `[role.attestation]`: `attested` lists the caveat names sourced
+# from a discharge (a subset of `[role.template].caveat`), baked into the
+# credential at exchange-finalize; the opaque `mode` tells the attestation
+# coordinator which ownership check to run and defaults to the role name;
+# `intermediate_ttl_seconds` is required and bounds the exchange-finalize
+# intermediate — `0` = no expiry, so the coordinator holds the intermediate
+# and finalizes it per-volume for its lifetime (Elide's case); `n > 0` would
+# force a single back-to-back finalize.
+
+[[role]]
+name = "volume-ro"
+min_ttl_seconds = 60
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
+
+[role.template]
+caveat = ["volume"]
+
+[role.attestation]
+attested = ["volume"]
+intermediate_ttl_seconds = 0   # no expiry: held + finalized per-volume
+# mode defaults to the role name (volume-ro)
+
+[[role]]
+name = "volume-rw"
+min_ttl_seconds = 60
+max_ttl_seconds = 86400        # 24h
+default_ttl_seconds = 86400
+
+[role.template]
+caveat = ["volume"]
+
+[role.attestation]
+attested = ["volume"]
+intermediate_ttl_seconds = 0   # no expiry: held + finalized per-volume
+# mode defaults to the role name (volume-rw)
+
+[[role]]
+name = "coord-ro"
+min_ttl_seconds = 60
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
+
+[[role]]
+name = "coord-rw"
+min_ttl_seconds = 60
+max_ttl_seconds = 3600         # 1h
+default_ttl_seconds = 3600
+
+[role.template]
+caveat = ["sub"]

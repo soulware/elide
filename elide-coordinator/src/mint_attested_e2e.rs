@@ -3,11 +3,11 @@
 //! harness from the mint repo, github.com/soulware/mint), a real coord B
 //! discharge listener (`elide-attestation`), and this crate's own
 //! enrollment + assume-role client as coord A. The mint config and role
-//! templates are elide-owned fixtures under
-//! `elide-coordinator/fixtures/mint-e2e/` (mint is a separate repo; only
-//! its binaries are consumed, via MINT_BIN / MINT_E2E_BIN). The config is
-//! patched only for paths, the attestation location, and the colocated
-//! demo auth role.
+//! templates are the elide-owned deployment artifact under `deploy/mint/`
+//! (mint is a separate repo; only its binaries are consumed, via MINT_BIN /
+//! MINT_E2E_BIN) — this test is the lockstep check that the coordinator
+//! client works against exactly those shipped templates. The config is
+//! patched only for paths and the colocated demo auth role.
 //!
 //! Ignored by default: it spawns the mint binaries and binds sockets.
 //! Build mint from a sibling `../mint` checkout (clone it there if you
@@ -150,17 +150,17 @@ async fn attested_loop_over_shipped_templates() {
     std::fs::create_dir_all(&bucket_dir).expect("bucket dir");
     std::fs::create_dir_all(home.join(".config")).expect("home dir");
 
-    // The mint config is elide's own mint inventory, patched for the
-    // test root. mint is a separate repo now; elide owns the config and
-    // role templates it runs mint with — these fixtures live here, not
-    // in the mint checkout (only the binaries come from there, via
-    // MINT_BIN / MINT_E2E_BIN). The attestation location stays the
-    // fixture value — it is the authority's identity, never dialled; the
-    // connection is the coord B UDS below. [auth.demo] is inserted
-    // because the operator gates (login / seal / invite / approve) need
-    // an issuer and production's is a separate auth-service binary.
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mint-e2e");
-    let shipped = std::fs::read_to_string(fixtures.join("mint-elide.toml")).expect("mint-elide");
+    // The shipped deployment artifact (deploy/mint/), patched for the test
+    // root. mint is a separate repo; elide owns the config + role templates
+    // it runs mint with (only the binaries come from there, via MINT_BIN /
+    // MINT_E2E_BIN), so this test runs the real shipped config. The
+    // attestation location stays the shipped value — it is the authority's
+    // identity, never dialled; the connection is the coord B UDS below.
+    // [auth.demo] is inserted because the operator gates (login / seal /
+    // invite / approve) need an issuer and production's is a separate
+    // auth-service binary.
+    let deploy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/mint");
+    let shipped = std::fs::read_to_string(deploy.join("mint-elide.toml")).expect("mint-elide");
     let mut cfg_doc: toml::Value = toml::from_str(&shipped).expect("parse mint-elide.toml");
     let location = cfg_doc["attestation"]["location"]
         .as_str()
@@ -176,10 +176,7 @@ async fn attested_loop_over_shipped_templates() {
                 tbl.insert(k.into(), toml::Value::String(v));
             };
             set("data_dir", root_p.join("mint_data").display().to_string());
-            set(
-                "roles_dir",
-                fixtures.join("elide_roles").display().to_string(),
-            );
+            set("roles_dir", deploy.join("roles").display().to_string());
             set("socket", mint_sock.display().to_string());
         }
         // Colocate the demo auth role under the shipped [auth] table.
