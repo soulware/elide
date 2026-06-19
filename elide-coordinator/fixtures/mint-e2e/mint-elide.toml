@@ -42,14 +42,14 @@ bucket = "elide-demo"
 [env]
 bucket = "elide-demo"
 
-# The `[role.template]` subtable declares the role's substitution contract:
-# the `{{attested.X}}` discharge-attested names and `{{caveat.X}}` MAC-verified
-# names its policy template uses. Seal authoring rejects a template whose
-# tokens don't match these exactly, and the request path enforces them before
-# render. The volume roles also declare `[role.attestation]`: their credential
-# carries an attested third-party caveat whose opaque `mode` tells the
-# attestation coordinator which ownership check to run. `mode` defaults to
-# the role name; set it only to use a distinct name for role vs mode.
+# The `[role.template]` subtable declares the role's caveat contract: the
+# full manifest of `{{caveat.X}}` names its policy template substitutes,
+# whatever their provenance. Seal authoring rejects a template whose
+# `{{caveat.X}}` tokens don't match this set exactly. The volume roles also
+# declare `[role.attestation]`: `attested` lists the caveat names sourced
+# from a discharge (a subset of `[role.template].caveat`), baked into the
+# credential at exchange-finalize; the opaque `mode` tells the attestation
+# coordinator which ownership check to run and defaults to the role name.
 
 [[role]]
 name = "volume-ro"
@@ -58,10 +58,11 @@ max_ttl_seconds = 3600         # 1h
 default_ttl_seconds = 3600
 
 [role.template]
-attested = ["volume"]
+caveat = ["volume"]
 
 [role.attestation]
-# mode = "volume-ro"
+attested = ["volume"]
+# mode defaults to the role name (volume-ro)
 
 [[role]]
 name = "volume-rw"
@@ -70,10 +71,11 @@ max_ttl_seconds = 86400        # 24h
 default_ttl_seconds = 86400
 
 [role.template]
-attested = ["volume"]
+caveat = ["volume"]
 
 [role.attestation]
-# mode = "volume-rw"
+attested = ["volume"]
+# mode defaults to the role name (volume-rw)
 
 [[role]]
 name = "coord-ro"
