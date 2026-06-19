@@ -10,12 +10,12 @@
 //! demo auth role.
 //!
 //! Ignored by default: it spawns the mint binaries and binds sockets.
-//! Check out and build mint, then point the env vars at it:
+//! Build mint from a sibling `../mint` checkout (clone it there if you
+//! don't have one) and point the env vars at the two binaries:
 //!
 //! ```sh
-//! git clone https://github.com/soulware/mint   # or use an existing checkout
-//! (cd mint && cargo build --bin mint --features e2e-harness --bin mint-e2e)
-//! MINT_BIN=mint/target/debug/mint MINT_E2E_BIN=mint/target/debug/mint-e2e \
+//! (cd ../mint && cargo build --bin mint --features e2e-harness --bin mint-e2e)
+//! MINT_BIN=../mint/target/debug/mint MINT_E2E_BIN=../mint/target/debug/mint-e2e \
 //!   cargo test -p elide-coordinator --bin elide-coordinator -- --ignored attested_loop
 //! ```
 //!
@@ -52,10 +52,9 @@ fn bin_from_env(var: &str) -> PathBuf {
     match std::env::var_os(var) {
         Some(p) => PathBuf::from(p),
         None => panic!(
-            "{var} not set; check out and build the mint repo first:\n  \
-             git clone https://github.com/soulware/mint\n  \
-             (cd mint && cargo build --bin mint --features e2e-harness --bin mint-e2e)\n\
-             and point MINT_BIN / MINT_E2E_BIN at mint/target/debug/"
+            "{var} not set; build mint from a sibling ../mint checkout first:\n  \
+             (cd ../mint && cargo build --bin mint --features e2e-harness --bin mint-e2e)\n\
+             then point MINT_BIN / MINT_E2E_BIN at ../mint/target/debug/"
         ),
     }
 }
@@ -439,9 +438,9 @@ async fn attested_loop_over_shipped_templates() {
         "refusal happens at coord B, got: {err}"
     );
 
-    // Fail-closed: the sealed template demands `attested.volume`, so a
-    // client not configured for attestation presents an undischarged TPC
-    // and mint refuses the volume role outright.
+    // Fail-closed: the sealed role attests `volume`, so a client not
+    // configured for attestation presents an undischarged TPC and mint
+    // refuses the volume role outright.
     let blind_cfg = MintConfig {
         attestation_location: None,
         attestation_transport: None,
