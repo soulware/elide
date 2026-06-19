@@ -302,10 +302,6 @@ async fn run() -> Result<()> {
                 &session,
             )
             .await
-            // The returned ticket is only of use for on-demand per-volume
-            // credential minting; `elide coord enroll` provisions the
-            // coord roles and is done.
-            .map(|_ticket| ())
             .map_err(anyhow::Error::from)
         }
     }

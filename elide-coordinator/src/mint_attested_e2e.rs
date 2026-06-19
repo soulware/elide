@@ -284,9 +284,6 @@ async fn attested_loop_over_shipped_templates() {
         let cfg = mint_cfg.clone();
         let identity = identity.clone();
         let coord_dir = coord_dir.clone();
-        // The operator session is reused below to mint per-volume
-        // credentials, so the task gets a clone.
-        let session = session.clone();
         tokio::spawn(async move {
             enroll::run(
                 &cfg,
@@ -319,11 +316,10 @@ async fn attested_loop_over_shipped_templates() {
             }
         }
     }
-    let ticket = enroll_task
+    enroll_task
         .await
         .expect("enroll task")
-        .expect("enrollment completes");
-    assert!(!ticket.is_empty(), "enrollment returns a reusable ticket");
+        .expect("enrollment completes — coord credentials + volume parents");
 
     // A named, locally-keyed volume to anchor on, forked from a parent:
     // key + name in the coordinator's fork dir (what coord A's discharge
@@ -379,19 +375,12 @@ async fn attested_loop_over_shipped_templates() {
     .expect("put names record");
 
     // The loop itself. Coord roles were minted directly at enrollment;
-    // volume roles are attested and per-volume, so each is first
-    // exchange-finalized for its target — coord B vouches the volume and
-    // mint bakes it into the credential — then assumed as a pure render.
+    // volume roles are attested and per-volume, so the first `assume-role`
+    // for a volume *finalizes* its credential from the durable enrollment
+    // parent — coord B vouches the volume, mint bakes it in — stores it, and
+    // renders. Every later `assume-role` reads that stored credential and is
+    // a pure render. No operator session or ticket is in this path.
     let endpoint = MintEndpoint::new(&mint_cfg, coord_dir.clone(), identity.clone());
-
-    // Mint a per-volume credential through the operator-gated
-    // enroll-exchange + coord-B-discharged exchange-finalize flow.
-    let provision = async |endpoint: &MintEndpoint, cfg: &MintConfig, role, target| {
-        enroll::exchange_volume_role(
-            cfg, endpoint, &identity, &coord_dir, &ticket, &session, role, target,
-        )
-        .await
-    };
 
     // A coord role was minted directly at enrollment; assume-role is a
     // pure render with no attestation.
@@ -400,74 +389,61 @@ async fn attested_loop_over_shipped_templates() {
         .await
         .expect("coord-ro assumes without a discharge");
 
-    // volume-rw: possession of owned's volume.key + binding liveness,
-    // vouched by coord B at finalize, baked by mint as the by_id/<owned>
-    // scope; assume-role then renders it.
-    provision(
-        &endpoint,
-        &mint_cfg,
-        "volume-rw",
-        AssumeTarget::VolumeRw(owned),
-    )
-    .await
-    .expect("volume-rw exchange-finalize");
+    // volume-rw: first assume finalizes (possession of owned's volume.key +
+    // binding liveness, vouched by coord B, baked by mint as the
+    // by_id/<owned> scope) then renders.
     let rw = endpoint
         .assume_role("volume-rw", 3600, AssumeTarget::VolumeRw(owned))
         .await
-        .expect("volume-rw round trip");
+        .expect("volume-rw finalize-on-miss + render");
     assert!(!rw.access_key_id.is_empty(), "vended keypair");
 
     // volume-ro: the fork's parent is in owned's read set; the leaf
-    // reading its own prefix is the degenerate target == owned case.
+    // reading its own prefix is the degenerate target == owned case. One
+    // durable parent finalizes for both volumes.
     for target in [parent, owned] {
-        let t = AssumeTarget::VolumeRo { owned, target };
-        provision(&endpoint, &mint_cfg, "volume-ro", t)
-            .await
-            .expect("volume-ro exchange-finalize");
         endpoint
-            .assume_role("volume-ro", 3600, t)
+            .assume_role("volume-ro", 3600, AssumeTarget::VolumeRo { owned, target })
             .await
-            .expect("volume-ro round trip");
+            .expect("volume-ro finalize-on-miss + render");
     }
 
     // A volume outside owned's read set: coord B refuses the discharge at
-    // finalize, so no credential is ever minted — the refusal moved from
-    // assume-role to exchange-finalize along with the volume scope.
+    // finalize, so no credential is ever minted and the first assume fails.
     let stranger = Ulid::new();
-    let err = provision(
-        &endpoint,
-        &mint_cfg,
-        "volume-ro",
-        AssumeTarget::VolumeRo {
-            owned,
-            target: stranger,
-        },
-    )
-    .await
-    .expect_err("a volume outside the read set must not be vouched");
+    let err = endpoint
+        .assume_role(
+            "volume-ro",
+            3600,
+            AssumeTarget::VolumeRo {
+                owned,
+                target: stranger,
+            },
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a volume outside the read set must not be vouched");
     assert!(
         err.to_string().contains("coord B discharge"),
         "refusal happens at coord B, got: {err}"
     );
 
-    // Fail-closed: a client not configured for attestation cannot
-    // discharge the intermediate's attestation TPC, so it can never
-    // finalize a volume credential — the attested role is unreachable
-    // without attestation.
+    // Fail-closed: a client not configured for attestation cannot discharge
+    // the parent's attestation TPC, so it can never finalize a volume
+    // credential. Use a not-yet-finalized volume so the call hits
+    // finalize-on-miss rather than rendering an already-stored credential.
     let blind_cfg = MintConfig {
         attestation_location: None,
         attestation_transport: None,
         ..mint_cfg.clone()
     };
     let blind = MintEndpoint::new(&blind_cfg, coord_dir.clone(), identity.clone());
-    let err = provision(
-        &blind,
-        &blind_cfg,
-        "volume-rw",
-        AssumeTarget::VolumeRw(owned),
-    )
-    .await
-    .expect_err("an undischargeable attestation TPC must not finalize");
+    let blind_vol = Ulid::new();
+    let err = blind
+        .assume_role("volume-rw", 3600, AssumeTarget::VolumeRw(blind_vol))
+        .await
+        .map(|_| ())
+        .expect_err("an undischargeable attestation TPC must not finalize");
     assert!(
         err.to_string().contains("attestation_location"),
         "a blind client cannot finalize a volume credential, got: {err}"
