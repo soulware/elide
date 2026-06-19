@@ -87,15 +87,15 @@ pub(crate) const ROLE_COORD_RW: &str = "coord-rw";
 pub(crate) const ROLE_VOLUME_RW: &str = "volume-rw";
 pub(crate) const ROLE_VOLUME_RO: &str = "volume-ro";
 
-/// Filename of the durable, volume-parametric enrollment *parent* stored
-/// under an attested role's directory (`credentials/<role>/_parent`). The
-/// parent is the `op=exchange-finalize` token exchanged once at enrollment
-/// (operator-gated) and finalized per-volume at runtime
-/// ([`MintEndpoint::assume_role`]'s finalize-on-miss), which writes the
-/// rendered per-volume credential alongside it at
+/// Filename of the durable, volume-parametric enrollment *intermediate*
+/// stored under an attested role's directory
+/// (`credentials/<role>/_intermediate`). It is the `op=exchange-finalize`
+/// token exchanged once at enrollment (operator-gated) and finalized
+/// per-volume at runtime ([`MintEndpoint::assume_role`]'s finalize-on-miss),
+/// which writes the rendered per-volume credential alongside it at
 /// `credentials/<role>/<volume>`. Lowercase, so it can never collide with a
 /// volume ULID (uppercase Crockford base32).
-pub(crate) const PARENT_FILE: &str = "_parent";
+pub(crate) const INTERMEDIATE_FILE: &str = "_intermediate";
 
 const CAVEAT_EXP: &str = "exp";
 
@@ -803,10 +803,11 @@ impl MintEndpoint {
     }
 
     /// Finalize the per-volume credential for an attested `target` from the
-    /// durable enrollment parent (`credentials/<role>/_parent`) and persist
-    /// it `0600` at `cred_path`, returning the rendered credential string.
+    /// durable enrollment intermediate (`credentials/<role>/_intermediate`)
+    /// and persist it `0600` at `cred_path`, returning the rendered
+    /// credential string.
     ///
-    /// The parent is the `op=exchange-finalize` token exchanged once at
+    /// The intermediate is the `op=exchange-finalize` token exchanged once at
     /// enrollment; [`Self::finalize_volume`] discharges its attestation TPC
     /// via coord B (vouching the volume, anchored on `owned`) and bakes the
     /// volume in. Called on the first `assume-role` for a volume that has no
@@ -821,21 +822,23 @@ impl MintEndpoint {
         let (owned, vouched) = target
             .attestation()
             .ok_or_else(|| io::Error::other(format!("{role} is not an attested volume role")))?;
-        let parent_path = self
+        let intermediate_path = self
             .data_dir
             .join("credentials")
             .join(role)
-            .join(PARENT_FILE);
-        let parent = std::fs::read_to_string(&parent_path).map_err(|e| {
+            .join(INTERMEDIATE_FILE);
+        let intermediate = std::fs::read_to_string(&intermediate_path).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!(
-                    "reading {role} enrollment parent at {}: {e} (run `elide coord enroll`)",
-                    parent_path.display()
+                    "reading {role} enrollment intermediate at {}: {e} (run `elide coord enroll`)",
+                    intermediate_path.display()
                 ),
             )
         })?;
-        let credential = self.finalize_volume(owned, vouched, parent.trim()).await?;
+        let credential = self
+            .finalize_volume(owned, vouched, intermediate.trim())
+            .await?;
         write_credential_file(cred_path, role, &credential)?;
         Ok(credential)
     }
@@ -859,10 +862,10 @@ impl MintEndpoint {
         let stored = match std::fs::read_to_string(&cred_path) {
             Ok(s) => s,
             // An attested volume role's per-volume credential is finalized
-            // on first use from the durable enrollment parent, then stored
-            // so every later assume-role is a pure render. A coord role has
-            // no parent, so a missing file there is an un-enrolled
-            // coordinator, not a finalize trigger.
+            // on first use from the durable enrollment intermediate, then
+            // stored so every later assume-role is a pure render. A coord
+            // role has no intermediate, so a missing file there is an
+            // un-enrolled coordinator, not a finalize trigger.
             Err(e) if e.kind() == io::ErrorKind::NotFound && target.attestation().is_some() => {
                 self.finalize_volume_credential(role, target, &cred_path)
                     .await?

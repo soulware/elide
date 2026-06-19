@@ -92,7 +92,7 @@ jobs:
   # hermetic `mint-e2e` harness, from github.com/soulware/mint), the
   # coord B discharge listener, and the coordinator's enrollment +
   # assume-role client, over elide's own mint role templates (the
-  # fixtures under elide-coordinator/fixtures/mint-e2e/). The test is
+  # shipped deployment artifact under deploy/mint/). The test is
   # #[ignore]d (it spawns the mint binaries and binds sockets), so it
   # gets its own job that checks out and builds mint first.
   attested-e2e:

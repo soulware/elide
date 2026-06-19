@@ -224,7 +224,7 @@ pub(crate) async fn release_volume_op(
     // `names/<name>` flip + the `events/<name>/` emission, and per-vol
     // `volume-rw` for the `by_id/<vol>/snapshots/` promote / publish.
     // `coord-rw` has no access to `by_id/` (see
-    // `mint/examples/elide_roles/`), so the typed [`VolumeData`] is
+    // `deploy/mint/roles/`), so the typed [`VolumeData`] is
     // constructed once `vol_ulid` is known and threaded into each
     // by_id/ op.
     let writer = ctx.stores.writer();

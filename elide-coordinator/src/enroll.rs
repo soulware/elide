@@ -5,10 +5,11 @@
 //! operator approves out of band (B), then exchange the ticket once per
 //! role (C). A coord role's credential is written to
 //! `<data_dir>/credentials/<role>`; an attested volume role's durable,
-//! volume-parametric parent to `<data_dir>/credentials/<role>/_parent`
-//! (finalized per-volume at runtime — `crate::mint_client`). The credential
-//! ticket lives in memory for the command's duration and never touches disk
-//! — those files are the only durable enrollment artifacts.
+//! volume-parametric intermediate to
+//! `<data_dir>/credentials/<role>/_intermediate` (finalized per-volume at
+//! runtime — `crate::mint_client`). The credential ticket lives in memory
+//! for the command's duration and never touches disk — those files are the
+//! only durable enrollment artifacts.
 //!
 //! A and C are operator-gated: the invite and the ticket each carry a
 //! third-party caveat keyed by the auth service, so the command fetches
@@ -40,7 +41,7 @@ use elide_coordinator::config::MintConfig;
 use elide_coordinator::identity::CoordinatorIdentity;
 
 use crate::mint_client::{
-    PARENT_FILE, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO, ROLE_VOLUME_RW, WireMacaroon,
+    INTERMEDIATE_FILE, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO, ROLE_VOLUME_RW, WireMacaroon,
     json_str_field, now_unix, pop_digest, post, write_credential_file,
 };
 
@@ -88,40 +89,41 @@ fn credentials_dir(data_dir: &Path) -> PathBuf {
 struct EnrollRole {
     name: &'static str,
     /// `true` for an attested volume role: the exchange yields a durable,
-    /// volume-parametric *parent* stored at `credentials/<role>/_parent` and
-    /// finalized per-volume at runtime. `false` for a coord role: a
-    /// directly-assumable credential at `credentials/<role>`.
-    parent: bool,
+    /// volume-parametric *intermediate* stored at
+    /// `credentials/<role>/_intermediate` and finalized per-volume at
+    /// runtime. `false` for a coord role: a directly-assumable credential at
+    /// `credentials/<role>`.
+    intermediate: bool,
 }
 
 const ENROLL_ROLES: &[EnrollRole] = &[
     EnrollRole {
         name: ROLE_COORD_RO,
-        parent: false,
+        intermediate: false,
     },
     EnrollRole {
         name: ROLE_COORD_RW,
-        parent: false,
+        intermediate: false,
     },
     EnrollRole {
         name: ROLE_VOLUME_RW,
-        parent: true,
+        intermediate: true,
     },
     EnrollRole {
         name: ROLE_VOLUME_RO,
-        parent: true,
+        intermediate: true,
     },
 ];
 
 impl EnrollRole {
     /// Where this role's enrollment artifact lands. A coord role is the file
-    /// `credentials/<role>`; an attested role's parent is
-    /// `credentials/<role>/_parent` (the same directory the per-volume
+    /// `credentials/<role>`; an attested role's intermediate is
+    /// `credentials/<role>/_intermediate` (the same directory the per-volume
     /// credentials finalize into).
     fn path(&self, data_dir: &Path) -> PathBuf {
         let base = credentials_dir(data_dir).join(self.name);
-        if self.parent {
-            base.join(PARENT_FILE)
+        if self.intermediate {
+            base.join(INTERMEDIATE_FILE)
         } else {
             base
         }
@@ -345,8 +347,9 @@ async fn exchange_request(
 }
 
 /// `[mint]` startup gate. Every enrollment artifact — each coord credential
-/// and each attested role's volume parent — must exist and decode; otherwise
-/// the daemon refuses to start half-enrolled. The parents are required
+/// and each attested role's volume intermediate — must exist and decode;
+/// otherwise the daemon refuses to start half-enrolled. The intermediates are
+/// required
 /// because the mint-backed store finalizes per-volume credentials from them
 /// at runtime; without them no `by_id/<vol>` op can proceed.
 pub fn assert_enrolled(data_dir: &Path) -> io::Result<()> {
@@ -370,7 +373,7 @@ pub fn assert_enrolled(data_dir: &Path) -> io::Result<()> {
 /// fan-out over [`ENROLL_ROLES`]. Idempotent — only roles whose artifact is
 /// absent (or all, under `force`) are (re-)exchanged; an already-complete
 /// enrollment is a no-op. The ticket is held only for the command's duration
-/// (the attested-role parents it mints are durable, so nothing needs it
+/// (the attested-role intermediates it mints are durable, so nothing needs it
 /// after this returns).
 pub async fn run(
     cfg: &MintConfig,
@@ -434,13 +437,13 @@ pub async fn run(
                 ExchangeOutcome::Granted(credential) => {
                     // A coord role's credential is directly assumable; an
                     // attested role's is the durable, volume-parametric
-                    // parent finalized per-volume at runtime.
+                    // intermediate finalized per-volume at runtime.
                     write_credential_file(&role.path(data_dir), role.name, &credential)?;
                     info!(
                         "[enroll] {}: {} written",
                         role.name,
-                        if role.parent {
-                            "volume parent"
+                        if role.intermediate {
+                            "volume intermediate"
                         } else {
                             "credential"
                         }
