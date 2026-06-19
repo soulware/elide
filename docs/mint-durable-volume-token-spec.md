@@ -1,92 +1,88 @@
-# Mint change spec — durable volume-parametric token
+# Mint change spec — durable, further-exchangeable role tokens
 
 > Hand-off spec for a change in the **mint** repo (`github.com/soulware/mint`).
-> Written from elide's side; elide is wired to consume it. Move/delete this
-> file once the mint change lands.
+> This fixes the *behavioral contract* only — the config key, the wire
+> representation, and the rest of the implementation are the mint session's to
+> choose. Move/delete this file once the change lands.
 
 ## Goal
 
-Let an enrolled coordinator hold a **durable, volume-parametric capability**
-per attested role (`volume-rw`, `volume-ro`): minted **once at enrollment**
-(operator-gated) and finalized **autonomously per volume** (coord-B-attested)
-for the coordinator's whole lifetime. This removes the human operator from the
-per-volume credential path, which a long-running coordinator daemon traverses
-unattended (GC reading ancestors, first drain, demand-fetch) for volumes it may
-never have "created".
+elide needs a role whose exchange yields a **durable, further-exchangeable
+token** — minted once at enrollment (operator-gated) and held for the
+coordinator's whole lifetime, then finalized repeatedly (once per volume) with
+no further operator interaction.
 
-The capability is exactly today's `op=exchange-finalize` intermediate — it
-carries `(role, sub, cnf, attestation-TPC)` and **nothing volume-specific** —
-made durable instead of 600s-ephemeral. Its volume requirement is already
-declared by the role contract (`[role.attestation].attested = ["volume"]` plus
-the `{{caveat.volume}}` template); the token is the unfulfilled, must-be-attested
-form, finalized per volume.
+This is what lets a long-running coordinator daemon provision per-volume
+credentials **unattended** (GC reading ancestors, first drain, demand-fetch)
+for volumes it may never have created — even though `enroll-exchange` is
+operator-gated and no operator is present at 3am. The operator gate is paid
+once, at enrollment, for the durable parent; per-volume finalize needs only the
+attestation authority (coord B).
 
 ## The change
 
-At `POST /v1/enroll-exchange`, when the resolved role declares
-`[role.attestation]`, mint the returned `op=exchange-finalize` intermediate
-**durable (no `exp` caveat)** instead of stamping `now + INTERMEDIATE_TTL_SECONDS`.
+Today, exchanging a role at `/v1/enroll-exchange` yields either a
+directly-usable credential, or — for a role that requires a further attestation
+step — a short-lived token that must be finalized promptly. elide needs the
+exchange to instead yield a **durable** token it can hold and finalize many
+times over its lifetime.
 
-Touchpoints (paths as of `main`):
-- `issuance::mint_intermediate` — currently appends `Caveat::scalar(name::EXP, exp_unix)`.
-  Drop the `exp` for the durable form (or add a durable variant / `Option<exp>`).
-- `http::enroll_exchange` — the caller passes `now_unix.saturating_add(issuance::INTERMEDIATE_TTL_SECONDS)`; stop passing an expiry.
-- `INTERMEDIATE_TTL_SECONDS` — retire, unless a transient intermediate path remains for some other caller.
+Make this an **explicit, opt-in property declared on the role in config.** A
+role states that its exchange produces a durable, further-exchangeable parent
+rather than an ephemeral or final credential.
 
-That is the whole protocol change. Everything below is already correct and
-should **not** move.
+**This is orthogonal to `[role.attestation]` — do not gate it on the presence
+of an attestation contract.** A role may be attested without being durable, or
+durable without being attested. elide's volume roles happen to be *both*
+(durable parents that finalize under a coord-B attestation), but mint should let
+the two be declared independently rather than inferring one from the other.
 
-## Unchanged (already correct)
-
-- `/v1/enroll-exchange` stays **operator-gated** (`mint:exchange` discharge).
-  This is the once-per-coordinator gate, exercised while the operator is present
-  at enrollment. The operator authorizes *that this coordinator may provision
-  volume credentials at all* — not each volume.
-- `/v1/exchange-finalize` stays **coord-B-gated**; it bakes `caveat.volume`
-  **from the discharge's caveats** (`cleared.discharge_caveats`), never from the
-  request body; re-reads the enrolled record and stamps the current `rev_epoch`;
-  and mints the non-expiring `op=assume-role` credential. A no-`exp` parent
-  already verifies and clears cleanly here (`exp` is a bound, not required).
-- `assume-role` over the finalized per-volume credential is a pure render —
-  unchanged.
-
-## Properties to preserve / verify
-
-1. **Non-bearer.** The durable parent is `cnf`-bound; only the holding
-   coordinator (PoP by `coordinator.key`) can finalize it. Already enforced —
-   finalize requires the PoP.
-2. **Not directly usable.** The parent carries `op=exchange-finalize` and no
-   `caveat.volume`, so `assume-role` must reject it (wrong `op`, and the policy
-   template has no `volume` to substitute). Worth an explicit test now that the
-   token is long-lived.
-3. **Per-volume authority is coord B's, not the coordinator's.** The baked
-   `volume` derives solely from coord B's discharge; the coordinator cannot
-   self-assert it. Already true; keep it.
-4. **Revocable.** An operator revoke (`rev_epoch` bump on the enrolled record)
-   must invalidate both *pending* finalizes (finalize re-reads the record) and
-   *already-finalized* per-volume credentials (the `assume-role` `rev_epoch`
-   check). This is the property most worth a dedicated test, since the parent
-   now lives indefinitely rather than 600s.
-5. **One parent → many volumes.** A single durable intermediate must finalize
-   for arbitrarily many distinct volumes (it carries no volume; each finalize
-   supplies its own via the discharge). Add/extend a test asserting this.
-6. **K_M-B rotation.** The parent's attestation TPC is bound to the current
-   K_M-B. After a K_M-B rotation, outstanding parents become undischargeable and
-   the coordinator re-enrolls to mint fresh ones. Acceptable; note it.
+How the token's durability is represented, and the name/shape of the config
+property, are the mint session's call — this doc does not prescribe them.
 
 ## Contract elide relies on
 
-The `/v1/enroll-exchange` response for an attested role is a **durable token**
-that the coordinator stores and presents to `/v1/exchange-finalize` repeatedly —
-once per volume, with a fresh coord-B discharge each time — indefinitely, with no
-further operator interaction.
+- Exchanging a durable-parent role at `/v1/enroll-exchange` (operator-gated)
+  returns a token elide **stores and reuses indefinitely**.
+- That token is presented to `/v1/exchange-finalize` **repeatedly — once per
+  volume, with a fresh coord-B discharge each time** — with no further operator
+  interaction. Each finalize yields the usable per-volume credential, which
+  `assume-role` then renders.
+- The token carries **nothing volume-specific**, so a single parent finalizes
+  for any number of distinct volumes (the volume is supplied per-finalize, from
+  the discharge — see below).
+- `exchange-finalize` continues to bake the attested value(s) **from the
+  authority's discharge**, not from the request body, and to re-check the
+  enrolled record so a revoke still bites. (elide depends on this existing
+  behavior; the durability change must not alter it.)
 
-## Compatibility note (no elide-side dependency for CI)
+## Properties to preserve / verify
 
-The elide wiring works against **both** the current 600s intermediate and the
-durable form: elide fetches the parent at enrollment and finalizes promptly in
-the e2e (sub-second), so the attested-e2e stays green before this change lands.
-The durability change matters only for the **production daemon**, which finalizes
-new volumes minutes-to-days after enrollment — with the 600s form those parents
-expire and production cannot onboard new volumes. So: CI is unaffected by merge
-order; production per-volume provisioning requires this change.
+The durable parent must keep every security property the short-lived token
+already has, now over an indefinite lifetime:
+
+1. **Non-bearer.** Holder-of-key bound; only the enrolled coordinator can
+   present it. A leaked parent is inert without the coordinator's key.
+2. **Not usable on its own.** It is not an `assume-role` credential and cannot
+   be rendered directly — it only finalizes.
+3. **Revocable.** An operator revoke of the enrollment must invalidate the
+   parent (pending finalizes) and the per-volume credentials finalized from it.
+   This is the property most worth a dedicated test, since the parent now lives
+   indefinitely rather than briefly.
+4. **One parent → many volumes** (for elide's attested volume roles). A single
+   durable parent finalizes for arbitrarily many volumes; per-volume authority
+   comes solely from coord B's discharge, never from the coordinator's
+   assertion. Add/extend a test.
+5. **Attestation-key rotation.** A rotation of the attestation root makes
+   outstanding parents undischargeable; the coordinator re-enrolls to mint fresh
+   ones. Acceptable; note it.
+
+## Compatibility note (merge order is free)
+
+elide's side is already merged and works against **current `mint@main`**: it
+fetches the parent at enrollment and finalizes promptly in the e2e (sub-second),
+so today's short-lived token suffices for CI. The durability change matters only
+for the **production daemon**, which finalizes new volumes minutes-to-days after
+enrollment — there, a short-lived parent expires and the daemon cannot onboard
+new volumes. So CI is unaffected by merge order; production per-volume
+provisioning depends on this change.
