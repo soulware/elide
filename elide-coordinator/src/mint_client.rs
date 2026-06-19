@@ -87,13 +87,15 @@ pub(crate) const ROLE_COORD_RW: &str = "coord-rw";
 pub(crate) const ROLE_VOLUME_RW: &str = "volume-rw";
 pub(crate) const ROLE_VOLUME_RO: &str = "volume-ro";
 
-/// The coordinator-wide roles enrolled up front, in fan-out order.
-/// Their credentials are minted directly at `enroll-exchange` (no
-/// attestation). Volume roles are not here: they are attested and
-/// per-volume, so their credentials are minted on demand via
-/// [`crate::enroll::exchange_volume_role`] once the target volume is
-/// known.
-pub(crate) const COORD_ENROLL_ROLES: &[&str] = &[ROLE_COORD_RO, ROLE_COORD_RW];
+/// Filename of the durable, volume-parametric enrollment *parent* stored
+/// under an attested role's directory (`credentials/<role>/_parent`). The
+/// parent is the `op=exchange-finalize` token exchanged once at enrollment
+/// (operator-gated) and finalized per-volume at runtime
+/// ([`MintEndpoint::assume_role`]'s finalize-on-miss), which writes the
+/// rendered per-volume credential alongside it at
+/// `credentials/<role>/<volume>`. Lowercase, so it can never collide with a
+/// volume ULID (uppercase Crockford base32).
+pub(crate) const PARENT_FILE: &str = "_parent";
 
 const CAVEAT_EXP: &str = "exp";
 
@@ -114,11 +116,7 @@ pub(crate) enum AssumeTarget {
     /// (`volume-ro`; `target == owned` is the leaf reading its own
     /// prefix). `owned` is read only when minting a credential (via
     /// [`AssumeTarget::attestation`]), not when rendering one.
-    VolumeRo {
-        #[allow(dead_code, reason = "read by attestation(), the per-volume mint path")]
-        owned: Ulid,
-        target: Ulid,
-    },
+    VolumeRo { owned: Ulid, target: Ulid },
 }
 
 impl AssumeTarget {
@@ -137,10 +135,6 @@ impl AssumeTarget {
     /// The `(owned, target)` pair a discharge attests, when this target
     /// carries an attestation TPC. `owned` anchors the possession proof;
     /// `target` is the vouched volume baked into the credential.
-    #[allow(
-        dead_code,
-        reason = "reached only by the attested-loop e2e until RoleStore provisions per-volume credentials"
-    )]
     pub(crate) fn attestation(&self) -> Option<(Ulid, Ulid)> {
         match self {
             AssumeTarget::Coord => None,
@@ -300,10 +294,6 @@ impl WireMacaroon {
     /// carries one. Used to find the attestation caveat coord B discharges;
     /// other third-party caveats (e.g. operator-authorisation) sit at
     /// different locations and are discharged by their own authorities.
-    #[allow(
-        dead_code,
-        reason = "e2e-only until RoleStore provisions per-volume credentials"
-    )]
     pub(crate) fn third_party_cid_at(&self, location: &str) -> Option<&[u8]> {
         self.caveats.iter().find_map(|c| match c {
             Caveat::ThirdParty {
@@ -579,6 +569,30 @@ pub(crate) fn json_str_field(body: &str, key: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::other(format!("mint response missing `{key}` field")))
 }
 
+/// Validate `credential` decodes, then write it `0600` to `path` (atomic
+/// temp + rename), creating the parent directory if absent. Shared by
+/// enrollment (`crate::enroll`) and the finalize-on-miss path.
+pub(crate) fn write_credential_file(
+    path: &std::path::Path,
+    role: &str,
+    credential: &str,
+) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    WireMacaroon::decode(credential).map_err(|e| {
+        io::Error::other(format!(
+            "mint returned an undecodable {role} credential: {e}"
+        ))
+    })?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, credential.as_bytes())?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, path)
+}
+
 /// A configured mint endpoint plus the coordinator identity that
 /// proves possession. Shared by every role the coordinator assumes —
 /// `volume-ro` (vended to volumes, [`MintCredentialer`]) and the
@@ -594,17 +608,9 @@ pub struct MintEndpoint {
     /// attestation. A primary whose third-party caveat sits at this exact
     /// location is discharged at `exchange-finalize`; see
     /// [`MintEndpoint::finalize_volume`].
-    #[allow(
-        dead_code,
-        reason = "e2e-only until RoleStore provisions per-volume credentials"
-    )]
     attestation_location: Option<String>,
     /// How to dial coord B when the location is not the connection
     /// (`[mint] attestation_transport`); `None` dials the location.
-    #[allow(
-        dead_code,
-        reason = "e2e-only until RoleStore provisions per-volume credentials"
-    )]
     attestation_transport: Option<String>,
 }
 
@@ -613,10 +619,6 @@ pub struct MintEndpoint {
 /// the connection is `transport` when given — coord B off-network on a
 /// UDS, or any dial target differing from the identity — else the
 /// location minus its path.
-#[allow(
-    dead_code,
-    reason = "e2e-only until RoleStore provisions per-volume credentials"
-)]
 fn discharge_dial<'a>(
     location: &'a str,
     transport: Option<&'a str>,
@@ -671,10 +673,6 @@ impl MintEndpoint {
     /// `(owned, target)` shapes coord B accepts is the CID's baked
     /// `mode`: `volume-rw` requires `target == owned`; `volume-ro`
     /// requires `target` in `owned`'s read set.
-    #[allow(
-        dead_code,
-        reason = "e2e-only until RoleStore provisions per-volume credentials"
-    )]
     async fn fetch_attestation_discharge(
         &self,
         owned: Ulid,
@@ -713,10 +711,6 @@ impl MintEndpoint {
     /// `DischargeRequest` expects. Separated from the POST so the
     /// request/response contract with coord B is testable without a
     /// live server.
-    #[allow(
-        dead_code,
-        reason = "e2e-only until RoleStore provisions per-volume credentials"
-    )]
     fn build_discharge_request(&self, owned: Ulid, target: Ulid, cid: &[u8]) -> io::Result<String> {
         let fork_dir = elide_coordinator::volume_state::fork_dir(&self.data_dir, owned);
         let name = elide_coordinator::tasks::read_volume_name(&fork_dir).ok_or_else(|| {
@@ -764,10 +758,6 @@ impl MintEndpoint {
     /// `POST /v1/exchange-finalize`, which bakes the attested volume into
     /// the returned credential as an ordinary `caveat.volume`. The result
     /// is a bare primary — `assume-role` over it is a pure render.
-    #[allow(
-        dead_code,
-        reason = "e2e-only until RoleStore provisions per-volume credentials"
-    )]
     pub(crate) async fn finalize_volume(
         &self,
         owned: Ulid,
@@ -812,6 +802,44 @@ impl MintEndpoint {
         json_str_field(&text, "credential")
     }
 
+    /// Finalize the per-volume credential for an attested `target` from the
+    /// durable enrollment parent (`credentials/<role>/_parent`) and persist
+    /// it `0600` at `cred_path`, returning the rendered credential string.
+    ///
+    /// The parent is the `op=exchange-finalize` token exchanged once at
+    /// enrollment; [`Self::finalize_volume`] discharges its attestation TPC
+    /// via coord B (vouching the volume, anchored on `owned`) and bakes the
+    /// volume in. Called on the first `assume-role` for a volume that has no
+    /// stored credential yet; every later `assume-role` reads the file this
+    /// writes and is a pure render.
+    async fn finalize_volume_credential(
+        &self,
+        role: &str,
+        target: AssumeTarget,
+        cred_path: &std::path::Path,
+    ) -> io::Result<String> {
+        let (owned, vouched) = target
+            .attestation()
+            .ok_or_else(|| io::Error::other(format!("{role} is not an attested volume role")))?;
+        let parent_path = self
+            .data_dir
+            .join("credentials")
+            .join(role)
+            .join(PARENT_FILE);
+        let parent = std::fs::read_to_string(&parent_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "reading {role} enrollment parent at {}: {e} (run `elide coord enroll`)",
+                    parent_path.display()
+                ),
+            )
+        })?;
+        let credential = self.finalize_volume(owned, vouched, parent.trim()).await?;
+        write_credential_file(cred_path, role, &credential)?;
+        Ok(credential)
+    }
+
     pub async fn assume_role(
         &self,
         role: &str,
@@ -828,15 +856,27 @@ impl MintEndpoint {
                 None => base,
             }
         };
-        let stored = std::fs::read_to_string(&cred_path).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "reading {role} credential at {}: {e} (run enrollment for this role)",
-                    cred_path.display()
-                ),
-            )
-        })?;
+        let stored = match std::fs::read_to_string(&cred_path) {
+            Ok(s) => s,
+            // An attested volume role's per-volume credential is finalized
+            // on first use from the durable enrollment parent, then stored
+            // so every later assume-role is a pure render. A coord role has
+            // no parent, so a missing file there is an un-enrolled
+            // coordinator, not a finalize trigger.
+            Err(e) if e.kind() == io::ErrorKind::NotFound && target.attestation().is_some() => {
+                self.finalize_volume_credential(role, target, &cred_path)
+                    .await?
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "reading {role} credential at {}: {e} (run enrollment for this role)",
+                        cred_path.display()
+                    ),
+                ));
+            }
+        };
 
         let mut attempt: u32 = 0;
         let (text, exp) = loop {

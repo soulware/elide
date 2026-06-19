@@ -3,9 +3,12 @@
 //!
 //! One blocking operator command: `POST /v1/enroll` (A), wait while the
 //! operator approves out of band (B), then exchange the ticket once per
-//! role (C), writing `<data_dir>/credentials/<role>`. The credential
-//! ticket lives in memory for the command's duration and never touches
-//! disk — `credentials/<role>` is the only durable enrollment artifact.
+//! role (C). A coord role's credential is written to
+//! `<data_dir>/credentials/<role>`; an attested volume role's durable,
+//! volume-parametric parent to `<data_dir>/credentials/<role>/_parent`
+//! (finalized per-volume at runtime — `crate::mint_client`). The credential
+//! ticket lives in memory for the command's duration and never touches disk
+//! — those files are the only durable enrollment artifacts.
 //!
 //! A and C are operator-gated: the invite and the ticket each carry a
 //! third-party caveat keyed by the auth service, so the command fetches
@@ -32,14 +35,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use tracing::{info, warn};
-use ulid::Ulid;
 
 use elide_coordinator::config::MintConfig;
 use elide_coordinator::identity::CoordinatorIdentity;
 
 use crate::mint_client::{
-    AssumeTarget, COORD_ENROLL_ROLES, MintEndpoint, WireMacaroon, json_str_field, now_unix,
-    pop_digest, post,
+    PARENT_FILE, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO, ROLE_VOLUME_RW, WireMacaroon,
+    json_str_field, now_unix, pop_digest, post, write_credential_file,
 };
 
 const CAVEAT_SUB: &str = "sub";
@@ -80,8 +82,57 @@ fn credentials_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("credentials")
 }
 
-fn credential_path(data_dir: &Path, role: &str) -> PathBuf {
-    credentials_dir(data_dir).join(role)
+/// What enrollment provisions, in fan-out order. Every entry is exchanged
+/// the same way at `/v1/enroll-exchange` (operator-gated); only where the
+/// result is stored differs, driven by the role's own attestation contract.
+struct EnrollRole {
+    name: &'static str,
+    /// `true` for an attested volume role: the exchange yields a durable,
+    /// volume-parametric *parent* stored at `credentials/<role>/_parent` and
+    /// finalized per-volume at runtime. `false` for a coord role: a
+    /// directly-assumable credential at `credentials/<role>`.
+    parent: bool,
+}
+
+const ENROLL_ROLES: &[EnrollRole] = &[
+    EnrollRole {
+        name: ROLE_COORD_RO,
+        parent: false,
+    },
+    EnrollRole {
+        name: ROLE_COORD_RW,
+        parent: false,
+    },
+    EnrollRole {
+        name: ROLE_VOLUME_RW,
+        parent: true,
+    },
+    EnrollRole {
+        name: ROLE_VOLUME_RO,
+        parent: true,
+    },
+];
+
+impl EnrollRole {
+    /// Where this role's enrollment artifact lands. A coord role is the file
+    /// `credentials/<role>`; an attested role's parent is
+    /// `credentials/<role>/_parent` (the same directory the per-volume
+    /// credentials finalize into).
+    fn path(&self, data_dir: &Path) -> PathBuf {
+        let base = credentials_dir(data_dir).join(self.name);
+        if self.parent {
+            base.join(PARENT_FILE)
+        } else {
+            base
+        }
+    }
+}
+
+/// An enrollment artifact is present if it exists and decodes as a macaroon.
+fn credential_present_at(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|s| WireMacaroon::decode(s.trim()).is_ok())
 }
 
 /// Resolve the invite argument: `-` reads stdin, an inline macaroon
@@ -293,138 +344,34 @@ async fn exchange_request(
     }
 }
 
-/// Validate the credential decodes, then write it `0600` to
-/// `credentials/<role>` via a temp file + rename.
-fn write_credential(data_dir: &Path, role: &str, credential: &str) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    WireMacaroon::decode(credential).map_err(|e| {
-        io::Error::other(format!(
-            "mint returned an undecodable {role} credential: {e}"
-        ))
-    })?;
-    let dir = credentials_dir(data_dir);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(role);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, credential.as_bytes())?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, &path)
-}
-
-fn credential_present(data_dir: &Path, role: &str) -> bool {
-    std::fs::read_to_string(credential_path(data_dir, role))
-        .ok()
-        .is_some_and(|s| WireMacaroon::decode(s.trim()).is_ok())
-}
-
-/// Validate and write a per-volume attested credential `0600` to
-/// `credentials/<role>/<volume>` (atomic temp + rename). The volume is
-/// baked into the credential at finalize, so each volume gets its own
-/// file under the role's directory.
-#[allow(
-    dead_code,
-    reason = "e2e-only until RoleStore provisions per-volume credentials"
-)]
-fn write_volume_credential(
-    data_dir: &Path,
-    role: &str,
-    volume: Ulid,
-    credential: &str,
-) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    WireMacaroon::decode(credential).map_err(|e| {
-        io::Error::other(format!(
-            "mint returned an undecodable {role} credential: {e}"
-        ))
-    })?;
-    let dir = credentials_dir(data_dir).join(role);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(volume.to_string());
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, credential.as_bytes())?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, &path)
-}
-
-/// Mint a per-volume attested credential for `target` and store it under
-/// `credentials/<role>/<volume>`. Presents the retained enrollment
-/// `ticket` at `/v1/enroll-exchange` for `role` (with a fresh operator
-/// exchange-gate discharge from `session`), then finalizes the returned
-/// short-lived `op=exchange-finalize` intermediate through coord B via
-/// [`MintEndpoint::finalize_volume`] — which bakes the vouched volume in.
-/// The volume is fixed in the credential, so `assume-role` over it is a
-/// pure render. Requires enrollment to be approved (the operator gate)
-/// and `target` to be an attested volume role.
-#[allow(
-    dead_code,
-    clippy::too_many_arguments,
-    reason = "e2e-only; signature is reshaped when wired into the RoleStore credential path"
-)]
-pub async fn exchange_volume_role(
-    cfg: &MintConfig,
-    endpoint: &MintEndpoint,
-    identity: &CoordinatorIdentity,
-    data_dir: &Path,
-    ticket: &str,
-    session: &OperatorSession,
-    role: &str,
-    target: AssumeTarget,
-) -> io::Result<()> {
-    let (owned, vouched) = target
-        .attestation()
-        .ok_or_else(|| io::Error::other(format!("{role} is not an attested volume role")))?;
-
-    let ticket_mac = WireMacaroon::decode(ticket)?;
-    let discharges = gate_discharges(cfg, session, &ticket_mac, SCOPE_EXCHANGE).await?;
-    let intermediate = match exchange_request(cfg, identity, ticket, role, &discharges).await? {
-        ExchangeOutcome::Granted(c) => c,
-        ExchangeOutcome::AwaitingApproval => {
-            return Err(io::Error::other(format!(
-                "{role}: enrollment is not yet approved"
-            )));
-        }
-        ExchangeOutcome::TicketExpired => {
-            return Err(io::Error::other(format!(
-                "{role}: enrollment ticket expired; re-run `elide coord enroll`"
-            )));
-        }
-    };
-
-    let credential = endpoint
-        .finalize_volume(owned, vouched, &intermediate)
-        .await?;
-    write_volume_credential(data_dir, role, vouched, &credential)
-}
-
-/// `[mint]` startup gate. Every enrolled role's credential must exist
-/// and decode; otherwise the daemon refuses to start half-credentialed.
+/// `[mint]` startup gate. Every enrollment artifact — each coord credential
+/// and each attested role's volume parent — must exist and decode; otherwise
+/// the daemon refuses to start half-enrolled. The parents are required
+/// because the mint-backed store finalizes per-volume credentials from them
+/// at runtime; without them no `by_id/<vol>` op can proceed.
 pub fn assert_enrolled(data_dir: &Path) -> io::Result<()> {
-    let missing: Vec<&str> = COORD_ENROLL_ROLES
+    let missing: Vec<&str> = ENROLL_ROLES
         .iter()
-        .copied()
-        .filter(|role| !credential_present(data_dir, role))
+        .filter(|r| !credential_present_at(&r.path(data_dir)))
+        .map(|r| r.name)
         .collect();
     if missing.is_empty() {
         return Ok(());
     }
     Err(io::Error::other(format!(
-        "[mint] is configured but credential(s) for [{}] are missing or unreadable under {}; \
-         run `elide coord enroll` to provision them",
+        "[mint] is configured but enrollment artifact(s) for [{}] are missing or unreadable \
+         under {}; run `elide coord enroll` to provision them",
         missing.join(", "),
         credentials_dir(data_dir).display()
     )))
 }
 
 /// The single blocking operator command: A → wait for approval → C
-/// fan-out. Idempotent — only roles whose credential is absent (or all,
-/// under `force`) are (re-)exchanged; an already-complete enrollment is
-/// a no-op.
-/// Returns the enrollment ticket used (multi-use until its `exp`), so a
-/// caller can go on to mint per-volume attested credentials with
-/// [`exchange_volume_role`] in the same operator-approved window. Empty
-/// when every coord credential was already present (nothing enrolled).
+/// fan-out over [`ENROLL_ROLES`]. Idempotent — only roles whose artifact is
+/// absent (or all, under `force`) are (re-)exchanged; an already-complete
+/// enrollment is a no-op. The ticket is held only for the command's duration
+/// (the attested-role parents it mints are durable, so nothing needs it
+/// after this returns).
 pub async fn run(
     cfg: &MintConfig,
     identity: &CoordinatorIdentity,
@@ -433,19 +380,18 @@ pub async fn run(
     wait: Duration,
     force: bool,
     session: &OperatorSession,
-) -> io::Result<String> {
-    let mut remaining: Vec<&str> = COORD_ENROLL_ROLES
+) -> io::Result<()> {
+    let mut remaining: Vec<&EnrollRole> = ENROLL_ROLES
         .iter()
-        .copied()
-        .filter(|role| force || !credential_present(data_dir, role))
+        .filter(|r| force || !credential_present_at(&r.path(data_dir)))
         .collect();
     if remaining.is_empty() {
         info!(
-            "[enroll] all {} role credential(s) already present under {}; nothing to do",
-            COORD_ENROLL_ROLES.len(),
+            "[enroll] all {} enrollment artifact(s) already present under {}; nothing to do",
+            ENROLL_ROLES.len(),
             credentials_dir(data_dir).display()
         );
-        return Ok(String::new());
+        return Ok(());
     }
 
     let invite = resolve_invite(invite_src)?;
@@ -461,7 +407,11 @@ pub async fn run(
     info!(
         "[enroll] waiting for approval, exchanging {} role(s): [{}]",
         remaining.len(),
-        remaining.join(", ")
+        remaining
+            .iter()
+            .map(|r| r.name)
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     let deadline = Instant::now() + wait;
@@ -480,10 +430,21 @@ pub async fn run(
         let idx = 0;
         while idx < remaining.len() {
             let role = remaining[idx];
-            match exchange_request(cfg, identity, &ticket, role, &discharges).await? {
+            match exchange_request(cfg, identity, &ticket, role.name, &discharges).await? {
                 ExchangeOutcome::Granted(credential) => {
-                    write_credential(data_dir, role, &credential)?;
-                    info!("[enroll] {role}: credential written");
+                    // A coord role's credential is directly assumable; an
+                    // attested role's is the durable, volume-parametric
+                    // parent finalized per-volume at runtime.
+                    write_credential_file(&role.path(data_dir), role.name, &credential)?;
+                    info!(
+                        "[enroll] {}: {} written",
+                        role.name,
+                        if role.parent {
+                            "volume parent"
+                        } else {
+                            "credential"
+                        }
+                    );
                     remaining.remove(idx);
                 }
                 ExchangeOutcome::AwaitingApproval => {
@@ -504,11 +465,11 @@ pub async fn run(
 
         if remaining.is_empty() {
             info!(
-                "[enroll] complete: {} role credential(s) under {}",
-                COORD_ENROLL_ROLES.len(),
+                "[enroll] complete: {} enrollment artifact(s) under {}",
+                ENROLL_ROLES.len(),
                 credentials_dir(data_dir).display()
             );
-            return Ok(ticket);
+            return Ok(());
         }
         if !awaiting {
             continue;
@@ -517,7 +478,11 @@ pub async fn run(
             return Err(io::Error::other(format!(
                 "timed out waiting for operator approval; [{}] still unenrolled. \
                  Approval persists — re-run `elide coord enroll` to resume",
-                remaining.join(", ")
+                remaining
+                    .iter()
+                    .map(|r| r.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -592,8 +557,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = assert_enrolled(dir.path()).expect_err("none present");
         let msg = err.to_string();
-        for role in COORD_ENROLL_ROLES {
-            assert!(msg.contains(role), "missing list should name {role}: {msg}");
+        for r in ENROLL_ROLES {
+            assert!(
+                msg.contains(r.name),
+                "missing list should name {}: {msg}",
+                r.name
+            );
         }
     }
 }
