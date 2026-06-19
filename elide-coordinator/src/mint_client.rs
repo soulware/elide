@@ -1,13 +1,16 @@
 //! mint credential-service client (`docs/design-mint.md`
 //! § "Coordinator configuration").
 //!
-//! The coordinator holds a per-role capability macaroon under
-//! `<data_dir>/credentials/<role>` (provisioned by enrollment — out of
-//! scope here) and exercises it against mint's `assume-role`. Per
-//! request it attenuates the stored macaroon with the bounding `exp`
-//! and the per-volume `elide:Volume` caveat, proves possession with an
-//! Ed25519 signature by `coordinator.key` over
-//! `BLAKE3(macaroon-tail ‖ BLAKE3(request-body))`, and POSTs it.
+//! The coordinator holds a capability macaroon under
+//! `<data_dir>/credentials/<role>` for coordinator roles, or
+//! `<data_dir>/credentials/<role>/<volume>` for attested volume roles —
+//! the volume is baked into the credential as `caveat.volume` at
+//! `exchange-finalize`, so a volume credential is per-volume.
+//! `assume-role` is a pure render: it attenuates the stored macaroon
+//! with the bounding `exp`, proves possession with an Ed25519 signature
+//! by `coordinator.key` over `BLAKE3(macaroon-tail ‖ BLAKE3(request-body))`,
+//! and POSTs it. Scoping rides the credential's baked caveats, not the
+//! request body or an attached discharge.
 //!
 //! The macaroon wire format and PoP construction are reimplemented
 //! here against the spec rather than shared: mint is a standalone
@@ -76,28 +79,32 @@ const TYPE_THIRD_PARTY: u64 = 1;
 /// Canonical mint role inventory — the single source of truth shared by
 /// the enrollment fan-out (`crate::enroll`), the `[mint]` startup gate,
 /// and the scoped stores (`crate::mint_stores`), so the three can never
-/// drift. `volume-rw` is per-volume only at `assume-role` time (the
-/// `elide:Volume` narrowing caveat); enrollment still mints exactly one
-/// `credentials/volume-rw`.
+/// drift. The volume roles are attested: their credentials are minted
+/// per-volume at `exchange-finalize` (the volume baked in as
+/// `caveat.volume`), not once at enrollment.
 pub(crate) const ROLE_COORD_RO: &str = "coord-ro";
 pub(crate) const ROLE_COORD_RW: &str = "coord-rw";
 pub(crate) const ROLE_VOLUME_RW: &str = "volume-rw";
 pub(crate) const ROLE_VOLUME_RO: &str = "volume-ro";
 
-/// Every role the coordinator enrols for, in fan-out order.
-pub(crate) const COORD_ENROLL_ROLES: &[&str] =
-    &[ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RW, ROLE_VOLUME_RO];
+/// The coordinator-wide roles enrolled up front, in fan-out order.
+/// Their credentials are minted directly at `enroll-exchange` (no
+/// attestation). Volume roles are not here: they are attested and
+/// per-volume, so their credentials are minted on demand via
+/// [`crate::enroll::exchange_volume_role`] once the target volume is
+/// known.
+pub(crate) const COORD_ENROLL_ROLES: &[&str] = &[ROLE_COORD_RO, ROLE_COORD_RW];
 
 const CAVEAT_EXP: &str = "exp";
 
-/// What an `assume-role` is for — the `req.volume` target plus the
-/// attestation anchor, made structural so the discharge decision is a
-/// property of the variant, not a role-string comparison at the call
-/// site.
+/// What an `assume-role` is for — the volume the credential is scoped to
+/// plus the attestation anchor, made structural so the per-volume mint
+/// decision is a property of the variant, not a role-string comparison
+/// at the call site.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AssumeTarget {
-    /// Coordinator-wide roles (`coord-ro` / `coord-rw`): no
-    /// `req.volume`, no attestation discharge.
+    /// Coordinator-wide roles (`coord-ro` / `coord-rw`): no volume, no
+    /// attestation.
     Coord,
     /// `volume-rw`: the volume is both the possession-proven anchor
     /// and the vouched target (`volume-rw`).
@@ -105,13 +112,21 @@ pub(crate) enum AssumeTarget {
     /// `volume-ro`: read `target`'s prefix, anchored on the live,
     /// locally-keyed `owned` whose key signs the possession proof
     /// (`volume-ro`; `target == owned` is the leaf reading its own
-    /// prefix).
-    VolumeRo { owned: Ulid, target: Ulid },
+    /// prefix). `owned` is read only when minting a credential (via
+    /// [`AssumeTarget::attestation`]), not when rendering one.
+    VolumeRo {
+        #[allow(dead_code, reason = "read by attestation(), the per-volume mint path")]
+        owned: Ulid,
+        target: Ulid,
+    },
 }
 
 impl AssumeTarget {
-    /// The `req.volume` value for the assume-role body.
-    fn volume(&self) -> Option<Ulid> {
+    /// The volume a credential for this target is scoped to — the value
+    /// mint bakes in as `caveat.volume` at `exchange-finalize`. Keys the
+    /// per-volume credential on disk; `None` for coord roles, which are
+    /// one credential per role.
+    pub(crate) fn volume(&self) -> Option<Ulid> {
         match self {
             AssumeTarget::Coord => None,
             AssumeTarget::VolumeRw(v) => Some(*v),
@@ -119,9 +134,14 @@ impl AssumeTarget {
         }
     }
 
-    /// The `(owned, target)` pair a discharge attests, when this
-    /// assume carries an attestation TPC.
-    fn attestation(&self) -> Option<(Ulid, Ulid)> {
+    /// The `(owned, target)` pair a discharge attests, when this target
+    /// carries an attestation TPC. `owned` anchors the possession proof;
+    /// `target` is the vouched volume baked into the credential.
+    #[allow(
+        dead_code,
+        reason = "reached only by the attested-loop e2e until RoleStore provisions per-volume credentials"
+    )]
+    pub(crate) fn attestation(&self) -> Option<(Ulid, Ulid)> {
         match self {
             AssumeTarget::Coord => None,
             AssumeTarget::VolumeRw(v) => Some((*v, *v)),
@@ -280,6 +300,10 @@ impl WireMacaroon {
     /// carries one. Used to find the attestation caveat coord B discharges;
     /// other third-party caveats (e.g. operator-authorisation) sit at
     /// different locations and are discharged by their own authorities.
+    #[allow(
+        dead_code,
+        reason = "e2e-only until RoleStore provisions per-volume credentials"
+    )]
     pub(crate) fn third_party_cid_at(&self, location: &str) -> Option<&[u8]> {
         self.caveats.iter().find_map(|c| match c {
             Caveat::ThirdParty {
@@ -568,11 +592,19 @@ pub struct MintEndpoint {
     identity: Arc<CoordinatorIdentity>,
     /// coord B's discharge location, when this deployment uses volume
     /// attestation. A primary whose third-party caveat sits at this exact
-    /// location is discharged before `assume-role`; see
-    /// [`MintEndpoint::fetch_attestation_discharge`].
+    /// location is discharged at `exchange-finalize`; see
+    /// [`MintEndpoint::finalize_volume`].
+    #[allow(
+        dead_code,
+        reason = "e2e-only until RoleStore provisions per-volume credentials"
+    )]
     attestation_location: Option<String>,
     /// How to dial coord B when the location is not the connection
     /// (`[mint] attestation_transport`); `None` dials the location.
+    #[allow(
+        dead_code,
+        reason = "e2e-only until RoleStore provisions per-volume credentials"
+    )]
     attestation_transport: Option<String>,
 }
 
@@ -581,6 +613,10 @@ pub struct MintEndpoint {
 /// the connection is `transport` when given — coord B off-network on a
 /// UDS, or any dial target differing from the identity — else the
 /// location minus its path.
+#[allow(
+    dead_code,
+    reason = "e2e-only until RoleStore provisions per-volume credentials"
+)]
 fn discharge_dial<'a>(
     location: &'a str,
     transport: Option<&'a str>,
@@ -635,6 +671,10 @@ impl MintEndpoint {
     /// `(owned, target)` shapes coord B accepts is the CID's baked
     /// `mode`: `volume-rw` requires `target == owned`; `volume-ro`
     /// requires `target` in `owned`'s read set.
+    #[allow(
+        dead_code,
+        reason = "e2e-only until RoleStore provisions per-volume credentials"
+    )]
     async fn fetch_attestation_discharge(
         &self,
         owned: Ulid,
@@ -673,6 +713,10 @@ impl MintEndpoint {
     /// `DischargeRequest` expects. Separated from the POST so the
     /// request/response contract with coord B is testable without a
     /// live server.
+    #[allow(
+        dead_code,
+        reason = "e2e-only until RoleStore provisions per-volume credentials"
+    )]
     fn build_discharge_request(&self, owned: Ulid, target: Ulid, cid: &[u8]) -> io::Result<String> {
         let fork_dir = elide_coordinator::volume_state::fork_dir(&self.data_dir, owned);
         let name = elide_coordinator::tasks::read_volume_name(&fork_dir).ok_or_else(|| {
@@ -712,13 +756,78 @@ impl MintEndpoint {
         Ok(serde_json::Value::Object(obj).to_string())
     }
 
+    /// Finalize an attested role's short-lived `op=exchange-finalize`
+    /// intermediate into the long-lived credential. The intermediate
+    /// carries an undischarged attestation third-party caveat; this
+    /// discharges it via coord B (vouching `target`, anchored on
+    /// `owned`) and presents `intermediate,discharge` to
+    /// `POST /v1/exchange-finalize`, which bakes the attested volume into
+    /// the returned credential as an ordinary `caveat.volume`. The result
+    /// is a bare primary — `assume-role` over it is a pure render.
+    #[allow(
+        dead_code,
+        reason = "e2e-only until RoleStore provisions per-volume credentials"
+    )]
+    pub(crate) async fn finalize_volume(
+        &self,
+        owned: Ulid,
+        target: Ulid,
+        intermediate: &str,
+    ) -> io::Result<String> {
+        let location = self.attestation_location.as_deref().ok_or_else(|| {
+            io::Error::other("cannot finalize an attested role without [mint] attestation_location")
+        })?;
+        let mac = WireMacaroon::decode(intermediate)?;
+        let cid = mac
+            .third_party_cid_at(location)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "intermediate carries no attestation caveat at {location}"
+                ))
+            })?
+            .to_vec();
+        let discharge = self
+            .fetch_attestation_discharge(owned, target, &cid, location)
+            .await?;
+
+        let body = format!(r#"{{"ts":{}}}"#, now_unix()?);
+        let sig = BASE64.encode(self.identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
+        let auth = format!("MintV1 {},{}", mac.encode(), discharge);
+        let (status, text, _) = post(
+            &self.url,
+            self.connect_timeout,
+            self.request_timeout,
+            "/v1/exchange-finalize",
+            &auth,
+            &sig,
+            body,
+        )
+        .await?;
+        if status != 200 {
+            let snippet: String = text.chars().take(200).collect();
+            return Err(io::Error::other(format!(
+                "mint /v1/exchange-finalize returned {status}: {snippet}"
+            )));
+        }
+        json_str_field(&text, "credential")
+    }
+
     pub async fn assume_role(
         &self,
         role: &str,
         ttl_secs: u64,
         target: AssumeTarget,
     ) -> io::Result<IssuedCredentials> {
-        let cred_path = self.data_dir.join("credentials").join(role);
+        // Coord roles store one credential per role; attested roles store
+        // one per baked volume (the volume is finalized into the credential
+        // at `exchange-finalize`, so a credential is per-volume).
+        let cred_path = {
+            let base = self.data_dir.join("credentials").join(role);
+            match target.volume() {
+                Some(v) => base.join(v.to_string()),
+                None => base,
+            }
+        };
         let stored = std::fs::read_to_string(&cred_path).map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -728,27 +837,6 @@ impl MintEndpoint {
                 ),
             )
         })?;
-
-        // If this credential carries an attestation third-party caveat at
-        // the configured coord B location, discharge it once and attach the
-        // discharge to every attempt's bundle. The `(owned, target)` the
-        // discharge attests is a property of the assume's variant.
-        let discharge = match (&self.attestation_location, target.attestation()) {
-            (Some(loc), Some((owned, tgt))) => {
-                let cid = WireMacaroon::decode(&stored)?
-                    .third_party_cid_at(loc)
-                    .map(<[u8]>::to_vec);
-                match cid {
-                    Some(cid) => Some(
-                        self.fetch_attestation_discharge(owned, tgt, &cid, loc)
-                            .await?,
-                    ),
-                    None => None,
-                }
-            }
-            _ => None,
-        };
-        let volume = target.volume();
 
         let mut attempt: u32 = 0;
         let (text, exp) = loop {
@@ -767,24 +855,20 @@ impl MintEndpoint {
             // Build the exact body bytes once: they are both signed
             // (via BLAKE3(body)) and sent. Mint hashes the raw bytes
             // before parsing, so no canonicalization step may sit
-            // between. The per-volume target rides the PoP-signed body as
-            // `req.volume`; the policy template substitutes it.
+            // between. Scoping is baked into the credential's caveats at
+            // exchange-finalize, so the body carries no volume — these are
+            // the only fields mint reads.
             let mut obj = serde_json::Map::new();
             obj.insert("ts".into(), now.into());
             obj.insert("role".into(), role.into());
             obj.insert("ttl_seconds".into(), ttl_secs.into());
-            if let Some(v) = volume {
-                obj.insert("volume".into(), v.to_string().into());
-            }
             let body = serde_json::Value::Object(obj).to_string();
 
             let sig = BASE64.encode(self.identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
-            // Attach the attestation discharge (if any) as the second
-            // macaroon in the bundle; mint parses `MintV1 <primary>,<dis>`.
-            let auth = match &discharge {
-                Some(d) => format!("MintV1 {},{}", mac.encode(), d),
-                None => format!("MintV1 {}", mac.encode()),
-            };
+            // The credential is a bare primary — any attestation was
+            // discharged and baked in at exchange-finalize, so assume-role
+            // is a pure render with no discharge attached.
+            let auth = format!("MintV1 {}", mac.encode());
 
             let (status, text, retry_after) = post(
                 &self.url,

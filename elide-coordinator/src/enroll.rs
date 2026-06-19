@@ -32,12 +32,14 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use tracing::{info, warn};
+use ulid::Ulid;
 
 use elide_coordinator::config::MintConfig;
 use elide_coordinator::identity::CoordinatorIdentity;
 
 use crate::mint_client::{
-    COORD_ENROLL_ROLES, WireMacaroon, json_str_field, now_unix, pop_digest, post,
+    AssumeTarget, COORD_ENROLL_ROLES, MintEndpoint, WireMacaroon, json_str_field, now_unix,
+    pop_digest, post,
 };
 
 const CAVEAT_SUB: &str = "sub";
@@ -114,6 +116,7 @@ fn resolve_invite(src: &str) -> io::Result<String> {
 /// session shape is the auth service's
 /// (`docs/design-auth-service.md` § *Login flow*), shared across its
 /// CLIs — one login serves the mint operator plane and this command.
+#[derive(Clone)]
 pub struct OperatorSession {
     pub session: String,
     pub transport: String,
@@ -315,6 +318,86 @@ fn credential_present(data_dir: &Path, role: &str) -> bool {
         .is_some_and(|s| WireMacaroon::decode(s.trim()).is_ok())
 }
 
+/// Validate and write a per-volume attested credential `0600` to
+/// `credentials/<role>/<volume>` (atomic temp + rename). The volume is
+/// baked into the credential at finalize, so each volume gets its own
+/// file under the role's directory.
+#[allow(
+    dead_code,
+    reason = "e2e-only until RoleStore provisions per-volume credentials"
+)]
+fn write_volume_credential(
+    data_dir: &Path,
+    role: &str,
+    volume: Ulid,
+    credential: &str,
+) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    WireMacaroon::decode(credential).map_err(|e| {
+        io::Error::other(format!(
+            "mint returned an undecodable {role} credential: {e}"
+        ))
+    })?;
+    let dir = credentials_dir(data_dir).join(role);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(volume.to_string());
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, credential.as_bytes())?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Mint a per-volume attested credential for `target` and store it under
+/// `credentials/<role>/<volume>`. Presents the retained enrollment
+/// `ticket` at `/v1/enroll-exchange` for `role` (with a fresh operator
+/// exchange-gate discharge from `session`), then finalizes the returned
+/// short-lived `op=exchange-finalize` intermediate through coord B via
+/// [`MintEndpoint::finalize_volume`] — which bakes the vouched volume in.
+/// The volume is fixed in the credential, so `assume-role` over it is a
+/// pure render. Requires enrollment to be approved (the operator gate)
+/// and `target` to be an attested volume role.
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "e2e-only; signature is reshaped when wired into the RoleStore credential path"
+)]
+pub async fn exchange_volume_role(
+    cfg: &MintConfig,
+    endpoint: &MintEndpoint,
+    identity: &CoordinatorIdentity,
+    data_dir: &Path,
+    ticket: &str,
+    session: &OperatorSession,
+    role: &str,
+    target: AssumeTarget,
+) -> io::Result<()> {
+    let (owned, vouched) = target
+        .attestation()
+        .ok_or_else(|| io::Error::other(format!("{role} is not an attested volume role")))?;
+
+    let ticket_mac = WireMacaroon::decode(ticket)?;
+    let discharges = gate_discharges(cfg, session, &ticket_mac, SCOPE_EXCHANGE).await?;
+    let intermediate = match exchange_request(cfg, identity, ticket, role, &discharges).await? {
+        ExchangeOutcome::Granted(c) => c,
+        ExchangeOutcome::AwaitingApproval => {
+            return Err(io::Error::other(format!(
+                "{role}: enrollment is not yet approved"
+            )));
+        }
+        ExchangeOutcome::TicketExpired => {
+            return Err(io::Error::other(format!(
+                "{role}: enrollment ticket expired; re-run `elide coord enroll`"
+            )));
+        }
+    };
+
+    let credential = endpoint
+        .finalize_volume(owned, vouched, &intermediate)
+        .await?;
+    write_volume_credential(data_dir, role, vouched, &credential)
+}
+
 /// `[mint]` startup gate. Every enrolled role's credential must exist
 /// and decode; otherwise the daemon refuses to start half-credentialed.
 pub fn assert_enrolled(data_dir: &Path) -> io::Result<()> {
@@ -338,6 +421,10 @@ pub fn assert_enrolled(data_dir: &Path) -> io::Result<()> {
 /// fan-out. Idempotent — only roles whose credential is absent (or all,
 /// under `force`) are (re-)exchanged; an already-complete enrollment is
 /// a no-op.
+/// Returns the enrollment ticket used (multi-use until its `exp`), so a
+/// caller can go on to mint per-volume attested credentials with
+/// [`exchange_volume_role`] in the same operator-approved window. Empty
+/// when every coord credential was already present (nothing enrolled).
 pub async fn run(
     cfg: &MintConfig,
     identity: &CoordinatorIdentity,
@@ -346,7 +433,7 @@ pub async fn run(
     wait: Duration,
     force: bool,
     session: &OperatorSession,
-) -> io::Result<()> {
+) -> io::Result<String> {
     let mut remaining: Vec<&str> = COORD_ENROLL_ROLES
         .iter()
         .copied()
@@ -358,7 +445,7 @@ pub async fn run(
             COORD_ENROLL_ROLES.len(),
             credentials_dir(data_dir).display()
         );
-        return Ok(());
+        return Ok(String::new());
     }
 
     let invite = resolve_invite(invite_src)?;
@@ -421,7 +508,7 @@ pub async fn run(
                 COORD_ENROLL_ROLES.len(),
                 credentials_dir(data_dir).display()
             );
-            return Ok(());
+            return Ok(ticket);
         }
         if !awaiting {
             continue;
