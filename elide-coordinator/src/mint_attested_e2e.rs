@@ -316,7 +316,7 @@ async fn attested_loop_over_shipped_templates() {
     enroll_task
         .await
         .expect("enroll task")
-        .expect("enrollment completes — coord credentials + volume parents");
+        .expect("enrollment completes — coord credentials + volume intermediates");
 
     // A named, locally-keyed volume to anchor on, forked from a parent:
     // key + name in the coordinator's fork dir (what coord A's discharge
@@ -374,8 +374,8 @@ async fn attested_loop_over_shipped_templates() {
     // The loop itself. Coord roles were minted directly at enrollment;
     // volume roles are attested and per-volume, so the first `assume-role`
     // for a volume *finalizes* its credential from the durable enrollment
-    // parent — coord B vouches the volume, mint bakes it in — stores it, and
-    // renders. Every later `assume-role` reads that stored credential and is
+    // intermediate — coord B vouches the volume, mint bakes it in — stores it,
+    // and renders. Every later `assume-role` reads that stored credential and is
     // a pure render. No operator session or ticket is in this path.
     let endpoint = MintEndpoint::new(&mint_cfg, coord_dir.clone(), identity.clone());
 
@@ -397,7 +397,7 @@ async fn attested_loop_over_shipped_templates() {
 
     // volume-ro: the fork's parent is in owned's read set; the leaf
     // reading its own prefix is the degenerate target == owned case. One
-    // durable parent finalizes for both volumes.
+    // durable intermediate finalizes for both volumes.
     for target in [parent, owned] {
         endpoint
             .assume_role("volume-ro", 3600, AssumeTarget::VolumeRo { owned, target })
@@ -426,7 +426,7 @@ async fn attested_loop_over_shipped_templates() {
     );
 
     // Fail-closed: a client not configured for attestation cannot discharge
-    // the parent's attestation TPC, so it can never finalize a volume
+    // the intermediate's attestation TPC, so it can never finalize a volume
     // credential. Use a not-yet-finalized volume so the call hits
     // finalize-on-miss rather than rendering an already-stored credential.
     let blind_cfg = MintConfig {
