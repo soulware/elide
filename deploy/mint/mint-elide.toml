@@ -1,8 +1,8 @@
 # Elide's mint configuration: the role inventory the stock mint binary is
 # sealed with to serve an Elide deployment (`mint serve --config
-# mint-elide.toml`; see README.md). The [[role]] inventory and its
-# caveat/attestation contracts are fixed and version-locked to the
-# coordinator; the keys marked PER-DEPLOYMENT below are filled in per site.
+# mint-elide.toml`; see README.md). The [[role]] inventory and its caveat
+# contracts are fixed and version-locked to the coordinator; the keys marked
+# PER-DEPLOYMENT below are filled in per site.
 
 audience = "mint"
 
@@ -29,73 +29,36 @@ location = "https://auth.elide.internal/v1/discharge"
 
 [attestation]
 # PER-DEPLOYMENT. Discharge URL of the attestation coordinator (coord B).
-# Required: the volume roles below declare [role.attestation].
+# Required: the volume roles bind a non-reserved caveat, which makes them
+# attested.
 location = "https://coord-b.elide.internal/v1/discharge"
 
 [store]
-# PER-DEPLOYMENT. The bucket mint administers (holds `_mint/*`).
+# PER-DEPLOYMENT. The bucket mint administers (holds `_mint/*`). The bucket
+# holding Elide volume data is a literal in the role templates under roles/,
+# set independently of this value.
 bucket = "elide"
 # endpoint = "https://t3.storage.dev"   # default; set for non-Tigris S3
 # region   = "us-east-1"                # default
 
-# PER-DEPLOYMENT. Surfaced to role policy templates as `{{env.X}}` (flat
-# scalars only). The roles grant on `{{env.bucket}}` — the bucket holding
-# Elide volume data, configured independently of [store].bucket above.
-[env]
-bucket = "elide"
-
-# The `[role.template]` subtable declares the role's caveat contract: the
-# full manifest of `{{caveat.X}}` names its policy template substitutes,
-# whatever their provenance. Seal authoring rejects a template whose
-# `{{caveat.X}}` tokens don't match this set exactly. The volume roles also
-# declare `[role.attestation]`: `attested` lists the caveat names sourced
-# from a discharge (a subset of `[role.template].caveat`), baked into the
-# credential at exchange-finalize; the opaque `mode` tells the attestation
-# coordinator which ownership check to run and defaults to the role name;
-# `intermediate_ttl_seconds` is required and bounds the exchange-finalize
-# intermediate — `0` = no expiry, so the coordinator holds the intermediate
-# and finalizes it per-volume for its lifetime (Elide's case); `n > 0` would
-# force a single back-to-back finalize.
+# A role is its `name`, a single `ttl_seconds`, and a policy template under
+# roles_dir. Caveat provenance is derived from the template: a `{{caveat.X}}`
+# whose name is reserved (e.g. `sub`) is issuer-stamped; any other name is
+# attested. `ttl_seconds` is the credential lifetime ceiling in seconds (> 0),
+# clamped to the `exp` the coordinator attenuates onto each assumed credential.
 
 [[role]]
 name = "volume-ro"
-min_ttl_seconds = 60
-max_ttl_seconds = 3600         # 1h
-default_ttl_seconds = 3600
-
-[role.template]
-caveat = ["volume"]
-
-[role.attestation]
-attested = ["volume"]
-intermediate_ttl_seconds = 0   # no expiry: held + finalized per-volume
-# mode defaults to the role name (volume-ro)
+ttl_seconds = 3600         # 1h
 
 [[role]]
 name = "volume-rw"
-min_ttl_seconds = 60
-max_ttl_seconds = 86400        # 24h
-default_ttl_seconds = 86400
-
-[role.template]
-caveat = ["volume"]
-
-[role.attestation]
-attested = ["volume"]
-intermediate_ttl_seconds = 0   # no expiry: held + finalized per-volume
-# mode defaults to the role name (volume-rw)
+ttl_seconds = 86400        # 24h
 
 [[role]]
 name = "coord-ro"
-min_ttl_seconds = 60
-max_ttl_seconds = 3600         # 1h
-default_ttl_seconds = 3600
+ttl_seconds = 3600         # 1h
 
 [[role]]
 name = "coord-rw"
-min_ttl_seconds = 60
-max_ttl_seconds = 3600         # 1h
-default_ttl_seconds = 3600
-
-[role.template]
-caveat = ["sub"]
+ttl_seconds = 3600         # 1h

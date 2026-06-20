@@ -180,8 +180,8 @@ async fn attested_loop_over_shipped_templates() {
             set("socket", mint_sock.display().to_string());
         }
         // Colocate the demo auth role under the shipped [auth] table.
+        // Presence of the [auth.demo] table is the switch; the socket binds it.
         let mut demo = toml::value::Table::new();
-        demo.insert("enabled".into(), toml::Value::Boolean(true));
         demo.insert(
             "socket".into(),
             toml::Value::String(auth_sock.display().to_string()),

@@ -5,10 +5,10 @@
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
     "Resource": [
-      "arn:aws:s3:::{{env.bucket}}/names/*",
-      "arn:aws:s3:::{{env.bucket}}/coordinators/*",
-      "arn:aws:s3:::{{env.bucket}}/events/*",
-      "arn:aws:s3:::{{env.bucket}}/meta/*"
+      "arn:aws:s3:::elide/names/*",
+      "arn:aws:s3:::elide/coordinators/*",
+      "arn:aws:s3:::elide/events/*",
+      "arn:aws:s3:::elide/meta/*"
     ],
     "Condition": {
       "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}

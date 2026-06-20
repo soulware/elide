@@ -10,10 +10,17 @@ that inventory, version-locked to the coordinator:
   `events/*` append-only, `coordinators/{{caveat.sub}}/*`, `meta/*`, `names/*`),
   so they move in lockstep with the coordinator. The `attested-e2e` CI job is
   the lockstep check — it runs the real coordinator client against exactly
-  these templates.
+  these templates. The volume-data bucket is a literal in each template (`elide`
+  by default); a site using a different bucket edits all four.
 - **`mint-elide.toml`** — the role inventory + contracts (fixed) plus the keys
-  marked `PER-DEPLOYMENT` (bucket, store endpoint, auth/attestation discharge
-  URLs, listener). Copy it and fill those in per site.
+  marked `PER-DEPLOYMENT` (mint's admin/store bucket + endpoint, auth/attestation
+  discharge URLs, listener). Copy it and fill those in per site.
+
+Caveat provenance is **derived from the template**, not declared: a
+`{{caveat.X}}` whose name is reserved (`sub`) is issuer-stamped by mint; any
+other name (`volume`) is attested. So `volume-ro`/`volume-rw` are attested by
+virtue of binding `{{caveat.volume}}`, and `coord-ro`/`coord-rw` are issuer-only.
+Each role's single `ttl_seconds` is the credential lifetime ceiling.
 
 ## Roles
 
@@ -23,11 +30,10 @@ that inventory, version-locked to the coordinator:
 | `volume-ro` / `volume-rw` | one volume's `by_id/<vol>/*` | attested + per-volume |
 
 The volume roles are **attested**: `enroll-exchange` returns a durable
-intermediate (`intermediate_ttl_seconds = 0`) the coordinator holds and
-finalizes **per volume** under a fresh attestation-coordinator (coord B)
-discharge. The operator gate is paid once, at enrollment; per-volume finalize
-is unattended. See `docs/design-mint.md` § *Elide as customer* and
-`docs/design-mint-volume-attestation.md`.
+intermediate the coordinator holds and finalizes **per volume** under a fresh
+attestation-coordinator (coord B) discharge. The operator gate is paid once, at
+enrollment; per-volume finalize is unattended. See `docs/design-mint.md` §
+*Elide as customer* and `docs/design-mint-volume-attestation.md`.
 
 ## Bring-up
 

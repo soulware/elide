@@ -5,7 +5,7 @@
     "Effect": "Allow",
     "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
     "Resource": [
-      "arn:aws:s3:::{{env.bucket}}/by_id/{{caveat.volume}}/*"
+      "arn:aws:s3:::elide/by_id/{{caveat.volume}}/*"
     ],
     "Condition": {
       "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
