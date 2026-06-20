@@ -4,7 +4,7 @@
     "Sid": "ReadVolume",
     "Effect": "Allow",
     "Action": ["s3:GetObject"],
-    "Resource": ["arn:aws:s3:::{{env.bucket}}/by_id/{{caveat.volume}}/*"],
+    "Resource": ["arn:aws:s3:::elide/by_id/{{caveat.volume}}/*"],
     "Condition": {
       "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
     }

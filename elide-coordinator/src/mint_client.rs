@@ -899,12 +899,12 @@ impl MintEndpoint {
             // (via BLAKE3(body)) and sent. Mint hashes the raw bytes
             // before parsing, so no canonicalization step may sit
             // between. Scoping is baked into the credential's caveats at
-            // exchange-finalize, so the body carries no volume — these are
-            // the only fields mint reads.
+            // exchange-finalize and the lifetime is the role's sealed
+            // `ttl_seconds` clamped to the `exp` attenuated above, so the
+            // body carries only `ts`/`role` — the only fields mint reads.
             let mut obj = serde_json::Map::new();
             obj.insert("ts".into(), now.into());
             obj.insert("role".into(), role.into());
-            obj.insert("ttl_seconds".into(), ttl_secs.into());
             let body = serde_json::Value::Object(obj).to_string();
 
             let sig = BASE64.encode(self.identity.sign(&pop_digest(mac.tail(), body.as_bytes())));

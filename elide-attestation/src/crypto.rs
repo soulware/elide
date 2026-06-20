@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(pt.r, hex32(&v, "r"));
         assert_eq!(pt.client_id, v["client_id"].as_str().unwrap());
         assert_eq!(pt.org_id, v["org_id"].as_str().unwrap());
-        assert_eq!(pt.mode, v["mode"].as_str().unwrap());
+        assert_eq!(pt.mode, v["role"].as_str().unwrap());
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
             &r,
             v["client_id"].as_str().unwrap(),
             v["org_id"].as_str().unwrap(),
-            v["mode"].as_str().unwrap(),
+            v["role"].as_str().unwrap(),
         );
         assert_eq!(cid, fixture);
     }
