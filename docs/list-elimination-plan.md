@@ -423,7 +423,7 @@ Ordered so each phase builds on the prior.
   `prefetch`/`recovery`/`fork-verify` *and* `prefetch` supersession +
   `reaper`; rebuild defines the proptested reconcile invariant.
 - **P5 — drop the grant.** Delete `s3:ListBucket` from
-  `deploy/mint/roles/coord-rw.json`, the §*`coord-rw`*
+  `deploy/mint/role-templates/coord-rw.json`, the §*`coord-rw`*
   policy, and the role-inventory table in `design-mint.md`. End state:
   no role carries `ListBucket`. The structural guarantee is the role
   policy itself — any errant `.list(` against a mint-backed store

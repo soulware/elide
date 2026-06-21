@@ -64,8 +64,10 @@ constants. Mint *derives* a caveat's provenance from its name (mint's
 
 Elide's roles bind exactly one non-reserved caveat, `volume`, on the two volume
 roles; everything else is either reserved (`sub`) or a literal. The volume-data
-bucket is a literal (`elide`) in each policy template — a deployment constant,
-edited per site alongside `[store].bucket` in `mint-elide.toml`.
+bucket is the `{{build.bucket}}` build-time token in each policy template,
+resolved per site by `mint render` (see `deploy/mint/README.md`) — a
+deploy-time pass distinct from mint's request-time `{{caveat.*}}` / `{{mint.*}}`
+— and matches the coordinator's `[store].bucket`.
 
 ## Elide as customer: role inventory
 
