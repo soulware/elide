@@ -91,3 +91,55 @@ operator interaction.
 - **Production** — mint standalone on a TCP `bind`, with a separate
   auth-service and attestation coordinator at the `PER-DEPLOYMENT` discharge
   URLs.
+
+## Fly.io deployment
+
+`Dockerfile` + `fly.toml` (from the committed `fly.toml.example`) deploy
+mint-for-elide as a **private** Fly app (no public service): the mint plane is
+reachable only over Fly's private network
+(6PN) at `<app>.internal:8085`, and the colocated demo auth issuer binds an
+in-container UDS, off the network entirely. The image builds the stock `mint`
+from the pinned `MINT_REF`, renders `role-templates/` with `DATA_BUCKET`, and
+runs `mint serve`. The keyring, sealed surface, and demo secrets live on the
+`mint_data` volume and survive redeploys.
+
+The runtime config is `mint-fly.toml` — a self-contained restatement of
+`mint-elide.toml` with the Fly `data_dir`, listener, and colocated demo
+auth/attestation. Its `[[role]]` inventory mirrors `mint-elide.toml`; keep the
+two in sync.
+
+Prerequisites: the `fly` CLI, a Tigris bucket, and an admin credential that can
+manage it (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
+
+1. Copy the template — `cp fly.toml.example fly.toml` (the live `fly.toml` is
+   gitignored) — and set `app` / `primary_region` and the build args:
+   `DATA_BUCKET` (= the coordinator's `[store].bucket`) and `MINT_REF` (the
+   lockstep mint commit). All deploy commands run from this directory.
+2. `fly apps create <app>` and `fly volumes create mint_data --size 1`.
+3. `fly secrets set AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…`.
+4. `fly deploy` — the keyring and `K_M-*` generate on first boot (the demo
+   tables enable first-boot generation), into the volume.
+
+Then seal and mint an invite **inside the machine** — the demo auth issuer is
+in-container UDS-only, so the operator gates run there, not from your
+workstation:
+
+    fly ssh console
+    mint login  --config /app/mint.toml --subject <operator>
+    mint seal   --config /app/mint.toml
+    mint invite --config /app/mint.toml
+
+At this point mint is serving, sealed, and issuing. A coordinator on Fly's 6PN
+points `[mint].url` at `http://<app>.internal:8085`; a coordinator in a local VM
+reaches the same address after `fly wireguard create`.
+
+Not yet wired for the off-Fly VM coordinator: enrollment has the coordinator
+fetch operator discharges from the auth issuer, which is in-container UDS-only,
+so enrolling across the Fly↔VM boundary needs that issuer bridged onto 6PN.
+Attested volume roles additionally need `K_M-B`
+(`<data_dir>/attestation-shared.key`, generated on the volume) shared with the
+VM's attestation coordinator. The issuer-only `coord-ro` / `coord-rw` roles do
+not depend on either.
+
+The keyring is the root of trust and auto-generates onto the `mint_data` volume;
+losing the volume invalidates every issued credential, so back it up.

@@ -1,0 +1,39 @@
+# mint-for-elide on Fly.io — a private app (no public service): reachable over
+# 6PN at <app>.internal:8085. Template: copy to fly.toml (gitignored), fill
+# app/primary_region and the build args, then `fly deploy` from this directory.
+# See README.md § Fly.io deployment.
+
+app = "mint-for-elide"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+  [build.args]
+    # Lockstep mint source ref and the volume-data bucket baked into the role
+    # ARNs. DATA_BUCKET must equal the coordinator's [store].bucket.
+    MINT_REF = "93ffda83e69c17e5572ce0104ae8c5d84e353d5e"
+    DATA_BUCKET = "elide"
+
+[env]
+  RUST_LOG = "info"
+
+# Keyring + sealed surface + invite nonce + demo secrets live here, on the
+# volume, so they survive redeploys (matches data_dir in fly/config.head.toml).
+[mounts]
+  source = "mint_data"
+  destination = "/data"
+
+# Serverless-off: keep one instance up so the keyring and seal stay live.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# No [http_service]: the app is private. The demo auth issuer is off the network
+# entirely (in-container UDS); the mint plane is 6PN-only.
+[checks]
+  [checks.mint]
+    type = "tcp"
+    port = 8085
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
