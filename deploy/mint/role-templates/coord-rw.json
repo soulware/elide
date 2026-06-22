@@ -5,7 +5,7 @@
       "Sid": "NamesReadWriteDelete",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": ["arn:aws:s3:::elide/names/*"],
+      "Resource": ["arn:aws:s3:::{{build.bucket}}/names/*"],
       "Condition": {
         "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
       }
@@ -14,7 +14,7 @@
       "Sid": "EventsAppendOnly",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": ["arn:aws:s3:::elide/events/*"],
+      "Resource": ["arn:aws:s3:::{{build.bucket}}/events/*"],
       "Condition": {
         "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
       }
@@ -23,7 +23,7 @@
       "Sid": "OwnIdentityImmutable",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": ["arn:aws:s3:::elide/coordinators/{{caveat.sub}}/*"],
+      "Resource": ["arn:aws:s3:::{{build.bucket}}/coordinators/{{caveat.sub}}/*"],
       "Condition": {
         "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
       }
@@ -32,7 +32,7 @@
       "Sid": "MetaIdentityEstablishment",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
-      "Resource": ["arn:aws:s3:::elide/meta/*"],
+      "Resource": ["arn:aws:s3:::{{build.bucket}}/meta/*"],
       "Condition": {
         "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
       }

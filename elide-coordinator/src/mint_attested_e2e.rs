@@ -169,6 +169,11 @@ async fn attested_loop_over_shipped_templates() {
     let mint_sock = root_p.join("mint.sock");
     let auth_sock = root_p.join("auth.sock");
     let coord_b_sock = root_p.join("coord-b.sock");
+
+    // `roles_dir` is the rendered output `mint serve` / `mint seal` load; the
+    // render step (below) writes it from the shipped role-templates/. The store
+    // is local, so the rendered bucket name is cosmetic; any valid name works.
+    let rendered_roles = root_p.join("roles");
     {
         let tbl = cfg_doc.as_table_mut().expect("config table");
         {
@@ -176,7 +181,7 @@ async fn attested_loop_over_shipped_templates() {
                 tbl.insert(k.into(), toml::Value::String(v));
             };
             set("data_dir", root_p.join("mint_data").display().to_string());
-            set("roles_dir", deploy.join("roles").display().to_string());
+            set("roles_dir", rendered_roles.display().to_string());
             set("socket", mint_sock.display().to_string());
         }
         // Colocate the demo auth role under the shipped [auth] table.
@@ -198,6 +203,22 @@ async fn attested_loop_over_shipped_templates() {
     )
     .expect("write config");
     let cfg_str = cfg_path.to_str().expect("utf-8 path");
+
+    // Render the shipped role templates the way a real deployment does:
+    // `mint render` bakes the `{{build.bucket}}` token from role-templates/ into
+    // roles_dir before mint seals them. Running the real command keeps the e2e
+    // in lockstep with the documented deploy flow.
+    let render_status = std::process::Command::new(&mint_bin)
+        .arg("render")
+        .arg("--in-dir")
+        .arg(deploy.join("role-templates"))
+        .arg("--build")
+        .arg("bucket=elide-e2e")
+        .arg("--out-dir")
+        .arg(&rendered_roles)
+        .status()
+        .expect("spawn mint render");
+    assert!(render_status.success(), "mint render failed");
 
     // The daemon: production serve loop over FakeMinter + local store.
     let log_path = root_p.join("mint-e2e.log");

@@ -8,13 +8,15 @@ audience = "mint"
 
 # roles_dir / data_dir: a relative value resolves against mint's working
 # directory, not this file's parent; an absolute path is used verbatim.
-# `roles` is the policy-template directory shipped alongside this file.
+#
+# roles_dir holds the role policy templates that `mint serve` / `mint seal`
+# load. These are the rendered output of `mint render` (see README.md § Data
+# bucket); it is generated, not committed.
 roles_dir = "roles"
 # data_dir = "mint_data"   # default; the keyring + sealed surface live here
 #
-# Each role's policy template is <roles_dir>/<name>.json by default
-# (volume-ro -> roles/volume-ro.json); set an explicit policy_file on a
-# role only to override that name.
+# Each role's template is <roles_dir>/<name>.json by default (volume-ro ->
+# roles/volume-ro.json); set policy_file on a role to override the name.
 
 # PER-DEPLOYMENT. Listener transport; `bind` and `socket` are mutually
 # exclusive. UDS for the single-host shape (coordinator + mint co-resident),
@@ -34,10 +36,10 @@ location = "https://auth.elide.internal/v1/discharge"
 location = "https://coord-b.elide.internal/v1/discharge"
 
 [store]
-# PER-DEPLOYMENT. The bucket mint administers (holds `_mint/*`). The bucket
-# holding Elide volume data is a literal in the role templates under roles/,
-# set independently of this value.
-bucket = "elide"
+# PER-DEPLOYMENT. The bucket mint administers, holding mint's own `_mint/*`
+# state. Set it to the real bucket; it may be the same bucket as the volume
+# data or a separate one.
+bucket = "mint-admin"
 # endpoint = "https://t3.storage.dev"   # default; set for non-Tigris S3
 # region   = "us-east-1"                # default
 
