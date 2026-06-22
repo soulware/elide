@@ -1,8 +1,9 @@
 # mint-for-elide container image for Fly.io.
 #
 # Stage 1 builds the stock `mint` binary from a pinned source ref (mint
-# publishes no release artifact). Stage 2 renders the role templates with the
-# deployment's data bucket and runs `mint serve` over mint-fly.toml.
+# publishes no release artifact) and renders the role templates with the
+# deployment's data bucket. Stage 2 assembles the runtime image and runs
+# `mint serve` over mint-fly.toml.
 #
 # Build args:
 #   MINT_REF     mint commit/tag to build (lockstep with this coordinator).
@@ -26,23 +27,27 @@ RUN git clone https://github.com/soulware/mint /src \
  && git -C /src checkout "${MINT_REF}" \
  && cargo build --release --manifest-path /src/Cargo.toml --bin mint
 
+# Resolve {{build.bucket}} into the rendered roles/ that `mint serve` loads.
+# A pure file pass — no S3, no credentials — done here so the unrendered
+# templates stay out of the runtime image.
+ARG DATA_BUCKET=elide
+COPY role-templates/ /role-templates/
+RUN /src/target/release/mint render --in-dir /role-templates \
+      --build "bucket=${DATA_BUCKET}" --out-dir /roles
+
 FROM ubuntu:24.04
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /src/target/release/mint /usr/local/bin/mint
-
-# Resolve {{build.bucket}} into the rendered roles/ that `mint serve` loads.
-# A pure file pass — no S3 — so it runs here without credentials.
-ARG DATA_BUCKET=elide
-COPY role-templates/ /app/role-templates/
-RUN mint render --in-dir /app/role-templates --build "bucket=${DATA_BUCKET}" --out-dir /app/roles
+COPY --from=build /roles /app/roles
 
 COPY mint-fly.toml /app/mint.toml
 # mint's [store].bucket (its own _mint/* admin state) is TOML-only, not an env
 # input. Default it to the data bucket — _mint/* shares the bucket under a
 # distinct prefix — or set STORE_BUCKET to give mint its own bucket.
+ARG DATA_BUCKET=elide
 ARG STORE_BUCKET=
 RUN sed -i "s|^bucket = .*|bucket = \"${STORE_BUCKET:-$DATA_BUCKET}\"|" /app/mint.toml
 
