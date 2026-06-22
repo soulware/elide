@@ -46,5 +46,8 @@ COPY mint-fly.toml /app/mint.toml
 ARG STORE_BUCKET=
 RUN sed -i "s|^bucket = .*|bucket = \"${STORE_BUCKET:-$DATA_BUCKET}\"|" /app/mint.toml
 
+# Every mint subcommand reads MINT_CONFIG, so serve and the in-container
+# operator commands (login/seal/invite) need no --config.
+ENV MINT_CONFIG=/app/mint.toml
 EXPOSE 8085
-CMD ["mint", "serve", "--config", "/app/mint.toml"]
+CMD ["mint", "serve"]

@@ -127,9 +127,12 @@ in-container UDS-only, so the operator gates run there, not from your
 workstation:
 
     fly ssh console
-    mint login  --config /app/mint.toml --subject <operator>
-    mint seal   --config /app/mint.toml
-    mint invite --config /app/mint.toml
+    mint login --subject <operator>
+    mint seal
+    mint invite
+
+(The image sets `MINT_CONFIG=/app/mint.toml`, so the subcommands need no
+`--config`.)
 
 At this point mint is serving, sealed, and issuing. A coordinator on Fly's 6PN
 points `[mint].url` at `http://<app>.internal:8085`; a coordinator in a local VM
