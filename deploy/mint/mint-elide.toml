@@ -6,19 +6,17 @@
 
 audience = "mint"
 
-# template_dir / roles_dir / data_dir: a relative value resolves against mint's
-# working directory, not this file's parent; an absolute path is used verbatim.
+# roles_dir / data_dir: a relative value resolves against mint's working
+# directory, not this file's parent; an absolute path is used verbatim.
 #
-# template_dir is the committed source of role policy templates ({{build.*}}
-# tokens unresolved); roles_dir is where `mint render` writes them resolved, and
-# where `mint serve` / `mint seal` then read. roles_dir is generated, not
-# committed.
-template_dir = "role-templates"
+# roles_dir holds the role policy templates that `mint serve` / `mint seal`
+# load. These are the rendered output of `mint render` (see README.md § Data
+# bucket); it is generated, not committed.
 roles_dir = "roles"
 # data_dir = "mint_data"   # default; the keyring + sealed surface live here
 #
-# Each role's template is <template_dir>/<name>.json by default (volume-ro ->
-# role-templates/volume-ro.json); set policy_file on a role to override the name.
+# Each role's template is <roles_dir>/<name>.json by default (volume-ro ->
+# roles/volume-ro.json); set policy_file on a role to override the name.
 
 # PER-DEPLOYMENT. Listener transport; `bind` and `socket` are mutually
 # exclusive. UDS for the single-host shape (coordinator + mint co-resident),

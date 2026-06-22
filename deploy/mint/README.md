@@ -49,14 +49,15 @@ the sealed templates carry only request-time tokens.
 Rendering is **required** before `mint seal`: the raw templates carry an
 unresolved token and are not valid policies until the bucket is supplied.
 
-    mint render --config mint-elide.toml --build bucket=<data-bucket>
+    mint render --in-dir role-templates --build bucket=<data-bucket> --out-dir roles
 
-`mint render` reads `template_dir` (the committed `role-templates/`) and writes
-`roles_dir` (the gitignored `roles/`) from the config, so the only argument is
-the bucket. The rendered bucket must equal the **coordinator's** data bucket
-(`[store].bucket` in the coordinator config): the minted keys carry no policy, so
-the coordinator addresses this bucket directly and the role ARNs only authorise
-what it requests. Supply both from one deploy variable so they cannot diverge.
+`mint render` bakes `{{build.*}}` from the committed `role-templates/` into the
+gitignored `roles/`; `--out-dir` must be the config's `roles_dir`, which is
+where `mint serve` / `mint seal` then read. The rendered bucket must equal the
+**coordinator's** data bucket (`[store].bucket` in the coordinator config): the
+minted keys carry no policy, so the coordinator addresses this bucket directly
+and the role ARNs only authorise what it requests. Supply both from one deploy
+variable so they cannot diverge.
 
 This is **not** mint's `[store].bucket`, which is mint's own administrative
 bucket; the two are configured independently.
@@ -68,8 +69,8 @@ attestation coordinator (coord B). For mint's own keyring and `mint serve` /
 `mint seal` mechanics, see `docs/design-mint.md` § *Mint configuration*.
 
 1. Copy `mint-elide.toml`; fill the `PER-DEPLOYMENT` keys, then render the
-   templates: `mint render --config mint-elide.toml --build bucket=<data-bucket>`
-   (§ Data bucket). This produces the gitignored `roles/`.
+   templates: `mint render --in-dir role-templates --build bucket=<data-bucket>
+   --out-dir roles` (§ Data bucket). This produces the gitignored `roles/`.
 2. Provision mint's keyring (`<data_dir>/root_keys/`) out of band.
 3. `mint serve --config mint-elide.toml`
 4. `mint seal --config mint-elide.toml` — seals the `roles/` templates.
