@@ -40,6 +40,11 @@ COPY role-templates/ /app/role-templates/
 RUN mint render --in-dir /app/role-templates --build "bucket=${DATA_BUCKET}" --out-dir /app/roles
 
 COPY mint-fly.toml /app/mint.toml
+# mint's [store].bucket (its own _mint/* admin state) is TOML-only, not an env
+# input. Default it to the data bucket — _mint/* shares the bucket under a
+# distinct prefix — or set STORE_BUCKET to give mint its own bucket.
+ARG STORE_BUCKET=
+RUN sed -i "s|^bucket = .*|bucket = \"${STORE_BUCKET:-$DATA_BUCKET}\"|" /app/mint.toml
 
 EXPOSE 8085
 CMD ["mint", "serve", "--config", "/app/mint.toml"]

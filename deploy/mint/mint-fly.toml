@@ -23,7 +23,8 @@ location = "https://auth.elide.internal/v1/discharge"
 location = "https://coord-b.elide.internal/v1/discharge"
 
 [store]
-# mint's own administrative bucket (holds its _mint/* state).
+# mint's own administrative bucket (holds its _mint/* state). The Fly build
+# overrides this from the DATA_BUCKET / STORE_BUCKET build arg.
 bucket = "mint-admin"
 
 [[role]]
