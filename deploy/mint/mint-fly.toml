@@ -1,0 +1,53 @@
+# mint-for-elide config for the Fly.io deployment (see README.md § Fly.io
+# deployment). Self-contained: mint-elide.toml plus the Fly data_dir, listener,
+# and colocated demo auth/attestation. The [[role]] inventory mirrors
+# mint-elide.toml — keep the two in sync.
+
+audience = "mint"
+
+# Rendered roles/ (mint render output), resolved against mint's working dir.
+roles_dir = "roles"
+
+# Keyring, sealed surface, invite nonce, and demo secrets — the Fly volume.
+data_dir = "/data/mint_data"
+
+# Private 6PN listener (all interfaces).
+bind = "[::]:8085"
+
+[auth]
+# Auth-service identity stamped into the enroll/exchange/admin gates.
+location = "https://auth.elide.internal/v1/discharge"
+
+[attestation]
+# Attestation coordinator (coord B) identity for the attested volume roles.
+location = "https://coord-b.elide.internal/v1/discharge"
+
+[store]
+# mint's own administrative bucket (holds its _mint/* state). The Fly build
+# overrides this from the DATA_BUCKET / STORE_BUCKET build arg.
+bucket = "mint-admin"
+
+[[role]]
+name = "volume-ro"
+ttl_seconds = 3600
+
+[[role]]
+name = "volume-rw"
+ttl_seconds = 86400
+
+[[role]]
+name = "coord-ro"
+ttl_seconds = 3600
+
+[[role]]
+name = "coord-rw"
+ttl_seconds = 3600
+
+# Colocated demo auth + attestation. Presence is the switch; it also enables
+# first-boot generation of the keyring, K_M-A, K_session, and K_M-B. Both bind
+# UDS reachable only inside the container.
+[auth.demo]
+socket = "/data/mint_data/auth.sock"
+
+[attestation.demo]
+socket = "/data/mint_data/attest.sock"

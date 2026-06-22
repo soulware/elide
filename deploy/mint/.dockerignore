@@ -1,0 +1,4 @@
+# roles/ is rendered inside the image; never ship a host copy.
+roles/
+# Fly app config; not used inside the image.
+fly.toml*
