@@ -184,11 +184,17 @@ async fn run() -> Result<()> {
 
             if let Some(mint_cfg) = &config.mint {
                 mint_cfg.validate()?;
-                // Refuse to start half-credentialed: every enrolled
-                // role's credential must be present and decode. The
-                // mint path is not exercisable until enrollment has
-                // provisioned them.
-                enroll::assert_enrolled(&config.data_dir)?;
+                // Wait for enrollment rather than failing closed: a fresh
+                // deploy comes up before the operator runs `elide coord
+                // enroll`, and the daemon already blocks for mint just below
+                // (`wait_for_ready`). `assert_enrolled` is all-or-nothing, so
+                // this proceeds only once every role's credential is present.
+                while let Err(missing) = enroll::assert_enrolled(&config.data_dir) {
+                    tracing::info!(
+                        "[coordinator] awaiting enrollment: {missing}; run `elide coord enroll`"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
                 tracing::info!(
                     "[coordinator] store: mint-backed scoped \
                      (coord-ro / coord-rw / volume-rw); reachability \
