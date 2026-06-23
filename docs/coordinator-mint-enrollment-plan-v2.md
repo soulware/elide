@@ -95,7 +95,7 @@ role(s) and pointing at `elide coord enroll`. The `[mint]`-absent branch
 
 2. **Operator session is a prerequisite; discharges are fetched, not
    stored.** The command requires a live operator session (from `elide
-   operator login`); it fetches the enroll-gate and exchange-gate
+   login`); it fetches the enroll-gate and exchange-gate
    discharges on demand and holds them only in memory for the call. The
    discharge route is derived from each macaroon's TPC `location`, so no
    separate `--auth-url` flag is needed (the transport may still come
@@ -147,7 +147,7 @@ role(s) and pointing at `elide coord enroll`. The `[mint]`-absent branch
   `COORD_ENROLL_ROLES`; otherwise untouched.
 - **Operator session** — load the session written by `elide operator
   login` (see `design-auth-service.md` § *Login flow*); reuse its
-  storage path and decode. If no `elide operator login` surface exists in
+  storage path and decode. If no `elide login` surface exists in
   the coordinator CLI yet, that is a prerequisite this plan depends on
   (flag it explicitly rather than inlining a login flow here).
 - **`main.rs`** — new `Command::Enroll`; startup-gate check in the
@@ -163,7 +163,7 @@ elide coord enroll [--data-dir <dir>] <invite-macaroon | file | ->
 
 - positional invite source: inline macaroon, a file path, or `-` for
   stdin (same resolution as `mint client enroll`).
-- requires a live operator session (`elide operator login` first);
+- requires a live operator session (`elide login` first);
   errors clearly if absent or expired.
 - `--timeout`: overall wait-for-approval bound (default e.g. `30m`); on
   timeout, exit non-zero with the resume instruction (re-run is safe).
@@ -175,7 +175,7 @@ elide coord enroll [--data-dir <dir>] <invite-macaroon | file | ->
 ## Edge cases
 
 - **No / expired operator session**: fail fast before touching mint,
-  pointing at `elide operator login`.
+  pointing at `elide login`.
 - **Auth unreachable** (cannot fetch a discharge): fail with a clear
   "auth service unreachable — enrollment needs a logged-in operator"
   message; re-run is safe.
@@ -219,7 +219,7 @@ elide coord enroll [--data-dir <dir>] <invite-macaroon | file | ->
 - The steady-state Tigris-keypair cache / proactive refresh
   (`assume-role` side) — credentials themselves never expire, so
   enrollment is converge-once and has no refresh cadence.
-- The standalone auth-service binary and `elide operator login` UX
+- The standalone auth-service binary and `elide login` UX
   beyond consuming a session it produces (demo-auth covers the test
   path).
 - `mint invite --rotate` handling beyond surfacing the diagnosis.
