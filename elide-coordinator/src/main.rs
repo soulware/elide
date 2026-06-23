@@ -288,10 +288,17 @@ async fn run() -> Result<()> {
                 &config.data_dir,
             )
             .with_context(|| "loading coordinator identity")?;
-            // The enroll/exchange gates are operator-discharged, so a
-            // logged-in operator session is a prerequisite.
-            let session = enroll::load_operator_session()
-                .with_context(|| "loading the operator session for the enrollment gates")?;
+            // The enroll/exchange gates are operator-discharged. In the
+            // shared-key demo the coordinator self-issues them from the
+            // `K_M-A` it shares with mint (`[auth.demo]`), stamped with the
+            // logged-in operator subject.
+            let k_m_a = config.demo_k_m_a()?.with_context(|| {
+                "`elide coord enroll` needs an operator-auth source: set [auth.demo].k_m_a \
+                 in coordinator.toml (the same value mint is deployed with)"
+            })?;
+            let subject = elide_core::operator_session::load_subject()
+                .with_context(|| "loading the operator login for the enrollment gates")?;
+            let issuer = enroll::DemoIssuer { k_m_a, subject };
             enroll::run(
                 mint_cfg,
                 &identity,
@@ -299,7 +306,7 @@ async fn run() -> Result<()> {
                 &invite,
                 timeout,
                 force,
-                &session,
+                &issuer,
             )
             .await
             .map_err(anyhow::Error::from)

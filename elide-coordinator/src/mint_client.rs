@@ -312,6 +312,16 @@ impl WireMacaroon {
         })
     }
 
+    /// The value of the first-party caveat named `name`, if present. Used
+    /// to read the anchor's `aud` so a self-issued discharge declares the
+    /// same audience the primary clears under (`crate::enroll`).
+    pub(crate) fn first_party_value(&self, name: &str) -> Option<&str> {
+        self.caveats.iter().find_map(|c| match c {
+            Caveat::FirstParty { name: n, value } if n == name => Some(value.as_str()),
+            _ => None,
+        })
+    }
+
     pub(crate) fn encode(&self) -> String {
         let mut buf = Vec::new();
         rmp::encode::write_array_len(&mut buf, 4).expect("vec writer");

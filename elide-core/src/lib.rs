@@ -11,6 +11,7 @@ pub mod import;
 pub mod ipc;
 pub mod lbamap;
 pub mod name_record;
+pub mod operator_session;
 pub mod process;
 pub mod rewrite_apply;
 pub mod rewrite_plan;

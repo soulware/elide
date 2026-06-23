@@ -864,9 +864,12 @@ drift. Holding `K_M-A`, each party issues the operator discharges it
 needs **locally**, with no cross-host auth call:
 
 - The coordinator self-issues its enroll- and exchange-gate discharges:
-  read the presented TPC's `CID = AEAD(K_M-A, r ‖ OrgId)`, recover
-  `(r, OrgId)`, mint the discharge keyed by `r` — the coord-B issuance
-  path (`elide-attestation`) with `K_M-A` substituted for `K_M-B`.
+  read the presented TPC's `CID = AEAD(K_M-A, r ‖ client_id ‖ org_id)`,
+  recover `(r, client_id, org_id)`, mint the discharge keyed by `r`
+  carrying `(aud, sub, scope, exp)` — the coord-B issuance path
+  (`elide-attestation`) with `K_M-A` substituted for `K_M-B`. (The
+  construction sections above abbreviate the CID as `r ‖ OrgId`; the wire
+  form length-prefixes `client_id` and `org_id` between.)
 - Mint verifies each discharge inline under the same `K_M-A`. **Mint's
   verifier is unchanged** — a coordinator-issued discharge is
   indistinguishable from one mint-as-auth would have minted; only the

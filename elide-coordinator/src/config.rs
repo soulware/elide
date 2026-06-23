@@ -110,6 +110,15 @@ pub struct CoordinatorConfig {
     /// enables only this (and may keep it off the network on a UDS).
     #[serde(default)]
     pub attestation: Option<AttestationConfig>,
+
+    /// Operator-auth source for `elide coord enroll`. Absent → enrollment
+    /// has no discharge source and fails with a pointer to configure one.
+    /// `[auth.demo]` selects the shared-key demo where the coordinator
+    /// holds the same `K_M-A` as mint and self-issues operator discharges
+    /// locally (`docs/design-auth-service.md` § *Proposed: distributed
+    /// demo — shared K_M-A*).
+    #[serde(default)]
+    pub auth: Option<AuthSection>,
 }
 
 impl CoordinatorConfig {
@@ -119,6 +128,42 @@ impl CoordinatorConfig {
             .clone()
             .unwrap_or_else(|| self.data_dir.join("control.sock"))
     }
+
+    /// The shared-key demo `K_M-A`, decoded from `[auth.demo].k_m_a`
+    /// (standard base64 of 32 bytes — the identical value mint sources from
+    /// its own `[auth.demo].k_m_a`). `Ok(None)` when no `[auth.demo]` is set.
+    pub fn demo_k_m_a(&self) -> Result<Option<[u8; 32]>> {
+        use base64::Engine as _;
+        let Some(raw) = self.auth.as_ref().and_then(|a| a.demo.as_ref()) else {
+            return Ok(None);
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw.k_m_a.trim())
+            .context("[auth.demo].k_m_a is not valid standard base64")?;
+        let key: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("[auth.demo].k_m_a decoded {} bytes, need 32", v.len())
+        })?;
+        Ok(Some(key))
+    }
+}
+
+/// `[auth]` — the operator-auth source for enrollment.
+#[derive(Deserialize)]
+pub struct AuthSection {
+    /// `[auth.demo]` — the shared-key demo (`docs/design-auth-service.md`
+    /// § *Proposed: distributed demo — shared K_M-A*).
+    #[serde(default)]
+    pub demo: Option<RawDemoAuth>,
+}
+
+/// `[auth.demo]` — shared-key demo auth: the coordinator holds the same
+/// `K_M-A` as mint and self-issues the operator discharges enrollment
+/// needs, without a cross-host auth call.
+#[derive(Deserialize)]
+pub struct RawDemoAuth {
+    /// `K_M-A` as standard base64 of 32 bytes — the identical value mint is
+    /// deployed with (`openssl rand -base64 32`).
+    pub k_m_a: String,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -581,6 +626,16 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # connect_timeout = "5s"
 # request_timeout = "30s"
 
+# [auth] — operator-auth source for `elide coord enroll`. `[auth.demo]`
+# selects the shared-key demo: the coordinator holds the same K_M-A as the
+# mint it enrolls against and self-issues the operator discharges locally,
+# with no cross-host auth call (docs/design-auth-service.md § "Proposed:
+# distributed demo — shared K_M-A"). `k_m_a` is standard base64 of 32 bytes
+# — the identical value set in mint's own [auth.demo].k_m_a.
+#
+# [auth.demo]
+# k_m_a = "..."   # openssl rand -base64 32, shared with mint
+
 [peer_fetch]
 # Setting `port` enables peer fetch: the coordinator binds an HTTP server on
 # this port and advertises it at `coordinators/<id>/peer-endpoint.toml` for
@@ -619,6 +674,7 @@ impl Default for CoordinatorConfig {
             peer_fetch: PeerFetchConfig::default(),
             mint: None,
             attestation: None,
+            auth: None,
         }
     }
 }

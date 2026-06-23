@@ -140,29 +140,34 @@ reaches the same address after `fly wireguard create`.
 
 ### Enrolling a VM coordinator
 
-A coordinator off Fly (e.g. a local VM) enrolls by reaching two endpoints over
-6PN: the mint plane (`<app>.internal:8085`) and the auth issuer. The colocated
-demo auth binds a UDS only, so set `BRIDGE_AUTH=1` (under `[env]`) to expose its
-`/v1/login` + `/v1/discharge` on 6PN TCP `8086` through a socat bridge in the
-container.
+A coordinator off Fly (e.g. a local VM) reaches **only the mint plane**
+(`<app>.internal:8085`) to enrol — it self-issues its own operator discharges
+from a `K_M-A` it shares with mint, so there is no auth endpoint to reach and no
+socat bridge (`BRIDGE_AUTH` is unnecessary for this). See
+`docs/design-auth-service.md` § *Proposed: distributed demo — shared K_M-A*.
 
-This is a **demo-tier, opt-in** stopgap: it puts the open demo issuer on your
-private network (fine on a WireGuard mesh you control, not a production posture)
-and is disposable — it goes away once a standalone auth-service exists. Leave
-`BRIDGE_AUTH` unset to keep auth in-container.
+Share the key: generate one value (`openssl rand -base64 32`) and set it as
+`[auth.demo].k_m_a` in **both** mint's config and the coordinator's
+`coordinator.toml`. (mint also persists its key at `<data_dir>/auth-shared.key`,
+so you can instead read the one mint generated.) Holding the same `K_M-A`, the
+coordinator mints the enroll/exchange-gate discharges locally and mint verifies
+them as its own. This is **demo-tier**: a holder of the shared `K_M-A` can forge
+operator discharges — fine for a demo, which is exactly why the real posture is
+a standalone auth-service that holds the key alone.
 
-With the bridge on and the VM joined to 6PN (`fly wireguard create`):
+With the VM joined to 6PN (`fly wireguard create`):
 
-    # on the coordinator host (the VM): log the operator in against the bridge
-    mint login --url http://<app>.internal:8086 --subject <operator>
-    # enroll the coordinator (reaches mint :8085 + auth :8086)
+    # on the coordinator host (the VM): record the operator identity — local,
+    # no network, since the shared K_M-A is the trust anchor
+    elide login --subject <operator>
+    # enrol the coordinator (reaches only mint :8085, self-issues the gates)
     elide coord enroll <invite>
-    # operator, inside the machine: approve the pending enrollment
+    # operator, inside the mint machine: approve the pending enrollment
     fly ssh console
     mint login --subject <operator>
     mint enroll approve <coordinator-sub>
 
-That enrolls the coordinator and lets it assume the issuer-only `coord-ro` /
+That enrols the coordinator and lets it assume the issuer-only `coord-ro` /
 `coord-rw` roles. The attested `volume-*` roles additionally need `K_M-B`
 (`<data_dir>/attestation-shared.key`, generated on the volume) shared with the
 VM's attestation coordinator — still out of scope here.

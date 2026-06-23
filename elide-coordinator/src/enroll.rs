@@ -34,9 +34,9 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use tracing::{info, warn};
 
+use elide_attestation::crypto::{decrypt_cid, mint_discharge_with_nonce, ticket_id};
 use elide_coordinator::config::MintConfig;
 use elide_coordinator::identity::CoordinatorIdentity;
 
@@ -163,86 +163,57 @@ fn resolve_invite(src: &str) -> io::Result<String> {
     Ok(trimmed)
 }
 
-/// The operator's auth-service session, as written by `mint login`:
-/// the session bearer that gates `/v1/discharge` plus the transport to
-/// dial the auth role with (`unix:<sock>` or `http(s)://host`). The
-/// session shape is the auth service's
-/// (`docs/design-auth-service.md` § *Login flow*), shared across its
-/// CLIs — one login serves the mint operator plane and this command.
-#[derive(Clone)]
-pub struct OperatorSession {
-    pub session: String,
-    pub transport: String,
+/// The shared-key demo operator-discharge issuer (`docs/design-auth-service.md`
+/// § *Proposed: distributed demo — shared K_M-A*). The coordinator holds the
+/// same `K_M-A` as mint and self-mints the enroll/exchange-gate discharges,
+/// stamping the logged-in operator as the discharge `sub` — no auth-service
+/// round-trip, the shared `K_M-A` is the trust anchor.
+pub struct DemoIssuer {
+    /// `K_M-A`, from `coordinator.toml [auth.demo]` — identical to mint's.
+    pub k_m_a: [u8; 32],
+    /// The logged-in operator subject (`elide login`), stamped as `sub`.
+    pub subject: String,
 }
 
-/// Load the session from the per-user store `mint login` writes:
-/// `$XDG_CONFIG_HOME/mint`, else `$HOME/.config/mint` — the `session`
-/// and `auth-transport` files.
-pub fn load_operator_session() -> io::Result<OperatorSession> {
-    let dir = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(x) if !x.is_empty() => PathBuf::from(x).join("mint"),
-        _ => match std::env::var_os("HOME") {
-            Some(h) if !h.is_empty() => PathBuf::from(h).join(".config").join("mint"),
-            _ => {
-                return Err(io::Error::other(
-                    "no config home — set HOME or XDG_CONFIG_HOME",
-                ));
-            }
-        },
-    };
-    let read = |file: &str, missing: &str| -> io::Result<String> {
-        match std::fs::read_to_string(dir.join(file)) {
-            Ok(s) => Ok(s.trim().to_owned()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Err(io::Error::other(format!("{missing} (run `mint login`)")))
-            }
-            Err(e) => Err(e),
-        }
-    };
-    Ok(OperatorSession {
-        session: read("session", "not logged in")?,
-        transport: read("auth-transport", "no auth transport known")?,
-    })
-}
+/// Discharge lifetime, matching mint's demo issuer
+/// (`mint/src/auth.rs::DISCHARGE_EXP_SECONDS`).
+const DISCHARGE_EXP_SECONDS: u64 = 300;
 
-/// Fetch the operator discharge for each third-party caveat on
-/// `anchor` (the invite's enroll gate, the ticket's exchange gate):
-/// POST the CID and the requested `scope` to the authority's discharge
-/// route under the session bearer. The authority issues only if the
-/// session grants `scope`; the returned discharges bundle after the
-/// primary.
-async fn gate_discharges(
-    cfg: &MintConfig,
-    session: &OperatorSession,
+/// Self-issue the operator discharge for each third-party caveat on
+/// `anchor` (the invite's enroll gate, the ticket's exchange gate). For
+/// each, recover `r` from the CID under the shared `K_M-A` and mint a
+/// discharge keyed by `r` carrying `(aud, sub, scope, exp)` — byte-for-byte
+/// what mint-as-auth would have issued. mint's verifier recovers `r` from
+/// the VID (not `K_M-A`), so a coordinator-minted discharge is
+/// indistinguishable. The discharges bundle after the primary.
+fn gate_discharges(
+    issuer: &DemoIssuer,
     anchor: &WireMacaroon,
     scope: &str,
 ) -> io::Result<Vec<String>> {
+    // The discharge declares the same audience the primary clears under.
+    let aud = anchor.first_party_value("aud").ok_or_else(|| {
+        io::Error::other("enrollment anchor carries no `aud` caveat to mirror into the discharge")
+    })?;
+    let exp = (now_unix()? + DISCHARGE_EXP_SECONDS).to_string();
     let mut discharges = Vec::new();
-    for (location, cid) in anchor.third_party_caveats() {
-        let path = elide_coordinator::config::location_path(location).ok_or_else(|| {
-            io::Error::other(format!("{scope} gate location carries no path: {location}"))
+    for (_location, cid) in anchor.third_party_caveats() {
+        let pt = decrypt_cid(&issuer.k_m_a, cid).map_err(|e| {
+            io::Error::other(format!(
+                "{scope} gate CID failed to decrypt under [auth.demo].k_m_a — the \
+                 coordinator's shared key does not match mint's: {e}"
+            ))
         })?;
-        let body = format!(
-            r#"{{"cid":"{}","scope":"{scope}"}}"#,
-            BASE64_URL.encode(cid)
-        );
-        let (status, text, _retry_after) = post(
-            &session.transport,
-            cfg.connect_timeout,
-            cfg.request_timeout,
-            path,
-            &format!("Bearer {}", session.session),
-            "",
-            body,
-        )
-        .await?;
-        if status != 200 {
-            let snippet: String = text.chars().take(200).collect();
-            return Err(io::Error::other(format!(
-                "auth discharge for the {scope} gate returned {status}: {snippet}"
-            )));
-        }
-        discharges.push(json_str_field(&text, "discharge")?);
+        discharges.push(mint_discharge_with_nonce(
+            &pt.r,
+            &ticket_id(cid),
+            &[
+                ("aud", aud),
+                ("sub", issuer.subject.as_str()),
+                ("scope", scope),
+                ("exp", exp.as_str()),
+            ],
+        ));
     }
     Ok(discharges)
 }
@@ -264,12 +235,12 @@ async fn enroll_request(
     cfg: &MintConfig,
     identity: &CoordinatorIdentity,
     invite: &str,
-    session: &OperatorSession,
+    issuer: &DemoIssuer,
 ) -> io::Result<String> {
     let mut mac = WireMacaroon::decode(invite)?;
     mac.attenuate(CAVEAT_SUB, identity.coordinator_id_str());
     mac.attenuate(CAVEAT_CNF, &cnf_value(identity));
-    let discharges = gate_discharges(cfg, session, &mac, SCOPE_ENROLL).await?;
+    let discharges = gate_discharges(issuer, &mac, SCOPE_ENROLL)?;
 
     let body = format!(r#"{{"ts":{}}}"#, now_unix()?);
     let sig = BASE64.encode(identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
@@ -382,7 +353,7 @@ pub async fn run(
     invite_src: &str,
     wait: Duration,
     force: bool,
-    session: &OperatorSession,
+    issuer: &DemoIssuer,
 ) -> io::Result<()> {
     let mut remaining: Vec<&EnrollRole> = ENROLL_ROLES
         .iter()
@@ -401,7 +372,7 @@ pub async fn run(
     let sub = identity.coordinator_id_str();
     let cnf = cnf_value(identity);
 
-    let mut ticket = enroll_request(cfg, identity, &invite, session).await?;
+    let mut ticket = enroll_request(cfg, identity, &invite, issuer).await?;
     info!(
         "[enroll] enrolled sub={sub} cnf-fingerprint={} — now run `mint enroll approve {sub}` \
          on the mint host (match that fingerprint out of band first)",
@@ -427,7 +398,7 @@ pub async fn run(
         // (the auth scope is per-operation, not per-role); fetched per
         // pass so a long approval wait never presents a stale one.
         let ticket_mac = WireMacaroon::decode(&ticket)?;
-        let discharges = gate_discharges(cfg, session, &ticket_mac, SCOPE_EXCHANGE).await?;
+        let discharges = gate_discharges(issuer, &ticket_mac, SCOPE_EXCHANGE)?;
         // Always process from the front: Granted removes the head;
         // AwaitingApproval / TicketExpired break the pass.
         let idx = 0;
@@ -459,7 +430,7 @@ pub async fn run(
                         "[enroll] credential ticket expired before approval; re-enrolling — \
                          the operator must re-run `mint enroll approve {sub}`"
                     );
-                    ticket = enroll_request(cfg, identity, &invite, session).await?;
+                    ticket = enroll_request(cfg, identity, &invite, issuer).await?;
                     awaiting = true;
                     break;
                 }
