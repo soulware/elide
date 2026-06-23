@@ -9,6 +9,9 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
   [build.args]
+    # ELIDE_REF: elide source ref to build — a commit/tag pins it, "main"
+    # tracks latest.
+    ELIDE_REF = "main"
     # DATA_BUCKET: the Tigris data bucket (must equal mint's DATA_BUCKET);
     # baked into coord.toml [store].bucket.
     DATA_BUCKET = "elide"
