@@ -650,15 +650,20 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 
 /// Load and parse a `coordinator.toml` file.
 ///
-/// If the file does not exist, returns a default config (all fields use their
-/// defaults: `data_dir = ./elide_data`, `store = ./elide_store`, etc.).
+/// A missing file is an error, not a silent fall-through to defaults: a
+/// coordinator with no `[store]`/`[mint]` config cannot serve, and a default
+/// config quietly routes serve into the shared-key passthrough branch where it
+/// fails far from the cause (an opaque conditional-PUT bail on the default local
+/// store). Surfacing the missing path here is immediately actionable.
 pub fn load(path: &Path) -> Result<CoordinatorConfig> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text)
-            .with_context(|| format!("parsing config file: {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CoordinatorConfig::default()),
-        Err(e) => Err(e).with_context(|| format!("reading config file: {}", path.display())),
-    }
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading config file: {} (pass --config, set ELIDE_COORD_CONFIG, \
+             or run `elide-coordinator init` to create one)",
+            path.display()
+        )
+    })?;
+    toml::from_str(&text).with_context(|| format!("parsing config file: {}", path.display()))
 }
 
 impl Default for CoordinatorConfig {
@@ -990,6 +995,20 @@ mod tests {
             Some(32)
         );
         assert!(cfg.mint.is_some(), "[mint] present");
+    }
+
+    #[test]
+    fn load_errors_on_missing_file() {
+        // A missing config path must fail loudly, not silently fall through to
+        // a default config — a default routes serve into the shared-key
+        // passthrough branch and bails on conditional PUT far from the cause.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.toml");
+        let Err(err) = load(&missing) else {
+            panic!("missing config must error, not fall through to defaults");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nope.toml"), "error names the path: {msg}");
     }
 
     #[test]
