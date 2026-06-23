@@ -19,6 +19,9 @@ primary_region = "iad"
 
 [env]
   RUST_LOG = "info"
+  # BRIDGE_AUTH = "1"   # expose the demo auth issuer on 6PN :8086 so an off-Fly
+  #                     # coordinator can enroll (demo-tier; see README § VM-
+  #                     # coordinator enrollment). Unset = auth stays in-container.
 
 # Keyring + sealed surface + invite nonce + demo secrets live here, on the
 # volume, so they survive redeploys (matches data_dir in fly/config.head.toml).

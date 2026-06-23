@@ -138,13 +138,34 @@ At this point mint is serving, sealed, and issuing. A coordinator on Fly's 6PN
 points `[mint].url` at `http://<app>.internal:8085`; a coordinator in a local VM
 reaches the same address after `fly wireguard create`.
 
-Not yet wired for the off-Fly VM coordinator: enrollment has the coordinator
-fetch operator discharges from the auth issuer, which is in-container UDS-only,
-so enrolling across the Fly↔VM boundary needs that issuer bridged onto 6PN.
-Attested volume roles additionally need `K_M-B`
+### Enrolling a VM coordinator
+
+A coordinator off Fly (e.g. a local VM) enrolls by reaching two endpoints over
+6PN: the mint plane (`<app>.internal:8085`) and the auth issuer. The colocated
+demo auth binds a UDS only, so set `BRIDGE_AUTH=1` (under `[env]`) to expose its
+`/v1/login` + `/v1/discharge` on 6PN TCP `8086` through a socat bridge in the
+container.
+
+This is a **demo-tier, opt-in** stopgap: it puts the open demo issuer on your
+private network (fine on a WireGuard mesh you control, not a production posture)
+and is disposable — it goes away once a standalone auth-service exists. Leave
+`BRIDGE_AUTH` unset to keep auth in-container.
+
+With the bridge on and the VM joined to 6PN (`fly wireguard create`):
+
+    # on the coordinator host (the VM): log the operator in against the bridge
+    mint login --url http://<app>.internal:8086 --subject <operator>
+    # enroll the coordinator (reaches mint :8085 + auth :8086)
+    elide coord enroll <invite>
+    # operator, inside the machine: approve the pending enrollment
+    fly ssh console
+    mint login --subject <operator>
+    mint enroll approve <coordinator-sub>
+
+That enrolls the coordinator and lets it assume the issuer-only `coord-ro` /
+`coord-rw` roles. The attested `volume-*` roles additionally need `K_M-B`
 (`<data_dir>/attestation-shared.key`, generated on the volume) shared with the
-VM's attestation coordinator. The issuer-only `coord-ro` / `coord-rw` roles do
-not depend on either.
+VM's attestation coordinator — still out of scope here.
 
 The keyring is the root of trust and auto-generates onto the `mint_data` volume;
 losing the volume invalidates every issued credential, so back it up.
