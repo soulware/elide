@@ -977,6 +977,25 @@ mod tests {
     }
 
     #[test]
+    fn shipped_coordinator_demo_config_parses() {
+        // The committed shared-key demo template (deploy/coordinator/) — nothing
+        // else loads it, so this is its guard: it must parse and its
+        // [auth.demo].k_m_a must decode to 32 bytes, matching mint-fly.toml.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../deploy/coordinator/coordinator.toml.example"
+        );
+        let text = std::fs::read_to_string(path).expect("read coordinator.toml.example");
+        let cfg: CoordinatorConfig =
+            toml::from_str(&text).expect("coordinator.toml must parse as a CoordinatorConfig");
+        assert_eq!(
+            cfg.demo_k_m_a().expect("k_m_a decodes").map(|k| k.len()),
+            Some(32)
+        );
+        assert!(cfg.mint.is_some(), "[mint] present");
+    }
+
+    #[test]
     fn default_config_template_parses_to_defaults() {
         let cfg: CoordinatorConfig = toml::from_str(DEFAULT_CONFIG_TEMPLATE)
             .expect("DEFAULT_CONFIG_TEMPLATE must parse as a CoordinatorConfig");

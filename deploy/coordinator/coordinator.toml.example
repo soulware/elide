@@ -1,0 +1,26 @@
+# Elide coordinator — shared-key demo against a Fly-deployed mint.
+#
+# Copy to `coordinator.toml` (gitignored) and fill the per-deployment values
+# (`<…>`). `[auth.demo].k_m_a`
+# is the committed demo K_M-A, identical to `deploy/mint/mint-fly.toml`'s:
+# holding the same key, this coordinator self-issues its operator discharges
+# at `elide coord enroll` — no auth round-trip, no bridge. Demo-tier: a known,
+# forgeable key (docs/design-auth-service.md § "Proposed: distributed demo —
+# shared K_M-A").
+
+data_dir = "elide_data"
+
+[store]
+# The same Tigris data bucket the mint roles are scoped to (mint's DATA_BUCKET).
+bucket = "<data-bucket>"
+endpoint = "https://t3.storage.dev"
+region = "auto"
+
+[mint]
+# The mint plane: the Fly app's 6PN address (or its wireguard-reachable
+# address from an off-Fly VM).
+url = "http://<mint-app>.internal:8085"
+
+[auth.demo]
+# K_M-A shared with mint — identical to deploy/mint/mint-fly.toml.
+k_m_a = "XXdf8FWWdPwfx2RePVaoQzxA7zLjbC+zEnkAWiVA/2M="
