@@ -17,10 +17,11 @@ ARG ELIDE_REF=main
 FROM ubuntu:24.04 AS build
 ARG ELIDE_REF
 # Rust via rustup (edition 2024 needs a recent toolchain); build-essential
-# supplies the C compiler the ublk/io-uring deps need. `ublk` is a default
-# feature, so a plain build links it on Linux.
+# supplies the C compiler, and clang/libclang-dev the libclang that libublk's
+# bindgen needs to generate the ublk bindings. `ublk` is a default feature, so
+# a plain build links it on Linux.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
+ && apt-get install -y --no-install-recommends ca-certificates curl git build-essential clang libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   | sh -s -- -y --profile minimal --default-toolchain stable
