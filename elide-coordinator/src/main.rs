@@ -37,13 +37,6 @@ use std::process;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use elide_core::process::pid_is_alive;
-
-/// Coordinator-process pidfile. Lives at `<data_dir>/coordinator.pid` so
-/// `elide coord start` can refuse to start a second instance for the
-/// same data directory and `elide coord stop` can fall back to
-/// PID-based liveness if the IPC reply never arrives.
-const COORDINATOR_PID_FILE: &str = "coordinator.pid";
 
 #[derive(Parser)]
 #[command(about = "Elide coordinator: manages volumes, segment upload, and GC")]
@@ -151,25 +144,15 @@ async fn run() -> Result<()> {
                     "[log-relay] failed to start ({e}); volumes will log to elide.log only"
                 );
             }
-            // Refuse to start if another coordinator is already serving
-            // this data dir, and write our own pidfile. Removed when
-            // `daemon::run` returns (clean shutdown). On panic / kill -9
-            // a stale-but-dead pidfile is silently replaced by the next
-            // start.
+            // Single-instance guard: an exclusive flock on the pidfile held for
+            // the whole process lifetime (see `pidfile::lock_instance`). The
+            // kernel releases it on any exit — crash, kill, or reboot — so it
+            // never goes stale, which a pid-liveness check can't guarantee for a
+            // data dir on a durable volume. Held until the end of this arm,
+            // across `daemon::run`.
             std::fs::create_dir_all(&config.data_dir)
                 .with_context(|| format!("creating data dir: {}", config.data_dir.display()))?;
-            let pid_path = config.data_dir.join(COORDINATOR_PID_FILE);
-            if let Ok(text) = std::fs::read_to_string(&pid_path)
-                && let Ok(pid) = text.trim().parse::<u32>()
-                && pid_is_alive(pid)
-            {
-                bail!(
-                    "coordinator already running (pid {pid}, pidfile {})",
-                    pid_path.display()
-                );
-            }
-            std::fs::write(&pid_path, std::process::id().to_string())
-                .with_context(|| format!("writing pidfile: {}", pid_path.display()))?;
+            let _coord_lock = pidfile::lock_instance(&config.data_dir)?;
 
             // Loaded here so the coord-id is in scope for the
             // mint-stores wiring and the per-coordinator caps-probe key
@@ -213,14 +196,11 @@ async fn run() -> Result<()> {
                 // first S3 op (publish coordinator.pub) with a connect
                 // error.
                 if let Err(e) = scoped.wait_for_ready().await {
-                    let _ = std::fs::remove_file(&pid_path);
                     return Err(anyhow::anyhow!("waiting for mint to become ready: {e}"));
                 }
                 let stores: std::sync::Arc<dyn elide_coordinator::stores::ScopedStores> =
                     std::sync::Arc::new(scoped);
-                let result = daemon::run(config, stores).await;
-                let _ = std::fs::remove_file(&pid_path);
-                return result;
+                return daemon::run(config, stores).await;
             }
 
             let store = config.store.build()?;
@@ -262,9 +242,7 @@ async fn run() -> Result<()> {
 
             let stores: std::sync::Arc<dyn elide_coordinator::stores::ScopedStores> =
                 std::sync::Arc::new(elide_coordinator::stores::PassthroughStores::new(store));
-            let result = daemon::run(config, stores).await;
-            let _ = std::fs::remove_file(&pid_path);
-            result
+            daemon::run(config, stores).await
         }
         Command::Init { config, force } => {
             elide_coordinator::log_init::init_stderr();
