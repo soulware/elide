@@ -247,7 +247,7 @@ credentials are inert service tokens it presents at `assume-role`.
 
 Same chained-keyed-BLAKE3 construction throughout.
 
-**1. Session.** Auth-issued, CLI-held. One per operator login, ~7d
+**1. Session.** Auth-issued, CLI-held. One per login, ~7d
 lifetime. Caveats `(sub, exp)`. Chain-MAC'd under
 `K_session`. Used only on the CLI ↔ auth channel; coord and mint never
 see it.
@@ -475,10 +475,10 @@ specifics of any second issuer's wire protocol.
 
 ## Login flow
 
-`elide operator login` supports two modes. The CLI selects mode by
+`elide login` supports two modes. The CLI selects mode by
 whether `ELIDE_OPERATOR_API_KEY` is set; both end at the same
 artefact — a session macaroon stored once, per-user, in a file under
-`~/.elide/`. Structurally it's a macaroon under `K_session` with
+`~/.config/elide/`. Structurally it's a macaroon under `K_session` with
 caveats `(sub, exp=login_time+7d)`. The session is a
 CLI ↔ auth-service credential only — coord and mint never see it.
 
@@ -500,7 +500,7 @@ local laptop; SSH is the expected calling context, not an edge case.
    selected org.
 4. `/v1/login/poll` returns the session; CLI stores it.
 
-`elide operator login --org <name>` is an explicit override for
+`elide login --org <name>` is an explicit override for
 scriptable cases. For single-org operators the auth service may skip
 the picker and issue directly. No X11 forwarding, no port forwarding,
 no remote browser launch. Same convention as `gh auth login` /
@@ -510,8 +510,7 @@ no remote browser launch. Same convention as `gh auth login` /
 
 1. Operator obtains a long-lived API key from the auth service (out
    of band; the auth service owns issuance, rotation, revocation).
-2. Caller sets `ELIDE_OPERATOR_API_KEY=<key>` and runs `elide
-   operator login`.
+2. Caller sets `ELIDE_OPERATOR_API_KEY=<key>` and runs `elide login`.
 3. CLI POSTs `<auth>/v1/login/api-key` with the key, receives a
    session, stores it.
 
@@ -520,6 +519,9 @@ appear in `ps`). The auth service typically issues shorter-lived
 sessions for API-key logins than for interactive ones, and may set a
 `MachineAccount=true` field on issued discharges so audit can
 distinguish automated from human actions.
+
+`elide logout` discards the stored session (or, in shared-key demo mode,
+the stamped subject) at `~/.config/elide`.
 
 ## Identity and policy
 
@@ -593,7 +595,7 @@ without changing the surrounding design.
 
 The auth service must be reachable from two places:
 
-- **The operator's CLI machine** — for `elide operator login` and
+- **The operator's CLI machine** — for `elide login` and
   `/v1/discharge` issuance (enrollment requests and admin verbs). The
   interactive flow also needs the auth service reachable from the
   operator's laptop browser.
@@ -608,7 +610,7 @@ If the auth service is unreachable, the CLI cannot fetch fresh
 discharges, so enrollment and admin verbs stall (a cached discharge
 covers a transient outage for up to 5 min); already-enrolled
 coordinators are unaffected. There is no offline escape hatch for
-operator login.
+login.
 
 ## Offline / air-gapped
 
@@ -838,7 +840,65 @@ The canonical test-fixture pattern is a single mint process with
 `demo-enabled = true` bound to a UDS; the client fetches a discharge
 against a TPC's CID with no session in the request. The full wire flow
 runs end-to-end with no browser, no API key, and no `#[cfg(test)]`
-shortcuts anywhere.
+shortcuts anywhere. This single-process fixture keeps the coordinator's
+discharge **fetch** path identical to prod.
+
+### Proposed: distributed demo — shared `K_M-A`
+
+The fixture above is single-process: the coordinator reaches mint-as-auth
+over a co-resident UDS. When mint and the coordinator run on **separate
+hosts** (e.g. distinct Fly apps) that UDS doesn't span the gap, and
+bridging mint-as-auth's `/v1/discharge` onto the network would both
+expose the rubber-stamp issuer and tie the coordinator to mint's session
+store. The demo tier instead shares the trust anchor directly: **both
+sides source the same `K_M-A` from config.**
+
+```toml
+# mint.toml and coordinator.toml — identical value
+[auth.demo]
+k_m_a = "<base64 32-byte AEAD key>"
+```
+
+The deploy renders one generated value into both files, so they cannot
+drift. Holding `K_M-A`, each party issues the operator discharges it
+needs **locally**, with no cross-host auth call:
+
+- The coordinator self-issues its enroll- and exchange-gate discharges:
+  read the presented TPC's `CID = AEAD(K_M-A, r ‖ OrgId)`, recover
+  `(r, OrgId)`, mint the discharge keyed by `r` — the coord-B issuance
+  path (`elide-attestation`) with `K_M-A` substituted for `K_M-B`.
+- Mint verifies each discharge inline under the same `K_M-A`. **Mint's
+  verifier is unchanged** — a coordinator-issued discharge is
+  indistinguishable from one mint-as-auth would have minted; only the
+  holder of the key differs.
+
+There is no session to fetch in this mode, so `elide login` /
+`mint login` reduce to **subject-stampers**: they record the operator
+identity locally (`~/.config/elide`, `~/.config/mint`) for the
+discharge's `sub`, and the shared `K_M-A` is the trust. This replaces the
+interim in which the coordinator read mint's `~/.config/mint` session
+directly.
+
+The coordinator selects its discharge source at **config time** —
+self-issue when `[auth.demo]` is present, fetch from the standalone
+service when an `[auth]` section is — so the enroll logic stays uniform
+and the choice is never a per-request branch. As with mint-as-auth, the
+coordinator logs `WARN auth=demo: operator discharges self-issued without
+authentication` at startup and per discharge. This is demo-only by
+construction: holding `K_M-A` is forgery capability (see
+[Forgery model](#forgery-model)), which is exactly why the standalone
+auth service holds it alone.
+
+**Mint-side requirement (the one cross-repo change).** mint's
+`[auth.demo]` must source `K_M-A` from the `k_m_a` field rather than
+generating it at demo startup; mint's issuer and verifier are otherwise
+untouched. The single-process fixture above may still default to a
+generated key when `k_m_a` is absent.
+
+Because the coordinator calls no auth endpoint in this mode, the network
+bridge that exposed mint-as-auth's `/v1/discharge` is unnecessary here —
+the coordinator reaches only the mint plane (`/v1/enroll`,
+`/v1/enroll-exchange`, `assume-role`).
 
 ## Deployment shapes
 
