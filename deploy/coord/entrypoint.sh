@@ -9,6 +9,6 @@ modprobe ublk_drv 2>/dev/null || true
 # PID 1 so `fly ssh` enrollment works and SIGTERM is clean. Enrol once over
 # fly ssh:
 #   elide login --subject <operator>
-#   elide coord enroll --config /app/coord.toml <invite>
+#   elide coord enroll <invite>          # config via ELIDE_COORD_CONFIG
 # then 'mint enroll approve <coord-sub>' on the mint app.
-exec elide-coordinator serve --config /app/coord.toml
+exec elide-coordinator serve

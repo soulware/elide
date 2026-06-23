@@ -150,7 +150,7 @@ enum CoordCommand {
         /// Path to the coordinator config file (forwarded to the
         /// daemon). Defaults to `coordinator.toml` in the daemon's
         /// working directory.
-        #[arg(long)]
+        #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
     },
 
@@ -168,7 +168,7 @@ enum CoordCommand {
         /// Path to the coordinator config file. Used to resolve the
         /// data_dir (and thus the control socket) when `--data-dir`
         /// is not given. Falls back to `elide_data` if neither is set.
-        #[arg(long)]
+        #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
     },
 
@@ -182,7 +182,7 @@ enum CoordCommand {
     Run {
         /// Path to the coordinator config file. Defaults to
         /// `coordinator.toml` in the working directory.
-        #[arg(long)]
+        #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
     },
 
@@ -199,7 +199,7 @@ enum CoordCommand {
     Enroll {
         /// Path to the coordinator config file. Defaults to
         /// `coordinator.toml` in the working directory.
-        #[arg(long)]
+        #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
         /// Invite macaroon: the macaroon text inline, a file path,
         /// or `-` for stdin. Distributed out of band by the operator.

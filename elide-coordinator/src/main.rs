@@ -60,7 +60,7 @@ enum Command {
     /// supervises volume processes, and continuously drains pending segments to
     /// the object store. Configuration is read from coordinator.toml.
     Serve {
-        #[arg(long, default_value = "coordinator.toml")]
+        #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
         config: PathBuf,
         /// Override the data_dir from the config file.
         #[arg(long)]
@@ -73,7 +73,7 @@ enum Command {
     /// the defaults the daemon would use if the file were absent. Edit the
     /// fields you want to override.
     Init {
-        #[arg(long, default_value = "coordinator.toml")]
+        #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
         config: PathBuf,
         /// Overwrite the file if it already exists.
         #[arg(long)]
@@ -91,7 +91,7 @@ enum Command {
     /// `--force` to re-exchange all). `coord serve` refuses to start
     /// until this has completed.
     Enroll {
-        #[arg(long, default_value = "coordinator.toml")]
+        #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
         config: PathBuf,
         /// Override the data_dir from the config file.
         #[arg(long)]

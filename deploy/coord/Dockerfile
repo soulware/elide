@@ -54,4 +54,8 @@ RUN sed -i \
   -e "s|^url = .*|url = \"http://${MINT_APP}.internal:8085\"|" \
   /app/coord.toml
 
+# Every coordinator subcommand reads ELIDE_COORD_CONFIG, so the in-container
+# `elide coord enroll` needs no --config.
+ENV ELIDE_COORD_CONFIG=/app/coord.toml
+
 CMD ["sh", "/usr/local/bin/entrypoint.sh"]

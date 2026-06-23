@@ -24,7 +24,7 @@ hyper          = { version = "1", features = ["client", "http1"] }
 hyper-util     = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 hyperlocal     = { version = "0.9", default-features = false, features = ["client"] }
 http-body-util = "0.1"
-clap         = { version = "4", features = ["derive"] }
+clap         = { version = "4", features = ["derive", "env"] }
 elide-core   = { path = "../elide-core" }
 lz4_flex     = "0.11"
 elide-attestation = { path = "../elide-attestation" }
