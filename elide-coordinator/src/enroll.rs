@@ -163,59 +163,67 @@ fn resolve_invite(src: &str) -> io::Result<String> {
     Ok(trimmed)
 }
 
-/// The shared-key demo operator-discharge issuer (`docs/design-auth-service.md`
-/// § *Proposed: distributed demo — shared K_M-A*). The coordinator holds the
-/// same `K_M-A` as mint and self-mints the enroll/exchange-gate discharges,
-/// stamping the logged-in operator as the discharge `sub` — no auth-service
-/// round-trip, the shared `K_M-A` is the trust anchor.
-pub struct DemoIssuer {
+/// Discharge lifetime, matching mint's demo issuer
+/// (`mint/src/auth.rs::DISCHARGE_EXP_SECONDS`).
+const DISCHARGE_EXP_SECONDS: u64 = 300;
+
+/// How enrollment acquires the operator discharge for a gate. Selected once
+/// at config time, so [`run`]'s call site is identical regardless: the
+/// shared-key demo self-issues ([`SelfMint`]); a standalone auth service
+/// will fetch (a future `Fetch { url, session }` impl POSTing `(cid,
+/// session)` to it). See `docs/design-auth-service.md` § *Proposed:
+/// distributed demo — shared K_M-A*.
+pub(crate) trait DischargeSource {
+    /// The operator discharges for every third-party caveat on `anchor`, at
+    /// gate `scope`, to bundle after the primary.
+    async fn discharges(&self, anchor: &WireMacaroon, scope: &str) -> io::Result<Vec<String>>;
+}
+
+/// The shared-key demo source: hold the same `K_M-A` as mint and self-mint
+/// the enroll/exchange-gate discharges, stamping the logged-in operator as
+/// `sub` — no auth-service round-trip, the shared `K_M-A` is the trust
+/// anchor. mint's verifier recovers `r` from the VID (not `K_M-A`), so a
+/// coordinator-minted discharge is indistinguishable from a mint-as-auth one.
+pub(crate) struct SelfMint {
     /// `K_M-A`, from `coordinator.toml [auth.demo]` — identical to mint's.
     pub k_m_a: [u8; 32],
     /// The logged-in operator subject (`elide login`), stamped as `sub`.
     pub subject: String,
 }
 
-/// Discharge lifetime, matching mint's demo issuer
-/// (`mint/src/auth.rs::DISCHARGE_EXP_SECONDS`).
-const DISCHARGE_EXP_SECONDS: u64 = 300;
-
-/// Self-issue the operator discharge for each third-party caveat on
-/// `anchor` (the invite's enroll gate, the ticket's exchange gate). For
-/// each, recover `r` from the CID under the shared `K_M-A` and mint a
-/// discharge keyed by `r` carrying `(aud, sub, scope, exp)` — byte-for-byte
-/// what mint-as-auth would have issued. mint's verifier recovers `r` from
-/// the VID (not `K_M-A`), so a coordinator-minted discharge is
-/// indistinguishable. The discharges bundle after the primary.
-fn gate_discharges(
-    issuer: &DemoIssuer,
-    anchor: &WireMacaroon,
-    scope: &str,
-) -> io::Result<Vec<String>> {
-    // The discharge declares the same audience the primary clears under.
-    let aud = anchor.first_party_value("aud").ok_or_else(|| {
-        io::Error::other("enrollment anchor carries no `aud` caveat to mirror into the discharge")
-    })?;
-    let exp = (now_unix()? + DISCHARGE_EXP_SECONDS).to_string();
-    let mut discharges = Vec::new();
-    for (_location, cid) in anchor.third_party_caveats() {
-        let pt = decrypt_cid(&issuer.k_m_a, cid).map_err(|e| {
-            io::Error::other(format!(
-                "{scope} gate CID failed to decrypt under [auth.demo].k_m_a — the \
-                 coordinator's shared key does not match mint's: {e}"
-            ))
+impl DischargeSource for SelfMint {
+    /// For each CID, recover `r` under the shared `K_M-A` and mint a
+    /// discharge keyed by `r` carrying `(aud, sub, scope, exp)` —
+    /// byte-for-byte what mint-as-auth would have issued.
+    async fn discharges(&self, anchor: &WireMacaroon, scope: &str) -> io::Result<Vec<String>> {
+        // The discharge declares the same audience the primary clears under.
+        let aud = anchor.first_party_value("aud").ok_or_else(|| {
+            io::Error::other(
+                "enrollment anchor carries no `aud` caveat to mirror into the discharge",
+            )
         })?;
-        discharges.push(mint_discharge_with_nonce(
-            &pt.r,
-            &ticket_id(cid),
-            &[
-                ("aud", aud),
-                ("sub", issuer.subject.as_str()),
-                ("scope", scope),
-                ("exp", exp.as_str()),
-            ],
-        ));
+        let exp = (now_unix()? + DISCHARGE_EXP_SECONDS).to_string();
+        let mut discharges = Vec::new();
+        for (_location, cid) in anchor.third_party_caveats() {
+            let pt = decrypt_cid(&self.k_m_a, cid).map_err(|e| {
+                io::Error::other(format!(
+                    "{scope} gate CID failed to decrypt under [auth.demo].k_m_a — the \
+                     coordinator's shared key does not match mint's: {e}"
+                ))
+            })?;
+            discharges.push(mint_discharge_with_nonce(
+                &pt.r,
+                &ticket_id(cid),
+                &[
+                    ("aud", aud),
+                    ("sub", self.subject.as_str()),
+                    ("scope", scope),
+                    ("exp", exp.as_str()),
+                ],
+            ));
+        }
+        Ok(discharges)
     }
-    Ok(discharges)
 }
 
 /// `MintV1 <primary>[,<discharge>…]` — the bundle wire mint parses.
@@ -235,12 +243,12 @@ async fn enroll_request(
     cfg: &MintConfig,
     identity: &CoordinatorIdentity,
     invite: &str,
-    issuer: &DemoIssuer,
+    source: &impl DischargeSource,
 ) -> io::Result<String> {
     let mut mac = WireMacaroon::decode(invite)?;
     mac.attenuate(CAVEAT_SUB, identity.coordinator_id_str());
     mac.attenuate(CAVEAT_CNF, &cnf_value(identity));
-    let discharges = gate_discharges(issuer, &mac, SCOPE_ENROLL)?;
+    let discharges = source.discharges(&mac, SCOPE_ENROLL).await?;
 
     let body = format!(r#"{{"ts":{}}}"#, now_unix()?);
     let sig = BASE64.encode(identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
@@ -346,14 +354,14 @@ pub fn assert_enrolled(data_dir: &Path) -> io::Result<()> {
 /// enrollment is a no-op. The ticket is held only for the command's duration
 /// (the attested-role intermediates it mints are durable, so nothing needs it
 /// after this returns).
-pub async fn run(
+pub(crate) async fn run<S: DischargeSource>(
     cfg: &MintConfig,
     identity: &CoordinatorIdentity,
     data_dir: &Path,
     invite_src: &str,
     wait: Duration,
     force: bool,
-    issuer: &DemoIssuer,
+    source: &S,
 ) -> io::Result<()> {
     let mut remaining: Vec<&EnrollRole> = ENROLL_ROLES
         .iter()
@@ -372,7 +380,7 @@ pub async fn run(
     let sub = identity.coordinator_id_str();
     let cnf = cnf_value(identity);
 
-    let mut ticket = enroll_request(cfg, identity, &invite, issuer).await?;
+    let mut ticket = enroll_request(cfg, identity, &invite, source).await?;
     info!(
         "[enroll] enrolled sub={sub} cnf-fingerprint={} — now run `mint enroll approve {sub}` \
          on the mint host (match that fingerprint out of band first)",
@@ -398,7 +406,7 @@ pub async fn run(
         // (the auth scope is per-operation, not per-role); fetched per
         // pass so a long approval wait never presents a stale one.
         let ticket_mac = WireMacaroon::decode(&ticket)?;
-        let discharges = gate_discharges(issuer, &ticket_mac, SCOPE_EXCHANGE)?;
+        let discharges = source.discharges(&ticket_mac, SCOPE_EXCHANGE).await?;
         // Always process from the front: Granted removes the head;
         // AwaitingApproval / TicketExpired break the pass.
         let idx = 0;
@@ -430,7 +438,7 @@ pub async fn run(
                         "[enroll] credential ticket expired before approval; re-enrolling — \
                          the operator must re-run `mint enroll approve {sub}`"
                     );
-                    ticket = enroll_request(cfg, identity, &invite, issuer).await?;
+                    ticket = enroll_request(cfg, identity, &invite, source).await?;
                     awaiting = true;
                     break;
                 }

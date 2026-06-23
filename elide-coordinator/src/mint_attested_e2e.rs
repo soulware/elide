@@ -297,7 +297,7 @@ async fn attested_loop_over_shipped_templates() {
     // The coordinator self-issues its operator discharges from the shared
     // K_M-A (same value mint sources from [auth.demo].k_m_a), stamping the
     // logged-in operator as `sub` — no ~/.config session read.
-    let issuer = enroll::DemoIssuer {
+    let issuer = enroll::SelfMint {
         k_m_a,
         subject: "e2e-operator".to_owned(),
     };

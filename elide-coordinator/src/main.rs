@@ -298,7 +298,7 @@ async fn run() -> Result<()> {
             })?;
             let subject = elide_core::operator_session::load_subject()
                 .with_context(|| "loading the operator login for the enrollment gates")?;
-            let issuer = enroll::DemoIssuer { k_m_a, subject };
+            let issuer = enroll::SelfMint { k_m_a, subject };
             enroll::run(
                 mint_cfg,
                 &identity,
