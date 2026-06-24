@@ -57,5 +57,9 @@ RUN sed -i \
 # Every coordinator subcommand reads ELIDE_COORD_CONFIG, so the in-container
 # `elide coord enroll` needs no --config.
 ENV ELIDE_COORD_CONFIG=/app/coord.toml
+# The `elide` volume/CLI subcommands resolve their data_dir from ELIDE_DATA_DIR;
+# set it to coord.toml's data_dir so an in-container `elide volume …` finds the
+# coordinator's control socket with no --data-dir.
+ENV ELIDE_DATA_DIR=/data/elide_data
 
 CMD ["sh", "/usr/local/bin/entrypoint.sh"]
