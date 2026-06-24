@@ -117,6 +117,53 @@ fn parse_attested_cid(buf: &[u8]) -> Result<AttestedCid, CryptoError> {
     })
 }
 
+/// The plaintext recovered from an operator (non-attested) TPC's CID —
+/// mint's `tpc::CidPlaintext`. `r` is the discharge-MAC root key;
+/// `client_id`/`org_id` are the bound identity strings (carried for
+/// attribution, not re-stamped into the discharge). The twin of
+/// [`AttestedCid`] minus the `mode` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CidPlaintext {
+    pub r: [u8; 32],
+    pub client_id: String,
+    pub org_id: String,
+}
+
+/// Decrypt an operator TPC's CID under `K_M-A`, recovering
+/// `(r, client_id, org_id)`. mint sealed the CID at anchor issuance via
+/// `tpc::encrypt_cid`; in the shared-key demo the coordinator holds the
+/// same `K_M-A` and self-mints the operator discharge keyed by the
+/// recovered `r` (`docs/design-auth-service.md` § *Proposed: distributed
+/// demo — shared K_M-A*).
+pub fn decrypt_cid(k_m_a: &[u8; 32], cid: &[u8]) -> Result<CidPlaintext, CryptoError> {
+    let (nonce, ciphertext) = cid
+        .split_at_checked(AEAD_NONCE_LEN)
+        .ok_or(CryptoError::Aead)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(k_m_a));
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| CryptoError::Aead)?;
+    parse_cid(&plaintext)
+}
+
+fn parse_cid(buf: &[u8]) -> Result<CidPlaintext, CryptoError> {
+    if buf.len() < 32 {
+        return Err(CryptoError::Truncated);
+    }
+    let r: [u8; 32] = buf[..32].try_into().map_err(|_| CryptoError::Truncated)?;
+    let mut pos = 32;
+    let client_id = read_length_prefixed_str(buf, &mut pos)?;
+    let org_id = read_length_prefixed_str(buf, &mut pos)?;
+    if pos != buf.len() {
+        return Err(CryptoError::Trailing);
+    }
+    Ok(CidPlaintext {
+        r,
+        client_id,
+        org_id,
+    })
+}
+
 /// Test-only inverse of [`decrypt_cid_attested`]: seal
 /// `r ‖ lp(client_id) ‖ lp(org_id) ‖ lp(mode)` under `K_M-B` with the
 /// caller's nonce prepended. Production never seals CIDs — mint does — so
@@ -140,6 +187,35 @@ pub(crate) fn encrypt_cid_attested(
         plaintext.extend_from_slice(s.as_bytes());
     }
     let cipher = ChaCha20Poly1305::new(Key::from_slice(k_m_b));
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(nonce), plaintext.as_slice())
+        .expect("chacha20-poly1305 encrypt is infallible for this payload size");
+    let mut sealed = Vec::with_capacity(AEAD_NONCE_LEN + ciphertext.len());
+    sealed.extend_from_slice(nonce);
+    sealed.extend_from_slice(&ciphertext);
+    sealed
+}
+
+/// Test-only inverse of [`decrypt_cid`]: seal `r ‖ lp(client_id) ‖
+/// lp(org_id)` under `K_M-A` with the caller's nonce prepended. Pins the
+/// operator-CID layout the way [`encrypt_cid_attested`] pins the attested
+/// one — production never seals operator CIDs (mint does).
+#[cfg(test)]
+pub(crate) fn encrypt_cid(
+    k_m_a: &[u8; 32],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    r: &[u8; 32],
+    client_id: &str,
+    org_id: &str,
+) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(32 + 8 + client_id.len() + org_id.len());
+    plaintext.extend_from_slice(r);
+    for s in [client_id, org_id] {
+        let len: u32 = s.len().try_into().expect("field fits u32");
+        plaintext.extend_from_slice(&len.to_be_bytes());
+        plaintext.extend_from_slice(s.as_bytes());
+    }
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(k_m_a));
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(nonce), plaintext.as_slice())
         .expect("chacha20-poly1305 encrypt is infallible for this payload size");
@@ -372,6 +448,25 @@ mod tests {
         assert_eq!(pt.client_id, "client-x");
         assert_eq!(pt.org_id, "org-y");
         assert_eq!(pt.mode, "volume-ro");
+    }
+
+    #[test]
+    fn operator_cid_round_trips() {
+        let k_m_a = [3u8; 32];
+        let r = [7u8; 32];
+        let cid = encrypt_cid(&k_m_a, &[1u8; AEAD_NONCE_LEN], &r, "01COORD", "org-demo");
+        let pt = decrypt_cid(&k_m_a, &cid).expect("decrypt");
+        assert_eq!(pt.r, r);
+        assert_eq!(pt.client_id, "01COORD");
+        assert_eq!(pt.org_id, "org-demo");
+    }
+
+    #[test]
+    fn operator_cid_rejects_wrong_key() {
+        let cid = encrypt_cid(&[3u8; 32], &[1u8; AEAD_NONCE_LEN], &[7u8; 32], "c", "o");
+        let mut wrong = [3u8; 32];
+        wrong[0] ^= 0x80;
+        assert_eq!(decrypt_cid(&wrong, &cid), Err(CryptoError::Aead));
     }
 
     #[test]

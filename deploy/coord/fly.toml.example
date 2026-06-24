@@ -1,0 +1,41 @@
+# Elide coordinator on Fly.io — a private app (no public service), reachable
+# over 6PN at <app>.internal. Template: copy to fly.toml (gitignored), fill
+# app/primary_region and the build args, then `fly deploy` from this directory.
+# Pairs with coord.toml (the baked runtime config). See README.md.
+
+app = "elide-coord"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+  [build.args]
+    # ELIDE_REF: elide source ref to build — a commit/tag pins it, "main"
+    # tracks latest.
+    ELIDE_REF = "main"
+    # DATA_BUCKET: the Tigris data bucket (must equal mint's DATA_BUCKET);
+    # baked into coord.toml [store].bucket.
+    DATA_BUCKET = "elide"
+    # MINT_APP: the mint Fly app this coordinator enrols against; baked into
+    # coord.toml [mint].url as http://<MINT_APP>.internal:8085.
+    MINT_APP = "mint-for-elide"
+
+[env]
+  RUST_LOG = "info"
+
+# Coordinator state — index/, cache/, credentials/, keys — lives here on the
+# volume so it survives redeploys (matches data_dir in coord.toml). No AWS_*
+# secrets: the coordinator gets its S3 credentials from mint via assume-role.
+[mounts]
+  source = "elide_data"
+  destination = "/data"
+
+# Serverless-off: keep one instance up so the served volumes and credentials
+# stay live. The coordinator serves block devices over ublk (the image loads
+# `ublk_drv`; Fly machines grant CAP_SYS_MODULE), so size for volume I/O.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1024mb"
+
+# No [http_service] and no tcp [checks]: the app is private and the coordinator
+# binds no TCP port — its control plane is a UDS and ublk is local. The mint it
+# enrols against is reached over 6PN at [mint].url in coord.toml.

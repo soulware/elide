@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use ulid::Ulid;
@@ -169,6 +170,10 @@ async fn attested_loop_over_shipped_templates() {
     let mint_sock = root_p.join("mint.sock");
     let auth_sock = root_p.join("auth.sock");
     let coord_b_sock = root_p.join("coord-b.sock");
+    // The shared-key demo secret: mint sources K_M-A from [auth.demo].k_m_a
+    // and the coordinator self-issues its operator discharges under the same
+    // value (the DemoIssuer below) — a fixed test key (any 32 bytes).
+    let k_m_a: [u8; 32] = [0x5a; 32];
 
     // `roles_dir` is the rendered output `mint serve` / `mint seal` load; the
     // render step (below) writes it from the shipped role-templates/. The store
@@ -190,6 +195,10 @@ async fn attested_loop_over_shipped_templates() {
         demo.insert(
             "socket".into(),
             toml::Value::String(auth_sock.display().to_string()),
+        );
+        demo.insert(
+            "k_m_a".into(),
+            toml::Value::String(base64::engine::general_purpose::STANDARD.encode(k_m_a)),
         );
         tbl.get_mut("auth")
             .and_then(toml::Value::as_table_mut)
@@ -285,18 +294,12 @@ async fn attested_loop_over_shipped_templates() {
         attestation_location: Some(location.clone()),
         attestation_transport: Some(format!("unix:{}", coord_b_sock.display())),
     };
-    // The operator session `mint login` wrote, read from the same store
-    // the production command loads it from.
-    let session_dir = home.join(".config/mint");
-    let session = enroll::OperatorSession {
-        session: std::fs::read_to_string(session_dir.join("session"))
-            .expect("session written by mint login")
-            .trim()
-            .to_owned(),
-        transport: std::fs::read_to_string(session_dir.join("auth-transport"))
-            .expect("auth transport written by mint login")
-            .trim()
-            .to_owned(),
+    // The coordinator self-issues its operator discharges from the shared
+    // K_M-A (same value mint sources from [auth.demo].k_m_a), stamping the
+    // logged-in operator as `sub` — no ~/.config session read.
+    let issuer = enroll::SelfMint {
+        k_m_a,
+        subject: "e2e-operator".to_owned(),
     };
     let enroll_task = {
         let cfg = mint_cfg.clone();
@@ -310,7 +313,7 @@ async fn attested_loop_over_shipped_templates() {
                 &invite,
                 Duration::from_secs(60),
                 false,
-                &session,
+                &issuer,
             )
             .await
         })

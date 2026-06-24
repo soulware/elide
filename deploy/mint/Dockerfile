@@ -10,7 +10,7 @@
 #   DATA_BUCKET  the volume-data bucket baked into the role ARNs; must equal
 #                the coordinator's [store].bucket.
 
-ARG MINT_REF=93ffda83e69c17e5572ce0104ae8c5d84e353d5e
+ARG MINT_REF=0fc7334e844807d319d5f318a43a65f4de3fd1b1
 
 FROM ubuntu:24.04 AS build
 ARG MINT_REF

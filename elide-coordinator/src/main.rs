@@ -37,13 +37,6 @@ use std::process;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use elide_core::process::pid_is_alive;
-
-/// Coordinator-process pidfile. Lives at `<data_dir>/coordinator.pid` so
-/// `elide coord start` can refuse to start a second instance for the
-/// same data directory and `elide coord stop` can fall back to
-/// PID-based liveness if the IPC reply never arrives.
-const COORDINATOR_PID_FILE: &str = "coordinator.pid";
 
 #[derive(Parser)]
 #[command(about = "Elide coordinator: manages volumes, segment upload, and GC")]
@@ -60,7 +53,7 @@ enum Command {
     /// supervises volume processes, and continuously drains pending segments to
     /// the object store. Configuration is read from coordinator.toml.
     Serve {
-        #[arg(long, default_value = "coordinator.toml")]
+        #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
         config: PathBuf,
         /// Override the data_dir from the config file.
         #[arg(long)]
@@ -73,7 +66,7 @@ enum Command {
     /// the defaults the daemon would use if the file were absent. Edit the
     /// fields you want to override.
     Init {
-        #[arg(long, default_value = "coordinator.toml")]
+        #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
         config: PathBuf,
         /// Overwrite the file if it already exists.
         #[arg(long)]
@@ -91,7 +84,7 @@ enum Command {
     /// `--force` to re-exchange all). `coord serve` refuses to start
     /// until this has completed.
     Enroll {
-        #[arg(long, default_value = "coordinator.toml")]
+        #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
         config: PathBuf,
         /// Override the data_dir from the config file.
         #[arg(long)]
@@ -151,25 +144,15 @@ async fn run() -> Result<()> {
                     "[log-relay] failed to start ({e}); volumes will log to elide.log only"
                 );
             }
-            // Refuse to start if another coordinator is already serving
-            // this data dir, and write our own pidfile. Removed when
-            // `daemon::run` returns (clean shutdown). On panic / kill -9
-            // a stale-but-dead pidfile is silently replaced by the next
-            // start.
+            // Single-instance guard: an exclusive flock on the pidfile held for
+            // the whole process lifetime (see `pidfile::lock_instance`). The
+            // kernel releases it on any exit — crash, kill, or reboot — so it
+            // never goes stale, which a pid-liveness check can't guarantee for a
+            // data dir on a durable volume. Held until the end of this arm,
+            // across `daemon::run`.
             std::fs::create_dir_all(&config.data_dir)
                 .with_context(|| format!("creating data dir: {}", config.data_dir.display()))?;
-            let pid_path = config.data_dir.join(COORDINATOR_PID_FILE);
-            if let Ok(text) = std::fs::read_to_string(&pid_path)
-                && let Ok(pid) = text.trim().parse::<u32>()
-                && pid_is_alive(pid)
-            {
-                bail!(
-                    "coordinator already running (pid {pid}, pidfile {})",
-                    pid_path.display()
-                );
-            }
-            std::fs::write(&pid_path, std::process::id().to_string())
-                .with_context(|| format!("writing pidfile: {}", pid_path.display()))?;
+            let _coord_lock = pidfile::lock_instance(&config.data_dir)?;
 
             // Loaded here so the coord-id is in scope for the
             // mint-stores wiring and the per-coordinator caps-probe key
@@ -184,11 +167,17 @@ async fn run() -> Result<()> {
 
             if let Some(mint_cfg) = &config.mint {
                 mint_cfg.validate()?;
-                // Refuse to start half-credentialed: every enrolled
-                // role's credential must be present and decode. The
-                // mint path is not exercisable until enrollment has
-                // provisioned them.
-                enroll::assert_enrolled(&config.data_dir)?;
+                // Wait for enrollment rather than failing closed: a fresh
+                // deploy comes up before the operator runs `elide coord
+                // enroll`, and the daemon already blocks for mint just below
+                // (`wait_for_ready`). `assert_enrolled` is all-or-nothing, so
+                // this proceeds only once every role's credential is present.
+                while let Err(missing) = enroll::assert_enrolled(&config.data_dir) {
+                    tracing::info!(
+                        "[coordinator] awaiting enrollment: {missing}; run `elide coord enroll`"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
                 tracing::info!(
                     "[coordinator] store: mint-backed scoped \
                      (coord-ro / coord-rw / volume-rw); reachability \
@@ -207,14 +196,11 @@ async fn run() -> Result<()> {
                 // first S3 op (publish coordinator.pub) with a connect
                 // error.
                 if let Err(e) = scoped.wait_for_ready().await {
-                    let _ = std::fs::remove_file(&pid_path);
                     return Err(anyhow::anyhow!("waiting for mint to become ready: {e}"));
                 }
                 let stores: std::sync::Arc<dyn elide_coordinator::stores::ScopedStores> =
                     std::sync::Arc::new(scoped);
-                let result = daemon::run(config, stores).await;
-                let _ = std::fs::remove_file(&pid_path);
-                return result;
+                return daemon::run(config, stores).await;
             }
 
             let store = config.store.build()?;
@@ -256,9 +242,7 @@ async fn run() -> Result<()> {
 
             let stores: std::sync::Arc<dyn elide_coordinator::stores::ScopedStores> =
                 std::sync::Arc::new(elide_coordinator::stores::PassthroughStores::new(store));
-            let result = daemon::run(config, stores).await;
-            let _ = std::fs::remove_file(&pid_path);
-            result
+            daemon::run(config, stores).await
         }
         Command::Init { config, force } => {
             elide_coordinator::log_init::init_stderr();
@@ -288,10 +272,17 @@ async fn run() -> Result<()> {
                 &config.data_dir,
             )
             .with_context(|| "loading coordinator identity")?;
-            // The enroll/exchange gates are operator-discharged, so a
-            // logged-in operator session is a prerequisite.
-            let session = enroll::load_operator_session()
-                .with_context(|| "loading the operator session for the enrollment gates")?;
+            // The enroll/exchange gates are operator-discharged. In the
+            // shared-key demo the coordinator self-issues them from the
+            // `K_M-A` it shares with mint (`[auth.demo]`), stamped with the
+            // logged-in operator subject.
+            let k_m_a = config.demo_k_m_a()?.with_context(|| {
+                "`elide coord enroll` needs an operator-auth source: set [auth.demo].k_m_a \
+                 in coordinator.toml (the same value mint is deployed with)"
+            })?;
+            let subject = elide_core::operator_session::load_subject()
+                .with_context(|| "loading the operator login for the enrollment gates")?;
+            let issuer = enroll::SelfMint { k_m_a, subject };
             enroll::run(
                 mint_cfg,
                 &identity,
@@ -299,7 +290,7 @@ async fn run() -> Result<()> {
                 &invite,
                 timeout,
                 force,
-                &session,
+                &issuer,
             )
             .await
             .map_err(anyhow::Error::from)

@@ -122,6 +122,21 @@ enum Command {
         #[command(subcommand)]
         command: CoordCommand,
     },
+
+    /// Log in as an operator (records the subject for `coord enroll`).
+    ///
+    /// In the shared-key demo this stamps the operator identity into
+    /// `~/.config/elide`; `coord enroll` then self-issues the operator
+    /// discharges under that `sub`. A standalone auth service will later
+    /// make this an interactive device-code flow.
+    Login {
+        /// The operator subject to record.
+        #[arg(long)]
+        subject: String,
+    },
+
+    /// Clear the stored operator login (`~/.config/elide`).
+    Logout,
 }
 
 #[derive(Subcommand)]
@@ -135,7 +150,7 @@ enum CoordCommand {
         /// Path to the coordinator config file (forwarded to the
         /// daemon). Defaults to `coordinator.toml` in the daemon's
         /// working directory.
-        #[arg(long)]
+        #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
     },
 
@@ -153,7 +168,7 @@ enum CoordCommand {
         /// Path to the coordinator config file. Used to resolve the
         /// data_dir (and thus the control socket) when `--data-dir`
         /// is not given. Falls back to `elide_data` if neither is set.
-        #[arg(long)]
+        #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
     },
 
@@ -167,7 +182,7 @@ enum CoordCommand {
     Run {
         /// Path to the coordinator config file. Defaults to
         /// `coordinator.toml` in the working directory.
-        #[arg(long)]
+        #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
     },
 
@@ -184,7 +199,7 @@ enum CoordCommand {
     Enroll {
         /// Path to the coordinator config file. Defaults to
         /// `coordinator.toml` in the working directory.
-        #[arg(long)]
+        #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
         /// Invite macaroon: the macaroon text inline, a file path,
         /// or `-` for stdin. Distributed out of band by the operator.
@@ -576,6 +591,21 @@ fn main() {
     }
 
     match args.command {
+        Command::Login { subject } => {
+            if let Err(e) = elide_core::operator_session::save_subject(&subject) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            println!("logged in as {}", subject.trim());
+        }
+        Command::Logout => match elide_core::operator_session::clear() {
+            Ok(true) => println!("logged out"),
+            Ok(false) => println!("not logged in"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
         Command::Volume { command } => match command {
             VolumeCommand::List { ro, rw, all } => {
                 let filter = if ro {

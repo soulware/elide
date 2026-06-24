@@ -110,6 +110,15 @@ pub struct CoordinatorConfig {
     /// enables only this (and may keep it off the network on a UDS).
     #[serde(default)]
     pub attestation: Option<AttestationConfig>,
+
+    /// Operator-auth source for `elide coord enroll`. Absent → enrollment
+    /// has no discharge source and fails with a pointer to configure one.
+    /// `[auth.demo]` selects the shared-key demo where the coordinator
+    /// holds the same `K_M-A` as mint and self-issues operator discharges
+    /// locally (`docs/design-auth-service.md` § *Proposed: distributed
+    /// demo — shared K_M-A*).
+    #[serde(default)]
+    pub auth: Option<AuthSection>,
 }
 
 impl CoordinatorConfig {
@@ -119,6 +128,42 @@ impl CoordinatorConfig {
             .clone()
             .unwrap_or_else(|| self.data_dir.join("control.sock"))
     }
+
+    /// The shared-key demo `K_M-A`, decoded from `[auth.demo].k_m_a`
+    /// (standard base64 of 32 bytes — the identical value mint sources from
+    /// its own `[auth.demo].k_m_a`). `Ok(None)` when no `[auth.demo]` is set.
+    pub fn demo_k_m_a(&self) -> Result<Option<[u8; 32]>> {
+        use base64::Engine as _;
+        let Some(raw) = self.auth.as_ref().and_then(|a| a.demo.as_ref()) else {
+            return Ok(None);
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw.k_m_a.trim())
+            .context("[auth.demo].k_m_a is not valid standard base64")?;
+        let key: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("[auth.demo].k_m_a decoded {} bytes, need 32", v.len())
+        })?;
+        Ok(Some(key))
+    }
+}
+
+/// `[auth]` — the operator-auth source for enrollment.
+#[derive(Deserialize)]
+pub struct AuthSection {
+    /// `[auth.demo]` — the shared-key demo (`docs/design-auth-service.md`
+    /// § *Proposed: distributed demo — shared K_M-A*).
+    #[serde(default)]
+    pub demo: Option<RawDemoAuth>,
+}
+
+/// `[auth.demo]` — shared-key demo auth: the coordinator holds the same
+/// `K_M-A` as mint and self-issues the operator discharges enrollment
+/// needs, without a cross-host auth call.
+#[derive(Deserialize)]
+pub struct RawDemoAuth {
+    /// `K_M-A` as standard base64 of 32 bytes — the identical value mint is
+    /// deployed with (`openssl rand -base64 32`).
+    pub k_m_a: String,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -581,6 +626,16 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # connect_timeout = "5s"
 # request_timeout = "30s"
 
+# [auth] — operator-auth source for `elide coord enroll`. `[auth.demo]`
+# selects the shared-key demo: the coordinator holds the same K_M-A as the
+# mint it enrolls against and self-issues the operator discharges locally,
+# with no cross-host auth call (docs/design-auth-service.md § "Proposed:
+# distributed demo — shared K_M-A"). `k_m_a` is standard base64 of 32 bytes
+# — the identical value set in mint's own [auth.demo].k_m_a.
+#
+# [auth.demo]
+# k_m_a = "..."   # openssl rand -base64 32, shared with mint
+
 [peer_fetch]
 # Setting `port` enables peer fetch: the coordinator binds an HTTP server on
 # this port and advertises it at `coordinators/<id>/peer-endpoint.toml` for
@@ -595,15 +650,20 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 
 /// Load and parse a `coordinator.toml` file.
 ///
-/// If the file does not exist, returns a default config (all fields use their
-/// defaults: `data_dir = ./elide_data`, `store = ./elide_store`, etc.).
+/// A missing file is an error, not a silent fall-through to defaults: a
+/// coordinator with no `[store]`/`[mint]` config cannot serve, and a default
+/// config quietly routes serve into the shared-key passthrough branch where it
+/// fails far from the cause (an opaque conditional-PUT bail on the default local
+/// store). Surfacing the missing path here is immediately actionable.
 pub fn load(path: &Path) -> Result<CoordinatorConfig> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text)
-            .with_context(|| format!("parsing config file: {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CoordinatorConfig::default()),
-        Err(e) => Err(e).with_context(|| format!("reading config file: {}", path.display())),
-    }
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading config file: {} (pass --config, set ELIDE_COORD_CONFIG, \
+             or run `elide-coordinator init` to create one)",
+            path.display()
+        )
+    })?;
+    toml::from_str(&text).with_context(|| format!("parsing config file: {}", path.display()))
 }
 
 impl Default for CoordinatorConfig {
@@ -619,6 +679,7 @@ impl Default for CoordinatorConfig {
             peer_fetch: PeerFetchConfig::default(),
             mint: None,
             attestation: None,
+            auth: None,
         }
     }
 }
@@ -918,6 +979,36 @@ mod tests {
             Some("https://t3.storage.dev")
         );
         assert_eq!(cfg.store.region.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn shipped_coordinator_demo_config_parses() {
+        // The committed shared-key demo config (deploy/coord/) — nothing else
+        // loads it, so this is its guard: it must parse and its
+        // [auth.demo].k_m_a must decode to 32 bytes, matching mint-fly.toml.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/coord/coord.toml");
+        let text = std::fs::read_to_string(path).expect("read coord.toml");
+        let cfg: CoordinatorConfig =
+            toml::from_str(&text).expect("coordinator.toml must parse as a CoordinatorConfig");
+        assert_eq!(
+            cfg.demo_k_m_a().expect("k_m_a decodes").map(|k| k.len()),
+            Some(32)
+        );
+        assert!(cfg.mint.is_some(), "[mint] present");
+    }
+
+    #[test]
+    fn load_errors_on_missing_file() {
+        // A missing config path must fail loudly, not silently fall through to
+        // a default config — a default routes serve into the shared-key
+        // passthrough branch and bails on conditional PUT far from the cause.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.toml");
+        let Err(err) = load(&missing) else {
+            panic!("missing config must error, not fall through to defaults");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nope.toml"), "error names the path: {msg}");
     }
 
     #[test]

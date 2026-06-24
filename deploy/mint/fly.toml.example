@@ -13,7 +13,7 @@ primary_region = "iad"
     # baked into the role ARNs (must equal the coordinator's [store].bucket); it
     # also becomes mint's own admin-store bucket (_mint/* under a distinct
     # prefix) unless STORE_BUCKET overrides it.
-    MINT_REF = "93ffda83e69c17e5572ce0104ae8c5d84e353d5e"
+    MINT_REF = "0fc7334e844807d319d5f318a43a65f4de3fd1b1"
     DATA_BUCKET = "elide"
     # STORE_BUCKET = "mint-admin"   # set only to isolate mint's _mint/* in its own bucket
 
