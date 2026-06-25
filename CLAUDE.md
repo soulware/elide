@@ -70,11 +70,20 @@ When in doubt, re-read the Fly.io blog before proposing changes to anything maca
 
 ## Comments
 
-**Comments describe the thing they annotate — nothing external.**
-- A comment's scope is the code or config it sits next to. Don't pad it with surrounding context, runtime behaviour, or how other components consume it, hoping it's "useful" — it's noise.
-- In config files specifically: comment only the keys in that file (what the value means, valid forms, defaults). Do not describe what the program does with it at runtime, what is configured elsewhere, or what isn't configured here.
-- Don't write comments stating what is deliberately *not* done, not done yet, or not done here. Status and rejected-alternative rationale belong in the commit message or design docs, not the source.
-- Don't expand existing comments across successive edits. Trim or delete; never accrete rationale.
+Default to **no comment**. Write the code first with none, then add one only where it earns its place — a non-obvious *why*, an invariant, a gotcha. Adding from zero produces far fewer comments than writing-then-pruning, and makes each a deliberate choice.
+
+When you do comment, it may describe only what the adjacent code **does, right now**. That single test catches the comments that keep creeping in — each one fails by reaching somewhere else:
+
+- **Other code** — surrounding context, runtime behaviour, how other components use this. (Config files: comment only what *this* key means; never what the program does with it or what's set elsewhere.)
+- **Other time** — what it used to do, will do, doesn't do yet, or how it changed → commit message.
+- **Other place** — that something is unchanged, untouched, or handled/defined elsewhere.
+- **Other choice** — what you considered and rejected, or deliberately didn't do → commit message or design doc.
+
+These words are a stop signal *while writing*, not a review filter — the moment one forms in a comment, it has already failed; delete it rather than reword it: *unchanged, untouched, stays, remains, still, not done here, not a change to, left as-is, for now, unlike*.
+
+Never grow a comment across edits — trim or delete, never accrete.
+
+The same test governs prose in design docs and PR descriptions: state what the change **is**, not what it isn't, was, or might have been.
 
 ## Documentation
 
