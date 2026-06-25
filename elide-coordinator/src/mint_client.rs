@@ -970,24 +970,14 @@ impl MintEndpoint {
 
         let access_key_id = json_str_field(&text, "access_key_id")?;
         let secret_access_key = json_str_field(&text, "secret_access_key")?;
-        // mint may clamp to the role max; its `expiration` is
-        // authoritative. If it is unparseable, the `exp` we attenuated
-        // to is a valid upper bound — fall back to it rather than fail
-        // a credential mint that otherwise succeeded.
-        let expiry_unix = json_str_field(&text, "expiration")
-            .ok()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
-            .map(|dt| dt.timestamp().max(0) as u64)
-            .unwrap_or_else(|| {
-                warn!("[coordinator] mint {role} expiration unparseable; using attenuated exp");
-                exp
-            });
-
+        // The credential's lifetime is the `exp` we attenuated onto the
+        // macaroon: mint clamps the issued key to it (and to the role's
+        // sealed ceiling), so it is the authoritative upper bound.
         Ok(IssuedCredentials {
             access_key_id,
             secret_access_key,
             session_token: None,
-            expiry_unix: Some(expiry_unix),
+            expiry_unix: Some(exp),
         })
     }
 
