@@ -12,7 +12,7 @@
 #   DATA_BUCKET   the volume-data bucket baked into the role ARNs; must equal
 #                 the coordinator's [store].bucket.
 
-ARG MINT_VERSION=v0.1.0
+ARG MINT_VERSION=v0.1.1
 
 FROM ubuntu:24.04 AS build
 ARG MINT_VERSION
@@ -26,7 +26,7 @@ RUN apt-get update \
 # (an actor who can replace the binary can replace that checksum too).
 ARG MINT_ASSET=mint-x86_64-unknown-linux-gnu
 ARG MINT_BASE=https://github.com/soulware/mint/releases/download
-ARG MINT_SHA256=e54f14be734d10b30191cfc6f3eda73f22ee399d23a05005eea90df6433ee1ca
+ARG MINT_SHA256=REPLACE_WITH_v0.1.1_RELEASE_SHA256
 RUN curl --proto '=https' --tlsv1.2 -fsSLO "${MINT_BASE}/${MINT_VERSION}/${MINT_ASSET}" \
  && echo "${MINT_SHA256}  ${MINT_ASSET}" | sha256sum -c - \
  && install -m 0755 "${MINT_ASSET}" /usr/local/bin/mint
