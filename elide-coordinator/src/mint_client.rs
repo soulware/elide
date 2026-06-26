@@ -290,17 +290,24 @@ impl WireMacaroon {
         self.mac.as_bytes()
     }
 
-    /// The `cid` of the third-party caveat at `location`, if the macaroon
-    /// carries one. Used to find the attestation caveat coord B discharges;
-    /// other third-party caveats (e.g. operator-authorisation) sit at
-    /// different locations and are discharged by their own authorities.
-    pub(crate) fn third_party_cid_at(&self, location: &str) -> Option<&[u8]> {
-        self.caveats.iter().find_map(|c| match c {
-            Caveat::ThirdParty {
-                location: l, cid, ..
-            } if l == location => Some(cid.as_slice()),
-            _ => None,
-        })
+    /// The `(location, cid)` of the credential's sole third-party caveat —
+    /// the attestation TPC coord B discharges. An attested role's
+    /// `exchange-finalize` intermediate carries exactly one TPC (mint's
+    /// `issuance::mint_intermediate`), so the discharge route is read from
+    /// the caveat's own `location`, never from config. Fails closed unless
+    /// exactly one is present, so a malformed intermediate cannot silently
+    /// route the wrong caveat or skip attestation.
+    pub(crate) fn attestation_third_party(&self) -> io::Result<(&str, &[u8])> {
+        let mut tpcs = self.third_party_caveats();
+        let first = tpcs
+            .next()
+            .ok_or_else(|| io::Error::other("intermediate carries no attestation caveat"))?;
+        if tpcs.next().is_some() {
+            return Err(io::Error::other(
+                "intermediate carries multiple third-party caveats; expected exactly one",
+            ));
+        }
+        Ok(first)
     }
 
     /// Every third-party caveat as `(location, cid)` — what a gate
@@ -614,13 +621,8 @@ pub struct MintEndpoint {
     request_timeout: Duration,
     data_dir: PathBuf,
     identity: Arc<CoordinatorIdentity>,
-    /// coord B's discharge location, when this deployment uses volume
-    /// attestation. A primary whose third-party caveat sits at this exact
-    /// location is discharged at `exchange-finalize`; see
-    /// [`MintEndpoint::finalize_volume`].
-    attestation_location: Option<String>,
-    /// How to dial coord B when the location is not the connection
-    /// (`[mint] attestation_transport`); `None` dials the location.
+    /// How to dial coord B when its sealed location is not the connection
+    /// (`[mint] attestation_transport`); `None` dials the caveat's location.
     attestation_transport: Option<String>,
 }
 
@@ -653,7 +655,6 @@ impl MintEndpoint {
             request_timeout: cfg.request_timeout,
             data_dir,
             identity,
-            attestation_location: cfg.attestation_location.clone(),
             attestation_transport: cfg.attestation_transport.clone(),
         }
     }
@@ -774,20 +775,13 @@ impl MintEndpoint {
         target: Ulid,
         intermediate: &str,
     ) -> io::Result<String> {
-        let location = self.attestation_location.as_deref().ok_or_else(|| {
-            io::Error::other("cannot finalize an attested role without [mint] attestation_location")
-        })?;
         let mac = WireMacaroon::decode(intermediate)?;
-        let cid = mac
-            .third_party_cid_at(location)
-            .ok_or_else(|| {
-                io::Error::other(format!(
-                    "intermediate carries no attestation caveat at {location}"
-                ))
-            })?
-            .to_vec();
+        let (location, cid) = {
+            let (loc, cid) = mac.attestation_third_party()?;
+            (loc.to_owned(), cid.to_vec())
+        };
         let discharge = self
-            .fetch_attestation_discharge(owned, target, &cid, location)
+            .fetch_attestation_discharge(owned, target, &cid, &location)
             .await?;
 
         let body = format!(r#"{{"ts":{}}}"#, now_unix()?);
@@ -1236,37 +1230,45 @@ mod tests {
     }
 
     #[test]
-    fn third_party_cid_at_selects_the_caveat_for_a_location() {
-        // A credential can carry several third-party caveats discharged by
-        // different authorities; coord A must pick the attestation one by
-        // its location, not by position.
-        let m = WireMacaroon {
+    fn attestation_third_party_takes_the_sole_caveat() {
+        // An attested role's exchange-finalize intermediate carries exactly
+        // one third-party caveat — the attestation TPC — so coord A reads its
+        // location from the caveat, never from config.
+        let mac = |caveats| WireMacaroon {
             key_ref: vec![0, 0],
             nonce: [0u8; NONCE_LEN],
             mac: blake3::Hash::from_bytes([0u8; 32]),
-            caveats: vec![
-                first_party("aud", "mint"),
-                Caveat::ThirdParty {
-                    location: "https://auth.example/v1/discharge".into(),
-                    vid: vec![3, 3],
-                    cid: vec![7, 7, 7],
-                },
-                Caveat::ThirdParty {
-                    location: "https://coord-b.example/v1/discharge".into(),
-                    vid: vec![1, 1],
-                    cid: vec![9, 9, 9, 9],
-                },
-            ],
+            caveats,
         };
+        let coord_b = || Caveat::ThirdParty {
+            location: "https://coord-b.example/v1/discharge".into(),
+            vid: vec![1, 1],
+            cid: vec![9, 9, 9, 9],
+        };
+
         assert_eq!(
-            m.third_party_cid_at("https://coord-b.example/v1/discharge"),
-            Some(&[9u8, 9, 9, 9][..])
+            mac(vec![first_party("aud", "mint"), coord_b()])
+                .attestation_third_party()
+                .unwrap(),
+            ("https://coord-b.example/v1/discharge", &[9u8, 9, 9, 9][..])
         );
-        assert_eq!(
-            m.third_party_cid_at("https://auth.example/v1/discharge"),
-            Some(&[7u8, 7, 7][..])
+
+        // Zero or several TPCs fail closed rather than guess which to route.
+        assert!(
+            mac(vec![first_party("aud", "mint")])
+                .attestation_third_party()
+                .is_err()
         );
-        assert_eq!(m.third_party_cid_at("https://nowhere.example"), None);
+        let auth = Caveat::ThirdParty {
+            location: "https://auth.example/v1/discharge".into(),
+            vid: vec![3, 3],
+            cid: vec![7, 7, 7],
+        };
+        assert!(
+            mac(vec![auth, coord_b()])
+                .attestation_third_party()
+                .is_err()
+        );
     }
 
     /// The shared cross-implementation fixture (canonical volume-rw CID under
@@ -1323,7 +1325,6 @@ mod tests {
             url: "unix:/tmp/unused.sock".into(),
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
-            attestation_location: Some("https://coord-b.example/v1/discharge".into()),
             attestation_transport: None,
         };
         let endpoint = MintEndpoint::new(&cfg, data_dir.path().to_path_buf(), identity);
@@ -1409,7 +1410,6 @@ mod tests {
             url: "unix:/tmp/unused.sock".into(),
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
-            attestation_location: Some("https://coord-b.example/v1/discharge".into()),
             attestation_transport: None,
         };
         let endpoint = MintEndpoint::new(&cfg, data_dir.path().to_path_buf(), identity);

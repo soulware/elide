@@ -356,12 +356,11 @@ The coordinator reaches mint through one `coordinator.toml` section:
 # enable mint
 [mint]
 url = "unix:mint/mint_data/mint.sock"   # or "https://mint.host:8085"
-# attestation discharge authority (coord B), when this deployment uses
-# volume-ownership attestation (docs/design-mint-volume-attestation.md):
-attestation_location = "https://coord-b.host:8086/v1/discharge"
-# how to dial coord B when the location is not the connection (e.g. a
-# co-located coord B off the network on a UDS); the request path still
-# comes from attestation_location:
+# how to dial the attestation discharge authority (coord B) when its
+# sealed location is not the connection — e.g. a co-located coord B off
+# the network on a UDS (docs/design-mint-volume-attestation.md). The
+# discharge route comes from the caveat's own location; this supplies
+# only the connection. Omit when that location is directly reachable:
 # attestation_transport = "unix:/run/elide/discharge.sock"
 ```
 
@@ -380,16 +379,17 @@ inside the macaroon. Only the endpoint — and optionally
 `connect_timeout` / `request_timeout` (humantime, mirroring
 `[store]`) — is configurable.
 
-`attestation_location` is set when credentials carry an attestation
-third-party caveat (`docs/design-mint-volume-attestation.md`). It must
-equal the location mint sealed into the caveat — the authority's
-identity, a URL whose path is the discharge route; before
-`assume-role`, the coordinator discharges a credential carrying a
-third-party caveat at this exact location by proving possession of the
-volume's `volume.key` (a `volume-rw` discharge for `volume-rw`) and
-attaches the returned discharge to the bundle. Absent → no discharge is
-fetched. The connection comes from `attestation_transport` when set
-(coord B off-network on a UDS), else the location is dialled directly.
+Whether the coordinator fetches a discharge is driven by the credential,
+not config: a credential carrying an attestation third-party caveat
+(`docs/design-mint-volume-attestation.md`) is discharged before
+`assume-role` by proving possession of the volume's `volume.key` (a
+`volume-rw` discharge for `volume-rw`) and attaching the discharge to the
+bundle. The discharge route is read from the caveat's own sealed location
+— the authority's identity, a URL whose path is the route — so the
+coordinator holds no location of its own. `attestation_transport` is set
+only when that sealed location is not itself reachable (coord B
+off-network on a UDS); it supplies the connection while the route still
+comes from the caveat. Absent → the location host is dialled directly.
 
 The coordinator credential plane has exactly two states: `[mint]`
 present (per-volume scoping via the role inventory below), or absent

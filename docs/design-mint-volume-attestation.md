@@ -790,8 +790,8 @@ different exposure profiles. Segment fetch reads local `by_id/` bodies and
 is **advertised to remote peers** (`coordinators/<id>/peer-endpoint.toml`),
 so it needs a network-reachable address. Discharge reads only public signed
 metadata under `coord-ro`, holds no `by_id/`, and is **not advertised** —
-coord A learns where to POST from the `attestation_location` mint sealed
-into the caveat — so it can live entirely off the network on a UDS.
+coord A learns where to POST from the location mint sealed into the
+caveat — so it can live entirely off the network on a UDS.
 
 So coord B is the **`elide-attestation` crate**, not a route bolted onto
 the peer-fetch server: the discharge handler, the discharge-mint crypto,
@@ -823,7 +823,7 @@ discharge served only to a co-located coord A over UDS while peer-fetch is
 the sole network surface. Two couplings remain: peer-fetch's advertised
 host must stay network-reachable (its `listen` is TCP-only — a `unix:`
 value is rejected), and coord A must be able to reach the discharge
-`listen`. The sealed `attestation_location` is the authority's
+`listen`. The sealed location is the authority's
 *identity* — a URL whose path is the discharge route — and is not
 required to be dialable: coord A dials it directly by default, and when
 coord B is off-network, coord A's `[mint] attestation_transport`
@@ -867,6 +867,84 @@ single-sourced because `elide-core` is already a shared dependency — no
 crate boundary forces a copy. The discharge crypto is reimplemented
 because `mint` is unlinkable by design. Share code where the crate graph
 allows it; pin with vectors only where it does not.
+
+## Deployment and configuration surface
+
+Three holders configure the attestation flow, each minimally. The split
+keeps the requester (coord A) ignorant of where the authority lives and the
+authority ignorant of who requests — the location/transport split of § *A
+separate crate and listener from peer fetch* applied to config.
+
+| holder | attestation config | why |
+|---|---|---|
+| **mint** (issuer) | `[attestation] location`; `K_M-B` | mint seals `location` and the `cid` (under `K_M-B`) into every attested TPC at issuance, so it holds both. |
+| **coord A** (requester) | `[mint] attestation_transport` only | The discharge route is read from the caveat's own `location`; transport is only *how* to dial when that sealed location is not itself reachable. |
+| **coord B** (authority) | `[attestation] listen`; `K_M-B` | The listener it binds, and the key to open the `cid`. Possession, lineage and liveness are read from `coord-ro`. |
+
+**coord A holds no location.** The authority's identity rides every
+attested TPC as its `location` field, MAC-bound and authoritative. coord A
+discharges each third-party caveat at the authority *that caveat's*
+`location` names — routing is per-caveat and intrinsic, so a primary
+carrying both an attestation TPC and an operator-auth TPC routes each to its
+own authority without coord A holding a config copy of either location. The
+only attestation value coord A configures is `attestation_transport`: the
+dial override for a sealed location that is not reachable as written (coord
+B off-network on a UDS), supplying the connection while the route still
+comes from the caveat. Absent, the location's host is dialled directly.
+
+**`K_M-B` enters by holder.** mint holds it to *seal* the `cid`; coord B
+holds it to *open* the `cid`. In the production shape the key never leaves
+mint and coord B unwraps over the wire (§ *Proposed: `K_M-B` stays at
+mint*); in the single-host shape both hold it directly.
+
+### Co-located shape: one coordinator, both hats
+
+In the bundled single-host deployment the coordinator *is* coord B for its
+own requests, so the two surfaces collapse onto one process:
+
+- `[attestation] listen` binds the authority — a `unix:<path>` keeps it off
+  the network, reachable only in-container;
+- `[mint] attestation_transport` points back at that same `listen`, so
+  coord A's discharge POST loops back to the in-process authority;
+- the sealed `location` in the caveat stays coord B's identity — never
+  dialled, only routed-by-path and matched by mint at verify.
+
+### Proposed: distributed demo — shared `K_M-B`
+
+The demo tier mirrors the shared-`K_M-A` model (`design-auth-service.md` §
+*Proposed: distributed demo — shared `K_M-A`*). When mint and the
+coordinator run on separate hosts, the production unwrap-at-mint exchange is
+more machinery than a demo needs, so the trust anchor is shared directly:
+**both sides source the same `K_M-B` from config** — a known, forgeable key
+rather than one mint generates.
+
+```toml
+# mint-fly.toml — colocated demo attestation
+[attestation.demo]
+k_m_b = "<base64 32-byte AEAD key>"
+
+# coord.toml — the coordinator as coord B
+[attestation]
+k_m_b = "<base64 32-byte AEAD key>"   # identical value
+```
+
+The deploy renders one generated value into both files, so they cannot
+drift. mint seals attestation `cid`s under it; the co-located coordinator
+opens them locally to discharge — no unwrap round-trip, no out-of-band key
+delivery. The `cid` construction and the discharge MAC are unchanged; only
+the holder of the key differs, exactly as shared-`K_M-A` leaves mint's
+discharge verifier untouched.
+
+**Mint-side requirement (the one cross-repo change).** mint's
+`[attestation.demo]` must source `K_M-B` from a `k_m_b` field rather than
+generating it at first start — the `K_M-B` analog of the `k_m_a` field
+`[auth.demo]` already carries. The colocated `[attestation.demo].socket`
+that stands up mint's *own* discharge authority is unused in this shape: the
+coordinator is coord B, so mint seals `cid`s but serves no discharge.
+
+Demo-tier only: a shared forgeable `K_M-B` is offline discharge-forgery
+capability for every attested credential (§ *Proposed: `K_M-B` stays at
+mint*), which is exactly why production keeps it at mint.
 
 ## Proposed: a standalone verifier process
 
@@ -977,7 +1055,7 @@ replication does to coord B.
 
 ## Proposed: HA — N instances, one location, no shared secret
 
-Multiple instances stand behind the one sealed `attestation_location`
+Multiple instances stand behind the one sealed location
 (the location names the *authority*; instances are interchangeable
 servers of it). Each instance's durable state is its identity directory
 — its own enrollment keypair and `cnf`-bound `credentials/coord-ro` —

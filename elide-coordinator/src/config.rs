@@ -709,25 +709,13 @@ pub struct MintConfig {
     #[serde(default = "default_mint_request_timeout", with = "humantime_serde")]
     pub request_timeout: Duration,
 
-    /// Discharge location of the attestation coordinator (coord B) that
-    /// vouches volume ownership (`docs/design-mint-volume-attestation.md`).
-    /// When set, a primary credential carrying a third-party caveat at
-    /// this exact location is discharged before `assume-role`: the
-    /// coordinator proves possession of the volume's `volume.key` and
-    /// attaches the returned discharge to the bundle. Absent → no
-    /// discharge is fetched (the enrolled credentials carry no attestation
-    /// caveat). Must equal the `attestation_location` mint sealed into the
-    /// caveat — the authority's *identity*, a URL whose path is the
-    /// discharge route. The connection comes from
-    /// [`attestation_transport`](Self::attestation_transport) when set,
-    /// else the location is dialled directly.
-    #[serde(default)]
-    pub attestation_location: Option<String>,
-
-    /// How to dial coord B when its location is not the connection:
-    /// `unix:<path>` (the co-located, off-network shape) or
-    /// `http(s)://host:port`. The request path still comes from
-    /// `attestation_location`. Absent → the location itself is dialled,
+    /// How to dial the attestation coordinator (coord B) when its sealed
+    /// location is not itself reachable: `unix:<path>` (the co-located,
+    /// off-network shape) or `http(s)://host:port`. The discharge route is
+    /// read from the third-party caveat's own `location` field on the
+    /// credential being finalized (`docs/design-mint-volume-attestation.md`
+    /// § "Deployment and configuration surface"); this supplies only the
+    /// connection. Absent → the caveat's location host is dialled directly,
     /// so it must then be a reachable `http(s)` URL.
     #[serde(default)]
     pub attestation_transport: Option<String>,
@@ -762,10 +750,8 @@ fn valid_dial_scheme(s: &str) -> bool {
 
 impl MintConfig {
     /// Reject a dial target whose scheme is neither `unix:` nor
-    /// `http(s)://`, an attestation location with no discharge route,
-    /// and a transport with nothing to route. Validated at issuer-build
-    /// time so a typo fails at startup rather than on the first
-    /// `assume-role`.
+    /// `http(s)://`. Validated at issuer-build time so a typo fails at
+    /// startup rather than on the first `assume-role`.
     pub fn validate(&self) -> Result<()> {
         if !valid_dial_scheme(self.url.trim()) {
             bail!(
@@ -773,26 +759,15 @@ impl MintConfig {
                 self.url
             );
         }
-        if let Some(loc) = &self.attestation_location
-            && location_path(loc.trim()).is_none()
+        if let Some(t) = &self.attestation_transport
+            && !valid_dial_scheme(t.trim())
         {
             bail!(
-                "[mint] attestation_location must carry the discharge route as its \
-                 URL path (e.g. `https://coord-b/v1/discharge`), got {loc:?}"
+                "[mint] attestation_transport must be `unix:<path>` or \
+                 `http(s)://host:port` (got {t:?})"
             );
         }
-        match &self.attestation_transport {
-            Some(_) if self.attestation_location.is_none() => {
-                bail!("[mint] attestation_transport is set without attestation_location");
-            }
-            Some(t) if !valid_dial_scheme(t.trim()) => {
-                bail!(
-                    "[mint] attestation_transport must be `unix:<path>` or \
-                     `http(s)://host:port` (got {t:?})"
-                );
-            }
-            _ => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -874,10 +849,17 @@ impl PeerFetchConfig {
 /// Volume-attestation discharge-authority configuration (coord B).
 #[derive(Clone, Deserialize)]
 pub struct AttestationConfig {
-    /// Path to the `attestation-shared.key` file (64 hex chars = 32 bytes):
-    /// the symmetric `K_M-B` mint shares with this authority. In the
-    /// co-located demo this is the same file mint generates.
-    pub discharge_key_file: PathBuf,
+    /// Inline `K_M-B` as standard base64 of 32 bytes — the identical value
+    /// mint is deployed with in `[attestation.demo].k_m_b`
+    /// (`openssl rand -base64 32`). Mutually exclusive with
+    /// `discharge_key_file`.
+    #[serde(default)]
+    pub k_m_b: Option<String>,
+
+    /// Path to an `attestation-shared.key` file (64 hex chars = 32 bytes)
+    /// holding the symmetric `K_M-B`. Mutually exclusive with `k_m_b`.
+    #[serde(default)]
+    pub discharge_key_file: Option<PathBuf>,
 
     /// Listen address for `POST /v1/discharge`: `<host>:<port>` (TCP) or
     /// `unix:<path>` (UDS — keeps the discharge endpoint off the network,
@@ -895,18 +877,36 @@ impl AttestationConfig {
         self.listen.as_deref().map(parse_listen).transpose()
     }
 
-    /// Load and parse the shared `K_M-B` discharge key.
+    /// Load and decode the shared `K_M-B` discharge key from the inline
+    /// `k_m_b` (standard base64) or `discharge_key_file` (hex). Exactly one
+    /// of the two must be set.
     pub fn load_discharge_key(&self) -> Result<[u8; 32]> {
-        let text = std::fs::read_to_string(&self.discharge_key_file)
-            .with_context(|| format!("read discharge key {:?}", self.discharge_key_file))?;
-        let bytes = elide_core::signing::decode_hex(text.trim())
-            .with_context(|| format!("decode discharge key {:?}", self.discharge_key_file))?;
-        bytes.try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "discharge key {:?} must be 32 bytes (64 hex chars)",
-                self.discharge_key_file
-            )
-        })
+        match (&self.k_m_b, &self.discharge_key_file) {
+            (Some(_), Some(_)) => bail!(
+                "[attestation] sets both k_m_b and discharge_key_file; they are mutually exclusive"
+            ),
+            (None, None) => {
+                bail!("[attestation] requires either k_m_b (inline) or discharge_key_file")
+            }
+            (Some(b64), None) => {
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64.trim())
+                    .context("[attestation].k_m_b is not valid standard base64")?;
+                bytes.try_into().map_err(|v: Vec<u8>| {
+                    anyhow::anyhow!("[attestation].k_m_b decoded {} bytes, need 32", v.len())
+                })
+            }
+            (None, Some(path)) => {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("read discharge key {path:?}"))?;
+                let bytes = elide_core::signing::decode_hex(text.trim())
+                    .with_context(|| format!("decode discharge key {path:?}"))?;
+                bytes.try_into().map_err(|_| {
+                    anyhow::anyhow!("discharge key {path:?} must be 32 bytes (64 hex chars)")
+                })
+            }
+        }
     }
 }
 
@@ -984,8 +984,9 @@ mod tests {
     #[test]
     fn shipped_coordinator_demo_config_parses() {
         // The committed shared-key demo config (deploy/coord/) — nothing else
-        // loads it, so this is its guard: it must parse and its
-        // [auth.demo].k_m_a must decode to 32 bytes, matching mint-fly.toml.
+        // loads it, so this is its guard: it must parse, and its
+        // [auth.demo].k_m_a and [attestation].k_m_b must each decode to 32
+        // bytes (matching mint-fly.toml).
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/coord/coord.toml");
         let text = std::fs::read_to_string(path).expect("read coord.toml");
         let cfg: CoordinatorConfig =
@@ -994,7 +995,9 @@ mod tests {
             cfg.demo_k_m_a().expect("k_m_a decodes").map(|k| k.len()),
             Some(32)
         );
-        assert!(cfg.mint.is_some(), "[mint] present");
+        cfg.mint.as_ref().expect("[mint] present");
+        let att = cfg.attestation.as_ref().expect("[attestation] present");
+        assert_eq!(att.load_discharge_key().expect("k_m_b decodes").len(), 32);
     }
 
     #[test]
@@ -1091,40 +1094,25 @@ mod tests {
     }
 
     #[test]
-    fn mint_validate_checks_the_attestation_pair() {
+    fn mint_validate_checks_the_attestation_transport() {
         let base = MintConfig {
             url: "unix:/run/elide/mint.sock".into(),
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
-            attestation_location: None,
             attestation_transport: None,
         };
         assert!(base.validate().is_ok());
 
-        // A location must carry the discharge route.
-        let pathless = MintConfig {
-            attestation_location: Some("https://coord-b.example".into()),
-            ..base.clone()
-        };
-        assert!(pathless.validate().is_err());
-
-        // A transport needs a location to take the route from.
-        let dangling = MintConfig {
-            attestation_transport: Some("unix:/run/elide/coord-b.sock".into()),
-            ..base.clone()
-        };
-        assert!(dangling.validate().is_err());
-
-        // The co-located shape: logical location, UDS connection.
+        // A transport supplies only the connection — the off-network UDS
+        // shape; the route comes from the caveat, so no location is needed.
         let uds = MintConfig {
-            attestation_location: Some("https://coord-b.example/v1/discharge".into()),
             attestation_transport: Some("unix:/run/elide/coord-b.sock".into()),
             ..base.clone()
         };
         assert!(uds.validate().is_ok());
 
+        // A transport must still carry a dial scheme.
         let bad_scheme = MintConfig {
-            attestation_location: Some("https://coord-b.example/v1/discharge".into()),
             attestation_transport: Some("coord-b.example:8086".into()),
             ..base
         };
