@@ -26,7 +26,7 @@ RUN apt-get update \
 # (an actor who can replace the binary can replace that checksum too).
 ARG MINT_ASSET=mint-x86_64-unknown-linux-gnu
 ARG MINT_BASE=https://github.com/soulware/mint/releases/download
-ARG MINT_SHA256=REPLACE_WITH_v0.1.1_RELEASE_SHA256
+ARG MINT_SHA256=d5c1a801ba38dae84d0ad66898586960f0561154f69ee31a0417a0907dc5fce4
 RUN curl --proto '=https' --tlsv1.2 -fsSLO "${MINT_BASE}/${MINT_VERSION}/${MINT_ASSET}" \
  && echo "${MINT_SHA256}  ${MINT_ASSET}" | sha256sum -c - \
  && install -m 0755 "${MINT_ASSET}" /usr/local/bin/mint
