@@ -119,8 +119,8 @@ manage it (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
    separate bucket. All deploy commands run from this directory.
 2. `fly apps create <app>` and `fly volumes create mint_data --size 1`.
 3. `fly secrets set AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…`.
-4. `fly deploy` — the keyring and `K_M-*` generate on first boot (the demo
-   tables enable first-boot generation), into the volume.
+4. `fly deploy` — the keyring and `K_session` generate on first boot into the
+   volume.
 
 Then seal and mint an invite **inside the machine** — the demo auth issuer is
 in-container UDS-only, so the operator gates run there, not from your
@@ -168,9 +168,10 @@ With the VM joined to 6PN (`fly wireguard create`):
     mint enroll approve <coordinator-sub>
 
 That enrols the coordinator and lets it assume the issuer-only `coord-ro` /
-`coord-rw` roles. The attested `volume-*` roles additionally need `K_M-B`
-(`<data_dir>/attestation-shared.key`, generated on the volume) shared with the
-VM's attestation coordinator — still out of scope here.
+`coord-rw` roles. The attested `volume-*` roles additionally need `K_M-B`,
+shared the same way as `K_M-A`: one value set as `[attestation.demo].k_m_b` in
+mint's config and `[attestation].k_m_b` in the coordinator's. mint persists it
+at `<data_dir>/attestation-shared.key`.
 
 The keyring is the root of trust and auto-generates onto the `mint_data` volume;
 losing the volume invalidates every issued credential, so back it up.

@@ -43,14 +43,10 @@ ttl_seconds = 3600
 name = "coord-rw"
 ttl_seconds = 3600
 
-# Colocated demo auth + attestation. Presence is the switch; it also enables
-# first-boot generation of the keyring and K_session. Both bind UDS reachable
-# only inside the container. `k_m_a` and `k_m_b` are the shared-key demo secrets
-# (standard base64 of 32 bytes): mint sources K_M-A and K_M-B from them rather
-# than generating, so an off-host coordinator holding the identical values
-# self-issues its operator discharges and opens attestation CIDs under the same
-# keys (docs/design-auth-service.md § "Proposed: distributed demo — shared
-# K_M-A"; docs/mint-shared-k-m-b-spec.md). Demo-tier — known, forgeable keys.
+# Colocated demo auth + attestation, both binding a container-internal UDS.
+# `k_m_a` and `k_m_b` are demo-tier shared-key secrets — standard base64 of 32
+# bytes, known and forgeable — each identical to the coordinator's value
+# (docs/design-auth-service.md; docs/mint-shared-k-m-b-spec.md).
 [auth.demo]
 socket = "/data/mint_data/auth.sock"
 k_m_a = "XXdf8FWWdPwfx2RePVaoQzxA7zLjbC+zEnkAWiVA/2M="
