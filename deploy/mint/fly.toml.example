@@ -9,11 +9,13 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
   [build.args]
-    # MINT_REF: lockstep mint source ref. DATA_BUCKET: the volume-data bucket
-    # baked into the role ARNs (must equal the coordinator's [store].bucket); it
-    # also becomes mint's own admin-store bucket (_mint/* under a distinct
-    # prefix) unless STORE_BUCKET overrides it.
-    MINT_REF = "0fc7334e844807d319d5f318a43a65f4de3fd1b1"
+    # MINT_VERSION: lockstep released mint tag. MINT_SHA256: the expected sha256
+    # of that release's binary (bump together). DATA_BUCKET: the volume-data
+    # bucket baked into the role ARNs (must equal the coordinator's
+    # [store].bucket); it also becomes mint's own admin-store bucket (_mint/*
+    # under a distinct prefix) unless STORE_BUCKET overrides it.
+    MINT_VERSION = "v0.1.0"
+    MINT_SHA256 = "e54f14be734d10b30191cfc6f3eda73f22ee399d23a05005eea90df6433ee1ca"
     DATA_BUCKET = "elide"
     # STORE_BUCKET = "mint-admin"   # set only to isolate mint's _mint/* in its own bucket
 

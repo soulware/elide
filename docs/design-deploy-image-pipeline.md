@@ -1,13 +1,16 @@
 # Deploy image pipeline
 
-**Status:** Proposed. No implementation. Captures the discussion for building the
-mint and coordinator binaries in CI and downloading them at deploy time, in
-place of the source compile in the Fly image builds.
+**Status:** Implemented for mint; proposed for the coordinator. mint's binary is
+built in CI and published as a GitHub release (mint #43; first tag `v0.1.0`), and
+`deploy/mint/` downloads and checksum-verifies it at a pinned `MINT_VERSION` in
+place of the source compile. The coordinator image (`deploy/coord/`) still
+compiles from source; the rest of this note covers extending the same pipeline to
+the elide binaries.
 
 ## Problem
 
-Both Fly images (`deploy/mint/`, `deploy/coord/`) compile from source inside the
-image build, at deploy time, from a `*_REF` build arg:
+The coordinator image (`deploy/coord/`) compiles its binary from source inside
+the image build, at deploy time, from a `*_REF` build arg:
 
 ```dockerfile
 RUN git clone https://github.com/soulware/<repo> /src \
@@ -35,7 +38,7 @@ shipped a mint that generated its own `K_M-A` instead of reading it from config,
 which silently broke coordinator enrollment (the coordinator's gate discharge
 could not be decrypted). The cause was a stale `*_REF`.
 
-## Proposed: build binaries in CI, download at deploy
+## The pipeline: build binaries in CI, download at deploy
 
 CI compiles each repo's binaries once per release and publishes them as
 **release artifacts**; the deploy Dockerfile downloads the pinned binary version
@@ -64,16 +67,16 @@ This fixes all three failure modes:
 - **Lockstep explicit.** The deploy pins `(mint version, elide version)` as
   readable release tags rather than SHAs, in one place.
 
-## Wrinkles to design for
+## Settled by mint's pipeline
 
-1. **Binary ABI matches the runtime base.** CI builds on `ubuntu-24.04`, runtime
-   is `ubuntu:24.04`, so glibc matches. (A static musl build would remove the
-   coupling entirely — probably more than needed.)
-2. **Native deps present at runtime.** The `elide` binary links libublk
-   (liburing); the runtime base must carry whatever the CI-built binary loads.
-3. **A release/tag step.** Each repo's CI publishes the artifact on a tag (clean
-   versioning, deliberate cadence) or on every `main` push (named by version /
-   SHA).
+- **Artifact hosting** — GitHub Releases: one release asset per tag, durable and
+  tokenless for the public repo.
+- **Version scheme** — semver release tags (`vX.Y.Z`); the deploy pins the tag
+  and the asset's sha256 together, so a bump moves both.
+- **CI trigger** — publish on a `v*` tag, a deliberate release cadence rather
+  than on every `main` push.
+- **Binary ABI** — the release builds on `ubuntu-24.04` and the runtime base is
+  `ubuntu:24.04`, so glibc matches with no static-musl build.
 
 ## The mint ↔ elide lockstep
 
@@ -83,17 +86,12 @@ bumped together. The compatibility itself stays *tested* where it is today:
 elide CI exercises the role templates against a specific mint version. The
 deploy config records the validated pair.
 
-## Open questions
+## Open for the coordinator half
 
-1. **Artifact hosting.** GitHub Releases (release assets per tag, durable,
-   tokenless for public repos) is the obvious default; confirm nothing wants a
-   container/package registry instead.
-2. **Version scheme.** Semver release tags (`v0.3`, readable lockstep) vs
-   per-commit artifacts named by SHA.
-3. **Where the pinned pair lives.** elide's `deploy/`, or the standalone deploy
+1. **Native deps at runtime.** The `elide` binary links libublk (liburing); the
+   runtime base must carry whatever the CI-built binary loads — confirm
+   `ubuntu:24.04` satisfies it, or `apt install` the libs in the runtime stage.
+   mint has no such native deps.
+2. **Where the pinned pair lives.** elide's `deploy/`, or a standalone deploy
    repo — the cleaner home for the `(mint, elide)` pin and per-deploy configs,
    though the role-template lockstep tests stay in elide CI.
-4. **Native-deps verification.** Confirm the `elide` binary's runtime
-   dependencies (liburing et al.) are satisfied by `ubuntu:24.04`, or `apt
-   install` them in the runtime stage.
-5. **CI trigger.** Publish on tag (deliberate release) vs on every `main` push.

@@ -98,9 +98,10 @@ operator interaction.
 mint-for-elide as a **private** Fly app (no public service): the mint plane is
 reachable only over Fly's private network
 (6PN) at `<app>.internal:8085`, and the colocated demo auth issuer binds an
-in-container UDS, off the network entirely. The image builds the stock `mint`
-from the pinned `MINT_REF`, renders `role-templates/` with `DATA_BUCKET`, and
-runs `mint serve`. The keyring, sealed surface, and demo secrets live on the
+in-container UDS, off the network entirely. The image downloads and
+checksum-verifies the released `mint` binary at `MINT_VERSION`, renders
+`role-templates/` with `DATA_BUCKET`, and runs `mint serve`. The keyring, sealed
+surface, and demo secrets live on the
 `mint_data` volume and survive redeploys.
 
 The runtime config is `mint-fly.toml` — a self-contained restatement of
@@ -113,8 +114,9 @@ manage it (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
 
 1. Copy the template — `cp fly.toml.example fly.toml` (the live `fly.toml` is
    gitignored) — and set `app` / `primary_region` and the build args:
-   `DATA_BUCKET` (= the coordinator's `[store].bucket`) and `MINT_REF` (the
-   lockstep mint commit). `DATA_BUCKET` also holds mint's own `_mint/*` state
+   `DATA_BUCKET` (= the coordinator's `[store].bucket`) and `MINT_VERSION` (the
+   released mint tag, e.g. `v0.1.0`, with its `MINT_SHA256`). `DATA_BUCKET` also
+   holds mint's own `_mint/*` state
    (distinct prefix); set `STORE_BUCKET` to put that in a separate bucket. All
    deploy commands run from this directory.
 2. `fly apps create <app>` and `fly volumes create mint_data --size 1`.

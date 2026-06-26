@@ -1,38 +1,42 @@
 # mint-for-elide container image for Fly.io.
 #
-# Stage 1 builds the stock `mint` binary from a pinned source ref (mint
-# publishes no release artifact) and renders the role templates with the
+# Stage 1 downloads the released `mint` binary at a pinned version, verifies it
+# against a digest pinned in this repo, and renders the role templates with the
 # deployment's data bucket. Stage 2 assembles the runtime image and runs
 # `mint serve` over mint-fly.toml.
 #
 # Build args:
-#   MINT_REF     mint commit/tag to build (lockstep with this coordinator).
-#   DATA_BUCKET  the volume-data bucket baked into the role ARNs; must equal
-#                the coordinator's [store].bucket.
+#   MINT_VERSION  released mint tag to download, e.g. v0.1.0 (lockstep with this
+#                 coordinator).
+#   MINT_SHA256   expected sha256 of the downloaded asset; bump with MINT_VERSION.
+#   DATA_BUCKET   the volume-data bucket baked into the role ARNs; must equal
+#                 the coordinator's [store].bucket.
 
-ARG MINT_REF=0fc7334e844807d319d5f318a43a65f4de3fd1b1
+ARG MINT_VERSION=v0.1.0
 
 FROM ubuntu:24.04 AS build
-ARG MINT_REF
-# Rust via rustup (no official rust image on Ubuntu, and mint is edition 2024 so
-# Ubuntu's apt rustc is too old); build-essential supplies the C compiler ring
-# needs. mint is rustls-based, so no libssl-dev.
+ARG MINT_VERSION
+# curl + CA certs only — the binary is a published release artifact, so the build
+# stage needs no rust toolchain, git, or build-essential.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y --profile minimal --default-toolchain stable
-ENV PATH="/root/.cargo/bin:${PATH}"
-RUN git clone https://github.com/soulware/mint /src \
- && git -C /src checkout "${MINT_REF}" \
- && cargo build --release --manifest-path /src/Cargo.toml --bin mint
+
+# Verify the download against a digest pinned here, not the release's own .sha256
+# (an actor who can replace the binary can replace that checksum too).
+ARG MINT_ASSET=mint-x86_64-unknown-linux-gnu
+ARG MINT_BASE=https://github.com/soulware/mint/releases/download
+ARG MINT_SHA256=e54f14be734d10b30191cfc6f3eda73f22ee399d23a05005eea90df6433ee1ca
+RUN curl --proto '=https' --tlsv1.2 -fsSLO "${MINT_BASE}/${MINT_VERSION}/${MINT_ASSET}" \
+ && echo "${MINT_SHA256}  ${MINT_ASSET}" | sha256sum -c - \
+ && install -m 0755 "${MINT_ASSET}" /usr/local/bin/mint
 
 # Resolve {{build.bucket}} into the rendered roles/ that `mint serve` loads.
 # A pure file pass — no S3, no credentials — done here so the unrendered
 # templates stay out of the runtime image.
 ARG DATA_BUCKET=elide
 COPY role-templates/ /role-templates/
-RUN /src/target/release/mint render --in-dir /role-templates \
+RUN mint render --in-dir /role-templates \
       --build "bucket=${DATA_BUCKET}" --out-dir /roles
 
 FROM ubuntu:24.04
@@ -42,7 +46,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates socat \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=build /src/target/release/mint /usr/local/bin/mint
+COPY --from=build /usr/local/bin/mint /usr/local/bin/mint
 COPY --from=build /roles /app/roles
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
