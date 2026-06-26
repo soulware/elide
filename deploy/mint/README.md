@@ -113,12 +113,10 @@ Prerequisites: the `fly` CLI, a Tigris bucket, and an admin credential that can
 manage it (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
 
 1. Copy the template — `cp fly.toml.example fly.toml` (the live `fly.toml` is
-   gitignored) — and set `app` / `primary_region` and the build args:
-   `DATA_BUCKET` (= the coordinator's `[store].bucket`) and `MINT_VERSION` (the
-   released mint tag, e.g. `v0.1.0`, with its `MINT_SHA256`). `DATA_BUCKET` also
-   holds mint's own `_mint/*` state
-   (distinct prefix); set `STORE_BUCKET` to put that in a separate bucket. All
-   deploy commands run from this directory.
+   gitignored) — and set `app` / `primary_region` and the `DATA_BUCKET` build
+   arg (= the coordinator's `[store].bucket`). `DATA_BUCKET` also holds mint's
+   own `_mint/*` state (distinct prefix); set `STORE_BUCKET` to put that in a
+   separate bucket. All deploy commands run from this directory.
 2. `fly apps create <app>` and `fly volumes create mint_data --size 1`.
 3. `fly secrets set AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…`.
 4. `fly deploy` — the keyring and `K_M-*` generate on first boot (the demo
