@@ -154,19 +154,16 @@ async fn attested_loop_over_shipped_templates() {
     // The shipped deployment artifact (deploy/mint/), patched for the test
     // root. mint is a separate repo; elide owns the config + role templates
     // it runs mint with (only the binaries come from there, via MINT_BIN /
-    // MINT_E2E_BIN), so this test runs the real shipped config. The
-    // attestation location stays the shipped value — it is the authority's
-    // identity, never dialled; the connection is the coord B UDS below.
+    // MINT_E2E_BIN), so this test runs the real shipped config. mint seals
+    // its [attestation].location into the caveat; coord A reads the route
+    // from there, never from config — the location is the authority's
+    // identity, never dialled, and the connection is the coord B UDS below.
     // [auth.demo] is inserted because the operator gates (login / seal /
     // invite / approve) need an issuer and production's is a separate
     // auth-service binary.
     let deploy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/mint");
     let shipped = std::fs::read_to_string(deploy.join("mint-elide.toml")).expect("mint-elide");
     let mut cfg_doc: toml::Value = toml::from_str(&shipped).expect("parse mint-elide.toml");
-    let location = cfg_doc["attestation"]["location"]
-        .as_str()
-        .expect("shipped [attestation].location")
-        .to_owned();
     let mint_sock = root_p.join("mint.sock");
     let auth_sock = root_p.join("auth.sock");
     let coord_b_sock = root_p.join("coord-b.sock");
@@ -291,7 +288,6 @@ async fn attested_loop_over_shipped_templates() {
         url: format!("unix:{}", mint_sock.display()),
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(30),
-        attestation_location: Some(location.clone()),
         attestation_transport: Some(format!("unix:{}", coord_b_sock.display())),
     };
     // The coordinator self-issues its operator discharges from the shared
@@ -449,24 +445,29 @@ async fn attested_loop_over_shipped_templates() {
         "refusal happens at coord B, got: {err}"
     );
 
-    // Fail-closed: a client not configured for attestation cannot discharge
-    // the intermediate's attestation TPC, so it can never finalize a volume
-    // credential. Use a not-yet-finalized volume so the call hits
-    // finalize-on-miss rather than rendering an already-stored credential.
-    let blind_cfg = MintConfig {
-        attestation_location: None,
-        attestation_transport: None,
-        ..mint_cfg.clone()
-    };
-    let blind = MintEndpoint::new(&blind_cfg, coord_dir.clone(), identity.clone());
+    // Fail-closed: attestation is mandatory and anchored. There is no config
+    // knob to skip the discharge — finalize always discharges the
+    // intermediate's TPC — and the discharge must anchor on a locally-keyed
+    // volume, so a target with no on-disk volume key produces no possession
+    // proof, fails before any credential is minted, and leaves nothing
+    // stored. Use a not-yet-finalized volume so the call hits finalize-on-miss
+    // rather than rendering an already-stored credential.
     let blind_vol = Ulid::new();
-    let err = blind
+    let err = endpoint
         .assume_role("volume-rw", 3600, AssumeTarget::VolumeRw(blind_vol))
         .await
         .map(|_| ())
-        .expect_err("an undischargeable attestation TPC must not finalize");
+        .expect_err("a volume with no local key cannot finalize");
     assert!(
-        err.to_string().contains("attestation_location"),
-        "a blind client cannot finalize a volume credential, got: {err}"
+        err.to_string().contains("no local volume name"),
+        "finalize fails closed without a local anchor, got: {err}"
+    );
+    assert!(
+        !coord_dir
+            .join("credentials")
+            .join("volume-rw")
+            .join(blind_vol.to_string())
+            .exists(),
+        "no credential is minted when the anchor cannot prove possession",
     );
 }

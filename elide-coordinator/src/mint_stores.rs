@@ -411,7 +411,6 @@ mod tests {
             url: "unix:/tmp/elide-mint-test.sock".to_owned(),
             connect_timeout: std::time::Duration::from_secs(5),
             request_timeout: std::time::Duration::from_secs(30),
-            attestation_location: None,
             attestation_transport: None,
         };
         MintScopedStores::new(
