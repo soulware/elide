@@ -62,23 +62,22 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 - Lifecycle: `ADD_DEV` → `SET_PARAMS` → `START_DEV` → run → daemon-exit detection → `START_USER_RECOVERY` (next serve) → `END_USER_RECOVERY`. `libublk::run_target` handles the first three; elide installs a SIGINT/SIGTERM/SIGHUP handler that fsyncs the WAL and `process::exit(0)`s without calling `STOP_DEV` or `DEL_DEV` — the kernel's monitor work observes the io_uring fds close and parks the device in QUIESCED via `UBLK_F_USER_RECOVERY`. Explicit deletion is the operator action `elide ublk delete <id>` (or the coordinator's startup reconciliation sweep). See `docs/design-ublk-shutdown-park.md`.
 - `UblkConfig { dev_id: Option<i32> }` in `elide-core/src/config.rs`.
-- CLI: `--ublk` / `--ublk-id N`.
+- CLI: `--ublk` (the kernel auto-allocates the id and records it in `volume.toml`).
 - Conflict detection: `find_ublk_conflict` checks for `dev_id` collisions.
-- Coordinator supervision: spawn `elide serve ... --ublk-id N`, respawn on crash.
+- Coordinator supervision: spawn `elide serve-volume ... --ublk`, respawn on crash.
 
 ## Crash recovery
 
 - `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`: on unclean daemon exit the kernel transitions the device to QUIESCED instead of tearing it down, buffers in-flight I/O, and reissues it once a new daemon attaches.
 - Safe because WAL + lowest-ULID-wins already handles duplicate writes (same LBA, same or newer ULID — idempotent).
 - **Enabled unconditionally.** Both flags are set on every `ADD_DEV`. There is no non-recoverable mode.
-- **Volume ↔ device binding.** The kernel's sysfs entry alone does not identify which volume a QUIESCED device belongs to. Reissuing one volume's buffered writes into a different volume's WAL is silent corruption, so every successful ADD records the kernel-assigned id in `<volume>/ublk.id` (per-host runtime state). The file persists across both clean and unclean daemon exits — it is the binding the next serve uses to take Route::Recover. Clearing happens only via `elide ublk delete <id>` or the coordinator's startup reconciliation sweep.
-- **Startup routing.** Let `P = read(ublk.id)`, `C = --ublk-id`, `sysfs(id)` = `/sys/class/ublk-char/ublkc<id>` exists. Decision table:
-  - `P` and `C` both set and disagree → refuse with "volume bound to X, got Y".
-  - `target = P.or(C)`. If `target` is none → ADD, let the kernel auto-allocate.
-  - If `sysfs(target)` is false → ADD with `target` (rebind the slot).
-  - If `sysfs(target)` is true and `P == Some(target)` → `START_USER_RECOVERY` + `RECOVER_DEV`; `run_target` finishes with `END_USER_RECOVERY`.
-  - If `sysfs(target)` is true and `P` is none → refuse with "ublk dev N exists but this volume is not bound to it".
-- **Clean and crash exits are unified (shutdown-park).** SIGINT/SIGTERM/SIGHUP → signal handler fsyncs the WAL and `process::exit(0)`s; SIGKILL/OOM/panic → process dies. Either way the kernel observes uring_cmd fds closing and transitions the device LIVE → QUIESCED via `UBLK_F_USER_RECOVERY`. Sysfs entry stays, `ublk.id` stays, next serve performs RECOVER against the bound id. STOP_DEV (via `kill_dev`) is deliberately NOT called on shutdown: it goes to DEAD, not QUIESCED. See `docs/design-ublk-shutdown-park.md`.
+- **Volume ↔ device binding.** The kernel's sysfs entry alone does not identify which volume a QUIESCED device belongs to. Reissuing one volume's buffered writes into a different volume's WAL is silent corruption, so every successful ADD both records the kernel-assigned id in `volume.toml`'s `[ublk] dev_id` and stamps the kernel `target_data` with this volume's ULID (the authoritative ownership marker). The binding persists across both clean and unclean daemon exits — it is what the next serve uses to take Route::Recover. It is cleared only via `elide ublk delete <id>`; the coordinator's startup reconciliation sweep leaves it intact so the next serve re-ADDs at the same id.
+- **Startup routing.** Let `P` = persisted `[ublk] dev_id`, `sysfs(id)` = `/sys/class/ublk-char/ublkc<id>` exists, `owner(id)` = the kernel device's `target_data` ULID names this volume. Decision table:
+  - `P` is none → ADD, let the kernel auto-allocate.
+  - `sysfs(P)` is false → ADD at `P` (re-ADD at the same id; stable across reboots).
+  - `sysfs(P)` is true and `owner(P)` is false → a foreign device holds the slot (the kernel re-assigned `P` after a reboot). `Relocate`: drop the binding and ADD at a kernel-assigned id, leaving the foreign device alone. The ownership stamp guarantees we never attach to it.
+  - `sysfs(P)` is true and `owner(P)` is true → `START_USER_RECOVERY` + `RECOVER_DEV`; `run_target` finishes with `END_USER_RECOVERY`.
+- **Clean and crash exits are unified (shutdown-park).** SIGINT/SIGTERM/SIGHUP → signal handler fsyncs the WAL and `process::exit(0)`s; SIGKILL/OOM/panic → process dies. Either way the kernel observes uring_cmd fds closing and transitions the device LIVE → QUIESCED via `UBLK_F_USER_RECOVERY`. Sysfs entry stays, the `[ublk] dev_id` binding stays, next serve performs RECOVER against the bound id. STOP_DEV (via `kill_dev`) is deliberately NOT called on shutdown: it goes to DEAD, not QUIESCED. See `docs/design-ublk-shutdown-park.md`.
 - **Crash-injection test follow-up.** A kernel-lane integration test that drives an actual write → SIGKILL → respawn → read-back loop is tracked as a follow-up; the plumbing lands here so step 5 (coordinator supervision) can rely on it.
 
 ## Dependencies & platform gating
@@ -127,7 +126,7 @@ First PR is the spike only. Later steps are sequenced separately, each on its ow
 2b. **Depth > 1 (landed).** `queue_depth = 64` via uring-registered eventfd bridging from a per-queue worker pool. See Async model above for the dead-end we avoided.
 3. **USER_RECOVERY_REISSUE (landed).** Added with `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE` by default; sysfs-scan-based add/recover routing at serve startup; `START_USER_RECOVERY` issued before the recovery builder, `END_USER_RECOVERY` via libublk's internal `start_dev` path. Crash-injection integration test is a follow-up.
 4. **Zero-copy (optional, future).** `UBLK_F_AUTO_BUF_REG` on WRITE. Benchmark. Beyond the obvious cost — root is required (`CAP_SYS_ADMIN`) and the kernel floor lifts to 6.10+ for `AUTO_BUF_REG` — the real cost is that the synchronous `VolumeReader` model in *Async model* breaks. Zero-copy hands the daemon a kernel-registered buffer index per tag; reads must land directly in that buffer via io_uring SQEs against the queue's ring, not via a sync `pread` into an arbitrary `&mut [u8]`. The backend either reworks its I/O path to issue ring-targeted ops, or copies into the registered buffer at the boundary and gives up the win. Internal copies (cache, dedup, decompression) further bound the upside, so this should be measured before committing. Likely a separate "privileged" tier.
-5. **Config + CLI (landed).** `[ublk]` section in `volume.toml`. `volume create` / `volume update` grew `--ublk` / `--ublk-id` / `--no-ublk` flags. Supervisor reads `[ublk]` and passes `--ublk` / `--ublk-id` to `serve-volume`; `find_ublk_conflict` resolves `dev_id` collisions by lowest-ULID-wins. Operator docs in `operations.md` and `quickstart.md`.
+5. **Config + CLI (landed).** `[ublk]` section in `volume.toml`. `volume create` / `volume update` grew `--ublk` / `--no-ublk` flags (no id is pinnable — the kernel auto-allocates and the chosen id is recorded into `volume.toml`). Supervisor reads `[ublk]` and passes `--ublk` to `serve-volume`, which reads the bound id from `volume.toml`. `find_ublk_conflict` resolves `dev_id` collisions by lowest-ULID-wins. Operator docs in `operations.md` and `quickstart.md`.
 
 ## References
 

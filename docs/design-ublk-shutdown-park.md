@@ -34,15 +34,17 @@ handler did not.
   handle to the watcher is also gone. `ublk.id` persists across all daemon
   exits.
 - `elide-coordinator/src/ublk_sweep.rs` — startup reconciliation sweep that
-  enumerates `/sys/class/ublk-char/`, walks `<data_dir>/by_id/*/ublk.id`,
-  shells out to `elide ublk delete <id>` for orphan kernel devices (with a
-  per-device 10 s subprocess timeout), and removes binding files whose
-  kernel device has gone (e.g. after a host reboot). Wired into `daemon::run`
+  enumerates `/sys/class/ublk-char/`, walks `<data_dir>/by_id/*/volume.toml`
+  for `[ublk] dev_id` bindings, and `del_dev`s orphan kernel devices (live
+  ids with no matching binding) via libublk on a bounded blocking thread
+  (per-device 10 s timeout). A binding whose kernel device has gone (e.g.
+  after a host reboot) is left intact and logged. Wired into `daemon::run`
   before the first scan tick.
 - `elide ublk delete` (existing CLI) remains the explicit deletion verb.
-- Open question §"Boot-time devices" is resolved: sweep step 4 clears
-  `ublk.id` files whose sysfs entry no longer exists; the next serve takes
-  `Route::Add { target_id: None }` and the kernel auto-allocates a fresh id.
+- Open question §"Boot-time devices" is resolved: a binding whose sysfs entry
+  is gone is not cleared; the next serve sees the persisted id with no live
+  device and takes `Route::Add { target_id: Some(id) }`, re-adding at the same
+  id so `/dev/ublkb<N>` stays stable across reboots.
 
 ## Durability on graceful shutdown
 
@@ -131,7 +133,7 @@ The `del_dev` paths that *do* run — the explicit `elide ublk delete <id>` comm
 
 **Devices accumulate when volumes are deleted unsafely.** Today, daemon shutdown del's the device, so even `rm -rf <volume>` after a clean stop leaves no kernel state. Under the proposal, deleting the volume directory while the daemon is stopped strands the ublk device until the next coordinator startup sweep. Mitigation: documenting `elide volume delete` as the only supported deletion path, and having `elide volume delete` orchestrate the daemon stop + ublk delete + directory removal sequence.
 
-**`ublk.id` is never cleared by the daemon.** Today a clean shutdown clears `ublk.id`; under the proposal it stays for recovery. The next serve sees it, finds a QUIESCED device in sysfs, takes `Route::Recover`. If the device is gone (operator did `elide ublk delete` between stops), the existing `sysfs_has(id)` check downgrades the route to `Route::Add { target_id: Some(id) }` and re-adds at the same id. Both branches already exist in `plan_route`.
+**The bound dev_id is never cleared by the daemon.** Today a clean shutdown clears the binding; under the proposal it stays for recovery. The next serve sees it, finds a QUIESCED device in sysfs, takes `Route::Recover`. If the device is gone (host reboot, `rmmod ublk_drv`), the `sysfs_has(id)` check downgrades the route to `Route::Add { target_id: Some(id) }` and re-adds at the same id — the reconciliation sweep leaves the binding intact precisely so this re-ADD lands on the original id, keeping `/dev/ublkb<N>` stable. If a foreign device has since taken that id, the serve relocates to a kernel-assigned id (`Route::Relocate`), leaving the foreign device alone. All three branches exist in `plan_route`.
 
 **One more state for operators to reason about.** "Volume daemon stopped" is no longer the same as "ublk device gone." `elide volume status` should show both, and document the distinction. This is arguably *more* honest than today: the kernel has always had this distinction, we were just hiding it.
 

@@ -7,9 +7,10 @@
 //
 // Transport binding:
 //   By default no block-device transport is started (IPC-only mode). To expose
-//   a fork, add a `[ublk]` section to `volume.toml`. The supervisor reads
-//   volume.toml at spawn time and passes the matching `--ublk` / `--ublk-id`
-//   flags.
+//   a fork, add a `[ublk]` section to `volume.toml`. The supervisor passes
+//   `--ublk` when that section is present; the bound dev_id is read by
+//   serve-volume from volume.toml itself, and the kernel auto-allocates on
+//   first serve.
 //
 // State files written to the fork directory:
 //   volume.pid  — PID of the running volume process, for display; absent when
@@ -187,12 +188,9 @@ fn spawn_volume(
     }
 
     if let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir)
-        && let Some(ublk) = cfg.ublk
+        && cfg.ublk.is_some()
     {
         cmd.arg("--ublk");
-        if let Some(id) = ublk.dev_id {
-            cmd.arg("--ublk-id").arg(id.to_string());
-        }
     }
 
     // Place the child in a new session so it is not signalled when the
