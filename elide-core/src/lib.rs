@@ -1,3 +1,6 @@
+/// Build-time version: the release tag, or `<manifest>-dev` otherwise.
+pub const VERSION: &str = env!("ELIDE_VERSION");
+
 pub mod actor;
 pub mod blake3_id_hasher;
 pub mod block_reader;
