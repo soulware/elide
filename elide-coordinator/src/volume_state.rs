@@ -14,14 +14,13 @@
 
 use std::path::{Path, PathBuf};
 
-use elide_core::process::pid_is_alive;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-/// Per-volume daemon pidfile. Written by the volume process on
-/// startup; presence + liveness drives the `Running` classification.
-/// Canonical home for the filename — other modules consume it from
-/// here rather than redefining the literal.
+/// Per-volume pidfile holding the serving process's pid for display in
+/// `volume list`. Written by the supervisor after spawn. Canonical home
+/// for the filename — other modules consume it from here rather than
+/// redefining the literal.
 pub const PID_FILE: &str = "volume.pid";
 
 /// Manual-stop marker. Presence pins the volume to `StoppedManual`
@@ -84,7 +83,7 @@ impl std::fmt::Display for VolumeMode {
 ///   2. `volume.readonly` → `ReadonlyImported`
 ///   3. `volume.stopped`  → `StoppedManual`
 ///   4. `volume.importing`→ `Importing { import_ulid }`
-///   5. `volume.pid` names a live process → `Running { pid }`
+///   5. `volume.lock` is held → `Running { pid }`
 ///   6. otherwise → `Stopped`
 ///
 /// `Absent` is produced only by [`Self::resolve`] — it represents
@@ -107,8 +106,9 @@ pub enum VolumeLifecycle {
     /// claim. Distinct from "stopped but never started" — there is
     /// no fork directory at all.
     Absent,
-    /// Daemon is running with the embedded pid.
-    Running { pid: u32 },
+    /// A process holds the volume lock. The pid is read from `volume.pid`
+    /// for display and is `None` when that file is missing or unparsable.
+    Running { pid: Option<u32> },
     /// Import subprocess is active. The ULID is read from the lock file.
     Importing { import_ulid: String },
     /// `volume.released` marker is present; the bucket record is in
@@ -161,10 +161,10 @@ impl VolumeLifecycle {
                 .to_owned();
             return Self::Importing { import_ulid };
         }
-        if let Ok(text) = std::fs::read_to_string(vol_dir.join(PID_FILE))
-            && let Ok(pid) = text.trim().parse::<u32>()
-            && pid_is_alive(pid)
-        {
+        if elide_core::volume::lock_is_held(vol_dir) {
+            let pid = std::fs::read_to_string(vol_dir.join(PID_FILE))
+                .ok()
+                .and_then(|t| t.trim().parse::<u32>().ok());
             return Self::Running { pid };
         }
         Self::Stopped
@@ -221,7 +221,7 @@ impl VolumeLifecycle {
     /// Pid of the live volume daemon, when running.
     pub fn pid(&self) -> Option<u32> {
         match self {
-            Self::Running { pid } => Some(*pid),
+            Self::Running { pid } => *pid,
             _ => None,
         }
     }
@@ -551,24 +551,39 @@ mod tests {
         }
     }
 
+    /// Hold the volume lock the way a live `serve-volume` process does, so
+    /// `from_dir` observes a held lock. Returned guard releases on drop.
+    fn hold_lock(dir: &std::path::Path) -> nix::fcntl::Flock<std::fs::File> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join(elide_core::volume::VOLUME_LOCK_FILE))
+            .unwrap();
+        nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap()
+    }
+
     #[test]
-    fn live_pidfile_classifies_as_running() {
+    fn held_lock_classifies_as_running() {
         let d = TempDir::new().unwrap();
         let me = std::process::id();
+        let _held = hold_lock(d.path());
         std::fs::write(d.path().join(PID_FILE), me.to_string()).unwrap();
         assert_eq!(
             VolumeLifecycle::from_dir(d.path()),
-            VolumeLifecycle::Running { pid: me }
+            VolumeLifecycle::Running { pid: Some(me) }
         );
     }
 
     #[test]
-    fn dead_pidfile_classifies_as_stopped() {
+    fn live_pid_without_lock_classifies_as_stopped() {
+        // The reboot / pid-reuse scenario: a pidfile survives but no process
+        // holds the lock. Even a pid naming a live process (our own) must
+        // classify as stopped — liveness is the lock, not the recorded pid.
         let d = TempDir::new().unwrap();
-        // u32::MAX is far above any plausible system pid_max, so the
-        // kernel returns ESRCH for `kill(pid, 0)` (matches the
-        // `pid_is_alive` test in elide-core).
-        std::fs::write(d.path().join(PID_FILE), u32::MAX.to_string()).unwrap();
+        std::fs::write(d.path().join(PID_FILE), std::process::id().to_string()).unwrap();
         assert_eq!(
             VolumeLifecycle::from_dir(d.path()),
             VolumeLifecycle::Stopped
@@ -576,12 +591,13 @@ mod tests {
     }
 
     #[test]
-    fn malformed_pidfile_classifies_as_stopped() {
+    fn held_lock_with_malformed_pidfile_runs_without_pid() {
         let d = TempDir::new().unwrap();
+        let _held = hold_lock(d.path());
         std::fs::write(d.path().join(PID_FILE), "not a number").unwrap();
         assert_eq!(
             VolumeLifecycle::from_dir(d.path()),
-            VolumeLifecycle::Stopped
+            VolumeLifecycle::Running { pid: None }
         );
     }
 
@@ -589,7 +605,10 @@ mod tests {
     fn label_drops_payload() {
         let snap = ulid::Ulid::new();
         assert_eq!(VolumeLifecycle::Absent.label(), "absent");
-        assert_eq!(VolumeLifecycle::Running { pid: 42 }.label(), "running");
+        assert_eq!(
+            VolumeLifecycle::Running { pid: Some(42) }.label(),
+            "running"
+        );
         assert_eq!(
             VolumeLifecycle::Importing {
                 import_ulid: "01...".to_owned()
@@ -613,7 +632,10 @@ mod tests {
     fn wire_body_appends_ulids() {
         let snap = ulid::Ulid::new();
         assert_eq!(VolumeLifecycle::Absent.wire_body(), "absent");
-        assert_eq!(VolumeLifecycle::Running { pid: 42 }.wire_body(), "running");
+        assert_eq!(
+            VolumeLifecycle::Running { pid: Some(42) }.wire_body(),
+            "running"
+        );
         assert_eq!(
             VolumeLifecycle::Importing {
                 import_ulid: "01J0".to_owned()
@@ -655,7 +677,7 @@ mod tests {
     fn pid_only_set_for_running() {
         let snap = ulid::Ulid::new();
         assert_eq!(VolumeLifecycle::Absent.pid(), None);
-        assert_eq!(VolumeLifecycle::Running { pid: 42 }.pid(), Some(42));
+        assert_eq!(VolumeLifecycle::Running { pid: Some(42) }.pid(), Some(42));
         assert_eq!(
             VolumeLifecycle::Importing {
                 import_ulid: String::new()
@@ -701,7 +723,7 @@ mod tests {
 
     #[test]
     fn helpers_match_variants() {
-        assert!(VolumeLifecycle::Running { pid: 1 }.is_running());
+        assert!(VolumeLifecycle::Running { pid: Some(1) }.is_running());
         assert!(!VolumeLifecycle::Stopped.is_running());
         assert!(VolumeLifecycle::ReadonlyImported.is_readonly_local());
         assert!(!VolumeLifecycle::Stopped.is_readonly_local());
@@ -805,9 +827,9 @@ mod tests {
             [0u8; 32],
         )
         .unwrap();
-        // A live pid in volume.pid is the canonical "daemon is running"
-        // signal — see `VolumeLifecycle::from_dir`.
-        std::fs::write(vol_dir.join(PID_FILE), std::process::id().to_string()).unwrap();
+        // A held volume lock is the "daemon is running" signal — see
+        // `VolumeLifecycle::from_dir`.
+        let _held = hold_lock(&vol_dir);
         let err = reconcile_owned_local_to_stopped(&vol_dir, &data_dir, vol_ulid)
             .expect_err("running daemon must refuse");
         assert!(matches!(err, ReconcileError::DaemonRunning));

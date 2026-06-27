@@ -2973,7 +2973,6 @@ mod tests {
         use elide_coordinator::stores::{
             PassthroughStores, RecordingStores, RoleCall, ScopedStores,
         };
-        use elide_coordinator::volume_state::PID_FILE;
 
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path();
@@ -2983,9 +2982,17 @@ mod tests {
         let by_name = data_dir.join("by_name");
         std::fs::create_dir_all(&by_name).unwrap();
         std::os::unix::fs::symlink(&vol_dir, by_name.join("vol")).unwrap();
-        // Fake a running daemon by writing our own pid — passes the
+        // Fake a running daemon by holding the volume lock — passes the
         // is_running() gate without a real subprocess.
-        std::fs::write(vol_dir.join(PID_FILE), std::process::id().to_string()).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(vol_dir.join(elide_core::volume::VOLUME_LOCK_FILE))
+            .unwrap();
+        let _held = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap();
 
         let identity = std::sync::Arc::new(
             elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir).unwrap(),
