@@ -40,15 +40,13 @@ RUN mint render --in-dir /role-templates \
       --build "bucket=${DATA_BUCKET}" --out-dir /roles
 
 FROM ubuntu:24.04
-# socat is dormant unless BRIDGE_AUTH is set (see entrypoint.sh); ca-certificates
-# for HTTPS to Tigris.
+# ca-certificates for HTTPS to Tigris.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates socat \
+ && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /usr/local/bin/mint /usr/local/bin/mint
 COPY --from=build /roles /app/roles
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 COPY mint-fly.toml /app/mint.toml
 # mint's [store].bucket (its own _mint/* admin state) is TOML-only, not an env
@@ -62,6 +60,4 @@ RUN sed -i "s|^bucket = .*|bucket = \"${STORE_BUCKET:-$DATA_BUCKET}\"|" /app/min
 # operator commands (login/seal/invite) need no --config.
 ENV MINT_CONFIG=/app/mint.toml
 EXPOSE 8085
-# 8086 is the auth bridge, active only when BRIDGE_AUTH is set.
-EXPOSE 8086
-CMD ["sh", "/usr/local/bin/entrypoint.sh"]
+CMD ["mint", "serve"]
