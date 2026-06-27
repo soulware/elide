@@ -9,6 +9,8 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
   [build.args]
+    # ELIDE_VERSION: the released elide tag to download and deploy.
+    ELIDE_VERSION = "v0.1.1"
     # DATA_BUCKET: the Tigris data bucket (must equal mint's DATA_BUCKET);
     # baked into coord.toml [store].bucket.
     DATA_BUCKET = "elide"

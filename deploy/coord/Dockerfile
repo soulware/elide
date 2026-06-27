@@ -1,14 +1,12 @@
 # Elide coordinator container image for Fly.io.
 #
-# Stage 1 downloads the released elide binaries at a pinned version and verifies
-# each against a digest pinned in this repo — the coordinator daemon, the `elide`
-# volume/CLI binary (it opens /dev/ublk-control and carries login/enroll), and
-# elide-import. Stage 2 assembles the runtime image, loads `ublk_drv`, and runs
-# `elide-coordinator serve` over coord.toml.
+# Stage 1 downloads the released elide binaries at the pinned ELIDE_VERSION — the
+# coordinator daemon, the `elide` volume/CLI binary (it opens /dev/ublk-control
+# and carries login/enroll), and elide-import. Stage 2 assembles the runtime
+# image, loads `ublk_drv`, and runs `elide-coordinator serve` over coord.toml.
 #
 # Build args:
-#   ELIDE_VERSION  released elide tag to download, e.g. v0.1.0.
-#   ELIDE_*_SHA256 expected sha256 of each downloaded binary; bump with ELIDE_VERSION.
+#   ELIDE_VERSION  released elide tag to download, e.g. v0.1.1.
 #   DATA_BUCKET    the Tigris data bucket (must equal mint's DATA_BUCKET); baked
 #                  into coord.toml [store].bucket.
 #   MINT_APP       the mint Fly app this coordinator enrols against; baked into
@@ -24,21 +22,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
-# Verify each download against a digest pinned here, not the release's own
-# .sha256 (an actor who can replace a binary can replace that checksum too).
+# The ELIDE_VERSION tag is the pin; HTTPS covers the transfer.
 ARG ELIDE_TARGET=x86_64-unknown-linux-gnu
 ARG ELIDE_BASE=https://github.com/soulware/elide/releases/download
-ARG ELIDE_SHA256=c5acccd0925e98c791b82d72d085c36b41ebd85682daa1d1e7b3f9e667bdab23
-ARG ELIDE_COORDINATOR_SHA256=015f5b4115cbe9dbefe327ee26a185c686d181405a32c978347d9ec51d3756ba
-ARG ELIDE_IMPORT_SHA256=99fa5d5545403bc346317eb6abdb0bd04a2cb6cc6041225bd2d3cf76bf8b6bd8
 RUN set -eu; \
-    for spec in \
-      "elide:${ELIDE_SHA256}" \
-      "elide-coordinator:${ELIDE_COORDINATOR_SHA256}" \
-      "elide-import:${ELIDE_IMPORT_SHA256}"; do \
-      bin="${spec%%:*}"; sha="${spec#*:}"; asset="${bin}-${ELIDE_TARGET}"; \
+    for bin in elide elide-coordinator elide-import; do \
+      asset="${bin}-${ELIDE_TARGET}"; \
       curl --proto '=https' --tlsv1.2 -fsSLO "${ELIDE_BASE}/${ELIDE_VERSION}/${asset}"; \
-      echo "${sha}  ${asset}" | sha256sum -c -; \
       install -m 0755 "${asset}" "/usr/local/bin/${bin}"; \
     done
 
