@@ -1,12 +1,11 @@
 # Deploy image pipeline
 
-**Status:** Both repos build and publish their binaries in CI. mint's binary is
-published as a GitHub release (mint #43; first tag `v0.1.0`), and `deploy/mint/`
-downloads and checksum-verifies it at a pinned `MINT_VERSION` in place of the
-source compile. elide's `release.yml` publishes its three binaries the same way
-(below). The remaining half is the consumer: the coordinator image
-(`deploy/coord/`) still compiles from source and is yet to switch to the
-download.
+**Status:** Both repos build and publish their binaries in CI, and both deploy
+images consume them by download. mint's binary is published as a GitHub release
+(mint #43; first tag `v0.1.0`), and `deploy/mint/` downloads and checksum-verifies
+it at a pinned `MINT_VERSION` in place of the source compile. elide's `release.yml`
+publishes its three binaries the same way (first tag `v0.1.0`), and `deploy/coord/`
+downloads and checksum-verifies them at a pinned `ELIDE_VERSION`.
 
 ## Problem
 
@@ -111,20 +110,17 @@ bumped together. The compatibility itself stays *tested* where it is today:
 elide CI exercises the role templates against a specific mint version. The
 deploy config records the validated pair.
 
-## Remaining: the coordinator image consumes the release
+## The coordinator image consumes the release
 
-`deploy/coord/Dockerfile` still clones and compiles. The flip mirrors
-`deploy/mint/`: download each of the three assets at a pinned `ELIDE_VERSION`,
-verify against an `ELIDE_SHA256` pinned in this repo (not the release's own
-`.sha256` — an actor who can replace the binary can replace that checksum too),
-and drop the rust/clang toolchain from the build stage. Two points specific to
-the coordinator:
+`deploy/coord/Dockerfile` downloads the three assets at a pinned `ELIDE_VERSION`
+and verifies each against a per-binary `*_SHA256` pinned in this repo (not the
+release's own `.sha256` — an actor who can replace a binary can replace that
+checksum too). The build stage carries only `curl` + CA certs; the runtime stage
+stays `ubuntu:24.04` + `kmod`. The `elide` binary links libublk (liburing) and
+runs on that base, since the CI build shares the runtime's `ubuntu-24.04` glibc.
+The version is pinned in one place — the Dockerfile's `ELIDE_VERSION` / `*_SHA256`
+ARG defaults — not duplicated in `fly.toml.example`.
 
-1. **Native deps at runtime.** The `elide` binary links libublk (liburing); the
-   runtime base must carry whatever the CI-built binary loads. The source-built
-   binary already runs on the `ubuntu:24.04` + `kmod` runtime stage, and the
-   CI binary shares its `ubuntu-24.04` glibc — confirm on the first downloaded
-   image, or `apt install` the libs in the runtime stage.
-2. **Where the pinned pair lives.** elide's `deploy/`, or a standalone deploy
-   repo — the cleaner home for the `(mint, elide)` pin and per-deploy configs,
-   though the role-template lockstep tests stay in elide CI.
+Open: where the `(mint, elide)` pin lives — elide's `deploy/`, or a standalone
+deploy repo (the cleaner home for the per-deploy configs), though the
+role-template lockstep tests stay in elide CI.
