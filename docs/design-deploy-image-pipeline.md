@@ -1,11 +1,12 @@
 # Deploy image pipeline
 
-**Status:** Implemented for mint; proposed for the coordinator. mint's binary is
-built in CI and published as a GitHub release (mint #43; first tag `v0.1.0`), and
-`deploy/mint/` downloads and checksum-verifies it at a pinned `MINT_VERSION` in
-place of the source compile. The coordinator image (`deploy/coord/`) still
-compiles from source; the rest of this note covers extending the same pipeline to
-the elide binaries.
+**Status:** Both repos build and publish their binaries in CI. mint's binary is
+published as a GitHub release (mint #43; first tag `v0.1.0`), and `deploy/mint/`
+downloads and checksum-verifies it at a pinned `MINT_VERSION` in place of the
+source compile. elide's `release.yml` publishes its three binaries the same way
+(below). The remaining half is the consumer: the coordinator image
+(`deploy/coord/`) still compiles from source and is yet to switch to the
+download.
 
 ## Problem
 
@@ -45,11 +46,11 @@ CI compiles each repo's binaries once per release and publishes them as
 in place of the clone-and-compile.
 
 ```
-soulware/mint   ──CI build (GH Actions)──▶  release asset:  mint-vX.Y
-soulware/elide  ──CI build (GH Actions)──▶  release assets: elide-vX.Y, elide-coordinator-vX.Y, elide-import-vX.Y
+soulware/mint   ──CI build (GH Actions)──▶  release asset:  mint-x86_64-unknown-linux-gnu (+ .sha256)
+soulware/elide  ──CI build (GH Actions)──▶  release assets: {elide,elide-coordinator,elide-import}-x86_64-unknown-linux-gnu (+ .sha256 each)
 
 deploy Dockerfile (runs at deploy time):
-  curl -L .../mint/releases/download/vX.Y/mint -o /usr/local/bin/mint
+  curl -L .../mint/releases/download/vX.Y.Z/mint-x86_64-unknown-linux-gnu -o /usr/local/bin/mint
   mint render --build bucket=<DATA_BUCKET> ...     # resolves the per-deploy bucket into roles/
   COPY mint.toml ; sed [store].bucket
 ```
@@ -66,6 +67,30 @@ This fixes all three failure modes:
   packaging — no `cargo build`, no rustup/clang toolchain in the image.
 - **Lockstep explicit.** The deploy pins `(mint version, elide version)` as
   readable release tags rather than SHAs, in one place.
+
+## What elide's release publishes
+
+`.github/workflows/release.yml` fires on a `v*` tag push and builds the three
+deploy binaries — `elide`, `elide-coordinator`, `elide-import` — for
+`x86_64-unknown-linux-gnu` on `ubuntu-24.04`. Each is attached to a GitHub
+Release as a triple-named asset with a `sha256sum`-format sidecar:
+
+```
+.../elide/releases/download/<tag>/elide-coordinator-x86_64-unknown-linux-gnu
+.../elide/releases/download/<tag>/elide-coordinator-x86_64-unknown-linux-gnu.sha256
+```
+
+- The asset name carries the **target triple, not the version** (the tag does),
+  so the download URL shape is stable across releases.
+- Built `--locked` against the committed `Cargo.lock`, reproducible from the
+  tagged tree. `ublk` is a default feature, so the build job installs
+  `clang`/`libclang-dev` for libublk's bindgen.
+- The **tag is the single source of truth for the version**: the workflow passes
+  it as `ELIDE_RELEASE_VERSION`, and elide-core's `build.rs` bakes it into
+  `elide_core::VERSION`, which each binary reports via `--version` (the smoke
+  step asserts they match). Non-release builds report `<manifest>-dev`.
+- A hyphenated tag (`vX.Y.Z-rc1`) publishes as a GitHub pre-release, off the
+  "Latest" badge; a plain `vX.Y.Z` is a final release.
 
 ## Settled by mint's pipeline
 
@@ -86,12 +111,20 @@ bumped together. The compatibility itself stays *tested* where it is today:
 elide CI exercises the role templates against a specific mint version. The
 deploy config records the validated pair.
 
-## Open for the coordinator half
+## Remaining: the coordinator image consumes the release
+
+`deploy/coord/Dockerfile` still clones and compiles. The flip mirrors
+`deploy/mint/`: download each of the three assets at a pinned `ELIDE_VERSION`,
+verify against an `ELIDE_SHA256` pinned in this repo (not the release's own
+`.sha256` — an actor who can replace the binary can replace that checksum too),
+and drop the rust/clang toolchain from the build stage. Two points specific to
+the coordinator:
 
 1. **Native deps at runtime.** The `elide` binary links libublk (liburing); the
-   runtime base must carry whatever the CI-built binary loads — confirm
-   `ubuntu:24.04` satisfies it, or `apt install` the libs in the runtime stage.
-   mint has no such native deps.
+   runtime base must carry whatever the CI-built binary loads. The source-built
+   binary already runs on the `ubuntu:24.04` + `kmod` runtime stage, and the
+   CI binary shares its `ubuntu-24.04` glibc — confirm on the first downloaded
+   image, or `apt install` the libs in the runtime stage.
 2. **Where the pinned pair lives.** elide's `deploy/`, or a standalone deploy
    repo — the cleaner home for the `(mint, elide)` pin and per-deploy configs,
    though the role-template lockstep tests stay in elide CI.

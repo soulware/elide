@@ -29,7 +29,10 @@ use tempfile::TempDir;
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(about = "Import a readonly Elide volume from an OCI image or a raw ext4 file")]
+#[command(
+    version = elide_core::VERSION,
+    about = "Import a readonly Elide volume from an OCI image or a raw ext4 file"
+)]
 struct Args {
     /// Path to the volume directory to create (e.g. volumes/ubuntu-22.04)
     vol_dir: String,

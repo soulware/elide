@@ -39,7 +39,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(about = "Elide coordinator: manages volumes, segment upload, and GC")]
+#[command(
+    version = elide_core::VERSION,
+    about = "Elide coordinator: manages volumes, segment upload, and GC"
+)]
 struct Args {
     #[command(subcommand)]
     command: Command,

@@ -1,0 +1,109 @@
+name: release
+
+# Build the elide release binaries and publish them as GitHub Release assets on
+# a `v*` tag push. Downstream deployments (the deploy/coord image) pull these
+# prebuilt artifacts and verify their checksums, so the runtime image needs no
+# rust toolchain.
+#
+# Three binaries ship: `elide` (volume/CLI), `elide-coordinator` (the daemon),
+# and `elide-import`. Each is published as a triple-named asset plus a `.sha256`
+# sidecar; BINS and the build matrix are the only repo-specific knobs.
+#
+# A tag points at a commit `ci.yml` already validated on its PR to main, so this
+# workflow builds and ships.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the Release and upload assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BINS: "elide elide-coordinator elide-import"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # Built on ubuntu-24.04 so the glibc the binaries link against matches
+          # the ubuntu:24.04 runtime image the deploy Dockerfile runs them on.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # `ublk` is a default feature; libublk's bindgen needs libclang to
+      # generate the ublk bindings at compile time.
+      - name: Install libclang (ublk bindgen)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: elide-release-${{ matrix.target }}
+
+      # --locked builds against the committed Cargo.lock so the released
+      # binaries are reproducible from the tagged tree. ELIDE_RELEASE_VERSION
+      # carries the tag, which elide-core's build.rs bakes into each binary's
+      # `--version` — making the tag the version's single source of truth.
+      - name: Build
+        env:
+          ELIDE_RELEASE_VERSION: ${{ github.ref_name }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p elide -p elide-coordinator -p elide-import
+
+      - name: Smoke-test the binaries
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          for b in $BINS; do
+            bin="./target/${{ matrix.target }}/release/$b"
+            "$bin" --help >/dev/null
+            got="$("$bin" --version)"
+            echo "$b reported: $got"
+            case "$got" in
+              *"$want"*) ;;
+              *) echo "::error::'$got' does not contain tag version '$want'"; exit 1 ;;
+            esac
+          done
+
+      # Name each asset by binary + target triple so consumer download URLs are
+      # stable across releases; the tag carries the version. The .sha256 uses the
+      # asset's own name, so `sha256sum -c` passes against the downloaded file.
+      - name: Stage artifacts + checksums
+        run: |
+          for b in $BINS; do
+            asset="$b-${{ matrix.target }}"
+            install -m 0755 "target/${{ matrix.target }}/release/$b" "$asset"
+            sha256sum "$asset" > "$asset.sha256"
+          done
+
+      # Idempotent: the first matrix job creates the Release, later ones reuse
+      # it. --clobber lets a re-run of the same tag replace its assets.
+      - name: Publish to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A semver pre-release tag carries a hyphen (v1.2.3-rc1, -alpha, …);
+          # publish those as a GitHub pre-release, keeping them off the "Latest"
+          # badge. A plain vX.Y.Z is a final release.
+          extra=""
+          case "$GITHUB_REF_NAME" in *-*) extra="--prerelease" ;; esac
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes $extra
+          for b in $BINS; do
+            asset="$b-${{ matrix.target }}"
+            gh release upload "$GITHUB_REF_NAME" "$asset" "$asset.sha256" --clobber
+          done

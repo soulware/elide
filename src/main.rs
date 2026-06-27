@@ -13,6 +13,7 @@ use elide::{
 
 /// Elide volume management and analysis tools.
 #[derive(Parser)]
+#[command(version = elide_core::VERSION)]
 struct Args {
     /// Directory containing volumes and the coordinator socket.
     /// When unset, defaults to `elide_data` for non-coord commands;
