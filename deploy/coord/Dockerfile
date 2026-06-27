@@ -14,7 +14,7 @@
 #   MINT_APP       the mint Fly app this coordinator enrols against; baked into
 #                  coord.toml [mint].url.
 
-ARG ELIDE_VERSION=v0.1.0
+ARG ELIDE_VERSION=v0.1.1
 
 FROM ubuntu:24.04 AS build
 ARG ELIDE_VERSION
@@ -28,9 +28,9 @@ RUN apt-get update \
 # .sha256 (an actor who can replace a binary can replace that checksum too).
 ARG ELIDE_TARGET=x86_64-unknown-linux-gnu
 ARG ELIDE_BASE=https://github.com/soulware/elide/releases/download
-ARG ELIDE_SHA256=c055a43917bdd6452fcd30e924483c3ed5125176933922496d101a11adebe30a
-ARG ELIDE_COORDINATOR_SHA256=2479fa27d7ddc24f8509c3395218a95fbcfd84729fb206fce0b4b8411834b9eb
-ARG ELIDE_IMPORT_SHA256=fd377102cac625d62852124de7ab18d8ce3c8ead80619faa47e9fedd887245dc
+ARG ELIDE_SHA256=c5acccd0925e98c791b82d72d085c36b41ebd85682daa1d1e7b3f9e667bdab23
+ARG ELIDE_COORDINATOR_SHA256=015f5b4115cbe9dbefe327ee26a185c686d181405a32c978347d9ec51d3756ba
+ARG ELIDE_IMPORT_SHA256=99fa5d5545403bc346317eb6abdb0bd04a2cb6cc6041225bd2d3cf76bf8b6bd8
 RUN set -eu; \
     for spec in \
       "elide:${ELIDE_SHA256}" \
