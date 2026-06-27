@@ -12,12 +12,15 @@
 //   flags.
 //
 // State files written to the fork directory:
-//   volume.pid  — PID of the running volume process; absent when not running
+//   volume.pid  — PID of the running volume process, for display; absent when
+//                 not running
 //
 // Re-adoption on coordinator restart:
-//   If volume.pid exists and the process is alive, the supervisor polls until
-//   it exits, then restarts it. If the pid file is stale (process gone), the
-//   file is removed and a fresh process is spawned.
+//   The serving process holds an exclusive flock on volume.lock for its
+//   lifetime. If the lock is held the supervisor waits for it to free rather
+//   than double-spawning; otherwise it spawns a fresh process. The kernel
+//   releases the lock on process death or host reboot, so a recycled pid can
+//   never read as a live server.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -29,6 +32,7 @@ use tracing::{error, info, warn};
 use tokio::process::Command;
 
 use elide_coordinator::volume_state::{PID_FILE, STOPPED_FILE};
+use elide_core::volume::lock_is_held;
 
 /// Env vars the coordinator exports into each volume subprocess so the
 /// volume's fetcher inherits store config without operator-level env or a
@@ -105,19 +109,17 @@ pub async fn supervise(fork_dir: PathBuf, data_dir: PathBuf, child_env: ChildEnv
             continue;
         }
 
-        // Check for a running process left by a previous coordinator session.
-        if let Some(pid) = read_pid(&fork_dir) {
-            if is_alive(pid) {
-                info!("[supervisor {label}] re-adopted running process {pid}");
-                poll_until_dead(pid).await;
-                info!("[supervisor {label}] process {pid} exited");
-                remove_pid(&fork_dir);
-                tokio::time::sleep(RESTART_DELAY).await;
-                continue;
-            }
-            // Stale pid file.
-            warn!("[supervisor {label}] removing stale pid file (pid {pid} not running)");
+        // A serve-volume from a previous coordinator session (within this
+        // boot) still holds the volume lock. Wait for it to exit rather than
+        // double-spawning. The kernel drops the lock on process death or host
+        // reboot, so after a reboot the lock is simply free and we spawn fresh.
+        if lock_is_held(&fork_dir) {
+            info!("[supervisor {label}] volume already being served; waiting for it to exit");
+            poll_until_unlocked(&fork_dir).await;
+            info!("[supervisor {label}] previous server exited");
             remove_pid(&fork_dir);
+            tokio::time::sleep(RESTART_DELAY).await;
+            continue;
         }
 
         match spawn_volume(&fork_dir, &child_env) {
@@ -206,21 +208,14 @@ fn spawn_volume(
     cmd.spawn()
 }
 
-/// Poll every POLL_INTERVAL until the process is no longer alive.
-async fn poll_until_dead(pid: u32) {
+/// Poll every POLL_INTERVAL until the volume lock is free.
+async fn poll_until_unlocked(fork_dir: &Path) {
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
-        if !is_alive(pid) {
+        if !lock_is_held(fork_dir) {
             break;
         }
     }
-}
-
-use elide_core::process::pid_is_alive as is_alive;
-
-fn read_pid(fork_dir: &Path) -> Option<u32> {
-    let text = std::fs::read_to_string(fork_dir.join(PID_FILE)).ok()?;
-    text.trim().parse().ok()
 }
 
 fn write_pid(fork_dir: &Path, pid: u32) {
@@ -258,21 +253,15 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn pid_file_roundtrip() {
+    fn pid_file_write_and_remove() {
         let tmp = TempDir::new().unwrap();
-        let pid = std::process::id();
-        write_pid(tmp.path(), pid);
-        assert_eq!(read_pid(tmp.path()), Some(pid));
+        write_pid(tmp.path(), 4242);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(PID_FILE)).unwrap(),
+            "4242"
+        );
         remove_pid(tmp.path());
-        assert_eq!(read_pid(tmp.path()), None);
-    }
-
-    #[test]
-    fn stale_pid_not_alive() {
-        let tmp = TempDir::new().unwrap();
-        write_pid(tmp.path(), u32::MAX);
-        let pid = read_pid(tmp.path()).unwrap();
-        assert!(!is_alive(pid));
+        assert!(!tmp.path().join(PID_FILE).exists());
     }
 
     #[test]

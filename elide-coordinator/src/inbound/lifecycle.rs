@@ -1113,8 +1113,9 @@ pub(crate) async fn start_volume_op(
     match &shape {
         VolumeLifecycle::StoppedManual => {}
         VolumeLifecycle::Running { pid } => {
+            let at = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
             return Err(IpcError::conflict(format!(
-                "volume '{volume_name}' is already running (pid {pid})"
+                "volume '{volume_name}' is already running{at}"
             )));
         }
         VolumeLifecycle::Importing { import_ulid } => {
@@ -1361,7 +1362,6 @@ async fn cleanup_stop_snapshots(
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
-    use elide_coordinator::volume_state::PID_FILE;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -1422,15 +1422,30 @@ mod tests {
     //      the bucket update on InvalidTransition, halt locally
     //      regardless.
 
+    /// Hold the exclusive `volume.lock` the way a live serve-volume
+    /// process does, so the fork classifies as `Running` under
+    /// `VolumeLifecycle::from_dir`. The guard releases on drop.
+    fn hold_volume_lock(vol_dir: &Path) -> nix::fcntl::Flock<std::fs::File> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(vol_dir.join(elide_core::volume::VOLUME_LOCK_FILE))
+            .unwrap();
+        nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap()
+    }
+
     /// Build a `by_name/<vol>` symlink pointing at a `by_id/<ulid>/`
-    /// directory in a chosen lifecycle. `pid` controls whether a live
-    /// pidfile is written (use `Some(std::process::id())` for a
-    /// genuinely-running classification under `VolumeLifecycle::from_dir`).
+    /// directory in a chosen lifecycle. When `running`, holds the
+    /// `volume.lock` so the fork classifies as `Running`; keep the
+    /// returned guard alive for the duration of the test.
     fn make_volume_with_marker(
         data_dir: &Path,
         marker: Option<&str>,
-        pid: Option<u32>,
-    ) -> ulid::Ulid {
+        running: bool,
+    ) -> (ulid::Ulid, Option<nix::fcntl::Flock<std::fs::File>>) {
         let vol_ulid = ulid::Ulid::new();
         let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
         std::fs::create_dir_all(&vol_dir).unwrap();
@@ -1442,10 +1457,8 @@ mod tests {
         if let Some(name) = marker {
             std::fs::write(vol_dir.join(name), "").unwrap();
         }
-        if let Some(pid) = pid {
-            std::fs::write(vol_dir.join(PID_FILE), pid.to_string()).unwrap();
-        }
-        vol_ulid
+        let lock = running.then(|| hold_volume_lock(&vol_dir));
+        (vol_ulid, lock)
     }
 
     #[test]
@@ -1471,21 +1484,17 @@ mod tests {
     }
 
     #[test]
-    fn local_daemon_running_true_for_live_pid() {
+    fn local_daemon_running_true_for_held_lock() {
         let data_dir = TempDir::new().unwrap();
-        make_volume_with_marker(data_dir.path(), None, Some(std::process::id()));
+        let (_ulid, _lock) = make_volume_with_marker(data_dir.path(), None, true);
         assert!(local_daemon_running(data_dir.path(), "vol"));
     }
 
     #[test]
     fn local_daemon_running_false_for_stopped_marker() {
         let data_dir = TempDir::new().unwrap();
-        // Both a live pid AND volume.stopped: parked wins.
-        make_volume_with_marker(
-            data_dir.path(),
-            Some(STOPPED_FILE),
-            Some(std::process::id()),
-        );
+        // Both a held lock AND volume.stopped: parked wins.
+        let (_ulid, _lock) = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), true);
         assert!(!local_daemon_running(data_dir.path(), "vol"));
     }
 
@@ -1587,7 +1596,7 @@ mod tests {
 
         // Clean stopped fork: by_name symlink + by_id dir +
         // volume.stopped, no wal/pending/gc/index/snapshots.
-        let vol_ulid = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), None);
+        let (vol_ulid, _lock) = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), false);
 
         let identity = std::sync::Arc::new(
             elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir.path())
@@ -1656,7 +1665,7 @@ mod tests {
         let store = mem_store();
         let data_dir = TempDir::new().unwrap();
 
-        let vol_ulid = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), None);
+        let (vol_ulid, _lock) = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), false);
         let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
 
         // Synthesis signs with the volume's key shadow.
@@ -1757,7 +1766,7 @@ mod tests {
         let store = mem_store();
         let data_dir = TempDir::new().unwrap();
 
-        let vol_ulid = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), None);
+        let (vol_ulid, _lock) = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), false);
 
         let keytmp = TempDir::new().unwrap();
         let sk = elide_core::signing::generate_keypair(keytmp.path(), "k", "p").unwrap();

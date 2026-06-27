@@ -2862,6 +2862,30 @@ fn describe_stale_cancel(stale: &[(blake3::Hash, Ulid)], lbamap: &lbamap::LbaMap
     out
 }
 
+/// Filename of the per-volume liveness lock within a fork directory.
+///
+/// A serving process holds an exclusive `flock` on this file for the lifetime
+/// of its open [`Volume`] (see [`acquire_lock`]). The kernel releases an flock
+/// when its holder exits by any means, including a host reboot, so the lock's
+/// held/free state — not a recorded pid — answers "is this volume being
+/// served".
+pub const VOLUME_LOCK_FILE: &str = "volume.lock";
+
+/// True when a serving process holds the exclusive [`VOLUME_LOCK_FILE`] flock
+/// for `dir`.
+///
+/// Probes with a non-blocking *shared* `flock`: it fails only when the exclusive
+/// lock is held, so concurrent probes (also shared) never read each other as a
+/// server. Acquiring it (released again immediately) or a missing lock file
+/// means it is free. Opens read-only and never creates the file — only a
+/// serving process does that.
+pub fn lock_is_held(dir: &Path) -> bool {
+    let Ok(file) = fs::File::open(dir.join(VOLUME_LOCK_FILE)) else {
+        return false;
+    };
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockSharedNonblock).is_err()
+}
+
 /// Acquire an exclusive non-blocking flock on `<dir>/volume.lock`.
 ///
 /// Creates the lock file if it does not exist. Returns the open `File` — the
@@ -2872,9 +2896,59 @@ fn acquire_lock(dir: &Path) -> io::Result<nix::fcntl::Flock<fs::File>> {
         .create(true)
         .write(true)
         .truncate(false)
-        .open(dir.join("volume.lock"))?;
+        .open(dir.join(VOLUME_LOCK_FILE))?;
     nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
         .map_err(|(_, e)| io::Error::from(e))
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::{VOLUME_LOCK_FILE, lock_is_held};
+
+    #[test]
+    fn absent_lock_file_is_not_held() {
+        let d = tempfile::TempDir::new().unwrap();
+        assert!(!lock_is_held(d.path()));
+    }
+
+    #[test]
+    fn free_lock_is_not_held() {
+        let d = tempfile::TempDir::new().unwrap();
+        std::fs::write(d.path().join(VOLUME_LOCK_FILE), "").unwrap();
+        assert!(!lock_is_held(d.path()));
+    }
+
+    #[test]
+    fn exclusive_holder_reads_as_held() {
+        let d = tempfile::TempDir::new().unwrap();
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(d.path().join(VOLUME_LOCK_FILE))
+            .unwrap();
+        let _held = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        assert!(lock_is_held(d.path()));
+    }
+
+    #[test]
+    fn concurrent_shared_probe_is_not_held() {
+        // A simultaneous probe also takes a shared lock; it must not read
+        // another probe as a live server — only the exclusive lock counts.
+        let d = tempfile::TempDir::new().unwrap();
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(d.path().join(VOLUME_LOCK_FILE))
+            .unwrap();
+        let _probe = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockSharedNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        assert!(!lock_is_held(d.path()));
+    }
 }
 
 #[cfg(test)]
