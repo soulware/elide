@@ -50,13 +50,11 @@ enum Command {
         readonly: bool,
         /// Serve over ublk. Without this flag the volume runs for coordinator
         /// IPC only (no block device). Requires Linux with CONFIG_BLK_DEV_UBLK
-        /// and the 'ublk' cargo feature enabled.
+        /// and the 'ublk' cargo feature enabled. The kernel device id is read
+        /// from (and recorded into) volume.toml; the kernel auto-allocates on
+        /// first serve.
         #[arg(long)]
         ublk: bool,
-        /// Explicit ublk device id (maps to /dev/ublkb<id>). If omitted and
-        /// --ublk is passed, the kernel auto-allocates.
-        #[arg(long, requires = "ublk")]
-        ublk_id: Option<i32>,
     },
 
     /// Scan an image for file extents and analyse dedup + delta compression potential
@@ -1019,7 +1017,6 @@ fn main() {
             size,
             readonly,
             ublk,
-            ublk_id,
         } => {
             // In the flat layout, fork_dir IS the volume directory.
             let size_bytes = resolve_volume_size(&fork_dir, size.as_deref())
@@ -1030,7 +1027,7 @@ fn main() {
                 if readonly {
                     panic!("ublk transport does not yet support --readonly");
                 }
-                match ublk::run_volume_ublk(&fork_dir, size_bytes, fetch_config, ublk_id) {
+                match ublk::run_volume_ublk(&fork_dir, size_bytes, fetch_config) {
                     Ok(()) => return,
                     Err(ublk::UblkRunError::Config(msg)) => {
                         eprintln!("ublk: {msg}");

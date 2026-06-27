@@ -22,9 +22,11 @@
 //   4. Remaining live id with no matching binding → orphan: kill_dev +
 //      del_dev via libublk on a `tokio::task::spawn_blocking` thread
 //      (bounded by a per-device timeout).
-//   5. Binding pointing at a non-existent live id → stale: clear the
-//      `dev_id` field (preserving the `[ublk]` section). The next serve
-//      sees no bound id + no sysfs entry and does a fresh ADD.
+//   5. Binding pointing at a non-existent live id → logged only. The id
+//      space is empty after a reboot, so the next serve re-ADDs at the
+//      same persisted id (`plan_route` routes persisted + sysfs-absent
+//      to ADD-at-that-id), keeping `/dev/ublkb<N>` stable. Clearing the
+//      `dev_id` here would force an auto-id ADD and shuffle device paths.
 //
 // The sweep is idempotent and cheap. On non-Linux hosts the sysfs path simply
 // does not exist and the sweep is a no-op.
@@ -74,24 +76,17 @@ pub async fn reconcile(data_dir: &Path) {
     let bindings = scan_bindings(data_dir);
     let (orphans, stale_bindings) = diff(&live, &bindings);
 
-    if orphans.is_empty() && stale_bindings.is_empty() {
-        return;
+    for (vol_dir, id) in stale_bindings {
+        debug!(
+            "[ublk-sweep] {} bound to ublk{id} with no live kernel device; next serve re-adds at ublk{id}",
+            vol_dir.display()
+        );
     }
 
     for id in orphans {
         info!("[ublk-sweep] deleting orphan kernel device ublk{id} (no matching volume binding)");
         if let Err(e) = delete_device(id).await {
             warn!("[ublk-sweep] del_dev ublk{id}: {e}");
-        }
-    }
-
-    for (vol_dir, id) in stale_bindings {
-        info!(
-            "[ublk-sweep] clearing stale binding {} → ublk{id} (kernel device gone)",
-            vol_dir.display()
-        );
-        if let Err(e) = elide_core::config::VolumeConfig::clear_bound_ublk_id(&vol_dir) {
-            warn!("[ublk-sweep] clear dev_id in {}: {e}", vol_dir.display());
         }
     }
 }
@@ -392,8 +387,8 @@ mod tests {
     #[test]
     fn diff_stale_binding_is_flagged() {
         // Volume bound to ublk0, but the kernel forgot the device (host
-        // reboot). The binding should be cleared so the next serve does
-        // a fresh ADD.
+        // reboot). Reported as stale so reconcile can log it; the binding
+        // is left intact and the next serve re-ADDs at the same id.
         let live = HashSet::new();
         let bindings = HashMap::from([binding("/d/by_id/A", 0)]);
         let (orphans, stale) = diff(&live, &bindings);

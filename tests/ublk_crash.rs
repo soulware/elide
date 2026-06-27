@@ -38,12 +38,6 @@ use std::time::{Duration, Instant};
 const BLOCK: usize = 4096;
 const VOLUME_SIZE: &str = "64M";
 
-/// Device ids chosen well above any realistic kernel auto-allocation so
-/// the tests do not collide with anything the host allocated for itself.
-/// Distinct ids per test let them run in parallel.
-const DEV_ID_SIGKILL: i32 = 1001;
-const DEV_ID_SIGTERM: i32 = 1002;
-
 /// Runtime-overridable path to the elide binary. `env!("CARGO_BIN_EXE_elide")`
 /// is a compile-time host path; when this binary is copied into the CI
 /// guest over 9p the host path is not valid, so CI sets `ELIDE_BIN` to
@@ -100,26 +94,46 @@ fn scratch_dir(tag: &str) -> PathBuf {
     p
 }
 
-/// Spawn the daemon in `serve-volume` mode bound to `dev_id`. The
-/// caller owns the `Child` and is responsible for signalling / reaping.
-fn spawn_daemon(dir: &Path, dev_id: i32) -> Child {
+/// Spawn the daemon in `serve-volume` mode with ublk enabled. The kernel
+/// auto-allocates the device id; the caller discovers it from volume.toml
+/// via `wait_for_bound_device`. The caller owns the `Child` and is
+/// responsible for signalling / reaping.
+fn spawn_daemon(dir: &Path) -> Child {
     Command::new(elide_bin())
         .arg("serve-volume")
         .arg(dir)
         .arg("--size")
         .arg(VOLUME_SIZE)
         .arg("--ublk")
-        .arg("--ublk-id")
-        .arg(dev_id.to_string())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn elide serve-volume")
 }
 
-/// Block until `/dev/ublkb<dev_id>` and its sysfs entry are both
-/// present, or panic after 20s. Small settle after appearance gives the
-/// kernel time to publish queue limits before we open the device.
+/// Block until the volume binds a kernel device — both the recorded
+/// `[ublk] dev_id` in volume.toml and the corresponding `/dev/ublkb<N>`
+/// node and sysfs entry — and return the id. Panics after 20s. The id is
+/// recorded by the daemon's `wait_hook` once the kernel device goes LIVE.
+fn wait_for_bound_device(dir: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Ok(Some(id)) = elide_core::config::VolumeConfig::bound_ublk_id(dir)
+            && bdev_path(id).exists()
+            && sysfs_entry_exists(id)
+        {
+            thread::sleep(Duration::from_millis(200));
+            return id;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("volume did not bind a ublk device within 20s");
+}
+
+/// Block until `/dev/ublkb<dev_id>` and its sysfs entry are both present,
+/// or panic after 20s. Used on respawn, where the id is already known
+/// from the first serve. Small settle after appearance gives the kernel
+/// time to publish queue limits before we open the device.
 fn wait_for_device(dev_id: i32) {
     let deadline = Instant::now() + Duration::from_secs(20);
     let bdev = bdev_path(dev_id);
@@ -354,14 +368,14 @@ fn sigkill_recovery() {
 
     let dir = scratch_dir("sigkill");
     bootstrap_volume(&dir);
-    force_delete_device(DEV_ID_SIGKILL);
 
-    // Round 1: spawn, write pattern at block 0, wait for durability.
-    let mut daemon = spawn_daemon(&dir, DEV_ID_SIGKILL);
-    wait_for_device(DEV_ID_SIGKILL);
+    // Round 1: spawn, discover the auto-allocated id, write a pattern at
+    // block 0, wait for durability.
+    let mut daemon = spawn_daemon(&dir);
+    let dev_id = wait_for_bound_device(&dir);
 
     let data = pattern(0xa5);
-    write_pattern(DEV_ID_SIGKILL, 0, &data);
+    write_pattern(dev_id, 0, &data);
 
     // Kill the daemon uncleanly. Kernel sees the uring_cmd fds close,
     // moves the device to QUIESCED, and keeps /dev/ublkbN alive pending
@@ -371,22 +385,22 @@ fn sigkill_recovery() {
     reap_killed(&mut daemon, "SIGKILL");
 
     assert!(
-        sysfs_entry_exists(DEV_ID_SIGKILL),
+        sysfs_entry_exists(dev_id),
         "sysfs entry should survive SIGKILL (device should be QUIESCED, not DELETED)"
     );
     assert_eq!(
         elide_core::config::VolumeConfig::bound_ublk_id(&dir).unwrap(),
-        Some(DEV_ID_SIGKILL),
+        Some(dev_id),
         "bound dev_id must survive SIGKILL for Route::Recover on next serve"
     );
 
-    // Round 2: respawn same volume, same id. plan_route sees
-    // persisted=Some(id), sysfs=true => Route::Recover. The kernel
-    // reissues any buffered I/O that was in flight at the crash.
-    let mut daemon = spawn_daemon(&dir, DEV_ID_SIGKILL);
-    wait_for_device(DEV_ID_SIGKILL);
+    // Round 2: respawn same volume. plan_route sees persisted=Some(id),
+    // sysfs=true => Route::Recover. The kernel reissues any buffered I/O
+    // that was in flight at the crash.
+    let mut daemon = spawn_daemon(&dir);
+    wait_for_device(dev_id);
 
-    let read_back = read_pattern(DEV_ID_SIGKILL, 0, BLOCK);
+    let read_back = read_pattern(dev_id, 0, BLOCK);
     assert_eq!(
         read_back, data,
         "pattern at LBA 0 must survive SIGKILL + USER_RECOVERY_REISSUE"
@@ -397,7 +411,7 @@ fn sigkill_recovery() {
     // responsibility.
     send_signal(&daemon, libc::SIGTERM);
     reap_clean(&mut daemon, "SIGTERM (cleanup)");
-    delete_and_wait_sysfs_gone(DEV_ID_SIGKILL);
+    delete_and_wait_sysfs_gone(dev_id);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -411,14 +425,14 @@ fn sigterm_clean_restart() {
 
     let dir = scratch_dir("sigterm");
     bootstrap_volume(&dir);
-    force_delete_device(DEV_ID_SIGTERM);
 
-    // Round 1: spawn, write pattern, signal SIGTERM for a clean exit.
-    let mut daemon = spawn_daemon(&dir, DEV_ID_SIGTERM);
-    wait_for_device(DEV_ID_SIGTERM);
+    // Round 1: spawn, discover the auto-allocated id, write a pattern,
+    // signal SIGTERM for a clean exit.
+    let mut daemon = spawn_daemon(&dir);
+    let dev_id = wait_for_bound_device(&dir);
 
     let data = pattern(0x5a);
-    write_pattern(DEV_ID_SIGTERM, 0, &data);
+    write_pattern(dev_id, 0, &data);
 
     send_signal(&daemon, libc::SIGTERM);
     reap_clean(&mut daemon, "SIGTERM");
@@ -429,12 +443,12 @@ fn sigterm_clean_restart() {
     // field in volume.toml must both survive so the next serve takes
     // Route::Recover.
     assert!(
-        sysfs_entry_exists(DEV_ID_SIGTERM),
+        sysfs_entry_exists(dev_id),
         "sysfs entry should survive SIGTERM (device parked QUIESCED, not deleted)"
     );
     assert_eq!(
         elide_core::config::VolumeConfig::bound_ublk_id(&dir).unwrap(),
-        Some(DEV_ID_SIGTERM),
+        Some(dev_id),
         "bound dev_id must persist across clean shutdown for Route::Recover"
     );
 
@@ -443,10 +457,10 @@ fn sigterm_clean_restart() {
     // (`client.flush()` before exit) made the acked write durable; the
     // recovery attaches fresh queue rings and reads return the same
     // pattern.
-    let mut daemon = spawn_daemon(&dir, DEV_ID_SIGTERM);
-    wait_for_device(DEV_ID_SIGTERM);
+    let mut daemon = spawn_daemon(&dir);
+    wait_for_device(dev_id);
 
-    let read_back = read_pattern(DEV_ID_SIGTERM, 0, BLOCK);
+    let read_back = read_pattern(dev_id, 0, BLOCK);
     assert_eq!(
         read_back, data,
         "acked writes must survive SIGTERM + recovery"
@@ -454,7 +468,7 @@ fn sigterm_clean_restart() {
 
     send_signal(&daemon, libc::SIGTERM);
     reap_clean(&mut daemon, "SIGTERM (cleanup)");
-    delete_and_wait_sysfs_gone(DEV_ID_SIGTERM);
+    delete_and_wait_sysfs_gone(dev_id);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -62,17 +62,18 @@
 //!     serve which id to probe.
 //!   * Kernel `target_data.elide.volume_ulid` — authoritative
 //!     ownership stamp, set in `tgt_init` on every ADD. The verify-
-//!     on-recover guard refuses to attach to any device whose stamp
-//!     does not match this volume's ULID, even if `volume.toml` and
-//!     the CLI both name that id. This is what makes "bind to the
-//!     wrong device" impossible regardless of how the local hint
-//!     drifts (operator-driven `del_dev` followed by someone else
-//!     ADDing at the same id, etc.).
+//!     on-recover guard never attaches to a device whose stamp does
+//!     not match this volume's ULID, even if `volume.toml` names that
+//!     id. This is what makes "bind to the wrong device" impossible
+//!     regardless of how the local hint drifts (operator-driven
+//!     `del_dev` followed by someone else ADDing at the same id, etc.).
 //!
-//! On a subsequent serve: if `volume.toml` and `--ublk-id` disagree,
-//! refuse; if the sysfs entry exists but its owner stamp doesn't name
-//! this volume, refuse; otherwise route to RECOVER (bound + sysfs
-//! present + owner verified) or ADD (no live device at the bound id).
+//! On a subsequent serve: with no bound id, ADD and let the kernel
+//! auto-allocate; with a bound id and no live device, ADD at that id
+//! (stable across reboots); with a bound id whose live device is owned
+//! by us, RECOVER; with a bound id whose live device is foreign,
+//! relocate to a fresh kernel-assigned id (leaving the foreign device
+//! untouched).
 //!
 //! Zero-copy (`UBLK_F_AUTO_BUF_REG`) is a follow-up step. See
 //! docs/design-ublk-transport.md.
@@ -221,8 +222,8 @@ mod imp {
     const UBLK_IO_OP_WRITE_ZEROES: u32 = libublk::sys::UBLK_IO_OP_WRITE_ZEROES;
 
     /// Startup decision: what the serve should do given the persisted
-    /// volume↔device binding, the CLI `--ublk-id`, and whether a kernel
-    /// sysfs entry already exists.
+    /// volume↔device binding and whether a live kernel device exists at
+    /// that id (and if so, whether its owner stamp is ours).
     #[derive(Debug, PartialEq, Eq)]
     enum Route {
         /// No prior binding that matches a live kernel device. ADD with
@@ -233,16 +234,13 @@ mod imp {
         /// Safe to RECOVER — the kernel-buffered I/O queued under the
         /// last serve was destined for *us*.
         Recover { id: i32 },
-        /// `--ublk-id` contradicts what `volume.toml` says this volume
-        /// is bound to. Refusing is the whole point of persisting the
-        /// binding.
-        BoundMismatch { persisted: i32, cli: i32 },
-        /// A sysfs entry exists at the requested id but its `target_data`
-        /// stamp does not name this volume — either another volume's
-        /// QUIESCED device, a non-elide device, or an unstamped device
-        /// from an older codebase. Reissuing someone else's buffered
-        /// writes into our WAL would be silent corruption; refuse.
-        ForeignDevice { id: i32 },
+        /// Our persisted id is occupied by a foreign device. The host
+        /// re-assigned it after a reboot/rmmod before this volume
+        /// re-claimed it (e.g. a freshly-created auto-id volume won the
+        /// slot). Drop the binding and ADD at a kernel-assigned id — the
+        /// foreign device is left untouched, and the ownership stamp
+        /// guarantees we never attach to it.
+        Relocate { from: i32 },
     }
 
     /// `sysfs_has(id)` → kernel device entry exists.
@@ -250,27 +248,19 @@ mod imp {
     /// equals our volume's ULID. Always called *after* `sysfs_has(id)`
     /// is true, so the implementation may assume the device exists.
     ///
-    /// Returns `Recover` only when both predicates hold *and* the
-    /// persisted binding agrees; an `owner_matches` failure converts
-    /// any candidate id into `ForeignDevice`. This is the load-bearing
-    /// safety net: the kernel stamp is authoritative ownership, so a
-    /// stale `volume.toml` (from operator del_dev + someone-else ADD)
-    /// can never lead us into the wrong device.
+    /// The id is read from `volume.toml` (`persisted`); the kernel
+    /// auto-allocates when there is none, and the chosen id is recorded
+    /// back. The ownership stamp is the load-bearing safety net: a stale
+    /// binding (operator del_dev + someone-else ADD, or a host re-assign
+    /// after reboot) is never attached to — it routes to `Relocate`, so
+    /// the volume moves to a fresh id rather than reissuing another
+    /// volume's buffered writes into our WAL.
     fn plan_route(
         persisted: Option<i32>,
-        cli: Option<i32>,
         sysfs_has: impl Fn(i32) -> bool,
         owner_matches: impl Fn(i32) -> bool,
     ) -> Route {
-        if let (Some(p), Some(c)) = (persisted, cli)
-            && p != c
-        {
-            return Route::BoundMismatch {
-                persisted: p,
-                cli: c,
-            };
-        }
-        let Some(id) = persisted.or(cli) else {
+        let Some(id) = persisted else {
             return Route::Add { target_id: None };
         };
         if !sysfs_has(id) {
@@ -279,12 +269,9 @@ mod imp {
             };
         }
         if !owner_matches(id) {
-            return Route::ForeignDevice { id };
+            return Route::Relocate { from: id };
         }
-        match persisted {
-            Some(p) if p == id => Route::Recover { id },
-            _ => Route::ForeignDevice { id },
-        }
+        Route::Recover { id }
     }
 
     /// Classify a `UblkCtrlBuilder::build()` failure into permanent
@@ -357,10 +344,10 @@ mod imp {
             let id = target_id.expect("id_in_use implies target_id.is_some()");
             super::UblkRunError::Config(format!(
                 "{detail} — ublk dev id {id} is already in use at the kernel level. \
-                 If /sys/class/ublk-char/ublkc{id} exists, run `elide ublk delete {id}` \
-                 (or pick a different --ublk-id). If sysfs is empty but the slot is \
-                 still pinned, an earlier device leaked a kernel reference; \
-                 reload the module (`rmmod ublk_drv && modprobe ublk_drv`) or reboot"
+                 If /sys/class/ublk-char/ublkc{id} exists, run `elide ublk delete {id}`. \
+                 If sysfs is empty but the slot is still pinned, an earlier device \
+                 leaked a kernel reference; reload the module \
+                 (`rmmod ublk_drv && modprobe ublk_drv`) or reboot"
             ))
         } else if module_or_priv {
             super::UblkRunError::Config(format!(
@@ -531,7 +518,6 @@ mod imp {
         dir: &Path,
         size_bytes: u64,
         fetch_inputs: crate::VolumeFetchInputs,
-        dev_id: Option<i32>,
     ) -> Result<(), super::UblkRunError> {
         // Block the shutdown signals on the calling thread BEFORE any
         // other thread is spawned. The block is inherited by every
@@ -612,7 +598,7 @@ mod imp {
             .unwrap_or("")
             .to_owned();
         let owner_matches = |id: i32| device_owner_ulid(id).as_deref() == Some(our_ulid.as_str());
-        let route = plan_route(persisted_id, dev_id, ublk_device_exists, owner_matches);
+        let route = plan_route(persisted_id, ublk_device_exists, owner_matches);
         let (target_id, recovering) = match route {
             Route::Add { target_id } => (target_id, false),
             Route::Recover { id } => {
@@ -642,18 +628,15 @@ mod imp {
                     }
                 }
             }
-            Route::BoundMismatch { persisted, cli } => {
-                return Err(super::UblkRunError::Config(format!(
-                    "volume bound to ublk dev {persisted}; refusing to serve with --ublk-id {cli}. \
-                     run `elide volume update --ublk-id {persisted} <name>` to align config, \
-                     or `elide ublk delete {persisted}` to drop the binding"
-                )));
-            }
-            Route::ForeignDevice { id } => {
-                return Err(super::UblkRunError::Config(format!(
-                    "ublk dev {id} exists but is not stamped with this volume's ULID. \
-                     run `elide ublk delete {id}` to remove the foreign device, or use a different --ublk-id"
-                )));
+            Route::Relocate { from } => {
+                tracing::warn!(
+                    "ublk dev {from} (this volume's persisted id) is held by a foreign device; \
+                     relocating to a kernel-assigned id"
+                );
+                if let Err(e) = elide_core::config::VolumeConfig::clear_bound_ublk_id(dir) {
+                    tracing::warn!("ublk clearing stale binding for dev {from}: {e}");
+                }
+                (None, false)
             }
         };
 
@@ -1328,96 +1311,47 @@ mod imp {
         const OWNER_FOREIGN: fn(i32) -> bool = |_| false;
 
         #[test]
-        fn plan_route_add_when_no_prior_state() {
+        fn plan_route_add_when_no_prior_binding() {
+            // No bound id in volume.toml: ADD and let the kernel
+            // auto-allocate. owner_matches/sysfs_has are never consulted.
             assert_eq!(
-                plan_route(None, None, |_| false, OWNER_OK),
+                plan_route(None, |_| false, OWNER_OK),
                 Route::Add { target_id: None }
             );
-            assert_eq!(
-                plan_route(None, Some(3), |_| false, OWNER_OK),
-                Route::Add { target_id: Some(3) }
-            );
         }
 
         #[test]
-        fn plan_route_recover_on_bound_and_present_with_owner_match() {
-            // Persisted == CLI, sysfs has it, our owner stamp: canonical
-            // recover after a clean shutdown.
+        fn plan_route_recover_on_bound_present_and_owned() {
+            // Bound id with a live sysfs device carrying our owner stamp:
+            // canonical recover after a parked (QUIESCED) exit.
             assert_eq!(
-                plan_route(Some(5), Some(5), |id| id == 5, OWNER_OK),
-                Route::Recover { id: 5 }
-            );
-            // CLI omitted but persisted id is present: recover without
-            // needing the operator to re-type the id.
-            assert_eq!(
-                plan_route(Some(5), None, |id| id == 5, OWNER_OK),
+                plan_route(Some(5), |id| id == 5, OWNER_OK),
                 Route::Recover { id: 5 }
             );
         }
 
         #[test]
-        fn plan_route_recover_refuses_when_owner_stamp_doesnt_match() {
-            // Sysfs has the persisted id, but the kernel device's
-            // target_data names a different volume (e.g. operator
-            // del_dev'd ours and someone else ADDed at this id). This
-            // is the load-bearing safety net — never bind to the wrong
-            // device.
-            assert_eq!(
-                plan_route(Some(5), Some(5), |id| id == 5, OWNER_FOREIGN),
-                Route::ForeignDevice { id: 5 }
-            );
-        }
-
-        #[test]
-        fn plan_route_add_rebinds_to_persisted_when_sysfs_gone() {
-            // volume.toml says "this volume is dev 5", but the kernel
-            // entry is gone (e.g. operator ran `elide ublk delete 5`).
-            // ADD with the persisted id so the volume reclaims its slot.
+        fn plan_route_add_at_persisted_when_sysfs_gone() {
+            // volume.toml says "this volume is dev 5" but the kernel
+            // entry is gone (host reboot / `elide ublk delete 5`). ADD at
+            // the persisted id so `/dev/ublkb5` stays stable.
             // owner_matches isn't called because sysfs_has is false first.
             assert_eq!(
-                plan_route(Some(5), None, |_| false, OWNER_OK),
+                plan_route(Some(5), |_| false, OWNER_OK),
                 Route::Add { target_id: Some(5) }
             );
         }
 
         #[test]
-        fn plan_route_bound_mismatch_refuses() {
-            // The whole point of persisting the binding.
+        fn plan_route_relocates_when_persisted_id_is_foreign() {
+            // The bound id has a live device whose owner stamp names a
+            // different volume (the kernel re-assigned our id after a
+            // reboot, e.g. a freshly-created auto-id volume won the slot).
+            // Drop the binding and ADD at a kernel-assigned id rather than
+            // attaching to — or parking against — the foreign device.
             assert_eq!(
-                plan_route(Some(5), Some(7), |_| true, OWNER_OK),
-                Route::BoundMismatch {
-                    persisted: 5,
-                    cli: 7,
-                }
-            );
-            // Mismatch still refuses even if the CLI id has no sysfs
-            // entry — catch the operator mistake early, don't let them
-            // silently drift off the persisted binding.
-            assert_eq!(
-                plan_route(Some(5), Some(7), |_| false, OWNER_OK),
-                Route::BoundMismatch {
-                    persisted: 5,
-                    cli: 7,
-                }
-            );
-        }
-
-        #[test]
-        fn plan_route_foreign_device_refuses_no_persisted_binding() {
-            // No persisted binding, CLI says id 5, ublkc5 exists — even
-            // if its owner stamp happened to match us, we never ADDed it
-            // so refuse on persisted-binding grounds (the sysfs entry
-            // wasn't ours to begin with). Owner check is the second
-            // gate; persisted-binding presence is the first.
-            assert_eq!(
-                plan_route(None, Some(5), |_| true, OWNER_OK),
-                Route::ForeignDevice { id: 5 }
-            );
-            // Owner mismatch is also ForeignDevice (caught by the
-            // owner_matches gate before the persisted check).
-            assert_eq!(
-                plan_route(None, Some(5), |_| true, OWNER_FOREIGN),
-                Route::ForeignDevice { id: 5 }
+                plan_route(Some(5), |id| id == 5, OWNER_FOREIGN),
+                Route::Relocate { from: 5 }
             );
         }
 
@@ -1691,7 +1625,6 @@ mod imp {
         _dir: &Path,
         _size_bytes: u64,
         _fetch_inputs: crate::VolumeFetchInputs,
-        _dev_id: Option<i32>,
     ) -> Result<(), super::UblkRunError> {
         Err(super::UblkRunError::Config(stub_msg().to_owned()))
     }
@@ -1716,15 +1649,15 @@ mod imp {
 /// Serve a volume over ublk. Creates `/dev/ublkbN` and runs the I/O loop.
 ///
 /// Step-2b: multi-queue (up to 4) at queue_depth = 64 with an async per-tag
-/// handler and a per-queue worker pool. `dev_id = None` lets the kernel
-/// auto-allocate. See docs/design-ublk-transport.md.
+/// handler and a per-queue worker pool. The kernel device id is read from
+/// (and recorded into) `volume.toml`; the kernel auto-allocates on first
+/// serve. See docs/design-ublk-transport.md.
 pub fn run_volume_ublk(
     dir: &Path,
     size_bytes: u64,
     fetch_inputs: crate::VolumeFetchInputs,
-    dev_id: Option<i32>,
 ) -> Result<(), UblkRunError> {
-    imp::run_volume_ublk(dir, size_bytes, fetch_inputs, dev_id)
+    imp::run_volume_ublk(dir, size_bytes, fetch_inputs)
 }
 
 /// List ublk devices known to the kernel (reads `/sys/class/ublk-char`).

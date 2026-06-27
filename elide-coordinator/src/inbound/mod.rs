@@ -1463,11 +1463,10 @@ pub(crate) struct TransportPatch {
 /// `no-ublk`.
 ///
 /// Unknown tokens produce an error so silent typos don't get accepted.
-/// There is no `ublk-id=<n>` token: the kernel auto-allocates on first
-/// ADD and the chosen id is sticky across restarts (recorded in
-/// `volume.toml`). Direct `elide serve-volume --ublk-id <n>` invocations
-/// still allow pinning at the lowest layer for tests / emergency
-/// override; that path bypasses this parser.
+/// There is no `ublk-id=<n>` token: the kernel auto-allocates the device
+/// id on first ADD and the chosen id is sticky across restarts (recorded
+/// in `volume.toml`). To move a volume to a different id, edit
+/// `[ublk] dev_id` in `volume.toml`.
 pub(crate) fn parse_transport_flags(args: &str) -> Result<TransportPatch, String> {
     let mut patch = TransportPatch::default();
     for tok in args.split_whitespace() {
@@ -1739,13 +1738,13 @@ async fn update_volume_op(
     }
 
     // Decide which previously-bound kernel device (if any) to tear
-    // down *after* writing the new config. With `--ublk-id` removed
-    // from the user CLI, the only path that requires teardown here is
-    // transport disabled / switched: the volume previously had a bound
-    // id and the new cfg has no `[ublk]` section. The kernel device
-    // must go — leaving it QUIESCED contradicts the new transport
-    // policy and leaves an orphan whose stamped owner can take down
-    // the daemon on the next `elide ublk delete`.
+    // down *after* writing the new config. The dev_id cannot be changed
+    // through this path, so the only case requiring teardown is transport
+    // disabled / switched: the volume previously had a bound id and the
+    // new cfg has no `[ublk]` section. The kernel device must go —
+    // leaving it QUIESCED contradicts the new transport policy and leaves
+    // an orphan whose stamped owner can take down the daemon on the next
+    // `elide ublk delete`.
     //
     // Plain `volume stop` / restart with no transport change does NOT
     // take this path — that's the maintenance bounce, where QUIESCED +
@@ -2598,10 +2597,9 @@ mod tests {
 
     #[test]
     fn parse_flags_ublk_id_no_longer_recognised() {
-        // `ublk-id=N` was the user-facing pin token; removed in the
-        // collapse follow-up. Operator pinning happens via direct
-        // `elide serve-volume --ublk-id <n>` (the internal CLI), not
-        // via the coordinator IPC parser.
+        // `ublk-id=N` was the user-facing pin token; the kernel
+        // auto-allocates the id and records it in `volume.toml`, so the
+        // IPC parser rejects an explicit pin.
         let err = match parse_transport_flags("ublk-id=7") {
             Ok(_) => panic!("ublk-id=7 should be rejected"),
             Err(e) => e,

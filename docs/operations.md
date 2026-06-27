@@ -160,9 +160,11 @@ Prereqs:
 
 Crash recovery is enabled unconditionally
 (`UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`). The kernel-assigned
-device id is persisted in `<vol>/ublk.id` so the next supervisor restart
-re-attaches to the same `/dev/ublkb<N>` and reissues buffered I/O — see
-`docs/design-ublk-transport.md` for the full lifecycle.
+device id is persisted in `volume.toml`'s `[ublk] dev_id`, so `/dev/ublkb<N>`
+is stable across restarts: a daemon that exited while the kernel device
+stayed parked (QUIESCED) is recovered in place with buffered I/O reissued;
+after a host reboot, where the kernel device is gone, the next serve re-ADDs
+at the same id — see `docs/design-ublk-transport.md` for the full lifecycle.
 
 Diagnostic CLI: `elide ublk list` and `elide ublk delete <id>` /
 `elide ublk delete --all` for inspecting and tearing down stray devices.

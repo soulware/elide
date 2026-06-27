@@ -492,7 +492,7 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 **Internal (spawned by coordinator; not intended for direct use):**
 
 ```
-elide serve-volume <vol-dir> [--ublk] [--ublk-id <n>] [--readonly]
+elide serve-volume <vol-dir> [--ublk] [--readonly]
 ```
 
 ### `elide-coordinator` CLI commands
