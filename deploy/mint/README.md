@@ -113,16 +113,14 @@ Prerequisites: the `fly` CLI, a Tigris bucket, and an admin credential that can
 manage it (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
 
 1. Copy the template — `cp fly.toml.example fly.toml` (the live `fly.toml` is
-   gitignored) — and set `app` / `primary_region` and the build args:
-   `DATA_BUCKET` (= the coordinator's `[store].bucket`) and `MINT_VERSION` (the
-   released mint tag, e.g. `v0.1.0`, with its `MINT_SHA256`). `DATA_BUCKET` also
-   holds mint's own `_mint/*` state
-   (distinct prefix); set `STORE_BUCKET` to put that in a separate bucket. All
-   deploy commands run from this directory.
+   gitignored) — and set `app` / `primary_region` and the `DATA_BUCKET` build
+   arg (= the coordinator's `[store].bucket`). `DATA_BUCKET` also holds mint's
+   own `_mint/*` state (distinct prefix); set `STORE_BUCKET` to put that in a
+   separate bucket. All deploy commands run from this directory.
 2. `fly apps create <app>` and `fly volumes create mint_data --size 1`.
 3. `fly secrets set AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…`.
-4. `fly deploy` — the keyring and `K_M-*` generate on first boot (the demo
-   tables enable first-boot generation), into the volume.
+4. `fly deploy` — the keyring and `K_session` generate on first boot into the
+   volume.
 
 Then seal and mint an invite **inside the machine** — the demo auth issuer is
 in-container UDS-only, so the operator gates run there, not from your
@@ -170,9 +168,10 @@ With the VM joined to 6PN (`fly wireguard create`):
     mint enroll approve <coordinator-sub>
 
 That enrols the coordinator and lets it assume the issuer-only `coord-ro` /
-`coord-rw` roles. The attested `volume-*` roles additionally need `K_M-B`
-(`<data_dir>/attestation-shared.key`, generated on the volume) shared with the
-VM's attestation coordinator — still out of scope here.
+`coord-rw` roles. The attested `volume-*` roles additionally need `K_M-B`,
+shared the same way as `K_M-A`: one value set as `[attestation.demo].k_m_b` in
+mint's config and `[attestation].k_m_b` in the coordinator's. mint persists it
+at `<data_dir>/attestation-shared.key`.
 
 The keyring is the root of trust and auto-generates onto the `mint_data` volume;
 losing the volume invalidates every issued credential, so back it up.
