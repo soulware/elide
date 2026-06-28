@@ -983,11 +983,11 @@ mod tests {
 
     #[test]
     fn shipped_coordinator_demo_config_parses() {
-        // The committed shared-key demo config (deploy/coord/) — nothing else
+        // The committed shared-key demo config (deploy/elide/) — nothing else
         // loads it, so this is its guard: it must parse, and its
         // [auth.demo].k_m_a and [attestation].k_m_b must each decode to 32
         // bytes (matching mint-fly.toml).
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/coord/coord.toml");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/elide/coord.toml");
         let text = std::fs::read_to_string(path).expect("read coord.toml");
         let cfg: CoordinatorConfig =
             toml::from_str(&text).expect("coordinator.toml must parse as a CoordinatorConfig");

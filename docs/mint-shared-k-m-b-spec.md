@@ -143,7 +143,7 @@ vector regeneration.
 Once mint ships the above:
 
 - `deploy/mint/mint-fly.toml` — add `k_m_b = "<value>"` under
-  `[attestation.demo]`, byte-identical to `deploy/coord/coord.toml`'s
+  `[attestation.demo]`, byte-identical to `deploy/elide/coord.toml`'s
   `[attestation] k_m_b` (currently `8K0oyDybI3jBHjtUYxtrfLKHeniWHK8JmxxpCS/e3IU=`).
 - Bump the deploy `MINT_REF` to the commit carrying this change.
 - The co-located `[attestation.demo].socket` stands up mint's *own*
