@@ -2,6 +2,7 @@
 # Deploy the Elide coordinator to Fly.io at a resolved elide release version.
 #
 #   ./deploy.sh            deploy the latest release
+#   ./deploy.sh latest     same, stated explicitly
 #   ./deploy.sh v0.1.2     deploy a specific tag
 #
 # Resolves the version to a concrete tag, checks the release assets exist, and
@@ -20,6 +21,7 @@ cd "$(dirname "$0")"
 version=""
 case "${1:-}" in
   ""|-*) ;;
+  latest) shift ;;
   *) version="$1"; shift ;;
 esac
 
