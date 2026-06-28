@@ -1,0 +1,16 @@
+# Elide coordinator on Fly.io, standalone — no mint, no enrollment. The
+# coordinator signs every S3 operation with the Tigris keypair in its
+# environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, set as Fly secrets)
+# and vends that same keypair to each volume it serves. Paired with
+# fly.toml.example (the deploy config). See README.md.
+#
+# Set [store].bucket for your deployment (the Dockerfile bakes it from the
+# DATA_BUCKET build arg).
+
+data_dir = "/data/elide_data"
+
+[store]
+# The Tigris bucket the AWS_* keypair has read/write on.
+bucket = "elide"
+endpoint = "https://t3.storage.dev"
+region = "auto"

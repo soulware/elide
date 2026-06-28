@@ -1,0 +1,4 @@
+# Not part of the image — the binaries are downloaded during the build and
+# coord.toml is the only config baked in.
+fly.toml
+deploy.sh
