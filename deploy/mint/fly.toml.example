@@ -1,6 +1,6 @@
 # mint-for-elide on Fly.io — a private app (no public service): reachable over
 # 6PN at <app>.internal:8085. Template: copy to fly.toml (gitignored), fill
-# app/primary_region and the build args, then `fly deploy` from this directory.
+# app/primary_region and the build args, then `./deploy.sh` from this directory.
 # See README.md § Fly.io deployment.
 
 app = "mint-for-elide"
@@ -9,9 +9,8 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
   [build.args]
-    # MINT_VERSION: the released mint tag to download and deploy (keep in lockstep
-    # with the coordinator's ELIDE_VERSION).
-    MINT_VERSION = "v0.1.1"
+    # MINT_VERSION is supplied by deploy.sh (it resolves the release tag); a bare
+    # `fly deploy` fails without it.
     # DATA_BUCKET: the volume-data bucket baked into the role ARNs (must equal
     # the coordinator's [store].bucket); it also becomes mint's own admin-store
     # bucket (_mint/* under a distinct prefix) unless STORE_BUCKET overrides it.

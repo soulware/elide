@@ -1,6 +1,6 @@
 # Elide coordinator on Fly.io — a private app (no public service), reachable
 # over 6PN at <app>.internal. Template: copy to fly.toml (gitignored), fill
-# app/primary_region and the build args, then `fly deploy` from this directory.
+# app/primary_region and the build args, then `./deploy.sh` from this directory.
 # Pairs with coord.toml (the baked runtime config). See README.md.
 
 app = "elide-coord"
@@ -9,8 +9,8 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
   [build.args]
-    # ELIDE_VERSION: the released elide tag to download and deploy.
-    ELIDE_VERSION = "v0.1.1"
+    # ELIDE_VERSION is supplied by deploy.sh (it resolves the release tag); a
+    # bare `fly deploy` fails without it.
     # DATA_BUCKET: the Tigris data bucket (must equal mint's DATA_BUCKET);
     # baked into coord.toml [store].bucket.
     DATA_BUCKET = "elide"
