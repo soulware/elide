@@ -1,30 +1,25 @@
 # mint-for-elide container image for Fly.io.
 #
-# Stage 1 downloads the released `mint` binary at the pinned MINT_VERSION and
-# renders the role templates with the deployment's data bucket. Stage 2 assembles
-# the runtime image and runs `mint serve` over mint-fly.toml.
+# Stage 1 downloads the released `mint` binary at MINT_VERSION and renders the
+# role templates with the deployment's data bucket. Stage 2 assembles the
+# runtime image and runs `mint serve` over mint-fly.toml.
 #
 # Build args:
-#   MINT_VERSION  released mint tag to download, e.g. v0.1.1 (lockstep with this
-#                 coordinator).
+#   MINT_VERSION  released mint tag to download (required; deploy.sh resolves it).
 #   DATA_BUCKET   the volume-data bucket baked into the role ARNs; must equal
 #                 the coordinator's [store].bucket.
 
-ARG MINT_VERSION=v0.1.1
-
 FROM ubuntu:24.04 AS build
-ARG MINT_VERSION
-# curl + CA certs only — the binary is a published release artifact, so the build
-# stage needs no rust toolchain, git, or build-essential.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
- && rm -rf /var/lib/apt/lists/*
 
-# The MINT_VERSION tag is the pin; HTTPS covers the transfer.
+# MINT_VERSION has no default; an unset build fails here rather than fetching a
+# malformed URL.
+ARG MINT_VERSION
+RUN [ -n "${MINT_VERSION}" ] || { echo "MINT_VERSION build-arg is required; deploy via ./deploy.sh" >&2; exit 1; }
+
+# The tag is the pin; HTTPS covers the transfer.
 ARG MINT_ASSET=mint-x86_64-unknown-linux-gnu
 ARG MINT_BASE=https://github.com/soulware/mint/releases/download
-RUN curl --proto '=https' --tlsv1.2 -fsSLO "${MINT_BASE}/${MINT_VERSION}/${MINT_ASSET}" \
- && install -m 0755 "${MINT_ASSET}" /usr/local/bin/mint
+ADD --chmod=0755 ${MINT_BASE}/${MINT_VERSION}/${MINT_ASSET} /usr/local/bin/mint
 
 # Resolve {{build.bucket}} into the rendered roles/ that `mint serve` loads.
 # A pure file pass — no S3, no credentials — done here so the unrendered
