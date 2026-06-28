@@ -4,12 +4,12 @@
 images consume them by download. mint's binary is published as a GitHub release
 (mint #43; first tag `v0.1.0`), and `deploy/mint/` downloads and checksum-verifies
 it at a pinned `MINT_VERSION` in place of the source compile. elide's `release.yml`
-publishes its three binaries the same way (first tag `v0.1.0`), and `deploy/coord/`
+publishes its three binaries the same way (first tag `v0.1.0`), and `deploy/elide/`
 downloads and checksum-verifies them at a pinned `ELIDE_VERSION`.
 
 ## Problem
 
-The coordinator image (`deploy/coord/`) compiles its binary from source inside
+The coordinator image (`deploy/elide/`) compiles its binary from source inside
 the image build, at deploy time, from a `*_REF` build arg:
 
 ```dockerfile
@@ -112,7 +112,7 @@ deploy config records the validated pair.
 
 ## The coordinator image consumes the release
 
-`deploy/coord/Dockerfile` downloads the three assets at a pinned `ELIDE_VERSION`
+`deploy/elide/Dockerfile` downloads the three assets at a pinned `ELIDE_VERSION`
 and verifies each against a per-binary `*_SHA256` pinned in this repo (not the
 release's own `.sha256` — an actor who can replace a binary can replace that
 checksum too). The build stage carries only `curl` + CA certs; the runtime stage

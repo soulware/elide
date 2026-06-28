@@ -1,7 +1,7 @@
 name: release
 
 # Build the elide release binaries and publish them as GitHub Release assets on
-# a `v*` tag push. Downstream deployments (the deploy/coord image) pull these
+# a `v*` tag push. Downstream deployments (the deploy/elide image) pull these
 # prebuilt artifacts and verify their checksums, so the runtime image needs no
 # rust toolchain.
 #
