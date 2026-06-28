@@ -9,6 +9,9 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
   [build.args]
+    # MINT_VERSION: the released mint tag to download and deploy (keep in lockstep
+    # with the coordinator's ELIDE_VERSION).
+    MINT_VERSION = "v0.1.1"
     # DATA_BUCKET: the volume-data bucket baked into the role ARNs (must equal
     # the coordinator's [store].bucket); it also becomes mint's own admin-store
     # bucket (_mint/* under a distinct prefix) unless STORE_BUCKET overrides it.
