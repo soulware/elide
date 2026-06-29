@@ -1001,6 +1001,28 @@ mod tests {
     }
 
     #[test]
+    fn shipped_standalone_config_parses() {
+        // The committed standalone config (deploy/elide-standalone/) — nothing
+        // else loads it, so this is its guard: it must parse, and it must carry
+        // no mint/attestation/auth, since the whole point of the standalone
+        // variant is the shared-key path their absence selects.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../deploy/elide-standalone/coord.toml"
+        );
+        let text = std::fs::read_to_string(path).expect("read coord.toml");
+        let cfg: CoordinatorConfig =
+            toml::from_str(&text).expect("coordinator.toml must parse as a CoordinatorConfig");
+        assert_eq!(cfg.store.bucket.as_deref(), Some("elide"));
+        assert!(cfg.mint.is_none(), "standalone config must carry no [mint]");
+        assert!(
+            cfg.attestation.is_none(),
+            "standalone config must carry no [attestation]"
+        );
+        assert!(cfg.auth.is_none(), "standalone config must carry no [auth]");
+    }
+
+    #[test]
     fn load_errors_on_missing_file() {
         // A missing config path must fail loudly, not silently fall through to
         // a default config — a default routes serve into the shared-key
