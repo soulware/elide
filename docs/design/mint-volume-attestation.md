@@ -751,37 +751,40 @@ same way the auth service establishes `K_M-A` (`docs/design/mint.md` §
 roles' TPC names coord B; operator-authorisation TPCs continue to name
 the auth service — a primary may carry both, discharged independently.
 
-## S3 access: the verifier holds `coord-ro`, nothing more
+## S3 access: the verifier holds `attest-ro`, the minimal read set
 
-Every read the discharge predicate makes maps onto an existing `coord-ro`
-grant (`docs/design/mint.md` § *`coord-ro`*: `GetObject` on `names/*`,
-`coordinators/*`, `events/*`, `meta/*`):
+Every read the discharge predicate makes is public signed metadata under
+`meta/*` or `names/*`:
 
-| check | object | `coord-ro` prefix |
+| check | object | prefix |
 |---|---|---|
 | possession | `meta/<owned>.pub` | `meta/*` |
 | lineage walk | `meta/<vol>.provenance` (owned + each ancestor) | `meta/*` |
 | liveness | `names/<name>` | `names/*` |
 
-The verifier needs **zero `by_id/` access** — it reads only public signed
-metadata, never segment bodies. That is exactly `coord-ro`'s load-bearing
-**`by_id/`-free invariant**, which the doc already designed so `coord-ro`
-can be the *only* credential an internet/LAN-exposed verifier holds: a
-compromise of the exposed discharge endpoint can neither mutate state nor
-read bulk data. So coord B reuses `coord-ro` unchanged — **no new role**.
+The verifier needs **zero `by_id/` access** — only public signed metadata,
+never segment bodies. `coord-ro` would satisfy that (`docs/design/mint.md`
+§ *`coord-ro`*: `GetObject` on `names/*`, `coordinators/*`, `events/*`,
+`meta/*`), but two of its prefixes — `coordinators/*` and `events/*` — are
+ones the discharge predicate never reads. So coord B holds **`attest-ro`**:
+`coord-ro` narrowed to exactly `GetObject` on `meta/*` + `names/*`. A
+compromise of the exposed discharge endpoint then reads only the two
+prefixes it serves from, not the whole control plane — and still mutates
+nothing.
 
-This is not a coincidence of grants. The peer-fetch verifier
-(`docs/design/peer-segment-fetch.md`) is the structural twin: on `coord-ro`
-alone it already does the near-identical trio — an ETag-conditional
-`names/<name>` fence (our *liveness*), a `coordinators/<B>/coordinator.pub`
-requester check, and a signed-`volume.provenance` lineage walk (our
-*lineage*). The attestation verifier is the same animal pointed at a
-different question.
+The peer-fetch verifier (`docs/design/peer-segment-fetch.md`) is the
+structural cousin: on `coord-ro` it does a near-identical trio — an
+ETag-conditional `names/<name>` fence (our *liveness*), a
+`coordinators/<B>/coordinator.pub` requester check, and a
+signed-`volume.provenance` lineage walk (our *lineage*). The attestation
+verifier reads strictly less — possession is proven against the volume key
+in `meta/<owned>.pub`, not a coordinator key, so it makes no
+`coordinators/*` read, and `attest-ro` drops that prefix peer fetch keeps.
 
-No bootstrap loop: `coord-ro` is gated by `caveat.sub`, not by a volume
-attestation, so coord B obtains it through ordinary `assume-role` without
-needing a discharge from itself. Only `volume-rw` / `volume-ro` carry the
-volume TPC.
+No bootstrap loop: `attest-ro`, like `coord-ro`, is gated by `caveat.sub`,
+not by a volume attestation, so coord B obtains it through ordinary
+`assume-role` without needing a discharge from itself. Only `volume-rw` /
+`volume-ro` carry the volume TPC.
 
 ### A separate crate and listener from peer fetch
 
@@ -789,7 +792,7 @@ Peer fetch and the discharge authority are different capabilities with
 different exposure profiles. Segment fetch reads local `by_id/` bodies and
 is **advertised to remote peers** (`coordinators/<id>/peer-endpoint.toml`),
 so it needs a network-reachable address. Discharge reads only public signed
-metadata under `coord-ro`, holds no `by_id/`, and is **not advertised** —
+metadata under `attest-ro`, holds no `by_id/`, and is **not advertised** —
 coord A learns where to POST from the location mint sealed into the
 caveat — so it can live entirely off the network on a UDS.
 
@@ -879,7 +882,7 @@ separate crate and listener from peer fetch* applied to config.
 |---|---|---|
 | **mint** (issuer) | `[attestation] location`; `K_M-B` | mint seals `location` and the `cid` (under `K_M-B`) into every attested TPC at issuance, so it holds both. |
 | **coord A** (requester) | `[mint] attestation_transport` only | The discharge route is read from the caveat's own `location`; transport is only *how* to dial when that sealed location is not itself reachable. |
-| **coord B** (authority) | `[attestation] listen`; `K_M-B` | The listener it binds, and the key to open the `cid`. Possession, lineage and liveness are read from `coord-ro`. |
+| **coord B** (authority) | `[attestation] listen`; `K_M-B` | The listener it binds, and the key to open the `cid`. Possession, lineage and liveness are read from `attest-ro`. |
 
 **coord A holds no location.** The authority's identity rides every
 attested TPC as its `location` field, MAC-bound and authoritative. coord A
@@ -951,20 +954,22 @@ mint*), which is exactly why production keeps it at mint.
 Splitting coord B off the volume-serving coordinator gives the discharge
 authority its own deployable, so its custody of `K_M-B` and its
 availability are independent of the data plane. coord B runs in one of
-three shapes, in increasing separation; all are **enrolled attestation
-instances** (§ *Attestation-profile enrollment*) that hold their own
-identity keypair, assume `coord-ro` through ordinary `assume-role` with
-the half-TTL refresh every coordinator uses, serve only
-`POST /v1/discharge`, and drive the same `DischargeState`:
+three shapes, in increasing separation. All hold their own identity
+keypair, read possession / lineage / liveness through ordinary `assume-role`
+(half-TTL refresh, like every coordinator credential), serve only
+`POST /v1/discharge`, and drive the same `DischargeState` — differing in how
+much coordinator they bring up and which read role backs the predicate:
 
 1. **Co-located** — `elide-coordinator serve` with `[attestation]`. One
    process is both coord A (requester) and coord B (authority), looping
-   its own discharge POST back over a UDS. The single-host bundle; brings
-   up the whole coordinator (supervisor, GC, IPC socket, volume scan)
-   alongside the one POST route.
+   its own discharge POST back over a UDS. A full coordinator (the
+   `coordinator` profile), so the discharge half reuses its own `coord-ro`.
+   The single-host bundle; brings up the whole coordinator (supervisor, GC,
+   IPC socket, volume scan) alongside the one POST route.
 2. **Dedicated instance, shared binary** — `elide-coordinator attest`.
    coord B in its own process and its own app, serving only the discharge
-   route: it enrolls, assumes `coord-ro`, builds the `DischargeState`, and
+   route: it enrolls as the `attestation` profile (§ *Attestation-profile
+   enrollment*), assumes `attest-ro`, builds the `DischargeState`, and
    binds the discharge listener — none of the supervisor, GC, IPC, or
    volume scan. It reuses `coordinator.toml` because it holds `K_M-B` (and
    `K_M-A` for the enroll gate) locally as the shared literals (§
@@ -985,8 +990,8 @@ the half-TTL refresh every coordinator uses, serve only
    instance — paired with § *`K_M-B` stays at mint*, where the CID is
    unwrapped over the wire and the instance holds no local secret. The
    process then consumes only a listen address, a mint endpoint plus
-   enrolled identity (keypair + `credentials/coord-ro` under
-   `--identity-dir`), and the store coordinates for its `coord-ro` reads
+   enrolled identity (keypair + `credentials/attest-ro` under
+   `--identity-dir`), and the store coordinates for its `attest-ro` reads
    (S3 keypairs arrive via `assume-role`, never via flags or env). The HA
    shape (§ *HA — N instances*).
 
@@ -1002,7 +1007,7 @@ explicit and typed:
   fingerprint at approval, and covered by the record's body MAC.
   `enroll-exchange` refuses a role outside the grant.
 - A **coordinator enrollment** grants the four coordinator roles, as
-  today. An **attestation enrollment** grants `{coord-ro}` — and is the
+  today. An **attestation enrollment** grants `{attest-ro}` — and is the
   gate for the CID-unwrap endpoint (§ *Proposed: `K_M-B` stays at
   mint*).
 - Each attestation instance enrolls **as its own `sub`**. The
@@ -1049,7 +1054,7 @@ credential's `exp`) plus an **online** oracle that logs every use at
 mint and dies the moment its one `sub` is revoked.
 
 **Availability.** Mint lands on the discharge path, but the verifier
-already depends on mint at the half-TTL timescale for its `coord-ro`
+already depends on mint at the half-TTL timescale for its `attest-ro`
 refresh, and the unwrap cache covers already-seen credentials through
 a mint outage. The marginal coupling is one POST per *new* credential,
 against the 2–4 S3 GETs already in every discharge.
@@ -1072,14 +1077,14 @@ replication does to coord B.
 Multiple instances stand behind the one sealed location
 (the location names the *authority*; instances are interchangeable
 servers of it). Each instance's durable state is its identity directory
-— its own enrollment keypair and `cnf`-bound `credentials/coord-ro` —
+— its own enrollment keypair and `cnf`-bound `credentials/attest-ro` —
 and nothing else: no `K_M-B`, no fleet secret, no disk state beyond
 identity.
 
 The discharge protocol is single-shot — one POST carrying
 `cid, ts, nonce, proof`, one response — so no load-balancer affinity is
 required. Every cache an instance holds is soft: `cid → r` re-fetches
-from mint, the `coord-ro` credential re-assumes, and a restart loses
+from mint, the `attest-ro` credential re-assumes, and a restart loses
 nothing durable.
 
 The one per-instance cache with protocol meaning is the possession-proof
@@ -1131,10 +1136,11 @@ compromise is one `revoke`, leaving the rest of the fleet untouched.
 - **coord B is a true (limited) coord instance**; it enrolls as a
   discharge authority establishing `K_M-B` per the auth service's `K_M-A`
   pattern (see *The attestation coordinator…*).
-- **The verifier reuses `coord-ro` unchanged** — its possession / lineage
-  / liveness reads are all `meta/*` + `names/*`, with no `by_id/` access,
-  matching `coord-ro`'s `by_id/`-free exposed-verifier invariant. No new
-  role; no bootstrap loop (`coord-ro` is `caveat.sub`-gated, not
+- **The verifier holds `attest-ro`, the minimal read set** — its possession
+  / lineage / liveness reads are all `meta/*` + `names/*`, with no `by_id/`
+  access, so `attest-ro` grants exactly those two prefixes: `coord-ro`
+  narrowed, dropping the `coordinators/*` + `events/*` the predicate never
+  reads. No bootstrap loop (`attest-ro` is `caveat.sub`-gated, not
   volume-attested).
 - **The lineage walk's trust-critical per-link step is single-sourced** in
   `elide-core` (the signature verify `verify_lineage_with_key` and the
@@ -1190,11 +1196,11 @@ compromise is one `revoke`, leaving the rest of the fleet untouched.
   `elide-attestation serve` binary (shape 3) is deferred until § *`K_M-B`
   stays at mint* removes the on-instance secret; it is the HA shape and
   earns its own crate boundary only then.
-- **coord B obtains `coord-ro` by attestation-profile enrollment** (§
+- **coord B obtains `attest-ro` by attestation-profile enrollment** (§
   *Attestation-profile enrollment*), not a hand-issued key: the `Enrolled`
   record carries a granted role set the enrollee declares at `/v1/enroll`,
   the operator ratifies at approval alongside the key fingerprint, and
   `enroll-exchange` refuses any role outside it. An attestation enrollment
-  grants `{coord-ro}` and nothing else, so the verifier's read-only,
+  grants `{attest-ro}` and nothing else, so the verifier's read-only,
   `by_id/`-free property is mint-enforced, not voluntary. The mint-side
   contract is `docs/attestation-readonly-enrollment-spec.md`.

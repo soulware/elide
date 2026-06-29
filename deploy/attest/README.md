@@ -1,6 +1,6 @@
 # Elide attestation authority (coord B) on Fly.io
 
-A dedicated, discharge-only coordinator instance. It assumes `coord-ro`
+A dedicated, discharge-only coordinator instance. It assumes `attest-ro`
 through mint, opens attested TPC CIDs under `K_M-B`, and serves
 `POST /v1/discharge` over 6PN — none of the volume serving, supervisor, GC,
 or import a full coordinator runs (`docs/design/mint-volume-attestation.md`
@@ -38,8 +38,8 @@ elide coord enroll --attestation <invite>
 ```
 
 Then approve it on the mint app (`mint enroll approve <coord-sub>`). coord B
-then assumes `coord-ro` and starts serving discharges. An attestation
-enrollment grants `coord-ro` only.
+then assumes `attest-ro` and starts serving discharges. An attestation
+enrollment grants `attest-ro` only.
 
 ## Point the volume coordinator(s) at it
 

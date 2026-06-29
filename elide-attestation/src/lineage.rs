@@ -1,4 +1,4 @@
-//! coord B's signed-lineage walk over coord-ro `meta/*`.
+//! coord B's signed-lineage walk over `meta/*`.
 //!
 //! Given the `owned` volume and the verifying key coord B already
 //! validated the possession proof against, [`walk_lineage_set`] returns

@@ -12,11 +12,11 @@ enrollment* and § *A dedicated attestation instance*.
 Let an enrollee declare, at `/v1/enroll`, a **profile** that bounds the set
 of roles its `Enrolled` record may later exchange. A `coordinator`
 enrollment grants the four roles it grants today; an `attestation`
-enrollment grants `{coord-ro}` and nothing else. `enroll-exchange` refuses
+enrollment grants `{attest-ro}` and nothing else. `enroll-exchange` refuses
 any role outside the record's granted set.
 
 This is the gate for the dedicated attestation instance
-(`elide-coordinator attest`): coord B holds only `coord-ro`, so its
+(`elide-coordinator attest`): coord B holds only `attest-ro`, so its
 read-only, `by_id/`-free property must be **mint-enforced**, not left to the
 coordinator's good behaviour.
 
@@ -68,7 +68,7 @@ mint holds the mapping as a top-level `[[profile]]` catalog, a sibling to
 | profile | granted role set |
 |---|---|
 | `coordinator` | `coord-ro`, `coord-rw`, `volume-rw`, `volume-ro` |
-| `attestation` | `coord-ro` |
+| `attestation` | `attest-ro` |
 
 At least one `[[profile]]` is required and the catalog is validated at
 config load (unique names; every granted role is a configured `[[role]]`).
@@ -106,7 +106,7 @@ clear message.
 > which is the behaviour wanted here.
 
 A legitimate client never hits this — an `attestation` enrollee only ever
-asks for `coord-ro`. It is the enforcement backstop against a buggy or
+asks for `attest-ro`. It is the enforcement backstop against a buggy or
 compromised coordinator reaching past its grant.
 
 ## Clean break (no compat default)
@@ -123,10 +123,10 @@ it.
 
 - `/v1/enroll` sends `profile` (`enroll.rs`, `enroll_request`).
 - The role fan-out is profile-parametric: `EnrollProfile::Coordinator` fans
-  out all four roles, `EnrollProfile::Attestation` fans out `{coord-ro}`
+  out all four roles, `EnrollProfile::Attestation` fans out `{attest-ro}`
   (`enroll.rs`, `assert_enrolled`).
 - `elide-coordinator attest` enrols `profile=attestation`, assumes
-  `coord-ro`, and serves only the discharge listener (§ *A dedicated
+  `attest-ro`, and serves only the discharge listener (§ *A dedicated
   attestation instance*, shape 2).
 - `deploy/mint/` declares the `[[role]]` + `[[profile]]` catalog in a
   `catalog_file`.

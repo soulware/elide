@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AttestationReadOnly",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject"],
+    "Resource": [
+      "arn:aws:s3:::{{build.bucket}}/meta/*",
+      "arn:aws:s3:::{{build.bucket}}/names/*"
+    ],
+    "Condition": {
+      "DateLessThan": {"aws:CurrentTime": "{{mint.expiry}}"}
+    }
+  }]
+}

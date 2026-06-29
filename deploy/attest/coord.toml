@@ -1,6 +1,6 @@
 # Elide attestation authority (coord B) on Fly.io — the runtime config the
 # image runs, paired with fly.toml.example. A dedicated, discharge-only
-# instance: it assumes coord-ro through mint, opens attested CIDs under K_M-B,
+# instance: it assumes attest-ro through mint, opens attested CIDs under K_M-B,
 # and serves POST /v1/discharge over 6PN — no volumes, no data plane
 # (docs/design/mint-volume-attestation.md § "A dedicated attestation
 # instance", shape 2).
@@ -11,13 +11,13 @@
 data_dir = "/data/elide_data"
 
 [store]
-# The Tigris data bucket the coord-ro role is scoped to (= mint's DATA_BUCKET).
+# The Tigris data bucket the attest-ro role is scoped to (= mint's DATA_BUCKET).
 bucket = "elide"
 endpoint = "https://t3.storage.dev"
 region = "auto"
 
 [mint]
-# The mint app this authority enrols against and assumes coord-ro from.
+# The mint app this authority enrols against and assumes attest-ro from.
 url = "http://mint-for-elide.internal:8085"
 
 [attestation]

@@ -86,6 +86,9 @@ pub(crate) const ROLE_COORD_RO: &str = "coord-ro";
 pub(crate) const ROLE_COORD_RW: &str = "coord-rw";
 pub(crate) const ROLE_VOLUME_RW: &str = "volume-rw";
 pub(crate) const ROLE_VOLUME_RO: &str = "volume-ro";
+/// The read-only attestation authority's role — `coord-ro` narrowed to the
+/// discharge predicate's exact read set (`GetObject` on `meta/*` + `names/*`).
+pub(crate) const ROLE_ATTEST_RO: &str = "attest-ro";
 
 /// Filename of the durable, volume-parametric enrollment *intermediate*
 /// stored under an attested role's directory

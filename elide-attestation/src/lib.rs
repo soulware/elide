@@ -4,8 +4,8 @@
 //! coordinator runs it as a `POST /v1/discharge` listener, separate from
 //! peer fetch. It recovers `r` from an attested TPC's CID, verifies a
 //! possession proof of the volume's signing key over public signed state
-//! (`coord-ro` only — `meta/*` + `names/*`, never `by_id/` bodies), and
-//! mints a discharge that attests the scoped volume.
+//! (read-only `meta/*` + `names/*`, never `by_id/` bodies), and mints a
+//! discharge that attests the scoped volume.
 //!
 //! Two modes are served, distinguished by the opaque `mode` mint sealed
 //! into the CID:
@@ -15,7 +15,7 @@
 //! - **`volume-ro`** — the requester proves possession of a live volume
 //!   and is vouched for any volume in that volume's read set (the
 //!   fork-parent chain plus every `extent_index` source named along it),
-//!   established by a signed-lineage walk over coord-ro `meta/*`.
+//!   established by a signed-lineage walk over `meta/*`.
 
 pub mod crypto;
 pub mod lineage;
@@ -137,7 +137,7 @@ type SeenCache = HashMap<(String, String), u64>;
 
 /// coord B's discharge-authority state — the axum state for the
 /// `POST /v1/discharge` router ([`discharge_router`]). Holds the symmetric
-/// `K_M-B` and a `coord-ro` store.
+/// `K_M-B` and a read-only `meta/*` + `names/*` store.
 #[derive(Clone)]
 pub struct DischargeState {
     inner: Arc<DischargeInner>,
@@ -147,7 +147,7 @@ struct DischargeInner {
     /// The symmetric key mint shares with this authority; recovers `r` and
     /// the opaque `mode` from an attested TPC's CID.
     k_m_b: [u8; 32],
-    /// Coord-ro S3 store: `meta/<owned>.pub` (possession) and
+    /// Read-only S3 store granting `meta/<owned>.pub` (possession) and
     /// `names/<name>` (liveness). No `by_id/` access.
     store: Arc<dyn ObjectStore>,
     skew_secs: u64,
@@ -155,7 +155,8 @@ struct DischargeInner {
 }
 
 impl DischargeState {
-    /// Build a discharge authority over `store` (coord-ro) keyed by `k_m_b`.
+    /// Build a discharge authority over `store` (read-only `meta/*` +
+    /// `names/*`) keyed by `k_m_b`.
     pub fn new(k_m_b: [u8; 32], store: Arc<dyn ObjectStore>) -> Self {
         Self {
             inner: Arc::new(DischargeInner {
@@ -305,9 +306,9 @@ impl DischargeState {
         NameRecord::from_toml(text).map_err(|_| DischargeError::Denied("name parse"))
     }
 
-    /// GET a coord-ro object. A missing object is a denial (the requester
-    /// proved nothing about a volume with no published key / claim); other
-    /// errors are backend faults.
+    /// GET a control-plane object (`meta/*` or `names/*`). A missing object is
+    /// a denial (the requester proved nothing about a volume with no published
+    /// key / claim); other errors are backend faults.
     async fn get_bytes(&self, key: &StorePath) -> Result<bytes::Bytes, DischargeError> {
         match self.inner.store.get(key).await {
             Ok(r) => r
@@ -364,7 +365,7 @@ fn parse_pub_hex(s: &str) -> Result<VerifyingKey, ()> {
     VerifyingKey::from_bytes(&bytes).map_err(|_| ())
 }
 
-/// Put a coord-ro object — used by the daemon to seed test fixtures and by
+/// Put a control-plane object — used by the daemon to seed test fixtures and by
 /// callers that need to publish public metadata through the same handle.
 pub async fn put_object(
     store: &dyn ObjectStore,
@@ -405,7 +406,7 @@ mod tests {
     }
 
     /// A coordinator that owns a live volume, with its pub key and a Live
-    /// name record published to an in-memory coord-ro store, and a valid
+    /// name record published to an in-memory read store, and a valid
     /// volume-rw possession proof over the fixture CID.
     async fn live_volume_rw() -> Fixture {
         let v = vectors();
@@ -637,7 +638,7 @@ mod tests {
     }
 
     /// owned ← parent (fork), owned names `extent` as a dedup/delta source.
-    /// All published to a fresh coord-ro store, owned the Live claimant of
+    /// All published to a fresh read store, owned the Live claimant of
     /// `name`. The CID carries `mode = "volume-ro"`; possession proofs are
     /// minted on demand per target via [`RoCtx::request_for`].
     struct RoCtx {

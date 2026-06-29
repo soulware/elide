@@ -21,7 +21,7 @@ primary_region = "iad"
 [env]
   RUST_LOG = "info"
 
-# Durable state — the coord-ro credential and the identity keypair under
+# Durable state — the attest-ro credential and the identity keypair under
 # credentials/ and keys — lives here so it survives redeploys (matches
 # data_dir in coord.toml). No AWS_* secrets: coord B gets its S3 credentials
 # from mint via assume-role.

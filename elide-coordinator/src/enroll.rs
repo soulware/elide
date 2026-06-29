@@ -41,8 +41,9 @@ use elide_coordinator::config::MintConfig;
 use elide_coordinator::identity::CoordinatorIdentity;
 
 use crate::mint_client::{
-    INTERMEDIATE_FILE, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO, ROLE_VOLUME_RW, WireMacaroon,
-    json_str_field, now_unix, pop_digest, post, write_credential_file,
+    INTERMEDIATE_FILE, ROLE_ATTEST_RO, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO,
+    ROLE_VOLUME_RW, WireMacaroon, json_str_field, now_unix, pop_digest, post,
+    write_credential_file,
 };
 
 const CAVEAT_SUB: &str = "sub";
@@ -115,11 +116,11 @@ const COORDINATOR_ROLES: &[EnrollRole] = &[
     },
 ];
 
-/// A read-only attestation authority (coord B) holds only `coord-ro`
-/// (`docs/design/mint-volume-attestation.md` § *Attestation-profile
-/// enrollment*).
+/// A read-only attestation authority (coord B) holds only `attest-ro`, the
+/// discharge predicate's exact read set (`docs/design/mint-volume-attestation.md`
+/// § *Attestation-profile enrollment*).
 const ATTESTATION_ROLES: &[EnrollRole] = &[EnrollRole {
-    name: ROLE_COORD_RO,
+    name: ROLE_ATTEST_RO,
     intermediate: false,
 }];
 
@@ -613,19 +614,19 @@ mod tests {
             names(EnrollProfile::Coordinator),
             vec![ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RW, ROLE_VOLUME_RO]
         );
-        assert_eq!(names(EnrollProfile::Attestation), vec![ROLE_COORD_RO]);
+        assert_eq!(names(EnrollProfile::Attestation), vec![ROLE_ATTEST_RO]);
         assert_eq!(EnrollProfile::Coordinator.as_str(), "coordinator");
         assert_eq!(EnrollProfile::Attestation.as_str(), "attestation");
     }
 
     #[test]
-    fn attestation_assert_enrolled_wants_only_coord_ro() {
+    fn attestation_assert_enrolled_wants_only_attest_ro() {
         let dir = tempfile::tempdir().expect("tempdir");
         let msg = assert_enrolled(dir.path(), EnrollProfile::Attestation)
             .expect_err("none present")
             .to_string();
-        assert!(msg.contains(ROLE_COORD_RO), "should name coord-ro: {msg}");
-        for absent in [ROLE_COORD_RW, ROLE_VOLUME_RW, ROLE_VOLUME_RO] {
+        assert!(msg.contains(ROLE_ATTEST_RO), "should name attest-ro: {msg}");
+        for absent in [ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RW, ROLE_VOLUME_RO] {
             assert!(
                 !msg.contains(absent),
                 "attestation enrollment must not require {absent}: {msg}"
@@ -677,5 +678,23 @@ mod tests {
             fanned(COORDINATOR_ROLES),
             "coordinator profile vs COORDINATOR_ROLES"
         );
+
+        // Every role a profile grants must be a defined `[[role]]` (mint
+        // rejects the config otherwise); guard it before mint ever sees it.
+        let defined: Vec<&str> = catalog
+            .get("role")
+            .and_then(toml::Value::as_array)
+            .expect("[[role]] present")
+            .iter()
+            .filter_map(|r| r.get("name").and_then(toml::Value::as_str))
+            .collect();
+        for profile in ["coordinator", "attestation"] {
+            for role in granted(profile) {
+                assert!(
+                    defined.contains(&role),
+                    "profile {profile} grants {role}, absent from [[role]]"
+                );
+            }
+        }
     }
 }
