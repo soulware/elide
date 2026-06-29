@@ -1,5 +1,5 @@
 //! Coordinator-side mint enrollment
-//! (`docs/coordinator-mint-enrollment-plan-v2.md`).
+//! (`docs/plans/coordinator-mint-enrollment-plan-v2.md`).
 //!
 //! One blocking operator command: `POST /v1/enroll` (A), wait while the
 //! operator approves out of band (B), then exchange the ticket once per
@@ -171,7 +171,7 @@ const DISCHARGE_EXP_SECONDS: u64 = 300;
 /// at config time, so [`run`]'s call site is identical regardless: the
 /// shared-key demo self-issues ([`SelfMint`]); a standalone auth service
 /// will fetch (a future `Fetch { url, session }` impl POSTing `(cid,
-/// session)` to it). See `docs/design-auth-service.md` § *Proposed:
+/// session)` to it). See `docs/design/auth-service.md` § *Proposed:
 /// distributed demo — shared K_M-A*.
 pub(crate) trait DischargeSource {
     /// The operator discharges for every third-party caveat on `anchor`, at

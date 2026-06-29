@@ -546,12 +546,12 @@ async fn release_breadcrumb_only(
 
 /// The handoff snapshot to reuse for a breadcrumb / never-started
 /// release, read off the already-fetched `names/<name>` record — no
-/// snapshot LIST, no event walk (`docs/list-elimination-plan.md`
+/// snapshot LIST, no event walk (`docs/plans/list-elimination-plan.md`
 /// § *Identity axes*).
 ///
 /// Only `record.handoff_snapshot` is honoured. Per the field's
 /// invariant (`NameRecord::handoff_snapshot`,
-/// `docs/design-portable-live-volume.md`), the snap it names lives
+/// `docs/design/portable-live-volume.md`), the snap it names lives
 /// under **`record.vol_ulid`** — set either by the original owner's
 /// `mark_released` or retained across in-place reclaim (same
 /// `vol_ulid`), so the bare ULID composes correctly with the
@@ -1316,7 +1316,7 @@ async fn cleanup_stop_snapshots(
     // sealed locally at its last stop. Enumerate the local snapshots
     // dir for them, then delete each bucket object by its
     // deterministic `stop_snapshot_manifest_key` — no snapshot LIST
-    // (`docs/list-elimination-plan.md` § *Identity axes*). A `-stop`
+    // (`docs/plans/list-elimination-plan.md` § *Identity axes*). A `-stop`
     // with no local trace (only reachable via the old prefix LIST) is
     // not swept here: it is best-effort residue the next `stop`
     // overwrites and the GC floor tolerates, never a correctness

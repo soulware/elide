@@ -1,6 +1,6 @@
 // Per-volume HEAD: the post-snapshot delta over the latest signed manifest.
 //
-// See `docs/design-segment-index.md` for the surrounding design. This module
+// See `docs/design/segment-index.md` for the surrounding design. This module
 // defines the on-disk record and parsing primitives plus the live-set
 // computation; the single-writer tick-loop integration lives in
 // `crate::gc_cycle`, and the read-side consumers (prefetch, fork, recovery)
@@ -277,7 +277,7 @@ where
 ///
 /// `live = manifest ∪ added − superseded.inputs − tombstoned`
 ///
-/// Matches `docs/design-segment-index.md` *Read path*. The manifest
+/// Matches `docs/design/segment-index.md` *Read path*. The manifest
 /// `segment_ulids` is authoritative for the snapshot/HEAD boundary;
 /// HEAD is a pure delta. `Superseded` is applied over the manifest set
 /// too, not just over `added` — a pre-snapshot input GC superseded

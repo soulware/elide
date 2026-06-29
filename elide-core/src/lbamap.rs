@@ -63,7 +63,7 @@ struct MapEntry {
     /// the body lives in some earlier `u_owner`. Used by `insert_if_newer`
     /// to let structural-commit outputs (GC / redact / repack) merge into
     /// the live lbamap without clobbering concurrent live writes whose
-    /// ULID is higher. See `docs/design-lbamap-claimant-tracking.md`.
+    /// ULID is higher. See `docs/design/lbamap-claimant-tracking.md`.
     claimant_ulid: Ulid,
 }
 
@@ -187,7 +187,7 @@ impl LbaMap {
     /// structural-commit apply paths (GC / redact / repack) to merge their
     /// output into the live lbamap without clobbering concurrent live
     /// writes whose ULID is higher than the structural op's `new_ulid`. See
-    /// `docs/design-lbamap-claimant-tracking.md` and
+    /// `docs/design/lbamap-claimant-tracking.md` and
     /// `gc_output_loses_to_live_write_applied_after_gc`.
     pub fn insert_if_newer(
         &mut self,
@@ -561,7 +561,7 @@ impl LbaMap {
     /// Used by the no-op write skip in `Volume::write`: a match means the
     /// LBA map already records our exact content at the exact range, so
     /// the write can return immediately without touching the WAL, segment
-    /// tree, or extent index. See `docs/design-noop-write-skip.md`.
+    /// tree, or extent index. See `docs/design/noop-write-skip.md`.
     ///
     /// BLAKE3 length folding means a hash match would already imply a
     /// length match *for whole payloads*, but an LBA map entry may be a

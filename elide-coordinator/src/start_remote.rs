@@ -49,7 +49,7 @@ pub(crate) async fn hydrate_remote_owned(
     // reads `by_id/<leaf>/*` and rides `volume-ro`.
     pull_skeleton_chain(vol_ulid, &core.data_dir, &by_id_dir, &core.stores).await?;
 
-    // Possession proof (`design-mint-volume-attestation.md` § *`start`
+    // Possession proof (`docs/design/mint-volume-attestation.md` § *`start`
     // anchors on the key shadow*): the shadow is the surviving copy of
     // the leaf's signing key, checked against the leaf's published
     // `volume.pub` before any `by_id` basis read. No shadow ⇒ no
@@ -180,7 +180,7 @@ async fn pull_skeleton_chain(
 
 /// GET the per-vol latest stable (`User`) snapshot pointer. Replaces
 /// the former `by_id/<vol>/snapshots/` LIST
-/// (`docs/list-elimination-plan.md` § *Identity axes*). The stop /
+/// (`docs/plans/list-elimination-plan.md` § *Identity axes*). The stop /
 /// handoff basis is a name-axis fact resolved from the event spine,
 /// not this pointer.
 async fn latest_snapshot_in_store(

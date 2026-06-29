@@ -206,7 +206,7 @@ pub struct DrainResult {
     pub promote_failed: usize,
     /// ULIDs of segments confirmed uploaded *and* promoted this tick.
     /// Fed into the per-volume HEAD's `Added` set by the orchestrator
-    /// (`docs/design-segment-index.md`). Excludes upload-failed and
+    /// (`docs/design/segment-index.md`). Excludes upload-failed and
     /// promote-failed segments — those still sit in `pending/` and are
     /// retried next tick, so they are not yet durable from a reader's
     /// perspective. The count of "uploaded this tick" is
@@ -418,7 +418,7 @@ async fn upload_volume_metadata(
 /// Identity establishment rides `coord-rw`, never `volume-rw`: a
 /// volume cannot attest its own first write, because the `volume-rw`
 /// possession check reads this very object
-/// (`design-mint-volume-attestation.md` § *New-volume bootstrap*).
+/// (`docs/design/mint-volume-attestation.md` § *New-volume bootstrap*).
 ///
 /// Used at create / fork time to establish the invariant
 /// "`names/<name>` only ever points at a `vol_ulid` whose `volume.pub` is
@@ -600,7 +600,7 @@ pub async fn upload_snapshot_metadata(
                     // starts empty. Single writer (the seal is the same
                     // tick loop / inbound handler that authors HEAD), so
                     // a plain unconditional PUT — same pattern as
-                    // `snapshots/LATEST`. See `docs/design-segment-index.md`
+                    // `snapshots/LATEST`. See `docs/design/segment-index.md`
                     // *Truncation*.
                     let empty = crate::segment_head::SegmentHead::empty(Some(snap_ulid));
                     if let Err(e) = vd.head().put(&empty).await {

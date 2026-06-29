@@ -9,7 +9,7 @@
 // `[mint]` is configured; it slots in behind this same trait.
 //
 // Coordinator identity (signing key + macaroon MAC root) lives in
-// `crate::identity` — see `docs/design-portable-live-volume.md`
+// `crate::identity` — see `docs/design/portable-live-volume.md`
 // § "Coordinator identity".
 
 use std::io;
@@ -64,7 +64,7 @@ pub trait CredentialIssuer: Send + Sync {
 /// The requester is carried as the read's `owned` anchor: the live,
 /// locally-keyed volume whose key signs the `volume-ro` possession
 /// proof when credential acquisition requires a discharge
-/// (`design-mint-volume-attestation.md` § *Threading the `owned`
+/// (`docs/design/mint-volume-attestation.md` § *Threading the `owned`
 /// anchor*).
 ///
 /// Parallel to [`Verified`] and composes with it — a `Verified`
@@ -122,7 +122,7 @@ pub fn authorize_target(
 /// per-volume credential material. The implementation is
 /// `crate::mint_client::MintCredentialer`, which exercises the
 /// external mint service's `assume-role` over the configured endpoint
-/// (`docs/design-mint.md` § "Coordinator configuration").
+/// (`docs/design/mint.md` § "Coordinator configuration").
 ///
 /// The trait carries the per-volume RO key lifecycle; the coordinator's
 /// own coord-* roles are handled separately via `crate::mint_stores`.

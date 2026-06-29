@@ -727,7 +727,7 @@ proptest! {
                     // low ULID would be used later for an output whose
                     // content is post-`CoordGcLocal`, breaking the
                     // rebuild-ordering invariant in
-                    // docs/design-gc-ulid-ordering.md.
+                    // docs/design/gc-ulid-ordering.md.
                     pending_gc = None;
                     // Match production sequencing: `tasks.rs` runs drain →
                     // GC sequentially within each tick. Without an explicit

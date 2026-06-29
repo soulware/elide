@@ -1,6 +1,6 @@
 // Per-volume HEAD rebuild invariant.
 //
-// `docs/design-segment-index.md` *Rebuild defines correctness*: the
+// `docs/design/segment-index.md` *Rebuild defines correctness*: the
 // rebuild is the specification, and HEAD is a *safe subset* of it.
 // The one-directional invariant the proptest enforces:
 //
@@ -173,7 +173,7 @@ async fn run_gc(world: &mut World, head: &mut SegmentHead, input_count: u8) -> b
     }
     let inputs: Vec<Ulid> = candidates.into_iter().take(take).collect();
     let max = *inputs.iter().max().expect("non-empty");
-    // `max(inputs).increment()` per `design-gc-ulid-ordering.md`. The
+    // `max(inputs).increment()` per `docs/design/gc-ulid-ordering.md`. The
     // millisecond clock can hand back ULIDs in the same ms as `max`
     // when we're generating fast, so an explicit increment keeps
     // outputs strictly > inputs.
@@ -312,7 +312,7 @@ async fn rebuild_head(world: &World) -> SegmentHead {
     // surviving GC output's signed `inputs` header — cancels it out
     // of the live set. Filtering by ULID order is *not* sound: a GC
     // output's ULID is history-derived (`max(inputs).increment()`,
-    // `design-gc-ulid-ordering.md`) and can sort below a later-minted
+    // `docs/design/gc-ulid-ordering.md`) and can sort below a later-minted
     // seal ULID even when it's a legitimate post-seal output.
     let manifest_segments = read_manifest_segments(world).await;
     let added: BTreeSet<Ulid> = s3_segments
@@ -363,7 +363,7 @@ async fn assert_equivalence(world: &World) -> Result<(), TestCaseError> {
     let live_actual = segment_head::live_set(&manifest, &actual);
     let live_rebuilt = segment_head::live_set(&manifest, &rebuilt);
 
-    // The invariant from `docs/design-segment-index.md` *Rebuild
+    // The invariant from `docs/design/segment-index.md` *Rebuild
     // defines correctness* is **one-directional**:
     // `live(actual) ⊆ live(rebuilt)`. The rebuild is a safe superset
     // — HEAD never claims a segment is live that the rebuild can't
@@ -436,7 +436,7 @@ proptest! {
 
     /// After every op in a clean Drain/Gc/Reap/Seal sequence,
     /// live(actual HEAD) ≡ live(rebuild-from-LIST). This is the
-    /// invariant `docs/design-segment-index.md` *Rebuild defines
+    /// invariant `docs/design/segment-index.md` *Rebuild defines
     /// correctness* states.
     #[test]
     fn prop_rebuild_equivalence(ops in arb_ops()) {

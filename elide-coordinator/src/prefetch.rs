@@ -264,7 +264,7 @@ pub async fn prefetch_indexes(
     // task gets its own `PrefetchResult`; merge after. Each reads only
     // its own fork's `by_id/<vol>/*` prefix, so it takes a single-prefix
     // `volume-ro` credential of its own rather than one credential
-    // spanning the whole ancestor chain (`docs/design-mint.md`
+    // spanning the whole ancestor chain (`docs/design/mint.md`
     // § `volume-ro`).
     let peer_owned: Option<PeerFetchContext> = peer.cloned();
     let outcomes: Vec<PrefetchResult> = futures::stream::iter(tasks.into_iter().map(|task| {
@@ -723,7 +723,7 @@ async fn prefetch_snapshots(
     // pointer — and fetch just that. No LIST. Older stable snapshots
     // are not a writable head's basis (ancestors resolve via signed
     // provenance) and stop-snapshots never flow into prefetch, per
-    // `docs/list-elimination-plan.md` § *Identity axes*.
+    // `docs/plans/list-elimination-plan.md` § *Identity axes*.
     let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     let snapshots = vd.snapshots();
     let basis = match branch_ulid {

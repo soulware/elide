@@ -2,7 +2,7 @@
 //! separate mode from peer fetch with its own listener, so it carries its
 //! own (tiny) serve helpers rather than sharing peer-fetch's. A UDS keeps
 //! the discharge endpoint off the network, reachable only by a co-located
-//! coord A (`docs/design-mint-volume-attestation.md` § *Proposed:
+//! coord A (`docs/design/mint-volume-attestation.md` § *Proposed:
 //! per-endpoint transport*).
 
 use std::io;

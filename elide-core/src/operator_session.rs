@@ -1,7 +1,7 @@
 //! The per-user operator-identity store at `~/.config/elide`, written by
 //! `elide login` and read by `elide coord enroll`.
 //!
-//! In the shared-key demo (`docs/design-auth-service.md` § *Proposed:
+//! In the shared-key demo (`docs/design/auth-service.md` § *Proposed:
 //! distributed demo — shared K_M-A*) the only artifact is the operator
 //! `subject` that enrollment stamps into the `sub` caveat of the discharges
 //! it self-issues; the shared `K_M-A` itself comes from `coordinator.toml

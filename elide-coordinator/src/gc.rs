@@ -3,7 +3,7 @@
 // Per-tick first-fit-decreasing bin-pack across cache-resident eligible
 // segments, emitting up to `max_buckets_per_tick` output plans (each ≤
 // SWEEP_LIVE_CAP = 32 MiB live bytes / SWEEP_ENTRY_CAP = 8192 entries).
-// See `docs/design-gc-bucket-unification.md`.
+// See `docs/design/gc-bucket-unification.md`.
 //
 //   Eligibility:
 //     * dead input — live_lba_bytes == 0, includable at zero rewrite cost
@@ -36,7 +36,7 @@
 // the apply side.
 //
 // Handoff protocol (plan-based, crash-safe, filesystem-only coordination —
-// see docs/design-gc-plan-handoff.md for the full design):
+// see docs/design/gc-plan-handoff.md for the full design):
 //
 //   1. Coordinator writes a plaintext plan to gc/<new-ulid>.plan via
 //      tmp+rename. The plan lists the transformation for each input's
@@ -147,7 +147,7 @@ pub struct GcStats {
     pub dead_cleaned: usize,
     /// Number of segments held back because they have at least one
     /// partially-LBA-dead body-bearing entry. See
-    /// `docs/design-gc-overlap-correctness.md`.
+    /// `docs/design/gc-overlap-correctness.md`.
     pub deferred: usize,
     /// Number of plans emitted this tick (number of `gc/<ulid>.plan`
     /// files written). Zero on `None` outcomes.
@@ -375,7 +375,7 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
     // and retry next tick, when later writes may re-establish a source.
     // Data/Inline/DedupRef partial death, and Delta with at least one
     // resolvable source, are all handled in-band via `expand_partial_death`.
-    // See `docs/design-gc-partial-death-compaction.md`.
+    // See `docs/design/gc-partial-death-compaction.md`.
     let (deferred, eligible_stats): (Vec<SegmentStats>, Vec<SegmentStats>) =
         all_stats.into_iter().partition(|s| s.has_partial_death);
     let deferred_count = deferred.len();
@@ -570,7 +570,7 @@ fn select_buckets(
 /// Returns one [`HandoffOutcome`] per handoff completed end-to-end this
 /// tick — the orchestrator feeds these into the per-volume HEAD's
 /// `Added` (the output ULID) and `Superseded` (input → output edges)
-/// per `docs/design-segment-index.md`. The folded reap step in the
+/// per `docs/design/segment-index.md`. The folded reap step in the
 /// same tick loop later DELETEs the consumed inputs once
 /// `since + retention_window` elapses. Handoffs that deferred (volume
 /// not running) are absent from the returned vec and retried next tick.
@@ -619,7 +619,7 @@ pub async fn apply_done_handoffs(
 /// segment was uploaded to S3 and promoted on the volume, and the
 /// `inputs` listed are now dead. Fed into the per-volume HEAD's `Added`
 /// (the output) and `Superseded` (one edge per input) by the
-/// orchestrator — see `docs/design-segment-index.md`.
+/// orchestrator — see `docs/design/segment-index.md`.
 pub struct HandoffOutcome {
     pub output: Ulid,
     pub inputs: Vec<Ulid>,
@@ -817,7 +817,7 @@ struct SegmentStats {
     /// partial LBA death, the list of live sub-runs (filtered to `r.hash ==
     /// entry.hash`). The coordinator encodes these as `PlanOutput::Partial`
     /// runs; the volume materialises by slicing the composite body. `None`
-    /// for non-partial entries. See `docs/design-gc-partial-death-compaction.md`.
+    /// for non-partial entries. See `docs/design/gc-partial-death-compaction.md`.
     partial_death_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>>,
     /// True if at least one partial-LBA-death entry in this segment cannot
     /// be expanded this pass. In the current implementation this is only
@@ -1182,7 +1182,7 @@ fn collect_stats(
 /// file describing the desired output. The volume picks up the plan on its
 /// next idle tick, resolves bodies through its own ancestor-aware BlockReader,
 /// assembles and signs the output segment, and renames tmp → bare. See
-/// `docs/design-gc-plan-handoff.md`.
+/// `docs/design/gc-plan-handoff.md`.
 ///
 fn compact_segments(
     candidates: Vec<SegmentStats>,

@@ -1,6 +1,6 @@
 //! coord B — mint's volume-attestation discharge authority.
 //!
-//! A standalone crate (`docs/design-mint-volume-attestation.md`): the
+//! A standalone crate (`docs/design/mint-volume-attestation.md`): the
 //! coordinator runs it as a `POST /v1/discharge` listener, separate from
 //! peer fetch. It recovers `r` from an attested TPC's CID, verifies a
 //! possession proof of the volume's signing key over public signed state
@@ -44,13 +44,13 @@ const DEFAULT_SKEW_SECS: u64 = 30;
 /// `volume-rw` discharge lifetime, seconds. RW ownership is revocable
 /// (forced claim/handoff), so the discharge is the liveness-staleness
 /// bound and is kept short — roughly the Tigris keypair lifetime
-/// (`docs/design-mint-volume-attestation.md` § *One liveness check*).
+/// (`docs/design/mint-volume-attestation.md` § *One liveness check*).
 const VOLUME_RW_DISCHARGE_TTL_SECS: u64 = 300;
 /// `volume-ro` discharge lifetime, seconds. Ancestors are frozen and the
 /// binding of an ancestor episode never changes, so this discharge cannot
 /// go stale the way `volume-rw` can — coord B drops off the path after
 /// first-touch. The lifetime is bounded only by the primary's own `exp`
-/// (`docs/design-mint-volume-attestation.md` § *One liveness check*).
+/// (`docs/design/mint-volume-attestation.md` § *One liveness check*).
 const VOLUME_RO_DISCHARGE_TTL_SECS: u64 = 3600;
 
 /// The opaque `mode` mint sealed into the attested TPC's CID for the
@@ -169,7 +169,7 @@ impl DischargeState {
 
     /// Run the discharge predicate and mint the discharge.
     ///
-    /// Order follows `docs/design-mint-volume-attestation.md` § *coord B
+    /// Order follows `docs/design/mint-volume-attestation.md` § *coord B
     /// verification*: recover the CID, check freshness + anti-replay, verify
     /// possession against `meta/<owned>.pub`, confirm liveness via
     /// `names/<name>`, enforce the mode, then mint.
@@ -322,7 +322,7 @@ impl DischargeState {
 
 /// Build the [`axum::Router`] for the discharge route (`POST
 /// /v1/discharge`), served on its own listener — independent of the
-/// peer-fetch segment routes (`docs/design-mint-volume-attestation.md`
+/// peer-fetch segment routes (`docs/design/mint-volume-attestation.md`
 /// § *Proposed: per-endpoint transport*).
 pub fn discharge_router(state: DischargeState) -> axum::Router {
     axum::Router::new()

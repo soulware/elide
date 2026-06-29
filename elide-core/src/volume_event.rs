@@ -1,6 +1,6 @@
 //! `events/<name>/<event_ulid>` append-only journal entry.
 //!
-//! See `docs/design-volume-event-log.md`. Each event records one
+//! See `docs/design/volume-event-log.md`. Each event records one
 //! lifecycle transition of a named volume. The pointer at
 //! `names/<name>` (`name_record.rs`) is canonical for "now"; this
 //! type is canonical for "ever" — the durable, signed history of
@@ -114,7 +114,7 @@ pub enum EventKind {
     },
     /// This name was created as a fork of another name's snapshot.
     /// Emitted on the *new* name's log only; the source name's log
-    /// is not updated (see `design-volume-event-log.md` open question
+    /// is not updated (see `docs/design/volume-event-log.md` open question
     /// 1).
     ForkedFrom {
         source_name: String,

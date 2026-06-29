@@ -198,7 +198,7 @@ that never made it into either*.
 
 ## Cross-references
 
-- `docs/design-pending-compaction-unification.md` — PR #297 design
+- `docs/design/pending-compaction-unification.md` — PR #297 design
 - `docs/finding-sweep-flush-claimant-bug.md` — the predecessor
   consumed-inputs override that fixed an earlier symptom in this same
   area

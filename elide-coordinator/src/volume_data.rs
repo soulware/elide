@@ -1,14 +1,14 @@
 //! Domain-typed handle over a single volume's `by_id/<vol>/…` objects.
 //!
 //! Third slice of the domain-typed store layer
-//! (`docs/design-domain-store.md`). [`VolumeData`] is the per-volume
+//! (`docs/design/domain-store.md`). [`VolumeData`] is the per-volume
 //! handle; it carves the volume's `volume-rw` prefix into
 //! object-class sub-accessors that callers name explicitly. The
 //! currently-populated sub-accessors are:
 //!
 //! * [`HeadView`] — the per-volume HEAD object
 //!   (`by_id/<vol>/HEAD`, the post-snapshot delta from
-//!   `docs/design-segment-index.md`). Single-writer, no CAS.
+//!   `docs/design/segment-index.md`). Single-writer, no CAS.
 //! * [`MetadataView`] — the immutable trust artefacts
 //!   `meta/<vol>.pub` and `meta/<vol>.provenance`.
 //! * [`SnapshotsView`] — signed snapshot manifests under
@@ -127,7 +127,7 @@ impl HeadView<'_> {
 
     /// PUT `by_id/<vol>/HEAD` with the rendered body. Whole-object
     /// overwrite, no CAS — the per-volume tick loop is the sole
-    /// writer (`docs/design-segment-index.md`).
+    /// writer (`docs/design/segment-index.md`).
     pub async fn put(&self, head: &SegmentHead) -> Result<(), HeadError> {
         let key = segment_head::head_key(self.vol_ulid);
         let body = segment_head::render(head);
@@ -579,7 +579,7 @@ impl SegmentsView<'_> {
 
     /// DELETE the segment object. Used by the per-volume retention
     /// reaper after the `Superseded` edge has aged past retention
-    /// (`docs/design-segment-index.md`).
+    /// (`docs/design/segment-index.md`).
     pub async fn delete(&self, seg_ulid: Ulid) -> Result<(), SegmentsError> {
         let key = self.segment_key(seg_ulid);
         self.store.delete(&key).await.map_err(SegmentsError::Delete)

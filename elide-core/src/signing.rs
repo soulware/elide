@@ -281,7 +281,7 @@ pub struct ProvenanceLineage {
 /// it and the coordinator signs `volume-rw` possession proofs from it.
 /// The completion flip to `Readonly` destroys it — a `Readonly` record
 /// implies the key is gone, so the published base is cryptographically
-/// immutable (`design-mint-volume-attestation.md` § *Import runs under
+/// immutable (`docs/design/mint-volume-attestation.md` § *Import runs under
 /// an `Importing` record*).
 pub fn setup_import_identity(
     dir: &Path,
@@ -372,7 +372,7 @@ pub fn verify_lineage_with_key(
 }
 
 /// Domain-separation prefix for the volume-possession proof
-/// (`docs/design-mint-volume-attestation.md` § *Possession-proof
+/// (`docs/design/mint-volume-attestation.md` § *Possession-proof
 /// binding*). A coordinator proves it holds a live volume's `volume.key`
 /// — without revealing it — by signing this payload; the attestation
 /// coordinator (coord B) verifies it against the volume's public

@@ -99,7 +99,7 @@ pub struct CoordinatorConfig {
     /// shared-key downgrade (every volume gets the coordinator's own
     /// key). Presence routes per-volume RO issuance through mint's
     /// `assume-role` over the configured endpoint
-    /// (`docs/design-mint.md` § "Coordinator configuration").
+    /// (`docs/design/mint.md` § "Coordinator configuration").
     #[serde(default)]
     pub mint: Option<MintConfig>,
 
@@ -115,7 +115,7 @@ pub struct CoordinatorConfig {
     /// has no discharge source and fails with a pointer to configure one.
     /// `[auth.demo]` selects the shared-key demo where the coordinator
     /// holds the same `K_M-A` as mint and self-issues operator discharges
-    /// locally (`docs/design-auth-service.md` § *Proposed: distributed
+    /// locally (`docs/design/auth-service.md` § *Proposed: distributed
     /// demo — shared K_M-A*).
     #[serde(default)]
     pub auth: Option<AuthSection>,
@@ -150,7 +150,7 @@ impl CoordinatorConfig {
 /// `[auth]` — the operator-auth source for enrollment.
 #[derive(Deserialize)]
 pub struct AuthSection {
-    /// `[auth.demo]` — the shared-key demo (`docs/design-auth-service.md`
+    /// `[auth.demo]` — the shared-key demo (`docs/design/auth-service.md`
     /// § *Proposed: distributed demo — shared K_M-A*).
     #[serde(default)]
     pub demo: Option<RawDemoAuth>,
@@ -611,7 +611,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 
 # [mint] — opt-in; uncomment the header and `url` to enable. Routes
 # per-volume RO credential issuance through the external `mint`
-# service's `assume-role` (docs/design-mint.md § "Coordinator
+# service's `assume-role` (docs/design/mint.md § "Coordinator
 # configuration"). Absence keeps the shared-key downgrade where every
 # volume gets the coordinator's own AWS_* key. The coordinator's
 # mint identity is its existing `coordinator.key`; the per-role
@@ -629,7 +629,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # [auth] — operator-auth source for `elide coord enroll`. `[auth.demo]`
 # selects the shared-key demo: the coordinator holds the same K_M-A as the
 # mint it enrolls against and self-issues the operator discharges locally,
-# with no cross-host auth call (docs/design-auth-service.md § "Proposed:
+# with no cross-host auth call (docs/design/auth-service.md § "Proposed:
 # distributed demo — shared K_M-A"). `k_m_a` is standard base64 of 32 bytes
 # — the identical value set in mint's own [auth.demo].k_m_a.
 #
@@ -684,7 +684,7 @@ impl Default for CoordinatorConfig {
     }
 }
 
-/// External `mint` credential service (`docs/design-mint.md`). The
+/// External `mint` credential service (`docs/design/mint.md`). The
 /// coordinator holds a per-role capability macaroon under
 /// `<data_dir>/credentials/<role>` (provisioned by enrollment, not
 /// config) and exercises it via mint's `assume-role`. Identity is the
@@ -694,7 +694,7 @@ impl Default for CoordinatorConfig {
 #[derive(Deserialize, Clone, Debug)]
 pub struct MintConfig {
     /// mint endpoint, scheme-discriminated exactly as mint's reference
-    /// client `--url` (`docs/design-mint.md` § "Transport"):
+    /// client `--url` (`docs/design/mint.md` § "Transport"):
     /// `unix:<path>` selects the UDS leg (the bundled single-host
     /// shape), `http://`/`https://` the TCP leg (the network shapes).
     pub url: String,
@@ -713,7 +713,7 @@ pub struct MintConfig {
     /// location is not itself reachable: `unix:<path>` (the co-located,
     /// off-network shape) or `http(s)://host:port`. The discharge route is
     /// read from the third-party caveat's own `location` field on the
-    /// credential being finalized (`docs/design-mint-volume-attestation.md`
+    /// credential being finalized (`docs/design/mint-volume-attestation.md`
     /// § "Deployment and configuration surface"); this supplies only the
     /// connection. Absent → the caveat's location host is dialled directly,
     /// so it must then be a reachable `http(s)` URL.
@@ -743,7 +743,7 @@ pub fn location_path(location: &str) -> Option<&str> {
 }
 
 /// `unix:<path>` or `http(s)://…` — the scheme set every dial target in
-/// this config speaks (`docs/design-mint.md` § "Transport").
+/// this config speaks (`docs/design/mint.md` § "Transport").
 fn valid_dial_scheme(s: &str) -> bool {
     s.starts_with("unix:") || s.starts_with("http://") || s.starts_with("https://")
 }

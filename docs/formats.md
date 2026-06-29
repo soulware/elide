@@ -179,7 +179,7 @@ The same `rename + fsync_dir` pattern applies to all segment-creating renames: W
      - Delta entries (and their delta body section) were written into the
        file by either elide-import (filemap-matched, at import time) or by
        the post-snapshot delta repack pass that the coordinator runs before
-       drain. See [design-delta-compression.md](design-delta-compression.md).
+       drain. See [design/delta-compression.md](design/delta-compression.md).
 7. Upload the file unmodified.
 8. Volume writes index/<ULID>.idx and cache/<ULID>.{body,present}
    (full body, all bits set); deletes pending/<ULID>.
@@ -328,7 +328,7 @@ A Delta entry implicitly carries `FLAG_HAS_DELTAS` and must have **at least one*
 **Unified across `pending/`, `cache/`, and S3**, same as DedupRef: the local `pending/<ULID>` file, the three-file cache format, and the uploaded S3 object all agree that Delta entries carry no body bytes. Delta blobs live in the segment's delta body section, which *is* uploaded to S3 and *is* present in the cache file.
 
 Reads of a Delta-mapped LBA:
-1. Scan the entry's delta options in order (earliest-source preference; see § Read path in `design-delta-compression.md`).
+1. Scan the entry's delta options in order (earliest-source preference; see § Read path in `docs/design/delta-compression.md`).
 2. For each option, check `extent_index.lookup(source_hash)`. First hit wins.
 3. Fetch the source extent body (local or via demand-fetch).
 4. Fetch the delta blob from the segment's delta body section (or inline).
@@ -422,7 +422,7 @@ Written at import, fork, and create time and uploaded with `volume.pub` so any h
 - `oci_image:` / `oci_digest:` / `oci_arch:` — present together iff this volume is an OCI-imported root. Forks of an imported volume don't inherit them.
 - `sig:` — 64-byte Ed25519 signature over the canonical signing input.
 
-`size` is **not** here — it lives on the `names/<name>` claim record (see [design-volume-size-ownership.md](design-volume-size-ownership.md)). `name` is **not** here either — `names/<name>` is the canonical name→ulid index.
+`size` is **not** here — it lives on the `names/<name>` claim record (see [docs/design/volume-size-ownership.md](design/volume-size-ownership.md)). `name` is **not** here either — `names/<name>` is the canonical name→ulid index.
 
 **Snapshot markers:**
 ```

@@ -38,7 +38,7 @@ pub struct GcCycleOrchestrator {
     store: Arc<dyn ObjectStore>,
     /// `coord-rw` store for the drain's `meta/<vol>.{pub,provenance}`
     /// self-heal uploads — identity writes are coordinator-plane
-    /// (`design-mint-volume-attestation.md` § *New-volume bootstrap*).
+    /// (`docs/design/mint-volume-attestation.md` § *New-volume bootstrap*).
     meta_store: Arc<dyn ObjectStore>,
     /// Typed handle for the per-volume `by_id/<vol>/…` objects. Used
     /// for HEAD ops; raw `store` is still used for object classes the
@@ -51,7 +51,7 @@ pub struct GcCycleOrchestrator {
     /// Cross-tick: last time the reap step fired. Gated on
     /// `gc_config.reaper_cadence()` (= `max(retention/10, 1s)`,
     /// unchanged from the old standalone reaper); see
-    /// `docs/design-segment-index.md` *Reaper fold*.
+    /// `docs/design/segment-index.md` *Reaper fold*.
     last_reap: Instant,
     /// Per-tick scratch: ULIDs uploaded (drain) or produced (GC output)
     /// that must land in HEAD's `Added` set before this tick reports
@@ -60,7 +60,7 @@ pub struct GcCycleOrchestrator {
     /// Per-tick scratch: GC supersession edges produced this tick —
     /// `(input, output, since)` — that must land in HEAD's `Superseded`
     /// set. `since` is captured at handoff completion time per
-    /// `docs/design-segment-index.md` (the GC output ULID is
+    /// `docs/design/segment-index.md` (the GC output ULID is
     /// history-derived, not wall-clock).
     tick_superseded: Vec<(Ulid, Ulid, DateTime<Utc>)>,
     /// `coord-rw` handle for the `names/<name>.latest_snapshot` bump
@@ -159,7 +159,7 @@ impl GcCycleOrchestrator {
         };
 
         // Fresh scratch every tick — HEAD is read-modify-write per
-        // active tick (`docs/design-segment-index.md` *Writer state*),
+        // active tick (`docs/design/segment-index.md` *Writer state*),
         // never accumulated across ticks in memory.
         self.tick_added.clear();
         self.tick_superseded.clear();
@@ -403,7 +403,7 @@ impl GcCycleOrchestrator {
     /// `head` via `apply_reap`. Returns `true` if any input was
     /// reaped (the caller PUTs HEAD only when mutated).
     ///
-    /// Crash ordering (`docs/design-segment-index.md` *Writers and
+    /// Crash ordering (`docs/design/segment-index.md` *Writers and
     /// crash ordering*): DELETE the object first, *then* PUT HEAD
     /// dropping the `Superseded` edge / adding `Tombstoned`. A crash
     /// between leaves HEAD listing a gone object — readers tolerate
