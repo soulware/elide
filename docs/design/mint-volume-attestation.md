@@ -734,10 +734,10 @@ set, detect cycles — differ by source and live with their consumer:
 
 - the read path's synchronous local-file `walk_ancestors` /
   `walk_extent_ancestors` (`elide-core`);
-- coord B's asynchronous `meta/`-prefix walk (`elide-peer-fetch`), which
-  the peer-fetch fork-only ancestry walk now shares: a `meta`/`by_id`
-  layout switch and an `include_extents` flag select fork-only (peer
-  auth) versus fork ∪ extent (attestation).
+- coord B's asynchronous `meta/`-prefix walk over fork ∪ extent
+  (`elide-attestation::lineage::walk_lineage_set`); peer-fetch keeps its
+  own fork-only `meta`/`by_id` ancestry walk. Both bottom out in the same
+  `elide-core` per-link step.
 
 **vouchable ≡ readable** is pinned by an equivalence test: coord B's
 `walk_lineage_set(owned)` must equal the read path's `lineage_ulids(owned)`
@@ -909,7 +909,7 @@ own requests, so the two surfaces collapse onto one process:
 - the sealed `location` in the caveat stays coord B's identity — never
   dialled, only routed-by-path and matched by mint at verify.
 
-### Proposed: distributed demo — shared `K_M-B`
+### Distributed demo — shared `K_M-B`
 
 The demo tier mirrors the shared-`K_M-A` model (`docs/design/auth-service.md` §
 *Proposed: distributed demo — shared `K_M-A`*). When mint and the
@@ -946,37 +946,51 @@ Demo-tier only: a shared forgeable `K_M-B` is offline discharge-forgery
 capability for every attested credential (§ *Proposed: `K_M-B` stays at
 mint*), which is exactly why production keeps it at mint.
 
-## Proposed: a standalone verifier process
+## A dedicated attestation instance
 
-coord B's embedded form — `elide-coordinator serve` with an
-`[attestation]` section — brings up the whole coordinator (supervisor,
-GC, IPC socket, volume scan) to serve one POST route. The deployment
-shape for a multi-coord installation is a dedicated process:
+Splitting coord B off the volume-serving coordinator gives the discharge
+authority its own deployable, so its custody of `K_M-B` and its
+availability are independent of the data plane. coord B runs in one of
+three shapes, in increasing separation; all are **enrolled attestation
+instances** (§ *Attestation-kind enrollment*) that hold their own
+identity keypair, assume `coord-ro` through ordinary `assume-role` with
+the half-TTL refresh every coordinator uses, serve only
+`POST /v1/discharge`, and drive the same `DischargeState`:
 
-```
-elide-attestation serve \
-  --listen 0.0.0.0:8087 \                      # or unix:<path>
-  --mint-url https://mint.example \
-  --identity-dir /var/lib/elide-attestation \
-  --bucket elide --endpoint https://t3.storage.dev --region auto
-```
+1. **Co-located** — `elide-coordinator serve` with `[attestation]`. One
+   process is both coord A (requester) and coord B (authority), looping
+   its own discharge POST back over a UDS. The single-host bundle; brings
+   up the whole coordinator (supervisor, GC, IPC socket, volume scan)
+   alongside the one POST route.
+2. **Dedicated instance, shared binary** — `elide-coordinator attest`.
+   coord B in its own process and its own app, serving only the discharge
+   route: it enrolls, assumes `coord-ro`, builds the `DischargeState`, and
+   binds the discharge listener — none of the supervisor, GC, IPC, or
+   volume scan. It reuses `coordinator.toml` because it holds `K_M-B` (and
+   `K_M-A` for the enroll gate) locally as the shared literals (§
+   *Distributed demo — shared `K_M-B`*), which live in a key file, not a
+   flag. The multi-coord shape with the demo's local `K_M-B`.
+3. **Dedicated flags-only binary** — `elide-attestation serve`, no config
+   file:
 
-**Flags only — no config file.** The process consumes three things: a
-listen address, a mint endpoint plus enrolled identity (the keypair and
-`credentials/coord-ro` under `--identity-dir`), and the store
-coordinates for its `coord-ro` reads (S3 keypairs arrive via
-`assume-role`, never via flags or env). None of the coordinator config
-applies — no `data_dir` of volumes, no supervisor, no `elide_bin` — so a
-config file would hold five scalars.
+   ```
+   elide-attestation serve \
+     --listen 0.0.0.0:8087 \                      # or unix:<path>
+     --mint-url https://mint.example \
+     --identity-dir /var/lib/elide-attestation \
+     --bucket elide --endpoint https://t3.storage.dev --region auto
+   ```
 
-The process is **an enrolled attestation instance** (§ *Proposed:
-attestation-kind enrollment*): it holds its own identity keypair,
-assumes `coord-ro` through ordinary `assume-role` with the same
-half-TTL refresh every coordinator uses, and serves `POST /v1/discharge`
-— nothing else. The embedded `[attestation]` mode remains for the
-co-located single-host shape; both drive the same `DischargeState`.
+   The flags-only shape is available once `K_M-B` no longer lives on the
+   instance — paired with § *`K_M-B` stays at mint*, where the CID is
+   unwrapped over the wire and the instance holds no local secret. The
+   process then consumes only a listen address, a mint endpoint plus
+   enrolled identity (keypair + `credentials/coord-ro` under
+   `--identity-dir`), and the store coordinates for its `coord-ro` reads
+   (S3 keypairs arrive via `assume-role`, never via flags or env). The HA
+   shape (§ *HA — N instances*).
 
-## Proposed: attestation-kind enrollment
+## Attestation-kind enrollment
 
 Enrollment today grants every approved `sub` the full coordinator role
 set — the `Enrolled` record carries no role constraint, and
@@ -1126,8 +1140,8 @@ compromise is one `revoke`, leaving the rest of the fleet untouched.
   `elide-core` (the signature verify `verify_lineage_with_key` and the
   `extent_index`-entry parser `parse_lineage_pair`); the driver loops
   differ by source — the read path's sync local-file walks, and coord B's
-  async `meta/` walk, which peer-fetch's fork-only ancestry walk shares via
-  a layout switch and an `include_extents` flag. `vouchable ≡ readable` is
+  async `meta/` walk in `elide-attestation`; peer-fetch keeps its own
+  fork-only ancestry walk. `vouchable ≡ readable` is
   pinned by an equivalence test (coord B's `walk_lineage_set(owned)` ==
   `lineage_ulids(owned)` ∪ `{owned}`). The read set is exactly
   `walk_ancestors ∪ walk_extent_ancestors`, complete by construction
@@ -1167,3 +1181,20 @@ compromise is one `revoke`, leaving the rest of the fleet untouched.
     auth authority's vocabulary (a volume discharge carrying `Scope` is
     invalid by vocabulary, just as an auth discharge carrying `volume`
     would be). Each authority emits only its own type's names.
+- **The dedicated instance is `elide-coordinator attest`** (shape 2 of §
+  *A dedicated attestation instance*): a subcommand serving only
+  `POST /v1/discharge`, reusing `coordinator.toml` and the enroll →
+  `assume-role` → `DischargeState` stack, with no data plane. It holds
+  `K_M-B` (and `K_M-A` for the enroll gate) locally as the shared literals
+  (§ *Distributed demo — shared `K_M-B`*). The flags-only
+  `elide-attestation serve` binary (shape 3) is deferred until § *`K_M-B`
+  stays at mint* removes the on-instance secret; it is the HA shape and
+  earns its own crate boundary only then.
+- **coord B obtains `coord-ro` by attestation-kind enrollment** (§
+  *Attestation-kind enrollment*), not a hand-issued key: the `Enrolled`
+  record carries a granted role set the enrollee declares at `/v1/enroll`,
+  the operator ratifies at approval alongside the key fingerprint, and
+  `enroll-exchange` refuses any role outside it. An attestation enrollment
+  grants `{coord-ro}` and nothing else, so the verifier's read-only,
+  `by_id/`-free property is mint-enforced, not voluntary. The mint-side
+  contract is `docs/attestation-readonly-enrollment-spec.md`.
