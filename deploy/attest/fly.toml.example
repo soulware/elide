@@ -1,0 +1,42 @@
+# Elide attestation authority (coord B) on Fly.io — a private app (no public
+# service), reachable over 6PN at <app>.internal:8087. Template: copy to
+# fly.toml (gitignored), fill app/primary_region and the build args, then
+# `./deploy.sh` from this directory. Pairs with coord.toml. See README.md.
+
+app = "elide-attest"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+  [build.args]
+    # ELIDE_VERSION is supplied by deploy.sh (it resolves the release tag); a
+    # bare `fly deploy` fails without it.
+    # DATA_BUCKET: the Tigris data bucket (must equal mint's DATA_BUCKET);
+    # baked into coord.toml [store].bucket.
+    DATA_BUCKET = "elide"
+    # MINT_APP: the mint Fly app this authority enrols against; baked into
+    # coord.toml [mint].url as http://<MINT_APP>.internal:8085.
+    MINT_APP = "mint-for-elide"
+
+[env]
+  RUST_LOG = "info"
+
+# Durable state — the coord-ro credential and the identity keypair under
+# credentials/ and keys — lives here so it survives redeploys (matches
+# data_dir in coord.toml). No AWS_* secrets: coord B gets its S3 credentials
+# from mint via assume-role.
+[mounts]
+  source = "elide_data"
+  destination = "/data"
+
+# Serverless-off: keep one instance up so coord A can always reach the
+# discharge route. The authority is a stateless verifier (S3 reads + an axum
+# POST handler), so it needs little memory and no ublk.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# No [http_service] and no tcp [checks]: the app is private. The discharge
+# route binds 0.0.0.0:8087 ([attestation].listen in coord.toml) and is reached
+# over 6PN at <app>.internal:8087 — coord A points its
+# [mint].attestation_transport there.

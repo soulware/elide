@@ -1023,6 +1023,55 @@ mod tests {
     }
 
     #[test]
+    fn shipped_attestation_config_parses() {
+        // The committed attestation-authority config (deploy/attest/) — nothing
+        // else loads it, so this is its guard. It must parse; carry [mint]
+        // (coord B assumes coord-ro through mint); have an [attestation] whose
+        // K_M-B decodes to 32 bytes and whose listen is a TCP 6PN address; and
+        // self-issue the enroll gate from a 32-byte K_M-A. K_M-B and K_M-A must
+        // be identical to deploy/elide/coord.toml — mint seals what coord B
+        // opens, so a drift between the two would fail every discharge.
+        let load = |rel: &str| -> CoordinatorConfig {
+            let text = std::fs::read_to_string(format!("{}/../{rel}", env!("CARGO_MANIFEST_DIR")))
+                .expect("read coord.toml");
+            toml::from_str(&text).expect("coord.toml must parse as a CoordinatorConfig")
+        };
+        let cfg = load("deploy/attest/coord.toml");
+        cfg.mint.as_ref().expect("[mint] present");
+        let att = cfg.attestation.as_ref().expect("[attestation] present");
+        assert_eq!(att.load_discharge_key().expect("k_m_b decodes").len(), 32);
+        assert!(
+            matches!(
+                att.listen_addr().expect("listen parses"),
+                Some(ListenAddr::Tcp(_))
+            ),
+            "attestation authority must listen on TCP for 6PN reach"
+        );
+        let k_m_a = cfg
+            .demo_k_m_a()
+            .expect("k_m_a decodes")
+            .expect("k_m_a present");
+        assert_eq!(k_m_a.len(), 32);
+
+        let coord = load("deploy/elide/coord.toml");
+        assert_eq!(
+            att.load_discharge_key().unwrap(),
+            coord
+                .attestation
+                .as_ref()
+                .unwrap()
+                .load_discharge_key()
+                .unwrap(),
+            "K_M-B must match deploy/elide/coord.toml"
+        );
+        assert_eq!(
+            k_m_a,
+            coord.demo_k_m_a().unwrap().unwrap(),
+            "K_M-A must match deploy/elide/coord.toml"
+        );
+    }
+
+    #[test]
     fn load_errors_on_missing_file() {
         // A missing config path must fail loudly, not silently fall through to
         // a default config — a default routes serve into the shared-key
