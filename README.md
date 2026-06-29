@@ -63,22 +63,16 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 ## Status updates
 
 Dated waypoints — each file summarises major changes, bug fixes, and
-remaining work relative to the previous status.  Latest first.
+remaining work relative to the previous status.  The five most recent
+are below; the full archive lives in [docs/status/](docs/status/).
 
 | Date | Document |
 |---|---|
-| 2026-06-29 | [docs/status-2026-06-29.md](docs/status-2026-06-29.md) |
-| 2026-06-24 | [docs/status-2026-06-24.md](docs/status-2026-06-24.md) |
-| 2026-06-17 | [docs/status-2026-06-17.md](docs/status-2026-06-17.md) |
-| 2026-06-10 | [docs/status-2026-06-10.md](docs/status-2026-06-10.md) |
-| 2026-06-02 | [docs/status-2026-06-02.md](docs/status-2026-06-02.md) |
-| 2026-05-26 | [docs/status-2026-05-26.md](docs/status-2026-05-26.md) |
-| 2026-05-19 | [docs/status-2026-05-19.md](docs/status-2026-05-19.md) |
-| 2026-05-10 | [docs/status-2026-05-10.md](docs/status-2026-05-10.md) |
-| 2026-04-27 | [docs/status-2026-04-27.md](docs/status-2026-04-27.md) |
-| 2026-04-20 | [docs/status-2026-04-20.md](docs/status-2026-04-20.md) |
-| 2026-04-09 | [docs/status-2026-04-09.md](docs/status-2026-04-09.md) |
-| 2026-03-30 | [docs/status-2026-03-30.md](docs/status-2026-03-30.md) |
+| 2026-06-29 | [docs/status/status-2026-06-29.md](docs/status/status-2026-06-29.md) |
+| 2026-06-24 | [docs/status/status-2026-06-24.md](docs/status/status-2026-06-24.md) |
+| 2026-06-17 | [docs/status/status-2026-06-17.md](docs/status/status-2026-06-17.md) |
+| 2026-06-10 | [docs/status/status-2026-06-10.md](docs/status/status-2026-06-10.md) |
+| 2026-06-02 | [docs/status/status-2026-06-02.md](docs/status/status-2026-06-02.md) |
 
 Start with [docs/overview.md](docs/overview.md).
 
