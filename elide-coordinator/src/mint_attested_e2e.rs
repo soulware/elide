@@ -307,8 +307,11 @@ async fn attested_loop_over_shipped_templates() {
                 &identity,
                 &coord_dir,
                 &invite,
-                Duration::from_secs(60),
-                false,
+                enroll::EnrollOptions {
+                    wait: Duration::from_secs(60),
+                    force: false,
+                    kind: enroll::EnrollKind::Coordinator,
+                },
                 &issuer,
             )
             .await
