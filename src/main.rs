@@ -211,6 +211,10 @@ enum CoordCommand {
         /// the missing ones.
         #[arg(long)]
         force: bool,
+        /// Enrol as a read-only attestation authority (coord B): request
+        /// `coord-ro` only, not the full coordinator role set.
+        #[arg(long)]
+        attestation: bool,
     },
 }
 
@@ -1193,6 +1197,7 @@ fn main() {
                 invite,
                 timeout,
                 force,
+                attestation,
             } => {
                 // Like `run`: exec the sibling and let it own data_dir
                 // resolution from --config; exec returns only on
@@ -1204,6 +1209,7 @@ fn main() {
                     &invite,
                     timeout.as_deref(),
                     force,
+                    attestation,
                 );
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -1265,6 +1271,7 @@ fn coord_enroll(
     invite: &str,
     timeout: Option<&str>,
     force: bool,
+    attestation: bool,
 ) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
@@ -1286,6 +1293,9 @@ fn coord_enroll(
     }
     if force {
         cmd.arg("--force");
+    }
+    if attestation {
+        cmd.arg("--attestation");
     }
     // Positional invite last, so a value like `-` (stdin) is
     // unambiguous after the flags.

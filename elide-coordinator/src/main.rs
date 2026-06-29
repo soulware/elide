@@ -9,6 +9,7 @@
 //     Write a default coordinator.toml (commented template) to the given path.
 
 // Binary-only modules (process supervision, IPC, import jobs).
+mod attest;
 mod claim;
 mod credential;
 mod daemon;
@@ -102,6 +103,26 @@ enum Command {
         /// the missing ones.
         #[arg(long)]
         force: bool,
+        /// Enrol as a read-only attestation authority (coord B): request
+        /// `coord-ro` only, not the full coordinator role set.
+        #[arg(long)]
+        attestation: bool,
+    },
+
+    /// Serve the volume-attestation discharge authority (coord B) only.
+    ///
+    /// A dedicated attestation instance: it assumes `coord-ro`, opens
+    /// attested CIDs under `K_M-B`, and serves `POST /v1/discharge` on the
+    /// `[attestation] listen` address — none of the supervisor, GC, IPC,
+    /// or volume scan that `serve` runs. Requires `[mint]` and
+    /// `[attestation]`; enrol first with `enroll --attestation`. Waits for
+    /// that enrollment to complete, mirroring `serve`.
+    Attest {
+        #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
+        config: PathBuf,
+        /// Override the data_dir from the config file.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 }
 
@@ -175,7 +196,9 @@ async fn run() -> Result<()> {
                 // enroll`, and the daemon already blocks for mint just below
                 // (`wait_for_ready`). `assert_enrolled` is all-or-nothing, so
                 // this proceeds only once every role's credential is present.
-                while let Err(missing) = enroll::assert_enrolled(&config.data_dir) {
+                while let Err(missing) =
+                    enroll::assert_enrolled(&config.data_dir, enroll::EnrollKind::Coordinator)
+                {
                     tracing::info!(
                         "[coordinator] awaiting enrollment: {missing}; run `elide coord enroll`"
                     );
@@ -257,6 +280,7 @@ async fn run() -> Result<()> {
             invite,
             timeout,
             force,
+            attestation,
         } => {
             elide_coordinator::log_init::init_stderr();
             let mut config = config::load(&config)?;
@@ -286,17 +310,38 @@ async fn run() -> Result<()> {
             let subject = elide_core::operator_session::load_subject()
                 .with_context(|| "loading the operator login for the enrollment gates")?;
             let issuer = enroll::SelfMint { k_m_a, subject };
+            let kind = if attestation {
+                enroll::EnrollKind::Attestation
+            } else {
+                enroll::EnrollKind::Coordinator
+            };
             enroll::run(
                 mint_cfg,
                 &identity,
                 &config.data_dir,
                 &invite,
-                timeout,
-                force,
+                enroll::EnrollOptions {
+                    wait: timeout,
+                    force,
+                    kind,
+                },
                 &issuer,
             )
             .await
             .map_err(anyhow::Error::from)
+        }
+        Command::Attest { config, data_dir } => {
+            let mut config = config::load(&config)?;
+            if let Some(dir) = data_dir {
+                config.data_dir = dir;
+            }
+            elide_coordinator::log_init::init_for_coord(&config.data_dir).with_context(|| {
+                format!("initialising tracing in {}", config.data_dir.display())
+            })?;
+            std::fs::create_dir_all(&config.data_dir)
+                .with_context(|| format!("creating data dir: {}", config.data_dir.display()))?;
+            let _coord_lock = pidfile::lock_instance(&config.data_dir)?;
+            attest::run(config).await
         }
     }
 }
