@@ -2,7 +2,7 @@
 (*
   TLA+ model of the actor↔worker offload protocol used for every
   maintenance op after the actor-offload refactor (see
-  docs/actor-offload-plan.md). A single canonical op — "Promote" — is
+  docs/plans/actor-offload-plan.md). A single canonical op — "Promote" — is
   modelled here; sweep, repack, delta_repack, gc_handoff, and
   sign_snapshot_manifest all share the same three-phase shape:
 

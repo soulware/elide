@@ -55,7 +55,7 @@ These rules apply to all Rust code in this project. Follow them without needing 
 
 ## Macaroon design
 
-Macaroons in this project follow the canonical design from Fly.io's ["Macaroons Escalated Quickly"](https://fly.io/blog/macaroons-escalated-quickly/). Two examples in tree: volume macaroons (coord-issued, PID-bound — see `docs/architecture.md`) and the operator-authorisation chain (mint primaries + auth-issued discharges, see `docs/design-auth-service.md`).
+Macaroons in this project follow the canonical design from Fly.io's ["Macaroons Escalated Quickly"](https://fly.io/blog/macaroons-escalated-quickly/). Two examples in tree: volume macaroons (coord-issued, PID-bound — see `docs/architecture.md`) and the operator-authorisation chain (mint primaries + auth-issued discharges, see `docs/design/auth-service.md`).
 
 **Stay aligned with the canonical model.**
 

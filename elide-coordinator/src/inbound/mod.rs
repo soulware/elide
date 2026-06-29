@@ -819,7 +819,7 @@ pub(crate) async fn snapshot_volume_kind(
     // into the manifest itself (the consumed inputs are excluded from
     // the manifest's segment_ulids) and HEAD is truncated to empty
     // post-seal, so the orchestrator doesn't need them — drop on the
-    // floor here. See `docs/design-segment-index.md` *Truncation*.
+    // floor here. See `docs/design/segment-index.md` *Truncation*.
     elide_coordinator::gc::apply_done_handoffs(&fork_dir, vol_ulid, &store)
         .await
         .map_err(|e| IpcError::store(format!("draining gc handoffs: {e:#}")))?;
@@ -1808,7 +1808,7 @@ async fn update_volume_op(
 /// skeleton under `data_dir/by_id/<vol_ulid>/`. Returns the parent ULID
 /// parsed from the (signature-verified) provenance, or `None` if this is a
 /// root volume. Ancestors carry no `volume.toml` and no size: per
-/// `docs/design-volume-size-ownership.md`, size lives only on the live
+/// `docs/design/volume-size-ownership.md`, size lives only on the live
 /// `names/<name>` record.
 ///
 /// `peer` is best-effort: when `Some` and the peer's auth pipeline
@@ -2118,7 +2118,7 @@ async fn issue_credentials(
     // macaroon authenticates the requester; `target` is the single
     // `by_id/<target>/*` prefix it wants to read. The resulting
     // `AuthorizedTarget` is a proof the check passed — `issue` cannot be
-    // reached without one (`docs/design-mint.md` § per-volume read creds).
+    // reached without one (`docs/design/mint.md` § per-volume read creds).
     let authorized = crate::credential::authorize_target(&verified, target, data_dir)?;
 
     let creds = issuer
@@ -3069,7 +3069,7 @@ mod tests {
         // upload, volume.provenance upload, names/<name> claim) and all
         // of them are coordinator-plane (coord-rw): identity
         // establishment cannot ride volume-rw — a volume cannot attest
-        // its own first write (`design-mint-volume-attestation.md`
+        // its own first write (`docs/design/mint-volume-attestation.md`
         // § *New-volume bootstrap*) — and names/events always were
         // coord-rw. No per-volume credential of either direction may
         // be minted at create time.

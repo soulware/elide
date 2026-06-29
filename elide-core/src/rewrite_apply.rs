@@ -7,7 +7,7 @@
 //! declarative description; this module turns it into a concrete
 //! `(Vec<SegmentEntry>, Vec<u8>)` ready for [`crate::segment::write_segment_full`].
 //!
-//! See `docs/design-gc-plan-handoff.md` for the original GC handoff
+//! See `docs/design/gc-plan-handoff.md` for the original GC handoff
 //! design that this module's primitives were factored out of.
 //!
 //! Body resolution is abstracted via [`BodyResolver`] — the production

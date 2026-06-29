@@ -31,8 +31,8 @@
 //! carrying a `payload_block_offset` that the materialiser uses to slice
 //! into the composite body.
 //!
-//! See `docs/design-gc-overlap-correctness.md` and
-//! `docs/design-gc-partial-death-compaction.md`.
+//! See `docs/design/gc-overlap-correctness.md` and
+//! `docs/design/gc-partial-death-compaction.md`.
 
 use std::collections::HashSet;
 use std::sync::Arc;

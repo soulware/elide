@@ -2,7 +2,7 @@
 //!
 //! coord B mints a discharge but lives in the coordinator, which cannot
 //! link `mint` (a standalone workspace —
-//! `docs/design-mint-volume-attestation.md` § *coord B mints the
+//! `docs/design/mint-volume-attestation.md` § *coord B mints the
 //! discharge*). So the two primitives coord B needs are re-expressed here:
 //!
 //! - [`decrypt_cid_attested`] — ChaCha20-Poly1305(`K_M-B`) over an attested
@@ -133,7 +133,7 @@ pub struct CidPlaintext {
 /// `(r, client_id, org_id)`. mint sealed the CID at anchor issuance via
 /// `tpc::encrypt_cid`; in the shared-key demo the coordinator holds the
 /// same `K_M-A` and self-mints the operator discharge keyed by the
-/// recovered `r` (`docs/design-auth-service.md` § *Proposed: distributed
+/// recovered `r` (`docs/design/auth-service.md` § *Proposed: distributed
 /// demo — shared K_M-A*).
 pub fn decrypt_cid(k_m_a: &[u8; 32], cid: &[u8]) -> Result<CidPlaintext, CryptoError> {
     let (nonce, ciphertext) = cid

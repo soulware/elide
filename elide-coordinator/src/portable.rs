@@ -1,7 +1,7 @@
 //! Foundations for portable live volumes.
 //!
-//! See `docs/design-portable-live-volume.md` and
-//! `docs/portable-live-volume-plan.md`. This module hosts Phase 0 work:
+//! See `docs/design/portable-live-volume.md` and
+//! `docs/plans/portable-live-volume-plan.md`. This module hosts Phase 0 work:
 //!
 //! - `coordinator_id()` derivation from `coordinator.root_key`.
 //! - Conditional-PUT helpers (`put_if_absent`, `put_with_match`).
@@ -37,7 +37,7 @@ pub const MIME_TEXT: &str = "text/plain; charset=utf-8";
 ///
 /// Generating a new keypair (deleting `coordinator.key` /
 /// `coordinator.pub`) produces a new identity; this is the documented
-/// escape hatch in `design-portable-live-volume.md`.
+/// escape hatch in `docs/design/portable-live-volume.md`.
 pub fn coordinator_id(coord_pub: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("elide coordinator-id v1", coord_pub)
 }

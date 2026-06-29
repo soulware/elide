@@ -1,6 +1,6 @@
 //! Five-step verify pipeline for incoming peer-fetch requests.
 //!
-//! See `docs/design-peer-segment-fetch.md` § "Peer verification (v1)"
+//! See `docs/design/peer-segment-fetch.md` § "Peer verification (v1)"
 //! for the full design. Each [`AuthError`] variant corresponds to one
 //! failed check and maps to a specific HTTP status code:
 //!
@@ -161,7 +161,7 @@ struct AuthStateInner {
     /// only: the signed `volume.provenance` chain the peer holds for
     /// every fork it serves. Never an S3 handle in production —
     /// lineage is verified with no remote read and no credential
-    /// (docs/design-peer-segment-fetch.md § Peer verification check 4).
+    /// (docs/design/peer-segment-fetch.md § Peer verification check 4).
     lineage_store: Arc<dyn ObjectStore>,
     pub_keys: RwLock<HashMap<String, VerifyingKey>>,
     ancestry_cache: RwLock<HashMap<Ulid, HashSet<Ulid>>>,
@@ -429,7 +429,7 @@ impl AuthState {
         // serving peer's local disk. The gate is "this peer holds a
         // self-consistent signed chain rooted at `url_vol_id`" — the
         // walk fails closed (`OutsideLineage`) for any fork it doesn't
-        // serve. See docs/design-peer-segment-fetch.md.
+        // serve. See docs/design/peer-segment-fetch.md.
         if matches!(mode, RouteAuthMode::LineageGated) {
             let ancestry = self.ancestry(url_vol_id).await?;
             if !ancestry.contains(&url_vol_id) {
@@ -1035,7 +1035,7 @@ mod tests {
     /// local store. Step 4 must anchor at the URL's `vol_id` (the
     /// parent fork the peer actually serves), not the name record —
     /// otherwise every first claim 403s and falls back to S3. See
-    /// docs/design-peer-segment-fetch.md.
+    /// docs/design/peer-segment-fetch.md.
     #[tokio::test]
     async fn lineage_anchored_at_url_vol_id_not_name_record() {
         let (store, auth) = make_state();

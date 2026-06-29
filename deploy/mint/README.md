@@ -35,8 +35,8 @@ Each role's single `ttl_seconds` is the credential lifetime ceiling.
 The volume roles are **attested**: `enroll-exchange` returns a durable
 intermediate the coordinator holds and finalizes **per volume** under a fresh
 attestation-coordinator (coord B) discharge. The operator gate is paid once, at
-enrollment; per-volume finalize is unattended. See `docs/design-mint.md` §
-*Elide as customer* and `docs/design-mint-volume-attestation.md`.
+enrollment; per-volume finalize is unattended. See `docs/design/mint.md` §
+*Elide as customer* and `docs/design/mint-volume-attestation.md`.
 
 ## Data bucket
 
@@ -66,7 +66,7 @@ bucket; the two are configured independently.
 
 Prerequisites: a `mint` binary, an S3/Tigris bucket, an auth service, and an
 attestation coordinator (coord B). For mint's own keyring and `mint serve` /
-`mint seal` mechanics, see `docs/design-mint.md` § *Mint configuration*.
+`mint seal` mechanics, see `docs/design/mint.md` § *Mint configuration*.
 
 1. Copy `mint-elide.toml`; fill the `PER-DEPLOYMENT` keys, then render the
    templates: `mint render --in-dir role-templates --build bucket=<data-bucket>
@@ -86,7 +86,7 @@ operator interaction.
 
 - **Single-host dev** — coordinator + mint co-resident over the UDS `socket`,
   with the demo auth issuer and a co-located coord B. This is the shape the
-  `attested-e2e` job exercises; see `docs/design-mint.md` for `[auth.demo]` and
+  `attested-e2e` job exercises; see `docs/design/mint.md` for `[auth.demo]` and
   the co-located attestation listener.
 - **Production** — mint standalone on a TCP `bind`, with a separate
   auth-service and attestation coordinator at the `PER-DEPLOYMENT` discharge
@@ -142,7 +142,7 @@ reaches the same address after `fly wireguard create`.
 
 A coordinator off Fly (e.g. a local VM) reaches **only the mint plane**
 (`<app>.internal:8085`) to enrol — it self-issues its own operator discharges
-from a `K_M-A` it shares with mint. See `docs/design-auth-service.md` §
+from a `K_M-A` it shares with mint. See `docs/design/auth-service.md` §
 *Proposed: distributed demo — shared K_M-A*.
 
 Share the key: generate one value (`openssl rand -base64 32`) and set it as

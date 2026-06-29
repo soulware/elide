@@ -4,7 +4,7 @@
 //! `names/<name>` and translates the underlying conditional-PUT
 //! mechanics into operator-level errors.
 //!
-//! See `docs/design-portable-live-volume.md`. Phase 2 of the rollout
+//! See `docs/design/portable-live-volume.md`. Phase 2 of the rollout
 //! lands `mark_stopped` here; subsequent phases add `mark_released`
 //! (release verb) and `claim_started_from_released` (the start verb's
 //! claim path).
@@ -360,7 +360,7 @@ pub async fn mark_reclaimed_local(
     // structured pointer to that basis for a fork reclaimed and
     // released again without ever being started, and it is read only
     // in `Released` state, so retaining it on `Live`/`Stopped` is
-    // inert for every other consumer (`docs/list-elimination-plan.md`
+    // inert for every other consumer (`docs/plans/list-elimination-plan.md`
     // § *Identity axes* — replaces the snapshot-prefix LIST).
 
     name_store::update_name_record(store, name, &record, version).await?;
@@ -760,7 +760,7 @@ pub struct ObservedRecord {
 
 /// Forced rebind of `names/<name>` to `new_vol_ulid` over a dead
 /// owner's `Live`/`Stopped` record — the fence point of
-/// `volume claim --force` (`docs/design-force-release-fencing.md`).
+/// `volume claim --force` (`docs/design/force-release-fencing.md`).
 ///
 /// "Force" skips the ownership refusal, **not** the precondition: the
 /// PUT is conditioned (`If-Match`) on `observed_version`, the version

@@ -620,7 +620,7 @@ impl ClaimOrchestrator {
         // shape. `finalize` overwrites this with the effective `ParentRef`
         // once `effective` is resolved.
         //
-        // Claim-first ordering (`design-mint-volume-attestation.md`
+        // Claim-first ordering (`docs/design/mint-volume-attestation.md`
         // § *Setup reads*): everything before `mark_claimed` below is
         // control-plane only. Both provisional trust anchors come from
         // there — the basis (`handoff_snap`) from the Released record,

@@ -3,7 +3,7 @@
 # discharges at `elide coord enroll` from the K_M-A it shares with mint
 # ([auth.demo].k_m_a below, identical to deploy/mint/mint-fly.toml's) — no auth
 # round-trip, no bridge. Demo-tier: a known, forgeable key
-# (docs/design-auth-service.md § "Proposed: distributed demo — shared K_M-A").
+# (docs/design/auth-service.md § "Proposed: distributed demo — shared K_M-A").
 #
 # Set [store].bucket and [mint].url for your deployment.
 

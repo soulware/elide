@@ -1,4 +1,4 @@
-//! Mint-backed [`ScopedStores`] (`docs/design-mint.md` § *Coordinator
+//! Mint-backed [`ScopedStores`] (`docs/design/mint.md` § *Coordinator
 //! store architecture*).
 //!
 //! Each coordinator role (`coord-ro`, `coord-rw`, and one
@@ -42,7 +42,7 @@ use crate::mint_client::{
     VOLUME_RO_TTL_SECS,
 };
 
-/// Documented coord-* TTLs (`docs/design-mint.md` § *Elide as
+/// Documented coord-* TTLs (`docs/design/mint.md` § *Elide as
 /// customer*): coordinator-wide control plane 1h, per-volume data 24h.
 const COORD_CONTROL_TTL_SECS: u64 = 60 * 60;
 const VOLUME_RW_TTL_SECS: u64 = 24 * 60 * 60;
@@ -201,7 +201,7 @@ impl ObjectStore for RoleStore {
 
     fn list(&self, _prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
         // No coordinator credential carries `s3:ListBucket`
-        // (`docs/list-elimination-plan.md` P5). Refuse locally
+        // (`docs/plans/list-elimination-plan.md` P5). Refuse locally
         // rather than forward; a forward would 403 on Tigris with
         // a generic S3 error. The `ObjectStore` trait requires
         // this method on `RoleStore` as long as `MintScopedStores`
@@ -212,7 +212,7 @@ impl ObjectStore for RoleStore {
         Box::pin(futures::stream::once(async {
             Err(object_store::Error::NotSupported {
                 source: "coord-role credentials carry no s3:ListBucket; \
-                         see docs/list-elimination-plan.md"
+                         see docs/plans/list-elimination-plan.md"
                     .into(),
             })
         }))
@@ -221,7 +221,7 @@ impl ObjectStore for RoleStore {
     async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> OsResult<ListResult> {
         Err(object_store::Error::NotSupported {
             source: "coord-role credentials carry no s3:ListBucket; \
-                     see docs/list-elimination-plan.md"
+                     see docs/plans/list-elimination-plan.md"
                 .into(),
         })
     }

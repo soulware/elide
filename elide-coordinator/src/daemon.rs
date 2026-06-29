@@ -165,7 +165,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     }
 
     // Discharge authority (coord B): its own listener — TCP or UDS — wholly
-    // independent of peer fetch (`docs/design-mint-volume-attestation.md`
+    // independent of peer fetch (`docs/design/mint-volume-attestation.md`
     // § *Proposed: per-endpoint transport*). A pure verifier serves only
     // this and may keep it off the network on a unix socket. The predicate
     // reads meta/*.pub + names/* through the coord-ro store.
@@ -198,7 +198,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     elide_coordinator::tasks::set_peer_fetch_handle(peer_fetch_handle);
 
     // Credential issuer. `[mint]` routes per-volume RO issuance
-    // through the external mint service (docs/design-mint.md
+    // through the external mint service (docs/design/mint.md
     // § "Coordinator configuration"); its absence keeps the shared-key
     // downgrade where every volume gets the coordinator's own AWS_*
     // key.
@@ -376,7 +376,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
 
     // Retention reaping is folded into the per-volume tick loop
     // (`gc_cycle::GcCycleOrchestrator::reap_expired`); see
-    // `docs/design-segment-index.md` *Reaper fold*. No coordinator-
+    // `docs/design/segment-index.md` *Reaper fold*. No coordinator-
     // wide reaper task — the per-volume loop is the sole writer of
     // its volume's HEAD and the sole DELETEr of its superseded
     // inputs.

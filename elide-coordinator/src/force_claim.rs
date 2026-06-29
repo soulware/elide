@@ -1,8 +1,8 @@
 //! `volume claim --force`: ownership-first recovery of a name whose
 //! owner is unreachable.
 //!
-//! Design: `docs/design-mint-volume-attestation.md` § *Recovery is a
-//! claim* and `docs/design-force-release-fencing.md`. The forced CAS
+//! Design: `docs/design/mint-volume-attestation.md` § *Recovery is a
+//! claim* and `docs/design/force-release-fencing.md`. The forced CAS
 //! on `names/<name>` is the fence point; everything the claimant
 //! reads from the dead fork's prefix happens after it, anchored on
 //! the now-live new fork. The dead fork's prefix is never written:

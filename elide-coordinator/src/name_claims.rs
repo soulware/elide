@@ -1,7 +1,7 @@
 //! Domain-typed handle over the `names/<name>` claim records.
 //!
 //! Second slice of the domain-typed store layer
-//! (`docs/design-domain-store.md`). Wraps the existing
+//! (`docs/design/domain-store.md`). Wraps the existing
 //! [`crate::name_store`] primitive (S3 CAS) and the
 //! [`crate::lifecycle`] state-machine verbs (`mark_*`) behind a typed
 //! trait pair: [`NameClaimsReader`] (read-only, coord-ro) and
@@ -50,7 +50,7 @@ pub trait NameClaimsReader: Send + Sync {
 /// Full read+write handle over `names/<name>`. Extends
 /// [`NameClaimsReader`] with the state-machine verbs. Each `mark_*`
 /// runs its full read-modify-write on the `coord-rw` credential
-/// (one credential per mutation — the `docs/design-mint.md` rule),
+/// (one credential per mutation — the `docs/design/mint.md` rule),
 /// inherited reads stay on `coord-ro`.
 ///
 /// Acquired via [`crate::stores::ScopedStores::name_claims`].

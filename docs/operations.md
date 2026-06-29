@@ -127,7 +127,7 @@ An imported volume is readonly. Two ways to handle writes (not mutually exclusiv
 
 - **Disk loss on a live volume.** Recoverable: everything in fully-uploaded segments. Lost: `pending/` and the in-memory WAL tail. Recover from another host with `volume claim --force <name>`: mints a fresh local fork based on the stale record's latest published snapshot, force-CASes `names/<name>` straight to it — conditioned on the record it read, so concurrent recoveries can't both win — and re-owns the dead fork's post-snapshot tail under the new fork's prefix. Finally `volume start <name>` brings up the daemon. The recovered fork is fresh and writable.
 - **Lost private key.** S3 data remains readable (signatures verified with `volume.pub` in S3), but new writes are impossible. If snapshots exist, branch from the latest via `volume create --from <src>`. Snapshot markers are intentionally unsigned empty files, so an emergency branch point can be created by uploading an empty file to `by_id/<vol>/snapshots/<ulid>` with a ULID ≥ the latest segment.
-- **Unresponsive or dead upstream, need current state past the latest snapshot.** `volume claim --force <name>` takes the name over and re-owns the dead fork's post-snapshot head delta. Proposed for the keep-the-upstream-name case: `volume materialize <new-name> --from <vol_ulid>` copies the upstream's current state into a self-contained new volume, pending TTL resolution — see [design-replica-model.md](design-replica-model.md).
+- **Unresponsive or dead upstream, need current state past the latest snapshot.** `volume claim --force <name>` takes the name over and re-owns the dead fork's post-snapshot head delta. Proposed for the keep-the-upstream-name case: `volume materialize <new-name> --from <vol_ulid>` copies the upstream's current state into a self-contained new volume, pending TTL resolution — see [design/replica-model.md](design/replica-model.md).
 - **Local `cache/` deletion.** Automatic recovery — `Volume::open` rebuilds from `index/*.idx` and reads demand-fetch bodies.
 - **Local `cache/` + `index/` deletion.** Prefetch re-runs on startup (empty `index/` + empty `pending/`) and the volume reopens writable.
 - **Partial `index/` deletion is silent data loss.** The prefetch trigger requires `index/` to be *completely* empty; a partial delete leaves the coordinator seeing locally-present data. Missing segments' LBAs read as zeros. The only safe way to remove individual body files is the (hidden, dev-only) `elide volume evict`, which preserves `.idx`.
@@ -156,7 +156,7 @@ Prereqs:
 - Unprivileged operation (`UBLK_F_UNPRIVILEGED_DEV`, kernel 6.5+) plus
   udev rules granting your user access to `/dev/ublk-control` and
   `/dev/ublkc<N>` is on the roadmap but not yet wired up — see
-  `docs/design-ublk-transport.md` step 1.
+  `docs/design/ublk-transport.md` step 1.
 
 Crash recovery is enabled unconditionally
 (`UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE`). The kernel-assigned
@@ -164,7 +164,7 @@ device id is persisted in `volume.toml`'s `[ublk] dev_id`, so `/dev/ublkb<N>`
 is stable across restarts: a daemon that exited while the kernel device
 stayed parked (QUIESCED) is recovered in place with buffered I/O reissued;
 after a host reboot, where the kernel device is gone, the next serve re-ADDs
-at the same id — see `docs/design-ublk-transport.md` for the full lifecycle.
+at the same id — see `docs/design/ublk-transport.md` for the full lifecycle.
 
 Diagnostic CLI: `elide ublk list` and `elide ublk delete <id>` /
 `elide ublk delete --all` for inspecting and tearing down stray devices.
@@ -211,7 +211,7 @@ Each GC tick selects one bucket of eligible segments and emits one output plan p
 
 Per-tick work is bounded by the 32 MiB live cap, the 8192-entry cap, and O(1)-per-input tombstone bookkeeping on the apply side. "Repack-multi" falls out for free: multiple sparse smalls can land in one bucket. The entry cap matches the WAL flush cap (see *Pending compaction*) so GC outputs sit at the same scale as freshly-flushed segments — without it, packing many thin-entry inputs (DedupRef, Zero, small Inline) could produce a single output with an over-large index region.
 
-**Retention interaction.** Compacted input segments are not deleted from S3 immediately — they're held for the configured retention window (`retention_window`) before the reaper removes them. This means GC during the retention window *defers* space reclamation rather than driving it. The peak storage cost of running GC at compaction throughput C with retention T is `live_data + post_compaction_outputs + (C × T)`. Tuning `density_threshold` and T together is what controls overall storage efficiency; see `docs/design-replica-model.md` *Retention economics* for the full model.
+**Retention interaction.** Compacted input segments are not deleted from S3 immediately — they're held for the configured retention window (`retention_window`) before the reaper removes them. This means GC during the retention window *defers* space reclamation rather than driving it. The peak storage cost of running GC at compaction throughput C with retention T is `live_data + post_compaction_outputs + (C × T)`. Tuning `density_threshold` and T together is what controls overall storage efficiency; see `docs/design/replica-model.md` *Retention economics* for the full model.
 
 **Local-first fetch.** Before issuing any S3 GET, `fetch_live_bodies` checks whether the input's body is already resolvable from `cache/<ulid>.body`. A cache hit requires (a) the body file exists and (b) every live DATA entry's bit is set in `cache/<ulid>.present`. On a full hit, the body is read from the local file and sliced per-entry; S3 is not touched. On any partial state (missing file, missing bit, short read) the path falls through to the existing range-GET / full-body-GET logic. This is safe without locks because `cache/` is append-only from the volume's perspective (the coordinator is the sole deleter), `.present` bits are durable before they are published, and bodies covered by a set bit are immutable until the file is unlinked. The hash-verification step in `compact_segments` remains the correctness backstop regardless of fetch source. Self-written-and-promoted segments — where the volume copied the full body from `pending/` into `cache/` at promote time — are the common hit case; partially demand-fetched segments fall back to S3.
 
@@ -253,7 +253,7 @@ using it as the grace anchor would mis-fire.
 ### Self-describing handoff
 
 Under the self-describing GC handoff protocol (see
-`docs/design-gc-self-describing-handoff.md`) there is no separate
+`docs/design/gc-self-describing-handoff.md`) there is no separate
 manifest file. The compacted segment carries the sorted list of
 input ULIDs in its own header (`inputs_length` field at byte 32; data
 at the tail of the index section). The volume's apply path reads this
@@ -303,7 +303,7 @@ written via tmp+rename. They are swept on every apply pass.
    `gc/<result-ulid>` body. Handoff complete.
 
 A crash at any step leaves recoverable state. The crash-recovery
-table lives in `docs/design-gc-self-describing-handoff.md`; the short
+table lives in `docs/design/gc-self-describing-handoff.md`; the short
 version is: stale `.tmp` / `.staged.tmp` are swept; `.staged` alone
 re-runs apply (the apply path is deterministic, so a partial `.tmp`
 from a crashed re-sign produces the same bytes on retry); `.staged` +

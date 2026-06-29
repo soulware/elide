@@ -25,7 +25,7 @@ A single **Elide coordinator** runs on each host and manages all volumes. It for
 
 **S3 credential split:** the volume process requires only **read-only** S3 credentials (for demand-fetch). All S3 mutations — segment upload, segment delete, GC rewrites — are performed exclusively by the coordinator, which holds read-write credentials. This limits the blast radius if a volume host is compromised.
 
-**No cross-host coordinator coupling.** Coordinators on different hosts never talk to each other. A volume's S3 prefix has exactly one writer — the coordinator on the host that owns the volume — and any other host reading that prefix (replica, cross-host materialize, cold recovery) does so purely by reading objects, with no control-plane channel back to the owner. Cross-host protocols (e.g. the retention window described in `design-replica-model.md`) rendezvous through S3 object state rather than through coordinator RPC. This keeps the default deployment a self-contained per-host daemon; scale-out multi-host coordination is a separate concern, out of scope for this doc.
+**No cross-host coordinator coupling.** Coordinators on different hosts never talk to each other. A volume's S3 prefix has exactly one writer — the coordinator on the host that owns the volume — and any other host reading that prefix (replica, cross-host materialize, cold recovery) does so purely by reading objects, with no control-plane channel back to the owner. Cross-host protocols (e.g. the retention window described in `docs/design/replica-model.md`) rendezvous through S3 object state rather than through coordinator RPC. This keeps the default deployment a self-contained per-host daemon; scale-out multi-host coordination is a separate concern, out of scope for this doc.
 
 ## Crate structure
 
@@ -76,7 +76,7 @@ The volume process carries tokio today to satisfy `object_store`'s async trait o
 Three independent changes compose to get there:
 
 1. **Sync demand-fetch.** Replace `object_store` inside `elide-fetch` with `rust-s3` (`sync` feature — uses `attohttpc`, no tokio). `elide-fetch` exposes a small sync `RangeFetcher` trait with two built-in impls (S3 via `rust-s3`, local filesystem via `std::fs`). The coordinator continues to use `object_store` for its own list/put/delete and adapts its store to `RangeFetcher` when constructing a fetcher (cheap wrapper, runs on a `spawn_blocking` thread).
-2. **Thread-bounded async in ublk queue threads.** ublk integration confines async to the per-queue event loop: one `smol::LocalExecutor` per queue thread running async per-tag tasks, with backend work offloaded to a per-queue `std::thread` worker pool. Each worker owns its own `VolumeReader` and blocks on `crossbeam-channel` into the actor. The async surface is local to `src/ublk.rs`; `VolumeClient`/`VolumeReader` and everything downstream stay synchronous. Completions cross from worker threads back into the queue's io_uring via an eventfd watched by the queue's own ring — see `docs/design-ublk-transport.md` for why that bridge is necessary.
+2. **Thread-bounded async in ublk queue threads.** ublk integration confines async to the per-queue event loop: one `smol::LocalExecutor` per queue thread running async per-tag tasks, with backend work offloaded to a per-queue `std::thread` worker pool. Each worker owns its own `VolumeReader` and blocks on `crossbeam-channel` into the actor. The async surface is local to `src/ublk.rs`; `VolumeClient`/`VolumeReader` and everything downstream stay synchronous. Completions cross from worker threads back into the queue's io_uring via an eventfd watched by the queue's own ring — see `docs/design/ublk-transport.md` for why that bridge is necessary.
 3. **Drop `tokio` from `elide/Cargo.toml`.** Requires (1), (2), *and* relocating the embedded coordinator-tasks loop and the CLI's S3 subcommands (`pull`, `ls`, fork-from-S3) out of the volume binary — either into `elide-coordinator` (the daemon) or behind a thin sync RPC to it.
 
 **Rationale.** The volume is the correctness-critical hot path and the primitive the whole design orbits (see *Design principle: the volume is the primitive*). Keeping the actor and backend synchronous matches the I/O model at the actor interface (ublk dispatches through synchronous `VolumeClient`/`VolumeReader` calls) and removes the only external dependency forcing a *global* async runtime into it. The `smol::LocalExecutor` inside each ublk queue thread is thread-local, not a runtime; it coexists fine with tokio if tokio is ever re-introduced for other reasons. The coordinator and import tool are naturally async (HTTP, supervision, signals) and keep tokio unchanged.
@@ -305,7 +305,7 @@ The `index/<ulid>.idx` format is a complete segment header plus the index sectio
 ### GC cleanup ordering
 
 Under the self-describing GC handoff protocol (see
-`docs/design-gc-self-describing-handoff.md`) the new segment carries
+`docs/design/gc-self-describing-handoff.md`) the new segment carries
 its input ULID list in the segment header, so the volume never needs
 to consult a manifest sidecar.
 
@@ -467,7 +467,7 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 | `elide volume list` | Scan `data_dir` for ULID dirs; show name, ULID, state |
 | `elide volume info <name\|ulid>` | Segment counts, WAL size, snapshot history, ancestry chain |
 | `elide volume snapshot <name\|ulid>` | Write a snapshot marker file |
-| `elide volume create <name> --from <source>` | Create a new writable replica of an existing volume. `<source>` is one of: `<vol_ulid>/<snap_ulid>` or `<name>/<snap_ulid>` (explicit pin), or `<name>` (local or remote lookup; a remote basis comes from the `names/<name>` record's `latest_snapshot`). A bare `<vol_ulid>` is rejected — raw ULIDs always carry an explicit pin; the name is the discovery surface. Refuses if `<name>` already exists. Reads traverse the upstream's S3 prefix via the ancestor chain (cheap-reference shape). See [design-replica-model.md](design-replica-model.md) for the direction of travel |
+| `elide volume create <name> --from <source>` | Create a new writable replica of an existing volume. `<source>` is one of: `<vol_ulid>/<snap_ulid>` or `<name>/<snap_ulid>` (explicit pin), or `<name>` (local or remote lookup; a remote basis comes from the `names/<name>` record's `latest_snapshot`). A bare `<vol_ulid>` is rejected — raw ULIDs always carry an explicit pin; the name is the discovery surface. Refuses if `<name>` already exists. Reads traverse the upstream's S3 prefix via the ancestor chain (cheap-reference shape). See [design/replica-model.md](design/replica-model.md) for the direction of travel |
 | `elide volume create <name> --size N` | Create a new empty root volume (generates ULID dir, writes `volume.name`); rescan |
 | `elide volume status --remote <name>` | `GET names/<name>` against the store; print the authoritative record (state, vol_ulid, coordinator_id, hostname, claimed_at, parent, handoff_snapshot) plus this coordinator's eligibility |
 | `elide volume claim <name>` | Claim a `Released` name from the store: pull the released ancestor's chain, mint a fresh local fork, and conditionally rebind `names/<name>` to the new fork (state ends `Stopped`). Always CAS-protected. To override an unreachable owner of a `Live`/`Stopped` record, use `volume claim --force <name>` |
@@ -543,7 +543,7 @@ Most verbs follow the standard one-request / one-reply model. `import-attach` is
 
 **Authentication.** `register { volume_ulid }` uses SO_PEERCRED to bind the issued macaroon to the connecting volume process's PID — the coordinator refuses if the peer's PID does not match the volume's recorded `volume.pid`. `credentials { macaroon }` re-checks SO_PEERCRED against the macaroon's `pid` caveat, then delegates to the configured `CredentialIssuer`. See *S3 credential distribution via macaroons* below.
 
-Destructive coordinator verbs (currently `remove`) are gated by an *operator token* — a coordinator-wide macaroon minted on `elide token create` and attenuated per use by the CLI. The operator-token surface, audit-log structure, and isolation model live in [`design-auth-model.md`](design-auth-model.md); the underlying macaroon construction is shared with volume macaroons and is described under *S3 credential distribution via macaroons* below.
+Destructive coordinator verbs (currently `remove`) are gated by an *operator token* — a coordinator-wide macaroon minted on `elide token create` and attenuated per use by the CLI. The operator-token surface, audit-log structure, and isolation model live in [`design/auth-model.md`](design/auth-model.md); the underlying macaroon construction is shared with volume macaroons and is described under *S3 credential distribution via macaroons* below.
 
 The core isolation goal: **a compromised volume process must not be able to affect another volume's S3 data**.
 
@@ -559,7 +559,7 @@ Each token carries a **16-byte random nonce** generated at mint time, mixed into
 
 The MAC is **chained**, not a one-shot signature over the whole caveat list: a domain-separated seed is keyed by the root key, then each caveat re-keys the next step with the previous step's MAC. The stored MAC is the final value. This is what makes attenuation work — a holder of the trailing MAC can extend the chain with a new caveat without knowing the root key. Removing a caveat is infeasible (it would require inverting a keyed-BLAKE3 step). Verification is stateless: the coordinator replays the chain from the root key and constant-time-compares the final MAC.
 
-In this deployment the coordinator is **both issuer and verifier** — the root key never leaves the coordinator process. Volumes hold only the bearer token. In a future scale-out deployment with a central issuer and per-host verifiers (see [`design-deployment-modes.md`](design-deployment-modes.md)), the same construction supports a real issuer/verifier split sharing the root key out-of-band.
+In this deployment the coordinator is **both issuer and verifier** — the root key never leaves the coordinator process. Volumes hold only the bearer token. In a future scale-out deployment with a central issuer and per-host verifiers (see [`design/deployment-modes.md`](design/deployment-modes.md)), the same construction supports a real issuer/verifier split sharing the root key out-of-band.
 
 **Caveats on a volume macaroon:**
 
@@ -602,7 +602,7 @@ Step 4 delegates to a `CredentialIssuer` selected at coordinator startup from `c
 |---|---|---|
 | AWS S3 | STS `AssumeRole` with a session policy narrowing `s3:GetObject` to `arn:aws:s3:::<bucket>/by_id/<volume-ulid>/*` | Session duration 15 min – 12 h; the coordinator's own role needs `sts:AssumeRole` on a dedicated read-only role |
 | S3-compatible with STS (e.g. MinIO, Ceph RGW/STS) | `AssumeRole` against the backend's STS endpoint with the same session policy | Compatibility varies by backend; the session policy shape is the portable part |
-| S3-compatible with IAM-keyed policies (e.g. Tigris) | Call the external `mint` service's `assume-role` over the `[mint]` endpoint; mint mints the per-volume key and renders its IAM policy from the request's macaroon caveats | See [`design-mint.md`](design-mint.md) for the credential plane; the key-inventory and policy-scoping rationale it inherits is in [`design-iam-key-model.md`](design-iam-key-model.md). |
+| S3-compatible with IAM-keyed policies (e.g. Tigris) | Call the external `mint` service's `assume-role` over the `[mint]` endpoint; mint mints the per-volume key and renders its IAM policy from the request's macaroon caveats | See [`design/mint.md`](design/mint.md) for the credential plane; the key-inventory and policy-scoping rationale it inherits is in [`design/iam-key-model.md`](design/iam-key-model.md). |
 | S3-compatible without STS or per-key IAM | Coordinator returns its own configured read-only key pair with no per-volume scoping | Defense-in-depth only — the coordinator must be configured with a distinct read-only key, not the upload key. Logged as a downgrade at coordinator startup. |
 | Local filesystem (`elide_store/`) | No-op issuer — returns a sentinel the volume's fetcher treats as "no auth needed" | Used for tests and single-host deployments |
 
@@ -610,7 +610,7 @@ The volume never negotiates the backend type. It treats the returned triple as o
 
 ### Issuer: Tigris-native (no STS, IAM-policied keys)
 
-Per-volume Tigris keys are vended by the external `mint` service, not minted in-process by the coordinator. The coordinator holds a per-role capability macaroon and calls mint's `assume-role`; mint renders the IAM policy from the macaroon caveats and returns a scoped keypair. The credential plane is documented in [`design-mint.md`](design-mint.md) (§ *Coordinator configuration* for the `coordinator.toml` `[mint]` wiring); the key-inventory and policy-scoping rationale mint's roles inherit is in [`design-iam-key-model.md`](design-iam-key-model.md).
+Per-volume Tigris keys are vended by the external `mint` service, not minted in-process by the coordinator. The coordinator holds a per-role capability macaroon and calls mint's `assume-role`; mint renders the IAM policy from the macaroon caveats and returns a scoped keypair. The credential plane is documented in [`design/mint.md`](design/mint.md) (§ *Coordinator configuration* for the `coordinator.toml` `[mint]` wiring); the key-inventory and policy-scoping rationale mint's roles inherit is in [`design/iam-key-model.md`](design/iam-key-model.md).
 
 **Standalone-mode shortcut.** When the operator does not need per-volume scoping (single-tenant dev, no untrusted volumes), the same Tigris account can be used with the *S3-compatible without STS or per-key IAM* row above — i.e. a single static read-only key shared across volumes. mint is the per-volume upgrade path, not a requirement.
 
@@ -980,7 +980,7 @@ Two edge cases worth making explicit, since they test both invariants simultaneo
 
 **Why `live_hashes()` must be sourced from the LBA map, not from extent_index keys.** Variant (b) only works because `lba_map::live_hashes()` is `self.inner.values().map(|e| e.hash).collect()` — every hash in the LBA map contributes, whether the LBA was populated via a DATA write or a DedupRef write. If `live_hashes()` were ever "optimised" to a DATA-only filter, the DATA at LBA1 in variant (b) would become invisible to GC (not in live_hashes, not lba_live) and would be dropped as dead. The sibling DedupRef at LBA2 would then lose its canonical, violating the canonical-presence invariant. The function's name is worth hardening (`lba_referenced_hashes()` is more precise and hostile to this misreading) and the behaviour is worth a regression test.
 
-**Delta compression** is a separate concern from dedup. See [design-delta-compression.md](design-delta-compression.md) for the full sequencing; the summary below covers the format interaction with GC, the extent index, and `lba_referenced_hashes`.
+**Delta compression** is a separate concern from dedup. See [design/delta-compression.md](design/delta-compression.md) for the full sequencing; the summary below covers the format interaction with GC, the extent index, and `lba_referenced_hashes`.
 
 **Source selection** is filemap path-matching across imported snapshots linked by `extent_index` provenance lineage. For a changed file in a child import, the natural delta source is the same path in the parent import. Filemap-based delta, computed in-process in `elide-import` after pending segments are written but before the volume is promoted, is the single production delta path.
 
@@ -1124,7 +1124,7 @@ The coordinator processes bare `gc/<ulid>` files at the start of each GC tick (`
 
 **Race tolerance:** LBA map and extent index rebuild (`Volume::open`) collect `index/*.idx` paths and then read each one. If the coordinator deletes an index file during a GC cleanup pass between path collection and the read, the rebuild skips the missing file with a warning rather than failing. This is always correct: the new compacted segment (with a higher ULID) has its own `index/<new>.idx` and its entries will overwrite whatever the deleted file would have contributed. The same tolerance is applied in `repack()` when it scans `index/`.
 
-**The `.staged` file is written atomically** (`<ulid>.staged.tmp` then rename) to prevent a coordinator crash from leaving a partial handoff. Crash recovery is content-resolved: stale `.tmp` and `.staged.tmp` files are swept on the next apply pass, and a partially re-signed `<ulid>.tmp` from a volume-side crash is regenerated byte-identically because the apply path is deterministic (see `docs/design-gc-self-describing-handoff.md` for the full crash table).
+**The `.staged` file is written atomically** (`<ulid>.staged.tmp` then rename) to prevent a coordinator crash from leaving a partial handoff. Crash recovery is content-resolved: stale `.tmp` and `.staged.tmp` files are swept on the next apply pass, and a partially re-signed `<ulid>.tmp` from a volume-side crash is regenerated byte-identically because the apply path is deterministic (see `docs/design/gc-self-describing-handoff.md` for the full crash table).
 
 **Tombstone and removal-only handoffs collapse into one shape.** When all extents in GC candidates are truly extent-dead, or when only extent-index references need cleanup with no live LBAs, the coordinator still writes a real GC output via `write_gc_segment` — a zero-entry segment with a non-empty `inputs` list. `promote_segment` recognises zero-entry GC outputs and skips writing `index/<new>.idx` and `cache/<new>.body` entirely, only deleting the input idx files. The bare `gc/<new>` body is then deleted via `finalize_gc_handoff` the same way as a live output. Direct coordinator deletion without staging a handoff is never safe: the coordinator's liveness view is built from on-disk index files and may be behind the volume's in-memory WAL.
 

@@ -388,7 +388,7 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
     // identity files (volume.{key,pub,provenance}) right after
     // resolving the image manifest — before the bulk download and
     // extraction. The coordinator then runs the bootstrap planes
-    // (`design-mint-volume-attestation.md` § *Import runs under an
+    // (`docs/design/mint-volume-attestation.md` § *Import runs under an
     // `Importing` record*): identity uploads on coord-rw, then the
     // `names/<name>` CAS-create as `Importing` — the uniqueness gate,
     // settled before the heavy work; a lost race kills the worker.

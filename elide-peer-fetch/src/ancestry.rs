@@ -9,7 +9,7 @@
 //! so the walk reads the peer's *own local* `by_id/<vol>/volume.
 //! {provenance,pub}` — the copies it holds for every fork it serves.
 //! Lineage is therefore established with no S3 read and no credential
-//! (docs/design-peer-segment-fetch.md § Peer verification, check 4). A
+//! (docs/design/peer-segment-fetch.md § Peer verification, check 4). A
 //! fork the peer does not serve has no local provenance: the walk
 //! returns a `NotFound` error and the caller fails closed (declines;
 //! the requester falls back to S3).

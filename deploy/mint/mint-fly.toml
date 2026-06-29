@@ -46,7 +46,7 @@ ttl_seconds = 3600
 # Colocated demo auth + attestation, both binding a container-internal UDS.
 # `k_m_a` and `k_m_b` are demo-tier shared-key secrets — standard base64 of 32
 # bytes, known and forgeable — each identical to the coordinator's value
-# (docs/design-auth-service.md; docs/mint-shared-k-m-b-spec.md).
+# (docs/design/auth-service.md; docs/mint-shared-k-m-b-spec.md).
 [auth.demo]
 socket = "/data/mint_data/auth.sock"
 k_m_a = "XXdf8FWWdPwfx2RePVaoQzxA7zLjbC+zEnkAWiVA/2M="

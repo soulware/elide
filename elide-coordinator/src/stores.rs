@@ -2,7 +2,7 @@
 //!
 //! Every coordinator S3 op routes through a [`ScopedStores`] handle.
 //! The trait carves the bucket into the three mint credential roles
-//! the coordinator wields (`docs/design-mint.md` § *Coordinator store
+//! the coordinator wields (`docs/design/mint.md` § *Coordinator store
 //! architecture*). A call site picks the role matching the purpose of
 //! its code path. A mutation path uses [`ScopedStores::writer`] for
 //! its whole `names/`+`events/`+own-`coordinators/` interaction; the
@@ -126,7 +126,7 @@ pub trait ScopedStores: Send + Sync {
     /// own prefix, the leaf when reading an ancestor's. The facade is
     /// per-`(owned, target)`; the anchor is what signs the
     /// possession proof when `volume-ro` acquisition
-    /// requires a discharge (`design-mint-volume-attestation.md`
+    /// requires a discharge (`docs/design/mint-volume-attestation.md`
     /// § *Threading the `owned` anchor*).
     fn read_volume(&self, owned: &Ulid, target: &Ulid) -> Arc<dyn ObjectStore>;
 
@@ -146,7 +146,7 @@ pub trait ScopedStores: Send + Sync {
     /// `coord-ro` (for the inherited reads, which need
     /// cross-coordinator pubkey lookups in `list_and_verify`).
     /// First slice of the domain-typed store layer
-    /// (`docs/design-domain-store.md`); the trait deliberately has
+    /// (`docs/design/domain-store.md`); the trait deliberately has
     /// no `delete`, so a caller holding only an [`EventJournal`]
     /// cannot violate the append-only invariant.
     fn event_journal(&self) -> Arc<dyn EventJournal> {
@@ -193,7 +193,7 @@ pub trait ScopedStores: Send + Sync {
     /// `volume-rw` credential as [`Self::volume_rw`]; the two
     /// co-exist while the remaining object-class views
     /// (segments / snapshots / retention) migrate in later steps of
-    /// `docs/design-domain-store.md`.
+    /// `docs/design/domain-store.md`.
     fn volume_data(&self, vol_ulid: &Ulid) -> VolumeData {
         VolumeData::new(self.volume_rw(vol_ulid), *vol_ulid)
     }

@@ -1,4 +1,4 @@
-//! mint credential-service client (`docs/design-mint.md`
+//! mint credential-service client (`docs/design/mint.md`
 //! § "Coordinator configuration").
 //!
 //! The coordinator holds a capability macaroon under
@@ -146,7 +146,7 @@ impl AssumeTarget {
 
 /// Lifetime requested for a `volume-ro` credential. Set to 1h: the
 /// non-lazy fetch episode completes in seconds, and the lazy-volume
-/// cache refreshes proactively at half-life (`docs/design-mint.md`
+/// cache refreshes proactively at half-life (`docs/design/mint.md`
 /// § "Keypair freshness — split by volume mode"). Read keys on the
 /// narrowest scope still benefit from the tightest revocation window
 /// that doesn't put the refresh path on the hot path.
@@ -438,7 +438,7 @@ fn uds_socket(url: &str) -> Option<&str> {
 /// Returns `(status, body, retry_after_secs)`. The retry-after value
 /// is parsed from the response `Retry-After` header when present and
 /// expressed in seconds (mint always emits seconds —
-/// `docs/design-mint.md` § *Failure modes*); the HTTP-date form is
+/// `docs/design/mint.md` § *Failure modes*); the HTTP-date form is
 /// not parsed.
 pub(crate) async fn post(
     cfg_url: &str,
@@ -518,7 +518,7 @@ async fn post_tcp(
 
 /// HTTP-over-UDS leg — `reqwest` has no UDS support, so this drops to
 /// `hyper` dialed through `hyperlocal`, the same split mint's
-/// reference client makes (`docs/design-mint.md` § "Transport").
+/// reference client makes (`docs/design/mint.md` § "Transport").
 async fn post_uds(
     socket: &str,
     request_timeout: Duration,
@@ -666,7 +666,7 @@ impl MintEndpoint {
     /// PoP-signed request fields (e.g. `volume-ro`'s `ancestors`).
     ///
     /// Transient `503` responses (mint's signal for Tigris-side
-    /// throttling or backend unavailability, `docs/design-mint.md`
+    /// throttling or backend unavailability, `docs/design/mint.md`
     /// § *Failure modes*) are retried a bounded number of times,
     /// honouring `Retry-After` clamped to a sane band. Mint also
     /// performs its own per-IAM-call retry before surfacing 503, so

@@ -46,7 +46,7 @@ Walk:
 3. `apply_sweep_result` calls
    `lbamap.insert_if_newer(44, 3, acce0fb0_hash, u_sweep)`.
    `insert_if_newer` is the protection added by PR #277
-   (`docs/design-lbamap-claimant-tracking.md`): it refuses to install
+   (`docs/design/lbamap-claimant-tracking.md`): it refuses to install
    when an existing entry has `claimant_ulid >= caller's claimant`. The
    existing claimant is `u_flush > u_sweep`, so the install is blocked.
 4. lbamap[44..47] continues to point at `(wm1_hash, claimant=u_flush)`.

@@ -1,7 +1,7 @@
 //! Domain-typed handle over the per-name event log.
 //!
 //! First slice of the domain-typed store layer
-//! (`docs/design-domain-store.md`). Replaces module-level functions
+//! (`docs/design/domain-store.md`). Replaces module-level functions
 //! over `Arc<dyn ObjectStore>` with the [`EventJournal`] trait — an
 //! object-typed handle vended by [`crate::stores::ScopedStores`].
 //!
@@ -16,8 +16,8 @@
 //! * `events/<name>/<event_ulid>` — the immutable archival record,
 //!   one per event.
 //!
-//! See `docs/design-volume-event-log.md` for the on-disk shape and
-//! `docs/list-elimination-plan.md` § *event-log spine* for the
+//! See `docs/design/volume-event-log.md` for the on-disk shape and
+//! `docs/plans/list-elimination-plan.md` § *event-log spine* for the
 //! single-writer / no-LIST invariants this implementation preserves.
 
 use std::collections::HashMap;
@@ -45,7 +45,7 @@ use crate::portable::{
 
 /// Number of most-recent signed events carried inline in the
 /// `events/<name>/HEAD` window. Tuning parameter (see
-/// `docs/list-elimination-plan.md` § *event-log spine*).
+/// `docs/plans/list-elimination-plan.md` § *event-log spine*).
 const HEAD_WINDOW: usize = 16;
 
 /// Default `limit` for [`EventJournal::recent`] / `volume events` when
@@ -142,7 +142,7 @@ pub enum EventError {
     /// changed under us. The only writer that can do that to a name
     /// we own is a concurrent `claim --force` — i.e. **this
     /// coordinator has been displaced**. Caller must fail hard, not
-    /// retry (`docs/list-elimination-plan.md` § *Single-writer*).
+    /// retry (`docs/plans/list-elimination-plan.md` § *Single-writer*).
     Displaced,
 }
 
@@ -235,7 +235,7 @@ pub trait EventJournalReader: Send + Sync {
 ///
 /// Extends [`EventJournalReader`] with the mutating [`Self::emit`].
 /// Backed by both `coord-rw` (for the emit CAS, which runs wholly
-/// on one credential per `docs/design-mint.md`) and `coord-ro` (for
+/// on one credential per `docs/design/mint.md`) and `coord-ro` (for
 /// the inherited read methods, which need cross-coord pubkey reads
 /// for verify).
 ///

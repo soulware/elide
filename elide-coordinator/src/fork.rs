@@ -379,7 +379,7 @@ impl ForkOrchestrator {
                 // (`coord-ro`). `by_id/<vol>/snapshots/LATEST` is
                 // owner-anchored; strangers discover a basis via the
                 // record's `latest_snapshot`
-                // (`design-mint-volume-attestation.md` § *Basis
+                // (`docs/design/mint-volume-attestation.md` § *Basis
                 // resolution per `--from` form*). Guarded on the record
                 // still binding this vol_ulid so a rebound name never
                 // supplies a previous binding's snapshot.
