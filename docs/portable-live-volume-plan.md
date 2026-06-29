@@ -621,7 +621,7 @@ lookups go through `volume status --remote`.
     `claim --force` semantics for unreachable owners).
   - `docs/quickstart-tigris.md`: add a section showing two-host
     migration end to end.
-  - `docs/status-2026-MM-DD.md`: a new status doc capturing the
+  - `docs/status/status-2026-MM-DD.md`: a new status doc capturing the
     landed work.
 - [ ] **Memory updates.** Update `project_volume_naming.md` to note
   the concern is resolved by the portable-volume work; remove or
