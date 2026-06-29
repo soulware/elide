@@ -1,0 +1,34 @@
+# Elide attestation authority (coord B) on Fly.io — the runtime config the
+# image runs, paired with fly.toml.example. A dedicated, discharge-only
+# instance: it assumes coord-ro through mint, opens attested CIDs under K_M-B,
+# and serves POST /v1/discharge over 6PN — no volumes, no data plane
+# (docs/design/mint-volume-attestation.md § "A dedicated attestation
+# instance", shape 2).
+#
+# Set [store].bucket and [mint].url for your deployment. The K_M-B and K_M-A
+# values below must be byte-identical to mint's and to deploy/elide/coord.toml.
+
+data_dir = "/data/elide_data"
+
+[store]
+# The Tigris data bucket the coord-ro role is scoped to (= mint's DATA_BUCKET).
+bucket = "elide"
+endpoint = "https://t3.storage.dev"
+region = "auto"
+
+[mint]
+# The mint app this authority enrols against and assumes coord-ro from.
+url = "http://mint-for-elide.internal:8085"
+
+[attestation]
+# The discharge-authority listener. TCP on 6PN so a separate coord A can dial
+# it at http://<this-app>.internal:8087.
+listen = "0.0.0.0:8087"
+# K_M-B, standard base64 of 32 bytes — identical to the value mint is deployed
+# with and to deploy/elide/coord.toml.
+k_m_b = "8K0oyDybI3jBHjtUYxtrfLKHeniWHK8JmxxpCS/e3IU="
+
+[auth.demo]
+# K_M-A, used to self-issue the enroll gate at `elide coord enroll
+# --attestation` — identical to deploy/elide/coord.toml.
+k_m_a = "XXdf8FWWdPwfx2RePVaoQzxA7zLjbC+zEnkAWiVA/2M="
