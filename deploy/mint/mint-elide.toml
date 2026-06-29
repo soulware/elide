@@ -1,8 +1,7 @@
-# Elide's mint configuration: the role inventory the stock mint binary is
+# Elide's mint configuration: the operational surface the stock mint binary is
 # sealed with to serve an Elide deployment (`mint serve --config
-# mint-elide.toml`; see README.md). The [[role]] inventory and its caveat
-# contracts are fixed and version-locked to the coordinator; the keys marked
-# PER-DEPLOYMENT below are filled in per site.
+# mint-elide.toml`; see README.md). The role + profile catalog lives in
+# `catalog.toml`; the keys marked PER-DEPLOYMENT below are filled in per site.
 
 audience = "mint"
 
@@ -17,6 +16,10 @@ roles_dir = "roles"
 #
 # Each role's template is <roles_dir>/<name>.json by default (volume-ro ->
 # roles/volume-ro.json); set policy_file on a role to override the name.
+
+# The [[role]] + [[profile]] catalog in its own file, resolved against mint's
+# working directory (relative) or used verbatim (absolute).
+catalog_file = "catalog.toml"
 
 # PER-DEPLOYMENT. Listener transport; `bind` and `socket` are mutually
 # exclusive. UDS for the single-host shape (coordinator + mint co-resident),
@@ -42,25 +45,3 @@ location = "https://coord-b.elide.internal/v1/discharge"
 bucket = "mint-admin"
 # endpoint = "https://t3.storage.dev"   # default; set for non-Tigris S3
 # region   = "us-east-1"                # default
-
-# A role is its `name`, a single `ttl_seconds`, and a policy template under
-# roles_dir. Caveat provenance is derived from the template: a `{{caveat.X}}`
-# whose name is reserved (e.g. `sub`) is issuer-stamped; any other name is
-# attested. `ttl_seconds` is the credential lifetime ceiling in seconds (> 0),
-# clamped to the `exp` the coordinator attenuates onto each assumed credential.
-
-[[role]]
-name = "volume-ro"
-ttl_seconds = 3600         # 1h
-
-[[role]]
-name = "volume-rw"
-ttl_seconds = 86400        # 24h
-
-[[role]]
-name = "coord-ro"
-ttl_seconds = 3600         # 1h
-
-[[role]]
-name = "coord-rw"
-ttl_seconds = 3600         # 1h

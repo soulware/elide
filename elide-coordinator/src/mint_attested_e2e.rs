@@ -310,7 +310,7 @@ async fn attested_loop_over_shipped_templates() {
                 enroll::EnrollOptions {
                     wait: Duration::from_secs(60),
                     force: false,
-                    kind: enroll::EnrollKind::Coordinator,
+                    profile: enroll::EnrollProfile::Coordinator,
                 },
                 &issuer,
             )

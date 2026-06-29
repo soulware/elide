@@ -39,6 +39,9 @@ COPY --from=build /usr/local/bin/mint /usr/local/bin/mint
 COPY --from=build /roles /app/roles
 
 COPY mint-fly.toml /app/mint.toml
+# The role + profile catalog mint-fly.toml references via catalog_file, resolved
+# against WORKDIR.
+COPY catalog.toml /app/catalog.toml
 # mint's [store].bucket (its own _mint/* admin state) is TOML-only, not an env
 # input. Default it to the data bucket — _mint/* shares the bucket under a
 # distinct prefix — or set STORE_BUCKET to give mint its own bucket.

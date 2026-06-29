@@ -197,7 +197,7 @@ async fn run() -> Result<()> {
                 // (`wait_for_ready`). `assert_enrolled` is all-or-nothing, so
                 // this proceeds only once every role's credential is present.
                 while let Err(missing) =
-                    enroll::assert_enrolled(&config.data_dir, enroll::EnrollKind::Coordinator)
+                    enroll::assert_enrolled(&config.data_dir, enroll::EnrollProfile::Coordinator)
                 {
                     tracing::info!(
                         "[coordinator] awaiting enrollment: {missing}; run `elide coord enroll`"
@@ -310,10 +310,10 @@ async fn run() -> Result<()> {
             let subject = elide_core::operator_session::load_subject()
                 .with_context(|| "loading the operator login for the enrollment gates")?;
             let issuer = enroll::SelfMint { k_m_a, subject };
-            let kind = if attestation {
-                enroll::EnrollKind::Attestation
+            let profile = if attestation {
+                enroll::EnrollProfile::Attestation
             } else {
-                enroll::EnrollKind::Coordinator
+                enroll::EnrollProfile::Coordinator
             };
             enroll::run(
                 mint_cfg,
@@ -323,7 +323,7 @@ async fn run() -> Result<()> {
                 enroll::EnrollOptions {
                     wait: timeout,
                     force,
-                    kind,
+                    profile,
                 },
                 &issuer,
             )

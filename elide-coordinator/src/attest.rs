@@ -42,7 +42,7 @@ pub async fn run(config: CoordinatorConfig) -> Result<()> {
     // closed: a fresh deploy comes up before the operator runs `enroll
     // --attestation`, and we block on mint just below anyway.
     while let Err(missing) =
-        enroll::assert_enrolled(&config.data_dir, enroll::EnrollKind::Attestation)
+        enroll::assert_enrolled(&config.data_dir, enroll::EnrollProfile::Attestation)
     {
         info!("[attest] awaiting enrollment: {missing}; run `elide coord enroll --attestation`");
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;

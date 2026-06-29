@@ -952,7 +952,7 @@ Splitting coord B off the volume-serving coordinator gives the discharge
 authority its own deployable, so its custody of `K_M-B` and its
 availability are independent of the data plane. coord B runs in one of
 three shapes, in increasing separation; all are **enrolled attestation
-instances** (§ *Attestation-kind enrollment*) that hold their own
+instances** (§ *Attestation-profile enrollment*) that hold their own
 identity keypair, assume `coord-ro` through ordinary `assume-role` with
 the half-TTL refresh every coordinator uses, serve only
 `POST /v1/discharge`, and drive the same `DischargeState`:
@@ -990,7 +990,7 @@ the half-TTL refresh every coordinator uses, serve only
    (S3 keypairs arrive via `assume-role`, never via flags or env). The HA
    shape (§ *HA — N instances*).
 
-## Attestation-kind enrollment
+## Attestation-profile enrollment
 
 Enrollment today grants every approved `sub` the full coordinator role
 set — the `Enrolled` record carries no role constraint, and
@@ -1190,8 +1190,8 @@ compromise is one `revoke`, leaving the rest of the fleet untouched.
   `elide-attestation serve` binary (shape 3) is deferred until § *`K_M-B`
   stays at mint* removes the on-instance secret; it is the HA shape and
   earns its own crate boundary only then.
-- **coord B obtains `coord-ro` by attestation-kind enrollment** (§
-  *Attestation-kind enrollment*), not a hand-issued key: the `Enrolled`
+- **coord B obtains `coord-ro` by attestation-profile enrollment** (§
+  *Attestation-profile enrollment*), not a hand-issued key: the `Enrolled`
   record carries a granted role set the enrollee declares at `/v1/enroll`,
   the operator ratifies at approval alongside the key fingerprint, and
   `enroll-exchange` refuses any role outside it. An attestation enrollment

@@ -116,27 +116,27 @@ const COORDINATOR_ROLES: &[EnrollRole] = &[
 ];
 
 /// A read-only attestation authority (coord B) holds only `coord-ro`
-/// (`docs/design/mint-volume-attestation.md` § *Attestation-kind
+/// (`docs/design/mint-volume-attestation.md` § *Attestation-profile
 /// enrollment*).
 const ATTESTATION_ROLES: &[EnrollRole] = &[EnrollRole {
     name: ROLE_COORD_RO,
     intermediate: false,
 }];
 
-/// The kind of enrollment, declared by the enrollee in the `/v1/enroll`
-/// body and bounding the role set it may exchange. mint maps the kind to
+/// The enrollment profile, declared by the enrollee in the `/v1/enroll`
+/// body and bounding the role set it may exchange. mint maps the profile to
 /// the same grant and enforces `role ∈ grant` at `enroll-exchange`
 /// (`docs/attestation-readonly-enrollment-spec.md`).
 #[derive(Clone, Copy)]
-pub(crate) enum EnrollKind {
+pub(crate) enum EnrollProfile {
     /// A full coordinator: the four coordinator roles.
     Coordinator,
     /// A read-only attestation authority: `coord-ro` only.
     Attestation,
 }
 
-impl EnrollKind {
-    /// The wire value for the `kind` field of the `/v1/enroll` body.
+impl EnrollProfile {
+    /// The wire value for the `profile` field of the `/v1/enroll` body.
     fn as_str(self) -> &'static str {
         match self {
             Self::Coordinator => "coordinator",
@@ -144,7 +144,7 @@ impl EnrollKind {
         }
     }
 
-    /// The roles this kind provisions.
+    /// The roles this profile provisions.
     fn roles(self) -> &'static [EnrollRole] {
         match self {
             Self::Coordinator => COORDINATOR_ROLES,
@@ -159,8 +159,8 @@ pub(crate) struct EnrollOptions {
     pub wait: Duration,
     /// Re-exchange and overwrite every role, not just the missing ones.
     pub force: bool,
-    /// The enrollment kind, bounding the role set.
-    pub kind: EnrollKind,
+    /// The enrollment profile, bounding the role set.
+    pub profile: EnrollProfile,
 }
 
 impl EnrollRole {
@@ -285,14 +285,14 @@ fn bundle_auth(primary: &WireMacaroon, discharges: &[String]) -> String {
 }
 
 /// A — `POST /v1/enroll`. Attenuate the invite with `sub`/`cnf`,
-/// discharge its enroll gate, PoP over `{ts, kind}`, return the
-/// credential-ticket macaroon string. `kind` rides the PoP-signed body,
+/// discharge its enroll gate, PoP over `{ts, profile}`, return the
+/// credential-ticket macaroon string. `profile` rides the PoP-signed body,
 /// so the declared grant is bound to the enrollee.
 async fn enroll_request(
     cfg: &MintConfig,
     identity: &CoordinatorIdentity,
     invite: &str,
-    kind: EnrollKind,
+    profile: EnrollProfile,
     source: &impl DischargeSource,
 ) -> io::Result<String> {
     let mut mac = WireMacaroon::decode(invite)?;
@@ -301,9 +301,9 @@ async fn enroll_request(
     let discharges = source.discharges(&mac, SCOPE_ENROLL).await?;
 
     let body = format!(
-        r#"{{"ts":{},"kind":{}}}"#,
+        r#"{{"ts":{},"profile":{}}}"#,
         now_unix()?,
-        serde_json::Value::from(kind.as_str())
+        serde_json::Value::from(profile.as_str())
     );
     let sig = BASE64.encode(identity.sign(&pop_digest(mac.tail(), body.as_bytes())));
     let auth = bundle_auth(&mac, &discharges);
@@ -385,8 +385,8 @@ async fn exchange_request(
 /// required
 /// because the mint-backed store finalizes per-volume credentials from them
 /// at runtime; without them no `by_id/<vol>` op can proceed.
-pub(crate) fn assert_enrolled(data_dir: &Path, kind: EnrollKind) -> io::Result<()> {
-    let missing: Vec<&str> = kind
+pub(crate) fn assert_enrolled(data_dir: &Path, profile: EnrollProfile) -> io::Result<()> {
+    let missing: Vec<&str> = profile
         .roles()
         .iter()
         .filter(|r| !credential_present_at(&r.path(data_dir)))
@@ -418,7 +418,7 @@ pub(crate) async fn run<S: DischargeSource>(
     source: &S,
 ) -> io::Result<()> {
     let mut remaining: Vec<&EnrollRole> = opts
-        .kind
+        .profile
         .roles()
         .iter()
         .filter(|r| opts.force || !credential_present_at(&r.path(data_dir)))
@@ -426,7 +426,7 @@ pub(crate) async fn run<S: DischargeSource>(
     if remaining.is_empty() {
         info!(
             "[enroll] all {} enrollment artifact(s) already present under {}; nothing to do",
-            opts.kind.roles().len(),
+            opts.profile.roles().len(),
             credentials_dir(data_dir).display()
         );
         return Ok(());
@@ -436,7 +436,7 @@ pub(crate) async fn run<S: DischargeSource>(
     let sub = identity.coordinator_id_str();
     let cnf = cnf_value(identity);
 
-    let mut ticket = enroll_request(cfg, identity, &invite, opts.kind, source).await?;
+    let mut ticket = enroll_request(cfg, identity, &invite, opts.profile, source).await?;
     info!(
         "[enroll] enrolled sub={sub} cnf-fingerprint={} — now run `mint enroll approve {sub}` \
          on the mint host (match that fingerprint out of band first)",
@@ -494,7 +494,7 @@ pub(crate) async fn run<S: DischargeSource>(
                         "[enroll] credential ticket expired before approval; re-enrolling — \
                          the operator must re-run `mint enroll approve {sub}`"
                     );
-                    ticket = enroll_request(cfg, identity, &invite, opts.kind, source).await?;
+                    ticket = enroll_request(cfg, identity, &invite, opts.profile, source).await?;
                     awaiting = true;
                     break;
                 }
@@ -504,7 +504,7 @@ pub(crate) async fn run<S: DischargeSource>(
         if remaining.is_empty() {
             info!(
                 "[enroll] complete: {} enrollment artifact(s) under {}",
-                opts.kind.roles().len(),
+                opts.profile.roles().len(),
                 credentials_dir(data_dir).display()
             );
             return Ok(());
@@ -593,9 +593,10 @@ mod tests {
     #[test]
     fn assert_enrolled_reports_missing_roles() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = assert_enrolled(dir.path(), EnrollKind::Coordinator).expect_err("none present");
+        let err =
+            assert_enrolled(dir.path(), EnrollProfile::Coordinator).expect_err("none present");
         let msg = err.to_string();
-        for r in EnrollKind::Coordinator.roles() {
+        for r in EnrollProfile::Coordinator.roles() {
             assert!(
                 msg.contains(r.name),
                 "missing list should name {}: {msg}",
@@ -605,22 +606,22 @@ mod tests {
     }
 
     #[test]
-    fn enroll_kinds_map_to_expected_role_sets() {
+    fn enroll_profiles_map_to_expected_role_sets() {
         let names =
-            |k: EnrollKind| -> Vec<&'static str> { k.roles().iter().map(|r| r.name).collect() };
+            |p: EnrollProfile| -> Vec<&'static str> { p.roles().iter().map(|r| r.name).collect() };
         assert_eq!(
-            names(EnrollKind::Coordinator),
+            names(EnrollProfile::Coordinator),
             vec![ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RW, ROLE_VOLUME_RO]
         );
-        assert_eq!(names(EnrollKind::Attestation), vec![ROLE_COORD_RO]);
-        assert_eq!(EnrollKind::Coordinator.as_str(), "coordinator");
-        assert_eq!(EnrollKind::Attestation.as_str(), "attestation");
+        assert_eq!(names(EnrollProfile::Attestation), vec![ROLE_COORD_RO]);
+        assert_eq!(EnrollProfile::Coordinator.as_str(), "coordinator");
+        assert_eq!(EnrollProfile::Attestation.as_str(), "attestation");
     }
 
     #[test]
     fn attestation_assert_enrolled_wants_only_coord_ro() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let msg = assert_enrolled(dir.path(), EnrollKind::Attestation)
+        let msg = assert_enrolled(dir.path(), EnrollProfile::Attestation)
             .expect_err("none present")
             .to_string();
         assert!(msg.contains(ROLE_COORD_RO), "should name coord-ro: {msg}");
@@ -630,5 +631,51 @@ mod tests {
                 "attestation enrollment must not require {absent}: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn shipped_mint_catalog_matches_enroll_profiles() {
+        // deploy/mint/catalog.toml is mint's authoritative profile → role-set
+        // map; this binary fans each profile out to a fixed role set at
+        // exchange. The two must agree, or an enrolment requests a role its
+        // profile's grant omits. Nothing else reads that file, so guard it here.
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../deploy/mint/catalog.toml"
+        ))
+        .expect("read catalog.toml");
+        let catalog: toml::Value = toml::from_str(&text).expect("catalog.toml parses");
+        let profiles = catalog
+            .get("profile")
+            .and_then(|p| p.as_array())
+            .expect("[[profile]] present");
+        let granted = |name: &str| -> Vec<&str> {
+            let mut roles: Vec<&str> = profiles
+                .iter()
+                .find(|p| p.get("name").and_then(toml::Value::as_str) == Some(name))
+                .and_then(|p| p.get("roles"))
+                .and_then(toml::Value::as_array)
+                .unwrap_or_else(|| panic!("profile {name} with roles"))
+                .iter()
+                .map(|r| r.as_str().expect("role is a string"))
+                .collect();
+            roles.sort_unstable();
+            roles
+        };
+        let fanned = |roles: &[EnrollRole]| -> Vec<&str> {
+            let mut names: Vec<&str> = roles.iter().map(|r| r.name).collect();
+            names.sort_unstable();
+            names
+        };
+        assert_eq!(
+            granted("attestation"),
+            fanned(ATTESTATION_ROLES),
+            "attestation profile vs ATTESTATION_ROLES"
+        );
+        assert_eq!(
+            granted("coordinator"),
+            fanned(COORDINATOR_ROLES),
+            "coordinator profile vs COORDINATOR_ROLES"
+        );
     }
 }
