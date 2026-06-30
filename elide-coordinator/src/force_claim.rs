@@ -351,15 +351,15 @@ impl ForceClaimOrchestrator {
                 snapshot_ulid: basis.to_string(),
                 pubkey: source_pubkey.to_bytes(),
             }),
-            None => ProvenanceLineage {
-                parent: source_lineage.parent.clone(),
-                extent_index: source_lineage.extent_index.clone(),
-                // Source is read transiently during re_own to recover its
-                // unsnapshotted tail but is not F's content parent (P is);
-                // this grants the read, finalize clears it.
-                recovery_sources: vec![source],
-                ..ProvenanceLineage::root()
-            },
+            // Source is read transiently during re_own to recover its
+            // unsnapshotted tail but is not F's content parent (P is, or
+            // none); the grant authorises the read, finalize collapses the
+            // `Recovering` lineage to its steady-state shape.
+            None => ProvenanceLineage::from_parts(
+                source_lineage.parent().cloned(),
+                source_lineage.extent_index().to_vec(),
+                vec![source],
+            ),
         };
         write_provenance(&new_dir, &signing_key, VOLUME_PROVENANCE_FILE, &provisional)
             .map_err(|e| IpcError::internal(format!("writing provisional provenance: {e}")))?;
@@ -744,8 +744,7 @@ impl ForceClaimOrchestrator {
         let rewrite = match basis {
             Some(effective_basis) => {
                 let pin = provisional
-                    .parent
-                    .as_ref()
+                    .parent()
                     .filter(|p| p.volume_ulid == source.to_string())
                     .map(|p| p.snapshot_ulid.clone());
                 if pin.as_deref() != Some(effective_basis.to_string().as_str()) {
@@ -762,20 +761,14 @@ impl ForceClaimOrchestrator {
                         snapshot_ulid: effective_basis.to_string(),
                         pubkey: source_pubkey.to_bytes(),
                     }))
-                } else if provisional.recovery_sources.is_empty() {
+                } else if provisional.recovery_sources().is_empty() {
                     None
                 } else {
-                    Some(ProvenanceLineage {
-                        recovery_sources: Vec::new(),
-                        ..provisional
-                    })
+                    Some(provisional.cleared_recovery())
                 }
             }
-            None if provisional.recovery_sources.is_empty() => None,
-            None => Some(ProvenanceLineage {
-                recovery_sources: Vec::new(),
-                ..provisional
-            }),
+            None if provisional.recovery_sources().is_empty() => None,
+            None => Some(provisional.cleared_recovery()),
         };
 
         if let Some(lineage) = rewrite {
@@ -1094,7 +1087,7 @@ mod tests {
             VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        let parent = lineage.parent.expect("parent pin");
+        let parent = lineage.parent().expect("parent pin");
         assert_eq!(parent.volume_ulid, dead.vol.to_string());
         assert_eq!(parent.snapshot_ulid, basis.to_string());
         assert_eq!(parent.pubkey, dead.vk.to_bytes());
@@ -1162,9 +1155,9 @@ mod tests {
             VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        assert!(lineage.parent.is_none(), "root continuation stays a root");
+        assert!(lineage.parent().is_none(), "root continuation stays a root");
         assert!(
-            lineage.recovery_sources.is_empty(),
+            lineage.recovery_sources().is_empty(),
             "finalize must clear the transient recovery-source grant the rebind set"
         );
         let head = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), fork)
@@ -1226,7 +1219,7 @@ mod tests {
             VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        let parent = lineage.parent.expect("takeover carries the ParentRef");
+        let parent = lineage.parent().expect("takeover carries the ParentRef");
         assert_eq!(parent.volume_ulid, grandparent.vol.to_string());
         assert_eq!(parent.snapshot_ulid, gsnap.to_string());
         assert_eq!(parent.pubkey, grandparent.vk.to_bytes());

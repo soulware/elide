@@ -166,7 +166,7 @@ pub async fn prefetch_indexes(
         signing::read_lineage_with_key(fork_dir, &own_vk, signing::VOLUME_PROVENANCE_FILE)
             .with_context(|| format!("reading provenance for {}", fork_dir.display()))?;
     let mut ancestor_ulids: Vec<Ulid> = Vec::new();
-    let mut cursor = own_lineage.parent;
+    let mut cursor = own_lineage.parent().cloned();
     while let Some(parent) = cursor {
         let parent_ulid = Ulid::from_string(&parent.volume_ulid).map_err(|e| {
             anyhow::anyhow!(
@@ -208,7 +208,7 @@ pub async fn prefetch_indexes(
             signing::VOLUME_PROVENANCE_FILE,
         )
         .with_context(|| format!("reading provenance for ancestor {}", parent.volume_ulid))?;
-        cursor = parent_lineage.parent;
+        cursor = parent_lineage.parent().cloned();
     }
 
     // Extent-index ancestors have no embedded pubkey — the child just

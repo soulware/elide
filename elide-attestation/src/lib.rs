@@ -618,11 +618,7 @@ mod tests {
         extent_index: Vec<String>,
     ) {
         let tmp = TempDir::new().unwrap();
-        let lineage = ProvenanceLineage {
-            parent,
-            extent_index,
-            ..ProvenanceLineage::root()
-        };
+        let lineage = ProvenanceLineage::from_parts(parent, extent_index, Vec::new());
         write_provenance(tmp.path(), key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
         let prov = std::fs::read(tmp.path().join(VOLUME_PROVENANCE_FILE)).unwrap();
         put_object(store, &meta_provenance_key(ulid), prov)

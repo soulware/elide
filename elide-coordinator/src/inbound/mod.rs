@@ -1859,7 +1859,7 @@ pub(crate) async fn pull_readonly_op(
         elide_core::signing::VOLUME_PROVENANCE_FILE,
     ) {
         Ok(lineage) => lineage
-            .parent
+            .parent()
             .map(|p| {
                 ulid::Ulid::from_string(&p.volume_ulid).map_err(|e| {
                     IpcError::internal(format!("malformed parent ULID {:?}: {e}", p.volume_ulid))

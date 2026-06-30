@@ -158,7 +158,7 @@ impl BlockReader {
         // Parent's provenance is verified under the parent_pubkey the child
         // signed over — not the parent's own volume.pub on disk.
         let mut parents: Vec<SnapshotLayer> = Vec::new();
-        let mut cursor = own_lineage.parent;
+        let mut cursor = own_lineage.parent().cloned();
         while let Some(parent) = cursor {
             let parent_dir = volume::resolve_ancestor_dir(by_id_dir, &parent.volume_ulid);
             if !parent_dir.exists() {
@@ -192,7 +192,7 @@ impl BlockReader {
                 segs,
                 vk: parent_vk,
             });
-            cursor = parent_lineage.parent;
+            cursor = parent_lineage.parent().cloned();
         }
 
         // Apply oldest-first: root ancestor, ..., immediate parent, own fork.

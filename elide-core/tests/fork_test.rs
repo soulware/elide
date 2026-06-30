@@ -51,7 +51,7 @@ fn fork_via_symlink_writes_ulid_in_provenance_parent() {
         elide_core::signing::VOLUME_PROVENANCE_FILE,
     )
     .unwrap();
-    let parent = lineage.parent.expect("fork must record parent");
+    let parent = lineage.parent().expect("fork must record parent");
     assert_eq!(
         parent.volume_ulid, source_ulid,
         "provenance parent volume ULID should match the source, not the symlink name"

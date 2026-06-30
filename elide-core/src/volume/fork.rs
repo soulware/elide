@@ -145,10 +145,10 @@ mod tests {
             crate::signing::VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        let parent = lineage.parent.expect("fork must record parent");
+        let parent = lineage.parent().expect("fork must record parent");
         assert_eq!(parent.volume_ulid, root_ulid);
         assert_eq!(parent.snapshot_ulid, snap_ulid);
-        assert!(lineage.extent_index.is_empty());
+        assert!(lineage.extent_index().is_empty());
 
         fs::remove_dir_all(by_id).unwrap();
     }
@@ -191,7 +191,7 @@ mod tests {
             crate::signing::VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        let parent = lineage.parent.expect("fork must record parent");
+        let parent = lineage.parent().expect("fork must record parent");
         assert_eq!(parent.volume_ulid, source_ulid);
         assert_eq!(parent.snapshot_ulid, branch_ulid.to_string());
 
@@ -241,7 +241,7 @@ mod tests {
             crate::signing::VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        let parent = lineage.parent.expect("fork must record parent");
+        let parent = lineage.parent().expect("fork must record parent");
         assert_eq!(parent.volume_ulid, root_ulid);
         assert_eq!(
             parent.snapshot_ulid, snap2,
@@ -296,7 +296,7 @@ mod tests {
             crate::signing::VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        let leaf_parent = leaf_lineage.parent.expect("leaf must record parent");
+        let leaf_parent = leaf_lineage.parent().expect("leaf must record parent");
         assert_eq!(leaf_parent.volume_ulid, mid_ulid);
         let mid_lineage = crate::signing::read_lineage_verifying_signature(
             &mid_dir,
@@ -304,7 +304,7 @@ mod tests {
             crate::signing::VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        let mid_parent = mid_lineage.parent.expect("mid must record parent");
+        let mid_parent = mid_lineage.parent().expect("mid must record parent");
         assert_eq!(mid_parent.volume_ulid, root_ulid);
 
         // Leaf sees data from all three levels.

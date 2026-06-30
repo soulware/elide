@@ -103,7 +103,7 @@ fn build_extent_index_entries(sources: &[String], data_dir: &Path) -> std::io::R
             ))
         })?;
 
-        for entry in source_lineage.extent_index {
+        for entry in source_lineage.extent_index() {
             let ulid_key = entry
                 .split_once('/')
                 .and_then(|(u, s)| {
@@ -117,7 +117,7 @@ fn build_extent_index_entries(sources: &[String], data_dir: &Path) -> std::io::R
                     ))
                 })?;
             if seen_ulids.insert(ulid_key) {
-                inherited.push(entry);
+                inherited.push(entry.clone());
             }
         }
 

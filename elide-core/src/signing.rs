@@ -248,57 +248,152 @@ pub struct OciSource {
     pub arch: String,
 }
 
-/// Lineage fields embedded in `volume.provenance` under the signature.
+/// Lineage embedded in `volume.provenance` under the signature, in one of
+/// three shapes: a `Root` (no fork parent — a fresh writable volume or an
+/// import), a `Fork` descending from a `parent` snapshot, or a transient
+/// `Recovering` (a forced-claim re-own in flight).
 ///
-/// `parent` is the fork ancestor (writable CoW relationship — merged into
-/// the child's LBA map at open time). `extent_index` is a flat list of
+/// `extent_index` is a flat list of `<volume-ulid>/<snapshot-ulid>`
 /// hash-source snapshots whose extents seed the child's extent index for
-/// dedup and delta compression, but are never merged into the LBA map.
-/// `oci_source` records how an import root was built and is present
-/// only on OCI-imported roots. All three are optional: fresh writable
-/// volumes carry none, forks carry only `parent`, imports carry
-/// `oci_source` (and optionally `extent_index`), and in principle a
-/// future flow could carry several.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
-pub struct ProvenanceLineage {
-    /// Parent snapshot reference with embedded parent pubkey, or `None`
-    /// for root volumes.
-    pub parent: Option<ParentRef>,
-    /// Flat list of `<volume-ulid>/<snapshot-ulid>` entries naming
-    /// hash-source snapshots.
-    pub extent_index: Vec<String>,
-    /// Present iff this volume is an OCI-imported root.
-    pub oci_source: Option<OciSource>,
-    /// Volumes this fork may read transiently during a forced-claim
-    /// re-own but does not derive content from — walked into the read set
-    /// as leaves, no snapshot pin. Empty on every steady-state provenance:
-    /// set at rebind, cleared at finalize
-    /// (`docs/design/mint-volume-attestation.md` § *The no-basis re-own
-    /// reads outside the new fork's lineage*).
-    pub recovery_sources: Vec<ulid::Ulid>,
+/// dedup and delta compression; it never merges into the LBA map, and every
+/// shape may carry it. `oci_source` records how an import root was built and
+/// exists only on `Root`. `recovery_sources` — volumes a forced-claim re-own
+/// reads transiently but does not derive content from, walked into the read
+/// set as leaves — exists only on `Recovering`, so a steady-state provenance
+/// structurally cannot carry one (`docs/design/mint-volume-attestation.md`
+/// § *The no-basis re-own and `recovery_sources`*). `Recovering` collapses
+/// to `Root`/`Fork` at finalize via [`Self::cleared_recovery`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvenanceLineage {
+    /// A volume with no fork parent: a fresh writable volume, or an
+    /// import (`oci_source` present iff OCI-imported).
+    Root {
+        extent_index: Vec<String>,
+        oci_source: Option<OciSource>,
+    },
+    /// A volume forked from `parent`'s snapshot.
+    Fork {
+        parent: ParentRef,
+        extent_index: Vec<String>,
+    },
+    /// A forced-claim re-own in flight: the eventual steady-state shape
+    /// (`parent` present → `Fork`, absent → `Root`) plus the transient
+    /// `recovery_sources` grant that authorises reading the dead fork.
+    /// Collapsed to its steady-state variant at finalize.
+    Recovering {
+        parent: Option<ParentRef>,
+        extent_index: Vec<String>,
+        recovery_sources: Vec<ulid::Ulid>,
+    },
+}
+
+impl Default for ProvenanceLineage {
+    fn default() -> Self {
+        Self::root()
+    }
 }
 
 impl ProvenanceLineage {
-    /// A root volume: no parent, no extent sources, no recovery grant.
-    /// Roots that carry extents or an OCI source override that one field
-    /// via struct-update — `ProvenanceLineage { oci_source: .., ..root() }`
-    /// — so a new field added here lands as a default everywhere.
+    /// A root volume: no parent, no extent sources.
     pub fn root() -> Self {
-        Self {
-            parent: None,
+        Self::Root {
             extent_index: Vec::new(),
             oci_source: None,
-            recovery_sources: Vec::new(),
         }
     }
 
-    /// A fork descending from `parent`, with no extent sources or recovery
-    /// grant. Sites carrying extents override `extent_index` via
-    /// struct-update over this base.
+    /// A fork descending from `parent`, with no extent sources.
     pub fn fork(parent: ParentRef) -> Self {
-        Self {
-            parent: Some(parent),
-            ..Self::root()
+        Self::Fork {
+            parent,
+            extent_index: Vec::new(),
+        }
+    }
+
+    /// The variant implied by the parts: a `Recovering` when a recovery
+    /// grant is present, else a `Fork` (parent present) or `Root`. What
+    /// callers reach for when the shape is dynamic — a claim's provisional
+    /// basis, a re-own grant.
+    pub fn from_parts(
+        parent: Option<ParentRef>,
+        extent_index: Vec<String>,
+        recovery_sources: Vec<ulid::Ulid>,
+    ) -> Self {
+        if !recovery_sources.is_empty() {
+            return Self::Recovering {
+                parent,
+                extent_index,
+                recovery_sources,
+            };
+        }
+        match parent {
+            Some(parent) => Self::Fork {
+                parent,
+                extent_index,
+            },
+            None => Self::Root {
+                extent_index,
+                oci_source: None,
+            },
+        }
+    }
+
+    /// The fork parent, or `None` for a root.
+    pub fn parent(&self) -> Option<&ParentRef> {
+        match self {
+            Self::Fork { parent, .. } => Some(parent),
+            Self::Recovering { parent, .. } => parent.as_ref(),
+            Self::Root { .. } => None,
+        }
+    }
+
+    /// The extent-index hash-source snapshots (every shape may carry them).
+    pub fn extent_index(&self) -> &[String] {
+        match self {
+            Self::Root { extent_index, .. }
+            | Self::Fork { extent_index, .. }
+            | Self::Recovering { extent_index, .. } => extent_index,
+        }
+    }
+
+    /// The OCI import source — only a `Root` can have one.
+    pub fn oci_source(&self) -> Option<&OciSource> {
+        match self {
+            Self::Root { oci_source, .. } => oci_source.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The transient forced-claim recovery grant — only `Recovering` has
+    /// one; empty for every steady-state shape.
+    pub fn recovery_sources(&self) -> &[ulid::Ulid] {
+        match self {
+            Self::Recovering {
+                recovery_sources, ..
+            } => recovery_sources,
+            _ => &[],
+        }
+    }
+
+    /// Collapse a `Recovering` lineage to its steady-state `Root`/`Fork`
+    /// (by `parent`) once the re-own is done; identity on `Root`/`Fork`.
+    pub fn cleared_recovery(self) -> Self {
+        match self {
+            Self::Recovering {
+                parent,
+                extent_index,
+                ..
+            } => match parent {
+                Some(parent) => Self::Fork {
+                    parent,
+                    extent_index,
+                },
+                None => Self::Root {
+                    extent_index,
+                    oci_source: None,
+                },
+            },
+            other => other,
         }
     }
 }
@@ -508,29 +603,28 @@ const PROVENANCE_RECOVERY_SOURCES_DOMAIN: &str = "elide-recovery-sources-v1";
 /// original format, so existing provenance signatures continue to verify
 /// under the same input.
 fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
-    let parent_display = lineage.parent.as_ref().map(ParentRef::to_display);
+    let parent_display = lineage.parent().map(ParentRef::to_display);
     let parent_str = parent_display.as_deref().unwrap_or("");
     let parent_pubkey_hex = lineage
-        .parent
-        .as_ref()
+        .parent()
         .map(|p| encode_hex(&p.pubkey))
         .unwrap_or_default();
-    let mut total = parent_str.len() + 1 + parent_pubkey_hex.len() + lineage.extent_index.len();
-    for entry in &lineage.extent_index {
+    let mut total = parent_str.len() + 1 + parent_pubkey_hex.len() + lineage.extent_index().len();
+    for entry in lineage.extent_index() {
         total += entry.len();
     }
-    if let Some(src) = &lineage.oci_source {
+    if let Some(src) = lineage.oci_source() {
         total += 3 + src.image.len() + src.digest.len() + src.arch.len();
     }
     let mut msg = Vec::with_capacity(total);
     msg.extend_from_slice(parent_str.as_bytes());
     msg.push(0u8);
     msg.extend_from_slice(parent_pubkey_hex.as_bytes());
-    for entry in &lineage.extent_index {
+    for entry in lineage.extent_index() {
         msg.push(0u8);
         msg.extend_from_slice(entry.as_bytes());
     }
-    if let Some(src) = &lineage.oci_source {
+    if let Some(src) = lineage.oci_source() {
         msg.push(0u8);
         msg.extend_from_slice(src.image.as_bytes());
         msg.push(0u8);
@@ -538,10 +632,10 @@ fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
         msg.push(0u8);
         msg.extend_from_slice(src.arch.as_bytes());
     }
-    if !lineage.recovery_sources.is_empty() {
+    if !lineage.recovery_sources().is_empty() {
         msg.push(0u8);
         msg.extend_from_slice(PROVENANCE_RECOVERY_SOURCES_DOMAIN.as_bytes());
-        for src in &lineage.recovery_sources {
+        for src in lineage.recovery_sources() {
             msg.push(0u8);
             msg.extend_from_slice(src.to_string().as_bytes());
         }
@@ -550,11 +644,10 @@ fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
 }
 
 fn serialize_provenance(lineage: &ProvenanceLineage, sig: &[u8; 64]) -> String {
-    let parent_display = lineage.parent.as_ref().map(ParentRef::to_display);
+    let parent_display = lineage.parent().map(ParentRef::to_display);
     let parent_str = parent_display.as_deref().unwrap_or("");
     let parent_pubkey_hex = lineage
-        .parent
-        .as_ref()
+        .parent()
         .map(|p| encode_hex(&p.pubkey))
         .unwrap_or_default();
     let mut content = String::new();
@@ -565,14 +658,14 @@ fn serialize_provenance(lineage: &ProvenanceLineage, sig: &[u8; 64]) -> String {
     content.push_str(&parent_pubkey_hex);
     content.push('\n');
     content.push_str("extent_index:\n");
-    for entry in &lineage.extent_index {
+    for entry in lineage.extent_index() {
         content.push_str("  ");
         content.push_str(entry);
         content.push('\n');
     }
     // Only emit when set, so non-OCI roots serialise byte-identically
     // to the pre-oci_source format.
-    if let Some(src) = &lineage.oci_source {
+    if let Some(src) = lineage.oci_source() {
         content.push_str("oci_image: ");
         content.push_str(&src.image);
         content.push('\n');
@@ -585,9 +678,9 @@ fn serialize_provenance(lineage: &ProvenanceLineage, sig: &[u8; 64]) -> String {
     }
     // Only emit when non-empty, so steady-state provenance serialises
     // byte-identically to the pre-`recovery_sources` format.
-    if !lineage.recovery_sources.is_empty() {
+    if !lineage.recovery_sources().is_empty() {
         content.push_str("recovery_sources:\n");
-        for src in &lineage.recovery_sources {
+        for src in lineage.recovery_sources() {
             content.push_str("  ");
             content.push_str(&src.to_string());
             content.push('\n');
@@ -744,15 +837,37 @@ fn parse_provenance(
         }
     };
 
-    Ok((
-        ProvenanceLineage {
+    let lineage = if !recovery_sources.is_empty() {
+        if oci_source.is_some() {
+            return Err(io::Error::other(format!(
+                "{provenance_file} carries both recovery_sources and oci_source"
+            )));
+        }
+        ProvenanceLineage::Recovering {
             parent,
             extent_index,
-            oci_source,
             recovery_sources,
-        },
-        sig,
-    ))
+        }
+    } else {
+        match parent {
+            Some(parent) => {
+                if oci_source.is_some() {
+                    return Err(io::Error::other(format!(
+                        "{provenance_file} carries both a parent and oci_source (a fork cannot be an OCI root)"
+                    )));
+                }
+                ProvenanceLineage::Fork {
+                    parent,
+                    extent_index,
+                }
+            }
+            None => ProvenanceLineage::Root {
+                extent_index,
+                oci_source,
+            },
+        }
+    };
+    Ok((lineage, sig))
 }
 
 // --- snapshot manifest (`snapshots/<ulid>.manifest`) ---
@@ -1189,13 +1304,13 @@ mod tests {
         crate::segment::write_file_atomic(&tmp.path().join(VOLUME_PUB_FILE), pub_hex.as_bytes())
             .unwrap();
 
-        let lineage = ProvenanceLineage {
+        let lineage = ProvenanceLineage::Root {
+            extent_index: vec![],
             oci_source: Some(OciSource {
                 image: "docker.io/library/ubuntu:24.04".to_owned(),
                 digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
                 arch: "amd64".to_owned(),
             }),
-            ..ProvenanceLineage::root()
         };
         write_provenance(tmp.path(), &key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 
@@ -1210,9 +1325,9 @@ mod tests {
     /// stable across the schema extension.
     #[test]
     fn provenance_signing_input_unchanged_when_oci_source_absent() {
-        let lineage = ProvenanceLineage {
+        let lineage = ProvenanceLineage::Root {
             extent_index: vec!["01ABC/01DEF".to_owned()],
-            ..ProvenanceLineage::root()
+            oci_source: None,
         };
         let with_oci_none = provenance_signing_input(&lineage);
 
@@ -1239,9 +1354,10 @@ mod tests {
 
         let a = ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let b = ulid::Ulid::from_string("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
-        let lineage = ProvenanceLineage {
+        let lineage = ProvenanceLineage::Recovering {
+            parent: None,
+            extent_index: vec![],
             recovery_sources: vec![a, b],
-            ..ProvenanceLineage::root()
         };
         write_provenance(tmp.path(), &key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
         let got =
@@ -1259,10 +1375,7 @@ mod tests {
         expected.extend_from_slice(b.to_string().as_bytes());
         assert_eq!(provenance_signing_input(&lineage), expected);
 
-        let empty = ProvenanceLineage {
-            recovery_sources: vec![],
-            ..lineage
-        };
+        let empty = lineage.cleared_recovery();
         assert_eq!(
             provenance_signing_input(&empty),
             vec![0u8],

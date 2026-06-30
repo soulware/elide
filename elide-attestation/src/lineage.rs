@@ -51,7 +51,7 @@ pub async fn walk_lineage_set(
     loop {
         let lineage = load_provenance(store, &current_ulid, &current_vk).await?;
 
-        for entry in &lineage.extent_index {
+        for entry in lineage.extent_index() {
             let (source, _snapshot) =
                 elide_core::volume::parse_lineage_pair(entry).map_err(|e| {
                     io::Error::other(format!(
@@ -62,12 +62,12 @@ pub async fn walk_lineage_set(
         }
 
         if current_ulid == owned {
-            for source in &lineage.recovery_sources {
+            for source in lineage.recovery_sources() {
                 set.insert(*source);
             }
         }
 
-        let Some(parent) = lineage.parent else {
+        let Some(parent) = lineage.parent() else {
             break;
         };
 
@@ -171,12 +171,7 @@ mod tests {
         let dir = by_id.join(ulid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(VOLUME_PUB_FILE), pub_hex(key)).unwrap();
-        let lineage = ProvenanceLineage {
-            parent,
-            extent_index,
-            recovery_sources,
-            ..ProvenanceLineage::root()
-        };
+        let lineage = ProvenanceLineage::from_parts(parent, extent_index, recovery_sources);
         write_provenance(&dir, key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 
         let prov = std::fs::read(dir.join(VOLUME_PROVENANCE_FILE)).unwrap();
