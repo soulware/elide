@@ -398,7 +398,7 @@ pub(crate) fn assert_enrolled(data_dir: &Path, profile: EnrollProfile) -> io::Re
     }
     Err(io::Error::other(format!(
         "[mint] is configured but enrollment artifact(s) for [{}] are missing or unreadable \
-         under {}; run `elide coord enroll` to provision them",
+         under {}",
         missing.join(", "),
         credentials_dir(data_dir).display()
     )))
