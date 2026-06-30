@@ -185,6 +185,10 @@ async fn attested_loop_over_shipped_templates() {
             set("data_dir", root_p.join("mint_data").display().to_string());
             set("roles_dir", rendered_roles.display().to_string());
             set("socket", mint_sock.display().to_string());
+            set(
+                "catalog_file",
+                deploy.join("catalog.toml").display().to_string(),
+            );
         }
         // Colocate the demo auth role under the shipped [auth] table.
         // Presence of the [auth.demo] table is the switch; the socket binds it.
@@ -310,7 +314,7 @@ async fn attested_loop_over_shipped_templates() {
                 enroll::EnrollOptions {
                     wait: Duration::from_secs(60),
                     force: false,
-                    kind: enroll::EnrollKind::Coordinator,
+                    profile: enroll::EnrollProfile::Coordinator,
                 },
                 &issuer,
             )

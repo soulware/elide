@@ -1,12 +1,15 @@
 # mint-for-elide config for the Fly.io deployment (see README.md § Fly.io
 # deployment). Self-contained: mint-elide.toml plus the Fly data_dir, listener,
-# and colocated demo auth/attestation. The [[role]] inventory mirrors
-# mint-elide.toml — keep the two in sync.
+# and colocated demo auth/attestation. The role + profile catalog is the shared
+# catalog.toml.
 
 audience = "mint"
 
 # Rendered roles/ (mint render output), resolved against mint's working dir.
 roles_dir = "roles"
+
+# The [[role]] + [[profile]] catalog, resolved against mint's working dir.
+catalog_file = "catalog.toml"
 
 # Keyring, sealed surface, invite nonce, and demo secrets — the Fly volume.
 data_dir = "/data/mint_data"
@@ -26,22 +29,6 @@ location = "https://coord-b.elide.internal/v1/discharge"
 # mint's own administrative bucket (holds its _mint/* state). The Fly build
 # overrides this from the DATA_BUCKET / STORE_BUCKET build arg.
 bucket = "mint-admin"
-
-[[role]]
-name = "volume-ro"
-ttl_seconds = 3600
-
-[[role]]
-name = "volume-rw"
-ttl_seconds = 86400
-
-[[role]]
-name = "coord-ro"
-ttl_seconds = 3600
-
-[[role]]
-name = "coord-rw"
-ttl_seconds = 3600
 
 # Colocated demo auth + attestation, both binding a container-internal UDS.
 # `k_m_a` and `k_m_b` are demo-tier shared-key secrets — standard base64 of 32

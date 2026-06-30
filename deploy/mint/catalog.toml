@@ -1,0 +1,37 @@
+# Elide's mint authorization catalog: the role inventory plus the enrollment
+# profiles that bound what an enrolled coordinator may exchange. The operational
+# config points at this file with `catalog_file`.
+
+# A role is its `name`, a single `ttl_seconds` (the credential lifetime ceiling
+# in seconds), and a policy template under the config's roles_dir. Caveat
+# provenance is derived from the template: a `{{caveat.X}}` whose name is
+# reserved (`sub`) is issuer-stamped; any other name (`volume`) is attested.
+
+[[role]]
+name = "volume-ro"
+ttl_seconds = 3600         # 1h
+
+[[role]]
+name = "volume-rw"
+ttl_seconds = 86400        # 24h
+
+[[role]]
+name = "coord-ro"
+ttl_seconds = 3600         # 1h
+
+[[role]]
+name = "coord-rw"
+ttl_seconds = 3600         # 1h
+
+# An enrollment profile names the role set its enrollee may exchange. The
+# enrollee declares a profile at /v1/enroll; mint enforces role ∈ grant at
+# enroll-exchange. `coordinator` is the full coordinator; `attestation` is the
+# read-only discharge authority (coord B), holding coord-ro alone.
+
+[[profile]]
+name = "coordinator"
+roles = ["coord-ro", "coord-rw", "volume-rw", "volume-ro"]
+
+[[profile]]
+name = "attestation"
+roles = ["coord-ro"]
