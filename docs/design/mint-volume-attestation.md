@@ -198,7 +198,10 @@ walk_extent_ancestors` (`elide-core/src/volume/open_state.rs`); every
 is no out-of-band dedup against volumes outside the recorded lineage, so
 a read can never resolve to a prefix outside this union. coord A
 therefore never legitimately needs a prefix coord B would refuse, and
-coord B never vouches for one a read could not reach.
+coord B never vouches for one a read could not reach. The one read
+outside this union is the forced-claim re-own of a never-snapshotted dead
+volume — a transient recovery copy, not a steady-state read; § *The
+no-basis re-own reads outside the new fork's lineage* covers it.
 
 > **Delta to `architecture.md`** (apply with this work): tighten the
 > cross-volume-dedup prose (§ *Cross-volume dedup*, ~line 938). Dedup
@@ -548,9 +551,13 @@ owner, so the rework gives the operation to the next owner: recovery is
 2. **Re-own the head delta, anchored.** The live segments above
    `latest_snapshot` — resolved from one post-CAS read of the dead
    volume's HEAD, the cut that defines the claim set — become the new
-   fork's first segments. The claimant is live and the dead volume is
-   its declared parent, so the reads ride `volume-ro`; the writes
-   land under the claimant's own prefix and ride `volume-rw`. Per
+   fork's first segments. The reads of the dead volume's prefix ride
+   `volume-ro` anchored on the claimant, which requires the dead volume
+   to sit in the claimant's read set: true when step 1 found a basis (the
+   dead volume is then the declared parent), but **not** in the no-basis
+   case (§ *The no-basis re-own reads outside the new fork's lineage*).
+   The writes land under the claimant's own prefix and ride `volume-rw`.
+   Per
    segment: verify the parent's signature over the index, re-sign the
    same index bytes with the fork's key — the segment signature covers
    `BLAKE3(header || index_bytes)` only, body integrity being the
@@ -580,6 +587,40 @@ head-delta cut* carries the mechanism and walkthroughs.
 An operator who wants to free a dead name without hosting its volume
 runs `claim --force` followed by a normal `release`; the resulting
 Released record carries a real volume-signed handoff.
+
+#### The no-basis re-own reads outside the new fork's lineage
+
+When the dead volume never snapshotted, step 1 gives the new fork the
+dead fork's *own* parent, so the dead volume is a **sibling** of the new
+fork — absent from its `fork ∪ extent_index` read set — yet step 2 still
+reads the dead volume's `by_id/` (HEAD, then each live segment) to
+re-own it. coord B's lineage walk, anchored on the new fork, omits the
+dead volume, so the `volume-ro` discharge is refused
+`Denied("target not in read set")`, the re-own cannot proceed, and the
+claim fails. The dead volume is correctly *not* part of the new fork's
+final content lineage — after re-own its segments are the fork's own — so
+this is a transient recovery read, not a steady-state one. Reproduced by
+`elide-attestation`'s
+`forced_claim_fork_cannot_read_unsnapshotted_dead_source`.
+
+**Proposed: a transient `recovery_sources` grant.** Add a bare-ULID
+`recovery_sources` list to `ProvenanceLineage`, signed into the
+provenance and walked into the read set as leaves — like `extent_index`,
+but with no snapshot pin, since the re-own reads the dead volume's live
+HEAD, not a snapshot. Rebind sets `recovery_sources = [dead_vol]` so the
+anchored re-own is authorised; `finalize` clears it once the segments are
+re-owned, leaving the steady-state `parent = <dead's parent>` shape. The
+field is empty on every non-recovery provenance: its emptiness is the
+"recovery complete" signal, and a `cat` of an in-flight fork's provenance
+shows exactly what it is re-owning.
+
+coord B is untouched. `recovery_sources` is the same volume-signed
+self-declaration that already scopes every read (§ *The read set is
+exactly fork ∪ extent_index*): a leaked `volume-ro` cred cannot widen it,
+because the grant is written under the coordinator's write authority, not
+the read credential. It expresses a transient read, not content
+derivation or ownership — which is why it is a distinct field cleared at
+finalize rather than a `ParentRef`, and why it carries no snapshot.
 
 ### Foreign reads have no anchor — `volume fetch` is removed
 

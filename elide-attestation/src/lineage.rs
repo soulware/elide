@@ -281,4 +281,96 @@ mod tests {
             .expect_err("imposter parent pubkey");
         assert!(err.to_string().contains("signature invalid"), "got {err}");
     }
+
+    /// Reproduces the production `claim --force` denial against a dead fork
+    /// that never published its own snapshot.
+    ///
+    /// `force_claim`'s rebind, in the `latest_snapshot == None` branch
+    /// (`force_claim.rs`), gives the new fork the dead fork's *parent* as
+    /// its own parent — so the dead fork itself is absent from the new
+    /// fork's lineage. `re_own` must then read the dead fork's `by_id/` to
+    /// recover its unsnapshotted tail, anchored on the new fork; coord B's
+    /// read-set walk does not contain it, so the discharge is refused with
+    /// `Denied("target not in read set")` (`discharge`, step 6).
+    ///
+    /// The gap is a genuine lineage omission, not a coord B quirk: the dead
+    /// source is absent from both the signed-lineage walk coord B runs and
+    /// the local read path it is pinned to equal. Option A (a transient
+    /// `recovery_sources` grant on the provisional provenance, dropped at
+    /// finalize) closes it — when that lands, the new fork's read set
+    /// contains `dead` and this test passes; drop the `#[ignore]` then.
+    ///
+    /// Run today with `--ignored` to observe the denial it documents.
+    #[tokio::test]
+    #[ignore = "reproduces the force-claim x attested-read gap; un-ignore when recovery_sources (Option A) lands"]
+    async fn forced_claim_fork_cannot_read_unsnapshotted_dead_source() {
+        let by_id = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let base_key = SigningKey::generate(&mut OsRng); // snapshotted ancestor P
+        let dead_key = SigningKey::generate(&mut OsRng); // dead fork E, never snapshotted
+        let fork_key = SigningKey::generate(&mut OsRng); // fork F the forced claim mints
+        let base = Ulid::new();
+        let dead = Ulid::new();
+        let fork = Ulid::new();
+
+        // P: a root with a published snapshot.
+        publish_both(
+            by_id.path(),
+            store.as_ref(),
+            base,
+            &base_key,
+            None,
+            Vec::new(),
+        )
+        .await;
+
+        // E forks from P at a snapshot, then writes without ever
+        // snapshotting — so its name record carries no `latest_snapshot`.
+        let base_parent = ParentRef {
+            volume_ulid: base.to_string(),
+            snapshot_ulid: Ulid::new().to_string(),
+            pubkey: base_key.verifying_key().to_bytes(),
+        };
+        publish_both(
+            by_id.path(),
+            store.as_ref(),
+            dead,
+            &dead_key,
+            Some(base_parent.clone()),
+            Vec::new(),
+        )
+        .await;
+
+        // F is what the forced claim mints for a never-snapshotted dead
+        // fork: it inherits E's parent (P), so E is absent from F's lineage.
+        publish_both(
+            by_id.path(),
+            store.as_ref(),
+            fork,
+            &fork_key,
+            Some(base_parent),
+            Vec::new(),
+        )
+        .await;
+
+        let read_set = walk_lineage_set(store.as_ref(), fork, fork_key.verifying_key())
+            .await
+            .unwrap();
+        let fork_dir = by_id.path().join(fork.to_string());
+        let local: HashSet<Ulid> = elide_core::volume::lineage_ulids(&fork_dir, by_id.path())
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert!(
+            read_set.contains(&dead),
+            "coord B must vouch the dead source the re-own reads; \
+             absent today (read set = {read_set:?})"
+        );
+        assert!(
+            local.contains(&dead),
+            "the local read path the walk is pinned to also omits the dead source"
+        );
+    }
 }
