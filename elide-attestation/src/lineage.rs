@@ -174,8 +174,8 @@ mod tests {
         let lineage = ProvenanceLineage {
             parent,
             extent_index,
-            oci_source: None,
             recovery_sources,
+            ..ProvenanceLineage::root()
         };
         write_provenance(&dir, key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 

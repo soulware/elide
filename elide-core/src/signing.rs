@@ -278,6 +278,31 @@ pub struct ProvenanceLineage {
     pub recovery_sources: Vec<ulid::Ulid>,
 }
 
+impl ProvenanceLineage {
+    /// A root volume: no parent, no extent sources, no recovery grant.
+    /// Roots that carry extents or an OCI source override that one field
+    /// via struct-update — `ProvenanceLineage { oci_source: .., ..root() }`
+    /// — so a new field added here lands as a default everywhere.
+    pub fn root() -> Self {
+        Self {
+            parent: None,
+            extent_index: Vec::new(),
+            oci_source: None,
+            recovery_sources: Vec::new(),
+        }
+    }
+
+    /// A fork descending from `parent`, with no extent sources or recovery
+    /// grant. Sites carrying extents override `extent_index` via
+    /// struct-update over this base.
+    pub fn fork(parent: ParentRef) -> Self {
+        Self {
+            parent: Some(parent),
+            ..Self::root()
+        }
+    }
+}
+
 /// Set up an importing volume's identity and return a signer for
 /// segment writing.
 ///
@@ -1165,14 +1190,12 @@ mod tests {
             .unwrap();
 
         let lineage = ProvenanceLineage {
-            parent: None,
-            extent_index: vec![],
             oci_source: Some(OciSource {
                 image: "docker.io/library/ubuntu:24.04".to_owned(),
                 digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
                 arch: "amd64".to_owned(),
             }),
-            recovery_sources: vec![],
+            ..ProvenanceLineage::root()
         };
         write_provenance(tmp.path(), &key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 
@@ -1188,10 +1211,8 @@ mod tests {
     #[test]
     fn provenance_signing_input_unchanged_when_oci_source_absent() {
         let lineage = ProvenanceLineage {
-            parent: None,
             extent_index: vec!["01ABC/01DEF".to_owned()],
-            oci_source: None,
-            recovery_sources: vec![],
+            ..ProvenanceLineage::root()
         };
         let with_oci_none = provenance_signing_input(&lineage);
 
@@ -1219,10 +1240,8 @@ mod tests {
         let a = ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let b = ulid::Ulid::from_string("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
         let lineage = ProvenanceLineage {
-            parent: None,
-            extent_index: vec![],
-            oci_source: None,
             recovery_sources: vec![a, b],
+            ..ProvenanceLineage::root()
         };
         write_provenance(tmp.path(), &key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
         let got =

@@ -346,24 +346,19 @@ impl ForceClaimOrchestrator {
             .latest_snapshot
             .map(|snap| format!("{source}/{snap}"));
         let provisional = match self.observed.record.latest_snapshot {
-            Some(basis) => ProvenanceLineage {
-                parent: Some(ParentRef {
-                    volume_ulid: source.to_string(),
-                    snapshot_ulid: basis.to_string(),
-                    pubkey: source_pubkey.to_bytes(),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-                recovery_sources: Vec::new(),
-            },
+            Some(basis) => ProvenanceLineage::fork(ParentRef {
+                volume_ulid: source.to_string(),
+                snapshot_ulid: basis.to_string(),
+                pubkey: source_pubkey.to_bytes(),
+            }),
             None => ProvenanceLineage {
                 parent: source_lineage.parent.clone(),
                 extent_index: source_lineage.extent_index.clone(),
-                oci_source: None,
                 // Source is read transiently during re_own to recover its
                 // unsnapshotted tail but is not F's content parent (P is);
                 // this grants the read, finalize clears it.
                 recovery_sources: vec![source],
+                ..ProvenanceLineage::root()
             },
         };
         write_provenance(&new_dir, &signing_key, VOLUME_PROVENANCE_FILE, &provisional)
@@ -762,16 +757,11 @@ impl ForceClaimOrchestrator {
                         load_verifying_key(&source_dir, VOLUME_PUB_FILE).map_err(|e| {
                             IpcError::internal(format!("loading volume.pub for {source}: {e}"))
                         })?;
-                    Some(ProvenanceLineage {
-                        parent: Some(ParentRef {
-                            volume_ulid: source.to_string(),
-                            snapshot_ulid: effective_basis.to_string(),
-                            pubkey: source_pubkey.to_bytes(),
-                        }),
-                        extent_index: Vec::new(),
-                        oci_source: None,
-                        recovery_sources: Vec::new(),
-                    })
+                    Some(ProvenanceLineage::fork(ParentRef {
+                        volume_ulid: source.to_string(),
+                        snapshot_ulid: effective_basis.to_string(),
+                        pubkey: source_pubkey.to_bytes(),
+                    }))
                 } else if provisional.recovery_sources.is_empty() {
                     None
                 } else {
@@ -1210,16 +1200,11 @@ mod tests {
         let partial = make_dead_volume_with_lineage(
             &store,
             mint.next(),
-            &ProvenanceLineage {
-                parent: Some(ParentRef {
-                    volume_ulid: grandparent.vol.to_string(),
-                    snapshot_ulid: gsnap.to_string(),
-                    pubkey: grandparent.vk.to_bytes(),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-                recovery_sources: Vec::new(),
-            },
+            &ProvenanceLineage::fork(ParentRef {
+                volume_ulid: grandparent.vol.to_string(),
+                snapshot_ulid: gsnap.to_string(),
+                pubkey: grandparent.vk.to_bytes(),
+            }),
         )
         .await;
 

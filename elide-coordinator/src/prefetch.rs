@@ -884,16 +884,11 @@ mod tests {
             &child_dir,
             &child_key,
             VOLUME_PROVENANCE_FILE,
-            &ProvenanceLineage {
-                parent: Some(elide_core::signing::ParentRef {
-                    volume_ulid: parent_ulid.to_owned(),
-                    snapshot_ulid: snap_ulid.to_owned(),
-                    pubkey: parent_key.verifying_key().to_bytes(),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-                recovery_sources: Vec::new(),
-            },
+            &ProvenanceLineage::fork(elide_core::signing::ParentRef {
+                volume_ulid: parent_ulid.to_owned(),
+                snapshot_ulid: snap_ulid.to_owned(),
+                pubkey: parent_key.verifying_key().to_bytes(),
+            }),
         )
         .unwrap();
 
@@ -1019,16 +1014,11 @@ mod tests {
             &child_dir,
             &child_key,
             VOLUME_PROVENANCE_FILE,
-            &ProvenanceLineage {
-                parent: Some(elide_core::signing::ParentRef {
-                    volume_ulid: parent_ulid.to_owned(),
-                    snapshot_ulid: snap_ulid.to_owned(),
-                    pubkey: parent_key.verifying_key().to_bytes(),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-                recovery_sources: Vec::new(),
-            },
+            &ProvenanceLineage::fork(elide_core::signing::ParentRef {
+                volume_ulid: parent_ulid.to_owned(),
+                snapshot_ulid: snap_ulid.to_owned(),
+                pubkey: parent_key.verifying_key().to_bytes(),
+            }),
         )
         .unwrap();
 
@@ -1328,16 +1318,11 @@ mod tests {
             &child_dir,
             &child_key,
             VOLUME_PROVENANCE_FILE,
-            &ProvenanceLineage {
-                parent: Some(elide_core::signing::ParentRef {
-                    volume_ulid: parent_ulid.to_owned(),
-                    snapshot_ulid: branch.to_owned(),
-                    pubkey: parent_key.verifying_key().to_bytes(),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-                recovery_sources: Vec::new(),
-            },
+            &ProvenanceLineage::fork(elide_core::signing::ParentRef {
+                volume_ulid: parent_ulid.to_owned(),
+                snapshot_ulid: branch.to_owned(),
+                pubkey: parent_key.verifying_key().to_bytes(),
+            }),
         )
         .unwrap();
 
@@ -1494,16 +1479,11 @@ mod tests {
             &child_dir,
             &child_key,
             VOLUME_PROVENANCE_FILE,
-            &ProvenanceLineage {
-                parent: Some(elide_core::signing::ParentRef {
-                    volume_ulid: parent_ulid.to_owned(),
-                    snapshot_ulid: branch.to_owned(),
-                    pubkey: parent_key.verifying_key().to_bytes(),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-                recovery_sources: Vec::new(),
-            },
+            &ProvenanceLineage::fork(elide_core::signing::ParentRef {
+                volume_ulid: parent_ulid.to_owned(),
+                snapshot_ulid: branch.to_owned(),
+                pubkey: parent_key.verifying_key().to_bytes(),
+            }),
         )
         .unwrap();
 

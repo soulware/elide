@@ -621,8 +621,7 @@ mod tests {
         let lineage = ProvenanceLineage {
             parent,
             extent_index,
-            oci_source: None,
-            recovery_sources: Vec::new(),
+            ..ProvenanceLineage::root()
         };
         write_provenance(tmp.path(), key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
         let prov = std::fs::read(tmp.path().join(VOLUME_PROVENANCE_FILE)).unwrap();
