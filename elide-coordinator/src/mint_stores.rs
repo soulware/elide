@@ -38,8 +38,8 @@ use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::stores::{ReadOnlyAdapter, ReadStore, ScopedStores};
 
 use crate::mint_client::{
-    AssumeTarget, MintEndpoint, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO, ROLE_VOLUME_RW,
-    VOLUME_RO_TTL_SECS,
+    AssumeTarget, MintEndpoint, ROLE_ATTEST_RO, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO,
+    ROLE_VOLUME_RW, VOLUME_RO_TTL_SECS,
 };
 
 /// Documented coord-* TTLs (`docs/design/mint.md` § *Elide as
@@ -254,17 +254,43 @@ pub struct MintScopedStores {
 }
 
 impl MintScopedStores {
+    /// The full coordinator store set: a `coord-ro` read base, a `coord-rw`
+    /// writer, and lazy per-volume facades.
     pub fn new(
         cfg: &MintConfig,
         store_cfg: StoreSection,
         data_dir: std::path::PathBuf,
         identity: Arc<CoordinatorIdentity>,
     ) -> Self {
+        Self::with_base_role(cfg, store_cfg, data_dir, identity, ROLE_COORD_RO)
+    }
+
+    /// The attestation authority's store set: the read base assumes the
+    /// narrower `attest-ro` (`GetObject` on `meta/*` + `names/*`). The writer
+    /// and per-volume facades are built but never assumed — coord B only
+    /// reads, and its enrollment provisions `attest-ro` alone, so a stray
+    /// write would fail at `assume-role`.
+    pub fn new_attestation(
+        cfg: &MintConfig,
+        store_cfg: StoreSection,
+        data_dir: std::path::PathBuf,
+        identity: Arc<CoordinatorIdentity>,
+    ) -> Self {
+        Self::with_base_role(cfg, store_cfg, data_dir, identity, ROLE_ATTEST_RO)
+    }
+
+    fn with_base_role(
+        cfg: &MintConfig,
+        store_cfg: StoreSection,
+        data_dir: std::path::PathBuf,
+        identity: Arc<CoordinatorIdentity>,
+        base_role: &'static str,
+    ) -> Self {
         let endpoint = MintEndpoint::new(cfg, data_dir, identity);
         let base = Arc::new(RoleStore::new(
             endpoint.clone(),
             store_cfg.clone(),
-            ROLE_COORD_RO,
+            base_role,
             COORD_CONTROL_TTL_SECS,
             AssumeTarget::Coord,
         ));
@@ -285,26 +311,26 @@ impl MintScopedStores {
         }
     }
 
-    /// Block until the mint endpoint accepts a `coord-ro`
-    /// `assume-role`, then eagerly warm the `coord-ro` credential.
+    /// Block until the mint endpoint accepts the base read role's
+    /// `assume-role`, then eagerly warm that credential.
     ///
-    /// Used at startup so the coordinator survives mint coming up after
-    /// it (systemd ordering, fresh box, etc.) instead of failing on the
-    /// first S3 op. `coord-ro` is the always-held control-plane
-    /// credential, so the first op that touches it — a claim, a
-    /// peer-fetch verification — should not be the one to pay its
-    /// ~0.5s `assume-role`: assume it now and seed the cache. The probe
-    /// proves mint is reachable; the warm-up populates `base`'s cache.
-    /// Warm-up failure is non-fatal — the lazy path still mints on
-    /// first use, so a transient blip just defers the cost.
+    /// Used at startup so the process survives mint coming up after it
+    /// (systemd ordering, fresh box, etc.) instead of failing on the first
+    /// S3 op. The base read credential is always held, so the first op that
+    /// touches it — a claim, a peer-fetch verification, a discharge — should
+    /// not be the one to pay its ~0.5s `assume-role`: assume it now and seed
+    /// the cache. The probe proves mint is reachable; the warm-up populates
+    /// `base`'s cache. Warm-up failure is non-fatal — the lazy path still
+    /// mints on first use, so a transient blip just defers the cost.
     pub async fn wait_for_ready(&self) -> std::io::Result<()> {
         self.endpoint
-            .wait_for_ready(ROLE_COORD_RO, COORD_CONTROL_TTL_SECS)
+            .wait_for_ready(self.base.role, self.base.ttl_secs)
             .await?;
         if let Err(e) = self.base.ensure().await {
             tracing::warn!(
-                "[coordinator] coord-ro warm-up failed ({e}); \
-                 first control-plane op will assume it lazily"
+                "[coordinator] {} warm-up failed ({e}); \
+                 first control-plane op will assume it lazily",
+                self.base.role
             );
         }
         Ok(())

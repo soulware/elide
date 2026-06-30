@@ -5,7 +5,7 @@ Elide deployment runs the **stock mint binary** sealed with the role inventory
 in this directory — there is no Elide-specific mint build. This directory is
 that inventory, version-locked to the coordinator:
 
-- **`role-templates/`** — the four role policy templates (IAM policy JSON). They
+- **`role-templates/`** — the five role policy templates (IAM policy JSON). They
   encode Elide's S3 layout and caveat contract directly
   (`by_id/{{caveat.volume}}/*`, `events/*` append-only,
   `coordinators/{{caveat.sub}}/*`, `meta/*`, `names/*`), so they move in lockstep
@@ -25,14 +25,15 @@ that inventory, version-locked to the coordinator:
 Caveat provenance is **derived from the template**, not declared: a
 `{{caveat.X}}` whose name is reserved (`sub`) is issuer-stamped by mint; any
 other name (`volume`) is attested. So `volume-ro`/`volume-rw` are attested by
-virtue of binding `{{caveat.volume}}`, and `coord-ro`/`coord-rw` are issuer-only.
-Each role's single `ttl_seconds` is the credential lifetime ceiling.
+virtue of binding `{{caveat.volume}}`, and `coord-ro`/`coord-rw`/`attest-ro` are
+issuer-only. Each role's single `ttl_seconds` is the credential lifetime ceiling.
 
 ## Roles
 
 | Role | Scope | Notes |
 |------|-------|-------|
 | `coord-ro` / `coord-rw` | coordinator control plane | directly assumable after enrollment |
+| `attest-ro` | `meta/*` + `names/*` (read) | the discharge authority's least-privilege read |
 | `volume-ro` / `volume-rw` | one volume's `by_id/<vol>/*` | attested + per-volume |
 
 The volume roles are **attested**: `enroll-exchange` returns a durable
@@ -49,8 +50,8 @@ enrollee declares a profile at `/v1/enroll`; mint enforces `role ∈ grant` at
 
 | Profile | Roles | Used by |
 |---------|-------|---------|
-| `coordinator` | all four | a full coordinator (`elide coord enroll`) |
-| `attestation` | `coord-ro` | the read-only discharge authority, coord B (`elide coord enroll --attestation`) |
+| `coordinator` | `coord-ro` + `coord-rw` + `volume-rw` + `volume-ro` | a full coordinator (`elide coord enroll`) |
+| `attestation` | `attest-ro` | the read-only discharge authority, coord B (`elide coord enroll --attestation`) |
 
 The `attestation` profile is what makes coord B's read-only property
 **mint-enforced**. See `docs/attestation-readonly-enrollment-spec.md`.

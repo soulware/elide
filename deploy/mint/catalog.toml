@@ -23,10 +23,16 @@ ttl_seconds = 3600         # 1h
 name = "coord-rw"
 ttl_seconds = 3600         # 1h
 
+# coord-ro narrowed to the discharge predicate's exact read set
+# (`meta/*` + `names/*`); the attestation authority holds this, not coord-ro.
+[[role]]
+name = "attest-ro"
+ttl_seconds = 3600         # 1h
+
 # An enrollment profile names the role set its enrollee may exchange. The
 # enrollee declares a profile at /v1/enroll; mint enforces role ∈ grant at
 # enroll-exchange. `coordinator` is the full coordinator; `attestation` is the
-# read-only discharge authority (coord B), holding coord-ro alone.
+# read-only discharge authority (coord B), holding attest-ro alone.
 
 [[profile]]
 name = "coordinator"
@@ -34,4 +40,4 @@ roles = ["coord-ro", "coord-rw", "volume-rw", "volume-ro"]
 
 [[profile]]
 name = "attestation"
-roles = ["coord-ro"]
+roles = ["attest-ro"]

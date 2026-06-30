@@ -1,6 +1,6 @@
 //! Dedicated attestation authority (coord B) serve loop.
 //!
-//! `elide-coordinator attest`: assume `coord-ro`, open attested CIDs under
+//! `elide-coordinator attest`: assume `attest-ro`, open attested CIDs under
 //! `K_M-B`, and serve `POST /v1/discharge` on the `[attestation] listen`
 //! address — none of the supervisor, GC, IPC, or volume scan
 //! `daemon::run` runs (`docs/design/mint-volume-attestation.md` § *A
@@ -48,13 +48,13 @@ pub async fn run(config: CoordinatorConfig) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     }
 
-    let scoped = mint_stores::MintScopedStores::new(
+    let scoped = mint_stores::MintScopedStores::new_attestation(
         mint_cfg,
         config.store.clone(),
         config.data_dir.clone(),
         identity.clone(),
     );
-    // Block until mint accepts a coord-ro assume-role, so coord B survives
+    // Block until mint accepts an attest-ro assume-role, so coord B survives
     // mint coming up after it instead of failing on the first S3 read.
     scoped
         .wait_for_ready()
