@@ -100,6 +100,7 @@ pub fn fork_volume_at(
         }),
         extent_index: Vec::new(),
         oci_source: None,
+        recovery_sources: Vec::new(),
     };
     crate::signing::write_provenance(
         new_fork_dir,

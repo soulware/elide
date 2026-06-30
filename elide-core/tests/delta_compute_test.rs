@@ -134,6 +134,7 @@ fn rewrite_pending_with_deltas_converts_matching_entry() {
         parent: None,
         extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
         oci_source: None,
+        recovery_sources: Vec::new(),
     };
     let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
     let child_seg_ulid = write_single_entry_segment(
@@ -260,6 +261,7 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
         parent: None,
         extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
         oci_source: None,
+        recovery_sources: Vec::new(),
     };
     let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
     let child_seg_ulid = write_single_entry_segment(
@@ -362,6 +364,7 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
         parent: None,
         extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
         oci_source: None,
+        recovery_sources: Vec::new(),
     };
     let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
     let child_seg_ulid = write_single_entry_segment(
@@ -454,6 +457,7 @@ fn rewrite_pending_with_deltas_handles_inline_source() {
         parent: None,
         extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
         oci_source: None,
+        recovery_sources: Vec::new(),
     };
     let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
     let child_seg_ulid = write_single_entry_segment(
@@ -519,6 +523,7 @@ fn rewrite_pending_with_deltas_skips_unchanged_hashes() {
         parent: None,
         extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
         oci_source: None,
+        recovery_sources: Vec::new(),
     };
     let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
     let child_seg_ulid =

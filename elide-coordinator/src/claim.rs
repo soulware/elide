@@ -643,6 +643,7 @@ impl ClaimOrchestrator {
             }),
             extent_index: Vec::new(),
             oci_source: None,
+            recovery_sources: Vec::new(),
         };
         write_provenance(
             &new_fork_dir,
@@ -922,6 +923,7 @@ impl ClaimOrchestrator {
             }),
             extent_index: Vec::new(),
             oci_source: None,
+            recovery_sources: Vec::new(),
         };
         write_provenance(
             &new_fork.dir,
@@ -1231,6 +1233,7 @@ mod tests {
                 }),
                 extent_index: vec![],
                 oci_source: None,
+                recovery_sources: Vec::new(),
             },
         };
 

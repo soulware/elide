@@ -129,6 +129,7 @@ fn run_from_file(
         parent: None,
         extent_index: extent_sources,
         oci_source: None,
+        recovery_sources: Vec::new(),
     };
     // The importing window is the volume's rw phase: volume.key is
     // persisted so the worker signs segments and the coordinator signs
@@ -279,6 +280,7 @@ async fn run_oci(
             digest: digest.clone(),
             arch: target_arch.to_string(),
         }),
+        recovery_sources: Vec::new(),
     };
     // The importing window is the volume's rw phase: volume.key is
     // persisted so the worker signs segments and the coordinator signs

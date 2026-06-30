@@ -269,6 +269,13 @@ pub struct ProvenanceLineage {
     pub extent_index: Vec<String>,
     /// Present iff this volume is an OCI-imported root.
     pub oci_source: Option<OciSource>,
+    /// Volumes this fork may read transiently during a forced-claim
+    /// re-own but does not derive content from — walked into the read set
+    /// as leaves, no snapshot pin. Empty on every steady-state provenance:
+    /// set at rebind, cleared at finalize
+    /// (`docs/design/mint-volume-attestation.md` § *The no-basis re-own
+    /// reads outside the new fork's lineage*).
+    pub recovery_sources: Vec<ulid::Ulid>,
 }
 
 /// Set up an importing volume's identity and return a signer for
@@ -457,17 +464,24 @@ fn sign_provenance(key: &SigningKey, lineage: &ProvenanceLineage) -> [u8; 64] {
     key.sign(&provenance_signing_input(lineage)).to_bytes()
 }
 
+/// Domain tag prefixing the `recovery_sources` block in the signing
+/// input, so a bare recovery ULID can never alias an `extent_index`
+/// entry's bytes (entries carry a `/`, the tag does not).
+const PROVENANCE_RECOVERY_SOURCES_DOMAIN: &str = "elide-recovery-sources-v1";
+
 /// Signing input (NUL-separated, fixed field order):
 ///   parent_or_empty || NUL || parent_pubkey_hex_or_empty || NUL ||
 ///   entry_1 || NUL || entry_2 || NUL || … || entry_N
 ///   [ || NUL || oci_image || NUL || oci_digest || NUL || oci_arch ]
 ///                                                              (only when Some)
+///   [ || NUL || recovery_domain || NUL || rsrc_1 || NUL || … || rsrc_M ]
+///                                                       (only when non-empty)
 ///
 /// Empty `extent_index` contributes zero trailing entries. The optional
-/// `oci_source` suffix is only included when the field is `Some` — when
-/// absent, the signing input is byte-identical to the original format,
-/// so existing provenance signatures continue to verify under the same
-/// input.
+/// `oci_source` and `recovery_sources` suffixes are included only when
+/// present — when both absent, the signing input is byte-identical to the
+/// original format, so existing provenance signatures continue to verify
+/// under the same input.
 fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
     let parent_display = lineage.parent.as_ref().map(ParentRef::to_display);
     let parent_str = parent_display.as_deref().unwrap_or("");
@@ -498,6 +512,14 @@ fn provenance_signing_input(lineage: &ProvenanceLineage) -> Vec<u8> {
         msg.extend_from_slice(src.digest.as_bytes());
         msg.push(0u8);
         msg.extend_from_slice(src.arch.as_bytes());
+    }
+    if !lineage.recovery_sources.is_empty() {
+        msg.push(0u8);
+        msg.extend_from_slice(PROVENANCE_RECOVERY_SOURCES_DOMAIN.as_bytes());
+        for src in &lineage.recovery_sources {
+            msg.push(0u8);
+            msg.extend_from_slice(src.to_string().as_bytes());
+        }
     }
     msg
 }
@@ -536,6 +558,16 @@ fn serialize_provenance(lineage: &ProvenanceLineage, sig: &[u8; 64]) -> String {
         content.push_str(&src.arch);
         content.push('\n');
     }
+    // Only emit when non-empty, so steady-state provenance serialises
+    // byte-identically to the pre-`recovery_sources` format.
+    if !lineage.recovery_sources.is_empty() {
+        content.push_str("recovery_sources:\n");
+        for src in &lineage.recovery_sources {
+            content.push_str("  ");
+            content.push_str(&src.to_string());
+            content.push('\n');
+        }
+    }
     content.push_str("sig: ");
     content.push_str(&encode_hex(sig));
     content.push('\n');
@@ -558,6 +590,7 @@ fn parse_provenance(
     let mut oci_digest: Option<String> = None;
     let mut oci_arch: Option<String> = None;
     let mut sig: Option<Vec<u8>> = None;
+    let mut recovery_sources: Vec<ulid::Ulid> = Vec::new();
 
     let mut lines = content.lines().peekable();
     while let Some(line) = lines.next() {
@@ -600,6 +633,20 @@ fn parse_provenance(
                 }
             }
             extent_index = Some(entries);
+        } else if line == "recovery_sources:" {
+            while let Some(peek) = lines.peek() {
+                if let Some(entry) = peek.strip_prefix("  ") {
+                    let ulid = ulid::Ulid::from_string(entry).map_err(|e| {
+                        io::Error::other(format!(
+                            "{provenance_file} recovery_sources entry {entry:?} not a ulid: {e}"
+                        ))
+                    })?;
+                    recovery_sources.push(ulid);
+                    lines.next();
+                } else {
+                    break;
+                }
+            }
         } else if let Some(v) = line.strip_prefix("sig: ") {
             sig = Some(decode_hex(v)?);
         }
@@ -677,6 +724,7 @@ fn parse_provenance(
             parent,
             extent_index,
             oci_source,
+            recovery_sources,
         },
         sig,
     ))
@@ -1124,6 +1172,7 @@ mod tests {
                 digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
                 arch: "amd64".to_owned(),
             }),
+            recovery_sources: vec![],
         };
         write_provenance(tmp.path(), &key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 
@@ -1142,6 +1191,7 @@ mod tests {
             parent: None,
             extent_index: vec!["01ABC/01DEF".to_owned()],
             oci_source: None,
+            recovery_sources: vec![],
         };
         let with_oci_none = provenance_signing_input(&lineage);
 
@@ -1153,6 +1203,52 @@ mod tests {
         expected.push(0u8);
         expected.extend_from_slice(b"01ABC/01DEF");
         assert_eq!(with_oci_none, expected);
+    }
+
+    /// A non-empty `recovery_sources` round-trips through serialize/parse
+    /// and contributes a domain-tagged suffix to the signing input; an
+    /// empty one stays byte-identical to the pre-`recovery_sources` format.
+    #[test]
+    fn provenance_recovery_sources_round_trip_and_signing_input() {
+        let tmp = TempDir::new().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let pub_hex = encode_hex(&key.verifying_key().to_bytes()) + "\n";
+        crate::segment::write_file_atomic(&tmp.path().join(VOLUME_PUB_FILE), pub_hex.as_bytes())
+            .unwrap();
+
+        let a = ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let b = ulid::Ulid::from_string("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
+        let lineage = ProvenanceLineage {
+            parent: None,
+            extent_index: vec![],
+            oci_source: None,
+            recovery_sources: vec![a, b],
+        };
+        write_provenance(tmp.path(), &key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
+        let got =
+            read_lineage_verifying_signature(tmp.path(), VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE)
+                .unwrap();
+        assert_eq!(got, lineage, "recovery_sources must round-trip");
+
+        let mut expected = Vec::new();
+        expected.push(0u8); // NUL between empty parent and empty parent_pubkey
+        expected.push(0u8); // NUL prefixing the recovery_sources suffix
+        expected.extend_from_slice(PROVENANCE_RECOVERY_SOURCES_DOMAIN.as_bytes());
+        expected.push(0u8);
+        expected.extend_from_slice(a.to_string().as_bytes());
+        expected.push(0u8);
+        expected.extend_from_slice(b.to_string().as_bytes());
+        assert_eq!(provenance_signing_input(&lineage), expected);
+
+        let empty = ProvenanceLineage {
+            recovery_sources: vec![],
+            ..lineage
+        };
+        assert_eq!(
+            provenance_signing_input(&empty),
+            vec![0u8],
+            "empty recovery_sources contributes no suffix"
+        );
     }
 
     /// Partial `oci_*` lines (e.g. only `oci_image:` without `oci_digest:`)

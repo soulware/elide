@@ -33,7 +33,10 @@ use ulid::Ulid;
 ///
 /// Each step is signature-verified; failures bubble up as `io::Error`.
 /// `extent_index` sources are leaves — the list is already flat at attach
-/// time, so their own lineage is not expanded.
+/// time, so their own lineage is not expanded. `owned`'s own
+/// `recovery_sources` are unioned in as leaves too (the dead fork a forced
+/// claim re-owns, readable until finalize clears it); they are read only
+/// from `owned`, never inherited from an ancestor.
 pub async fn walk_lineage_set(
     store: &dyn ObjectStore,
     owned: Ulid,
@@ -56,6 +59,12 @@ pub async fn walk_lineage_set(
                     ))
                 })?;
             set.insert(source);
+        }
+
+        if current_ulid == owned {
+            for source in &lineage.recovery_sources {
+                set.insert(*source);
+            }
         }
 
         let Some(parent) = lineage.parent else {
@@ -157,6 +166,7 @@ mod tests {
         key: &SigningKey,
         parent: Option<ParentRef>,
         extent_index: Vec<String>,
+        recovery_sources: Vec<Ulid>,
     ) {
         let dir = by_id.join(ulid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
@@ -165,6 +175,7 @@ mod tests {
             parent,
             extent_index,
             oci_source: None,
+            recovery_sources,
         };
         write_provenance(&dir, key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 
@@ -201,6 +212,7 @@ mod tests {
         let owned = Ulid::new();
         let parent = Ulid::new();
         let extent = Ulid::new();
+        let recovery = Ulid::new();
 
         publish_both(
             by_id.path(),
@@ -213,6 +225,7 @@ mod tests {
                 pubkey: parent_key.verifying_key().to_bytes(),
             }),
             vec![format!("{extent}/{}", Ulid::new())],
+            vec![recovery],
         )
         .await;
         publish_both(
@@ -221,6 +234,7 @@ mod tests {
             parent,
             &parent_key,
             None,
+            Vec::new(),
             Vec::new(),
         )
         .await;
@@ -264,6 +278,7 @@ mod tests {
                 pubkey: imposter.verifying_key().to_bytes(),
             }),
             Vec::new(),
+            Vec::new(),
         )
         .await;
         publish_both(
@@ -272,6 +287,7 @@ mod tests {
             parent,
             &parent_key,
             None,
+            Vec::new(),
             Vec::new(),
         )
         .await;
@@ -282,28 +298,18 @@ mod tests {
         assert!(err.to_string().contains("signature invalid"), "got {err}");
     }
 
-    /// Reproduces the production `claim --force` denial against a dead fork
-    /// that never published its own snapshot.
+    /// Pins that a forced claim's transient `recovery_sources` grant
+    /// authorises the re-own read of a dead fork that never published its
+    /// own snapshot.
     ///
-    /// `force_claim`'s rebind, in the `latest_snapshot == None` branch
-    /// (`force_claim.rs`), gives the new fork the dead fork's *parent* as
-    /// its own parent — so the dead fork itself is absent from the new
-    /// fork's lineage. `re_own` must then read the dead fork's `by_id/` to
-    /// recover its unsnapshotted tail, anchored on the new fork; coord B's
-    /// read-set walk does not contain it, so the discharge is refused with
-    /// `Denied("target not in read set")` (`discharge`, step 6).
-    ///
-    /// The gap is a genuine lineage omission, not a coord B quirk: the dead
-    /// source is absent from both the signed-lineage walk coord B runs and
-    /// the local read path it is pinned to equal. Option A (a transient
-    /// `recovery_sources` grant on the provisional provenance, dropped at
-    /// finalize) closes it — when that lands, the new fork's read set
-    /// contains `dead` and this test passes; drop the `#[ignore]` then.
-    ///
-    /// Run today with `--ignored` to observe the denial it documents.
+    /// In the `latest_snapshot == None` branch, `force_claim`'s rebind
+    /// gives the new fork the dead fork's *parent* — so the dead fork is a
+    /// sibling, absent from the new fork's fork/extent lineage. Naming it
+    /// in the new fork's `recovery_sources` puts it in the read set coord B
+    /// vouches and the local read path computes (the two stay equal), so
+    /// `re_own` may read it; finalize later clears the grant.
     #[tokio::test]
-    #[ignore = "reproduces the force-claim x attested-read gap; un-ignore when recovery_sources (Option A) lands"]
-    async fn forced_claim_fork_cannot_read_unsnapshotted_dead_source() {
+    async fn forced_claim_recovery_source_vouches_the_dead_fork() {
         let by_id = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
@@ -322,6 +328,7 @@ mod tests {
             &base_key,
             None,
             Vec::new(),
+            Vec::new(),
         )
         .await;
 
@@ -339,11 +346,13 @@ mod tests {
             &dead_key,
             Some(base_parent.clone()),
             Vec::new(),
+            Vec::new(),
         )
         .await;
 
         // F is what the forced claim mints for a never-snapshotted dead
-        // fork: it inherits E's parent (P), so E is absent from F's lineage.
+        // fork: parent is E's parent (P), and E is named as a transient
+        // recovery source so the re-own may read it.
         publish_both(
             by_id.path(),
             store.as_ref(),
@@ -351,6 +360,7 @@ mod tests {
             &fork_key,
             Some(base_parent),
             Vec::new(),
+            vec![dead],
         )
         .await;
 
@@ -365,12 +375,11 @@ mod tests {
 
         assert!(
             read_set.contains(&dead),
-            "coord B must vouch the dead source the re-own reads; \
-             absent today (read set = {read_set:?})"
+            "coord B must vouch the recovery source the re-own reads (read set = {read_set:?})"
         );
         assert!(
             local.contains(&dead),
-            "the local read path the walk is pinned to also omits the dead source"
+            "the local read path the walk is pinned to must include the recovery source"
         );
     }
 }

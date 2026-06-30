@@ -892,6 +892,7 @@ mod tests {
                 }),
                 extent_index: Vec::new(),
                 oci_source: None,
+                recovery_sources: Vec::new(),
             },
         )
         .unwrap();
@@ -1026,6 +1027,7 @@ mod tests {
                 }),
                 extent_index: Vec::new(),
                 oci_source: None,
+                recovery_sources: Vec::new(),
             },
         )
         .unwrap();
@@ -1334,6 +1336,7 @@ mod tests {
                 }),
                 extent_index: Vec::new(),
                 oci_source: None,
+                recovery_sources: Vec::new(),
             },
         )
         .unwrap();
@@ -1499,6 +1502,7 @@ mod tests {
                 }),
                 extent_index: Vec::new(),
                 oci_source: None,
+                recovery_sources: Vec::new(),
             },
         )
         .unwrap();

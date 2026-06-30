@@ -375,6 +375,7 @@ async fn attested_loop_over_shipped_templates() {
             }),
             extent_index: Vec::new(),
             oci_source: None,
+            recovery_sources: Vec::new(),
         },
     )
     .await;
@@ -386,6 +387,7 @@ async fn attested_loop_over_shipped_templates() {
             parent: None,
             extent_index: Vec::new(),
             oci_source: None,
+            recovery_sources: Vec::new(),
         },
     )
     .await;

@@ -735,6 +735,7 @@ mod tests {
             parent,
             extent_index: Vec::new(),
             oci_source: None,
+            recovery_sources: Vec::new(),
         };
         write_provenance(tmp.path(), key, "volume.provenance", &lineage).unwrap();
         let pub_bytes = std::fs::read(tmp.path().join("volume.pub")).unwrap();

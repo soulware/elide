@@ -217,6 +217,7 @@ mod tests {
             parent,
             extent_index: Vec::new(),
             oci_source: None,
+            recovery_sources: Vec::new(),
         };
         write_provenance(tmp.path(), key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 
