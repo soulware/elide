@@ -582,6 +582,19 @@ async fn post_uds(
     ))
 }
 
+/// Map an `assume-role` HTTP status to an `io::ErrorKind`. A 401 is mint's
+/// opaque "not validly enrolled" (de-authorized, revoked, cnf mismatch,
+/// schema-stale record); `PermissionDenied` lets the readiness path stay
+/// pending for a manual re-enroll instead of treating it as fatal. Every other
+/// non-200 is an ordinary error.
+fn assume_role_error_kind(status: u16) -> io::ErrorKind {
+    if status == 401 {
+        io::ErrorKind::PermissionDenied
+    } else {
+        io::ErrorKind::Other
+    }
+}
+
 pub(crate) fn json_str_field(body: &str, key: &str) -> io::Result<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -960,9 +973,8 @@ impl MintEndpoint {
                         .unwrap_or_else(|| "<absent>".into()),
                 );
             }
-            return Err(io::Error::other(format!(
-                "mint assume-role for {role} returned {status}: {snippet}"
-            )));
+            let msg = format!("mint assume-role for {role} returned {status}: {snippet}");
+            return Err(io::Error::new(assume_role_error_kind(status), msg));
         };
 
         let access_key_id = json_str_field(&text, "access_key_id")?;
@@ -1091,6 +1103,22 @@ impl CredentialIssuer for MintCredentialIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assume_role_401_is_permission_denied_others_are_other() {
+        assert_eq!(
+            assume_role_error_kind(401),
+            io::ErrorKind::PermissionDenied,
+            "401 must be PermissionDenied so the readiness loop stays pending for re-enroll"
+        );
+        for status in [400, 403, 500, 503] {
+            assert_eq!(
+                assume_role_error_kind(status),
+                io::ErrorKind::Other,
+                "{status} must stay an ordinary error, not trip the re-enroll path"
+            );
+        }
+    }
 
     /// Build a wire macaroon the way `mint/src/macaroon.rs` does, so
     /// the coordinator's decode/attenuate/encode is checked against the

@@ -55,11 +55,23 @@ pub async fn run(config: CoordinatorConfig) -> Result<()> {
         identity.clone(),
     );
     // Block until mint accepts an attest-ro assume-role, so coord B survives
-    // mint coming up after it instead of failing on the first S3 read.
-    scoped
-        .wait_for_ready()
-        .await
-        .map_err(|e| anyhow::anyhow!("waiting for mint to become ready: {e}"))?;
+    // mint coming up after it instead of failing on the first S3 read. A 401
+    // (the held enrollment is de-authorized/stale) is recovered by a manual
+    // re-enroll, so stay pending and keep probing rather than crash-loop.
+    loop {
+        match scoped.wait_for_ready().await {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!(
+                    "[attest] mint rejected the held enrollment as unauthorized ({e}); \
+                     re-enroll with `elide coord enroll --attestation --force` then \
+                     `mint enroll approve` — staying pending"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("waiting for mint to become ready: {e}")),
+        }
+    }
 
     let state = elide_attestation::DischargeState::new(k_m_b, scoped.base_object_store());
     info!("[attest] discharge authority (coord B) serving on {listen:?}");

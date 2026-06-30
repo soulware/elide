@@ -221,8 +221,28 @@ async fn run() -> Result<()> {
                 // (systemd ordering, fresh box) instead of failing on the
                 // first S3 op (publish coordinator.pub) with a connect
                 // error.
-                if let Err(e) = scoped.wait_for_ready().await {
-                    return Err(anyhow::anyhow!("waiting for mint to become ready: {e}"));
+                // A 401 means the held primary is no longer validly enrolled
+                // (de-authorized, revoked, schema-stale). Re-enrollment is a
+                // manual operator action, so stay pending and keep probing
+                // instead of exiting into an orchestrator crash-loop; a
+                // `elide coord enroll --force` is picked up on a later probe.
+                // Connect/timeout/503 are absorbed inside `wait_for_ready`; any
+                // other error remains fatal.
+                loop {
+                    match scoped.wait_for_ready().await {
+                        Ok(()) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            tracing::warn!(
+                                "[coordinator] mint rejected the held enrollment as \
+                                 unauthorized ({e}); re-enroll with `elide coord enroll \
+                                 --force` then `mint enroll approve` — staying pending"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("waiting for mint to become ready: {e}"));
+                        }
+                    }
                 }
                 let stores: std::sync::Arc<dyn elide_coordinator::stores::ScopedStores> =
                     std::sync::Arc::new(scoped);
