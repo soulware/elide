@@ -340,7 +340,7 @@ pub async fn handle_discharge(
     match state.discharge(req).await {
         Ok(discharge) => Json(DischargeResponse { discharge }).into_response(),
         Err(e) => {
-            tracing::info!("[discharge] denied: {e}");
+            tracing::info!("[discharge] denied: {e:?}");
             e.into_response()
         }
     }
