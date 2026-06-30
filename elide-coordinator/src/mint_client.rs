@@ -582,6 +582,26 @@ async fn post_uds(
     ))
 }
 
+/// Map an `assume-role` HTTP status to an `io::ErrorKind`. A 401 is mint's
+/// opaque "not validly enrolled" (de-authorized, revoked, cnf mismatch,
+/// schema-stale record); `PermissionDenied` lets the readiness path stay
+/// pending for a manual re-enroll instead of treating it as fatal. Every other
+/// non-200 is an ordinary error.
+fn assume_role_error_kind(status: u16) -> io::ErrorKind {
+    if status == 401 {
+        io::ErrorKind::PermissionDenied
+    } else {
+        io::ErrorKind::Other
+    }
+}
+
+/// Whether a 503 body is mint's dormant `{"error":"not sealed"}` (as opposed to
+/// a transient backend 503). The dormant case is waited out; a backend 503 is
+/// retried then surfaced.
+fn is_not_sealed(body: &str) -> bool {
+    json_str_field(body, "error").is_ok_and(|e| e == "not sealed")
+}
+
 pub(crate) fn json_str_field(body: &str, key: &str) -> io::Result<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -938,6 +958,15 @@ impl MintEndpoint {
             // mint's error model is deliberately coarse (401/400/503);
             // surface status + a short body for the operator log.
             let snippet: String = text.chars().take(200).collect();
+            // A 503 "not sealed" means mint is up but dormant (no template
+            // seal). That clears only when an operator seals, not on its own,
+            // so don't spend the bounded backend-retry budget — surface it as
+            // `WouldBlock` so the readiness probe waits it out. A sustained
+            // *backend* 503 still exhausts the budget below and stays fatal.
+            if status == 503 && is_not_sealed(&text) {
+                let msg = format!("mint assume-role for {role} returned 503: {snippet}");
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, msg));
+            }
             if status == 503 && attempt < MAX_503_RETRIES {
                 let delay = retry_after_delay(retry_after);
                 warn!(
@@ -960,9 +989,8 @@ impl MintEndpoint {
                         .unwrap_or_else(|| "<absent>".into()),
                 );
             }
-            return Err(io::Error::other(format!(
-                "mint assume-role for {role} returned {status}: {snippet}"
-            )));
+            let msg = format!("mint assume-role for {role} returned {status}: {snippet}");
+            return Err(io::Error::new(assume_role_error_kind(status), msg));
         };
 
         let access_key_id = json_str_field(&text, "access_key_id")?;
@@ -979,12 +1007,14 @@ impl MintEndpoint {
     }
 
     /// Block until the mint endpoint accepts an `assume-role` for
-    /// `role`. Retries indefinitely on connect/timeout failures with
-    /// exponential backoff (100ms → 5s cap); any other error
-    /// (HTTP status, missing credential file, decode failure, etc.)
-    /// is fatal. The vended credentials are discarded — this is a
-    /// readiness probe; the real first use during normal operation
-    /// will re-assume and cache.
+    /// `role`. Retries indefinitely with exponential backoff (100ms →
+    /// 5s cap) while mint is unreachable (connect/timeout) or dormant
+    /// (503 "not sealed"). A 401 surfaces as `PermissionDenied` for the
+    /// caller to handle (the held enrollment is invalid); any other
+    /// error (sustained backend 503, missing credential file, decode
+    /// failure, etc.) is fatal. The vended credentials are discarded —
+    /// this is a readiness probe; the real first use during normal
+    /// operation will re-assume and cache.
     pub async fn wait_for_ready(&self, role: &str, ttl_secs: u64) -> io::Result<()> {
         let mut delay = Duration::from_millis(100);
         let cap = Duration::from_secs(5);
@@ -1008,6 +1038,20 @@ impl MintEndpoint {
                         warn!(
                             "[coordinator] mint not reachable yet ({e}); \
                              retrying (attempt {attempt})"
+                        );
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(cap);
+                }
+                // 503 "not sealed": mint is up but dormant. It becomes ready
+                // only when an operator seals, so wait it out like a not-yet-up
+                // mint rather than fail (a sustained backend 503 surfaces as a
+                // fatal error instead, having exhausted `assume_role`'s budget).
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if attempt == 1 || attempt.is_multiple_of(10) {
+                        warn!(
+                            "[coordinator] mint is dormant (not sealed); \
+                             waiting for `mint seal` (attempt {attempt})"
                         );
                     }
                     tokio::time::sleep(delay).await;
@@ -1091,6 +1135,31 @@ impl CredentialIssuer for MintCredentialIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assume_role_401_is_permission_denied_others_are_other() {
+        assert_eq!(
+            assume_role_error_kind(401),
+            io::ErrorKind::PermissionDenied,
+            "401 must be PermissionDenied so the readiness loop stays pending for re-enroll"
+        );
+        for status in [400, 403, 500, 503] {
+            assert_eq!(
+                assume_role_error_kind(status),
+                io::ErrorKind::Other,
+                "{status} must stay an ordinary error, not trip the re-enroll path"
+            );
+        }
+    }
+
+    #[test]
+    fn is_not_sealed_only_matches_the_dormant_body() {
+        assert!(is_not_sealed(r#"{"error":"not sealed"}"#));
+        assert!(!is_not_sealed(r#"{"error":"unavailable"}"#));
+        assert!(!is_not_sealed(r#"{"error":"unauthorized"}"#));
+        assert!(!is_not_sealed("Service Unavailable"));
+        assert!(!is_not_sealed(""));
+    }
 
     /// Build a wire macaroon the way `mint/src/macaroon.rs` does, so
     /// the coordinator's decode/attenuate/encode is checked against the
