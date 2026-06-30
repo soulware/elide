@@ -232,11 +232,13 @@ pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Ve
 /// Union of ancestor volume ULIDs whose `by_id/<ulid>/` prefix the
 /// volume's read path may visit: the fork-parent chain plus every
 /// extent-index source recursively reachable from this volume or its
-/// parents.
+/// parents, plus this volume's own `recovery_sources` (the dead fork a
+/// forced claim re-owns, readable transiently until finalize clears it).
 ///
 /// Order: deduplicated, deterministic insertion order (fork-parent
-/// chain oldest-first, then extent-index sources). Used to build the
-/// per-volume IAM read policy at fork time.
+/// chain oldest-first, then extent-index sources, then recovery
+/// sources). Used to build the per-volume IAM read policy at fork time,
+/// and pinned equal to coord B's signed-lineage walk.
 pub fn lineage_ulids(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ulid>> {
     use std::collections::HashSet;
 
@@ -255,6 +257,11 @@ pub fn lineage_ulids(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ulid>>
     }
     for layer in walk_extent_ancestors(fork_dir, by_id_dir)? {
         push(&layer.dir, &mut out, &mut seen);
+    }
+    for source in load_lineage_or_empty(fork_dir)?.recovery_sources {
+        if seen.insert(source) {
+            out.push(source);
+        }
     }
     Ok(out)
 }

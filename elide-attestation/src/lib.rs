@@ -340,7 +340,7 @@ pub async fn handle_discharge(
     match state.discharge(req).await {
         Ok(discharge) => Json(DischargeResponse { discharge }).into_response(),
         Err(e) => {
-            tracing::info!("[discharge] denied: {e}");
+            tracing::info!("[discharge] denied: {e:?}");
             e.into_response()
         }
     }
@@ -621,7 +621,7 @@ mod tests {
         let lineage = ProvenanceLineage {
             parent,
             extent_index,
-            oci_source: None,
+            ..ProvenanceLineage::root()
         };
         write_provenance(tmp.path(), key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
         let prov = std::fs::read(tmp.path().join(VOLUME_PROVENANCE_FILE)).unwrap();

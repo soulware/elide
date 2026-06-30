@@ -367,26 +367,18 @@ async fn attested_loop_over_shipped_templates() {
         store.as_ref(),
         owned,
         &owned_sk,
-        &ProvenanceLineage {
-            parent: Some(ParentRef {
-                volume_ulid: parent.to_string(),
-                snapshot_ulid: Ulid::new().to_string(),
-                pubkey: parent_sk.verifying_key().to_bytes(),
-            }),
-            extent_index: Vec::new(),
-            oci_source: None,
-        },
+        &ProvenanceLineage::fork(ParentRef {
+            volume_ulid: parent.to_string(),
+            snapshot_ulid: Ulid::new().to_string(),
+            pubkey: parent_sk.verifying_key().to_bytes(),
+        }),
     )
     .await;
     seed_identity(
         store.as_ref(),
         parent,
         &parent_sk,
-        &ProvenanceLineage {
-            parent: None,
-            extent_index: Vec::new(),
-            oci_source: None,
-        },
+        &ProvenanceLineage::root(),
     )
     .await;
     let record = NameRecord::live_minimal(owned, 4 * 1024 * 1024 * 1024);

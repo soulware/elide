@@ -2556,15 +2556,11 @@ mod tests {
             &self_dir,
             &self_key,
             elide_core::signing::VOLUME_PROVENANCE_FILE,
-            &elide_core::signing::ProvenanceLineage {
-                parent: Some(elide_core::signing::ParentRef {
-                    volume_ulid: parent_str.to_owned(),
-                    snapshot_ulid: "01JQCCCCCCCCCCCCCCCCCCCCCC".to_owned(),
-                    pubkey: self_key.verifying_key().to_bytes(),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-            },
+            &elide_core::signing::ProvenanceLineage::fork(elide_core::signing::ParentRef {
+                volume_ulid: parent_str.to_owned(),
+                snapshot_ulid: "01JQCCCCCCCCCCCCCCCCCCCCCC".to_owned(),
+                pubkey: self_key.verifying_key().to_bytes(),
+            }),
         )
         .unwrap();
         let mint_reply = register_volume(ulid_from(ulid_str), tmp.path(), Some(my_pid), &key())

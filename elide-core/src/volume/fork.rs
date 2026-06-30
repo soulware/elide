@@ -92,15 +92,11 @@ pub fn fork_volume_at(
     // artefacts — see `ParentRef` in signing.rs.
     let parent_pubkey =
         crate::signing::load_verifying_key(&source_real, crate::signing::VOLUME_PUB_FILE)?;
-    let lineage = crate::signing::ProvenanceLineage {
-        parent: Some(crate::signing::ParentRef {
-            volume_ulid: source_ulid.to_owned(),
-            snapshot_ulid: branch_ulid.to_string(),
-            pubkey: parent_pubkey.to_bytes(),
-        }),
-        extent_index: Vec::new(),
-        oci_source: None,
-    };
+    let lineage = crate::signing::ProvenanceLineage::fork(crate::signing::ParentRef {
+        volume_ulid: source_ulid.to_owned(),
+        snapshot_ulid: branch_ulid.to_string(),
+        pubkey: parent_pubkey.to_bytes(),
+    });
     crate::signing::write_provenance(
         new_fork_dir,
         &key,

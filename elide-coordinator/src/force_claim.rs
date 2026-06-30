@@ -346,19 +346,19 @@ impl ForceClaimOrchestrator {
             .latest_snapshot
             .map(|snap| format!("{source}/{snap}"));
         let provisional = match self.observed.record.latest_snapshot {
-            Some(basis) => ProvenanceLineage {
-                parent: Some(ParentRef {
-                    volume_ulid: source.to_string(),
-                    snapshot_ulid: basis.to_string(),
-                    pubkey: source_pubkey.to_bytes(),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-            },
+            Some(basis) => ProvenanceLineage::fork(ParentRef {
+                volume_ulid: source.to_string(),
+                snapshot_ulid: basis.to_string(),
+                pubkey: source_pubkey.to_bytes(),
+            }),
             None => ProvenanceLineage {
                 parent: source_lineage.parent.clone(),
                 extent_index: source_lineage.extent_index.clone(),
-                oci_source: None,
+                // Source is read transiently during re_own to recover its
+                // unsnapshotted tail but is not F's content parent (P is);
+                // this grants the read, finalize clears it.
+                recovery_sources: vec![source],
+                ..ProvenanceLineage::root()
             },
         };
         write_provenance(&new_dir, &signing_key, VOLUME_PROVENANCE_FILE, &provisional)
@@ -724,60 +724,76 @@ impl ForceClaimOrchestrator {
         Ok(None)
     }
 
-    /// Stage 5. Rewrite the provenance with the effective basis when
-    /// the data plane disagreed with the record hint, then
-    /// materialise the local fork (config, `wal/`, `pending/`,
-    /// symlink, stopped marker) so the daemon can supervise it.
+    /// Stage 5. Rewrite the provisional provenance into its steady-state
+    /// shape — fold in a basis the record hint missed, and always drop the
+    /// transient `recovery_sources` grant the rebind may have set — then
+    /// materialise the local fork (config, `wal/`, `pending/`, symlink,
+    /// stopped marker) so the daemon can supervise it.
     async fn finalize(&mut self) -> Result<(), IpcError> {
         let fork = self.fork.as_ref().expect("rebind ran");
         let source = self.source_vol.expect("resolve_source ran");
         let basis = self.basis.expect("re_own ran");
 
-        // Effective rewrite: only needed when a basis exists and the
-        // provisional pin (record hint) named a different snapshot.
-        // The no-basis shape (dead fork's own ParentRef carried over)
-        // is already effective.
         let provisional =
             read_lineage_verifying_signature(&fork.dir, VOLUME_PUB_FILE, VOLUME_PROVENANCE_FILE)
                 .map_err(|e| IpcError::internal(format!("reading provisional provenance: {e}")))?;
-        if let Some(effective_basis) = basis {
-            let provisional_pin = provisional
-                .parent
-                .as_ref()
-                .filter(|p| p.volume_ulid == source.to_string())
-                .map(|p| p.snapshot_ulid.clone());
-            if provisional_pin.as_deref() != Some(effective_basis.to_string().as_str()) {
-                let source_dir =
-                    elide_core::volume::resolve_ancestor_dir(&self.by_id_dir, &source.to_string());
-                let source_pubkey =
-                    load_verifying_key(&source_dir, VOLUME_PUB_FILE).map_err(|e| {
-                        IpcError::internal(format!("loading volume.pub for {source}: {e}"))
-                    })?;
-                let lineage = ProvenanceLineage {
-                    parent: Some(ParentRef {
+
+        // Rewrite when the data plane revealed a basis the record hint did
+        // not name, and/or the rebind left a `recovery_sources` grant: the
+        // grant authorises re_own's reads but must never persist past them.
+        let rewrite = match basis {
+            Some(effective_basis) => {
+                let pin = provisional
+                    .parent
+                    .as_ref()
+                    .filter(|p| p.volume_ulid == source.to_string())
+                    .map(|p| p.snapshot_ulid.clone());
+                if pin.as_deref() != Some(effective_basis.to_string().as_str()) {
+                    let source_dir = elide_core::volume::resolve_ancestor_dir(
+                        &self.by_id_dir,
+                        &source.to_string(),
+                    );
+                    let source_pubkey =
+                        load_verifying_key(&source_dir, VOLUME_PUB_FILE).map_err(|e| {
+                            IpcError::internal(format!("loading volume.pub for {source}: {e}"))
+                        })?;
+                    Some(ProvenanceLineage::fork(ParentRef {
                         volume_ulid: source.to_string(),
                         snapshot_ulid: effective_basis.to_string(),
                         pubkey: source_pubkey.to_bytes(),
-                    }),
-                    extent_index: Vec::new(),
-                    oci_source: None,
-                };
-                write_provenance(
-                    &fork.dir,
-                    &fork.signing_key,
-                    VOLUME_PROVENANCE_FILE,
-                    &lineage,
-                )
-                .map_err(|e| IpcError::internal(format!("writing provenance: {e}")))?;
-                let meta_store = self.ctx.core.stores.writer();
-                elide_coordinator::upload::upload_volume_provenance_initial(
-                    &self.ctx.core.data_dir,
-                    fork.vol_ulid,
-                    &meta_store,
-                )
-                .await
-                .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
+                    }))
+                } else if provisional.recovery_sources.is_empty() {
+                    None
+                } else {
+                    Some(ProvenanceLineage {
+                        recovery_sources: Vec::new(),
+                        ..provisional
+                    })
+                }
             }
+            None if provisional.recovery_sources.is_empty() => None,
+            None => Some(ProvenanceLineage {
+                recovery_sources: Vec::new(),
+                ..provisional
+            }),
+        };
+
+        if let Some(lineage) = rewrite {
+            write_provenance(
+                &fork.dir,
+                &fork.signing_key,
+                VOLUME_PROVENANCE_FILE,
+                &lineage,
+            )
+            .map_err(|e| IpcError::internal(format!("writing provenance: {e}")))?;
+            let meta_store = self.ctx.core.stores.writer();
+            elide_coordinator::upload::upload_volume_provenance_initial(
+                &self.ctx.core.data_dir,
+                fork.vol_ulid,
+                &meta_store,
+            )
+            .await
+            .map_err(|e| IpcError::store(format!("uploading volume.provenance: {e:#}")))?;
         }
 
         std::fs::create_dir_all(fork.dir.join("wal"))
@@ -1147,6 +1163,10 @@ mod tests {
         )
         .unwrap();
         assert!(lineage.parent.is_none(), "root continuation stays a root");
+        assert!(
+            lineage.recovery_sources.is_empty(),
+            "finalize must clear the transient recovery-source grant the rebind set"
+        );
         let head = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), fork)
             .head()
             .read()
@@ -1180,15 +1200,11 @@ mod tests {
         let partial = make_dead_volume_with_lineage(
             &store,
             mint.next(),
-            &ProvenanceLineage {
-                parent: Some(ParentRef {
-                    volume_ulid: grandparent.vol.to_string(),
-                    snapshot_ulid: gsnap.to_string(),
-                    pubkey: grandparent.vk.to_bytes(),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-            },
+            &ProvenanceLineage::fork(ParentRef {
+                volume_ulid: grandparent.vol.to_string(),
+                snapshot_ulid: gsnap.to_string(),
+                pubkey: grandparent.vk.to_bytes(),
+            }),
         )
         .await;
 

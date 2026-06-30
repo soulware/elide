@@ -635,15 +635,11 @@ impl ClaimOrchestrator {
                 self.released_vol_ulid
             ))
         })?;
-        let provisional_lineage = ProvenanceLineage {
-            parent: Some(ParentRef {
-                volume_ulid: self.released_vol_ulid.to_string(),
-                snapshot_ulid: self.handoff_snap.to_string(),
-                pubkey: parent_pubkey.to_bytes(),
-            }),
-            extent_index: Vec::new(),
-            oci_source: None,
-        };
+        let provisional_lineage = ProvenanceLineage::fork(ParentRef {
+            volume_ulid: self.released_vol_ulid.to_string(),
+            snapshot_ulid: self.handoff_snap.to_string(),
+            pubkey: parent_pubkey.to_bytes(),
+        });
         write_provenance(
             &new_fork_dir,
             &signing_key,
@@ -914,15 +910,11 @@ impl ClaimOrchestrator {
         let parent_pubkey = load_verifying_key(&parent_dir, VOLUME_PUB_FILE)
             .map_err(|e| IpcError::internal(format!("loading parent volume.pub: {e}")))?;
 
-        let lineage = ProvenanceLineage {
-            parent: Some(ParentRef {
-                volume_ulid: effective.vol.to_string(),
-                snapshot_ulid: effective.snap.to_string(),
-                pubkey: parent_pubkey.to_bytes(),
-            }),
-            extent_index: Vec::new(),
-            oci_source: None,
-        };
+        let lineage = ProvenanceLineage::fork(ParentRef {
+            volume_ulid: effective.vol.to_string(),
+            snapshot_ulid: effective.snap.to_string(),
+            pubkey: parent_pubkey.to_bytes(),
+        });
         write_provenance(
             &new_fork.dir,
             &new_fork.signing_key,
@@ -1223,15 +1215,11 @@ mod tests {
 
         let lineage = match parent {
             None => ProvenanceLineage::default(),
-            Some(p) => ProvenanceLineage {
-                parent: Some(ParentRef {
-                    volume_ulid: p.vol.to_string(),
-                    snapshot_ulid: p.snap.to_string(),
-                    pubkey: p.verifying_key.to_bytes(),
-                }),
-                extent_index: vec![],
-                oci_source: None,
-            },
+            Some(p) => ProvenanceLineage::fork(ParentRef {
+                volume_ulid: p.vol.to_string(),
+                snapshot_ulid: p.snap.to_string(),
+                pubkey: p.verifying_key.to_bytes(),
+            }),
         };
 
         let signer = setup_import_identity(

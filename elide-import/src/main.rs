@@ -126,9 +126,8 @@ fn run_from_file(
     // Raw ext4 imports carry no OCI source — that field is only set on
     // OCI-imported roots.
     let lineage = elide_core::signing::ProvenanceLineage {
-        parent: None,
         extent_index: extent_sources,
-        oci_source: None,
+        ..elide_core::signing::ProvenanceLineage::root()
     };
     // The importing window is the volume's rw phase: volume.key is
     // persisted so the worker signs segments and the coordinator signs
@@ -272,13 +271,13 @@ async fn run_oci(
     // are always roots — and `extent_sources` carry hash-pool ancestors
     // for delta compression, not lineage.
     let lineage = elide_core::signing::ProvenanceLineage {
-        parent: None,
         extent_index: extent_sources,
         oci_source: Some(OciSource {
             image: image.to_owned(),
             digest: digest.clone(),
             arch: target_arch.to_string(),
         }),
+        ..elide_core::signing::ProvenanceLineage::root()
     };
     // The importing window is the volume's rw phase: volume.key is
     // persisted so the worker signs segments and the coordinator signs

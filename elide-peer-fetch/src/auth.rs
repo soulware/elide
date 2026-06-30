@@ -733,8 +733,7 @@ mod tests {
         std::fs::write(tmp.path().join("volume.pub"), pub_hex(key)).unwrap();
         let lineage = ProvenanceLineage {
             parent,
-            extent_index: Vec::new(),
-            oci_source: None,
+            ..ProvenanceLineage::root()
         };
         write_provenance(tmp.path(), key, "volume.provenance", &lineage).unwrap();
         let pub_bytes = std::fs::read(tmp.path().join("volume.pub")).unwrap();

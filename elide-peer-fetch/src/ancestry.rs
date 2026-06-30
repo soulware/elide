@@ -215,8 +215,7 @@ mod tests {
         std::fs::write(tmp.path().join(VOLUME_PUB_FILE), pub_hex(key)).unwrap();
         let lineage = ProvenanceLineage {
             parent,
-            extent_index: Vec::new(),
-            oci_source: None,
+            ..ProvenanceLineage::root()
         };
         write_provenance(tmp.path(), key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 

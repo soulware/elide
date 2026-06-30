@@ -33,7 +33,10 @@ use ulid::Ulid;
 ///
 /// Each step is signature-verified; failures bubble up as `io::Error`.
 /// `extent_index` sources are leaves — the list is already flat at attach
-/// time, so their own lineage is not expanded.
+/// time, so their own lineage is not expanded. `owned`'s own
+/// `recovery_sources` are unioned in as leaves too (the dead fork a forced
+/// claim re-owns, readable until finalize clears it); they are read only
+/// from `owned`, never inherited from an ancestor.
 pub async fn walk_lineage_set(
     store: &dyn ObjectStore,
     owned: Ulid,
@@ -56,6 +59,12 @@ pub async fn walk_lineage_set(
                     ))
                 })?;
             set.insert(source);
+        }
+
+        if current_ulid == owned {
+            for source in &lineage.recovery_sources {
+                set.insert(*source);
+            }
         }
 
         let Some(parent) = lineage.parent else {
@@ -157,6 +166,7 @@ mod tests {
         key: &SigningKey,
         parent: Option<ParentRef>,
         extent_index: Vec<String>,
+        recovery_sources: Vec<Ulid>,
     ) {
         let dir = by_id.join(ulid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
@@ -164,7 +174,8 @@ mod tests {
         let lineage = ProvenanceLineage {
             parent,
             extent_index,
-            oci_source: None,
+            recovery_sources,
+            ..ProvenanceLineage::root()
         };
         write_provenance(&dir, key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 
@@ -201,6 +212,7 @@ mod tests {
         let owned = Ulid::new();
         let parent = Ulid::new();
         let extent = Ulid::new();
+        let recovery = Ulid::new();
 
         publish_both(
             by_id.path(),
@@ -213,6 +225,7 @@ mod tests {
                 pubkey: parent_key.verifying_key().to_bytes(),
             }),
             vec![format!("{extent}/{}", Ulid::new())],
+            vec![recovery],
         )
         .await;
         publish_both(
@@ -221,6 +234,7 @@ mod tests {
             parent,
             &parent_key,
             None,
+            Vec::new(),
             Vec::new(),
         )
         .await;
@@ -264,6 +278,7 @@ mod tests {
                 pubkey: imposter.verifying_key().to_bytes(),
             }),
             Vec::new(),
+            Vec::new(),
         )
         .await;
         publish_both(
@@ -273,6 +288,7 @@ mod tests {
             &parent_key,
             None,
             Vec::new(),
+            Vec::new(),
         )
         .await;
 
@@ -280,5 +296,90 @@ mod tests {
             .await
             .expect_err("imposter parent pubkey");
         assert!(err.to_string().contains("signature invalid"), "got {err}");
+    }
+
+    /// Pins that a forced claim's transient `recovery_sources` grant
+    /// authorises the re-own read of a dead fork that never published its
+    /// own snapshot.
+    ///
+    /// In the `latest_snapshot == None` branch, `force_claim`'s rebind
+    /// gives the new fork the dead fork's *parent* — so the dead fork is a
+    /// sibling, absent from the new fork's fork/extent lineage. Naming it
+    /// in the new fork's `recovery_sources` puts it in the read set coord B
+    /// vouches and the local read path computes (the two stay equal), so
+    /// `re_own` may read it; finalize later clears the grant.
+    #[tokio::test]
+    async fn forced_claim_recovery_source_vouches_the_dead_fork() {
+        let by_id = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let base_key = SigningKey::generate(&mut OsRng); // snapshotted ancestor P
+        let dead_key = SigningKey::generate(&mut OsRng); // dead fork E, never snapshotted
+        let fork_key = SigningKey::generate(&mut OsRng); // fork F the forced claim mints
+        let base = Ulid::new();
+        let dead = Ulid::new();
+        let fork = Ulid::new();
+
+        // P: a root with a published snapshot.
+        publish_both(
+            by_id.path(),
+            store.as_ref(),
+            base,
+            &base_key,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+
+        // E forks from P at a snapshot, then writes without ever
+        // snapshotting — so its name record carries no `latest_snapshot`.
+        let base_parent = ParentRef {
+            volume_ulid: base.to_string(),
+            snapshot_ulid: Ulid::new().to_string(),
+            pubkey: base_key.verifying_key().to_bytes(),
+        };
+        publish_both(
+            by_id.path(),
+            store.as_ref(),
+            dead,
+            &dead_key,
+            Some(base_parent.clone()),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+
+        // F is what the forced claim mints for a never-snapshotted dead
+        // fork: parent is E's parent (P), and E is named as a transient
+        // recovery source so the re-own may read it.
+        publish_both(
+            by_id.path(),
+            store.as_ref(),
+            fork,
+            &fork_key,
+            Some(base_parent),
+            Vec::new(),
+            vec![dead],
+        )
+        .await;
+
+        let read_set = walk_lineage_set(store.as_ref(), fork, fork_key.verifying_key())
+            .await
+            .unwrap();
+        let fork_dir = by_id.path().join(fork.to_string());
+        let local: HashSet<Ulid> = elide_core::volume::lineage_ulids(&fork_dir, by_id.path())
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert!(
+            read_set.contains(&dead),
+            "coord B must vouch the recovery source the re-own reads (read set = {read_set:?})"
+        );
+        assert!(
+            local.contains(&dead),
+            "the local read path the walk is pinned to must include the recovery source"
+        );
     }
 }

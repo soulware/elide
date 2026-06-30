@@ -1502,15 +1502,11 @@ mod tests {
             prov_dir.path(),
             &owned_sk,
             VOLUME_PROVENANCE_FILE,
-            &ProvenanceLineage {
-                parent: Some(ParentRef {
-                    volume_ulid: parent.to_string(),
-                    snapshot_ulid: Ulid::new().to_string(),
-                    pubkey: parent_sk.verifying_key().to_bytes(),
-                }),
-                extent_index: Vec::new(),
-                oci_source: None,
-            },
+            &ProvenanceLineage::fork(ParentRef {
+                volume_ulid: parent.to_string(),
+                snapshot_ulid: Ulid::new().to_string(),
+                pubkey: parent_sk.verifying_key().to_bytes(),
+            }),
         )
         .unwrap();
         let prov = std::fs::read(prov_dir.path().join(VOLUME_PROVENANCE_FILE)).unwrap();
